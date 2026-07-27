@@ -1,7 +1,7 @@
 ---
 rfc: 0041
 title: Dashboard datasource plugins — Ourios as a Grafana / Perses source
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -11,23 +11,33 @@ superseded-by: —
 
 # RFC 0041 — Dashboard datasource plugins
 
-> **Status: `drafted` (2026-07-25).** §§1–4 and §§7–8 are filled per
-> `docs/rfcs/README.md`'s lifecycle; §5 acceptance criteria and §6 testing
-> strategy are deliberately **not** written, because the open question is not
-> *how* to build this but *whether it is worth building and where*. Both
-> options were spiked to a rendered dashboard before this was written (§3.1),
-> so the estimates here are measured rather than guessed. **This RFC asks for
-> a decision, not for implementation.** One finding the spikes surfaced has
-> already been decided and shipped on its own (§3.4 severity → RFC0002.21);
-> everything else is open.
+> **Status: `specified` (2026-07-27).** The decision this RFC asked for has
+> been made (maintainer, same date): **build it now, Perses first, three
+> plugins, in the dedicated
+> [`ourios-perses-plugin`](https://github.com/jensholdgaard/ourios-perses-plugin)
+> repository** — with the FinOps dashboard as the capstone artifact and the
+> Grafana datasource an ungated later follow-up. What changed since
+> `drafted`: RFC 0042 landed typed numeric promotion and verified live spend
+> aggregation (RFC0042.9), so a dashboard now charts *money* — the plugin
+> became the demo artifact for the agent-FinOps direction rather than a
+> generic API client. §5/§6 are now written; §7 records the resolutions.
+>
+> *(Original `drafted` framing, 2026-07-25: §5/§6 were deliberately empty
+> because the open question was not* how *but* whether and where*; both
+> hosts were spiked to a rendered dashboard first, so §3.1's figures are
+> measured, not guessed. The §3.4 severity finding shipped separately as
+> RFC0002.21.)*
 
 ## 1. Summary
 
 Ourios answers queries over HTTP (`POST /v1/query`, RFC 0016) in a logs DSL
 (RFC 0002) that was designed with dashboard authors as its primary audience.
 Neither Grafana nor Perses can consume it today: each needs a datasource
-plugin. This RFC proposes writing one — and asks which host, or whether the
-work belongs in this cycle at all.
+plugin. At `drafted` this RFC asked which host — or whether the work belongs
+in this cycle at all; at `specified` both questions are resolved (§7):
+build now, **Perses first** — three plugins in the dedicated
+`ourios-perses-plugin` repository, capped by the committed FinOps dashboard
+(RFC0041.6) — with the Grafana datasource an ungated later follow-up.
 
 Working spikes exist for **both** Grafana and Perses. Each renders real
 ingested logs in a real dashboard against the live querier. The Ourios-side
@@ -218,33 +228,114 @@ option, not a strawman — see §7.
 
 ## 5. Acceptance criteria
 
-Deliberately empty at `drafted`. To be written when §7's first question is
-answered; a plugin in its own repository (§3.3) would carry its own criteria,
-the §3.4 severity decision having already landed against this repo
-(RFC0002.21).
+Written at the `specified` flip (2026-07-27), the §7 host question resolved:
+**Perses first** — three plugins in the dedicated
+[`ourios-perses-plugin`](https://github.com/jensholdgaard/ourios-perses-plugin)
+repository — with the Grafana datasource an explicitly cheap follow-up this
+RFC does not gate on. Criteria RFC0041.1–.5 are satisfied by tests in the
+plugin repository's CI (run against the released `ourios-server` container
+image, the collector-interop pattern inverted); RFC0041.6 by an artifact in
+this repository. The RFC ladder here tracks their aggregate state.
+
+- **RFC0041.1 — datasource connection across both auth modes `[RFC 0026]`**
+  - **Given** a Perses instance with the `OuriosDatasource` plugin
+    configured against a running `ourios-server` container
+  - **When** the datasource health/connection path runs against a server
+    in **open mode** (no `auth` section)
+  - **Then** it succeeds with no credential configured
+  - **When** it runs against a server with RFC 0026 **enforcement on**
+  - **Then** a datasource carrying a valid bearer token for the
+    configured tenant succeeds; one carrying **no** token surfaces the
+    API's **401**; and one whose token does not cover the configured
+    tenant surfaces the API's **403** — each as a distinct, visible
+    datasource error, never swallowed into a generic failure.
+- **RFC0041.2 — log-panel parity with the RFC 0016 response**
+  - **Given** ingested fixture records
+  - **When** a Perses log panel runs an RFC 0002 DSL statement through
+    `OuriosLogQuery`
+  - **Then** the rendered rows equal the RFC 0016 response — body,
+    timestamp, severity, and service mapped per §3.2
+  - **And** a DSL error surfaces as the panel's error state carrying the
+    API's own message.
+- **RFC0041.3 — time-series mapping under §6.3 bucket semantics `[RFC 0002 §6.3, RFC 0042 §3.5]`**
+  - **Given** fixture records spanning multiple bucket windows,
+    including a record exactly on a window boundary
+  - **When** a time-series panel runs `count by bucket(w)` and
+    `sum(attr.<k>) by attr.<group_k>, bucket(w)` (aggregated numeric key
+    `<k>`, series-label group key `<group_k>`) through
+    `OuriosTimeSeriesQuery`
+  - **Then** the series match the API's aggregate groups under RFC 0002
+    §6.3's bucket semantics — half-open, epoch-aligned UTC windows
+    `[k·w, (k+1)·w)`, the boundary record landing in the *later* bucket,
+    keys the window **start**
+  - **And** bucket keys render as timestamps, group keys as series
+    labels, and NULL aggregate values as **gaps** — never zeros (the
+    RFC 0042 §3.5 rule shown, not re-derived).
+- **RFC0041.4 — query editors adapt via the runtime schema `[RFC 0032]`**
+  - **Given** a deployment's `ourios://query-schema` document
+  - **When** the query editors initialize
+  - **Then** field and promoted-attribute suggestions (severity band
+    names included) derive from that document, not from names hardcoded
+    in the plugin.
+- **RFC0041.5 — compatibility declaration, CI-exercised**
+  - **Given** plugin release metadata declaring its minimum
+    `ourios-server` version
+  - **When** the plugin repository's CI runs
+  - **Then** the e2e suite executes against exactly that image tag
+    alongside `latest`
+  - **And** a contract break fails the plugin's gate — not a user's
+    dashboard.
+- **RFC0041.6 — the committed FinOps dashboard renders `[capstone]`**
+  - **Given** the committed Perses dashboard definition in this
+    repository — agent spend by model over time (`sum(attr.cost_usd)`),
+    token throughput, and tool-decision mix — and a dogfood capture
+    served by the local stack
+  - **When** the dashboard is imported into a Perses instance with the
+    plugins installed
+  - **Then** every panel renders from the capture with no manual edits
+    to the definition. This is the demo artifact the host decision was
+    made for.
 
 ## 6. Testing strategy
 
-Deliberately empty at `drafted`. See §5.
+Per `CLAUDE.md` §6.2, adapted to a TypeScript workspace: RFC0041.1–.5 are
+end-to-end tests in the plugin repository (Playwright or the Perses e2e
+harness against the GHCR `ourios-server` image; unit tests for the DSL
+request/response mapping), pinned to the criterion ids so the mapping stays
+greppable. RFC0041.6 is verified by rendering the committed dashboard
+against a dogfood capture — the same corpus discipline as RFC0042.9. The
+main repository's CI is untouched: the contract surface it already gates
+(RFC 0016 shapes, RFC 0032 document, RFC0002.10 YAML-embeddability) is what
+the plugin builds on.
 
 ## 7. Open questions
 
-- [ ] **Is this worth doing now?** The honest framing: this is a client for a
-      stable API, not engine work. Nothing in `CLAUDE.md` §2 moves. Competing
-      calls on the same time include the recurring RFC 0009 D1/D2 soak
-      cadence now that the harness has shipped, RFC 0021's phase 2 (gated on
-      upstream DataFusion 55), and the agent-observability/FinOps direction.
-      **Answer this before the others.**
-- [ ] **Which host — Grafana, Perses, or both?** §4 lays out the trade;
-      §3.1 gives measured effort for each.
+- [x] **Is this worth doing now? — RESOLVED yes (2026-07-27).** What changed
+      the calculus: RFC 0042 landed typed numeric promotion and RFC0042.9
+      verified live spend aggregation over MCP, so a dashboard now shows
+      *money*, not just logs — the plugin became the FinOps demo artifact
+      rather than a generic API client.
+- [x] **Which host — RESOLVED: Perses first (2026-07-27).** Grafana wins the
+      measured-effort comparison (§3.1), but Perses wins the posture that
+      matters: Apache-2.0 + CNCF end-to-end (Grafana OSS is AGPL),
+      dashboards-as-code fitting the GitOps/air-gapped story, and the §5
+      deferred-capabilities commitment the roadmap has carried from the
+      start. Scoped to all three plugins (the FinOps dashboard needs time
+      series). The Grafana datasource remains a cheap later follow-up and
+      is not gated by this RFC.
 - [x] **§3.4 severity — RESOLVED (RFC0002.21, PR #641).** Ourios's floor
       semantics were the inverse of the OTel Logs SDK's; floors now admit
       unspecified severity, ceilings exclude it, and the rule is compiled into
       the predicate so row-group pruning agrees with it. Shipped independently
       of this RFC's decision.
-- [ ] **Repository placement.** §3.3 argues for a separate repo. If it lives
-      here instead, that is a `CLAUDE.md` §7 layout change and needs a `meta:`
-      RFC.
+- [x] **Repository placement — RESOLVED: separate repo (2026-07-27),**
+      [`ourios-perses-plugin`](https://github.com/jensholdgaard/ourios-perses-plugin).
+      The boundary is the stable public query surface (unlike the rejected
+      intra-workspace splits, which cut private co-evolving internals); the
+      toolchains, release cadences, and supply-chain postures are disjoint;
+      and standalone plugin repositories are the host ecosystem's
+      convention. Drift is gated by RFC0041.5, adaptation by RFC0041.4. The
+      FinOps dashboard definition stays in this repository (RFC0041.6).
 - [ ] **Does a per-row `id` belong in the query response?** Neither host gets
       one today; both spikes synthesize `{ts}-{template_id}-{index}`. Adequate
       for display, not stable across pagination, which matters for live

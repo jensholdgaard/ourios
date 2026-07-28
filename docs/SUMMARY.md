@@ -69,6 +69,7 @@
 - [RFC 0040 — DataFusion operator instrumentation](./rfcs/0040-datafusion-operator-instrumentation.md)
 - [RFC 0041 — Dashboard datasource plugins](./rfcs/0041-dashboard-datasource-plugins.md)
 - [RFC 0042 — Typed numeric attribute promotion](./rfcs/0042-typed-numeric-promotion.md)
+- [RFC 0043 — Derive event_name from the legacy event.name attribute](./rfcs/0043-event-name-attribute-ingest.md)
 - [RFC 0044 — Template-aware body equality](./rfcs/0044-template-aware-body-equality.md)
 
 # Talks

@@ -119,8 +119,8 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 # slice-2 pattern. `opentelemetry` `trace` supplies `SpanKind`/`TracerProvider`.
 # The `tracing-opentelemetry` layer these tests install is no longer listed
 # here: RFC0039.6 promoted it to `[dependencies]`, which tests can reach too.
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
 # RFC 0019 server-level S3 integration tests (rfc0019_storage_backend): spin
 # LocalStack (S3-compatible, Apache-2.0) via testcontainers, spawn the server
 # pointed at it through the endpoint override, and assert bucket contents via a

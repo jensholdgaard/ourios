@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.6.0] - 2026-07-28
+
+### Added
+
+- Promote cost_usd + token counts for the FinOps loop (#646) (44d2046)
+- Numeric-class predicates + cast-free aggregation (RFC 0042 slice 3b) (#652) (318e5ff)
+- Mixed-schema scans via the §3.3 no-coercion adapter (RFC 0042 slice 3a) (#651) (da13581)
+- Typed promoted-attribute config entries (RFC 0042 slice 2) (#650) (2f7a339)
+- Typed promotion classes — writer side (RFC 0042 slice 1) (#649) (9bc8436)
+- Expose the traces and logs signals, not just metrics (#644) (b807e18)
+
+### Chore
+
+- Update gcr.io/distroless/static-debian12 docker digest to a9fcaed (#658) (f5010bb)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 574eb28 (#659) (56a0f60)
+- Update gcr.io/distroless/cc-debian12 docker digest to e8e7ee4 (#656) (a84e247)
+- Pin dependencies (#655) (b5a010c)
+- Bump quinn-proto 0.11.14 -> 0.11.15 (GHSA-4w2j-m93h-cj5j) (#648) (5a4681a)
+
+### Documentation
+
+- Flip RFCs 0040, 0041, 0042 to accepted — maintainer sign-off (#663) (b0fb749)
+- Flip RFC 0041 to green — plugins shipped, dashboard verified (#662) (4ea4d76)
+- Commit the RFC0041.6 FinOps dashboard artifact (#661) (b223917)
+- Flip RFC 0041 to specified — Perses first, separate repo (#660) (25f476f)
+- Flip RFC 0042 to green — RFC0042.9 verified on live spend (#657) (0607949)
+- Draft RFC 0042 — typed numeric promotion (RFC 0022 amendment) (#647) (c017e42)
+- Refresh §3 through RFC 0041 (#643) (d38291a)
+- Draft RFC 0041 — dashboard datasource plugins (Grafana / Perses) (#640) (3ea7bfe)
+
+### Fixed
+
+- Per-signal OTLP endpoints need explicit /v1/<signal> paths (#654) (1082038)
+- **BREAKING** Configure the OTel SDK via verbatim extraEnv, not chart keys (#645) (bb54780)
+- **BREAKING** Unspecified severity bypasses a minimum-severity floor (RFC0002.21) (#641) (4bacd20)
+- Regenerate THIRD-PARTY-LICENSES.md during release (#639) (a2e61e5)
+
+### Tests
+
+- Compaction re-projects across a re-typing (RFC 0042 slice 4) (#653) (3d6916d)
+
 ## [0.5.0] - 2026-07-25
 
 ### Added

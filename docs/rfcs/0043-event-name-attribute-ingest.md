@@ -52,16 +52,24 @@ handling from body-mining into the designed event-keyed path.
 At the OTLP decode boundary (`ourios-core` OTLP conversion, both
 protobuf and JSON paths per the RFC0003.6 checklist):
 
-1. If `LogRecord.event_name` is set, it wins. The `event.name`
-   attribute, if also present, is stored untouched — no comparison, no
-   correction, no flag (a mismatch between the two is source telemetry,
-   and we preserve it; the read path returns both as received).
-2. If `LogRecord.event_name` is unset and an `event.name` attribute is
-   present with a string value, the stored record's `event_name` is set
-   to that string. The attribute remains in `attributes` verbatim —
-   derivation, not a move. Non-string `event.name` values derive
-   nothing.
+1. If `LogRecord.event_name` is set **and non-empty**, it wins. The
+   `event.name` attribute, if also present, is stored untouched — no
+   comparison, no correction, no flag (a mismatch between the two is
+   source telemetry, and we preserve it; the read path returns both as
+   received).
+2. If `LogRecord.event_name` is unset **or empty** and an `event.name`
+   attribute is present with a **non-empty string** value, the stored
+   record's `event_name` is set to that string. The attribute remains
+   in `attributes` verbatim — derivation, not a move. Non-string and
+   empty-string `event.name` values derive nothing.
 3. Neither present → `event_name` stays NULL, exactly as today.
+
+"Set" is defined identically for both encodings: protobuf cannot
+distinguish an absent string field from an empty one (proto3 default),
+and RFC0003.6 JSON may spell absence as a missing key, `null`, or `""`
+— all three read as unset. An empty string is therefore never a value,
+on either side of the derivation, and the two decode paths cannot
+diverge (RFC0043.3/.7).
 
 The invariant posture: the OTLP-fidelity rule (preserve / flag / never
 correct) is untouched because nothing received is altered or dropped —
@@ -113,11 +121,24 @@ sources.
   - **Given** an ingested attr-only corpus (Claude Code-shaped fixture)
   - **When** `event_name == "claude_code.api_request"` runs
   - **Then** exactly the api_request records return.
-- **RFC0043.6 — RFC 0037 keying engages**
-  - **Given** the same corpus
+- **RFC0043.6 — RFC 0037 keying engages, observably**
+  - **Given** two attr-only records sharing `event.name` but with
+    differing bodies (shapes that body mining would assign distinct
+    templates)
   - **When** mined
-  - **Then** the api_request records take the event-keyed template path
-    (asserted via the RFC 0037 §3.1 keying, not body mining).
+  - **Then** both records carry the **same** `template_id`
+  - **And** the RFC 0037 §3.1 event-keyed counter (not the body-mining
+    path's) accounts for them — the same-key/different-body collapse is
+    the externally visible proof body mining was not used.
+- **RFC0043.7 — empty is never a value, in either encoding**
+  - **Given** records with (a) empty-string wire `event_name` plus an
+    `event.name` attribute, (b) an empty-string `event.name` attribute
+    only, and (c) JSON `null` `event.name` — each encoded as protobuf
+    and as RFC0003.6 JSON where representable
+  - **When** ingested
+  - **Then** (a) derives from the attribute, (b) and (c) derive
+    nothing, and the protobuf and JSON results are identical
+    shape-for-shape.
 
 ## 6. Testing strategy
 

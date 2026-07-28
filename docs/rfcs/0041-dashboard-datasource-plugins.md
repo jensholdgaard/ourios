@@ -13,10 +13,10 @@ superseded-by: —
 
 > **Status: `accepted` (2026-07-28, maintainer sign-off).** Terminal. No
 > thesis-gate applies (`validated` vacuous, RFC 0008 precedent). The
-> RFC0041.5 recorded deferral survives acceptance unchanged — the `latest`
-> e2e leg and wire-level `sum` land in the plugin repository when the next
-> server release ships typed columns (tracked there, not by reopening this
-> RFC). The Grafana datasource remains an ungated follow-up.
+> RFC0041.5 recorded deferral **closed the same day**: v0.6.0 shipped
+> typed columns and the plugin repositories landed the `latest` matrix
+> leg + wire-level `sum` e2e (§9.3). The Grafana datasource follow-up
+> also shipped, in its own repository.
 >
 > **Status: `green` (2026-07-27, maintainer flip).** RFC0041.1–.4 and the
 > .6 capstone are verified — the plugins shipped in
@@ -399,10 +399,9 @@ e2e with the RFC 0026 auth matrix — 401 and 403 classified distinctly),
 `OuriosTimeSeriesQuery` (.3 — bucket detection positional, NULL scalar
 renders as a gap and never zero, series identity keyed on the group tuple),
 runtime schema suggestions over the MCP resource (.4, degrading to a plain
-field when unreachable). `.5` is deliberately partial: `0.5.0` is the
-declared minimum and is what CI exercises; the `latest` leg and wire-level
-`sum` e2e land with the next server release, which is the first to carry
-RFC 0042 typed columns.
+field when unreachable). `.5` was deliberately partial until v0.6.0
+(the first release carrying RFC 0042 typed columns); §9.3 records its
+completion.
 
 ### 9.2 RFC0041.6 — the committed dashboard renders (2026-07-27)
 
@@ -419,3 +418,20 @@ events). Idle hours draw as gaps, not zeros — the RFC 0042
 null-propagation contract on screen. The panel time range arrives as a
 DSL `range(...)` stage (the request body carries only the `query`
 field), confirming the §3.2 mapping.
+
+### 9.3 RFC0041.5 — deferral closed (2026-07-28)
+
+v0.6.0 shipped typed columns, and both plugin repositories completed the
+matrix the same day (`ourios-perses-plugin` #9, `ourios-grafana-datasource`
+#4 — the Grafana datasource itself having shipped as the ungated
+follow-up): the e2e job runs the declared-minimum `0.5.0` image alongside
+`latest`, where the typed leg starts the fixture with map-form promotion
+entries (rejected by 0.5.0's parser — the compatibility boundary the
+criterion pins) and verifies `sum(attr.cost_usd) by attr.model, bucket(1h)`
+over real Float64 columns with an all-NULL bucket staying `null` on the
+wire, plus the Int64 token sum. The matrix immediately proved its worth:
+RFC0002.21's severity-floor change surfaced as a live behavioural
+difference between the legs, and the floor-dependent expectations are now
+leg-aware in both repositories. Validating the same release against the
+envykube consumer surfaced #664 (`body ==` silently empty on
+template-mined records) — filed, not a plugin defect.

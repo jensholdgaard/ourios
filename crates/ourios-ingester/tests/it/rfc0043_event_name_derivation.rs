@@ -56,6 +56,7 @@ fn rfc0043_1_wire_field_wins_and_attribute_is_preserved() {
 }
 
 /// Scenario RFC0043.2 — derivation from the attribute, attribute intact.
+/// See `docs/rfcs/0043-event-name-attribute-ingest.md` §5.
 #[test]
 fn rfc0043_2_derives_from_attribute_and_preserves_it() {
     let record = LogRecord {
@@ -84,6 +85,7 @@ fn rfc0043_2_derives_from_attribute_and_preserves_it() {
 /// payload spells the record per RFC0003.6 (lowerCamelCase, no wire
 /// `eventName`); decoding yields the same proto structs the protobuf
 /// path produces, so one materialisation covers both.
+/// See `docs/rfcs/0043-event-name-attribute-ingest.md` §5.
 #[test]
 fn rfc0043_3_json_and_protobuf_paths_agree() {
     let json = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9,"body":{"stringValue":"api_request"},"attributes":[{"key":"event.name","value":{"stringValue":"claude_code.api_request"}}]}]}]}]}"#;
@@ -112,6 +114,7 @@ fn rfc0043_3_json_and_protobuf_paths_agree() {
 }
 
 /// Scenario RFC0043.4 — a non-string `event.name` derives nothing.
+/// See `docs/rfcs/0043-event-name-attribute-ingest.md` §5.
 #[test]
 fn rfc0043_4_non_string_attribute_derives_nothing() {
     let record = LogRecord {
@@ -131,6 +134,7 @@ fn rfc0043_4_non_string_attribute_derives_nothing() {
 /// (a) an empty wire field is unset (proto3 cannot distinguish absent
 /// from empty), so the attribute derives; (b) an empty-string attribute
 /// derives nothing; (c) a JSON `null` value derives nothing.
+/// See `docs/rfcs/0043-event-name-attribute-ingest.md` §5.
 #[test]
 fn rfc0043_7_empty_is_never_a_value() {
     // (a) empty wire field + attribute → derives.

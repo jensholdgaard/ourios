@@ -28,7 +28,8 @@ superseded-by: —
 > wire-level `sum` e2e land with the next server release, the first to
 > carry RFC 0042 typed columns (precedent for a recorded deferral at
 > green: RFC 0005's `#[ignore]`d sizing criterion). The Grafana datasource
-> remains an ungated later follow-up.
+> remains an ungated later follow-up. *(Both since closed — the deferral
+> per §9.3, the Grafana datasource in its own repository.)*
 >
 > *(`specified`, same date: build now, Perses first, three plugins,
 > separate repo — the maintainer decision this RFC asked for. What changed
@@ -422,9 +423,9 @@ field), confirming the §3.2 mapping.
 ### 9.3 RFC0041.5 — deferral closed (2026-07-28)
 
 v0.6.0 shipped typed columns, and both plugin repositories completed the
-matrix the same day (`ourios-perses-plugin` #9, `ourios-grafana-datasource`
-#4 — the Grafana datasource itself having shipped as the ungated
-follow-up): the e2e job runs the declared-minimum `0.5.0` image alongside
+matrix the same day (jensholdgaard/ourios-perses-plugin#9,
+jensholdgaard/ourios-grafana-datasource#4 — the Grafana datasource itself
+having shipped as the ungated follow-up): the e2e job runs the declared-minimum `0.5.0` image alongside
 `latest`, where the typed leg starts the fixture with map-form promotion
 entries (rejected by 0.5.0's parser — the compatibility boundary the
 criterion pins) and verifies `sum(attr.cost_usd) by attr.model, bucket(1h)`

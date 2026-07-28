@@ -13,6 +13,7 @@
 //! `materialize_record` takes the resolved `tenant_id` as a parameter,
 //! so the fan-out slice supplies it.
 
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs};
 use ourios_core::otlp::{Body, OtlpLogRecord};
@@ -36,6 +37,11 @@ pub fn materialize_record(
     scope_schema_url: &str,
     tenant_id: TenantId,
 ) -> OtlpLogRecord {
+    // RFC 0043: the wire field wins when non-empty; otherwise derive from
+    // the legacy `event.name` attribute. Computed before the struct
+    // literal because the literal moves `record.attributes`.
+    let event_name =
+        nonempty(record.event_name).or_else(|| event_name_from_attributes(&record.attributes));
     OtlpLogRecord {
         tenant_id,
         // Event time: `0` = unknown per the OTLP spec, kept as `0`
@@ -66,7 +72,7 @@ pub fn materialize_record(
         trace_id: fixed_len(&record.trace_id),
         span_id: fixed_len(&record.span_id),
         flags: record.flags,
-        event_name: nonempty(record.event_name),
+        event_name,
         // `string_value` → mining path (`Body::String`), every other
         // variant → `Body::Structured` verbatim (RFC0003.7/.8); `None`
         // when the wire delivered no body.
@@ -141,6 +147,23 @@ fn nonzero(v: u64) -> Option<u64> {
 /// sentinel proto uses for optional strings.
 fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+/// RFC 0043 §3 — derive `event_name` from the legacy `event.name`
+/// attribute: a non-empty string value derives; anything else (absent,
+/// non-string, empty) derives nothing. The attribute itself stays in
+/// `attributes` verbatim — derivation, never correction — so the
+/// fidelity rule holds by construction. Both wire encodings funnel
+/// through this one seam (JSON decodes into the same proto structs),
+/// which is what keeps them from diverging (RFC0043.3).
+fn event_name_from_attributes(attributes: &[KeyValue]) -> Option<String> {
+    attributes
+        .iter()
+        .find(|kv| kv.key == "event.name")
+        .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+            Value::StringValue(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })
 }
 
 /// A proto `bytes` id (`trace_id` / `span_id`): exactly `N` bytes →

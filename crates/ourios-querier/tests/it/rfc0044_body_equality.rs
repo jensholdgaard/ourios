@@ -373,3 +373,68 @@ async fn rfc0044_8_unmatched_literal_returns_empty() {
     let result = run(bucket.path(), r#"body == "no such body anywhere""#).await;
     assert_eq!(result.rows, 0);
 }
+
+// --- RFC0044.9: the reconstruction invariant, driven through the predicate ---
+
+use ourios_config::MinerConfig;
+use ourios_core::audit::SharedAuditSink;
+use ourios_core::otlp::{Body as OtlpBody, OtlpLogRecord};
+use ourios_miner::cluster::MinerCluster;
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: ourios_testgen::proptest_cases(10),
+        ..ProptestConfig::default()
+    })]
+
+    /// Scenario RFC0044.9 `[property]` — for every line of a mined corpus,
+    /// `body == <the original line>` finds its record(s): the real miner
+    /// mines, its real audit emissions build the registry, and equality
+    /// through templates is exactly as faithful as reconstruction itself.
+    /// See `docs/rfcs/0044-template-aware-body-equality.md` §5.
+    #[test]
+    fn rfc0044_9_every_mined_line_is_findable_by_its_own_body(
+        lines in proptest::collection::vec("[a-z]{1,5}( [a-z0-9]{1,7}){0,4}", 1..10),
+    ) {
+        let tenant = TenantId::new("t");
+        let audit = SharedAuditSink::new();
+        let mut cluster =
+            MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()));
+        let mut mined_records = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let record = OtlpLogRecord {
+                tenant_id: tenant.clone(),
+                time_unix_nano: TS0 + u64::try_from(i).expect("small index") * 1_000,
+                severity_number: 9,
+                body: Some(OtlpBody::String(line.clone())),
+                ..Default::default()
+            };
+            let (_, captured) = cluster.ingest_mined(&record);
+            mined_records.push(captured.expect("string-bodied record captures"));
+        }
+        let bucket = tempfile::TempDir::new().expect("temp");
+        write_all(bucket.path(), &mined_records);
+        write_audit(bucket.path(), &audit.drain());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let mut distinct: Vec<&String> = lines.iter().collect();
+        distinct.sort();
+        distinct.dedup();
+        for line in distinct {
+            let expected = lines.iter().filter(|l| *l == line).count();
+            let result = runtime.block_on(run(
+                bucket.path(),
+                &format!(r#"body == "{line}""#),
+            ));
+            prop_assert_eq!(
+                result.rows as usize,
+                expected,
+                "`body == {:?}` must find exactly its own records",
+                line,
+            );
+        }
+    }
+}

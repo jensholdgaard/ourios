@@ -39,6 +39,7 @@
 
 mod alias_store;
 mod audit_scan;
+pub mod body_match;
 mod compile;
 mod drift;
 pub mod dsl;

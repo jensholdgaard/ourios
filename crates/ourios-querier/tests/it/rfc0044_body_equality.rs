@@ -298,7 +298,7 @@ async fn rfc0044_overflow_spill_cannot_false_match_a_crafted_literal() {
 
 /// Scenario RFC0044.7 — pruning still engages: two hour-partitioned
 /// files, the matched template only in the first. The second file's row
-/// group is skippable by both arms (its template_id statistics exclude
+/// group is skippable by both arms (its `template_id` statistics exclude
 /// every candidate and its body column is all-NULL), so the scan touches
 /// only the matching file — and the result is still complete.
 /// See `docs/rfcs/0044-template-aware-body-equality.md` §5.

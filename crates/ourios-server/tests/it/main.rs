@@ -31,3 +31,4 @@ mod rfc0032_query_schema;
 mod rfc0038_1_request_spans;
 mod rfc0039_1_query_propagation;
 mod rfc0039_4_sampling;
+mod rfc0043_5_event_name_query;

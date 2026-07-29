@@ -48,4 +48,5 @@ mod rfc0035_2_sweep_crash;
 mod rfc0035_5_on_disk_equivalence;
 mod rfc0035_f2_miner_panic_salvage;
 mod rfc0038_2_ingest_batch_span;
+mod rfc0043_6_event_keyed_templating;
 mod rfc0043_event_name_derivation;

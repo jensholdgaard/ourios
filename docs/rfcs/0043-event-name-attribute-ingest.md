@@ -22,7 +22,7 @@ superseded-by: —
 >
 > *(`specified`, same date: §5 criteria written and testable; the one
 > fidelity question (§7) resolved in the design — the attribute is
-> preserved verbatim, the field is* derived*, nothing is corrected.)*
+> preserved verbatim, the field is derived, nothing is corrected.)*
 
 ## 1. Summary
 

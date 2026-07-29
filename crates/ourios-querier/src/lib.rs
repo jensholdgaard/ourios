@@ -39,7 +39,7 @@
 
 mod alias_store;
 mod audit_scan;
-pub mod body_match;
+mod body_match;
 mod compile;
 mod drift;
 pub mod dsl;
@@ -49,6 +49,7 @@ mod template_map;
 mod template_registry;
 
 pub use alias_store::derive_alias_map;
+pub use body_match::{BodyLiteralMatch, body_literal_candidates};
 pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};

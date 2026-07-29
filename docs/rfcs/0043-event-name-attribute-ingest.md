@@ -1,7 +1,7 @@
 ---
 rfc: 0043
 title: Derive event_name from the legacy event.name attribute at ingest
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-29
@@ -11,9 +11,18 @@ superseded-by: —
 
 # RFC 0043 — Derive `event_name` from the legacy `event.name` attribute at ingest
 
-> **Status: `specified` (2026-07-29).** §5 criteria written and testable;
-> the one fidelity question (§7) is resolved in the design: the attribute
-> is preserved verbatim, the field is *derived*, nothing is corrected.
+> **Status: `green` (2026-07-29).** All seven §5 criteria pass: the
+> derivation + boundary shapes landed in #668 (RFC0043.1–.4/.7, both
+> encodings through the one `materialize_record` seam), and #669 closed
+> .5 (attr-only records through the real miner into a real store,
+> matched end-to-end by `event_name ==`) and .6 (the id-separation
+> observable, criterion refined inline — the originally referenced
+> counter does not exist as a distinct instrument). No thesis-gate
+> applies; `accepted` is a maintainer flip.
+>
+> *(`specified`, same date: §5 criteria written and testable; the one
+> fidelity question (§7) resolved in the design — the attribute is
+> preserved verbatim, the field is* derived*, nothing is corrected.)*
 
 ## 1. Summary
 

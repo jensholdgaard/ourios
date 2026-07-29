@@ -356,6 +356,11 @@ async fn rfc0044_8_correct_empties_prune_everything() {
         "an unmatched literal must not scan anything: {:?}",
         result.stats,
     );
+    assert_eq!(
+        result.stats.row_groups_pruned, 2,
+        "both partitions' row groups are pruned, not elided: {:?}",
+        result.stats,
+    );
 }
 
 /// The empty-set half of RFC0044.8 — a literal matching no template and

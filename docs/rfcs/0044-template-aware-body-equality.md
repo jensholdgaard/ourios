@@ -1,7 +1,7 @@
 ---
 rfc: 0044
 title: Template-aware body equality — the two-arm compile for body ==
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-29
@@ -11,6 +11,12 @@ superseded-by: —
 
 # RFC 0044 — Template-aware body equality (`body ==` two-arm compile)
 
+> **Status: `accepted` (2026-07-29, maintainer sign-off).** Terminal. No
+> thesis-gate applies (`validated` vacuous, RFC 0008 precedent). The one
+> open §7 fork — substring/ordering/regex on `body` — survives
+> acceptance as a follow-up decision, tracked in §7, not by reopening
+> this RFC.
+>
 > **Status: `green` (2026-07-29).** All nine §5 criteria pass, landed in
 > five slices the same day: #671 (the plan-time matcher), #672 (the
 > two-arm compile — #664 closed there), #673 (.6 with the alias-exclusion

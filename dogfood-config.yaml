@@ -79,6 +79,17 @@ storage:
       - { key: cost_usd, type: f64 }
       - { key: input_tokens, type: i64 }
       - { key: output_tokens, type: i64 }
+      # The OTel GenAI semconv keys (dotted form) — what a
+      # semconv-conformant source (e.g. the OTel Demo 3.0 agent under
+      # opentelemetry-instrumentation-openai-v2) emits on its
+      # gen_ai.client.inference.operation.details events. Both key
+      # families promoted side by side is the two-sources story:
+      # Claude Code's flat keys above, the semconv's dotted ones here.
+      - gen_ai.request.model
+      - gen_ai.operation.name
+      - gen_ai.provider.name
+      - { key: gen_ai.usage.input_tokens, type: i64 }
+      - { key: gen_ai.usage.output_tokens, type: i64 }
 receiver:
   enabled: true
   grpc_addr: "127.0.0.1:24317"

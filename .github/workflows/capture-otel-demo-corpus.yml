@@ -55,6 +55,15 @@ on:
         description: Space/comma-separated flagd failure flags to force on (e.g. adFailure paymentFailure) — empty leaves the demo's defaults
         default: ''
         required: false
+      agentic:
+        description: >-
+          'vcr' layers the demo's agent/MCP/chatbot services (3.0+,
+          compose.agent.yaml) in VCR replay mode — no LLM key, recorded
+          responses, REAL gen_ai.* telemetry — and drives the three
+          cassette-backed prompts through the capture window. Empty
+          skips the agent layer (the pre-3.0 behaviour).
+        default: ''
+        required: false
       release_tag:
         description: If set, publish the corpus as assets on a GitHub release at this tag (e.g. corpus/otel-demo-v1)
         default: ''
@@ -135,6 +144,8 @@ jobs:
       # (resolved from the `demo` working-dir); the override is
       # absolute so it's project-dir-independent.
       - name: Resolve the demo's base compose file
+        env:
+          AGENTIC: ${{ inputs.agentic }}
         run: |
           set -euxo pipefail
           if [ -f demo/compose.yaml ]; then
@@ -145,7 +156,20 @@ jobs:
             echo "::error::neither compose.yaml nor docker-compose.yml in the demo clone"
             exit 1
           fi
-          echo "COMPOSE_FILE=${base}:${GITHUB_WORKSPACE}/.github/otel-demo-capture-compose-override.yml" \
+          layers="${base}"
+          # The agent layer (3.0+) rides between the base and our
+          # override so the override's collector mount still wins.
+          if [ "$AGENTIC" = "vcr" ]; then
+            if [ ! -f demo/compose.agent.yaml ]; then
+              echo "::error::agentic=vcr but this demo ref has no compose.agent.yaml (needs 3.0+)"
+              exit 1
+            fi
+            layers="${layers}:compose.agent.yaml"
+          elif [ -n "$AGENTIC" ]; then
+            echo "::error::unknown agentic mode '$AGENTIC' (only 'vcr' is supported)"
+            exit 1
+          fi
+          echo "COMPOSE_FILE=${layers}:${GITHUB_WORKSPACE}/.github/otel-demo-capture-compose-override.yml" \
             >> "$GITHUB_ENV"
 
       - name: Inject the file/corpus collector overlay
@@ -240,6 +264,8 @@ jobs:
 
       - name: Wait for the traffic path to be ready
         working-directory: demo
+        env:
+          AGENTIC: ${{ inputs.agentic }}
         run: |
           set -euxo pipefail
           # We bypass frontend-proxy (Envoy) — its baked image
@@ -266,6 +292,12 @@ jobs:
           }
           want_running otel-collector
           want_running frontend
+          # The agent layer, when present: VCR replay needs no LLM
+          # backend, but the service itself must be up before the
+          # prompt driver starts.
+          if [ "$AGENTIC" = "vcr" ]; then
+            want_running agent
+          fi
           # frontend-proxy is bypassed and crash-loops on its bad
           # baked config; stop it so it stops burning runner CPU
           # and restart-spamming. Nothing else depends on it (it
@@ -282,6 +314,7 @@ jobs:
         env:
           WARMUP: ${{ inputs.warmup_seconds }}
           DURATION: ${{ inputs.duration_seconds }}
+          AGENTIC: ${{ inputs.agentic }}
         run: |
           set -euxo pipefail
           raw="$OURIOS_CAPTURE_DIR/logs.raw.jsonl"
@@ -297,7 +330,39 @@ jobs:
           start_line="$(wc -l < "$raw" 2>/dev/null || echo 0)"
           echo "CAPTURE_START_LINE=${start_line}" >> "$GITHUB_ENV"
           echo "steady-state window starts at raw line ${start_line}; capturing ${DURATION}s"
+          driver_pid=""
+          if [ "$AGENTIC" = "vcr" ]; then
+            # Drive the agent with the three cassette-backed prompts
+            # (src/agent/README.md "Default Requests") for the whole
+            # window: VCR replays the recorded LLM responses, the
+            # Traceloop/OTel instrumentation around them is live, so
+            # every loop emits real gen_ai.* telemetry. The host port
+            # is ephemeral (compose publishes "${AGENT_PORT}").
+            agent_addr="$(docker compose port agent 8010)"
+            (
+              set +x
+              prompts=(
+                'Show all available products in the store.'
+                'What currencies are supported by the Astronomy Shop?'
+                'What current promotions are available on binoculars?'
+              )
+              i=0
+              while :; do
+                p="${prompts[$((i % 3))]}"
+                curl -s -m 60 -X POST "http://${agent_addr}/prompt" \
+                  -H 'content-type: application/json' \
+                  -d "{\"message\": \"${p}\", \"history\": []}" \
+                  -o /dev/null -w "prompt $((i % 3)): %{http_code}\n" || true
+                i=$((i + 1))
+                sleep 10
+              done
+            ) &
+            driver_pid=$!
+          fi
           sleep "$DURATION"
+          if [ -n "$driver_pid" ]; then
+            kill "$driver_pid" 2>/dev/null || true
+          fi
 
       - name: Slice steady-state corpus + verify
         working-directory: demo
@@ -354,6 +419,11 @@ jobs:
             # emitting services landed in the corpus.
             grep -o '"service.name"[^}]*"stringValue":"[^"]*"' logs.jsonl \
               | grep -o '"stringValue":"[^"]*"$' | sort | uniq -c | sort -rn | head -40 || true
+            echo
+            echo "## gen_ai.* attribute keys seen"
+            # The agentic layer's whole point: the census proves (or
+            # disproves) that GenAI semconv telemetry landed.
+            grep -o '"key":"gen_ai[^"]*"' logs.jsonl | sort | uniq -c | sort -rn | head -20 || true
           } > manifest.md
           echo '--- manifest ---'
           cat manifest.md

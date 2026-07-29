@@ -63,7 +63,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::functions::expr_fn::{coalesce, get_field, regexp_like, starts_with};
 use datafusion::functions_aggregate::expr_fn::{avg, max, min, sum};
 use datafusion::functions_nested::expr_fn::array_element;
-use datafusion::logical_expr::{Expr, cast, not, try_cast};
+use datafusion::logical_expr::{Expr, cast, is_not_true, is_true, not, try_cast};
 use datafusion::prelude::{col, lit};
 
 use ourios_core::alias::AliasMap;
@@ -1003,8 +1003,12 @@ fn body_equality(
             } else {
                 lit(true)
             });
+        // `IS NOT TRUE` totalises the arm: a NULL (a corrupted param slot
+        // under a matching template — reconstruct's own fallback treats the
+        // row as body-retained) reads as "not this candidate", so the row
+        // stays admitted rather than being three-valued-dropped.
         let mined_ne = match template_arm {
-            Some(arm) => mined_base.and(not(arm)),
+            Some(arm) => mined_base.and(is_not_true(arm)),
             None => mined_base,
         };
         return PredExpr::Filter(match physical_ne {
@@ -1015,8 +1019,13 @@ fn body_equality(
 
     let physical_eq =
         physical_present.then(|| string_kind.clone().and(col(columns::BODY).eq(body_lit())));
-    let template_eq =
-        template_arm.map(|arm| string_kind.and(not(col(columns::LOSSY_FLAG))).and(arm));
+    // `IS TRUE` mirrors the `!=` totalisation: an unknowable row never
+    // matches equality.
+    let template_eq = template_arm.map(|arm| {
+        string_kind
+            .and(not(col(columns::LOSSY_FLAG)))
+            .and(is_true(arm))
+    });
     match (physical_eq, template_eq) {
         (Some(p), Some(t)) => PredExpr::Filter(p.or(t)),
         (Some(p), None) => PredExpr::Filter(p),
@@ -2003,5 +2012,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- RFC 0044 plan-time + lowering units ---
+
+    fn reg(entries: &[((u64, u32), &str)]) -> crate::template_registry::TemplateRegistry {
+        entries
+            .iter()
+            .map(|&(key, canonical)| (key, ourios_miner::tree::parse_template(canonical)))
+            .collect()
+    }
+
+    fn body_eq_predicate(literal: &str, ne: bool) -> Predicate {
+        Predicate::Comparison {
+            field: Field::Body,
+            op: CmpOp::Ord(if ne { OrdOp::Ne } else { OrdOp::Eq }),
+            value: Value::Str(literal.to_owned()),
+        }
+    }
+
+    /// The walker fires on `==`/`!=` string comparisons at any nesting
+    /// depth and on nothing else (a regex on body, a non-body equality).
+    #[test]
+    fn uses_body_equality_walks_exactly_the_equality_comparisons() {
+        assert!(uses_body_equality(&body_eq_predicate("x", false)));
+        assert!(uses_body_equality(&Predicate::Not(Box::new(
+            Predicate::And(vec![Predicate::Bool(true), body_eq_predicate("x", true),])
+        ))));
+        assert!(!uses_body_equality(&Predicate::Comparison {
+            field: Field::Body,
+            op: CmpOp::Match,
+            value: Value::Str("x".to_owned()),
+        }));
+        assert!(!uses_body_equality(&Predicate::Comparison {
+            field: Field::Scope,
+            op: CmpOp::Ord(OrdOp::Eq),
+            value: Value::Str("x".to_owned()),
+        }));
+    }
+
+    /// The collector resolves each distinct literal once (dedup), carries
+    /// the literal's separator sequence, and resolves a tokenizer-rejected
+    /// literal to no candidates and no separators.
+    #[test]
+    fn collect_body_equalities_dedups_and_handles_tokenizer_failure() {
+        let registry = reg(&[((7, 1), "claude_code.api_request")]);
+        let p = Predicate::Or(vec![
+            body_eq_predicate("claude_code.api_request", false),
+            body_eq_predicate("claude_code.api_request", true),
+            body_eq_predicate("nul\0literal", false),
+        ]);
+        let mut out = BTreeMap::new();
+        collect_body_equalities(&p, &registry, &mut out);
+        assert_eq!(out.len(), 2, "one entry per distinct literal");
+        let hit = &out["claude_code.api_request"];
+        assert_eq!(hit.candidates.len(), 1);
+        assert_eq!(hit.candidates[0].template_id, 7);
+        assert_eq!(hit.separators, vec![b"".to_vec(), b"".to_vec()]);
+        let rejected = &out["nul\0literal"];
+        assert!(rejected.candidates.is_empty());
+        assert!(rejected.separators.is_empty());
+    }
+
+    /// The candidate conjunction pins the version-qualified template
+    /// identity and the 1-based `params`/`separators` element equalities,
+    /// in order — asserted on the lowered `Expr` text so operand order and
+    /// indexing regressions are caught at the compile step.
+    #[test]
+    fn candidate_arm_lowers_version_params_and_separators_one_based() {
+        let arm = candidate_arm(
+            &BodyLiteralMatch {
+                template_id: 9,
+                template_version: 2,
+                params: vec!["42".to_owned()],
+            },
+            &[b"".to_vec(), b" ".to_vec(), b"".to_vec()],
+        )
+        .to_string();
+        assert!(arm.contains("template_id = UInt64(9)"), "{arm}");
+        assert!(arm.contains("template_version = UInt32(2)"), "{arm}");
+        assert!(
+            arm.contains("array_element(params, Int64(1))"),
+            "1-based param indexing: {arm}"
+        );
+        assert!(
+            arm.contains("array_element(separators, Int64(3))"),
+            "all three separator slots, 1-based: {arm}"
+        );
     }
 }

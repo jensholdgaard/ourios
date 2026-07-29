@@ -296,6 +296,73 @@ async fn rfc0044_overflow_spill_cannot_false_match_a_crafted_literal() {
     assert_eq!(truth.rows, 1, "the retained body is the truth");
 }
 
+/// Scenario RFC0044.7 — pruning still engages: two hour-partitioned
+/// files, the matched template only in the first. The second file's row
+/// group is skippable by both arms (its `template_id` statistics exclude
+/// every candidate and its body column is all-NULL), so the scan touches
+/// only the matching file — and the result is still complete.
+/// See `docs/rfcs/0044-template-aware-body-equality.md` §5.
+#[tokio::test]
+async fn rfc0044_7_pruning_engages_across_partitions() {
+    const HOUR: u64 = 3_600_000_000_000;
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(
+        bucket.path(),
+        &[
+            created("t", 1, "claude_code.api_request", TS0),
+            created("t", 9, "claude_code.tool_result", TS0 + 1),
+        ],
+    );
+    write_all(
+        bucket.path(),
+        &[
+            mined("t", 1, TS0 + 10, &[], &["", ""]),
+            // A different template a partition-hour later: its own file.
+            mined("t", 9, TS0 + HOUR + 10, &[], &["", ""]),
+        ],
+    );
+    let result = run(bucket.path(), r#"body == "claude_code.api_request""#).await;
+    assert_eq!(result.rows, 1, "the matching record returns, completely");
+    assert!(
+        result.stats.row_groups_pruned >= 1,
+        "the non-candidate partition is pruned: {:?}",
+        result.stats,
+    );
+}
+
+/// Scenario RFC0044.8 (full) — a literal matching no template and no
+/// retained body returns empty with every row group pruned: correct
+/// empties stay cheap.
+/// See `docs/rfcs/0044-template-aware-body-equality.md` §5.
+#[tokio::test]
+async fn rfc0044_8_correct_empties_prune_everything() {
+    const HOUR: u64 = 3_600_000_000_000;
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(
+        bucket.path(),
+        &[created("t", 1, "claude_code.api_request", TS0)],
+    );
+    write_all(
+        bucket.path(),
+        &[
+            mined("t", 1, TS0 + 10, &[], &["", ""]),
+            mined("t", 1, TS0 + HOUR + 10, &[], &["", ""]),
+        ],
+    );
+    let result = run(bucket.path(), r#"body == "claude_code.no_such_event""#).await;
+    assert_eq!(result.rows, 0);
+    assert_eq!(
+        result.stats.row_groups_scanned, 0,
+        "an unmatched literal must not scan anything: {:?}",
+        result.stats,
+    );
+    assert_eq!(
+        result.stats.row_groups_pruned, 2,
+        "both partitions' row groups are pruned, not elided: {:?}",
+        result.stats,
+    );
+}
+
 /// The empty-set half of RFC0044.8 — a literal matching no template and
 /// no retained body returns empty (the full pruning assertion lands with
 /// the partitioned fixtures in a later slice).

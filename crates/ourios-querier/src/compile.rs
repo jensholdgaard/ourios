@@ -1020,10 +1020,20 @@ fn body_equality(
     let physical_eq =
         physical_present.then(|| string_kind.clone().and(col(columns::BODY).eq(body_lit())));
     // `IS TRUE` mirrors the `!=` totalisation: an unknowable row never
-    // matches equality.
+    // matches equality. The arm is further gated to NULL physical bodies:
+    // when a body is retained the stored bytes are the truth (an
+    // overflow-spilled param's truncated stored value could otherwise
+    // false-match a crafted literal — `reconstruct` refuses exactly that
+    // case), and for non-lossy retention §3.3 makes the physical arm
+    // equivalent anyway.
     let template_eq = template_arm.map(|arm| {
         string_kind
             .and(not(col(columns::LOSSY_FLAG)))
+            .and(if physical_present {
+                col(columns::BODY).is_null()
+            } else {
+                lit(true)
+            })
             .and(is_true(arm))
     });
     match (physical_eq, template_eq) {

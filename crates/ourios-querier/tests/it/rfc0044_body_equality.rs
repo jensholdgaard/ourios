@@ -191,6 +191,38 @@ async fn rfc0044_5_structured_bodies_are_excluded_not_errored() {
     assert_eq!(result.rows, 0, "canonical-JSON bytes must not string-match");
 }
 
+/// An overflow-spilled record: the stored param is truncated, the true
+/// body is retained. A literal crafted from the truncated value must NOT
+/// match via the template arm — the retained body is the truth.
+#[tokio::test]
+async fn rfc0044_overflow_spill_cannot_false_match_a_crafted_literal() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(bucket.path(), &[created("t", 5, "spill <*>", TS0)]);
+    write_all(
+        bucket.path(),
+        &[MinedRecord {
+            params: vec![Param {
+                type_tag: ParamType::Overflow,
+                value: "TRUNCATED".to_owned(),
+            }],
+            separators: vec![String::new(), " ".to_owned(), String::new()],
+            body: Some("spill TRUNCATED-BUT-THE-REAL-LINE-WENT-ON".to_owned()),
+            ..simple("t", 5, TS0 + 10)
+        }],
+    );
+    let crafted = run(bucket.path(), r#"body == "spill TRUNCATED""#).await;
+    assert_eq!(
+        crafted.rows, 0,
+        "the truncated stored param must not satisfy the crafted literal"
+    );
+    let truth = run(
+        bucket.path(),
+        r#"body == "spill TRUNCATED-BUT-THE-REAL-LINE-WENT-ON""#,
+    )
+    .await;
+    assert_eq!(truth.rows, 1, "the retained body is the truth");
+}
+
 /// The empty-set half of RFC0044.8 — a literal matching no template and
 /// no retained body returns empty (the full pruning assertion lands with
 /// the partitioned fixtures in a later slice).

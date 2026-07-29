@@ -191,6 +191,46 @@ async fn rfc0044_5_structured_bodies_are_excluded_not_errored() {
     assert_eq!(result.rows, 0, "canonical-JSON bytes must not string-match");
 }
 
+/// Scenario RFC0044.6 — renames and reversions across deploys: the
+/// registry folds every `(template_id, version)`'s tokens from the audit
+/// stream, so unification finds every id under which byte-identical
+/// records were written — a re-created (renamed) template and a widened
+/// version both contribute. No alias-class expansion is involved: alias
+/// classes group *different* shapes, which byte-equality must never
+/// cross (§3.3 refinement).
+/// See `docs/rfcs/0044-template-aware-body-equality.md` §5.
+#[tokio::test]
+async fn rfc0044_6_renames_and_reversions_contribute_every_matching_id() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(
+        bucket.path(),
+        &[
+            created("t", 2, "user <*> logged in from <*>", TS0),
+            // The same shape re-created under a new id after a deploy —
+            // the RFC 0010 drift scenario.
+            created("t", 7, "user <*> logged in from <*>", TS0 + 2),
+        ],
+    );
+    let sep6 = ["", " ", " ", " ", " ", " ", ""];
+    write_all(
+        bucket.path(),
+        &[
+            mined("t", 2, TS0 + 10, &["999", "1.2.3.4"], &sep6),
+            mined("t", 7, TS0 + 20, &["999", "1.2.3.4"], &sep6),
+            mined("t", 7, TS0 + 30, &["888", "1.2.3.4"], &sep6),
+        ],
+    );
+    let result = run(
+        bucket.path(),
+        r#"body == "user 999 logged in from 1.2.3.4""#,
+    )
+    .await;
+    assert_eq!(
+        result.rows, 2,
+        "both ids' byte-identical records return; the differing record does not"
+    );
+}
+
 /// An overflow-spilled record: the stored param is truncated, the true
 /// body is retained. A literal crafted from the truncated value must NOT
 /// match via the template arm — the retained body is the truth.

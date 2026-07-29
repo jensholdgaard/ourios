@@ -93,11 +93,18 @@ exclude mined records (the mirror image of the #664 bug). The typed
 - The template arm resolves against the **same tenant template map
   snapshot the query's read path uses** (RFC 0033) — the predicate can
   never be staler than the rendering the user sees.
-- The plan-time match traverses template **versions and aliases**
-  (RFC 0007 storage, RFC 0010 drift semantics): a template renamed or
-  re-versioned across deploys still contributes every id under which
-  matching records were written. Missing this recreates #664 one
-  deploy later.
+- The plan-time match covers template **versions and renames**
+  inherently: the registry folds *every* `(template_id, version)`'s
+  tokens from the audit stream, and unification checks every entry — a
+  template re-created under a new id or widened to a new version across
+  deploys contributes each id/version whose tokens still unify with the
+  literal. Missing this recreates #664 one deploy later.
+  *(Refined at implementation time from "traverses versions and
+  aliases": expanding RFC 0007 **alias classes** here would be wrong,
+  not just unnecessary — alias classes group templates whose shapes
+  differ, and byte-equality must never admit a record whose own tokens
+  do not render the literal. `resolves_to(n)` remains the query for
+  shape-crossing equivalence.)*
 
 ### 3.4 Structured bodies
 
@@ -151,11 +158,14 @@ not smuggled into this slice.
   - **Given** a mixed corpus with RFC 0037 structured bodies
   - **When** `body == "<string>"` runs
   - **Then** structured-body records are absent and the query succeeds.
-- **RFC0044.6 — version/alias traversal**
-  - **Given** records written under a template later aliased/reversioned
-    (RFC 0010 drift fixture)
+- **RFC0044.6 — versions and renames contribute every matching id**
+  - **Given** records written under a template later re-created under a
+    new id and under a widened version (the RFC 0010 drift shapes)
   - **When** `body ==` runs with the rendered text
-  - **Then** records under every linked id return.
+  - **Then** records under every id/version whose tokens render the
+    literal return — and no record whose own tokens do not. *(Refined
+    at implementation time: alias-class expansion is excluded by
+    design — see §3.3.)*
 - **RFC0044.7 — pruning still engages**
   - **Given** a multi-file corpus where the matched template appears in
     a strict subset of row groups

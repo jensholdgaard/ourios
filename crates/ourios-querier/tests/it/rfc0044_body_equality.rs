@@ -438,3 +438,60 @@ proptest! {
         }
     }
 }
+
+/// Scenario RFC0044.9 `[corpus]` — the same property over the committed
+/// `testdata/corpus/*.txt`, every line: the §3.3 reconstruction corpus is
+/// exactly the corpus body equality must be faithful on.
+/// See `docs/rfcs/0044-template-aware-body-equality.md` §5.
+#[tokio::test]
+async fn rfc0044_9_every_corpus_line_is_findable_by_its_own_body() {
+    let corpus_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(&corpus_dir).expect("corpus dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_some_and(|e| e == "txt") {
+            for line in std::fs::read_to_string(&path).expect("read").lines() {
+                if !line.is_empty() {
+                    lines.push(line.to_owned());
+                }
+            }
+        }
+    }
+    assert!(!lines.is_empty(), "the committed corpus must not be empty");
+
+    let tenant = TenantId::new("t");
+    let audit = SharedAuditSink::new();
+    let mut cluster =
+        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()));
+    let mut mined_records = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let record = OtlpLogRecord {
+            tenant_id: tenant.clone(),
+            time_unix_nano: TS0 + u64::try_from(i).expect("small index") * 1_000,
+            severity_number: 9,
+            body: Some(OtlpBody::String(line.clone())),
+            ..Default::default()
+        };
+        let (_, captured) = cluster.ingest_mined(&record);
+        mined_records.push(captured.expect("string-bodied record captures"));
+    }
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(bucket.path(), &mined_records);
+    write_audit(bucket.path(), &audit.drain());
+
+    // §7 string escaping for the DSL literal (`\` and `"` are the only
+    // escapable bytes the corpus contains; controls would take \uXXXX).
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut distinct: Vec<&String> = lines.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    for line in distinct {
+        let expected = lines.iter().filter(|l| *l == line).count();
+        let result = run(bucket.path(), &format!(r#"body == "{}""#, escape(line))).await;
+        assert_eq!(
+            usize::try_from(result.rows).expect("fits"),
+            expected,
+            "`body == {line:?}` must find exactly its own records",
+        );
+    }
+}

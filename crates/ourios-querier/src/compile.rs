@@ -63,7 +63,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::functions::expr_fn::{coalesce, get_field, regexp_like, starts_with};
 use datafusion::functions_aggregate::expr_fn::{avg, max, min, sum};
 use datafusion::functions_nested::expr_fn::array_element;
-use datafusion::logical_expr::{Expr, cast, is_not_true, is_true, not, try_cast};
+use datafusion::logical_expr::{Expr, cast, is_not_true, not, try_cast};
 use datafusion::prelude::{col, lit};
 
 use ourios_core::alias::AliasMap;
@@ -1019,9 +1019,12 @@ fn body_equality(
 
     let physical_eq =
         physical_present.then(|| string_kind.clone().and(col(columns::BODY).eq(body_lit())));
-    // `IS TRUE` mirrors the `!=` totalisation: an unknowable row never
-    // matches equality. The arm is further gated to NULL physical bodies:
-    // when a body is retained the stored bytes are the truth (an
+    // No `IS TRUE` here, deliberately: under a filter NULL and false are
+    // equivalent (both drop the row), so equality is already total — and
+    // wrapping the arm would defeat the row-group pruning the template
+    // ids exist to enable (the `!=` branch, where NULL genuinely differs
+    // from false, uses `IS NOT TRUE`). The arm is gated to NULL physical
+    // bodies: when a body is retained the stored bytes are the truth (an
     // overflow-spilled param's truncated stored value could otherwise
     // false-match a crafted literal — `reconstruct` refuses exactly that
     // case), and for non-lossy retention §3.3 makes the physical arm
@@ -1034,7 +1037,7 @@ fn body_equality(
             } else {
                 lit(true)
             })
-            .and(is_true(arm))
+            .and(arm)
     });
     match (physical_eq, template_eq) {
         (Some(p), Some(t)) => PredExpr::Filter(p.or(t)),

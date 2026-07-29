@@ -122,14 +122,21 @@ sources.
   - **When** `event_name == "claude_code.api_request"` runs
   - **Then** exactly the api_request records return.
 - **RFC0043.6 — RFC 0037 keying engages, observably**
-  - **Given** two attr-only records sharing `event.name` but with
-    differing bodies (shapes that body mining would assign distinct
-    templates)
+  - **Given** three attr-only **structured** records: two sharing an
+    `event.name` (with differing body content) and one with a distinct
+    `event.name` (RFC 0037 §3.1 keys `(severity, scope, event_name)`
+    for structured bodies; without derivation all three collapse into
+    the one no-event sentinel)
   - **When** mined
-  - **Then** both records carry the **same** `template_id`
-  - **And** the RFC 0037 §3.1 event-keyed counter (not the body-mining
-    path's) accounts for them — the same-key/different-body collapse is
-    the externally visible proof body mining was not used.
+  - **Then** the two same-name records carry the **same** `template_id`
+    despite differing content
+  - **And** the distinct-name record carries a **different**
+    `template_id` — the separation is the externally visible proof the
+    derived name reached the template key, since the sentinel would
+    have merged all three. *(Refined at implementation time: the
+    originally referenced "event-keyed counter" does not exist as a
+    distinct instrument; the id separation is a strictly stronger
+    observable.)*
 - **RFC0043.7 — empty is never a value, in either encoding**
   - **Given** records with (a) empty-string wire `event_name` plus an
     `event.name` attribute, (b) an empty-string `event.name` attribute

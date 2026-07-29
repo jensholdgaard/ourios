@@ -430,7 +430,7 @@ proptest! {
                 &format!(r#"body == "{line}""#),
             ));
             prop_assert_eq!(
-                result.rows as usize,
+                usize::try_from(result.rows).expect("row count fits usize"),
                 expected,
                 "`body == {:?}` must find exactly its own records",
                 line,

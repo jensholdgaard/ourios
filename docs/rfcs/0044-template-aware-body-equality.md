@@ -1,7 +1,7 @@
 ---
 rfc: 0044
 title: Template-aware body equality — the two-arm compile for body ==
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-29
@@ -11,11 +11,23 @@ superseded-by: —
 
 # RFC 0044 — Template-aware body equality (`body ==` two-arm compile)
 
-> **Status: `specified` (2026-07-29).** Closes #664. Scope is equality
-> only (`==`/`!=`); other body operators are §7. The design reuses
-> RFC 0042 §3.3's two-arm pattern and the miner's bit-identical
-> reconstruction invariant — the inversion this RFC performs is only
-> well-defined because §3.3 of `CLAUDE.md` guarantees render fidelity.
+> **Status: `green` (2026-07-29).** All nine §5 criteria pass, landed in
+> five slices the same day: #671 (the plan-time matcher), #672 (the
+> two-arm compile — #664 closed there), #673 (.6 with the alias-exclusion
+> refinement), #674 (.7/.8 pruning fixtures), #675 (.9 as a generative
+> property **and** every line of the committed §3.3 corpus). Three
+> refinements implementation forced on the spec, each stated inline:
+> the template arm is a plan-time candidate *superset* with exactness at
+> scan time (separators/overflow are per-record); alias-class expansion
+> is excluded as wrong, not just unneeded (§3.3); and equality carries no
+> `IS TRUE` wrap — under a filter NULL ≡ false, and the wrap defeats
+> row-group pruning (`!=` keeps `IS NOT TRUE`, where three-valued logic
+> genuinely bites). No thesis-gate applies; `accepted` is a maintainer
+> flip.
+>
+> *(`specified`, same date: closes #664; equality only, other body
+> operators §7; the design reuses RFC 0042 §3.3's two-arm pattern and is
+> well-defined because `CLAUDE.md` §3.3 guarantees render fidelity.)*
 
 ## 1. Summary
 

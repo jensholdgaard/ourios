@@ -69,10 +69,12 @@ use datafusion::prelude::{col, lit};
 use ourios_core::alias::AliasMap;
 use ourios_core::tenant::TenantId;
 
+use crate::body_match::{BodyLiteralMatch, body_literal_candidates};
 use crate::dsl::ir::{
     AggFn, Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityValue, Stage, Time,
     Value,
 };
+use crate::template_registry::TemplateRegistry;
 use crate::{QueryError, column_type, has_column, time_bound_scalar};
 use ourios_parquet::{columns, promoted};
 
@@ -90,6 +92,11 @@ pub(crate) struct Plan {
     pub(crate) window: (u64, u64),
     predicate: Predicate,
     alias_classes: BTreeMap<u64, BTreeSet<u64>>,
+    /// Per distinct `body ==`/`!=` string literal: the plan-time template
+    /// resolution (RFC 0044 §3.1) — candidates from the tenant registry
+    /// plus the literal's own separator sequence. Empty when the query has
+    /// no body equality.
+    body_equalities: BTreeMap<String, BodyEqualityPlan>,
     pub(crate) limit: Option<usize>,
     pub(crate) aggregate: Option<Aggregate>,
 }
@@ -312,6 +319,7 @@ pub(crate) fn compile(
     now_unix_nano: u64,
     default_window_nanos: u64,
     alias_map: &AliasMap,
+    registry: &TemplateRegistry,
 ) -> Result<Plan, QueryError> {
     let Validated {
         window,
@@ -322,11 +330,17 @@ pub(crate) fn compile(
     // so the deferred predicate compilation in `apply` is tenant-agnostic.
     let mut alias_classes = BTreeMap::new();
     collect_alias_classes(&query.predicate, tenant, alias_map, &mut alias_classes);
+    // Same eager rule for `body ==`/`!=` literals: the RFC 0044 template
+    // arm resolves at plan time against the tenant registry the caller
+    // acquired (empty when the query has no body equality).
+    let mut body_equalities = BTreeMap::new();
+    collect_body_equalities(&query.predicate, registry, &mut body_equalities);
 
     Ok(Plan {
         window,
         predicate: query.predicate.clone(),
         alias_classes,
+        body_equalities,
         limit,
         aggregate,
     })
@@ -344,6 +358,82 @@ pub(crate) fn uses_resolves_to(p: &Predicate) -> bool {
         | Predicate::Comparison { .. }
         | Predicate::Severity { .. }
         | Predicate::Call(_) => false,
+    }
+}
+
+/// The plan-time half of a `body ==`/`!=` literal (RFC 0044 §3.1): the
+/// registry candidates the literal unifies with, and the literal's own
+/// separator sequence (`tokenize` is lossless, so `separators` is exactly
+/// what a byte-identical record must have stored).
+#[derive(Debug, Clone)]
+pub(crate) struct BodyEqualityPlan {
+    candidates: Vec<BodyLiteralMatch>,
+    separators: Vec<Vec<u8>>,
+}
+
+/// Whether the predicate contains a `body ==`/`!=` string comparison. The
+/// caller uses this to decide whether the RFC 0033 template-map acquisition
+/// (which carries the RFC 0017 registry) is needed at all.
+pub(crate) fn uses_body_equality(p: &Predicate) -> bool {
+    match p {
+        Predicate::Comparison {
+            field: Field::Body,
+            op: CmpOp::Ord(OrdOp::Eq | OrdOp::Ne),
+            value: Value::Str(_),
+        } => true,
+        Predicate::Not(inner) => uses_body_equality(inner),
+        Predicate::And(terms) | Predicate::Or(terms) => terms.iter().any(uses_body_equality),
+        Predicate::Bool(_)
+        | Predicate::Comparison { .. }
+        | Predicate::Severity { .. }
+        | Predicate::Call(_) => false,
+    }
+}
+
+/// Resolve every distinct `body ==`/`!=` literal against `registry`
+/// (RFC 0044 §3.1). A literal the tokenizer rejects resolves to no
+/// candidates and an empty separator list — the physical arm alone is
+/// exact for it (the parse-failure ingest path retains such bodies).
+fn collect_body_equalities(
+    p: &Predicate,
+    registry: &TemplateRegistry,
+    out: &mut BTreeMap<String, BodyEqualityPlan>,
+) {
+    match p {
+        Predicate::Comparison {
+            field: Field::Body,
+            op: CmpOp::Ord(OrdOp::Eq | OrdOp::Ne),
+            value: Value::Str(literal),
+        } => {
+            if !out.contains_key(literal) {
+                let separators = ourios_miner::tokenize::tokenize(literal).map_or_else(
+                    |_| Vec::new(),
+                    |tk| {
+                        tk.separators
+                            .iter()
+                            .map(|s| s.as_bytes().to_vec())
+                            .collect()
+                    },
+                );
+                out.insert(
+                    literal.clone(),
+                    BodyEqualityPlan {
+                        candidates: body_literal_candidates(registry, literal),
+                        separators,
+                    },
+                );
+            }
+        }
+        Predicate::Not(inner) => collect_body_equalities(inner, registry, out),
+        Predicate::And(terms) | Predicate::Or(terms) => {
+            for term in terms {
+                collect_body_equalities(term, registry, out);
+            }
+        }
+        Predicate::Bool(_)
+        | Predicate::Comparison { .. }
+        | Predicate::Severity { .. }
+        | Predicate::Call(_) => {}
     }
 }
 
@@ -385,6 +475,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         window: (start, end),
         predicate,
         alias_classes,
+        body_equalities,
         // `limit` is **not** applied to this (counted) frame: the count
         // (`QueryResult.rows`) is the total matching rows, and the limit caps
         // only the returned `records` — applied downstream in
@@ -403,7 +494,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
     let window_filter = crate::time_window_filter(&df, start, end)?;
     let mut df = df.filter(window_filter).map_err(crate::storage_err)?;
 
-    match compile_predicate(&predicate, &df, &alias_classes)? {
+    match compile_predicate(&predicate, &df, &alias_classes, &body_equalities)? {
         // `true` ⇒ match-all ⇒ no predicate filter (window only).
         PredExpr::All => {}
         // `false` ⇒ match-none ⇒ short-circuit to an empty result.
@@ -725,18 +816,21 @@ fn compile_predicate(
     p: &Predicate,
     df: &DataFrame,
     alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
+    body_eqs: &BTreeMap<String, BodyEqualityPlan>,
 ) -> Result<PredExpr, QueryError> {
     match p {
         Predicate::Bool(true) => Ok(PredExpr::All),
         Predicate::Bool(false) => Ok(PredExpr::None),
-        Predicate::Not(inner) => match compile_predicate(inner, df, alias_classes)? {
+        Predicate::Not(inner) => match compile_predicate(inner, df, alias_classes, body_eqs)? {
             PredExpr::All => Ok(PredExpr::None),
             PredExpr::None => Ok(PredExpr::All),
             PredExpr::Filter(e) => Ok(PredExpr::Filter(not(e))),
         },
-        Predicate::And(terms) => combine(terms, df, alias_classes, true),
-        Predicate::Or(terms) => combine(terms, df, alias_classes, false),
-        Predicate::Comparison { field, op, value } => compile_comparison(field, *op, value, df),
+        Predicate::And(terms) => combine(terms, df, alias_classes, body_eqs, true),
+        Predicate::Or(terms) => combine(terms, df, alias_classes, body_eqs, false),
+        Predicate::Comparison { field, op, value } => {
+            compile_comparison(field, *op, value, df, body_eqs)
+        }
         Predicate::Severity { op, value } => Ok(compile_severity(*op, value)),
         Predicate::Call(call) => compile_call(call, df, alias_classes),
     }
@@ -746,11 +840,15 @@ fn combine(
     terms: &[Predicate],
     df: &DataFrame,
     alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
+    body_eqs: &BTreeMap<String, BodyEqualityPlan>,
     is_and: bool,
 ) -> Result<PredExpr, QueryError> {
     let mut acc: Option<Expr> = None;
     for term in terms {
-        match (compile_predicate(term, df, alias_classes)?, is_and) {
+        match (
+            compile_predicate(term, df, alias_classes, body_eqs)?,
+            is_and,
+        ) {
             // `x and true` = x ; `x or false` = x — drop the identity term.
             (PredExpr::All, true) | (PredExpr::None, false) => {}
             // `x and false` = false (whole conjunction is empty).
@@ -833,14 +931,123 @@ fn compile_comparison(
     op: CmpOp,
     value: &Value,
     df: &DataFrame,
+    body_eqs: &BTreeMap<String, BodyEqualityPlan>,
 ) -> Result<PredExpr, QueryError> {
-    match field {
-        // Attribute-backed fields have no dedicated column (JSON storage).
-        Field::Service => attr_match(columns::RESOURCE_ATTRIBUTES, "service.name", op, value, df),
-        Field::Resource(key) => attr_match(columns::RESOURCE_ATTRIBUTES, key, op, value, df),
-        Field::Attr(key) => attr_match(columns::ATTRIBUTES, key, op, value, df),
-        _ => column_comparison(field, op, value, df),
+    match (field, op, value) {
+        // `body ==`/`!=` compiles to the RFC 0044 two-arm form; the plan
+        // resolved the literal's template candidates eagerly.
+        (Field::Body, CmpOp::Ord(OrdOp::Eq), Value::Str(literal)) => {
+            Ok(body_equality(&body_eqs[literal], literal, df, false))
+        }
+        (Field::Body, CmpOp::Ord(OrdOp::Ne), Value::Str(literal)) => {
+            Ok(body_equality(&body_eqs[literal], literal, df, true))
+        }
+        _ => match field {
+            // Attribute-backed fields have no dedicated column (JSON storage).
+            Field::Service => {
+                attr_match(columns::RESOURCE_ATTRIBUTES, "service.name", op, value, df)
+            }
+            Field::Resource(key) => attr_match(columns::RESOURCE_ATTRIBUTES, key, op, value, df),
+            Field::Attr(key) => attr_match(columns::ATTRIBUTES, key, op, value, df),
+            _ => column_comparison(field, op, value, df),
+        },
     }
+}
+
+/// The RFC 0044 §3.1 two-arm compile for `body == literal` (`negated` for
+/// `!=`, §3.2's three-valued handling made explicit).
+///
+/// **Physical arm** — the stored body column, gated on
+/// `body_kind = String`: retained (low-confidence) and lossy bodies, where
+/// the stored bytes are the truth. The gate is also what excludes
+/// structured bodies from both operators (§3.4 — their canonical JSON
+/// bytes must never string-match).
+///
+/// **Template arm** — for each plan-time candidate: the version-qualified
+/// `template_id` (prunable via the existing statistics), `lossy = false`
+/// (a lossy reconstruction's truth is the retained body, physical arm),
+/// and element-wise equality of the stored `params`/`separators` against
+/// the values the literal implies. Params are single whitespace-free
+/// tokens by construction, so element equality *is* byte-identical
+/// reconstruction equality (`CLAUDE.md` §3.3).
+fn body_equality(
+    plan: &BodyEqualityPlan,
+    literal: &str,
+    df: &DataFrame,
+    negated: bool,
+) -> PredExpr {
+    let string_kind = col(columns::BODY_KIND).eq(lit(0_u8));
+    let physical_present = has_column(df, columns::BODY);
+    let body_lit = || lit(ScalarValue::Binary(Some(literal.as_bytes().to_vec())));
+
+    let template_arm = plan
+        .candidates
+        .iter()
+        .map(|c| candidate_arm(c, &plan.separators))
+        .reduce(Expr::or);
+
+    if negated {
+        // `!=`: a stored body that differs, OR a faithful (non-lossy) mined
+        // record matching no candidate — NULL physical bodies must not
+        // silently drop mined records (§3.2, the mirror of #664).
+        let physical_ne = physical_present.then(|| {
+            string_kind
+                .clone()
+                .and(col(columns::BODY).is_not_null())
+                .and(col(columns::BODY).not_eq(body_lit()))
+        });
+        let mined_base = string_kind
+            .and(not(col(columns::LOSSY_FLAG)))
+            .and(if physical_present {
+                col(columns::BODY).is_null()
+            } else {
+                lit(true)
+            });
+        let mined_ne = match template_arm {
+            Some(arm) => mined_base.and(not(arm)),
+            None => mined_base,
+        };
+        return PredExpr::Filter(match physical_ne {
+            Some(p) => p.or(mined_ne),
+            None => mined_ne,
+        });
+    }
+
+    let physical_eq =
+        physical_present.then(|| string_kind.clone().and(col(columns::BODY).eq(body_lit())));
+    let template_eq =
+        template_arm.map(|arm| string_kind.and(not(col(columns::LOSSY_FLAG))).and(arm));
+    match (physical_eq, template_eq) {
+        (Some(p), Some(t)) => PredExpr::Filter(p.or(t)),
+        (Some(p), None) => PredExpr::Filter(p),
+        (None, Some(t)) => PredExpr::Filter(t),
+        // No body column in the union schema and no candidates: nothing
+        // can match — the correct, cheap empty (§5 RFC0044.8).
+        (None, None) => PredExpr::None,
+    }
+}
+
+/// One candidate's conjunction: version-qualified template identity plus
+/// the element-wise `params`/`separators` equalities the literal implies.
+fn candidate_arm(candidate: &BodyLiteralMatch, separators: &[Vec<u8>]) -> Expr {
+    let mut arm = col(columns::TEMPLATE_ID)
+        .eq(lit(candidate.template_id))
+        .and(col(columns::TEMPLATE_VERSION).eq(lit(candidate.template_version)));
+    for (i, value) in candidate.params.iter().enumerate() {
+        let idx = i64::try_from(i).unwrap_or(i64::MAX).saturating_add(1);
+        arm = arm.and(
+            get_field(array_element(col(columns::PARAMS), lit(idx)), "value")
+                .eq(lit(ScalarValue::Binary(Some(value.as_bytes().to_vec())))),
+        );
+    }
+    for (k, sep) in separators.iter().enumerate() {
+        let idx = i64::try_from(k).unwrap_or(i64::MAX).saturating_add(1);
+        arm = arm.and(
+            array_element(col(columns::SEPARATORS), lit(idx))
+                .eq(lit(ScalarValue::Binary(Some(sep.clone())))),
+        );
+    }
+    arm
 }
 
 /// A comparison over a field that maps to a dedicated RFC 0005 column.

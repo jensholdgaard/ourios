@@ -35,3 +35,4 @@ mod rfc0031_single_pass;
 mod rfc0033_cached_template_map;
 mod rfc0036_window_materialization;
 mod rfc0042_mixed_schema;
+mod rfc0044_body_equality;

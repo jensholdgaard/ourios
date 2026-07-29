@@ -1,7 +1,7 @@
 ---
 rfc: 0043
 title: Derive event_name from the legacy event.name attribute at ingest
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-29
@@ -11,6 +11,10 @@ superseded-by: —
 
 # RFC 0043 — Derive `event_name` from the legacy `event.name` attribute at ingest
 
+> **Status: `accepted` (2026-07-29, maintainer sign-off).** Terminal. No
+> thesis-gate applies (`validated` vacuous, RFC 0008 precedent); the
+> flip records maintainer approval of the derivation as binding.
+>
 > **Status: `green` (2026-07-29).** All seven §5 criteria pass: the
 > derivation + boundary shapes landed in #668 (RFC0043.1–.4/.7, both
 > encodings through the one `materialize_record` seam), and #669 closed

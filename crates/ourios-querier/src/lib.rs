@@ -1154,43 +1154,58 @@ impl Querier {
         // pure validation internally — one source of truth, negligible
         // cost.
         compile::validate(query, now_unix_nano, default_window_nanos)?;
+        // A `body ==`/`!=` needs the RFC 0017 registry for the RFC 0044
+        // template arm; the `resolves_to` alias fold needs the alias map.
+        // Both ride the one RFC 0033 cached-map acquisition (artifact hit or
+        // fresh fold + write-through), so the two needs share one map (and
+        // one frontier) per query — and the acquisition is skipped entirely
+        // when neither is in the predicate. The blocking IO (S3 GETs / local
+        // `std::fs`) offloads off the runtime worker, mirroring `run_drift`.
+        let needs_registry = compile::uses_body_equality(&query.predicate);
+        let needs_alias_fold = alias_map.is_none() && compile::uses_resolves_to(&query.predicate);
         let mut acquired: Option<AcquiredTemplateMap> = None;
+        if needs_alias_fold || needs_registry {
+            let (template_map, acquisition_bytes, _outcome) = self
+                .spawn_blocking_audit({
+                    let backend = self.backend.clone();
+                    let tenant = tenant.clone();
+                    move || template_map::load_or_derive(backend.store_ref(), &tenant)
+                })
+                .await?;
+            acquired = Some(AcquiredTemplateMap {
+                map: template_map,
+                acquisition_bytes,
+            });
+        }
         let derived;
-        let map = match alias_map {
-            Some(map) => map,
-            None if compile::uses_resolves_to(&query.predicate) => {
-                // The alias fold comes from the cached template map
-                // (RFC 0033): artifact hit or fresh fold + write-through.
-                // Offload the blocking IO (S3 GETs / the local `std::fs`
-                // reads) off the runtime worker, mirroring `run_drift` —
-                // the derivation is deeply sync, so clone the cheap
-                // backend handle into the blocking task. The acquired map
-                // is handed down to the row-rendering pass, so the alias
-                // map and the registry share one acquisition (and one
-                // frontier) per query.
-                let (template_map, acquisition_bytes, _outcome) = self
-                    .spawn_blocking_audit({
-                        let backend = self.backend.clone();
-                        let tenant = tenant.clone();
-                        move || template_map::load_or_derive(backend.store_ref(), &tenant)
-                    })
-                    .await?;
-                acquired
-                    .insert(AcquiredTemplateMap {
-                        map: template_map,
-                        acquisition_bytes,
-                    })
-                    .map
-                    .alias_map()
-            }
-            // No `resolves_to` ⇒ the map is never consulted; an empty
-            // projection avoids the audit-tree scan.
-            None => {
+        let map = match (alias_map, &acquired) {
+            // A caller-held projection — the test/operator override —
+            // always wins (RFC 0005 §3.7.1).
+            (Some(map), _) => map,
+            (None, Some(a)) => a.map.alias_map(),
+            // Never consulted: an empty projection, no audit-tree scan.
+            (None, None) => {
                 derived = ourios_core::alias::AliasMap::new();
                 &derived
             }
         };
-        let plan = compile::compile(query, tenant, now_unix_nano, default_window_nanos, map)?;
+        let empty_registry;
+        let registry = match &acquired {
+            Some(a) if needs_registry => a.map.registry(),
+            // Never consulted: no body equality in the predicate.
+            _ => {
+                empty_registry = TemplateRegistry::new();
+                &empty_registry
+            }
+        };
+        let plan = compile::compile(
+            query,
+            tenant,
+            now_unix_nano,
+            default_window_nanos,
+            map,
+            registry,
+        )?;
         // The DSL `limit` (RFC 0002) doubles as the RFC 0017 row cap; read it
         // — and the aggregation stage — before `plan` moves into the filter
         // closure. An aggregation query terminates in the grouped-count scan:

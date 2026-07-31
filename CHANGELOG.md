@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.7.0] - 2026-07-31
+
+### Added
+
+- Promote the OTel GenAI semconv keys alongside the flat set (#679) (54e3d35)
+- Agentic VCR capture mode for the demo corpus workflow (#678) (c23c805)
+- Two-arm body equality — the template arm (RFC 0044 slice 2) (#672) (752c455)
+- Plan-time body-literal candidate matcher (RFC 0044 slice 1) (#671) (f7b0c36)
+- Derive event_name from the legacy event.name attribute (RFC 0043 slice 1) (#668) (feb55d5)
+
+### Documentation
+
+- Flip RFCs 0043 and 0044 to accepted — maintainer sign-off (#677) (36e21cd)
+- Flip RFC 0044 to green — all nine criteria pass (#676) (f51a6e1)
+- Flip RFC 0043 to green — all seven criteria pass (#670) (8a31f61)
+- Draft RFC 0043 — event_name from the legacy event.name attribute (#666) (260ad52)
+- Draft RFC 0044 — template-aware body equality (closes-by-design #664) (#667) (378eeb0)
+- Record RFC0041.5 deferral closed — matrix + typed sums landed (#665) (5dbf502)
+
+### Tests
+
+- Rfc0044.9 property — every mined line findable by its body (#675) (dd5608e)
+- Rfc0044.7/.8 pruning fixtures; unwrap the eq arm (slice 4) (#674) (7e3a783)
+- Rfc0044.6 — renames and reversions, no alias expansion (#673) (cbc38d2)
+- Rfc0043 slices .5/.6 — query end-to-end + keying observable (#669) (6b6d926)
+
 ## [0.6.0] - 2026-07-28
 
 ### Added

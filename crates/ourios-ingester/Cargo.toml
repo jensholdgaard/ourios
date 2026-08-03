@@ -140,7 +140,7 @@ tempfile = "=3.27.0"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
 # threading test (pinned in lockstep with ourios-parquet's arrow stack,
 # matching ourios-querier's dev pin).
-parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
+parquet = { version = "=58.4.0", default-features = false, features = ["arrow"] }
 # Drive the axum `Router` in-process (`ServiceExt::oneshot`) for the
 # HTTP-transport acceptance tests — no real socket.
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
@@ -169,7 +169,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # The metrics test collects via the in-memory reader's periodic-export
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.
-tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 
 [lints]
 workspace = true

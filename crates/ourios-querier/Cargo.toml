@@ -118,7 +118,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 # (ourios-parquet, a normal dep) lays down fixture Parquet, and
 # tempfile gives each test a scratch bucket. `rt-multi-thread` for the
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
-tokio = { version = "=1.53.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "=3.27.0"
 # RFC 0033 §3.4 S3 publish arm (`template_map_publish_cas_on_s3`):
 # LocalStack via testcontainers, the same harness as ourios-parquet's
@@ -132,9 +132,9 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # over a batch built from the public `data_schema()`. Pinned to
 # the same arrow/parquet 58 the whole workspace now shares
 # (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
-parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=58.3.0", default-features = false }
-arrow-schema = { version = "=58.3.0", default-features = false }
+parquet = { version = "=58.4.0", default-features = false, features = ["arrow"] }
+arrow-array = { version = "=58.4.0", default-features = false }
+arrow-schema = { version = "=58.4.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
 serde_yaml_ng = { version = "=0.10.0", default-features = false }
@@ -142,7 +142,7 @@ serde_yaml_ng = { version = "=0.10.0", default-features = false }
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.48.1", default-features = false }
+jsonschema = { version = "=0.49.3", default-features = false }
 
 [lints]
 workspace = true

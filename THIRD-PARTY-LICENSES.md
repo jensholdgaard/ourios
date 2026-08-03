@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 337 |
+| `Apache-2.0` | 339 |
 | `MIT` | 72 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 8 |
@@ -470,20 +470,20 @@ Used by:
 Used by:
 
 - `arrow-arith` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-array` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 58.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 58.4.0 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 58.4.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 58.4.0 — <https://github.com/apache/arrow-rs>
 - `arrow-csv` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 58.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 58.4.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 58.4.0 — <https://github.com/apache/arrow-rs>
 - `arrow-json` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 58.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 58.4.0 — <https://github.com/apache/arrow-rs>
 - `arrow-row` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 58.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 58.4.0 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 58.4.0 — <https://github.com/apache/arrow-rs>
 - `arrow-string` 58.3.0 — <https://github.com/apache/arrow-rs>
 - `arrow` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `parquet` 58.3.0 — <https://github.com/apache/arrow-rs>
+- `parquet` 58.4.0 — <https://github.com/apache/arrow-rs>
 - `utf8_iter` 1.0.4 — <https://github.com/hsivonen/utf8_iter>
 - `zeroize` 1.9.0 — <https://github.com/RustCrypto/utils>
 - `zeroize_derive` 1.5.0 — <https://github.com/RustCrypto/utils>
@@ -922,36 +922,36 @@ Used by:
 
 Used by:
 
-- `datafusion-catalog-listing` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-catalog` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-common-runtime` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-common` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-arrow` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-csv` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-json` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-parquet` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-doc` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-execution` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr-common` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate-common` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-nested` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-table` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window-common` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-macros` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-optimizer` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-adapter` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-common` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-optimizer` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-plan` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-pruning` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-session` 54.0.0 — <https://github.com/apache/datafusion>
-- `datafusion` 54.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog-listing` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-common-runtime` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-common` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-arrow` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-csv` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-json` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-parquet` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-doc` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-execution` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr-common` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate-common` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-nested` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-table` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window-common` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-macros` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-optimizer` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-adapter` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-common` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-optimizer` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-plan` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-pruning` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-session` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion` 54.1.0 — <https://github.com/apache/datafusion>
 
 <details>
 <summary>Full license text</summary>
@@ -1185,6 +1185,7 @@ Used by:
 - `windows-result` 0.4.1 — <https://github.com/microsoft/windows-rs>
 - `windows-strings` 0.5.1 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.52.0 — <https://github.com/microsoft/windows-rs>
+- `windows-sys` 0.59.0 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.61.2 — <https://github.com/microsoft/windows-rs>
 - `windows-targets` 0.52.6 — <https://github.com/microsoft/windows-rs>
 - `windows_aarch64_gnullvm` 0.52.6 — <https://github.com/microsoft/windows-rs>
@@ -2282,9 +2283,9 @@ Used by:
 - `anstyle-query` 1.1.5 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle-wincon` 3.0.11 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle` 1.0.14 — <https://github.com/rust-cli/anstyle.git>
-- `clap` 4.6.2 — <https://github.com/clap-rs/clap>
-- `clap_builder` 4.6.2 — <https://github.com/clap-rs/clap>
-- `clap_derive` 4.6.1 — <https://github.com/clap-rs/clap>
+- `clap` 4.6.5 — <https://github.com/clap-rs/clap>
+- `clap_builder` 4.6.5 — <https://github.com/clap-rs/clap>
+- `clap_derive` 4.6.4 — <https://github.com/clap-rs/clap>
 - `clap_lex` 1.1.0 — <https://github.com/clap-rs/clap>
 - `colorchoice` 1.0.5 — <https://github.com/rust-cli/anstyle.git>
 - `crc32fast` 1.5.0 — <https://github.com/srijs/rust-crc32fast>
@@ -3165,7 +3166,7 @@ limitations under the License.
 
 Used by:
 
-- `http` 1.4.2 — <https://github.com/hyperium/http>
+- `http` 1.5.0 — <https://github.com/hyperium/http>
 
 <details>
 <summary>Full license text</summary>
@@ -4248,7 +4249,7 @@ limitations under the License.
 
 Used by:
 
-- `rustls-pki-types` 1.15.0 — <https://github.com/rustls/pki-types>
+- `rustls-pki-types` 1.15.1 — <https://github.com/rustls/pki-types>
 
 <details>
 <summary>Full license text</summary>
@@ -4716,6 +4717,7 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
+- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
 - `js-sys` 0.3.103 — <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys>
@@ -4748,7 +4750,7 @@ Used by:
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
 - `rustix` 1.1.4 — <https://github.com/bytecodealliance/rustix>
 - `rustls-native-certs` 0.8.4 — <https://github.com/rustls/rustls-native-certs>
-- `rustls` 0.23.42 — <https://github.com/rustls/rustls>
+- `rustls` 0.23.43 — <https://github.com/rustls/rustls>
 - `rusty-fork` 0.3.1 — <https://github.com/altsysrq/rusty-fork>
 - `scopeguard` 1.2.0 — <https://github.com/bluss/scopeguard>
 - `security-framework-sys` 2.17.0 — <https://github.com/kornelski/rust-security-framework>
@@ -6803,8 +6805,8 @@ Used by:
 - `serde` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_core` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_derive` 1.0.229 — <https://github.com/serde-rs/serde>
-- `serde_derive_internals` 0.29.1 — <https://github.com/serde-rs/serde>
-- `serde_json` 1.0.150 — <https://github.com/serde-rs/json>
+- `serde_derive_internals` 0.30.0 — <https://github.com/serde-rs/serde>
+- `serde_json` 1.0.151 — <https://github.com/serde-rs/json>
 - `serde_urlencoded` 0.7.1 — <https://github.com/nox/serde_urlencoded>
 - `shlex` 2.0.1 — <https://github.com/comex/rust-shlex>
 - `simdutf8` 0.1.5 — <https://github.com/rusticstuff/simdutf8>
@@ -8988,8 +8990,8 @@ SOFTWARE.
 
 Used by:
 
-- `schemars` 1.2.1 — <https://github.com/GREsau/schemars>
-- `schemars_derive` 1.2.1 — <https://github.com/GREsau/schemars>
+- `schemars` 1.2.2 — <https://github.com/GREsau/schemars>
+- `schemars_derive` 1.2.2 — <https://github.com/GREsau/schemars>
 
 <details>
 <summary>Full license text</summary>
@@ -9103,7 +9105,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `arrow-array` 58.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 58.4.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9210,9 +9212,9 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `tokio-stream` 0.1.18 — <https://github.com/tokio-rs/tokio>
+- `tokio-stream` 0.1.19 — <https://github.com/tokio-rs/tokio>
 - `tokio-util` 0.7.18 — <https://github.com/tokio-rs/tokio>
-- `tokio` 1.53.0 — <https://github.com/tokio-rs/tokio>
+- `tokio` 1.53.1 — <https://github.com/tokio-rs/tokio>
 
 <details>
 <summary>Full license text</summary>

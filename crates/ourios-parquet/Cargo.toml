@@ -84,7 +84,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 ourios-miner = { path = "../ourios-miner" }
 # RFC0021.4 view-representation test: cast a plain batch's string/binary
 # columns to Utf8View/BinaryView and prove the shared decoder reads both.
-arrow-cast = { version = "=58.3.0", default-features = false }
+arrow-cast = { version = "=58.4.0", default-features = false }
 # Property tests for the compaction row-conservation invariant
 # (RFC0009.2 / CLAUDE.md §6.2 — invariants get a property test).
 proptest = "=1.11.0"
@@ -92,7 +92,7 @@ proptest = "=1.11.0"
 # async via `object_store`). `rt-multi-thread` so the S3 integration tests'
 # `#[tokio::test(flavor = "multi_thread")]` is self-contained rather than
 # relying on the main dependency's feature set. Already in the workspace tree.
-tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 # RFC 0013 S3 integration tests: spin LocalStack (S3-compatible, Apache-2.0)
 # via testcontainers and point `Store::s3` at it through the endpoint override.
 # The S3 tests are `#[ignore]`d (run only by the `s3-integration` CI job via

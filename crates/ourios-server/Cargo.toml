@@ -106,7 +106,7 @@ proptest = "=1.11.0"
 tempfile = "=3.27.0"
 prost = { version = "=0.14.4", default-features = false, features = ["std"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["transport", "channel", "gzip", "tls-ring"] }
-tokio = { version = "=1.53.0", default-features = false, features = ["io-util", "time", "process"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["io-util", "time", "process"] }
 # Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
 # RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
@@ -135,7 +135,7 @@ jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["rus
 # real Parquet footer, so the MCP cost-model resource is pinned to the
 # writer rather than to repeated literals. Already in the tree via
 # ourios-parquet — no new compilation unit versions.
-parquet = { version = "=58.3.0", default-features = false, features = ["arrow", "zstd"] }
+parquet = { version = "=58.4.0", default-features = false, features = ["arrow", "zstd"] }
 bytes = { version = "=1.12.1", default-features = false }
 # The RFC0029.7 Dex arm mints real tokens (form POST to the container's
 # token endpoint) and polls readiness — same crate + TLS stack as the
@@ -143,7 +143,7 @@ bytes = { version = "=1.12.1", default-features = false }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
 rand = "=0.8.7"
-base64 = "=0.22.1"
+base64 = "=0.23.0"
 
 [lints]
 workspace = true

@@ -51,7 +51,7 @@ jobs:
       # Pin cargo-about so the attribution is reproducible and the no-diff gate
       # can't flake on a new release changing output; bump deliberately
       # alongside any about.toml / about.hbs change.
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
         with:
           tool: cargo-about@0.9.1
       - name: Regenerate THIRD-PARTY-LICENSES.md

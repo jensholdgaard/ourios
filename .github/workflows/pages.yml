@@ -31,7 +31,7 @@ jobs:
       # The Mermaid preprocessor (declared in book.toml) must be on
       # PATH or `mdbook build` fails; see docs/rfcs/README.md.
       - name: Install mdBook + mdbook-mermaid
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
 

@@ -222,7 +222,7 @@ jobs:
           # silently with the action default. v4.1.2 defaults to cosign
           # v3.0.6; keep the v2.5.2 the releases have been signing with —
           # the cosign v2→v3 major is a separate, release-verified step.
-          cosign-release: v2.5.2
+          cosign-release: v2.6.5
 
       - name: cosign sign (keyless)
         env:

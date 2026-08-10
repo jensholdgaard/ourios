@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 339 |
+| `Apache-2.0` | 337 |
 | `MIT` | 72 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 8 |
@@ -1185,7 +1185,6 @@ Used by:
 - `windows-result` 0.4.1 — <https://github.com/microsoft/windows-rs>
 - `windows-strings` 0.5.1 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.52.0 — <https://github.com/microsoft/windows-rs>
-- `windows-sys` 0.59.0 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.61.2 — <https://github.com/microsoft/windows-rs>
 - `windows-targets` 0.52.6 — <https://github.com/microsoft/windows-rs>
 - `windows_aarch64_gnullvm` 0.52.6 — <https://github.com/microsoft/windows-rs>
@@ -2283,8 +2282,8 @@ Used by:
 - `anstyle-query` 1.1.5 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle-wincon` 3.0.11 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle` 1.0.14 — <https://github.com/rust-cli/anstyle.git>
-- `clap` 4.6.5 — <https://github.com/clap-rs/clap>
-- `clap_builder` 4.6.5 — <https://github.com/clap-rs/clap>
+- `clap` 4.6.6 — <https://github.com/clap-rs/clap>
+- `clap_builder` 4.6.6 — <https://github.com/clap-rs/clap>
 - `clap_derive` 4.6.4 — <https://github.com/clap-rs/clap>
 - `clap_lex` 1.1.0 — <https://github.com/clap-rs/clap>
 - `colorchoice` 1.0.5 — <https://github.com/rust-cli/anstyle.git>
@@ -4717,7 +4716,6 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
-- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
 - `js-sys` 0.3.103 — <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys>
@@ -4743,7 +4741,7 @@ Used by:
 - `prost-derive` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `prost-types` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `prost` 0.14.4 — <https://github.com/tokio-rs/prost>
-- `regex-automata` 0.4.14 — <https://github.com/rust-lang/regex>
+- `regex-automata` 0.4.18 — <https://github.com/rust-lang/regex>
 - `regex-syntax` 0.8.11 — <https://github.com/rust-lang/regex>
 - `regex` 1.12.4 — <https://github.com/rust-lang/regex>
 - `ring` 0.17.14 — <https://github.com/briansmith/ring>
@@ -6762,7 +6760,7 @@ Used by:
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
 - `async-trait` 0.1.89 — <https://github.com/dtolnay/async-trait>
-- `blake3` 1.8.5 — <https://github.com/BLAKE3-team/BLAKE3>
+- `blake3` 1.8.6 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
 - `constant_time_eq` 0.4.2 — <https://github.com/cesarb/constant_time_eq>
 - `crc32c` 0.6.8 — <https://github.com/zowens/crc32c>

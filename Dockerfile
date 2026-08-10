@@ -8,7 +8,7 @@
 # pinned by digest for reproducibility. This rust ref carries a tag, so
 # Renovate's docker manager bumps both the tag and the digest — no directive
 # comment needed.
-FROM rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
+FROM rust:1.97-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS builder
 WORKDIR /build
 COPY . .
 # `--locked` so a stale Cargo.lock fails the build instead of being

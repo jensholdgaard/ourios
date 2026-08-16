@@ -28,7 +28,9 @@ use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
 use ourios_ingester::receiver::tls_serve::{
     LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
 };
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
+use ourios_ingester::receiver::{
+    CommitCoordinator, IngestPipeline, SharedPipeline, TenantDerivation,
+};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
@@ -274,6 +276,8 @@ pub struct ReceiverConfig {
     /// (`receiver.encode_workers`; the config layer validates ≥ 1 and
     /// defaults to the host's available cores).
     pub encode_workers: usize,
+    /// RFC 0045 §3.1 — the tenant derivation rule and divergence watch.
+    pub tenant: TenantDerivation,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -478,7 +482,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut miner =
         MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
             .with_record_sink(Box::new(sink.clone()));
-    let rule = TenantRule::service_name();
+    let rule = config.tenant.rule.clone();
 
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &rule)
         .map_err(|e| format!("startup recovery: {e}"))?;
@@ -666,6 +670,7 @@ mod tests {
     use ourios_core::audit::{AuditSink, ParamType};
     use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
     use ourios_core::tenant::TenantId;
+    use ourios_ingester::receiver::TenantRule;
 
     use super::*;
 
@@ -888,6 +893,7 @@ mod tests {
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
             encode_workers: 2,
+            tenant: TenantDerivation::default(),
         })
         .await
         .expect("serve");
@@ -919,6 +925,7 @@ mod tests {
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
             encode_workers: 2,
+            tenant: TenantDerivation::default(),
         })
         .await
         .expect("serve");
@@ -1049,6 +1056,7 @@ mod tests {
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
             encode_workers: 2,
+            tenant: TenantDerivation::default(),
         })
         .await
         .expect("serve");

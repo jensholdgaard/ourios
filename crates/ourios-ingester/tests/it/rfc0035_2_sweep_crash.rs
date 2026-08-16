@@ -18,9 +18,9 @@ use std::process::{Command, Stdio};
 
 use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
-use ourios_ingester::receiver::TenantRule;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::Wal;
@@ -111,7 +111,7 @@ fn rfc0035_2_crash_during_the_sweeps_in_flight_publish_replays_the_records() {
         &mut wal,
         &snapshots_root,
         &mut miner,
-        &TenantRule::service_name(),
+        &RuleEpochs::load(&wal_root).expect("epochs"),
     )
     .expect("startup recovery");
     assert_eq!(

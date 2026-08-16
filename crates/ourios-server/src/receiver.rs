@@ -33,6 +33,7 @@ use ourios_ingester::receiver::{
 };
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_wal::{Wal, WalConfig, WalOffset};
@@ -466,6 +467,11 @@ async fn bind_listeners(
 #[allow(clippy::too_many_lines)]
 pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
+    // RFC 0045 §3.3: replay derives each frame under the rule it was
+    // acknowledged under; the configured rule takes over for frames appended
+    // after this start.
+    let mut epochs =
+        RuleEpochs::load(&config.wal.root).map_err(|e| format!("startup recovery: {e}"))?;
     // The §3.4 group-commit knobs, captured before `config.wal` is moved
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
@@ -484,8 +490,18 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             .with_record_sink(Box::new(sink.clone()));
     let rule = config.tenant.rule.clone();
 
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &rule)
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &epochs)
         .map_err(|e| format!("startup recovery: {e}"))?;
+    if epochs
+        .advance(&rule, report.max_delivered)
+        .map_err(|e| format!("startup recovery: {e}"))?
+    {
+        tracing::info!(
+            keys = ?rule.keys(),
+            "tenant derivation rule changed; frames from here on derive under the new rule, \
+             stored tenant ids are unchanged (RFC 0045 §3.3)"
+        );
+    }
     for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
         tracing::warn!(
             name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,

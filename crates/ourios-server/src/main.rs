@@ -1774,10 +1774,7 @@ auth:
             tenant_derivation(&absent.receiver.tenant).expect("default"),
             TenantDerivation::default()
         );
-        assert_eq!(
-            TenantDerivation::default().rule,
-            TenantRule::service_name()
-        );
+        assert_eq!(TenantDerivation::default().rule, TenantRule::service_name());
 
         let empty = parse("receiver:\n  tenant:\n    rule: []\n", &lookup).expect("valid yaml");
         assert!(

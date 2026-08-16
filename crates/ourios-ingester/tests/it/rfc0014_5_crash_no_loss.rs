@@ -22,9 +22,9 @@ use std::time::Duration;
 
 use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
-use ourios_ingester::receiver::TenantRule;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::{Wal, WalConfig};
@@ -131,7 +131,7 @@ fn rfc0014_5_no_acknowledged_data_loss() {
         &mut wal,
         &snapshots_root,
         &mut miner,
-        &TenantRule::service_name(),
+        &RuleEpochs::load(&wal_root).expect("epochs"),
     )
     .expect("startup recovery");
     assert_eq!(

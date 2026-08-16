@@ -16,6 +16,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 use ourios_ingester::receiver::{TenantRule, fan_out};
 use ourios_ingester::recovery;
+use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::RecoveryOutcome;
 use ourios_wal::{FrameKind, Wal, WalOffset};
@@ -60,7 +61,6 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
-    let rule = TenantRule::service_name();
 
     let pre = [
         request(vec![
@@ -105,8 +105,13 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // Act: recover into a fresh miner over the same WAL + snapshots.
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &snapshots_root, &mut recovered, &rule).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &RuleEpochs::load(root).expect("epochs"),
+    )
+    .expect("recover");
 
     // Assert (a): restored + tail-replayed state equals the
     // from-scratch control, per tenant.
@@ -137,7 +142,6 @@ async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
-    let rule = TenantRule::service_name();
 
     let batches = [
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
@@ -159,8 +163,13 @@ async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &snapshots_root, &mut recovered, &rule).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &RuleEpochs::load(root).expect("epochs"),
+    )
+    .expect("recover");
 
     // Assert: artefact discarded, nothing suppressed, full-replay
     // state equals the control.
@@ -187,7 +196,6 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
-    let rule = TenantRule::service_name();
 
     let batches = [
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
@@ -208,8 +216,13 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &snapshots_root, &mut recovered, &rule).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &RuleEpochs::load(root).expect("epochs"),
+    )
+    .expect("recover");
 
     // Assert: discarded (not restored without suppression), nothing
     // suppressed, full-replay state equals the control.
@@ -278,7 +291,6 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
-    let rule = TenantRule::service_name();
 
     let seg1_batches = [
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
@@ -315,8 +327,13 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &snapshots_root, &mut recovered, &rule).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &RuleEpochs::load(root).expect("epochs"),
+    )
+    .expect("recover");
 
     // Assert: restored + flagged, surviving frames folded, no error.
     assert_eq!(report.tenants.len(), 1);
@@ -338,7 +355,6 @@ async fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
     // Arrange: a WAL with batches and no snapshots dir at all.
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
-    let rule = TenantRule::service_name();
 
     let batches = [
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
@@ -356,8 +372,13 @@ async fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &root.join("snapshots"), &mut recovered, &rule)
-        .expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &root.join("snapshots"),
+        &mut recovered,
+        &RuleEpochs::load(root).expect("epochs"),
+    )
+    .expect("recover");
 
     // Assert
     assert!(report.tenants.is_empty(), "no artefacts, no outcomes");

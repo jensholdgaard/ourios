@@ -24,7 +24,8 @@ use ourios_miner::snapshot::{RecoveryOutcome, WalHighWater};
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalOffset};
 use prost::Message;
 
-use crate::receiver::tenant::{TenantRule, fan_out};
+use crate::receiver::tenant::fan_out;
+use crate::rule_epochs::RuleEpochs;
 use crate::snapshot_store::{self, SnapshotStoreError};
 
 /// What recovery did, for the caller to log and for the
@@ -114,7 +115,7 @@ pub fn recover(
     wal: &mut Wal,
     snapshots_root: &Path,
     miner: &mut MinerCluster,
-    rule: &TenantRule,
+    epochs: &RuleEpochs,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
     let artefacts = snapshot_store::load_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
@@ -152,7 +153,7 @@ pub fn recover(
 
     let mut sink = DriverSink {
         miner,
-        rule,
+        epochs,
         horizons: &horizons,
         frames_delivered: 0,
         records_fed: 0,
@@ -243,11 +244,12 @@ fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
 }
 
 /// The §6.6 [`FrameSink`]: per `OtlpBatch` frame, decode →
-/// [`fan_out`] → feed each record to the miner iff the frame offset
-/// is above that record's tenant horizon.
+/// [`fan_out`] under the frame's rule epoch (RFC 0045 §3.3) → feed each
+/// record to the miner iff the frame offset is above that record's
+/// tenant horizon.
 struct DriverSink<'a> {
     miner: &'a mut MinerCluster,
-    rule: &'a TenantRule,
+    epochs: &'a RuleEpochs,
     horizons: &'a HashMap<TenantId, WalOffset>,
     frames_delivered: u64,
     records_fed: u64,
@@ -273,7 +275,8 @@ impl FrameSink for DriverSink<'_> {
             FrameKind::OtlpBatch => {
                 let request =
                     ExportLogsServiceRequest::decode(payload).map_err(|e| reject(offset, &e))?;
-                let records = fan_out(request, self.rule).map_err(|e| reject(offset, &e))?;
+                let records = fan_out(request, self.epochs.rule_for(offset))
+                    .map_err(|e| reject(offset, &e))?;
                 for record in &records {
                     let feed = match self.horizons.get(&record.tenant_id) {
                         Some(horizon) => offset > *horizon,
@@ -375,11 +378,12 @@ mod tests {
     #[test]
     fn sink_rejects_a_malformed_payload_naming_the_offset() {
         let mut miner = MinerCluster::new(MinerConfig::default());
-        let rule = TenantRule::service_name();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let epochs = RuleEpochs::load(dir.path()).expect("implicit epoch");
         let horizons = HashMap::new();
         let mut sink = DriverSink {
             miner: &mut miner,
-            rule: &rule,
+            epochs: &epochs,
             horizons: &horizons,
             frames_delivered: 0,
             records_fed: 0,

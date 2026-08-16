@@ -69,52 +69,96 @@ receiver:
     # Keys watched for divergence (§3.4) when not already in `rule`.
     # Default: [k8s.cluster.name].
     watch: [k8s.cluster.name]
+    # Upper bound on remembered (tenant, key) pairs (§3.4). Default: 10000.
+    watch_capacity: 10000
 ```
 
 - An empty `rule` list is a startup configuration error. A duplicate key in
-  `rule` is a startup configuration error.
+  `rule` is a startup configuration error. A key listed in both `rule` and
+  `watch` is accepted and simply not watched (§3.4).
 - Derivation is per-`ResourceLogs` group from `Resource.attributes`,
-  unchanged in shape. **Every configured key is required**: any group whose
-  resource lacks a key, or carries it with a non-string or empty-string
-  value, rejects the **whole export** — the existing RFC0003.4 posture, and
-  the RFC 0043 rule that an empty string is never a value. Partial joins are
-  explicitly rejected as a design (§4): a group missing `k8s.cluster.name`
-  that silently derived plain `fluxcd` would recreate the exact collision
-  this RFC exists to close.
+  unchanged in shape. **Every key in `rule` is required**: any group whose
+  resource lacks a `rule` key, or carries it with a non-string or
+  empty-string value, rejects the **whole export** — the existing RFC0003.4
+  posture, and the RFC 0043 rule that an empty string is never a value.
+  Partial joins are explicitly rejected as a design (§4): a group missing
+  `k8s.cluster.name` that silently derived plain `fluxcd` would recreate the
+  exact collision this RFC exists to close.
+- `watch` keys are never required. A group that lacks a `watch` key, or
+  carries it as a non-string or empty string, is simply not observed by the
+  detector for that key; the export's acceptance is decided by `rule` alone.
+  The detector observes, it never enforces (§3.4).
 
-### 3.2 The join is injective
+### 3.2 The join is injective, and the single-key case is byte-identical
 
-Each component value percent-encodes `%` (as `%25`) and `/` (as `%2F`)
-before the components join with `/`. Distinct component tuples therefore
-produce distinct tenant ids: `("a", "b/c")` → `a/b%2Fc` and `("a/b", "c")`
-→ `a%2Fb/c` cannot merge. The tenant id remains an opaque string to every
-downstream consumer (auth, storage, query); the partition layer's existing
-`percent_encode_tenant` already makes any tenant id path-safe, so no
-storage change is required.
+A **single-key** rule (including the default `[service.name]`) derives the
+tenant id as the attribute's string value, verbatim — exactly what
+`TenantRule::service_name()` produces today. No escaping is applied: a
+`service.name` of `a/b` stays tenant `a/b`, `100%` stays `100%`, so
+existing storage paths and token bindings are untouched (RFC0045.6 covers
+both characters).
+
+A **composite** rule (two or more keys) percent-encodes `%` (as `%25`) and
+`/` (as `%2F`) in each component value, then joins the components with
+`/`. For a fixed rule, distinct component tuples therefore produce distinct
+tenant ids: `("a", "b/c")` → `a/b%2Fc` and `("a/b", "c")` → `a%2Fb/c`
+cannot merge. Injectivity is a per-rule property — within one epoch exactly
+one rule is in force, so no two live resources can collide; the cross-epoch
+case is §3.3.
+
+The tenant id remains an opaque string to every downstream consumer (auth,
+storage, query); the partition layer's existing `percent_encode_tenant`
+already makes any tenant id path-safe, so no storage change is required.
 
 ### 3.3 Epoch semantics
 
 Derivation happens at ingest, once. A rule change (config edit + restart)
 affects newly ingested data only: stored files keep the tenant ids they
-were written under, no repartitioning, no rewrite. Both epochs remain
-independently queryable under their own ids. This is documented operator
-guidance, not mechanism — the mechanism is precisely that nothing happens
-to old data. Read-time tenant *aliasing* (query tenant X also reads legacy
-tenant Y through an explicit, audited mapping) is the named escape hatch if
-S7-style demand materializes; it is out of scope here.
+were written under, no repartitioning, no rewrite, no epoch qualifier in
+the id or the storage key. **Tenant identity is the id string and nothing
+else** (opaque ids, Q4): if a later rule derives an id that an earlier rule
+also produced, those records are one tenant, intentionally — the same way
+they would be if the rule had never changed. Records whose ids differ
+across epochs (`fluxcd` before, `cluster1/fluxcd` after) are two tenants,
+each queryable under its own id. Operator guidance, not mechanism: the
+mechanism is precisely that nothing happens to old data. Read-time tenant
+*aliasing* (query tenant X also reads legacy tenant Y through an explicit,
+audited mapping) is the named escape hatch if S7-style demand
+materializes; it is out of scope here.
 
 ### 3.4 The divergence detector
 
 For each key in `watch` that is not part of `rule`: per (tenant, key), the
-receiver remembers the first observed value (bounded in-memory state, reset
-on restart — documented). When a later group for the same tenant carries a
-*different* value, the receiver emits a rate-limited warning naming the
-tenant, the key, and both values, and increments a counter. The S2
-misconfiguration — two clusters merging into one tenant under a single-key
-rule — thereby announces itself on the first divergent batch instead of
-corrupting silently. Ingest is never rejected by the detector: it observes,
-it does not enforce (the operator may genuinely intend one tenant spanning
-clusters).
+receiver remembers the first observed value. When a later group for the
+same tenant carries a *different* value, the receiver emits a rate-limited
+warning naming the tenant, the key, and both values, and increments a
+counter. The S2 misconfiguration — two clusters merging into one tenant
+under a single-key rule — thereby announces itself on the first divergent
+batch instead of corrupting silently. Ingest is never rejected by the
+detector: it observes, it does not enforce (the operator may genuinely
+intend one tenant spanning clusters).
+
+**State bound.** The detector's memory is a map of at most
+`receiver.tenant.watch_capacity` (tenant, key) entries — default 10 000 —
+each holding the first-observed value. Admission is first-come: once the
+map is full, new (tenant, key) pairs are not admitted and are not watched;
+a single warning announces saturation (once per process lifetime), so an
+un-watched tenant is a known, logged condition rather than a silent one.
+No eviction — first-observed semantics have no meaningful "least recently
+used" entry, and evicting would only trade one blind spot for another.
+State resets on restart (documented; the detector is best-effort by
+design, and the first divergent batch after restart re-announces).
+
+**Value representation.** Only non-empty string values are observed
+(§3.1); non-string values never reach the detector, so nothing needs a
+serialization. Each stored and logged value is bounded to 128 bytes —
+longer values are truncated at a UTF-8 boundary and marked with a
+trailing `…` — which caps both the memory per entry and the log line. The
+warning is rate-limited per (tenant, key), so a persistently divergent
+tenant produces one line per rate window, not one per batch. Redaction is
+not applied: `watch` keys are operator-selected producer descriptors, and
+selecting a key opts its values into the operator's own logs exactly as
+selecting a `rule` key opts them into tenant ids and storage paths.
 
 The counter's name and attributes are minted at implementation time through
 the semconv registry + weaver process (provisional:
@@ -129,6 +173,14 @@ The derived tenant remains a claim checked against the token's tenant set
 opaque strings to that machinery. A token authorizing `cluster1/fluxcd`
 authorizes exactly that string; nothing about binding, rejection, or the
 403 contract changes.
+
+**Rollout under a rule change** follows from §3.3 and needs no mechanism:
+a token naming `fluxcd` keeps authorizing exactly `fluxcd` — the old-epoch
+tenant — and does not authorize `cluster1/fluxcd`. The operator issues (or
+extends) tokens naming the new ids before or with the restart; until then,
+exports deriving new ids are rejected by the unchanged binding check
+(RFC0045.8) rather than silently landing somewhere. Whether old tokens are
+revoked once the old-epoch data ages out is the operator's call.
 
 ## 4. Alternatives considered
 
@@ -183,30 +235,76 @@ Scenario ids `RFC0045.<n>`.
 > rule, When the server restarts with the composite rule and further
 > records are ingested, Then the old records remain queryable under their
 > original tenant, the new records under the composite tenant, and no
-> stored file was rewritten.
+> stored file was rewritten; And Given a later epoch derives an id the
+> earlier epoch also produced, Then a query for that id returns records
+> from both epochs — one tenant, per §3.3.
 
 > **RFC0045.6 — default regression.** Given no `receiver.tenant` config,
 > When the existing RFC 0003 tenancy suite runs, Then it passes unchanged —
-> derivation is byte-identical to the pre-RFC behaviour.
+> derivation is byte-identical to the pre-RFC behaviour; And Given a
+> single-key rule and a `service.name` of `a/b` (and of `100%`), Then the
+> derived tenant is exactly `a/b` (`100%`) — no escaping on the single-key
+> path.
 
 > **RFC0045.7 — divergence detector.** Given the default rule and default
 > `watch`, When two exports share `service.name` but differ in
 > `k8s.cluster.name`, Then a warning naming the tenant, key, and both
 > values is emitted and the divergence counter increments; And Given
-> uniform `k8s.cluster.name` values, Then no warning and no increment.
+> uniform `k8s.cluster.name` values, Then no warning and no increment; And
+> Given a group lacking `k8s.cluster.name` (or carrying it non-string or
+> empty), Then the export is accepted and that group is not observed; And
+> Given a divergent value longer than 128 bytes, Then the warning carries
+> the value truncated at a UTF-8 boundary with a trailing `…`.
 
 > **RFC0045.8 — auth binding unchanged.** Given auth enabled with a token
 > bound to `cluster1/fluxcd` and the composite rule, When an export
 > deriving `cluster2/fluxcd` is presented under that token, Then the whole
 > batch is rejected per the RFC 0026 contract, with unchanged telemetry.
 
-## 6. Telemetry
+> **RFC0045.9 — watch state bound.** Given `watch_capacity: 1` and two
+> tenants that each later diverge on `k8s.cluster.name`, When both are
+> ingested, Then the first tenant's divergence is reported, the second
+> tenant's is not, the saturation warning is emitted exactly once, and
+> every export is accepted.
 
-The §3.4 warning and counter are the only additions. The counter is minted
-via `semconv/registry/` + weaver at implementation; the live-check gate
-covers it like every other emission.
+## 6. Testing strategy
 
-## 7. Deferred (recorded, not built)
+Unit tests in `ourios-ingester` for the rule (single-key verbatim,
+composite encode + join, missing/empty/non-string rejection, injectivity
+pairs) and for the detector (first-value memory, divergence, watch-key
+absence, truncation, capacity admission); a `proptest` over component
+tuples asserting the composite join is injective for a fixed key count
+(RFC0045.4 in property form). Config resolution (RFC0045.1) as
+`FileConfig` unit tests. RFC0045.2/.3/.5/.8 as `ourios-server` integration
+tests through the served OTLP → query path, reusing the RFC 0003 / RFC 0026
+harnesses; RFC0045.6 is the existing suite plus two rule-level cases.
+RFC0045.7/.9 assert on captured `tracing` output and the counter, in the
+pattern the RFC 0038 exporter tests use.
+
+## 7. Open questions
+
+- [ ] **Counter final name** — `ourios.tenant.watch_divergence` is
+      provisional; minted through the semconv registry + weaver at
+      implementation, with the OTel-MCP naming check.
+- [ ] **Saturation visibility** — a once-per-lifetime warning is the
+      minimum; whether the admitted-entry count deserves a gauge is
+      decided when the counter is minted (same registry pass).
+
+## 8. References
+
+- #688 — the tenancy concept discussion; Q1–Q10 are this RFC's premises.
+- RFC 0001 §6.1 — the reserved tenant-derivation rule this RFC exposes.
+- RFC 0003 §6.3 / RFC0003.4 — per-`ResourceLogs` derivation and
+  whole-export rejection.
+- RFC 0005 §3.4 — `percent_encode_tenant`, the path-safety layer.
+- RFC 0026 / RFC 0029 — whole-batch binding and token resolution the
+  derived tenant is checked against.
+- RFC 0043 — the empty-string-is-never-a-value rule.
+- OTel semantic conventions, `service.name` — uniqueness scoped to
+  `service.namespace`; k8s attribute derivation chain.
+- `CLAUDE.md` §3.7 — the multi-tenancy invariant this RFC defends.
+
+## 9. Deferred (recorded, not built)
 
 Read-time tenant aliasing (Q5 escape hatch); visibility classes within a
 tenant (Q8 — the query-rewrite layer); conversation-scoped erasure (Q9);

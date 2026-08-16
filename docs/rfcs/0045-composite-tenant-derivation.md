@@ -13,7 +13,8 @@ superseded-by: —
 
 > **Status: `specified` (2026-08-17).** §5 criteria written and testable.
 > Grounded in the tenancy concept discussion (#688): the maintainer-settled
-> Q1–Q10 answers are this RFC's premises, restated in §2/§3 where they bind.
+> Q1–Q10 answers (Q1–Q7 in the issue body, Q8–Q10 raised and settled in its
+> comment thread) are this RFC's premises, restated in §2/§3 where they bind.
 
 ## 1. Summary
 
@@ -339,7 +340,8 @@ by-offset lookup.
 
 ## 8. References
 
-- #688 — the tenancy concept discussion; Q1–Q10 are this RFC's premises.
+- #688 — the tenancy concept discussion; Q1–Q10 are this RFC's premises
+  (Q1–Q7 in the issue body, Q8–Q10 in its comment thread).
 - RFC 0001 §6.1 — the reserved tenant-derivation rule this RFC exposes.
 - RFC 0003 §6.3 / RFC0003.4 — per-`ResourceLogs` derivation and
   whole-export rejection.

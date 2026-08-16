@@ -120,11 +120,36 @@ else** (opaque ids, Q4): if a later rule derives an id that an earlier rule
 also produced, those records are one tenant, intentionally — the same way
 they would be if the rule had never changed. Records whose ids differ
 across epochs (`fluxcd` before, `cluster1/fluxcd` after) are two tenants,
-each queryable under its own id. Operator guidance, not mechanism: the
-mechanism is precisely that nothing happens to old data. Read-time tenant
-*aliasing* (query tenant X also reads legacy tenant Y through an explicit,
-audited mapping) is the named escape hatch if S7-style demand
-materializes; it is out of scope here.
+each queryable under its own id. Nothing happens to old data — with one
+qualification, the WAL tail, which is the only place "derive once" needs
+a mechanism.
+
+**The WAL tail derives under the rule it was acknowledged under.**
+Startup recovery (RFC 0001 §6.9 / RFC0014.5) replays every surviving WAL
+frame through the tenant fan-out — un-flushed frames, plus frames a
+floor-retained segment still holds. Re-deriving those under a *changed*
+rule would either abort startup (a `rule` key the old frames never
+carried) or, worse, silently re-tenant acknowledged records into the new
+epoch's ids — a duplicate in `cluster1/fluxcd` for a record already stored
+under `fluxcd`, and a miner tree fed twice. So the receiver persists a
+**rule-epoch log** in the WAL root (`tenant_rule_epochs.json` — a sidecar
+like the checkpoint file, not a new WAL frame kind; written
+temp-file → rename → directory fsync): an ordered list of
+`{rule, after}` entries meaning "frames with offset > `after` derive under
+`rule`" (`after: null` = from the beginning). Replay picks each frame's
+epoch by offset. On startup, after replay, if the configured rule differs
+from the newest entry's rule, a new entry is appended with `after` = the
+highest offset replay delivered. An absent log means one implicit epoch,
+`{[service.name], null}` — every pre-RFC WAL is that epoch, so the upgrade
+needs no migration. A log that exists but fails to parse aborts startup
+loudly (corruption class, like a bad segment header). Entries are never
+pruned; a rule change is rare and the file stays a few lines. Every WAL
+offset is globally ordered (UUIDv7 segment, byte), so "which epoch" is one
+comparison.
+
+Read-time tenant *aliasing* (query tenant X also reads legacy tenant Y
+through an explicit, audited mapping) is the named escape hatch if
+S7-style demand materializes; it is out of scope here.
 
 ### 3.4 The divergence detector
 
@@ -202,6 +227,15 @@ revoked once the old-epoch data ages out is the operator's call.
 - **Repartitioning on rule change.** Rejected per Q5: a data-rewriting
   migration for a config edit inverts the risk profile of the entire
   design.
+- **Replaying the WAL tail under the new rule** (no epoch log; document
+  "drain before you change the rule"). Rejected: replay delivers
+  floor-retained frames even after a clean shutdown, so the procedure
+  cannot be made airtight, and the failure is either a startup abort or a
+  silent re-tenanting of acknowledged data — the second is exactly the
+  §3.7 class this RFC exists to close. Stamping the tenant id or rule into
+  each WAL frame was the other option; it changes the RFC 0008 frame
+  format for a once-per-deployment event, where a sidecar keyed by offset
+  does not.
 
 ## 5. Acceptance criteria
 
@@ -267,6 +301,16 @@ Scenario ids `RFC0045.<n>`.
 > tenant's is not, the saturation warning is emitted exactly once, and
 > every export is accepted.
 
+> **RFC0045.10 — WAL tail keeps its epoch.** Given records acknowledged
+> under the default rule whose frames are still in the WAL (un-flushed),
+> When the server restarts with the composite rule, Then recovery derives
+> those frames under `[service.name]` — they land only in their original
+> tenant, no duplicate exists in any composite tenant, startup succeeds
+> even though the frames lack `k8s.cluster.name`, and the epoch log gains
+> one entry; And Given no epoch log exists beside a pre-RFC WAL, Then
+> replay behaves as a single `[service.name]` epoch; And Given an
+> unparseable epoch log, Then startup aborts naming the file.
+
 ## 6. Testing strategy
 
 Unit tests in `ourios-ingester` for the rule (single-key verbatim,
@@ -279,7 +323,10 @@ tuples asserting the composite join is injective for a fixed key count
 tests through the served OTLP → query path, reusing the RFC 0003 / RFC 0026
 harnesses; RFC0045.6 is the existing suite plus two rule-level cases.
 RFC0045.7/.9 assert on captured `tracing` output and the counter, in the
-pattern the RFC 0038 exporter tests use.
+pattern the RFC 0026 telemetry tests use. RFC0045.10 extends the RFC0014.5
+crash/replay harness (ingest → kill before flush → restart with a
+different rule) plus unit tests for the epoch log's parse, append, and
+by-offset lookup.
 
 ## 7. Open questions
 

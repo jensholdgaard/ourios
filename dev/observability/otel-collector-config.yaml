@@ -27,6 +27,9 @@ exporters:
   # the docker bridge address and cannot — see `dogfood-config.yaml`.
   otlp/ourios:
     endpoint: host.docker.internal:24317
+    # RFC 0046: the tenant is named out of band on every export.
+    headers:
+      x-ourios-tenant: agent-dogfood
     tls:
       insecure: true
   debug:

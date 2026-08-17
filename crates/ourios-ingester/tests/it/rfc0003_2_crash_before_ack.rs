@@ -4,7 +4,7 @@
 //! (append + fsync) over a real `Wal`, prints `READY`, and parks; this
 //! test `SIGKILL`s it after `READY` — i.e. after the batch is durable but
 //! before any transport ack would be sent — then reopens the WAL and
-//! replays. The fsync'd `OtlpBatch` frame must survive and recover the
+//! replays. The fsync'd `TenantOtlpBatch` frame must survive and recover the
 //! input.
 //!
 //! This is the *no-loss* half of the at-least-once contract: a crash in
@@ -51,15 +51,15 @@ fn rfc0003_2_fsynced_batch_survives_a_crash_before_ack() {
     child.kill().expect("SIGKILL fixture");
     child.wait().expect("reap fixture");
 
-    // Assert: the fsync'd OtlpBatch frame survived the crash and recovers
+    // Assert: the fsync'd TenantOtlpBatch frame survived the crash and recovers
     // the input batch's record.
     let frames = replay_frames(tmp.path());
     assert_eq!(
         frames.len(),
         1,
-        "exactly one fsync'd OtlpBatch frame survives"
+        "exactly one fsync'd TenantOtlpBatch frame survives"
     );
-    assert_eq!(frames[0].0, FrameKind::OtlpBatch);
+    assert_eq!(frames[0].0, FrameKind::TenantOtlpBatch);
     let recovered = decode_protobuf(&frames[0].1).expect("frame payload decodes");
     let body = recovered.resource_logs[0].scope_logs[0].log_records[0]
         .body

@@ -18,3 +18,4 @@ mod rfc0008_5_corruption;
 mod rfc0008_6_rotation;
 mod rfc0008_7_checkpoint;
 mod rfc0008_9_unflushed_bytes;
+mod rfc0046_6_frame_kind_dimension;

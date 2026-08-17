@@ -275,7 +275,21 @@ mod ingest_binding {
         jsonwebtoken::encode(&header, &claims, encoding).expect("mint")
     }
 
-    /// One `ResourceLogs` batch whose tenant derives from `service.name`.
+    /// [`batch`] wrapped in a tonic request selecting `tenant` out of band
+    /// (RFC 0046 §3.1); the batch's `service.name` merely carries the same
+    /// string as a plain resource attribute — it is not what selects the
+    /// tenant.
+    pub(super) fn tenant_request(tenant: &str) -> tonic::Request<ExportLogsServiceRequest> {
+        let mut request = tonic::Request::new(batch(tenant));
+        request
+            .metadata_mut()
+            .insert("x-ourios-tenant", tenant.parse().expect("ascii tenant"));
+        request
+    }
+
+    /// One `ResourceLogs` batch carrying `tenant` as its `service.name` resource
+    /// attribute — producer metadata only; the tenant itself is selected out of
+    /// band by [`tenant_request`] (RFC 0046).
     pub(super) fn batch(tenant: &str) -> ExportLogsServiceRequest {
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -367,7 +381,7 @@ mod ingest_binding {
 
         // Bearer-less: UNAUTHENTICATED from the auth layer, pre-decode.
         let status = client
-            .export(tonic::Request::new(batch("acme")))
+            .export(tenant_request("acme"))
             .await
             .expect_err("no bearer is rejected");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
@@ -376,7 +390,7 @@ mod ingest_binding {
         let token = mint(&encoding, "key-1", &issuer, &["acme"]);
         let authorization: tonic::metadata::MetadataValue<_> =
             format!("Bearer {token}").parse().expect("metadata");
-        let mut request = tonic::Request::new(batch("acme"));
+        let mut request = tenant_request("acme");
         request
             .metadata_mut()
             .insert("authorization", authorization.clone());
@@ -384,7 +398,7 @@ mod ingest_binding {
 
         // …and an out-of-set tenant is whole-batch denied (§3.2 —
         // RFC 0026 semantics with the OIDC-resolved binding).
-        let mut request = tonic::Request::new(batch("globex"));
+        let mut request = tenant_request("globex");
         request
             .metadata_mut()
             .insert("authorization", authorization);
@@ -489,7 +503,7 @@ mod claim_binding {
     use tokio::process::Command;
     use tokio::time::timeout;
 
-    use super::ingest_binding::{batch, make_key, mint, serve_issuer};
+    use super::ingest_binding::{make_key, mint, serve_issuer, tenant_request};
 
     /// Spawn the binary with receiver+querier and the given `auth` YAML
     /// block; return (child, grpc, http-receiver, http-querier).
@@ -611,12 +625,12 @@ mod claim_binding {
             .expect("grpc connect");
         let authorization: tonic::metadata::MetadataValue<_> =
             format!("Bearer {token}").parse().expect("metadata");
-        let mut request = tonic::Request::new(batch("b"));
+        let mut request = tenant_request("b");
         request
             .metadata_mut()
             .insert("authorization", authorization.clone());
         client.export(request).await.expect("in-set batch acks");
-        let mut request = tonic::Request::new(batch("c"));
+        let mut request = tenant_request("c");
         request
             .metadata_mut()
             .insert("authorization", authorization);
@@ -676,7 +690,7 @@ mod claim_binding {
         for tenant in ["alpha", "beta", "entirely-new-tenant"] {
             let authorization: tonic::metadata::MetadataValue<_> =
                 format!("Bearer {token}").parse().expect("metadata");
-            let mut request = tonic::Request::new(batch(tenant));
+            let mut request = tenant_request(tenant);
             request
                 .metadata_mut()
                 .insert("authorization", authorization);
@@ -731,7 +745,7 @@ mod claim_binding {
         ] {
             let authorization: tonic::metadata::MetadataValue<_> =
                 format!("Bearer {bearer}").parse().expect("metadata");
-            let mut request = tonic::Request::new(batch(in_set));
+            let mut request = tenant_request(in_set);
             request
                 .metadata_mut()
                 .insert("authorization", authorization.clone());
@@ -739,7 +753,7 @@ mod claim_binding {
                 .export(request)
                 .await
                 .unwrap_or_else(|e| panic!("{label}: in-set batch acks: {e}"));
-            let mut request = tonic::Request::new(batch(out_of_set));
+            let mut request = tenant_request(out_of_set);
             request
                 .metadata_mut()
                 .insert("authorization", authorization);
@@ -785,7 +799,7 @@ mod dex {
     use tokio::process::Command;
     use tokio::time::timeout;
 
-    use super::ingest_binding::batch;
+    use super::ingest_binding::tenant_request;
 
     const DEX_IMAGE: &str = "ghcr.io/dexidp/dex";
     const DEX_TAG: &str =
@@ -989,12 +1003,12 @@ mod dex {
             .expect("grpc connect");
         let authorization: tonic::metadata::MetadataValue<_> =
             format!("Bearer {token}").parse().expect("metadata");
-        let mut request = tonic::Request::new(batch("acme"));
+        let mut request = tenant_request("acme");
         request
             .metadata_mut()
             .insert("authorization", authorization.clone());
         client.export(request).await.expect("in-claim batch acks");
-        let mut request = tonic::Request::new(batch("intruder"));
+        let mut request = tenant_request("intruder");
         request
             .metadata_mut()
             .insert("authorization", authorization.clone());

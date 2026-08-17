@@ -15,7 +15,7 @@
 use ourios_config::MinerConfig;
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, TemplateChange};
 use ourios_ingester::encode_pool::EncodePool;
-use ourios_ingester::receiver::{IngestPipeline, TenantRule};
+use ourios_ingester::receiver::IngestPipeline;
 use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
@@ -99,12 +99,8 @@ async fn rfc0035_f2_pre_panic_records_reach_parquet_and_the_next_batch_acks() {
     )
     .with_record_sink(Box::new(sink.clone()));
     let pipeline = Arc::new(
-        IngestPipeline::new(
-            coordinator(Box::new(wal)),
-            miner,
-            TenantRule::service_name(),
-        )
-        .with_encode_pool(EncodePool::new(&sink, 2)),
+        IngestPipeline::new(coordinator(Box::new(wal)), miner)
+            .with_encode_pool(EncodePool::new(&sink, 2)),
     );
 
     // Records 1–2 share the batch's first template (one Created + one
@@ -113,10 +109,13 @@ async fn rfc0035_f2_pre_panic_records_reach_parquet_and_the_next_batch_acks() {
     let poisoned = pipeline.clone();
     let outcome = tokio::spawn(async move {
         poisoned
-            .ingest(request(vec![resource_logs(
-                "svc",
-                &["alpha 1 done", "alpha 2 done", "beta started", "gamma seen"],
-            )]))
+            .ingest(
+                request(vec![resource_logs(
+                    "svc",
+                    &["alpha 1 done", "alpha 2 done", "beta started", "gamma seen"],
+                )]),
+                ourios_core::tenant::TenantId::new("svc"),
+            )
             .await
     })
     .await;
@@ -139,7 +138,10 @@ async fn rfc0035_f2_pre_panic_records_reach_parquet_and_the_next_batch_acks() {
     // The pipeline survives: gate released, miner mutex recovered,
     // capture slot clean — a clean follow-up batch acks and lands.
     let ingested = pipeline
-        .ingest(request(vec![resource_logs("svc", &["delta 7 sent"])]))
+        .ingest(
+            request(vec![resource_logs("svc", &["delta 7 sent"])]),
+            ourios_core::tenant::TenantId::new("svc"),
+        )
         .await
         .expect("the next batch acks after the panic");
     assert_eq!(ingested, 1);

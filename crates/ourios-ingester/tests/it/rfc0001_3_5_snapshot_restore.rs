@@ -11,12 +11,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ingest_support::{open_pipeline, request, resource_logs, wal_config};
+use crate::ingest_support::{open_pipeline, request, resource_logs, tenant_for, wal_config};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
-use ourios_ingester::receiver::{TenantRule, fan_out};
+
 use ourios_ingester::recovery;
-use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::RecoveryOutcome;
 use ourios_wal::{FrameKind, Wal, WalOffset};
@@ -25,10 +24,9 @@ use prost::Message;
 /// Feed every record of `requests` (in order) to `miner`, returning
 /// the record count.
 fn ingest_all(miner: &mut MinerCluster, requests: &[ExportLogsServiceRequest]) -> u64 {
-    let rule = TenantRule::service_name();
     let mut count = 0;
     for request in requests {
-        for record in fan_out(request.clone(), &rule).expect("fan out") {
+        for record in ourios_ingester::receiver::assign(request.clone(), &tenant_for(request)) {
             miner.ingest(&record);
             count += 1;
         }
@@ -63,10 +61,11 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let snapshots_root = root.join("snapshots");
 
     let pre = [
-        request(vec![
-            resource_logs("checkout", &["user 1 logged in", "user 2 logged in"]),
-            resource_logs("billing", &["charge 9 EUR accepted"]),
-        ]),
+        request(vec![resource_logs(
+            "checkout",
+            &["user 1 logged in", "user 2 logged in"],
+        )]),
+        request(vec![resource_logs("billing", &["charge 9 EUR accepted"])]),
         request(vec![resource_logs("checkout", &["user 1 logged out"])]),
     ];
     let post = [
@@ -80,7 +79,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let pipeline = open_pipeline(root);
     for r in &pre {
         pipeline
-            .ingest(r.clone())
+            .ingest(r.clone(), tenant_for(r))
             .await
             .expect("ingest pre-S batch");
     }
@@ -92,7 +91,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
         .expect("snapshot at S");
     for r in &post {
         pipeline
-            .ingest(r.clone())
+            .ingest(r.clone(), tenant_for(r))
             .await
             .expect("ingest post-S batch");
     }
@@ -105,13 +104,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // Act: recover into a fresh miner over the same WAL + snapshots.
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut recovered,
-        &RuleEpochs::load(root).expect("epochs"),
-    )
-    .expect("recover");
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
 
     // Assert (a): restored + tail-replayed state equals the
     // from-scratch control, per tenant.
@@ -149,7 +142,10 @@ async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     ];
     let pipeline = open_pipeline(root);
     for r in &batches {
-        pipeline.ingest(r.clone()).await.expect("ingest");
+        pipeline
+            .ingest(r.clone(), tenant_for(r))
+            .await
+            .expect("ingest");
     }
     drop(pipeline);
 
@@ -163,13 +159,7 @@ async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut recovered,
-        &RuleEpochs::load(root).expect("epochs"),
-    )
-    .expect("recover");
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
 
     // Assert: artefact discarded, nothing suppressed, full-replay
     // state equals the control.
@@ -203,7 +193,10 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     ];
     let pipeline = open_pipeline(root);
     for r in &batches {
-        pipeline.ingest(r.clone()).await.expect("ingest");
+        pipeline
+            .ingest(r.clone(), tenant_for(r))
+            .await
+            .expect("ingest");
     }
     pipeline
         .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, None))
@@ -216,13 +209,7 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut recovered,
-        &RuleEpochs::load(root).expect("epochs"),
-    )
-    .expect("recover");
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
 
     // Assert: discarded (not restored without suppression), nothing
     // suppressed, full-replay state equals the control.
@@ -236,7 +223,7 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     assert_equivalent(&recovered, &control);
 }
 
-/// Mint a closed segment holding one `OtlpBatch` frame per request:
+/// Mint a closed segment holding one `TenantOtlpBatch` frame per request:
 /// build it in a scratch root through the public API, then move the
 /// file into `dest_root` (rotation, RFC0008.6, is not implemented
 /// yet — same construction as ourios-wal's checkpoint tests).
@@ -250,8 +237,11 @@ fn build_closed_segment(
     let offsets = requests
         .iter()
         .map(|r| {
-            wal.append(FrameKind::OtlpBatch, &r.encode_to_vec())
-                .expect("append")
+            wal.append(
+                FrameKind::TenantOtlpBatch,
+                &ourios_wal::TenantBatch::encode("checkout", &r.encode_to_vec()).expect("frame"),
+            )
+            .expect("append")
         })
         .collect();
     wal.sync().expect("sync");
@@ -327,13 +317,7 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut recovered,
-        &RuleEpochs::load(root).expect("epochs"),
-    )
-    .expect("recover");
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
 
     // Assert: restored + flagged, surviving frames folded, no error.
     assert_eq!(report.tenants.len(), 1);
@@ -362,7 +346,10 @@ async fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
     ];
     let pipeline = open_pipeline(root);
     for r in &batches {
-        pipeline.ingest(r.clone()).await.expect("ingest");
+        pipeline
+            .ingest(r.clone(), tenant_for(r))
+            .await
+            .expect("ingest");
     }
     drop(pipeline);
 
@@ -372,13 +359,8 @@ async fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(
-        &mut wal,
-        &root.join("snapshots"),
-        &mut recovered,
-        &RuleEpochs::load(root).expect("epochs"),
-    )
-    .expect("recover");
+    let report =
+        recovery::recover(&mut wal, &root.join("snapshots"), &mut recovered).expect("recover");
 
     // Assert
     assert!(report.tenants.is_empty(), "no artefacts, no outcomes");

@@ -68,7 +68,7 @@ fn export_request(body: &str) -> ExportLogsServiceRequest {
 async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect HTTP");
     let head = format!(
-        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nX-Ourios-Tenant: checkout\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
     );
@@ -177,7 +177,11 @@ async fn rfc0003_16_served_binary_binds_round_trips_and_shuts_down() {
     let mut grpc = LogsServiceClient::connect(format!("http://{grpc_addr}"))
         .await
         .expect("connect gRPC");
-    grpc.export(export_request("grpc batch"))
+    let mut grpc_export = tonic::Request::new(export_request("grpc batch"));
+    grpc_export
+        .metadata_mut()
+        .insert("x-ourios-tenant", "checkout".parse().expect("ascii"));
+    grpc.export(grpc_export)
         .await
         .expect("gRPC export succeeds");
 
@@ -214,12 +218,18 @@ async fn rfc0003_16_served_binary_binds_round_trips_and_shuts_down() {
     // Assert: both batches are durable in the WAL (the process is gone, so
     // the single-writer handle is free), recovering each body. No dedup.
     let frames = replay_frames(&wal_root);
-    assert_eq!(frames.len(), 2, "one durable OtlpBatch frame per export");
+    assert_eq!(
+        frames.len(),
+        2,
+        "one durable TenantOtlpBatch frame per export"
+    );
     let bodies: Vec<String> = frames
         .iter()
         .map(|(kind, payload)| {
-            assert_eq!(*kind, FrameKind::OtlpBatch);
-            let request = decode_protobuf(payload).expect("frame decodes");
+            assert_eq!(*kind, FrameKind::TenantOtlpBatch);
+            let batch = ourios_wal::TenantBatch::decode(payload).expect("tenant prefix");
+            assert_eq!(batch.tenant, "checkout");
+            let request = decode_protobuf(batch.protobuf).expect("frame decodes");
             body_of(&request).expect("frame carries a string body")
         })
         .collect();

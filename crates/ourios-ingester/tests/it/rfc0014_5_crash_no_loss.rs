@@ -24,7 +24,6 @@ use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
-use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::{Wal, WalConfig};
@@ -127,13 +126,8 @@ fn rfc0014_5_no_acknowledged_data_loss() {
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let snapshots_root = wal_root.join("snapshots"); // the fixture wrote none → full replay
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut miner,
-        &RuleEpochs::load(&wal_root).expect("epochs"),
-    )
-    .expect("startup recovery");
+    let report =
+        recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("startup recovery");
     assert_eq!(
         report.records_fed_to_miner, 2,
         "replay re-mined both records"

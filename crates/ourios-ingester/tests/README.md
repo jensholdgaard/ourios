@@ -22,9 +22,6 @@ one-per-binary:
   global in-memory provider.
 - `rfc0026_telemetry.rs` — the RFC0026.7 rejection-telemetry arm installs
   the global in-memory provider.
-- `rfc0045_divergence_telemetry.rs` — the RFC0045.7/.9 divergence-detector
-  arm reads `ourios.receiver.tenant.divergences` through the global
-  in-memory provider.
 - `rfc0038_3_spawn_boundary.rs` — installs the global in-memory **tracer**;
   a global (not scoped) tracer is required to capture the `ingest logs` /
   `sweep partitions` spans across the receiver's `tokio::spawn` and the

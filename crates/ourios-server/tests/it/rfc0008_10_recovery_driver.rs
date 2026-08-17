@@ -27,11 +27,11 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_config::MinerConfig;
-use ourios_ingester::receiver::{TenantRule, fan_out};
+
 use ourios_ingester::{recovery, snapshot_store};
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::RecoveryOutcome;
-use ourios_wal::{FrameKind, Wal, WalConfig};
+use ourios_wal::{FrameKind, TenantBatch, Wal, WalConfig};
 use prost::Message;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -88,7 +88,7 @@ fn wal_config(root: &Path) -> WalConfig {
 async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect HTTP");
     let head = format!(
-        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nX-Ourios-Tenant: checkout\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
     );
@@ -103,6 +103,49 @@ async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
+/// Append each `(tenant, export)` as a fsynced `TenantOtlpBatch` frame and
+/// return the durable offset after the **first** one (the snapshot mark).
+fn seed_wal(
+    wal_root: &Path,
+    batches: &[(
+        &str,
+        &opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest,
+    )],
+) -> ourios_wal::WalOffset {
+    let mut wal = Wal::open(wal_config(wal_root)).expect("open WAL");
+    let mut first = None;
+    for (tenant, request) in batches {
+        wal.append(
+            FrameKind::TenantOtlpBatch,
+            &TenantBatch::encode(tenant, &request.encode_to_vec()).expect("frame"),
+        )
+        .expect("append");
+        let offset = wal.sync().expect("sync");
+        first.get_or_insert(offset);
+    }
+    first.expect("at least one batch")
+}
+
+/// A from-scratch miner fed `(export, tenant)` pairs in order — the control
+/// the recovered state is compared against.
+fn control_miner(
+    batches: &[(
+        &opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest,
+        &str,
+    )],
+) -> MinerCluster {
+    let mut control = MinerCluster::new(MinerConfig::default());
+    for (request, tenant) in batches {
+        for record in ourios_ingester::receiver::assign(
+            (*request).clone(),
+            &ourios_core::tenant::TenantId::new(*tenant),
+        ) {
+            control.ingest(&record);
+        }
+    }
+    control
+}
+
 /// Scenario RFC0008.10 — Startup recovery driver: per-consumer
 /// horizons, observed through the served binary.
 /// See `docs/rfcs/0008-wal.md` §5.
@@ -114,25 +157,18 @@ async fn rfc0008_10_recovery_runs_before_serving_and_shutdown_snapshots_are_cohe
     let tmp = tempfile::TempDir::new().expect("temp");
     let wal_root: PathBuf = tmp.path().join("wal");
     let snapshots_root = wal_root.join("snapshots");
-    let rule = TenantRule::service_name();
 
     let covered = export_request("checkout", &["user 1 logged in", "user 2 logged in"]);
     let tail = export_request("billing", &["charge 9 EUR accepted"]);
     let live_batch = export_request("checkout", &["user 3 logged in"]);
 
-    let s = {
-        let mut wal = Wal::open(wal_config(&wal_root)).expect("open WAL");
-        wal.append(FrameKind::OtlpBatch, &covered.encode_to_vec())
-            .expect("append covered");
-        let s = wal.sync().expect("sync covered");
-        wal.append(FrameKind::OtlpBatch, &tail.encode_to_vec())
-            .expect("append tail");
-        wal.sync().expect("sync tail");
-        s
-    };
+    let s = seed_wal(&wal_root, &[("checkout", &covered), ("billing", &tail)]);
 
     let mut snap_miner = MinerCluster::new(MinerConfig::default());
-    for record in fan_out(covered.clone(), &rule).expect("fan out covered") {
+    for record in ourios_ingester::receiver::assign(
+        covered.clone(),
+        &ourios_core::tenant::TenantId::new("checkout"),
+    ) {
         snap_miner.ingest(&record);
     }
     recovery::write_snapshots(&snapshots_root, &snap_miner, Some(s)).expect("snapshot at S");
@@ -200,12 +236,11 @@ async fn rfc0008_10_recovery_runs_before_serving_and_shutdown_snapshots_are_cohe
     // fed covered → tail → live from scratch — restored snapshot,
     // suppressed covered frame, replayed tail, live ingest, all
     // folded into one coherent per-tenant state.
-    let mut control = MinerCluster::new(MinerConfig::default());
-    for request in [&covered, &tail, &live_batch] {
-        for record in fan_out(request.clone(), &rule).expect("fan out") {
-            control.ingest(&record);
-        }
-    }
+    let control = control_miner(&[
+        (&covered, "checkout"),
+        (&tail, "billing"),
+        (&live_batch, "checkout"),
+    ]);
 
     let artefacts = snapshot_store::load_all(&snapshots_root).expect("load shutdown snapshots");
     let tenants: Vec<&str> = artefacts.iter().map(|(t, _)| t.as_str()).collect();
@@ -242,8 +277,11 @@ async fn rfc0008_10_shutdown_without_live_traffic_stamps_the_recovered_high_wate
     let batch = export_request("checkout", &["user 1 logged in"]);
     let durable = {
         let mut wal = Wal::open(wal_config(&wal_root)).expect("open WAL");
-        wal.append(FrameKind::OtlpBatch, &batch.encode_to_vec())
-            .expect("append");
+        wal.append(
+            FrameKind::TenantOtlpBatch,
+            &TenantBatch::encode("checkout", &batch.encode_to_vec()).expect("frame"),
+        )
+        .expect("append");
         wal.sync().expect("sync")
     };
 

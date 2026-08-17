@@ -22,15 +22,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, Wal, WalOffset};
+use ourios_wal::{FrameKind, TenantBatch, Wal, WalOffset};
 use prost::Message;
 use tracing::Instrument as _;
 
 use crate::metrics::IngestMetrics;
 use crate::receiver::commit::CommitCoordinator;
-use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out_observed};
-use crate::receiver::watch::DivergenceWatch;
+use crate::receiver::tenant::assign;
 
 /// The §6.9 rotation-cadence callback: receives the miner as it
 /// stands and the rotation-point high-water mark. See
@@ -81,7 +81,7 @@ pub trait Journal: Send {
 
 impl Journal for Wal {
     fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
-        Wal::append(self, FrameKind::OtlpBatch, payload)
+        Wal::append(self, FrameKind::TenantOtlpBatch, payload)
             .map(|_| ())
             .map_err(ReceiveError::WalAppend)
     }
@@ -98,8 +98,9 @@ impl Journal for Wal {
 /// The ingester's WAL-before-ack ingest path. Owns the group-commit
 /// [`CommitCoordinator`] (which owns the durability [`Journal`]), the
 /// per-process `MinerCluster` (behind a mutex — the coordinator lets
-/// requests run concurrently, so the miner needs its own serialization),
-/// and the tenant-derivation `TenantRule`.
+/// requests run concurrently, so the miner needs its own serialization).
+/// The tenant is chosen out of band per request (RFC 0046 §3.1) and handed
+/// in by the transport; the pipeline never derives one.
 ///
 /// Releases the in-order miner hand-off to `seq + 1` on drop — so the
 /// gate advances on *every* exit from the post-durability region,
@@ -121,10 +122,6 @@ impl Drop for IngestGateGuard<'_> {
 pub struct IngestPipeline {
     coordinator: Arc<CommitCoordinator>,
     miner: Mutex<MinerCluster>,
-    rule: TenantRule,
-    /// RFC 0045 §3.4 — the divergence detector, when any watch key is
-    /// configured beyond the rule's own keys.
-    watch: Option<DivergenceWatch>,
     /// The durable high-water mark after the most recent acked batch (or
     /// the startup seed). Behind a mutex: concurrent acks update it, and
     /// the rotation-detection read-then-write must see a consistent value.
@@ -160,29 +157,19 @@ pub struct IngestPipeline {
 }
 
 impl IngestPipeline {
-    /// Build a pipeline over a group-commit `coordinator`, a
-    /// `MinerCluster`, and a tenant-derivation rule.
+    /// Build a pipeline over a group-commit `coordinator` and a
+    /// `MinerCluster`.
     #[must_use]
-    pub fn new(coordinator: Arc<CommitCoordinator>, miner: MinerCluster, rule: TenantRule) -> Self {
+    pub fn new(coordinator: Arc<CommitCoordinator>, miner: MinerCluster) -> Self {
         Self {
             coordinator,
             miner: Mutex::new(miner),
-            rule,
-            watch: None,
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
             encode_pool: None,
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
         }
-    }
-
-    /// Attach the RFC 0045 §3.4 divergence detector; every derived group
-    /// is observed after fan-out.
-    #[must_use]
-    pub fn with_tenant_watch(mut self, watch: Option<DivergenceWatch>) -> Self {
-        self.watch = watch;
-        self
     }
 
     /// Enable the RFC 0035 §3.1 ordered/concurrent ingest split: the
@@ -268,16 +255,21 @@ impl IngestPipeline {
     /// # Errors
     ///
     /// As [`Self::ingest_bound`], minus the binding rejection.
-    pub async fn ingest(&self, request: ExportLogsServiceRequest) -> Result<usize, ReceiveError> {
-        self.ingest_bound(request, None, false).await
+    pub async fn ingest(
+        &self,
+        request: ExportLogsServiceRequest,
+        tenant: TenantId,
+    ) -> Result<usize, ReceiveError> {
+        self.ingest_bound(request, tenant, None, false).await
     }
 
-    /// Ingest one decoded export per the §6.5 sequence: enforce the
-    /// RFC 0026 §3.2 tenant binding (when `binding` is present), fan out,
-    /// append the export as a single `OtlpBatch` frame, **fsync** (batched
-    /// via the group-commit coordinator), then hand the records to the
-    /// miner, then ack. Returns the number of records ingested (`0` for
-    /// the empty fast path).
+    /// Ingest one decoded export under the out-of-band `tenant` (RFC 0046
+    /// §3.1) per the §6.5 sequence: enforce the RFC 0026 §3.2 tenant
+    /// binding (when `binding` is present), materialise every record under
+    /// `tenant`, append the export as a single `TenantOtlpBatch` frame,
+    /// **fsync** (batched via the group-commit coordinator), then hand the
+    /// records to the miner, then ack. Returns the number of records
+    /// ingested (`0` for the empty fast path).
     ///
     /// The covering fsync completes before this returns `Ok`, so the
     /// caller never acks a batch that isn't durable (`[§3.4]`). `&self`
@@ -286,13 +278,9 @@ impl IngestPipeline {
     ///
     /// # Errors
     ///
-    /// - [`ReceiveError::TenantDenied`] if any `ResourceLogs` group's
-    ///   derived tenant falls outside the binding's set — the whole batch
-    ///   is rejected before any WAL write, with no partial success
-    ///   (RFC 0026 §3.2).
-    /// - [`ReceiveError::TenantResolution`] if any `ResourceLogs` fails
-    ///   tenant resolution — the whole batch is rejected before any WAL
-    ///   write (RFC0003.4).
+    /// - [`ReceiveError::TenantDenied`] if `tenant` falls outside the
+    ///   binding's set — the whole batch is rejected before any WAL write,
+    ///   with no partial success (RFC 0026 §3.2).
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
     // RFC 0038: one span per OTLP `Export` batch — the correct coarse
@@ -314,15 +302,16 @@ impl IngestPipeline {
     pub async fn ingest_bound(
         &self,
         request: ExportLogsServiceRequest,
+        tenant: TenantId,
         binding: Option<&super::auth::AuthBinding>,
         lenient_json: bool,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
-        // batch does no encode, fan-out, or WAL work. §3.4: the denial counts on
-        // `ourios.ingest.batches` (`error.type = permission_denied`)
-        // and emits the audit event.
+        // batch does no encode, materialisation, or WAL work. §3.4: the
+        // denial counts on `ourios.ingest.batches` (`error.type =
+        // permission_denied`) and emits the audit event.
         if let Some(binding) = binding
-            && let Err(e) = super::auth::check_binding(&request, &self.rule, binding)
+            && let Err(e) = super::auth::check_binding(&tenant, binding)
         {
             if let ReceiveError::TenantDenied { token_name, tenant } = &e {
                 self.metrics
@@ -343,18 +332,16 @@ impl IngestPipeline {
             }
             return Err(e);
         }
-        // Encode before fan-out consumes the request: the WAL frame is a
-        // protobuf `ExportLogsServiceRequest` (§6.5 step 3). Byte-equality
-        // to the wire isn't required — recoverability is.
-        let payload = request.encode_to_vec();
+        // Encode before materialisation consumes the request: the WAL frame
+        // is the tenant prefix + the protobuf `ExportLogsServiceRequest`
+        // (RFC 0046 §3.3 / §6.5 step 3). Byte-equality to the wire isn't
+        // required — recoverability is. The selector was validated by the
+        // transport, so the codec's own bound cannot fail here.
+        let payload = TenantBatch::encode(tenant.as_str(), &request.encode_to_vec())
+            .map_err(ReceiveError::TenantFrame)?;
 
-        // Steps 1–2: fan out per tenant. An unresolvable Resource rejects
-        // the entire batch here, before any WAL write (RFC0003.4).
-        let records = fan_out_observed(request, &self.rule, |tenant, attributes| {
-            if let Some(watch) = &self.watch {
-                watch.observe(tenant, attributes);
-            }
-        })?;
+        // Steps 1–2: every record under the selected tenant (RFC 0046 §3.2).
+        let records = assign(request, &tenant);
 
         // Empty fast path (RFC0003.12): no records → success, no WAL
         // frame, miner untouched.
@@ -362,7 +349,7 @@ impl IngestPipeline {
             return Ok(0);
         }
 
-        // Steps 3–4: append the export as one OtlpBatch frame and await
+        // Steps 3–4: append the export as one TenantOtlpBatch frame and await
         // its (batched) fsync — concurrent requests fold into one window's
         // fsync (RFC0008.8). The frame's append `seq` orders the miner
         // hand-off below.
@@ -615,36 +602,29 @@ impl IngestPipeline {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReceiveError {
-    /// A `ResourceLogs` group's Resource did not resolve to a tenant.
-    TenantResolution(TenantResolutionError),
-    /// A group's derived tenant falls outside the authenticated token's
+    /// The selected tenant falls outside the authenticated token's
     /// allowed set — the whole batch is denied before any WAL work
     /// (RFC 0026 §3.2, `PERMISSION_DENIED` / 403).
     TenantDenied {
         /// The rejecting token's audit/metric label (never the value) —
         /// what the §3.4 rejection audit event will carry.
         token_name: String,
-        /// The offending derived tenant.
+        /// The offending selected tenant.
         tenant: ourios_core::tenant::TenantId,
     },
+    /// The tenant could not be framed into the WAL payload (RFC 0046
+    /// §3.3) — unreachable for a transport-validated selector; surfaced
+    /// rather than unwrapped.
+    TenantFrame(ourios_wal::TenantBatchError),
     /// Appending the `OtlpBatch` frame to the WAL failed.
     WalAppend(ourios_wal::AppendError),
     /// Fsyncing the WAL failed — the batch must not be acked.
     WalSync(ourios_wal::SyncError),
 }
 
-impl From<TenantResolutionError> for ReceiveError {
-    fn from(e: TenantResolutionError) -> Self {
-        Self::TenantResolution(e)
-    }
-}
-
 impl std::fmt::Display for ReceiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // `TenantResolutionError`'s own Display already leads with
-            // "tenant resolution failed: …"; delegate, don't re-prefix.
-            Self::TenantResolution(e) => write!(f, "{e}"),
             // The wire message names the tenant, not the token: the caller
             // knows its own credential, and the token's label belongs to
             // the operator's audit surface (RFC 0026 §3.4), not the
@@ -655,6 +635,7 @@ impl std::fmt::Display for ReceiveError {
                  tenant set (RFC 0026 §3.2)",
                 tenant.as_str(),
             ),
+            Self::TenantFrame(e) => write!(f, "{e}"),
             Self::WalAppend(e) => write!(f, "{e}"),
             Self::WalSync(e) => write!(f, "{e}"),
         }
@@ -664,8 +645,8 @@ impl std::fmt::Display for ReceiveError {
 impl std::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TenantResolution(e) => Some(e),
             Self::TenantDenied { .. } => None,
+            Self::TenantFrame(e) => Some(e),
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),
         }
@@ -723,11 +704,7 @@ mod tests {
             Duration::from_millis(5),
             u64::MAX,
         );
-        IngestPipeline::new(
-            coordinator,
-            MinerCluster::new(MinerConfig::default()),
-            TenantRule::service_name(),
-        )
+        IngestPipeline::new(coordinator, MinerCluster::new(MinerConfig::default()))
     }
 
     fn pipeline(sync_offset: WalOffset) -> IngestPipeline {
@@ -781,7 +758,10 @@ mod tests {
         let pipeline = pipeline(synced).with_last_durable(Some(seed));
 
         assert_eq!(pipeline.last_durable(), Some(seed));
-        pipeline.ingest(request()).await.expect("ingest");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("ingest");
         assert_eq!(pipeline.last_durable(), Some(synced));
     }
 
@@ -813,12 +793,8 @@ mod tests {
             Duration::from_millis(5),
             u64::MAX,
         );
-        IngestPipeline::new(
-            coordinator,
-            MinerCluster::new(MinerConfig::default()),
-            TenantRule::service_name(),
-        )
-        .with_rotation_hook(hook)
+        IngestPipeline::new(coordinator, MinerCluster::new(MinerConfig::default()))
+            .with_rotation_hook(hook)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -844,17 +820,26 @@ mod tests {
         );
 
         // Batch 1: no previous durable offset — never a rotation.
-        pipeline.ingest(request()).await.expect("batch 1");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 1");
         assert!(calls.lock().expect("lock").is_empty());
 
         // Batch 2: segment changed — the hook fires once with the OLD
         // segment's last durable offset, before batch 2 hits the miner
         // (the template count is still batch 1's).
-        pipeline.ingest(request()).await.expect("batch 2");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 2");
         assert_eq!(*calls.lock().expect("lock"), vec![(in_first, 1)]);
 
         // Batch 3: same segment — no further firing.
-        pipeline.ingest(request()).await.expect("batch 3");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
     }
 
@@ -878,8 +863,14 @@ mod tests {
             vec![in_first, in_second],
             Box::new(move |_, mark| seen.lock().expect("lock").push(mark)),
         );
-        pipeline.ingest(request()).await.expect("batch 1");
-        pipeline.ingest(request()).await.expect("batch 2");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 1");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 2");
         assert_eq!(*calls.lock().expect("lock"), vec![in_first]);
     }
 
@@ -902,10 +893,19 @@ mod tests {
             Box::new(|_, _| panic!("snapshot writer blew up")),
         );
 
-        pipeline.ingest(request()).await.expect("batch 1");
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 1");
         // Batch 2 rotates and the hook panics — the ingest still acks
         // and the records still reach the miner.
-        assert_eq!(pipeline.ingest(request()).await.expect("batch 2 acks"), 1);
+        assert_eq!(
+            pipeline
+                .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+                .await
+                .expect("batch 2 acks"),
+            1
+        );
         assert_eq!(
             pipeline.with_miner(|m| {
                 m.template_count(&ourios_core::tenant::TenantId::new("checkout"))
@@ -914,6 +914,12 @@ mod tests {
             "the rotating batch's records reached the miner despite the panic",
         );
         // The pipeline stays usable afterwards.
-        assert_eq!(pipeline.ingest(request()).await.expect("batch 3 acks"), 1);
+        assert_eq!(
+            pipeline
+                .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+                .await
+                .expect("batch 3 acks"),
+            1
+        );
     }
 }

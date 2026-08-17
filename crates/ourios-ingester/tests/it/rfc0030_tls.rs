@@ -17,7 +17,7 @@ use prost::Message as _;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
-use crate::ingest_support::{capturing_pipeline, request, resource_logs};
+use crate::ingest_support::{capturing_pipeline, grpc_request, request, resource_logs};
 
 /// Mint a self-signed leaf (its own CA) with `localhost` + `127.0.0.1`
 /// SANs — so a tonic client can pin `domain_name("localhost")` and a
@@ -88,7 +88,7 @@ async fn rfc0030_1_grpc_ingest_over_tls() {
         .expect("TLS connect");
     let mut client = LogsServiceClient::new(channel);
     client
-        .export(tonic::Request::new(request(vec![resource_logs(
+        .export(grpc_request(request(vec![resource_logs(
             "checkout",
             &["one line"],
         )])))
@@ -101,7 +101,7 @@ async fn rfc0030_1_grpc_ingest_over_tls() {
     let plaintext = LogsServiceClient::connect(format!("http://{addr}")).await;
     let plaintext_export = match plaintext {
         Ok(mut c) => c
-            .export(tonic::Request::new(request(vec![resource_logs(
+            .export(grpc_request(request(vec![resource_logs(
                 "checkout",
                 &["nope"],
             )])))
@@ -159,6 +159,7 @@ async fn rfc0030_2_http_ingest_over_tls() {
     let resp = client
         .post(format!("https://127.0.0.1:{}/v1/logs", addr.port()))
         .header("content-type", "application/x-protobuf")
+        .header("x-ourios-tenant", "checkout")
         .body(body.clone())
         .send()
         .await
@@ -170,6 +171,7 @@ async fn rfc0030_2_http_ingest_over_tls() {
     let plaintext = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}/v1/logs", addr.port()))
         .header("content-type", "application/x-protobuf")
+        .header("x-ourios-tenant", "checkout")
         .body(body)
         .send()
         .await;
@@ -227,6 +229,7 @@ async fn stalled_handshake_does_not_block_the_listener() {
         client
             .post(format!("https://127.0.0.1:{}/v1/logs", addr.port()))
             .header("content-type", "application/x-protobuf")
+            .header("x-ourios-tenant", "checkout")
             .body(body)
             .send(),
     )
@@ -325,7 +328,7 @@ async fn rfc0030_4_mtls_require_and_verify() {
         .await
         .expect("mTLS connect");
     let mut client = LogsServiceClient::new(channel);
-    let mut req = tonic::Request::new(request(vec![resource_logs("checkout", &["one line"])]));
+    let mut req = grpc_request(request(vec![resource_logs("checkout", &["one line"])]));
     req.metadata_mut()
         .insert("authorization", "Bearer tok-edge".parse().expect("md"));
     client.export(req).await.expect("authed mTLS export");
@@ -341,7 +344,7 @@ async fn rfc0030_4_mtls_require_and_verify() {
         .expect("mTLS connect");
     let mut client = LogsServiceClient::new(channel);
     let status = client
-        .export(tonic::Request::new(request(vec![resource_logs(
+        .export(grpc_request(request(vec![resource_logs(
             "checkout",
             &["no bearer"],
         )])))
@@ -362,7 +365,7 @@ async fn rfc0030_4_mtls_require_and_verify() {
             .connect()
             .await?;
         let mut client = LogsServiceClient::new(channel);
-        let mut req = tonic::Request::new(request(vec![resource_logs("checkout", &["x"])]));
+        let mut req = grpc_request(request(vec![resource_logs("checkout", &["x"])]));
         req.metadata_mut()
             .insert("authorization", "Bearer tok-edge".parse().expect("md"));
         client.export(req).await?;

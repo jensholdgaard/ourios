@@ -47,7 +47,7 @@ use ourios_config::MinerConfig;
 use ourios_ingester::compactor::run_sweep;
 use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::receiver::pipeline::{Journal, ReceiveError};
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{
@@ -61,9 +61,9 @@ pub const D1_LINES_PER_SEC_PER_CORE: u64 = 100_000;
 /// §D1 latency bar: p99 ingest-ack latency in milliseconds.
 pub const D1_P99_ACK_MS: u64 = 200;
 
-/// The soak tenant (derived from `service.name` by the production
-/// [`TenantRule`], so the batches exercise the real fan-out). With
-/// `--tenants N > 1` the load fans out over `"{TENANT}-{i}"` for
+/// The soak tenant — selected out of band per batch (RFC 0046 §3.1; the
+/// batch's `service.name` carries the same value as a resource attribute).
+/// With `--tenants N > 1` the load fans out over `"{TENANT}-{i}"` for
 /// `i in 0..N` (see [`tenant_name`]); N == 1 keeps the bare `TENANT` so
 /// the single-tenant §9.19/§9.20 numbers stay byte-for-byte comparable.
 const TENANT: &str = "soak";
@@ -380,7 +380,7 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // the gate, the sink emit on the concurrent encode pool — so the
     // harness measures what the server role runs.
     let pipeline = Arc::new(
-        IngestPipeline::new(coordinator, miner, TenantRule::service_name())
+        IngestPipeline::new(coordinator, miner)
             .with_encode_pool(EncodePool::new(&sink, config.encode_workers)),
     );
 
@@ -718,9 +718,10 @@ async fn run_load(
             clock.now_unix_nanos(),
             config.tenants,
         );
+        let tenant = ourios_core::tenant::TenantId::new(tenant_name(batch_idx, config.tenants));
         tokio::spawn(async move {
             let started = Instant::now();
-            match pipeline.ingest(batch).await {
+            match pipeline.ingest(batch, tenant).await {
                 Ok(lines) => {
                     let elapsed_us = saturating_u64(started.elapsed().as_micros());
                     stats
@@ -973,8 +974,8 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The `service.name` (⇒ tenant, via [`TenantRule::service_name`]) for
-/// batch `batch_idx` under round-robin fan-out over `tenants` tenants.
+/// The tenant (and the batch's `service.name`) for batch `batch_idx` under
+/// round-robin fan-out over `tenants` tenants.
 ///
 /// `tenants <= 1` returns the bare [`TENANT`] borrowed — the
 /// single-tenant fast path, so the baseline batch is byte-for-byte

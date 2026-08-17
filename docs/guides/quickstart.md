@@ -67,10 +67,12 @@ the file the sole source.
 ## 3. Send logs
 
 Ourios speaks OTLP and nothing else — any OpenTelemetry SDK or
-Collector can ship to it unmodified. The tenant is derived from the
-`service.name` resource attribute.
+Collector can ship to it unmodified. Every export names its **tenant out
+of band** — the `X-Ourios-Tenant` header (HTTP) or `x-ourios-tenant`
+metadata (gRPC); resource attributes such as `service.name` describe the
+producer and never choose the tenant (RFC 0046).
 
-With a Collector, point the OTLP exporter at it:
+With a Collector, point the OTLP exporter at it and set the tenant once:
 
 ```yaml
 exporters:
@@ -78,14 +80,20 @@ exporters:
     # host:port is version-proof for the gRPC exporter; recent
     # Collectors also accept scheme'd forms.
     endpoint: localhost:4317
+    headers:
+      x-ourios-tenant: checkout
     tls:
       insecure: true
 ```
+
+An SDK sets the same header through the standard variable:
+`OTEL_EXPORTER_OTLP_HEADERS=x-ourios-tenant=checkout`.
 
 Or hand-deliver one OTLP/JSON record for a first smoke test:
 
 ```sh
 curl -s http://localhost:4318/v1/logs \
+  -H 'X-Ourios-Tenant: checkout' \
   -H 'Content-Type: application/json' \
   -d '{
     "resourceLogs": [{

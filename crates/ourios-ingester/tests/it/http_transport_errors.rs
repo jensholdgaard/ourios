@@ -1,5 +1,5 @@
 //! HTTP transport-error arms of RFC0003.11 — controlled status codes,
-//! never a panic, and no `OtlpBatch` frame appended on a rejected
+//! never a panic, and no `TenantOtlpBatch` frame appended on a rejected
 //! request.
 //!
 //! These cover the HTTP side of RFC0003.11; the gRPC arm (client
@@ -23,7 +23,7 @@ async fn assert_rejected(request: axum::http::Request<axum::body::Body>, expecte
     assert_eq!(status, expected);
     assert!(
         captured.lock().expect("captured").is_empty(),
-        "a rejected request appends no OtlpBatch frame",
+        "a rejected request appends no TenantOtlpBatch frame",
     );
 }
 
@@ -150,7 +150,7 @@ async fn oversize_body_is_413() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(
         captured.lock().expect("captured").is_empty(),
-        "an oversize request appends no OtlpBatch frame",
+        "an oversize request appends no TenantOtlpBatch frame",
     );
 }
 
@@ -173,6 +173,6 @@ async fn non_post_to_logs_path_is_405() {
     );
     assert!(
         captured.lock().expect("captured").is_empty(),
-        "a rejected-method request appends no OtlpBatch frame",
+        "a rejected-method request appends no TenantOtlpBatch frame",
     );
 }

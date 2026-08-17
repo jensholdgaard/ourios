@@ -489,6 +489,11 @@ groups:
     type: metric
     metric_name: ourios.receiver.tenant.divergences
     stability: development
+    deprecated:
+      reason: obsoleted
+      note: >-
+        The RFC 0045 divergence detector was removed by RFC 0046 (tenancy is
+        out of band). Never emitted by a released version.
     brief: >-
       ResourceLogs groups whose watched resource attribute differed from
       the value first observed for their tenant (RFC 0045 §3.4) — the

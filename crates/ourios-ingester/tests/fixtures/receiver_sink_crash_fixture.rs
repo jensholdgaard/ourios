@@ -33,7 +33,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::publish::PublishCoordinator;
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::Store;
@@ -88,7 +88,6 @@ async fn main() {
     let pipeline = IngestPipeline::new(
         coordinator,
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone())),
-        TenantRule::service_name(),
     )
     .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2));
 
@@ -120,7 +119,10 @@ async fn main() {
     };
 
     // Append + fsync the batch (durable) — the receiver would now ack.
-    let ingested = pipeline.ingest(request).await.expect("fixture: ingest");
+    let ingested = pipeline
+        .ingest(request, ourios_core::tenant::TenantId::new("checkout"))
+        .await
+        .expect("fixture: ingest");
     assert_eq!(ingested, 2, "fixture ingested two records");
 
     // Drain the encode pool so the acked records have reached the buffer

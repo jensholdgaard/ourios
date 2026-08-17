@@ -4,15 +4,16 @@
 //! coordinator serializes appends to the single-writer WAL and folds
 //! their fsyncs into a window — RFC0008.8). Each call is durable before
 //! it acks, so all N succeed and the WAL ends with exactly N durable
-//! `OtlpBatch` frames — none lost or interleaved away.
+//! `TenantOtlpBatch` frames — none lost or interleaved away.
 
 use std::sync::Arc;
 
-use crate::ingest_support::{replay_frames, request, resource_logs, shared_wal_pipeline};
+use crate::ingest_support::{
+    grpc_request, replay_frames, request, resource_logs, shared_wal_pipeline,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_wal::FrameKind;
-use tonic::Request;
 
 const N: usize = 8;
 
@@ -31,7 +32,7 @@ async fn rfc0003_15_concurrent_exports_are_each_durable() {
         handles.push(tokio::spawn(async move {
             let body = format!("line {i}");
             let export = request(vec![resource_logs("checkout", &[body.as_str()])]);
-            receiver.export(Request::new(export)).await
+            receiver.export(grpc_request(export)).await
         }));
     }
 
@@ -41,14 +42,16 @@ async fn rfc0003_15_concurrent_exports_are_each_durable() {
         assert!(response.is_ok(), "each concurrent Export acks");
     }
 
-    // ...and every batch is durable: the WAL holds exactly N OtlpBatch
+    // ...and every batch is durable: the WAL holds exactly N TenantOtlpBatch
     // frames (none lost or dropped under concurrency). Drop the last
     // pipeline ref so the WAL handle is released before replay.
     drop(receiver);
     let frames = replay_frames(tmp.path());
     assert_eq!(frames.len(), N, "one durable frame per concurrent Export");
     assert!(
-        frames.iter().all(|(kind, _)| *kind == FrameKind::OtlpBatch),
-        "every durable frame is an OtlpBatch",
+        frames
+            .iter()
+            .all(|(kind, _)| *kind == FrameKind::TenantOtlpBatch),
+        "every durable frame is a TenantOtlpBatch",
     );
 }

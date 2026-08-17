@@ -264,10 +264,10 @@ async fn read_listen_addr(child: &mut Child, prefix: &str) -> SocketAddr {
 }
 
 /// Hand-rolled OTLP/HTTP POST (no HTTP-client dependency).
-async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
+async fn http_post_logs(addr: SocketAddr, tenant: &str, body: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect HTTP");
     let head = format!(
-        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nX-Ourios-Tenant: {tenant}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
     );
@@ -419,6 +419,7 @@ async fn rfc0019_2_wal_stays_local_under_s3() {
     let wal_root = tmp.path().join("wal");
 
     let batch = export_request(&[("checkout", &["user 1 logged in", "user 2 logged in"])]);
+    let tenant = "checkout";
 
     // Receiver on the S3 data backend; WAL on local disk.
     let mut child = s3_server(&endpoint, "ourios-it-srv-wal")
@@ -431,7 +432,7 @@ async fn rfc0019_2_wal_stays_local_under_s3() {
         .expect("spawn ourios-server");
 
     let http_addr = read_listen_addr(&mut child, "receiver HTTP listening on ").await;
-    let response = http_post_logs(http_addr, &batch.encode_to_vec()).await;
+    let response = http_post_logs(http_addr, tenant, &batch.encode_to_vec()).await;
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "export returns 200, got status line {:?}",
@@ -488,6 +489,7 @@ async fn rfc0019_3_ingest_query_end_to_end_on_s3() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let bodies = ["user 1 logged in", "user 2 logged in", "user 3 logged in"];
     let batch = export_request(&[("storefront", &bodies)]);
+    let tenant = "storefront";
 
     // Phase 1 — ingest, then drain to S3 on SIGTERM.
     let mut receiver = s3_server(&endpoint, "ourios-it-srv-e2e")
@@ -499,7 +501,7 @@ async fn rfc0019_3_ingest_query_end_to_end_on_s3() {
         .spawn()
         .expect("spawn receiver");
     let http_addr = read_listen_addr(&mut receiver, "receiver HTTP listening on ").await;
-    let response = http_post_logs(http_addr, &batch.encode_to_vec()).await;
+    let response = http_post_logs(http_addr, tenant, &batch.encode_to_vec()).await;
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "export returns 200, got status line {:?}",
@@ -642,10 +644,10 @@ async fn rfc0019_4_compaction_operates_on_s3() {
 async fn rfc0019_5_tenant_isolation_on_s3() {
     let (_node, endpoint, _s3) = localstack_s3("ourios-it-srv-tenants").await;
     let tmp = tempfile::TempDir::new().expect("temp");
-    let batch = export_request(&[
-        ("alpha", &["alpha one apple", "alpha two apple"]),
-        ("bravo", &["bravo one cherry", "bravo two cherry"]),
-    ]);
+    // RFC 0046: one export = one tenant, so the two tenants are two exports,
+    // each naming its tenant out of band.
+    let alpha = export_request(&[("alpha", &["alpha one apple", "alpha two apple"])]);
+    let bravo = export_request(&[("bravo", &["bravo one cherry", "bravo two cherry"])]);
 
     // Phase 1 — both tenants ingest on the one bucket, drained on SIGTERM.
     let mut receiver = s3_server(&endpoint, "ourios-it-srv-tenants")
@@ -657,12 +659,14 @@ async fn rfc0019_5_tenant_isolation_on_s3() {
         .spawn()
         .expect("spawn receiver");
     let http_addr = read_listen_addr(&mut receiver, "receiver HTTP listening on ").await;
-    let response = http_post_logs(http_addr, &batch.encode_to_vec()).await;
-    assert!(
-        response.starts_with("HTTP/1.1 200"),
-        "export returns 200, got status line {:?}",
-        response.lines().next(),
-    );
+    for (tenant, batch) in [("alpha", &alpha), ("bravo", &bravo)] {
+        let response = http_post_logs(http_addr, tenant, &batch.encode_to_vec()).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "{tenant} export returns 200, got {:?}",
+            response.lines().next(),
+        );
+    }
     terminate_and_assert_clean(receiver).await;
 
     // Phase 2 — query `alpha`; it must see only its own rows.
@@ -717,6 +721,7 @@ async fn rfc0019_8_explicit_s3_credentials_authenticate() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let bodies = ["user 1 logged in", "user 2 logged in"];
     let batch = export_request(&[("storefront", &bodies)]);
+    let tenant = "storefront";
 
     // Phase 1 — ingest with explicit OURIOS_S3_* creds (no AWS_*), drain on SIGTERM.
     let mut receiver = s3_server_explicit_creds(&endpoint, BUCKET)
@@ -728,7 +733,7 @@ async fn rfc0019_8_explicit_s3_credentials_authenticate() {
         .spawn()
         .expect("spawn receiver");
     let http_addr = read_listen_addr(&mut receiver, "receiver HTTP listening on ").await;
-    let response = http_post_logs(http_addr, &batch.encode_to_vec()).await;
+    let response = http_post_logs(http_addr, tenant, &batch.encode_to_vec()).await;
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "export returns 200 under explicit creds, got status line {:?}",

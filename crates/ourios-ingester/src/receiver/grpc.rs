@@ -34,6 +34,7 @@ use opentelemetry::context::FutureExt as _;
 use crate::receiver::auth::{AuthBinding, AuthResolver};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 use crate::receiver::propagation::extract_context_from_metadata;
+use crate::receiver::selector;
 
 /// The authentication gate for the gRPC listener (RFC 0026 §3.2 /
 /// RFC 0029 §3.3), applied as a tower layer on the tonic server. A tower
@@ -165,6 +166,11 @@ impl LogsService for LogsReceiver {
         // The [`AuthInterceptor`]'s binding, when auth is enabled — the
         // pipeline enforces the §3.2 tenant binding against it.
         let binding = request.extensions().get::<AuthBinding>().cloned();
+        // RFC 0046 §3.1: the tenant selector — required, exactly once,
+        // visible-ASCII metadata — decided before the set check and before
+        // any WAL work; a missing/malformed one is INVALID_ARGUMENT.
+        let tenant = selector::from_metadata(request.metadata())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let export = request.into_inner();
         // Run the ingest on its own task so a panic in the pipeline/miner
         // (e.g. an internal `expect` invariant) is contained as a
@@ -174,8 +180,12 @@ impl LogsService for LogsReceiver {
         // so this is `spawn`, not `spawn_blocking`.
         let pipeline = self.pipeline.clone();
         match tokio::spawn(
-            async move { pipeline.ingest_bound(export, binding.as_ref(), false).await }
-                .with_context(parent),
+            async move {
+                pipeline
+                    .ingest_bound(export, tenant, binding.as_ref(), false)
+                    .await
+            }
+            .with_context(parent),
         )
         .await
         {
@@ -190,10 +200,10 @@ impl LogsService for LogsReceiver {
 
 /// Map a settled ingest failure to a tonic `Status` (RFC 0018 §3.2).
 ///
-/// Permanent client errors are non-retryable: tenant-resolution failure and
-/// an oversize payload (`AppendError::TooLarge`, over the 16 MiB WAL frame
-/// ceiling) both → `INVALID_ARGUMENT` — retrying an oversize batch
-/// byte-identical can never succeed. Any other WAL append/sync failure is
+/// Permanent client errors are non-retryable: a tenant outside the token's
+/// set → `PERMISSION_DENIED`; an oversize payload (`AppendError::TooLarge`,
+/// over the 16 MiB WAL frame ceiling) → `INVALID_ARGUMENT` — retrying an
+/// oversize batch byte-identical can never succeed. Any other WAL append/sync failure is
 /// *transient* (the batch was not acked, §3.4) → retryable `UNAVAILABLE`, so
 /// compliant clients re-send rather than drop data (a non-retryable
 /// `INTERNAL` would tell them to drop it).
@@ -203,9 +213,6 @@ impl LogsService for LogsReceiver {
 /// retryable-vs-not decision rather than defaulting either way.
 fn ingest_error_status(error: &ReceiveError) -> Status {
     match error {
-        // `TenantResolutionError`'s Display names the failing ResourceLogs
-        // index + attribute.
-        ReceiveError::TenantResolution(e) => Status::invalid_argument(e.to_string()),
         // An authenticated caller writing outside its tenant set — a
         // permanent authz rejection, whole batch, pre-WAL (RFC 0026 §3.2).
         e @ ReceiveError::TenantDenied { .. } => Status::permission_denied(e.to_string()),
@@ -215,21 +222,16 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
         e @ (ReceiveError::WalAppend(_) | ReceiveError::WalSync(_)) => {
             Status::unavailable(e.to_string())
         }
+        // Unreachable for a metadata-validated selector; our bug — INTERNAL.
+        e @ ReceiveError::TenantFrame(_) => Status::internal(e.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ReceiveError, ingest_error_status};
-    use crate::receiver::tenant::TenantResolutionError;
     use ourios_wal::{AppendError, SyncError};
     use tonic::Code;
-
-    #[test]
-    fn tenant_resolution_is_invalid_argument() {
-        let e = ReceiveError::TenantResolution(TenantResolutionError::for_test("service.name"));
-        assert_eq!(ingest_error_status(&e).code(), Code::InvalidArgument);
-    }
 
     #[test]
     fn tenant_denied_is_permission_denied() {

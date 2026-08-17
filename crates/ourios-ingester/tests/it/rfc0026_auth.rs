@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use crate::ingest_support::{capturing_pipeline, post_request, request, resource_logs, send};
+use crate::ingest_support::{
+    capturing_pipeline, grpc_request, post_request, request, resource_logs, send,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_core::auth::{TokenSpec, TokenStore, build_token_store};
 use ourios_ingester::receiver::AuthResolver;
@@ -59,12 +61,24 @@ fn protobuf_body(services: &[&str]) -> Vec<u8> {
 
 /// A `/v1/logs` POST carrying `services`, with an optional bearer.
 fn logs_post(services: &[&str], bearer: Option<&str>) -> axum::http::Request<axum::body::Body> {
+    logs_post_for("checkout", services, bearer)
+}
+
+/// [`logs_post`] selecting `tenant` (RFC 0046 §3.1) instead of the default.
+fn logs_post_for(
+    tenant: &str,
+    services: &[&str],
+    bearer: Option<&str>,
+) -> axum::http::Request<axum::body::Body> {
     let mut request = post_request(
         "/v1/logs",
         Some("application/x-protobuf"),
         None,
         protobuf_body(services),
     );
+    request
+        .headers_mut()
+        .insert("x-ourios-tenant", tenant.parse().expect("header value"));
     if let Some(value) = bearer {
         request.headers_mut().insert(
             axum::http::header::AUTHORIZATION,
@@ -169,7 +183,7 @@ async fn rfc0026_2_served_grpc_stack_authenticates() {
 
     // No bearer → the interceptor rejects before the handler.
     let status = client
-        .export(tonic::Request::new(request(vec![resource_logs(
+        .export(grpc_request(request(vec![resource_logs(
             "checkout",
             &["one line"],
         )])))
@@ -182,7 +196,7 @@ async fn rfc0026_2_served_grpc_stack_authenticates() {
     );
 
     // A known bearer authenticates through the metadata and the batch lands.
-    let mut authed = tonic::Request::new(request(vec![resource_logs("checkout", &["one line"])]));
+    let mut authed = grpc_request(request(vec![resource_logs("checkout", &["one line"])]));
     authed
         .metadata_mut()
         .insert("authorization", "Bearer tok-edge".parse().expect("md"));
@@ -192,41 +206,43 @@ async fn rfc0026_2_served_grpc_stack_authenticates() {
     server.abort();
 }
 
-/// Scenario RFC0026.3 — ingest tenant binding.
-/// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
+/// Scenario RFC0026.3 — ingest tenant binding: the out-of-band selector
+/// (RFC 0046 §3.1) must fall inside the token's set; a selector outside it
+/// denies the whole batch before any WAL work.
+/// See `docs/rfcs/0026-authentication-tenant-binding.md` §5 and RFC0046.2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0026_3_ingest_tenant_binding() {
     let (pipeline, captured) = capturing_pipeline();
     let bound = binding(&["tenant-a", "tenant-b"]);
 
-    // A batch whose derived tenants all fall inside {a, b} acks normally.
+    // A batch selecting an in-set tenant acks normally — whatever its
+    // resources say (service names are not tenancy inputs).
     let accepted = pipeline
         .ingest_bound(
             request(vec![
                 resource_logs("tenant-a", &["a line"]),
-                resource_logs("tenant-b", &["b line"]),
+                resource_logs("tenant-c", &["another producer"]),
             ]),
+            ourios_core::tenant::TenantId::new("tenant-b"),
             Some(&bound),
             false,
         )
         .await
-        .expect("in-set batch acks");
+        .expect("in-set selector acks");
     assert_eq!(accepted, 2);
     assert_eq!(captured.lock().expect("captured").len(), 1);
 
-    // One out-of-set group rejects the WHOLE batch — in-set siblings
-    // included — with no WAL append and no partial success.
+    // An out-of-set selector rejects the WHOLE batch with no WAL append and
+    // no partial success.
     let denied = pipeline
         .ingest_bound(
-            request(vec![
-                resource_logs("tenant-a", &["a line"]),
-                resource_logs("tenant-c", &["intruding line"]),
-            ]),
+            request(vec![resource_logs("tenant-a", &["a line"])]),
+            ourios_core::tenant::TenantId::new("tenant-c"),
             Some(&bound),
             false,
         )
         .await
-        .expect_err("out-of-set batch is denied");
+        .expect_err("out-of-set selector is denied");
     assert!(
         matches!(
             &denied,
@@ -254,20 +270,23 @@ async fn rfc0026_3_ingest_tenant_binding() {
                 ..HttpConfig::default()
             },
         ),
-        logs_post(&["tenant-a", "tenant-c"], Some("Bearer tok-edge")),
+        logs_post_for("tenant-c", &["tenant-a"], Some("Bearer tok-edge")),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
 
     let receiver = LogsReceiver::new(pipeline.clone());
-    let mut grpc_request = tonic::Request::new(request(vec![resource_logs(
-        "tenant-c",
+    let mut denied_grpc = tonic::Request::new(request(vec![resource_logs(
+        "tenant-a",
         &["intruding line"],
     )]));
-    grpc_request
+    denied_grpc
+        .metadata_mut()
+        .insert("x-ourios-tenant", "tenant-c".parse().expect("md"));
+    denied_grpc
         .extensions_mut()
         .insert(binding(&["tenant-a", "tenant-b"]));
-    let status = receiver.export(grpc_request).await.expect_err("denied");
+    let status = receiver.export(denied_grpc).await.expect_err("denied");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(
         captured.lock().expect("captured").len(),
@@ -285,15 +304,16 @@ async fn rfc0026_5_wildcard_binding_ingest() {
 
     // Arbitrary tenants — including ones no config lists — all ack, as if
     // every tenant were listed.
-    for service in ["alpha", "beta", "entirely-new-tenant"] {
+    for tenant in ["alpha", "beta", "entirely-new-tenant"] {
         let accepted = pipeline
             .ingest_bound(
-                request(vec![resource_logs(service, &["a line"])]),
+                request(vec![resource_logs("svc", &["a line"])]),
+                ourios_core::tenant::TenantId::new(tenant),
                 Some(&bound),
                 false,
             )
             .await
-            .unwrap_or_else(|e| panic!("wildcard ingests to {service}: {e}"));
+            .unwrap_or_else(|e| panic!("wildcard ingests to {tenant}: {e}"));
         assert_eq!(accepted, 1);
     }
     assert_eq!(captured.lock().expect("captured").len(), 3);

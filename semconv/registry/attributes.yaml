@@ -270,6 +270,12 @@ groups:
       - id: ourios.tenant.watch.key
         type: string
         stability: development
+        deprecated:
+          reason: obsoleted
+          note: >-
+            The RFC 0045 divergence detector was removed by RFC 0046 (tenancy is
+            out of band; nothing derives or watches tenancy from resource
+            attributes). Never emitted by a released version.
         brief: >-
           The resource-attribute key the RFC 0045 §3.4 tenant divergence
           detector watched (`receiver.tenant.watch`).
@@ -277,6 +283,12 @@ groups:
       - id: ourios.tenant.watch.first_value
         type: string
         stability: development
+        deprecated:
+          reason: obsoleted
+          note: >-
+            The RFC 0045 divergence detector was removed by RFC 0046 (tenancy is
+            out of band; nothing derives or watches tenancy from resource
+            attributes). Never emitted by a released version.
         brief: >-
           The first value of the watched key observed for the tenant
           (bounded to 128 bytes, truncated with a trailing `…`).
@@ -284,6 +296,12 @@ groups:
       - id: ourios.tenant.watch.value
         type: string
         stability: development
+        deprecated:
+          reason: obsoleted
+          note: >-
+            The RFC 0045 divergence detector was removed by RFC 0046 (tenancy is
+            out of band; nothing derives or watches tenancy from resource
+            attributes). Never emitted by a released version.
         brief: >-
           The divergent value of the watched key a later group carried
           for the same tenant (bounded to 128 bytes, truncated with a

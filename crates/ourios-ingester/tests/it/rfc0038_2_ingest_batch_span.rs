@@ -44,7 +44,12 @@ async fn ingest_and_collect_spans(record_count: usize) -> Vec<SpanData> {
     let export = request(vec![resource_logs("checkout", &body_refs)]);
 
     let acked = pipeline
-        .ingest_bound(export, None, false)
+        .ingest_bound(
+            export,
+            ourios_core::tenant::TenantId::new("checkout"),
+            None,
+            false,
+        )
         .with_subscriber(subscriber)
         .await
         .expect("ingest acks");

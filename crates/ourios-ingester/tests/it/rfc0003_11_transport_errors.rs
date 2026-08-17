@@ -18,68 +18,41 @@
 //! (a follow-up); flagged to the maintainer as an OTLP/tonic nuance
 //! rather than faked here.
 
-use crate::ingest_support::{capturing_pipeline, request, resource_logs};
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use crate::ingest_support::{capturing_pipeline, grpc_request, request, resource_logs};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
-use opentelemetry_proto::tonic::common::v1::any_value::Value;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
-use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use tonic::{Code, Request};
 
-/// A request whose single Resource lacks `service.name` (only `host.name`).
-fn unresolvable_request() -> ExportLogsServiceRequest {
-    ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: vec![KeyValue {
-                    key: "host.name".to_owned(),
-                    value: Some(AnyValue {
-                        value: Some(Value::StringValue("node-1".to_owned())),
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            scope_logs: vec![ScopeLogs {
-                log_records: vec![LogRecord::default()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-    }
-}
-
-/// Scenario RFC0003.11 — Transport-level errors are controlled, not panics.
-/// See `docs/rfcs/0003-otlp-receiver.md` §5.
+/// Scenario RFC0003.11 — Transport-level errors are controlled, not panics;
+/// the tenancy arm is now RFC0046.1 (missing selector → `INVALID_ARGUMENT`
+/// naming the header, nothing appended).
+/// See `docs/rfcs/0003-otlp-receiver.md` §5 and RFC 0046 §5.
 #[tokio::test]
-async fn rfc0003_11_grpc_tenant_failure_is_invalid_argument() {
+async fn rfc0003_11_grpc_missing_selector_is_invalid_argument() {
     // Arrange
     let (pipeline, captured) = capturing_pipeline();
     let receiver = LogsReceiver::new(pipeline);
 
-    // Act
+    // Act: a well-formed export with no `x-ourios-tenant` metadata.
     let status = receiver
-        .export(Request::new(unresolvable_request()))
+        .export(Request::new(request(vec![resource_logs(
+            "checkout",
+            &["x"],
+        )])))
         .await
-        .expect_err("an unresolvable Resource is rejected");
+        .expect_err("an export without a tenant selector is rejected");
 
-    // Assert: a controlled INVALID_ARGUMENT naming the attribute — not a
+    // Assert: a controlled INVALID_ARGUMENT naming the header — not a
     // panic — and nothing appended.
     assert_eq!(status.code(), Code::InvalidArgument);
     let message = status.message();
     assert!(
-        message.contains("service.name"),
-        "the Status names the missing attribute, got {message:?}",
-    );
-    assert!(
-        message.contains("ResourceLogs[0]"),
-        "the Status names the failing ResourceLogs index (RFC0003.4/.11), got {message:?}",
+        message.contains("x-ourios-tenant"),
+        "the Status names the selector header, got {message:?}",
     );
     assert!(
         captured.lock().expect("captured").is_empty(),
-        "a rejected batch appends no OtlpBatch frame",
+        "a rejected batch appends no frame",
     );
 }
 
@@ -92,7 +65,7 @@ async fn rfc0003_11_grpc_valid_request_succeeds() {
     let receiver = LogsReceiver::new(pipeline);
 
     let response = receiver
-        .export(Request::new(request(vec![resource_logs(
+        .export(grpc_request(request(vec![resource_logs(
             "checkout",
             &["x"],
         )])))

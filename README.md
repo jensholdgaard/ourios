@@ -270,9 +270,12 @@ OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
 
 Point any OpenTelemetry SDK or Collector at the OTLP ports — on the
 ingest side Ourios speaks OTLP and nothing else (queries use the plain
-HTTP API below), and the tenant derives from the resource's
-`service.name` (so logs sent with `service.name=checkout` land in tenant
-`checkout`). Then query that same tenant with the logs DSL:
+HTTP API below). Every export names its tenant out of band with the
+`X-Ourios-Tenant` header / `x-ourios-tenant` gRPC metadata
+(`OTEL_EXPORTER_OTLP_HEADERS=x-ourios-tenant=checkout` on an SDK, an
+exporter `headers:` entry on a Collector); resource attributes such as
+`service.name` describe the producer and never choose the tenant. Then
+query that same tenant with the logs DSL:
 
 ```sh
 curl -s http://localhost:4319/v1/query \

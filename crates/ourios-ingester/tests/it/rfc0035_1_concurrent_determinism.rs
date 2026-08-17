@@ -18,14 +18,13 @@
 //! mixes, and template selections, each case run concurrently and
 //! compared to its serial WAL-order-replay control.
 
-use crate::ingest_support::{pooled_wal_pipeline, replay_frames, request, resource_logs};
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use crate::ingest_support::{
+    pooled_wal_pipeline, replay_batches, request, resource_logs, tenant_for,
+};
 use ourios_config::MinerConfig;
-use ourios_ingester::receiver::{TenantRule, fan_out};
+
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::FrameKind;
 use proptest::prelude::*;
-use prost::Message;
 
 /// Replay `root`'s WAL frames in order into a fresh control miner and
 /// assert every tenant's live state equals the control's.
@@ -36,12 +35,9 @@ fn assert_equals_wal_order_replay(
         ourios_miner::snapshot::SnapshotState,
     )>,
 ) {
-    let rule = TenantRule::service_name();
     let mut control = MinerCluster::new(MinerConfig::default());
-    for (kind, payload) in replay_frames(root) {
-        assert_eq!(kind, FrameKind::OtlpBatch);
-        let request = ExportLogsServiceRequest::decode(payload.as_slice()).expect("decode frame");
-        for record in fan_out(request, &rule).expect("fan out") {
+    for (tenant, request) in replay_batches(root) {
+        for record in ourios_ingester::receiver::assign(request, &tenant) {
             control.ingest(&record);
         }
     }
@@ -100,7 +96,8 @@ async fn rfc0035_1_multi_tenant_concurrent_ingest_matches_wal_order_replay() {
                 let tag = char::from(b'a' + u8::try_from(k).expect("k fits u8"));
                 let body = format!("event kind {tag} completed");
                 let export = request(vec![resource_logs(&service, &[body.as_str()])]);
-                pipeline.ingest(export).await
+                let tenant = tenant_for(&export);
+                pipeline.ingest(export, tenant).await
             }));
         }
     }
@@ -185,7 +182,8 @@ proptest! {
                         .collect();
                     let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
                     let export = request(vec![resource_logs(&service, &refs)]);
-                    pipeline.ingest(export).await
+                    let tenant = tenant_for(&export);
+                    pipeline.ingest(export, tenant).await
                 }));
             }
             for h in handles {

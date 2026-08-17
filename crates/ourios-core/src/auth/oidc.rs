@@ -62,8 +62,19 @@ enum DecodeAttempt {
 pub struct VerifiedIdentity {
     /// The `name_claim` value — the audit/metric label.
     pub name: String,
-    /// The `tenant_claim` value, validated into the RFC 0026 set.
-    pub tenants: TenantSet,
+    /// The `sub` claim — the RFC 0047 §3.1 principal id (`user:<sub>` /
+    /// `agent:<sub>`).
+    pub subject: String,
+    /// Whether the configured `agent_claim` marked this subject as an
+    /// agent principal (RFC 0047 §3.1).
+    pub is_agent: bool,
+    /// The `tenant_claim` value, validated into the RFC 0026 set. `None`
+    /// only when no tenant claim is configured — legal solely with the
+    /// RFC 0047 graph resolver, which then binds the tenants itself.
+    pub tenants: Option<TenantSet>,
+    /// The `groups_claim` value (RFC 0047 §3.1 contextual `team#member`
+    /// tuples); empty when unconfigured or absent from the token.
+    pub groups: Vec<String>,
 }
 
 /// Why construction failed. Startup-only; request-path failures are the
@@ -237,9 +248,12 @@ impl OidcVerifier {
     }
 
     /// Map the configured claims' values onto the binding shape. `None`
-    /// when the tenant claim is missing/mistyped/invalid or the name claim
-    /// is not a non-empty string — an identity the audit surface cannot
-    /// label is not an identity.
+    /// when a configured tenant claim is missing/mistyped/invalid, `sub`
+    /// is missing, or the name claim is not a non-empty string — an
+    /// identity the audit surface cannot label is not an identity. A
+    /// configured groups claim that is present must be a string list; a
+    /// mistyped one rejects the token rather than silently dropping
+    /// memberships.
     fn resolve_identity(
         &self,
         claims: &serde_json::Map<String, serde_json::Value>,
@@ -248,16 +262,44 @@ impl OidcVerifier {
         if name.is_empty() {
             return None;
         }
-        let tenants: Vec<String> = claims
-            .get(self.config.tenant_claim())?
-            .as_array()?
-            .iter()
-            .map(|value| value.as_str().map(str::to_string))
-            .collect::<Option<_>>()?;
-        let tenants = validate_tenant_list(&tenants)?;
+        let subject = claims.get("sub")?.as_str()?;
+        if subject.is_empty() {
+            return None;
+        }
+        let tenants = match self.config.tenant_claim() {
+            None => None,
+            Some(claim) => {
+                let tenants: Vec<String> = claims
+                    .get(claim)?
+                    .as_array()?
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_string))
+                    .collect::<Option<_>>()?;
+                Some(validate_tenant_list(&tenants)?)
+            }
+        };
+        let is_agent = match self.config.agent_claim() {
+            None => false,
+            Some((claim, value)) => claims.get(claim).and_then(|v| v.as_str()) == Some(value),
+        };
+        let groups = match self
+            .config
+            .groups_claim()
+            .and_then(|claim| claims.get(claim))
+        {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()?
+                .iter()
+                .map(|group| group.as_str().map(str::to_string))
+                .collect::<Option<_>>()?,
+        };
         Some(VerifiedIdentity {
             name: name.to_string(),
+            subject: subject.to_string(),
+            is_agent,
             tenants,
+            groups,
         })
     }
 
@@ -437,7 +479,8 @@ mod tests {
     use p256::pkcs8::EncodePrivateKey as _;
     use serde_json::{Value, json};
 
-    use super::super::{OidcSpec, TenantSet, build_oidc_config};
+    use super::super::openfga::OpenFgaSpec;
+    use super::super::{OidcSpec, TenantSet, build_auth_config, build_oidc_config};
     use super::OidcVerifier;
 
     /// One fixture signing key: the private half for minting, the public
@@ -561,8 +604,103 @@ mod tests {
             tenant_claim: Some("ourios_tenants".to_string()),
             name_claim: None,
             clock_skew_secs: Some("0".to_string()),
+            ..OidcSpec::default()
         })
         .expect("valid config")
+    }
+
+    /// Scenario RFC0047.1 (principal mapping) — with the graph resolver
+    /// configured the tenant claim is optional (the graph binds), the
+    /// `agent_claim` `<claim>=<value>` marks an `agent:` principal, the
+    /// `groups_claim` rides along as the contextual-tuple source, and a
+    /// mistyped groups claim rejects the token rather than dropping
+    /// memberships. See `docs/rfcs/0047-rebac-resolver-and-graph-visibility.md` §5.
+    #[tokio::test]
+    async fn rfc0047_1_principal_claims() {
+        let (encoding, jwk) = make_key("key-1");
+        let jwks = Arc::new(StdRwLock::new(json!({ "keys": [jwk] })));
+        let (issuer, _) = serve_issuer(jwks).await;
+        let auth = build_auth_config(
+            None,
+            Some(&OidcSpec {
+                issuer: Some(issuer.clone()),
+                audience: Some("ourios".to_string()),
+                tenant_claim: None,
+                clock_skew_secs: Some("0".to_string()),
+                agent_claim: Some("ourios_principal_type=agent".to_string()),
+                groups_claim: Some("groups".to_string()),
+                ..OidcSpec::default()
+            }),
+            Some(&OpenFgaSpec {
+                api_url: Some("http://openfga.invalid:8080".to_string()),
+                store_id: Some("s".to_string()),
+                ..OpenFgaSpec::default()
+            }),
+        )
+        .expect("tenant_claim optional under openfga");
+        let verifier = OidcVerifier::discover(auth.oidc.expect("oidc"))
+            .await
+            .expect("discover");
+
+        let user = json!({
+            "iss": issuer, "aud": "ourios", "exp": now_secs() + 600,
+            "sub": "alice", "groups": ["platform", "finops"],
+        });
+        let identity = verifier
+            .verify(&mint(&encoding, "key-1", &user))
+            .await
+            .expect("verifies without a tenant claim");
+        assert_eq!(identity.subject, "alice");
+        assert!(!identity.is_agent);
+        assert_eq!(identity.tenants, None, "the graph binds");
+        assert_eq!(identity.groups, ["platform", "finops"]);
+
+        let mut agent = user.clone();
+        agent["sub"] = json!("bot");
+        agent["ourios_principal_type"] = json!("agent");
+        agent.as_object_mut().expect("object").remove("groups");
+        let identity = verifier
+            .verify(&mint(&encoding, "key-1", &agent))
+            .await
+            .expect("verifies");
+        assert!(identity.is_agent);
+        assert!(identity.groups.is_empty(), "absent groups claim is empty");
+
+        let mut other_value = user.clone();
+        other_value["ourios_principal_type"] = json!("service");
+        assert!(
+            !verifier
+                .verify(&mint(&encoding, "key-1", &other_value))
+                .await
+                .expect("verifies")
+                .is_agent,
+            "only the configured value marks an agent"
+        );
+
+        let mut mistyped = user;
+        mistyped["groups"] = json!("platform");
+        assert!(
+            verifier
+                .verify(&mint(&encoding, "key-1", &mistyped))
+                .await
+                .is_none(),
+            "a non-list groups claim rejects the token"
+        );
+
+        assert!(
+            build_auth_config(
+                None,
+                Some(&OidcSpec {
+                    issuer: Some(issuer),
+                    audience: Some("ourios".to_string()),
+                    tenant_claim: None,
+                    ..OidcSpec::default()
+                }),
+                None,
+            )
+            .expect_err("tenant_claim required without openfga")
+            .contains("auth.oidc.tenant_claim")
+        );
     }
 
     /// Scenario RFC0029.2 — the verification matrix against the fixture
@@ -570,6 +708,7 @@ mod tests {
     /// to `None` (the caller's one undifferentiated 401).
     /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one matrix, one test — splitting it hides the shape
     async fn rfc0029_2_verification_matrix() {
         let (encoding, jwk) = make_key("key-1");
         let jwks = Arc::new(StdRwLock::new(json!({ "keys": [jwk] })));
@@ -584,8 +723,12 @@ mod tests {
             .await
             .expect("valid token verifies");
         assert_eq!(identity.name, "edge-collector");
-        assert!(identity.tenants.allows("acme"));
-        assert!(!identity.tenants.allows("initech"));
+        assert_eq!(identity.subject, "edge-collector");
+        assert!(!identity.is_agent);
+        assert!(identity.groups.is_empty());
+        let tenants = identity.tenants.as_ref().expect("tenant claim configured");
+        assert!(tenants.allows("acme"));
+        assert!(!tenants.allows("initech"));
 
         // (b)–(e) claim failures: expired, nbf in the future (beyond the
         // zero configured skew), wrong audience, wrong issuer.
@@ -693,7 +836,7 @@ mod tests {
             .verify(&mint(&encoding, "key-1", &wildcard))
             .await
             .expect("wildcard verifies");
-        assert_eq!(identity.tenants, TenantSet::All);
+        assert_eq!(identity.tenants, Some(TenantSet::All));
     }
 
     /// Scenario RFC0029.6 — JWKS rotation: an unseen `kid` triggers a
@@ -891,8 +1034,7 @@ mod tests {
             issuer: Some(unreachable),
             audience: Some("ourios".to_string()),
             tenant_claim: Some("ourios_tenants".to_string()),
-            name_claim: None,
-            clock_skew_secs: None,
+            ..OidcSpec::default()
         };
         let err = OidcVerifier::discover(build_oidc_config(&config).expect("valid"))
             .await

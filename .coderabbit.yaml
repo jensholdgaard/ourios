@@ -1,0 +1,7 @@
+# CodeRabbit configuration. Vendored agent skills (installed with
+# `npx skills add`, pinned by skills-lock.json) are upstream content: findings
+# on them belong upstream, not in our review threads.
+reviews:
+  path_filters:
+    - "!.agents/**"
+    - "!.claude/skills/**"

@@ -114,29 +114,6 @@ check "s3 existingSecret envFrom is untouched" \
       --set 'receiver.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
       --set 'receiver.extraEnv[0].value=x=y')"
 
-# --- receiver.tenant passthrough (RFC 0045) ---------------------------------
-
-# The receiver's rendered config document (the ConfigMap's `receiver.yaml`).
-receiver_config() {
-  helm template t "$CHART" --show-only templates/configmap.yaml "$@" \
-    | sed -n '/^  receiver.yaml: |/,/^  [a-z]*.yaml: |/p'
-}
-
-check "defaults render no receiver.tenant block" "" \
-  "$(receiver_config | grep '^      tenant:' || true)"
-check "receiver.tenant renders verbatim under receiver" \
-  "      tenant:
-        rule:
-        - k8s.cluster.name
-        - service.name
-        watch:
-        - cloud.region" \
-  "$(receiver_config \
-      --set 'receiver.tenant.rule[0]=k8s.cluster.name' \
-      --set 'receiver.tenant.rule[1]=service.name' \
-      --set 'receiver.tenant.watch[0]=cloud.region' \
-      | sed -n '/^      tenant:/,/^    [a-z_]*:$/p' | sed '$d')"
-
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2
   exit 1

@@ -72,17 +72,19 @@ export OTEL_METRICS_EXPORTER=none          # Ourios is logs-only
 export OTEL_TRACES_EXPORTER=none
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
-export OTEL_SERVICE_NAME=my-agent          # → the Ourios tenant
+export OTEL_SERVICE_NAME=my-agent
+export OTEL_EXPORTER_OTLP_HEADERS=x-ourios-tenant=my-agent   # → the Ourios tenant
 
 # then the per-tool enable flag:
 export CLAUDE_CODE_ENABLE_TELEMETRY=1      # Claude Code
 # export COPILOT_OTEL_ENABLED=true         # Copilot CLI
 ```
 
-The **tenant** is the telemetry's `service.name` — `OTEL_SERVICE_NAME`
-sets it; if an agent overrides it with its own default, that default is
-the tenant instead. The tenants that exist show up as directories under
-`bucket_root/data/` — e.g. `/var/lib/ourios/store/data/tenant_id=my-agent/`.
+The **tenant** is named out of band by the exporter header
+(`OTEL_EXPORTER_OTLP_HEADERS=x-ourios-tenant=…`, RFC 0046) — never by
+`service.name`, which stays a plain resource attribute you can filter on.
+The tenants that exist show up as directories under `bucket_root/data/` —
+e.g. `/var/lib/ourios/store/data/tenant_id=my-agent/`.
 
 Prompt and tool bodies are **not** captured by default. Turn them on only
 on data you're willing to retain — this is the sensitive part:

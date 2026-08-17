@@ -47,17 +47,6 @@ receiver:
   wal_root: /var/lib/ourios/wal
   # RFC 0035: concurrent Parquet-encode workers (default: all cores).
   encode_workers: 4
-  # RFC 0045: how a tenant id is derived from each ResourceLogs group.
-  # Default rule is [service.name]. List several keys when the same
-  # service.name runs in more than one cluster — every key is required,
-  # values join with "/" (cluster1/fluxcd). Changing the rule affects
-  # newly ingested data only; stored tenant ids never change.
-  tenant:
-    rule: [k8s.cluster.name, service.name]
-    # Keys watched for the "one tenant spans several clusters" signal
-    # (a warning + counter, never a rejection). Default: [k8s.cluster.name].
-    watch: [k8s.cluster.name]
-    watch_capacity: 10000
 
 querier:
   enabled: true
@@ -99,6 +88,11 @@ Auth configuration is **file-only** — there are deliberately no
 `OURIOS_AUTH_*` variables; token values reach the file through
 `${env:…}` references.
 
-Tenant derivation (`receiver.tenant`, RFC 0045) is likewise **file-only**:
-the environment path always runs the `[service.name]` default. A
-multi-cluster rule needs `--config`.
+There is no tenant-derivation configuration: the tenant is named **out of
+band on every export** (RFC 0046) — the `X-Ourios-Tenant` header over
+OTLP/HTTP, `x-ourios-tenant` metadata over OTLP/gRPC — exactly as the
+querier's `X-Ourios-Tenant`. It is required in open mode too (no default
+tenant) and, with auth on, must be one of the credential's tenants. A
+Collector sets it once, e.g. `exporters.otlp.headers.x-ourios-tenant: acme`
+(or per request via the `headers_setter` extension). Resource attributes such
+as `service.name` describe the producer and never choose the tenant.

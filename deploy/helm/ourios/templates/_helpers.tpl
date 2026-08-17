@@ -152,10 +152,6 @@ receiver:
   grpc_addr: "0.0.0.0:4317"
   http_addr: "0.0.0.0:4318"
   wal_root: {{ $.Values.receiver.wal.mountPath | quote }}
-{{- with $.Values.receiver.tenant }}
-  tenant:
-{{ toYaml . | indent 4 }}
-{{- end }}
 compaction:
   enabled: false
 {{- else if eq $role "querier" }}

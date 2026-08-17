@@ -6,7 +6,8 @@
 //! `otelcol` binary — its OTLP exporter, its `configtls` client, its
 //! `oauth2client` extension — actually interoperates with our receiver over
 //! the wire. This test closes that gap: a real `otelcol-contrib` container
-//! reads log lines from a file, sets the tenant via a `resource` processor,
+//! reads log lines from a file, names the tenant on the exporter (`headers:
+//! x-ourios-tenant`, RFC 0046 §3.6) and stamps `service.name` via a `resource` processor,
 //! and exports them over gRPC to a served Ourios instance with **TLS**
 //! (server auth) and an **OIDC** bearer fetched from the same Dex fixture
 //! RFC0029.7 uses. We then flush and read the store back, asserting the
@@ -250,6 +251,8 @@ async fn collector_exports_over_tls_and_oidc() {
          exporters:\n\
          \x20\x20otlp:\n\
          \x20\x20\x20\x20endpoint: host.docker.internal:{grpc_port}\n\
+         \x20\x20\x20\x20headers:\n\
+         \x20\x20\x20\x20\x20\x20x-ourios-tenant: {TENANT}\n\
          \x20\x20\x20\x20tls:\n\
          \x20\x20\x20\x20\x20\x20ca_file: /etc/otelcol/ca.crt\n\
          \x20\x20\x20\x20auth:\n\

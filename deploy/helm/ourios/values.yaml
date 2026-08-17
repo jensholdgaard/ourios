@@ -127,15 +127,6 @@ receiver:
   extraEnv: []
     # - name: OTEL_RESOURCE_ATTRIBUTES
     #   value: deployment.environment.name=production,service.namespace=ourios
-  # Tenant derivation (RFC 0045): rendered verbatim as `receiver.tenant` in the
-  # config file. Empty = the [service.name] default. When the same service.name
-  # runs in several clusters, list the cluster key first — every key is
-  # required, values join with "/" (cluster1/fluxcd). Changing the rule affects
-  # newly ingested data only (stored tenant ids never change).
-  tenant: {}
-    # rule: [k8s.cluster.name, service.name]
-    # watch: [k8s.cluster.name]
-    # watch_capacity: 10000
 
 # Querier role (RFC 0016): a stateless Deployment that reads the configured store
 # (local or s3) and scales freely.
@@ -243,6 +234,9 @@ otel:
 #     OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT
 #                                   per-signal endpoint overrides
 #     OTEL_EXPORTER_OTLP_HEADERS / _TIMEOUT / _COMPRESSION ...
+#                                   (when the LOGS endpoint is another Ourios,
+#                                   set OTEL_EXPORTER_OTLP_LOGS_HEADERS=
+#                                   x-ourios-tenant=<tenant> — RFC 0046)
 extraEnv: []
   # - name: OTEL_TRACES_SAMPLER
   #   value: parentbased_traceidratio

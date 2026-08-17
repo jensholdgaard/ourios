@@ -266,7 +266,10 @@ dogfood-env:
     # into a 404). Explicit paths are correct under both behaviours.
     export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318/v1/logs     # -> dogfood-server
     export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces  # -> Collector -> Jaeger
-    export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant
+    export OTEL_SERVICE_NAME=agent-dogfood   # your source identity (a resource attribute)
+    # RFC 0046: the tenant is named out of band — the exporter header, per signal
+    # or globally; OTEL_EXPORTER_OTLP_LOGS_HEADERS keeps it off the traces path.
+    export OTEL_EXPORTER_OTLP_LOGS_HEADERS=x-ourios-tenant=agent-dogfood
     # then enable telemetry on the source (per-tool flag):
     #   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1
     #                 export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1  # required for spans (beta)

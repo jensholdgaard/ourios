@@ -358,7 +358,6 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `receiver.replicas` | `1` | Receiver replicas (each gets its own WAL PVC). |
 | `receiver.wal.size` | `2Gi` | WAL PVC size (`OURIOS_WAL_ROOT`, always local). |
 | `receiver.wal.storageClassName` | `""` | WAL StorageClass (`""` = cluster default). |
-| `receiver.tenant` | `{}` | Tenant derivation (RFC 0045), rendered verbatim as `receiver.tenant` in the config: `rule` (ordered resource-attribute keys joined into the tenant id; default `[service.name]`), `watch`, `watch_capacity`. Set `rule: [k8s.cluster.name, service.name]` when one `service.name` runs in several clusters. |
 | `querier.enabled` | `true` | Querier Deployment (HTTP `:4319`). |
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |

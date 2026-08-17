@@ -384,6 +384,8 @@ async fn rfc0030_8_served_end_to_end() {
         .expect("mTLS connect");
     let mut grpc = LogsServiceClient::new(channel);
     let mut req = tonic::Request::new(batch(TENANT, GRPC_BODY));
+    req.metadata_mut()
+        .insert("x-ourios-tenant", TENANT.parse().expect("ascii tenant"));
     req.metadata_mut().insert(
         "authorization",
         format!("Bearer {BEARER}").parse().expect("md"),
@@ -398,6 +400,7 @@ async fn rfc0030_8_served_end_to_end() {
     let resp = https
         .post(format!("https://{http_addr}/v1/logs"))
         .header("content-type", "application/x-protobuf")
+        .header("x-ourios-tenant", TENANT)
         .header("authorization", format!("Bearer {BEARER}"))
         .body(batch(TENANT, HTTP_BODY).encode_to_vec())
         .send()
@@ -432,6 +435,7 @@ async fn rfc0030_8_served_end_to_end() {
         plain
             .post(format!("http://{http_addr}/v1/logs"))
             .header("content-type", "application/x-protobuf")
+            .header("x-ourios-tenant", TENANT)
             .header("authorization", format!("Bearer {BEARER}"))
             .body(batch(TENANT, "plaintext").encode_to_vec())
             .send()
@@ -456,6 +460,8 @@ async fn rfc0030_8_served_end_to_end() {
     let plaintext_grpc = async {
         let mut c = LogsServiceClient::connect(format!("http://{grpc_addr}")).await?;
         let mut req = tonic::Request::new(batch(TENANT, "plaintext"));
+        req.metadata_mut()
+            .insert("x-ourios-tenant", TENANT.parse().expect("ascii tenant"));
         req.metadata_mut()
             .insert("authorization", format!("Bearer {BEARER}").parse()?);
         c.export(req).await?;

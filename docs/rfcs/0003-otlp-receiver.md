@@ -640,6 +640,13 @@ decoded `ExportLogsServiceRequest` and:
 
 ### 6.3 Tenant fan-out
 
+> **Superseded by RFC 0046 (2026-08-17).** The tenant is no longer derived
+> from the payload: every export names it out of band (`X-Ourios-Tenant`
+> / `x-ourios-tenant`, required, one export = one tenant), and a missing
+> or out-of-set selector is the rejection RFC0003.4 described. The text
+> below is kept as the historical design; RFC0003.3 and RFC0003.4 are
+> replaced by RFC0046.3 and RFC0046.1/.2.
+
 Per RFC 0001 §6.1 *Tenant derivation*, `tenant_id` is derived
 per `ResourceLogs` group, not per export batch. The receiver:
 

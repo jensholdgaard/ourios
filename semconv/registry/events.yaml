@@ -92,6 +92,11 @@ groups:
     type: event
     name: ourios.receiver.tenant.divergence
     stability: development
+    deprecated:
+      reason: obsoleted
+      note: >-
+        The RFC 0045 divergence detector was removed by RFC 0046 (tenancy is
+        out of band). Never emitted by a released version.
     brief: >
       A tenant spans more than one value of a watched resource attribute
       (RFC 0045 §3.4): the first observed value and the divergent one are
@@ -109,6 +114,11 @@ groups:
     type: event
     name: ourios.receiver.tenant.watch_saturated
     stability: development
+    deprecated:
+      reason: obsoleted
+      note: >-
+        The RFC 0045 divergence detector was removed by RFC 0046 (tenancy is
+        out of band). Never emitted by a released version.
     brief: >
       The tenant divergence watch reached `receiver.tenant.watch_capacity`;
       further (tenant, key) pairs are not watched. Emitted once per process.

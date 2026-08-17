@@ -67,7 +67,7 @@ fn export_request(service: &str, bodies: &[&str]) -> ExportLogsServiceRequest {
 async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect HTTP");
     let head = format!(
-        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+        "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nX-Ourios-Tenant: checkout\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
     );

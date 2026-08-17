@@ -65,8 +65,19 @@ auth:
   oidc:
     issuer: https://dex.example.com
     audience: ourios-collector
-    tenant_claim: groups
+    tenant_claim: groups              # optional once openfga binds the tenants
     name_claim: name
+    # RFC 0047: agent principals + group claims for the graph resolver
+    agent_claim: ourios_principal_type=agent
+    groups_claim: groups
+  openfga:                            # RFC 0047 — the graph binds tenants
+    api_url: http://openfga.auth.svc:8080
+    store_id: 01M07RYMXRDW4ND5M7XQV04W8R
+    authorization_model_id: 01M07RZE9RHPVPTYCV22RX0TDA   # pinned; omit = latest
+    api_token: ${env:OURIOS_OPENFGA_TOKEN}                 # ${env:…} only
+    session_ttl_secs: 60
+    consistency: minimize_latency     # or higher_consistency
+    request_timeout_secs: 5
 ```
 
 ## Environment variables (no `--config`)

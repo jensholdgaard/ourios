@@ -506,13 +506,28 @@ impl Store {
     }
 
     /// Resolve a `/`-delimited `key` to an absolute object path under the
-    /// store prefix. At `red` the prefix is empty, so this is just the key;
-    /// once prefix scoping is wired (RFC0013.5) the prefix segments lead.
-    fn resolve(&self, key: &str) -> ObjectPath {
-        self.prefix
-            .parts()
-            .chain(ObjectPath::from(key).parts())
-            .collect()
+    /// store prefix.
+    ///
+    /// Keys are already path-safe by construction (RFC 0005 §3.4
+    /// `percent_encode_tenant`, fixed partition names, UUID file names), so
+    /// they are *parsed* — stored verbatim as the object key and, on the
+    /// local backend, as the directory name — rather than re-encoded.
+    /// `ObjectPath::from` would escape the `%` of an encoded tenant a second
+    /// time (`a%2Fb` → `a%252Fb`), putting the object where neither the
+    /// local querier's `tenant_id=<enc>` join nor `percent_decode_tenant`
+    /// would find it — invisible for plain tenant ids, fatal for the RFC 0045
+    /// composite ones.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if `key` is not a valid object path (an
+    /// empty segment, `.`/`..`, a control character or raw `/` inside a
+    /// segment) — a programming error at the call site, surfaced rather
+    /// than silently re-encoded.
+    fn resolve(&self, key: &str) -> Result<ObjectPath, StoreError> {
+        let path = ObjectPath::parse(key)
+            .map_err(|source| StoreError::Backend(object_store::Error::InvalidPath { source }))?;
+        Ok(self.prefix.parts().chain(path.parts()).collect())
     }
 
     /// Write `bytes` to `key`.
@@ -521,7 +536,7 @@ impl Store {
     /// [`StoreError::Backend`] if the put fails.
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         self.inner
-            .put(&self.resolve(key), PutPayload::from(bytes))
+            .put(&self.resolve(key)?, PutPayload::from(bytes))
             .await
             .map_err(StoreError::Backend)?;
         Ok(())
@@ -534,7 +549,7 @@ impl Store {
     pub async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let got = self
             .inner
-            .get(&self.resolve(key))
+            .get(&self.resolve(key)?)
             .await
             .map_err(StoreError::Backend)?;
         let bytes = got.bytes().await.map_err(StoreError::Backend)?;
@@ -547,7 +562,7 @@ impl Store {
     /// [`StoreError::Backend`] if the delete fails.
     pub async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner
-            .delete(&self.resolve(key))
+            .delete(&self.resolve(key)?)
             .await
             .map_err(StoreError::Backend)
     }
@@ -610,7 +625,10 @@ impl Store {
     /// per-object `head`. Same tenant-isolation gating and key normalisation as
     /// [`Self::list`].
     async fn list_entries(&self, prefix: Option<&str>) -> Result<Vec<(String, u64)>, StoreError> {
-        let scoped = prefix.map_or_else(|| self.prefix.clone(), |p| self.resolve(p));
+        let scoped = match prefix {
+            Some(p) => self.resolve(p)?,
+            None => self.prefix.clone(),
+        };
         let metas: Vec<ObjectMeta> = self
             .inner
             .list(Some(&scoped))
@@ -686,7 +704,10 @@ impl Store {
     /// (RFC0019.5): a string-prefix sibling of the requested prefix is excluded.
     /// `LocalFileSystem` and S3 both surface subdirectories as common-prefixes.
     async fn list_common_prefixes(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
-        let scoped = prefix.map_or_else(|| self.prefix.clone(), |p| self.resolve(p));
+        let scoped = match prefix {
+            Some(p) => self.resolve(p)?,
+            None => self.prefix.clone(),
+        };
         let result = self
             .inner
             .list_with_delimiter(Some(&scoped))
@@ -755,7 +776,7 @@ impl Store {
     pub async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         self.inner
             .put_opts(
-                &self.resolve(key),
+                &self.resolve(key)?,
                 PutPayload::from(bytes),
                 PutOptions::from(PutMode::Create),
             )
@@ -796,7 +817,7 @@ impl Store {
     pub async fn get_with_etag(&self, key: &str) -> Result<EtaggedBytes, StoreError> {
         let got = self
             .inner
-            .get(&self.resolve(key))
+            .get(&self.resolve(key)?)
             .await
             .map_err(StoreError::Backend)?;
         let e_tag = got.meta.e_tag.clone();
@@ -825,7 +846,7 @@ impl Store {
             version: None,
         }));
         self.inner
-            .put_opts(&self.resolve(key), PutPayload::from(bytes), opts)
+            .put_opts(&self.resolve(key)?, PutPayload::from(bytes), opts)
             .await
             .map_err(StoreError::Backend)?;
         Ok(())
@@ -996,6 +1017,46 @@ mod tests {
             store.get_blocking(key).expect("get_blocking"),
             b"hello-blocking"
         );
+    }
+
+    /// RFC 0005 §3.4 / RFC 0045 §3.2 — a percent-encoded tenant key is stored
+    /// verbatim: on the local backend the directory is `tenant_id=<enc>`
+    /// exactly (what the local querier joins and `percent_decode_tenant`
+    /// inverts), and listing returns the same key `put` took.
+    #[test]
+    fn encoded_tenant_keys_are_stored_verbatim_and_round_trip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let enc = crate::percent_encode_tenant("cluster1/flux%cd");
+        assert_eq!(enc, "cluster1%2Fflux%25cd");
+        let key = format!("data/tenant_id={enc}/year=2026/x.parquet");
+        store.put_blocking(&key, b"row".to_vec()).expect("put");
+
+        assert!(
+            dir.path()
+                .join("data")
+                .join(format!("tenant_id={enc}"))
+                .join("year=2026")
+                .join("x.parquet")
+                .is_file(),
+            "the on-disk directory is the once-encoded tenant"
+        );
+        assert_eq!(
+            store.list_blocking(Some("data/")).expect("list"),
+            vec![key.clone()],
+            "listing returns the key put took"
+        );
+        assert_eq!(
+            store
+                .list_common_prefixes_blocking(Some("data/"))
+                .expect("prefixes"),
+            vec![format!("data/tenant_id={enc}")]
+        );
+        assert_eq!(store.get_blocking(&key).expect("get"), b"row");
+        assert!(matches!(
+            store.put_blocking("data/../x", Vec::new()),
+            Err(StoreError::Backend(_))
+        ));
     }
 
     /// `list_blocking` enumerates keys under a prefix recursively, in

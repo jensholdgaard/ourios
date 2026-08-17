@@ -337,5 +337,43 @@ mod tests {
             RuleEpochs::load(dir.path()).unwrap_err(),
             RuleEpochsError::Malformed { .. }
         ));
+
+        // Boundaries that go backwards are rejected; an equal boundary is
+        // append order and accepted.
+        let later = offset(5);
+        let earlier = WalOffset {
+            segment: later.segment,
+            byte: 4,
+        };
+        let entry = |keys: &str, o: WalOffset| {
+            format!(
+                "{{\"rule\": [{keys}], \"after\": {{\"segment\": \"{}\", \"byte\": {}}}}}",
+                o.segment, o.byte
+            )
+        };
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            format!(
+                "{{\"epochs\": [{}, {}]}}",
+                entry("\"a\"", later),
+                entry("\"b\"", earlier)
+            ),
+        )
+        .expect("write");
+        assert!(matches!(
+            RuleEpochs::load(dir.path()).unwrap_err(),
+            RuleEpochsError::Malformed { .. }
+        ));
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            format!(
+                "{{\"epochs\": [{}, {}]}}",
+                entry("\"a\"", later),
+                entry("\"b\"", later)
+            ),
+        )
+        .expect("write");
+        let epochs = RuleEpochs::load(dir.path()).expect("equal boundary is append order");
+        assert_eq!(epochs.current().keys(), ["b"]);
     }
 }

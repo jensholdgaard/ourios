@@ -14,6 +14,7 @@
 //! (tenant, key). Everything resets on restart by design.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -35,8 +36,20 @@ pub const MAX_VALUE_BYTES: usize = 128;
 pub const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 struct Entry {
-    first: String,
+    /// Exact identity of the first value: digest + byte length. Comparison
+    /// never uses the preview, so values sharing a 128-byte prefix are
+    /// still told apart.
+    first_digest: u64,
+    first_len: usize,
+    /// The bounded rendering of the first value, for the warning only.
+    first_preview: String,
     last_warned: Option<Instant>,
+}
+
+fn digest(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The detector: build one per pipeline from the resolved
@@ -128,16 +141,18 @@ impl DivergenceWatch {
             state.insert(
                 slot,
                 Entry {
-                    first: bound(value).into_owned(),
+                    first_digest: digest(value),
+                    first_len: value.len(),
+                    first_preview: bound(value).into_owned(),
                     last_warned: None,
                 },
             );
             return;
         };
-        let seen = bound(value);
-        if entry.first == seen {
+        if entry.first_len == value.len() && entry.first_digest == digest(value) {
             return;
         }
+        let seen = bound(value);
         self.divergences.add(
             1,
             &[OtelKeyValue::new(
@@ -158,7 +173,7 @@ impl DivergenceWatch {
             tracing::Level::WARN,
             ourios.tenant = tenant.as_str(),
             ourios.tenant.watch.key = key,
-            ourios.tenant.watch.first_value = entry.first.as_str(),
+            ourios.tenant.watch.first_value = entry.first_preview.as_str(),
             ourios.tenant.watch.value = seen.as_ref(),
             "tenant spans more than one value of a watched resource attribute — if these are \
              different producers, add the key to receiver.tenant.rule (RFC 0045 §3.4)"
@@ -281,7 +296,7 @@ mod tests {
         let entry = state
             .get(&(tenant, "k8s.cluster.name".to_owned()))
             .expect("entry");
-        assert_eq!(entry.first, "cluster1");
+        assert_eq!(entry.first_preview, "cluster1");
         assert!(entry.last_warned.is_none(), "no divergence, no warning");
     }
 
@@ -298,7 +313,7 @@ mod tests {
             let entry = state
                 .get(&(tenant.clone(), "k8s.cluster.name".to_owned()))
                 .expect("entry");
-            assert_eq!(entry.first, "cluster1");
+            assert_eq!(entry.first_preview, "cluster1");
             entry.last_warned.expect("warned")
         };
         w.observe(&tenant, &[attr("k8s.cluster.name", "cluster3")]);
@@ -325,6 +340,30 @@ mod tests {
                 .last_warned
                 .is_some()
         );
+    }
+
+    // RFC0045.7 — two values sharing their first 128 bytes still diverge:
+    // comparison is digest + length, the preview is display only.
+    #[test]
+    fn shared_prefix_values_still_diverge() {
+        let w = watch(10);
+        let tenant = TenantId::new("t");
+        let prefix = "p".repeat(MAX_VALUE_BYTES);
+        w.observe(
+            &tenant,
+            &[attr("k8s.cluster.name", &format!("{prefix}-one"))],
+        );
+        w.observe(
+            &tenant,
+            &[attr("k8s.cluster.name", &format!("{prefix}-two"))],
+        );
+        let state = w.state.lock().expect("lock");
+        let entry = &state[&(tenant, "k8s.cluster.name".to_owned())];
+        assert!(
+            entry.last_warned.is_some(),
+            "divergence detected past the preview bound"
+        );
+        assert_eq!(entry.first_preview, format!("{prefix}…"));
     }
 
     // RFC0045.7 — values are bounded at a UTF-8 boundary with a trailing `…`.

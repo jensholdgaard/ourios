@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Consistency, OpenFgaConfig, Principal, PrincipalKind, TENANT_TYPE};
+use super::{
+    CONVERSATION_TYPE, Consistency, OpenFgaConfig, Principal, PrincipalKind, TENANT_TYPE,
+    VisibilityConfig,
+};
 
 /// `OpenFGA`'s cap on contextual tuples per request (RFC 0047 §3.1): a
 /// token carrying more groups than this fails resolution closed.
@@ -77,6 +80,9 @@ pub enum OpenFgaError {
         /// How many the caller wanted to send.
         count: usize,
     },
+    /// A principal id (OIDC `sub` / static token name) that cannot form an
+    /// `OpenFGA` user id — a credential/config defect, 401-class.
+    InvalidPrincipal,
     /// A token group name that cannot form an `OpenFGA` object id
     /// (empty, over 256 bytes, or containing `:`, `#` or whitespace) — a
     /// credential defect, answered like the cap: named, 401-class.
@@ -102,6 +108,10 @@ impl fmt::Display for OpenFgaError {
                 f,
                 "openfga: {count} contextual tuples exceed the per-request cap of \
                  {MAX_CONTEXTUAL_TUPLES}"
+            ),
+            Self::InvalidPrincipal => f.write_str(
+                "openfga: principal id cannot form a user id (empty, too long, or contains \
+                 ':', '#' or whitespace)",
             ),
             Self::InvalidGroup { index } => write!(
                 f,
@@ -522,7 +532,43 @@ struct CacheKey {
 pub struct OpenFgaResolver {
     client: OpenFgaClient,
     session_ttl: Duration,
+    visibility: VisibilityConfig,
     cache: Mutex<HashMap<CacheKey, CachedGrants>>,
+    /// The RFC 0047 §3.4 two-step outcome per (session, tenant), cached
+    /// like the binding — the enumeration behind `Scoped` is never cached.
+    branches: Mutex<HashMap<(CacheKey, String), CachedBranch>>,
+}
+
+struct CachedBranch {
+    expires: Instant,
+    branch: Branch,
+}
+
+/// The two-step's outcome for a principal in a tenant, before any
+/// enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Branch {
+    TenantWide,
+    MetadataOnly,
+    Scoped,
+}
+
+/// What a principal may see inside a tenant (RFC 0047 §3.4): the whole
+/// tenant, the whole tenant with content masked, or exactly the listed
+/// conversations (ids with the `conversation:<tenant>/` prefix stripped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Visibility {
+    /// `Check(can_read_content, tenant)` allowed — the tenant predicate only.
+    TenantWide,
+    /// `Check(can_read_metadata, tenant)` allowed — every row, content
+    /// columns masked.
+    MetadataOnly,
+    /// A scoped principal: the tenant's conversation ids it may read
+    /// (empty when none, or when no object type is bound).
+    Scoped {
+        /// Conversation ids, prefix stripped, tenant-filtered.
+        conversations: BTreeSet<String>,
+    },
 }
 
 impl fmt::Debug for OpenFgaResolver {
@@ -544,8 +590,16 @@ impl OpenFgaResolver {
         Ok(Self {
             client: OpenFgaClient::new(config)?,
             session_ttl: config.session_ttl(),
+            visibility: config.visibility().clone(),
             cache: Mutex::new(HashMap::new()),
+            branches: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The layer-2 visibility configuration.
+    #[must_use]
+    pub fn visibility_config(&self) -> &VisibilityConfig {
+        &self.visibility
     }
 
     /// The underlying client, for the planner and tool gate.
@@ -599,13 +653,7 @@ impl OpenFgaResolver {
         principal: &Principal,
         groups: &[String],
     ) -> Result<Grants, OpenFgaError> {
-        let mut groups: Vec<String> = groups.to_vec();
-        groups.sort();
-        groups.dedup();
-        let cache_key = CacheKey {
-            principal: principal.clone(),
-            groups,
-        };
+        let cache_key = Self::cache_key(principal, groups)?;
         let now = Instant::now();
         {
             let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -642,6 +690,139 @@ impl OpenFgaResolver {
             );
         }
         Ok(grants)
+    }
+
+    fn cache_key(principal: &Principal, groups: &[String]) -> Result<CacheKey, OpenFgaError> {
+        if !is_object_id(principal.id()) {
+            return Err(OpenFgaError::InvalidPrincipal);
+        }
+        let mut groups: Vec<String> = groups.to_vec();
+        groups.sort();
+        groups.dedup();
+        Ok(CacheKey {
+            principal: principal.clone(),
+            groups,
+        })
+    }
+
+    /// The RFC 0047 §3.4 two-step for `principal` in `tenant`:
+    /// `Check(can_read_content)` → [`Visibility::TenantWide`]; else
+    /// `Check(can_read_metadata)` → [`Visibility::MetadataOnly`]; else the
+    /// scoped enumeration — the **streamed** `ListObjects(can_read_content,
+    /// conversation)`, filtered to this tenant's `conversation:<tenant>/`
+    /// prefix, counting only those toward `visibility.max_objects`, within
+    /// `visibility.list_timeout` — a truncated or cut-off set is never an
+    /// answer. The two checks are cached with the session TTL; the
+    /// enumeration never is.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenFgaError::BoundExceeded`] past `max_objects` tenant ids,
+    /// [`OpenFgaError::Incomplete`] when the stream is cut off,
+    /// [`OpenFgaError::Unavailable`] on transport/status failure, and the
+    /// credential-defect variants ([`OpenFgaError::InvalidPrincipal`],
+    /// [`OpenFgaError::InvalidGroup`], [`OpenFgaError::TooManyContextualTuples`]).
+    pub async fn visibility(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+        tenant: &str,
+    ) -> Result<Visibility, OpenFgaError> {
+        let cache_key = Self::cache_key(principal, groups)?;
+        let contextual = Self::group_tuples(principal, &cache_key.groups)?;
+        let user = principal.to_string();
+        let tenant_object = format!("{TENANT_TYPE}:{tenant}");
+        let now = Instant::now();
+        let branch_key = (cache_key, tenant.to_string());
+        let cached = {
+            let branches = self.branches.lock().unwrap_or_else(PoisonError::into_inner);
+            branches
+                .get(&branch_key)
+                .filter(|entry| entry.expires > now)
+                .map(|entry| entry.branch)
+        };
+        let branch = if let Some(branch) = cached {
+            branch
+        } else {
+            let branch = self.two_step(&user, &tenant_object, &contextual).await?;
+            if !self.session_ttl.is_zero() {
+                let mut branches = self.branches.lock().unwrap_or_else(PoisonError::into_inner);
+                if branches.len() >= CACHE_SWEEP_THRESHOLD {
+                    branches.retain(|_, entry| entry.expires > now);
+                }
+                if branches.len() >= MAX_CACHE_ENTRIES
+                    && let Some(soonest) = branches
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.expires)
+                        .map(|(key, _)| key.clone())
+                {
+                    branches.remove(&soonest);
+                }
+                branches.insert(
+                    branch_key,
+                    CachedBranch {
+                        expires: now + self.session_ttl,
+                        branch,
+                    },
+                );
+            }
+            branch
+        };
+        match branch {
+            Branch::TenantWide => Ok(Visibility::TenantWide),
+            Branch::MetadataOnly => Ok(Visibility::MetadataOnly),
+            Branch::Scoped => {
+                let bound = self
+                    .visibility
+                    .objects()
+                    .iter()
+                    .any(|object| object.object_type() == CONVERSATION_TYPE);
+                if !bound {
+                    return Ok(Visibility::Scoped {
+                        conversations: BTreeSet::new(),
+                    });
+                }
+                let prefix = format!("{CONVERSATION_TYPE}:{tenant}/");
+                let objects = self
+                    .client
+                    .streamed_list_objects(
+                        ListObjectsRequest {
+                            user: &user,
+                            relation: "can_read_content",
+                            object_type: CONVERSATION_TYPE,
+                            contextual_tuples: &contextual,
+                        },
+                        self.visibility.list_timeout(),
+                        self.visibility.max_objects(),
+                        |object| object.starts_with(&prefix),
+                    )
+                    .await?;
+                Ok(Visibility::Scoped {
+                    conversations: objects
+                        .into_iter()
+                        .map(|object| object[prefix.len()..].to_string())
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    /// The two `Check`s of RFC 0047 §3.4 steps 1–2.
+    async fn two_step(
+        &self,
+        user: &str,
+        tenant_object: &str,
+        contextual: &[TupleKey],
+    ) -> Result<Branch, OpenFgaError> {
+        let content = TupleKey::new(user, "can_read_content", tenant_object);
+        if self.client.check(&content, contextual).await? {
+            return Ok(Branch::TenantWide);
+        }
+        let metadata = TupleKey::new(user, "can_read_metadata", tenant_object);
+        if self.client.check(&metadata, contextual).await? {
+            return Ok(Branch::MetadataOnly);
+        }
+        Ok(Branch::Scoped)
     }
 
     async fn list_tenants(
@@ -690,7 +871,7 @@ mod tests {
     use super::super::{OpenFgaSpec, Principal, PrincipalKind, build_openfga_config};
     use super::{
         Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient, OpenFgaError,
-        OpenFgaResolver, TupleKey,
+        OpenFgaResolver, TupleKey, Visibility,
     };
 
     /// A loopback stand-in for the `OpenFGA` HTTP API: `check` answers from
@@ -927,6 +1108,235 @@ mod tests {
         );
     }
 
+    /// A grant-table fake for the two-step: `check` answers membership of
+    /// (user, relation, object); `streamed-list-objects` lists the grants of
+    /// the requested type/relation for the user, optionally stalling after
+    /// the first frame.
+    #[derive(Clone)]
+    struct GrantFake {
+        calls: Arc<AtomicUsize>,
+        streams: Arc<AtomicUsize>,
+        grants: Arc<Vec<(&'static str, &'static str, &'static str)>>,
+        stall: bool,
+    }
+
+    async fn grant_check(
+        State(fake): State<GrantFake>,
+        body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        fake.calls.fetch_add(1, Ordering::SeqCst);
+        let request: Value = serde_json::from_slice(&body).expect("json");
+        let key = &request["tuple_key"];
+        let allowed = fake
+            .grants
+            .iter()
+            .any(|(u, r, o)| key["user"] == *u && key["relation"] == *r && key["object"] == *o);
+        axum::Json(json!({ "allowed": allowed })).into_response()
+    }
+
+    async fn grant_streamed(
+        State(fake): State<GrantFake>,
+        body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        fake.calls.fetch_add(1, Ordering::SeqCst);
+        fake.streams.fetch_add(1, Ordering::SeqCst);
+        let request: Value = serde_json::from_slice(&body).expect("json");
+        let user = request["user"].as_str().expect("user").to_string();
+        let relation = request["relation"].as_str().expect("relation").to_string();
+        let prefix = format!("{}:", request["type"].as_str().expect("type"));
+        let objects: Vec<String> = fake
+            .grants
+            .iter()
+            .filter(|(u, r, o)| *u == user && *r == relation && o.starts_with(&prefix))
+            .map(|(_, _, o)| (*o).to_string())
+            .collect();
+        let stall = fake.stall;
+        let stream = async_stream(move |tx| async move {
+            for object in objects {
+                let line = format!("{{\"result\":{{\"object\":\"{object}\"}}}}\n");
+                if tx.send(Ok::<_, std::io::Error>(line)).await.is_err() {
+                    return;
+                }
+                if stall {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        });
+        axum::response::Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .expect("response")
+    }
+
+    async fn serve_grants(fake: GrantFake) -> String {
+        let app = Router::new()
+            .route("/stores/{store}/check", post(grant_check))
+            .route(
+                "/stores/{store}/streamed-list-objects",
+                post(grant_streamed),
+            )
+            .with_state(fake);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        url
+    }
+
+    fn visibility_resolver(url: &str, max_objects: &str, list_timeout_ms: &str) -> OpenFgaResolver {
+        use super::super::{VisibilityObjectSpec, VisibilitySpec};
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(url.to_string()),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("1".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                max_objects: Some(max_objects.to_string()),
+                list_timeout_ms: Some(list_timeout_ms.to_string()),
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("config");
+        OpenFgaResolver::new(&config).expect("resolver")
+    }
+
+    /// RFC 0047 §3.4 two-step (RFC0047.4/.5/.7 at the resolver): a
+    /// tenant-wide reader never enumerates; a metadata reader is masked,
+    /// never enumerated; a scoped principal's conversations are enumerated
+    /// through the **streamed** call, filtered to the tenant prefix, and
+    /// only tenant ids count toward the bound; the branch is cached per
+    /// session while the enumeration is not.
+    #[tokio::test]
+    async fn two_step_visibility() {
+        let fake = GrantFake {
+            calls: Arc::new(AtomicUsize::new(0)),
+            streams: Arc::new(AtomicUsize::new(0)),
+            grants: Arc::new(vec![
+                ("user:alice", "can_read_content", "tenant:acme"),
+                ("user:alice", "can_read_metadata", "tenant:acme"),
+                ("user:fin", "can_read_metadata", "tenant:acme"),
+                ("user:bob", "can_read_content", "conversation:acme/c-1"),
+                ("user:bob", "can_read_content", "conversation:acme/c-2"),
+                ("user:bob", "can_read_content", "conversation:globex/c-1"),
+                ("agent:bot", "can_read_content", "conversation:acme/c-3"),
+                ("agent:bot", "can_read_content", "conversation:acme/c-4"),
+                ("agent:bot", "can_read_content", "conversation:globex/c-5"),
+                ("agent:bot", "can_read_content", "conversation:globex/c-6"),
+                ("agent:bot", "can_read_content", "conversation:globex/c-7"),
+            ]),
+            stall: false,
+        };
+        let streams = Arc::clone(&fake.streams);
+        let calls = Arc::clone(&fake.calls);
+        let url = serve_grants(fake).await;
+        let resolver = visibility_resolver(&url, "2", "500");
+        let alice = Principal::new(PrincipalKind::User, "alice");
+        let fin = Principal::new(PrincipalKind::User, "fin");
+        let bob = Principal::new(PrincipalKind::User, "bob");
+        let bot = Principal::new(PrincipalKind::Agent, "bot");
+
+        assert_eq!(
+            resolver
+                .visibility(&alice, &[], "acme")
+                .await
+                .expect("alice"),
+            Visibility::TenantWide
+        );
+        assert_eq!(
+            streams.load(Ordering::SeqCst),
+            0,
+            "RFC0047.4: no enumeration"
+        );
+        assert_eq!(
+            resolver.visibility(&fin, &[], "acme").await.expect("fin"),
+            Visibility::MetadataOnly
+        );
+        assert_eq!(
+            streams.load(Ordering::SeqCst),
+            0,
+            "RFC0047.8: no enumeration"
+        );
+        assert_eq!(
+            resolver.visibility(&bob, &[], "acme").await.expect("bob"),
+            Visibility::Scoped {
+                conversations: BTreeSet::from(["c-1".to_string(), "c-2".to_string()])
+            },
+            "RFC0047.5: exactly bob's acme conversations, globex filtered out"
+        );
+        assert_eq!(streams.load(Ordering::SeqCst), 1);
+        // The branch is cached; the enumeration is not.
+        let before = calls.load(Ordering::SeqCst);
+        resolver.visibility(&bob, &[], "acme").await.expect("bob");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before + 1,
+            "one stream, no checks"
+        );
+        // RFC0047.7: bot has 2 acme + 3 globex conversations under a bound
+        // of 2 — succeeds with exactly the 2 (only acme ids count) …
+        assert_eq!(
+            resolver.visibility(&bot, &[], "acme").await.expect("bot"),
+            Visibility::Scoped {
+                conversations: BTreeSet::from(["c-3".to_string(), "c-4".to_string()])
+            }
+        );
+        // … and fails closed past the bound in globex (3 > 2).
+        assert_eq!(
+            resolver
+                .visibility(&bot, &[], "globex")
+                .await
+                .expect_err("bound"),
+            OpenFgaError::BoundExceeded { bound: 2 }
+        );
+        // A principal with no grant on the tenant scopes to nothing.
+        assert_eq!(
+            resolver
+                .visibility(&fin, &[], "globex")
+                .await
+                .expect("fin/globex"),
+            Visibility::Scoped {
+                conversations: BTreeSet::new()
+            }
+        );
+        // Enumeration errors are never cached: a stalled stream fails closed
+        // with `Incomplete`, every time.
+        let stalled = serve_grants(GrantFake {
+            calls: Arc::new(AtomicUsize::new(0)),
+            streams: Arc::new(AtomicUsize::new(0)),
+            grants: Arc::new(vec![
+                ("user:bob", "can_read_content", "conversation:acme/c-1"),
+                ("user:bob", "can_read_content", "conversation:acme/c-2"),
+            ]),
+            stall: true,
+        })
+        .await;
+        let resolver = visibility_resolver(&stalled, "10", "200");
+        for _ in 0..2 {
+            assert_eq!(
+                resolver
+                    .visibility(&bob, &[], "acme")
+                    .await
+                    .expect_err("stalled"),
+                OpenFgaError::Incomplete
+            );
+        }
+        // A principal whose id is no object id is a credential defect.
+        assert_eq!(
+            resolver
+                .visibility(&Principal::new(PrincipalKind::User, "a b"), &[], "acme")
+                .await
+                .expect_err("invalid principal"),
+            OpenFgaError::InvalidPrincipal
+        );
+    }
+
     /// The resolver: `can_query` / `can_write` sets with the `tenant:`
     /// prefix stripped, cached per (principal, groups) for the TTL — and
     /// re-resolved past it; errors are not cached; a group list past the
@@ -999,11 +1409,19 @@ mod tests {
             1
         );
 
-        // The cache key is structured: a subject or group carrying a
-        // separator can never alias another session (`"a\nb"` with no
-        // groups vs `"a"` in group `"b"`).
+        // A subject that is no object id is a credential defect, before any
+        // call; and the cache key is structured, so a subject or group
+        // carrying a separator can never alias another session (`"a|b"`
+        // with no groups vs `"a"` in group `"b"`).
+        assert_eq!(
+            resolver
+                .resolve(&Principal::new(PrincipalKind::User, "a\nb"), &[])
+                .await
+                .expect_err("whitespace in sub"),
+            OpenFgaError::InvalidPrincipal
+        );
         let before = calls.load(Ordering::SeqCst);
-        let odd = Principal::new(PrincipalKind::User, "a\nb");
+        let odd = Principal::new(PrincipalKind::User, "a|b");
         resolver.resolve(&odd, &[]).await.expect("resolve");
         resolver
             .resolve(

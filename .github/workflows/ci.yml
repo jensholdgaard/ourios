@@ -348,6 +348,38 @@ jobs:
   # pre-1.0) passes. Complements the `semconv` job: that one validates
   # the registry *definitions*; this one validates what the binary
   # actually *emits* against them. A required check (in `ci-success`'s
+  # RFC 0047 §3.2 / RFC0047.12: the OpenFGA authorization model is an in-tree,
+  # tested artefact — `fga model validate` on `deploy/openfga/model.fga` and
+  # `fga model test` on `store.fga.yaml` (the §5 relationship claims as
+  # check / list_objects / list_users assertions). Same posture as the
+  # `semconv` job for the registry: a model that breaks a documented claim
+  # fails the build. A required check (in `ci-success`'s `needs`).
+  openfga-model:
+    name: openfga model (fga)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      FGA_VERSION: 0.7.20
+      # sha256 of fga_${FGA_VERSION}_linux_amd64.tar.gz (openfga/cli release
+      # asset). Bump both together.
+      FGA_SHA256: f0136868bdced6f8fded1876d41aa8d594d23588183497f6d876c1a5343529a4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install fga
+        run: |
+          set -euo pipefail
+          tarball="fga_${FGA_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/openfga/cli/releases/download/v${FGA_VERSION}/${tarball}"
+          echo "${FGA_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" fga
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: fga model validate --file deploy/openfga/model.fga
+      - run: fga model test --tests deploy/openfga/store.fga.yaml
+
   # `needs`).
   live-check:
     name: live-check (weaver)
@@ -678,7 +710,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, docs, test, book, semconv, live-check, deny, s3-integration, dex-oidc, collector-interop, loki-interop]
+    needs: [fmt, clippy, docs, test, book, semconv, live-check, openfga-model, deny, s3-integration, dex-oidc, collector-interop, loki-interop]
     # Excluded from the canary too: with ten of twelve `needs` skipped it would
     # report "all required checks passed" off two jobs, which reads as a much
     # stronger claim than it is. `hygiene-report` is the canary's signal.

@@ -1,0 +1,41 @@
+# Ourios authorization model — RFC 0047 §3.2. Validated and tested in CI
+# (`fga model validate`, `fga model test store.fga.yaml`) the way weaver gates
+# semconv/registry. Layer 1: tenant = the RFC 0046 out-of-band tenant object.
+# Layer 2: conversations (from gen_ai.conversation.id) and MCP tools inside it.
+model
+  schema 1.1
+
+type user
+
+type agent
+
+type service_account
+
+type team
+  relations
+    define member: [user, service_account, team#member]
+
+type tenant
+  relations
+    define owner: [user, service_account, team#member]
+    define writer: [service_account, team#member]
+    define reader: [user, service_account, team#member]
+    define metadata_reader: [user, service_account, team#member]
+    define can_write: writer or owner
+    define can_read_metadata: metadata_reader or reader or owner
+    define can_read_content: reader or owner
+
+type conversation
+  relations
+    define parent: [tenant]
+    define participant: [user]
+    define actor: [agent]
+    define delegate: [agent]
+    define can_read_metadata: participant or actor or delegate or can_read_metadata from parent
+    define can_read_content: participant or actor or delegate or can_read_content from parent
+
+type tool
+  relations
+    define parent: [tenant]
+    define caller: [user, agent, service_account, team#member]
+    define can_call: caller or can_read_content from parent

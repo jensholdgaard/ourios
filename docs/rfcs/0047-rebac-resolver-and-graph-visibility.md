@@ -99,7 +99,7 @@ auth:
     authorization_model_id: 01M07RZE9RHPVPTYCV22RX0TDA   # pinned; empty = latest
     api_token: ${env:OURIOS_OPENFGA_TOKEN}                 # ${env:…} only, RFC 0026 rule
     session_ttl_secs: 60
-    consistency: minimize_latency | higher_consistency     # default minimize_latency
+    consistency: minimize_latency    # or higher_consistency (bypasses OpenFGA's cache)
 ```
 
 At session establishment (bearer resolved by the static or OIDC path first
@@ -121,10 +121,11 @@ OpenFGA's own cache after writes. Ingest authorization is exactly RFC 0046
 
 ### 3.2 The authorization model
 
-Kept **in-tree** as `deploy/openfga/model.fga` with `deploy/openfga/
-store.fga.yaml` tests, validated in CI with the OpenFGA CLI (`fga model
-validate` + `fga model test`) the way `semconv/registry` is gated by weaver
-— the model is a tested artefact, not prose:
+Kept **in-tree** — `deploy/openfga/model.fga` and `deploy/openfga/
+store.fga.yaml` land with this RFC, and CI's `openfga-model` job runs
+`fga model validate` + `fga model test` on them (a required check, the way
+`semconv/registry` is gated by weaver) — so the model is a tested artefact
+from the day it is specified, not prose:
 
 ```fga
 model
@@ -247,7 +248,7 @@ auth:
         - type: conversation
           column: attr.gen_ai.conversation.id
       self_principal_column: attr.user.hash          # the §3.3 fast path
-      content_columns: [body, attr.gen_ai.input.messages, …]
+      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
       max_objects: 10000
 ```
 

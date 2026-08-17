@@ -1,0 +1,191 @@
+# RFC 0047 §5 relationship claims as OpenFGA model tests (RFC0047.12).
+# Run: fga model validate --file model.fga && fga model test --tests store.fga.yaml
+name: Ourios tenancy + graph visibility (RFC 0047)
+model_file: ./model.fga
+
+tuples:
+  # Layer 1 — tenant acme: platform team owns it, alice reads content, fin reads
+  # metadata only, the collector writes.
+  - user: user:jens
+    relation: member
+    object: team:platform
+  - user: team:platform#member
+    relation: owner
+    object: tenant:acme
+  - user: user:alice
+    relation: reader
+    object: tenant:acme
+  - user: user:fin
+    relation: metadata_reader
+    object: tenant:acme
+  - user: service_account:collector-cluster1
+    relation: writer
+    object: tenant:acme
+  # A second tenant nobody above may touch.
+  - user: user:mallory
+    relation: reader
+    object: tenant:globex
+  # Layer 2 — conversations inside acme (emitter tuples: parent/participant/actor)
+  # plus one delegation.
+  - user: tenant:acme
+    relation: parent
+    object: conversation:acme/c-1
+  - user: tenant:acme
+    relation: parent
+    object: conversation:acme/c-2
+  - user: tenant:acme
+    relation: parent
+    object: conversation:acme/c-3
+  - user: user:bob
+    relation: participant
+    object: conversation:acme/c-1
+  - user: agent:bot
+    relation: actor
+    object: conversation:acme/c-2
+  - user: agent:bot
+    relation: delegate
+    object: conversation:acme/c-1
+  # MCP tools inside acme; bot may call query_logs only.
+  - user: tenant:acme
+    relation: parent
+    object: tool:acme/query_logs
+  - user: tenant:acme
+    relation: parent
+    object: tool:acme/template_drift
+  - user: agent:bot
+    relation: caller
+    object: tool:acme/query_logs
+
+tests:
+  - name: layer 1 — tenant-wide read, write, ownership through the team
+    check:
+      - user: user:alice
+        object: tenant:acme
+        assertions:
+          can_read_content: true
+          can_read_metadata: true
+          can_write: false
+      - user: user:fin
+        object: tenant:acme
+        assertions:
+          can_read_metadata: true
+          can_read_content: false
+      - user: service_account:collector-cluster1
+        object: tenant:acme
+        assertions:
+          can_write: true
+          can_read_content: false
+      - user: user:jens
+        object: tenant:acme
+        assertions:
+          can_write: true
+          can_read_content: true
+      - user: user:alice
+        object: tenant:globex
+        assertions:
+          can_read_content: false
+          can_read_metadata: false
+    list_objects:
+      - user: user:alice
+        type: tenant
+        assertions:
+          can_read_content:
+            - tenant:acme
+          can_write: []
+      - user: service_account:collector-cluster1
+        type: tenant
+        assertions:
+          can_write:
+            - tenant:acme
+      - user: user:mallory
+        type: tenant
+        assertions:
+          can_read_content:
+            - tenant:globex
+
+  - name: layer 2 — tenant-wide readers see every conversation, fin only metadata
+    check:
+      - user: user:alice
+        object: conversation:acme/c-3
+        assertions:
+          can_read_content: true
+      - user: user:fin
+        object: conversation:acme/c-3
+        assertions:
+          can_read_metadata: true
+          can_read_content: false
+    list_objects:
+      - user: user:alice
+        type: conversation
+        assertions:
+          can_read_content:
+            - conversation:acme/c-1
+            - conversation:acme/c-2
+            - conversation:acme/c-3
+
+  - name: layer 2 — participants and agents read only their own conversations
+    check:
+      - user: user:bob
+        object: conversation:acme/c-1
+        assertions:
+          can_read_content: true
+      - user: user:bob
+        object: conversation:acme/c-2
+        assertions:
+          can_read_content: false
+      - user: agent:bot
+        object: conversation:acme/c-2
+        assertions:
+          can_read_content: true
+      - user: agent:bot
+        object: conversation:acme/c-3
+        assertions:
+          can_read_content: false
+      - user: agent:bot
+        object: tenant:acme
+        assertions:
+          can_read_content: false
+    list_objects:
+      - user: user:bob
+        type: conversation
+        assertions:
+          can_read_content:
+            - conversation:acme/c-1
+      - user: agent:bot
+        type: conversation
+        assertions:
+          # c-2 as actor, c-1 as delegate — never c-3
+          can_read_content:
+            - conversation:acme/c-1
+            - conversation:acme/c-2
+      - user: user:mallory
+        type: conversation
+        assertions:
+          can_read_content: []
+
+  - name: MCP tools — tenant-wide readers call everything, an agent only what it was granted
+    check:
+      - user: user:alice
+        object: tool:acme/template_drift
+        assertions:
+          can_call: true
+      - user: agent:bot
+        object: tool:acme/query_logs
+        assertions:
+          can_call: true
+      - user: agent:bot
+        object: tool:acme/template_drift
+        assertions:
+          can_call: false
+      - user: user:fin
+        object: tool:acme/query_logs
+        assertions:
+          can_call: false
+    list_users:
+      - object: tool:acme/query_logs
+        user_filter:
+          - type: agent
+        assertions:
+          can_call:
+            users:
+              - agent:bot

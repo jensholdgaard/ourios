@@ -1,16 +1,28 @@
 ---
 rfc: 0045
 title: Operator-configured composite tenant derivation
-status: green
+status: superseded
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
 supersedes: —
-superseded-by: —
+superseded-by: RFC 0046
 ---
 
 # RFC 0045 — Operator-configured composite tenant derivation
 
+> **Status: `superseded` by RFC 0046 (2026-08-17).** The maintainer ruled
+> the same day that tenancy does not reside in OTLP data — no resource
+> attribute is ever a tenancy input — so the in-band composite derivation
+> this RFC specified was the wrong model, not a bad rule. RFC 0046 (out-of-
+> band tenancy) replaced §3.1–§3.4 (rule, epoch log, divergence detector)
+> in #702; the `Store` double-encoding fix of §3.2 and `TenantId` opacity
+> survive. The registry entries the detector minted are `deprecated`, not
+> deleted. Kept as the record of a `green` implementation and of the
+> reasoning that led out of it.
+>
+> *(`green`, earlier the same day, before the ruling:)*
+>
 > **Status: `green` (2026-08-17).** All ten §5 criteria pass, landed in
 > one implementation PR (#692) of six slices the same day as the spec
 > (#689): the `TenantRule` key list + `receiver.tenant` config (.1/.2/.3/.4/.6);

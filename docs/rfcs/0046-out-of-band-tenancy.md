@@ -1,7 +1,7 @@
 ---
 rfc: 0046
 title: Out-of-band tenancy — the credential names the tenant, the data never does
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
@@ -11,17 +11,32 @@ superseded-by: —
 
 # RFC 0046 — Out-of-band tenancy
 
-> **Status: `specified` (2026-08-17).** §5 criteria written and testable.
-> Premise settled by the maintainer the same day: tenancy does not reside
-> in OTLP data — no resource attribute (`service.name` included) is ever a
-> tenancy input. That is also the #688 OTel-docs finding (OTel's own
-> multi-tenancy is out-of-band: collector metadata routing + an auth
-> extension, `headers_setter` → `X-Scope-OrgID`), which the #688 strawman
-> and RFC 0045 drifted from for a zero-config default. RFC 0045 stays
-> `green` as an implemented mechanism and is superseded by this RFC (its
-> frontmatter gains `superseded-by: RFC 0046` when this RFC lands); the
-> finer-grained replacements — RFC 0003 §6.3 / RFC0003.3–.4 (fan-out) and
-> RFC 0001 §6.1 *Tenant derivation* — are recorded in §3.2 and §3.4.
+> **Status: `green` (2026-08-17).** All eleven §5 criteria pass, landed in
+> one implementation PR (#702) the same day as the spec (#699): the
+> `0x03 TenantOtlpBatch` frame + codec (`ourios-wal`); the selector,
+> one-export-one-tenant materialisation, binding-on-selector and the
+> removal of derivation / the epoch log / the detector (`ourios-ingester`);
+> the config-surface removal, docs, Helm, dogfood, kind smoke test and
+> Collector interop header (`ourios-server` + surface). RFC0046.1/.2/.3/.7/
+> .10 served-binary over both transports, .4 on the WAL crash shape, .5/.11
+> at the recovery driver, .6 as a `0x03` dimension over the RFC 0008
+> harnesses, .8 in the collector interop job, .9 by grep. Two things
+> implementation forced on the spec, both recorded inline: `reject` names
+> the frame kind (§3.3), and the gRPC non-ASCII caveat is enforced by
+> `MetadataValue::to_str` (obs-text bytes are admitted, then refused as
+> not-text). No thesis-gate applies (`validated` vacuous, RFC 0008/0044
+> precedent); `accepted` is a maintainer flip. **RFC 0045 is superseded**
+> by this RFC as of this flip (its frontmatter says so).
+>
+> *(`specified`, same date: §5 criteria written and testable. Premise
+> settled by the maintainer: tenancy does not reside in OTLP data — no
+> resource attribute (`service.name` included) is ever a tenancy input.
+> That is also the #688 OTel-docs finding — OTel's own multi-tenancy is
+> out-of-band: collector metadata routing + an auth extension,
+> `headers_setter` → `X-Scope-OrgID` — which the #688 strawman and RFC 0045
+> drifted from for a zero-config default. The finer-grained replacements —
+> RFC 0003 §6.3 / RFC0003.3–.4 (fan-out) and RFC 0001 §6.1 *Tenant
+> derivation* — are recorded in §3.2 and §3.4.)*
 
 ## 1. Summary
 

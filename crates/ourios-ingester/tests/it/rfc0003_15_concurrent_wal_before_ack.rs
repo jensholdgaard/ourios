@@ -4,7 +4,7 @@
 //! coordinator serializes appends to the single-writer WAL and folds
 //! their fsyncs into a window — RFC0008.8). Each call is durable before
 //! it acks, so all N succeed and the WAL ends with exactly N durable
-//! `OtlpBatch` frames — none lost or interleaved away.
+//! `TenantOtlpBatch` frames — none lost or interleaved away.
 
 use std::sync::Arc;
 

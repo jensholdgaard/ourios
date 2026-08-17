@@ -276,7 +276,8 @@ dogfood-env:
     #   Copilot CLI:  export COPILOT_OTEL_ENABLED=true
     # opt-in content capture (privacy: retains prompts/tool output):
     #   Claude Code:  export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1
-    # query the ingested logs over HTTP (needs x-ourios-tenant; tenant == service.name):
+    # query the ingested logs over HTTP (x-ourios-tenant = the tenant the exporter
+    # header named; it only happens to equal OTEL_SERVICE_NAME in this setup):
     #   curl -sS http://127.0.0.1:4319/v1/query \
     #     -H 'x-ourios-tenant: agent-dogfood' \
     #     -H 'content-type: text/plain' \

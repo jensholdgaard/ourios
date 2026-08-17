@@ -642,10 +642,14 @@ decoded `ExportLogsServiceRequest` and:
 
 > **Superseded by RFC 0046 (2026-08-17).** The tenant is no longer derived
 > from the payload: every export names it out of band (`X-Ourios-Tenant`
-> / `x-ourios-tenant`, required, one export = one tenant), and a missing
-> or out-of-set selector is the rejection RFC0003.4 described. The text
-> below is kept as the historical design; RFC0003.3 and RFC0003.4 are
-> replaced by RFC0046.3 and RFC0046.1/.2.
+> / `x-ourios-tenant`, required, one export = one tenant). The failure
+> semantics moved with it: a missing or malformed selector is rejected
+> **before** the payload is decoded (`400` / `INVALID_ARGUMENT` naming the
+> header, RFC0046.1/.7), and a selector outside the credential's set is
+> rejected after authentication (`403` / `PERMISSION_DENIED`, RFC0046.2)
+> — neither is the missing-attribute / `ResourceLogs`-index rejection
+> RFC0003.4 described. The text below is kept as the historical design;
+> RFC0003.3 and RFC0003.4 are replaced by RFC0046.3 and RFC0046.1/.2.
 
 Per RFC 0001 §6.1 *Tenant derivation*, `tenant_id` is derived
 per `ResourceLogs` group, not per export batch. The receiver:

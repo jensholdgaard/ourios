@@ -2,7 +2,7 @@
 //!
 //! All three "zero `LogRecord`" shapes — empty `resource_logs`, a
 //! Resource with empty `scope_logs`, and a `ScopeLogs` with empty
-//! `log_records` — are accepted as success with no `OtlpBatch` frame
+//! `log_records` — are accepted as success with no `TenantOtlpBatch` frame
 //! appended and no record reaching the miner.
 
 use crate::ingest_support::{

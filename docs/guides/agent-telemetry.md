@@ -106,9 +106,10 @@ Now ask the agent about itself in plain language — it reads the
 
 > What has `my-agent` cost so far, by model? Use the ourios tools.
 
-Queries are scoped by **tenant**, which is the whole `my-agent`
-`service.name`, not a single run — so this reports every session that
-shared that tenant, not just the current one (see the last note below).
+Queries are scoped by **tenant** — the `x-ourios-tenant` value the
+exporter header set (`my-agent` above), not a single run — so this reports
+every session that shipped under that tenant, not just the current one
+(see the last note below).
 
 Or query the DSL directly. First find your templates — the
 `list_templates` MCP tool (or just ask the agent) lists each
@@ -142,9 +143,10 @@ curl -s http://127.0.0.1:4319/v1/query \
   `attr.model` column to group on.
 - **`CLAUDE_CODE_ENABLE_TELEMETRY=1` alone exports nothing** — the
   `OTEL_LOGS_EXPORTER`/endpoint block in step 2 is what ships the logs.
-- **Queries are tenant-wide, not per-session.** The tenant is the whole
-  `service.name`, so every session that used that name aggregates
-  together. To scope to one run, promote `session.id` (add it to
+- **Queries are tenant-wide, not per-session.** The tenant is the
+  exporter-header value, so every session that shipped under it
+  aggregates together (`service.name` is producer metadata you can
+  filter on, not the tenant). To scope to one run, promote `session.id` (add it to
   `promoted_attributes.log`) and filter on it — e.g.
   `attr.session.id == "…" | sum(attr.cost_usd) by attr.model`.
 

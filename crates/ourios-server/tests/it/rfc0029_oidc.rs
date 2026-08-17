@@ -275,10 +275,10 @@ mod ingest_binding {
         jsonwebtoken::encode(&header, &claims, encoding).expect("mint")
     }
 
-    /// One `ResourceLogs` batch whose tenant derives from `service.name`.
     /// [`batch`] wrapped in a tonic request selecting `tenant` out of band
-    /// (RFC 0046 §3.1) — the batch's `service.name` carries the same value
-    /// as a plain resource attribute.
+    /// (RFC 0046 §3.1); the batch's `service.name` merely carries the same
+    /// string as a plain resource attribute — it is not what selects the
+    /// tenant.
     pub(super) fn tenant_request(tenant: &str) -> tonic::Request<ExportLogsServiceRequest> {
         let mut request = tonic::Request::new(batch(tenant));
         request
@@ -287,6 +287,9 @@ mod ingest_binding {
         request
     }
 
+    /// One `ResourceLogs` batch carrying `tenant` as its `service.name` resource
+    /// attribute — producer metadata only; the tenant itself is selected out of
+    /// band by [`tenant_request`] (RFC 0046).
     pub(super) fn batch(tenant: &str) -> ExportLogsServiceRequest {
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {

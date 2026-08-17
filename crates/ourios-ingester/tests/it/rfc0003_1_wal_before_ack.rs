@@ -1,6 +1,6 @@
 //! RFC0003.1 — WAL-before-ack `[§3.4]`.
 //!
-//! A non-empty batch is acked only after its `OtlpBatch` frame is
+//! A non-empty batch is acked only after its `TenantOtlpBatch` frame is
 //! durably written: when `ingest` returns `Ok`, a fresh WAL replay
 //! finds the frame on disk (it was fsync'd before the ack), and its
 //! payload recovers the export.
@@ -39,11 +39,15 @@ async fn rfc0003_1_no_ack_until_the_batch_is_durable() {
     );
 
     // The ack returned only after the frame was fsync'd: reopening the
-    // WAL and replaying finds exactly one durable OtlpBatch frame whose
+    // WAL and replaying finds exactly one durable TenantOtlpBatch frame whose
     // payload recovers the export content (not just its shape).
     drop(pipeline);
     let frames = replay_frames(tmp.path());
-    assert_eq!(frames.len(), 1, "exactly one OtlpBatch frame is durable");
+    assert_eq!(
+        frames.len(),
+        1,
+        "exactly one TenantOtlpBatch frame is durable"
+    );
     assert_eq!(frames[0].0, FrameKind::TenantOtlpBatch);
     let recovered = decode_protobuf(&frames[0].1)
         .expect("the frame payload is a valid ExportLogsServiceRequest");

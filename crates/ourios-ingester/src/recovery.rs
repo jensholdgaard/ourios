@@ -273,6 +273,7 @@ impl FrameSink for DriverSink<'_> {
             // frame's own CRC passed, so this is not RFC0008.5 corruption.
             FrameKind::OtlpBatch => {
                 return Err(reject(
+                    kind,
                     offset,
                     &"legacy OtlpBatch frame (kind 0x01, pre-RFC 0046) carries no tenant and \
                       cannot be replayed by this version — drain the WAL under the previous \
@@ -280,10 +281,10 @@ impl FrameSink for DriverSink<'_> {
                 ));
             }
             FrameKind::TenantOtlpBatch => {
-                let batch = TenantBatch::decode(payload).map_err(|e| reject(offset, &e))?;
+                let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
                 let tenant = TenantId::new(batch.tenant);
                 let request = ExportLogsServiceRequest::decode(batch.protobuf)
-                    .map_err(|e| reject(offset, &e))?;
+                    .map_err(|e| reject(kind, offset, &e))?;
                 let records = assign(request, &tenant);
                 for record in &records {
                     let feed = match self.horizons.get(&record.tenant_id) {
@@ -312,10 +313,10 @@ impl FrameSink for DriverSink<'_> {
 /// A WAL-fsync'd frame failing decode or fan-out is
 /// corruption-adjacent (it was valid when acked), so replay stops
 /// loudly rather than skipping it.
-fn reject(offset: WalOffset, error: &dyn std::fmt::Display) -> RecoveryError {
+fn reject(kind: FrameKind, offset: WalOffset, error: &dyn std::fmt::Display) -> RecoveryError {
     RecoveryError::SinkRejected {
         detail: format!(
-            "OtlpBatch frame at {}+{}: {error}",
+            "{kind:?} frame at {}+{}: {error}",
             offset.segment, offset.byte
         ),
     }

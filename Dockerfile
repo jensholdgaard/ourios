@@ -8,7 +8,7 @@
 # pinned by digest for reproducibility. This rust ref carries a tag, so
 # Renovate's docker manager bumps both the tag and the digest — no directive
 # comment needed.
-FROM rust:1.97-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS builder
+FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 WORKDIR /build
 COPY . .
 # `--locked` so a stale Cargo.lock fails the build instead of being
@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # and is published multi-arch, so it works under the QEMU cross-build.
 # Pinned by digest for reproducibility; this distroless ref has no explicit
 # tag (implicit :latest), so Renovate updates only the digest.
-FROM gcr.io/distroless/cc-debian12@sha256:e8e7ee4b8b106d4c5fde9e422a321b2b8a2d5cca546c97adcce927f3e1d36e36
+FROM gcr.io/distroless/cc-debian12@sha256:6e1871c34683dc9ee996d13084497783fd98ac0200213d0826625f4e9d4be1d0
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
 # the future query endpoint (RFC 0016) and is intentionally not exposed

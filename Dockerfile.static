@@ -14,7 +14,7 @@
 # so Renovate bumps tag + digest). musl-tools provides the native musl-gcc each
 # architecture leg needs — the CI legs run on native runners, so this is
 # a native musl build, not a cross-compile.
-FROM rust:1.97-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS builder
+FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 # ca-certificates is installed explicitly rather than assumed from the
 # base image — the scratch runtime stage COPYs the bundle out of here.
 RUN apt-get update \
@@ -62,7 +62,7 @@ ENTRYPOINT ["/usr/local/bin/ourios-server"]
 # distroless ref has no explicit tag (implicit :latest), so Renovate updates
 # only the digest. Last stage = the default target,
 # so a plain `docker build -f Dockerfile.static` yields this variant.
-FROM gcr.io/distroless/static-debian12@sha256:a9fcaedd4c9b59e12dd65d954f0b5044f19b0647a8a3712e77205df9e7b102cd AS runtime-static
+FROM gcr.io/distroless/static-debian12@sha256:6447365a6337c3732f412d1b74357b30a633831955b2bc45552b0086be907687 AS runtime-static
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
 # the future query endpoint (RFC 0016) and is intentionally not exposed

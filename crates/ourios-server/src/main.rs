@@ -474,6 +474,12 @@ fn tenant_derivation(section: &TenantSection) -> Result<TenantDerivation, String
     if watch.iter().any(|key| key.trim().is_empty()) {
         return Err("receiver.tenant.watch lists an empty resource attribute key".to_owned());
     }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(duplicate) = watch.iter().find(|key| !seen.insert(key.as_str())) {
+        return Err(format!(
+            "receiver.tenant.watch lists resource attribute key `{duplicate}` more than once"
+        ));
+    }
     let watch_capacity = match section.watch_capacity.as_deref().map(str::trim) {
         Some(raw) if !raw.is_empty() => match raw.parse::<usize>() {
             Ok(n) if n >= 1 => n,
@@ -1813,11 +1819,12 @@ auth:
         for bad_yaml in [
             "receiver:\n  tenant:\n    rule: [service.name, \"\"]\n",
             "receiver:\n  tenant:\n    watch: [\" \"]\n",
+            "receiver:\n  tenant:\n    watch: [cloud.region, cloud.region]\n",
         ] {
             let cfg = parse(bad_yaml, &lookup).expect("valid yaml");
             assert!(
                 tenant_derivation(&cfg.receiver.tenant).is_err(),
-                "blank key rejected: {bad_yaml:?}"
+                "blank or duplicate key rejected: {bad_yaml:?}"
             );
         }
 

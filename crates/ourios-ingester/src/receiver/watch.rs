@@ -36,9 +36,10 @@ pub const MAX_VALUE_BYTES: usize = 128;
 pub const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 struct Entry {
-    /// Exact identity of the first value: digest + byte length. Comparison
-    /// never uses the preview, so values sharing a 128-byte prefix are
-    /// still told apart.
+    /// Fingerprint of the first value: 64-bit digest + byte length (a
+    /// collision is astronomically unlikely and only ever *hides* a
+    /// divergence, never invents one). Comparison never uses the preview,
+    /// so values sharing a 128-byte prefix are still told apart.
     first_digest: u64,
     first_len: usize,
     /// The bounded rendering of the first value, for the warning only.

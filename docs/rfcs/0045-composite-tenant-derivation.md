@@ -1,7 +1,7 @@
 ---
 rfc: 0045
 title: Operator-configured composite tenant derivation
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
@@ -11,10 +11,25 @@ superseded-by: —
 
 # RFC 0045 — Operator-configured composite tenant derivation
 
-> **Status: `specified` (2026-08-17).** §5 criteria written and testable.
-> Grounded in the tenancy concept discussion (#688): the maintainer-settled
-> Q1–Q10 answers (Q1–Q7 in the issue body, Q8–Q10 raised and settled in its
-> comment thread) are this RFC's premises, restated in §2/§3 where they bind.
+> **Status: `green` (2026-08-17).** All ten §5 criteria pass, landed in
+> one implementation PR (#692) of six slices the same day as the spec
+> (#689): the `TenantRule` key list + `receiver.tenant` config (.1/.2/.3/.4/.6);
+> the rule-epoch log (.10, on the RFC0014.5 crash fixture); the divergence
+> detector + `ourios.receiver.tenant.divergences` (.7/.9); the served-binary
+> sequence over one store + WAL — default → composite → composite + token
+> (.2/.3/.4/.5/.8); a Helm `receiver.tenant` passthrough. Two things
+> implementation forced on the spec, both recorded inline: the `Store`
+> double-encoded any tenant id with a reserved character (§3.2 — fixed as
+> `fix(parquet)!`, one-shot prefix rename for legacy objects), and the
+> detector compares a digest + length rather than the 128-byte preview
+> (§3.4). No thesis-gate applies (`validated` vacuous, RFC 0008/0044
+> precedent); `accepted` is a maintainer flip.
+>
+> *(`specified`, same date: §5 criteria written and testable. Grounded in
+> the tenancy concept discussion (#688): the maintainer-settled Q1–Q10
+> answers (Q1–Q7 in the issue body, Q8–Q10 raised and settled in its
+> comment thread) are this RFC's premises, restated in §2/§3 where they
+> bind.)*
 
 ## 1. Summary
 
@@ -168,8 +183,9 @@ frame. On startup, after replay and **before either listener is bound**
 durable), if the configured rule differs from the newest entry's rule, a
 new entry is appended with `after` = the highest offset replay delivered.
 Replay delivers every surviving frame, so a `None` there means the WAL
-holds no frames at all; the entry is then written with `after: null` and
-shadows its predecessors — nothing exists to attribute to them. Every WAL
+holds no frames at all; the log then collapses to the single entry
+`{rule, null}` — nothing exists to attribute to earlier epochs — so only
+the first entry is ever unbounded. Every WAL
 offset is globally ordered (UUIDv7 segment, byte), so "which epoch" is one
 comparison.
 
@@ -178,9 +194,10 @@ comparison.
 checkpoint file, so a crash leaves either the previous log or the new one,
 never a torn file. On load the log must be an object with a non-empty
 `epochs` array; every entry a valid rule (non-empty, no duplicate keys) and
-either `after: null` or a `{segment: UUID, byte}` offset; and successive
-non-null `after` values non-decreasing (an equal boundary is allowed — the
-later entry wins for frames above it, which is what append order means).
+the first with `after: null` and every later one with a
+`{segment: UUID, byte}` offset; and successive `after` values
+non-decreasing (an equal boundary is allowed — the later entry wins for
+frames above it, which is what append order means).
 Anything else, and an absent `epochs`, aborts startup naming the file
 (corruption class, like a bad segment header). An absent *file* means one
 implicit epoch, `{[service.name], null}` — every pre-RFC WAL is that epoch,

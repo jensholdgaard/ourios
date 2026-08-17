@@ -76,7 +76,9 @@ receiver:
 
 - An empty `rule` list is a startup configuration error. A duplicate key in
   `rule` is a startup configuration error. A key listed in both `rule` and
-  `watch` is accepted and simply not watched (§3.4).
+  `watch` is accepted and simply not watched (§3.4). `watch_capacity` must
+  be an integer ≥ 1 — `0` and negative values are startup configuration
+  errors (an operator who wants no watching sets `watch: []`).
 - Derivation is per-`ResourceLogs` group from `Resource.attributes`,
   unchanged in shape. **Every key in `rule` is required**: any group whose
   resource lacks a `rule` key, or carries it with a non-string or
@@ -118,6 +120,21 @@ never found such a tenant's objects. Invisible while tenant ids were plain
 `service.name` values; unavoidable once ids carry `/`. Keys are parsed
 (stored verbatim) instead; RFC0045.2/.4 exercise the fix end-to-end.
 
+*Legacy objects.* A pre-fix deployment whose `service.name` values contained
+any character outside the unreserved set (`/`, `%`, `=`, `:`, space, …)
+wrote that tenant's objects under the doubly-encoded key. Those objects
+were already unreadable on the local backend and mis-attributed by the
+compactor's `percent_decode_tenant`; on S3 they were readable only because
+the writer and the remote read path shared the same double encoding. No
+dual-read is built: this is a pre-release fix, no correct deployment could
+have depended on the layout, and a read-side fallback would have to live in
+every consumer forever. The fix ships as a conventional breaking change
+(`fix(parquet)!`) whose note names the one-shot migration — rename the
+`tenant_id=<double-encoded>` prefix to `tenant_id=<encoded>` (an object
+copy on S3, a directory rename locally). Tenants whose ids are unreserved
+throughout — every plain `service.name` — have identical keys before and
+after.
+
 ### 3.3 Epoch semantics
 
 Derivation happens at ingest, once. A rule change (config edit + restart)
@@ -145,15 +162,30 @@ like the checkpoint file, not a new WAL frame kind; written
 temp-file → rename → directory fsync): an ordered list of
 `{rule, after}` entries meaning "frames with offset > `after` derive under
 `rule`" (`after: null` = from the beginning). Replay picks each frame's
-epoch by offset. On startup, after replay, if the configured rule differs
-from the newest entry's rule, a new entry is appended with `after` = the
-highest offset replay delivered. An absent log means one implicit epoch,
-`{[service.name], null}` — every pre-RFC WAL is that epoch, so the upgrade
-needs no migration. A log that exists but fails to parse aborts startup
-loudly (corruption class, like a bad segment header). Entries are never
-pruned; a rule change is rare and the file stays a few lines. Every WAL
+epoch by offset: the newest entry whose `after` lies strictly below the
+frame. On startup, after replay and **before either listener is bound**
+(so no frame can be acknowledged under the new rule until the entry is
+durable), if the configured rule differs from the newest entry's rule, a
+new entry is appended with `after` = the highest offset replay delivered.
+Replay delivers every surviving frame, so a `None` there means the WAL
+holds no frames at all; the entry is then written with `after: null` and
+shadows its predecessors — nothing exists to attribute to them. Every WAL
 offset is globally ordered (UUIDv7 segment, byte), so "which epoch" is one
 comparison.
+
+*Durability and validation.* The sidecar is written as temp file →
+`fsync(file)` → `rename` → `fsync(directory)`, the same sequence as the
+checkpoint file, so a crash leaves either the previous log or the new one,
+never a torn file. On load the log must be an object with a non-empty
+`epochs` array; every entry a valid rule (non-empty, no duplicate keys) and
+either `after: null` or a `{segment: UUID, byte}` offset; and successive
+non-null `after` values non-decreasing (an equal boundary is allowed — the
+later entry wins for frames above it, which is what append order means).
+Anything else, and an absent `epochs`, aborts startup naming the file
+(corruption class, like a bad segment header). An absent *file* means one
+implicit epoch, `{[service.name], null}` — every pre-RFC WAL is that epoch,
+so the upgrade needs no migration. Entries are never pruned; a rule change
+is rare and the file stays a few lines.
 
 Read-time tenant *aliasing* (query tenant X also reads legacy tenant Y
 through an explicit, audited mapping) is the named escape hatch if
@@ -178,17 +210,26 @@ map is full, new (tenant, key) pairs are not admitted and are not watched;
 a single warning announces saturation (once per process lifetime), so an
 un-watched tenant is a known, logged condition rather than a silent one.
 No eviction — first-observed semantics have no meaningful "least recently
-used" entry, and evicting would only trade one blind spot for another.
-State resets on restart (documented; the detector is best-effort by
-design, and the first divergent batch after restart re-announces).
+used" entry, and evicting would only trade one blind spot for another. The
+bound is an entry count, not a byte budget: each entry holds the tenant id
+(a string storage already holds per partition), the watched key (operator
+config), a 64-bit digest and the length of the first value, and its ≤128-byte
+preview — so the memory ceiling is `watch_capacity × (|tenant| + |key| +
+~160 B)`. State resets on restart (documented; the detector is best-effort
+by design): the first value seen after a restart becomes the new baseline,
+so a divergence that straddles the restart is not announced — only a
+divergence observed within one process lifetime is.
 
 **Value representation.** Only non-empty string values are observed
 (§3.1); non-string values never reach the detector, so nothing needs a
-serialization. Each stored and logged value is bounded to 128 bytes —
-longer values are truncated at a UTF-8 boundary and marked with a
-trailing `…` — which caps both the memory per entry and the log line. The
-warning is rate-limited per (tenant, key), so a persistently divergent
-tenant produces one line per rate window, not one per batch. Redaction is
+serialization. Comparison is exact: the detector keeps a 64-bit digest plus
+the byte length of the first value and compares later values against both,
+so two values that share a long common prefix are still told apart. What
+is *stored for display and logged* is a preview bounded to 128 bytes —
+longer values are truncated at a UTF-8 boundary and marked with a trailing
+`…` — which caps both the memory per entry and the log line. The warning is
+rate-limited per (tenant, key), so a persistently divergent tenant produces
+one line per rate window, not one per batch. Redaction is
 not applied: `watch` keys are operator-selected producer descriptors, and
 selecting a key opts its values into the operator's own logs exactly as
 selecting a `rule` key opts them into tenant ids and storage paths.
@@ -253,7 +294,9 @@ Scenario ids `RFC0045.<n>`.
 > `receiver.tenant` section, When the server starts, Then derivation uses
 > `[service.name]`; Given `rule: []`, Then startup fails with a
 > configuration error; Given `rule: [service.name, service.name]`, Then
-> startup fails with a configuration error.
+> startup fails with a configuration error; Given `watch_capacity: 0` (or a
+> negative or non-integer value), Then startup fails with a configuration
+> error.
 
 > **RFC0045.2 — the S2 scenario end-to-end.** Given
 > `rule: [k8s.cluster.name, service.name]` and two exports whose resources
@@ -296,7 +339,9 @@ Scenario ids `RFC0045.<n>`.
 > Given a group lacking `k8s.cluster.name` (or carrying it non-string or
 > empty), Then the export is accepted and that group is not observed; And
 > Given a divergent value longer than 128 bytes, Then the warning carries
-> the value truncated at a UTF-8 boundary with a trailing `…`.
+> the value truncated at a UTF-8 boundary with a trailing `…`; And Given
+> two values that agree on their first 128 bytes and differ after, Then the
+> divergence is still detected and counted.
 
 > **RFC0045.8 — auth binding unchanged.** Given auth enabled with a token
 > bound to `cluster1/fluxcd` and the composite rule, When an export
@@ -310,14 +355,16 @@ Scenario ids `RFC0045.<n>`.
 > every export is accepted.
 
 > **RFC0045.10 — WAL tail keeps its epoch.** Given records acknowledged
-> under the default rule whose frames are still in the WAL (un-flushed),
-> When the server restarts with the composite rule, Then recovery derives
-> those frames under `[service.name]` — they land only in their original
-> tenant, no duplicate exists in any composite tenant, startup succeeds
-> even though the frames lack `k8s.cluster.name`, and the epoch log gains
-> one entry; And Given no epoch log exists beside a pre-RFC WAL, Then
-> replay behaves as a single `[service.name]` epoch; And Given an
-> unparseable epoch log, Then startup aborts naming the file.
+> under the default rule whose frames are still in the WAL — un-flushed
+> after a crash, or retained after a clean shutdown — When the server
+> restarts with the composite rule, Then recovery derives those frames
+> under `[service.name]` — they land only in their original tenant, no
+> duplicate exists in any composite tenant, startup succeeds even though
+> the frames lack `k8s.cluster.name`, and the epoch log gains one entry;
+> And Given no epoch log exists beside a pre-RFC WAL, Then replay behaves
+> as a single `[service.name]` epoch; And Given an epoch log that is
+> unparseable, has no entries, or whose `after` boundaries go backwards,
+> Then startup aborts naming the file.
 
 ## 6. Testing strategy
 
@@ -333,8 +380,12 @@ harnesses; RFC0045.6 is the existing suite plus two rule-level cases.
 RFC0045.7/.9 assert on captured `tracing` output and the counter, in the
 pattern the RFC 0026 telemetry tests use. RFC0045.10 extends the RFC0014.5
 crash/replay harness (ingest → kill before flush → restart with a
-different rule) plus unit tests for the epoch log's parse, append, and
-by-offset lookup.
+different rule) plus unit tests for the epoch log's parse (including the
+rejection cases), append, and by-offset lookup; the retained-after-clean-
+shutdown arm is the served-binary RFC0045.5 sequence, where the phase-1
+frame (which carries the composite keys) must not reappear as a duplicate
+in the composite tenant after the rule change — a re-derivation at replay
+would put it there.
 
 ## 7. Open questions
 

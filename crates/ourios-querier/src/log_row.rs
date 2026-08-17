@@ -129,6 +129,10 @@ pub enum LogBody {
     /// JSON `body`, returned as the typed value (any non-`String` variant:
     /// kvlist / array or a scalar int / bool / bytes), never flattened.
     Structured(AnyValue),
+    /// The body was withheld from a metadata-only reader (RFC 0047 §3.4
+    /// masking). Distinct from [`LogBody::Absent`]: the record has a body;
+    /// this principal may not read it.
+    Masked,
     /// `body_kind = Absent` — the wire delivered no body (RFC 0025
     /// §3.2). Deliberately distinct from
     /// [`LogBody::Rendered`] with an empty line: an empty-string
@@ -185,6 +189,15 @@ pub fn render_log_body(record: &MinedRecord, registry: &TemplateRegistry) -> Log
 }
 
 #[cfg(test)]
+impl LogRow {
+    /// A row with every field at its zero value — the fixture other
+    /// in-crate unit tests mutate.
+    pub(crate) fn test_row() -> Self {
+        Self::from_record(&tests::record(BodyKind::Absent), &TemplateRegistry::new())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use ourios_core::otlp::any_value::Value;
     use ourios_core::otlp::canonical::encode_any_value;
@@ -196,7 +209,7 @@ mod tests {
         AnyValue, BodyKind, LogBody, MinedRecord, Reconstruction, TemplateRegistry, render_log_body,
     };
 
-    fn record(body_kind: BodyKind) -> MinedRecord {
+    pub(super) fn record(body_kind: BodyKind) -> MinedRecord {
         MinedRecord {
             tenant_id: TenantId::new("t"),
             template_id: 0,

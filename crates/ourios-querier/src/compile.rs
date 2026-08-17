@@ -99,6 +99,9 @@ pub(crate) struct Plan {
     body_equalities: BTreeMap<String, BodyEqualityPlan>,
     pub(crate) limit: Option<usize>,
     pub(crate) aggregate: Option<Aggregate>,
+    /// RFC 0047 §3.4 layer-2 visibility, applied in [`apply`] as one more
+    /// filter over the promoted columns (so it prunes like any predicate).
+    visibility: Option<crate::Visibility>,
 }
 
 /// A validated aggregation stage (RFC 0002 §6.3/§6.5 amendment 2026-07-15 for
@@ -320,6 +323,7 @@ pub(crate) fn compile(
     default_window_nanos: u64,
     alias_map: &AliasMap,
     registry: &TemplateRegistry,
+    visibility: Option<crate::Visibility>,
 ) -> Result<Plan, QueryError> {
     let Validated {
         window,
@@ -343,6 +347,7 @@ pub(crate) fn compile(
         body_equalities,
         limit,
         aggregate,
+        visibility,
     })
 }
 
@@ -487,6 +492,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         // the `Aggregate` node, over the same filtered scan); the caller
         // reads it off the plan before handing the plan here.
         aggregate: _,
+        visibility,
     } = plan;
     // The window filters the *effective* timestamp (RFC 0002 §6.2 amendment
     // 2026-06-11), with the RFC 0005 §3.9 fallback for pre-amendment files;
@@ -501,6 +507,19 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         PredExpr::None => return Ok(None),
         PredExpr::Filter(expr) => {
             df = df.filter(expr).map_err(crate::storage_err)?;
+        }
+    }
+
+    // RFC 0047 §3.4: the scoped principal's `IN (…)` / self fast path — an
+    // ordinary predicate over promoted columns, so it prunes; nothing to
+    // see ⇒ an empty result, not an error.
+    if let Some(visibility) = &visibility {
+        match visibility.filter(&df)? {
+            crate::visibility::VisibilityFilter::Nothing => return Ok(None),
+            crate::visibility::VisibilityFilter::Everything => {}
+            crate::visibility::VisibilityFilter::Only(expr) => {
+                df = df.filter(expr).map_err(crate::storage_err)?;
+            }
         }
     }
 

@@ -120,6 +120,49 @@ impl DivergenceWatch {
     }
 
     fn observe_one(&self, tenant: &TenantId, key: &str, value: &str) {
+        // Decide under the lock, emit outside it: telemetry can block on a
+        // subscriber or exporter and must not stall unrelated ingest.
+        let Some(outcome) = self.classify(tenant, key, value) else {
+            return;
+        };
+        match outcome {
+            Outcome::Saturated => tracing::warn!(
+                name: semconv::EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED,
+                "tenant divergence watch is full ({} entries); further (tenant, key) pairs \
+                 are not watched — raise receiver.tenant.watch_capacity if this matters",
+                self.capacity,
+            ),
+            Outcome::Diverged {
+                first_preview,
+                warn,
+            } => {
+                self.divergences.add(
+                    1,
+                    &[OtelKeyValue::new(
+                        semconv::OURIOS_TENANT_WATCH_KEY,
+                        key.to_owned(),
+                    )],
+                );
+                if warn {
+                    tracing::event!(
+                        name: semconv::EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE,
+                        tracing::Level::WARN,
+                        ourios.tenant = tenant.as_str(),
+                        ourios.tenant.watch.key = key,
+                        ourios.tenant.watch.first_value = first_preview.as_str(),
+                        ourios.tenant.watch.value = bound(value).as_ref(),
+                        "tenant spans more than one value of a watched resource attribute — if \
+                         these are different producers, add the key to receiver.tenant.rule \
+                         (RFC 0045 §3.4)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The locked half of [`observe_one`](Self::observe_one): admit or
+    /// compare, and say what (if anything) to emit once the lock is gone.
+    fn classify(&self, tenant: &TenantId, key: &str, value: &str) -> Option<Outcome> {
         let mut state = self
             .state
             .lock()
@@ -127,16 +170,8 @@ impl DivergenceWatch {
         let slot = (tenant.clone(), key.to_owned());
         let Some(entry) = state.get_mut(&slot) else {
             if state.len() >= self.capacity {
-                if !self.saturated.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        name: semconv::EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED,
-                        "tenant divergence watch is full ({} entries); further (tenant, key) \
-                         pairs are not watched — raise receiver.tenant.watch_capacity if this \
-                         matters",
-                        self.capacity,
-                    );
-                }
-                return;
+                return (!self.saturated.swap(true, Ordering::Relaxed))
+                    .then_some(Outcome::Saturated);
             }
             state.insert(
                 slot,
@@ -147,38 +182,28 @@ impl DivergenceWatch {
                     last_warned: None,
                 },
             );
-            return;
+            return None;
         };
         if entry.first_len == value.len() && entry.first_digest == digest(value) {
-            return;
+            return None;
         }
-        let seen = bound(value);
-        self.divergences.add(
-            1,
-            &[OtelKeyValue::new(
-                semconv::OURIOS_TENANT_WATCH_KEY,
-                key.to_owned(),
-            )],
-        );
         let now = Instant::now();
-        if entry
+        let warn = entry
             .last_warned
-            .is_some_and(|last| now.duration_since(last) < WARN_INTERVAL)
-        {
-            return;
+            .is_none_or(|last| now.duration_since(last) >= WARN_INTERVAL);
+        if warn {
+            entry.last_warned = Some(now);
         }
-        entry.last_warned = Some(now);
-        tracing::event!(
-            name: semconv::EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE,
-            tracing::Level::WARN,
-            ourios.tenant = tenant.as_str(),
-            ourios.tenant.watch.key = key,
-            ourios.tenant.watch.first_value = entry.first_preview.as_str(),
-            ourios.tenant.watch.value = seen.as_ref(),
-            "tenant spans more than one value of a watched resource attribute — if these are \
-             different producers, add the key to receiver.tenant.rule (RFC 0045 §3.4)"
-        );
+        Some(Outcome::Diverged {
+            first_preview: entry.first_preview.clone(),
+            warn,
+        })
     }
+}
+
+enum Outcome {
+    Saturated,
+    Diverged { first_preview: String, warn: bool },
 }
 
 fn string_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a str> {

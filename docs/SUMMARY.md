@@ -73,6 +73,7 @@
 - [RFC 0044 — Template-aware body equality](./rfcs/0044-template-aware-body-equality.md)
 - [RFC 0045 — Composite tenant derivation](./rfcs/0045-composite-tenant-derivation.md)
 - [RFC 0046 — Out-of-band tenancy](./rfcs/0046-out-of-band-tenancy.md)
+- [RFC 0047 — ReBAC resolver and graph-fed visibility](./rfcs/0047-rebac-resolver-and-graph-visibility.md)
 
 # Talks
 

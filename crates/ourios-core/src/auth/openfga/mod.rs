@@ -1,7 +1,7 @@
 //! The RFC 0047 §3.1 `OpenFGA` resolver: configuration and the principal
 //! vocabulary here (always compiled — they are plain data the config
 //! layer maps onto), the HTTP client and the session resolver in
-//! [`client`] behind the `openfga` feature.
+//! the `client` submodule behind the `openfga` feature (re-exported here).
 //!
 //! `OpenFGA` does not authenticate: the static store or the OIDC verifier
 //! establishes *who* the bearer is, and this layer asks the graph *what*

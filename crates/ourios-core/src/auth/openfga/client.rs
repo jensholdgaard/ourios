@@ -451,6 +451,15 @@ struct CachedGrants {
     grants: Grants,
 }
 
+/// The session-cache key: a structured (principal, sorted groups) pair, so
+/// two credentials can never collide through the encoding — `sub` and
+/// group names are untrusted strings and may contain any separator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    principal: Principal,
+    groups: Vec<String>,
+}
+
 /// The session resolver: principal → [`Grants`], cached per credential
 /// for the configured TTL, fail-closed. Errors are never cached, and a
 /// cached answer is never served past its TTL — revocation latency is
@@ -458,7 +467,7 @@ struct CachedGrants {
 pub struct OpenFgaResolver {
     client: OpenFgaClient,
     session_ttl: Duration,
-    cache: Mutex<HashMap<String, CachedGrants>>,
+    cache: Mutex<HashMap<CacheKey, CachedGrants>>,
 }
 
 impl fmt::Debug for OpenFgaResolver {
@@ -527,7 +536,10 @@ impl OpenFgaResolver {
         let mut groups: Vec<String> = groups.to_vec();
         groups.sort();
         groups.dedup();
-        let cache_key = format!("{principal}\n{}", groups.join("\n"));
+        let cache_key = CacheKey {
+            principal: principal.clone(),
+            groups,
+        };
         let now = Instant::now();
         {
             let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -537,7 +549,7 @@ impl OpenFgaResolver {
                 return Ok(cached.grants.clone());
             }
         }
-        let contextual = Self::group_tuples(principal, &groups)?;
+        let contextual = Self::group_tuples(principal, &cache_key.groups)?;
         let user = principal.to_string();
         let query = self.list_tenants(&user, "can_query", &contextual).await?;
         let write = self.list_tenants(&user, "can_write", &contextual).await?;
@@ -885,5 +897,24 @@ mod tests {
             Err(OpenFgaError::TooManyContextualTuples { .. })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 8, "rejected before any call");
+
+        // The cache key is structured: a subject or group carrying a
+        // separator can never alias another session (`"a\nb"` with no
+        // groups vs `"a"` in group `"b"`).
+        let before = calls.load(Ordering::SeqCst);
+        let odd = Principal::new(PrincipalKind::User, "a\nb");
+        resolver.resolve(&odd, &[]).await.expect("resolve");
+        resolver
+            .resolve(
+                &Principal::new(PrincipalKind::User, "a"),
+                &["b".to_string()],
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before + 4,
+            "two distinct sessions, two resolutions — no key collision"
+        );
     }
 }

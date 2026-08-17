@@ -374,11 +374,13 @@ groups:
     metric_name: ourios.auth.resolutions
     stability: development
     brief: >-
-      Credential resolutions by the auth resolver (RFC 0026 static tokens,
-      RFC 0029 OIDC, RFC 0047 OpenFGA): one per authenticated request in a
-      non-open deployment. A failed resolution carries `error.type`
-      (`unauthenticated`, or `upstream_unavailable` when the OpenFGA
-      resolver could not answer and the request failed closed).
+      Credential resolution attempts by the auth resolver (RFC 0026 static
+      tokens, RFC 0029 OIDC, RFC 0047 OpenFGA): one per request that
+      presents itself to a non-open deployment, whether or not it resolves.
+      A successful binding carries no `error.type`; a failed one carries
+      `unauthenticated` (missing/malformed/unknown/unbound credential) or
+      `upstream_unavailable` (the OpenFGA resolver could not answer and the
+      request failed closed).
     instrument: counter
     unit: "{resolution}"
 

@@ -13,11 +13,12 @@
 //! - [`materialize`] — the §6.1 step 2–3 mapping from a decoded
 //!   `LogRecord` to the flat `OtlpLogRecord` the miner consumes (body
 //!   fork + empty-sentinel narrowing).
-//! - [`tenant`] — per-`ResourceLogs` tenant derivation + the
-//!   [`tenant::fan_out`] that tags each record with its `tenant_id`
-//!   (RFC0003.3/.4).
+//! - [`selector`] — the RFC 0046 §3.1 out-of-band tenant selector
+//!   (`X-Ourios-Tenant` / `x-ourios-tenant`), required once per export.
+//! - [`tenant`] — [`tenant::assign`]: every record of the export under the
+//!   selected tenant (RFC 0046 §3.2).
 //! - [`pipeline`] — the §6.5 WAL-before-ack ingest path
-//!   ([`pipeline::IngestPipeline`]): fan out → append one `OtlpBatch`
+//!   ([`pipeline::IngestPipeline`]): assign → append one `TenantOtlpBatch`
 //!   frame → fsync → miner → ack (RFC0003.1/.12).
 //! - [`commit`] — the RFC0008.8 group-commit coordinator
 //!   ([`commit::CommitCoordinator`]): windowed batched fsync that folds

@@ -26,8 +26,8 @@ env:
   IMAGE_REPO: ourios
   IMAGE_TAG: smoke
   KIND_CLUSTER: ourios-smoke
-  # Tenant == the service.name resource attribute (TenantRule::service_name),
-  # so the ingested service.name and the query's X-Ourios-Tenant must match.
+  # The tenant is named out of band (RFC 0046): telemetrygen sends it as the
+  # x-ourios-tenant gRPC header, and the query's X-Ourios-Tenant must match.
   TENANT: ourios-smoke
   S3_BUCKET: ourios-smoke
   # The log line we ingest and expect the querier to reconstruct bit-identically
@@ -141,8 +141,9 @@ jobs:
       # Ingest one OTLP log over gRPC (:4317) with telemetrygen — the
       # OpenTelemetry synthetic-telemetry generator — run as an in-cluster Job
       # against the receiver's gRPC service. A real OTLP client on the wire, not
-      # a hand-built payload. service.name is the tenant; --body is the line the
-      # querier must reconstruct. Image pinned by digest.
+      # a hand-built payload. --otlp-header names the tenant (RFC 0046),
+      # service.name rides along as a plain resource attribute; --body is the
+      # line the querier must reconstruct. Image pinned by digest.
       - name: Ingest OTLP logs (telemetrygen, gRPC)
         run: |
           kubectl apply -f - <<YAML
@@ -163,6 +164,7 @@ jobs:
                       - --otlp-endpoint=ourios-receiver:4317
                       - --otlp-insecure
                       - --logs=1
+                      - --otlp-header=x-ourios-tenant="${TENANT}"
                       - --otlp-attributes=service.name="${TENANT}"
                       - --body=${LOG_BODY}
           YAML

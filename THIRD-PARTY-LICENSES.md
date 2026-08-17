@@ -2509,15 +2509,15 @@ Used by:
 
 Used by:
 
-- `futures-channel` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-core` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-executor` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-io` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-macro` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-sink` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-task` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures-util` 0.3.33 — <https://github.com/rust-lang/futures-rs>
-- `futures` 0.3.33 — <https://github.com/rust-lang/futures-rs>
+- `futures-channel` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-core` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-executor` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-io` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-macro` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-sink` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-task` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures-util` 0.3.34 — <https://github.com/rust-lang/futures-rs>
+- `futures` 0.3.34 — <https://github.com/rust-lang/futures-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -4762,7 +4762,7 @@ Used by:
 - `unicode-segmentation` 1.13.3 — <https://github.com/unicode-rs/unicode-segmentation>
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `url` 2.5.8 — <https://github.com/servo/rust-url>
-- `uuid` 1.24.0 — <https://github.com/uuid-rs/uuid>
+- `uuid` 1.24.1 — <https://github.com/uuid-rs/uuid>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>
 - `wait-timeout` 0.2.1 — <https://github.com/alexcrichton/wait-timeout>
 - `wasi` 0.11.1+wasi-snapshot-preview1 — <https://github.com/bytecodealliance/wasi>

@@ -42,7 +42,7 @@ async fn rfc0003_15_concurrent_exports_are_each_durable() {
         assert!(response.is_ok(), "each concurrent Export acks");
     }
 
-    // ...and every batch is durable: the WAL holds exactly N OtlpBatch
+    // ...and every batch is durable: the WAL holds exactly N TenantOtlpBatch
     // frames (none lost or dropped under concurrency). Drop the last
     // pipeline ref so the WAL handle is released before replay.
     drop(receiver);
@@ -52,6 +52,6 @@ async fn rfc0003_15_concurrent_exports_are_each_durable() {
         frames
             .iter()
             .all(|(kind, _)| *kind == FrameKind::TenantOtlpBatch),
-        "every durable frame is an OtlpBatch",
+        "every durable frame is a TenantOtlpBatch",
     );
 }

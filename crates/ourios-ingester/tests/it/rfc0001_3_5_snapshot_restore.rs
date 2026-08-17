@@ -223,7 +223,7 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     assert_equivalent(&recovered, &control);
 }
 
-/// Mint a closed segment holding one `OtlpBatch` frame per request:
+/// Mint a closed segment holding one `TenantOtlpBatch` frame per request:
 /// build it in a scratch root through the public API, then move the
 /// file into `dest_root` (rotation, RFC0008.6, is not implemented
 /// yet — same construction as ourios-wal's checkpoint tests).

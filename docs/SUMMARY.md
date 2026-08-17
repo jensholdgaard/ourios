@@ -72,6 +72,7 @@
 - [RFC 0043 — Derive event_name from the legacy event.name attribute](./rfcs/0043-event-name-attribute-ingest.md)
 - [RFC 0044 — Template-aware body equality](./rfcs/0044-template-aware-body-equality.md)
 - [RFC 0045 — Composite tenant derivation](./rfcs/0045-composite-tenant-derivation.md)
+- [RFC 0046 — Out-of-band tenancy](./rfcs/0046-out-of-band-tenancy.md)
 
 # Talks
 

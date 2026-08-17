@@ -109,7 +109,14 @@ case is §3.3.
 
 The tenant id remains an opaque string to every downstream consumer (auth,
 storage, query); the partition layer's existing `percent_encode_tenant`
-already makes any tenant id path-safe, so no storage change is required.
+makes any tenant id path-safe, so the on-disk layout needs no change. One
+latent defect on that path does need fixing, and this RFC owns it: the
+`Store` resolved keys with `ObjectPath::from`, which escapes the `%` of an
+already-encoded tenant a second time (`a%2Fb` → `a%252Fb`), so the local
+querier's `tenant_id=<enc>` join and the compactor's `percent_decode_tenant`
+never found such a tenant's objects. Invisible while tenant ids were plain
+`service.name` values; unavoidable once ids carry `/`. Keys are parsed
+(stored verbatim) instead; RFC0045.2/.4 exercise the fix end-to-end.
 
 ### 3.3 Epoch semantics
 

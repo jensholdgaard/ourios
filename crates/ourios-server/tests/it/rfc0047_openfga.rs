@@ -1,5 +1,5 @@
-//! RFC 0047 §5 — the OpenFGA resolver on the served binary, against a
-//! **real OpenFGA container** (testcontainers; CI-gated like the RFC 0029
+//! RFC 0047 §5 — the `OpenFGA` resolver on the served binary, against a
+//! **real `OpenFGA` container** (testcontainers; CI-gated like the RFC 0029
 //! Dex job — `#[ignore]`d in the default run) loaded with the in-tree
 //! model (`deploy/openfga/model.json`, the `fga model transform` of
 //! `model.fga`).
@@ -89,9 +89,10 @@ fn tuple(user: &str, relation: &str, object: &str) -> TupleKey {
 /// Scenarios RFC0047.1–.3 on the served binary. One container, one
 /// server: alice (tenant reader), the collector (tenant writer, static
 /// token), bob (participant + binding tuple), fin (metadata reader) and a
-/// principal with no tuples establish sessions; then OpenFGA is stopped
+/// principal with no tuples establish sessions; then `OpenFGA` is stopped
 /// and every path fails closed once the short session TTL lapses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // one container + one server, every arm in sequence
 #[ignore = "RFC0047.1–.3 — needs Docker (real OpenFGA container); run by the openfga-resolver CI job via --ignored"]
 async fn rfc0047_1_to_3_resolver_end_to_end() {
     // --- OpenFGA -----------------------------------------------------------

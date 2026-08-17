@@ -21,9 +21,18 @@ type tenant
     define writer: [service_account, team#member]
     define reader: [user, service_account, team#member]
     define metadata_reader: [user, service_account, team#member]
+    # Data-derived binding (RFC 0047 §3.3): the principal holds a grant on at
+    # least one conversation in this tenant. Written by the emitter next to
+    # every participant/actor tuple (and by operators next to a delegate
+    # tuple); grants NO tenant-wide read on its own — layer 2 decides rows.
+    define scoped_reader: [user, agent]
     define can_write: writer or owner
     define can_read_metadata: metadata_reader or reader or owner
     define can_read_content: reader or owner
+    # The session-binding capability (§3.1): the tenant may be queried at all.
+    # Tenant-wide readers and scoped principals bind; how much they see is
+    # the planner's two-step (§3.4), never this relation.
+    define can_query: can_read_metadata or scoped_reader
 
 type conversation
   relations

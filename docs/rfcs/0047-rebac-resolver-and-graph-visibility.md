@@ -32,10 +32,11 @@ the OpenTelemetry GenAI identifiers already stored as promoted columns —
 `gen_ai.conversation.id`, `user.hash` / `enduser.pseudo.id`,
 `gen_ai.agent.id`, `gen_ai.workflow.name` — are graph nodes; enforcement is
 **query rewrite at plan time**, never per-record checks: `Check(principal,
-can_read_content, tenant)` first, and only for principals *without*
-tenant-wide read a bounded, streamed `ListObjects(conversation)` that becomes
-an `IN (…)` predicate over the promoted column, failing closed past an
-explicit bound. Content and metadata are separate relations, mapped to
+can_read_content, tenant)` first, then `Check(can_read_metadata, tenant)`
+(tenant-wide with content masked), and only for scoped principals a
+bounded, streamed `ListObjects(conversation)` — filtered and counted per
+tenant — that becomes an `IN (…)` predicate over the promoted column,
+failing closed past an explicit bound or an incomplete stream. Content and metadata are separate relations, mapped to
 column masking. Agents are first-class principals; MCP tools are graph
 objects (`can_call`). Tuples are written asynchronously from stored data by a
 tenant-scoped emitter riding the compaction pass; erasure removes them the
@@ -107,17 +108,38 @@ At session establishment (bearer resolved by the static or OIDC path first
 credential to a **principal**: a static token → `service_account:<name>`,
 an OIDC subject → `user:<sub>` unless the token carries the configured
 agent claim (`auth.oidc.agent_claim`, e.g. `ourios_principal_type=agent`) →
-`agent:<sub>`. It then issues `ListObjects(principal, can_read_content,
-tenant)` and `ListObjects(principal, can_write, tenant)` (bounded, streamed
-— tenant sets are small by construction) and produces the same
+`agent:<sub>`. It then issues `ListObjects(principal, can_query, tenant)`
+and `ListObjects(principal, can_write, tenant)` (bounded, streamed —
+tenant sets are small by construction) and produces the same
 `AuthBinding { name, tenant-set }` RFC 0026 enforcement consumes; a
-principal with no readable and no writable tenant is unbound (401-class).
+principal with no queryable and no writable tenant is unbound (401-class).
+`can_query` is the **binding** capability, deliberately distinct from the
+read capabilities: it holds for tenant-wide content readers, tenant-wide
+metadata readers, *and* scoped principals (`scoped_reader` — a participant,
+actor or delegate on some conversation in the tenant, §3.2/§3.3), so a
+participant like `user:bob` or an agent like `agent:bot` binds the tenant
+and reaches the planner, where the two-step (§3.4) decides *which rows*.
+Binding never grants reading: `can_read_content` / `can_read_metadata` /
+`can_write` stay separate relations, and the model tests assert that scoped
+and metadata-only principals hold `can_query` without tenant-wide content.
 The binding is cached per credential for `session_ttl_secs`, **fail-closed**:
 an OpenFGA error or timeout during resolution is a `503` on the query side
 and `UNAVAILABLE`/`503` on ingest, never an open door, and never a stale
 grant past the TTL. Revocation latency ≡ TTL; `higher_consistency` bypasses
 OpenFGA's own cache after writes. Ingest authorization is exactly RFC 0046
 §3.5: the out-of-band selector ∈ the resolved write set.
+
+**Token claims as contextual tuples.** An OIDC token's group claim
+(`auth.oidc.groups_claim`, e.g. Dex `groups`) is passed to the resolver's
+`ListObjects` calls as contextual tuples `team:<group>#member@<principal>`
+— OpenFGA's documented pattern for claims-carried membership — so team
+membership needs no synchronisation pipeline; only the stable edges
+(`team#owner/reader` on tenants) are stored tuples written by operators.
+Contextual tuples cap at 100 per request (a token with more groups than
+that fails resolution closed, named error), are never persisted, and their
+effect lives exactly as long as the session — the same
+`session_ttl_secs` bound as everything else, so a group revocation in the
+IdP is honoured on the next resolution.
 
 ### 3.2 The authorization model
 
@@ -145,9 +167,11 @@ type tenant
     define writer: [service_account, team#member]
     define reader: [user, service_account, team#member]
     define metadata_reader: [user, service_account, team#member]
+    define scoped_reader: [user, agent]            # data-derived binding (§3.3)
     define can_write: writer or owner
     define can_read_metadata: metadata_reader or reader or owner
     define can_read_content: reader or owner
+    define can_query: can_read_metadata or scoped_reader   # session binding (§3.1)
 
 type conversation
   relations
@@ -185,26 +209,45 @@ duplicates ignored):
 
 | From promoted column(s) | Tuple |
 |---|---|
-| every distinct `gen_ai.conversation.id` in tenant T | `conversation:<id>#parent@tenant:T` |
-| (`gen_ai.conversation.id`, `user.hash` or `enduser.pseudo.id`) | `conversation:<id>#participant@user:<hash>` |
-| (`gen_ai.conversation.id`, `gen_ai.agent.id`) | `conversation:<id>#actor@agent:<id>` |
+| every distinct `gen_ai.conversation.id` in tenant T | `conversation:T/<id>#parent@tenant:T` |
+| (`gen_ai.conversation.id`, `user.hash` or `enduser.pseudo.id`) | `conversation:T/<id>#participant@user:<hash>` **and** `tenant:T#scoped_reader@user:<hash>` |
+| (`gen_ai.conversation.id`, `gen_ai.agent.id`) | `conversation:T/<id>#actor@agent:<id>` **and** `tenant:T#scoped_reader@agent:<id>` |
 
-Object ids are **tenant-prefixed** (`conversation:T/<id>`): OpenFGA object
-ids are opaque strings in one store, so the same raw conversation id in two
-tenants must be two objects; the `parent` tuple carries the tenant edge and
-the planner strips the prefix when it builds predicates (§3.4). A pure
-naming rule, mirrored in exactly two places (emitter, planner). Ownership
-tuples (`tenant#owner/writer/reader`, `team#member`, `tool#caller`,
-`conversation#delegate`) are administrative: written by operators through
-OpenFGA's own API/CLI, never by Ourios.
+Object ids are **tenant-prefixed** (`conversation:T/<id>`) in every tuple
+the emitter writes and every id the planner reads: OpenFGA object ids are
+opaque strings in one store, so the same raw conversation id in two tenants
+must be two objects; the `parent` tuple carries the tenant edge and the
+planner strips the prefix when it builds predicates (§3.4). A pure naming
+rule, mirrored in exactly two places (emitter, planner).
+
+The **binding tuple** (`tenant:T#scoped_reader@<principal>`) rides along
+with every conversation grant so the principal can bind the tenant at
+session establishment (§3.1). It is idempotent like the rest, and **stale
+is safe by construction**: a `scoped_reader` whose last conversation grant
+was erased (§3.6) still binds the tenant, but layer 2 then enumerates
+nothing and — absent the self fast path — the query returns no rows. The
+sweep garbage-collects such tuples best-effort; correctness never depends
+on it. Ownership tuples (`tenant#owner/writer/reader/metadata_reader`,
+`team#member`, `tool#caller`, `conversation#delegate`) are administrative:
+written by operators through OpenFGA's own API/CLI, never by Ourios — and
+a `delegate` grant on `conversation:T/<id>` MUST be paired by the operator
+with `tenant:T#scoped_reader@agent:<id>` for the same reason (documented
+next to the model; the `.fga.yaml` fixture shows the pair).
 
 **Freshness.** A conversation is invisible to fine-grained principals until
 its tuples land (seconds after the next sweep; the emitter is also invoked
 on the receiver's flush cadence for the tenants it flushed). Two bridges,
-both in the planner: (a) the **self fast path** — a `user:` principal always
-gets `user.hash == <principal>` as an additional OR-predicate without
-consulting the graph; (b) **contextual tuples** — a request may carry
-`{conversation:<id>#participant@<principal>}` for ids it just created,
+both in the planner: (a) the **self fast path** — a `user:` principal (and
+only a `user:` principal; agents and service accounts never get it) always
+gets `<self_principal_column> == <subject>` as an additional OR-predicate
+without consulting the graph, where `<subject>` is the principal id with
+its `user:` prefix stripped: `user:bob` matches rows whose promoted
+`attr.user.hash` is `bob`. The path presumes the deployment's
+`self_principal_column` carries the same identity the OIDC subject does
+(the RFC0047.5 fixture emits `user.hash = <sub>`); a deployment whose
+hashes are not subjects leaves `self_principal_column` unset and the fast
+path is disabled — never a mismatched comparison; (b) **contextual tuples** — a request may carry
+`{conversation:T/<id>#participant@<principal>}` for ids it just created,
 passed on `Check`/`ListObjects` and never persisted. Tenant-wide readers
 (the FinOps/operator case) never wait: they resolve at layer 1.
 
@@ -214,28 +257,46 @@ For a query over tenant T by principal P, the planner runs the **two-step**:
 
 1. `Check(P, can_read_content, tenant:T)` (cached with the session, TTL as
    §3.1). **Allowed ⇒ the tenant partition predicate only** — no
-   enumeration, no change to today's plan.
-2. Otherwise `StreamedListObjects(P, can_read_content, conversation)` — the
-   streamed variant, never plain `ListObjects`: the spike showed the plain
-   call **returns HTTP 200 with 1000 objects and no truncation marker** for a
-   tenant-wide reader over 100 000 conversations (13 ms) — a planner that
-   enumerated for such a principal would emit a *wrong* predicate silently.
-   The stream is consumed up to `auth.openfga.visibility.max_objects`
-   (default 10 000); reaching the bound **fails the query closed** with a
-   named error ("visibility set exceeds N objects; ask for tenant-wide read")
-   rather than emitting a giant `IN`. The ids (with the tenant prefix
-   stripped) become `attr.gen_ai.conversation.id IN (…)` — over the promoted
-   column, so RFC 0022/0042 pruning still applies — OR'd with the §3.3 self
-   fast path and any contextual-tuple ids. A principal with an empty set and
-   no fast path gets an empty result, not an error.
-3. `can_read_metadata` without `can_read_content` ⇒ the same predicate plus
-   **column masking**: the configured content columns
+   enumeration, no masking, no change to today's plan.
+2. Otherwise `Check(P, can_read_metadata, tenant:T)`. **Allowed ⇒ the tenant
+   partition predicate plus column masking** — the tenant-wide metadata
+   reader (`user:fin`, RFC0047.8) sees every row with the content columns
+   masked, never an empty result: the configured content columns
    (`auth.openfga.visibility.content_columns`, default the GenAI content
    attributes `gen_ai.input.messages`, `gen_ai.output.messages`,
    `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
    `gen_ai.tool.call.result` and `body`) are projected as NULL, and a query
    that filters or aggregates on a masked column is rejected (`403`, named
    column) rather than answered from data the principal may not read.
+3. Otherwise the principal is scoped (it bound the tenant through
+   `scoped_reader`, §3.1): `StreamedListObjects(P, can_read_content,
+   conversation)` — the streamed variant, never plain `ListObjects`: the
+   spike showed the plain call **returns HTTP 200 with 1000 objects and no
+   truncation marker** for a principal over 100 000 conversations (13 ms) —
+   a planner that enumerated with it would emit a *wrong* predicate
+   silently. The stream is **global to the principal** (OpenFGA enumerates
+   objects, not objects-within-a-tenant), so the planner filters each
+   streamed id by the `T/` prefix and **counts only tenant-T ids** toward
+   `auth.openfga.visibility.max_objects` (default 10 000): another tenant's
+   grants can cost stream time but can never exhaust T's bound. The stream
+   MUST be consumed to completion (or until T's bound is hit) within
+   `auth.openfga.visibility.list_timeout` (default `2s`, below the server's
+   own deadline — see the config note); reaching the
+   bound **fails the query closed** with a named error ("visibility set
+   exceeds N objects in tenant T; ask for tenant-wide read"), and hitting
+   the timeout before the stream ends fails closed too ("visibility
+   enumeration incomplete") — a partial tenant set is never accepted as a
+   predicate. The surviving ids (prefix stripped) become
+   `attr.gen_ai.conversation.id IN (…)` — over the promoted column, so
+   RFC 0022/0042 pruning still applies — OR'd with the §3.3 self fast path
+   and any contextual-tuple ids. A principal with an empty set and no fast
+   path gets an empty result, not an error.
+4. Scoped **metadata-only** grants do not exist in the v1 model (every
+   conversation-level relation — `participant`, `actor`, `delegate` — grants
+   content on that conversation), so there is no fourth branch today. If a
+   future model adds one, the branch is: enumerate `can_read_metadata`
+   conversations exactly as in step 3 and apply step 2's masking to the
+   result — recorded here so the shape is settled before it is needed.
 
 Configuration binds object types to columns explicitly — nothing is
 inferred:
@@ -249,8 +310,17 @@ auth:
           column: attr.gen_ai.conversation.id
       self_principal_column: attr.user.hash          # the §3.3 fast path
       content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
-      max_objects: 10000
+      max_objects: 10000        # tenant-T ids only (§3.4 step 3)
+      list_timeout: 2s          # MUST stay below OPENFGA_LIST_OBJECTS_DEADLINE (3s)
 ```
+
+`list_timeout` is deliberately **below** OpenFGA's own
+`OPENFGA_LIST_OBJECTS_DEADLINE` (server default 3 s, which bounds the
+streamed call too): the client-side timeout must be the one that fires, so
+an incomplete enumeration is always detected here and failed closed, never
+ended quietly by the server. Startup validation rejects a `list_timeout`
+that is not below the configured server deadline when the operator declares
+one (`auth.openfga.server_list_objects_deadline`, default 3 s).
 
 Per-record `Check` calls in the scan path are **never** performed (the
 architectural line from the first spike, confirmed by both reviews).
@@ -311,6 +381,12 @@ a deployment that wants coarse tenants only never touches this RFC.
   walks the data, and the freshness bridges (§3.3) cover the lag.
 - **A second source of truth for tenants** (graph + derived). Removed by
   RFC 0046; this RFC depends on there being exactly one.
+- **One OpenFGA store per tenant** (to make `ListObjects` tenant-constrained
+  natively instead of the §3.4 prefix filter). Rejected: the multi-tenant
+  guidance is one store with a `tenant` object (shared teams, one model
+  version, one migration), and per-store provisioning would have to follow
+  every RFC 0046 tenant's lifecycle. The prefix filter + per-tenant counting
+  is the cost of the single store, paid in the planner.
 
 ## 5. Acceptance criteria
 
@@ -322,8 +398,14 @@ container (testcontainers, like Dex for RFC 0029) with the in-tree model.
 > `service_account:collector` writer on `tenant:acme`, When alice's OIDC
 > bearer establishes a session, Then her binding's read set is `{acme}` and
 > write set empty; And When the collector's token establishes one, Then its
-> write set is `{acme}`; And Given a principal with no tuples, Then the
-> session is unbound (401-class) — never an empty-but-open binding.
+> write set is `{acme}`; And Given `user:bob` with only a `participant`
+> tuple on `conversation:acme/c-1` plus its paired
+> `tenant:acme#scoped_reader` binding tuple, and `user:fin` with only
+> `metadata_reader` on `tenant:acme`, When each establishes a session, Then
+> each binding's read set is `{acme}` (they reach the planner) while
+> `Check(can_read_content, tenant:acme)` is false for both; And Given a
+> principal with no tuples, Then the session is unbound (401-class) — never
+> an empty-but-open binding.
 
 > **RFC0047.2 — ingest binding through the resolver.** Given the collector
 > above, When it exports with selector `acme`, Then it is accepted; with
@@ -343,11 +425,14 @@ container (testcontainers, like Dex for RFC 0029) with the in-tree model.
 > / a counter), and every row is returned.
 
 > **RFC0047.5 — two-step, participant.** Given `user:bob` participant of
-> conversations `c-1` and `c-2` only (tuples), When bob queries `true`,
-> Then exactly the rows of `c-1`/`c-2` return; And Given a further
-> conversation `c-9` whose rows carry `user.hash = bob` but no tuple yet,
-> Then those rows also return (self fast path); And Given a contextual tuple
-> for `c-10` on the request, Then `c-10`'s rows return too.
+> conversations `acme/c-1` and `acme/c-2` only (tuples, with the binding
+> tuple), When bob queries `true` on tenant `acme`, Then exactly the rows of
+> `c-1`/`c-2` return; And Given a further conversation `c-9` whose rows
+> carry `attr.user.hash = bob` (the principal's subject, prefix stripped)
+> but no tuple yet, Then those rows also return (self fast path); And Given
+> a contextual tuple for `c-10` on the request, Then `c-10`'s rows return
+> too; And Given bob is also participant on `globex/c-1` (another tenant),
+> Then that id never appears in the `acme` predicate.
 
 > **RFC0047.6 — agent as principal.** Given `agent:bot` actor on 500
 > conversations and `agent:other` actor on 500 different ones, When bot
@@ -356,15 +441,23 @@ container (testcontainers, like Dex for RFC 0029) with the in-tree model.
 > Then `c-7` returns for bot; And When the delegation tuple is deleted,
 > Then (after the TTL) `c-7` no longer returns.
 
-> **RFC0047.7 — bounded enumeration fails closed.** Given
-> `visibility.max_objects: 100` and an agent actor on 150 conversations,
-> When it queries, Then the query is rejected with the named bound error,
-> no partial result is returned, and the plain (capped) `ListObjects` is
-> never used — the streamed call is what the OpenFGA log shows.
+> **RFC0047.7 — bounded enumeration fails closed, per tenant.** Given
+> `visibility.max_objects: 100` and an agent actor on 150 conversations in
+> `acme`, When it queries `acme`, Then the query is rejected with the named
+> bound error, no partial result is returned, and the plain (capped)
+> `ListObjects` is never used — the streamed call is what the OpenFGA log
+> shows; And Given instead an agent actor on 50 conversations in `acme` and
+> 150 in `globex`, When it queries `acme`, Then the query **succeeds** with
+> exactly the 50 (only tenant-`acme` ids count toward the bound); And Given
+> `visibility.list_timeout` shorter than the stream (a stalled fake), Then
+> the query fails closed with the incomplete-enumeration error, never a
+> partial predicate.
 
 > **RFC0047.8 — metadata without content.** Given `user:fin` with
-> `metadata_reader` on `tenant:acme` only, When fin queries
-> `sum(attr.cost_usd) by attr.model`, Then it succeeds; When fin selects or
+> `metadata_reader` on `tenant:acme` only (no conversation tuples), When
+> fin queries `sum(attr.cost_usd) by attr.model`, Then it succeeds over
+> **every** row of the tenant (the §3.4 step-2 branch — the tenant
+> predicate with masking, no enumeration issued); When fin selects or
 > filters on `body` or `attr.gen_ai.input.messages`, Then rows carry NULL
 > for those columns and a filter on them is `403` naming the column.
 

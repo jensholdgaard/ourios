@@ -149,6 +149,14 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
     )
     .await
     .expect("seed tuples");
+    // Writes are idempotent (`on_duplicate: ignore`): re-seeding is not an
+    // error — the RFC0047.10 emitter relies on this.
+    fga.write(&[tuple("user:alice", "reader", "tenant:acme")], &[])
+        .await
+        .expect("duplicate write ignored");
+    fga.write(&[], &[tuple("user:nobody", "reader", "tenant:acme")])
+        .await
+        .expect("missing delete ignored");
 
     // --- Issuer + server ---------------------------------------------------
     let (encoding, jwk) = make_key("key-1");

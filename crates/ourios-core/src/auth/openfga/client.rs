@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Consistency, OpenFgaConfig, Principal, TENANT_TYPE};
+use super::{Consistency, OpenFgaConfig, Principal, PrincipalKind, TENANT_TYPE};
 
 /// `OpenFGA`'s cap on contextual tuples per request (RFC 0047 §3.1): a
 /// token carrying more groups than this fails resolution closed.
@@ -28,6 +28,14 @@ const MAX_TENANTS_PER_PRINCIPAL: usize = 10_000;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Cache-size threshold past which an insert first sweeps expired entries.
 const CACHE_SWEEP_THRESHOLD: usize = 1024;
+/// Hard capacity of the session cache: past it an insert evicts the entry
+/// closest to expiry, so many live principals cannot grow the map (or the
+/// per-insert sweep) without bound.
+const MAX_CACHE_ENTRIES: usize = 4096;
+/// How much of a non-2xx body is kept for the error message.
+const MAX_ERROR_BODY_BYTES: usize = 512;
+/// `OpenFGA`'s object-id limit.
+const MAX_OBJECT_ID_BYTES: usize = 256;
 
 /// One relationship tuple / tuple key on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,6 +77,13 @@ pub enum OpenFgaError {
         /// How many the caller wanted to send.
         count: usize,
     },
+    /// A token group name that cannot form an `OpenFGA` object id
+    /// (empty, over 256 bytes, or containing `:`, `#` or whitespace) — a
+    /// credential defect, answered like the cap: named, 401-class.
+    InvalidGroup {
+        /// The offending group's position in the token's list.
+        index: usize,
+    },
     /// A streamed enumeration reached the caller's bound before ending.
     BoundExceeded {
         /// The bound that was hit.
@@ -87,6 +102,11 @@ impl fmt::Display for OpenFgaError {
                 f,
                 "openfga: {count} contextual tuples exceed the per-request cap of \
                  {MAX_CONTEXTUAL_TUPLES}"
+            ),
+            Self::InvalidGroup { index } => write!(
+                f,
+                "openfga: token group #{index} cannot form an object id (empty, too long, or \
+                 contains ':', '#' or whitespace)"
             ),
             Self::BoundExceeded { bound } => {
                 write!(
@@ -170,6 +190,14 @@ struct StreamError {
 #[derive(Serialize)]
 struct WriteKeys<'a> {
     tuple_keys: &'a [TupleKey],
+    /// `on_duplicate` (writes) / `on_missing` (deletes) = `ignore`
+    /// (`OpenFGA` ≥ 1.10): the Write is idempotent — an existing tuple or an
+    /// already-gone one is not an error, so the RFC 0047 §3.3 emitter and
+    /// §3.6 erasure need no read-then-diff pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_duplicate: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_missing: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -350,9 +378,11 @@ impl OpenFgaClient {
         Ok(kept)
     }
 
-    /// `Write`: add `writes` and remove `deletes` in one transactional
-    /// call. `OpenFGA` caps a transactional write at 100 tuples; chunking
-    /// (RFC 0047 §3.3) is the caller's job.
+    /// `Write`: add `writes` and remove `deletes` in one transactional,
+    /// **idempotent** call (`on_duplicate` / `on_missing` = `ignore`, so a
+    /// tuple already present or already gone is not an error). `OpenFGA`
+    /// caps a transactional write at 100 tuples; chunking (RFC 0047 §3.3)
+    /// is the caller's job.
     ///
     /// # Errors
     ///
@@ -363,9 +393,15 @@ impl OpenFgaClient {
         deletes: &[TupleKey],
     ) -> Result<(), OpenFgaError> {
         let body = WriteBody {
-            writes: (!writes.is_empty()).then_some(WriteKeys { tuple_keys: writes }),
+            writes: (!writes.is_empty()).then_some(WriteKeys {
+                tuple_keys: writes,
+                on_duplicate: Some("ignore"),
+                on_missing: None,
+            }),
             deletes: (!deletes.is_empty()).then_some(WriteKeys {
                 tuple_keys: deletes,
+                on_duplicate: None,
+                on_missing: Some("ignore"),
             }),
             authorization_model_id: self.authorization_model_id.as_deref(),
         };
@@ -376,6 +412,15 @@ impl OpenFgaClient {
             .map_err(|e| transport(&e))?;
         ok_status(response).await.map(drop)
     }
+}
+
+/// Whether `id` can be the id half of an `OpenFGA` object (`type:id`).
+fn is_object_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_OBJECT_ID_BYTES
+        && !id
+            .chars()
+            .any(|c| c == ':' || c == '#' || c.is_whitespace())
 }
 
 fn transport(e: &reqwest::Error) -> OpenFgaError {
@@ -392,8 +437,18 @@ async fn ok_status(response: reqwest::Response) -> Result<reqwest::Response, Ope
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
-    let body: String = body.chars().take(512).collect();
+    // Read only enough of the error body to be diagnostic: reqwest sets no
+    // response-size limit and this path runs per failed request.
+    let mut response = response;
+    let mut raw: Vec<u8> = Vec::new();
+    while raw.len() < MAX_ERROR_BODY_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => raw.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    raw.truncate(MAX_ERROR_BODY_BYTES);
+    let body = String::from_utf8_lossy(&raw);
     Err(OpenFgaError::Unavailable(format!("HTTP {status}: {body}")))
 }
 
@@ -500,11 +555,16 @@ impl OpenFgaResolver {
     }
 
     /// The contextual `team:<group>#member@<principal>` tuples a token's
-    /// group claim contributes (RFC 0047 §3.1).
+    /// group claim contributes (RFC 0047 §3.1). Only `user:` and
+    /// `service_account:` principals may be team members in the model
+    /// (`team.member: [user, service_account, team#member]`); an `agent:`
+    /// principal's groups contribute nothing rather than a tuple the server
+    /// would reject.
     ///
     /// # Errors
     ///
-    /// [`OpenFgaError::TooManyContextualTuples`] past the per-request cap.
+    /// [`OpenFgaError::TooManyContextualTuples`] past the per-request cap;
+    /// [`OpenFgaError::InvalidGroup`] for a name that cannot be an object id.
     pub fn group_tuples(
         principal: &Principal,
         groups: &[String],
@@ -513,6 +573,12 @@ impl OpenFgaResolver {
             return Err(OpenFgaError::TooManyContextualTuples {
                 count: groups.len(),
             });
+        }
+        if let Some(index) = groups.iter().position(|group| !is_object_id(group)) {
+            return Err(OpenFgaError::InvalidGroup { index });
+        }
+        if principal.kind() == PrincipalKind::Agent {
+            return Ok(Vec::new());
         }
         let user = principal.to_string();
         Ok(groups
@@ -558,6 +624,14 @@ impl OpenFgaResolver {
             let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
             if cache.len() >= CACHE_SWEEP_THRESHOLD {
                 cache.retain(|_, entry| entry.expires > now);
+            }
+            if cache.len() >= MAX_CACHE_ENTRIES
+                && let Some(soonest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone())
+            {
+                cache.remove(&soonest);
             }
             cache.insert(
                 cache_key,
@@ -897,6 +971,33 @@ mod tests {
             Err(OpenFgaError::TooManyContextualTuples { .. })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 8, "rejected before any call");
+
+        // Group names are validated before any call, and an agent's groups
+        // contribute no team tuples (the model forbids agent team members).
+        assert!(matches!(
+            resolver.resolve(&alice, &["ops team".to_string()]).await,
+            Err(OpenFgaError::InvalidGroup { index: 0 })
+        ));
+        assert!(matches!(
+            resolver
+                .resolve(&alice, &["ok".to_string(), "a:b".to_string()])
+                .await,
+            Err(OpenFgaError::InvalidGroup { .. })
+        ));
+        assert!(
+            OpenFgaResolver::group_tuples(
+                &Principal::new(PrincipalKind::Agent, "bot"),
+                &["platform".to_string()]
+            )
+            .expect("valid")
+            .is_empty()
+        );
+        assert_eq!(
+            OpenFgaResolver::group_tuples(&alice, &["platform".to_string()])
+                .expect("valid")
+                .len(),
+            1
+        );
 
         // The cache key is structured: a subject or group carrying a
         // separator can never alias another session (`"a\nb"` with no

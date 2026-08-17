@@ -327,18 +327,22 @@ impl AuthResolver {
             use ourios_core::auth::openfga::OpenFgaError;
             let grants = match openfga.resolve(&identity.principal, &identity.groups).await {
                 Ok(grants) => grants,
-                Err(OpenFgaError::TooManyContextualTuples { count }) => {
+                // Credential defects (a group list past the cap, a group
+                // name that is no object id): named, 401-class.
+                Err(
+                    e @ (OpenFgaError::TooManyContextualTuples { .. }
+                    | OpenFgaError::InvalidGroup { .. }),
+                ) => {
                     tracing::warn!(
-                        principal = %identity.principal,
-                        groups = count,
-                        "openfga: token carries more groups than the contextual-tuple cap; \
-                         resolution fails closed (RFC 0047 §3.1)"
+                        token_name = %identity.name,
+                        error = %e,
+                        "openfga: token groups unusable; resolution fails closed (RFC 0047 §3.1)"
                     );
                     return Err(AuthError::Unauthenticated);
                 }
                 Err(e) => {
                     tracing::warn!(
-                        principal = %identity.principal,
+                        token_name = %identity.name,
                         error = %e,
                         "openfga resolution failed; request fails closed (RFC 0047 §3.1)"
                     );

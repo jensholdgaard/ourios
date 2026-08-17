@@ -481,6 +481,8 @@ fn build_tenant_set(index: usize, spec: &TokenSpec) -> Result<TenantSet, String>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         OidcSpec, TenantSet, TokenSpec, build_auth_config, build_oidc_config, build_token_store,
     };
@@ -705,6 +707,81 @@ mod tests {
             "edge"
         );
         assert!(both.oidc.is_some());
+    }
+
+    /// RFC 0047 §3.1 — the graph is authoritative; a credential's own
+    /// tenant list can only narrow the grant, never widen it, and a
+    /// disjoint or `None` credential yields `None`.
+    #[test]
+    fn tenant_sets_intersect_narrows_only() {
+        let granted: BTreeSet<String> = ["acme", "globex"]
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        assert_eq!(
+            TenantSet::All.intersect(&granted),
+            TenantSet::Listed(granted.clone())
+        );
+        let listed: TenantSet = TenantSet::Listed(
+            ["acme", "initech"]
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
+        );
+        assert_eq!(
+            listed.intersect(&granted),
+            TenantSet::Listed(BTreeSet::from(["acme".to_string()]))
+        );
+        assert!(
+            TenantSet::Listed(BTreeSet::from(["initech".to_string()]))
+                .intersect(&granted)
+                .is_empty()
+        );
+        assert!(TenantSet::None.intersect(&granted).is_empty());
+        assert!(TenantSet::All.intersect(&BTreeSet::new()).is_empty());
+        assert!(!TenantSet::None.allows("acme"));
+    }
+
+    /// RFC 0047 §3.1 — `agent_claim` is `<claim>=<value>` (both halves
+    /// non-empty, no surrounding whitespace); `groups_claim` follows the
+    /// claim-name rule; each rejection names its key.
+    #[test]
+    fn oidc_agent_and_groups_claims_validate() {
+        let ok = build_oidc_config(&OidcSpec {
+            agent_claim: Some("ourios_principal_type=agent".to_string()),
+            groups_claim: Some("groups".to_string()),
+            ..oidc_spec()
+        })
+        .expect("valid");
+        assert_eq!(ok.agent_claim(), Some(("ourios_principal_type", "agent")));
+        assert_eq!(ok.groups_claim(), Some("groups"));
+        let none = build_oidc_config(&oidc_spec()).expect("valid");
+        assert_eq!(none.agent_claim(), None);
+        assert_eq!(none.groups_claim(), None);
+
+        for bad in [
+            "agent",
+            "=agent",
+            "kind=",
+            " kind=agent",
+            "kind= agent",
+            "kind=agent ",
+        ] {
+            let err = build_oidc_config(&OidcSpec {
+                agent_claim: Some(bad.to_string()),
+                ..oidc_spec()
+            })
+            .expect_err("invalid agent_claim");
+            assert!(err.contains("auth.oidc.agent_claim"), "{bad:?}: {err}");
+        }
+        for bad in ["", " groups"] {
+            let err = build_oidc_config(&OidcSpec {
+                groups_claim: Some(bad.to_string()),
+                ..oidc_spec()
+            })
+            .expect_err("invalid groups_claim");
+            assert!(err.contains("auth.oidc.groups_claim"), "{bad:?}: {err}");
+        }
     }
 
     /// `Debug` renders names and tenant sets, never a token value — the

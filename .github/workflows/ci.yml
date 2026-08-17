@@ -339,15 +339,6 @@ jobs:
             exit 1
           fi
 
-  # Emission-time semconv conformance: boot the real `ourios-server`,
-  # point its OTLP export (metrics + the dogfooded logs signal) at
-  # `weaver registry live-check`, drive a little traffic, and gate on the
-  # exit code — weaver exits non-zero on a `violation` (an unregistered
-  # metric/attribute/event name, wrong instrument, …), while
-  # improvement-level advice (e.g. `stability: development`, expected
-  # pre-1.0) passes. Complements the `semconv` job: that one validates
-  # the registry *definitions*; this one validates what the binary
-  # actually *emits* against them. A required check (in `ci-success`'s
   # RFC 0047 §3.2 / RFC0047.12: the OpenFGA authorization model is an in-tree,
   # tested artefact — `fga model validate` on `deploy/openfga/model.fga` and
   # `fga model test` on `store.fga.yaml` (the §5 relationship claims as
@@ -377,9 +368,22 @@ jobs:
           echo "${FGA_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" fga
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      - run: fga model validate --file deploy/openfga/model.fga
-      - run: fga model test --tests deploy/openfga/store.fga.yaml
+      - name: Validate and test the model
+        working-directory: deploy/openfga
+        run: |
+          set -euo pipefail
+          fga model validate --file model.fga
+          fga model test --tests store.fga.yaml
 
+  # Emission-time semconv conformance: boot the real `ourios-server`,
+  # point its OTLP export (metrics + the dogfooded logs signal) at
+  # `weaver registry live-check`, drive a little traffic, and gate on the
+  # exit code — weaver exits non-zero on a `violation` (an unregistered
+  # metric/attribute/event name, wrong instrument, …), while
+  # improvement-level advice (e.g. `stability: development`, expected
+  # pre-1.0) passes. Complements the `semconv` job: that one validates
+  # the registry *definitions*; this one validates what the binary
+  # actually *emits* against them. A required check (in `ci-success`'s
   # `needs`).
   live-check:
     name: live-check (weaver)

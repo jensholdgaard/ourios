@@ -15,9 +15,8 @@ superseded-by: —
 > Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
 > opaque, coarse, credential-selected object, which is exactly the object
 > type this RFC binds the authorization graph to. Grounded in the #688
-> OpenFGA spike (resolver seam holds, p50 1.4 ms), the two OpenFGA-assistant
-> reviews (`scratch/openfga-ai-review-2026-08-17.md`) and the agent-scale
-> `ListObjects` spike (`scratch/openfga-spike-2-listobjects.md`) whose
+> OpenFGA spike (resolver seam holds, p50 1.4 ms), two OpenFGA-assistant
+> reviews (§8) and the agent-scale `ListObjects` spike recorded in §10, whose
 > central finding — the 1000-object cap is **silent** — shapes §3.4.
 
 ## 1. Summary
@@ -515,14 +514,15 @@ planner's returned row set equals the naive "rows whose conversation ∈
 
 ## 8. References
 
-- #688 — concept discussion; OpenFGA resolver spike (`scratch/openfga-spike.md`).
-- `scratch/openfga-ai-review-2026-08-17.md` — two OpenFGA-assistant reviews:
+- #688 — concept discussion (Q1–Q10 strawman) and the OpenFGA resolver
+  spike report (seam holds, p50 1.4 ms).
+- Two OpenFGA-assistant reviews (2026-08-17, maintainer-run, working notes
+  not in-tree; every load-bearing answer is restated where it applies):
   model shape, ListObjects cap/deadline, two-step pattern, contextual tuples,
   ≤100 tuples/Write, no wildcard delete, single store, agents/delegation, MCP
   tool authorization (`tool` / `can_call`), ReBAC vs RBAC/ABAC.
-- `scratch/openfga-spike-2-listobjects.md` — agent-scale measurements: silent
-  1000 cap on plain ListObjects; streamed 5000 in 50 ms, 100k in 0.5 s;
-  Check ~1 ms.
+- §10 — the agent-scale `ListObjects` spike: silent 1000 cap on plain
+  ListObjects; streamed 5000 in 50 ms, 100k in 0.5 s; Check ~1 ms.
 - RFC 0046 — out-of-band tenancy (prerequisite); RFC 0026/0029 — the binding
   and resolver seam; RFC 0027/0032 — MCP tools and query schema; RFC 0022/
   0042 — promoted columns the predicates target; RFC 0009 — compaction sweep
@@ -543,3 +543,45 @@ Cluster/service ownership as graph objects (from the reviewed model) once a
 scenario needs them; time-boxed grants (`temporal_grant` CEL condition on
 `tool#caller` / `conversation#delegate`); an upstream write-up for the OTel
 community once this is validated in a real deployment (#688 Q7).
+
+## 10. Evidence — agent-scale `ListObjects` spike (2026-08-17)
+
+Throwaway `openfga/openfga run` (memory backend, defaults
+`OPENFGA_LIST_OBJECTS_MAX_RESULTS=1000`, 3 s deadline); model = the §3.2
+DSL. Seed: `tenant:acme`, 100 000 `conversation:acme/c-i` with
+`parent tenant:acme`, agents `bot50` / `bot500` / `bot5000` as `actor` on
+that many conversations, `user:alice` tenant reader, `user:bob` participant
+of one conversation. Seeding via `/write` in 100-tuple chunks: 74.8 s
+(~1 300 tuples/s single-threaded).
+
+| Call | Result | Latency |
+|---|---|---|
+| Check(alice, `can_read_content`, tenant:acme) — the two-step gate | allowed | p50 1.1 ms / p95 1.4 ms |
+| Check(agent, `can_read_content`, tenant:acme) | false | p50 0.8 ms |
+| Check(agent, `can_read_content`, conversation:acme/c-3) | allowed | p50 2.1 ms |
+| Check(collector, `can_write`, tenant:acme) — ingest binding | allowed | p50 1.0 ms |
+| ListObjects(bot50, conversation) | 50 | 2.3 ms |
+| ListObjects(bot500, conversation) | 500 | 2.5 ms |
+| ListObjects(bot5000, conversation) | **1000 (silently capped, HTTP 200)** | 3.4 ms |
+| ListObjects(bob, conversation) | 1 | 1.6 ms |
+| ListObjects(alice tenant-wide, conversation) over 100k | **1000 (silently capped, HTTP 200)** | 13 ms |
+| StreamedListObjects(bot5000) | 5000 | 0.05 s wall |
+| StreamedListObjects(alice tenant-wide) | 100 000 | 0.53 s wall |
+
+What this decided:
+
+1. **The cap is silent** — 200 with 1000 objects and no truncation marker.
+   A planner that enumerated for a tenant-wide reader would build a *wrong*
+   `IN()` (1 % of the tenant) with no error, so the two-step in §3.4 is a
+   correctness requirement, not an optimisation.
+2. **Scoped sets are cheap** (2–3 ms for 50–500) but a principal with more
+   than 1000 conversations still hits the cap → the scoped path uses
+   `StreamedListObjects`, filters to the tenant, and fails closed at
+   `max_objects` (§3.4 step 3) rather than emitting a giant `IN()`.
+3. Session-time checks are ~1 ms → TTL-cached fail-closed resolution is free
+   at the RFC 0029 seam (as the first spike found).
+4. Write throughput at 100 tuples/Write is adequate for an emitter riding
+   the compaction pass; a burst of new conversations lags seconds, which
+   contextual tuples and the §3.3 self fast path cover.
+
+The harness was a throwaway script; nothing from it lands in-tree.

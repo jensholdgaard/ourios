@@ -5,7 +5,7 @@ status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
-supersedes: RFC 0045 (§3.1–§3.4); RFC 0003 §6.3 and RFC0003.3/.4; RFC 0001 §6.1 *Tenant derivation*
+supersedes: RFC 0045
 superseded-by: —
 ---
 
@@ -18,7 +18,10 @@ superseded-by: —
 > multi-tenancy is out-of-band: collector metadata routing + an auth
 > extension, `headers_setter` → `X-Scope-OrgID`), which the #688 strawman
 > and RFC 0045 drifted from for a zero-config default. RFC 0045 stays
-> `green` as an implemented mechanism and is superseded by this RFC.
+> `green` as an implemented mechanism and is superseded by this RFC (its
+> frontmatter gains `superseded-by: RFC 0046` when this RFC lands); the
+> finer-grained replacements — RFC 0003 §6.3 / RFC0003.3–.4 (fan-out) and
+> RFC 0001 §6.1 *Tenant derivation* — are recorded in §3.2 and §3.4.
 
 ## 1. Summary
 
@@ -82,10 +85,22 @@ single-tenant credential does not make the header optional: one rule for
 both roles, nothing implicit; a Collector sets it once
 (`otlphttp.headers` / `headers_setter`).
 
-The value is an opaque `TenantId` — the same string the querier's header,
-the MCP `tenant` argument and the token set already use — trimmed of
-surrounding whitespace, non-empty, at most 256 bytes. No validation beyond
-that; storage path-safety is `percent_encode_tenant` (RFC 0005 §3.4).
+**One selector, one canonical value.** Exactly one selector per request:
+a repeated `X-Ourios-Tenant` header or a repeated `x-ourios-tenant`
+metadata entry — even with equal values — is rejected `400` /
+`INVALID_ARGUMENT` before authorization and before any WAL work, so no two
+layers can ever see different selections. The value is normalised once, at
+extraction, and that one string is what authorization compares (byte-exact
+against the binding set), the WAL records, storage encodes and queries
+match: the raw bytes must be valid UTF-8; ASCII whitespace is trimmed at
+both ends; the result must be non-empty, at most 256 bytes, and contain no
+control characters (`U+0000`–`U+001F`, `U+007F`). Anything else is `400` /
+`INVALID_ARGUMENT`. Transport caveat, stated rather than hidden: gRPC
+ASCII metadata can only carry visible ASCII, so a tenant id with non-ASCII
+characters is reachable over OTLP/HTTP, the querier and MCP but not over
+OTLP/gRPC (a non-ASCII value there is `INVALID_ARGUMENT`); operators who want
+gRPC everywhere keep ids ASCII. Nothing else is validated: `TenantId` stays
+opaque, and storage path-safety is `percent_encode_tenant` (RFC 0005 §3.4).
 
 ### 3.2 One export, one tenant
 
@@ -109,7 +124,7 @@ there is nothing to re-derive from, so the acknowledged frame must record
 its tenant. RFC 0008 §6.2 reserves `kind > 0x02` for exactly this: a new
 frame kind
 
-```
+```text
 kind = 0x03  TenantOtlpBatch
 payload = u16 (little-endian) tenant byte length
         ‖ tenant bytes (UTF-8, as validated in §3.1)
@@ -118,17 +133,29 @@ payload = u16 (little-endian) tenant byte length
 
 Everything else about the frame (header, CRC, `_pad`, torn-tail rules,
 group-commit fsync, checkpoint/retain semantics) is unchanged; RFC0008.x
-criteria hold as written because they are payload-agnostic. Replay decodes
-the tenant prefix, materialises the request under it and feeds the miner as
-before; the RFC 0045 rule-epoch log is deleted, not migrated.
+criteria hold as written because they are payload-agnostic. Replay
+validates the tenant prefix **before** touching the protobuf — a zero
+length, a length above 256, a length running past the payload, or invalid
+UTF-8 is a `SinkRejected` invalid-payload failure at the recovery driver
+(the class a CRC-valid frame with an undecodable protobuf already has:
+loud, startup-aborting, *not* RFC0008.5 corruption, since the frame's own
+integrity check passed) — then materialises the request under the tenant
+and feeds the miner as before. The RFC 0045 rule-epoch log is deleted, not
+migrated.
 
-**Legacy frames.** A `kind = 0x01` (`OtlpBatch`) frame has no recorded
-tenant. Per the maintainer's persisted-layout ruling (nothing pre-production
-is preserved) replay does not guess: encountering one aborts startup with an
-error naming the frame's offset and the remedy (drain the WAL under the
-previous version, or delete it). `0x01` stays a valid kind byte on the wire
-— rejected as *unsupported for replay*, never as corruption — so RFC0008.5's
-corruption classification is untouched.
+**Legacy frames and downgrade.** A `kind = 0x01` (`OtlpBatch`) frame has
+no recorded tenant. Per the maintainer's persisted-layout ruling (nothing
+pre-production is preserved) replay does not guess: encountering one aborts
+startup with an error naming the frame's offset and the remedy (drain the
+WAL under the previous version, or delete it). `0x01` stays a valid kind
+byte on the wire — rejected by *this* binary as *unsupported for replay*,
+never as corruption — so RFC0008.5's corruption classification is
+untouched. The reverse direction is unsupported by construction: a binary
+predating this RFC reads `0x03` as an unknown kind, which RFC 0008 §6.2
+already classifies as corruption (`FrameError::UnknownKind` → halt). That is
+the documented behaviour of the *old* reader, not a contradiction of the
+sentence above; the operator procedure for downgrading across this RFC is
+the same as for upgrading — drain the WAL first, or delete it.
 
 ### 3.4 What RFC 0045 leaves behind
 
@@ -210,10 +237,11 @@ Scenario ids `RFC0046.<n>`.
 
 > **RFC0046.4 — WAL frame carries the tenant.** Given exports acknowledged
 > under selectors `acme` and `globex` whose records lack `service.name`
-> entirely, When the receiver is `SIGKILL`ed before any flush and restarted,
-> Then replay lands every record in the tenant it was acknowledged under, no
-> record is lost, no record moves tenant, and every replayed frame is
-> `kind = 0x03`.
+> entirely — acknowledged meaning the `0x03` frame was appended and fsynced
+> (WAL-before-ack, unchanged) — When the receiver is `SIGKILL`ed before any
+> Parquet flush and restarted, Then replay lands every record in the tenant
+> it was acknowledged under, no record is lost, no record moves tenant, and
+> every replayed frame is `kind = 0x03`.
 
 > **RFC0046.5 — legacy frames abort loudly.** Given a WAL holding a
 > `kind = 0x01` frame, When the receiver starts, Then startup aborts naming
@@ -221,16 +249,21 @@ Scenario ids `RFC0046.<n>`.
 > (RFC0008.5's classification is unchanged).
 
 > **RFC0046.6 — RFC 0008 invariants hold for the new kind.** Given the
-> RFC0008.4/.5/.7/.8/.10 suites, When they run with `0x03` frames, Then they
-> pass unchanged (torn tail, corruption, checkpoint/retain, group commit,
-> recovery driver are payload-agnostic).
+> RFC0008.4/.5/.7/.8/.10 scenarios, When their harnesses additionally
+> exercise `0x03` frames, Then every invariant and expected outcome is
+> unchanged (torn tail, corruption, checkpoint/retain, group commit,
+> recovery driver are payload-agnostic) — the criteria are not edited, the
+> harnesses gain a frame-kind dimension.
 
 > **RFC0046.7 — selector hygiene.** Given selectors ` acme ` (whitespace),
-> `` (empty), and one of 257 bytes, When exported, Then the first is accepted
-> as `acme`, the other two are rejected `400`; And Given a selector
-> containing `/`, `%` and a space, Then it round-trips: the export is
+> `` (empty), one of 257 bytes, one containing a control character, and a
+> request carrying the selector twice (equal values), When exported, Then
+> the first is accepted as `acme` and every other case is rejected `400` /
+> `INVALID_ARGUMENT` before any WAL append; And Given a selector containing
+> `/`, `%` and an interior space, Then it round-trips: the export is
 > accepted, stored under `tenant_id=<percent_encode_tenant>` and queryable
-> under the same header value.
+> under the same header value; And Given a non-ASCII selector, Then it is
+> accepted over HTTP and rejected `INVALID_ARGUMENT` over gRPC.
 
 > **RFC0046.8 — Collector interop.** Given the reference `otelcol-contrib`
 > pipeline exporting over TLS + OIDC with `X-Ourios-Tenant` set on the
@@ -250,6 +283,12 @@ Scenario ids `RFC0046.<n>`.
 > query and MCP suites, When they run, Then they pass unchanged — the read
 > side already was out-of-band.
 
+> **RFC0046.11 — malformed `0x03` payloads.** Given CRC-valid `0x03` frames
+> whose tenant prefix has zero length, a length above 256, a length past the
+> payload end, or invalid UTF-8, When replayed, Then each is a `SinkRejected`
+> invalid-payload failure naming the offset — startup aborts — and none is
+> classified as RFC0008.5 corruption.
+
 ## 6. Testing strategy
 
 Unit tests in `ourios-ingester` for selector extraction (header/metadata,
@@ -258,15 +297,18 @@ prefix bounds, decode of a `0x01` frame → the unsupported-for-replay error).
 RFC0046.1/.2/.3/.7 as `ourios-server` served-binary tests through both
 transports and the querier (reusing the RFC 0045 harness shape); RFC0046.2's
 telemetry half in the RFC0026.7 harness-exempt binary. RFC0046.4 on the
-RFC0014.5 crash fixture with two tenants and no `service.name`. RFC0046.5/.6
-in `ourios-wal` (`it/`), the existing RFC 0008 suites parameterised over the
-frame kind. RFC0046.8 in the CI-only collector interop job. RFC0046.9 is a
+RFC0014.5 crash fixture with two tenants and no `service.name`. RFC0046.5/.6/.11
+in `ourios-wal` (`it/`): the existing RFC 0008 harnesses gain a `0x03`
+dimension (invariants unchanged) and the recovery driver's prefix
+validation gets its own rejection cases. RFC0046.8 in the CI-only collector interop job. RFC0046.9 is a
 `git grep` in the PR description plus the compile.
 
 ## 7. Open questions
 
 - [ ] **Selector length bound (256 B)** — generous for opaque ids; is a
       shorter bound wanted so headers stay log-friendly?
+- [ ] **Non-ASCII tenant ids over gRPC** — accept the stated caveat, or
+      define a `-bin` metadata carrier so gRPC parity is total?
 - [ ] **Deprecation window for the RFC 0045 registry entries** — deprecate
       now and delete at the next minor, or keep indefinitely per semconv
       practice? (Leaning: keep deprecated; they were never released.)

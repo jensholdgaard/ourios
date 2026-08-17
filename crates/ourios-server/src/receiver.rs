@@ -28,9 +28,12 @@ use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
 use ourios_ingester::receiver::tls_serve::{
     LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
 };
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
+use ourios_ingester::receiver::{
+    CommitCoordinator, DivergenceWatch, IngestPipeline, SharedPipeline, TenantDerivation,
+};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_wal::{Wal, WalConfig, WalOffset};
@@ -274,6 +277,8 @@ pub struct ReceiverConfig {
     /// (`receiver.encode_workers`; the config layer validates ≥ 1 and
     /// defaults to the host's available cores).
     pub encode_workers: usize,
+    /// RFC 0045 §3.1 — the tenant derivation rule and divergence watch.
+    pub tenant: TenantDerivation,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -462,6 +467,11 @@ async fn bind_listeners(
 #[allow(clippy::too_many_lines)]
 pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
+    // RFC 0045 §3.3: replay derives each frame under the rule it was
+    // acknowledged under; the configured rule takes over for frames appended
+    // after this start.
+    let mut epochs =
+        RuleEpochs::load(&config.wal.root).map_err(|e| format!("startup recovery: {e}"))?;
     // The §3.4 group-commit knobs, captured before `config.wal` is moved
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
@@ -478,10 +488,20 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut miner =
         MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
             .with_record_sink(Box::new(sink.clone()));
-    let rule = TenantRule::service_name();
+    let rule = config.tenant.rule.clone();
 
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &rule)
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &epochs)
         .map_err(|e| format!("startup recovery: {e}"))?;
+    if epochs
+        .advance(&rule, report.max_delivered)
+        .map_err(|e| format!("startup recovery: {e}"))?
+    {
+        tracing::info!(
+            keys = ?rule.keys(),
+            "tenant derivation rule changed; frames from here on derive under the new rule, \
+             stored tenant ids are unchanged (RFC 0045 §3.3)"
+        );
+    }
     for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
         tracing::warn!(
             name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,
@@ -518,6 +538,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(coordinator, miner, rule)
+            .with_tenant_watch(DivergenceWatch::from_derivation(&config.tenant))
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
@@ -666,6 +687,7 @@ mod tests {
     use ourios_core::audit::{AuditSink, ParamType};
     use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
     use ourios_core::tenant::TenantId;
+    use ourios_ingester::receiver::TenantRule;
 
     use super::*;
 
@@ -888,6 +910,7 @@ mod tests {
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
             encode_workers: 2,
+            tenant: TenantDerivation::default(),
         })
         .await
         .expect("serve");
@@ -919,6 +942,7 @@ mod tests {
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
             encode_workers: 2,
+            tenant: TenantDerivation::default(),
         })
         .await
         .expect("serve");
@@ -1049,6 +1073,7 @@ mod tests {
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
             encode_workers: 2,
+            tenant: TenantDerivation::default(),
         })
         .await
         .expect("serve");

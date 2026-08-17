@@ -5,7 +5,8 @@
 //! `Resource.attributes`, so one OTLP export can route records to
 //! several tenants. The default rule reads `service.name` — the
 //! OTel-canonical "what application emitted this", which maps onto
-//! Ourios's per-tenant template-tree partitioning (`[§3.7]`). If any
+//! Ourios's per-tenant template-tree partitioning (`[§3.7]`); the
+//! operator may configure a composite of several keys (RFC 0045). If any
 //! group's Resource resolves to no tenant, the **entire** export is
 //! rejected (RFC0003.4) — no silent default tenant, no per-Resource
 //! partial acceptance.
@@ -19,15 +20,16 @@ use ourios_core::tenant::TenantId;
 use crate::receiver::materialize::materialize_resource_logs;
 
 /// The operator-configured rule that derives a `tenant_id` from a
-/// `ResourceLogs`' `Resource.attributes`.
+/// `ResourceLogs`' `Resource.attributes` (RFC 0045 §3.1): an ordered,
+/// non-empty list of resource-attribute keys, every one required.
 ///
-/// Today the rule reads a single string-valued resource attribute (the
-/// default key is `service.name`). RFC 0001 §6.1 reserves richer
-/// operator models (per-namespace, composite of several attributes) for
-/// when they're actually configured; this stays a single key until then.
-#[derive(Debug, Clone)]
+/// A single-key rule (the default `[service.name]`) derives the
+/// attribute's string value verbatim. A composite rule (two or more keys)
+/// percent-escapes `%` and `/` in each value and joins the values with
+/// `/`, so distinct value tuples never collide (RFC 0045 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantRule {
-    attribute_key: String,
+    keys: Vec<String>,
 }
 
 impl TenantRule {
@@ -38,47 +40,175 @@ impl TenantRule {
         Self::by_attribute("service.name")
     }
 
-    /// A rule reading an operator-chosen resource attribute key.
+    /// A single-key rule reading an operator-chosen resource attribute.
     pub fn by_attribute(key: impl Into<String>) -> Self {
         Self {
-            attribute_key: key.into(),
+            keys: vec![key.into()],
         }
     }
 
-    /// The resource attribute key this rule reads.
+    /// An ordered rule over `keys` (RFC0045.1).
+    ///
+    /// # Errors
+    ///
+    /// [`TenantRuleError::Empty`] for no keys, [`TenantRuleError::BlankKey`]
+    /// for an empty or whitespace-only key, [`TenantRuleError::Duplicate`]
+    /// naming the first repeated key.
+    pub fn from_keys<I, K>(keys: I) -> Result<Self, TenantRuleError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
+        if keys.is_empty() {
+            return Err(TenantRuleError::Empty);
+        }
+        if keys.iter().any(|key| key.trim().is_empty()) {
+            return Err(TenantRuleError::BlankKey);
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(duplicate) = keys.iter().find(|key| !seen.insert(key.as_str())) {
+            return Err(TenantRuleError::Duplicate {
+                key: duplicate.clone(),
+            });
+        }
+        Ok(Self { keys })
+    }
+
+    /// The resource attribute keys this rule reads, in join order.
     #[must_use]
-    pub fn attribute_key(&self) -> &str {
-        &self.attribute_key
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    /// Whether `key` is one of the rule's keys.
+    #[must_use]
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.iter().any(|k| k == key)
     }
 
     /// Derive the tenant for one Resource from its `attributes`.
     ///
-    /// Resolves to the rule's attribute when it is present with a
-    /// non-empty string value.
+    /// Resolves when every key is present with a non-empty string value.
     ///
     /// # Errors
     ///
-    /// [`TenantResolutionError`] (naming the attribute) when the
-    /// attribute is absent, not a string, or an empty string — the
-    /// receiver never invents a tenant the operator hasn't declared.
+    /// [`TenantResolutionError`] naming the first key that is absent, not a
+    /// string, or an empty string — the receiver never invents a tenant the
+    /// operator hasn't declared, and never joins a partial tuple.
     pub fn derive(
         &self,
         resource_attributes: &[KeyValue],
     ) -> Result<TenantId, TenantResolutionError> {
-        resource_attributes
-            .iter()
-            .find(|kv| kv.key == self.attribute_key)
-            .and_then(|kv| kv.value.as_ref())
-            .and_then(|value| match value.value.as_ref() {
-                Some(Value::StringValue(s)) if !s.is_empty() => Some(TenantId::new(s.clone())),
-                _ => None,
-            })
-            .ok_or_else(|| TenantResolutionError {
-                attribute: self.attribute_key.clone(),
-                resource_index: None,
-            })
+        let mut values = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let value = string_attribute(resource_attributes, key).ok_or_else(|| {
+                TenantResolutionError {
+                    attribute: key.clone(),
+                    resource_index: None,
+                }
+            })?;
+            values.push(value);
+        }
+        Ok(TenantId::new(join_components(&values)))
     }
 }
+
+/// The non-empty string value of `key` in `attributes`, if any.
+fn string_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|kv| kv.key == key)
+        .and_then(|kv| kv.value.as_ref())
+        .and_then(|value| match value.value.as_ref() {
+            Some(Value::StringValue(s)) if !s.is_empty() => Some(s.as_str()),
+            _ => None,
+        })
+}
+
+/// RFC 0045 §3.2: one component is the value verbatim; two or more are
+/// `%`/`/`-escaped and `/`-joined.
+fn join_components(values: &[&str]) -> String {
+    match values {
+        [single] => (*single).to_owned(),
+        many => {
+            let mut out = String::new();
+            for (i, value) in many.iter().enumerate() {
+                if i > 0 {
+                    out.push('/');
+                }
+                for c in value.chars() {
+                    match c {
+                        '%' => out.push_str("%25"),
+                        '/' => out.push_str("%2F"),
+                        other => out.push(other),
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+/// The resolved `receiver.tenant` section (RFC 0045 §3.1): the derivation
+/// rule plus the divergence-watch keys and state bound (§3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDerivation {
+    pub rule: TenantRule,
+    /// Keys watched for divergence; a key also in `rule` is skipped.
+    pub watch: Vec<String>,
+    /// Upper bound on remembered (tenant, key) pairs.
+    pub watch_capacity: usize,
+}
+
+impl TenantDerivation {
+    /// The RFC 0045 §3.4 default watch key.
+    pub const DEFAULT_WATCH: &'static str = "k8s.cluster.name";
+    /// The RFC 0045 §3.4 default state bound.
+    pub const DEFAULT_WATCH_CAPACITY: usize = 10_000;
+}
+
+impl Default for TenantDerivation {
+    fn default() -> Self {
+        Self {
+            rule: TenantRule::service_name(),
+            watch: vec![Self::DEFAULT_WATCH.to_owned()],
+            watch_capacity: Self::DEFAULT_WATCH_CAPACITY,
+        }
+    }
+}
+
+/// A `receiver.tenant.rule` that cannot be a rule (RFC0045.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantRuleError {
+    /// No keys at all.
+    Empty,
+    /// An empty or whitespace-only key — it can never match a resource
+    /// attribute, so every export would fail at request time.
+    BlankKey,
+    /// The same key listed twice.
+    Duplicate { key: String },
+}
+
+impl std::fmt::Display for TenantRuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(
+                f,
+                "tenant rule must list at least one resource attribute key"
+            ),
+            Self::BlankKey => write!(f, "tenant rule lists an empty resource attribute key"),
+            Self::Duplicate { key } => {
+                write!(
+                    f,
+                    "tenant rule lists resource attribute key `{key}` more than once"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TenantRuleError {}
 
 impl Default for TenantRule {
     fn default() -> Self {
@@ -169,11 +299,30 @@ pub fn fan_out(
     request: ExportLogsServiceRequest,
     rule: &TenantRule,
 ) -> Result<Vec<OtlpLogRecord>, TenantResolutionError> {
+    fan_out_observed(request, rule, |_, _| {})
+}
+
+/// [`fan_out`] with a per-group observer, called with each group's derived
+/// tenant and its `Resource.attributes` after derivation succeeds — the
+/// RFC 0045 §3.4 divergence detector's hook. Groups after a failing one
+/// are never observed (the export is rejected whole).
+///
+/// # Errors
+///
+/// As [`fan_out`].
+pub fn fan_out_observed(
+    request: ExportLogsServiceRequest,
+    rule: &TenantRule,
+    mut observe: impl FnMut(&TenantId, &[KeyValue]),
+) -> Result<Vec<OtlpLogRecord>, TenantResolutionError> {
     let mut records = Vec::new();
     for (index, resource_logs) in request.resource_logs.into_iter().enumerate() {
         // Derived before `resource_logs` is moved into
         // `materialize_resource_logs`.
         let tenant_id = derive_for_group(&resource_logs, index, rule)?;
+        if let Some(resource) = &resource_logs.resource {
+            observe(&tenant_id, &resource.attributes);
+        }
         records.extend(materialize_resource_logs(resource_logs, &tenant_id));
     }
     Ok(records)
@@ -199,8 +348,9 @@ pub(crate) fn derive_for_group(
 
 #[cfg(test)]
 mod tests {
-    use super::{TenantRule, Value};
+    use super::{TenantRule, TenantRuleError, Value};
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use proptest::strategy::Strategy;
 
     fn string_attr(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -265,5 +415,123 @@ mod tests {
             .expect("resolves under the custom key");
         // Assert
         assert_eq!(tenant.as_str(), "acme");
+    }
+
+    // RFC0045.6 — the single-key path never escapes.
+    #[test]
+    fn single_key_rule_is_verbatim_even_with_slash_and_percent() {
+        for raw in ["a/b", "100%", "a%2Fb"] {
+            let attrs = [string_attr("service.name", raw)];
+            let tenant = TenantRule::service_name().derive(&attrs).expect("resolves");
+            assert_eq!(tenant.as_str(), raw);
+        }
+    }
+
+    // RFC0045.2 — composite join.
+    #[test]
+    fn composite_rule_joins_in_key_order() {
+        let rule = TenantRule::from_keys(["k8s.cluster.name", "service.name"]).expect("valid");
+        let attrs = [
+            string_attr("service.name", "fluxcd"),
+            string_attr("k8s.cluster.name", "cluster1"),
+        ];
+        let tenant = rule.derive(&attrs).expect("resolves");
+        assert_eq!(tenant.as_str(), "cluster1/fluxcd");
+    }
+
+    // RFC0045.4 — the two canonical colliding tuples stay apart.
+    #[test]
+    fn composite_join_escapes_separator_and_escape_char() {
+        let rule = TenantRule::from_keys(["a", "b"]).expect("valid");
+        let left = rule
+            .derive(&[string_attr("a", "a"), string_attr("b", "b/c")])
+            .expect("resolves");
+        let right = rule
+            .derive(&[string_attr("a", "a/b"), string_attr("b", "c")])
+            .expect("resolves");
+        assert_eq!(left.as_str(), "a/b%2Fc");
+        assert_eq!(right.as_str(), "a%2Fb/c");
+        let pct = rule
+            .derive(&[string_attr("a", "50%"), string_attr("b", "x")])
+            .expect("resolves");
+        assert_eq!(pct.as_str(), "50%25/x");
+    }
+
+    // RFC0045.3 — every rule key is required; the error names the missing one.
+    #[test]
+    fn composite_rule_rejects_missing_empty_or_non_string_component() {
+        let rule = TenantRule::from_keys(["k8s.cluster.name", "service.name"]).expect("valid");
+        let missing = [string_attr("service.name", "fluxcd")];
+        let err = rule.derive(&missing).unwrap_err();
+        assert_eq!(err.attribute(), "k8s.cluster.name");
+
+        let empty = [
+            string_attr("k8s.cluster.name", ""),
+            string_attr("service.name", "fluxcd"),
+        ];
+        assert_eq!(
+            rule.derive(&empty).unwrap_err().attribute(),
+            "k8s.cluster.name"
+        );
+
+        let non_string = [
+            KeyValue {
+                key: "k8s.cluster.name".to_owned(),
+                value: Some(AnyValue {
+                    value: Some(Value::IntValue(1)),
+                }),
+                ..Default::default()
+            },
+            string_attr("service.name", "fluxcd"),
+        ];
+        assert_eq!(
+            rule.derive(&non_string).unwrap_err().attribute(),
+            "k8s.cluster.name"
+        );
+    }
+
+    // RFC0045.1 — rule validation.
+    #[test]
+    fn from_keys_rejects_empty_and_duplicate() {
+        assert_eq!(
+            TenantRule::from_keys(Vec::<String>::new()).unwrap_err(),
+            TenantRuleError::Empty
+        );
+        assert_eq!(
+            TenantRule::from_keys(["service.name", " "]).unwrap_err(),
+            TenantRuleError::BlankKey
+        );
+        assert_eq!(
+            TenantRule::from_keys(["service.name", "service.name"]).unwrap_err(),
+            TenantRuleError::Duplicate {
+                key: "service.name".to_owned()
+            }
+        );
+        assert_eq!(
+            TenantRule::from_keys(["service.name"]).expect("valid"),
+            TenantRule::service_name()
+        );
+    }
+
+    // RFC0045.4 in property form: for a fixed composite rule, distinct
+    // value tuples derive distinct tenant ids.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+        #[test]
+        fn composite_join_is_injective(
+            (left, right) in (2usize..=3).prop_flat_map(|arity| (
+                proptest::collection::vec("[a-c/%]{1,4}", arity),
+                proptest::collection::vec("[a-c/%]{1,4}", arity),
+            )),
+        ) {
+            let keys: Vec<String> = (0..left.len()).map(|i| format!("k{i}")).collect();
+            let rule = TenantRule::from_keys(keys.clone()).expect("valid");
+            let attrs = |values: &[String]| -> Vec<KeyValue> {
+                keys.iter().zip(values).map(|(k, v)| string_attr(k, v)).collect()
+            };
+            let l = rule.derive(&attrs(&left)).expect("resolves");
+            let r = rule.derive(&attrs(&right)).expect("resolves");
+            proptest::prop_assert_eq!(left == right, l == r);
+        }
     }
 }

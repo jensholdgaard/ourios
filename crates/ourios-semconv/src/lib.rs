@@ -124,6 +124,9 @@ pub const OURIOS_QUERY_DURATION: &str = "ourios.query.duration";
 /// `ourios.query.row_groups` (counter, unit `{row_group}`).
 pub const OURIOS_QUERY_ROW_GROUPS: &str = "ourios.query.row_groups";
 
+/// `ourios.receiver.tenant.divergences` (counter, unit `{divergence}`).
+pub const OURIOS_RECEIVER_TENANT_DIVERGENCES: &str = "ourios.receiver.tenant.divergences";
+
 /// `ourios.receiver.tls.handshake_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES: &str = "ourios.receiver.tls.handshake_failures";
 
@@ -216,6 +219,15 @@ pub const OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME: &str = "ourios.template_map.publi
 /// `ourios.tenant` attribute key.
 pub const OURIOS_TENANT: &str = "ourios.tenant";
 
+/// `ourios.tenant.watch.first_value` attribute key.
+pub const OURIOS_TENANT_WATCH_FIRST_VALUE: &str = "ourios.tenant.watch.first_value";
+
+/// `ourios.tenant.watch.key` attribute key.
+pub const OURIOS_TENANT_WATCH_KEY: &str = "ourios.tenant.watch.key";
+
+/// `ourios.tenant.watch.value` attribute key.
+pub const OURIOS_TENANT_WATCH_VALUE: &str = "ourios.tenant.watch.value";
+
 /// `ourios.tls.failure` attribute key.
 pub const OURIOS_TLS_FAILURE: &str = "ourios.tls.failure";
 
@@ -246,6 +258,13 @@ pub const EVENT_OURIOS_RECEIVER_SINK_RETAINED: &str = "ourios.receiver.sink.reta
 
 /// `ourios.receiver.snapshot.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR: &str = "ourios.receiver.snapshot.error";
+
+/// `ourios.receiver.tenant.divergence` log event name.
+pub const EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE: &str = "ourios.receiver.tenant.divergence";
+
+/// `ourios.receiver.tenant.watch_saturated` log event name.
+pub const EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED: &str =
+    "ourios.receiver.tenant.watch_saturated";
 
 /// `ourios.receiver.wal.truncated` log event name.
 pub const EVENT_OURIOS_RECEIVER_WAL_TRUNCATED: &str = "ourios.receiver.wal.truncated";

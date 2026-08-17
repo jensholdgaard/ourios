@@ -26,6 +26,7 @@ use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::receiver::{IngestPipeline, TenantRule, fan_out};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::{FrameKind, Wal, WalConfig};
@@ -159,7 +160,13 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
         ..wal_config(&wal_root)
     })
     .expect("reopen WAL");
-    recovery::recover(&mut wal, &snapshots_root, &mut recovered, &rule).expect("recover");
+    recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &RuleEpochs::load(&wal_root).expect("epochs"),
+    )
+    .expect("recover");
     drop(wal);
 
     let mut control = MinerCluster::new(MinerConfig::default());

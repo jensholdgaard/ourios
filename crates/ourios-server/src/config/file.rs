@@ -332,6 +332,27 @@ pub struct ReceiverSection {
     /// (`receiver.encode_workers`; default: the host's available cores).
     #[serde(deserialize_with = "scalar_opt")]
     pub encode_workers: Option<String>,
+    /// RFC 0045 §3.1 — tenant derivation (`receiver.tenant.*`).
+    pub tenant: TenantSection,
+}
+
+/// `receiver.tenant.*` — the RFC 0045 §3.1 tenant-derivation rule and
+/// divergence watch. Raw string leaves; validation (non-empty, no
+/// duplicates, capacity ≥ 1) lives in the resolver, the single path.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TenantSection {
+    /// Ordered resource-attribute keys joined into the tenant id. `None`
+    /// (absent) is the `[service.name]` default; an explicit `[]` is a
+    /// startup error (RFC0045.1), so the two are kept apart here.
+    #[serde(deserialize_with = "scalar_vec_opt")]
+    pub rule: Option<Vec<String>>,
+    /// Keys watched for divergence (§3.4). `None` = `[k8s.cluster.name]`.
+    #[serde(deserialize_with = "scalar_vec_opt")]
+    pub watch: Option<Vec<String>>,
+    /// Upper bound on remembered (tenant, key) pairs (§3.4).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub watch_capacity: Option<String>,
 }
 
 /// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
@@ -672,7 +693,20 @@ impl ReceiverSection {
         substitute(&mut self.http_addr, lookup)?;
         self.http_tls.substitute(lookup)?;
         substitute(&mut self.wal_root, lookup)?;
-        substitute(&mut self.encode_workers, lookup)
+        substitute(&mut self.encode_workers, lookup)?;
+        self.tenant.substitute(lookup)
+    }
+}
+
+impl TenantSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        for key in self.rule.iter_mut().chain(self.watch.iter_mut()).flatten() {
+            *key = env_subst::resolve(key, lookup)?;
+        }
+        substitute(&mut self.watch_capacity, lookup)
     }
 }
 
@@ -725,6 +759,16 @@ where
         .into_iter()
         .map(|s| s.0)
         .collect())
+}
+
+/// [`scalar_vec`] for a key whose absence means "default" while an
+/// explicit empty sequence is a value in its own right.
+fn scalar_vec_opt<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Scalar>>::deserialize(deserializer)?
+        .map(|scalars| scalars.into_iter().map(|s| s.0).collect()))
 }
 
 /// A YAML scalar captured as its string form (see [`scalar_opt`]).
@@ -956,6 +1000,38 @@ storage:
             &lookup,
         )
         .expect_err("unknown key inside promoted_attributes");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+    }
+
+    /// RFC0045.1 — `receiver.tenant.*` parses as raw leaves: absent
+    /// `rule`/`watch` stay `None` (the resolver applies the defaults), an
+    /// explicit `[]` is preserved as an empty list (the resolver rejects
+    /// it), elements ride `${env:…}`, and unknown keys are a schema error.
+    #[test]
+    fn receiver_tenant_section_parses_and_substitutes() {
+        let lookup = env(&[("CLUSTER_KEY", "k8s.cluster.name")]);
+        let cfg = parse("receiver:\n  enabled: true\n", &lookup).expect("valid");
+        assert!(cfg.receiver.tenant.rule.is_none());
+        assert!(cfg.receiver.tenant.watch.is_none());
+        assert!(cfg.receiver.tenant.watch_capacity.is_none());
+
+        let cfg = parse(
+            "receiver:\n  tenant:\n    rule: [\"${env:CLUSTER_KEY}\", service.name]\n    watch: []\n    watch_capacity: 42\n",
+            &lookup,
+        )
+        .expect("valid");
+        assert_eq!(
+            cfg.receiver.tenant.rule.as_deref(),
+            Some(&["k8s.cluster.name".to_owned(), "service.name".to_owned()][..])
+        );
+        assert_eq!(cfg.receiver.tenant.watch.as_deref(), Some(&[][..]));
+        assert_eq!(cfg.receiver.tenant.watch_capacity.as_deref(), Some("42"));
+
+        let err = parse("receiver:\n  tenant:\n    rules: [a]\n", &lookup)
+            .expect_err("unknown key inside receiver.tenant");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+        let err = parse("receiver:\n  tenant:\n    rule: service.name\n", &lookup)
+            .expect_err("scalar where a list is expected");
         assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
     }
 

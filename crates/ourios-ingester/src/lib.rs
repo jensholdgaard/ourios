@@ -40,6 +40,7 @@ pub mod publish;
 pub mod receiver;
 pub mod record_sink;
 pub mod recovery;
+pub mod rule_epochs;
 pub mod snapshot_store;
 
 pub use compactor::{Compactor, IngestError, SweepReport, run_sweep, run_sweep_with_promoted};

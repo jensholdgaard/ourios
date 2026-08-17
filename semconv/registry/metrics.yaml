@@ -485,6 +485,23 @@ groups:
       - ref: ourios.tls.reload_error
         requirement_level: required
 
+  - id: metric.ourios.receiver.tenant.divergences
+    type: metric
+    metric_name: ourios.receiver.tenant.divergences
+    stability: development
+    brief: >-
+      ResourceLogs groups whose watched resource attribute differed from
+      the value first observed for their tenant (RFC 0045 §3.4) — the
+      signal that one tenant spans what are probably several producers
+      (two clusters merged under a single-key rule). Observation only;
+      ingest is never rejected. The tenant id rides the accompanying
+      warning event, not this counter.
+    instrument: counter
+    unit: "{divergence}"
+    attributes:
+      - ref: ourios.tenant.watch.key
+        requirement_level: required
+
   # Cached template map (RFC 0033 §3.7): the querier's per-tenant cached
   # fold of the audit stream. Lookup outcomes carry the corruption /
   # forward-compat signals (`torn` / `unknown_version`); publish outcomes

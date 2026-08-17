@@ -267,6 +267,29 @@ groups:
           The disposition of a failed audit partition flush (issue #302):
           whether the batch was retained for retry or dropped.
 
+      - id: ourios.tenant.watch.key
+        type: string
+        stability: development
+        brief: >-
+          The resource-attribute key the RFC 0045 §3.4 tenant divergence
+          detector watched (`receiver.tenant.watch`).
+        examples: ["k8s.cluster.name", "cloud.region"]
+      - id: ourios.tenant.watch.first_value
+        type: string
+        stability: development
+        brief: >-
+          The first value of the watched key observed for the tenant
+          (bounded to 128 bytes, truncated with a trailing `…`).
+        examples: ["cluster1"]
+      - id: ourios.tenant.watch.value
+        type: string
+        stability: development
+        brief: >-
+          The divergent value of the watched key a later group carried
+          for the same tenant (bounded to 128 bytes, truncated with a
+          trailing `…`).
+        examples: ["cluster2"]
+
       - id: ourios.tls.listener
         type:
           members:

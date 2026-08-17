@@ -42,10 +42,11 @@ use std::time::Duration;
 use clap::Parser;
 use ourios_ingester::Compactor;
 use ourios_ingester::receiver::tls::TlsSettings;
+use ourios_ingester::receiver::{TenantDerivation, TenantRule};
 use ourios_parquet::{
     CompactionPolicy, ParquetAuditSink, PromotedAttributes, S3Config, StoreConfig,
 };
-use ourios_server::config::file::{FileConfig, PromotedEntry, TlsSection};
+use ourios_server::config::file::{FileConfig, PromotedEntry, TenantSection, TlsSection};
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
 
@@ -125,6 +126,9 @@ struct ReceiverParams {
     /// (`receiver.encode_workers` / `OURIOS_RECEIVER_ENCODE_WORKERS`;
     /// default: the host's available cores, validated ≥ 1).
     encode_workers: usize,
+    /// RFC 0045 §3.1 — tenant derivation rule + divergence watch
+    /// (`receiver.tenant.*`, config-file only; default `[service.name]`).
+    tenant: TenantDerivation,
 }
 
 /// Resolve [`ServerConfig`] from the environment:
@@ -277,6 +281,7 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
     if let Some(receiver) = config.receiver.as_mut() {
         receiver.grpc_tls = tls_settings("receiver.grpc_tls", &file.receiver.grpc_tls)?;
         receiver.http_tls = tls_settings("receiver.http_tls", &file.receiver.http_tls)?;
+        receiver.tenant = tenant_derivation(&file.receiver.tenant)?;
     }
     config.querier = build_querier_config(
         file.querier.enabled.as_deref(),
@@ -451,7 +456,46 @@ fn build_receiver_config(
         http_tls: None,
         wal_root,
         encode_workers,
+        tenant: TenantDerivation::default(),
     }))
+}
+
+/// Resolve `receiver.tenant.*` (RFC 0045 §3.1 / RFC0045.1): absent keys
+/// take the defaults; an empty or duplicate-key `rule` and a
+/// `watch_capacity` below 1 are configuration errors.
+fn tenant_derivation(section: &TenantSection) -> Result<TenantDerivation, String> {
+    let defaults = TenantDerivation::default();
+    let rule = match &section.rule {
+        Some(keys) => TenantRule::from_keys(keys.iter().cloned())
+            .map_err(|e| format!("receiver.tenant.rule: {e}"))?,
+        None => defaults.rule,
+    };
+    let watch = section.watch.clone().unwrap_or(defaults.watch);
+    if watch.iter().any(|key| key.trim().is_empty()) {
+        return Err("receiver.tenant.watch lists an empty resource attribute key".to_owned());
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(duplicate) = watch.iter().find(|key| !seen.insert(key.as_str())) {
+        return Err(format!(
+            "receiver.tenant.watch lists resource attribute key `{duplicate}` more than once"
+        ));
+    }
+    let watch_capacity = match section.watch_capacity.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                return Err(format!(
+                    "receiver.tenant.watch_capacity must be an integer ≥ 1, got {raw:?}"
+                ));
+            }
+        },
+        _ => defaults.watch_capacity,
+    };
+    Ok(TenantDerivation {
+        rule,
+        watch,
+        watch_capacity,
+    })
 }
 
 /// Parse the RFC 0035 encode-pool worker count: ≥ 1 when set, else the
@@ -879,6 +923,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 promoted: config.promoted.clone(),
                 auth: resolver.clone().expect("resolver built for enabled roles"),
                 encode_workers: params.encode_workers,
+                tenant: params.tenant.clone(),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -1724,6 +1769,76 @@ auth:
             build_receiver_config(Some("1"), None, None, Some(PathBuf::from("")), None).is_err(),
             "an empty WAL root is rejected",
         );
+    }
+
+    /// RFC0045.1 — `receiver.tenant` resolution: absent → the
+    /// `[service.name]` default (byte-identical to the pre-RFC rule),
+    /// `rule: []` and a duplicate key are configuration errors, and the
+    /// composite rule + watch settings resolve in order.
+    #[test]
+    fn tenant_derivation_defaults_and_validates() {
+        let lookup = |_: &str| None;
+        let absent = parse("receiver:\n  enabled: true\n", &lookup).expect("valid");
+        assert_eq!(
+            tenant_derivation(&absent.receiver.tenant).expect("default"),
+            TenantDerivation::default()
+        );
+        assert_eq!(TenantDerivation::default().rule, TenantRule::service_name());
+
+        let empty = parse("receiver:\n  tenant:\n    rule: []\n", &lookup).expect("valid yaml");
+        assert!(
+            tenant_derivation(&empty.receiver.tenant)
+                .unwrap_err()
+                .contains("receiver.tenant.rule")
+        );
+
+        let dup = parse(
+            "receiver:\n  tenant:\n    rule: [service.name, service.name]\n",
+            &lookup,
+        )
+        .expect("valid yaml");
+        assert!(
+            tenant_derivation(&dup.receiver.tenant)
+                .unwrap_err()
+                .contains("service.name")
+        );
+
+        let composite = parse(
+            "receiver:\n  tenant:\n    rule: [k8s.cluster.name, service.name]\n    watch: [cloud.region]\n    watch_capacity: 7\n",
+            &lookup,
+        )
+        .expect("valid yaml");
+        let resolved = tenant_derivation(&composite.receiver.tenant).expect("resolves");
+        assert_eq!(
+            resolved.rule,
+            TenantRule::from_keys(["k8s.cluster.name", "service.name"]).expect("rule")
+        );
+        assert_eq!(resolved.watch, ["cloud.region"]);
+        assert_eq!(resolved.watch_capacity, 7);
+
+        for bad_yaml in [
+            "receiver:\n  tenant:\n    rule: [service.name, \"\"]\n",
+            "receiver:\n  tenant:\n    watch: [\" \"]\n",
+            "receiver:\n  tenant:\n    watch: [cloud.region, cloud.region]\n",
+        ] {
+            let cfg = parse(bad_yaml, &lookup).expect("valid yaml");
+            assert!(
+                tenant_derivation(&cfg.receiver.tenant).is_err(),
+                "blank or duplicate key rejected: {bad_yaml:?}"
+            );
+        }
+
+        for bad in ["0", "-1", "many"] {
+            let cfg = parse(
+                &format!("receiver:\n  tenant:\n    watch_capacity: {bad}\n"),
+                &lookup,
+            )
+            .expect("valid yaml");
+            assert!(
+                tenant_derivation(&cfg.receiver.tenant).is_err(),
+                "watch_capacity = {bad:?} is rejected"
+            );
+        }
     }
 
     #[test]

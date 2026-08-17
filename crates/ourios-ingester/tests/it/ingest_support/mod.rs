@@ -20,7 +20,8 @@ use ourios_wal::{
 };
 
 use ourios_ingester::receiver::{
-    CommitCoordinator, IngestPipeline, Journal, ReceiveError, TenantRule,
+    CommitCoordinator, DivergenceWatch, IngestPipeline, Journal, ReceiveError, TenantDerivation,
+    TenantRule,
 };
 
 pub fn wal_config(root: &Path) -> WalConfig {
@@ -56,6 +57,14 @@ pub fn open_pipeline(root: &Path) -> IngestPipeline {
         miner,
         TenantRule::service_name(),
     )
+}
+
+/// [`open_pipeline`] under an RFC 0045 tenant derivation (rule + watch).
+pub fn open_pipeline_with_derivation(root: &Path, derivation: &TenantDerivation) -> IngestPipeline {
+    let wal = Wal::open(wal_config(root)).expect("open WAL");
+    let miner = MinerCluster::new(MinerConfig::default());
+    IngestPipeline::new(coordinator(Box::new(wal)), miner, derivation.rule.clone())
+        .with_tenant_watch(DivergenceWatch::from_derivation(derivation))
 }
 
 /// One observed `Journal` call, in order.
@@ -247,6 +256,24 @@ pub fn resource_logs(service: &str, bodies: &[&str]) -> ResourceLogs {
         }],
         ..Default::default()
     }
+}
+
+/// A `ResourceLogs` whose `Resource` carries the given string attributes
+/// (in order) and one scope with one record per body.
+pub fn resource_logs_with_attrs(attrs: &[(&str, &str)], bodies: &[&str]) -> ResourceLogs {
+    let mut group = resource_logs("", bodies);
+    group.resource = Some(Resource {
+        attributes: attrs
+            .iter()
+            .map(|(key, value)| KeyValue {
+                key: (*key).to_owned(),
+                value: Some(string_value(value)),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    });
+    group
 }
 
 /// A `ResourceLogs` for `service` with **no** `ScopeLogs` at all.

@@ -29,7 +29,8 @@ use tracing::Instrument as _;
 
 use crate::metrics::IngestMetrics;
 use crate::receiver::commit::CommitCoordinator;
-use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
+use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out_observed};
+use crate::receiver::watch::DivergenceWatch;
 
 /// The §6.9 rotation-cadence callback: receives the miner as it
 /// stands and the rotation-point high-water mark. See
@@ -121,6 +122,9 @@ pub struct IngestPipeline {
     coordinator: Arc<CommitCoordinator>,
     miner: Mutex<MinerCluster>,
     rule: TenantRule,
+    /// RFC 0045 §3.4 — the divergence detector, when any watch key is
+    /// configured beyond the rule's own keys.
+    watch: Option<DivergenceWatch>,
     /// The durable high-water mark after the most recent acked batch (or
     /// the startup seed). Behind a mutex: concurrent acks update it, and
     /// the rotation-detection read-then-write must see a consistent value.
@@ -164,12 +168,21 @@ impl IngestPipeline {
             coordinator,
             miner: Mutex::new(miner),
             rule,
+            watch: None,
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
             encode_pool: None,
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
         }
+    }
+
+    /// Attach the RFC 0045 §3.4 divergence detector; every derived group
+    /// is observed after fan-out.
+    #[must_use]
+    pub fn with_tenant_watch(mut self, watch: Option<DivergenceWatch>) -> Self {
+        self.watch = watch;
+        self
     }
 
     /// Enable the RFC 0035 §3.1 ordered/concurrent ingest split: the
@@ -337,7 +350,11 @@ impl IngestPipeline {
 
         // Steps 1–2: fan out per tenant. An unresolvable Resource rejects
         // the entire batch here, before any WAL write (RFC0003.4).
-        let records = fan_out(request, &self.rule)?;
+        let records = fan_out_observed(request, &self.rule, |tenant, attributes| {
+            if let Some(watch) = &self.watch {
+                watch.observe(tenant, attributes);
+            }
+        })?;
 
         // Empty fast path (RFC0003.12): no records → success, no WAL
         // frame, miner untouched.

@@ -29,7 +29,7 @@ use ourios_ingester::receiver::tls_serve::{
     LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
 };
 use ourios_ingester::receiver::{
-    CommitCoordinator, IngestPipeline, SharedPipeline, TenantDerivation,
+    CommitCoordinator, DivergenceWatch, IngestPipeline, SharedPipeline, TenantDerivation,
 };
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
@@ -538,6 +538,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(coordinator, miner, rule)
+            .with_tenant_watch(DivergenceWatch::from_derivation(&config.tenant))
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))

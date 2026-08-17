@@ -291,11 +291,30 @@ pub fn fan_out(
     request: ExportLogsServiceRequest,
     rule: &TenantRule,
 ) -> Result<Vec<OtlpLogRecord>, TenantResolutionError> {
+    fan_out_observed(request, rule, |_, _| {})
+}
+
+/// [`fan_out`] with a per-group observer, called with each group's derived
+/// tenant and its `Resource.attributes` after derivation succeeds — the
+/// RFC 0045 §3.4 divergence detector's hook. Groups after a failing one
+/// are never observed (the export is rejected whole).
+///
+/// # Errors
+///
+/// As [`fan_out`].
+pub fn fan_out_observed(
+    request: ExportLogsServiceRequest,
+    rule: &TenantRule,
+    mut observe: impl FnMut(&TenantId, &[KeyValue]),
+) -> Result<Vec<OtlpLogRecord>, TenantResolutionError> {
     let mut records = Vec::new();
     for (index, resource_logs) in request.resource_logs.into_iter().enumerate() {
         // Derived before `resource_logs` is moved into
         // `materialize_resource_logs`.
         let tenant_id = derive_for_group(&resource_logs, index, rule)?;
+        if let Some(resource) = &resource_logs.resource {
+            observe(&tenant_id, &resource.attributes);
+        }
         records.extend(materialize_resource_logs(resource_logs, &tenant_id));
     }
     Ok(records)

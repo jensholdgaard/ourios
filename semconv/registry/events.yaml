@@ -88,3 +88,27 @@ groups:
       The WAL was truncated past a tenant's snapshot high-water mark
       (external mutation); templates first seen in the gap may re-mint —
       drift is observable via the RFC 0010 drift query.
+  - id: event.ourios.receiver.tenant.divergence
+    type: event
+    name: ourios.receiver.tenant.divergence
+    stability: development
+    brief: >
+      A tenant spans more than one value of a watched resource attribute
+      (RFC 0045 §3.4): the first observed value and the divergent one are
+      attached, bounded. Rate-limited per (tenant, key). Not a rejection.
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.tenant.watch.key
+        requirement_level: required
+      - ref: ourios.tenant.watch.first_value
+        requirement_level: required
+      - ref: ourios.tenant.watch.value
+        requirement_level: required
+  - id: event.ourios.receiver.tenant.watch_saturated
+    type: event
+    name: ourios.receiver.tenant.watch_saturated
+    stability: development
+    brief: >
+      The tenant divergence watch reached `receiver.tenant.watch_capacity`;
+      further (tenant, key) pairs are not watched. Emitted once per process.

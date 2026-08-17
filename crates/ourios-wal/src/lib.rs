@@ -72,21 +72,144 @@ impl PartialOrd for WalOffset {
 }
 
 /// Frame-kind discriminator per RFC 0008 §6.2.2. The reserved
-/// range (`0x03..=0xFF`) is rejected on read as RFC0008.5
+/// range (`0x04..=0xFF`) is rejected on read as RFC0008.5
 /// corruption — the format admits future kinds without a
 /// version bump but only when they're added here.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
     /// `ExportLogsServiceRequest` protobuf bytes the receiver
-    /// decoded, verbatim.
+    /// decoded, verbatim. Written by receivers before RFC 0046; the
+    /// frame carries no tenant, so current replay refuses it as
+    /// unsupported (not corruption) — see [`TenantBatch`].
     OtlpBatch = 0x01,
     /// One serialised [`AuditEvent`]. The exact encoding is still
     /// deferred per RFC 0008 §9 — `encode_audit_event` is
     /// `unimplemented!()` pending the system-scoped-audit design — but
     /// the frame layout does not depend on it.
     AuditEvent = 0x02,
+    /// RFC 0046 §3.3: the tenant the export was acknowledged under,
+    /// then the `ExportLogsServiceRequest` protobuf bytes —
+    /// [`TenantBatch`] is the payload codec.
+    TenantOtlpBatch = 0x03,
 }
+
+/// The `TenantOtlpBatch` payload (RFC 0046 §3.3):
+/// `u16 LE tenant byte length ‖ tenant bytes (UTF-8) ‖ protobuf`.
+///
+/// The tenant is validated on decode *before* the protobuf is
+/// touched: a zero length, a length above [`TenantBatch::MAX_TENANT_BYTES`],
+/// a length running past the payload, or invalid UTF-8 is a
+/// [`TenantBatchError`] — the recovery driver classifies it as an
+/// invalid payload (like an undecodable protobuf), not as RFC0008.5
+/// corruption, because the frame's own CRC passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantBatch<'a> {
+    pub tenant: &'a str,
+    pub protobuf: &'a [u8],
+}
+
+impl<'a> TenantBatch<'a> {
+    /// The RFC 0046 §3.1 selector bound, enforced on encode and decode.
+    pub const MAX_TENANT_BYTES: usize = 256;
+
+    /// Encode `tenant` + `protobuf` into a `TenantOtlpBatch` payload.
+    ///
+    /// # Errors
+    ///
+    /// [`TenantBatchError`] if `tenant` is empty or longer than
+    /// [`Self::MAX_TENANT_BYTES`] — callers validate the selector first
+    /// (RFC 0046 §3.1); this is the codec's own guard.
+    pub fn encode(tenant: &str, protobuf: &[u8]) -> Result<Vec<u8>, TenantBatchError> {
+        let len = tenant.len();
+        if len == 0 {
+            return Err(TenantBatchError::EmptyTenant);
+        }
+        if len > Self::MAX_TENANT_BYTES {
+            return Err(TenantBatchError::TenantTooLong { found: len });
+        }
+        // `len <= 256` fits u16 by the check above.
+        #[allow(clippy::cast_possible_truncation)]
+        let prefix = (len as u16).to_le_bytes();
+        let mut out = Vec::with_capacity(2 + len + protobuf.len());
+        out.extend_from_slice(&prefix);
+        out.extend_from_slice(tenant.as_bytes());
+        out.extend_from_slice(protobuf);
+        Ok(out)
+    }
+
+    /// Decode a `TenantOtlpBatch` payload, validating the tenant prefix
+    /// before exposing the protobuf bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`TenantBatchError`] on a truncated prefix, an empty or oversize
+    /// tenant, a length past the payload end, or invalid UTF-8.
+    pub fn decode(payload: &'a [u8]) -> Result<Self, TenantBatchError> {
+        let Some((prefix, rest)) = payload.split_first_chunk::<2>() else {
+            return Err(TenantBatchError::TruncatedPrefix {
+                found: payload.len(),
+            });
+        };
+        let len = usize::from(u16::from_le_bytes(*prefix));
+        if len == 0 {
+            return Err(TenantBatchError::EmptyTenant);
+        }
+        if len > Self::MAX_TENANT_BYTES {
+            return Err(TenantBatchError::TenantTooLong { found: len });
+        }
+        if len > rest.len() {
+            return Err(TenantBatchError::TenantPastEnd {
+                declared: len,
+                available: rest.len(),
+            });
+        }
+        let (tenant_bytes, protobuf) = rest.split_at(len);
+        let tenant = std::str::from_utf8(tenant_bytes).map_err(|_| TenantBatchError::NotUtf8)?;
+        Ok(Self { tenant, protobuf })
+    }
+}
+
+/// A `TenantOtlpBatch` payload whose tenant prefix is not the documented
+/// shape (RFC 0046 §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TenantBatchError {
+    TruncatedPrefix { found: usize },
+    EmptyTenant,
+    TenantTooLong { found: usize },
+    TenantPastEnd { declared: usize, available: usize },
+    NotUtf8,
+}
+
+impl std::fmt::Display for TenantBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TruncatedPrefix { found } => {
+                write!(
+                    f,
+                    "TenantOtlpBatch payload is {found} byte(s); the tenant length prefix needs 2"
+                )
+            }
+            Self::EmptyTenant => write!(f, "TenantOtlpBatch tenant length is zero"),
+            Self::TenantTooLong { found } => write!(
+                f,
+                "TenantOtlpBatch tenant length {found} exceeds {}",
+                TenantBatch::MAX_TENANT_BYTES
+            ),
+            Self::TenantPastEnd {
+                declared,
+                available,
+            } => write!(
+                f,
+                "TenantOtlpBatch tenant length {declared} runs past the payload ({available} byte(s) follow the prefix)"
+            ),
+            Self::NotUtf8 => write!(f, "TenantOtlpBatch tenant bytes are not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for TenantBatchError {}
 
 /// Operator-visible WAL configuration. Every field is a §6.9
 /// Tunable — `Wal::open` validates each one against the
@@ -1354,6 +1477,52 @@ mod tests {
     //! helper-level contracts so a regression caught at this
     //! layer surfaces here rather than as a cascading failure
     //! in the integration suite.
+
+    // RFC0046.11 — the TenantOtlpBatch prefix is validated before the
+    // protobuf is exposed; each malformed shape is its own error.
+    #[test]
+    fn tenant_batch_round_trips_and_rejects_malformed_prefixes() {
+        use super::{TenantBatch, TenantBatchError};
+        let payload = TenantBatch::encode("acme/eu", b"proto").expect("encode");
+        let decoded = TenantBatch::decode(&payload).expect("decode");
+        assert_eq!(decoded.tenant, "acme/eu");
+        assert_eq!(decoded.protobuf, b"proto");
+        let max = "x".repeat(TenantBatch::MAX_TENANT_BYTES);
+        assert!(TenantBatch::encode(&max, b"").is_ok());
+
+        assert_eq!(
+            TenantBatch::encode("", b"p").unwrap_err(),
+            TenantBatchError::EmptyTenant
+        );
+        assert!(matches!(
+            TenantBatch::encode(&"x".repeat(257), b"p").unwrap_err(),
+            TenantBatchError::TenantTooLong { found: 257 }
+        ));
+        assert!(matches!(
+            TenantBatch::decode(&[7]).unwrap_err(),
+            TenantBatchError::TruncatedPrefix { found: 1 }
+        ));
+        assert_eq!(
+            TenantBatch::decode(&[0, 0, b'p']).unwrap_err(),
+            TenantBatchError::EmptyTenant
+        );
+        assert!(matches!(
+            TenantBatch::decode(&[1, 1, b'a']).unwrap_err(),
+            TenantBatchError::TenantTooLong { found: 257 }
+        ));
+        assert!(matches!(
+            TenantBatch::decode(&[5, 0, b'a', b'b']).unwrap_err(),
+            TenantBatchError::TenantPastEnd {
+                declared: 5,
+                available: 2
+            }
+        ));
+        assert_eq!(
+            TenantBatch::decode(&[1, 0, 0xFF, b'p']).unwrap_err(),
+            TenantBatchError::NotUtf8
+        );
+    }
+
     use super::*;
 
     /// §6.3 macOS strong durability (#125): with the knob set, the

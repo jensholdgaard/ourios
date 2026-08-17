@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! | len:   u32_le   (payload length, excluding header + CRC)              |
-//! | kind:  u8       (0x01 = OtlpBatch, 0x02 = AuditEvent; reserved >0x02) |
+//! | kind:  u8       (0x01 OtlpBatch, 0x02 AuditEvent, 0x03 TenantOtlpBatch; reserved >0x03) |
 //! | _pad:  [u8; 3]  (reserved, MUST be zero, validated on read)           |
 //! | crc32: u32_le   (CRC32-C over kind || pad || payload, Castagnoli)     |
 //! | payload: [u8; len]                                                    |
@@ -53,7 +53,7 @@ pub enum FrameError {
     /// payload bytes landed partially.
     CrcMismatch { stored: u32, computed: u32 },
     /// `kind` byte was outside the defined range
-    /// (`0x01..=0x02` today). The reserved range is reserved
+    /// (`0x01..=0x03` today). The reserved range is reserved
     /// for future kinds; current readers MUST refuse rather
     /// than guess.
     UnknownKind { found: u8 },
@@ -83,7 +83,7 @@ impl std::fmt::Display for FrameError {
             ),
             Self::UnknownKind { found } => write!(
                 f,
-                "unknown frame kind 0x{found:02x} (this build understands 0x01, 0x02)",
+                "unknown frame kind 0x{found:02x} (this build understands 0x01, 0x02, 0x03)",
             ),
             Self::NonZeroPad { found } => {
                 write!(f, "frame `_pad` bytes MUST be zero; found {found:?}")
@@ -185,6 +185,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<(FrameKind, Vec<u8>), FrameError
     let kind = match kind_byte {
         0x01 => FrameKind::OtlpBatch,
         0x02 => FrameKind::AuditEvent,
+        0x03 => FrameKind::TenantOtlpBatch,
         found => return Err(FrameError::UnknownKind { found }),
     };
     let pad = [header[5], header[6], header[7]];

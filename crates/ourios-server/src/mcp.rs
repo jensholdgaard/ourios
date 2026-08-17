@@ -25,7 +25,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use opentelemetry::context::FutureExt as _;
 use ourios_core::tenant::TenantId;
-use ourios_ingester::receiver::{AuthBinding, AuthResolver, extract_context};
+use ourios_ingester::receiver::{AuthBinding, AuthError, AuthResolver, extract_context};
 use ourios_parquet::PromotedAttributes;
 use ourios_querier::Querier;
 use ourios_querier::dsl::ir::Stage;
@@ -270,7 +270,7 @@ impl OuriosMcp {
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<AuthBinding>());
         match binding {
-            Some(binding) if binding.tenants().allows(tenant) => Ok(()),
+            Some(binding) if binding.may_read(tenant) => Ok(()),
             Some(_) => Err(ErrorData::invalid_request(
                 "the tenant is outside the authenticated token's allowed set",
                 None,
@@ -666,8 +666,16 @@ async fn require_bearer(auth: AuthResolver, mut request: Request<Body>, next: Ne
         Ok(Some(binding)) => {
             request.extensions_mut().insert(binding);
         }
-        Err(_) => {
+        Err(AuthError::Unauthenticated) => {
             return (StatusCode::UNAUTHORIZED, "a valid bearer token is required").into_response();
+        }
+        // RFC 0047 §3.1: fail closed when the resolver cannot answer.
+        Err(AuthError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the authorization resolver is unavailable; retry later",
+            )
+                .into_response();
         }
     }
     next.run(request).await

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "openfga": {
+      "source": "openfga/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/openfga/SKILL.md",
+      "computedHash": "59ddf537464cf2b1ad4202f0ded04aaf3f13906b6b6565882a03fa874c97f755"
+    }
+  }
+}

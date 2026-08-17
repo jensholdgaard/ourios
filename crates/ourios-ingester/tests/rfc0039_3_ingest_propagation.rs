@@ -25,7 +25,7 @@ mod ingest_support;
 
 use axum::body::Body;
 use axum::http::{Request, header};
-use ingest_support::{request, resource_logs, shared_wal_pipeline};
+use ingest_support::{grpc_request, request, resource_logs, shared_wal_pipeline};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -108,15 +108,14 @@ async fn rfc0039_3_extracted_context_survives_the_ingest_spawn() {
     // the batch span is finished by the time this returns. ---
     let grpc_tmp = tempfile::tempdir().expect("temp");
     let receiver = LogsReceiver::new(shared_wal_pipeline(grpc_tmp.path()));
-    let mut grpc_request =
-        tonic::Request::new(request(vec![resource_logs("checkout", &["alpha", "beta"])]));
-    grpc_request.metadata_mut().insert(
+    let mut traced = grpc_request(request(vec![resource_logs("checkout", &["alpha", "beta"])]));
+    traced.metadata_mut().insert(
         "traceparent",
         traceparent(GRPC_TRACE, GRPC_SPAN)
             .parse()
             .expect("valid metadata value"),
     );
-    receiver.export(grpc_request).await.expect("export acks");
+    receiver.export(traced).await.expect("export acks");
 
     // --- Arm B: OTLP/HTTP, driven in-process through the real router. ---
     let http_tmp = tempfile::tempdir().expect("temp");
@@ -129,6 +128,7 @@ async fn rfc0039_3_extracted_context_survives_the_ingest_spawn() {
                 .method("POST")
                 .uri(&config.path)
                 .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .header("x-ourios-tenant", "checkout")
                 .header("traceparent", traceparent(HTTP_TRACE, HTTP_SPAN))
                 .body(Body::from(body))
                 .expect("build request"),
@@ -144,7 +144,7 @@ async fn rfc0039_3_extracted_context_survives_the_ingest_spawn() {
     // --- Arm C (RFC0039.2, ingest): no traceparent at all. ---
     let root_tmp = tempfile::tempdir().expect("temp");
     LogsReceiver::new(shared_wal_pipeline(root_tmp.path()))
-        .export(tonic::Request::new(request(vec![resource_logs(
+        .export(grpc_request(request(vec![resource_logs(
             "billing",
             &["delta"],
         )])))

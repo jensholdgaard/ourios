@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
-use ourios_ingester::receiver::{IngestPipeline, TenantRule};
+use ourios_ingester::receiver::IngestPipeline;
 use ourios_ingester::{recovery, snapshot_store};
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::load_snapshot;
@@ -31,7 +31,6 @@ fn rotating_pipeline(root: &Path, snapshots_root: &Path) -> IngestPipeline {
     IngestPipeline::new(
         coordinator(Box::new(wal)),
         MinerCluster::new(ourios_config::MinerConfig::default()),
-        TenantRule::service_name(),
     )
     .with_rotation_hook(Box::new(move |miner, mark| {
         recovery::write_snapshots(&hook_root, miner, Some(mark)).expect("snapshot write");
@@ -47,7 +46,10 @@ async fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
     // Batch A lands in the first segment; the durable mark after it
     // is the rotation-point high-water the hook must stamp.
     pipeline
-        .ingest(request(vec![resource_logs("svc", &["user 1 logged in"])]))
+        .ingest(
+            request(vec![resource_logs("svc", &["user 1 logged in"])]),
+            ourios_core::tenant::TenantId::new("svc"),
+        )
         .await
         .expect("batch A");
     let rotation_point = pipeline.last_durable().expect("durable after batch A");
@@ -64,7 +66,10 @@ async fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
     // wall time is comfortably past the strict 1 s cap.)
     std::thread::sleep(Duration::from_millis(1_200));
     pipeline
-        .ingest(request(vec![resource_logs("svc", &["payment 9 settled"])]))
+        .ingest(
+            request(vec![resource_logs("svc", &["payment 9 settled"])]),
+            ourios_core::tenant::TenantId::new("svc"),
+        )
         .await
         .expect("batch B");
 
@@ -111,7 +116,6 @@ async fn no_rotation_means_no_cadence_write() {
     let pipeline = IngestPipeline::new(
         coordinator(Box::new(wal)),
         MinerCluster::new(ourios_config::MinerConfig::default()),
-        TenantRule::service_name(),
     )
     .with_rotation_hook(Box::new(move |miner, mark| {
         *count.lock().expect("lock") += 1;
@@ -120,7 +124,10 @@ async fn no_rotation_means_no_cadence_write() {
 
     for body in ["a 1", "b 2", "c 3"] {
         pipeline
-            .ingest(request(vec![resource_logs("svc", &[body])]))
+            .ingest(
+                request(vec![resource_logs("svc", &[body])]),
+                ourios_core::tenant::TenantId::new("svc"),
+            )
             .await
             .expect("ingest");
     }

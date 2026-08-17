@@ -31,7 +31,7 @@ async fn rfc0003_12_empty_request_succeeds_without_persisting() {
 
         // Act
         let ingested = pipeline
-            .ingest(export)
+            .ingest(export, ourios_core::tenant::TenantId::new("checkout"))
             .await
             .expect("an empty request is accepted");
 

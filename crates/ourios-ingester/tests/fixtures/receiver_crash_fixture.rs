@@ -21,7 +21,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_config::MinerConfig;
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline};
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{Wal, WalConfig};
 
@@ -48,11 +48,7 @@ async fn main() {
     let segment_size_bytes = config.segment_size_bytes;
     let wal = Wal::open(config).expect("fixture: Wal::open");
     let coordinator = CommitCoordinator::new(Box::new(wal), window, segment_size_bytes);
-    let pipeline = IngestPipeline::new(
-        coordinator,
-        MinerCluster::new(MinerConfig::default()),
-        TenantRule::service_name(),
-    );
+    let pipeline = IngestPipeline::new(coordinator, MinerCluster::new(MinerConfig::default()));
 
     let request = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
@@ -76,7 +72,10 @@ async fn main() {
     };
 
     // Append + fsync the batch (durable) — the receiver would now ack.
-    let ingested = pipeline.ingest(request).await.expect("fixture: ingest");
+    let ingested = pipeline
+        .ingest(request, ourios_core::tenant::TenantId::new("checkout"))
+        .await
+        .expect("fixture: ingest");
     assert_eq!(ingested, 1, "fixture ingested one record");
 
     // Signal durability, then park so the parent kills us *after* the

@@ -59,7 +59,7 @@ fn rfc0003_2_fsynced_batch_survives_a_crash_before_ack() {
         1,
         "exactly one fsync'd OtlpBatch frame survives"
     );
-    assert_eq!(frames[0].0, FrameKind::OtlpBatch);
+    assert_eq!(frames[0].0, FrameKind::TenantOtlpBatch);
     let recovered = decode_protobuf(&frames[0].1).expect("frame payload decodes");
     let body = recovered.resource_logs[0].scope_logs[0].log_records[0]
         .body

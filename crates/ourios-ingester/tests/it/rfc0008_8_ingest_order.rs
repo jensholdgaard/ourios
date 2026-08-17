@@ -20,7 +20,7 @@
 use crate::ingest_support::{replay_frames, request, resource_logs, shared_wal_pipeline};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
-use ourios_ingester::receiver::{TenantRule, fan_out};
+
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::FrameKind;
 use prost::Message;
@@ -48,7 +48,9 @@ async fn rfc0008_8_concurrent_ingest_preserves_wal_order_at_the_miner() {
         handles.push(tokio::spawn(async move {
             let body = distinct_body(i);
             let export = request(vec![resource_logs("checkout", &[body.as_str()])]);
-            pipeline.ingest(export).await
+            pipeline
+                .ingest(export, ourios_core::tenant::TenantId::new("checkout"))
+                .await
         }));
     }
     for h in handles {
@@ -72,12 +74,14 @@ async fn rfc0008_8_concurrent_ingest_preserves_wal_order_at_the_miner() {
     // Build a control miner by replaying the WAL frames in order — this is
     // the authoritative WAL-append order, whatever the concurrent race
     // produced.
-    let rule = TenantRule::service_name();
     let mut control = MinerCluster::new(MinerConfig::default());
     for (kind, payload) in replay_frames(tmp.path()) {
-        assert_eq!(kind, FrameKind::OtlpBatch);
+        assert_eq!(kind, FrameKind::TenantOtlpBatch);
         let request = ExportLogsServiceRequest::decode(payload.as_slice()).expect("decode frame");
-        for record in fan_out(request, &rule).expect("fan out") {
+        for record in ourios_ingester::receiver::assign(
+            request,
+            &ourios_core::tenant::TenantId::new("checkout"),
+        ) {
             control.ingest(&record);
         }
     }

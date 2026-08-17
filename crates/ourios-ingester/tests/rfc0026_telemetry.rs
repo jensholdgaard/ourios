@@ -96,7 +96,8 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
         .expect("bound");
     let denied = pipeline
         .ingest_bound(
-            request(vec![resource_logs("tenant-b", &["intruding line"])]),
+            request(vec![resource_logs("svc", &["intruding line"])]),
+            ourios_core::tenant::TenantId::new("tenant-b"),
             Some(&binding),
             false,
         )

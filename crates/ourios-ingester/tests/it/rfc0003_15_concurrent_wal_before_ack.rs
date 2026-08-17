@@ -8,11 +8,12 @@
 
 use std::sync::Arc;
 
-use crate::ingest_support::{replay_frames, request, resource_logs, shared_wal_pipeline};
+use crate::ingest_support::{
+    grpc_request, replay_frames, request, resource_logs, shared_wal_pipeline,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_wal::FrameKind;
-use tonic::Request;
 
 const N: usize = 8;
 
@@ -31,7 +32,7 @@ async fn rfc0003_15_concurrent_exports_are_each_durable() {
         handles.push(tokio::spawn(async move {
             let body = format!("line {i}");
             let export = request(vec![resource_logs("checkout", &[body.as_str()])]);
-            receiver.export(Request::new(export)).await
+            receiver.export(grpc_request(export)).await
         }));
     }
 
@@ -48,7 +49,9 @@ async fn rfc0003_15_concurrent_exports_are_each_durable() {
     let frames = replay_frames(tmp.path());
     assert_eq!(frames.len(), N, "one durable frame per concurrent Export");
     assert!(
-        frames.iter().all(|(kind, _)| *kind == FrameKind::OtlpBatch),
+        frames
+            .iter()
+            .all(|(kind, _)| *kind == FrameKind::TenantOtlpBatch),
         "every durable frame is an OtlpBatch",
     );
 }

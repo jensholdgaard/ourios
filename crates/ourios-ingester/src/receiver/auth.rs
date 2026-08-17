@@ -18,11 +18,10 @@
 
 use std::sync::Arc;
 
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::auth::{TenantSet, TokenStore};
+use ourios_core::tenant::TenantId;
 
 use crate::receiver::pipeline::ReceiveError;
-use crate::receiver::tenant::{TenantRule, derive_for_group};
 
 /// The authenticated identity a listener attaches to a request: the
 /// token's audit/metric label and its tenant binding — never the token
@@ -201,37 +200,25 @@ impl AuthResolver {
     }
 }
 
-/// Enforce the §3.2 per-batch tenant binding: derive every `ResourceLogs`
-/// group's tenant (the same rule and error surface as the fan-out — RFC
-/// 0003 §6.3 derivation is unchanged) and require each to fall inside the
-/// binding's set.
+/// Enforce the §3.2 per-batch tenant binding: the out-of-band selected
+/// `tenant` (RFC 0046 §3.1) must fall inside the binding's set.
 ///
-/// Runs before the WAL append *and* before the fan-out's materialisation,
-/// so a denied batch does no ingest work at all. Groups with zero log
-/// records still have their derived tenant checked — the RFC binds the
-/// batch's *claimed* tenants, not just the record-bearing ones.
+/// Runs before the WAL append *and* before materialisation, so a denied
+/// batch does no ingest work at all.
 ///
 /// # Errors
 ///
-/// - [`ReceiveError::TenantResolution`] if a group fails derivation
-///   (identical to the fan-out's rejection, RFC0003.4).
-/// - [`ReceiveError::TenantDenied`] on the first out-of-set tenant — the
-///   whole batch is rejected (`PERMISSION_DENIED` / 403).
-pub(crate) fn check_binding(
-    request: &ExportLogsServiceRequest,
-    rule: &TenantRule,
-    binding: &AuthBinding,
-) -> Result<(), ReceiveError> {
-    for (index, resource_logs) in request.resource_logs.iter().enumerate() {
-        let tenant_id = derive_for_group(resource_logs, index, rule)?;
-        if !binding.tenants.allows(tenant_id.as_str()) {
-            return Err(ReceiveError::TenantDenied {
-                token_name: binding.token_name.clone(),
-                tenant: tenant_id,
-            });
-        }
+/// [`ReceiveError::TenantDenied`] when `tenant` is outside the set — the
+/// whole batch is rejected (`PERMISSION_DENIED` / 403).
+pub(crate) fn check_binding(tenant: &TenantId, binding: &AuthBinding) -> Result<(), ReceiveError> {
+    if binding.tenants.allows(tenant.as_str()) {
+        Ok(())
+    } else {
+        Err(ReceiveError::TenantDenied {
+            token_name: binding.token_name.clone(),
+            tenant: tenant.clone(),
+        })
     }
-    Ok(())
 }
 
 #[cfg(test)]

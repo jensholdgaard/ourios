@@ -30,6 +30,7 @@ use crate::receiver::auth::AuthResolver;
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 use crate::receiver::propagation::extract_context;
+use crate::receiver::selector;
 
 /// OTLP/HTTP listener configuration.
 #[derive(Debug, Clone)]
@@ -107,6 +108,13 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         state.pipeline.record_unauthenticated();
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    // RFC 0046 §3.1: the tenant selector is required, exactly once, and
+    // decided before authorization against the set, before decode, before
+    // any WAL work — a missing/malformed selector is a 400 with the reason.
+    let tenant = match selector::from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     let Some(format) = content_type(&headers) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -153,7 +161,7 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     match tokio::spawn(
         async move {
             pipeline
-                .ingest_bound(request, binding.as_ref(), lenient_json)
+                .ingest_bound(request, tenant, binding.as_ref(), lenient_json)
                 .await
         }
         .with_context(parent),
@@ -170,7 +178,7 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
 /// Map a settled ingest failure to its HTTP status (RFC 0018 §3.2).
 ///
 /// Permanent client errors are non-retryable but split by class:
-/// tenant-resolution failure → `400`; an oversize payload
+/// a tenant outside the token's set → `403`; an oversize payload
 /// (`AppendError::TooLarge`, over the 16 MiB WAL frame ceiling) → `413`. Any
 /// other WAL append/sync failure is *transient* (the batch was not acked,
 /// §3.4) → retryable `503`, so compliant clients re-send rather than drop
@@ -181,7 +189,6 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
 /// retryable-vs-not decision rather than defaulting either way.
 fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     match error {
-        ReceiveError::TenantResolution(_) => StatusCode::BAD_REQUEST,
         // An authenticated caller writing outside its tenant set — a
         // permanent authz rejection, whole batch, pre-WAL (RFC 0026 §3.2).
         ReceiveError::TenantDenied { .. } => StatusCode::FORBIDDEN,
@@ -189,6 +196,9 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
             StatusCode::PAYLOAD_TOO_LARGE
         }
         ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // Unreachable for a transport-validated selector; a client cannot
+        // fix it by retrying, and it is our bug — 500.
+        ReceiveError::TenantFrame(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -281,14 +291,7 @@ fn success_response(format: WireFormat) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{ReceiveError, StatusCode, ingest_error_status};
-    use crate::receiver::tenant::TenantResolutionError;
     use ourios_wal::{AppendError, SyncError};
-
-    #[test]
-    fn tenant_resolution_is_400() {
-        let e = ReceiveError::TenantResolution(TenantResolutionError::for_test("service.name"));
-        assert_eq!(ingest_error_status(&e), StatusCode::BAD_REQUEST);
-    }
 
     #[test]
     fn tenant_denied_is_403() {

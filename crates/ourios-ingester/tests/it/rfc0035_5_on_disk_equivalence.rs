@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::ingest_support::{never_flush, pooled_wal_pipeline, request, resource_logs, wal_config};
 use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
-use ourios_ingester::receiver::{IngestPipeline, TenantRule};
+use ourios_ingester::receiver::IngestPipeline;
 use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
@@ -116,10 +116,12 @@ async fn rfc0035_5_pooled_and_sync_paths_write_equivalent_parquet() {
         let pipeline = IngestPipeline::new(
             crate::ingest_support::coordinator(Box::new(wal)),
             MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sync_sink.clone())),
-            TenantRule::service_name(),
         );
         for export in corpus() {
-            pipeline.ingest(export).await.expect("sync ingest acks");
+            pipeline
+                .ingest(export, ourios_core::tenant::TenantId::new("checkout"))
+                .await
+                .expect("sync ingest acks");
         }
         sync_sink.flush_all();
     }
@@ -131,7 +133,10 @@ async fn rfc0035_5_pooled_and_sync_paths_write_equivalent_parquet() {
     let (pipeline, pooled_sink) =
         pooled_wal_pipeline(&tmp.path().join("pooled-wal"), &pooled_store, 4);
     for export in corpus() {
-        pipeline.ingest(export).await.expect("pooled ingest acks");
+        pipeline
+            .ingest(export, ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("pooled ingest acks");
     }
     pipeline.quiesce_encodes();
     pooled_sink.flush_all();

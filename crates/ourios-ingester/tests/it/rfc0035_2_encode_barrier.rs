@@ -23,10 +23,9 @@ use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 use ourios_ingester::encode_pool::EncodePool;
-use ourios_ingester::receiver::{IngestPipeline, TenantRule, fan_out};
+use ourios_ingester::receiver::IngestPipeline;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
-use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::{FrameKind, Wal, WalConfig};
@@ -104,19 +103,15 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     let hook_snapshots = snapshots_root.clone();
 
     let miner = MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
-    let pipeline = IngestPipeline::new(
-        coordinator(Box::new(wal)),
-        miner,
-        TenantRule::service_name(),
-    )
-    .with_encode_pool(EncodePool::new(&sink, 1))
-    .with_rotation_hook(Box::new(move |miner, mark| {
-        hook_observed
-            .lock()
-            .expect("lock")
-            .push((hook_sink.buffered_records(), store_rows(&hook_store)));
-        recovery::write_snapshots(&hook_snapshots, miner, Some(mark)).expect("snapshot write");
-    }));
+    let pipeline = IngestPipeline::new(coordinator(Box::new(wal)), miner)
+        .with_encode_pool(EncodePool::new(&sink, 1))
+        .with_rotation_hook(Box::new(move |miner, mark| {
+            hook_observed
+                .lock()
+                .expect("lock")
+                .push((hook_sink.buffered_records(), store_rows(&hook_store)));
+            recovery::write_snapshots(&hook_snapshots, miner, Some(mark)).expect("snapshot write");
+        }));
 
     // Batch A: one frame, PRE_ROTATION_RECORDS records — acked long
     // before its encodes finish (the ack never waits on the pool).
@@ -125,7 +120,10 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
         .collect();
     let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
     pipeline
-        .ingest(request(vec![resource_logs("svc", &refs)]))
+        .ingest(
+            request(vec![resource_logs("svc", &refs)]),
+            ourios_core::tenant::TenantId::new("svc"),
+        )
         .await
         .expect("batch A acks");
 
@@ -133,7 +131,10 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     // encodes are still in flight on the single worker.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     pipeline
-        .ingest(request(vec![resource_logs("svc", &["payment 9 settled"])]))
+        .ingest(
+            request(vec![resource_logs("svc", &["payment 9 settled"])]),
+            ourios_core::tenant::TenantId::new("svc"),
+        )
         .await
         .expect("batch B acks");
 
@@ -153,27 +154,22 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     // coherent — snapshot at the mark + tail replay == full rebuild.
     pipeline.quiesce_encodes();
     drop(pipeline);
-    let rule = TenantRule::service_name();
     let mut recovered = MinerCluster::new(MinerConfig::default());
     let mut wal = Wal::open(WalConfig {
         segment_age_secs: 1,
         ..wal_config(&wal_root)
     })
     .expect("reopen WAL");
-    recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut recovered,
-        &RuleEpochs::load(&wal_root).expect("epochs"),
-    )
-    .expect("recover");
+    recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
     drop(wal);
 
     let mut control = MinerCluster::new(MinerConfig::default());
     for (kind, payload) in crate::ingest_support::replay_frames(&wal_root) {
-        assert_eq!(kind, FrameKind::OtlpBatch);
+        assert_eq!(kind, FrameKind::TenantOtlpBatch);
         let request = ExportLogsServiceRequest::decode(payload.as_slice()).expect("decode frame");
-        for record in fan_out(request, &rule).expect("fan out") {
+        for record in
+            ourios_ingester::receiver::assign(request, &ourios_core::tenant::TenantId::new("svc"))
+        {
             control.ingest(&record);
         }
     }

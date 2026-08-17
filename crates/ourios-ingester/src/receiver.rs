@@ -39,10 +39,10 @@ pub mod http;
 pub mod materialize;
 pub mod pipeline;
 pub mod propagation;
+pub mod selector;
 pub mod tenant;
 pub mod tls;
 pub mod tls_serve;
-pub mod watch;
 
 pub use auth::{AuthBinding, AuthResolver, Unauthenticated, authenticate_bearer};
 pub use commit::CommitCoordinator;
@@ -52,7 +52,5 @@ pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use propagation::{
     HeaderExtractor, MetadataExtractor, extract_context, extract_context_from_metadata,
 };
-pub use tenant::{
-    TenantDerivation, TenantResolutionError, TenantRule, TenantRuleError, fan_out, fan_out_observed,
-};
-pub use watch::DivergenceWatch;
+pub use selector::{SelectorError, TENANT_HEADER};
+pub use tenant::assign;

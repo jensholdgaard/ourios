@@ -12,11 +12,15 @@ use prost::Message;
 
 const PROTOBUF: &str = "application/x-protobuf";
 
-/// Recover the single `OtlpBatch` payload the pipeline captured.
+/// Recover the single `TenantOtlpBatch` payload the pipeline captured —
+/// the protobuf part, past the RFC 0046 tenant prefix.
 fn only_captured(captured: &crate::ingest_support::Captured) -> Vec<u8> {
     let frames = captured.lock().expect("captured");
     assert_eq!(frames.len(), 1, "exactly one frame captured");
-    frames[0].clone()
+    ourios_wal::TenantBatch::decode(&frames[0])
+        .expect("valid tenant prefix")
+        .protobuf
+        .to_vec()
 }
 
 /// Scenario RFC0003.13 — Compression over HTTP: identity and gzip MUST be supported.

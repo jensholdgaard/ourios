@@ -21,11 +21,10 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::{RecoveryOutcome, WalHighWater};
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalOffset};
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, TenantBatch, Wal, WalOffset};
 use prost::Message;
 
-use crate::receiver::tenant::fan_out;
-use crate::rule_epochs::RuleEpochs;
+use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
 
 /// What recovery did, for the caller to log and for the
@@ -115,7 +114,6 @@ pub fn recover(
     wal: &mut Wal,
     snapshots_root: &Path,
     miner: &mut MinerCluster,
-    epochs: &RuleEpochs,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
     let artefacts = snapshot_store::load_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
@@ -153,7 +151,6 @@ pub fn recover(
 
     let mut sink = DriverSink {
         miner,
-        epochs,
         horizons: &horizons,
         frames_delivered: 0,
         records_fed: 0,
@@ -243,13 +240,12 @@ fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
     })
 }
 
-/// The §6.6 [`FrameSink`]: per `OtlpBatch` frame, decode →
-/// [`fan_out`] under the frame's rule epoch (RFC 0045 §3.3) → feed each
-/// record to the miner iff the frame offset is above that record's
-/// tenant horizon.
+/// The §6.6 [`FrameSink`]: per `TenantOtlpBatch` frame, decode the tenant
+/// prefix then the export (RFC 0046 §3.3) → [`assign`] every record to that
+/// tenant → feed each to the miner iff the frame offset is above the
+/// tenant's horizon.
 struct DriverSink<'a> {
     miner: &'a mut MinerCluster,
-    epochs: &'a RuleEpochs,
     horizons: &'a HashMap<TenantId, WalOffset>,
     frames_delivered: u64,
     records_fed: u64,
@@ -272,11 +268,23 @@ impl FrameSink for DriverSink<'_> {
             None => offset,
         });
         match kind {
+            // A pre-RFC 0046 frame carries no tenant; replay does not guess
+            // (RFC 0046 §3.3). Rejected as unsupported by the driver — the
+            // frame's own CRC passed, so this is not RFC0008.5 corruption.
             FrameKind::OtlpBatch => {
-                let request =
-                    ExportLogsServiceRequest::decode(payload).map_err(|e| reject(offset, &e))?;
-                let records = fan_out(request, self.epochs.rule_for(offset))
+                return Err(reject(
+                    offset,
+                    &"legacy OtlpBatch frame (kind 0x01, pre-RFC 0046) carries no tenant and \
+                      cannot be replayed by this version — drain the WAL under the previous \
+                      version, or delete it",
+                ));
+            }
+            FrameKind::TenantOtlpBatch => {
+                let batch = TenantBatch::decode(payload).map_err(|e| reject(offset, &e))?;
+                let tenant = TenantId::new(batch.tenant);
+                let request = ExportLogsServiceRequest::decode(batch.protobuf)
                     .map_err(|e| reject(offset, &e))?;
+                let records = assign(request, &tenant);
                 for record in &records {
                     let feed = match self.horizons.get(&record.tenant_id) {
                         Some(horizon) => offset > *horizon,
@@ -375,33 +383,83 @@ mod tests {
         assert!(!stale_gap(s, Some(x), &seen));
     }
 
-    #[test]
-    fn sink_rejects_a_malformed_payload_naming_the_offset() {
-        let mut miner = MinerCluster::new(MinerConfig::default());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let epochs = RuleEpochs::load(dir.path()).expect("implicit epoch");
-        let horizons = HashMap::new();
-        let mut sink = DriverSink {
-            miner: &mut miner,
-            epochs: &epochs,
-            horizons: &horizons,
+    fn sink<'a>(
+        miner: &'a mut MinerCluster,
+        horizons: &'a HashMap<TenantId, WalOffset>,
+    ) -> DriverSink<'a> {
+        DriverSink {
+            miner,
+            horizons,
             frames_delivered: 0,
             records_fed: 0,
             records_suppressed: 0,
             segments_seen: HashSet::new(),
             max_delivered: None,
-        };
+        }
+    }
 
-        // A truncated varint key cannot decode as a protobuf message.
-        let err = sink
-            .consume(offset(SEGMENT, 128), FrameKind::OtlpBatch, &[0xFF; 4])
-            .expect_err("malformed payload must be rejected");
+    fn sink_rejected(err: RecoveryError) -> String {
         let RecoveryError::SinkRejected { detail } = err else {
             panic!("expected SinkRejected, got {err:?}");
         };
+        detail
+    }
+
+    #[test]
+    fn sink_rejects_a_malformed_payload_naming_the_offset() {
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let horizons = HashMap::new();
+        let mut sink = sink(&mut miner, &horizons);
+
+        // A valid tenant prefix followed by a truncated varint key that
+        // cannot decode as a protobuf message.
+        let payload = TenantBatch::encode("acme", &[0xFF; 4]).expect("encode");
+        let detail = sink_rejected(
+            sink.consume(offset(SEGMENT, 128), FrameKind::TenantOtlpBatch, &payload)
+                .expect_err("malformed payload must be rejected"),
+        );
         assert!(
             detail.contains(&format!("{SEGMENT}+128")),
             "detail names the offset, got {detail:?}",
         );
+    }
+
+    // RFC0046.11 — the tenant prefix is validated before the protobuf; each
+    // malformed shape is a SinkRejected (not corruption) naming the offset.
+    #[test]
+    fn sink_rejects_malformed_tenant_prefixes() {
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let horizons = HashMap::new();
+        let mut sink = sink(&mut miner, &horizons);
+        for (payload, needle) in [
+            (vec![7u8], "length prefix"),
+            (vec![0, 0, 1], "zero"),
+            (vec![1, 1, b'a'], "exceeds"),
+            (vec![5, 0, b'a'], "runs past"),
+            (vec![1, 0, 0xFF], "UTF-8"),
+        ] {
+            let detail = sink_rejected(
+                sink.consume(offset(SEGMENT, 64), FrameKind::TenantOtlpBatch, &payload)
+                    .expect_err("malformed prefix must be rejected"),
+            );
+            assert!(detail.contains(needle), "{needle}: {detail}");
+            assert!(detail.contains(&format!("{SEGMENT}+64")));
+        }
+    }
+
+    // RFC0046.5 — a legacy 0x01 frame is unsupported for replay (a
+    // SinkRejected naming the offset and remedy), never corruption.
+    #[test]
+    fn sink_refuses_legacy_otlp_batch_frames() {
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let horizons = HashMap::new();
+        let mut sink = sink(&mut miner, &horizons);
+        let detail = sink_rejected(
+            sink.consume(offset(SEGMENT, 32), FrameKind::OtlpBatch, b"anything")
+                .expect_err("legacy frame is refused"),
+        );
+        assert!(detail.contains("legacy"), "{detail}");
+        assert!(detail.contains("drain the WAL"), "{detail}");
+        assert!(detail.contains(&format!("{SEGMENT}+32")));
     }
 }

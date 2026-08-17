@@ -23,7 +23,10 @@ async fn rfc0003_1_no_ack_until_the_batch_is_durable() {
     let export = request(vec![resource_logs("checkout", &["user 1 logged in"])]);
 
     // Act
-    let ingested = pipeline.ingest(export).await.expect("the batch is acked");
+    let ingested = pipeline
+        .ingest(export, ourios_core::tenant::TenantId::new("checkout"))
+        .await
+        .expect("the batch is acked");
 
     // Assert: the ack reflects one record, which reached the miner only
     // after durability (§6.5 step ordering). One distinct line → one
@@ -41,7 +44,7 @@ async fn rfc0003_1_no_ack_until_the_batch_is_durable() {
     drop(pipeline);
     let frames = replay_frames(tmp.path());
     assert_eq!(frames.len(), 1, "exactly one OtlpBatch frame is durable");
-    assert_eq!(frames[0].0, FrameKind::OtlpBatch);
+    assert_eq!(frames[0].0, FrameKind::TenantOtlpBatch);
     let recovered = decode_protobuf(&frames[0].1)
         .expect("the frame payload is a valid ExportLogsServiceRequest");
     let body = recovered.resource_logs[0].scope_logs[0].log_records[0]
@@ -64,7 +67,10 @@ async fn rfc0003_1_ack_is_gated_on_the_wal_fsync() {
     let export = request(vec![resource_logs("checkout", &["user 1 logged in"])]);
 
     // Act
-    pipeline.ingest(export).await.expect("the batch is acked");
+    pipeline
+        .ingest(export, ourios_core::tenant::TenantId::new("checkout"))
+        .await
+        .expect("the batch is acked");
 
     // Assert: before returning Ok, the pipeline appended the frame and
     // then fsync'd it — the ack is gated on `sync`, not merely on the

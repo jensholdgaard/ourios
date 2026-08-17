@@ -22,7 +22,7 @@ mod ingest_support;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ingest_support::{request, resource_logs, shared_wal_pipeline};
+use ingest_support::{grpc_request, request, resource_logs, shared_wal_pipeline};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
@@ -58,7 +58,7 @@ async fn rfc0038_3_span_context_survives_spawn_boundaries() {
     let ingest_tmp = tempfile::tempdir().expect("temp");
     let receiver = LogsReceiver::new(shared_wal_pipeline(ingest_tmp.path()));
     receiver
-        .export(tonic::Request::new(request(vec![resource_logs(
+        .export(grpc_request(request(vec![resource_logs(
             "checkout",
             &["alpha", "beta"],
         )])))

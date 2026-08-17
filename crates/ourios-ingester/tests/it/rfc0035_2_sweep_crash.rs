@@ -20,7 +20,6 @@ use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
-use ourios_ingester::rule_epochs::RuleEpochs;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::Wal;
@@ -107,13 +106,8 @@ fn rfc0035_2_crash_during_the_sweeps_in_flight_publish_replays_the_records() {
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let snapshots_root = wal_root.join("snapshots"); // none written → full replay
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut miner,
-        &RuleEpochs::load(&wal_root).expect("epochs"),
-    )
-    .expect("startup recovery");
+    let report =
+        recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("startup recovery");
     assert_eq!(
         report.records_fed_to_miner, 2,
         "replay re-mined both records the crash caught mid-publish"

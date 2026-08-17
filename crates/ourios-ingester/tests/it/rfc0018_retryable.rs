@@ -14,20 +14,16 @@
 use std::sync::Arc;
 
 use crate::ingest_support::{
-    capturing_pipeline, failing_append_pipeline_transient, failing_sync_pipeline,
+    capturing_pipeline, failing_append_pipeline_transient, failing_sync_pipeline, grpc_request,
     oversize_append_pipeline, post_request, request, resource_logs, send,
 };
 use axum::http::StatusCode;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
-use opentelemetry_proto::tonic::common::v1::any_value::Value;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
-use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use prost::Message;
-use tonic::{Code, Request};
+use tonic::Code;
 
 const PROTOBUF: &str = "application/x-protobuf";
 
@@ -39,28 +35,6 @@ fn valid_request() -> ExportLogsServiceRequest {
 
 /// A request whose only Resource lacks `service.name` → unresolvable tenant
 /// (a *permanent* client error).
-fn unresolvable_request() -> ExportLogsServiceRequest {
-    ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: vec![KeyValue {
-                    key: "host.name".to_owned(),
-                    value: Some(AnyValue {
-                        value: Some(Value::StringValue("node-1".to_owned())),
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            scope_logs: vec![ScopeLogs {
-                log_records: vec![LogRecord::default()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-    }
-}
-
 /// Scenario RFC0018.3 (gRPC) — a transient WAL failure is `UNAVAILABLE`
 /// (retryable); a permanent tenant failure is `INVALID_ARGUMENT`.
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
@@ -68,7 +42,7 @@ fn unresolvable_request() -> ExportLogsServiceRequest {
 async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument() {
     // Transient fsync failure → UNAVAILABLE (retryable), not INTERNAL.
     let sync_fail = LogsReceiver::new(Arc::new(failing_sync_pipeline()))
-        .export(Request::new(valid_request()))
+        .export(grpc_request(valid_request()))
         .await
         .expect_err("a WAL-sync failure is reported as an error");
     assert_eq!(
@@ -79,7 +53,7 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
 
     // Transient append I/O failure → UNAVAILABLE (retryable) too.
     let append_fail = LogsReceiver::new(Arc::new(failing_append_pipeline_transient()))
-        .export(Request::new(valid_request()))
+        .export(grpc_request(valid_request()))
         .await
         .expect_err("a WAL-append I/O failure is reported as an error");
     assert_eq!(
@@ -91,7 +65,7 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
     // Permanent oversize payload (AppendError::TooLarge) → INVALID_ARGUMENT,
     // never retryable: retrying the same oversized batch can't succeed.
     let oversize = LogsReceiver::new(Arc::new(oversize_append_pipeline()))
-        .export(Request::new(valid_request()))
+        .export(grpc_request(valid_request()))
         .await
         .expect_err("an oversize payload is rejected");
     assert_eq!(
@@ -100,11 +74,14 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
         "oversize payload → non-retryable INVALID_ARGUMENT, not UNAVAILABLE (RFC 0018 §3.2)",
     );
 
-    // Permanent: unresolvable tenant → INVALID_ARGUMENT (unchanged).
+    // Permanent: no tenant selector → INVALID_ARGUMENT (RFC0046.1).
     let permanent = LogsReceiver::new(capturing_pipeline().0)
-        .export(Request::new(unresolvable_request()))
+        .export(tonic::Request::new(request(vec![resource_logs(
+            "checkout",
+            &["x"],
+        )])))
         .await
-        .expect_err("an unresolvable Resource is rejected");
+        .expect_err("an export without a tenant selector is rejected");
     assert_eq!(
         permanent.code(),
         Code::InvalidArgument,
@@ -172,18 +149,16 @@ async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
         "oversize payload → non-retryable 413, not 503 (RFC 0018 §3.2)",
     );
 
-    // Permanent: unresolvable tenant → 400 (unchanged).
+    // Permanent: no tenant selector → 400 (RFC0046.1).
     let (pipeline, _) = capturing_pipeline();
-    let (status, _) = send(
-        router(pipeline, &HttpConfig::default()),
-        post_request(
-            "/v1/logs",
-            Some(PROTOBUF),
-            None,
-            unresolvable_request().encode_to_vec(),
-        ),
-    )
-    .await;
+    let mut no_selector = post_request(
+        "/v1/logs",
+        Some(PROTOBUF),
+        None,
+        request(vec![resource_logs("checkout", &["x"])]).encode_to_vec(),
+    );
+    no_selector.headers_mut().remove("x-ourios-tenant");
+    let (status, _) = send(router(pipeline, &HttpConfig::default()), no_selector).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,

@@ -19,10 +19,7 @@ use ourios_wal::{
     AppendError, FrameKind, FrameSink, RecoveryError, SyncError, Wal, WalConfig, WalOffset,
 };
 
-use ourios_ingester::receiver::{
-    CommitCoordinator, DivergenceWatch, IngestPipeline, Journal, ReceiveError, TenantDerivation,
-    TenantRule,
-};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, Journal, ReceiveError};
 
 pub fn wal_config(root: &Path) -> WalConfig {
     WalConfig {
@@ -52,19 +49,7 @@ pub fn coordinator(journal: Box<dyn Journal>) -> Arc<CommitCoordinator> {
 pub fn open_pipeline(root: &Path) -> IngestPipeline {
     let wal = Wal::open(wal_config(root)).expect("open WAL");
     let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(
-        coordinator(Box::new(wal)),
-        miner,
-        TenantRule::service_name(),
-    )
-}
-
-/// [`open_pipeline`] under an RFC 0045 tenant derivation (rule + watch).
-pub fn open_pipeline_with_derivation(root: &Path, derivation: &TenantDerivation) -> IngestPipeline {
-    let wal = Wal::open(wal_config(root)).expect("open WAL");
-    let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(coordinator(Box::new(wal)), miner, derivation.rule.clone())
-        .with_tenant_watch(DivergenceWatch::from_derivation(derivation))
+    IngestPipeline::new(coordinator(Box::new(wal)), miner)
 }
 
 /// One observed `Journal` call, in order.
@@ -112,11 +97,7 @@ impl Journal for SpyJournal {
 /// (default miner + `service.name` rule).
 pub fn spy_pipeline(log: CallLog) -> IngestPipeline {
     let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(
-        coordinator(Box::new(SpyJournal { log, byte: 0 })),
-        miner,
-        TenantRule::service_name(),
-    )
+    IngestPipeline::new(coordinator(Box::new(SpyJournal { log, byte: 0 })), miner)
 }
 
 /// A `Journal` that appends fine but **fails the fsync** — a transient
@@ -143,11 +124,7 @@ impl Journal for FailingSyncJournal {
 /// (`WalSync`) path for the RFC 0018 §3.2 retryable-status mapping.
 pub fn failing_sync_pipeline() -> IngestPipeline {
     let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(
-        coordinator(Box::new(FailingSyncJournal)),
-        miner,
-        TenantRule::service_name(),
-    )
+    IngestPipeline::new(coordinator(Box::new(FailingSyncJournal)), miner)
 }
 
 /// A `Journal` whose **append** fails with a configurable [`AppendError`] —
@@ -177,11 +154,7 @@ impl Journal for FailingAppendJournal {
 
 fn failing_append_pipeline(error: fn() -> AppendError) -> IngestPipeline {
     let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(
-        coordinator(Box::new(FailingAppendJournal { error })),
-        miner,
-        TenantRule::service_name(),
-    )
+    IngestPipeline::new(coordinator(Box::new(FailingAppendJournal { error })), miner)
 }
 
 /// A pipeline whose append fails with a transient I/O error
@@ -204,6 +177,9 @@ pub fn oversize_append_pipeline() -> IngestPipeline {
 
 /// Reopen the WAL at `root` and return its recovered frames. (Call after
 /// dropping the pipeline so its writer handle is released.)
+/// For `TenantOtlpBatch` frames the returned payload is the **protobuf**
+/// part (the RFC 0046 tenant prefix validated and stripped), so callers
+/// decode an `ExportLogsServiceRequest` directly; other kinds are verbatim.
 pub fn replay_frames(root: &Path) -> Vec<(FrameKind, Vec<u8>)> {
     #[derive(Default)]
     struct CollectingSink(Vec<(FrameKind, Vec<u8>)>);
@@ -214,11 +190,54 @@ pub fn replay_frames(root: &Path) -> Vec<(FrameKind, Vec<u8>)> {
             kind: FrameKind,
             payload: &[u8],
         ) -> Result<(), RecoveryError> {
-            self.0.push((kind, payload.to_vec()));
+            let bytes = match kind {
+                FrameKind::TenantOtlpBatch => ourios_wal::TenantBatch::decode(payload)
+                    .expect("valid tenant prefix")
+                    .protobuf
+                    .to_vec(),
+                _ => payload.to_vec(),
+            };
+            self.0.push((kind, bytes));
             Ok(())
         }
     }
     let mut sink = CollectingSink::default();
+    Wal::open(wal_config(root))
+        .expect("reopen WAL")
+        .replay(&mut sink)
+        .expect("replay");
+    sink.0
+}
+
+/// Replay the WAL under `root` and return every `TenantOtlpBatch` as
+/// `(tenant, export)` — the tenant each frame was acknowledged under (RFC
+/// 0046 §3.3), decoded from the frame itself.
+pub fn replay_batches(
+    root: &Path,
+) -> Vec<(ourios_core::tenant::TenantId, ExportLogsServiceRequest)> {
+    #[derive(Default)]
+    struct Sink(Vec<(ourios_core::tenant::TenantId, ExportLogsServiceRequest)>);
+    impl FrameSink for Sink {
+        fn consume(
+            &mut self,
+            _offset: WalOffset,
+            kind: FrameKind,
+            payload: &[u8],
+        ) -> Result<(), RecoveryError> {
+            assert_eq!(
+                kind,
+                FrameKind::TenantOtlpBatch,
+                "every ingest frame is 0x03"
+            );
+            let batch = ourios_wal::TenantBatch::decode(payload).expect("valid tenant prefix");
+            let request = <ExportLogsServiceRequest as prost::Message>::decode(batch.protobuf)
+                .expect("decode frame");
+            self.0
+                .push((ourios_core::tenant::TenantId::new(batch.tenant), request));
+            Ok(())
+        }
+    }
+    let mut sink = Sink::default();
     Wal::open(wal_config(root))
         .expect("reopen WAL")
         .replay(&mut sink)
@@ -375,12 +394,8 @@ pub fn pooled_wal_pipeline(
         never_flush(),
     ));
     let miner = MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
-    let pipeline = IngestPipeline::new(
-        coordinator(Box::new(wal)),
-        miner,
-        TenantRule::service_name(),
-    )
-    .with_encode_pool(EncodePool::new(&sink, workers));
+    let pipeline = IngestPipeline::new(coordinator(Box::new(wal)), miner)
+        .with_encode_pool(EncodePool::new(&sink, workers));
     (Arc::new(pipeline), sink)
 }
 
@@ -396,7 +411,6 @@ pub fn capturing_pipeline_with_denial_audit(
             byte: 0,
         })),
         miner,
-        TenantRule::service_name(),
     )
     .with_denial_audit_sink(sink);
     (Arc::new(pipeline), captured)
@@ -413,7 +427,6 @@ pub fn capturing_pipeline() -> (SharedPipeline, Captured) {
             byte: 0,
         })),
         miner,
-        TenantRule::service_name(),
     );
     (Arc::new(pipeline), captured)
 }
@@ -425,7 +438,11 @@ pub fn post_request(
     content_encoding: Option<&str>,
     body: Vec<u8>,
 ) -> Request<Body> {
-    let mut builder = Request::builder().method("POST").uri(path);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        // RFC 0046 §3.1: every export names its tenant out of band.
+        .header("x-ourios-tenant", "checkout");
     if let Some(value) = content_type {
         builder = builder.header(header::CONTENT_TYPE, value);
     }
@@ -433,6 +450,43 @@ pub fn post_request(
         builder = builder.header(header::CONTENT_ENCODING, value);
     }
     builder.body(Body::from(body)).expect("build request")
+}
+
+/// Test-only convenience for multi-tenant scenarios: the tenant a request
+/// is exported under is the first `ResourceLogs` group's `service.name`
+/// (falling back to `checkout`). Mirrors what the fixtures used to derive,
+/// so a test that builds one export per service still exercises several
+/// tenants; production never derives (RFC 0046).
+pub fn tenant_for(request: &ExportLogsServiceRequest) -> ourios_core::tenant::TenantId {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    let name = request
+        .resource_logs
+        .first()
+        .and_then(|group| group.resource.as_ref())
+        .and_then(|resource| {
+            resource
+                .attributes
+                .iter()
+                .find(|kv| kv.key == "service.name")
+        })
+        .and_then(|kv| kv.value.as_ref())
+        .and_then(|value| match value.value.as_ref() {
+            Some(Value::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "checkout".to_owned());
+    ourios_core::tenant::TenantId::new(name)
+}
+
+/// A tonic request carrying the RFC 0046 §3.1 tenant selector
+/// (`x-ourios-tenant: checkout`), for in-process `LogsReceiver::export`
+/// calls.
+pub fn grpc_request<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request
+        .metadata_mut()
+        .insert("x-ourios-tenant", "checkout".parse().expect("ascii"));
+    request
 }
 
 /// Drive `router` with `request` in-process (no socket) and return the

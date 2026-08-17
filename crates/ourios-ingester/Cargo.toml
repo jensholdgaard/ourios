@@ -123,6 +123,8 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 [features]
 # RFC 0029: OIDC bearer resolution in front of the RFC 0026 enforcement.
 oidc = ["ourios-core/oidc"]
+# RFC 0047: the OpenFGA resolver binding tenants behind the same seam.
+openfga = ["ourios-core/openfga"]
 
 [dev-dependencies]
 # RFC0030.2 HTTPS client: a real TLS handshake to the http listener

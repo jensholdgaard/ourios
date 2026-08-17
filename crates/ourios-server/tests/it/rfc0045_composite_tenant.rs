@@ -84,6 +84,9 @@ struct Server {
     child: Child,
     http: SocketAddr,
     querier: SocketAddr,
+    /// Drains stdout/stderr for the process lifetime — dropping the pipe
+    /// readers would make the server's later `println!` hit a closed pipe.
+    drain: tokio::task::JoinHandle<String>,
 }
 
 /// Spawn `ourios-server --config` with receiver + querier on ephemeral
@@ -110,14 +113,24 @@ async fn start(tmp: &Path, tenant_yaml: &str, auth_yaml: &str) -> Server {
         .expect("spawn ourios-server");
     let stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
+    let stderr_drain =
+        std::sync::Arc::new(tokio::sync::Mutex::new(Some(tokio::spawn(async move {
+            let mut err = String::new();
+            stderr.read_to_string(&mut err).await.ok();
+            err
+        }))));
+    let stderr_for_panic = std::sync::Arc::clone(&stderr_drain);
     let mut lines = BufReader::new(stdout).lines();
     let mut http = None;
     let mut querier = None;
     let read = async {
         while http.is_none() || querier.is_none() {
             let Some(line) = lines.next_line().await.expect("read stdout") else {
-                let mut err = String::new();
-                stderr.read_to_string(&mut err).await.ok();
+                let handle = stderr_for_panic.lock().await.take();
+                let err = match handle {
+                    Some(h) => h.await.unwrap_or_default(),
+                    None => String::new(),
+                };
                 panic!("server exited before announcing its addresses; stderr:\n{err}");
             };
             if let Some(rest) = line.strip_prefix("receiver HTTP listening on ") {
@@ -130,10 +143,18 @@ async fn start(tmp: &Path, tenant_yaml: &str, auth_yaml: &str) -> Server {
     timeout(Duration::from_secs(20), read)
         .await
         .expect("server announces its addresses");
+    let drain = tokio::spawn(async move {
+        while let Ok(Some(_)) = lines.next_line().await {}
+        match stderr_drain.lock().await.take() {
+            Some(h) => h.await.unwrap_or_default(),
+            None => String::new(),
+        }
+    });
     Server {
         child,
         http: http.expect("http"),
         querier: querier.expect("querier"),
+        drain,
     }
 }
 
@@ -149,7 +170,11 @@ async fn stop(mut server: Server) {
         .await
         .expect("exit before timeout")
         .expect("await exit");
-    assert!(status.success(), "clean shutdown, got {status:?}");
+    let stderr = server.drain.await.expect("drain");
+    assert!(
+        status.success(),
+        "clean shutdown, got {status:?}; stderr:\n{stderr}"
+    );
 }
 
 async fn raw_post(addr: SocketAddr, head: String, body: &[u8]) -> String {

@@ -100,7 +100,13 @@ impl RuleEpochs {
 
     /// Make `rule` the current epoch for frames after `after` (the highest
     /// offset replay delivered), persisting the log if the rule differs
-    /// from the newest epoch's. Returns whether an epoch was appended.
+    /// from the newest epoch's. Returns whether the log changed.
+    ///
+    /// `after: None` means replay delivered nothing — the WAL holds no
+    /// frames — so there is nothing to attribute to earlier epochs and the
+    /// log collapses to the single entry `{rule, null}`; every entry after
+    /// the first therefore always carries a boundary (the shape `load`
+    /// enforces).
     ///
     /// # Errors
     ///
@@ -113,10 +119,14 @@ impl RuleEpochs {
         if self.current() == rule {
             return Ok(false);
         }
-        self.epochs.push(RuleEpoch {
+        let epoch = RuleEpoch {
             rule: rule.clone(),
             after,
-        });
+        };
+        match after {
+            Some(_) => self.epochs.push(epoch),
+            None => self.epochs = vec![epoch],
+        }
         self.persist()?;
         Ok(true)
     }
@@ -191,7 +201,12 @@ fn parse(bytes: &[u8]) -> Result<Vec<RuleEpoch>, String> {
             .collect::<Result<Vec<_>, _>>()?;
         let rule = TenantRule::from_keys(keys).map_err(|e| format!("epochs[{index}].rule: {e}"))?;
         let after = match entry.get("after") {
-            None | Some(Value::Null) => None,
+            None | Some(Value::Null) if index == 0 => None,
+            None | Some(Value::Null) => {
+                return Err(format!(
+                    "epochs[{index}].after is null; only the first epoch is unbounded"
+                ));
+            }
             Some(after) => {
                 let segment = after
                     .get("segment")
@@ -313,6 +328,21 @@ mod tests {
         assert_eq!(reloaded.rule_for(offset(0)), &composite, "a newer segment");
     }
 
+    // RFC0045.10 — with no frames delivered (an empty WAL) a rule change
+    // collapses the log to one unbounded entry.
+    #[test]
+    fn advance_without_frames_collapses_to_a_single_epoch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let composite = TenantRule::from_keys(["a", "b"]).expect("valid");
+        let mut epochs = RuleEpochs::load(dir.path()).expect("loads");
+        assert!(epochs.advance(&composite, None).expect("writes"));
+        let reloaded = RuleEpochs::load(dir.path()).expect("reloads");
+        assert_eq!(reloaded.epochs().len(), 1);
+        assert_eq!(reloaded.current(), &composite);
+        assert_eq!(reloaded.epochs()[0].after, None);
+        assert_eq!(reloaded.rule_for(offset(0)), &composite);
+    }
+
     // RFC0045.10 — an unparseable log aborts loudly, naming the file.
     #[test]
     fn malformed_log_is_an_error_naming_the_file() {
@@ -331,6 +361,17 @@ mod tests {
         std::fs::write(
             dir.path().join(FILE_NAME),
             b"{\"epochs\": [{\"rule\": [\"a\", \"a\"], \"after\": null}]}",
+        )
+        .expect("write");
+        assert!(matches!(
+            RuleEpochs::load(dir.path()).unwrap_err(),
+            RuleEpochsError::Malformed { .. }
+        ));
+
+        // A null boundary after the first entry is rejected.
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            b"{\"epochs\": [{\"rule\": [\"a\"], \"after\": null}, {\"rule\": [\"b\"], \"after\": null}]}",
         )
         .expect("write");
         assert!(matches!(

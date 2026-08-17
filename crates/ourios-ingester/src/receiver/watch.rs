@@ -192,13 +192,14 @@ fn string_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a str
         })
 }
 
-/// `value` truncated to [`MAX_VALUE_BYTES`] at a UTF-8 boundary with a
-/// trailing `…`, or borrowed unchanged when it already fits.
+/// `value` bounded to [`MAX_VALUE_BYTES`] *including* the trailing `…`
+/// that marks a truncation (cut at a UTF-8 boundary), or borrowed unchanged
+/// when it already fits.
 fn bound(value: &str) -> std::borrow::Cow<'_, str> {
     if value.len() <= MAX_VALUE_BYTES {
         return std::borrow::Cow::Borrowed(value);
     }
-    let mut end = MAX_VALUE_BYTES;
+    let mut end = MAX_VALUE_BYTES - '…'.len_utf8();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -363,7 +364,10 @@ mod tests {
             entry.last_warned.is_some(),
             "divergence detected past the preview bound"
         );
-        assert_eq!(entry.first_preview, format!("{prefix}…"));
+        assert_eq!(
+            entry.first_preview,
+            format!("{}…", "p".repeat(MAX_VALUE_BYTES - '…'.len_utf8()))
+        );
     }
 
     // RFC0045.7 — values are bounded at a UTF-8 boundary with a trailing `…`.
@@ -371,10 +375,14 @@ mod tests {
     fn values_are_bounded_at_a_char_boundary() {
         let short = "x".repeat(MAX_VALUE_BYTES);
         assert_eq!(bound(&short), short);
-        // 'é' is two bytes; 127 ASCII bytes + 'é' straddles the boundary.
-        let long = format!("{}é{}", "x".repeat(MAX_VALUE_BYTES - 1), "tail");
+        // 'é' is two bytes and straddles the cut point (125 bytes into a
+        // 128-byte budget with a 3-byte ellipsis): the cut backs off to the
+        // char boundary before it.
+        let long = format!("{}é{}", "x".repeat(MAX_VALUE_BYTES - 4), "tail");
         let bounded = bound(&long);
-        assert_eq!(bounded, format!("{}…", "x".repeat(MAX_VALUE_BYTES - 1)));
-        assert!(bounded.len() <= MAX_VALUE_BYTES + '…'.len_utf8());
+        assert_eq!(bounded, format!("{}…", "x".repeat(MAX_VALUE_BYTES - 4)));
+        assert!(bounded.len() <= MAX_VALUE_BYTES);
+        let ascii = "y".repeat(MAX_VALUE_BYTES + 10);
+        assert_eq!(bound(&ascii).len(), MAX_VALUE_BYTES);
     }
 }

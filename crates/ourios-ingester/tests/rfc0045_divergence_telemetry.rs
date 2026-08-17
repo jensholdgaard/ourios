@@ -204,7 +204,7 @@ async fn scenario_7_detector(capture: &Capture) {
     );
 
     // A value longer than 128 bytes is truncated at a UTF-8 boundary with `…`.
-    let long = format!("{}é{}", "x".repeat(MAX_VALUE_BYTES - 1), "tail");
+    let long = format!("{}é{}", "x".repeat(MAX_VALUE_BYTES - 4), "tail");
     pipeline
         .ingest_bound(
             request(vec![cluster_group("payments", "c1", "line")]),
@@ -228,7 +228,7 @@ async fn scenario_7_detector(capture: &Capture) {
         .expect("payments diverged");
     assert_eq!(
         field(payments, ourios_semconv::OURIOS_TENANT_WATCH_VALUE),
-        Some(format!("{}…", "x".repeat(MAX_VALUE_BYTES - 1)).as_str())
+        Some(format!("{}…", "x".repeat(MAX_VALUE_BYTES - 4)).as_str())
     );
 }
 

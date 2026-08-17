@@ -18,6 +18,7 @@
 
 #[cfg(feature = "oidc")]
 pub mod oidc;
+pub mod openfga;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -74,6 +75,12 @@ pub struct OidcSpec {
     pub name_claim: Option<String>,
     /// `exp`/`nbf` clock-skew allowance in seconds (§3.2). Defaults to 60.
     pub clock_skew_secs: Option<String>,
+    /// `<claim>=<value>` marking a token's subject as an `agent:` principal
+    /// for the RFC 0047 §3.1 resolver (e.g. `ourios_principal_type=agent`).
+    pub agent_claim: Option<String>,
+    /// The claim carrying the subject's group list, passed to the RFC 0047
+    /// resolver as contextual `team#member` tuples (§3.1).
+    pub groups_claim: Option<String>,
 }
 
 /// The validated `auth.oidc` configuration (RFC 0029 §3.1).
@@ -81,9 +88,11 @@ pub struct OidcSpec {
 pub struct OidcConfig {
     issuer: String,
     audience: String,
-    tenant_claim: String,
+    tenant_claim: Option<String>,
     name_claim: String,
     clock_skew_secs: u64,
+    agent_claim: Option<(String, String)>,
+    groups_claim: Option<String>,
 }
 
 impl OidcConfig {
@@ -99,10 +108,26 @@ impl OidcConfig {
         &self.audience
     }
 
-    /// The claim carrying the tenant list.
+    /// The claim carrying the tenant list. `None` only when the RFC 0047
+    /// graph resolver is configured and the token carries no tenant list
+    /// of its own (the graph decides).
     #[must_use]
-    pub fn tenant_claim(&self) -> &str {
-        &self.tenant_claim
+    pub fn tenant_claim(&self) -> Option<&str> {
+        self.tenant_claim.as_deref()
+    }
+
+    /// The `(claim, value)` marking an `agent:` principal (RFC 0047 §3.1).
+    #[must_use]
+    pub fn agent_claim(&self) -> Option<(&str, &str)> {
+        self.agent_claim
+            .as_ref()
+            .map(|(claim, value)| (claim.as_str(), value.as_str()))
+    }
+
+    /// The claim carrying the subject's groups (RFC 0047 §3.1).
+    #[must_use]
+    pub fn groups_claim(&self) -> Option<&str> {
+        self.groups_claim.as_deref()
     }
 
     /// The claim feeding the audit/metric label (`sub` unless configured).
@@ -118,42 +143,56 @@ impl OidcConfig {
     }
 }
 
-/// The resolved `auth` section (RFC 0026 §3.1 + RFC 0029 §3.1): the static
-/// token store, the OIDC layer, or both — at least one by construction
-/// ([`build_auth_config`]). An absent `auth` section never constructs this
-/// type; open mode stays `None` at the callers.
+/// The resolved `auth` section (RFC 0026 §3.1 + RFC 0029 §3.1 + RFC 0047
+/// §3.1): the static token store, the OIDC layer, or both — at least one
+/// by construction ([`build_auth_config`]) — plus the optional `OpenFGA`
+/// resolver that authorizes whatever those two authenticate. An absent
+/// `auth` section never constructs this type; open mode stays `None` at
+/// the callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     /// The static bearer-token store (RFC 0026), if configured.
     pub static_tokens: Option<TokenStore>,
     /// The OIDC layer (RFC 0029), if configured.
     pub oidc: Option<OidcConfig>,
+    /// The `OpenFGA` resolver (RFC 0047 §3.1), if configured.
+    pub openfga: Option<openfga::OpenFgaConfig>,
 }
 
 /// Validate a raw `auth` section's halves into the resolved [`AuthConfig`]
-/// (RFC 0026 §3.1 + RFC 0029 §3.1). Callers only invoke this for a present
-/// `auth` section — an absent section is open mode and never reaches here.
+/// (RFC 0026 §3.1 + RFC 0029 §3.1 + RFC 0047 §3.1). Callers only invoke
+/// this for a present `auth` section — an absent section is open mode and
+/// never reaches here.
 ///
 /// # Errors
 ///
-/// Neither half configured is a startup error (a present-but-empty `auth`
-/// section is never the intent); each present half fails on its own rules
-/// ([`build_token_store`] — including the unconditional empty-list error —
-/// and [`build_oidc_config`]).
+/// Neither authenticating half configured is a startup error (a
+/// present-but-empty `auth` section is never the intent, and `OpenFGA` alone
+/// authorizes but cannot authenticate); each present half fails on its own
+/// rules ([`build_token_store`] — including the unconditional empty-list
+/// error — [`build_oidc_config`], and [`openfga::build_openfga_config`]).
+/// With `openfga` configured the OIDC `tenant_claim` becomes optional: the
+/// graph binds the tenants and a present claim only narrows them.
 pub fn build_auth_config(
     tokens: Option<&[TokenSpec]>,
     oidc: Option<&OidcSpec>,
+    openfga: Option<&openfga::OpenFgaSpec>,
 ) -> Result<AuthConfig, String> {
     if tokens.is_none() && oidc.is_none() {
         return Err(
-            "auth must configure tokens, oidc, or both — remove the auth section \
-             entirely for open mode (RFC 0026 §3.1, RFC 0029 §3.1)"
+            "auth must configure tokens, oidc, or both (openfga only authorizes \
+             what they authenticate) — remove the auth section entirely for open \
+             mode (RFC 0026 §3.1, RFC 0029 §3.1, RFC 0047 §3.1)"
                 .to_string(),
         );
     }
+    let openfga = openfga.map(openfga::build_openfga_config).transpose()?;
     Ok(AuthConfig {
         static_tokens: build_token_store(tokens)?,
-        oidc: oidc.map(build_oidc_config).transpose()?,
+        oidc: oidc
+            .map(|spec| build_oidc(spec, openfga.is_none()))
+            .transpose()?,
+        openfga,
     })
 }
 
@@ -166,6 +205,14 @@ pub fn build_auth_config(
 /// non-empty without surrounding whitespace; `name_claim` defaults to `sub`
 /// and must be non-empty without surrounding whitespace when given.
 pub fn build_oidc_config(spec: &OidcSpec) -> Result<OidcConfig, String> {
+    build_oidc(spec, true)
+}
+
+/// [`build_oidc_config`] with the RFC 0047 relaxation: when the graph
+/// resolver is configured the token need not carry a tenant list
+/// (`tenant_claim_required = false`) — the graph binds the tenants and a
+/// present claim can only narrow them.
+fn build_oidc(spec: &OidcSpec, tenant_claim_required: bool) -> Result<OidcConfig, String> {
     let required = |key: &str, value: Option<&str>| match value {
         Some(v) if !v.is_empty() && v.trim() == v => Ok(v.to_string()),
         _ => Err(format!(
@@ -177,6 +224,33 @@ pub fn build_oidc_config(spec: &OidcSpec) -> Result<OidcConfig, String> {
         None => "sub".to_string(),
         some => required("name_claim", some)?,
     };
+    let tenant_claim = match spec.tenant_claim.as_deref() {
+        None if !tenant_claim_required => None,
+        some => Some(required("tenant_claim", some)?),
+    };
+    let agent_claim = match spec.agent_claim.as_deref() {
+        None => None,
+        Some(raw) => match raw.split_once('=') {
+            Some((claim, value))
+                if !claim.is_empty()
+                    && claim.trim() == claim
+                    && !value.is_empty()
+                    && value.trim() == value =>
+            {
+                Some((claim.to_string(), value.to_string()))
+            }
+            _ => {
+                return Err("auth.oidc.agent_claim must be `<claim>=<value>` (e.g. \
+                     ourios_principal_type=agent), both non-empty without \
+                     surrounding whitespace (RFC 0047 §3.1)"
+                    .to_string());
+            }
+        },
+    };
+    let groups_claim = match spec.groups_claim.as_deref() {
+        None => None,
+        some => Some(required("groups_claim", some)?),
+    };
     let clock_skew_secs = match spec.clock_skew_secs.as_deref() {
         None => 60,
         Some(raw) => raw.trim().parse().map_err(|_| {
@@ -187,9 +261,11 @@ pub fn build_oidc_config(spec: &OidcSpec) -> Result<OidcConfig, String> {
     Ok(OidcConfig {
         issuer: required("issuer", spec.issuer.as_deref())?,
         audience: required("audience", spec.audience.as_deref())?,
-        tenant_claim: required("tenant_claim", spec.tenant_claim.as_deref())?,
+        tenant_claim,
         name_claim,
         clock_skew_secs,
+        agent_claim,
+        groups_claim,
     })
 }
 
@@ -202,6 +278,10 @@ pub enum TenantSet {
     All,
     /// An exact-string allow-list (non-empty by construction).
     Listed(BTreeSet<String>),
+    /// No tenant at all. Never built from configuration (an empty list is
+    /// a startup error); it is what the RFC 0047 graph resolver yields
+    /// for the side — read or write — a principal holds no grant on.
+    None,
 }
 
 impl TenantSet {
@@ -211,7 +291,32 @@ impl TenantSet {
         match self {
             Self::All => true,
             Self::Listed(set) => set.contains(tenant),
+            Self::None => false,
         }
+    }
+
+    /// The set narrowed to `granted` — the RFC 0047 §3.1 composition: the
+    /// graph is authoritative for what a principal may touch, and a
+    /// credential's own tenant list (static `tenants`, OIDC tenant claim)
+    /// can only shrink it, never widen it.
+    #[must_use]
+    pub fn intersect(&self, granted: &BTreeSet<String>) -> Self {
+        let kept: BTreeSet<String> = match self {
+            Self::All => granted.clone(),
+            Self::Listed(set) => set.intersection(granted).cloned().collect(),
+            Self::None => BTreeSet::new(),
+        };
+        if kept.is_empty() {
+            Self::None
+        } else {
+            Self::Listed(kept)
+        }
+    }
+
+    /// Whether the set admits no tenant.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::None)
     }
 }
 
@@ -376,6 +481,8 @@ fn build_tenant_set(index: usize, spec: &TokenSpec) -> Result<TenantSet, String>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         OidcSpec, TenantSet, TokenSpec, build_auth_config, build_oidc_config, build_token_store,
     };
@@ -492,6 +599,8 @@ mod tests {
             tenant_claim: Some("ourios_tenants".to_string()),
             name_claim: None,
             clock_skew_secs: None,
+            agent_claim: None,
+            groups_claim: None,
         }
     }
 
@@ -504,7 +613,7 @@ mod tests {
         let full = build_oidc_config(&oidc_spec()).expect("valid");
         assert_eq!(full.issuer(), "https://dex.internal.example");
         assert_eq!(full.audience(), "ourios");
-        assert_eq!(full.tenant_claim(), "ourios_tenants");
+        assert_eq!(full.tenant_claim(), Some("ourios_tenants"));
         assert_eq!(full.name_claim(), "sub", "defaults to sub");
 
         let named = build_oidc_config(&OidcSpec {
@@ -566,25 +675,26 @@ mod tests {
     /// gates. See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
     #[test]
     fn auth_config_rules_and_oidc_only_bridge() {
-        let err = build_auth_config(None, None).expect_err("neither half");
+        let err = build_auth_config(None, None, None).expect_err("neither half");
         assert!(
             err.contains("tokens, oidc, or both"),
             "names the rule: {err}"
         );
 
-        let err = build_auth_config(Some(&[]), Some(&oidc_spec())).expect_err("empty list");
+        let err = build_auth_config(Some(&[]), Some(&oidc_spec()), None).expect_err("empty list");
         assert!(
             err.contains("auth.tokens") && err.contains("oidc-only"),
             "the unconditional empty-list error points at omitting the list: {err}"
         );
 
-        let oidc_only = build_auth_config(None, Some(&oidc_spec())).expect("oidc-only");
+        let oidc_only = build_auth_config(None, Some(&oidc_spec()), None).expect("oidc-only");
         assert!(oidc_only.static_tokens.is_none());
         assert_eq!(oidc_only.oidc.as_ref().expect("oidc").audience(), "ourios");
 
         let both = build_auth_config(
             Some(&[spec("edge", "tok-edge", &["acme"])]),
             Some(&oidc_spec()),
+            None,
         )
         .expect("both halves");
         assert_eq!(
@@ -597,6 +707,81 @@ mod tests {
             "edge"
         );
         assert!(both.oidc.is_some());
+    }
+
+    /// RFC 0047 §3.1 — the graph is authoritative; a credential's own
+    /// tenant list can only narrow the grant, never widen it, and a
+    /// disjoint or `None` credential yields `None`.
+    #[test]
+    fn tenant_sets_intersect_narrows_only() {
+        let granted: BTreeSet<String> = ["acme", "globex"]
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        assert_eq!(
+            TenantSet::All.intersect(&granted),
+            TenantSet::Listed(granted.clone())
+        );
+        let listed: TenantSet = TenantSet::Listed(
+            ["acme", "initech"]
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
+        );
+        assert_eq!(
+            listed.intersect(&granted),
+            TenantSet::Listed(BTreeSet::from(["acme".to_string()]))
+        );
+        assert!(
+            TenantSet::Listed(BTreeSet::from(["initech".to_string()]))
+                .intersect(&granted)
+                .is_empty()
+        );
+        assert!(TenantSet::None.intersect(&granted).is_empty());
+        assert!(TenantSet::All.intersect(&BTreeSet::new()).is_empty());
+        assert!(!TenantSet::None.allows("acme"));
+    }
+
+    /// RFC 0047 §3.1 — `agent_claim` is `<claim>=<value>` (both halves
+    /// non-empty, no surrounding whitespace); `groups_claim` follows the
+    /// claim-name rule; each rejection names its key.
+    #[test]
+    fn oidc_agent_and_groups_claims_validate() {
+        let ok = build_oidc_config(&OidcSpec {
+            agent_claim: Some("ourios_principal_type=agent".to_string()),
+            groups_claim: Some("groups".to_string()),
+            ..oidc_spec()
+        })
+        .expect("valid");
+        assert_eq!(ok.agent_claim(), Some(("ourios_principal_type", "agent")));
+        assert_eq!(ok.groups_claim(), Some("groups"));
+        let none = build_oidc_config(&oidc_spec()).expect("valid");
+        assert_eq!(none.agent_claim(), None);
+        assert_eq!(none.groups_claim(), None);
+
+        for bad in [
+            "agent",
+            "=agent",
+            "kind=",
+            " kind=agent",
+            "kind= agent",
+            "kind=agent ",
+        ] {
+            let err = build_oidc_config(&OidcSpec {
+                agent_claim: Some(bad.to_string()),
+                ..oidc_spec()
+            })
+            .expect_err("invalid agent_claim");
+            assert!(err.contains("auth.oidc.agent_claim"), "{bad:?}: {err}");
+        }
+        for bad in ["", " groups"] {
+            let err = build_oidc_config(&OidcSpec {
+                groups_claim: Some(bad.to_string()),
+                ..oidc_spec()
+            })
+            .expect_err("invalid groups_claim");
+            assert!(err.contains("auth.oidc.groups_claim"), "{bad:?}: {err}");
+        }
     }
 
     /// `Debug` renders names and tenant sets, never a token value — the

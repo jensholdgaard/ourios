@@ -33,7 +33,7 @@ use axum::routing::post;
 use opentelemetry::context::FutureExt as _;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
-use ourios_ingester::receiver::auth::{AuthBinding, AuthResolver};
+use ourios_ingester::receiver::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_ingester::receiver::extract_context;
 use ourios_ingester::receiver::tls::{ALPN_HTTP, TlsSettings};
 use ourios_ingester::receiver::tls_serve::{LISTENER_QUERIER, TlsListener, reloading_acceptor};
@@ -458,25 +458,10 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
     // probe learns nothing about the tenant contract. One undifferentiated
     // message (missing vs malformed vs unknown would be an oracle).
     let gate_started = Instant::now();
-    let authorization = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let Ok(binding) = state.auth.authenticate(authorization).await else {
-        // RFC 0026 §3.4: the rejection records on the existing
-        // `ourios.query.duration` histogram, kind `rejected`
-        // (pre-dispatch), tagged with `error.type`.
-        state.metrics.record_err(
-            QUERY_KIND_REJECTED,
-            gate_started.elapsed(),
-            "unauthenticated",
-        );
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthenticated",
-            "a valid bearer token is required",
-        );
+    let binding = match authenticate_query(&state, &headers, gate_started).await {
+        Ok(binding) => binding,
+        Err(rejection) => return rejection,
     };
-    let binding: Option<AuthBinding> = binding;
 
     // Tenant is required and checked here, before the engine is invoked
     // (RFC 0016 §3.3): a missing/empty header is a `400` that never scans data.
@@ -493,7 +478,7 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
     // set is 403 — enforcement composes with (never replaces) the
     // structural per-tenant scan scoping below it.
     if let Some(binding) = &binding
-        && !binding.tenants().allows(tenant.as_str())
+        && !binding.may_read(tenant.as_str())
     {
         state.metrics.record_err(
             QUERY_KIND_REJECTED,
@@ -954,6 +939,47 @@ fn json_ok<T: Serialize>(value: &T) -> Response {
 
 /// A `status` JSON error body `{ "error": { "kind", "message" } }` (RFC 0016
 /// §3.5). `message` is Ourios-owned text — never engine internals.
+/// The query endpoint's bearer gate: `Ok(binding)` (`None` in open mode)
+/// or the finished rejection response, recorded on `ourios.query.duration`
+/// (kind `rejected`, RFC 0026 §3.4) with the failure class as `error.type`.
+async fn authenticate_query(
+    state: &QuerierState,
+    headers: &HeaderMap,
+    gate_started: Instant,
+) -> Result<Option<AuthBinding>, Response> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    match state.auth.authenticate(authorization).await {
+        Ok(binding) => Ok(binding),
+        Err(AuthError::Unauthenticated) => {
+            state.metrics.record_err(
+                QUERY_KIND_REJECTED,
+                gate_started.elapsed(),
+                "unauthenticated",
+            );
+            Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "a valid bearer token is required",
+            ))
+        }
+        // RFC 0047 §3.1: the resolver could not answer — fail closed.
+        Err(AuthError::Unavailable) => {
+            state.metrics.record_err(
+                QUERY_KIND_REJECTED,
+                gate_started.elapsed(),
+                "upstream_unavailable",
+            );
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth_unavailable",
+                "the authorization resolver is unavailable; retry later",
+            ))
+        }
+    }
+}
+
 fn error_response(status: StatusCode, kind: &'static str, message: &str) -> Response {
     let body = ErrorBody {
         error: ErrorDetail {

@@ -1,7 +1,7 @@
 ---
 rfc: 0047
 title: ReBAC resolver (OpenFGA) and graph-fed visibility inside a tenant
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
@@ -11,8 +11,11 @@ superseded-by: —
 
 # RFC 0047 — ReBAC resolver and graph-fed visibility
 
-> **Status: `specified` (2026-08-17).** §5 criteria written and testable.
-> Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
+> **Status: `red` (2026-08-17).** Slice 1 — the layer-1 resolver — is
+> green: RFC0047.1–.3 pass on the served binary against a real OpenFGA
+> container (`openfga-resolver` CI job) with the in-tree model; RFC0047.12
+> gates CI. RFC0047.4–.11 (planner two-step, tool gate, emitter, erasure)
+> are the remaining slices. Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
 > opaque, coarse, credential-selected object, which is exactly the object
 > type this RFC binds the authorization graph to. Grounded in the #688
 > OpenFGA spike (resolver seam holds, p50 1.4 ms), two OpenFGA-assistant
@@ -127,6 +130,21 @@ and `UNAVAILABLE`/`503` on ingest, never an open door, and never a stale
 grant past the TTL. Revocation latency ≡ TTL; `higher_consistency` bypasses
 OpenFGA's own cache after writes. Ingest authorization is exactly RFC 0046
 §3.5: the out-of-band selector ∈ the resolved write set.
+
+**Composition with the credential's own tenant list (slice 1 decision).**
+The graph is authoritative for *what* a principal may touch, and a
+credential's own list — a static token's `tenants`, an OIDC
+`tenant_claim` — can only narrow it, never widen it: the binding's read
+set is `credential ∩ ListObjects(can_query)`, the write set
+`credential ∩ ListObjects(can_write)`. With `auth.openfga` configured
+the OIDC `tenant_claim` becomes optional (the graph binds; a token
+without one binds exactly the graph's sets), and a static token
+declares `tenants: ["*"]` to defer to the graph entirely. Every OpenFGA
+round-trip is bounded by `auth.openfga.request_timeout_secs` (default
+5 s) so fail-closed has a deadline. A token whose group claim exceeds
+the contextual-tuple cap fails resolution with a **named** warning log
+and an unauthenticated (401-class) session — a credential
+defect, not an upstream outage.
 
 **Token claims as contextual tuples.** An OIDC token's group claim
 (`auth.oidc.groups_claim`, e.g. Dex `groups`) is passed to the resolver's

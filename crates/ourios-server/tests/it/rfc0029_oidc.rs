@@ -183,7 +183,7 @@ fn rfc0029_6_jwks_rotation() {}
 // (the ourios-core fixture policy — no committed private keys), and the
 // spawned binary enforcing OIDC-resolved bindings on both listeners.
 
-mod ingest_binding {
+pub(crate) mod ingest_binding {
     use std::io::Write as _;
     use std::time::Duration;
 
@@ -203,7 +203,7 @@ mod ingest_binding {
     use tokio::time::timeout;
 
     /// A fresh ES256 keypair (runtime-generated) and its public JWK.
-    pub(super) fn make_key(kid: &str) -> (EncodingKey, serde_json::Value) {
+    pub(crate) fn make_key(kid: &str) -> (EncodingKey, serde_json::Value) {
         let signing = SigningKey::random(&mut rand::rngs::OsRng);
         let pem = signing
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
@@ -219,7 +219,7 @@ mod ingest_binding {
     }
 
     /// A loopback issuer serving discovery + a fixed JWKS.
-    pub(super) async fn serve_issuer(jwk: serde_json::Value) -> String {
+    pub(crate) async fn serve_issuer(jwk: serde_json::Value) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture issuer");
@@ -279,7 +279,7 @@ mod ingest_binding {
     /// (RFC 0046 §3.1); the batch's `service.name` merely carries the same
     /// string as a plain resource attribute — it is not what selects the
     /// tenant.
-    pub(super) fn tenant_request(tenant: &str) -> tonic::Request<ExportLogsServiceRequest> {
+    pub(crate) fn tenant_request(tenant: &str) -> tonic::Request<ExportLogsServiceRequest> {
         let mut request = tonic::Request::new(batch(tenant));
         request
             .metadata_mut()
@@ -495,7 +495,7 @@ mod ingest_binding {
 // --- RFC 0029 §5 .3/.4/.5 — the query/MCP binding slice: the OIDC-resolved
 // binding drives the RFC 0026 contracts verbatim on the served binary.
 
-mod claim_binding {
+pub(crate) mod claim_binding {
     use std::io::Write as _;
     use std::time::Duration;
 
@@ -507,7 +507,7 @@ mod claim_binding {
 
     /// Spawn the binary with receiver+querier and the given `auth` YAML
     /// block; return (child, grpc, http-receiver, http-querier).
-    async fn spawn_with_auth(
+    pub(crate) async fn spawn_with_auth(
         tmp: &tempfile::TempDir,
         auth_yaml: &str,
         envs: &[(&str, &str)],
@@ -568,7 +568,7 @@ mod claim_binding {
 
     /// Raw `POST /v1/query` with optional bearer + tenant headers; returns
     /// the status line.
-    async fn query_status(
+    pub(crate) async fn query_status(
         addr: std::net::SocketAddr,
         bearer: Option<&str>,
         tenant: Option<&str>,

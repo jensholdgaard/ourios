@@ -374,6 +374,37 @@ jobs:
           set -euo pipefail
           fga model validate --file model.fga
           fga model test --tests store.fga.yaml
+      # `model.json` is what the served-binary tests load into a real
+      # OpenFGA (the API takes JSON, not the DSL); it must be the exact
+      # transform of `model.fga`, regenerated with
+      # `fga model transform --file model.fga > model.json`.
+      - name: model.json is the transform of model.fga
+        working-directory: deploy/openfga
+        run: |
+          set -euo pipefail
+          fga model transform --file model.fga | diff - model.json
+
+  # RFC 0047 §5 (RFC0047.1–.3): the OpenFGA resolver on the served binary
+  # against a real `openfga/openfga` container (testcontainers, image
+  # pinned by digest in the test) loaded with the in-tree model — the same
+  # posture as `dex-oidc`. A required check (in `ci-success`'s `needs`).
+  openfga-resolver:
+    name: openfga resolver (testcontainers)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: >
+          cargo test -p ourios-server --test it --
+          --ignored --exact
+          rfc0047_openfga::rfc0047_1_to_3_resolver_end_to_end
 
   # Emission-time semconv conformance: boot the real `ourios-server`,
   # point its OTLP export (metrics + the dogfooded logs signal) at
@@ -714,7 +745,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, docs, test, book, semconv, live-check, openfga-model, deny, s3-integration, dex-oidc, collector-interop, loki-interop]
+    needs: [fmt, clippy, docs, test, book, semconv, live-check, openfga-model, openfga-resolver, deny, s3-integration, dex-oidc, collector-interop, loki-interop]
     # Excluded from the canary too: with ten of twelve `needs` skipped it would
     # report "all required checks passed" off two jobs, which reads as a much
     # stronger claim than it is. `hygiene-report` is the canary's signal.

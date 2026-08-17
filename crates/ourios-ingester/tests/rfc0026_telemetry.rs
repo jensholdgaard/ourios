@@ -1,11 +1,13 @@
-//! Scenario RFC0026.7 — rejection telemetry and audit.
+//! Scenario RFC0026.7 — rejection telemetry and audit — plus the
+//! RFC0047.3 `ourios.auth.resolutions` arm, which shares the provider.
 //!
 //! Harness-exempt (RFC0028.2, see `tests/README.md`): the telemetry arm
 //! installs the **process-global** `OTel` meter provider
 //! (`init_in_memory`), which cannot share a process with another
 //! installer. One test, so the provider is installed exactly once.
 //!
-//! See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
+//! See `docs/rfcs/0026-authentication-tenant-binding.md` §5 and
+//! `docs/rfcs/0047-rebac-resolver-and-graph-visibility.md` §5.
 
 #[path = "it/ingest_support/mod.rs"]
 mod ingest_support;
@@ -23,10 +25,15 @@ use ourios_ingester::receiver::{ReceiveError, authenticate_bearer};
 /// The exported `ourios.ingest.batches` datapoint value for `error.type ==
 /// wanted`, across all resource metrics.
 fn rejected_batches(rms: &[ResourceMetrics], wanted: &str) -> u64 {
+    counted(rms, ourios_semconv::OURIOS_INGEST_BATCHES, wanted)
+}
+
+/// The exported `metric` counter value for `error.type == wanted`.
+fn counted(rms: &[ResourceMetrics], metric: &str, wanted: &str) -> u64 {
     rms.iter()
         .flat_map(ResourceMetrics::scope_metrics)
         .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .filter(|m| m.name() == ourios_semconv::OURIOS_INGEST_BATCHES)
+        .filter(|m| m.name() == metric)
         .filter_map(|m| match m.data() {
             AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
             _ => None,
@@ -47,6 +54,7 @@ fn rejected_batches(rms: &[ResourceMetrics], wanted: &str) -> u64 {
 /// token value appears on any surface (metric attributes, audit event,
 /// error text).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // one provider, one test: every arm that records must live here
 async fn rfc0026_7_rejection_telemetry_and_audit() {
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test-rfc0026-7");
 
@@ -126,10 +134,68 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
         "no token value on any surface: {rendered}",
     );
 
+    // RFC0047.3 arm — with the OpenFGA resolver configured and unreachable,
+    // a known credential fails closed and `ourios.auth.resolutions` counts
+    // `error.type = upstream_unavailable`; the same counter records the
+    // unauthenticated probe.
+    #[cfg(feature = "openfga")]
+    {
+        use ourios_core::auth::openfga::{OpenFgaResolver, OpenFgaSpec, build_openfga_config};
+        use ourios_ingester::receiver::AuthError;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", closed.local_addr().expect("addr"));
+        drop(closed);
+        let openfga = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(url),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("1".to_string()),
+            ..OpenFgaSpec::default()
+        })
+        .expect("config");
+        let resolver = AuthResolver::static_only(Some(Arc::new(store.clone())))
+            .with_openfga(Arc::new(OpenFgaResolver::new(&openfga).expect("resolver")));
+        assert_eq!(
+            resolver
+                .authenticate(Some("Bearer tok-secret-edge"))
+                .await
+                .expect_err("openfga down"),
+            AuthError::Unavailable
+        );
+        assert_eq!(
+            resolver
+                .authenticate(Some("Bearer tok-wrong"))
+                .await
+                .expect_err("unknown"),
+            AuthError::Unauthenticated
+        );
+    }
+
     // The metric stream: both rejections on the existing request counter,
     // attributed by error.type.
     guard.force_flush().expect("flush");
     let rms = exporter.get_finished_metrics().expect("collect");
+    #[cfg(feature = "openfga")]
+    {
+        assert_eq!(
+            counted(
+                &rms,
+                ourios_semconv::OURIOS_AUTH_RESOLUTIONS,
+                "upstream_unavailable"
+            ),
+            1,
+            "RFC0047.3: the fail-closed resolution counted"
+        );
+        assert_eq!(
+            counted(
+                &rms,
+                ourios_semconv::OURIOS_AUTH_RESOLUTIONS,
+                "unauthenticated"
+            ),
+            2,
+            "RFC0047.3: the bearer-less gRPC probe above and the unknown token here \
+             both count on the same instrument"
+        );
+    }
     assert_eq!(
         rejected_batches(&rms, "unauthenticated"),
         1,

@@ -31,7 +31,7 @@ use tonic::{Request, Response, Status};
 
 use opentelemetry::context::FutureExt as _;
 
-use crate::receiver::auth::{AuthBinding, AuthResolver};
+use crate::receiver::auth::{AuthBinding, AuthError, AuthResolver};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 use crate::receiver::propagation::extract_context_from_metadata;
 use crate::receiver::selector;
@@ -126,11 +126,20 @@ where
                 // unknown would be a probing oracle (RFC 0026 §3.2). §3.4:
                 // the rejection counts on `ourios.ingest.batches`
                 // (`error.type = unauthenticated`).
-                Err(_) => {
+                Err(AuthError::Unauthenticated) => {
                     metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
                     return Ok(
                         Status::unauthenticated("a valid bearer token is required").into_http()
                     );
+                }
+                // RFC 0047 §3.1: the resolver could not answer — fail
+                // closed, `UNAVAILABLE`.
+                Err(AuthError::Unavailable) => {
+                    metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_UPSTREAM_UNAVAILABLE);
+                    return Ok(Status::unavailable(
+                        "authorization resolver unavailable; retry later",
+                    )
+                    .into_http());
                 }
             }
             inner.call(request).await

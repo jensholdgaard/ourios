@@ -86,6 +86,9 @@ pub enum FileConfigError {
         /// The offending entry's index in `auth.tokens`.
         index: usize,
     },
+    /// `auth.openfga.api_token` holds an inline literal instead of an
+    /// `${env:…}` reference (RFC 0047 §3.1, the RFC 0026 rule).
+    InlineOpenFgaToken,
 }
 
 impl fmt::Display for FileConfigError {
@@ -103,6 +106,11 @@ impl fmt::Display for FileConfigError {
                 "auth.tokens[{index}].token must be an ${{env:…}} reference, not \
                  an inline literal (RFC 0026 §3.1)"
             ),
+            Self::InlineOpenFgaToken => write!(
+                f,
+                "auth.openfga.api_token must be an ${{env:…}} reference, not an \
+                 inline literal (RFC 0047 §3.1)"
+            ),
         }
     }
 }
@@ -112,7 +120,9 @@ impl std::error::Error for FileConfigError {
         match self {
             Self::Substitution(e) => Some(e),
             Self::Schema(e) => Some(e),
-            Self::InlineCredential { .. } | Self::InlineToken { .. } => None,
+            Self::InlineCredential { .. } | Self::InlineToken { .. } | Self::InlineOpenFgaToken => {
+                None
+            }
         }
     }
 }
@@ -404,6 +414,9 @@ pub struct AuthSection {
     pub tokens: Option<Vec<TokenEntry>>,
     /// The OIDC layer (RFC 0029 §3.1). Nothing in it is secret.
     pub oidc: Option<OidcSection>,
+    /// The `OpenFGA` resolver (RFC 0047 §3.1): binds the tenants of whatever
+    /// the two halves above authenticate.
+    pub openfga: Option<OpenFgaSection>,
 }
 
 /// `auth.oidc.*` — the OIDC bearer layer (RFC 0029 §3.1). Issuer, audience,
@@ -426,6 +439,56 @@ pub struct OidcSection {
     /// `exp`/`nbf` clock-skew allowance in seconds (default 60).
     #[serde(deserialize_with = "scalar_opt")]
     pub clock_skew_secs: Option<String>,
+    /// `<claim>=<value>` marking an `agent:` principal (RFC 0047 §3.1).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub agent_claim: Option<String>,
+    /// The claim carrying the subject's groups (RFC 0047 §3.1).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub groups_claim: Option<String>,
+}
+
+/// `auth.openfga.*` — the RFC 0047 §3.1 resolver. `api_token` is **secret**:
+/// the manual [`fmt::Debug`] redacts it and [`parse`] rejects an inline
+/// literal (the RFC 0026 rule).
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenFgaSection {
+    /// The `OpenFGA` HTTP API root.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub api_url: Option<String>,
+    /// The store id.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub store_id: Option<String>,
+    /// The pinned authorization model id (absent = latest).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub authorization_model_id: Option<String>,
+    /// The API bearer token (**secret**; `${env:…}` reference only).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub api_token: Option<String>,
+    /// Per-credential binding cache lifetime in seconds (default 60).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub session_ttl_secs: Option<String>,
+    /// `minimize_latency` (default) or `higher_consistency`.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub consistency: Option<String>,
+    /// Per-call request timeout in seconds (default 5).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub request_timeout_secs: Option<String>,
+}
+
+impl fmt::Debug for OpenFgaSection {
+    /// Redacts the API token — presence only, never the value.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenFgaSection")
+            .field("api_url", &self.api_url)
+            .field("store_id", &self.store_id)
+            .field("authorization_model_id", &self.authorization_model_id)
+            .field("api_token", &self.api_token.as_ref().map(|_| "<redacted>"))
+            .field("session_ttl_secs", &self.session_ttl_secs)
+            .field("consistency", &self.consistency)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .finish()
+    }
 }
 
 /// One `auth.tokens[…]` entry (RFC 0026 §3.1).
@@ -548,6 +611,15 @@ fn check_tokens_are_references(auth: &AuthSection) -> Result<(), FileConfigError
             return Err(FileConfigError::InlineToken { index });
         }
     }
+    // RFC 0047 §3.1: the OpenFGA API token follows the same rule; like an S3
+    // credential, an empty value reads as "unset" (an OpenFGA without
+    // API-token auth is a legitimate deployment).
+    if let Some(raw) = auth.openfga.as_ref().and_then(|o| o.api_token.as_ref())
+        && !raw.is_empty()
+        && !is_env_reference(raw)
+    {
+        return Err(FileConfigError::InlineOpenFgaToken);
+    }
     Ok(())
 }
 
@@ -605,6 +677,17 @@ impl AuthSection {
             substitute(&mut oidc.tenant_claim, lookup)?;
             substitute(&mut oidc.name_claim, lookup)?;
             substitute(&mut oidc.clock_skew_secs, lookup)?;
+            substitute(&mut oidc.agent_claim, lookup)?;
+            substitute(&mut oidc.groups_claim, lookup)?;
+        }
+        if let Some(openfga) = &mut self.openfga {
+            substitute(&mut openfga.api_url, lookup)?;
+            substitute(&mut openfga.store_id, lookup)?;
+            substitute(&mut openfga.authorization_model_id, lookup)?;
+            substitute(&mut openfga.api_token, lookup)?;
+            substitute(&mut openfga.session_ttl_secs, lookup)?;
+            substitute(&mut openfga.consistency, lookup)?;
+            substitute(&mut openfga.request_timeout_secs, lookup)?;
         }
         Ok(())
     }
@@ -1303,6 +1386,71 @@ auth:
             rendered.contains("<redacted>"),
             "shows presence: {rendered}"
         );
+    }
+
+    /// RFC 0047 §3.1 (`auth.openfga`): the section parses with `${env:…}`
+    /// substitution on every leaf, an inline `api_token` literal is
+    /// rejected (empty = unset, like an S3 credential), the resolved value
+    /// is redacted in `Debug`, and the new OIDC claim keys parse.
+    #[test]
+    fn openfga_section_parses_substitutes_and_rejects_inline_token() {
+        let lookup = env(&[
+            ("FGA_URL", "http://openfga.auth.svc:8080"),
+            ("FGA_TOKEN", "fga-s3cr3t"),
+        ]);
+        let cfg = parse(
+            "auth:\n  oidc:\n    issuer: https://dex\n    audience: ourios\n    agent_claim: ourios_principal_type=agent\n    groups_claim: groups\n  openfga:\n    api_url: ${env:FGA_URL}\n    store_id: 01M07RYMXRDW4ND5M7XQV04W8R\n    api_token: ${env:FGA_TOKEN}\n    session_ttl_secs: 30\n    consistency: higher_consistency\n",
+            &lookup,
+        )
+        .expect("valid");
+        let auth = cfg.auth.expect("present");
+        let oidc = auth.oidc.as_ref().expect("oidc");
+        assert_eq!(
+            oidc.agent_claim.as_deref(),
+            Some("ourios_principal_type=agent")
+        );
+        assert_eq!(oidc.groups_claim.as_deref(), Some("groups"));
+        let openfga = auth.openfga.as_ref().expect("openfga");
+        assert_eq!(
+            openfga.api_url.as_deref(),
+            Some("http://openfga.auth.svc:8080")
+        );
+        assert_eq!(openfga.api_token.as_deref(), Some("fga-s3cr3t"));
+        assert_eq!(openfga.session_ttl_secs.as_deref(), Some("30"));
+        let rendered = format!("{openfga:?}");
+        assert!(
+            !rendered.contains("fga-s3cr3t"),
+            "token redacted: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "shows presence: {rendered}"
+        );
+
+        let err = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:FGA_TOKEN}\n      tenants: [x]\n  openfga:\n    api_url: ${env:FGA_URL}\n    store_id: s\n    api_token: hardcoded\n",
+            &lookup,
+        )
+        .expect_err("inline literal");
+        assert!(
+            matches!(err, FileConfigError::InlineOpenFgaToken),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auth.openfga.api_token"),
+            "names the key: {msg}"
+        );
+        assert!(!msg.contains("hardcoded"), "never the value: {msg}");
+
+        parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:FGA_TOKEN}\n      tenants: [x]\n  openfga:\n    api_url: ${env:FGA_URL}\n    store_id: s\n    api_token: \"\"\n",
+            &lookup,
+        )
+        .expect("empty api_token reads as unset");
+
+        let err = parse("auth:\n  openfga:\n    api_uri: x\n", &lookup).expect_err("typo");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
     }
 
     /// An omitted section leaves its fields unset (`None`), matching an unset

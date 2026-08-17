@@ -2,13 +2,17 @@
 
 Three postures, one enforcement path
 ([RFC 0026](../rfcs/0026-authentication-tenant-binding.md) +
-[RFC 0029](../rfcs/0029-oidc-bearer-layer.md)). Whatever
-authenticates a request, the result is the same `(name, tenants)`
-binding: ingest batches must fall entirely inside the binding's
-tenant set (whole-batch 403 otherwise, before the WAL), queries and
-MCP tool calls enforce the same set, and the `name` labels the audit
-trail and metrics. Rejections are deliberately undifferentiated — one
-401 shape, no probing oracle.
+[RFC 0029](../rfcs/0029-oidc-bearer-layer.md)), plus an optional
+authorization graph behind them
+([RFC 0047](../rfcs/0047-rebac-resolver-and-graph-visibility.md)).
+Whatever authenticates a request, the result is the same
+`(name, read tenants, write tenants)` binding: ingest batches must
+fall entirely inside the binding's write set (whole-batch 403
+otherwise, before the WAL), queries and MCP tool calls enforce the
+read set, and the `name` labels the audit trail and metrics. Static
+tokens and OIDC claims bind both sets identically; the graph binds them
+separately. Rejections are deliberately undifferentiated — one 401
+shape, no probing oracle.
 
 ## Open mode (development only)
 
@@ -87,6 +91,56 @@ exporters:
 Both halves coexist in one config — a static-token Collector and
 JWT-bearing senders authenticate side by side, each confined to its
 own tenant binding.
+
+## OpenFGA (relationship graph binds the tenants)
+
+[RFC 0047](../rfcs/0047-rebac-resolver-and-graph-visibility.md) adds
+[OpenFGA](https://openfga.dev/) as an *authorization* layer behind
+either authenticator — OpenFGA never authenticates. Once a bearer is
+known (static token or verified JWT), the principal is mapped
+(`service_account:<token name>`, `user:<sub>`, or `agent:<sub>` when
+the token carries the configured `agent_claim`) and the graph answers
+which tenants it may query (`can_query`) and write (`can_write`),
+using the in-tree model `deploy/openfga/model.fga`:
+
+```yaml
+auth:
+  tokens:
+    - name: collector-cluster1
+      token: ${env:OURIOS_COLLECTOR_TOKEN}
+      tenants: ["*"]                  # the graph decides; a list here only narrows
+  oidc:
+    issuer: https://dex.example.com
+    audience: ourios
+    groups_claim: groups              # → contextual team#member tuples
+    agent_claim: ourios_principal_type=agent
+    # tenant_claim is optional here — the graph binds the tenants
+  openfga:
+    api_url: http://openfga.auth.svc:8080
+    store_id: 01M07RYMXRDW4ND5M7XQV04W8R
+    authorization_model_id: 01M07RZE9RHPVPTYCV22RX0TDA   # pinned; omit = latest
+    api_token: ${env:OURIOS_OPENFGA_TOKEN}                 # ${env:…} only
+    session_ttl_secs: 60              # revocation latency = binding cache TTL
+    consistency: minimize_latency     # higher_consistency bypasses OpenFGA's cache
+```
+
+Grants are administrative tuples written through OpenFGA's own API or
+CLI, never by Ourios: `tenant:acme#reader@user:alice`,
+`tenant:acme#writer@service_account:collector-cluster1`,
+`tenant:acme#owner@team:platform#member`. A token's group claim rides
+along as request-scoped `team:<group>#member@<principal>` tuples
+(never persisted; at most 100), so team membership needs no sync
+pipeline. A credential's own tenant list — a static token's `tenants`,
+an OIDC `tenant_claim` — can only narrow what the graph grants, never
+widen it; a principal the graph grants nothing is unbound (401).
+
+The binding is cached per credential for `session_ttl_secs` and is
+**fail-closed**: an unreachable or slow OpenFGA answers `503` on the
+query and MCP surfaces and `UNAVAILABLE`/`503` on ingest, and
+`ourios.auth.resolutions` counts the failure as
+`error.type = upstream_unavailable`. Static tokens and OIDC keep working
+without an `openfga` section; a deployment that wants coarse tenants only
+never touches it.
 
 ## TLS
 

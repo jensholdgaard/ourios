@@ -743,7 +743,7 @@ fn warn_if_open_mode(config: &ServerConfig) {
     }
 }
 
-/// Build a network role's RFC 0026/0029 credential resolver from the
+/// Build a network role's RFC 0026/0029/0047 credential resolver from the
 /// resolved auth config. OIDC discovery contacts the issuer once, here at
 /// startup — a failure (unreachable issuer, issuer mismatch, unusable
 /// JWKS) is a startup error, not a degraded mode (§3.2: with no cached
@@ -764,18 +764,24 @@ async fn auth_resolver(
         .as_ref()
         .and_then(|auth| auth.static_tokens.clone())
         .map(std::sync::Arc::new);
-    match config.auth.as_ref().and_then(|auth| auth.oidc.clone()) {
+    let mut resolver = match config.auth.as_ref().and_then(|auth| auth.oidc.clone()) {
         Some(oidc) => {
             let verifier = ourios_core::auth::oidc::OidcVerifier::discover(oidc)
                 .await
                 .map_err(|e| format!("auth.oidc: {e}"))?;
-            Ok(Some(AuthResolver::with_oidc(
-                static_store,
-                std::sync::Arc::new(verifier),
-            )))
+            AuthResolver::with_oidc(static_store, std::sync::Arc::new(verifier))
         }
-        None => Ok(Some(AuthResolver::static_only(static_store))),
+        None => AuthResolver::static_only(static_store),
+    };
+    // RFC 0047 §3.1: the graph resolver binds tenants for whatever the two
+    // halves above authenticate. No startup round-trip — OpenFGA is
+    // consulted per session, fail-closed, so an unreachable store is a 503
+    // at request time rather than a start-up failure of every other role.
+    if let Some(openfga) = config.auth.as_ref().and_then(|auth| auth.openfga.as_ref()) {
+        let openfga = ourios_core::auth::openfga::OpenFgaResolver::new(openfga)?;
+        resolver = resolver.with_openfga(std::sync::Arc::new(openfga));
     }
+    Ok(Some(resolver))
 }
 
 /// Start the querier role if enabled (RFC 0016), over the same store the

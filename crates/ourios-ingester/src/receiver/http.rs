@@ -26,7 +26,7 @@ use prost::Message;
 
 use opentelemetry::context::FutureExt as _;
 
-use crate::receiver::auth::AuthResolver;
+use crate::receiver::auth::{AuthError, AuthResolver};
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 use crate::receiver::propagation::extract_context;
@@ -103,10 +103,18 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let Ok(binding) = state.auth.authenticate(authorization).await else {
+    let binding = match state.auth.authenticate(authorization).await {
+        Ok(binding) => binding,
         // RFC 0026 §3.4: the rejection counts on `ourios.ingest.batches` (`error.type = unauthenticated`).
-        state.pipeline.record_unauthenticated();
-        return StatusCode::UNAUTHORIZED.into_response();
+        Err(AuthError::Unauthenticated) => {
+            state.pipeline.record_unauthenticated();
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        // RFC 0047 §3.1: the resolver could not answer — fail closed, 503.
+        Err(AuthError::Unavailable) => {
+            state.pipeline.record_auth_unavailable();
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     // RFC 0046 §3.1: the tenant selector is required, exactly once, and
     // decided before authorization against the set, before decode, before

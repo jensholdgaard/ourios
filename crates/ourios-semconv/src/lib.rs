@@ -42,6 +42,9 @@ pub const OURIOS_AUDIT_SINK_FLUSH_EVENTS: &str = "ourios.audit_sink.flush.events
 /// `ourios.audit_sink.flushes` (counter, unit `{flush}`).
 pub const OURIOS_AUDIT_SINK_FLUSHES: &str = "ourios.audit_sink.flushes";
 
+/// `ourios.auth.resolutions` (counter, unit `{resolution}`).
+pub const OURIOS_AUTH_RESOLUTIONS: &str = "ourios.auth.resolutions";
+
 /// `ourios.compaction.backlog` (updowncounter, unit `{partition}`).
 pub const OURIOS_COMPACTION_BACKLOG: &str = "ourios.compaction.backlog";
 

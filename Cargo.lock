@@ -3333,6 +3333,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "blake3",
+ "futures-core",
  "jsonwebtoken",
  "opentelemetry",
  "opentelemetry-proto",
@@ -3348,6 +3349,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

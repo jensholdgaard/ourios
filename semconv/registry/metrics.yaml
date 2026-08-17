@@ -485,10 +485,6 @@ groups:
       - ref: ourios.tls.reload_error
         requirement_level: required
 
-  # Cached template map (RFC 0033 §3.7): the querier's per-tenant cached
-  # fold of the audit stream. Lookup outcomes carry the corruption /
-  # forward-compat signals (`torn` / `unknown_version`); publish outcomes
-  # surface the best-effort write-through's failures.
   - id: metric.ourios.receiver.tenant.divergences
     type: metric
     metric_name: ourios.receiver.tenant.divergences
@@ -506,6 +502,10 @@ groups:
       - ref: ourios.tenant.watch.key
         requirement_level: required
 
+  # Cached template map (RFC 0033 §3.7): the querier's per-tenant cached
+  # fold of the audit stream. Lookup outcomes carry the corruption /
+  # forward-compat signals (`torn` / `unknown_version`); publish outcomes
+  # surface the best-effort write-through's failures.
   - id: metric.ourios.template_map.lookups
     type: metric
     metric_name: ourios.template_map.lookups

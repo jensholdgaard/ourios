@@ -98,3 +98,7 @@ auth:
 Auth configuration is **file-only** — there are deliberately no
 `OURIOS_AUTH_*` variables; token values reach the file through
 `${env:…}` references.
+
+Tenant derivation (`receiver.tenant`, RFC 0045) is likewise **file-only**:
+the environment path always runs the `[service.name]` default. A
+multi-cluster rule needs `--config`.

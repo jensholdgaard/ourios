@@ -1059,6 +1059,43 @@ mod tests {
         ));
     }
 
+    // RFC 0005 §3.4 / RFC 0045 §3.2 in property form: for any tenant id —
+    // reserved, unreserved and multi-byte UTF-8 characters mixed — the
+    // once-encoded key survives put → list → get on the local backend and
+    // the on-disk directory is exactly `tenant_id=<enc>`.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        #[test]
+        fn encoded_tenant_keys_round_trip_for_any_tenant(
+            tenant in "[a-z0-9._~/%=:+ éß日]{1,12}",
+        ) {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let store = Store::local(dir.path()).expect("local store");
+            let enc = crate::percent_encode_tenant(&tenant);
+            let key = format!("data/tenant_id={enc}/year=2026/x.parquet");
+            store.put_blocking(&key, tenant.as_bytes().to_vec()).expect("put");
+            let on_disk = dir
+                .path()
+                .join("data")
+                .join(format!("tenant_id={enc}"))
+                .join("year=2026")
+                .join("x.parquet");
+            proptest::prop_assert!(on_disk.is_file(), "missing {}", on_disk.display());
+            proptest::prop_assert_eq!(
+                store.list_blocking(Some("data/")).expect("list"),
+                vec![key.clone()]
+            );
+            proptest::prop_assert_eq!(
+                store.get_blocking(&key).expect("get"),
+                tenant.as_bytes().to_vec()
+            );
+            proptest::prop_assert_eq!(
+                crate::percent_decode_tenant(&enc),
+                Some(tenant.clone())
+            );
+        }
+    }
+
     /// `list_blocking` enumerates keys under a prefix recursively, in
     /// lexicographic order, returning store-relative keys (the same key space
     /// as `get`/`put`) — the seam the querier/compactor walk instead of

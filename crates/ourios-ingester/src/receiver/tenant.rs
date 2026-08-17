@@ -51,7 +51,8 @@ impl TenantRule {
     ///
     /// # Errors
     ///
-    /// [`TenantRuleError::Empty`] for no keys; [`TenantRuleError::Duplicate`]
+    /// [`TenantRuleError::Empty`] for no keys, [`TenantRuleError::BlankKey`]
+    /// for an empty or whitespace-only key, [`TenantRuleError::Duplicate`]
     /// naming the first repeated key.
     pub fn from_keys<I, K>(keys: I) -> Result<Self, TenantRuleError>
     where
@@ -61,6 +62,9 @@ impl TenantRule {
         let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
         if keys.is_empty() {
             return Err(TenantRuleError::Empty);
+        }
+        if keys.iter().any(|key| key.trim().is_empty()) {
+            return Err(TenantRuleError::BlankKey);
         }
         let mut seen = std::collections::HashSet::new();
         if let Some(duplicate) = keys.iter().find(|key| !seen.insert(key.as_str())) {
@@ -179,6 +183,9 @@ impl Default for TenantDerivation {
 pub enum TenantRuleError {
     /// No keys at all.
     Empty,
+    /// An empty or whitespace-only key — it can never match a resource
+    /// attribute, so every export would fail at request time.
+    BlankKey,
     /// The same key listed twice.
     Duplicate { key: String },
 }
@@ -190,6 +197,7 @@ impl std::fmt::Display for TenantRuleError {
                 f,
                 "tenant rule must list at least one resource attribute key"
             ),
+            Self::BlankKey => write!(f, "tenant rule lists an empty resource attribute key"),
             Self::Duplicate { key } => {
                 write!(
                     f,
@@ -488,6 +496,10 @@ mod tests {
         assert_eq!(
             TenantRule::from_keys(Vec::<String>::new()).unwrap_err(),
             TenantRuleError::Empty
+        );
+        assert_eq!(
+            TenantRule::from_keys(["service.name", " "]).unwrap_err(),
+            TenantRuleError::BlankKey
         );
         assert_eq!(
             TenantRule::from_keys(["service.name", "service.name"]).unwrap_err(),

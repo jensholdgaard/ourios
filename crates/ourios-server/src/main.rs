@@ -471,6 +471,9 @@ fn tenant_derivation(section: &TenantSection) -> Result<TenantDerivation, String
         None => defaults.rule,
     };
     let watch = section.watch.clone().unwrap_or(defaults.watch);
+    if watch.iter().any(|key| key.trim().is_empty()) {
+        return Err("receiver.tenant.watch lists an empty resource attribute key".to_owned());
+    }
     let watch_capacity = match section.watch_capacity.as_deref().map(str::trim) {
         Some(raw) if !raw.is_empty() => match raw.parse::<usize>() {
             Ok(n) if n >= 1 => n,
@@ -1806,6 +1809,17 @@ auth:
         );
         assert_eq!(resolved.watch, ["cloud.region"]);
         assert_eq!(resolved.watch_capacity, 7);
+
+        for bad_yaml in [
+            "receiver:\n  tenant:\n    rule: [service.name, \"\"]\n",
+            "receiver:\n  tenant:\n    watch: [\" \"]\n",
+        ] {
+            let cfg = parse(bad_yaml, &lookup).expect("valid yaml");
+            assert!(
+                tenant_derivation(&cfg.receiver.tenant).is_err(),
+                "blank key rejected: {bad_yaml:?}"
+            );
+        }
 
         for bad in ["0", "-1", "many"] {
             let cfg = parse(

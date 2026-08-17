@@ -88,14 +88,21 @@ impl RuleEpochs {
     }
 
     /// The rule a frame at `offset` was acknowledged under: the newest
-    /// epoch whose `after` lies strictly below `offset`.
+    /// epoch whose `after` lies strictly below `offset`. The first epoch is
+    /// always unbounded (`load` enforces it), so every offset resolves.
     #[must_use]
     pub fn rule_for(&self, offset: WalOffset) -> &TenantRule {
         self.epochs
             .iter()
             .rev()
             .find(|epoch| epoch.after.is_none_or(|after| offset > after))
-            .map_or_else(|| self.current(), |epoch| &epoch.rule)
+            .map_or_else(|| self.oldest(), |epoch| &epoch.rule)
+    }
+
+    fn oldest(&self) -> &TenantRule {
+        self.epochs
+            .first()
+            .map_or_else(|| unreachable!("epoch log is never empty"), |e| &e.rule)
     }
 
     /// Make `rule` the current epoch for frames after `after` (the highest
@@ -123,25 +130,31 @@ impl RuleEpochs {
             rule: rule.clone(),
             after,
         };
-        match after {
-            Some(_) => self.epochs.push(epoch),
-            None => self.epochs = vec![epoch],
-        }
-        self.persist()?;
+        let candidate = match after {
+            Some(_) => {
+                let mut epochs = self.epochs.clone();
+                epochs.push(epoch);
+                epochs
+            }
+            None => vec![epoch],
+        };
+        // Durable first: a failed write leaves `self` reporting the rule the
+        // sidecar actually records.
+        self.persist(&candidate)?;
+        self.epochs = candidate;
         Ok(true)
     }
 
-    fn persist(&self) -> Result<(), RuleEpochsError> {
+    fn persist(&self, epochs: &[RuleEpoch]) -> Result<(), RuleEpochsError> {
         let io = |op: &'static str, path: &Path| {
             let path = path.to_path_buf();
             move |source| RuleEpochsError::Io { op, path, source }
         };
-        let bytes = serde_json::to_vec_pretty(&render(&self.epochs)).map_err(|e| {
-            RuleEpochsError::Malformed {
+        let bytes =
+            serde_json::to_vec_pretty(&render(epochs)).map_err(|e| RuleEpochsError::Malformed {
                 path: self.path.clone(),
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
         let tmp = self.path.with_extension("json.tmp");
         let mut file = File::create(&tmp).map_err(io("create(tenant rule epochs tmp)", &tmp))?;
         file.write_all(&bytes)
@@ -206,6 +219,9 @@ fn parse(bytes: &[u8]) -> Result<Vec<RuleEpoch>, String> {
                 return Err(format!(
                     "epochs[{index}].after is null; only the first epoch is unbounded"
                 ));
+            }
+            Some(_) if index == 0 => {
+                return Err("epochs[0].after must be null; the first epoch is unbounded".to_owned());
             }
             Some(after) => {
                 let segment = after
@@ -343,6 +359,24 @@ mod tests {
         assert_eq!(reloaded.rule_for(offset(0)), &composite);
     }
 
+    // A failed persist leaves the in-memory log on the rule the sidecar
+    // records.
+    #[test]
+    fn failed_persist_does_not_advance_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut epochs = RuleEpochs::load(dir.path()).expect("loads");
+        // A file where the sidecar's directory should be: the write fails.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"").expect("write");
+        epochs.path = blocked.join(FILE_NAME);
+        let composite = TenantRule::from_keys(["a", "b"]).expect("valid");
+        assert!(matches!(
+            epochs.advance(&composite, Some(offset(1))),
+            Err(RuleEpochsError::Io { .. })
+        ));
+        assert_eq!(epochs.current(), &TenantRule::service_name());
+    }
+
     // RFC0045.10 — an unparseable log aborts loudly, naming the file.
     #[test]
     fn malformed_log_is_an_error_naming_the_file() {
@@ -361,6 +395,22 @@ mod tests {
         std::fs::write(
             dir.path().join(FILE_NAME),
             b"{\"epochs\": [{\"rule\": [\"a\", \"a\"], \"after\": null}]}",
+        )
+        .expect("write");
+        assert!(matches!(
+            RuleEpochs::load(dir.path()).unwrap_err(),
+            RuleEpochsError::Malformed { .. }
+        ));
+
+        // A bounded first entry is rejected (a frame below it would have no
+        // epoch).
+        let bounded_first = offset(1);
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            format!(
+                "{{\"epochs\": [{{\"rule\": [\"a\"], \"after\": {{\"segment\": \"{}\", \"byte\": {}}}}}]}}",
+                bounded_first.segment, bounded_first.byte
+            ),
         )
         .expect("write");
         assert!(matches!(
@@ -392,10 +442,11 @@ mod tests {
                 o.segment, o.byte
             )
         };
+        let first = "{\"rule\": [\"z\"], \"after\": null}";
         std::fs::write(
             dir.path().join(FILE_NAME),
             format!(
-                "{{\"epochs\": [{}, {}]}}",
+                "{{\"epochs\": [{first}, {}, {}]}}",
                 entry("\"a\"", later),
                 entry("\"b\"", earlier)
             ),
@@ -408,7 +459,7 @@ mod tests {
         std::fs::write(
             dir.path().join(FILE_NAME),
             format!(
-                "{{\"epochs\": [{}, {}]}}",
+                "{{\"epochs\": [{first}, {}, {}]}}",
                 entry("\"a\"", later),
                 entry("\"b\"", later)
             ),
@@ -416,5 +467,10 @@ mod tests {
         .expect("write");
         let epochs = RuleEpochs::load(dir.path()).expect("equal boundary is append order");
         assert_eq!(epochs.current().keys(), ["b"]);
+        assert_eq!(
+            epochs.rule_for(earlier).keys(),
+            ["z"],
+            "below every boundary → the oldest epoch"
+        );
     }
 }

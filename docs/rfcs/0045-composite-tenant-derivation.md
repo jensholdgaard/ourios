@@ -14,8 +14,8 @@ superseded-by: RFC 0046
 > **Status: `superseded` by RFC 0046 (2026-08-17).** The maintainer ruled
 > the same day that tenancy does not reside in OTLP data — no resource
 > attribute is ever a tenancy input — so the in-band composite derivation
-> this RFC specified was the wrong model, not a bad rule. RFC 0046 (out-of-
-> band tenancy) replaced §3.1–§3.4 (rule, epoch log, divergence detector)
+> this RFC specified was the wrong model, not a bad rule. RFC 0046
+> (out-of-band tenancy) replaced §3.1–§3.4 (rule, epoch log, detector)
 > in #702; the `Store` double-encoding fix of §3.2 and `TenantId` opacity
 > survive. The registry entries the detector minted are `deprecated`, not
 > deleted. Kept as the record of a `green` implementation and of the

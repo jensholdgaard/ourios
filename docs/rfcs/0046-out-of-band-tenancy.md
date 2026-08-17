@@ -17,8 +17,9 @@ superseded-by: —
 > one-export-one-tenant materialisation, binding-on-selector and the
 > removal of derivation / the epoch log / the detector (`ourios-ingester`);
 > the config-surface removal, docs, Helm, dogfood, kind smoke test and
-> Collector interop header (`ourios-server` + surface). RFC0046.1/.2/.3/.7/
-> .10 served-binary over both transports, .4 on the WAL crash shape, .5/.11
+> Collector interop header (`ourios-server` + surface).
+> RFC0046.1/.2/.3/.7/.10 served-binary over both transports, .4 on the WAL
+> crash shape, .5/.11
 > at the recovery driver, .6 as a `0x03` dimension over the RFC 0008
 > harnesses, .8 in the collector interop job, .9 by grep. Two things
 > implementation forced on the spec, both recorded inline: `reject` names

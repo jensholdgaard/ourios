@@ -455,10 +455,18 @@ sweep's compaction events, and removes the marker. A sweep interrupted
 between the phases retries only the tuple deletion; an unreachable graph
 leaves the marker and retries next sweep. Without a bound conversation
 object a marker is recorded as a sweep error, never silently dropped.
-The tuple deletion loops `Read → delete` until a `Read` returns empty
-(bounded): a paginated `Read` is not a snapshot (OpenFGA assistant,
-2026-08-18), so a tuple the flush-cadence feed writes concurrently is
-swept up by the next round. The same review confirmed the object-naming
+The tuple deletion loops `Read → delete` until a `Read` returns empty —
+at most **8** delete rounds plus one confirming read: a paginated `Read`
+is not a snapshot (OpenFGA assistant, 2026-08-18), so a tuple the
+flush-cadence feed writes concurrently is swept up by the next round; an
+object still non-empty after the rounds is `EraseIncomplete` — the marker
+stays in the `tuples` phase and the next sweep retries. Erasure covers the
+rows durable at the rewrite; rows ingested for the same conversation id
+afterwards are new data (with their tuples) — consistent by construction —
+and the flush-cadence emit is a fire-and-forget within the same process
+that completes in milliseconds and is never retried, so a batch published
+before a later sweep's rewrite cannot land tuples after that sweep's
+erasure; a dangling tuple is in any case harmless. The same review confirmed the object-naming
 scheme has no documented pitfall; the served-binary test writes tenants
 containing `/` and `%` to a real v1.11.1 and asserts `Read` returns the
 object ids byte-for-byte and the encoded prefix filters the stream. The

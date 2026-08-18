@@ -219,6 +219,26 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
             vec![pct.conversation("c-2")]
         );
         fga.write(&[], &seeded).await.expect("cleanup");
+        for tuple in &seeded {
+            assert!(
+                fga.read_by_object(&tuple.object)
+                    .await
+                    .expect("read")
+                    .is_empty(),
+                "deleted: {}",
+                tuple.object
+            );
+        }
+        for prefix in [
+            a.conversation_prefix(),
+            ab.conversation_prefix(),
+            pct.conversation_prefix(),
+        ] {
+            assert!(
+                list(prefix.to_string()).await.is_empty(),
+                "stream empty after cleanup: {prefix}"
+            );
+        }
     }
 
     // --- Issuer + server ---------------------------------------------------

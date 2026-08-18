@@ -237,7 +237,7 @@ impl GraphEmitter {
     ///
     /// [`OpenFgaError`] from a read or a failed batch, or
     /// [`OpenFgaError::Incomplete`] when the object is still non-empty after
-    /// [`ERASE_ROUNDS`] rounds (something keeps writing it); the erasure is
+    /// `ERASE_ROUNDS` rounds (something keeps writing it); the erasure is
     /// retried by the next sweep (deletes are idempotent).
     pub async fn erase_conversation(&self, tenant: &str, id: &str) -> Result<usize, OpenFgaError> {
         let objects = TenantObjects::new(tenant).ok_or(OpenFgaError::InvalidTenant)?;

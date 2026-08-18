@@ -466,13 +466,20 @@ pub fn run_sweep_hooked(
             partitions_compacted: compacted_here,
         });
     }
-    erase_pending(store, promoted, hooks.erasure_match, &mut report)?;
+    erase_pending(
+        store,
+        now_unix_nanos,
+        promoted,
+        hooks.erasure_match,
+        &mut report,
+    )?;
     Ok(report)
 }
 
 /// The RFC 0047 §3.6 erasure pass (rows phase).
 fn erase_pending(
     store: &Store,
+    now_unix_nanos: u64,
     promoted: &PromotedAttributes,
     erasure_match: Option<&ErasureMatch<'_>>,
     report: &mut SweepReport,
@@ -533,7 +540,7 @@ fn erase_pending(
                             });
                             report.compaction_events.push(compaction_audit_event(
                                 &request.tenant,
-                                now_unix_nanos(),
+                                now_unix_nanos,
                                 &partition,
                                 committed,
                                 o.rows,

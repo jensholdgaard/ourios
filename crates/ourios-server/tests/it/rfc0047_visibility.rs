@@ -6,7 +6,8 @@
 //!
 //! Scenarios RFC0047.4 (tenant-wide reader), .5 (participant + self fast
 //! path), .6 (agent principal + revocable delegation), .7 (bounded
-//! enumeration, per tenant), .8 (metadata without content).
+//! enumeration, per tenant), .8 (metadata without content), .9 (the MCP
+//! tool gate).
 //! See `docs/rfcs/0047-rebac-resolver-and-graph-visibility.md` §5.
 
 use std::collections::HashMap;
@@ -156,6 +157,69 @@ async fn query(
     )
 }
 
+/// One MCP `tools/call` over HTTP against the served `/mcp` (initialize →
+/// initialized → call); returns the JSON-RPC payload.
+async fn mcp_call(
+    http: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let url = format!("http://{addr}/mcp");
+    let post = |session: Option<String>, body: serde_json::Value| {
+        let mut request = http
+            .post(&url)
+            .bearer_auth(bearer)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&body);
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        request.send()
+    };
+    let init = post(
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "rfc0047-test", "version": "0"}}
+        }),
+    )
+    .await
+    .expect("initialize");
+    assert_eq!(init.status().as_u16(), 200, "initialize");
+    let session = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+    post(
+        Some(session.clone()),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await
+    .expect("initialized");
+    let call = post(
+        Some(session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}
+        }),
+    )
+    .await
+    .expect("tools/call");
+    let body = call.text().await.expect("body");
+    let payload = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find(|payload| !payload.trim().is_empty())
+        .unwrap_or(&body);
+    serde_json::from_str(payload.trim()).expect("json-rpc payload")
+}
+
 /// The sorted conversation ids of a row response.
 fn conversations(body: &serde_json::Value) -> Vec<String> {
     let mut ids: Vec<String> = body["records"]
@@ -177,12 +241,12 @@ fn conversations(body: &serde_json::Value) -> Vec<String> {
     ids
 }
 
-/// Scenarios RFC0047.4–.8 on the served binary (one container, one
+/// Scenarios RFC0047.4–.9 on the served binary (one container, one
 /// server, one seeded store).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one container + one server, every arm in sequence
-#[ignore = "RFC0047.4–.8 — needs Docker (real OpenFGA container); run by the openfga-resolver CI job via --ignored"]
-async fn rfc0047_4_to_8_visibility_end_to_end() {
+#[ignore = "RFC0047.4–.9 — needs Docker (real OpenFGA container); run by the openfga-resolver CI job via --ignored"]
+async fn rfc0047_4_to_9_visibility_end_to_end() {
     // --- OpenFGA -----------------------------------------------------------
     let container = GenericImage::new(OPENFGA_IMAGE, OPENFGA_TAG)
         .with_exposed_port(ContainerPort::Tcp(8080))
@@ -262,6 +326,11 @@ async fn rfc0047_4_to_8_visibility_end_to_end() {
     ] {
         tuples.push(tuple("tenant:acme", "parent", &conv(id)));
     }
+    // RFC0047.9: the MCP tools as objects; bot may call query_logs only.
+    for tool in ["query_logs", "list_templates", "template_drift"] {
+        tuples.push(tuple("tenant:acme", "parent", &format!("tool:acme/{tool}")));
+    }
+    tuples.push(tuple("agent:bot", "caller", "tool:acme/query_logs"));
     for chunk in tuples.chunks(100) {
         fga.write(chunk, &[]).await.expect("seed tuples");
     }
@@ -447,6 +516,54 @@ async fn rfc0047_4_to_8_visibility_end_to_end() {
     assert_eq!(body["error"]["kind"], "visibility_scoped", "{body}");
     let (status, _) = query(&http, querier, &alice, "acme", "drift from -1h to now").await;
     assert_eq!(status, 200, "tenant-wide readers may");
+
+    // --- RFC0047.9: tool gate ----------------------------------------------
+    let payload = mcp_call(
+        &http,
+        querier,
+        &bot,
+        "query_logs",
+        serde_json::json!({"tenant": "acme", "query": "true", "limit": 100}),
+    )
+    .await;
+    assert!(
+        payload.get("error").is_none(),
+        "bot may call query_logs: {payload}"
+    );
+    let text = payload["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let result: serde_json::Value = serde_json::from_str(text).expect("tool json");
+    assert_eq!(
+        conversations(&result),
+        ["c-3", "c-4"],
+        "and its data access is scoped exactly as the JSON API's"
+    );
+    let payload = mcp_call(
+        &http,
+        querier,
+        &bot,
+        "template_drift",
+        serde_json::json!({"tenant": "acme", "from": "-1h", "to": "now"}),
+    )
+    .await;
+    let message = payload["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("permission denied") && message.contains("template_drift"),
+        "the denial names the tool: {payload}"
+    );
+    let payload = mcp_call(
+        &http,
+        querier,
+        &alice,
+        "template_drift",
+        serde_json::json!({"tenant": "acme", "from": "-1h", "to": "now"}),
+    )
+    .await;
+    assert!(
+        payload.get("error").is_none(),
+        "a tenant-wide reader calls everything: {payload}"
+    );
 
     child.kill().await.expect("kill the server");
     drop(container);

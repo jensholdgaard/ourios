@@ -48,10 +48,29 @@ pub(crate) async fn resolve(
     else {
         return Ok(None);
     };
-    let decision = resolver
+    let decision = match resolver
         .visibility(graph.principal(), graph.groups(), tenant)
         .await
-        .map_err(|e| reject(&e, tenant, resolver.visibility_config().max_objects()))?;
+    {
+        Ok(decision) => decision,
+        Err(e) => {
+            // A scoped enumeration that failed closed still happened —
+            // count it, so `scoped` on `ourios.query.visibility` is exactly
+            // "a stream was issued".
+            if matches!(
+                e,
+                OpenFgaError::BoundExceeded { .. } | OpenFgaError::Incomplete
+            ) {
+                metrics.record_visibility(BRANCH_SCOPED);
+                tracing::Span::current().record("ourios.query.visibility.branch", BRANCH_SCOPED);
+            }
+            return Err(reject(
+                &e,
+                tenant,
+                resolver.visibility_config().max_objects(),
+            ));
+        }
+    };
     let config = resolver.visibility_config();
     let (branch, visibility) = match decision {
         GraphVisibility::TenantWide => (BRANCH_TENANT_WIDE, Visibility::TenantWide),

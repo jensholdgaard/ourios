@@ -493,7 +493,8 @@ pub struct VisibilitySection {
     #[serde(deserialize_with = "scalar_opt")]
     pub self_principal_column: Option<String>,
     /// The content columns a metadata-only reader may not read. `None` =
-    /// the `GenAI` default set; an explicit empty list disables masking.
+    /// the `GenAI` default set; an explicit list **replaces** it and must
+    /// not be empty (masking is never disabled — validated at startup).
     #[serde(default, deserialize_with = "scalar_vec_opt")]
     pub content_columns: Option<Vec<String>>,
     /// The per-tenant enumeration bound (default 10 000).
@@ -867,9 +868,9 @@ where
         .collect())
 }
 
-/// [`scalar_vec`] for an optional list — absent and explicitly empty
-/// differ (an empty `content_columns` disables masking; an absent one takes
-/// the default set).
+/// [`scalar_vec`] for an optional list — absent and present differ (an
+/// absent `content_columns` takes the default set; a present list replaces
+/// it — and, validated at startup, may not be empty).
 fn scalar_vec_opt<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1522,13 +1523,14 @@ auth:
     }
 
     /// RFC 0047 §3.4: the visibility section — `type` (a keyword, renamed
-    /// onto `object_type`), substituted leaves, an explicit empty
-    /// `content_columns` distinct from an absent one, unknown keys rejected.
+    /// onto `object_type`), substituted leaves, an explicit
+    /// `content_columns` list distinct from an absent one, unknown keys
+    /// rejected.
     #[test]
     fn openfga_visibility_section_parses() {
         let lookup = env(&[("CONV", "attr.gen_ai.conversation.id")]);
         let cfg = parse(
-            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n    server_list_objects_deadline_ms: 3000\n    visibility:\n      objects:\n        - type: conversation\n          column: ${env:CONV}\n      self_principal_column: attr.user.hash\n      content_columns: []\n      max_objects: 100\n      list_timeout_ms: 500\n",
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n    server_list_objects_deadline_ms: 3000\n    visibility:\n      objects:\n        - type: conversation\n          column: ${env:CONV}\n      self_principal_column: attr.user.hash\n      content_columns: [body, attr.prompt]\n      max_objects: 100\n      list_timeout_ms: 500\n",
             &lookup,
         )
         .expect("valid");
@@ -1553,8 +1555,8 @@ auth:
         );
         assert_eq!(
             visibility.content_columns.as_deref(),
-            Some(&[][..]),
-            "explicit empty"
+            Some(&["body".to_string(), "attr.prompt".to_string()][..]),
+            "an explicit list replaces the default set (non-empty by startup validation)"
         );
         assert_eq!(visibility.max_objects.as_deref(), Some("100"));
         assert_eq!(visibility.list_timeout_ms.as_deref(), Some("500"));

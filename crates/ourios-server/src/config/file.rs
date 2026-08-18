@@ -474,6 +474,47 @@ pub struct OpenFgaSection {
     /// Per-call request timeout in seconds (default 5).
     #[serde(deserialize_with = "scalar_opt")]
     pub request_timeout_secs: Option<String>,
+    /// The layer-2 visibility section (RFC 0047 §3.4).
+    pub visibility: VisibilitySection,
+    /// The `OpenFGA` server's `OPENFGA_LIST_OBJECTS_DEADLINE` in
+    /// milliseconds (default 3000); `visibility.list_timeout_ms` must stay
+    /// strictly below it.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub server_list_objects_deadline_ms: Option<String>,
+}
+
+/// `auth.openfga.visibility.*` — RFC 0047 §3.4. Nothing here is secret.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisibilitySection {
+    /// Object type → promoted column bindings (v1: `conversation` only).
+    pub objects: Vec<VisibilityObjectSection>,
+    /// The promoted column compared to a `user:` principal's subject.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub self_principal_column: Option<String>,
+    /// The content columns a metadata-only reader may not read. `None` =
+    /// the `GenAI` default set; an explicit list **replaces** it and must
+    /// not be empty (masking is never disabled — validated at startup).
+    #[serde(default, deserialize_with = "scalar_vec_opt")]
+    pub content_columns: Option<Vec<String>>,
+    /// The per-tenant enumeration bound (default 10 000).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub max_objects: Option<String>,
+    /// The client-side enumeration timeout in milliseconds (default 2000).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub list_timeout_ms: Option<String>,
+}
+
+/// One `auth.openfga.visibility.objects[]` entry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisibilityObjectSection {
+    /// The `OpenFGA` object type (`conversation`).
+    #[serde(rename = "type", deserialize_with = "scalar_opt")]
+    pub object_type: Option<String>,
+    /// The promoted column carrying the object ids.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub column: Option<String>,
 }
 
 impl fmt::Debug for OpenFgaSection {
@@ -487,6 +528,11 @@ impl fmt::Debug for OpenFgaSection {
             .field("session_ttl_secs", &self.session_ttl_secs)
             .field("consistency", &self.consistency)
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("visibility", &self.visibility)
+            .field(
+                "server_list_objects_deadline_ms",
+                &self.server_list_objects_deadline_ms,
+            )
             .finish()
     }
 }
@@ -688,6 +734,18 @@ impl AuthSection {
             substitute(&mut openfga.session_ttl_secs, lookup)?;
             substitute(&mut openfga.consistency, lookup)?;
             substitute(&mut openfga.request_timeout_secs, lookup)?;
+            substitute(&mut openfga.server_list_objects_deadline_ms, lookup)?;
+            let visibility = &mut openfga.visibility;
+            for object in &mut visibility.objects {
+                substitute(&mut object.object_type, lookup)?;
+                substitute(&mut object.column, lookup)?;
+            }
+            substitute(&mut visibility.self_principal_column, lookup)?;
+            for column in visibility.content_columns.iter_mut().flatten() {
+                *column = env_subst::resolve(column, lookup)?;
+            }
+            substitute(&mut visibility.max_objects, lookup)?;
+            substitute(&mut visibility.list_timeout_ms, lookup)?;
         }
         Ok(())
     }
@@ -808,6 +866,17 @@ where
         .into_iter()
         .map(|s| s.0)
         .collect())
+}
+
+/// [`scalar_vec`] for an optional list — absent and present differ (an
+/// absent `content_columns` takes the default set; a present list replaces
+/// it — and, validated at startup, may not be empty).
+fn scalar_vec_opt<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Scalar>>::deserialize(deserializer)?
+        .map(|scalars| scalars.into_iter().map(|s| s.0).collect()))
 }
 
 /// A YAML scalar captured as its string form (see [`scalar_opt`]).
@@ -1450,6 +1519,67 @@ auth:
         .expect("empty api_token reads as unset");
 
         let err = parse("auth:\n  openfga:\n    api_uri: x\n", &lookup).expect_err("typo");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+    }
+
+    /// RFC 0047 §3.4: the visibility section — `type` (a keyword, renamed
+    /// onto `object_type`), substituted leaves, an explicit
+    /// `content_columns` list distinct from an absent one, unknown keys
+    /// rejected.
+    #[test]
+    fn openfga_visibility_section_parses() {
+        let lookup = env(&[("CONV", "attr.gen_ai.conversation.id")]);
+        let cfg = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n    server_list_objects_deadline_ms: 3000\n    visibility:\n      objects:\n        - type: conversation\n          column: ${env:CONV}\n      self_principal_column: attr.user.hash\n      content_columns: [body, attr.prompt]\n      max_objects: 100\n      list_timeout_ms: 500\n",
+            &lookup,
+        )
+        .expect("valid");
+        let openfga = cfg.auth.expect("auth").openfga.expect("openfga");
+        assert_eq!(
+            openfga.server_list_objects_deadline_ms.as_deref(),
+            Some("3000")
+        );
+        let visibility = &openfga.visibility;
+        assert_eq!(
+            visibility.objects[0].object_type.as_deref(),
+            Some("conversation")
+        );
+        assert_eq!(
+            visibility.objects[0].column.as_deref(),
+            Some("attr.gen_ai.conversation.id"),
+            "substituted"
+        );
+        assert_eq!(
+            visibility.self_principal_column.as_deref(),
+            Some("attr.user.hash")
+        );
+        assert_eq!(
+            visibility.content_columns.as_deref(),
+            Some(&["body".to_string(), "attr.prompt".to_string()][..]),
+            "an explicit list replaces the default set (non-empty by startup validation)"
+        );
+        assert_eq!(visibility.max_objects.as_deref(), Some("100"));
+        assert_eq!(visibility.list_timeout_ms.as_deref(), Some("500"));
+        let cfg = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n",
+            &lookup,
+        )
+        .expect("valid");
+        assert!(
+            cfg.auth
+                .expect("auth")
+                .openfga
+                .expect("openfga")
+                .visibility
+                .content_columns
+                .is_none(),
+            "absent = the default set"
+        );
+        let err = parse(
+            "auth:\n  openfga:\n    visibility:\n      objects:\n        - kind: conversation\n",
+            &lookup,
+        )
+        .expect_err("typo");
         assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
     }
 

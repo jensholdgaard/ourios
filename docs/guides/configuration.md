@@ -78,6 +78,17 @@ auth:
     session_ttl_secs: 60
     consistency: minimize_latency     # or higher_consistency
     request_timeout_secs: 5
+    server_list_objects_deadline_ms: 3000
+    visibility:                       # RFC 0047 §3.4 — layer 2 inside a tenant
+      objects:
+        - type: conversation
+          column: attr.gen_ai.conversation.id
+      self_principal_column: attr.user.hash
+      # Optional. REPLACES the default set (body + the GenAI content
+      # attributes) — list every column to mask; must not be empty.
+      # content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
+      max_objects: 10000
+      list_timeout_ms: 2000           # must be < server_list_objects_deadline_ms
 ```
 
 ## Environment variables (no `--config`)

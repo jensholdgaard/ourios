@@ -11,11 +11,13 @@ superseded-by: —
 
 # RFC 0047 — ReBAC resolver and graph-fed visibility
 
-> **Status: `red` (2026-08-17).** Slice 1 — the layer-1 resolver — is
-> green: RFC0047.1–.3 pass on the served binary against a real OpenFGA
+> **Status: `red` (2026-08-18).** Slices 1–2 are green: RFC0047.1–.3
+> (the layer-1 resolver) and RFC0047.4–.8 (the planner two-step, masking,
+> bounded enumeration) pass on the served binary against a real OpenFGA
 > container (`openfga-resolver` CI job) with the in-tree model; RFC0047.12
-> gates CI. RFC0047.4–.11 (planner two-step, tool gate, emitter, erasure)
-> are the remaining slices. Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
+> gates CI. RFC0047.9–.11 (tool gate, emitter, erasure) are the remaining
+> slices; the RFC0047.5 request-carried contextual-tuple arm is deferred
+> (§3.3, §7). Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
 > opaque, coarse, credential-selected object, which is exactly the object
 > type this RFC binds the authorization graph to. Grounded in the #688
 > OpenFGA spike (resolver seam holds, p50 1.4 ms), two OpenFGA-assistant
@@ -235,7 +237,14 @@ the emitter writes and every id the planner reads: OpenFGA object ids are
 opaque strings in one store, so the same raw conversation id in two tenants
 must be two objects; the `parent` tuple carries the tenant edge and the
 planner strips the prefix when it builds predicates (§3.4). A pure naming
-rule, mirrored in exactly two places (emitter, planner).
+rule, held in **one** place (`TenantObjects` in the core `openfga` module)
+that both the emitter and the planner call. *Slice-2 decision:* the tenant
+segment is percent-encoded for `/` and `%` (`conversation:<enc(T)>/<id>`),
+so a tenant containing `/` can never alias another tenant's conversation
+(`a` + `b/c-1` vs `a/b` + `c-1`); the raw conversation id follows verbatim.
+A tenant that cannot itself be an object id (`:`, `#`, whitespace, > 256
+bytes) has no graph objects at all — every graph question about it fails
+closed (`403 tenant_unaddressable`, naming the rule).
 
 The **binding tuple** (`tenant:T#scoped_reader@<principal>`) rides along
 with every conversation grant so the principal can bind the tenant at
@@ -267,6 +276,17 @@ path is disabled — never a mismatched comparison; (b) **contextual tuples** �
 `{conversation:T/<id>#participant@<principal>}` for ids it just created,
 passed on `Check`/`ListObjects` and never persisted. Tenant-wide readers
 (the FinOps/operator case) never wait: they resolve at layer 1.
+
+**Slice-2 decision — bridge (b) is deferred, not built.** A contextual
+tuple carried *by the request* is asserted by the very principal it
+grants: any scoped caller could name any conversation id and read it —
+a self-granted escalation the graph never checked. Contextual tuples are
+an application-trusted input (the group claim, minted by the IdP, is one);
+a caller-supplied one is not. Until a trusted carrier exists (a signed
+claim from the producer, or the emitter's flush-cadence hook closing the
+gap), freshness bridges are the self fast path (a) — verified against the
+stored `user.hash` — and the emitter cadence. The RFC0047.5 contextual arm
+is therefore deferred with this question in §7.
 
 ### 3.4 Layer 2 — query rewrite at plan time
 
@@ -326,21 +346,41 @@ auth:
         - type: conversation
           column: attr.gen_ai.conversation.id
       self_principal_column: attr.user.hash          # the §3.3 fast path
-      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
+      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]  # replaces the default set
       max_objects: 10000        # tenant-T ids only (§3.4 step 3)
-      list_timeout: 2s          # MUST stay below OPENFGA_LIST_OBJECTS_DEADLINE (3s)
+      list_timeout_ms: 2000     # MUST stay below server_list_objects_deadline_ms (3000)
+    server_list_objects_deadline_ms: 3000   # the server's OPENFGA_LIST_OBJECTS_DEADLINE
 ```
 
-`list_timeout` is deliberately **below** OpenFGA's own
+`list_timeout_ms` is deliberately **below** OpenFGA's own
 `OPENFGA_LIST_OBJECTS_DEADLINE` (server default 3 s, which bounds the
 streamed call too): the client-side timeout must be the one that fires, so
 an incomplete enumeration is always detected here and failed closed, never
-ended quietly by the server. Startup validation rejects a `list_timeout`
-that is not below the configured server deadline when the operator declares
-one (`auth.openfga.server_list_objects_deadline`, default 3 s).
+ended quietly by the server. Startup validation rejects a `list_timeout_ms`
+that is not below the configured server deadline
+(`auth.openfga.server_list_objects_deadline_ms`, default 3000).
 
 Per-record `Check` calls in the scan path are **never** performed (the
 architectural line from the first spike, confirmed by both reviews).
+
+**Slice-2 decisions (implemented).** Durations are milliseconds
+(`list_timeout_ms`, `server_list_objects_deadline_ms`) like every other
+knob; `objects[].type` accepts only `conversation` in v1 (the one bindable
+type) and columns must be `attr.`/`resource.` promoted names; the two
+`Check`s cache with the session TTL, the enumeration never does; masking
+renders `body` as `{"kind":"masked"}` and a masked attribute as `"value":
+null` (the OTLP unset value) — a reader can tell withheld from absent;
+template-level surfaces (`drift`, `list_templates`, `template_drift`) need
+tenant-wide content read (`403 visibility_scoped`) because templates are
+mined from bodies; the branch taken is recorded on
+`ourios.query.visibility{ourios.query.visibility.branch}` and the request
+span (the MCP tool spans carry the same field), so RFC0047.4's "no
+enumeration" is a counter assertion; an explicit `content_columns` list
+replaces the default set and may not be empty (masking is never silently
+disabled). The self
+fast path is `user:` principals only, and principal ids are validated as
+object ids (a `sub` with `:`/`#`/whitespace is a 401-class credential
+defect, not a 503).
 
 ### 3.5 MCP tools as objects
 
@@ -446,10 +486,11 @@ container (testcontainers, like Dex for RFC 0029) with the in-tree model.
 > tuple), When bob queries `true` on tenant `acme`, Then exactly the rows of
 > `c-1`/`c-2` return; And Given a further conversation `c-9` whose rows
 > carry `attr.user.hash = bob` (the principal's subject, prefix stripped)
-> but no tuple yet, Then those rows also return (self fast path); And Given
-> a contextual tuple for `c-10` on the request, Then `c-10`'s rows return
-> too; And Given bob is also participant on `globex/c-1` (another tenant),
-> Then that id never appears in the `acme` predicate.
+> but no tuple yet, Then those rows also return (self fast path); And
+> *(deferred — §3.3 slice-2 decision, §7)* Given a contextual tuple for
+> `c-10` on the request, Then `c-10`'s rows return too; And Given bob is
+> also participant on `globex/c-1` (another tenant), Then that id never
+> appears in the `acme` predicate.
 
 > **RFC0047.6 — agent as principal.** Given `agent:bot` actor on 500
 > conversations and `agent:other` actor on 500 different ones, When bot
@@ -526,6 +567,11 @@ planner's returned row set equals the naive "rows whose conversation ∈
 - [ ] **Where the emitter runs** — compaction sweep only, or also the
       receiver flush cadence (§3.3 proposes both); the freshness bridges
       make the answer a tuning question.
+- [ ] **Request-carried contextual tuples (§3.3 bridge b)** — deferred in
+      slice 2: a caller-asserted `participant` tuple is a self-grant. Who
+      may assert one (a producer-signed claim? the emitter's flush hook
+      instead?), or drop the bridge and rely on the self fast path +
+      emitter cadence.
 - [ ] **OpenFGA MCP for design time** — community servers exist
       (`evansims/openfga-mcp`, read-only by default); adopt for authoring the
       `.fga.yaml` tests, never as a runtime dependency (assistant review 2 Q3).

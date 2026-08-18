@@ -47,6 +47,7 @@ mod log_row;
 mod schema_adapt;
 mod template_map;
 mod template_registry;
+pub mod visibility;
 
 pub use alias_store::derive_alias_map;
 pub use audit_scan::StoreRef;
@@ -59,6 +60,7 @@ pub use template_map::{
     load_or_derive,
 };
 pub use template_registry::{TemplateRegistry, derive_template_registry};
+pub use visibility::{ScopedIds, SelfMatch, Visibility};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -151,7 +153,7 @@ pub struct QueryStats {
 
 /// Additive execution options for [`Querier::run_query_with`]. The
 /// `Default` is byte-for-byte the [`Querier::run_query`] behavior.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct QueryOptions {
     /// Single-pass execution for limited queries (RFC 0031 §3.6): run the
@@ -175,6 +177,10 @@ pub struct QueryOptions {
     /// total IO. Callers needing the pinned "a limited query's `stats`
     /// equal a count-only query's" shape (RFC 0017 §3.4) keep the default.
     pub elide_count_scan: bool,
+    /// RFC 0047 §3.4 layer-2 visibility: `None` = no rewrite (open mode,
+    /// or a resolver without the graph); `Some` = the caller's two-step
+    /// decision, applied at plan time (see [`Visibility`]).
+    pub visibility: Option<Visibility>,
 }
 
 impl QueryOptions {
@@ -184,7 +190,15 @@ impl QueryOptions {
     pub const fn single_pass() -> Self {
         Self {
             elide_count_scan: true,
+            visibility: None,
         }
+    }
+
+    /// These options with the RFC 0047 §3.4 visibility decision attached.
+    #[must_use]
+    pub fn with_visibility(mut self, visibility: Visibility) -> Self {
+        self.visibility = Some(visibility);
+        self
     }
 }
 
@@ -291,6 +305,10 @@ pub enum QueryError {
     /// implementation specifics the public surface must not expose
     /// (hazard §4.6 / RFC0007.3).
     Storage { detail: String },
+    /// The query reads a column the principal may not read (RFC 0047
+    /// §3.4 masking — a filter or aggregation on a content column). Names
+    /// the column: it is configuration, not data.
+    Forbidden { column: String },
 }
 
 impl std::fmt::Display for QueryError {
@@ -302,6 +320,9 @@ impl std::fmt::Display for QueryError {
             // message would leak `DataFusion`/SQL specifics (§4.6).
             // The detail is preserved on the variant for `Debug`.
             Self::Storage { .. } => write!(f, "failed to read storage"),
+            Self::Forbidden { column } => {
+                write!(f, "column `{column}` is not readable by this principal")
+            }
         }
     }
 }
@@ -1154,6 +1175,11 @@ impl Querier {
         // pure validation internally — one source of truth, negligible
         // cost.
         compile::validate(query, now_unix_nano, default_window_nanos)?;
+        // RFC 0047 §3.4: a metadata-only reader's query must not touch a
+        // content column — rejected before any IO, naming the column.
+        if let Some(visibility) = &options.visibility {
+            visibility.validate(query)?;
+        }
         // A `body ==`/`!=` needs the RFC 0017 registry for the RFC 0044
         // template arm; the `resolves_to` alias fold needs the alias map.
         // Both ride the one RFC 0033 cached-map acquisition (artifact hit or
@@ -1205,6 +1231,7 @@ impl Querier {
             default_window_nanos,
             map,
             registry,
+            options.visibility.clone(),
         )?;
         // The DSL `limit` (RFC 0002) doubles as the RFC 0017 row cap; read it
         // — and the aggregation stage — before `plan` moves into the filter
@@ -1401,13 +1428,17 @@ impl Querier {
                 .collect_records(df.clone(), n, tenant, ctx.task_ctx(), acquired.take())
                 .await?;
             if collected.records.len() < n {
+                let mut records = collected.records;
+                if let Some(visibility) = &query_options.visibility {
+                    visibility.mask(&mut records);
+                }
                 return Ok(QueryResult {
-                    rows: collected.records.len() as u64,
+                    rows: records.len() as u64,
                     stats: QueryStats {
                         bytes_read: 0,
                         ..collected.scan
                     },
-                    records: collected.records,
+                    records,
                     aggregate: None,
                     materialize_bytes_read: collected.scan.bytes_read,
                     registry_bytes_read: collected.registry_bytes_read,
@@ -1449,10 +1480,14 @@ impl Querier {
             }
             (None, None) => CollectedRecords::default(),
         };
+        let mut records = collected.records;
+        if let Some(visibility) = &query_options.visibility {
+            visibility.mask(&mut records);
+        }
         Ok(QueryResult {
             rows,
             stats,
-            records: collected.records,
+            records,
             aggregate: None,
             materialize_bytes_read: collected.scan.bytes_read,
             registry_bytes_read: collected.registry_bytes_read,

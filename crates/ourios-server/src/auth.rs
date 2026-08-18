@@ -9,7 +9,7 @@
 //! ([`config::file::AuthSection`](crate::config::file::AuthSection)) onto
 //! the core spec shapes — the single validation path stays in core.
 
-use ourios_core::auth::openfga::OpenFgaSpec;
+use ourios_core::auth::openfga::{OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec};
 pub use ourios_core::auth::{AuthConfig, OidcConfig, ResolvedToken, TenantSet, TokenStore};
 use ourios_core::auth::{OidcSpec, TokenSpec};
 
@@ -58,6 +58,22 @@ pub fn build_auth_config(section: Option<&AuthSection>) -> Result<Option<AuthCon
         session_ttl_secs: openfga.session_ttl_secs.clone(),
         consistency: openfga.consistency.clone(),
         request_timeout_secs: openfga.request_timeout_secs.clone(),
+        visibility: VisibilitySpec {
+            objects: openfga
+                .visibility
+                .objects
+                .iter()
+                .map(|object| VisibilityObjectSpec {
+                    object_type: object.object_type.clone(),
+                    column: object.column.clone(),
+                })
+                .collect(),
+            self_principal_column: openfga.visibility.self_principal_column.clone(),
+            content_columns: openfga.visibility.content_columns.clone(),
+            max_objects: openfga.visibility.max_objects.clone(),
+            list_timeout_ms: openfga.visibility.list_timeout_ms.clone(),
+        },
+        server_list_objects_deadline_ms: openfga.server_list_objects_deadline_ms.clone(),
     });
     ourios_core::auth::build_auth_config(
         token_specs.as_deref(),

@@ -20,16 +20,22 @@ use tokio::time::timeout;
 use crate::rfc0029_oidc::claim_binding::{query_status, spawn_with_auth};
 use crate::rfc0029_oidc::ingest_binding::{make_key, serve_issuer, tenant_request};
 
-const OPENFGA_IMAGE: &str = "openfga/openfga";
+pub(crate) const OPENFGA_IMAGE: &str = "openfga/openfga";
 /// Pinned by digest for reproducibility (v1.11.1).
-const OPENFGA_TAG: &str =
+pub(crate) const OPENFGA_TAG: &str =
     "v1.11.1@sha256:1f9187961aded3ce60e3c4b7ccc39074ce88291aa51d9e3be09db4ff51e7b692";
-const MODEL_JSON: &str = include_str!("../../../../deploy/openfga/model.json");
+pub(crate) const MODEL_JSON: &str = include_str!("../../../../deploy/openfga/model.json");
 const COLLECTOR_TOKEN: &str = "tok-collector-cluster1";
 
 /// A JWT for `sub` from the fixture issuer — no tenant claim (the graph
-/// binds), optional groups.
-fn mint(encoding: &jsonwebtoken::EncodingKey, issuer: &str, sub: &str, groups: &[&str]) -> String {
+/// binds), optional groups, optionally carrying the agent claim.
+pub(crate) fn mint(
+    encoding: &jsonwebtoken::EncodingKey,
+    issuer: &str,
+    sub: &str,
+    groups: &[&str],
+    agent: bool,
+) -> String {
     let now = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -43,13 +49,16 @@ fn mint(encoding: &jsonwebtoken::EncodingKey, issuer: &str, sub: &str, groups: &
     if !groups.is_empty() {
         claims["groups"] = serde_json::json!(groups);
     }
+    if agent {
+        claims["ourios_principal_type"] = serde_json::json!("agent");
+    }
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
     header.kid = Some("key-1".to_string());
     jsonwebtoken::encode(&header, &claims, encoding).expect("mint")
 }
 
 /// Create a store and load the in-tree model; returns `(store_id, model_id)`.
-async fn provision(api_url: &str) -> (String, String) {
+pub(crate) async fn provision(api_url: &str) -> (String, String) {
     let http = reqwest::Client::new();
     let store: serde_json::Value = http
         .post(format!("{api_url}/stores"))
@@ -82,7 +91,7 @@ async fn provision(api_url: &str) -> (String, String) {
     (store_id, model_id)
 }
 
-fn tuple(user: &str, relation: &str, object: &str) -> TupleKey {
+pub(crate) fn tuple(user: &str, relation: &str, object: &str) -> TupleKey {
     TupleKey::new(user, relation, object)
 }
 
@@ -199,7 +208,7 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
     };
 
     // --- RFC0047.1: resolver binding ---------------------------------------
-    let alice = mint(&encoding, &issuer, "alice", &[]);
+    let alice = mint(&encoding, &issuer, "alice", &[], false);
     assert!(
         query_status(querier, Some(&alice), Some("acme"))
             .await
@@ -225,8 +234,8 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
     );
     // bob (participant + binding tuple) and fin (metadata only) reach the
     // planner — bound to acme — while holding no tenant-wide content read.
-    let bob = mint(&encoding, &issuer, "bob", &[]);
-    let fin = mint(&encoding, &issuer, "fin", &[]);
+    let bob = mint(&encoding, &issuer, "bob", &[], false);
+    let fin = mint(&encoding, &issuer, "fin", &[], false);
     for (who, token) in [("bob", &bob), ("fin", &fin)] {
         assert!(
             query_status(querier, Some(token), Some("acme"))
@@ -251,7 +260,7 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
         "alice does"
     );
     // A principal with no tuples is unbound — 401, never empty-but-open.
-    let nobody = mint(&encoding, &issuer, "nobody", &[]);
+    let nobody = mint(&encoding, &issuer, "nobody", &[], false);
     assert!(
         query_status(querier, Some(&nobody), Some("acme"))
             .await
@@ -270,7 +279,7 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
     )
     .await
     .expect("team edge");
-    let carol = mint(&encoding, &issuer, "carol", &["platform"]);
+    let carol = mint(&encoding, &issuer, "carol", &["platform"], false);
     assert!(
         query_status(querier, Some(&carol), Some("globex"))
             .await

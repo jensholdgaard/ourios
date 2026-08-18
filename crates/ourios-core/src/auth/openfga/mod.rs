@@ -17,7 +17,7 @@ mod client;
 #[cfg(feature = "openfga")]
 pub use client::{
     Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient, OpenFgaError,
-    OpenFgaResolver, TupleKey,
+    OpenFgaResolver, TupleKey, Visibility,
 };
 
 /// The default `session_ttl_secs` (RFC 0047 §3.1): revocation latency.
@@ -46,6 +46,38 @@ pub struct OpenFgaSpec {
     pub consistency: Option<String>,
     /// The per-call request timeout in seconds.
     pub request_timeout_secs: Option<String>,
+    /// The layer-2 visibility section (RFC 0047 §3.4).
+    pub visibility: VisibilitySpec,
+    /// The `OpenFGA` server's own `OPENFGA_LIST_OBJECTS_DEADLINE`, in
+    /// milliseconds, as the operator declares it (default 3000).
+    pub server_list_objects_deadline_ms: Option<String>,
+}
+
+/// The raw `auth.openfga.visibility` section (RFC 0047 §3.4) — nothing
+/// here is secret.
+#[derive(Debug, Default, Clone)]
+pub struct VisibilitySpec {
+    /// `objects[]`: graph object type → the promoted column carrying its id.
+    pub objects: Vec<VisibilityObjectSpec>,
+    /// The promoted column compared to a `user:` principal's subject (the
+    /// §3.3 self fast path); unset disables the path.
+    pub self_principal_column: Option<String>,
+    /// The columns a metadata-only reader sees as NULL and may not filter or
+    /// aggregate on. `None` = the `GenAI` content default set.
+    pub content_columns: Option<Vec<String>>,
+    /// The bound on tenant-scoped ids per enumeration (default 10 000).
+    pub max_objects: Option<String>,
+    /// The client-side enumeration timeout in milliseconds (default 2000).
+    pub list_timeout_ms: Option<String>,
+}
+
+/// One `visibility.objects[]` entry, raw.
+#[derive(Debug, Default, Clone)]
+pub struct VisibilityObjectSpec {
+    /// The `OpenFGA` object type (`conversation`).
+    pub object_type: Option<String>,
+    /// The promoted column (`attr.gen_ai.conversation.id`).
+    pub column: Option<String>,
 }
 
 impl fmt::Debug for OpenFgaSpec {
@@ -58,6 +90,11 @@ impl fmt::Debug for OpenFgaSpec {
             .field("session_ttl_secs", &self.session_ttl_secs)
             .field("consistency", &self.consistency)
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("visibility", &self.visibility)
+            .field(
+                "server_list_objects_deadline_ms",
+                &self.server_list_objects_deadline_ms,
+            )
             .finish()
     }
 }
@@ -94,7 +131,90 @@ pub struct OpenFgaConfig {
     session_ttl: Duration,
     consistency: Consistency,
     request_timeout: Duration,
+    visibility: VisibilityConfig,
 }
+
+/// The validated `auth.openfga.visibility` configuration (RFC 0047 §3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityConfig {
+    objects: Vec<VisibilityObject>,
+    self_principal_column: Option<String>,
+    content_columns: Vec<String>,
+    max_objects: usize,
+    list_timeout: Duration,
+}
+
+/// One bound object type: which promoted column carries its ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityObject {
+    object_type: String,
+    column: String,
+}
+
+impl VisibilityObject {
+    /// The `OpenFGA` object type.
+    #[must_use]
+    pub fn object_type(&self) -> &str {
+        &self.object_type
+    }
+
+    /// The promoted column carrying the object ids.
+    #[must_use]
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+}
+
+impl VisibilityConfig {
+    /// The bound object types, in configuration order.
+    #[must_use]
+    pub fn objects(&self) -> &[VisibilityObject] {
+        &self.objects
+    }
+
+    /// The self-fast-path column, when enabled.
+    #[must_use]
+    pub fn self_principal_column(&self) -> Option<&str> {
+        self.self_principal_column.as_deref()
+    }
+
+    /// The content columns (DSL names: `body`, `attr.<key>`).
+    #[must_use]
+    pub fn content_columns(&self) -> &[String] {
+        &self.content_columns
+    }
+
+    /// The per-tenant enumeration bound.
+    #[must_use]
+    pub fn max_objects(&self) -> usize {
+        self.max_objects
+    }
+
+    /// The client-side enumeration timeout.
+    #[must_use]
+    pub fn list_timeout(&self) -> Duration {
+        self.list_timeout
+    }
+}
+
+/// The RFC 0047 §3.4 default content columns: the `GenAI` semconv content
+/// attributes plus the log body.
+pub const DEFAULT_CONTENT_COLUMNS: [&str; 6] = [
+    "body",
+    "attr.gen_ai.input.messages",
+    "attr.gen_ai.output.messages",
+    "attr.gen_ai.system_instructions",
+    "attr.gen_ai.tool.call.arguments",
+    "attr.gen_ai.tool.call.result",
+];
+/// The default `visibility.max_objects`.
+pub const DEFAULT_MAX_OBJECTS: usize = 10_000;
+/// The default `visibility.list_timeout_ms`.
+pub const DEFAULT_LIST_TIMEOUT_MS: u64 = 2_000;
+/// The default `server_list_objects_deadline_ms` (`OpenFGA`'s own default).
+pub const DEFAULT_SERVER_LIST_OBJECTS_DEADLINE_MS: u64 = 3_000;
+/// The `OpenFGA` object type of a conversation — the one bindable type in v1.
+pub const CONVERSATION_TYPE: &str = "conversation";
 
 impl fmt::Debug for OpenFgaConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -106,6 +226,7 @@ impl fmt::Debug for OpenFgaConfig {
             .field("session_ttl", &self.session_ttl)
             .field("consistency", &self.consistency)
             .field("request_timeout", &self.request_timeout)
+            .field("visibility", &self.visibility)
             .finish()
     }
 }
@@ -151,6 +272,12 @@ impl OpenFgaConfig {
     #[must_use]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// The layer-2 visibility configuration.
+    #[must_use]
+    pub fn visibility(&self) -> &VisibilityConfig {
+        &self.visibility
     }
 }
 
@@ -228,6 +355,10 @@ pub fn build_openfga_config(spec: &OpenFgaSpec) -> Result<OpenFgaConfig, String>
             );
         }
     };
+    let visibility = build_visibility_config(
+        &spec.visibility,
+        spec.server_list_objects_deadline_ms.as_deref(),
+    )?;
     Ok(OpenFgaConfig {
         api_url,
         store_id,
@@ -236,6 +367,140 @@ pub fn build_openfga_config(spec: &OpenFgaSpec) -> Result<OpenFgaConfig, String>
         session_ttl,
         consistency,
         request_timeout: Duration::from_secs(request_timeout_secs),
+        visibility,
+    })
+}
+
+/// Validate `visibility.objects[]`: v1 binds at most the `conversation`
+/// type, once, to a promoted column.
+fn build_visibility_objects(
+    specs: &[VisibilityObjectSpec],
+    promoted_column: impl Fn(&str, &str) -> Result<String, String>,
+) -> Result<Vec<VisibilityObject>, String> {
+    let mut objects: Vec<VisibilityObject> = Vec::with_capacity(specs.len());
+    for (index, object) in specs.iter().enumerate() {
+        let object_type = match object.object_type.as_deref() {
+            Some(CONVERSATION_TYPE) => CONVERSATION_TYPE.to_string(),
+            _ => {
+                return Err(format!(
+                    "auth.openfga.visibility.objects[{index}].type must be \
+                     `conversation` — the one object type v1 binds (RFC 0047 §3.4)"
+                ));
+            }
+        };
+        if objects.iter().any(|o| o.object_type == object_type) {
+            return Err(format!(
+                "auth.openfga.visibility.objects[{index}]: type `{object_type}` \
+                 bound twice (RFC 0047 §3.4)"
+            ));
+        }
+        let column = promoted_column(
+            &format!("objects[{index}].column"),
+            object.column.as_deref().unwrap_or_default(),
+        )?;
+        objects.push(VisibilityObject {
+            object_type,
+            column,
+        });
+    }
+    Ok(objects)
+}
+
+/// Validate the raw visibility section (RFC 0047 §3.4).
+///
+/// # Errors
+///
+/// v1 binds at most the `conversation` type, to an `attr.`/`resource.`
+/// promoted column; `self_principal_column` must be such a column;
+/// `content_columns` entries must be `body` or `attr.`/`resource.` names;
+/// `max_objects` ≥ 1; `list_timeout_ms` ≥ 1 and **strictly below**
+/// `server_list_objects_deadline_ms` — the client timeout must be the one
+/// that fires, so an incomplete enumeration is always detected here.
+fn build_visibility_config(
+    spec: &VisibilitySpec,
+    server_deadline_ms: Option<&str>,
+) -> Result<VisibilityConfig, String> {
+    let promoted_column = |key: &str, value: &str| -> Result<String, String> {
+        if value.is_empty()
+            || value.trim() != value
+            || !(value.starts_with("attr.") || value.starts_with("resource."))
+        {
+            return Err(format!(
+                "auth.openfga.visibility.{key} must name a promoted column as \
+                 `attr.<key>` or `resource.<key>` (RFC 0047 §3.4)"
+            ));
+        }
+        Ok(value.to_string())
+    };
+    let objects = build_visibility_objects(&spec.objects, promoted_column)?;
+    let self_principal_column = match spec.self_principal_column.as_deref() {
+        None | Some("") => None,
+        Some(column) => Some(promoted_column("self_principal_column", column)?),
+    };
+    let content_columns = match &spec.content_columns {
+        None => DEFAULT_CONTENT_COLUMNS
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+        // Masking is never silently disabled: an empty list would let a
+        // metadata-only reader read every content column.
+        Some(columns) if columns.is_empty() => {
+            return Err(
+                "auth.openfga.visibility.content_columns must not be empty — omit it for the \
+                 default set; metadata-only readers always have content masked (RFC 0047 §3.4)"
+                    .to_string(),
+            );
+        }
+        Some(columns) => columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| match column.as_str() {
+                "body" => Ok(column.clone()),
+                other => promoted_column(&format!("content_columns[{index}]"), other),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let count = |key: &str, raw: Option<&str>, default: u64| -> Result<u64, String> {
+        match raw {
+            None => Ok(default),
+            Some(raw) => match raw.trim().parse::<u64>() {
+                Ok(n) if n >= 1 => Ok(n),
+                _ => Err(format!(
+                    "auth.openfga.{key} must be a positive integer (RFC 0047 §3.4)"
+                )),
+            },
+        }
+    };
+    let max_objects = usize::try_from(count(
+        "visibility.max_objects",
+        spec.max_objects.as_deref(),
+        DEFAULT_MAX_OBJECTS as u64,
+    )?)
+    .map_err(|_| "auth.openfga.visibility.max_objects is out of range".to_string())?;
+    let list_timeout_ms = count(
+        "visibility.list_timeout_ms",
+        spec.list_timeout_ms.as_deref(),
+        DEFAULT_LIST_TIMEOUT_MS,
+    )?;
+    let server_deadline_ms = count(
+        "server_list_objects_deadline_ms",
+        server_deadline_ms,
+        DEFAULT_SERVER_LIST_OBJECTS_DEADLINE_MS,
+    )?;
+    if list_timeout_ms >= server_deadline_ms {
+        return Err(format!(
+            "auth.openfga.visibility.list_timeout_ms ({list_timeout_ms}) must be strictly \
+             below auth.openfga.server_list_objects_deadline_ms ({server_deadline_ms}): the \
+             client timeout must be the one that fires, so an incomplete enumeration is \
+             detected and failed closed here (RFC 0047 §3.4)"
+        ));
+    }
+    Ok(VisibilityConfig {
+        objects,
+        self_principal_column,
+        content_columns,
+        max_objects,
+        list_timeout: Duration::from_millis(list_timeout_ms),
     })
 }
 
@@ -303,6 +568,93 @@ impl fmt::Display for Principal {
 /// The `OpenFGA` object type of an RFC 0046 tenant — the RFC 0047 §3.2
 /// `tenant` type, the object every resource hangs off.
 pub const TENANT_TYPE: &str = "tenant";
+
+/// `OpenFGA`'s object-id limit.
+pub const MAX_OBJECT_ID_BYTES: usize = 256;
+
+/// Whether `id` can be the id half of an `OpenFGA` object or user
+/// (`type:id`): non-empty, at most 256 bytes, no `:`, `#` or whitespace.
+#[must_use]
+pub fn is_object_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_OBJECT_ID_BYTES
+        && !id
+            .chars()
+            .any(|c| c == ':' || c == '#' || c.is_whitespace())
+}
+
+/// The naming rule for tenant-scoped objects (RFC 0047 §3.3) — the **one**
+/// place it lives, used by the planner and the emitter alike. The tenant is
+/// its own object, `tenant:<T>`; a conversation inside it is
+/// `conversation:<enc(T)>/<id>` where `enc` percent-encodes `%` and `/` in
+/// the tenant so the `/` separator is unambiguous — `a` + `b/c-1` and
+/// `a/b` + `c-1` are two different objects — and the raw conversation id
+/// follows verbatim (it may itself contain `/`).
+///
+/// A tenant that cannot be an object id at all (`:`, `#`, whitespace, too
+/// long, empty) has no graph objects; callers fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantObjects {
+    tenant_object: String,
+    conversation_prefix: String,
+    tool_prefix: String,
+}
+
+impl TenantObjects {
+    /// The graph objects of `tenant`, or `None` when the tenant id cannot
+    /// form an object id.
+    #[must_use]
+    pub fn new(tenant: &str) -> Option<Self> {
+        if !is_object_id(tenant) {
+            return None;
+        }
+        let encoded = encode_tenant_segment(tenant);
+        Some(Self {
+            tenant_object: format!("{TENANT_TYPE}:{tenant}"),
+            conversation_prefix: format!("{CONVERSATION_TYPE}:{encoded}/"),
+            tool_prefix: format!("tool:{encoded}/"),
+        })
+    }
+
+    /// `tenant:<T>`.
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant_object
+    }
+
+    /// `conversation:<enc(T)>/` — every conversation of the tenant starts
+    /// with this; the remainder is the raw conversation id.
+    #[must_use]
+    pub fn conversation_prefix(&self) -> &str {
+        &self.conversation_prefix
+    }
+
+    /// `conversation:<enc(T)>/<id>`.
+    #[must_use]
+    pub fn conversation(&self, id: &str) -> String {
+        format!("{}{id}", self.conversation_prefix)
+    }
+
+    /// `tool:<enc(T)>/<name>`.
+    #[must_use]
+    pub fn tool(&self, name: &str) -> String {
+        format!("{}{name}", self.tool_prefix)
+    }
+}
+
+/// Percent-encode the two bytes that would make the tenant segment of a
+/// `conversation:<T>/<id>` object ambiguous.
+fn encode_tenant_segment(tenant: &str) -> String {
+    let mut out = String::with_capacity(tenant.len());
+    for c in tenant.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -400,6 +752,161 @@ mod tests {
                 err.contains(&format!("auth.openfga.{key}")),
                 "{key} named: {err}"
             );
+        }
+    }
+
+    /// RFC 0047 §3.4 visibility validation: defaults, the conversation-only
+    /// binding, promoted-column names, and the client-below-server timeout
+    /// rule — each rejection naming its key.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one validation matrix, one test
+    fn visibility_config_defaults_and_rules() {
+        use super::{VisibilityObjectSpec, VisibilitySpec};
+        let defaults = build_openfga_config(&spec())
+            .expect("valid")
+            .visibility()
+            .clone();
+        assert!(defaults.objects().is_empty());
+        assert_eq!(defaults.self_principal_column(), None);
+        assert_eq!(defaults.content_columns()[0], "body");
+        assert_eq!(defaults.content_columns().len(), 6);
+        assert_eq!(defaults.max_objects(), 10_000);
+        assert_eq!(defaults.list_timeout(), Duration::from_secs(2));
+
+        let bound = build_openfga_config(&OpenFgaSpec {
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                self_principal_column: Some("attr.user.hash".to_string()),
+                content_columns: Some(vec!["body".to_string(), "attr.prompt".to_string()]),
+                max_objects: Some("100".to_string()),
+                list_timeout_ms: Some("500".to_string()),
+            },
+            server_list_objects_deadline_ms: Some("1000".to_string()),
+            ..spec()
+        })
+        .expect("valid");
+        let visibility = bound.visibility();
+        assert_eq!(visibility.objects()[0].object_type(), "conversation");
+        assert_eq!(
+            visibility.objects()[0].column(),
+            "attr.gen_ai.conversation.id"
+        );
+        assert_eq!(visibility.self_principal_column(), Some("attr.user.hash"));
+        assert_eq!(visibility.content_columns(), ["body", "attr.prompt"]);
+        assert_eq!(visibility.max_objects(), 100);
+        assert_eq!(visibility.list_timeout(), Duration::from_millis(500));
+
+        let object = |object_type: &str, column: &str| VisibilityObjectSpec {
+            object_type: Some(object_type.to_string()),
+            column: Some(column.to_string()),
+        };
+        for (key, visibility, deadline) in [
+            (
+                "objects[0].type",
+                VisibilitySpec {
+                    objects: vec![object("tool", "attr.tool")],
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "objects[1]",
+                VisibilitySpec {
+                    objects: vec![
+                        object("conversation", "attr.a"),
+                        object("conversation", "attr.b"),
+                    ],
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "objects[0].column",
+                VisibilitySpec {
+                    objects: vec![object("conversation", "gen_ai.conversation.id")],
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "self_principal_column",
+                VisibilitySpec {
+                    self_principal_column: Some("user.hash".to_string()),
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "content_columns[1]",
+                VisibilitySpec {
+                    content_columns: Some(vec!["body".to_string(), "severity".to_string()]),
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "visibility.max_objects",
+                VisibilitySpec {
+                    max_objects: Some("0".to_string()),
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "visibility.list_timeout_ms",
+                VisibilitySpec {
+                    list_timeout_ms: Some("3000".to_string()),
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+            (
+                "visibility.list_timeout_ms",
+                VisibilitySpec::default(),
+                Some("2000"),
+            ),
+            (
+                "content_columns must not be empty",
+                VisibilitySpec {
+                    content_columns: Some(Vec::new()),
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
+        ] {
+            let err = build_openfga_config(&OpenFgaSpec {
+                visibility,
+                server_list_objects_deadline_ms: deadline.map(str::to_string),
+                ..spec()
+            })
+            .expect_err("invalid");
+            assert!(err.contains(key), "{key} named: {err}");
+        }
+    }
+
+    /// The tenant-scoped object naming rule is injective in the tenant
+    /// (`/` and `%` percent-encoded in the tenant segment) and refuses a
+    /// tenant that cannot be an object id.
+    #[test]
+    fn tenant_objects_are_unambiguous() {
+        use super::TenantObjects;
+        let a = TenantObjects::new("a").expect("valid");
+        let ab = TenantObjects::new("a/b").expect("valid");
+        assert_eq!(a.tenant(), "tenant:a");
+        assert_eq!(a.conversation("b/c-1"), "conversation:a/b/c-1");
+        assert_eq!(ab.conversation("c-1"), "conversation:a%2Fb/c-1");
+        assert_ne!(a.conversation("b/c-1"), ab.conversation("c-1"));
+        assert_eq!(ab.conversation_prefix(), "conversation:a%2Fb/");
+        assert_eq!(
+            TenantObjects::new("100%").expect("valid").conversation("x"),
+            "conversation:100%25/x"
+        );
+        assert_eq!(a.tool("query_logs"), "tool:a/query_logs");
+        for bad in ["", "a b", "a:b", "a#b"] {
+            assert!(TenantObjects::new(bad).is_none(), "{bad:?}");
         }
     }
 

@@ -384,10 +384,11 @@ jobs:
           set -euo pipefail
           fga model transform --file model.fga | diff - model.json
 
-  # RFC 0047 §5 (RFC0047.1–.3): the OpenFGA resolver on the served binary
-  # against a real `openfga/openfga` container (testcontainers, image
-  # pinned by digest in the test) loaded with the in-tree model — the same
-  # posture as `dex-oidc`. A required check (in `ci-success`'s `needs`).
+  # RFC 0047 §5 (RFC0047.1–.8): the OpenFGA resolver and the layer-2
+  # visibility two-step on the served binary against a real
+  # `openfga/openfga` container (testcontainers, image pinned by digest in
+  # the tests) loaded with the in-tree model — the same posture as
+  # `dex-oidc`. A required check (in `ci-success`'s `needs`).
   openfga-resolver:
     name: openfga resolver (testcontainers)
     # Not part of the scheduled hygiene canary (see `on:`).
@@ -405,6 +406,7 @@ jobs:
           cargo test -p ourios-server --test it --
           --ignored --exact
           rfc0047_openfga::rfc0047_1_to_3_resolver_end_to_end
+          rfc0047_visibility::rfc0047_4_to_8_visibility_end_to_end
 
   # Emission-time semconv conformance: boot the real `ourios-server`,
   # point its OTLP export (metrics + the dogfooded logs signal) at

@@ -45,7 +45,7 @@ pub mod tenant;
 pub mod tls;
 pub mod tls_serve;
 
-pub use auth::{AuthBinding, AuthError, AuthResolver, authenticate_bearer};
+pub use auth::{AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate_bearer};
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};

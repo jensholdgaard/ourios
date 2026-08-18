@@ -134,6 +134,57 @@ pipeline. A credential's own tenant list — a static token's `tenants`,
 an OIDC `tenant_claim` — can only narrow what the graph grants, never
 widen it; a principal the graph grants nothing is unbound (401).
 
+### Visibility inside a tenant (layer 2)
+
+With the graph configured, every query also runs the RFC 0047 §3.4
+**two-step** for the principal in the tenant it queries — query rewrite
+at plan time, never per-record checks:
+
+1. `Check(principal, can_read_content, tenant)` allowed → the tenant
+   predicate only (today's plan).
+2. else `Check(can_read_metadata, tenant)` allowed → every row, with the
+   configured `content_columns` returned as null (`body` as
+   `{"kind":"masked"}`); a query that filters or aggregates on one of them
+   is `403 column_forbidden`, naming the column.
+3. else the principal is **scoped** (bound through `scoped_reader`): its
+   readable conversations are enumerated through the *streamed*
+   `ListObjects` — filtered to this tenant, at most `max_objects` tenant
+   ids, within `list_timeout_ms` — and become
+   `attr.gen_ai.conversation.id IN (…)`, OR'd with the self fast path
+   (`self_principal_column == <subject>`, `user:` principals only). Past
+   the bound: `403 visibility_bound` ("ask for tenant-wide read"); a
+   cut-off stream: `503 visibility_incomplete` — never a partial predicate.
+   Template-level queries (`drift`, `list_templates`, `template_drift`)
+   need tenant-wide content read (`403 visibility_scoped`).
+
+```yaml
+auth:
+  openfga:
+    # …
+    server_list_objects_deadline_ms: 3000   # OPENFGA_LIST_OBJECTS_DEADLINE
+    visibility:
+      objects:
+        - type: conversation
+          column: attr.gen_ai.conversation.id   # a promoted column
+      self_principal_column: attr.user.hash     # optional; user: principals only
+      # content_columns: [...]                  # optional; REPLACES the default set
+      max_objects: 10000                        # tenant ids only
+      list_timeout_ms: 2000                     # MUST be < the server deadline
+```
+
+`content_columns` defaults to the GenAI content attributes plus `body`;
+an explicit list **replaces** that set (list every column to mask) and
+may not be empty — masking is never silently disabled. `objects` unset
+means scoped principals see nothing (their bound is not enumerable).
+Tenant-scoped graph objects are `tenant:<T>` and
+`conversation:<enc(T)>/<id>` where `enc` percent-encodes `/` and `%` in
+the tenant, so tenants containing `/` never alias; a tenant that cannot
+be an object id (`:`, `#`, whitespace) has no graph objects and every
+question about it fails closed. The two `Check`s cache with the session TTL; the
+enumeration runs per query. The branch a query took is recorded on
+`ourios.query.visibility` (`ourios.query.visibility.branch`) and the
+request span.
+
 The binding is cached per credential for `session_ttl_secs` and is
 **fail-closed**: an unreachable or slow OpenFGA answers `503` on the
 query and MCP surfaces and `UNAVAILABLE`/`503` on ingest, and

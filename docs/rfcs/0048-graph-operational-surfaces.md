@@ -187,7 +187,7 @@ accident.
 not make backfill safe beside an erasure: a partition read before the
 erasure and written after it would recreate the erased conversation's
 tuples. So the two hold each other off through the store: backfill begins
-by creating (create-if-absent) a **lock marker** `backfill/tenant_id=<T>`
+by creating (create-if-absent) a **lock marker** `backfill/tenant_id=<enc>` (the RFC 0005 §3.4 path encoding, like the erasure marker)
 and refuses to start when any erasure marker for the tenant is pending
 ("erasures pending for `acme`; run again after the next sweep"); the
 sweep's erasure pass skips a tenant whose backfill lock exists (recorded

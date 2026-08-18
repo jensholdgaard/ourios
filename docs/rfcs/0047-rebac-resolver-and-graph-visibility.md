@@ -237,7 +237,14 @@ the emitter writes and every id the planner reads: OpenFGA object ids are
 opaque strings in one store, so the same raw conversation id in two tenants
 must be two objects; the `parent` tuple carries the tenant edge and the
 planner strips the prefix when it builds predicates (§3.4). A pure naming
-rule, mirrored in exactly two places (emitter, planner).
+rule, held in **one** place (`TenantObjects` in the core `openfga` module)
+that both the emitter and the planner call. *Slice-2 decision:* the tenant
+segment is percent-encoded for `/` and `%` (`conversation:<enc(T)>/<id>`),
+so a tenant containing `/` can never alias another tenant's conversation
+(`a` + `b/c-1` vs `a/b` + `c-1`); the raw conversation id follows verbatim.
+A tenant that cannot itself be an object id (`:`, `#`, whitespace, > 256
+bytes) has no graph objects at all — every graph question about it fails
+closed (`403 tenant_denied`).
 
 The **binding tuple** (`tenant:T#scoped_reader@<principal>`) rides along
 with every conversation grant so the principal can bind the tenant at
@@ -339,18 +346,19 @@ auth:
         - type: conversation
           column: attr.gen_ai.conversation.id
       self_principal_column: attr.user.hash          # the §3.3 fast path
-      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
+      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]  # replaces the default set
       max_objects: 10000        # tenant-T ids only (§3.4 step 3)
-      list_timeout: 2s          # MUST stay below OPENFGA_LIST_OBJECTS_DEADLINE (3s)
+      list_timeout_ms: 2000     # MUST stay below server_list_objects_deadline_ms (3000)
+    server_list_objects_deadline_ms: 3000   # the server's OPENFGA_LIST_OBJECTS_DEADLINE
 ```
 
-`list_timeout` is deliberately **below** OpenFGA's own
+`list_timeout_ms` is deliberately **below** OpenFGA's own
 `OPENFGA_LIST_OBJECTS_DEADLINE` (server default 3 s, which bounds the
 streamed call too): the client-side timeout must be the one that fires, so
 an incomplete enumeration is always detected here and failed closed, never
-ended quietly by the server. Startup validation rejects a `list_timeout`
-that is not below the configured server deadline when the operator declares
-one (`auth.openfga.server_list_objects_deadline`, default 3 s).
+ended quietly by the server. Startup validation rejects a `list_timeout_ms`
+that is not below the configured server deadline
+(`auth.openfga.server_list_objects_deadline_ms`, default 3000).
 
 Per-record `Check` calls in the scan path are **never** performed (the
 architectural line from the first spike, confirmed by both reviews).
@@ -366,7 +374,10 @@ template-level surfaces (`drift`, `list_templates`, `template_drift`) need
 tenant-wide content read (`403 visibility_scoped`) because templates are
 mined from bodies; the branch taken is recorded on
 `ourios.query.visibility{ourios.query.visibility.branch}` and the request
-span, so RFC0047.4's "no enumeration" is a counter assertion. The self
+span (the MCP tool spans carry the same field), so RFC0047.4's "no
+enumeration" is a counter assertion; an explicit `content_columns` list
+replaces the default set and may not be empty (masking is never silently
+disabled). The self
 fast path is `user:` principals only, and principal ids are validated as
 object ids (a `sub` with `:`/`#`/whitespace is a 401-class credential
 defect, not a 503).

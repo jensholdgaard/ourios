@@ -28,18 +28,27 @@ pub enum Visibility {
         /// The columns a metadata-only reader may not read.
         content_columns: Vec<String>,
     },
-    /// Step 3: only rows whose `column` value is one of `ids` (the
-    /// enumerated conversations, prefix stripped) — OR'd with the §3.3 self
-    /// fast path when configured. Empty `ids` and no self match ⇒ an empty
+    /// Step 3: only rows whose conversation is one the principal may read
+    /// — OR'd with the §3.3 self fast path when configured. No bound
+    /// object type, or an empty id set, and no self match ⇒ an empty
     /// result, not an error.
     Scoped {
-        /// The promoted column carrying the object ids.
-        column: String,
-        /// The ids the principal may read.
-        ids: Vec<String>,
+        /// The enumerated conversations over their promoted column; `None`
+        /// when no object type is bound (nothing to enumerate).
+        conversations: Option<ScopedIds>,
         /// The self fast path: rows whose `column` equals `value`.
         self_match: Option<SelfMatch>,
     },
+}
+
+/// The enumerated object ids of a scoped principal and the promoted
+/// column they are matched against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedIds {
+    /// The promoted column carrying the object ids (`attr.<key>`).
+    pub column: String,
+    /// The ids the principal may read (prefix stripped).
+    pub ids: Vec<String>,
 }
 
 /// The §3.3 self fast path: `<column> == <value>`, where `value` is a
@@ -101,15 +110,15 @@ impl Visibility {
     /// promoted-column name.
     pub(crate) fn filter(&self, df: &DataFrame) -> Result<VisibilityFilter, QueryError> {
         let Self::Scoped {
-            column,
-            ids,
+            conversations,
             self_match,
         } = self
         else {
             return Ok(VisibilityFilter::Everything);
         };
         let mut arms: Vec<Expr> = Vec::new();
-        if !ids.is_empty()
+        if let Some(ScopedIds { column, ids }) = conversations
+            && !ids.is_empty()
             && let Some(promoted) = promoted_expr(df, column)?
         {
             arms.push(promoted.in_list(ids.iter().map(|id| lit(id.clone())).collect(), false));
@@ -129,6 +138,9 @@ impl Visibility {
     /// Mask the content columns of returned rows (RFC0047.8): the body
     /// becomes [`LogBody::Masked`], masked attributes keep their key with
     /// the value unset — the OTLP null (`"value": null` on the JSON API).
+    /// The column vocabulary (`body`, `attr.<key>`, `resource.<key>`) is
+    /// validated where it is configured (`auth.openfga.visibility`), so a
+    /// name of any other shape cannot reach here.
     pub(crate) fn mask(&self, rows: &mut [LogRow]) {
         let Self::Masked { content_columns } = self else {
             return;
@@ -226,7 +238,7 @@ fn promoted_expr(df: &DataFrame, name: &str) -> Result<Option<Expr>, QueryError>
 
 #[cfg(test)]
 mod tests {
-    use super::{SelfMatch, Visibility};
+    use super::{ScopedIds, SelfMatch, Visibility};
     use crate::QueryError;
     use crate::dsl::ir::{Query, Statement};
     use crate::dsl::parse_statement;
@@ -279,8 +291,7 @@ mod tests {
         }
         let query = logs("attr.gen_ai.input.messages == \"hi\"");
         Visibility::Scoped {
-            column: "attr.gen_ai.conversation.id".to_string(),
-            ids: vec![],
+            conversations: None,
             self_match: None,
         }
         .validate(&query)
@@ -320,8 +331,10 @@ mod tests {
 
         let mut rows = vec![LogRow::test_row()];
         Visibility::Scoped {
-            column: "attr.gen_ai.conversation.id".to_string(),
-            ids: vec!["c-1".to_string()],
+            conversations: Some(ScopedIds {
+                column: "attr.gen_ai.conversation.id".to_string(),
+                ids: vec!["c-1".to_string()],
+            }),
             self_match: Some(SelfMatch {
                 column: "attr.user.hash".to_string(),
                 value: "bob".to_string(),

@@ -9,7 +9,7 @@
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{PromotedAttributes, PromotedClass, PromotedKey};
 use ourios_querier::{
-    LogBody, Querier, QueryError, QueryOptions, QueryResult, SelfMatch, Visibility,
+    LogBody, Querier, QueryError, QueryOptions, QueryResult, ScopedIds, SelfMatch, Visibility,
 };
 
 use crate::common::{
@@ -113,8 +113,10 @@ fn conversations(result: &QueryResult) -> Vec<String> {
 
 fn scoped(ids: &[&str], self_match: Option<&str>) -> Visibility {
     Visibility::Scoped {
-        column: CONVERSATION.to_string(),
-        ids: ids.iter().map(|s| (*s).to_string()).collect(),
+        conversations: Some(ScopedIds {
+            column: CONVERSATION.to_string(),
+            ids: ids.iter().map(|s| (*s).to_string()).collect(),
+        }),
         self_match: self_match.map(|value| SelfMatch {
             column: USER_HASH.to_string(),
             value: value.to_string(),

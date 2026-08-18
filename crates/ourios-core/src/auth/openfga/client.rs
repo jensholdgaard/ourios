@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CONVERSATION_TYPE, Consistency, OpenFgaConfig, Principal, PrincipalKind, TENANT_TYPE,
-    VisibilityConfig,
+    TenantObjects, VisibilityConfig, is_object_id,
 };
 
 /// `OpenFGA`'s cap on contextual tuples per request (RFC 0047 §3.1): a
@@ -37,8 +37,6 @@ const CACHE_SWEEP_THRESHOLD: usize = 1024;
 const MAX_CACHE_ENTRIES: usize = 4096;
 /// How much of a non-2xx body is kept for the error message.
 const MAX_ERROR_BODY_BYTES: usize = 512;
-/// `OpenFGA`'s object-id limit.
-const MAX_OBJECT_ID_BYTES: usize = 256;
 
 /// One relationship tuple / tuple key on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -83,6 +81,9 @@ pub enum OpenFgaError {
     /// A principal id (OIDC `sub` / static token name) that cannot form an
     /// `OpenFGA` user id — a credential/config defect, 401-class.
     InvalidPrincipal,
+    /// A tenant id that cannot form an `OpenFGA` object id — nothing in the
+    /// graph can refer to it, so every question about it fails closed.
+    InvalidTenant,
     /// A token group name that cannot form an `OpenFGA` object id
     /// (empty, over 256 bytes, or containing `:`, `#` or whitespace) — a
     /// credential defect, answered like the cap: named, 401-class.
@@ -111,6 +112,10 @@ impl fmt::Display for OpenFgaError {
             ),
             Self::InvalidPrincipal => f.write_str(
                 "openfga: principal id cannot form a user id (empty, too long, or contains \
+                 ':', '#' or whitespace)",
+            ),
+            Self::InvalidTenant => f.write_str(
+                "openfga: tenant id cannot form an object id (empty, too long, or contains \
                  ':', '#' or whitespace)",
             ),
             Self::InvalidGroup { index } => write!(
@@ -424,15 +429,6 @@ impl OpenFgaClient {
     }
 }
 
-/// Whether `id` can be the id half of an `OpenFGA` object (`type:id`).
-fn is_object_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_OBJECT_ID_BYTES
-        && !id
-            .chars()
-            .any(|c| c == ':' || c == '#' || c.is_whitespace())
-}
-
 fn transport(e: &reqwest::Error) -> OpenFgaError {
     OpenFgaError::Unavailable(if e.is_timeout() {
         "request timed out".to_string()
@@ -731,7 +727,8 @@ impl OpenFgaResolver {
         let cache_key = Self::cache_key(principal, groups)?;
         let contextual = Self::group_tuples(principal, &cache_key.groups)?;
         let user = principal.to_string();
-        let tenant_object = format!("{TENANT_TYPE}:{tenant}");
+        let objects = TenantObjects::new(tenant).ok_or(OpenFgaError::InvalidTenant)?;
+        let tenant_object = objects.tenant().to_string();
         let now = Instant::now();
         let branch_key = (cache_key, tenant.to_string());
         let cached = {
@@ -782,7 +779,7 @@ impl OpenFgaResolver {
                         conversations: BTreeSet::new(),
                     });
                 }
-                let prefix = format!("{CONVERSATION_TYPE}:{tenant}/");
+                let prefix = objects.conversation_prefix().to_string();
                 let objects = self
                     .client
                     .streamed_list_objects(
@@ -1328,13 +1325,53 @@ mod tests {
                 OpenFgaError::Incomplete
             );
         }
-        // A principal whose id is no object id is a credential defect.
+        // A principal whose id is no object id is a credential defect; a
+        // tenant that is none fails closed before any call.
         assert_eq!(
             resolver
                 .visibility(&Principal::new(PrincipalKind::User, "a b"), &[], "acme")
                 .await
                 .expect_err("invalid principal"),
             OpenFgaError::InvalidPrincipal
+        );
+        assert_eq!(
+            resolver
+                .visibility(&bob, &[], "acme:prod")
+                .await
+                .expect_err("invalid tenant"),
+            OpenFgaError::InvalidTenant
+        );
+    }
+
+    /// The conversation prefix is the injective tenant encoding: a tenant
+    /// containing `/` filters on `conversation:<enc>/` — `a` never sees
+    /// `a/b`'s conversations even though both spell `conversation:a/b/...`
+    /// without the encoding.
+    #[tokio::test]
+    async fn scoped_enumeration_uses_the_encoded_tenant_prefix() {
+        let fake = GrantFake {
+            calls: Arc::new(AtomicUsize::new(0)),
+            streams: Arc::new(AtomicUsize::new(0)),
+            grants: Arc::new(vec![
+                ("user:bob", "can_read_content", "conversation:a/b/c-1"),
+                ("user:bob", "can_read_content", "conversation:a%2Fb/c-2"),
+            ]),
+            stall: false,
+        };
+        let url = serve_grants(fake).await;
+        let resolver = visibility_resolver(&url, "10", "500");
+        let bob = Principal::new(PrincipalKind::User, "bob");
+        assert_eq!(
+            resolver.visibility(&bob, &[], "a").await.expect("a"),
+            Visibility::Scoped {
+                conversations: BTreeSet::from(["b/c-1".to_string()])
+            }
+        );
+        assert_eq!(
+            resolver.visibility(&bob, &[], "a/b").await.expect("a/b"),
+            Visibility::Scoped {
+                conversations: BTreeSet::from(["c-2".to_string()])
+            }
         );
     }
 

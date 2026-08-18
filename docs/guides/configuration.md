@@ -84,7 +84,9 @@ auth:
         - type: conversation
           column: attr.gen_ai.conversation.id
       self_principal_column: attr.user.hash
-      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
+      # Optional. REPLACES the default set (body + the GenAI content
+      # attributes) — list every column to mask; must not be empty.
+      # content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
       max_objects: 10000
       list_timeout_ms: 2000           # must be < server_list_objects_deadline_ms
 ```

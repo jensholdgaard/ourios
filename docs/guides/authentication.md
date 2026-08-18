@@ -167,14 +167,20 @@ auth:
         - type: conversation
           column: attr.gen_ai.conversation.id   # a promoted column
       self_principal_column: attr.user.hash     # optional; user: principals only
-      content_columns: [body, attr.gen_ai.input.messages, attr.gen_ai.output.messages]
+      # content_columns: [...]                  # optional; REPLACES the default set
       max_objects: 10000                        # tenant ids only
       list_timeout_ms: 2000                     # MUST be < the server deadline
 ```
 
 `content_columns` defaults to the GenAI content attributes plus `body`;
-`objects` unset means scoped principals see nothing (their bound is not
-enumerable). The two `Check`s cache with the session TTL; the
+an explicit list **replaces** that set (list every column to mask) and
+may not be empty — masking is never silently disabled. `objects` unset
+means scoped principals see nothing (their bound is not enumerable).
+Tenant-scoped graph objects are `tenant:<T>` and
+`conversation:<enc(T)>/<id>` where `enc` percent-encodes `/` and `%` in
+the tenant, so tenants containing `/` never alias; a tenant that cannot
+be an object id (`:`, `#`, whitespace) has no graph objects and every
+question about it fails closed. The two `Check`s cache with the session TTL; the
 enumeration runs per query. The branch a query took is recorded on
 `ourios.query.visibility` (`ourios.query.visibility.branch`) and the
 request span.

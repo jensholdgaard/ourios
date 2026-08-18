@@ -60,7 +60,7 @@ pub use template_map::{
     load_or_derive,
 };
 pub use template_registry::{TemplateRegistry, derive_template_registry};
-pub use visibility::{SelfMatch, Visibility};
+pub use visibility::{ScopedIds, SelfMatch, Visibility};
 
 use std::path::PathBuf;
 use std::sync::Arc;

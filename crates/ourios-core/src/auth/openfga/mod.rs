@@ -442,6 +442,15 @@ fn build_visibility_config(
             .iter()
             .map(|c| (*c).to_string())
             .collect(),
+        // Masking is never silently disabled: an empty list would let a
+        // metadata-only reader read every content column.
+        Some(columns) if columns.is_empty() => {
+            return Err(
+                "auth.openfga.visibility.content_columns must not be empty — omit it for the \
+                 default set; metadata-only readers always have content masked (RFC 0047 §3.4)"
+                    .to_string(),
+            );
+        }
         Some(columns) => columns
             .iter()
             .enumerate()
@@ -559,6 +568,93 @@ impl fmt::Display for Principal {
 /// The `OpenFGA` object type of an RFC 0046 tenant — the RFC 0047 §3.2
 /// `tenant` type, the object every resource hangs off.
 pub const TENANT_TYPE: &str = "tenant";
+
+/// `OpenFGA`'s object-id limit.
+pub const MAX_OBJECT_ID_BYTES: usize = 256;
+
+/// Whether `id` can be the id half of an `OpenFGA` object or user
+/// (`type:id`): non-empty, at most 256 bytes, no `:`, `#` or whitespace.
+#[must_use]
+pub fn is_object_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_OBJECT_ID_BYTES
+        && !id
+            .chars()
+            .any(|c| c == ':' || c == '#' || c.is_whitespace())
+}
+
+/// The naming rule for tenant-scoped objects (RFC 0047 §3.3) — the **one**
+/// place it lives, used by the planner and the emitter alike. The tenant is
+/// its own object, `tenant:<T>`; a conversation inside it is
+/// `conversation:<enc(T)>/<id>` where `enc` percent-encodes `%` and `/` in
+/// the tenant so the `/` separator is unambiguous — `a` + `b/c-1` and
+/// `a/b` + `c-1` are two different objects — and the raw conversation id
+/// follows verbatim (it may itself contain `/`).
+///
+/// A tenant that cannot be an object id at all (`:`, `#`, whitespace, too
+/// long, empty) has no graph objects; callers fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantObjects {
+    tenant_object: String,
+    conversation_prefix: String,
+    tool_prefix: String,
+}
+
+impl TenantObjects {
+    /// The graph objects of `tenant`, or `None` when the tenant id cannot
+    /// form an object id.
+    #[must_use]
+    pub fn new(tenant: &str) -> Option<Self> {
+        if !is_object_id(tenant) {
+            return None;
+        }
+        let encoded = encode_tenant_segment(tenant);
+        Some(Self {
+            tenant_object: format!("{TENANT_TYPE}:{tenant}"),
+            conversation_prefix: format!("{CONVERSATION_TYPE}:{encoded}/"),
+            tool_prefix: format!("tool:{encoded}/"),
+        })
+    }
+
+    /// `tenant:<T>`.
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant_object
+    }
+
+    /// `conversation:<enc(T)>/` — every conversation of the tenant starts
+    /// with this; the remainder is the raw conversation id.
+    #[must_use]
+    pub fn conversation_prefix(&self) -> &str {
+        &self.conversation_prefix
+    }
+
+    /// `conversation:<enc(T)>/<id>`.
+    #[must_use]
+    pub fn conversation(&self, id: &str) -> String {
+        format!("{}{id}", self.conversation_prefix)
+    }
+
+    /// `tool:<enc(T)>/<name>`.
+    #[must_use]
+    pub fn tool(&self, name: &str) -> String {
+        format!("{}{name}", self.tool_prefix)
+    }
+}
+
+/// Percent-encode the two bytes that would make the tenant segment of a
+/// `conversation:<T>/<id>` object ambiguous.
+fn encode_tenant_segment(tenant: &str) -> String {
+    let mut out = String::with_capacity(tenant.len());
+    for c in tenant.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -772,6 +868,14 @@ mod tests {
                 VisibilitySpec::default(),
                 Some("2000"),
             ),
+            (
+                "content_columns must not be empty",
+                VisibilitySpec {
+                    content_columns: Some(Vec::new()),
+                    ..VisibilitySpec::default()
+                },
+                None,
+            ),
         ] {
             let err = build_openfga_config(&OpenFgaSpec {
                 visibility,
@@ -780,6 +884,29 @@ mod tests {
             })
             .expect_err("invalid");
             assert!(err.contains(key), "{key} named: {err}");
+        }
+    }
+
+    /// The tenant-scoped object naming rule is injective in the tenant
+    /// (`/` and `%` percent-encoded in the tenant segment) and refuses a
+    /// tenant that cannot be an object id.
+    #[test]
+    fn tenant_objects_are_unambiguous() {
+        use super::TenantObjects;
+        let a = TenantObjects::new("a").expect("valid");
+        let ab = TenantObjects::new("a/b").expect("valid");
+        assert_eq!(a.tenant(), "tenant:a");
+        assert_eq!(a.conversation("b/c-1"), "conversation:a/b/c-1");
+        assert_eq!(ab.conversation("c-1"), "conversation:a%2Fb/c-1");
+        assert_ne!(a.conversation("b/c-1"), ab.conversation("c-1"));
+        assert_eq!(ab.conversation_prefix(), "conversation:a%2Fb/");
+        assert_eq!(
+            TenantObjects::new("100%").expect("valid").conversation("x"),
+            "conversation:100%25/x"
+        );
+        assert_eq!(a.tool("query_logs"), "tool:a/query_logs");
+        for bad in ["", "a b", "a:b", "a#b"] {
+            assert!(TenantObjects::new(bad).is_none(), "{bad:?}");
         }
     }
 

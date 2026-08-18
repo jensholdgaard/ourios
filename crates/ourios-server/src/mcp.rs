@@ -358,6 +358,7 @@ impl OuriosMcp {
             gen_ai.tool.name = "query_logs",
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
+            ourios.query.visibility.branch = tracing::field::Empty,
         )
     )]
     async fn query_logs_traced(
@@ -451,6 +452,7 @@ impl OuriosMcp {
             gen_ai.tool.name = "list_templates",
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
+            ourios.query.visibility.branch = tracing::field::Empty,
         )
     )]
     async fn list_templates_traced(
@@ -532,6 +534,7 @@ impl OuriosMcp {
             gen_ai.tool.name = "template_drift",
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
+            ourios.query.visibility.branch = tracing::field::Empty,
         )
     )]
     async fn template_drift_traced(

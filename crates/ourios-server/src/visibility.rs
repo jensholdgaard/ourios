@@ -10,7 +10,7 @@ use ourios_core::auth::openfga::{
     CONVERSATION_TYPE, OpenFgaError, PrincipalKind, Visibility as GraphVisibility,
 };
 use ourios_ingester::receiver::{AuthBinding, AuthResolver};
-use ourios_querier::{SelfMatch, Visibility};
+use ourios_querier::{ScopedIds, SelfMatch, Visibility};
 
 use crate::querier::QuerierMetrics;
 
@@ -62,12 +62,17 @@ pub(crate) async fn resolve(
             },
         ),
         GraphVisibility::Scoped { conversations } => {
-            let column = config
+            // No bound conversation object ⇒ nothing to enumerate (the
+            // resolver returned no ids) — represented as such, never as an
+            // empty column name.
+            let conversations = config
                 .objects()
                 .iter()
                 .find(|object| object.object_type() == CONVERSATION_TYPE)
-                .map(|object| object.column().to_string())
-                .unwrap_or_default();
+                .map(|object| ScopedIds {
+                    column: object.column().to_string(),
+                    ids: conversations.into_iter().collect(),
+                });
             // The self fast path is for `user:` principals only (§3.3):
             // agents and service accounts never get it.
             let self_match = match (graph.principal().kind(), config.self_principal_column()) {
@@ -80,8 +85,7 @@ pub(crate) async fn resolve(
             (
                 BRANCH_SCOPED,
                 Visibility::Scoped {
-                    column,
-                    ids: conversations.into_iter().collect(),
+                    conversations,
                     self_match,
                 },
             )
@@ -114,6 +118,14 @@ fn reject(error: &OpenFgaError, tenant: &str, bound: usize) -> VisibilityRejecti
             message: "the authorization resolver is unavailable; retry later".to_string(),
             error_type: "upstream_unavailable",
         },
+        // A tenant no graph object can name: the principal cannot have been
+        // granted anything on it — the tenant is outside its readable set.
+        OpenFgaError::InvalidTenant => VisibilityRejection {
+            status: StatusCode::FORBIDDEN,
+            kind: "tenant_denied",
+            message: "the tenant is outside the authenticated token's allowed set".to_string(),
+            error_type: "permission_denied",
+        },
         OpenFgaError::TooManyContextualTuples { .. }
         | OpenFgaError::InvalidGroup { .. }
         | OpenFgaError::InvalidPrincipal => VisibilityRejection {
@@ -138,5 +150,95 @@ pub(crate) fn require_tenant_wide(visibility: Option<&Visibility>) -> Option<Vis
             message: "template-level queries require tenant-wide content read".to_string(),
             error_type: "permission_denied",
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use ourios_core::auth::openfga::OpenFgaError;
+    use ourios_querier::Visibility;
+
+    use super::{reject, require_tenant_wide};
+
+    /// The refusal contract per resolver error: status, stable kind,
+    /// `error.type` — pinned so a reword cannot change a class unnoticed.
+    #[test]
+    fn rejections_map_each_error_class() {
+        let cases = [
+            (
+                OpenFgaError::BoundExceeded { bound: 3 },
+                StatusCode::FORBIDDEN,
+                "visibility_bound",
+                "visibility_bound",
+            ),
+            (
+                OpenFgaError::Incomplete,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "visibility_incomplete",
+                "visibility_incomplete",
+            ),
+            (
+                OpenFgaError::Unavailable("down".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth_unavailable",
+                "upstream_unavailable",
+            ),
+            (
+                OpenFgaError::InvalidTenant,
+                StatusCode::FORBIDDEN,
+                "tenant_denied",
+                "permission_denied",
+            ),
+            (
+                OpenFgaError::TooManyContextualTuples { count: 101 },
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "unauthenticated",
+            ),
+            (
+                OpenFgaError::InvalidGroup { index: 0 },
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "unauthenticated",
+            ),
+            (
+                OpenFgaError::InvalidPrincipal,
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "unauthenticated",
+            ),
+        ];
+        for (error, status, kind, error_type) in cases {
+            let rejection = reject(&error, "acme", 100);
+            assert_eq!(rejection.status, status, "{error:?}");
+            assert_eq!(rejection.kind, kind, "{error:?}");
+            assert_eq!(rejection.error_type, error_type, "{error:?}");
+        }
+        let bound = reject(&OpenFgaError::BoundExceeded { bound: 3 }, "acme", 100);
+        assert!(bound.message.contains("exceeds 100 objects in tenant acme"));
+        assert!(bound.message.contains("ask for tenant-wide read"));
+    }
+
+    /// Template-level surfaces: open mode and tenant-wide pass; masked and
+    /// scoped principals are refused with the stable kind.
+    #[test]
+    fn template_level_queries_need_tenant_wide_read() {
+        assert!(require_tenant_wide(None).is_none());
+        assert!(require_tenant_wide(Some(&Visibility::TenantWide)).is_none());
+        for visibility in [
+            Visibility::Masked {
+                content_columns: vec!["body".to_string()],
+            },
+            Visibility::Scoped {
+                conversations: None,
+                self_match: None,
+            },
+        ] {
+            let rejection = require_tenant_wide(Some(&visibility)).expect("refused");
+            assert_eq!(rejection.status, StatusCode::FORBIDDEN);
+            assert_eq!(rejection.kind, "visibility_scoped");
+            assert_eq!(rejection.error_type, "permission_denied");
+        }
     }
 }

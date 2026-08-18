@@ -62,9 +62,11 @@ pub struct SelfMatch {
 }
 
 impl Visibility {
-    /// Reject a query that reads a masked column (RFC0047.8): any content
-    /// column in the predicate, an aggregation path, or a `by`-list.
-    /// Never an oracle about the data — the columns are configuration.
+    /// Reject a query that *reads* a masked column (RFC0047.8): any content
+    /// column in the predicate, an aggregation path, or a `by`-list. A
+    /// projection is not a read — a projected content column comes back
+    /// masked, like every returned row's. Never an oracle about the data —
+    /// the columns are configuration.
     ///
     /// # Errors
     ///
@@ -82,8 +84,11 @@ impl Visibility {
                     fields.push(path);
                     collect_group_fields(by, &mut fields);
                 }
-                Stage::Project(projected) => fields.extend(projected.iter()),
-                Stage::Range(..) | Stage::Sort { .. } | Stage::Limit(_) | Stage::Render => {}
+                Stage::Range(..)
+                | Stage::Sort { .. }
+                | Stage::Limit(_)
+                | Stage::Project(_)
+                | Stage::Render => {}
             }
         }
         for field in fields {

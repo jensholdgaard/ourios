@@ -244,7 +244,7 @@ so a tenant containing `/` can never alias another tenant's conversation
 (`a` + `b/c-1` vs `a/b` + `c-1`); the raw conversation id follows verbatim.
 A tenant that cannot itself be an object id (`:`, `#`, whitespace, > 256
 bytes) has no graph objects at all — every graph question about it fails
-closed (`403 tenant_denied`).
+closed (`403 tenant_unaddressable`, naming the rule).
 
 The **binding tuple** (`tenant:T#scoped_reader@<principal>`) rides along
 with every conversation grant so the principal can bind the tenant at

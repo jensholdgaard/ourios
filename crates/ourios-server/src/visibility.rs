@@ -137,12 +137,16 @@ fn reject(error: &OpenFgaError, tenant: &str, bound: usize) -> VisibilityRejecti
             message: "the authorization resolver is unavailable; retry later".to_string(),
             error_type: "upstream_unavailable",
         },
-        // A tenant no graph object can name: the principal cannot have been
-        // granted anything on it — the tenant is outside its readable set.
+        // A tenant no graph object can name: nothing can have been granted
+        // on it, so nothing in it is readable — and the operator should hear
+        // why.
         OpenFgaError::InvalidTenant => VisibilityRejection {
             status: StatusCode::FORBIDDEN,
-            kind: "tenant_denied",
-            message: "the tenant is outside the authenticated token's allowed set".to_string(),
+            kind: "tenant_unaddressable",
+            message: format!(
+                "tenant `{tenant}` cannot be named in the authorization graph (an object id \
+                 may not be empty, exceed 256 bytes, or contain ':', '#' or whitespace)"
+            ),
             error_type: "permission_denied",
         },
         OpenFgaError::TooManyContextualTuples { .. }
@@ -206,7 +210,7 @@ mod tests {
             (
                 OpenFgaError::InvalidTenant,
                 StatusCode::FORBIDDEN,
-                "tenant_denied",
+                "tenant_unaddressable",
                 "permission_denied",
             ),
             (

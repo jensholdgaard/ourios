@@ -105,8 +105,8 @@ Consequences, in order:
   and the colon) — so a 128-byte tenant leaves 256 − 13 (`conversation:`)
   − 128 − 1 (`/`) = **114 bytes** for the conversation id. Whether the
   cap counts bytes or characters is not documented; the grammar here is
-  ASCII-only, so the two coincide and the question cannot bite. Pre-production, this is a `!` change with no
-  dual-read (`feedback: break persisted layouts pre-production`); the
+  ASCII-only, so the two coincide and the question cannot bite.
+  Pre-production, this is a `!` change with no dual-read (`feedback: break persisted layouts pre-production`); the
   percent-encoding of the *storage path* (`data/tenant_id=<enc>`, RFC 0005
   §3.4) is untouched — it is a path rule, not a grammar.
 - **Conversation ids** keep the *object-id* grammar, not the tenant

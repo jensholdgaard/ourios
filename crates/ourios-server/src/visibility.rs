@@ -131,12 +131,16 @@ fn reject(error: &OpenFgaError, tenant: &str, bound: usize) -> VisibilityRejecti
             message: "visibility enumeration incomplete; retry later".to_string(),
             error_type: "visibility_incomplete",
         },
-        OpenFgaError::Unavailable(_) => VisibilityRejection {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            kind: "auth_unavailable",
-            message: "the authorization resolver is unavailable; retry later".to_string(),
-            error_type: "upstream_unavailable",
-        },
+        // Never produced by the two-step (an erasure-only outcome); mapped
+        // like an unanswerable graph so a future caller stays fail-closed.
+        OpenFgaError::Unavailable(_) | OpenFgaError::EraseIncomplete { .. } => {
+            VisibilityRejection {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                kind: "auth_unavailable",
+                message: "the authorization resolver is unavailable; retry later".to_string(),
+                error_type: "upstream_unavailable",
+            }
+        }
         // A tenant no graph object can name: nothing can have been granted
         // on it, so nothing in it is readable — and the operator should hear
         // why.
@@ -203,6 +207,12 @@ mod tests {
             ),
             (
                 OpenFgaError::Unavailable("down".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth_unavailable",
+                "upstream_unavailable",
+            ),
+            (
+                OpenFgaError::EraseIncomplete { rounds: 8 },
                 StatusCode::SERVICE_UNAVAILABLE,
                 "auth_unavailable",
                 "upstream_unavailable",

@@ -33,6 +33,11 @@ pub const WRITE_CHUNK: usize = 100;
 pub const USER_KEYS: [&str; 2] = ["user.hash", "enduser.pseudo.id"];
 /// The agent-identity attribute key the emitter reads (RFC 0047 §3.3).
 pub const AGENT_KEY: &str = "gen_ai.agent.id";
+/// How many `Read → delete` rounds an erasure runs before giving up: a
+/// paginated `Read` is not a snapshot, so tuples written concurrently (the
+/// flush-cadence feed) are swept up by re-reading until the object is
+/// empty; a writer that never stops is a bug, not something to spin on.
+const ERASE_ROUNDS: usize = 8;
 
 const OPERATION_WRITE: &str = "write";
 const OPERATION_DELETE: &str = "delete";
@@ -221,13 +226,18 @@ impl GraphEmitter {
     }
 
     /// Erase a conversation from the graph (RFC 0047 §3.6): read the
-    /// object's tuples, delete them in ≤ 100-tuple batches. Returns the
-    /// number deleted. Call **after** the Parquet rewrite that dropped the
-    /// rows — a dangling tuple is harmless, a dangling row is a leak.
+    /// object's tuples, delete them in ≤ 100-tuple batches, and repeat
+    /// until a `Read` comes back empty — a paginated `Read` is not a
+    /// snapshot, so a tuple the flush-cadence feed writes concurrently is
+    /// swept up by the next round. Returns the number deleted. Call
+    /// **after** the Parquet rewrite that dropped the rows — a dangling
+    /// tuple is harmless, a dangling row is a leak.
     ///
     /// # Errors
     ///
-    /// [`OpenFgaError`] from the read or a failed batch; the erasure is
+    /// [`OpenFgaError`] from a read or a failed batch, or
+    /// [`OpenFgaError::Incomplete`] when the object is still non-empty after
+    /// [`ERASE_ROUNDS`] rounds (something keeps writing it); the erasure is
     /// retried by the next sweep (deletes are idempotent).
     pub async fn erase_conversation(&self, tenant: &str, id: &str) -> Result<usize, OpenFgaError> {
         let objects = TenantObjects::new(tenant).ok_or(OpenFgaError::InvalidTenant)?;
@@ -236,28 +246,31 @@ impl GraphEmitter {
         if !objects.conversation_fits(id) {
             return Ok(0);
         }
-        let tuples = self
-            .client
-            .read_by_object(&objects.conversation(id))
-            .await?;
+        let object = objects.conversation(id);
         let mut deleted = 0;
-        for chunk in tuples.chunks(WRITE_CHUNK) {
-            match self.client.write(&[], chunk).await {
-                Ok(()) => {
-                    self.record(OPERATION_DELETE, chunk.len(), None);
-                    deleted += chunk.len();
-                }
-                Err(e) => {
-                    self.record(
-                        OPERATION_DELETE,
-                        chunk.len(),
-                        Some(ERROR_TYPE_UPSTREAM_UNAVAILABLE),
-                    );
-                    return Err(e);
+        for _ in 0..ERASE_ROUNDS {
+            let tuples = self.client.read_by_object(&object).await?;
+            if tuples.is_empty() {
+                return Ok(deleted);
+            }
+            for chunk in tuples.chunks(WRITE_CHUNK) {
+                match self.client.write(&[], chunk).await {
+                    Ok(()) => {
+                        self.record(OPERATION_DELETE, chunk.len(), None);
+                        deleted += chunk.len();
+                    }
+                    Err(e) => {
+                        self.record(
+                            OPERATION_DELETE,
+                            chunk.len(),
+                            Some(ERROR_TYPE_UPSTREAM_UNAVAILABLE),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
-        Ok(deleted)
+        Err(OpenFgaError::Incomplete)
     }
 
     fn record(&self, operation: &'static str, count: usize, error_type: Option<&'static str>) {

@@ -455,6 +455,16 @@ sweep's compaction events, and removes the marker. A sweep interrupted
 between the phases retries only the tuple deletion; an unreachable graph
 leaves the marker and retries next sweep. Without a bound conversation
 object a marker is recorded as a sweep error, never silently dropped.
+The tuple deletion loops `Read → delete` until a `Read` returns empty
+(bounded): a paginated `Read` is not a snapshot (OpenFGA assistant,
+2026-08-18), so a tuple the flush-cadence feed writes concurrently is
+swept up by the next round. The same review confirmed the object-naming
+scheme has no documented pitfall; the served-binary test writes tenants
+containing `/` and `%` to a real v1.11.1 and asserts `Read` returns the
+object ids byte-for-byte and the encoded prefix filters the stream. The
+server-side deadline behaviour on `streamed-list-objects` remains
+undocumented (a source-level question); the client-side `list_timeout_ms`
+below the server deadline stays the fail-closed pattern.
 
 ### 3.7 Operational posture
 

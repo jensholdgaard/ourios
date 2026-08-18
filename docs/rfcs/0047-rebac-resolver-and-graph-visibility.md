@@ -638,11 +638,12 @@ planner's returned row set equals the naive "rows whose conversation ∈
 - [ ] **Where the emitter runs** — compaction sweep only, or also the
       receiver flush cadence (§3.3 proposes both); the freshness bridges
       make the answer a tuning question.
-- [ ] **Request-carried contextual tuples (§3.3 bridge b)** — deferred in
-      slice 2: a caller-asserted `participant` tuple is a self-grant. Who
-      may assert one (a producer-signed claim? the emitter's flush hook
-      instead?), or drop the bridge and rely on the self fast path +
-      emitter cadence.
+- [x] **Request-carried contextual tuples (§3.3 bridge b)** — deferred in
+      slice 2 (a caller-asserted `participant` tuple is a self-grant);
+      **rejected by RFC 0048 §3.5**, which also names the only trusted
+      carriers. RFC 0048 further takes over the tenant id grammar (removing
+      the §3.3 percent-encoding), the identity keys as configuration, the
+      erasure front door and a backfill pass.
 - [ ] **OpenFGA MCP for design time** — community servers exist
       (`evansims/openfga-mcp`, read-only by default); adopt for authoring the
       `.fga.yaml` tests, never as a runtime dependency (assistant review 2 Q3).

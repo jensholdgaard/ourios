@@ -31,3 +31,4 @@
 
 # Cargo.lock is NOT ignored — Ourios is a binary (CLAUDE.md §1) and its
 # lockfile is part of the reproducible-build contract.
+.playwright-mcp/

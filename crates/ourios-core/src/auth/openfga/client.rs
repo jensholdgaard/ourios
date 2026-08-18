@@ -708,7 +708,8 @@ impl OpenFgaResolver {
     /// # Errors
     ///
     /// [`OpenFgaError::TooManyContextualTuples`] past the per-request cap;
-    /// [`OpenFgaError::InvalidGroup`] for a name that cannot be an object id.
+    /// [`OpenFgaError::InvalidGroup`] for a name that cannot be an object
+    /// id, or whose `team:<group>` object would exceed the full-string cap.
     pub fn group_tuples(
         principal: &Principal,
         groups: &[String],

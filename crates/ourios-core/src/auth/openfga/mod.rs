@@ -627,10 +627,19 @@ impl TenantObjects {
         if conversation_prefix.len() >= MAX_OBJECT_BYTES {
             return None;
         }
+        let tool_prefix = format!("tool:{encoded}/");
+        let longest_tool = MCP_TOOL_NAMES
+            .iter()
+            .map(|name| name.len())
+            .max()
+            .unwrap_or(0);
+        if tool_prefix.len() + longest_tool > MAX_OBJECT_BYTES {
+            return None;
+        }
         Some(Self {
             tenant_object,
             conversation_prefix,
-            tool_prefix: format!("tool:{encoded}/"),
+            tool_prefix,
         })
     }
 
@@ -948,10 +957,11 @@ mod tests {
         let t = TenantObjects::new(&"t".repeat(128)).expect("fits alone");
         assert!(t.conversation_fits(&"c".repeat(114)));
         assert!(!t.conversation_fits(&"c".repeat(115)));
-        // The constructor demands room for at least a one-byte id next to
-        // the prefix: `conversation:` + 241 + `/` = 255 leaves exactly one.
-        assert!(TenantObjects::new(&"t".repeat(241)).is_some());
-        assert!(TenantObjects::new(&"t".repeat(242)).is_none());
+        // The constructor demands room for a one-byte conversation id and
+        // for every fixed RFC 0027 tool object: `tool:` + 236 + `/` +
+        // `template_drift` = 256 is the binding bound.
+        assert!(TenantObjects::new(&"t".repeat(236)).is_some());
+        assert!(TenantObjects::new(&"t".repeat(237)).is_none());
     }
 
     /// The principal vocabulary renders exactly the model's type names.

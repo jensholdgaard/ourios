@@ -56,9 +56,11 @@ const HOUR_NANOS: u64 = 3_600_000_000_000;
 pub struct CompactionOutcome {
     /// Number of live files before compaction.
     pub files_before: usize,
-    /// Rows in the consolidated file (equal to the total input rows).
-    /// `0` on a no-op.
+    /// Rows in the consolidated file (the total input rows minus any an
+    /// RFC 0047 §3.6 erasure dropped). `0` on a no-op.
     pub rows: u64,
+    /// Rows an erasure filter removed (RFC 0047 §3.6); `0` without one.
+    pub rows_dropped: u64,
     /// The commit, or `None` when compaction was a no-op (fewer than
     /// two live files — nothing to consolidate — or a lost CAS race that
     /// left the work for a later sweep).
@@ -209,6 +211,45 @@ pub fn compact_partition_with_promoted(
     )
 }
 
+/// Row-level hooks a caller threads through the rewrite (RFC 0047 §3.3 /
+/// §3.6): `observe` sees every input row once, as decoded (the graph
+/// emitter's feed); `drop` removes rows from the consolidated output (a
+/// conversation-scoped erasure) — with a `drop` filter the partition is
+/// rewritten even when it holds a single file, so the erasure lands.
+#[derive(Default)]
+pub struct RowHooks<'a> {
+    /// Called once per input file with its decoded rows, before any drop.
+    pub observe: Option<&'a mut RowObserver<'a>>,
+    /// Rows for which this returns `true` are not written back.
+    pub drop: Option<&'a RowFilter<'a>>,
+}
+
+/// A [`RowHooks::observe`] callback.
+pub type RowObserver<'a> = dyn FnMut(&[MinedRecord]) + 'a;
+/// A [`RowHooks::drop`] predicate.
+pub type RowFilter<'a> = dyn Fn(&MinedRecord) -> bool + 'a;
+
+/// [`compact_partition_with_promoted`] with [`RowHooks`].
+///
+/// # Errors
+///
+/// See [`compact_partition`].
+pub fn compact_partition_hooked(
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+    hooks: &mut RowHooks<'_>,
+) -> Result<CompactionOutcome, CompactionError> {
+    compact_sorted_hooked(
+        store,
+        partition,
+        promoted,
+        ClusterKeys::for_promoted(promoted),
+        SortTuning::default(),
+        hooks,
+    )
+}
+
 /// Like [`compact_partition`] but rotating compacted row groups at an
 /// explicit `flush_bytes` threshold instead of the RFC 0036 §3.3
 /// **adaptive** default (`OURIOS_COMPACTED_RG_BYTES` env, else the value
@@ -293,6 +334,24 @@ fn compact_sorted(
     keys: ClusterKeys,
     tuning: SortTuning,
 ) -> Result<CompactionOutcome, CompactionError> {
+    compact_sorted_hooked(
+        store,
+        partition,
+        promoted,
+        keys,
+        tuning,
+        &mut RowHooks::default(),
+    )
+}
+
+fn compact_sorted_hooked(
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+    keys: ClusterKeys,
+    tuning: SortTuning,
+    hooks: &mut RowHooks<'_>,
+) -> Result<CompactionOutcome, CompactionError> {
     let key = manifest_key(partition);
     let (existing, etag) =
         match Manifest::read_with_etag(store, &key).map_err(CompactionError::Manifest)? {
@@ -300,7 +359,10 @@ fn compact_sorted(
             None => (None, None),
         };
     let mut inputs = live_file_keys(store, partition, existing.as_ref())?;
-    if inputs.len() < 2 {
+    // Consolidation needs two files; an erasure (`drop`) rewrites any
+    // non-empty partition.
+    let minimum_inputs = if hooks.drop.is_some() { 1 } else { 2 };
+    if inputs.len() < minimum_inputs {
         return Ok(no_op_outcome(inputs.len()));
     }
     // §3.1 tie-break: the input-file ordinal is sorted-basename order.
@@ -364,7 +426,7 @@ fn compact_sorted(
         estimated_output_bytes,
     )
     .map_err(CompactionError::Write)?;
-    let (row_count, bytes_read) = sort_inputs_into(
+    let (row_count, bytes_read, rows_dropped) = sort_inputs_into(
         &mut writer,
         store,
         partition,
@@ -372,6 +434,7 @@ fn compact_sorted(
         keys,
         tuning,
         &inputs,
+        hooks,
     )?;
     let written = writer.close().map_err(CompactionError::Write)?;
     let bytes_written = written.bytes_written;
@@ -413,6 +476,7 @@ fn compact_sorted(
     Ok(CompactionOutcome {
         files_before: inputs.len(),
         rows: row_count,
+        rows_dropped,
         committed: Some(Committed {
             file: consolidated,
             generation,
@@ -518,6 +582,7 @@ enum SortState {
 ///   rows are held at once to sort in place and skip spilling — bounded
 ///   by one seal-target's worth of input, so no larger than decoding a
 ///   single worst-case input file (the [`SortTuning`] tradeoff).
+#[allow(clippy::too_many_arguments)] // one call site; the tuple of sort inputs is the seam
 fn sort_inputs_into(
     writer: &mut Writer,
     store: &Store,
@@ -526,9 +591,11 @@ fn sort_inputs_into(
     keys: ClusterKeys,
     tuning: SortTuning,
     inputs: &[String],
-) -> Result<(u64, u64), CompactionError> {
+    hooks: &mut RowHooks<'_>,
+) -> Result<(u64, u64, u64), CompactionError> {
     let mut row_count: u64 = 0;
     let mut bytes_read: u64 = 0;
+    let mut rows_dropped: u64 = 0;
     let mut state = SortState::Buffering(Vec::new());
     for input in inputs {
         let bytes = store
@@ -538,6 +605,17 @@ fn sort_inputs_into(
         let reader = Reader::open_partition_bytes(Bytes::from(bytes), partition.clone(), input)
             .map_err(CompactionError::Read)?;
         let mut records = reader.read_all().map_err(CompactionError::Read)?;
+        // RFC 0047 §3.3/§3.6: the graph feed sees every row once (before
+        // any drop); an erasure removes its rows before the sort.
+        if let Some(observe) = hooks.observe.as_deref_mut() {
+            observe(&records);
+        }
+        if let Some(drop) = hooks.drop {
+            let before = records.len();
+            records.retain(|record| !drop(record));
+            rows_dropped = rows_dropped
+                .saturating_add(u64::try_from(before - records.len()).unwrap_or(u64::MAX));
+        }
         #[cfg(test)]
         residency::add(records.len());
         // `usize <= u64` on every supported target; saturate rather than panic
@@ -602,7 +680,7 @@ fn sort_inputs_into(
             drop(scratch);
         }
     }
-    Ok((row_count, bytes_read))
+    Ok((row_count, bytes_read, rows_dropped))
 }
 
 /// Stable §3.1 sort of one input's decoded rows: promoted
@@ -1083,10 +1161,14 @@ fn is_candidate(
 /// the immediate common-prefixes (cheap), never the full object set. This is the
 /// object-store equivalent of the pre-RFC-0019 level-by-level `read_dir` walk,
 /// not a recursive `O(N_objects)` scan. Each level's segment is parsed in the
-/// canonical zero-padded form ([`parse_partition_segment`]); a non-canonical
+/// canonical zero-padded form (`parse_partition_segment`); a non-canonical
 /// child prefix is dropped exactly as the old walk dropped non-canonical dirs.
 /// Returned sorted chronologically (oldest first) and deduplicated.
-fn hour_partitions(store: &Store, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
+///
+/// # Errors
+///
+/// [`CompactionError`] when the store's prefixes cannot be listed.
+pub fn hour_partitions(store: &Store, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
     let root = format!("data/tenant_id={}", percent_encode_tenant(tenant));
     let mut partitions = Vec::new();
     for (year_prefix, year) in numbered_child_prefixes(store, &root, "year", 4)? {
@@ -1236,6 +1318,7 @@ fn no_op_outcome(files_before: usize) -> CompactionOutcome {
     CompactionOutcome {
         files_before,
         rows: 0,
+        rows_dropped: 0,
         committed: None,
         gc_failures: 0,
         bytes_read: 0,

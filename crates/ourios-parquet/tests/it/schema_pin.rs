@@ -197,6 +197,13 @@ fn rfc0005_10_audit_schema_matches_pinned_field_list() {
         // The ingest_denied column (RFC 0026 §3.4 amendment,
         // 2026-07-06): OPTIONAL, appended after the quarantine group.
         Field::new("denied_token_name", DataType::Utf8, true),
+        // The conversation_erased columns (RFC 0047 §3.6 amendment,
+        // 2026-08-18, RFC 0005 §3.7 kind 9): OPTIONAL, appended after
+        // the denial column.
+        Field::new("erasure_conversation_id", DataType::Utf8, true),
+        Field::new("erasure_partitions", DataType::UInt64, true),
+        Field::new("erasure_rows", DataType::UInt64, true),
+        Field::new("erasure_tuples", DataType::UInt64, true),
     ];
     check_schema_against(&expected, &audit_schema());
 }

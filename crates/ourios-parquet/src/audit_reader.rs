@@ -43,8 +43,8 @@ use parquet::errors::ParquetError;
 use crate::audit_columns;
 use crate::audit_record_batch::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED,
-    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_CONVERSATION_ERASED, EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED,
+    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
@@ -349,6 +349,7 @@ fn batch_to_audit_events(
     // Quarantine-group columns (RFC 0025 §3.3) — absent in
     // pre-amendment files (§3.7 absent-column tolerance).
     let (quarantine_partition, quarantine_error, denied_token_name) = rejection_columns(batch)?;
+    let erasure = erasure_columns(batch)?;
 
     for i in 0..n {
         let file_row = row_offset + i;
@@ -398,6 +399,7 @@ fn batch_to_audit_events(
                 decode_quarantine_payload(&cols, i, file_row)?
             }
             EVENT_KIND_INGEST_DENIED => decode_denied_payload(&denied_token_name, i, file_row)?,
+            EVENT_KIND_CONVERSATION_ERASED => decode_erasure_payload(&erasure, i, file_row)?,
             kind @ (EVENT_KIND_ALIAS_ASSERTED | EVENT_KIND_ALIAS_RETRACTED) => {
                 let cols = AliasColumns {
                     representative_id: &alias_representative_id,
@@ -489,6 +491,50 @@ fn rejection_columns(batch: &RecordBatch) -> Result<RejectionColumns, AuditReade
         optional_string(batch, audit_columns::QUARANTINE_ERROR)?.unwrap_or_default(),
         optional_string(batch, audit_columns::DENIED_TOKEN_NAME)?.unwrap_or_default(),
     ))
+}
+
+/// The `erasure_*` columns (RFC 0047 §3.6).
+struct ErasureColumns {
+    conversation_id: Vec<Option<String>>,
+    partitions: Vec<Option<u64>>,
+    rows: Vec<Option<u64>>,
+    tuples: Vec<Option<u64>>,
+}
+
+/// The erasure-group columns — absent in earlier files (§3.7
+/// absent-column tolerance).
+fn erasure_columns(batch: &RecordBatch) -> Result<ErasureColumns, AuditReaderError> {
+    Ok(ErasureColumns {
+        conversation_id: optional_string(batch, audit_columns::ERASURE_CONVERSATION_ID)?
+            .unwrap_or_default(),
+        partitions: optional_u64(batch, audit_columns::ERASURE_PARTITIONS)?,
+        rows: optional_u64(batch, audit_columns::ERASURE_ROWS)?,
+        tuples: optional_u64(batch, audit_columns::ERASURE_TUPLES)?,
+    })
+}
+
+/// Rebuild the `conversation_erased` payload for row `i` (RFC 0047 §3.6).
+fn decode_erasure_payload(
+    cols: &ErasureColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    Ok(AuditPayload::ConversationErased {
+        conversation_id: require_at(
+            &cols.conversation_id,
+            i,
+            audit_columns::ERASURE_CONVERSATION_ID,
+            file_row,
+        )?,
+        partitions_rewritten: require_at(
+            &cols.partitions,
+            i,
+            audit_columns::ERASURE_PARTITIONS,
+            file_row,
+        )?,
+        rows_dropped: require_at(&cols.rows, i, audit_columns::ERASURE_ROWS, file_row)?,
+        tuples_deleted: require_at(&cols.tuples, i, audit_columns::ERASURE_TUPLES, file_row)?,
+    })
 }
 
 /// Rebuild the `ingest_denied` payload for row `i` from its column

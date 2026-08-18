@@ -215,6 +215,9 @@ pub const DEFAULT_LIST_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_SERVER_LIST_OBJECTS_DEADLINE_MS: u64 = 3_000;
 /// The `OpenFGA` object type of a conversation — the one bindable type in v1.
 pub const CONVERSATION_TYPE: &str = "conversation";
+/// The RFC 0027 MCP tools as graph objects (RFC 0047 §3.5):
+/// `tool:<T>/<name>`; the emitter writes their `parent` tuples per tenant.
+pub const MCP_TOOL_NAMES: [&str; 3] = ["query_logs", "list_templates", "template_drift"];
 
 impl fmt::Debug for OpenFgaConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -602,13 +605,19 @@ pub struct TenantObjects {
 
 impl TenantObjects {
     /// The graph objects of `tenant`, or `None` when the tenant id cannot
-    /// form an object id.
+    /// form an object id — raw, or once its segment is encoded (the
+    /// encoding can only grow it; a tenant whose encoded segment plus the
+    /// `/` separator leaves no room for a conversation id has no
+    /// tenant-scoped objects).
     #[must_use]
     pub fn new(tenant: &str) -> Option<Self> {
         if !is_object_id(tenant) {
             return None;
         }
         let encoded = encode_tenant_segment(tenant);
+        if encoded.len() + 1 >= MAX_OBJECT_ID_BYTES {
+            return None;
+        }
         Some(Self {
             tenant_object: format!("{TENANT_TYPE}:{tenant}"),
             conversation_prefix: format!("{CONVERSATION_TYPE}:{encoded}/"),
@@ -633,6 +642,16 @@ impl TenantObjects {
     #[must_use]
     pub fn conversation(&self, id: &str) -> String {
         format!("{}{id}", self.conversation_prefix)
+    }
+
+    /// Whether `conversation:<enc(T)>/<id>` is a valid object: `id` must be
+    /// an object id itself and the combined id half must fit `OpenFGA`'s
+    /// 256-byte limit. The emitter skips ids that do not.
+    #[must_use]
+    pub fn conversation_fits(&self, id: &str) -> bool {
+        is_object_id(id)
+            && self.conversation_prefix.len() - CONVERSATION_TYPE.len() - 1 + id.len()
+                <= MAX_OBJECT_ID_BYTES
     }
 
     /// `tool:<enc(T)>/<name>`.
@@ -908,6 +927,15 @@ mod tests {
         for bad in ["", "a b", "a:b", "a#b"] {
             assert!(TenantObjects::new(bad).is_none(), "{bad:?}");
         }
+        // The encoding may not push the segment past the object-id limit,
+        // and a conversation id must fit next to it.
+        let slashes = "/".repeat(90); // 90 raw bytes → 270 encoded
+        assert!(TenantObjects::new(&slashes).is_none());
+        let long = "x".repeat(200);
+        let t = TenantObjects::new(&long).expect("fits alone");
+        assert!(t.conversation_fits("c-1"));
+        assert!(!t.conversation_fits(&"y".repeat(60)), "201 + 60 > 256");
+        assert!(!t.conversation_fits("a b"));
     }
 
     /// The principal vocabulary renders exactly the model's type names.

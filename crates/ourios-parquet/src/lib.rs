@@ -43,9 +43,9 @@ pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_audit_partition};
 pub use compaction::{
-    Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, compact_partition,
-    compact_partition_with_flush_threshold, compact_partition_with_promoted, gc_orphans,
-    plan_candidates,
+    Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, RowHooks,
+    compact_partition, compact_partition_hooked, compact_partition_with_flush_threshold,
+    compact_partition_with_promoted, gc_orphans, hour_partitions, plan_candidates,
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 pub use partition::{
@@ -139,6 +139,13 @@ pub mod audit_columns {
     /// The rejecting token's audit label on an `ingest_denied` event
     /// (RFC 0026 §3.4) — never the token value.
     pub const DENIED_TOKEN_NAME: &str = "denied_token_name";
+    /// `conversation_erased` (RFC 0047 §3.6, kind 9): the erased
+    /// conversation id and the pass's counts. OPTIONAL, NULL for every
+    /// other kind; appended after the denial column (§3.7 additive).
+    pub const ERASURE_CONVERSATION_ID: &str = "erasure_conversation_id";
+    pub const ERASURE_PARTITIONS: &str = "erasure_partitions";
+    pub const ERASURE_ROWS: &str = "erasure_rows";
+    pub const ERASURE_TUPLES: &str = "erasure_tuples";
 }
 
 /// Build the data-file Arrow schema per RFC 0005 §3.2.
@@ -331,5 +338,11 @@ pub fn audit_schema() -> SchemaRef {
         Field::new(audit_columns::QUARANTINE_PARTITION, DataType::Utf8, true),
         Field::new(audit_columns::QUARANTINE_ERROR, DataType::Utf8, true),
         Field::new(audit_columns::DENIED_TOKEN_NAME, DataType::Utf8, true),
+        // Erasure columns (RFC 0047 §3.6, kind 9) — OPTIONAL, NULL for
+        // every other kind (§3.7 additive).
+        Field::new(audit_columns::ERASURE_CONVERSATION_ID, DataType::Utf8, true),
+        Field::new(audit_columns::ERASURE_PARTITIONS, DataType::UInt64, true),
+        Field::new(audit_columns::ERASURE_ROWS, DataType::UInt64, true),
+        Field::new(audit_columns::ERASURE_TUPLES, DataType::UInt64, true),
     ]))
 }

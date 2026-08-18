@@ -9,17 +9,33 @@
 //! ([`crate::metrics::CompactionMetrics`]), and hands each result to a
 //! caller-supplied observer for logging.
 
+#[cfg(feature = "openfga")]
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+#[cfg(feature = "openfga")]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
+use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionPolicy, PartitionKey, PromotedAttributes, Store,
-    compact_partition_with_promoted, gc_orphans, percent_decode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionPolicy, PartitionKey, PromotedAttributes, RowHooks,
+    Store, compact_partition_hooked, gc_orphans, hour_partitions, percent_decode_tenant,
+    percent_encode_tenant, plan_candidates,
 };
 
+#[cfg(feature = "openfga")]
+use crate::graph_emitter::GraphEmitter;
 use crate::metrics::CompactionMetrics;
+
+/// The tuples one sweep derives for the graph (RFC 0047 §3.3).
+#[cfg(feature = "openfga")]
+type GraphTuples = BTreeSet<ourios_core::auth::openfga::TupleKey>;
+/// Nothing to derive without the graph.
+#[cfg(not(feature = "openfga"))]
+#[derive(Default)]
+struct GraphTuples;
 
 /// Failure during a compaction sweep.
 #[derive(Debug)]
@@ -111,6 +127,159 @@ pub struct SweepReport {
     /// Tenants whose planning *errored* are omitted (their candidate
     /// count is unknown; they're recorded in [`Self::errors`]).
     pub per_tenant: Vec<TenantSweep>,
+    /// RFC 0047 §3.6 erasure requests this sweep acted on, in the order
+    /// they were processed.
+    pub erasures: Vec<ErasureOutcome>,
+    /// RFC 0047 §3.3 graph tuples the emitter wrote after this sweep
+    /// (`0` without an emitter).
+    pub graph_tuples_emitted: usize,
+}
+
+/// One pending RFC 0047 §3.6 erasure: a durable request marker in the
+/// store (`erasure/tenant_id=<enc>/conversation=<enc>`, written by an
+/// operator through [`request_erasure`]) naming the conversation to
+/// remove from a tenant. The marker's body carries the phase, so a
+/// sweep interrupted after the rewrite retries only the tuple deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasureRequest {
+    /// The tenant the conversation lives in.
+    pub tenant: String,
+    /// The raw conversation id (the promoted-column value).
+    pub conversation_id: String,
+    /// The marker object's key.
+    pub marker: String,
+    /// Where the request stands.
+    pub phase: ErasurePhase,
+}
+
+/// The two phases of an erasure — rows first, tuples after (RFC 0047
+/// §3.6: a dangling tuple is harmless, a dangling row is a leak).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErasurePhase {
+    /// The Parquet rewrite has not completed for every partition.
+    Rows,
+    /// Rows are gone; the graph tuples remain to be deleted.
+    Tuples,
+}
+
+/// What one sweep did for one erasure request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasureOutcome {
+    /// The request as it was when the sweep picked it up.
+    pub request: ErasureRequest,
+    /// Partitions rewritten this sweep (`0` when the rows phase was
+    /// already done).
+    pub partitions_rewritten: u64,
+    /// Rows dropped this sweep.
+    pub rows_dropped: u64,
+    /// The phase after this sweep's blocking pass: `Tuples` once every
+    /// partition rewrote cleanly, else still `Rows` (retried next sweep).
+    pub phase: ErasurePhase,
+    /// Graph tuples deleted (set by the async phase; `None` until then).
+    pub tuples_deleted: Option<usize>,
+    /// Whether the marker was removed — the erasure is complete.
+    pub finished: bool,
+}
+
+/// The object-store prefix of erasure request markers.
+pub const ERASURE_PREFIX: &str = "erasure/";
+const ERASURE_PHASE_ROWS: &[u8] = br#"{"phase":"rows"}"#;
+const ERASURE_PHASE_TUPLES: &[u8] = br#"{"phase":"tuples"}"#;
+
+/// The marker key for erasing `conversation_id` from `tenant`.
+#[must_use]
+pub fn erasure_marker_key(tenant: &str, conversation_id: &str) -> String {
+    format!(
+        "{ERASURE_PREFIX}tenant_id={}/conversation={}",
+        percent_encode_tenant(tenant),
+        percent_encode_tenant(conversation_id)
+    )
+}
+
+/// Request the erasure of `conversation_id` from `tenant` (RFC 0047 §3.6):
+/// writes the durable marker the next sweep acts on. Idempotent —
+/// create-if-absent, so a repeated request never resets an erasure already
+/// in flight (one whose rows are gone and whose marker is in the `tuples`
+/// phase).
+///
+/// # Errors
+///
+/// [`IngestError::Io`] when the marker cannot be written.
+pub fn request_erasure(
+    store: &Store,
+    tenant: &str,
+    conversation_id: &str,
+) -> Result<(), IngestError> {
+    let key = erasure_marker_key(tenant, conversation_id);
+    match store.put_if_absent_blocking(&key, ERASURE_PHASE_ROWS.to_vec()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_already_exists() => Ok(()),
+        Err(e) => Err(store_error("put erasure marker", &key, &e)),
+    }
+}
+
+/// The pending erasure requests, in deterministic (lexicographic key)
+/// order.
+///
+/// # Errors
+///
+/// [`IngestError::Io`] when the marker prefix cannot be listed or a marker
+/// cannot be read — a transient store error never regresses a marker's
+/// phase.
+pub fn pending_erasures(store: &Store) -> Result<Vec<ErasureRequest>, IngestError> {
+    let mut keys = store
+        .list_blocking(Some(ERASURE_PREFIX))
+        .map_err(|e| store_error("list erasure markers", ERASURE_PREFIX, &e))?;
+    keys.sort();
+    let mut requests = Vec::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix(ERASURE_PREFIX) else {
+            continue;
+        };
+        let Some((tenant_segment, conversation_segment)) = rest.split_once('/') else {
+            continue;
+        };
+        let (Some(tenant), Some(conversation)) = (
+            tenant_segment
+                .strip_prefix("tenant_id=")
+                .and_then(percent_decode_tenant),
+            conversation_segment
+                .strip_prefix("conversation=")
+                .and_then(percent_decode_tenant),
+        ) else {
+            continue;
+        };
+        let body = store
+            .get_blocking_opt(&key)
+            .map_err(|e| store_error("read erasure marker", &key, &e))?;
+        // A marker removed between the listing and this read is finished.
+        let Some(body) = body else {
+            continue;
+        };
+        // The marker body is `{"phase": "rows" | "tuples"}`, parsed
+        // leniently (whitespace, key order) — operator tooling writes these.
+        let phase = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(marker) if marker["phase"].as_str().map(str::trim) == Some("tuples") => {
+                ErasurePhase::Tuples
+            }
+            _ => ErasurePhase::Rows,
+        };
+        requests.push(ErasureRequest {
+            tenant,
+            conversation_id: conversation,
+            marker: key,
+            phase,
+        });
+    }
+    Ok(requests)
+}
+
+fn store_error(op: &'static str, key: &str, e: &ourios_parquet::StoreError) -> IngestError {
+    IngestError::Io {
+        op,
+        path: PathBuf::from(key),
+        source: std::io::Error::other(e.to_string()),
+    }
 }
 
 /// Per-tenant candidate vs. compacted counts for one sweep — the basis
@@ -140,7 +309,7 @@ pub struct CompactedFile {
 /// Run one compaction sweep over `store`, as of wall-clock
 /// `now_unix_nanos`: for each tenant, select its sealed candidate
 /// partitions ([`plan_candidates`]) and consolidate each
-/// ([`compact_partition_with_promoted`]), accumulating a [`SweepReport`].
+/// ([`compact_partition_hooked`]), accumulating a [`SweepReport`].
 ///
 /// Resilient: a tenant whose planning fails, or a partition whose
 /// consolidation fails, is recorded in [`SweepReport::errors`] and
@@ -172,6 +341,48 @@ pub fn run_sweep(
 /// # Errors
 ///
 /// See [`run_sweep`].
+pub fn run_sweep_with_promoted(
+    store: &Store,
+    now_unix_nanos: u64,
+    policy: &CompactionPolicy,
+    promoted: &PromotedAttributes,
+) -> Result<SweepReport, IngestError> {
+    run_sweep_hooked(
+        store,
+        now_unix_nanos,
+        policy,
+        promoted,
+        &mut SweepHooks::default(),
+    )
+}
+
+/// The RFC 0047 hooks a sweep runs with: `observe` sees every row the
+/// sweep rewrites, per tenant (the graph feed, §3.3); `erasure_match`
+/// decides which rows an erasure request drops (§3.6) — without it,
+/// pending erasures are recorded as errors, never silently skipped.
+#[derive(Default)]
+pub struct SweepHooks<'a> {
+    /// `(tenant, rows)` for every input file the sweep decodes.
+    pub observe: Option<&'a mut SweepObserver<'a>>,
+    /// `(row, conversation_id)` → whether the row belongs to the conversation.
+    pub erasure_match: Option<&'a ErasureMatch<'a>>,
+}
+
+/// A [`SweepHooks::observe`] callback.
+pub type SweepObserver<'a> = dyn FnMut(&str, &[MinedRecord]) + 'a;
+/// A [`SweepHooks::erasure_match`] predicate.
+pub type ErasureMatch<'a> = dyn Fn(&MinedRecord, &str) -> bool + 'a;
+
+/// [`run_sweep_with_promoted`] with [`SweepHooks`]: the consolidation
+/// pass, then the RFC 0047 §3.6 erasure pass — every pending request in
+/// the `Rows` phase rewrites each of its tenant's partitions with the
+/// conversation's rows dropped; once every partition rewrote cleanly the
+/// marker advances to `Tuples` (the tuple deletion is the async caller's,
+/// after this pass — never before the rewrite).
+///
+/// # Errors
+///
+/// As [`run_sweep`].
 // RFC 0038: one span per compaction sweep — coarse and periodic. Opened inside
 // the callee (the tick `spawn_blocking`s this), and the per-tenant / per-file
 // loops below stay span-free.
@@ -180,11 +391,12 @@ pub fn run_sweep(
     name = "sweep partitions",
     fields(otel.kind = "internal")
 )]
-pub fn run_sweep_with_promoted(
+pub fn run_sweep_hooked(
     store: &Store,
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
     promoted: &PromotedAttributes,
+    hooks: &mut SweepHooks<'_>,
 ) -> Result<SweepReport, IngestError> {
     let mut report = SweepReport::default();
     for tenant in tenants(store)? {
@@ -209,7 +421,18 @@ pub fn run_sweep_with_promoted(
                     partition.year, partition.month, partition.day, partition.hour,
                 )),
             }
-            match compact_partition_with_promoted(store, &partition, promoted) {
+            let tenant_name = tenant.as_str();
+            let mut observe = hooks
+                .observe
+                .as_deref_mut()
+                .map(|observe| move |rows: &[MinedRecord]| observe(tenant_name, rows));
+            let mut row_hooks = RowHooks {
+                observe: observe
+                    .as_mut()
+                    .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
+                drop: None,
+            };
+            match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
@@ -243,7 +466,88 @@ pub fn run_sweep_with_promoted(
             partitions_compacted: compacted_here,
         });
     }
+    erase_pending(store, promoted, hooks.erasure_match, &mut report)?;
     Ok(report)
+}
+
+/// The RFC 0047 §3.6 erasure pass (rows phase).
+fn erase_pending(
+    store: &Store,
+    promoted: &PromotedAttributes,
+    erasure_match: Option<&ErasureMatch<'_>>,
+    report: &mut SweepReport,
+) -> Result<(), IngestError> {
+    for request in pending_erasures(store)? {
+        let mut outcome = ErasureOutcome {
+            request: request.clone(),
+            partitions_rewritten: 0,
+            rows_dropped: 0,
+            phase: request.phase,
+            tuples_deleted: None,
+            finished: false,
+        };
+        if request.phase == ErasurePhase::Rows {
+            let Some(matches) = erasure_match else {
+                report.errors.push(format!(
+                    "erase {:?} {:?}: no conversation column configured \
+                     (auth.openfga.visibility.objects) — request left pending",
+                    request.tenant, request.conversation_id
+                ));
+                report.erasures.push(outcome);
+                continue;
+            };
+            let id = request.conversation_id.as_str();
+            let drop = |record: &MinedRecord| matches(record, id);
+            let mut clean = true;
+            let partitions = match hour_partitions(store, &request.tenant) {
+                Ok(partitions) => partitions,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("erase {:?}: list partitions: {e}", request.tenant));
+                    report.erasures.push(outcome);
+                    continue;
+                }
+            };
+            for partition in partitions {
+                let mut row_hooks = RowHooks {
+                    observe: None,
+                    drop: Some(&drop),
+                };
+                match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
+                    Ok(o) => {
+                        if o.committed.is_some() {
+                            outcome.partitions_rewritten += 1;
+                            outcome.rows_dropped += o.rows_dropped;
+                        }
+                    }
+                    Err(e) => {
+                        clean = false;
+                        report.errors.push(format!(
+                            "erase {:?} {:?} {:04}-{:02}-{:02}T{:02}: {e}",
+                            request.tenant,
+                            request.conversation_id,
+                            partition.year,
+                            partition.month,
+                            partition.day,
+                            partition.hour,
+                        ));
+                    }
+                }
+            }
+            if clean {
+                match store.put_blocking(&request.marker, ERASURE_PHASE_TUPLES.to_vec()) {
+                    Ok(()) => outcome.phase = ErasurePhase::Tuples,
+                    Err(e) => report.errors.push(format!(
+                        "erase {:?} {:?}: advance marker: {e}",
+                        request.tenant, request.conversation_id
+                    )),
+                }
+            }
+        }
+        report.erasures.push(outcome);
+    }
+    Ok(())
 }
 
 /// Raw tenant ids present in the store, decoded from the immediate
@@ -289,18 +593,23 @@ pub struct Compactor {
     /// Defaults to [`NoOpAuditSink`]; set via [`Self::with_audit_sink`]
     /// (the WAL-backed sink replaces it once `ourios-wal` lands).
     audit_sink: Box<dyn AuditSink>,
+    /// The RFC 0047 §3.3 graph emitter, when the graph is configured.
+    #[cfg(feature = "openfga")]
+    emitter: Option<Arc<GraphEmitter>>,
 }
 
 impl std::fmt::Debug for Compactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `AuditSink` is not `Debug`; name it without its contents.
-        f.debug_struct("Compactor")
-            .field("store", &self.store)
+        let mut d = f.debug_struct("Compactor");
+        d.field("store", &self.store)
             .field("policy", &self.policy)
             .field("interval", &self.interval)
             .field("promoted", &self.promoted)
-            .field("audit_sink", &"Box<dyn AuditSink>")
-            .finish()
+            .field("audit_sink", &"Box<dyn AuditSink>");
+        #[cfg(feature = "openfga")]
+        d.field("emitter", &self.emitter);
+        d.finish()
     }
 }
 
@@ -318,7 +627,19 @@ impl Compactor {
             interval,
             promoted: PromotedAttributes::default(),
             audit_sink: Box::new(NoOpAuditSink::new()),
+            #[cfg(feature = "openfga")]
+            emitter: None,
         }
+    }
+
+    /// Feed the RFC 0047 §3.3 graph from every row the sweep rewrites, and
+    /// complete §3.6 erasures by deleting the conversation's tuples after
+    /// the rewrite.
+    #[cfg(feature = "openfga")]
+    #[must_use]
+    pub fn with_graph_emitter(mut self, emitter: Arc<GraphEmitter>) -> Self {
+        self.emitter = Some(emitter);
+        self
     }
 
     /// Set the RFC 0022 promoted attribute set consolidated files re-project
@@ -354,20 +675,14 @@ impl Compactor {
     where
         F: FnMut(Result<SweepReport, IngestError>),
     {
-        // Destructure up front into owned locals: `audit_sink` moves into each
-        // sweep's blocking task and back out, and `store`/`policy` are used
-        // inside the loop without holding `self`.
         let Self {
             store,
             policy,
             interval,
             promoted,
-            // Own the audit sink locally so it can move into each sweep's
-            // blocking task and back out. Its `emit` performs Parquet `put`s
-            // through the store — now S3 network I/O (RFC 0019 slice 2d) — so it
-            // must run on the blocking pool alongside the sweep, never on the
-            // async task where slow S3 would stall the runtime.
             mut audit_sink,
+            #[cfg(feature = "openfga")]
+            emitter,
         } = self;
         // Built (and zero-seeded) once, before the loop, so the metric
         // set is visible to the exporter even before the first sweep.
@@ -380,30 +695,199 @@ impl Compactor {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            // `Store` is a cheap `Arc` handle; clone it into the blocking task
-            // (compaction is blocking I/O). `policy` is `Copy`, so the `move`
-            // closure copies it and the outer binding stays valid each loop.
-            let store = store.clone();
-            let promoted = promoted.clone();
-            let (result, elapsed, sink) = tokio::task::spawn_blocking(move || {
-                let start = Instant::now();
-                let result = run_sweep_with_promoted(&store, now_unix_nanos(), &policy, &promoted);
-                // Emit the committed-compaction audit events here, on the
-                // blocking pool, since the sink's `put`s are blocking store I/O.
-                if let Ok(report) = &result {
-                    for event in &report.compaction_events {
-                        audit_sink.emit(event.clone());
-                    }
-                }
-                (result, start.elapsed(), audit_sink)
-            })
-            .await
-            .expect("compaction sweep task should not panic");
+            let (result, elapsed, sink) = sweep_once(
+                store.clone(),
+                policy,
+                promoted.clone(),
+                audit_sink,
+                #[cfg(feature = "openfga")]
+                emitter.clone(),
+            )
+            .await;
             audit_sink = sink;
             metrics.record_sweep(&result, elapsed);
             on_sweep(result);
         }
     }
+}
+
+/// One full sweep as the daemon runs it: the blocking pass (consolidation,
+/// erasure rewrites, compaction audit events) on the blocking pool, then
+/// — with an emitter — the async graph phase (write the tuples the pass
+/// derived; delete the tuples of every erasure whose rows are gone; then,
+/// back on the blocking pool, the `conversation_erased` audit event and
+/// the marker removal). Returns the report, the wall-clock spent, and the
+/// audit sink handed back. Runs the same way whether called by
+/// [`Compactor::run`] or a test.
+///
+/// # Panics
+///
+/// If a blocking task panics — `run_sweep` returns errors rather than
+/// panicking, so this signals a bug, surfaced loudly rather than silently
+/// stalling the daemon.
+pub async fn sweep_once(
+    store: Store,
+    policy: CompactionPolicy,
+    promoted: PromotedAttributes,
+    audit_sink: Box<dyn AuditSink>,
+    #[cfg(feature = "openfga")] emitter: Option<Arc<GraphEmitter>>,
+) -> (
+    Result<SweepReport, IngestError>,
+    Duration,
+    Box<dyn AuditSink>,
+) {
+    let start = Instant::now();
+    #[cfg(feature = "openfga")]
+    let blocking_emitter = emitter.clone();
+    let blocking_store = store.clone();
+    // `Store` is a cheap `Arc` handle; clone it into the blocking task
+    // (compaction is blocking I/O). `policy` is `Copy`. The audit sink moves
+    // into the task and back out: its `emit` performs Parquet `put`s through
+    // the store — S3 network I/O (RFC 0019) — so it must run on the blocking
+    // pool, never on the async task where slow S3 would stall the runtime.
+    #[cfg_attr(not(feature = "openfga"), allow(unused_mut))]
+    let (mut result, mut audit_sink, tuples) = tokio::task::spawn_blocking(move || {
+        let mut audit_sink = audit_sink;
+        let tuples: std::cell::RefCell<GraphTuples> = std::cell::RefCell::default();
+        let result = {
+            #[cfg(feature = "openfga")]
+            let tuples_ref = &tuples;
+            #[cfg(feature = "openfga")]
+            let mut observe = blocking_emitter.as_ref().map(|emitter| {
+                let emitter = Arc::clone(emitter);
+                move |tenant: &str, rows: &[MinedRecord]| {
+                    let mut tuples = tuples_ref.borrow_mut();
+                    tuples.extend(emitter.derive(tenant, rows));
+                    tuples.extend(GraphEmitter::tool_tuples(tenant));
+                }
+            });
+            #[cfg(feature = "openfga")]
+            let erasure_match = blocking_emitter.as_ref().map(|emitter| {
+                let emitter = Arc::clone(emitter);
+                move |record: &MinedRecord, id: &str| emitter.conversation_matches(record, id)
+            });
+            let mut hooks = SweepHooks {
+                #[cfg(feature = "openfga")]
+                observe: observe.as_mut().map(|f| f as &mut SweepObserver<'_>),
+                #[cfg(feature = "openfga")]
+                erasure_match: erasure_match.as_ref().map(|f| f as &ErasureMatch<'_>),
+                #[cfg(not(feature = "openfga"))]
+                observe: None,
+                #[cfg(not(feature = "openfga"))]
+                erasure_match: None,
+            };
+            run_sweep_hooked(
+                &blocking_store,
+                now_unix_nanos(),
+                &policy,
+                &promoted,
+                &mut hooks,
+            )
+        };
+        if let Ok(report) = &result {
+            for event in &report.compaction_events {
+                audit_sink.emit(event.clone());
+            }
+        }
+        (result, audit_sink, tuples.into_inner())
+    })
+    .await
+    .expect("compaction sweep task should not panic");
+
+    #[cfg(feature = "openfga")]
+    if let (Ok(report), Some(emitter)) = (&mut result, emitter.as_ref()) {
+        graph_phase(&store, emitter, report, &mut audit_sink, tuples).await;
+    }
+    #[cfg(not(feature = "openfga"))]
+    let GraphTuples = tuples;
+    (result, start.elapsed(), audit_sink)
+}
+
+/// The async graph phase of a sweep (RFC 0047 §3.3 / §3.6).
+#[cfg(feature = "openfga")]
+async fn graph_phase(
+    store: &Store,
+    emitter: &Arc<GraphEmitter>,
+    report: &mut SweepReport,
+    audit_sink: &mut Box<dyn AuditSink>,
+    tuples: GraphTuples,
+) {
+    if !tuples.is_empty() {
+        match emitter.emit(&tuples).await {
+            Ok(written) => report.graph_tuples_emitted = written.tuples,
+            Err(e) => report.errors.push(format!("graph emit: {e}")),
+        }
+    }
+    let mut completed: Vec<(usize, AuditEvent)> = Vec::new();
+    for (index, outcome) in report.erasures.iter_mut().enumerate() {
+        if outcome.phase != ErasurePhase::Tuples {
+            continue;
+        }
+        let request = &outcome.request;
+        match emitter
+            .erase_conversation(&request.tenant, &request.conversation_id)
+            .await
+        {
+            Ok(deleted) => {
+                outcome.tuples_deleted = Some(deleted);
+                completed.push((
+                    index,
+                    AuditEvent {
+                        tenant_id: TenantId::new(&request.tenant),
+                        timestamp: SystemTime::now(),
+                        payload: AuditPayload::ConversationErased {
+                            conversation_id: request.conversation_id.clone(),
+                            partitions_rewritten: outcome.partitions_rewritten,
+                            rows_dropped: outcome.rows_dropped,
+                            tuples_deleted: to_u64(deleted),
+                        },
+                    },
+                ));
+            }
+            Err(e) => report.errors.push(format!(
+                "erase {:?} {:?}: graph tuples: {e} — retried next sweep",
+                request.tenant, request.conversation_id
+            )),
+        }
+    }
+    if completed.is_empty() {
+        return;
+    }
+    // Back on the blocking pool for the audit `put`s and the marker
+    // deletes — after the tuples are gone.
+    let store = store.clone();
+    let markers: Vec<(usize, String, AuditEvent)> = completed
+        .into_iter()
+        .map(|(index, event)| (index, report.erasures[index].request.marker.clone(), event))
+        .collect();
+    let mut sink = std::mem::replace(audit_sink, Box::new(NoOpAuditSink::new()));
+    let (sink, finished, errors) = tokio::task::spawn_blocking(move || {
+        let mut finished = Vec::new();
+        let mut errors = Vec::new();
+        for (index, marker, event) in markers {
+            // The marker removal is the at-most-once transition: only the
+            // process that removes it writes the audit event. A marker
+            // already gone was finished (and audited) elsewhere; a failed
+            // delete leaves the marker in the `tuples` phase — the next
+            // sweep repeats the (idempotent) tuple deletion and retries.
+            match store.delete_blocking(&marker) {
+                Ok(()) => {
+                    sink.emit(event);
+                    finished.push(index);
+                }
+                Err(e) if e.is_not_found() => finished.push(index),
+                Err(e) => errors.push(format!("erase: remove marker {marker}: {e}")),
+            }
+        }
+        (sink, finished, errors)
+    })
+    .await
+    .expect("erasure completion task should not panic");
+    *audit_sink = sink;
+    for index in finished {
+        report.erasures[index].finished = true;
+    }
+    report.errors.extend(errors);
 }
 
 /// Saturating `usize` → `u64` (lossless on 64-bit; saturates rather
@@ -466,17 +950,17 @@ mod tests {
 
     /// A local [`Store`] rooted at `bucket` — the seam every sweep runs
     /// through (RFC 0019 §3.3).
-    fn store_at(bucket: &Path) -> Store {
+    pub(super) fn store_at(bucket: &Path) -> Store {
         Store::local(bucket).expect("local store")
     }
 
     /// 2026-04-02T10:58:00 UTC (hour 10).
-    const TS0: u64 = 1_775_127_480_000_000_000;
+    pub(super) const TS0: u64 = 1_775_127_480_000_000_000;
     const HOUR: u64 = 3_600_000_000_000;
     /// Well past hour 10's end + grace.
     const NOW_SEALED: u64 = TS0 + 2 * HOUR;
 
-    fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
+    pub(super) fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
         MinedRecord {
             tenant_id: TenantId::new(tenant),
             template_id,
@@ -763,5 +1247,433 @@ mod tests {
 
         // Assert — the loop ran a sweep that compacted the candidate.
         assert_eq!(compacted.expect("sweep ok"), 1);
+    }
+}
+
+#[cfg(all(test, feature = "openfga"))]
+mod graph_tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::extract::State;
+    use axum::routing::post;
+    use ourios_core::audit::{AuditPayload, SharedAuditSink};
+    use ourios_core::auth::openfga::{OpenFgaSpec, TupleKey, build_openfga_config};
+    use ourios_core::otlp::any_value::Value;
+    use ourios_core::otlp::{AnyValue, KeyValue};
+    use ourios_core::record::MinedRecord;
+    use ourios_parquet::{
+        CompactionPolicy, PartitionKey, PromotedAttributes, PromotedKey, Reader, Store, Writer,
+    };
+    use serde_json::json;
+
+    use super::{ErasurePhase, pending_erasures, request_erasure, sweep_once};
+    use crate::graph_emitter::GraphEmitter;
+
+    /// A fake `OpenFGA` store: `/write` applies writes/deletes (asserting the
+    /// ≤ 100 chunk), `/read` answers by object.
+    #[derive(Clone, Default)]
+    struct Fake {
+        tuples: Arc<Mutex<Vec<TupleKey>>>,
+        writes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    fn json(value: &serde_json::Value) -> ([(&'static str, &'static str); 1], String) {
+        ([("content-type", "application/json")], value.to_string())
+    }
+
+    async fn write(
+        State(fake): State<Fake>,
+        body: axum::body::Bytes,
+    ) -> ([(&'static str, &'static str); 1], String) {
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let mut tuples = fake.tuples.lock().expect("lock");
+        if let Some(keys) = request["writes"]["tuple_keys"].as_array() {
+            assert!(keys.len() <= 100, "RFC 0047 §3.3: ≤ 100 tuples per Write");
+            assert_eq!(request["writes"]["on_duplicate"], "ignore");
+            fake.writes.lock().expect("lock").push(keys.len());
+            for key in keys {
+                let key: TupleKey = serde_json::from_value(key.clone()).expect("tuple");
+                if !tuples.contains(&key) {
+                    tuples.push(key);
+                }
+            }
+        }
+        if let Some(keys) = request["deletes"]["tuple_keys"].as_array() {
+            assert!(keys.len() <= 100);
+            assert_eq!(request["deletes"]["on_missing"], "ignore");
+            for key in keys {
+                let key: TupleKey = serde_json::from_value(key.clone()).expect("tuple");
+                tuples.retain(|t| *t != key);
+            }
+        }
+        json(&json!({}))
+    }
+
+    async fn read(
+        State(fake): State<Fake>,
+        body: axum::body::Bytes,
+    ) -> ([(&'static str, &'static str); 1], String) {
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let object = request["tuple_key"]["object"].as_str().expect("object");
+        let tuples = fake.tuples.lock().expect("lock");
+        let matching: Vec<serde_json::Value> = tuples
+            .iter()
+            .filter(|t| t.object == object)
+            .map(|t| json!({ "key": t }))
+            .collect();
+        json(&json!({ "tuples": matching, "continuation_token": "" }))
+    }
+
+    async fn serve(fake: Fake) -> String {
+        let app = Router::new()
+            .route("/stores/{store}/write", post(write))
+            .route("/stores/{store}/read", post(read))
+            .with_state(fake);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        url
+    }
+
+    fn emitter(url: &str) -> Arc<GraphEmitter> {
+        use ourios_core::auth::openfga::{VisibilityObjectSpec, VisibilitySpec};
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(url.to_string()),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("2".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("config");
+        Arc::new(
+            GraphEmitter::from_config(&config)
+                .expect("client")
+                .expect("bound"),
+        )
+    }
+
+    fn kv(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.to_string())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn promoted() -> PromotedAttributes {
+        PromotedAttributes::new_typed(
+            [],
+            [
+                PromotedKey::string("gen_ai.conversation.id".to_string()),
+                PromotedKey::string("user.hash".to_string()),
+            ],
+        )
+    }
+
+    /// One file per call, in the sealed hour partition, `rows` records with
+    /// `conversation`/`user` attributes.
+    fn write_rows(store: &Store, conversation: &str, user: &str, agent: Option<&str>, n: u64) {
+        let rows: Vec<MinedRecord> = (0..n)
+            .map(|i| {
+                let mut r = super::tests::rec("acme", 1, super::tests::TS0 + i * 1_000);
+                r.attributes = vec![
+                    kv("gen_ai.conversation.id", conversation),
+                    kv("user.hash", user),
+                ];
+                if let Some(agent) = agent {
+                    r.attributes.push(kv("gen_ai.agent.id", agent));
+                }
+                r
+            })
+            .collect();
+        let partition = PartitionKey::derive(&rows[0]).expect("derive");
+        let mut w = Writer::open_in_with_promoted(
+            store,
+            partition,
+            ourios_parquet::DEFAULT_ZSTD_LEVEL,
+            promoted(),
+        )
+        .expect("open writer");
+        w.append_records(&rows).expect("append");
+        w.close().expect("close");
+    }
+
+    fn live_rows(store: &Store, bucket: &Path) -> Vec<MinedRecord> {
+        let mut rows = Vec::new();
+        for key in store.list_blocking(Some("data/")).expect("list") {
+            if !key.ends_with(".parquet") {
+                continue;
+            }
+            let bytes = store.get_blocking(&key).expect("get");
+            let reader = Reader::open_bytes(bytes.into()).expect("open");
+            rows.extend(reader.read_all().expect("read"));
+        }
+        let _ = bucket;
+        rows
+    }
+
+    /// Scenario RFC0047.10 — the sweep feeds the graph: after a sweep the
+    /// `parent`, `participant`, `actor` (and binding, and tool) tuples exist
+    /// with tenant-prefixed ids; a second sweep writes nothing new (the
+    /// partition is consolidated, nothing is rewritten); every `Write` is
+    /// ≤ 100 tuples. See `docs/rfcs/0047-rebac-resolver-and-graph-visibility.md` §5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc0047_10_sweep_emits_tuples_idempotently() {
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        // Two files → a sealed candidate; 130 distinct conversations so the
+        // tuple set spans more than one chunk.
+        write_rows(&store, "c-1", "alice", Some("bot"), 3);
+        for i in 0..130 {
+            write_rows(&store, &format!("c-{}", i + 10), "bob", None, 1);
+        }
+        let emitter = emitter(&url);
+        let (result, _, sink) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(SharedAuditSink::new()),
+            Some(Arc::clone(&emitter)),
+        )
+        .await;
+        let report = result.expect("sweep");
+        assert_eq!(report.partitions_compacted, 1, "{report:?}");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let tuples = fake.tuples.lock().expect("lock").clone();
+        let t = |u: &str, r: &str, o: &str| TupleKey::new(u, r, o);
+        for tuple in [
+            t("tenant:acme", "parent", "conversation:acme/c-1"),
+            t("user:alice", "participant", "conversation:acme/c-1"),
+            t("user:alice", "scoped_reader", "tenant:acme"),
+            t("agent:bot", "actor", "conversation:acme/c-1"),
+            t("agent:bot", "scoped_reader", "tenant:acme"),
+            t("tenant:acme", "parent", "conversation:acme/c-42"),
+            t("user:bob", "participant", "conversation:acme/c-42"),
+            t("user:bob", "scoped_reader", "tenant:acme"),
+            t("tenant:acme", "parent", "tool:acme/query_logs"),
+        ] {
+            assert!(tuples.contains(&tuple), "missing {tuple:?}");
+        }
+        assert_eq!(
+            report.graph_tuples_emitted,
+            tuples.len(),
+            "every tuple sent once"
+        );
+        let writes = fake.writes.lock().expect("lock").clone();
+        assert!(
+            writes.len() >= 2 && writes.iter().all(|n| *n <= 100),
+            "{writes:?}"
+        );
+
+        // Second sweep: nothing to consolidate, nothing rewritten, nothing sent.
+        let before = fake.writes.lock().expect("lock").len();
+        let (result, _, _) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            sink,
+            Some(emitter),
+        )
+        .await;
+        let report = result.expect("sweep");
+        assert_eq!(report.partitions_compacted, 0);
+        assert_eq!(report.graph_tuples_emitted, 0);
+        assert_eq!(
+            fake.writes.lock().expect("lock").len(),
+            before,
+            "nothing new"
+        );
+        assert_eq!(fake.tuples.lock().expect("lock").len(), tuples.len());
+    }
+
+    /// Scenario RFC0047.11 — erasure removes tuples after rows: a requested
+    /// erasure rewrites the tenant's partitions with the conversation's rows
+    /// dropped, then deletes its tuples, then writes the `conversation_erased`
+    /// audit event after every compaction event, then removes the marker; the
+    /// object is unlisted (no tuple on it remains) and other conversations'
+    /// tuples are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // one store, one graph: rows → tuples → audit → marker in sequence
+    async fn rfc0047_11_erasure_removes_tuples_after_rows() {
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        write_rows(&store, "c-1", "alice", Some("bot"), 3);
+        write_rows(&store, "c-2", "bob", None, 2);
+        let emitter = emitter(&url);
+        let audit = SharedAuditSink::new();
+        // Sweep 1: consolidate + feed the graph.
+        let (result, _, sink) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(audit.clone()),
+            Some(Arc::clone(&emitter)),
+        )
+        .await;
+        result.expect("sweep");
+        assert!(
+            fake.tuples
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|t| t.object == "conversation:acme/c-1")
+        );
+        let _ = audit.drain();
+
+        // Request the erasure of c-1; sweep 2 performs it. A repeated request
+        // is a no-op (create-if-absent) — it never resets a marker's phase.
+        request_erasure(&store, "acme", "c-1").expect("request");
+        request_erasure(&store, "acme", "c-1").expect("repeat");
+        assert_eq!(pending_erasures(&store).expect("pending").len(), 1);
+        store
+            .put_blocking(
+                &super::erasure_marker_key("acme", "c-9"),
+                b" { \"phase\" : \"tuples\" }\n".to_vec(),
+            )
+            .expect("hand-written marker");
+        request_erasure(&store, "acme", "c-9").expect("repeat");
+        let phases: Vec<_> = pending_erasures(&store)
+            .expect("pending")
+            .into_iter()
+            .map(|r| (r.conversation_id, r.phase))
+            .collect();
+        assert!(
+            phases.contains(&("c-9".to_string(), ErasurePhase::Tuples)),
+            "{phases:?}"
+        );
+        store
+            .delete_blocking(&super::erasure_marker_key("acme", "c-9"))
+            .expect("cleanup");
+        let (result, _, _) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            sink,
+            Some(Arc::clone(&emitter)),
+        )
+        .await;
+        let report = result.expect("sweep");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.erasures.len(), 1, "{report:?}");
+        let outcome = &report.erasures[0];
+        assert_eq!(outcome.request.conversation_id, "c-1");
+        assert_eq!(outcome.rows_dropped, 3);
+        assert_eq!(outcome.partitions_rewritten, 1);
+        assert_eq!(outcome.phase, ErasurePhase::Tuples);
+        assert_eq!(
+            outcome.tuples_deleted,
+            Some(3),
+            "parent + participant + actor"
+        );
+        assert!(outcome.finished);
+
+        // Rows: only c-2's remain.
+        let rows = live_rows(&store, bucket.path());
+        assert_eq!(rows.len(), 2, "c-1's three rows are gone");
+        assert!(rows.iter().all(|r| {
+            r.attributes.iter().any(|kv| {
+                kv.key == "gen_ai.conversation.id"
+                    && kv.value.as_ref().and_then(|v| v.value.as_ref())
+                        == Some(&Value::StringValue("c-2".to_string()))
+            })
+        }));
+        // Tuples: no tuple on the object remains; c-2's untouched; the
+        // binding tuples (tenant-scoped, not object-scoped) stay.
+        let tuples = fake.tuples.lock().expect("lock").clone();
+        assert!(!tuples.iter().any(|t| t.object == "conversation:acme/c-1"));
+        assert!(tuples.iter().any(|t| t.object == "conversation:acme/c-2"));
+        assert!(tuples.contains(&TupleKey::new("user:alice", "scoped_reader", "tenant:acme")));
+        // Marker gone; nothing pending.
+        assert!(pending_erasures(&store).expect("pending").is_empty());
+        // Audit order: the erasure event comes after every compaction
+        // event of the sweep (the rewrite), carrying the counts.
+        let events = audit.drain();
+        let erased = events
+            .iter()
+            .position(|e| matches!(e.payload, AuditPayload::ConversationErased { .. }))
+            .expect("conversation_erased event");
+        assert_eq!(erased, events.len() - 1, "last event of the sweep");
+        match &events[erased].payload {
+            AuditPayload::ConversationErased {
+                conversation_id,
+                partitions_rewritten,
+                rows_dropped,
+                tuples_deleted,
+            } => {
+                assert_eq!(conversation_id, "c-1");
+                assert_eq!(*partitions_rewritten, 1);
+                assert_eq!(*rows_dropped, 3);
+                assert_eq!(*tuples_deleted, 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(events[erased].tenant_id.as_str(), "acme");
+    }
+
+    /// RFC0047.11 (raw ids): a conversation whose id can never be a graph
+    /// object (here: whitespace) still has its rows erased — matched on the
+    /// stored value — with zero tuples to delete and an honest audit event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc0047_11_erasure_matches_raw_ids() {
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        write_rows(&store, "odd id", "alice", None, 2);
+        write_rows(&store, "c-2", "bob", None, 1);
+        let emitter = emitter(&url);
+        let audit = SharedAuditSink::new();
+        let (result, _, sink) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(audit.clone()),
+            Some(Arc::clone(&emitter)),
+        )
+        .await;
+        result.expect("sweep");
+        assert!(
+            !fake
+                .tuples
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|t| t.object.contains("odd")),
+            "no tuple was ever minted for a non-object-id conversation"
+        );
+        request_erasure(&store, "acme", "odd id").expect("request");
+        let (result, _, _) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            sink,
+            Some(emitter),
+        )
+        .await;
+        let report = result.expect("sweep");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let outcome = &report.erasures[0];
+        assert_eq!(outcome.rows_dropped, 2, "rows matched on the raw value");
+        assert_eq!(outcome.tuples_deleted, Some(0));
+        assert!(outcome.finished);
+        assert_eq!(live_rows(&store, bucket.path()).len(), 1);
     }
 }

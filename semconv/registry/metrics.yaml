@@ -427,6 +427,21 @@ groups:
       - ref: ourios.query.visibility.branch
         requirement_level: required
 
+  - id: metric.ourios.graph.tuples
+    type: metric
+    metric_name: ourios.graph.tuples
+    stability: development
+    brief: >-
+      Relationship tuples the RFC 0047 §3.3 emitter wrote to (or, for an
+      erasure, deleted from) the authorization graph, by operation. A
+      failed batch carries `error.type` (`upstream_unavailable`) with the
+      batch's tuple count.
+    instrument: counter
+    unit: "{tuple}"
+    attributes:
+      - ref: ourios.graph.tuple.operation
+        requirement_level: required
+
   # Audit sink (issue #302): the miner's template-audit write path. A
   # buffering sink mirroring the RFC 0014 record sink — events buffer on the
   # request path and flush off the runtime. `flush.outcome` splits a failed

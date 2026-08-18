@@ -69,8 +69,8 @@ use crate::audit_schema;
 /// existing call sites resolve them at their established path.
 pub use ourios_core::audit::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED,
-    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_CONVERSATION_ERASED, EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED,
+    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_ALIAS_ASSERTED,
     EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_CREATED,
     EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
@@ -214,6 +214,10 @@ struct Builders {
     quarantine_partition: StringBuilder,
     quarantine_error: StringBuilder,
     denied_token_name: StringBuilder,
+    erasure_conversation_id: StringBuilder,
+    erasure_partitions: UInt64Builder,
+    erasure_rows: UInt64Builder,
+    erasure_tuples: UInt64Builder,
     compaction_input_files: GenericListBuilder<i32, StringBuilder>,
     compaction_output_file: StringBuilder,
     compaction_generation: UInt64Builder,
@@ -272,6 +276,10 @@ impl Builders {
             quarantine_partition: StringBuilder::with_capacity(cap, 0),
             quarantine_error: StringBuilder::with_capacity(cap, 0),
             denied_token_name: StringBuilder::with_capacity(cap, 0),
+            erasure_conversation_id: StringBuilder::with_capacity(cap, 0),
+            erasure_partitions: UInt64Builder::with_capacity(cap),
+            erasure_rows: UInt64Builder::with_capacity(cap),
+            erasure_tuples: UInt64Builder::with_capacity(cap),
             compaction_input_files: GenericListBuilder::new(StringBuilder::new())
                 .with_field(Field::new("element", DataType::Utf8, false)),
             compaction_output_file: StringBuilder::with_capacity(cap, 0),
@@ -308,7 +316,7 @@ impl Builders {
                 // 2026-06-12).
                 self.append_compaction_nulls();
                 self.append_quarantine_nulls();
-                self.append_denied_nulls();
+                self.append_trailing_nulls();
                 self.append_alias_nulls();
                 self.template_id.append_value(*template_id);
                 self.triggering_line_hash
@@ -342,7 +350,7 @@ impl Builders {
                 self.append_template_nulls();
                 self.append_compaction_nulls();
                 self.append_quarantine_nulls();
-                self.append_denied_nulls();
+                self.append_trailing_nulls();
                 if reason.is_empty() {
                     self.reason.append_null();
                 } else {
@@ -365,7 +373,7 @@ impl Builders {
                 self.append_template_nulls();
                 self.append_compaction_nulls();
                 self.append_quarantine_nulls();
-                self.append_denied_nulls();
+                self.append_trailing_nulls();
                 self.append_alias_nulls();
                 self.reason.append_null();
             }
@@ -375,45 +383,30 @@ impl Builders {
                 output_file,
                 generation,
                 rows,
-            } => {
-                // Compaction events leave every template-specific
-                // and alias column NULL (§3.7 relaxed the former to
-                // OPTIONAL; the latter are alias-kind-only), and the
-                // facts live in the `compaction_*` columns — `reason`
-                // stays NULL.
-                self.append_template_nulls();
-                self.append_alias_nulls();
-                self.reason.append_null();
-                self.compaction_partition.append_value(partition);
-                append_string_list(&mut self.compaction_input_files, input_files);
-                self.compaction_output_file.append_value(output_file);
-                self.compaction_generation.append_value(*generation);
-                self.compaction_rows.append_value(*rows);
-                self.append_quarantine_nulls();
-                self.append_denied_nulls();
-            }
+            } => self.append_compaction(partition, input_files, output_file, *generation, *rows),
             AuditPayload::RecordQuarantined { partition, error } => {
                 // Quarantine events (RFC 0025 §3.3) populate only the
                 // envelope and the `quarantine_*` columns.
                 self.append_template_nulls();
                 self.append_compaction_nulls();
                 self.append_alias_nulls();
-                self.append_denied_nulls();
+                self.append_trailing_nulls();
                 self.reason.append_null();
                 self.quarantine_partition.append_value(partition);
                 self.quarantine_error.append_value(error);
             }
-            AuditPayload::IngestDenied { token_name } => {
-                // Denial events (RFC 0026 §3.4) populate only the
-                // envelope (whose `tenant_id` is the offending tenant)
-                // and the token's audit label.
-                self.append_template_nulls();
-                self.append_compaction_nulls();
-                self.append_alias_nulls();
-                self.append_quarantine_nulls();
-                self.reason.append_null();
-                self.denied_token_name.append_value(token_name);
-            }
+            AuditPayload::IngestDenied { token_name } => self.append_denied(token_name),
+            AuditPayload::ConversationErased {
+                conversation_id,
+                partitions_rewritten,
+                rows_dropped,
+                tuples_deleted,
+            } => self.append_erasure(
+                conversation_id,
+                *partitions_rewritten,
+                *rows_dropped,
+                *tuples_deleted,
+            ),
         }
 
         Ok(())
@@ -549,6 +542,78 @@ impl Builders {
         self.denied_token_name.append_null();
     }
 
+    /// Compaction events leave every template-specific and alias column
+    /// NULL (§3.7 relaxed the former to OPTIONAL; the latter are
+    /// alias-kind-only), and the facts live in the `compaction_*` columns —
+    /// `reason` stays NULL.
+    fn append_compaction(
+        &mut self,
+        partition: &str,
+        input_files: &[String],
+        output_file: &str,
+        generation: u64,
+        rows: u64,
+    ) {
+        self.append_template_nulls();
+        self.append_alias_nulls();
+        self.reason.append_null();
+        self.compaction_partition.append_value(partition);
+        append_string_list(&mut self.compaction_input_files, input_files);
+        self.compaction_output_file.append_value(output_file);
+        self.compaction_generation.append_value(generation);
+        self.compaction_rows.append_value(rows);
+        self.append_quarantine_nulls();
+        self.append_trailing_nulls();
+    }
+
+    /// Denial events (RFC 0026 §3.4) populate only the envelope (whose
+    /// `tenant_id` is the offending tenant) and the token's audit label.
+    fn append_denied(&mut self, token_name: &str) {
+        self.append_template_nulls();
+        self.append_compaction_nulls();
+        self.append_alias_nulls();
+        self.append_quarantine_nulls();
+        self.reason.append_null();
+        self.denied_token_name.append_value(token_name);
+        self.append_erasure_nulls();
+    }
+
+    /// Erasure events (RFC 0047 §3.6) populate only the envelope and the
+    /// `erasure_*` columns.
+    fn append_erasure(
+        &mut self,
+        conversation_id: &str,
+        partitions_rewritten: u64,
+        rows_dropped: u64,
+        tuples_deleted: u64,
+    ) {
+        self.append_template_nulls();
+        self.append_compaction_nulls();
+        self.append_alias_nulls();
+        self.append_quarantine_nulls();
+        self.reason.append_null();
+        self.append_denied_nulls();
+        self.erasure_conversation_id.append_value(conversation_id);
+        self.erasure_partitions.append_value(partitions_rewritten);
+        self.erasure_rows.append_value(rows_dropped);
+        self.erasure_tuples.append_value(tuples_deleted);
+    }
+
+    /// NULL the trailing rejection + erasure columns (every kind that is
+    /// neither `ingest_denied` nor `conversation_erased`).
+    fn append_trailing_nulls(&mut self) {
+        self.append_denied_nulls();
+        self.append_erasure_nulls();
+    }
+
+    /// NULL the `conversation_erased`-only columns (every other kind).
+    fn append_erasure_nulls(&mut self) {
+        self.erasure_conversation_id.append_null();
+        self.erasure_partitions.append_null();
+        self.erasure_rows.append_null();
+        self.erasure_tuples.append_null();
+    }
+
     fn finish(mut self) -> Vec<ArrayRef> {
         vec![
             Arc::new(self.tenant_id.finish()),
@@ -576,6 +641,10 @@ impl Builders {
             Arc::new(self.quarantine_partition.finish()),
             Arc::new(self.quarantine_error.finish()),
             Arc::new(self.denied_token_name.finish()),
+            Arc::new(self.erasure_conversation_id.finish()),
+            Arc::new(self.erasure_partitions.finish()),
+            Arc::new(self.erasure_rows.finish()),
+            Arc::new(self.erasure_tuples.finish()),
         ]
     }
 }

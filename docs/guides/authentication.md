@@ -185,6 +185,30 @@ enumeration runs per query. The branch a query took is recorded on
 `ourios.query.visibility` (`ourios.query.visibility.branch`) and the
 request span.
 
+### Feeding the graph from the data
+
+With a `conversation` object bound, Ourios writes the data-derived
+tuples itself (RFC 0047 §3.3) — nobody hand-writes conversation grants:
+for every stored row the compaction sweep rewrites, and for every batch
+the receiver flushes, the emitter derives
+`conversation:T/<id>#parent@tenant:T`, `#participant@user:<user.hash |
+enduser.pseudo.id>` (plus `tenant:T#scoped_reader@user:<…>`),
+`#actor@agent:<gen_ai.agent.id>` (plus its binding tuple) and the
+per-tenant `tool:T/<name>#parent@tenant:T` objects, and writes them in
+idempotent ≤ 100-tuple batches (`ourios.graph.tuples`). Operators write
+only the administrative tuples (`tenant#reader/writer/owner/
+metadata_reader`, `team#member`, `tool#caller`, `conversation#delegate`).
+
+**Erasing a conversation** (RFC 0047 §3.6): write a request marker into
+the object store — `erasure/tenant_id=<enc>/conversation=<enc>` (the
+same percent-encoding as `data/tenant_id=…`, body `{"phase":"rows"}`;
+`ourios-server`'s compactor exposes it as
+`ourios_ingester::compactor::request_erasure`) — and the next sweep
+rewrites every partition of the tenant with the conversation's rows
+dropped, then deletes its graph tuples, then writes a
+`conversation_erased` audit event and removes the marker. Rows first,
+tuples after — a dangling tuple is harmless, a dangling row is a leak.
+
 The binding is cached per credential for `session_ttl_secs` and is
 **fail-closed**: an unreachable or slow OpenFGA answers `503` on the
 query and MCP surfaces and `UNAVAILABLE`/`503` on ingest, and

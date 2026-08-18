@@ -69,6 +69,9 @@ pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 /// `ourios.compaction.sweeps` (counter, unit `{sweep}`).
 pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 
+/// `ourios.graph.tuples` (counter, unit `{tuple}`).
+pub const OURIOS_GRAPH_TUPLES: &str = "ourios.graph.tuples";
+
 /// `ourios.ingest.batches` (counter, unit `{batch}`).
 pub const OURIOS_INGEST_BATCHES: &str = "ourios.ingest.batches";
 
@@ -191,6 +194,9 @@ pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outco
 
 /// `ourios.compaction.result` attribute key.
 pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
+
+/// `ourios.graph.tuple.operation` attribute key.
+pub const OURIOS_GRAPH_TUPLE_OPERATION: &str = "ourios.graph.tuple.operation";
 
 /// `ourios.ingest.json.lenient` attribute key.
 pub const OURIOS_INGEST_JSON_LENIENT: &str = "ourios.ingest.json.lenient";

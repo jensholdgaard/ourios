@@ -39,7 +39,7 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 const MAX_ERROR_BODY_BYTES: usize = 512;
 
 /// One relationship tuple / tuple key on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TupleKey {
     /// `<type>:<id>` or a userset `<type>:<id>#<relation>`.
     pub user: String,
@@ -225,6 +225,42 @@ struct WriteBody<'a> {
     authorization_model_id: Option<&'a str>,
 }
 
+/// `Read` filter: every tuple on `object` (optionally one `relation`).
+#[derive(Serialize)]
+struct ReadTupleKey<'a> {
+    object: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relation: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ReadBody<'a> {
+    tuple_key: ReadTupleKey<'a>,
+    page_size: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct ReadResponse {
+    #[serde(default)]
+    tuples: Vec<ReadTuple>,
+    #[serde(default)]
+    continuation_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReadTuple {
+    key: TupleKey,
+}
+
+/// `Read` page size — `OpenFGA`'s maximum.
+const READ_PAGE_SIZE: u32 = 100;
+/// The bound on tuples one `read_by_object` returns: an object with more
+/// is not a conversation the emitter wrote (a few relations per
+/// participant), and an unbounded read is not fail-closed.
+const MAX_READ_TUPLES: usize = 10_000;
+
 /// The `OpenFGA` HTTP API over one store.
 #[derive(Clone)]
 pub struct OpenFgaClient {
@@ -391,6 +427,53 @@ impl OpenFgaClient {
         }
         offer_line(&buffer, &mut keep, max_kept, &mut kept)?;
         Ok(kept)
+    }
+
+    /// `Read`: every tuple on `object` (RFC 0047 §3.6 — "no wildcard
+    /// delete exists": erasure reads the object's tuples, then deletes
+    /// them). Paginated to completion; bounded.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenFgaError::Unavailable`] on transport/timeout/non-2xx;
+    /// [`OpenFgaError::BoundExceeded`] past the read bound.
+    pub async fn read_by_object(&self, object: &str) -> Result<Vec<TupleKey>, OpenFgaError> {
+        let mut tuples = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let body = ReadBody {
+                tuple_key: ReadTupleKey {
+                    object,
+                    relation: None,
+                },
+                page_size: READ_PAGE_SIZE,
+                continuation_token: continuation.as_deref(),
+            };
+            let response = self
+                .post("read", &body)?
+                .send()
+                .await
+                .map_err(|e| transport(&e))?;
+            let response = ok_status(response).await?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| OpenFgaError::Unavailable(format!("read read: {e}")))?;
+            let page: ReadResponse = serde_json::from_slice(&bytes)
+                .map_err(|e| OpenFgaError::Unavailable(format!("decode read: {e}")))?;
+            for tuple in page.tuples {
+                if tuples.len() >= MAX_READ_TUPLES {
+                    return Err(OpenFgaError::BoundExceeded {
+                        bound: MAX_READ_TUPLES,
+                    });
+                }
+                tuples.push(tuple.key);
+            }
+            match page.continuation_token {
+                Some(token) if !token.is_empty() => continuation = Some(token),
+                _ => return Ok(tuples),
+            }
+        }
     }
 
     /// `Write`: add `writes` and remove `deletes` in one transactional,

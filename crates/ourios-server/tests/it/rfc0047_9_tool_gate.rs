@@ -1,6 +1,7 @@
 //! Scenario RFC0047.9 — the MCP tool gate, in-process against a fake
-//! `OpenFGA` (no container): the tenant-wide bypass issues no `Check`, a
-//! scoped principal needs an explicit `caller` grant per tool, and an
+//! `OpenFGA` (no container): a tenant-wide reader skips the per-tool
+//! `can_call` check (the two-step's own `Check(can_read_content, tenant)`
+//! still runs), a scoped principal needs an explicit `caller` grant per tool, and an
 //! unanswerable graph fails the call closed. Complements the served-binary
 //! arm in `rfc0047_visibility` (real container).
 //! See `docs/rfcs/0047-rebac-resolver-and-graph-visibility.md` §5.

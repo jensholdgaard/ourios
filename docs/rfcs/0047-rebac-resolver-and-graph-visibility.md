@@ -1,7 +1,7 @@
 ---
 rfc: 0047
 title: ReBAC resolver (OpenFGA) and graph-fed visibility inside a tenant
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
@@ -11,13 +11,13 @@ superseded-by: —
 
 # RFC 0047 — ReBAC resolver and graph-fed visibility
 
-> **Status: `red` (2026-08-18).** Slices 1–3 are green: RFC0047.1–.3
-> (the layer-1 resolver), RFC0047.4–.8 (the planner two-step, masking,
-> bounded enumeration) and RFC0047.9 (the MCP tool gate) pass on the served
-> binary against a real OpenFGA container (`openfga-resolver` CI job) with
-> the in-tree model; RFC0047.12 gates CI. RFC0047.10–.11 (emitter, erasure)
-> are the remaining slice (slice 4); the RFC0047.5 request-carried contextual-tuple arm is deferred
-> (§3.3, §7). Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
+> **Status: `green` (2026-08-18).** All twelve §5 criteria pass:
+> RFC0047.1–.3 (the layer-1 resolver), .4–.8 (the planner two-step,
+> masking, bounded enumeration), .9 (the MCP tool gate), .10–.11 (the graph
+> emitter and erasure) on the served binary against a real OpenFGA container
+> (`openfga-resolver` CI job) with the in-tree model, and .12 gating CI. The
+> RFC0047.5 request-carried contextual-tuple arm is deferred (§3.3, §7);
+> the erasure request channel is the §3.6 slice-4 decision. Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
 > opaque, coarse, credential-selected object, which is exactly the object
 > type this RFC binds the authorization graph to. Grounded in the #688
 > OpenFGA spike (resolver seam holds, p50 1.4 ms), two OpenFGA-assistant
@@ -260,6 +260,23 @@ a `delegate` grant on `conversation:T/<id>` MUST be paired by the operator
 with `tenant:T#scoped_reader@agent:<id>` for the same reason (documented
 next to the model; the `.fga.yaml` fixture shows the pair).
 
+**Slice-4 decisions (implemented).** The emitter lives in the ingester
+(`graph_emitter`), fed from **both** hooks: the compaction sweep observes
+every input row it decodes (once, before any drop) and the receiver's
+`PublishCoordinator` derives tuples from every batch it publishes and sends
+them off the flush path once the batch is durable. The conversation key is
+the column bound in `visibility.objects` (`attr.` or `resource.` stripped);
+the user keys are `user.hash` and `enduser.pseudo.id`, the agent key
+`gen_ai.agent.id`; a value that cannot be an object id is skipped. It also
+writes the per-tenant `tool:T/<name>#parent@tenant:T` objects (§3.5), so
+operators grant `caller` only. Writes are `on_duplicate = ignore`
+(OpenFGA ≥ 1.10, per the OpenFGA assistant), so a resend is a no-op and
+no read-then-diff pass exists; the sweep sends what it derived after the
+blocking pass, in ≤ 100-tuple batches, counted on
+`ourios.graph.tuples{ourios.graph.tuple.operation}`. Data stored before the
+graph was configured is fed the next time its partition is rewritten
+(compaction) — a backfill sweep is a follow-on (§9).
+
 **Freshness.** A conversation is invisible to fine-grained principals until
 its tuples land (seconds after the next sweep; the emitter is also invoked
 on the receiver's flush cadence for the tenants it flushed). Two bridges,
@@ -418,6 +435,26 @@ rewrite that removes the rows: the same pass reads the object's tuples
 exists — so a deleted conversation is unreachable *and* unlisted. Tuple
 deletion follows the Parquet rewrite, never precedes it (a dangling tuple is
 harmless; a dangling row is a leak).
+
+**Slice-4 decisions (implemented).** The RFC left the *request* channel
+open; the choice is a durable **marker object in the store** —
+`erasure/tenant_id=<enc>/conversation=<enc>` (the partition
+percent-encoding; body `{"phase":"rows"}`) — because the object store is
+the source of truth (`CLAUDE.md` §3.6), it needs no new network surface
+or credential, and an operator can write it with the tooling they already
+have (`ourios_ingester::compactor::request_erasure` in-process). The sweep's
+blocking pass rewrites every hour partition of the tenant through the same
+compaction rewrite with the conversation's rows dropped (a single-file
+partition is rewritten too), advances the marker to `{"phase":"tuples"}`
+once every partition rewrote cleanly, and only then — in the async phase,
+after the blocking pass — reads the object's tuples and deletes them in
+≤ 100-tuple batches (`on_missing = ignore`), writes the new
+`conversation_erased` audit event (RFC 0005 §3.7 kind 9, carrying
+`partitions_rewritten` / `rows_dropped` / `tuples_deleted`) after the
+sweep's compaction events, and removes the marker. A sweep interrupted
+between the phases retries only the tuple deletion; an unreachable graph
+leaves the marker and retries next sweep. Without a bound conversation
+object a marker is recorded as a sweep error, never silently dropped.
 
 ### 3.7 Operational posture
 
@@ -619,8 +656,11 @@ planner's returned row set equals the naive "rows whose conversation ∈
 
 ## 9. Follow-ons (recorded, not built here)
 
-Cluster/service ownership as graph objects (from the reviewed model) once a
-scenario needs them; time-boxed grants (`temporal_grant` CEL condition on
+A backfill sweep that feeds the graph from data stored before the graph was
+configured (today only a rewrite re-derives); an operator-facing erasure
+surface over the store marker (a CLI verb / MCP tool); cluster/service
+ownership as graph objects (from the reviewed model) once a scenario needs
+them; time-boxed grants (`temporal_grant` CEL condition on
 `tool#caller` / `conversation#delegate`); an upstream write-up for the OTel
 community once this is validated in a real deployment (#688 Q7).
 

@@ -458,7 +458,7 @@ impl OpenFgaClient {
             let bytes = response
                 .bytes()
                 .await
-                .map_err(|e| OpenFgaError::Unavailable(format!("read read: {e}")))?;
+                .map_err(|e| OpenFgaError::Unavailable(format!("read response body: {e}")))?;
             let page: ReadResponse = serde_json::from_slice(&bytes)
                 .map_err(|e| OpenFgaError::Unavailable(format!("decode read: {e}")))?;
             for tuple in page.tuples {

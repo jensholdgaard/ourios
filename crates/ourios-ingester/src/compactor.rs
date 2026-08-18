@@ -516,9 +516,29 @@ fn erase_pending(
                 };
                 match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
                     Ok(o) => {
-                        if o.committed.is_some() {
+                        if let Some(committed) = &o.committed {
                             outcome.partitions_rewritten += 1;
                             outcome.rows_dropped += o.rows_dropped;
+                            // An erasure rewrite is a compaction like any
+                            // other for the sweep's IO accounting and audit
+                            // trail (RFC 0009 §3.6): it reads and writes the
+                            // partition and commits a generation.
+                            report.partitions_compacted += 1;
+                            report.files_compacted += to_u64(o.files_before);
+                            report.rows_compacted += o.rows;
+                            report.bytes_read = report.bytes_read.saturating_add(o.bytes_read);
+                            report.compacted_files.push(CompactedFile {
+                                tenant: request.tenant.clone(),
+                                bytes: o.bytes_written,
+                            });
+                            report.compaction_events.push(compaction_audit_event(
+                                &request.tenant,
+                                now_unix_nanos(),
+                                &partition,
+                                committed,
+                                o.rows,
+                            ));
+                            report.gc_failures += o.gc_failures;
                         }
                     }
                     Err(e) => {
@@ -1604,8 +1624,20 @@ mod graph_tests {
         // Marker gone; nothing pending.
         assert!(pending_erasures(&store).expect("pending").is_empty());
         // Audit order: the erasure event comes after every compaction
-        // event of the sweep (the rewrite), carrying the counts.
+        // event of the sweep (the rewrite is itself audited and counted as
+        // a compaction), carrying the counts.
         let events = audit.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.payload, AuditPayload::Compaction { .. })),
+            "the erasure rewrite is audited as a compaction: {events:?}"
+        );
+        assert_eq!(
+            report.partitions_compacted, 1,
+            "and counted in the sweep's IO accounting"
+        );
+        assert!(report.bytes_read > 0);
         let erased = events
             .iter()
             .position(|e| matches!(e.payload, AuditPayload::ConversationErased { .. }))

@@ -77,8 +77,10 @@ around them.
 
 ### 3.1 Tenant id grammar (amends RFC 0046 §3.1)
 
-A tenant id is **visible ASCII, 1–128 bytes, and contains none of `:`,
-`#`, `/`, or whitespace**. Every boundary applies the same rule, once, at
+A tenant id is **1–128 bytes of ASCII graphic characters (`0x21`–`0x7E`,
+i.e. printable ASCII excluding space) with `:`, `#` and `/` further
+excluded** — Rust's `char::is_ascii_graphic` minus three characters. Every
+boundary applies the same rule, once, at
 extraction: the OTLP selector (`X-Ourios-Tenant` / metadata, RFC 0046),
 the querier header and MCP `tenant` argument, `auth.tokens[].tenants`,
 the OIDC `tenant_claim` values, and the OpenFGA `tenant:<T>` object. A
@@ -149,8 +151,9 @@ HTTP or MCP surface: an erasure is an operator action against the store
 of record, not a tenant-facing request; an admin API is a later RFC if a
 scenario needs one. Completion is observable three ways, all existing: the
 marker disappears (`graph erasures`), the `conversation_erased` audit
-event lands (RFC 0005 §3.7 kind 9), and `ourios.graph.tuples{operation=
-delete}` counts. The compactor's sweep additionally logs one structured
+event lands (RFC 0005 §3.7 kind 9), and
+`ourios.graph.tuples{ourios.graph.tuple.operation="delete"}` counts. The
+compactor's sweep additionally logs one structured
 event per completed erasure naming tenant, conversation, rows dropped and
 tuples deleted.
 
@@ -281,7 +284,7 @@ which flip to the verbatim form.
 
 ## 7. Open questions
 
-- [ ] **Grammar strictness** — 128 bytes and visible ASCII minus four
+- [ ] **Grammar strictness** — 128 bytes and ASCII graphic minus three
       characters is deliberately tight; is there a known deployment that
       needs `.`-free or longer ids? (Defaults to tight; loosening later is
       additive, tightening later is not.)

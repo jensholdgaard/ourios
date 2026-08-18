@@ -197,7 +197,10 @@ pub fn erasure_marker_key(tenant: &str, conversation_id: &str) -> String {
 }
 
 /// Request the erasure of `conversation_id` from `tenant` (RFC 0047 §3.6):
-/// writes the durable marker the next sweep acts on. Idempotent.
+/// writes the durable marker the next sweep acts on. Idempotent —
+/// create-if-absent, so a repeated request never resets an erasure already
+/// in flight (one whose rows are gone and whose marker is in the `tuples`
+/// phase).
 ///
 /// # Errors
 ///
@@ -208,16 +211,21 @@ pub fn request_erasure(
     conversation_id: &str,
 ) -> Result<(), IngestError> {
     let key = erasure_marker_key(tenant, conversation_id);
-    store
-        .put_blocking(&key, ERASURE_PHASE_ROWS.to_vec())
-        .map_err(|e| store_error("put erasure marker", &key, &e))
+    match store.put_if_absent_blocking(&key, ERASURE_PHASE_ROWS.to_vec()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_already_exists() => Ok(()),
+        Err(e) => Err(store_error("put erasure marker", &key, &e)),
+    }
 }
 
-/// The pending erasure requests, oldest key first.
+/// The pending erasure requests, in deterministic (lexicographic key)
+/// order.
 ///
 /// # Errors
 ///
-/// [`IngestError::Io`] when the marker prefix cannot be listed.
+/// [`IngestError::Io`] when the marker prefix cannot be listed or a marker
+/// cannot be read — a transient store error never regresses a marker's
+/// phase.
 pub fn pending_erasures(store: &Store) -> Result<Vec<ErasureRequest>, IngestError> {
     let mut keys = store
         .list_blocking(Some(ERASURE_PREFIX))
@@ -241,8 +249,19 @@ pub fn pending_erasures(store: &Store) -> Result<Vec<ErasureRequest>, IngestErro
         ) else {
             continue;
         };
-        let phase = match store.get_blocking_opt(&key) {
-            Ok(Some(body)) if body == ERASURE_PHASE_TUPLES => ErasurePhase::Tuples,
+        let body = store
+            .get_blocking_opt(&key)
+            .map_err(|e| store_error("read erasure marker", &key, &e))?;
+        // A marker removed between the listing and this read is finished.
+        let Some(body) = body else {
+            continue;
+        };
+        // The marker body is `{"phase": "rows" | "tuples"}`, parsed
+        // leniently (whitespace, key order) — operator tooling writes these.
+        let phase = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(marker) if marker["phase"].as_str().map(str::trim) == Some("tuples") => {
+                ErasurePhase::Tuples
+            }
             _ => ErasurePhase::Rows,
         };
         requests.push(ErasureRequest {
@@ -846,9 +865,16 @@ async fn graph_phase(
         let mut finished = Vec::new();
         let mut errors = Vec::new();
         for (index, marker, event) in markers {
-            sink.emit(event);
+            // The marker removal is the at-most-once transition: only the
+            // process that removes it writes the audit event. A marker
+            // already gone was finished (and audited) elsewhere; a failed
+            // delete leaves the marker in the `tuples` phase — the next
+            // sweep repeats the (idempotent) tuple deletion and retries.
             match store.delete_blocking(&marker) {
-                Ok(()) => finished.push(index),
+                Ok(()) => {
+                    sink.emit(event);
+                    finished.push(index);
+                }
                 Err(e) if e.is_not_found() => finished.push(index),
                 Err(e) => errors.push(format!("erase: remove marker {marker}: {e}")),
             }
@@ -1483,6 +1509,7 @@ mod graph_tests {
     /// object is unlisted (no tuple on it remains) and other conversations'
     /// tuples are untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // one store, one graph: rows → tuples → audit → marker in sequence
     async fn rfc0047_11_erasure_removes_tuples_after_rows() {
         let fake = Fake::default();
         let url = serve(fake.clone()).await;
@@ -1511,9 +1538,30 @@ mod graph_tests {
         );
         let _ = audit.drain();
 
-        // Request the erasure of c-1; sweep 2 performs it.
+        // Request the erasure of c-1; sweep 2 performs it. A repeated request
+        // is a no-op (create-if-absent) — it never resets a marker's phase.
         request_erasure(&store, "acme", "c-1").expect("request");
+        request_erasure(&store, "acme", "c-1").expect("repeat");
         assert_eq!(pending_erasures(&store).expect("pending").len(), 1);
+        store
+            .put_blocking(
+                &super::erasure_marker_key("acme", "c-9"),
+                b" { \"phase\" : \"tuples\" }\n".to_vec(),
+            )
+            .expect("hand-written marker");
+        request_erasure(&store, "acme", "c-9").expect("repeat");
+        let phases: Vec<_> = pending_erasures(&store)
+            .expect("pending")
+            .into_iter()
+            .map(|r| (r.conversation_id, r.phase))
+            .collect();
+        assert!(
+            phases.contains(&("c-9".to_string(), ErasurePhase::Tuples)),
+            "{phases:?}"
+        );
+        store
+            .delete_blocking(&super::erasure_marker_key("acme", "c-9"))
+            .expect("cleanup");
         let (result, _, _) = sweep_once(
             store.clone(),
             CompactionPolicy::default(),

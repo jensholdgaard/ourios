@@ -111,21 +111,27 @@ impl GraphEmitter {
 
     /// Whether `record` belongs to conversation `id` — the erasure filter
     /// (RFC 0047 §3.6), reading the same column the tuples were derived
-    /// from.
+    /// from, on the **raw** value: a conversation whose id can never be a
+    /// graph object is still erasable from the rows.
     #[must_use]
     pub fn conversation_matches(&self, record: &MinedRecord, id: &str) -> bool {
-        self.conversation_id(record) == Some(id)
+        self.raw_conversation_id(record) == Some(id)
+    }
+
+    /// The conversation id of `record` as stored, if any.
+    fn raw_conversation_id<'a>(&self, record: &'a MinedRecord) -> Option<&'a str> {
+        match &self.conversation {
+            ConversationKey::Log(key) => project_string_value(&record.attributes, key),
+            ConversationKey::Resource(key) => {
+                project_string_value(&record.resource_attributes, key)
+            }
+        }
     }
 
     /// The conversation id of `record`, when it carries one that can be a
     /// graph object id.
     fn conversation_id<'a>(&self, record: &'a MinedRecord) -> Option<&'a str> {
-        let id = match &self.conversation {
-            ConversationKey::Log(key) => project_string_value(&record.attributes, key),
-            ConversationKey::Resource(key) => {
-                project_string_value(&record.resource_attributes, key)
-            }
-        }?;
+        let id = self.raw_conversation_id(record)?;
         is_object_id(id).then_some(id)
     }
 
@@ -225,6 +231,11 @@ impl GraphEmitter {
     /// retried by the next sweep (deletes are idempotent).
     pub async fn erase_conversation(&self, tenant: &str, id: &str) -> Result<usize, OpenFgaError> {
         let objects = TenantObjects::new(tenant).ok_or(OpenFgaError::InvalidTenant)?;
+        // A conversation the emitter could never have named has no tuples
+        // — nothing to read or delete; the rows were still dropped.
+        if !objects.conversation_fits(id) {
+            return Ok(0);
+        }
         let tuples = self
             .client
             .read_by_object(&objects.conversation(id))

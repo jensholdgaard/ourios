@@ -1627,4 +1627,53 @@ mod graph_tests {
         }
         assert_eq!(events[erased].tenant_id.as_str(), "acme");
     }
+
+    /// RFC0047.11 (raw ids): a conversation whose id can never be a graph
+    /// object (here: whitespace) still has its rows erased — matched on the
+    /// stored value — with zero tuples to delete and an honest audit event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc0047_11_erasure_matches_raw_ids() {
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        write_rows(&store, "odd id", "alice", None, 2);
+        write_rows(&store, "c-2", "bob", None, 1);
+        let emitter = emitter(&url);
+        let audit = SharedAuditSink::new();
+        let (result, _, sink) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(audit.clone()),
+            Some(Arc::clone(&emitter)),
+        )
+        .await;
+        result.expect("sweep");
+        assert!(
+            !fake
+                .tuples
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|t| t.object.contains("odd")),
+            "no tuple was ever minted for a non-object-id conversation"
+        );
+        request_erasure(&store, "acme", "odd id").expect("request");
+        let (result, _, _) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            sink,
+            Some(emitter),
+        )
+        .await;
+        let report = result.expect("sweep");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let outcome = &report.erasures[0];
+        assert_eq!(outcome.rows_dropped, 2, "rows matched on the raw value");
+        assert_eq!(outcome.tuples_deleted, Some(0));
+        assert!(outcome.finished);
+        assert_eq!(live_rows(&store, bucket.path()).len(), 1);
+    }
 }

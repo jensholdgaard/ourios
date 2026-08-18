@@ -256,9 +256,9 @@ impl OuriosMcp {
         &self,
         ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
         tenant: &str,
-    ) -> Result<(), ErrorData> {
+    ) -> Result<Option<AuthBinding>, ErrorData> {
         if self.auth.is_open() {
-            return Ok(());
+            return Ok(None);
         }
         // The transport layer (`require_bearer`) already authenticated and
         // cached the resolved binding on the request — read it from the
@@ -270,7 +270,7 @@ impl OuriosMcp {
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<AuthBinding>());
         match binding {
-            Some(binding) if binding.may_read(tenant) => Ok(()),
+            Some(binding) if binding.may_read(tenant) => Ok(Some(binding.clone())),
             Some(_) => Err(ErrorData::invalid_request(
                 "the tenant is outside the authenticated token's allowed set",
                 None,
@@ -280,6 +280,29 @@ impl OuriosMcp {
                 None,
             )),
         }
+    }
+
+    /// RFC 0047 §3.4 for a tool call: the two-step decision for the bound
+    /// principal in `tenant`, as an MCP error when refused.
+    async fn visibility(
+        &self,
+        binding: Option<&AuthBinding>,
+        tenant: &str,
+    ) -> Result<Option<ourios_querier::Visibility>, ErrorData> {
+        crate::visibility::resolve(&self.auth, binding, tenant, &self.metrics)
+            .await
+            .map_err(|rejection| visibility_error(&rejection))
+    }
+}
+
+/// Map a visibility refusal onto the MCP error vocabulary: `403`-class →
+/// `invalid_request` (the caller may not), `503`-class → `internal_error`
+/// (retry), `401`-class → `invalid_request` with the bearer message.
+fn visibility_error(rejection: &crate::visibility::VisibilityRejection) -> ErrorData {
+    if rejection.status.is_server_error() {
+        ErrorData::internal_error(rejection.message.clone(), None)
+    } else {
+        ErrorData::invalid_request(rejection.message.clone(), None)
     }
 }
 
@@ -346,7 +369,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        self.check_tenant(&ctx, tenant_arg)?;
+        let binding = self.check_tenant(&ctx, tenant_arg)?;
         let statement = dsl::parse_statement(&args.query)
             .map_err(|e| ErrorData::invalid_params(format!("invalid query: {e}"), None))?;
         let Statement::Logs(mut query) = statement else {
@@ -360,16 +383,21 @@ impl OuriosMcp {
         // documented "maximum rendered rows" contract holds.
         let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         cap_rows_unless_aggregation(&mut query.stages, cap);
+        let visibility = self.visibility(binding.as_ref(), tenant_arg).await?;
+        let options = visibility.map_or_else(ourios_querier::QueryOptions::default, |v| {
+            ourios_querier::QueryOptions::default().with_visibility(v)
+        });
         let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let result = self
             .querier
-            .run_query(
+            .run_query_with(
                 &query,
                 &tenant,
                 now_unix_nano(),
                 self.default_window_nanos,
                 None,
+                options,
             )
             .await;
         // The same instruments as the JSON API — an MCP query IS a query
@@ -434,7 +462,11 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        self.check_tenant(&ctx, tenant_arg)?;
+        let binding = self.check_tenant(&ctx, tenant_arg)?;
+        let visibility = self.visibility(binding.as_ref(), tenant_arg).await?;
+        if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
+            return Err(visibility_error(&rejection));
+        }
         let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let registry = match self.querier.template_registry(&tenant).await {
@@ -511,7 +543,11 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        self.check_tenant(&ctx, tenant_arg)?;
+        let binding = self.check_tenant(&ctx, tenant_arg)?;
+        let visibility = self.visibility(binding.as_ref(), tenant_arg).await?;
+        if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
+            return Err(visibility_error(&rejection));
+        }
         // One grammar, one boundary rule: the drift window parses through
         // the DSL front-end exactly as the JSON API's statement does
         // (RFC0010.2's half-open rule inherited verbatim).
@@ -636,7 +672,14 @@ fn now_unix_nano() -> u64 {
 /// H6-scrubbed surface the JSON API already exposes — no DataFusion/SQL
 /// leaks through either boundary.
 fn query_tool_error(e: &ourios_querier::QueryError) -> ErrorData {
-    ErrorData::internal_error(e.to_string(), None)
+    match e {
+        // RFC 0047 §3.4: a content column the principal may not read — the
+        // caller's request is wrong, not the server.
+        ourios_querier::QueryError::Forbidden { .. } => {
+            ErrorData::invalid_request(e.to_string(), None)
+        }
+        _ => ErrorData::internal_error(e.to_string(), None),
+    }
 }
 
 /// Serialize an RFC 0016 response shape as the tool's JSON content — the

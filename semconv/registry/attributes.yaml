@@ -181,6 +181,31 @@ groups:
           the total), so the B1 pruned fraction is derived in the backend
           as `pruned / (scanned + pruned)` (RFC 0016; OTel usage/state
           convention — record raw counts, derive the ratio).
+      - id: ourios.query.visibility.branch
+        type:
+          members:
+            - id: tenant_wide
+              value: "tenant_wide"
+              stability: development
+              brief: >-
+                `Check(can_read_content, tenant)` allowed — the tenant
+                predicate only, no enumeration (RFC 0047 §3.4 step 1).
+            - id: metadata_masked
+              value: "metadata_masked"
+              stability: development
+              brief: >-
+                `Check(can_read_metadata, tenant)` allowed — every row with
+                the content columns masked, no enumeration (step 2).
+            - id: scoped
+              value: "scoped"
+              stability: development
+              brief: >-
+                A scoped principal — the streamed, bounded conversation
+                enumeration became an `IN (…)` predicate (step 3).
+        stability: development
+        brief: >-
+          Which branch of the RFC 0047 §3.4 two-step a query took inside its
+          tenant. Absent when no graph resolver is configured.
       - id: ourios.template_map.lookup.outcome
         type:
           members:

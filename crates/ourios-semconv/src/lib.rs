@@ -127,6 +127,9 @@ pub const OURIOS_QUERY_DURATION: &str = "ourios.query.duration";
 /// `ourios.query.row_groups` (counter, unit `{row_group}`).
 pub const OURIOS_QUERY_ROW_GROUPS: &str = "ourios.query.row_groups";
 
+/// `ourios.query.visibility` (counter, unit `{query}`).
+pub const OURIOS_QUERY_VISIBILITY: &str = "ourios.query.visibility";
+
 /// `ourios.receiver.tenant.divergences` (counter, unit `{divergence}`).
 pub const OURIOS_RECEIVER_TENANT_DIVERGENCES: &str = "ourios.receiver.tenant.divergences";
 
@@ -206,6 +209,9 @@ pub const OURIOS_QUERY_KIND: &str = "ourios.query.kind";
 
 /// `ourios.query.row_group.state` attribute key.
 pub const OURIOS_QUERY_ROW_GROUP_STATE: &str = "ourios.query.row_group.state";
+
+/// `ourios.query.visibility.branch` attribute key.
+pub const OURIOS_QUERY_VISIBILITY_BRANCH: &str = "ourios.query.visibility.branch";
 
 /// `ourios.service` attribute key.
 pub const OURIOS_SERVICE: &str = "ourios.service";

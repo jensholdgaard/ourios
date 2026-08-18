@@ -128,7 +128,7 @@ impl Visibility {
 
     /// Mask the content columns of returned rows (RFC0047.8): the body
     /// becomes [`LogBody::Masked`], masked attributes keep their key with
-    /// the value unset — the OTLP null.
+    /// the value unset — the OTLP null (`"value": null` on the JSON API).
     pub(crate) fn mask(&self, rows: &mut [LogRow]) {
         let Self::Masked { content_columns } = self else {
             return;

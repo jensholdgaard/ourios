@@ -412,6 +412,21 @@ groups:
       - ref: ourios.query.row_group.state
         requirement_level: required
 
+  - id: metric.ourios.query.visibility
+    type: metric
+    metric_name: ourios.query.visibility
+    stability: development
+    brief: >-
+      Queries answered under RFC 0047 §3.4 layer-2 visibility, by the
+      two-step branch taken. `scoped` counts every streamed conversation
+      enumeration issued; a tenant-wide or metadata reader never
+      enumerates (RFC0047.4 / RFC0047.8).
+    instrument: counter
+    unit: "{query}"
+    attributes:
+      - ref: ourios.query.visibility.branch
+        requirement_level: required
+
   # Audit sink (issue #302): the miner's template-audit write path. A
   # buffering sink mirroring the RFC 0014 record sink — events buffer on the
   # request path and flush off the runtime. `flush.outcome` splits a failed

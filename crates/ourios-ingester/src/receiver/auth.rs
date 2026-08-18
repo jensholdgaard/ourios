@@ -42,6 +42,30 @@ pub struct AuthBinding {
     token_name: String,
     read: TenantSet,
     write: TenantSet,
+    /// The RFC 0047 principal and its token groups — `Some` only when the
+    /// graph resolver bound this session, for the planner's two-step.
+    graph: Option<GraphIdentity>,
+}
+
+/// The graph-side identity of a binding (RFC 0047 §3.1/§3.4).
+#[derive(Debug, Clone)]
+pub struct GraphIdentity {
+    principal: Principal,
+    groups: Vec<String>,
+}
+
+impl GraphIdentity {
+    /// The `OpenFGA` principal.
+    #[must_use]
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    /// The token's group claim (contextual `team#member` tuples).
+    #[must_use]
+    pub fn groups(&self) -> &[String] {
+        &self.groups
+    }
 }
 
 impl AuthBinding {
@@ -75,11 +99,18 @@ impl AuthBinding {
         self.write.allows(tenant)
     }
 
+    /// The graph identity, when the RFC 0047 resolver bound this session.
+    #[must_use]
+    pub fn graph(&self) -> Option<&GraphIdentity> {
+        self.graph.as_ref()
+    }
+
     fn same(token_name: String, tenants: TenantSet) -> Self {
         Self {
             token_name,
             read: tenants.clone(),
             write: tenants,
+            graph: None,
         }
     }
 }
@@ -235,6 +266,14 @@ impl AuthResolver {
         self
     }
 
+    /// The RFC 0047 graph resolver, when configured — the planner's
+    /// two-step and the tool gate consult it.
+    #[cfg(feature = "openfga")]
+    #[must_use]
+    pub fn openfga(&self) -> Option<&Arc<ourios_core::auth::openfga::OpenFgaResolver>> {
+        self.openfga.as_ref()
+    }
+
     /// Whether every request passes unbound (§3.1 open mode).
     #[must_use]
     pub fn is_open(&self) -> bool {
@@ -331,7 +370,8 @@ impl AuthResolver {
                 // name that is no object id): named, 401-class.
                 Err(
                     e @ (OpenFgaError::TooManyContextualTuples { .. }
-                    | OpenFgaError::InvalidGroup { .. }),
+                    | OpenFgaError::InvalidGroup { .. }
+                    | OpenFgaError::InvalidPrincipal),
                 ) => {
                     tracing::warn!(
                         token_name = %identity.name,
@@ -359,6 +399,10 @@ impl AuthResolver {
                 token_name: identity.name,
                 read,
                 write,
+                graph: Some(GraphIdentity {
+                    principal: identity.principal,
+                    groups: identity.groups,
+                }),
             }));
         }
         // Without the graph a credential must carry its own tenant list —

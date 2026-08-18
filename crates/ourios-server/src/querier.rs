@@ -49,7 +49,7 @@ use ourios_parquet::{PromotedAttributes, StoreConfig};
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
 use ourios_querier::{
-    AggregateGroup, DriftResult, LogBody, LogRow, Querier, QueryResult, QueryStats,
+    AggregateGroup, DriftResult, LogBody, LogRow, Querier, QueryOptions, QueryResult, QueryStats,
 };
 use ourios_semconv as semconv;
 
@@ -149,6 +149,8 @@ const ERROR_TYPE: &str = "error.type";
 pub(crate) struct QuerierMetrics {
     duration: Histogram<f64>,
     row_groups: Counter<u64>,
+    /// `ourios.query.visibility` (RFC 0047 §3.4): queries by two-step branch.
+    visibility: Counter<u64>,
 }
 
 impl QuerierMetrics {
@@ -168,10 +170,34 @@ impl QuerierMetrics {
         // ingester's single attribute-free `add(0, &[])`.
         row_groups.add(0, &Self::state_attrs(ROW_GROUP_SCANNED));
         row_groups.add(0, &Self::state_attrs(ROW_GROUP_PRUNED));
+        let visibility = meter
+            .u64_counter(semconv::OURIOS_QUERY_VISIBILITY)
+            .with_unit("{query}")
+            .build();
+        for branch in [
+            crate::visibility::BRANCH_TENANT_WIDE,
+            crate::visibility::BRANCH_METADATA_MASKED,
+            crate::visibility::BRANCH_SCOPED,
+        ] {
+            visibility.add(0, &Self::branch_attrs(branch));
+        }
         Self {
             duration,
             row_groups,
+            visibility,
         }
+    }
+
+    fn branch_attrs(branch: &'static str) -> [KeyValue; 1] {
+        [KeyValue::new(
+            semconv::OURIOS_QUERY_VISIBILITY_BRANCH,
+            branch,
+        )]
+    }
+
+    /// Record which RFC 0047 §3.4 branch a query took.
+    pub(crate) fn record_visibility(&self, branch: &'static str) {
+        self.visibility.add(1, &Self::branch_attrs(branch));
     }
 
     fn state_attrs(state: &'static str) -> [KeyValue; 1] {
@@ -436,6 +462,7 @@ async fn handle_query(
         http.route = "/v1/query",
         ourios.tenant = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
+        ourios.query.visibility.branch = tracing::field::Empty,
     )
 )]
 async fn handle_query_traced(state: QuerierState, headers: HeaderMap, body: Bytes) -> Response {
@@ -497,44 +524,31 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
         Err(message) => return error_response(StatusCode::BAD_REQUEST, "invalid_query", &message),
     };
 
+    // RFC 0047 §3.4: the two-step decides which rows this principal may see
+    // inside the tenant — after the syntactic gates (a malformed query never
+    // costs an enumeration), before the engine.
+    let visibility = match crate::visibility::resolve(
+        &state.auth,
+        binding.as_ref(),
+        tenant.as_str(),
+        &state.metrics,
+    )
+    .await
+    {
+        Ok(visibility) => visibility,
+        Err(rejection) => return reject_visibility(&state, gate_started, &rejection),
+    };
+
     let now = now_unix_nano();
     let started = Instant::now();
     match statement {
-        Statement::Logs(mut query) => {
-            // An aggregation — `count [by …]` or a scalar `sum`/`min`/`max`/
-            // `avg` — and `limit` are mutually exclusive (`compile::validate`
-            // rejects the combination, RFC 0002 amendments 2026-07-15 and
-            // 2026-07-23): the query answers with its grouped map, not a
-            // capped row set, so the §7 default/cap limit is meaningless for
-            // it and must not be injected.
-            let is_aggregation = query
-                .stages
-                .iter()
-                .any(|s| matches!(s, Stage::Count { .. } | Stage::Agg { .. }));
-            if !is_aggregation {
-                apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
-            }
-            let result = state
-                .querier
-                .run_query(&query, &tenant, now, state.default_window_nanos, None)
-                .await;
-            let elapsed = started.elapsed();
-            match result {
-                Ok(result) => {
-                    state
-                        .metrics
-                        .record_ok(QUERY_KIND_LOGS, elapsed, &result.stats);
-                    json_ok(&LogQueryResponse::from(&result))
-                }
-                Err(e) => {
-                    state
-                        .metrics
-                        .record_err(QUERY_KIND_LOGS, elapsed, query_error_type(&e));
-                    query_error_response(&e)
-                }
-            }
+        Statement::Logs(query) => {
+            run_logs_query(&state, query, &tenant, now, visibility, started).await
         }
         Statement::Drift(query) => {
+            if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
+                return reject_visibility(&state, gate_started, &rejection);
+            }
             let result = state.querier.run_drift(&query, &tenant, now).await;
             let elapsed = started.elapsed();
             match result {
@@ -563,6 +577,7 @@ pub(crate) fn query_error_type(error: &ourios_querier::QueryError) -> &'static s
         QueryError::TenantRequired => "tenant_required",
         QueryError::InvalidQuery { .. } => "invalid_query",
         QueryError::Storage { .. } => "storage",
+        QueryError::Forbidden { .. } => "permission_denied",
         // OpenTelemetry's fallback for an unclassified error class.
         _ => "_OTHER",
     }
@@ -804,6 +819,9 @@ enum LogBodyDto {
     Structured {
         value: serde_json::Value,
     },
+    /// The body exists but this principal may not read it (RFC 0047 §3.4
+    /// masking) — distinct from a missing `body` key (no body on the wire).
+    Masked,
 }
 
 impl From<&LogBody> for LogBodyDto {
@@ -825,6 +843,7 @@ impl From<&LogBody> for LogBodyDto {
             LogBody::Structured(value) => Self::Structured {
                 value: any_value_json(value),
             },
+            LogBody::Masked => Self::Masked,
             // `LogBody` is `#[non_exhaustive]`; a future body shape degrades to
             // an empty retained line rather than failing the whole response.
             // (`Absent` never reaches here — the row DTO maps it to a missing
@@ -939,6 +958,74 @@ fn json_ok<T: Serialize>(value: &T) -> Response {
 
 /// A `status` JSON error body `{ "error": { "kind", "message" } }` (RFC 0016
 /// §3.5). `message` is Ourios-owned text — never engine internals.
+/// The logs arm of the query endpoint: cap the rows, run under the
+/// RFC 0047 visibility decision, record, encode.
+async fn run_logs_query(
+    state: &QuerierState,
+    mut query: ourios_querier::dsl::ir::Query,
+    tenant: &TenantId,
+    now: u64,
+    visibility: Option<ourios_querier::Visibility>,
+    started: Instant,
+) -> Response {
+    // An aggregation — `count [by …]` or a scalar `sum`/`min`/`max`/
+    // `avg` — and `limit` are mutually exclusive (`compile::validate`
+    // rejects the combination, RFC 0002 amendments 2026-07-15 and
+    // 2026-07-23): the query answers with its grouped map, not a
+    // capped row set, so the §7 default/cap limit is meaningless for
+    // it and must not be injected.
+    let is_aggregation = query
+        .stages
+        .iter()
+        .any(|s| matches!(s, Stage::Count { .. } | Stage::Agg { .. }));
+    if !is_aggregation {
+        apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
+    }
+    let options = visibility.map_or_else(QueryOptions::default, |v| {
+        QueryOptions::default().with_visibility(v)
+    });
+    let result = state
+        .querier
+        .run_query_with(
+            &query,
+            tenant,
+            now,
+            state.default_window_nanos,
+            None,
+            options,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    match result {
+        Ok(result) => {
+            state
+                .metrics
+                .record_ok(QUERY_KIND_LOGS, elapsed, &result.stats);
+            json_ok(&LogQueryResponse::from(&result))
+        }
+        Err(e) => {
+            state
+                .metrics
+                .record_err(QUERY_KIND_LOGS, elapsed, query_error_type(&e));
+            query_error_response(&e)
+        }
+    }
+}
+
+/// An RFC 0047 §3.4 refusal, recorded like every pre-dispatch rejection.
+fn reject_visibility(
+    state: &QuerierState,
+    gate_started: Instant,
+    rejection: &crate::visibility::VisibilityRejection,
+) -> Response {
+    state.metrics.record_err(
+        QUERY_KIND_REJECTED,
+        gate_started.elapsed(),
+        rejection.error_type,
+    );
+    error_response(rejection.status, rejection.kind, &rejection.message)
+}
+
 /// The query endpoint's bearer gate: `Ok(binding)` (`None` in open mode)
 /// or the finished rejection response, recorded on `ourios.query.duration`
 /// (kind `rejected`, RFC 0026 §3.4) with the failure class as `error.type`.
@@ -1006,6 +1093,14 @@ fn query_error_response(error: &ourios_querier::QueryError) -> Response {
             StatusCode::BAD_REQUEST,
             "missing_tenant",
             "the X-Ourios-Tenant header is required and must be non-empty",
+        ),
+        // RFC 0047 §3.4: a metadata-only reader filtered or aggregated on a
+        // content column — refused, naming the column (configuration, not
+        // data).
+        QueryError::Forbidden { .. } => error_response(
+            StatusCode::FORBIDDEN,
+            "column_forbidden",
+            &error.to_string(),
         ),
         // `Storage` and any future `#[non_exhaustive]` variant → a scrubbed
         // 500. `QueryError::Display` is the H6-safe surface (it withholds the

@@ -1214,6 +1214,7 @@ mod tests {
     /// only tenant ids count toward the bound; the branch is cached per
     /// session while the enumeration is not.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one grant table, every branch of the two-step in sequence
     async fn two_step_visibility() {
         let fake = GrantFake {
             calls: Arc::new(AtomicUsize::new(0)),

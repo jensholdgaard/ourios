@@ -512,13 +512,24 @@ pub(crate) mod claim_binding {
         auth_yaml: &str,
         envs: &[(&str, &str)],
     ) -> (tokio::process::Child, String, String, std::net::SocketAddr) {
+        spawn_with_auth_and_storage(tmp, "", auth_yaml, envs).await
+    }
+
+    /// [`spawn_with_auth`] with extra `storage:` keys (e.g. a
+    /// `promoted_attributes` block, indented two spaces) after `local`.
+    pub(crate) async fn spawn_with_auth_and_storage(
+        tmp: &tempfile::TempDir,
+        storage_yaml: &str,
+        auth_yaml: &str,
+        envs: &[(&str, &str)],
+    ) -> (tokio::process::Child, String, String, std::net::SocketAddr) {
         let wal = tmp.path().join("wal");
         std::fs::create_dir_all(&wal).expect("wal dir");
         let config_path = tmp.path().join("ourios.yaml");
         let mut file = std::fs::File::create(&config_path).expect("create config");
         write!(
             file,
-            "storage:\n  local:\n    bucket_root: {}\n\
+            "storage:\n  local:\n    bucket_root: {}\n{storage_yaml}\
              receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
              querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n\
              {auth_yaml}",

@@ -39,7 +39,7 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 const MAX_ERROR_BODY_BYTES: usize = 512;
 
 /// One relationship tuple / tuple key on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TupleKey {
     /// `<type>:<id>` or a userset `<type>:<id>#<relation>`.
     pub user: String,

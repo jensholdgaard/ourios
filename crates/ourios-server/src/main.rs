@@ -867,6 +867,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // learns the actual ports.
     // One resolver, built once, shared by every enabled network role.
     let resolver = auth_resolver(&config).await?;
+    // RFC 0047 §3.3: the graph emitter — built for every role that stores or
+    // rewrites rows (receiver flush cadence, compaction sweep) when the graph
+    // binds a conversation object; no startup round-trip.
+    let graph_emitter = match config.auth.as_ref().and_then(|auth| auth.openfga.as_ref()) {
+        Some(openfga) => ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?
+            .map(std::sync::Arc::new),
+        None => None,
+    };
 
     let receiver = match &config.receiver {
         // The receiver's RFC 0014 data write path runs on the resolved store
@@ -886,6 +894,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 promoted: config.promoted.clone(),
                 auth: resolver.clone().expect("resolver built for enabled roles"),
                 encode_workers: params.encode_workers,
+                graph_emitter: graph_emitter.clone(),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -908,15 +917,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // the disabled state is logged so it's visible in a multi-pod rollout.
     let compactor = if config.compaction_enabled {
         let audit_store = store.clone();
-        Some(
-            Compactor::new(
-                store,
-                CompactionPolicy::default(),
-                config.compaction_interval,
-            )
-            .with_promoted_attributes(config.promoted.clone())
-            .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store))),
+        let mut compactor = Compactor::new(
+            store,
+            CompactionPolicy::default(),
+            config.compaction_interval,
         )
+        .with_promoted_attributes(config.promoted.clone())
+        .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store)));
+        if let Some(emitter) = graph_emitter.clone() {
+            compactor = compactor.with_graph_emitter(emitter);
+        }
+        Some(compactor)
     } else {
         tracing::info!(name: ourios_semconv::EVENT_OURIOS_SERVER_COMPACTION_DISABLED, "compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
         None

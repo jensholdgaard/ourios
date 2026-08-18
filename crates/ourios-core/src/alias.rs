@@ -402,6 +402,7 @@ impl AliasMap {
             | AuditPayload::Compaction { .. }
             | AuditPayload::RecordQuarantined { .. }
             | AuditPayload::IngestDenied { .. }
+            | AuditPayload::ConversationErased { .. }
             | AuditPayload::Unknown { .. } => {}
         }
     }

@@ -181,6 +181,21 @@ groups:
           the total), so the B1 pruned fraction is derived in the backend
           as `pruned / (scanned + pruned)` (RFC 0016; OTel usage/state
           convention — record raw counts, derive the ratio).
+      - id: ourios.graph.tuple.operation
+        type:
+          members:
+            - id: write
+              value: "write"
+              stability: development
+              brief: Tuples written by the emitter (idempotent, `on_duplicate = ignore`).
+            - id: delete
+              value: "delete"
+              stability: development
+              brief: Tuples deleted by a conversation erasure (`on_missing = ignore`).
+        stability: development
+        brief: >-
+          Whether a graph tuple batch was a write or a delete (RFC 0047 §3.3 /
+          §3.6).
       - id: ourios.query.visibility.branch
         type:
           members:

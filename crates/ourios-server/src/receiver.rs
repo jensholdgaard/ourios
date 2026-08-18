@@ -274,6 +274,9 @@ pub struct ReceiverConfig {
     /// (`receiver.encode_workers`; the config layer validates ≥ 1 and
     /// defaults to the host's available cores).
     pub encode_workers: usize,
+    /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
+    /// graph is configured with a bound conversation object.
+    pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -544,7 +547,10 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     // The cadence age-sweep publishes through the coordinator: atomic drain
     // under the miner lock + audit-ordered off-lock write (issue #302 #1/#2).
-    let coordinator = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    let mut coordinator = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    if let Some(emitter) = config.graph_emitter.clone() {
+        coordinator = coordinator.with_graph_emitter(emitter);
+    }
     let flush_tick = spawn_age_sweep(
         pipeline.clone(),
         coordinator,
@@ -886,6 +892,7 @@ mod tests {
             store,
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
+            graph_emitter: None,
             encode_workers: 2,
         })
         .await
@@ -917,6 +924,7 @@ mod tests {
             store,
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
+            graph_emitter: None,
             encode_workers: 2,
         })
         .await
@@ -1051,6 +1059,7 @@ mod tests {
             store,
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
+            graph_emitter: None,
             encode_workers: 2,
         })
         .await

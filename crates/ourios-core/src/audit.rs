@@ -245,6 +245,21 @@ pub enum AuditPayload {
         /// The rejecting token's audit/metric label (RFC 0026 §3.4).
         token_name: String,
     },
+    /// A conversation was erased from the tenant (RFC 0047 §3.6): its rows
+    /// dropped by the compaction rewrite of every partition, then its
+    /// graph tuples deleted — in that order; the event is written after
+    /// both. System-scoped like [`Self::Compaction`]; the event's
+    /// `tenant_id` is the tenant the conversation lived in.
+    ConversationErased {
+        /// The raw conversation id (the promoted-column value).
+        conversation_id: String,
+        /// Partitions rewritten by the erasure pass.
+        partitions_rewritten: u64,
+        /// Rows dropped across those rewrites.
+        rows_dropped: u64,
+        /// Graph tuples deleted for the conversation object.
+        tuples_deleted: u64,
+    },
 }
 
 /// Stable on-disk `event_kind` ordinals (RFC 0005 §3.7 mapping).
@@ -272,6 +287,9 @@ pub const EVENT_KIND_RECORD_QUARANTINED: u8 = 7;
 /// `ingest_denied` — an authenticated cross-tenant write attempt was
 /// rejected pre-WAL (RFC 0026 §3.2).
 pub const EVENT_KIND_INGEST_DENIED: u8 = 8;
+/// `conversation_erased` — a conversation's rows were dropped by the
+/// compaction rewrite and its graph tuples deleted (RFC 0047 §3.6).
+pub const EVENT_KIND_CONVERSATION_ERASED: u8 = 9;
 
 /// Canonical `event_type` strings paired with the ordinals above
 /// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
@@ -293,6 +311,8 @@ pub const EVENT_TYPE_TEMPLATE_CREATED: &str = "template_created";
 pub const EVENT_TYPE_RECORD_QUARANTINED: &str = "record_quarantined";
 /// The string form of [`EVENT_KIND_INGEST_DENIED`].
 pub const EVENT_TYPE_INGEST_DENIED: &str = "ingest_denied";
+/// The string form of [`EVENT_KIND_CONVERSATION_ERASED`].
+pub const EVENT_TYPE_CONVERSATION_ERASED: &str = "conversation_erased";
 
 /// The `template_version` a leaf is born at (RFC 0017 §3.1). The
 /// [`TemplateChange::Created`] variant omits a version field — the invariant
@@ -320,6 +340,7 @@ impl AuditPayload {
             Self::Compaction { .. } => EVENT_KIND_COMPACTION,
             Self::RecordQuarantined { .. } => EVENT_KIND_RECORD_QUARANTINED,
             Self::IngestDenied { .. } => EVENT_KIND_INGEST_DENIED,
+            Self::ConversationErased { .. } => EVENT_KIND_CONVERSATION_ERASED,
             Self::Unknown { event_kind, .. } => *event_kind,
         }
     }
@@ -344,6 +365,7 @@ impl AuditPayload {
             Self::Compaction { .. } => EVENT_TYPE_COMPACTION,
             Self::RecordQuarantined { .. } => EVENT_TYPE_RECORD_QUARANTINED,
             Self::IngestDenied { .. } => EVENT_TYPE_INGEST_DENIED,
+            Self::ConversationErased { .. } => EVENT_TYPE_CONVERSATION_ERASED,
             Self::Unknown { event_type, .. } => event_type,
         }
     }
@@ -365,6 +387,7 @@ impl AuditPayload {
             | Self::Compaction { .. }
             | Self::RecordQuarantined { .. }
             | Self::IngestDenied { .. }
+            | Self::ConversationErased { .. }
             | Self::Unknown { .. } => false,
         }
     }

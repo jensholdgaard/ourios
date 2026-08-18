@@ -219,10 +219,15 @@ pub fn compact_partition_with_promoted(
 #[derive(Default)]
 pub struct RowHooks<'a> {
     /// Called once per input file with its decoded rows, before any drop.
-    pub observe: Option<&'a mut dyn FnMut(&[MinedRecord])>,
+    pub observe: Option<&'a mut RowObserver<'a>>,
     /// Rows for which this returns `true` are not written back.
-    pub drop: Option<&'a dyn Fn(&MinedRecord) -> bool>,
+    pub drop: Option<&'a RowFilter<'a>>,
 }
+
+/// A [`RowHooks::observe`] callback.
+pub type RowObserver<'a> = dyn FnMut(&[MinedRecord]) + 'a;
+/// A [`RowHooks::drop`] predicate.
+pub type RowFilter<'a> = dyn Fn(&MinedRecord) -> bool + 'a;
 
 /// [`compact_partition_with_promoted`] with [`RowHooks`].
 ///
@@ -1156,9 +1161,13 @@ fn is_candidate(
 /// the immediate common-prefixes (cheap), never the full object set. This is the
 /// object-store equivalent of the pre-RFC-0019 level-by-level `read_dir` walk,
 /// not a recursive `O(N_objects)` scan. Each level's segment is parsed in the
-/// canonical zero-padded form ([`parse_partition_segment`]); a non-canonical
+/// canonical zero-padded form (`parse_partition_segment`); a non-canonical
 /// child prefix is dropped exactly as the old walk dropped non-canonical dirs.
 /// Returned sorted chronologically (oldest first) and deduplicated.
+///
+/// # Errors
+///
+/// [`CompactionError`] when the store's prefixes cannot be listed.
 pub fn hour_partitions(store: &Store, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
     let root = format!("data/tenant_id={}", percent_encode_tenant(tenant));
     let mut partitions = Vec::new();

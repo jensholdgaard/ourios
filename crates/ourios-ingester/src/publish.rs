@@ -71,13 +71,37 @@ impl Drained {
 pub struct PublishCoordinator {
     record: SharedParquetSink,
     audit: SharedParquetAuditSink,
+    /// The RFC 0047 §3.3 graph emitter — fed with every published batch
+    /// (the flush-cadence bridge), when the graph is configured.
+    #[cfg(feature = "openfga")]
+    graph: Option<std::sync::Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
 impl PublishCoordinator {
     /// Build a coordinator over the two shared sinks.
     #[must_use]
     pub fn new(record: SharedParquetSink, audit: SharedParquetAuditSink) -> Self {
-        Self { record, audit }
+        Self {
+            record,
+            audit,
+            #[cfg(feature = "openfga")]
+            graph: None,
+        }
+    }
+
+    /// Feed the RFC 0047 §3.3 graph from every batch this coordinator
+    /// publishes: tuples are derived from the records about to be written
+    /// and sent — asynchronously, best-effort, idempotent — once the batch
+    /// is durable. The compaction sweep re-derives the same tuples later,
+    /// so a failed send here only delays visibility.
+    #[cfg(feature = "openfga")]
+    #[must_use]
+    pub fn with_graph_emitter(
+        mut self,
+        emitter: std::sync::Arc<crate::graph_emitter::GraphEmitter>,
+    ) -> Self {
+        self.graph = Some(emitter);
+        self
     }
 
     /// Atomically take the audit buffer + the aged record partitions (the
@@ -144,7 +168,43 @@ impl PublishCoordinator {
             self.record.requeue(drained.records);
             return false;
         }
-        self.record.publish_owned(drained.records, trigger)
+        #[cfg(feature = "openfga")]
+        let tuples = self.graph.as_ref().map(|emitter| {
+            let mut tuples = std::collections::BTreeSet::new();
+            for (partition, records) in &drained.records {
+                tuples.extend(emitter.derive(&partition.tenant_id, records));
+                tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
+                    &partition.tenant_id,
+                ));
+            }
+            tuples
+        });
+        let published = self.record.publish_owned(drained.records, trigger);
+        #[cfg(feature = "openfga")]
+        if published
+            && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)
+            && !tuples.is_empty()
+        {
+            // Off the publish path: the graph is fed after the batch is
+            // durable, and never delays the next flush.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = emitter.emit(&tuples).await {
+                        tracing::warn!(
+                            error = %e,
+                            "graph emit after flush failed; the sweep re-derives these tuples \
+                             (RFC 0047 §3.3)"
+                        );
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    "graph emit after flush skipped: no runtime handle; the sweep re-derives \
+                     these tuples (RFC 0047 §3.3)"
+                );
+            }
+        }
+        published
     }
 
     /// The record sink handle (for the receiver's existing flush/snapshot paths).

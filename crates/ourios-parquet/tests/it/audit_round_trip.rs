@@ -150,6 +150,22 @@ fn denied_event(tenant: &str) -> AuditEvent {
     }
 }
 
+/// A `conversation_erased` event (RFC 0047 §3.6): the tenant on the
+/// envelope, the erased conversation and the pass's counts in the
+/// `erasure_*` columns.
+fn erased_event(tenant: &str) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(1_775_127_540),
+        payload: AuditPayload::ConversationErased {
+            conversation_id: "c-7".to_string(),
+            partitions_rewritten: 3,
+            rows_dropped: 12,
+            tuples_deleted: 4,
+        },
+    }
+}
+
 fn audit_partition_for(event: &AuditEvent) -> PartitionKey {
     // Audit partitioning shares the data-side `PartitionKey`
     // shape; the writer/reader compare only tenant + year/month/
@@ -240,6 +256,31 @@ fn rfc0026_ingest_denied_audit_event_round_trips() {
         round_tripped, events,
         "denial + quarantine rows round-trip exactly"
     );
+}
+
+/// RFC 0047 §3.6 — the `conversation_erased` audit event round-trips: kind
+/// 9, the tenant on the envelope, the id and counts in the `erasure_*`
+/// columns, every other payload column NULL — next to a denial and a
+/// compaction row so the null discipline holds across kinds.
+#[test]
+fn rfc0047_conversation_erased_audit_event_round_trips() {
+    let bucket = TempDir::new().unwrap();
+    let events = vec![
+        erased_event("acme"),
+        denied_event("acme"),
+        compaction_event("acme"),
+    ];
+    let partition = audit_partition_for(&events[0]);
+
+    let mut writer = AuditWriter::open(bucket.path(), partition.clone()).expect("open");
+    writer.append_events(&events).expect("append");
+    let written = writer.close().expect("close");
+
+    let reader = AuditReader::open_partition(&written.path, partition).expect("open_partition");
+    let round_tripped = reader.read_all().expect("read_all");
+    assert_eq!(round_tripped, events, "erasure rows round-trip exactly");
+    assert_eq!(round_tripped[0].payload.event_kind(), 9);
+    assert_eq!(round_tripped[0].payload.event_type(), "conversation_erased");
 }
 
 /// `AuditReader::open_bytes` reads an audit file from in-memory bytes — the

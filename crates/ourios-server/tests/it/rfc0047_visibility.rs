@@ -60,8 +60,13 @@ fn recent_ns(offset: u64) -> u64 {
 }
 
 /// One `acme` row in `conversation` with the given `user.hash`, a content
-/// attribute, a model and a $1.50 cost.
-fn row(i: u64, conversation: &str, user: &str) -> MinedRecord {
+/// attribute, a model and a $1.50 cost, timestamped a minute ago.
+pub(crate) fn row(i: u64, conversation: &str, user: &str) -> MinedRecord {
+    row_at(recent_ns(i), conversation, user)
+}
+
+/// [`row`] at an explicit timestamp.
+pub(crate) fn row_at(time_unix_nano: u64, conversation: &str, user: &str) -> MinedRecord {
     MinedRecord {
         tenant_id: TenantId::new("acme"),
         template_id: 1,
@@ -73,7 +78,7 @@ fn row(i: u64, conversation: &str, user: &str) -> MinedRecord {
         scope_attributes: Vec::new(),
         resource_schema_url: None,
         scope_schema_url: None,
-        time_unix_nano: recent_ns(i),
+        time_unix_nano,
         observed_time_unix_nano: None,
         attributes: vec![
             kv("gen_ai.conversation.id", conversation),
@@ -100,7 +105,7 @@ fn row(i: u64, conversation: &str, user: &str) -> MinedRecord {
     }
 }
 
-fn promoted() -> PromotedAttributes {
+pub(crate) fn promoted() -> PromotedAttributes {
     PromotedAttributes::new_typed(
         [],
         [
@@ -115,7 +120,7 @@ fn promoted() -> PromotedAttributes {
     )
 }
 
-fn write_records(bucket: &Path, recs: &[MinedRecord]) {
+pub(crate) fn write_records(bucket: &Path, recs: &[MinedRecord]) {
     let store = Store::local(bucket).expect("local store");
     let mut by_part: HashMap<PartitionKey, Vec<MinedRecord>> = HashMap::new();
     for r in recs {
@@ -133,7 +138,7 @@ fn write_records(bucket: &Path, recs: &[MinedRecord]) {
 }
 
 /// `POST /v1/query` with a bearer and tenant; returns (status, JSON body).
-async fn query(
+pub(crate) async fn query(
     http: &reqwest::Client,
     addr: std::net::SocketAddr,
     bearer: &str,
@@ -227,7 +232,7 @@ async fn mcp_call(
 }
 
 /// The sorted conversation ids of a row response.
-fn conversations(body: &serde_json::Value) -> Vec<String> {
+pub(crate) fn conversations(body: &serde_json::Value) -> Vec<String> {
     let mut ids: Vec<String> = body["records"]
         .as_array()
         .expect("records")

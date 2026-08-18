@@ -621,6 +621,10 @@ mapping:
 | `3` | `compaction` | `Compaction` | RFC 0009 §3.6 (amendment 2026-06-03) |
 | `4` | `alias_asserted` | `AliasAsserted` | RFC 0001 §6.7 (amendment 2026-06-12) |
 | `5` | `alias_retracted` | `AliasRetracted` | RFC 0001 §6.7 (amendment 2026-06-12) |
+| `6` | `template_created` | `Template { change: Created }` | RFC 0017 §3.1 |
+| `7` | `record_quarantined` | `RecordQuarantined` | RFC 0025 §3.3 |
+| `8` | `ingest_denied` | `IngestDenied` | RFC 0026 §3.4 |
+| `9` | `conversation_erased` | `ConversationErased` | RFC 0047 §3.6 (amendment 2026-08-18: OPTIONAL `erasure_conversation_id` / `erasure_partitions` / `erasure_rows` / `erasure_tuples` columns, NULL for every other kind) |
 
 Adding a new ordinal is a §3.8 additive amendment; the mapping
 table is the source of truth and a new ordinal lands as a new

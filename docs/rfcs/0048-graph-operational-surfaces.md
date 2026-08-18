@@ -186,11 +186,14 @@ accident.
 **Backfill and erasure exclude each other.** Idempotent writes alone do
 not make backfill safe beside an erasure: a partition read before the
 erasure and written after it would recreate the erased conversation's
-tuples. So the two hold each other off through the store: backfill begins
-by creating (create-if-absent) a **lock marker** `backfill/tenant_id=<enc>` (the RFC 0005 §3.4 path encoding, like the erasure marker)
-and refuses to start when any erasure marker for the tenant is pending
-("erasures pending for `acme`; run again after the next sweep"); the
-sweep's erasure pass skips a tenant whose backfill lock exists (recorded
+tuples. So the two hold each other off through the store: backfill first
+checks for pending erasure markers and refuses to start when any exists
+for the tenant ("erasures pending for `acme`; run again after the next
+sweep") — leaving **no** lock behind — then creates (create-if-absent) a
+**lock marker** `backfill/tenant_id=<enc>` (the RFC 0005 §3.4 path
+encoding, like the erasure marker) and re-checks the erasure markers once
+more under the lock, removing the lock and refusing if one appeared in
+between; the sweep's erasure pass skips a tenant whose backfill lock exists (recorded
 in the sweep report, retried next sweep); backfill removes its lock on
 completion, and `graph backfill --unlock --tenant T` clears a lock a
 crashed run left behind (the operator's call, logged). Both markers are
@@ -309,7 +312,8 @@ Scenario ids `RFC0048.<n>`.
 > **RFC0048.8 — backfill and erasure exclude each other.** Given a pending
 > erasure marker for tenant `T`, When `graph backfill --tenant T` runs,
 > Then it refuses before reading any partition, naming the pending
-> erasure; And Given a backfill lock for `T`, When a sweep runs with an
+> erasure, and leaves **no** backfill lock behind (`graph erasures` lists
+> only the erasure); And Given a backfill lock for `T`, When a sweep runs with an
 > erasure marker for `T`, Then the erasure is skipped and reported (not
 > advanced), and after the lock is removed the next sweep completes it;
 > And Given a backfill that finished, Then its lock is gone and

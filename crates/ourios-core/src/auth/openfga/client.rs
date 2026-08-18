@@ -99,6 +99,12 @@ pub enum OpenFgaError {
     /// A streamed enumeration was cut off (timeout mid-stream) — a
     /// partial set is never accepted as an answer.
     Incomplete,
+    /// An erasure re-read the object `rounds` times and it was still
+    /// non-empty — something keeps writing it; retried by the next sweep.
+    EraseIncomplete {
+        /// The rounds run before giving up.
+        rounds: usize,
+    },
 }
 
 impl fmt::Display for OpenFgaError {
@@ -130,6 +136,11 @@ impl fmt::Display for OpenFgaError {
                 )
             }
             Self::Incomplete => f.write_str("openfga: enumeration incomplete (stream cut off)"),
+            Self::EraseIncomplete { rounds } => write!(
+                f,
+                "openfga: object still has tuples after {rounds} read/delete rounds (still being \
+                 written?); retried next sweep"
+            ),
         }
     }
 }

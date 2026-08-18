@@ -167,6 +167,80 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
         .await
         .expect("missing delete ignored");
 
+    // Object naming on the real server: a tenant containing `/` and `%`
+    // percent-encodes its segment (`TenantObjects`); the stored object id
+    // comes back byte-for-byte from `Read` and the streamed enumeration
+    // filters on the encoded prefix — `a` and `a/b` never alias.
+    {
+        use ourios_core::auth::openfga::{ListObjectsRequest, TenantObjects};
+        let a = TenantObjects::new("a").expect("valid");
+        let ab = TenantObjects::new("a/b").expect("valid");
+        let pct = TenantObjects::new("100%").expect("valid");
+        let seeded = [
+            tuple("user:zoe", "participant", &a.conversation("b/c-1")),
+            tuple("user:zoe", "participant", &ab.conversation("c-1")),
+            tuple("user:zoe", "participant", &pct.conversation("c-2")),
+        ];
+        fga.write(&seeded, &[])
+            .await
+            .expect("write encoded objects");
+        for tuple in &seeded {
+            let read = fga.read_by_object(&tuple.object).await.expect("read");
+            assert_eq!(read, vec![tuple.clone()], "byte-for-byte: {}", tuple.object);
+        }
+        let list = |prefix: String| {
+            let fga = fga.clone();
+            async move {
+                fga.streamed_list_objects(
+                    ListObjectsRequest {
+                        user: "user:zoe",
+                        relation: "can_read_content",
+                        object_type: "conversation",
+                        contextual_tuples: &[],
+                    },
+                    Duration::from_secs(2),
+                    100,
+                    |object| object.starts_with(&prefix),
+                )
+                .await
+                .expect("stream")
+            }
+        };
+        assert_eq!(
+            list(a.conversation_prefix().to_string()).await,
+            vec![a.conversation("b/c-1")]
+        );
+        assert_eq!(
+            list(ab.conversation_prefix().to_string()).await,
+            vec![ab.conversation("c-1")]
+        );
+        assert_eq!(
+            list(pct.conversation_prefix().to_string()).await,
+            vec![pct.conversation("c-2")]
+        );
+        fga.write(&[], &seeded).await.expect("cleanup");
+        for tuple in &seeded {
+            assert!(
+                fga.read_by_object(&tuple.object)
+                    .await
+                    .expect("read")
+                    .is_empty(),
+                "deleted: {}",
+                tuple.object
+            );
+        }
+        for prefix in [
+            a.conversation_prefix(),
+            ab.conversation_prefix(),
+            pct.conversation_prefix(),
+        ] {
+            assert!(
+                list(prefix.to_string()).await.is_empty(),
+                "stream empty after cleanup: {prefix}"
+            );
+        }
+    }
+
     // --- Issuer + server ---------------------------------------------------
     let (encoding, jwk) = make_key("key-1");
     let issuer = serve_issuer(jwk).await;

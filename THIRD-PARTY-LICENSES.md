@@ -8246,7 +8246,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `h2` 0.4.15 — <https://github.com/hyperium/h2>
+- `h2` 0.4.16 — <https://github.com/hyperium/h2>
 
 <details>
 <summary>Full license text</summary>

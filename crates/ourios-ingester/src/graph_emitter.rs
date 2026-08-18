@@ -33,6 +33,11 @@ pub const WRITE_CHUNK: usize = 100;
 pub const USER_KEYS: [&str; 2] = ["user.hash", "enduser.pseudo.id"];
 /// The agent-identity attribute key the emitter reads (RFC 0047 §3.3).
 pub const AGENT_KEY: &str = "gen_ai.agent.id";
+/// How many `Read → delete` rounds an erasure runs before giving up: a
+/// paginated `Read` is not a snapshot, so tuples written concurrently (the
+/// flush-cadence feed) are swept up by re-reading until the object is
+/// empty; a writer that never stops is a bug, not something to spin on.
+const ERASE_ROUNDS: usize = 8;
 
 const OPERATION_WRITE: &str = "write";
 const OPERATION_DELETE: &str = "delete";
@@ -221,14 +226,19 @@ impl GraphEmitter {
     }
 
     /// Erase a conversation from the graph (RFC 0047 §3.6): read the
-    /// object's tuples, delete them in ≤ 100-tuple batches. Returns the
-    /// number deleted. Call **after** the Parquet rewrite that dropped the
-    /// rows — a dangling tuple is harmless, a dangling row is a leak.
+    /// object's tuples, delete them in ≤ 100-tuple batches, and repeat
+    /// until a `Read` comes back empty — a paginated `Read` is not a
+    /// snapshot, so a tuple the flush-cadence feed writes concurrently is
+    /// swept up by the next round. Returns the number deleted. Call
+    /// **after** the Parquet rewrite that dropped the rows — a dangling
+    /// tuple is harmless, a dangling row is a leak.
     ///
     /// # Errors
     ///
-    /// [`OpenFgaError`] from the read or a failed batch; the erasure is
-    /// retried by the next sweep (deletes are idempotent).
+    /// [`OpenFgaError`] from a read or a failed batch, or
+    /// [`OpenFgaError::EraseIncomplete`] when the object is still non-empty
+    /// after `ERASE_ROUNDS` rounds (something keeps writing it); the erasure
+    /// is retried by the next sweep (deletes are idempotent).
     pub async fn erase_conversation(&self, tenant: &str, id: &str) -> Result<usize, OpenFgaError> {
         let objects = TenantObjects::new(tenant).ok_or(OpenFgaError::InvalidTenant)?;
         // A conversation the emitter could never have named has no tuples
@@ -236,28 +246,38 @@ impl GraphEmitter {
         if !objects.conversation_fits(id) {
             return Ok(0);
         }
-        let tuples = self
-            .client
-            .read_by_object(&objects.conversation(id))
-            .await?;
+        let object = objects.conversation(id);
         let mut deleted = 0;
-        for chunk in tuples.chunks(WRITE_CHUNK) {
-            match self.client.write(&[], chunk).await {
-                Ok(()) => {
-                    self.record(OPERATION_DELETE, chunk.len(), None);
-                    deleted += chunk.len();
-                }
-                Err(e) => {
-                    self.record(
-                        OPERATION_DELETE,
-                        chunk.len(),
-                        Some(ERROR_TYPE_UPSTREAM_UNAVAILABLE),
-                    );
-                    return Err(e);
+        for round in 0..=ERASE_ROUNDS {
+            let tuples = self.client.read_by_object(&object).await?;
+            if tuples.is_empty() {
+                return Ok(deleted);
+            }
+            // The last read is a confirmation only: a delete round that
+            // emptied the object is a success, not an `EraseIncomplete`.
+            if round == ERASE_ROUNDS {
+                break;
+            }
+            for chunk in tuples.chunks(WRITE_CHUNK) {
+                match self.client.write(&[], chunk).await {
+                    Ok(()) => {
+                        self.record(OPERATION_DELETE, chunk.len(), None);
+                        deleted += chunk.len();
+                    }
+                    Err(e) => {
+                        self.record(
+                            OPERATION_DELETE,
+                            chunk.len(),
+                            Some(ERROR_TYPE_UPSTREAM_UNAVAILABLE),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
-        Ok(deleted)
+        Err(OpenFgaError::EraseIncomplete {
+            rounds: ERASE_ROUNDS,
+        })
     }
 
     fn record(&self, operation: &'static str, count: usize, error_type: Option<&'static str>) {
@@ -286,6 +306,8 @@ pub type SharedGraphEmitter = Arc<GraphEmitter>;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use ourios_core::auth::openfga::{OpenFgaSpec, TupleKey, build_openfga_config};
     use ourios_core::otlp::any_value::Value;
     use ourios_core::otlp::{AnyValue, KeyValue};
@@ -356,6 +378,185 @@ mod tests {
 
     fn t(user: &str, relation: &str, object: &str) -> TupleKey {
         TupleKey::new(user, relation, object)
+    }
+
+    /// A fake graph for the erase loop: `/read` answers from a script of
+    /// per-round tuple lists (the last entry repeats), `/write` records
+    /// each delete batch.
+    mod erase_fake {
+        use std::sync::{Arc, Mutex};
+
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::post;
+        use ourios_core::auth::openfga::TupleKey;
+
+        #[derive(Clone)]
+        pub(super) struct Fake {
+            /// What `/read` returns on successive calls (last repeats).
+            pub(super) reads: Arc<Vec<Vec<TupleKey>>>,
+            pub(super) read_calls: Arc<Mutex<usize>>,
+            pub(super) delete_batches: Arc<Mutex<Vec<usize>>>,
+        }
+
+        async fn read(State(fake): State<Fake>) -> ([(&'static str, &'static str); 1], String) {
+            let mut calls = fake.read_calls.lock().expect("lock");
+            let idx = (*calls).min(fake.reads.len() - 1);
+            *calls += 1;
+            let tuples: Vec<serde_json::Value> = fake.reads[idx]
+                .iter()
+                .map(|t| serde_json::json!({ "key": t }))
+                .collect();
+            (
+                [("content-type", "application/json")],
+                serde_json::json!({ "tuples": tuples, "continuation_token": "" }).to_string(),
+            )
+        }
+
+        async fn write(
+            State(fake): State<Fake>,
+            body: axum::body::Bytes,
+        ) -> ([(&'static str, &'static str); 1], String) {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            if let Some(keys) = request["deletes"]["tuple_keys"].as_array() {
+                assert!(keys.len() <= 100);
+                fake.delete_batches.lock().expect("lock").push(keys.len());
+            }
+            ([("content-type", "application/json")], "{}".to_string())
+        }
+
+        pub(super) async fn serve(fake: Fake) -> String {
+            let app = Router::new()
+                .route("/stores/{store}/read", post(read))
+                .route("/stores/{store}/write", post(write))
+                .with_state(fake);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let url = format!("http://{}", listener.local_addr().expect("addr"));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            url
+        }
+    }
+
+    fn emitter_at(url: &str) -> GraphEmitter {
+        use ourios_core::auth::openfga::{VisibilityObjectSpec, VisibilitySpec};
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(url.to_string()),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("2".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("config");
+        GraphEmitter::from_config(&config)
+            .expect("client")
+            .expect("conversation bound")
+    }
+
+    async fn erase_with(
+        reads: Vec<Vec<TupleKey>>,
+    ) -> (
+        Result<usize, ourios_core::auth::openfga::OpenFgaError>,
+        Vec<usize>,
+        usize,
+    ) {
+        let fake = erase_fake::Fake {
+            reads: Arc::new(reads),
+            read_calls: Arc::new(Mutex::new(0)),
+            delete_batches: Arc::new(Mutex::new(Vec::new())),
+        };
+        let url = erase_fake::serve(fake.clone()).await;
+        let result = emitter_at(&url).erase_conversation("acme", "c-1").await;
+        let batches = fake.delete_batches.lock().expect("lock").clone();
+        let reads = *fake.read_calls.lock().expect("lock");
+        (result, batches, reads)
+    }
+
+    /// RFC 0047 §3.6 erase loop contract: an empty first read deletes
+    /// nothing; a large object is deleted in ≤ 100 chunks and confirmed by
+    /// a final empty read; tuples that reappear (a concurrent writer) are
+    /// swept by later rounds; a round that empties the object on the last
+    /// permitted round is a success; only an object still non-empty after
+    /// the rounds is `EraseIncomplete`; a conversation that can never be a
+    /// graph object is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn erase_loop_reads_until_empty() {
+        use ourios_core::auth::openfga::OpenFgaError;
+        let big: Vec<TupleKey> = (0..250)
+            .map(|i| {
+                t(
+                    &format!("user:u{i}"),
+                    "participant",
+                    "conversation:acme/c-1",
+                )
+            })
+            .collect();
+
+        let (result, batches, reads) = erase_with(vec![vec![]]).await;
+        assert_eq!(result.expect("ok"), 0);
+        assert!(batches.is_empty());
+        assert_eq!(reads, 1, "one confirming read");
+
+        let (result, batches, reads) = erase_with(vec![big.clone(), vec![]]).await;
+        assert_eq!(result.expect("ok"), 250);
+        assert_eq!(batches, [100, 100, 50], "chunked");
+        assert_eq!(reads, 2, "read, delete, read-empty");
+
+        // A concurrent writer: tuples reappear twice, then stop.
+        let (result, batches, _) = erase_with(vec![
+            big[..3].to_vec(),
+            big[3..5].to_vec(),
+            big[5..6].to_vec(),
+            vec![],
+        ])
+        .await;
+        assert_eq!(result.expect("ok"), 6);
+        assert_eq!(batches, [3, 2, 1]);
+
+        // Emptied exactly on the last permitted round: success.
+        let mut script: Vec<Vec<TupleKey>> = (0..super::ERASE_ROUNDS)
+            .map(|_| big[..1].to_vec())
+            .collect();
+        script.push(vec![]);
+        let (result, batches, reads) = erase_with(script).await;
+        assert_eq!(result.expect("ok"), super::ERASE_ROUNDS);
+        assert_eq!(batches.len(), super::ERASE_ROUNDS);
+        assert_eq!(reads, super::ERASE_ROUNDS + 1);
+
+        // Never empties: EraseIncomplete after the rounds, no more deletes.
+        let (result, batches, _) = erase_with(vec![big[..1].to_vec()]).await;
+        assert_eq!(
+            result.expect_err("still writing"),
+            OpenFgaError::EraseIncomplete {
+                rounds: super::ERASE_ROUNDS
+            }
+        );
+        assert_eq!(batches.len(), super::ERASE_ROUNDS);
+
+        // Not a graph object: nothing read, nothing deleted.
+        let fake = erase_fake::Fake {
+            reads: Arc::new(vec![big.clone()]),
+            read_calls: Arc::new(Mutex::new(0)),
+            delete_batches: Arc::new(Mutex::new(Vec::new())),
+        };
+        let url = erase_fake::serve(fake.clone()).await;
+        assert_eq!(
+            emitter_at(&url)
+                .erase_conversation("acme", "has space")
+                .await
+                .expect("ok"),
+            0
+        );
+        assert_eq!(*fake.read_calls.lock().expect("lock"), 0);
     }
 
     /// RFC0047.10 (derivation): the §3.3 table — parent per conversation,

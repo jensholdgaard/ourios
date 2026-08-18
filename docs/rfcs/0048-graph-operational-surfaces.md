@@ -99,10 +99,14 @@ Consequences, in order:
 - RFC 0046's "non-ASCII reachable over HTTP but not gRPC" caveat
   disappears — the grammar is ASCII everywhere.
 - The 256-byte selector bound tightens to 128: OpenFGA caps the **full
-  object string** (`conversation:<T>/<id>`) at 256 bytes, so a 128-byte
-  tenant leaves 256 − 13 (`conversation:`) − 128 − 1 (`/`) = **114 bytes**
-  for the conversation id. Pre-production, this is a `!` change with no
-  dual-read (`feedback: break persisted layouts pre-production`); the
+  object string** (`conversation:<T>/<id>`) at 256 — the proto constraint
+  is `^[^\s]{2,256}$` on the whole `type:id` string (openfga/openfga
+  discussion #302; the docs AI confirms the cap includes the type prefix
+  and the colon) — so a 128-byte tenant leaves 256 − 13 (`conversation:`)
+  − 128 − 1 (`/`) = **114 bytes** for the conversation id. Whether the
+  cap counts bytes or characters is not documented; the grammar here is
+  ASCII-only, so the two coincide and the question cannot bite.
+  Pre-production, this is a `!` change with no dual-read (`feedback: break persisted layouts pre-production`); the
   percent-encoding of the *storage path* (`data/tenant_id=<enc>`, RFC 0005
   §3.4) is untouched — it is a path rule, not a grammar.
 - **Conversation ids** keep the *object-id* grammar, not the tenant
@@ -334,6 +338,19 @@ container tests keep passing unchanged except for the encoding assertions,
 which flip to the verbatim form.
 
 ## 7. Open questions
+
+- [ ] **Streamed deadline truncation is silent-until-proven-otherwise** —
+      the docs confirm `OPENFGA_LIST_OBJECTS_DEADLINE` applies to the
+      streamed endpoint (and `…_MAX_RESULTS` does not — the reason §3.4 of
+      RFC 0047 chose it), but say nothing about *how* deadline expiry ends
+      the stream: an NDJSON error frame (which the client already turns
+      into a fail-closed refusal) or a clean EOF (which the client reads
+      as complete — a truncated scoped set would then present as the full
+      one; visibility only narrows, never widens, but the partiality is
+      silent). The §3.6 implementation must pin this empirically: run a
+      real server with a deliberately tiny deadline and assert what
+      arrives on the wire, then either rely on the error frame or add a
+      completion check. (Docs-AI consult, 2026-08-19.)
 
 - [ ] **Grammar strictness** — 128 bytes and ASCII graphic minus three
       characters is deliberately tight; is there a known deployment that

@@ -98,13 +98,22 @@ Consequences, in order:
   and stays only as the library's own guard.
 - RFC 0046's "non-ASCII reachable over HTTP but not gRPC" caveat
   disappears — the grammar is ASCII everywhere.
-- The 256-byte selector bound tightens to 128: object ids are capped at
-  256 and a conversation id must fit next to the tenant with the
-  separator; 128 leaves the other half for the id. Pre-production, this
-  is a `!` change with no dual-read (`feedback: break persisted layouts
-  pre-production`); the percent-encoding of the *storage path*
-  (`data/tenant_id=<enc>`, RFC 0005 §3.4) is untouched — it is a path
-  rule, not a grammar.
+- The 256-byte selector bound tightens to 128: OpenFGA caps the **full
+  object string** (`conversation:<T>/<id>`) at 256 bytes, so a 128-byte
+  tenant leaves 256 − 13 (`conversation:`) − 128 − 1 (`/`) = **114 bytes**
+  for the conversation id. Pre-production, this is a `!` change with no
+  dual-read (`feedback: break persisted layouts pre-production`); the
+  percent-encoding of the *storage path* (`data/tenant_id=<enc>`, RFC 0005
+  §3.4) is untouched — it is a path rule, not a grammar.
+- **Conversation ids** keep the *object-id* grammar, not the tenant
+  grammar: 1 byte or more of ASCII graphic characters excluding `:` and
+  `#` (so `/` is allowed — a raw `gen_ai.conversation.id` may contain it),
+  and the full `conversation:<T>/<id>` string ≤ 256 bytes. One function
+  (`TenantObjects::conversation_fits`) is the rule; the emitter skips a row
+  whose id does not fit, the planner never sees such an id (the graph
+  cannot hold it), the erasure path erases its rows and deletes zero
+  tuples, and the CLI (§3.3) applies the *tenant* grammar to `--tenant`
+  and this object-id grammar to `--conversation`.
 
 ### 3.2 Identity keys as configuration (amends RFC 0047 §3.3)
 
@@ -138,7 +147,7 @@ The RFC 0047 store marker stays the **durable primitive and the only
 channel** — the compactor acts on markers and nothing else — and gains an
 operator front door:
 
-```
+```text
 ourios-server graph erase   --tenant acme --conversation c-7      # writes the marker
 ourios-server graph erasures [--tenant acme]                       # lists pending markers + phase
 ```
@@ -159,24 +168,44 @@ tuples deleted.
 
 ### 3.4 Backfill (amends RFC 0047 §3.3)
 
-```
-ourios-server graph backfill --tenant acme [--from 2026-08-01]  # one-off, resumable
+```text
+ourios-server graph backfill --tenant acme [--from 2026-08-01T00:00:00Z]  # one-off, resumable
 ```
 
-Reads every data partition of the tenant (optionally from a date), offers
-every row to the emitter, and writes the derived tuples in ≤ 100-tuple
-idempotent batches — the same code path as the sweep's observer, driven
-over all partitions instead of the ones being rewritten. It never rewrites
-Parquet. Resumable by construction (every write is idempotent); progress
-is one structured event per partition and `ourios.graph.tuples`. Runs as a
-subcommand, not a daemon mode, so it cannot be left on by accident.
+Reads every data partition of the tenant — `--from` (RFC 3339, UTC)
+selects partitions whose **hour start ≥ `from`**, a half-open
+`[from, ∞)` on the partition key, so a whole hour is either in or out —
+offers every row to the emitter, and writes the derived tuples in ≤ 100-
+tuple idempotent batches — the same code path as the sweep's observer,
+driven over all partitions instead of the ones being rewritten. It never
+rewrites Parquet. Resumable by construction (every write is idempotent);
+progress is one structured event per partition and `ourios.graph.tuples`.
+Runs as a subcommand, not a daemon mode, so it cannot be left on by
+accident.
 
-### 3.5 Contextual tuples — the trusted carriers (amends RFC 0047 §3.3)
+**Backfill and erasure exclude each other.** Idempotent writes alone do
+not make backfill safe beside an erasure: a partition read before the
+erasure and written after it would recreate the erased conversation's
+tuples. So the two hold each other off through the store: backfill begins
+by creating (create-if-absent) a **lock marker** `backfill/tenant_id=<T>`
+and refuses to start when any erasure marker for the tenant is pending
+("erasures pending for `acme`; run again after the next sweep"); the
+sweep's erasure pass skips a tenant whose backfill lock exists (recorded
+in the sweep report, retried next sweep); backfill removes its lock on
+completion, and `graph backfill --unlock --tenant T` clears a lock a
+crashed run left behind (the operator's call, logged). Both markers are
+listed by `graph erasures`.
+
+### 3.5 Contextual tuples — the trusted carrier (amends RFC 0047 §3.3)
 
 The request-carried bridge is **rejected**. Contextual tuples reach the
-graph from exactly two carriers, both trusted by construction: the OIDC
+graph from exactly one carrier in v1, trusted by construction: the OIDC
 group claim (`team:<group>#member@<principal>`, minted by the identity
-provider — RFC 0047 §3.1) and nothing else in v1. Freshness for a
+provider — RFC 0047 §3.1). The client API enforces it: `check` and
+`streamed_list_objects` take a `ContextualTuples` newtype whose only
+constructor is the group-claim path (`OpenFgaResolver::group_tuples`,
+which validates every group as an object id and applies the 100 cap) —
+no caller can hand the client an arbitrary tuple. Freshness for a
 conversation whose tuples have not landed is the self fast path (data-
 verified) and the flush-cadence emit (seconds). RFC 0047 §3.3(b) and the
 corresponding RFC0047.5 arm are struck; RFC 0047 §7's open item closes.
@@ -224,11 +253,13 @@ Scenario ids `RFC0048.<n>`.
 > `INVALID_ARGUMENT` at request boundaries, a startup error in config, an
 > unverifiable token for the claim).
 
-> **RFC0048.2 — no encoding.** Given the grammar, When the emitter and the
-> planner name a conversation, Then the object is `conversation:<T>/<id>`
-> with `T` verbatim (asserted against a real OpenFGA: write, `Read`
-> byte-for-byte, streamed prefix filter), and `TenantObjects` has no
-> encoding step.
+> **RFC0048.2 — no encoding, one byte budget.** Given the grammar, When
+> the emitter and the planner name a conversation, Then the object is
+> `conversation:<T>/<id>` with `T` verbatim (asserted against a real
+> OpenFGA: write, `Read` byte-for-byte, streamed prefix filter), and
+> `TenantObjects` has no encoding step; And Given a 128-byte tenant, Then a
+> 114-byte conversation id fits and a 115-byte one is skipped by the
+> emitter (never sent), and an id containing `/` fits.
 
 > **RFC0048.3 — identity keys are configuration.** Given
 > `identities.user_columns: [attr.enduser.id]` and
@@ -255,13 +286,19 @@ Scenario ids `RFC0048.<n>`.
 > it sees no rows; When `graph backfill --tenant T` runs, Then the graph
 > holds the RFC0047.10 tuples for every partition (writes ≤ 100 per batch),
 > the principal sees exactly its rows, a second run writes nothing new,
-> and no Parquet file was rewritten.
+> and no Parquet file was rewritten; And Given `--from` at an hour
+> boundary, Then partitions whose hour starts at or after it are fed and
+> earlier ones are not.
 
 > **RFC0048.6 — the request bridge is gone.** Given a scoped principal and
 > a request that attempts to carry a contextual `participant` tuple for a
 > conversation it holds no grant on, When it queries, Then no such tuple is
 > sent to the graph (asserted on the fake's request log) and the rows do
-> not return; And RFC 0047 §3.3(b) and the RFC0047.5 arm read as struck.
+> not return; And Given the client API, Then `check` /
+> `streamed_list_objects` accept only the `ContextualTuples` newtype and
+> its sole constructor is the validated group-claim path (a compile-time
+> property, exercised by the resolver tests); And RFC 0047 §3.3(b) and the
+> RFC0047.5 arm read as struck.
 
 > **RFC0048.7 — the deadline assumption is loud.** Given `auth.openfga`
 > configured, When the server starts, Then one
@@ -269,16 +306,26 @@ Scenario ids `RFC0048.<n>`.
 > `server_list_objects_deadline_ms`, and (RFC 0047) a `list_timeout_ms` not
 > below the deadline is still a startup error.
 
+> **RFC0048.8 — backfill and erasure exclude each other.** Given a pending
+> erasure marker for tenant `T`, When `graph backfill --tenant T` runs,
+> Then it refuses before reading any partition, naming the pending
+> erasure; And Given a backfill lock for `T`, When a sweep runs with an
+> erasure marker for `T`, Then the erasure is skipped and reported (not
+> advanced), and after the lock is removed the next sweep completes it;
+> And Given a backfill that finished, Then its lock is gone and
+> `graph erasures` lists neither.
+
 ## 6. Testing strategy
 
 Unit: the grammar as one function with a table test (each boundary calls
 it — the test asserts every boundary routes through it, RFC0048.1); config
 validation for `identities` (RFC0048.3); `TenantObjects` without encoding
 (RFC0048.2). Integration (`ourios-server` `it/`, the RFC 0047 container
-harness): RFC0048.2 and RFC0048.5 against a real OpenFGA; RFC0048.4 by
-spawning the subcommands against a temp store and asserting the marker,
-the listing and the sweep's completion event; RFC0048.6 on the fake
-(request log); RFC0048.7 on the served binary's stdout/log. The RFC 0047
+harness): RFC0048.2 and RFC0048.5 against a real OpenFGA; RFC0048.4 and
+RFC0048.8 by spawning the subcommands against a temp store and asserting
+the markers, the listing, the refusal and the sweep's completion/skip
+events; RFC0048.6 on the fake (request log) plus the newtype's
+constructor visibility; RFC0048.7 on the served binary's stdout/log. The RFC 0047
 container tests keep passing unchanged except for the encoding assertions,
 which flip to the verbatim form.
 
@@ -290,9 +337,10 @@ which flip to the verbatim form.
       additive, tightening later is not.)
 - [ ] **`graph erasures` output shape** — table for humans, `--json` for
       tooling; both, or JSON only?
-- [ ] **Backfill and the receiver's flush cadence** — should the backfill
-      verb refuse to run while a receiver is live on the same store, or is
-      idempotency enough? (Leaning: idempotency is enough.)
+- [ ] **Backfill and the receiver's flush cadence** — the flush emit and
+      backfill only ever *add* the same idempotent tuples, so no exclusion
+      is needed there (unlike erasure, §3.4); confirm nothing else writes
+      the graph concurrently before closing.
 
 ## 8. References
 

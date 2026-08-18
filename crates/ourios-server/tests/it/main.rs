@@ -33,5 +33,6 @@ mod rfc0039_1_query_propagation;
 mod rfc0039_4_sampling;
 mod rfc0043_5_event_name_query;
 mod rfc0046_out_of_band_tenancy;
+mod rfc0047_9_tool_gate;
 mod rfc0047_openfga;
 mod rfc0047_visibility;

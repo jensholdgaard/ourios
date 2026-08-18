@@ -196,12 +196,17 @@ async fn mcp_call(
         .and_then(|v| v.to_str().ok())
         .expect("session id")
         .to_string();
-    post(
+    let initialized = post(
         Some(session.clone()),
         serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     )
     .await
     .expect("initialized");
+    assert!(
+        initialized.status().is_success(),
+        "initialized notification: {}",
+        initialized.status()
+    );
     let call = post(
         Some(session),
         serde_json::json!({
@@ -211,6 +216,7 @@ async fn mcp_call(
     )
     .await
     .expect("tools/call");
+    assert_eq!(call.status().as_u16(), 200, "tools/call {tool}");
     let body = call.text().await.expect("body");
     let payload = body
         .lines()
@@ -539,19 +545,20 @@ async fn rfc0047_4_to_9_visibility_end_to_end() {
         ["c-3", "c-4"],
         "and its data access is scoped exactly as the JSON API's"
     );
-    let payload = mcp_call(
-        &http,
-        querier,
-        &bot,
-        "template_drift",
-        serde_json::json!({"tenant": "acme", "from": "-1h", "to": "now"}),
-    )
-    .await;
-    let message = payload["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("permission denied") && message.contains("template_drift"),
-        "the denial names the tool: {payload}"
-    );
+    for (tool, args) in [
+        (
+            "template_drift",
+            serde_json::json!({"tenant": "acme", "from": "-1h", "to": "now"}),
+        ),
+        ("list_templates", serde_json::json!({"tenant": "acme"})),
+    ] {
+        let payload = mcp_call(&http, querier, &bot, tool, args).await;
+        let message = payload["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("permission denied") && message.contains(tool),
+            "the denial names the tool: {payload}"
+        );
+    }
     let payload = mcp_call(
         &http,
         querier,

@@ -57,7 +57,7 @@ pub(crate) async fn mcp_post(
 /// Drive the full MCP handshake and one `tools/call` against `router`
 /// (cloned per request — the session manager is shared behind an `Arc`).
 /// Returns the tool's JSON-RPC response body text.
-async fn mcp_tool_call(
+pub(crate) async fn mcp_tool_call(
     router: &Router,
     bearer: Option<&str>,
     tool: &str,

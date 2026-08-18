@@ -11,12 +11,12 @@ superseded-by: —
 
 # RFC 0047 — ReBAC resolver and graph-fed visibility
 
-> **Status: `red` (2026-08-18).** Slices 1–2 are green: RFC0047.1–.3
-> (the layer-1 resolver) and RFC0047.4–.8 (the planner two-step, masking,
-> bounded enumeration) pass on the served binary against a real OpenFGA
-> container (`openfga-resolver` CI job) with the in-tree model; RFC0047.12
-> gates CI. RFC0047.9–.11 (tool gate, emitter, erasure) are the remaining
-> slices; the RFC0047.5 request-carried contextual-tuple arm is deferred
+> **Status: `red` (2026-08-18).** Slices 1–3 are green: RFC0047.1–.3
+> (the layer-1 resolver), RFC0047.4–.8 (the planner two-step, masking,
+> bounded enumeration) and RFC0047.9 (the MCP tool gate) pass on the served
+> binary against a real OpenFGA container (`openfga-resolver` CI job) with
+> the in-tree model; RFC0047.12 gates CI. RFC0047.10–.11 (emitter, erasure)
+> are the remaining slice (slice 4); the RFC0047.5 request-carried contextual-tuple arm is deferred
 > (§3.3, §7). Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
 > opaque, coarse, credential-selected object, which is exactly the object
 > type this RFC binds the authorization graph to. Grounded in the #688
@@ -393,6 +393,22 @@ one place CEL conditions belong (a `temporal_grant` condition on `caller`) —
 recorded, not built in v1. The tool call's own data access then goes through
 §3.4 like any query, so an agent calling `query_logs` reads exactly its own
 conversations.
+
+**Slice-3 decisions (implemented).** The gate runs after the RFC 0026
+tenant binding and the §3.4 two-step: a principal on the *tenant-wide*
+branch may call every tool without a round-trip (that is what the model's
+`can_call: caller or can_read_content from parent` says, and it does not
+depend on an operator having written the `tool#parent` tuple); every other
+graph-bound principal needs an explicit `caller` grant, checked per call
+with the session's contextual group tuples and never cached — a revoked
+grant is honoured on the next call. The denial names the tool
+(<code>permission denied: tool `template_drift` is not callable by this
+principal in tenant `acme`</code>). Template-level tools additionally require
+tenant-wide content read (§3.4 slice-2 rule), so a `caller` grant on
+`list_templates` / `template_drift` for a scoped principal passes the gate
+but not the content rule. The `tool:T/<name>#parent@tenant:T` tuples are
+written by the emitter for every tenant it sweeps (slice 4), so operators
+grant `caller` only.
 
 ### 3.6 Erasure (Q9)
 

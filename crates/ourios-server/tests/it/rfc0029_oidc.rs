@@ -531,7 +531,7 @@ pub(crate) mod claim_binding {
             file,
             "storage:\n  local:\n    bucket_root: {}\n{storage_yaml}\
              receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
-             querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n\
+             querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n  mcp:\n    enabled: true\n\
              {auth_yaml}",
             tmp.path().display(),
             wal.display(),

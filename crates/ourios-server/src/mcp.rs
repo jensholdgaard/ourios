@@ -24,6 +24,7 @@ use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use opentelemetry::context::FutureExt as _;
+use ourios_core::auth::openfga::{OpenFgaResolver, TupleKey};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::receiver::{AuthBinding, AuthError, AuthResolver, extract_context};
 use ourios_parquet::PromotedAttributes;
@@ -293,6 +294,64 @@ impl OuriosMcp {
             .await
             .map_err(|rejection| visibility_error(&rejection))
     }
+
+    /// The per-tool gate (RFC 0026 tenant binding → RFC 0047 §3.4 two-step
+    /// → §3.5 `Check(principal, can_call, tool:<tenant>/<tool>)`): the
+    /// binding and the visibility decision for the tool's own data access.
+    /// A tenant-wide content reader may call every tool (the model's
+    /// `can_call: caller or can_read_content from parent`, answered here
+    /// without a round-trip); every other graph-bound principal needs an
+    /// explicit `caller` grant on the tool object, checked per call — a
+    /// revoked grant is honoured on the next call.
+    async fn gate(
+        &self,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+        tenant: &str,
+        tool: &'static str,
+    ) -> Result<(Option<AuthBinding>, Option<ourios_querier::Visibility>), ErrorData> {
+        let binding = self.check_tenant(ctx, tenant)?;
+        let visibility = self.visibility(binding.as_ref(), tenant).await?;
+        if matches!(
+            visibility,
+            None | Some(ourios_querier::Visibility::TenantWide)
+        ) {
+            return Ok((binding, visibility));
+        }
+        let (Some(graph), Some(resolver)) = (
+            binding.as_ref().and_then(AuthBinding::graph),
+            self.auth.openfga(),
+        ) else {
+            return Ok((binding, visibility));
+        };
+        let contextual = OpenFgaResolver::group_tuples(graph.principal(), graph.groups())
+            .map_err(|_| ErrorData::invalid_request("a valid bearer token is required", None))?;
+        let key = TupleKey::new(
+            graph.principal().to_string(),
+            "can_call",
+            format!("tool:{tenant}/{tool}"),
+        );
+        match resolver.client().check(&key, &contextual).await {
+            Ok(true) => Ok((binding, visibility)),
+            Ok(false) => Err(ErrorData::invalid_request(
+                format!(
+                    "permission denied: tool `{tool}` is not callable by this principal in tenant `{tenant}`"
+                ),
+                None,
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    token_name = binding.as_ref().map_or("", AuthBinding::token_name),
+                    tool,
+                    error = %e,
+                    "openfga tool gate could not answer; call fails closed (RFC 0047 §3.5)"
+                );
+                Err(ErrorData::internal_error(
+                    "the authorization resolver is unavailable; retry later",
+                    None,
+                ))
+            }
+        }
+    }
 }
 
 /// Map a visibility refusal onto the MCP error vocabulary: `403`-class →
@@ -370,7 +429,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        let binding = self.check_tenant(&ctx, tenant_arg)?;
+        let (_binding, visibility) = self.gate(&ctx, tenant_arg, "query_logs").await?;
         let statement = dsl::parse_statement(&args.query)
             .map_err(|e| ErrorData::invalid_params(format!("invalid query: {e}"), None))?;
         let Statement::Logs(mut query) = statement else {
@@ -384,7 +443,6 @@ impl OuriosMcp {
         // documented "maximum rendered rows" contract holds.
         let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         cap_rows_unless_aggregation(&mut query.stages, cap);
-        let visibility = self.visibility(binding.as_ref(), tenant_arg).await?;
         let options = visibility.map_or_else(ourios_querier::QueryOptions::default, |v| {
             ourios_querier::QueryOptions::default().with_visibility(v)
         });
@@ -464,8 +522,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        let binding = self.check_tenant(&ctx, tenant_arg)?;
-        let visibility = self.visibility(binding.as_ref(), tenant_arg).await?;
+        let (_binding, visibility) = self.gate(&ctx, tenant_arg, "list_templates").await?;
         if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
             return Err(visibility_error(&rejection));
         }
@@ -546,8 +603,7 @@ impl OuriosMcp {
             tracing::Span::current().record("mcp.session.id", session);
         }
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        let binding = self.check_tenant(&ctx, tenant_arg)?;
-        let visibility = self.visibility(binding.as_ref(), tenant_arg).await?;
+        let (_binding, visibility) = self.gate(&ctx, tenant_arg, "template_drift").await?;
         if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
             return Err(visibility_error(&rejection));
         }

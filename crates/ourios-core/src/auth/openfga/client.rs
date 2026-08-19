@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CONVERSATION_TYPE, Consistency, OpenFgaConfig, Principal, PrincipalKind, TENANT_TYPE,
-    TenantObjects, VisibilityConfig, is_object_id,
+    CONVERSATION_TYPE, Consistency, MAX_OBJECT_BYTES, OpenFgaConfig, Principal, PrincipalKind,
+    TENANT_TYPE, TenantObjects, VisibilityConfig, is_object_id,
 };
 
 /// `OpenFGA`'s cap on contextual tuples per request (RFC 0047 §3.1): a
@@ -708,7 +708,8 @@ impl OpenFgaResolver {
     /// # Errors
     ///
     /// [`OpenFgaError::TooManyContextualTuples`] past the per-request cap;
-    /// [`OpenFgaError::InvalidGroup`] for a name that cannot be an object id.
+    /// [`OpenFgaError::InvalidGroup`] for a name that cannot be an object
+    /// id, or whose `team:<group>` object would exceed the full-string cap.
     pub fn group_tuples(
         principal: &Principal,
         groups: &[String],
@@ -718,7 +719,9 @@ impl OpenFgaResolver {
                 count: groups.len(),
             });
         }
-        if let Some(index) = groups.iter().position(|group| !is_object_id(group)) {
+        if let Some(index) = groups.iter().position(|group| {
+            !is_object_id(group) || "team:".len() + group.len() > MAX_OBJECT_BYTES
+        }) {
             return Err(OpenFgaError::InvalidGroup { index });
         }
         if principal.kind() == PrincipalKind::Agent {
@@ -1525,6 +1528,12 @@ mod tests {
                 .resolve(&alice, &["ok".to_string(), "a:b".to_string()])
                 .await,
             Err(OpenFgaError::InvalidGroup { .. })
+        ));
+        // `team:<group>` obeys the full-object cap: 251 fits syntactically
+        // and composes to exactly 256; 252 composes to 257 and is refused.
+        assert!(matches!(
+            resolver.resolve(&alice, &["g".repeat(252)]).await,
+            Err(OpenFgaError::InvalidGroup { index: 0 })
         ));
         assert!(
             OpenFgaResolver::group_tuples(

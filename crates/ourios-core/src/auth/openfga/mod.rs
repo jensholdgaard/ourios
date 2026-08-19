@@ -572,15 +572,19 @@ impl fmt::Display for Principal {
 /// `tenant` type, the object every resource hangs off.
 pub const TENANT_TYPE: &str = "tenant";
 
-/// `OpenFGA`'s object-id limit.
-pub const MAX_OBJECT_ID_BYTES: usize = 256;
+/// `OpenFGA`'s cap on a **full** `type:id` object string — the proto
+/// constraint is `^[^\s]{2,256}$` on the whole string, type name and colon
+/// included (openfga/openfga discussion #302; RFC 0048 §3.1).
+pub const MAX_OBJECT_BYTES: usize = 256;
 
 /// Whether `id` can be the id half of an `OpenFGA` object or user
-/// (`type:id`): non-empty, at most 256 bytes, no `:`, `#` or whitespace.
+/// (`type:id`): non-empty, no `:`, `#` or whitespace, and within the
+/// full-string cap. This is the *syntactic* half — every composition site
+/// also checks that the composed `type:id` fits [`MAX_OBJECT_BYTES`].
 #[must_use]
 pub fn is_object_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= MAX_OBJECT_ID_BYTES
+        && id.len() <= MAX_OBJECT_BYTES
         && !id
             .chars()
             .any(|c| c == ':' || c == '#' || c.is_whitespace())
@@ -614,14 +618,28 @@ impl TenantObjects {
         if !is_object_id(tenant) {
             return None;
         }
+        let tenant_object = format!("{TENANT_TYPE}:{tenant}");
+        if tenant_object.len() > MAX_OBJECT_BYTES {
+            return None;
+        }
         let encoded = encode_tenant_segment(tenant);
-        if encoded.len() + 1 >= MAX_OBJECT_ID_BYTES {
+        let conversation_prefix = format!("{CONVERSATION_TYPE}:{encoded}/");
+        if conversation_prefix.len() >= MAX_OBJECT_BYTES {
+            return None;
+        }
+        let tool_prefix = format!("tool:{encoded}/");
+        let longest_tool = MCP_TOOL_NAMES
+            .iter()
+            .map(|name| name.len())
+            .max()
+            .unwrap_or(0);
+        if tool_prefix.len() + longest_tool > MAX_OBJECT_BYTES {
             return None;
         }
         Some(Self {
-            tenant_object: format!("{TENANT_TYPE}:{tenant}"),
-            conversation_prefix: format!("{CONVERSATION_TYPE}:{encoded}/"),
-            tool_prefix: format!("tool:{encoded}/"),
+            tenant_object,
+            conversation_prefix,
+            tool_prefix,
         })
     }
 
@@ -645,13 +663,11 @@ impl TenantObjects {
     }
 
     /// Whether `conversation:<enc(T)>/<id>` is a valid object: `id` must be
-    /// an object id itself and the combined id half must fit `OpenFGA`'s
-    /// 256-byte limit. The emitter skips ids that do not.
+    /// an object id itself and the **full object string** must fit
+    /// `OpenFGA`'s 256-byte cap. The emitter skips ids that do not.
     #[must_use]
     pub fn conversation_fits(&self, id: &str) -> bool {
-        is_object_id(id)
-            && self.conversation_prefix.len() - CONVERSATION_TYPE.len() - 1 + id.len()
-                <= MAX_OBJECT_ID_BYTES
+        is_object_id(id) && self.conversation_prefix.len() + id.len() <= MAX_OBJECT_BYTES
     }
 
     /// `tool:<enc(T)>/<name>`.
@@ -934,8 +950,18 @@ mod tests {
         let long = "x".repeat(200);
         let t = TenantObjects::new(&long).expect("fits alone");
         assert!(t.conversation_fits("c-1"));
-        assert!(!t.conversation_fits(&"y".repeat(60)), "201 + 60 > 256");
+        assert!(!t.conversation_fits(&"y".repeat(43)), "214 + 43 > 256");
         assert!(!t.conversation_fits("a b"));
+        // The cap covers the full `type:id` string (RFC 0048 §3.1): a
+        // 128-byte tenant leaves exactly 256 − 13 − 128 − 1 = 114 bytes.
+        let t = TenantObjects::new(&"t".repeat(128)).expect("fits alone");
+        assert!(t.conversation_fits(&"c".repeat(114)));
+        assert!(!t.conversation_fits(&"c".repeat(115)));
+        // The constructor demands room for a one-byte conversation id and
+        // for every fixed RFC 0027 tool object: `tool:` + 236 + `/` +
+        // `template_drift` = 256 is the binding bound.
+        assert!(TenantObjects::new(&"t".repeat(236)).is_some());
+        assert!(TenantObjects::new(&"t".repeat(237)).is_none());
     }
 
     /// The principal vocabulary renders exactly the model's type names.

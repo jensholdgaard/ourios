@@ -808,11 +808,13 @@ fn validate_graph_columns(
     for object in visibility.objects() {
         check("objects[].column", object.column())?;
     }
-    for column in visibility.user_columns() {
-        check("identities.user_columns", column)?;
-    }
-    for column in visibility.agent_columns() {
-        check("identities.agent_columns", column)?;
+    if visibility.identities_configured() {
+        for column in visibility.user_columns() {
+            check("identities.user_columns", column)?;
+        }
+        for column in visibility.agent_columns() {
+            check("identities.agent_columns", column)?;
+        }
     }
     if let Some(column) = visibility.self_principal_column() {
         check("self_principal_column", column)?;

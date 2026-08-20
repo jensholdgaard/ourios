@@ -152,6 +152,7 @@ pub struct VisibilityConfig {
     objects: Vec<VisibilityObject>,
     user_columns: Vec<String>,
     agent_columns: Vec<String>,
+    identities_configured: bool,
     self_principal_column: Option<String>,
     content_columns: Vec<String>,
     max_objects: usize,
@@ -196,6 +197,15 @@ impl VisibilityConfig {
     #[must_use]
     pub fn agent_columns(&self) -> &[String] {
         &self.agent_columns
+    }
+
+    /// Whether either `identities` list was configured explicitly — the
+    /// promoted-set startup check applies only to listed columns; the
+    /// semconv defaults are the RFC 0047 constants and carry no promotion
+    /// requirement (RFC 0048 §3.2).
+    #[must_use]
+    pub fn identities_configured(&self) -> bool {
+        self.identities_configured
     }
 
     /// The column compared to a `user:` principal's subject, if the self
@@ -609,6 +619,8 @@ fn build_visibility_config(
         objects,
         user_columns,
         agent_columns,
+        identities_configured: spec.identities.user_columns.is_some()
+            || spec.identities.agent_columns.is_some(),
         self_principal_column,
         content_columns,
         max_objects,

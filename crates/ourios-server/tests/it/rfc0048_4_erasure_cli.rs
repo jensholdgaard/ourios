@@ -37,6 +37,44 @@ async fn run(tmp: &tempfile::TempDir, args: &[&str]) -> Output {
     .expect("run ourios-server")
 }
 
+/// RFC0048.3/.5 — the CLI backfill path runs the daemon's promoted-column
+/// gate: a graph column outside `storage.promoted_attributes` is refused
+/// naming the key, before any partition is read (it would otherwise feed
+/// the graph nothing for the whole history).
+#[tokio::test]
+async fn rfc0048_5_backfill_validates_graph_columns() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let config_path = tmp.path().join("ourios.yaml");
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    write!(
+        file,
+        "storage:\n  local:\n    bucket_root: {}\n  promoted_attributes:\n    log: [gen_ai.conversation.id]\n\
+         auth:\n  tokens:\n    - name: a\n      token: ${{env:RFC0048_TOKEN}}\n      tenants: [\"*\"]\n\
+         \x20\x20openfga:\n    api_url: http://openfga.invalid:8080\n    store_id: s\n    visibility:\n      objects:\n        - type: conversation\n          column: attr.gen_ai.conversation.id\n      identities:\n        user_columns: [attr.not.promoted]\n",
+        tmp.path().display(),
+    )
+    .expect("write config");
+    let output = timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+            .arg("--config")
+            .arg(&config_path)
+            .args(["graph", "backfill", "--tenant", "acme"])
+            .env("RFC0048_TOKEN", "tok-a")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("verb exits before timeout")
+    .expect("run ourios-server");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("identities.user_columns") && stderr.contains("attr.not.promoted"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one store, the whole verb surface in sequence
 async fn rfc0048_4_erase_and_erasures_verbs() {

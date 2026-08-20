@@ -368,6 +368,49 @@ mod tests {
         }
     }
 
+    /// RFC 0048 §3.4 — the `--from` boundary compares against the hour
+    /// start: a valid UTC hour converts, an impossible calendar tuple is
+    /// `None` (never produced by `derive`, but the filter must not panic).
+    #[test]
+    fn hour_start_converts_or_declines() {
+        let key = PartitionKey {
+            tenant_id: "acme".to_string(),
+            year: 2026,
+            month: 4,
+            day: 2,
+            hour: 11,
+        };
+        // 2026-04-02T11:00:00Z
+        assert_eq!(key.hour_start_unix_nanos(), Some(1_775_127_600_000_000_000));
+        let epoch = PartitionKey {
+            tenant_id: "acme".to_string(),
+            year: 1970,
+            month: 1,
+            day: 1,
+            hour: 0,
+        };
+        assert_eq!(epoch.hour_start_unix_nanos(), Some(0));
+        for bad in [(2026, 13, 1, 0), (2026, 2, 30, 0), (2026, 1, 1, 24)] {
+            let key = PartitionKey {
+                tenant_id: "acme".to_string(),
+                year: bad.0,
+                month: bad.1,
+                day: bad.2,
+                hour: bad.3,
+            };
+            assert_eq!(key.hour_start_unix_nanos(), None, "{bad:?}");
+        }
+        // Pre-epoch hours have no `u64` nanos.
+        let ancient = PartitionKey {
+            tenant_id: "acme".to_string(),
+            year: 1969,
+            month: 12,
+            day: 31,
+            hour: 23,
+        };
+        assert_eq!(ancient.hour_start_unix_nanos(), None);
+    }
+
     #[test]
     fn percent_encode_passes_unreserved_through() {
         assert_eq!(percent_encode_tenant("tenant-id_42.~"), "tenant-id_42.~");

@@ -1471,6 +1471,52 @@ mod tests {
         w.close().expect("close");
     }
 
+    /// RFC 0048 §3.4 — `visit_partition_rows` reads a partition's live
+    /// rows without rewriting: every row of every input file is delivered
+    /// in batches (glob fallback before any manifest exists), the
+    /// manifest is honoured once one does, and a missing partition is an
+    /// empty visit — never an error.
+    #[test]
+    fn visit_partition_rows_delivers_live_rows_only() {
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = store_at(bucket.path());
+        // Empty partition: no manifest, no files.
+        let mut seen: Vec<u64> = Vec::new();
+        visit_partition_rows(&store, &partition(), |batch| {
+            seen.extend(batch.iter().map(|r| r.template_id));
+        })
+        .expect("empty visit");
+        assert!(seen.is_empty());
+
+        // Two committed files, no manifest yet — the glob fallback path.
+        write_file(&store, &[rec(1, TS0), rec(2, TS0 + 1)]);
+        write_file(&store, &[rec(3, TS0 + 2)]);
+        let mut seen: Vec<u64> = Vec::new();
+        let mut batches = 0usize;
+        visit_partition_rows(&store, &partition(), |batch| {
+            batches += 1;
+            seen.extend(batch.iter().map(|r| r.template_id));
+        })
+        .expect("visit");
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2, 3], "every live row, no rewrite");
+        assert!(batches >= 2, "delivered per file/batch, got {batches}");
+        let before = on_disk_parquet_count(&store, &partition());
+
+        // After compaction the manifest is authoritative: the same rows
+        // arrive once, from the consolidated file, and the superseded
+        // inputs (if any linger as orphans) are not re-read.
+        compact_partition(&store, &partition()).expect("compact");
+        let mut seen: Vec<u64> = Vec::new();
+        visit_partition_rows(&store, &partition(), |batch| {
+            seen.extend(batch.iter().map(|r| r.template_id));
+        })
+        .expect("visit");
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2, 3], "manifest-listed rows, each exactly once");
+        assert!(before >= 2, "the pre-compaction listing saw both inputs");
+    }
+
     /// RFC 0022 §3.4 — compaction re-projects the rows it rewrites under the
     /// promoted set it is *given*: inputs written under the default
     /// (`service.name`-only) set consolidate into a file that carries the

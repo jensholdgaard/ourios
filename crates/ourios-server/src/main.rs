@@ -420,6 +420,10 @@ async fn run_backfill_verb(
              tuples from the visibility bindings)"
                 .to_string()
         })?;
+    // The same startup gate the daemon applies (RFC 0048 §3.2): a graph
+    // column outside the promoted set would silently derive no tuples for
+    // the whole history this run is meant to feed.
+    validate_graph_columns(openfga, &config.promoted)?;
     let emitter =
         ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?.ok_or_else(|| {
             "graph backfill needs a conversation object bound \

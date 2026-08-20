@@ -265,6 +265,30 @@ pub fn release_backfill_lock(store: &Store, tenant: &str) -> Result<(), IngestEr
     }
 }
 
+/// An acquired backfill lock, released on drop — so a panic, an early
+/// return or a cancelled task cannot leave the tenant's erasures deferred
+/// (RFC 0048 §3.4; an OS kill still needs `graph backfill --unlock`, which
+/// is why that verb exists). Release failures are logged, never panicked:
+/// the sweep must not die on a store hiccup.
+#[cfg(feature = "openfga")]
+struct BackfillLock<'a> {
+    store: &'a Store,
+    tenant: &'a str,
+}
+
+#[cfg(feature = "openfga")]
+impl Drop for BackfillLock<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = release_backfill_lock(self.store, self.tenant) {
+            tracing::warn!(
+                "backfill lock for tenant {:?} could not be released ({e}); \
+                 the tenant's erasures stay deferred until `graph backfill --unlock`",
+                self.tenant,
+            );
+        }
+    }
+}
+
 /// Whether `tenant` holds a backfill lock right now (RFC 0048 §3.4) —
 /// read per erasure request rather than from a snapshot, so a lock taken
 /// while the sweep runs is still observed.
@@ -370,22 +394,21 @@ pub async fn backfill_tenant(
     if !acquire_backfill_lock(store, tenant)? {
         return Ok(Err(BackfillRefusal::Locked));
     }
+    // From here the lock is owned: every exit — refusal, error, panic,
+    // cancellation — releases it (RFC0048.8).
+    let _lock = BackfillLock { store, tenant };
     // Re-check under the lock: a marker written between the check and the
-    // acquire must win — remove the lock and refuse (RFC0048.8).
-    let pending = match pending_erasures(store) {
-        Ok(requests) => requests.iter().filter(|r| r.tenant == tenant).count(),
-        Err(e) => {
-            release_backfill_lock(store, tenant)?;
-            return Err(e);
-        }
-    };
+    // acquire must win — refuse (RFC0048.8).
+    let pending = pending_erasures(store)?
+        .iter()
+        .filter(|r| r.tenant == tenant)
+        .count();
     if pending > 0 {
-        release_backfill_lock(store, tenant)?;
         return Ok(Err(BackfillRefusal::ErasuresPending(pending)));
     }
-    let result = backfill_locked(store, emitter, tenant, from_unix_nanos).await;
-    release_backfill_lock(store, tenant)?;
-    result.map(Ok)
+    backfill_locked(store, emitter, tenant, from_unix_nanos)
+        .await
+        .map(Ok)
 }
 
 /// The read → derive → emit loop of [`backfill_tenant`], run under the

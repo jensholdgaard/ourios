@@ -153,7 +153,7 @@ impl std::error::Error for OpenFgaError {}
 /// The field is private by design: no caller can hand the client an
 /// arbitrary tuple, so the RFC 0047 §3.3(b) request-carried bridge is
 /// unrepresentable, not merely rejected.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextualTuples(Vec<TupleKey>);
 
 impl ContextualTuples {

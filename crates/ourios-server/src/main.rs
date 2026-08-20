@@ -246,17 +246,19 @@ enum GraphVerb {
     },
 }
 
-/// Run the CLI's operator verb, if one was given: resolves the same
-/// storage config as the daemon, acts on the store of record, and the
-/// caller exits — no roles, no telemetry boot (RFC 0048 §3.3). `false`
-/// when there is no verb and the server should run its roles.
-fn run_operator_verb(cli: &Cli, config: &ServerConfig) -> Result<bool, String> {
+/// Run the CLI's operator verb, if one was given: the grammar gate runs
+/// **first** — even `resolve_config` can create the local store root, so
+/// an off-grammar invocation performs no filesystem or backend work at
+/// all — then the verb resolves the same storage config as the daemon,
+/// acts on the store of record, and the caller exits: no roles, no
+/// telemetry boot (RFC 0048 §3.3). `false` when there is no verb and the
+/// server should run its roles.
+fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
     match &cli.command {
         None => Ok(false),
         Some(Command::Graph(verb)) => {
-            // Ids are refused before the store is even opened — an
-            // off-grammar invocation performs no backend work at all.
             validate_graph_verb(verb)?;
+            let config = resolve_config(cli.config.as_deref())?;
             let store = config.store.open().map_err(|e| e.to_string())?;
             run_graph_verb(verb, &store)?;
             Ok(true)
@@ -996,11 +998,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
     // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
     let cli = Cli::parse();
-    let config = resolve_config(cli.config.as_deref())?;
-
-    if run_operator_verb(&cli, &config)? {
+    if run_operator_verb(&cli)? {
         return Ok(());
     }
+    let config = resolve_config(cli.config.as_deref())?;
 
     // Preflight the data store *before* binding any network role, so a
     // store-open failure early-returns here rather than after the

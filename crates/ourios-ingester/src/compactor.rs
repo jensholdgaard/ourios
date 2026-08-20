@@ -409,7 +409,15 @@ async fn backfill_locked(
             .map(|()| (rows, tuples))
         })
         .await
-        .expect("backfill read task should not panic")
+        // A panic or cancellation here must not unwind past
+        // `backfill_tenant`'s `release_backfill_lock` — a leaked lock
+        // would defer the tenant's erasures until an operator ran
+        // `--unlock` (RFC 0048 §3.4).
+        .map_err(|e| IngestError::Io {
+            op: "backfill read task",
+            path: PathBuf::from(tenant),
+            source: std::io::Error::other(e.to_string()),
+        })?
         .map_err(IngestError::Compaction)?;
         let written = emitter.emit(&tuples).await.map_err(|e| IngestError::Io {
             op: "backfill emit",
@@ -435,7 +443,6 @@ async fn backfill_locked(
 }
 
 /// The pending erasure requests, in deterministic (lexicographic key)
-/// order./// The pending erasure requests, in deterministic (lexicographic key)
 /// order.
 ///
 /// # Errors
@@ -1947,9 +1954,48 @@ mod graph_tests {
             "no tuple was ever minted for a non-object-id conversation"
         );
         request_erasure(&store, "acme", "odd id").expect("request");
-        // RFC0048.4 — the completion is a structured log event; the fmt
-        // mirror renders its message (the registry-backed name travels the
-        // OTel Logs signal, gated by the semconv live-check in CI).
+        let (result, _, _) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            sink,
+            Some(emitter),
+        )
+        .await;
+        let report = result.expect("sweep");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let outcome = &report.erasures[0];
+        assert_eq!(outcome.rows_dropped, 2, "rows matched on the raw value");
+        assert_eq!(outcome.tuples_deleted, Some(0));
+        assert!(outcome.finished);
+        assert_eq!(live_rows(&store, bucket.path()).len(), 1);
+    }
+
+    /// RFC0048.4 — the completion event: its **registry-backed name** is
+    /// the contract (a reword of the message must not silently drop it),
+    /// and the message carries the four values RFC 0048 §3.3 names.
+    /// Current-thread runtime on purpose: the event is emitted after an
+    /// `.await`, and a thread-local subscriber only sees it when the task
+    /// cannot migrate to another worker.
+    #[tokio::test]
+    async fn rfc0048_4_completion_event_carries_the_registry_name() {
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        write_rows(&store, "c-1", "alice", None, 2);
+        let emitter = emitter(&url);
+        let audit = SharedAuditSink::new();
+        let (result, _, sink) = sweep_once(
+            store.clone(),
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(audit),
+            Some(Arc::clone(&emitter)),
+        )
+        .await;
+        result.expect("sweep");
+        request_erasure(&store, "acme", "c-1").expect("request");
         let events: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
         let subscriber = {
             use tracing_subscriber::prelude::*;
@@ -1966,24 +2012,19 @@ mod graph_tests {
         .await;
         drop(guard);
         let report = result.expect("sweep");
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        let outcome = &report.erasures[0];
-        assert_eq!(outcome.rows_dropped, 2, "rows matched on the raw value");
-        assert_eq!(outcome.tuples_deleted, Some(0));
-        assert!(outcome.finished);
-        assert_eq!(live_rows(&store, bucket.path()).len(), 1);
-        // The **registry-backed name** is the contract (a reword of the
-        // message must not silently drop it), and the message carries the
-        // four values RFC 0048 §3.3 names.
+        assert!(report.erasures[0].finished, "{report:?}");
         let events = events.lock().expect("events").clone();
         let completion = events
             .iter()
             .find(|(name, _)| name == ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED)
             .unwrap_or_else(|| panic!("no completion event among {events:?}"));
         assert_eq!(completion.0, "ourios.compaction.erasure.completed");
+        // The fake's `Read` returns no tuples, so the delete count is 0 —
+        // the count *reaching the message* is what this pins (RFC0047.11
+        // covers a real graph's non-zero delete).
         assert!(
             completion.1.contains(
-                "conversation erasure completed: tenant \"acme\" conversation \"odd id\", \
+                "conversation erasure completed: tenant \"acme\" conversation \"c-1\", \
                  2 rows dropped, 0 tuples deleted"
             ),
             "{completion:?}"

@@ -238,11 +238,27 @@ enum GraphVerb {
         #[arg(long)]
         conversation: String,
     },
-    /// List pending erasure requests and their phase.
+    /// List pending erasure requests (and backfill locks) with their phase.
     Erasures {
         /// Restrict the listing to one tenant.
         #[arg(long)]
         tenant: Option<String>,
+    },
+    /// Feed the graph from stored history: read every partition of the
+    /// tenant, derive and write the RFC 0047 tuples (idempotent, never
+    /// rewrites Parquet). Refuses while erasures are pending (RFC 0048
+    /// §3.4).
+    Backfill {
+        /// The tenant (RFC 0048 §3.1 grammar).
+        #[arg(long)]
+        tenant: String,
+        /// Only partitions whose UTC hour starts at or after this
+        /// RFC 3339 instant.
+        #[arg(long)]
+        from: Option<String>,
+        /// Clear a crashed run's backfill lock instead of running.
+        #[arg(long, conflicts_with = "from")]
+        unlock: bool,
     },
 }
 
@@ -253,14 +269,14 @@ enum GraphVerb {
 /// acts on the store of record, and the caller exits: no roles, no
 /// telemetry boot (RFC 0048 §3.3). `false` when there is no verb and the
 /// server should run its roles.
-fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
+async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
     match &cli.command {
         None => Ok(false),
         Some(Command::Graph(verb)) => {
             validate_graph_verb(verb)?;
             let config = resolve_config(cli.config.as_deref())?;
             let store = config.store.open().map_err(|e| e.to_string())?;
-            run_graph_verb(verb, &store)?;
+            run_graph_verb(verb, &store, &config).await?;
             Ok(true)
         }
     }
@@ -293,13 +309,21 @@ fn validate_graph_verb(verb: &GraphVerb) -> Result<(), String> {
                 .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)")),
             None => Ok(()),
         },
+        GraphVerb::Backfill { tenant, .. } => ourios_core::tenant::validate_tenant_id(tenant)
+            .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)")),
     }
 }
 
 /// Run one grammar-checked `graph` verb against the configured store and
 /// exit (RFC0048.4).
-fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(), String> {
-    use ourios_ingester::compactor::{pending_erasures, request_erasure};
+async fn run_graph_verb(
+    verb: &GraphVerb,
+    store: &ourios_parquet::Store,
+    config: &ServerConfig,
+) -> Result<(), String> {
+    use ourios_ingester::compactor::{
+        backfill_locks, pending_erasures, pending_erasures_for, request_erasure,
+    };
     match verb {
         GraphVerb::Erase {
             tenant,
@@ -313,11 +337,16 @@ fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(),
             Ok(())
         }
         GraphVerb::Erasures { tenant } => {
-            let mut requests = pending_erasures(store).map_err(|e| e.to_string())?;
-            if let Some(tenant) = tenant {
-                requests.retain(|r| r.tenant == *tenant);
+            let requests = match tenant {
+                Some(tenant) => pending_erasures_for(store, tenant),
+                None => pending_erasures(store),
             }
-            if requests.is_empty() {
+            .map_err(|e| e.to_string())?;
+            let mut locks = backfill_locks(store).map_err(|e| e.to_string())?;
+            if let Some(tenant) = tenant {
+                locks.retain(|t| t == tenant);
+            }
+            if requests.is_empty() && locks.is_empty() {
                 println!("no pending erasures");
                 return Ok(());
             }
@@ -332,8 +361,16 @@ fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(),
                     }
                 );
             }
+            for tenant in locks {
+                println!("backfill lock: tenant {tenant:?}");
+            }
             Ok(())
         }
+        GraphVerb::Backfill {
+            tenant,
+            from,
+            unlock,
+        } => run_backfill_verb(store, config, tenant, from.as_deref(), *unlock).await,
     }
 }
 
@@ -345,6 +382,71 @@ fn non_empty_path(value: &str) -> Result<PathBuf, String> {
         Err("the config path must not be empty".to_owned())
     } else {
         Ok(PathBuf::from(value))
+    }
+}
+
+/// The `graph backfill` verb (RFC 0048 §3.4): parse `--from`, resolve the
+/// emitter from `auth.openfga`, run the fenced backfill (or clear a
+/// crashed run's lock with `--unlock`).
+async fn run_backfill_verb(
+    store: &ourios_parquet::Store,
+    config: &ServerConfig,
+    tenant: &str,
+    from: Option<&str>,
+    unlock: bool,
+) -> Result<(), String> {
+    use ourios_ingester::compactor::{backfill_tenant, release_backfill_lock};
+    if unlock {
+        release_backfill_lock(store, tenant).map_err(|e| e.to_string())?;
+        println!("backfill lock cleared for tenant {tenant:?} (if one existed)");
+        return Ok(());
+    }
+    let from_unix_nanos = from
+        .map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| format!("--from: not RFC 3339: {e}"))
+                .and_then(|dt| {
+                    u64::try_from(
+                        dt.timestamp_nanos_opt()
+                            .ok_or_else(|| "--from: out of range".to_string())?,
+                    )
+                    .map_err(|_| "--from: before the epoch".to_string())
+                })
+        })
+        .transpose()?;
+    let openfga = config
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.openfga.as_ref())
+        .ok_or_else(|| {
+            "graph backfill needs auth.openfga configured (the emitter derives \
+             tuples from the visibility bindings)"
+                .to_string()
+        })?;
+    // The same startup gate the daemon applies (RFC 0048 §3.2): a graph
+    // column outside the promoted set would silently derive no tuples for
+    // the whole history this run is meant to feed.
+    validate_graph_columns(openfga, &config.promoted)?;
+    let emitter =
+        ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?.ok_or_else(|| {
+            "graph backfill needs a conversation object bound \
+             (auth.openfga.visibility.objects)"
+                .to_string()
+        })?;
+    let emitter = std::sync::Arc::new(emitter);
+    match backfill_tenant(store, &emitter, tenant, from_unix_nanos)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Ok(report) => {
+            println!(
+                "backfill complete: tenant {tenant:?}, {} partitions, {} rows offered, \
+                 {} tuples written",
+                report.partitions, report.rows, report.tuples
+            );
+            Ok(())
+        }
+        Err(refusal) => Err(format!("backfill refused: {refusal}")),
     }
 }
 
@@ -998,7 +1100,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
     // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
     let cli = Cli::parse();
-    if run_operator_verb(&cli)? {
+    if run_operator_verb(&cli).await? {
         return Ok(());
     }
     let config = resolve_config(cli.config.as_deref())?;

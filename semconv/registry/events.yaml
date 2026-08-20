@@ -53,6 +53,14 @@ groups:
       without the rows, the graph tuples are deleted, and the marker is
       removed (RFC 0047 §3.6 / RFC 0048 §3.3). The message names the
       tenant, the conversation, rows dropped and tuples deleted.
+  - id: event.ourios.graph.backfill.progress
+    type: event
+    name: ourios.graph.backfill.progress
+    stability: development
+    brief: >
+      One partition of a `graph backfill` run was read and its derived
+      tuples written (RFC 0048 §3.4). The message names the tenant, the
+      partition, rows offered and tuples written.
   - id: event.ourios.querier.shutdown.error
     type: event
     name: ourios.querier.shutdown.error

@@ -1238,6 +1238,34 @@ fn parse_partition_segment(segment: &str, prefix: &str, width: usize) -> Option<
 /// the partition prefix when a manifest is present (authoritative), else every
 /// committed `*.parquet` object under the prefix (`*.parquet.tmp` and
 /// `manifest.json` are excluded by suffix). Mirrors the querier's resolution.
+/// Visit every live row of `partition`, batch by batch, without rewriting
+/// anything — the read half of the compaction path (manifest-listed files
+/// when a manifest exists, committed Parquet objects otherwise), for the
+/// RFC 0048 §3.4 backfill.
+///
+/// # Errors
+///
+/// [`CompactionError`] on listing, get, or decode failures.
+pub fn visit_partition_rows(
+    store: &Store,
+    partition: &PartitionKey,
+    mut visit: impl FnMut(&[MinedRecord]),
+) -> Result<(), CompactionError> {
+    let manifest = read_manifest(store, partition)?;
+    for key in live_file_keys(store, partition, manifest.as_ref())? {
+        let bytes = store
+            .get_blocking(&key)
+            .map_err(|e| store_io("get", &key, e))?;
+        let mut reader =
+            Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition.clone(), &key)
+                .map_err(CompactionError::Read)?;
+        while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
+            visit(&batch);
+        }
+    }
+    Ok(())
+}
+
 fn live_file_keys(
     store: &Store,
     partition: &PartitionKey,
@@ -1441,6 +1469,52 @@ mod tests {
         let mut w = Writer::open_in(store, partition()).expect("open writer");
         w.append_records(recs).expect("append");
         w.close().expect("close");
+    }
+
+    /// RFC 0048 §3.4 — `visit_partition_rows` reads a partition's live
+    /// rows without rewriting: every row of every input file is delivered
+    /// in batches (glob fallback before any manifest exists), the
+    /// manifest is honoured once one does, and a missing partition is an
+    /// empty visit — never an error.
+    #[test]
+    fn visit_partition_rows_delivers_live_rows_only() {
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = store_at(bucket.path());
+        // Empty partition: no manifest, no files.
+        let mut seen: Vec<u64> = Vec::new();
+        visit_partition_rows(&store, &partition(), |batch| {
+            seen.extend(batch.iter().map(|r| r.template_id));
+        })
+        .expect("empty visit");
+        assert!(seen.is_empty());
+
+        // Two committed files, no manifest yet — the glob fallback path.
+        write_file(&store, &[rec(1, TS0), rec(2, TS0 + 1)]);
+        write_file(&store, &[rec(3, TS0 + 2)]);
+        let mut seen: Vec<u64> = Vec::new();
+        let mut batches = 0usize;
+        visit_partition_rows(&store, &partition(), |batch| {
+            batches += 1;
+            seen.extend(batch.iter().map(|r| r.template_id));
+        })
+        .expect("visit");
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2, 3], "every live row, no rewrite");
+        assert!(batches >= 2, "delivered per file/batch, got {batches}");
+        let before = on_disk_parquet_count(&store, &partition());
+
+        // After compaction the manifest is authoritative: the same rows
+        // arrive once, from the consolidated file, and the superseded
+        // inputs (if any linger as orphans) are not re-read.
+        compact_partition(&store, &partition()).expect("compact");
+        let mut seen: Vec<u64> = Vec::new();
+        visit_partition_rows(&store, &partition(), |batch| {
+            seen.extend(batch.iter().map(|r| r.template_id));
+        })
+        .expect("visit");
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2, 3], "manifest-listed rows, each exactly once");
+        assert!(before >= 2, "the pre-compaction listing saw both inputs");
     }
 
     /// RFC 0022 §3.4 — compaction re-projects the rows it rewrites under the

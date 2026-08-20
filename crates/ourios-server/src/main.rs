@@ -809,10 +809,12 @@ fn validate_graph_columns(
     for object in visibility.objects() {
         check("objects[].column", object.column())?;
     }
-    if visibility.identities_configured() {
+    if visibility.user_columns_configured() {
         for column in visibility.user_columns() {
             check("identities.user_columns", column)?;
         }
+    }
+    if visibility.agent_columns_configured() {
         for column in visibility.agent_columns() {
             check("identities.agent_columns", column)?;
         }
@@ -1039,6 +1041,55 @@ mod tests {
     use super::*;
 
     use ourios_server::config::file::parse;
+
+    /// RFC0048.3 — the promoted-set check is per identity list: a partial
+    /// override checks only the listed side; the other side's defaults are
+    /// exempt even when unpromoted.
+    #[test]
+    fn graph_column_check_is_per_identity_list() {
+        use ourios_core::auth::openfga::{
+            IdentitiesSpec, OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
+        };
+        // Promoted: the conversation column + the custom identity column —
+        // neither default user column, nor the default agent column.
+        let promoted = PromotedAttributes::new(
+            vec![],
+            vec!["gen_ai.conversation.id".to_string(), "bot.name".to_string()],
+        );
+        let openfga = |identities: IdentitiesSpec| {
+            build_openfga_config(&OpenFgaSpec {
+                api_url: Some("http://openfga.invalid:8080".to_string()),
+                store_id: Some("s".to_string()),
+                visibility: VisibilitySpec {
+                    objects: vec![VisibilityObjectSpec {
+                        object_type: Some("conversation".to_string()),
+                        column: Some("attr.gen_ai.conversation.id".to_string()),
+                    }],
+                    identities,
+                    ..VisibilitySpec::default()
+                },
+                ..OpenFgaSpec::default()
+            })
+            .expect("config")
+        };
+        let agent_only = openfga(IdentitiesSpec {
+            user_columns: None,
+            agent_columns: Some(vec!["attr.bot.name".to_string()]),
+        });
+        validate_graph_columns(&agent_only, &promoted).expect("defaulted user columns are exempt");
+        let user_only = openfga(IdentitiesSpec {
+            user_columns: Some(vec!["attr.bot.name".to_string()]),
+            agent_columns: None,
+        });
+        validate_graph_columns(&user_only, &promoted).expect("defaulted agent columns are exempt");
+        let bad = openfga(IdentitiesSpec {
+            user_columns: None,
+            agent_columns: Some(vec!["attr.absent.key".to_string()]),
+        });
+        let err = validate_graph_columns(&bad, &promoted).expect_err("listed must be promoted");
+        assert!(err.contains("identities.agent_columns"), "{err}");
+        assert!(err.contains("attr.absent.key"), "{err}");
+    }
 
     /// A `local` [`StoreConfig`] for `path`, the common test fixture.
     fn local(path: &str) -> StoreConfig {

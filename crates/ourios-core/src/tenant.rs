@@ -42,7 +42,8 @@ impl fmt::Display for TenantIdError {
             ),
             Self::InvalidCharacter { found } => write!(
                 f,
-                "a tenant id is ASCII graphic characters excluding ':', '#' and '/';                  found {found:?}"
+                "a tenant id is ASCII graphic characters excluding ':', '#' and '/'; \
+                 found {found:?}"
             ),
         }
     }

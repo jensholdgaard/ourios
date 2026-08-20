@@ -208,7 +208,9 @@ pub(crate) struct OuriosMcp {
 /// the header: trimmed, then the RFC 0048 §3.1 tenant grammar — a value
 /// outside it is a caller error, never a distinct tenant id.
 fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
-    let tenant = raw.trim();
+    // ASCII-only trimming: a Unicode space (NBSP) is not padding, it is an
+    // off-grammar character the validator must see.
+    let tenant = raw.trim_matches(|c: char| c.is_ascii_whitespace());
     if let Err(e) = ourios_core::tenant::validate_tenant_id(tenant) {
         return Err(ErrorData::invalid_params(
             format!("the tenant argument is invalid: {e} (RFC 0048 §3.1)"),
@@ -942,6 +944,7 @@ mod tests {
             "a#b",
             "a b",
             "\u{e9}",
+            "\u{a0}acme\u{a0}",
             &"x".repeat(129),
         ] {
             let err = normalize_tenant(bad).expect_err("refused");

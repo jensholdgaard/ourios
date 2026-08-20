@@ -44,6 +44,15 @@ groups:
     brief: >
       A compaction sweep failed or reported per-item errors; the daemon
       continues with the next sweep.
+  - id: event.ourios.compaction.erasure.completed
+    type: event
+    name: ourios.compaction.erasure.completed
+    stability: development
+    brief: >
+      A requested conversation erasure completed: every partition rewrote
+      without the rows, the graph tuples are deleted, and the marker is
+      removed (RFC 0047 §3.6 / RFC 0048 §3.3). The message names the
+      tenant, the conversation, rows dropped and tuples deleted.
   - id: event.ourios.querier.shutdown.error
     type: event
     name: ourios.querier.shutdown.error

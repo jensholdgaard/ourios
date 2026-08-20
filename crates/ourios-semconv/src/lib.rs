@@ -256,6 +256,9 @@ pub const OURIOS_TLS_RELOAD_ERROR: &str = "ourios.tls.reload_error";
 // site names its event with one of these — `weaver registry live-check`
 // enforces it at emission time).
 
+/// `ourios.compaction.erasure.completed` log event name.
+pub const EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED: &str = "ourios.compaction.erasure.completed";
+
 /// `ourios.compaction.sweep.error` log event name.
 pub const EVENT_OURIOS_COMPACTION_SWEEP_ERROR: &str = "ourios.compaction.sweep.error";
 

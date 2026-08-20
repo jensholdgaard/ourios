@@ -213,6 +213,106 @@ struct Cli {
     /// `OURIOS_*` environment variables.
     #[arg(long, value_name = "PATH", value_parser = non_empty_path)]
     config: Option<PathBuf>,
+
+    /// An operator verb; without one, the server runs its configured roles.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Operate the authorization graph's operational surfaces (RFC 0048).
+    #[command(subcommand)]
+    Graph(GraphVerb),
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum GraphVerb {
+    /// Request the erasure of one conversation: writes the durable marker
+    /// the next compaction sweep acts on (idempotent, RFC 0048 §3.3).
+    Erase {
+        /// The tenant (RFC 0048 §3.1 grammar).
+        #[arg(long)]
+        tenant: String,
+        /// The raw conversation id (object-id grammar; `/` is allowed).
+        #[arg(long)]
+        conversation: String,
+    },
+    /// List pending erasure requests and their phase.
+    Erasures {
+        /// Restrict the listing to one tenant.
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+}
+
+/// Run the CLI's operator verb, if one was given: resolves the same
+/// storage config as the daemon, acts on the store of record, and the
+/// caller exits — no roles, no telemetry boot (RFC 0048 §3.3). `false`
+/// when there is no verb and the server should run its roles.
+fn run_operator_verb(cli: &Cli, config: &ServerConfig) -> Result<bool, String> {
+    match &cli.command {
+        None => Ok(false),
+        Some(Command::Graph(verb)) => {
+            let store = config.store.open().map_err(|e| e.to_string())?;
+            run_graph_verb(verb, &store)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Run one `graph` verb against the configured store and exit. Ids are
+/// checked against their grammars before any store work (RFC0048.4).
+fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(), String> {
+    use ourios_ingester::compactor::{pending_erasures, request_erasure};
+    match verb {
+        GraphVerb::Erase {
+            tenant,
+            conversation,
+        } => {
+            ourios_core::tenant::validate_tenant_id(tenant)
+                .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)"))?;
+            if !ourios_core::auth::openfga::is_object_id(conversation) {
+                return Err(
+                    "--conversation: not an object id (non-empty, no ':', '#' or \
+                     whitespace, at most 256 bytes) (RFC 0048 §3.1)"
+                        .to_string(),
+                );
+            }
+            request_erasure(store, tenant, conversation).map_err(|e| e.to_string())?;
+            println!(
+                "erasure requested: tenant {tenant:?} conversation {conversation:?} \
+                 (idempotent; the next compaction sweep acts on it)"
+            );
+            Ok(())
+        }
+        GraphVerb::Erasures { tenant } => {
+            if let Some(tenant) = tenant {
+                ourios_core::tenant::validate_tenant_id(tenant)
+                    .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)"))?;
+            }
+            let mut requests = pending_erasures(store).map_err(|e| e.to_string())?;
+            if let Some(tenant) = tenant {
+                requests.retain(|r| r.tenant == *tenant);
+            }
+            if requests.is_empty() {
+                println!("no pending erasures");
+                return Ok(());
+            }
+            for request in requests {
+                println!(
+                    "pending erasure: tenant {:?} conversation {:?} phase {}",
+                    request.tenant,
+                    request.conversation_id,
+                    match request.phase {
+                        ourios_ingester::compactor::ErasurePhase::Rows => "rows",
+                        ourios_ingester::compactor::ErasurePhase::Tuples => "tuples",
+                    }
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A `--config` value parser that rejects an empty path (a required argument
@@ -877,6 +977,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
     let cli = Cli::parse();
     let config = resolve_config(cli.config.as_deref())?;
+
+    if run_operator_verb(&cli, &config)? {
+        return Ok(());
+    }
 
     // Preflight the data store *before* binding any network role, so a
     // store-open failure early-returns here rather than after the

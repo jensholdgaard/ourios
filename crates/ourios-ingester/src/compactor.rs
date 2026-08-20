@@ -912,7 +912,18 @@ async fn graph_phase(
     .expect("erasure completion task should not panic");
     *audit_sink = sink;
     for index in finished {
-        report.erasures[index].finished = true;
+        let outcome = &mut report.erasures[index];
+        outcome.finished = true;
+        // RFC 0048 §3.3: completion is observable in the logs too — one
+        // structured event per finished erasure.
+        tracing::info!(
+            name: ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED,
+            "conversation erasure completed: tenant {:?} conversation {:?}, {} rows dropped, {} tuples deleted",
+            outcome.request.tenant,
+            outcome.request.conversation_id,
+            outcome.rows_dropped,
+            outcome.tuples_deleted.unwrap_or(0),
+        );
     }
     report.errors.extend(errors);
 }
@@ -1699,6 +1710,17 @@ mod graph_tests {
             "no tuple was ever minted for a non-object-id conversation"
         );
         request_erasure(&store, "acme", "odd id").expect("request");
+        // RFC0048.4 — the completion is a structured log event; the fmt
+        // mirror renders its message (the registry-backed name travels the
+        // OTel Logs signal, gated by the semconv live-check in CI).
+        let log: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let writer = Arc::clone(&log);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LockedWriter(Arc::clone(&writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
         let (result, _, _) = sweep_once(
             store.clone(),
             CompactionPolicy::default(),
@@ -1707,6 +1729,7 @@ mod graph_tests {
             Some(emitter),
         )
         .await;
+        drop(guard);
         let report = result.expect("sweep");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let outcome = &report.erasures[0];
@@ -1714,5 +1737,27 @@ mod graph_tests {
         assert_eq!(outcome.tuples_deleted, Some(0));
         assert!(outcome.finished);
         assert_eq!(live_rows(&store, bucket.path()).len(), 1);
+        let rendered = String::from_utf8_lossy(&log.lock().expect("log")).to_string();
+        assert!(
+            rendered.contains(
+                "conversation erasure completed: tenant \"acme\" conversation \"odd id\", \
+                 2 rows dropped, 0 tuples deleted"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// A `MakeWriter` into a shared buffer, for asserting rendered events.
+    struct LockedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LockedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

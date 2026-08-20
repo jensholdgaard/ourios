@@ -296,6 +296,9 @@ pub const EVENT_OURIOS_SERVER_AUTH_OPEN_MODE: &str = "ourios.server.auth.open_mo
 /// `ourios.server.compaction.disabled` log event name.
 pub const EVENT_OURIOS_SERVER_COMPACTION_DISABLED: &str = "ourios.server.compaction.disabled";
 
+/// `ourios.server.graph.list_deadline` log event name.
+pub const EVENT_OURIOS_SERVER_GRAPH_LIST_DEADLINE: &str = "ourios.server.graph.list_deadline";
+
 /// `ourios.server.signal_handler.error` log event name.
 pub const EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR: &str = "ourios.server.signal_handler.error";
 

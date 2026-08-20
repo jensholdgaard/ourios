@@ -1,7 +1,7 @@
 ---
 rfc: 0048
 title: Graph operational surfaces — tenant id grammar, identity keys, erasure and backfill
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-18
@@ -11,7 +11,22 @@ superseded-by: —
 
 # RFC 0048 — Graph operational surfaces
 
-> **Status: `specified` (2026-08-18).** §5 criteria written and testable.
+> **Status: `green` (2026-08-20).** All eight §5 criteria pass:
+> RFC0048.1 (`tenant.rs` grammar table + the RFC 0046 end-to-end OTLP
+> arms + `rfc0048_grammar` querier/MCP arms + config/claim unit tests),
+> RFC0048.2 (`rfc0048_2_verbatim_tenant_on_a_real_graph`, real OpenFGA:
+> 256-byte object accepted and `Read` byte-for-byte, 115 skipped, `/` id
+> fits), RFC0048.3 (emitter/config/parse unit tests + the served-binary
+> startup errors + the per-list promoted check), RFC0048.4
+> (`rfc0048_4_erase_and_erasures_verbs` + the completion event asserted
+> at the compactor), RFC0048.5/.8
+> (`rfc0048_5_8_backfill_and_fence_end_to_end`, real OpenFGA: `--from`
+> boundary, idempotent re-run, no Parquet rewrite, refusal-leaves-no-lock,
+> sweep defers under the lock then completes), RFC0048.6 (the sealed
+> `ContextualTuples` carrier + wire-shape fakes), RFC0048.7
+> (`rfc0048_7_list_deadline_event_at_startup`). Container scenarios run in
+> the `openfga-resolver` CI job. §7's deadline question is settled by
+> measurement (silent clean EOF — see §7). Implementation: #714–#718.
 > Prerequisites: RFC 0046 (`green`), RFC 0047 (`green`). This RFC closes
 > the operational gaps the RFC 0047 implementation (#705–#710) had to fill
 > on its own — each of them a decision that belongs in a spec, with a
@@ -339,7 +354,17 @@ which flip to the verbatim form.
 
 ## 7. Open questions
 
-- [ ] **Streamed deadline truncation is silent-until-proven-otherwise** —
+- [x] **Streamed deadline truncation is silent — measured.** Against a
+      real openfga v1.11.1 run with `OPENFGA_LIST_OBJECTS_DEADLINE=1ms`
+      and 3 000 matching tuples, `streamed-list-objects` returned 127
+      results and ended with **HTTP 200 and a clean EOF — no error
+      frame** (2026-08-20, the §3.6 implementation's experiment). So the
+      fail-closed property rests exactly where RFC 0047 §3.4 put it: the
+      client timeout is *strictly below* the declared deadline, so on any
+      stream that would outlive the real deadline the **client** cuts off
+      first (`Incomplete`, fail closed) — provided the declaration does
+      not overstate the server's real flag, which is what the §3.6
+      startup event exists to make loud. Original finding:
       the docs confirm `OPENFGA_LIST_OBJECTS_DEADLINE` applies to the
       streamed endpoint (and `…_MAX_RESULTS` does not — the reason §3.4 of
       RFC 0047 chose it), but say nothing about *how* deadline expiry ends
@@ -349,8 +374,8 @@ which flip to the verbatim form.
       one; visibility only narrows, never widens, but the partiality is
       silent). The §3.6 implementation must pin this empirically: run a
       real server with a deliberately tiny deadline and assert what
-      arrives on the wire, then either rely on the error frame or add a
-      completion check. (Docs-AI consult, 2026-08-19.)
+      arrives on the wire. (Docs-AI consult, 2026-08-19; settled by the
+      experiment above.)
 
 - [ ] **Grammar strictness** — 128 bytes and ASCII graphic minus three
       characters is deliberately tight; is there a known deployment that
@@ -358,10 +383,13 @@ which flip to the verbatim form.
       additive, tightening later is not.)
 - [ ] **`graph erasures` output shape** — table for humans, `--json` for
       tooling; both, or JSON only?
-- [ ] **Backfill and the receiver's flush cadence** — the flush emit and
+- [x] **Backfill and the receiver's flush cadence** — the flush emit and
       backfill only ever *add* the same idempotent tuples, so no exclusion
-      is needed there (unlike erasure, §3.4); confirm nothing else writes
-      the graph concurrently before closing.
+      is needed there (unlike erasure, §3.4). Confirmed: the emitter is
+      the graph's only writer (flush cadence, sweep, backfill — all
+      additive and idempotent; deletes run only in the fenced erasure
+      pass), and operators write administrative tuples on other object
+      types.
 
 ## 8. References
 

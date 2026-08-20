@@ -150,6 +150,7 @@ pub struct OpenFgaConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibilityConfig {
     objects: Vec<VisibilityObject>,
+    server_deadline_ms: u64,
     user_columns: Vec<String>,
     agent_columns: Vec<String>,
     user_columns_configured: bool,
@@ -227,6 +228,14 @@ impl VisibilityConfig {
     #[must_use]
     pub fn content_columns(&self) -> &[String] {
         &self.content_columns
+    }
+
+    /// The declared server-side `OPENFGA_LIST_OBJECTS_DEADLINE`, in
+    /// milliseconds (`server_list_objects_deadline_ms`, defaulted) — an
+    /// operator assumption, not an observation (RFC 0048 §3.6).
+    #[must_use]
+    pub fn server_deadline_ms(&self) -> u64 {
+        self.server_deadline_ms
     }
 
     /// The per-tenant enumeration bound.
@@ -625,6 +634,7 @@ fn build_visibility_config(
     }
     Ok(VisibilityConfig {
         objects,
+        server_deadline_ms,
         user_columns,
         agent_columns,
         user_columns_configured: spec.identities.user_columns.is_some(),

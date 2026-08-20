@@ -1002,6 +1002,18 @@ async fn auth_resolver(
     // consulted per session, fail-closed, so an unreachable store is a 503
     // at request time rather than a start-up failure of every other role.
     if let Some(openfga) = config.auth.as_ref().and_then(|auth| auth.openfga.as_ref()) {
+        // RFC 0048 §3.6: the deadline coupling made visible — the client
+        // timeout must stay below OpenFGA's OPENFGA_LIST_OBJECTS_DEADLINE,
+        // which this server cannot observe; one line to grep for.
+        let visibility = openfga.visibility();
+        tracing::info!(
+            name: ourios_semconv::EVENT_OURIOS_SERVER_GRAPH_LIST_DEADLINE,
+            "graph enumeration timeout: list_timeout_ms {} against a declared \
+             server_list_objects_deadline_ms {} — align the latter with the OpenFGA \
+             server's OPENFGA_LIST_OBJECTS_DEADLINE (RFC 0048 §3.6)",
+            visibility.list_timeout().as_millis(),
+            visibility.server_deadline_ms(),
+        );
         let openfga = ourios_core::auth::openfga::OpenFgaResolver::new(openfga)?;
         resolver = resolver.with_openfga(std::sync::Arc::new(openfga));
     }

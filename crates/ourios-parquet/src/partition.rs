@@ -93,6 +93,21 @@ impl PartitionKey {
     /// `bucket_root` per §3.4:
     /// `<bucket_root>/data/tenant_id=<urlenc>/year=YYYY/month=MM/day=DD/hour=HH/`.
     ///
+    /// The UTC hour start of this partition in Unix nanoseconds, or
+    /// `None` for a calendar tuple `chrono` rejects (never produced by
+    /// [`Self::derive`]). The RFC 0048 §3.4 `--from` filter compares
+    /// against this: a whole hour is either in or out.
+    #[must_use]
+    pub fn hour_start_unix_nanos(&self) -> Option<u64> {
+        use chrono::TimeZone as _;
+        let chrono::LocalResult::Single(start) =
+            chrono::Utc.with_ymd_and_hms(self.year, self.month, self.day, self.hour, 0, 0)
+        else {
+            return None;
+        };
+        u64::try_from(start.timestamp_nanos_opt()?).ok()
+    }
+
     /// The directory does not include the file name; the writer
     /// appends `<flush_uuid>.parquet` per §3.4.
     #[must_use]

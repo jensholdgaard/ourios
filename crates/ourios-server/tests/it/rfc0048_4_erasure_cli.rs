@@ -38,6 +38,7 @@ async fn run(tmp: &tempfile::TempDir, args: &[&str]) -> Output {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one store, the whole verb surface in sequence
 async fn rfc0048_4_erase_and_erasures_verbs() {
     let tmp = tempfile::TempDir::new().expect("temp");
 
@@ -114,6 +115,18 @@ async fn rfc0048_4_erase_and_erasures_verbs() {
 
     // Grammar refusals, before touching the store: off-grammar tenant,
     // off-grammar conversation, off-grammar filter.
+    // RFC0048.8 surface arms that need no graph: --unlock is idempotent
+    // on a store with no lock, and a backfill without auth.openfga is
+    // refused naming the missing section (the fenced run itself is the
+    // container test's).
+    let output = run(&tmp, &["graph", "backfill", "--tenant", "acme", "--unlock"]).await;
+    assert!(output.status.success(), "{output:?}");
+    let output = run(&tmp, &["graph", "backfill", "--tenant", "acme"]).await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("auth.openfga"),
+        "{output:?}"
+    );
     for (args, needle) in [
         (
             vec!["graph", "erase", "--tenant", "a/b", "--conversation", "c-1"],
@@ -131,6 +144,18 @@ async fn rfc0048_4_erase_and_erasures_verbs() {
             "--conversation",
         ),
         (vec!["graph", "erasures", "--tenant", "a:b"], "--tenant"),
+        (vec!["graph", "backfill", "--tenant", "a#b"], "--tenant"),
+        (
+            vec![
+                "graph",
+                "backfill",
+                "--tenant",
+                "acme",
+                "--from",
+                "yesterday",
+            ],
+            "--from",
+        ),
     ] {
         let output = run(&tmp, &args).await;
         assert!(!output.status.success(), "{args:?}");

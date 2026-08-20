@@ -38,4 +38,5 @@ mod rfc0047_emitter;
 mod rfc0047_openfga;
 mod rfc0047_visibility;
 mod rfc0048_4_erasure_cli;
+mod rfc0048_5_backfill;
 mod rfc0048_grammar;

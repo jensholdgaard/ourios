@@ -1238,6 +1238,34 @@ fn parse_partition_segment(segment: &str, prefix: &str, width: usize) -> Option<
 /// the partition prefix when a manifest is present (authoritative), else every
 /// committed `*.parquet` object under the prefix (`*.parquet.tmp` and
 /// `manifest.json` are excluded by suffix). Mirrors the querier's resolution.
+/// Visit every live row of `partition`, batch by batch, without rewriting
+/// anything — the read half of the compaction path (manifest-listed files
+/// when a manifest exists, committed Parquet objects otherwise), for the
+/// RFC 0048 §3.4 backfill.
+///
+/// # Errors
+///
+/// [`CompactionError`] on listing, get, or decode failures.
+pub fn visit_partition_rows(
+    store: &Store,
+    partition: &PartitionKey,
+    mut visit: impl FnMut(&[MinedRecord]),
+) -> Result<(), CompactionError> {
+    let manifest = read_manifest(store, partition)?;
+    for key in live_file_keys(store, partition, manifest.as_ref())? {
+        let bytes = store
+            .get_blocking(&key)
+            .map_err(|e| store_io("get", &key, e))?;
+        let mut reader =
+            Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition.clone(), &key)
+                .map_err(CompactionError::Read)?;
+        while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
+            visit(&batch);
+        }
+    }
+    Ok(())
+}
+
 fn live_file_keys(
     store: &Store,
     partition: &PartitionKey,

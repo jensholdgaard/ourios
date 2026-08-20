@@ -199,15 +199,38 @@ idempotent ≤ 100-tuple batches (`ourios.graph.tuples`). Operators write
 only the administrative tuples (`tenant#reader/writer/owner/
 metadata_reader`, `team#member`, `tool#caller`, `conversation#delegate`).
 
-**Erasing a conversation** (RFC 0047 §3.6): write a request marker into
-the object store — `erasure/tenant_id=<enc>/conversation=<enc>` (the
-same percent-encoding as `data/tenant_id=…`, body `{"phase":"rows"}`;
-`ourios-server`'s compactor exposes it as
-`ourios_ingester::compactor::request_erasure`) — and the next sweep
-rewrites every partition of the tenant with the conversation's rows
-dropped, then deletes its graph tuples, then writes a
-`conversation_erased` audit event and removes the marker. Rows first,
-tuples after — a dangling tuple is harmless, a dangling row is a leak.
+**Erasing a conversation** (RFC 0047 §3.6 / RFC 0048 §3.3): the front
+door is the CLI, run with the daemon's config —
+
+```text
+ourios-server --config ourios.yaml graph erase --tenant acme --conversation c-7
+ourios-server --config ourios.yaml graph erasures            # pending + phase
+```
+
+`erase` writes the durable request marker
+(`erasure/tenant_id=<enc>/conversation=<enc>`, create-if-absent, so a
+repeat never resets an in-flight erasure) and the next sweep rewrites
+every partition of the tenant with the conversation's rows dropped, then
+deletes its graph tuples, then writes a `conversation_erased` audit
+event, logs one `ourios.compaction.erasure.completed` event and removes
+the marker. Rows first, tuples after — a dangling tuple is harmless, a
+dangling row is a leak.
+
+**Backfilling history** (RFC 0048 §3.4): data stored before the graph
+was configured is fed to it with
+
+```text
+ourios-server --config ourios.yaml graph backfill --tenant acme [--from 2026-08-01T00:00:00Z]
+```
+
+— reads every partition of the tenant (`--from` keeps partitions whose
+UTC hour starts at or after it), derives and writes the same tuples the
+sweep would, in idempotent ≤ 100-tuple batches, and never rewrites
+Parquet. Resumable: run it again after an interruption. Backfill and
+erasure exclude each other through the store: backfill refuses while
+erasures are pending, and the sweep defers a tenant's erasures while a
+backfill lock exists (`graph backfill --unlock --tenant acme` clears a
+crashed run's lock; `graph erasures` lists both marker kinds).
 
 The binding is cached per credential for `session_ttl_secs` and is
 **fail-closed**: an unreachable or slow OpenFGA answers `503` on the

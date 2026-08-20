@@ -27,6 +27,9 @@ ourios-config = { path = "../ourios-config" }
 ourios-ingester = { path = "../ourios-ingester", features = ["oidc", "openfga"] }
 # Durable compaction-audit sink (RFC 0005 §3.7) + the compaction policy.
 ourios-parquet = { path = "../ourios-parquet" }
+# RFC 3339 parsing for the `graph backfill --from` boundary (RFC 0048
+# §3.4); already in the Arrow dep tree via ourios-parquet.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8).
 ourios-telemetry = { path = "../ourios-telemetry" }
 # OTel meter API for the querier role's metrics (RFC 0016 §3.6); the SDK

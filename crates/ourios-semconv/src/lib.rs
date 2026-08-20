@@ -262,6 +262,9 @@ pub const EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED: &str = "ourios.compaction.e
 /// `ourios.compaction.sweep.error` log event name.
 pub const EVENT_OURIOS_COMPACTION_SWEEP_ERROR: &str = "ourios.compaction.sweep.error";
 
+/// `ourios.graph.backfill.progress` log event name.
+pub const EVENT_OURIOS_GRAPH_BACKFILL_PROGRESS: &str = "ourios.graph.backfill.progress";
+
 /// `ourios.querier.shutdown.error` log event name.
 pub const EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR: &str = "ourios.querier.shutdown.error";
 

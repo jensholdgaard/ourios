@@ -808,6 +808,7 @@ mod tests {
         let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
         let metrics = CompactionMetrics::new();
         let report = SweepReport {
+            erasures_deferred: Vec::new(),
             erasures: Vec::new(),
             graph_tuples_emitted: 0,
             tenants_scanned: 2,

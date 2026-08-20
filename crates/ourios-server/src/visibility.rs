@@ -148,8 +148,9 @@ fn reject(error: &OpenFgaError, tenant: &str, bound: usize) -> VisibilityRejecti
             status: StatusCode::FORBIDDEN,
             kind: "tenant_unaddressable",
             message: format!(
-                "tenant `{tenant}` cannot be named in the authorization graph (an object id \
-                 may not be empty, exceed 256 bytes, or contain ':', '#' or whitespace)"
+                "tenant `{tenant}` cannot be named in the authorization graph (a tenant id \
+                 is 1-128 bytes of ASCII graphic characters excluding ':', '#' and '/' — \
+                 RFC 0048)"
             ),
             error_type: "permission_denied",
         },

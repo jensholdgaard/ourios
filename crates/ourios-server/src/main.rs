@@ -784,11 +784,12 @@ async fn auth_resolver(
     Ok(Some(resolver))
 }
 
-/// RFC 0047 §3.4 / RFC 0048 §3.2: every column the graph binds — the
-/// conversation object column, the identity columns, the self-fast-path
-/// column — must be in the effective promoted set; a key the store does
-/// not project can never feed or filter the graph, and the operator hears
-/// it at startup, not as an empty graph.
+/// RFC 0047 §3.4 / RFC 0048 §3.2: the object column, the self-fast-path
+/// column and every **operator-listed** identity column must be in the
+/// effective promoted set — the operator hears a typo at startup, not as
+/// an empty graph. The defaulted identity lists are exempt: they are the
+/// RFC 0047 constants, which never required promotion (the emitter reads
+/// record attributes, not the projection).
 fn validate_graph_columns(
     openfga: &ourios_core::auth::openfga::OpenFgaConfig,
     promoted: &PromotedAttributes,

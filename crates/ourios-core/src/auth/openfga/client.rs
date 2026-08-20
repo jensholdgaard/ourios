@@ -1445,13 +1445,16 @@ mod tests {
     /// `a/b`'s conversations even though both spell `conversation:a/b/...`
     /// without the encoding.
     #[tokio::test]
-    async fn scoped_enumeration_uses_the_encoded_tenant_prefix() {
+    async fn scoped_enumeration_scopes_by_the_verbatim_tenant_prefix() {
+        // RFC 0048 §3.1: `a` is a tenant, `a/b` is not (the grammar
+        // excludes `/`), so a conversation id containing `/` can never be
+        // confused with another tenant's prefix.
         let fake = GrantFake {
             calls: Arc::new(AtomicUsize::new(0)),
             streams: Arc::new(AtomicUsize::new(0)),
             grants: Arc::new(vec![
                 ("user:bob", "can_read_content", "conversation:a/b/c-1"),
-                ("user:bob", "can_read_content", "conversation:a%2Fb/c-2"),
+                ("user:bob", "can_read_content", "conversation:ab/c-2"),
             ]),
             stall: false,
         };
@@ -1465,10 +1468,17 @@ mod tests {
             }
         );
         assert_eq!(
-            resolver.visibility(&bob, &[], "a/b").await.expect("a/b"),
+            resolver.visibility(&bob, &[], "ab").await.expect("ab"),
             Visibility::Scoped {
                 conversations: BTreeSet::from(["c-2".to_string()])
             }
+        );
+        assert!(
+            matches!(
+                resolver.visibility(&bob, &[], "a/b").await,
+                Err(OpenFgaError::InvalidTenant)
+            ),
+            "a value outside the grammar cannot be addressed at all"
         );
     }
 

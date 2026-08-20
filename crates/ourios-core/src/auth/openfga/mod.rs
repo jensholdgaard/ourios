@@ -590,16 +590,17 @@ pub fn is_object_id(id: &str) -> bool {
             .any(|c| c == ':' || c == '#' || c.is_whitespace())
 }
 
-/// The naming rule for tenant-scoped objects (RFC 0047 §3.3) — the **one**
-/// place it lives, used by the planner and the emitter alike. The tenant is
-/// its own object, `tenant:<T>`; a conversation inside it is
-/// `conversation:<enc(T)>/<id>` where `enc` percent-encodes `%` and `/` in
-/// the tenant so the `/` separator is unambiguous — `a` + `b/c-1` and
-/// `a/b` + `c-1` are two different objects — and the raw conversation id
-/// follows verbatim (it may itself contain `/`).
+/// The naming rule for tenant-scoped objects (RFC 0047 §3.3, amended by
+/// RFC 0048 §3.1) — the **one** place it lives, used by the planner and
+/// the emitter alike. The tenant is its own object, `tenant:<T>`; a
+/// conversation inside it is `conversation:<T>/<id>` with `T` **verbatim**
+/// — the RFC 0048 grammar excludes `/` from tenant ids, so the separator
+/// is unambiguous without any encoding — and the raw conversation id
+/// follows (it may itself contain `/`).
 ///
-/// A tenant that cannot be an object id at all (`:`, `#`, whitespace, too
-/// long, empty) has no graph objects; callers fail closed.
+/// A value outside the tenant grammar has no graph objects; callers fail
+/// closed (unreachable from the request boundaries, which apply the same
+/// grammar first — this is the library's own guard).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantObjects {
     tenant_object: String,
@@ -608,38 +609,19 @@ pub struct TenantObjects {
 }
 
 impl TenantObjects {
-    /// The graph objects of `tenant`, or `None` when the tenant id cannot
-    /// form an object id — raw, or once its segment is encoded (the
-    /// encoding can only grow it; a tenant whose encoded segment plus the
-    /// `/` separator leaves no room for a conversation id has no
-    /// tenant-scoped objects).
+    /// The graph objects of `tenant`, or `None` when the value is outside
+    /// the RFC 0048 §3.1 tenant grammar. The 128-byte grammar bound keeps
+    /// every composed object (`tenant:`, `conversation:…/…`, `tool:…/…`)
+    /// under the 256-byte full-string cap by construction.
     #[must_use]
     pub fn new(tenant: &str) -> Option<Self> {
-        if !is_object_id(tenant) {
-            return None;
-        }
-        let tenant_object = format!("{TENANT_TYPE}:{tenant}");
-        if tenant_object.len() > MAX_OBJECT_BYTES {
-            return None;
-        }
-        let encoded = encode_tenant_segment(tenant);
-        let conversation_prefix = format!("{CONVERSATION_TYPE}:{encoded}/");
-        if conversation_prefix.len() >= MAX_OBJECT_BYTES {
-            return None;
-        }
-        let tool_prefix = format!("tool:{encoded}/");
-        let longest_tool = MCP_TOOL_NAMES
-            .iter()
-            .map(|name| name.len())
-            .max()
-            .unwrap_or(0);
-        if tool_prefix.len() + longest_tool > MAX_OBJECT_BYTES {
+        if crate::tenant::validate_tenant_id(tenant).is_err() {
             return None;
         }
         Some(Self {
-            tenant_object,
-            conversation_prefix,
-            tool_prefix,
+            tenant_object: format!("{TENANT_TYPE}:{tenant}"),
+            conversation_prefix: format!("{CONVERSATION_TYPE}:{tenant}/"),
+            tool_prefix: format!("tool:{tenant}/"),
         })
     }
 
@@ -649,20 +631,20 @@ impl TenantObjects {
         &self.tenant_object
     }
 
-    /// `conversation:<enc(T)>/` — every conversation of the tenant starts
+    /// `conversation:<T>/` — every conversation of the tenant starts
     /// with this; the remainder is the raw conversation id.
     #[must_use]
     pub fn conversation_prefix(&self) -> &str {
         &self.conversation_prefix
     }
 
-    /// `conversation:<enc(T)>/<id>`.
+    /// `conversation:<T>/<id>`.
     #[must_use]
     pub fn conversation(&self, id: &str) -> String {
         format!("{}{id}", self.conversation_prefix)
     }
 
-    /// Whether `conversation:<enc(T)>/<id>` is a valid object: `id` must be
+    /// Whether `conversation:<T>/<id>` is a valid object: `id` must be
     /// an object id itself and the **full object string** must fit
     /// `OpenFGA`'s 256-byte cap. The emitter skips ids that do not.
     #[must_use]
@@ -670,25 +652,11 @@ impl TenantObjects {
         is_object_id(id) && self.conversation_prefix.len() + id.len() <= MAX_OBJECT_BYTES
     }
 
-    /// `tool:<enc(T)>/<name>`.
+    /// `tool:<T>/<name>`.
     #[must_use]
     pub fn tool(&self, name: &str) -> String {
         format!("{}{name}", self.tool_prefix)
     }
-}
-
-/// Percent-encode the two bytes that would make the tenant segment of a
-/// `conversation:<T>/<id>` object ambiguous.
-fn encode_tenant_segment(tenant: &str) -> String {
-    let mut out = String::with_capacity(tenant.len());
-    for c in tenant.chars() {
-        match c {
-            '%' => out.push_str("%25"),
-            '/' => out.push_str("%2F"),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -929,39 +897,30 @@ mod tests {
     fn tenant_objects_are_unambiguous() {
         use super::TenantObjects;
         let a = TenantObjects::new("a").expect("valid");
-        let ab = TenantObjects::new("a/b").expect("valid");
         assert_eq!(a.tenant(), "tenant:a");
         assert_eq!(a.conversation("b/c-1"), "conversation:a/b/c-1");
-        assert_eq!(ab.conversation("c-1"), "conversation:a%2Fb/c-1");
-        assert_ne!(a.conversation("b/c-1"), ab.conversation("c-1"));
-        assert_eq!(ab.conversation_prefix(), "conversation:a%2Fb/");
-        assert_eq!(
-            TenantObjects::new("100%").expect("valid").conversation("x"),
-            "conversation:100%25/x"
-        );
+        assert_eq!(a.conversation_prefix(), "conversation:a/");
         assert_eq!(a.tool("query_logs"), "tool:a/query_logs");
-        for bad in ["", "a b", "a:b", "a#b"] {
+        // RFC 0048 §3.1: the grammar (not an encoding) makes the `/`
+        // separator unambiguous — a tenant containing `/`, `:`, `#`,
+        // whitespace or non-ASCII has no graph objects at all.
+        for bad in ["", "a b", "a:b", "a#b", "a/b", "100%\u{e9}", "a\tb"] {
             assert!(TenantObjects::new(bad).is_none(), "{bad:?}");
         }
-        // The encoding may not push the segment past the object-id limit,
-        // and a conversation id must fit next to it.
-        let slashes = "/".repeat(90); // 90 raw bytes → 270 encoded
-        assert!(TenantObjects::new(&slashes).is_none());
-        let long = "x".repeat(200);
-        let t = TenantObjects::new(&long).expect("fits alone");
-        assert!(t.conversation_fits("c-1"));
-        assert!(!t.conversation_fits(&"y".repeat(43)), "214 + 43 > 256");
-        assert!(!t.conversation_fits("a b"));
-        // The cap covers the full `type:id` string (RFC 0048 §3.1): a
-        // 128-byte tenant leaves exactly 256 − 13 − 128 − 1 = 114 bytes.
-        let t = TenantObjects::new(&"t".repeat(128)).expect("fits alone");
+        assert!(TenantObjects::new("100%").is_some(), "% is plain now");
+        assert!(TenantObjects::new(&"t".repeat(128)).is_some());
+        assert!(
+            TenantObjects::new(&"t".repeat(129)).is_none(),
+            "grammar bound"
+        );
+        // RFC0048.2 — the byte budget: the cap covers the full `type:id`
+        // string, so a 128-byte tenant leaves 256 − 13 − 128 − 1 = 114
+        // bytes for the conversation id; an id containing `/` fits.
+        let t = TenantObjects::new(&"t".repeat(128)).expect("fits");
         assert!(t.conversation_fits(&"c".repeat(114)));
         assert!(!t.conversation_fits(&"c".repeat(115)));
-        // The constructor demands room for a one-byte conversation id and
-        // for every fixed RFC 0027 tool object: `tool:` + 236 + `/` +
-        // `template_drift` = 256 is the binding bound.
-        assert!(TenantObjects::new(&"t".repeat(236)).is_some());
-        assert!(TenantObjects::new(&"t".repeat(237)).is_none());
+        assert!(t.conversation_fits("session/42"));
+        assert!(!t.conversation_fits("a b"));
     }
 
     /// The principal vocabulary renders exactly the model's type names.

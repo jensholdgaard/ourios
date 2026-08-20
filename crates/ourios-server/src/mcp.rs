@@ -205,13 +205,15 @@ pub(crate) struct OuriosMcp {
 }
 
 /// Normalize a tool's `tenant` argument the way the HTTP surface treats
-/// the header: trimmed, and empty is a caller error — never a distinct
-/// tenant id.
+/// the header: trimmed, then the RFC 0048 §3.1 tenant grammar — a value
+/// outside it is a caller error, never a distinct tenant id.
 fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
-    let tenant = raw.trim();
-    if tenant.is_empty() {
+    // ASCII-only trimming: a Unicode space (NBSP) is not padding, it is an
+    // off-grammar character the validator must see.
+    let tenant = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    if let Err(e) = ourios_core::tenant::validate_tenant_id(tenant) {
         return Err(ErrorData::invalid_params(
-            "the tenant argument is required and must be non-empty",
+            format!("the tenant argument is invalid: {e} (RFC 0048 §3.1)"),
             None,
         ));
     }
@@ -924,6 +926,32 @@ pub(crate) fn mcp_router(
 
 #[cfg(test)]
 mod tests {
+    use super::normalize_tenant;
+
+    /// RFC0048.1 — the MCP `tenant` argument speaks the tenant grammar.
+    #[test]
+    fn tenant_argument_speaks_the_grammar() {
+        assert_eq!(normalize_tenant(" acme ").expect("trimmed"), "acme");
+        assert_eq!(
+            normalize_tenant("team-eu.%1~x").expect("graphic"),
+            "team-eu.%1~x"
+        );
+        for bad in [
+            "",
+            "  ",
+            "a/b",
+            "a:b",
+            "a#b",
+            "a b",
+            "\u{e9}",
+            "\u{a0}acme\u{a0}",
+            &"x".repeat(129),
+        ] {
+            let err = normalize_tenant(bad).expect_err("refused");
+            assert!(err.message.contains("tenant argument"), "{bad:?}: {err:?}");
+        }
+    }
+
     use std::collections::BTreeSet;
 
     use ourios_core::audit::ParamType;

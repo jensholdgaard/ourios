@@ -167,20 +167,22 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
         .await
         .expect("missing delete ignored");
 
-    // Object naming on the real server: a tenant containing `/` and `%`
-    // percent-encodes its segment (`TenantObjects`); the stored object id
-    // comes back byte-for-byte from `Read` and the streamed enumeration
-    // filters on the encoded prefix — `a` and `a/b` never alias.
+    // Object naming on the real server (RFC 0048 §3.1): the tenant lands
+    // **verbatim** — the grammar (no `/` in tenants) is what keeps the
+    // prefix unambiguous, not an encoding; `a` and `ab` never alias, `%`
+    // is a plain character, and a value with `/` has no objects at all.
     {
         use ourios_core::auth::openfga::{ListObjectsRequest, TenantObjects};
         let a = TenantObjects::new("a").expect("valid");
-        let ab = TenantObjects::new("a/b").expect("valid");
+        let ab = TenantObjects::new("ab").expect("valid");
         let pct = TenantObjects::new("100%").expect("valid");
+        assert!(TenantObjects::new("a/b").is_none(), "outside the grammar");
         let seeded = [
             tuple("user:zoe", "participant", &a.conversation("b/c-1")),
             tuple("user:zoe", "participant", &ab.conversation("c-1")),
             tuple("user:zoe", "participant", &pct.conversation("c-2")),
         ];
+        assert_eq!(pct.conversation("c-2"), "conversation:100%/c-2");
         fga.write(&seeded, &[])
             .await
             .expect("write encoded objects");

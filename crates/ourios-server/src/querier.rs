@@ -492,12 +492,29 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
 
     // Tenant is required and checked here, before the engine is invoked
     // (RFC 0016 §3.3): a missing/empty header is a `400` that never scans data.
-    let Some(tenant) = tenant_from_headers(&headers) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing_tenant",
-            "the X-Ourios-Tenant header is required and must be non-empty",
-        );
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(TenantHeaderError::Missing) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing_tenant",
+                "the X-Ourios-Tenant header is required and must be non-empty",
+            );
+        }
+        Err(TenantHeaderError::NotText) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_tenant",
+                "the X-Ourios-Tenant value must be visible ASCII text (RFC 0048 §3.1)",
+            );
+        }
+        Err(TenantHeaderError::Invalid(e)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_tenant",
+                &format!("the X-Ourios-Tenant value is invalid: {e} (RFC 0048 §3.1)"),
+            );
+        }
     };
     tracing::Span::current().record("ourios.tenant", tenant.as_str());
 
@@ -583,11 +600,31 @@ pub(crate) fn query_error_type(error: &ourios_querier::QueryError) -> &'static s
     }
 }
 
-/// Read + validate the `X-Ourios-Tenant` header. `None` when absent, non-UTF-8,
-/// or empty (all → `400` at the call site).
-fn tenant_from_headers(headers: &HeaderMap) -> Option<TenantId> {
-    let value = headers.get(TENANT_HEADER)?.to_str().ok()?.trim();
-    (!value.is_empty()).then(|| TenantId::new(value))
+/// Read + validate the `X-Ourios-Tenant` header: `Missing` when absent
+/// (or opaque bytes), else the RFC 0048 §3.1 grammar's verdict — the two
+/// refusals carry distinct kinds at the call site.
+fn tenant_from_headers(headers: &HeaderMap) -> Result<TenantId, TenantHeaderError> {
+    let Some(value) = headers.get(TENANT_HEADER) else {
+        return Err(TenantHeaderError::Missing);
+    };
+    // Present but not visible-ASCII text (obs-text bytes): off-grammar,
+    // never conflated with an absent header.
+    let Ok(value) = value.to_str() else {
+        return Err(TenantHeaderError::NotText);
+    };
+    match TenantId::try_new(value.trim_matches(|c: char| c.is_ascii_whitespace())) {
+        Ok(tenant) => Ok(tenant),
+        // Present-but-empty keeps the RFC 0026 `missing_tenant` contract —
+        // an empty header is as good as an absent one.
+        Err(ourios_core::tenant::TenantIdError::Empty) => Err(TenantHeaderError::Missing),
+        Err(e) => Err(TenantHeaderError::Invalid(e)),
+    }
+}
+
+enum TenantHeaderError {
+    Missing,
+    NotText,
+    Invalid(ourios_core::tenant::TenantIdError),
 }
 
 /// Parse the body into a [`Statement`] by `Content-Type` (RFC 0016 §3.3):
@@ -1128,9 +1165,11 @@ struct QueryWrapper {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
+    use ourios_core::tenant::TenantId;
+
     use super::{
-        DEFAULT_LIMIT, LogRowDto, MAX_LIMIT, Stage, Statement, apply_limit, parse_body,
-        tenant_from_headers,
+        DEFAULT_LIMIT, LogRowDto, MAX_LIMIT, Stage, Statement, TenantHeaderError, apply_limit,
+        parse_body, tenant_from_headers,
     };
 
     fn headers(content_type: Option<&str>, tenant: Option<&str>) -> HeaderMap {
@@ -1211,15 +1250,32 @@ mod tests {
     }
 
     #[test]
-    fn tenant_header_present_absent_empty() {
-        assert_eq!(
-            tenant_from_headers(&headers(None, Some("acme")))
-                .as_ref()
-                .map(ourios_core::tenant::TenantId::as_str),
-            Some("acme"),
+    fn tenant_header_present_absent_invalid() {
+        let value = tenant_from_headers(&headers(None, Some("acme")));
+        assert_eq!(value.ok().as_ref().map(TenantId::as_str), Some("acme"));
+        assert!(matches!(
+            tenant_from_headers(&headers(None, None)),
+            Err(TenantHeaderError::Missing)
+        ));
+        // RFC0048.1: empty-after-trim and off-grammar values are `Invalid`
+        // (a distinct kind at the surface), never conflated with absent.
+        assert!(
+            matches!(
+                tenant_from_headers(&headers(None, Some("   "))),
+                Err(TenantHeaderError::Missing)
+            ),
+            "present-but-empty keeps the RFC 0026 missing_tenant contract"
         );
-        assert!(tenant_from_headers(&headers(None, None)).is_none());
-        assert!(tenant_from_headers(&headers(None, Some("   "))).is_none());
+        assert!(matches!(
+            tenant_from_headers(&headers(None, Some("a/b"))),
+            Err(TenantHeaderError::Invalid(_))
+        ));
+        // A present header whose bytes are not visible-ASCII text (an NBSP
+        // is obs-text to HeaderValue) is `NotText`, never `Missing`.
+        assert!(matches!(
+            tenant_from_headers(&headers(None, Some("\u{a0}acme"))),
+            Err(TenantHeaderError::NotText)
+        ));
     }
 
     #[test]

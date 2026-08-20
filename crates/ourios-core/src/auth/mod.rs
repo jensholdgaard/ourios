@@ -470,11 +470,12 @@ fn build_tenant_set(index: usize, spec: &TokenSpec) -> Result<TenantSet, String>
         }
         return Ok(TenantSet::All);
     }
-    if spec.tenants.iter().any(|t| t.is_empty() || t.trim() != t) {
-        return Err(format!(
-            "auth.tokens[{index}].tenants entries must be non-empty tenant ids \
-             without surrounding whitespace"
-        ));
+    for tenant in &spec.tenants {
+        if let Err(e) = crate::tenant::validate_tenant_id(tenant) {
+            return Err(format!(
+                "auth.tokens[{index}].tenants entry {tenant:?}: {e} (RFC 0048 §3.1)"
+            ));
+        }
     }
     Ok(TenantSet::Listed(spec.tenants.iter().cloned().collect()))
 }
@@ -583,7 +584,9 @@ mod tests {
             ),
             (vec![spec("a", "tok-a", &[])], "tenants"),
             (vec![spec("a", "tok-a", &["*", "acme"])], "only"),
-            (vec![spec("a", "tok-a", &[" acme"])], "whitespace"),
+            (vec![spec("a", "tok-a", &[" acme"])], "ASCII graphic"),
+            (vec![spec("a", "tok-a", &["a/b"])], "ASCII graphic"),
+            (vec![spec("a", "tok-a", &["\u{e9}"])], "ASCII graphic"),
         ];
         for (specs, needle) in cases {
             let err = build_token_store(Some(&specs)).expect_err("invalid");

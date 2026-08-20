@@ -446,7 +446,8 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
 }
 
 /// Validate a tenant-claim value with the RFC 0026 §3.1 list rules (the
-/// wildcard alone, else non-empty ids without surrounding whitespace).
+/// wildcard alone) and the RFC 0048 §3.1 tenant grammar per entry — a
+/// token whose claim carries an id outside the grammar is unverifiable.
 fn validate_tenant_list(tenants: &[String]) -> Option<TenantSet> {
     if tenants.is_empty() {
         return None;
@@ -457,7 +458,10 @@ fn validate_tenant_list(tenants: &[String]) -> Option<TenantSet> {
         }
         return Some(TenantSet::All);
     }
-    if tenants.iter().any(|t| t.is_empty() || t.trim() != t) {
+    if tenants
+        .iter()
+        .any(|t| crate::tenant::validate_tenant_id(t).is_err())
+    {
         return None;
     }
     Some(TenantSet::Listed(tenants.iter().cloned().collect()))

@@ -68,6 +68,10 @@ pub fn build_auth_config(section: Option<&AuthSection>) -> Result<Option<AuthCon
                     column: object.column.clone(),
                 })
                 .collect(),
+            identities: ourios_core::auth::openfga::IdentitiesSpec {
+                user_columns: openfga.visibility.identities.user_columns.clone(),
+                agent_columns: openfga.visibility.identities.agent_columns.clone(),
+            },
             self_principal_column: openfga.visibility.self_principal_column.clone(),
             content_columns: openfga.visibility.content_columns.clone(),
             max_objects: openfga.visibility.max_objects.clone(),

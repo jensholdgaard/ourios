@@ -784,6 +784,42 @@ async fn auth_resolver(
     Ok(Some(resolver))
 }
 
+/// RFC 0047 §3.4 / RFC 0048 §3.2: every column the graph binds — the
+/// conversation object column, the identity columns, the self-fast-path
+/// column — must be in the effective promoted set; a key the store does
+/// not project can never feed or filter the graph, and the operator hears
+/// it at startup, not as an empty graph.
+fn validate_graph_columns(
+    openfga: &ourios_core::auth::openfga::OpenFgaConfig,
+    promoted: &PromotedAttributes,
+) -> Result<(), String> {
+    let known: std::collections::BTreeSet<String> = promoted.column_names().collect();
+    let visibility = openfga.visibility();
+    let check = |what: &str, column: &str| -> Result<(), String> {
+        if known.contains(column) {
+            Ok(())
+        } else {
+            Err(format!(
+                "auth.openfga.visibility.{what}: `{column}` is not a promoted column — add \
+                 it to storage.promoted_attributes (RFC 0048 §3.2)"
+            ))
+        }
+    };
+    for object in visibility.objects() {
+        check("objects[].column", object.column())?;
+    }
+    for column in visibility.user_columns() {
+        check("identities.user_columns", column)?;
+    }
+    for column in visibility.agent_columns() {
+        check("identities.agent_columns", column)?;
+    }
+    if let Some(column) = visibility.self_principal_column() {
+        check("self_principal_column", column)?;
+    }
+    Ok(())
+}
+
 /// Start the querier role if enabled (RFC 0016), over the same store the
 /// receiver writes and the compactor sweeps. Reports the bound address on
 /// stdout (an operator — or a test binding `:0` — learns the actual port).
@@ -871,8 +907,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // rewrites rows (receiver flush cadence, compaction sweep) when the graph
     // binds a conversation object; no startup round-trip.
     let graph_emitter = match config.auth.as_ref().and_then(|auth| auth.openfga.as_ref()) {
-        Some(openfga) => ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?
-            .map(std::sync::Arc::new),
+        Some(openfga) => {
+            validate_graph_columns(openfga, &config.promoted)?;
+            ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?
+                .map(std::sync::Arc::new)
+        }
         None => None,
     };
 

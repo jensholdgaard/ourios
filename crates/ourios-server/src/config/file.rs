@@ -483,12 +483,27 @@ pub struct OpenFgaSection {
     pub server_list_objects_deadline_ms: Option<String>,
 }
 
+/// `auth.openfga.visibility.identities.*` — RFC 0048 §3.2.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdentitiesSection {
+    /// Promoted columns whose values become `user:` principals.
+    #[serde(default, deserialize_with = "scalar_vec_opt")]
+    pub user_columns: Option<Vec<String>>,
+    /// Promoted columns whose values become `agent:` principals.
+    #[serde(default, deserialize_with = "scalar_vec_opt")]
+    pub agent_columns: Option<Vec<String>>,
+}
+
 /// `auth.openfga.visibility.*` — RFC 0047 §3.4. Nothing here is secret.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VisibilitySection {
     /// Object type → promoted column bindings (v1: `conversation` only).
     pub objects: Vec<VisibilityObjectSection>,
+    /// Which promoted columns carry the principals in a conversation
+    /// (RFC 0048 §3.2). Unset lists take the semantic-convention defaults.
+    pub identities: IdentitiesSection,
     /// The promoted column compared to a `user:` principal's subject.
     #[serde(deserialize_with = "scalar_opt")]
     pub self_principal_column: Option<String>,
@@ -741,6 +756,12 @@ impl AuthSection {
                 substitute(&mut object.column, lookup)?;
             }
             substitute(&mut visibility.self_principal_column, lookup)?;
+            for column in visibility.identities.user_columns.iter_mut().flatten() {
+                *column = env_subst::resolve(column, lookup)?;
+            }
+            for column in visibility.identities.agent_columns.iter_mut().flatten() {
+                *column = env_subst::resolve(column, lookup)?;
+            }
             for column in visibility.content_columns.iter_mut().flatten() {
                 *column = env_subst::resolve(column, lookup)?;
             }
@@ -1530,7 +1551,7 @@ auth:
     fn openfga_visibility_section_parses() {
         let lookup = env(&[("CONV", "attr.gen_ai.conversation.id")]);
         let cfg = parse(
-            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n    server_list_objects_deadline_ms: 3000\n    visibility:\n      objects:\n        - type: conversation\n          column: ${env:CONV}\n      self_principal_column: attr.user.hash\n      content_columns: [body, attr.prompt]\n      max_objects: 100\n      list_timeout_ms: 500\n",
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n    server_list_objects_deadline_ms: 3000\n    visibility:\n      objects:\n        - type: conversation\n          column: ${env:CONV}\n      identities:\n        user_columns: [\"${env:CONV}\", attr.enduser.pseudo.id]\n        agent_columns: [attr.bot.name]\n      self_principal_column: attr.user.hash\n      content_columns: [body, attr.prompt]\n      max_objects: 100\n      list_timeout_ms: 500\n",
             &lookup,
         )
         .expect("valid");
@@ -1554,6 +1575,20 @@ auth:
             Some("attr.user.hash")
         );
         assert_eq!(
+            visibility.identities.user_columns.as_deref(),
+            Some(
+                &[
+                    "attr.gen_ai.conversation.id".to_string(),
+                    "attr.enduser.pseudo.id".to_string()
+                ][..]
+            ),
+            "identities substituted (RFC 0048 §3.2)"
+        );
+        assert_eq!(
+            visibility.identities.agent_columns.as_deref(),
+            Some(&["attr.bot.name".to_string()][..])
+        );
+        assert_eq!(
             visibility.content_columns.as_deref(),
             Some(&["body".to_string(), "attr.prompt".to_string()][..]),
             "an explicit list replaces the default set (non-empty by startup validation)"
@@ -1574,6 +1609,17 @@ auth:
                 .content_columns
                 .is_none(),
             "absent = the default set"
+        );
+        let cfg = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:CONV}\n      tenants: [x]\n  openfga:\n    api_url: http://fga:8080\n    store_id: s\n",
+            &lookup,
+        )
+        .expect("valid");
+        let visibility = cfg.auth.expect("auth").openfga.expect("openfga").visibility;
+        assert!(
+            visibility.identities.user_columns.is_none()
+                && visibility.identities.agent_columns.is_none(),
+            "absent identities = the semconv defaults"
         );
         let err = parse(
             "auth:\n  openfga:\n    visibility:\n      objects:\n        - kind: conversation\n",

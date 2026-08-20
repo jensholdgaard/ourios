@@ -59,6 +59,9 @@ pub struct OpenFgaSpec {
 pub struct VisibilitySpec {
     /// `objects[]`: graph object type → the promoted column carrying its id.
     pub objects: Vec<VisibilityObjectSpec>,
+    /// `identities`: which promoted columns carry the principals in a
+    /// conversation (RFC 0048 §3.2). Unset lists take the semconv defaults.
+    pub identities: IdentitiesSpec,
     /// The promoted column compared to a `user:` principal's subject (the
     /// §3.3 self fast path); unset disables the path.
     pub self_principal_column: Option<String>,
@@ -69,6 +72,15 @@ pub struct VisibilitySpec {
     pub max_objects: Option<String>,
     /// The client-side enumeration timeout in milliseconds (default 2000).
     pub list_timeout_ms: Option<String>,
+}
+
+/// The `visibility.identities` block, raw (RFC 0048 §3.2).
+#[derive(Debug, Default, Clone)]
+pub struct IdentitiesSpec {
+    /// Promoted columns whose values become `user:<v>` principals.
+    pub user_columns: Option<Vec<String>>,
+    /// Promoted columns whose values become `agent:<v>` principals.
+    pub agent_columns: Option<Vec<String>>,
 }
 
 /// One `visibility.objects[]` entry, raw.
@@ -138,6 +150,8 @@ pub struct OpenFgaConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibilityConfig {
     objects: Vec<VisibilityObject>,
+    user_columns: Vec<String>,
+    agent_columns: Vec<String>,
     self_principal_column: Option<String>,
     content_columns: Vec<String>,
     max_objects: usize,
@@ -172,7 +186,20 @@ impl VisibilityConfig {
         &self.objects
     }
 
-    /// The self-fast-path column, when enabled.
+    /// The promoted columns whose values become `user:` principals.
+    #[must_use]
+    pub fn user_columns(&self) -> &[String] {
+        &self.user_columns
+    }
+
+    /// The promoted columns whose values become `agent:` principals.
+    #[must_use]
+    pub fn agent_columns(&self) -> &[String] {
+        &self.agent_columns
+    }
+
+    /// The column compared to a `user:` principal's subject, if the self
+    /// fast path is enabled.
     #[must_use]
     pub fn self_principal_column(&self) -> Option<&str> {
         self.self_principal_column.as_deref()
@@ -209,6 +236,14 @@ pub const DEFAULT_CONTENT_COLUMNS: [&str; 6] = [
 ];
 /// The default `visibility.max_objects`.
 pub const DEFAULT_MAX_OBJECTS: usize = 10_000;
+
+/// The default `visibility.identities.user_columns` (RFC 0048 §3.2) — the
+/// OpenTelemetry semconv keys for an anonymised / pseudonymous end user.
+pub const DEFAULT_USER_COLUMNS: [&str; 2] = ["attr.user.hash", "attr.enduser.pseudo.id"];
+
+/// The default `visibility.identities.agent_columns` (RFC 0048 §3.2) — the
+/// `GenAI` semconv agent identifier.
+pub const DEFAULT_AGENT_COLUMNS: [&str; 1] = ["attr.gen_ai.agent.id"];
 /// The default `visibility.list_timeout_ms`.
 pub const DEFAULT_LIST_TIMEOUT_MS: u64 = 2_000;
 /// The default `server_list_objects_deadline_ms` (`OpenFGA`'s own default).
@@ -409,6 +444,65 @@ fn build_visibility_objects(
     Ok(objects)
 }
 
+/// Validate one `identities` list (RFC 0048 §3.2): an explicit empty list
+/// is refused (omit the key for the semconv defaults — a graph with no
+/// user columns has no participants, a misconfiguration, not a choice);
+/// entries must be promoted column names, listed once.
+fn build_identity_columns(
+    key: &str,
+    raw: Option<&Vec<String>>,
+    default: &[&str],
+    promoted_column: impl Fn(&str, &str) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
+    match raw {
+        None => Ok(default.iter().map(|c| (*c).to_string()).collect()),
+        Some(columns) if columns.is_empty() => Err(format!(
+            "auth.openfga.visibility.identities.{key} must not be empty — omit it for the \
+             semantic-convention defaults (RFC 0048 §3.2)"
+        )),
+        Some(columns) => {
+            let mut seen = std::collections::BTreeSet::new();
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let column = promoted_column(&format!("identities.{key}[{index}]"), column)?;
+                    if !seen.insert(column.clone()) {
+                        return Err(format!(
+                            "auth.openfga.visibility.identities.{key}[{index}]: `{column}` \
+                             listed twice (RFC 0048 §3.2)"
+                        ));
+                    }
+                    Ok(column)
+                })
+                .collect()
+        }
+    }
+}
+
+/// Validate `self_principal_column`: the fast path compares the subject
+/// to a column that also mints `participant`, or it compares nothing
+/// (RFC 0048 §3.2).
+fn build_self_column(
+    raw: Option<&str>,
+    user_columns: &[String],
+    promoted_column: impl Fn(&str, &str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(column) => {
+            let column = promoted_column("self_principal_column", column)?;
+            if !user_columns.contains(&column) {
+                return Err(format!(
+                    "auth.openfga.visibility.self_principal_column `{column}` must be one of \
+                     identities.user_columns {user_columns:?} (RFC 0048 §3.2)"
+                ));
+            }
+            Ok(Some(column))
+        }
+    }
+}
+
 /// Validate the raw visibility section (RFC 0047 §3.4).
 ///
 /// # Errors
@@ -436,10 +530,23 @@ fn build_visibility_config(
         Ok(value.to_string())
     };
     let objects = build_visibility_objects(&spec.objects, promoted_column)?;
-    let self_principal_column = match spec.self_principal_column.as_deref() {
-        None | Some("") => None,
-        Some(column) => Some(promoted_column("self_principal_column", column)?),
-    };
+    let user_columns = build_identity_columns(
+        "user_columns",
+        spec.identities.user_columns.as_ref(),
+        &DEFAULT_USER_COLUMNS,
+        promoted_column,
+    )?;
+    let agent_columns = build_identity_columns(
+        "agent_columns",
+        spec.identities.agent_columns.as_ref(),
+        &DEFAULT_AGENT_COLUMNS,
+        promoted_column,
+    )?;
+    let self_principal_column = build_self_column(
+        spec.self_principal_column.as_deref(),
+        &user_columns,
+        promoted_column,
+    )?;
     let content_columns = match &spec.content_columns {
         None => DEFAULT_CONTENT_COLUMNS
             .iter()
@@ -500,6 +607,8 @@ fn build_visibility_config(
     }
     Ok(VisibilityConfig {
         objects,
+        user_columns,
+        agent_columns,
         self_principal_column,
         content_columns,
         max_objects,
@@ -663,7 +772,82 @@ impl TenantObjects {
 mod tests {
     use std::time::Duration;
 
-    use super::{Consistency, OpenFgaSpec, Principal, PrincipalKind, build_openfga_config};
+    use super::{
+        Consistency, IdentitiesSpec, OpenFgaSpec, Principal, PrincipalKind, build_openfga_config,
+    };
+
+    /// RFC0048.3 — `identities` validation: semconv defaults when unset;
+    /// explicit empty and duplicate lists refused naming the key; the self
+    /// column must be one of `user_columns`.
+    #[test]
+    fn identities_default_validate_and_bind_the_self_column() {
+        use super::{DEFAULT_AGENT_COLUMNS, DEFAULT_USER_COLUMNS, IdentitiesSpec};
+        let config = build_openfga_config(&spec()).expect("valid");
+        assert_eq!(config.visibility().user_columns(), DEFAULT_USER_COLUMNS);
+        assert_eq!(config.visibility().agent_columns(), DEFAULT_AGENT_COLUMNS);
+        let with = |identities: IdentitiesSpec, self_column: Option<&str>| {
+            let mut spec = spec();
+            spec.visibility.identities = identities;
+            spec.visibility.self_principal_column = self_column.map(str::to_string);
+            build_openfga_config(&spec)
+        };
+        let custom = with(
+            IdentitiesSpec {
+                user_columns: Some(vec!["attr.enduser.id".to_string()]),
+                agent_columns: Some(vec!["resource.bot.name".to_string()]),
+            },
+            Some("attr.enduser.id"),
+        )
+        .expect("valid");
+        assert_eq!(custom.visibility().user_columns(), ["attr.enduser.id"]);
+        assert_eq!(custom.visibility().agent_columns(), ["resource.bot.name"]);
+        for (identities, self_column, needle) in [
+            (
+                IdentitiesSpec {
+                    user_columns: Some(Vec::new()),
+                    agent_columns: None,
+                },
+                None,
+                "identities.user_columns must not be empty",
+            ),
+            (
+                IdentitiesSpec {
+                    user_columns: None,
+                    agent_columns: Some(vec!["bot.name".to_string()]),
+                },
+                None,
+                "identities.agent_columns[0]",
+            ),
+            (
+                IdentitiesSpec {
+                    user_columns: Some(vec![
+                        "attr.enduser.id".to_string(),
+                        "attr.enduser.id".to_string(),
+                    ]),
+                    agent_columns: None,
+                },
+                None,
+                "listed twice",
+            ),
+            (
+                IdentitiesSpec {
+                    user_columns: Some(vec!["attr.enduser.id".to_string()]),
+                    agent_columns: None,
+                },
+                Some("attr.user.hash"),
+                "must be one of identities.user_columns",
+            ),
+        ] {
+            let err = with(identities, self_column).expect_err("invalid");
+            assert!(err.contains(needle), "{needle:?} not in {err:?}");
+        }
+        // The default self column pairs with the default user columns.
+        let defaulted = with(IdentitiesSpec::default(), Some("attr.user.hash")).expect("valid");
+        assert_eq!(
+            defaulted.visibility().self_principal_column(),
+            Some("attr.user.hash")
+        );
+    }
 
     fn spec() -> OpenFgaSpec {
         OpenFgaSpec {
@@ -782,6 +966,7 @@ mod tests {
                     object_type: Some("conversation".to_string()),
                     column: Some("attr.gen_ai.conversation.id".to_string()),
                 }],
+                identities: IdentitiesSpec::default(),
                 self_principal_column: Some("attr.user.hash".to_string()),
                 content_columns: Some(vec!["body".to_string(), "attr.prompt".to_string()]),
                 max_objects: Some("100".to_string()),

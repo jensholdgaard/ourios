@@ -254,6 +254,9 @@ fn run_operator_verb(cli: &Cli, config: &ServerConfig) -> Result<bool, String> {
     match &cli.command {
         None => Ok(false),
         Some(Command::Graph(verb)) => {
+            // Ids are refused before the store is even opened — an
+            // off-grammar invocation performs no backend work at all.
+            validate_graph_verb(verb)?;
             let store = config.store.open().map_err(|e| e.to_string())?;
             run_graph_verb(verb, &store)?;
             Ok(true)
@@ -261,10 +264,12 @@ fn run_operator_verb(cli: &Cli, config: &ServerConfig) -> Result<bool, String> {
     }
 }
 
-/// Run one `graph` verb against the configured store and exit. Ids are
-/// checked against their grammars before any store work (RFC0048.4).
-fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(), String> {
-    use ourios_ingester::compactor::{pending_erasures, request_erasure};
+/// The grammar gate for every `graph` verb's ids, run **before** the
+/// store is opened (RFC0048.4): the tenant grammar for `--tenant`, the
+/// object-id grammar for `--conversation` (a raw id may contain `/`; one
+/// that cannot name a graph object for its tenant is still erasable —
+/// its *rows* are the leak, RFC 0048 §3.1).
+fn validate_graph_verb(verb: &GraphVerb) -> Result<(), String> {
     match verb {
         GraphVerb::Erase {
             tenant,
@@ -279,6 +284,25 @@ fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(),
                         .to_string(),
                 );
             }
+            Ok(())
+        }
+        GraphVerb::Erasures { tenant } => match tenant {
+            Some(tenant) => ourios_core::tenant::validate_tenant_id(tenant)
+                .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)")),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Run one grammar-checked `graph` verb against the configured store and
+/// exit (RFC0048.4).
+fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(), String> {
+    use ourios_ingester::compactor::{pending_erasures, request_erasure};
+    match verb {
+        GraphVerb::Erase {
+            tenant,
+            conversation,
+        } => {
             request_erasure(store, tenant, conversation).map_err(|e| e.to_string())?;
             println!(
                 "erasure requested: tenant {tenant:?} conversation {conversation:?} \
@@ -287,10 +311,6 @@ fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(),
             Ok(())
         }
         GraphVerb::Erasures { tenant } => {
-            if let Some(tenant) = tenant {
-                ourios_core::tenant::validate_tenant_id(tenant)
-                    .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)"))?;
-            }
             let mut requests = pending_erasures(store).map_err(|e| e.to_string())?;
             if let Some(tenant) = tenant {
                 requests.retain(|r| r.tenant == *tenant);

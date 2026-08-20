@@ -916,13 +916,20 @@ async fn graph_phase(
         outcome.finished = true;
         // RFC 0048 §3.3: completion is observable in the logs too — one
         // structured event per finished erasure.
+        // `tuples_deleted` is set on the same path that queued the marker
+        // removal; a `None` here would be a regression worth seeing in the
+        // log rather than a silent 0 (and never worth a panic — §6.5's
+        // no-unwrap rule holds in the sweep).
+        let tuples_deleted = outcome
+            .tuples_deleted
+            .map_or_else(|| "unknown".to_string(), |n| n.to_string());
         tracing::info!(
             name: ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED,
             "conversation erasure completed: tenant {:?} conversation {:?}, {} rows dropped, {} tuples deleted",
             outcome.request.tenant,
             outcome.request.conversation_id,
             outcome.rows_dropped,
-            outcome.tuples_deleted.unwrap_or(0),
+            tuples_deleted,
         );
     }
     report.errors.extend(errors);

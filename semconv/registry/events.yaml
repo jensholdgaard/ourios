@@ -61,6 +61,16 @@ groups:
       One partition of a `graph backfill` run was read and its derived
       tuples written (RFC 0048 §3.4). The message names the tenant, the
       partition, rows offered and tuples written.
+  - id: event.ourios.server.graph.list_deadline
+    type: event
+    name: ourios.server.graph.list_deadline
+    stability: development
+    brief: >
+      The graph resolver's client-side enumeration timeout and the
+      declared server-side OPENFGA_LIST_OBJECTS_DEADLINE, logged once at
+      startup (RFC 0048 §3.6) — the server cannot observe the real
+      deadline, so it makes its assumption loud; the message carries both
+      values in milliseconds.
   - id: event.ourios.querier.shutdown.error
     type: event
     name: ourios.querier.shutdown.error

@@ -119,6 +119,53 @@ async fn rfc0048_3_unpromoted_identity_column_is_a_startup_error() {
     }
 }
 
+/// RFC0048.7 — the deadline assumption is loud: one startup line carries
+/// both values (and the RFC 0047 startup rejection for a timeout at or
+/// above the deadline stays — asserted in the config unit tests).
+#[tokio::test]
+async fn rfc0048_7_list_deadline_event_at_startup() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let config_path = tmp.path().join("ourios.yaml");
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    write!(
+        file,
+        "storage:\n  local:\n    bucket_root: {}\n  promoted_attributes:\n    log: [gen_ai.conversation.id]\n\
+         receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
+         auth:\n  tokens:\n    - name: a\n      token: ${{env:RFC0048_TOKEN}}\n      tenants: [\"*\"]\n\
+         \x20\x20openfga:\n    api_url: http://openfga.invalid:8080\n    store_id: s\n    server_list_objects_deadline_ms: 2500\n    visibility:\n      objects:\n        - type: conversation\n          column: attr.gen_ai.conversation.id\n      list_timeout_ms: 1500\n",
+        tmp.path().display(),
+        tmp.path().join("wal").display(),
+    )
+    .expect("write config");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .env("RFC0048_TOKEN", "tok-a")
+        .env("RUST_LOG", "info")
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let found = timeout(Duration::from_secs(15), async {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            if line.contains("list_timeout_ms 1500")
+                && line.contains("server_list_objects_deadline_ms 2500")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("startup line before timeout");
+    assert!(found, "the deadline event names both values");
+    child.kill().await.expect("kill");
+}
+
 /// RFC0048.2 — verbatim objects on a real graph: write → `Read`
 /// byte-for-byte → streamed prefix filter; the 114/115 budget and a `/`
 /// conversation id, end to end through the emitter.

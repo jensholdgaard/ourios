@@ -265,6 +265,21 @@ pub fn release_backfill_lock(store: &Store, tenant: &str) -> Result<(), IngestEr
     }
 }
 
+/// Whether `tenant` holds a backfill lock right now (RFC 0048 §3.4) —
+/// read per erasure request rather than from a snapshot, so a lock taken
+/// while the sweep runs is still observed.
+///
+/// # Errors
+///
+/// [`IngestError::Io`] when the marker cannot be read.
+pub fn backfill_lock_held(store: &Store, tenant: &str) -> Result<bool, IngestError> {
+    let key = backfill_lock_key(tenant);
+    store
+        .get_blocking_opt(&key)
+        .map(|body| body.is_some())
+        .map_err(|e| store_error("read backfill lock", &key, &e))
+}
+
 /// The tenants holding a backfill lock, in deterministic order.
 ///
 /// # Errors
@@ -708,12 +723,16 @@ fn erase_pending(
     erasure_match: Option<&ErasureMatch<'_>>,
     report: &mut SweepReport,
 ) -> Result<(), IngestError> {
-    let locked: std::collections::BTreeSet<String> = backfill_locks(store)?.into_iter().collect();
     for request in pending_erasures(store)? {
         // RFC 0048 §3.4: backfill and erasure exclude each other — a
         // partition read before this erasure and written after it would
-        // recreate the tuples. Skip (and report) while the lock exists.
-        if locked.contains(&request.tenant) {
+        // recreate the tuples. The lock is read **per request**, right
+        // before acting, never from a snapshot: with backfill's
+        // re-check-under-lock on the other side, every interleaving is
+        // covered — a backfill that acquired before this read is seen
+        // here (defer), and one that acquires after it sees this marker
+        // under its own lock (refuse + release).
+        if backfill_lock_held(store, &request.tenant)? {
             report.erasures_deferred.push(request.marker.clone());
             tracing::info!(
                 "erasure of tenant {:?} conversation {:?} deferred: backfill in progress",

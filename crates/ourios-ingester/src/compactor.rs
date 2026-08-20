@@ -912,7 +912,25 @@ async fn graph_phase(
     .expect("erasure completion task should not panic");
     *audit_sink = sink;
     for index in finished {
-        report.erasures[index].finished = true;
+        let outcome = &mut report.erasures[index];
+        outcome.finished = true;
+        // RFC 0048 §3.3: completion is observable in the logs too — one
+        // structured event per finished erasure.
+        // `tuples_deleted` is set on the same path that queued the marker
+        // removal; a `None` here would be a regression worth seeing in the
+        // log rather than a silent 0 (and never worth a panic — §6.5's
+        // no-unwrap rule holds in the sweep).
+        let tuples_deleted = outcome
+            .tuples_deleted
+            .map_or_else(|| "unknown".to_string(), |n| n.to_string());
+        tracing::info!(
+            name: ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED,
+            "conversation erasure completed: tenant {:?} conversation {:?}, {} rows dropped, {} tuples deleted",
+            outcome.request.tenant,
+            outcome.request.conversation_id,
+            outcome.rows_dropped,
+            tuples_deleted,
+        );
     }
     report.errors.extend(errors);
 }
@@ -1699,6 +1717,15 @@ mod graph_tests {
             "no tuple was ever minted for a non-object-id conversation"
         );
         request_erasure(&store, "acme", "odd id").expect("request");
+        // RFC0048.4 — the completion is a structured log event; the fmt
+        // mirror renders its message (the registry-backed name travels the
+        // OTel Logs signal, gated by the semconv live-check in CI).
+        let events: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let subscriber = {
+            use tracing_subscriber::prelude::*;
+            tracing_subscriber::registry().with(CaptureEvents(Arc::clone(&events)))
+        };
+        let guard = tracing::subscriber::set_default(subscriber);
         let (result, _, _) = sweep_once(
             store.clone(),
             CompactionPolicy::default(),
@@ -1707,6 +1734,7 @@ mod graph_tests {
             Some(emitter),
         )
         .await;
+        drop(guard);
         let report = result.expect("sweep");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let outcome = &report.erasures[0];
@@ -1714,5 +1742,53 @@ mod graph_tests {
         assert_eq!(outcome.tuples_deleted, Some(0));
         assert!(outcome.finished);
         assert_eq!(live_rows(&store, bucket.path()).len(), 1);
+        // The **registry-backed name** is the contract (a reword of the
+        // message must not silently drop it), and the message carries the
+        // four values RFC 0048 §3.3 names.
+        let events = events.lock().expect("events").clone();
+        let completion = events
+            .iter()
+            .find(|(name, _)| name == ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED)
+            .unwrap_or_else(|| panic!("no completion event among {events:?}"));
+        assert_eq!(completion.0, "ourios.compaction.erasure.completed");
+        assert!(
+            completion.1.contains(
+                "conversation erasure completed: tenant \"acme\" conversation \"odd id\", \
+                 2 rows dropped, 0 tuples deleted"
+            ),
+            "{completion:?}"
+        );
+    }
+
+    /// A `Layer` capturing `(event name, rendered message)` pairs — the
+    /// `fmt` mirror renders the message but not the metadata name, and the
+    /// name is what the registry pins.
+    struct CaptureEvents(Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .expect("events")
+                .push((event.metadata().name().to_string(), message.0));
+        }
     }
 }

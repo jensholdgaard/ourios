@@ -213,6 +213,128 @@ struct Cli {
     /// `OURIOS_*` environment variables.
     #[arg(long, value_name = "PATH", value_parser = non_empty_path)]
     config: Option<PathBuf>,
+
+    /// An operator verb; without one, the server runs its configured roles.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Operate the authorization graph's operational surfaces (RFC 0048).
+    #[command(subcommand)]
+    Graph(GraphVerb),
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum GraphVerb {
+    /// Request the erasure of one conversation: writes the durable marker
+    /// the next compaction sweep acts on (idempotent, RFC 0048 §3.3).
+    Erase {
+        /// The tenant (RFC 0048 §3.1 grammar).
+        #[arg(long)]
+        tenant: String,
+        /// The raw conversation id (object-id grammar; `/` is allowed).
+        #[arg(long)]
+        conversation: String,
+    },
+    /// List pending erasure requests and their phase.
+    Erasures {
+        /// Restrict the listing to one tenant.
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+}
+
+/// Run the CLI's operator verb, if one was given: the grammar gate runs
+/// **first** — even `resolve_config` can create the local store root, so
+/// an off-grammar invocation performs no filesystem or backend work at
+/// all — then the verb resolves the same storage config as the daemon,
+/// acts on the store of record, and the caller exits: no roles, no
+/// telemetry boot (RFC 0048 §3.3). `false` when there is no verb and the
+/// server should run its roles.
+fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
+    match &cli.command {
+        None => Ok(false),
+        Some(Command::Graph(verb)) => {
+            validate_graph_verb(verb)?;
+            let config = resolve_config(cli.config.as_deref())?;
+            let store = config.store.open().map_err(|e| e.to_string())?;
+            run_graph_verb(verb, &store)?;
+            Ok(true)
+        }
+    }
+}
+
+/// The grammar gate for every `graph` verb's ids, run **before** the
+/// store is opened (RFC0048.4): the tenant grammar for `--tenant`, the
+/// object-id grammar for `--conversation` (a raw id may contain `/`; one
+/// that cannot name a graph object for its tenant is still erasable —
+/// its *rows* are the leak, RFC 0048 §3.1).
+fn validate_graph_verb(verb: &GraphVerb) -> Result<(), String> {
+    match verb {
+        GraphVerb::Erase {
+            tenant,
+            conversation,
+        } => {
+            ourios_core::tenant::validate_tenant_id(tenant)
+                .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)"))?;
+            if !ourios_core::auth::openfga::is_object_id(conversation) {
+                return Err(
+                    "--conversation: not an object id (non-empty, no ':', '#' or \
+                     whitespace, at most 256 bytes) (RFC 0048 §3.1)"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        GraphVerb::Erasures { tenant } => match tenant {
+            Some(tenant) => ourios_core::tenant::validate_tenant_id(tenant)
+                .map_err(|e| format!("--tenant: {e} (RFC 0048 §3.1)")),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Run one grammar-checked `graph` verb against the configured store and
+/// exit (RFC0048.4).
+fn run_graph_verb(verb: &GraphVerb, store: &ourios_parquet::Store) -> Result<(), String> {
+    use ourios_ingester::compactor::{pending_erasures, request_erasure};
+    match verb {
+        GraphVerb::Erase {
+            tenant,
+            conversation,
+        } => {
+            request_erasure(store, tenant, conversation).map_err(|e| e.to_string())?;
+            println!(
+                "erasure requested: tenant {tenant:?} conversation {conversation:?} \
+                 (idempotent; the next compaction sweep acts on it)"
+            );
+            Ok(())
+        }
+        GraphVerb::Erasures { tenant } => {
+            let mut requests = pending_erasures(store).map_err(|e| e.to_string())?;
+            if let Some(tenant) = tenant {
+                requests.retain(|r| r.tenant == *tenant);
+            }
+            if requests.is_empty() {
+                println!("no pending erasures");
+                return Ok(());
+            }
+            for request in requests {
+                println!(
+                    "pending erasure: tenant {:?} conversation {:?} phase {}",
+                    request.tenant,
+                    request.conversation_id,
+                    match request.phase {
+                        ourios_ingester::compactor::ErasurePhase::Rows => "rows",
+                        ourios_ingester::compactor::ErasurePhase::Tuples => "tuples",
+                    }
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A `--config` value parser that rejects an empty path (a required argument
@@ -876,6 +998,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
     // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
     let cli = Cli::parse();
+    if run_operator_verb(&cli)? {
+        return Ok(());
+    }
     let config = resolve_config(cli.config.as_deref())?;
 
     // Preflight the data store *before* binding any network role, so a

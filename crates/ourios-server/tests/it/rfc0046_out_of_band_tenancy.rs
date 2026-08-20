@@ -301,8 +301,19 @@ async fn rfc0046_out_of_band_tenancy_end_to_end() {
     // (A control character inside a header value never reaches the handler
     // — hyper rejects the request at the parser — so that arm is the
     // selector unit test's; here: empty, oversize, repeated.)
-    let long = "x".repeat(257);
-    let bad_cases: [&[&str]; 3] = [&[""], &[long.as_str()], &["acme", "acme"]];
+    let long = "x".repeat(129);
+    // RFC0048.1 — the tenant grammar at the OTLP boundary: oversize (129 >
+    // 128), `/`, `:`, `#`, interior space and non-ASCII all refuse.
+    let bad_cases: [&[&str]; 8] = [
+        &[""],
+        &[long.as_str()],
+        &["acme", "acme"],
+        &["a/b"],
+        &["a:b"],
+        &["a#b"],
+        &["a b"],
+        &["\u{e9}-tenant"],
+    ];
     for bad in bad_cases {
         let (status, reason) = post_logs(s1.http, &plain(), bad, None).await;
         assert_eq!(status, 400, "{bad:?}: {reason}");
@@ -338,8 +349,9 @@ async fn rfc0046_out_of_band_tenancy_end_to_end() {
     )
     .await
     .expect("gRPC export with selector acks");
-    // RFC0046.7 — a selector with reserved characters round-trips.
-    let (status, reason) = post_logs(s1.http, &plain(), &["team/eu %1 x"], None).await;
+    // RFC0048.1 — graphic-ASCII punctuation inside the grammar
+    // round-trips (`%`, `.`, `~` are plain characters, not an encoding).
+    let (status, reason) = post_logs(s1.http, &plain(), &["team-eu.%1~x"], None).await;
     assert_eq!(status, 200, "{reason}");
     stop(s1).await;
 
@@ -384,9 +396,9 @@ async fn rfc0046_out_of_band_tenancy_end_to_end() {
         "the denied export never landed"
     );
     assert_eq!(
-        rows_for(q, "team/eu %1 x").await,
+        rows_for(q, "team-eu.%1~x").await,
         1,
-        "reserved chars round-trip"
+        "graphic punctuation round-trips"
     );
     stop(s3).await;
 }

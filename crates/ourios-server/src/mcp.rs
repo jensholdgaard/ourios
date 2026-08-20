@@ -205,13 +205,13 @@ pub(crate) struct OuriosMcp {
 }
 
 /// Normalize a tool's `tenant` argument the way the HTTP surface treats
-/// the header: trimmed, and empty is a caller error — never a distinct
-/// tenant id.
+/// the header: trimmed, then the RFC 0048 §3.1 tenant grammar — a value
+/// outside it is a caller error, never a distinct tenant id.
 fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
     let tenant = raw.trim();
-    if tenant.is_empty() {
+    if let Err(e) = ourios_core::tenant::validate_tenant_id(tenant) {
         return Err(ErrorData::invalid_params(
-            "the tenant argument is required and must be non-empty",
+            format!("the tenant argument is invalid: {e} (RFC 0048 §3.1)"),
             None,
         ));
     }

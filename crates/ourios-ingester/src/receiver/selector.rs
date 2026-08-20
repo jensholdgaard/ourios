@@ -3,14 +3,15 @@
 //! export, exactly one occurrence, normalised once into the `TenantId` that
 //! authorization, the WAL frame, storage and queries all use.
 
-use ourios_core::tenant::TenantId;
+use ourios_core::tenant::{MAX_TENANT_BYTES, TenantId, TenantIdError};
 
 /// The header / metadata key (lower-case; HTTP header names are
 /// case-insensitive, gRPC metadata keys are lower-case by construction).
 pub const TENANT_HEADER: &str = "x-ourios-tenant";
 
-/// The RFC 0046 §3.1 upper bound on a normalised selector, in bytes.
-pub const MAX_SELECTOR_BYTES: usize = 256;
+/// The RFC 0048 §3.1 upper bound on a normalised selector, in bytes — the
+/// tenant grammar's bound, re-exported for the receiver's error surface.
+pub const MAX_SELECTOR_BYTES: usize = MAX_TENANT_BYTES;
 
 /// Why a request's tenant selector was refused — always a client error
 /// (`400` / `INVALID_ARGUMENT`), decided before authorization and before
@@ -28,8 +29,9 @@ pub enum SelectorError {
     Empty,
     /// Longer than [`MAX_SELECTOR_BYTES`] after trimming.
     TooLong { found: usize },
-    /// Contains an ASCII control character.
-    ControlCharacter,
+    /// A character outside the RFC 0048 §3.1 tenant grammar (ASCII
+    /// graphic excluding `:`, `#` and `/`).
+    OutsideGrammar { found: char },
 }
 
 impl std::fmt::Display for SelectorError {
@@ -49,9 +51,10 @@ impl std::fmt::Display for SelectorError {
                 f,
                 "the {TENANT_HEADER} value is {found} bytes; the maximum is {MAX_SELECTOR_BYTES}"
             ),
-            Self::ControlCharacter => write!(
+            Self::OutsideGrammar { found } => write!(
                 f,
-                "the {TENANT_HEADER} value must not contain control characters"
+                "the {TENANT_HEADER} value must be ASCII graphic characters excluding \
+                 ':', '#' and '/' (RFC 0048); found {found:?}"
             ),
         }
     }
@@ -59,24 +62,19 @@ impl std::fmt::Display for SelectorError {
 
 impl std::error::Error for SelectorError {}
 
-/// Normalise one raw selector value: trim ASCII whitespace, then require
-/// non-empty, ≤ [`MAX_SELECTOR_BYTES`], no control characters.
+/// Normalise one raw selector value: trim ASCII whitespace, then apply
+/// the RFC 0048 §3.1 tenant grammar.
 ///
 /// # Errors
 ///
 /// [`SelectorError`] naming the first failed rule.
 pub fn normalise(raw: &str) -> Result<TenantId, SelectorError> {
     let value = raw.trim_matches(|c: char| c.is_ascii_whitespace());
-    if value.is_empty() {
-        return Err(SelectorError::Empty);
-    }
-    if value.len() > MAX_SELECTOR_BYTES {
-        return Err(SelectorError::TooLong { found: value.len() });
-    }
-    if value.chars().any(char::is_control) {
-        return Err(SelectorError::ControlCharacter);
-    }
-    Ok(TenantId::new(value))
+    TenantId::try_new(value).map_err(|e| match e {
+        TenantIdError::Empty => SelectorError::Empty,
+        TenantIdError::TooLong { found } => SelectorError::TooLong { found },
+        TenantIdError::InvalidCharacter { found } => SelectorError::OutsideGrammar { found },
+    })
 }
 
 /// Resolve the selector from every occurrence of the header/metadata key
@@ -121,9 +119,9 @@ pub fn from_headers(headers: &axum::http::HeaderMap) -> Result<TenantId, Selecto
 }
 
 /// The selector on an OTLP/gRPC request (RFC 0046 §3.1): all
-/// `x-ourios-tenant` ASCII metadata entries — gRPC ASCII metadata can only
-/// carry visible ASCII, so a non-ASCII tenant id is not reachable over
-/// gRPC (`INVALID_ARGUMENT`), as the RFC states.
+/// `x-ourios-tenant` ASCII metadata entries. The RFC 0046 "non-ASCII over
+/// HTTP but not gRPC" caveat is gone — the RFC 0048 grammar is ASCII on
+/// every transport.
 ///
 /// # Errors
 ///
@@ -140,31 +138,33 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use tonic::metadata::MetadataMap;
 
-    // RFC0046.7 — normalisation rules.
+    // RFC0046.7 normalisation, under the RFC0048.1 grammar.
     #[test]
-    fn normalise_trims_and_bounds() {
+    fn normalise_trims_and_applies_the_grammar() {
         assert_eq!(normalise(" acme ").expect("trimmed").as_str(), "acme");
-        assert_eq!(
-            normalise("a/b %c").expect("interior space ok").as_str(),
-            "a/b %c"
-        );
-        assert_eq!(normalise("é-tenant").expect("utf-8").as_str(), "é-tenant");
+        assert_eq!(normalise("100%").expect("graphic ascii").as_str(), "100%");
         assert_eq!(normalise("   ").unwrap_err(), SelectorError::Empty);
         assert_eq!(normalise("").unwrap_err(), SelectorError::Empty);
         assert!(matches!(
-            normalise(&"x".repeat(257)).unwrap_err(),
-            SelectorError::TooLong { found: 257 }
+            normalise(&"x".repeat(129)).unwrap_err(),
+            SelectorError::TooLong { found: 129 }
         ));
-        assert!(normalise(&"x".repeat(256)).is_ok());
-        assert_eq!(
-            normalise("a\u{7f}b").unwrap_err(),
-            SelectorError::ControlCharacter
-        );
-        assert_eq!(
-            normalise("a\tb").unwrap_err(),
-            SelectorError::ControlCharacter,
-            "interior tab is a control character (only the ends are trimmed)"
-        );
+        assert!(normalise(&"x".repeat(128)).is_ok());
+        for (bad, found) in [
+            ("a/b", '/'),
+            ("a:b", ':'),
+            ("a#b", '#'),
+            ("a b", ' '),
+            ("a\tb", '\t'),
+            ("é-tenant", 'é'),
+            ("a\u{7f}b", '\u{7f}'),
+        ] {
+            assert_eq!(
+                normalise(bad).unwrap_err(),
+                SelectorError::OutsideGrammar { found },
+                "{bad:?}"
+            );
+        }
     }
 
     // RFC0046.1/.7 — HTTP: missing, single, repeated (equal values too).

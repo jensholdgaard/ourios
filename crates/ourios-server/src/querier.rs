@@ -583,11 +583,12 @@ pub(crate) fn query_error_type(error: &ourios_querier::QueryError) -> &'static s
     }
 }
 
-/// Read + validate the `X-Ourios-Tenant` header. `None` when absent, non-UTF-8,
-/// or empty (all → `400` at the call site).
+/// Read + validate the `X-Ourios-Tenant` header. `None` when absent,
+/// non-UTF-8, or outside the RFC 0048 §3.1 tenant grammar (all → `400` at
+/// the call site).
 fn tenant_from_headers(headers: &HeaderMap) -> Option<TenantId> {
     let value = headers.get(TENANT_HEADER)?.to_str().ok()?.trim();
-    (!value.is_empty()).then(|| TenantId::new(value))
+    TenantId::try_new(value).ok()
 }
 
 /// Parse the body into a [`Statement`] by `Content-Type` (RFC 0016 §3.3):

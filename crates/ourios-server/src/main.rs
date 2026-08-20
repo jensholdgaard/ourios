@@ -257,7 +257,7 @@ enum GraphVerb {
         #[arg(long)]
         from: Option<String>,
         /// Clear a crashed run's backfill lock instead of running.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from")]
         unlock: bool,
     },
 }
@@ -321,7 +321,9 @@ async fn run_graph_verb(
     store: &ourios_parquet::Store,
     config: &ServerConfig,
 ) -> Result<(), String> {
-    use ourios_ingester::compactor::{backfill_locks, pending_erasures, request_erasure};
+    use ourios_ingester::compactor::{
+        backfill_locks, pending_erasures, pending_erasures_for, request_erasure,
+    };
     match verb {
         GraphVerb::Erase {
             tenant,
@@ -335,10 +337,11 @@ async fn run_graph_verb(
             Ok(())
         }
         GraphVerb::Erasures { tenant } => {
-            let mut requests = pending_erasures(store).map_err(|e| e.to_string())?;
-            if let Some(tenant) = tenant {
-                requests.retain(|r| r.tenant == *tenant);
+            let requests = match tenant {
+                Some(tenant) => pending_erasures_for(store, tenant),
+                None => pending_erasures(store),
             }
+            .map_err(|e| e.to_string())?;
             let mut locks = backfill_locks(store).map_err(|e| e.to_string())?;
             if let Some(tenant) = tenant {
                 locks.retain(|t| t == tenant);

@@ -384,10 +384,7 @@ pub async fn backfill_tenant(
     tenant: &str,
     from_unix_nanos: Option<u64>,
 ) -> Result<Result<BackfillReport, BackfillRefusal>, IngestError> {
-    let pending = pending_erasures(store)?
-        .iter()
-        .filter(|r| r.tenant == tenant)
-        .count();
+    let pending = pending_erasures_for(store, tenant)?.len();
     if pending > 0 {
         return Ok(Err(BackfillRefusal::ErasuresPending(pending)));
     }
@@ -399,10 +396,7 @@ pub async fn backfill_tenant(
     let _lock = BackfillLock { store, tenant };
     // Re-check under the lock: a marker written between the check and the
     // acquire must win — refuse (RFC0048.8).
-    let pending = pending_erasures(store)?
-        .iter()
-        .filter(|r| r.tenant == tenant)
-        .count();
+    let pending = pending_erasures_for(store, tenant)?.len();
     if pending > 0 {
         return Ok(Err(BackfillRefusal::ErasuresPending(pending)));
     }
@@ -489,9 +483,32 @@ async fn backfill_locked(
 /// cannot be read — a transient store error never regresses a marker's
 /// phase.
 pub fn pending_erasures(store: &Store) -> Result<Vec<ErasureRequest>, IngestError> {
+    pending_erasures_under(store, ERASURE_PREFIX)
+}
+
+/// The pending erasure requests **of one tenant** — the same listing
+/// scoped to `erasure/tenant_id=<enc>/`, so a caller interested in one
+/// tenant does not pay for every other tenant's markers (RFC 0048 §3.4:
+/// backfill checks this twice, before and under its lock).
+///
+/// # Errors
+///
+/// See [`pending_erasures`].
+pub fn pending_erasures_for(
+    store: &Store,
+    tenant: &str,
+) -> Result<Vec<ErasureRequest>, IngestError> {
+    let prefix = format!(
+        "{ERASURE_PREFIX}tenant_id={}/",
+        percent_encode_tenant(tenant)
+    );
+    pending_erasures_under(store, &prefix)
+}
+
+fn pending_erasures_under(store: &Store, prefix: &str) -> Result<Vec<ErasureRequest>, IngestError> {
     let mut keys = store
-        .list_blocking(Some(ERASURE_PREFIX))
-        .map_err(|e| store_error("list erasure markers", ERASURE_PREFIX, &e))?;
+        .list_blocking(Some(prefix))
+        .map_err(|e| store_error("list erasure markers", prefix, &e))?;
     keys.sort();
     let mut requests = Vec::new();
     for key in keys {

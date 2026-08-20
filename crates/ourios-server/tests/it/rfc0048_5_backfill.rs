@@ -33,6 +33,27 @@ const HOUR2_START: &str = "2026-04-02T11:00:00Z";
 const HOUR2: u64 = 1_775_131_080_000_000_000;
 const ALL: &str = "true | range(-365d, now) | limit 100";
 
+/// The `auth:` block binding this test's issuer and graph — one raw
+/// literal, so the YAML reads as YAML.
+fn auth_yaml(issuer: &str, api_url: &str, store_id: &str, model_id: &str) -> String {
+    format!(
+        r"auth:
+  oidc:
+    issuer: {issuer}
+    audience: ourios
+  openfga:
+    api_url: {api_url}
+    store_id: {store_id}
+    authorization_model_id: {model_id}
+    session_ttl_secs: 1
+    visibility:
+      objects:
+        - type: conversation
+          column: attr.gen_ai.conversation.id
+"
+    )
+}
+
 /// Run one `graph` CLI verb against `config_path`; return the output.
 async fn cli(config_path: &std::path::Path, args: &[&str]) -> std::process::Output {
     timeout(
@@ -103,22 +124,18 @@ async fn rfc0048_5_8_backfill_and_fence_end_to_end() {
     let issuer = serve_issuer(jwk).await;
     let config_path = tmp.path().join("ourios.yaml");
     let mut file = std::fs::File::create(&config_path).expect("create config");
+    // A raw literal: the YAML's indentation is the file's indentation, so
+    // a structural mistake is visible here rather than inside escapes.
     write!(
         file,
-        "storage:\n  local:\n    bucket_root: {}\n\
-         \x20\x20promoted_attributes:\n    log: [gen_ai.conversation.id, user.hash, model, {{key: cost_usd, type: f64}}]\n\
-         auth:\n\
-         \x20\x20oidc:\n    issuer: {issuer}\n    audience: ourios\n\
-         \x20\x20openfga:\n\
-         \x20\x20\x20\x20api_url: {api_url}\n\
-         \x20\x20\x20\x20store_id: {store_id}\n\
-         \x20\x20\x20\x20authorization_model_id: {model_id}\n\
-         \x20\x20\x20\x20session_ttl_secs: 1\n\
-         \x20\x20\x20\x20visibility:\n\
-         \x20\x20\x20\x20\x20\x20objects:\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20- type: conversation\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20column: attr.gen_ai.conversation.id\n",
-        tmp.path().display(),
+        r"storage:
+  local:
+    bucket_root: {bucket}
+  promoted_attributes:
+    log: [gen_ai.conversation.id, user.hash, model, {{key: cost_usd, type: f64}}]
+{auth}",
+        bucket = tmp.path().display(),
+        auth = auth_yaml(&issuer, &api_url, &store_id, &model_id),
     )
     .expect("write config");
 
@@ -204,21 +221,9 @@ async fn rfc0048_5_8_backfill_and_fence_end_to_end() {
 
     // --- The scoped principals see exactly their history ------------------
     let storage_yaml = "  promoted_attributes:\n    log: [gen_ai.conversation.id, user.hash, model, {key: cost_usd, type: f64}]\n";
-    let auth_yaml = format!(
-        "auth:\n\
-         \x20\x20oidc:\n    issuer: {issuer}\n    audience: ourios\n\
-         \x20\x20openfga:\n\
-         \x20\x20\x20\x20api_url: {api_url}\n\
-         \x20\x20\x20\x20store_id: {store_id}\n\
-         \x20\x20\x20\x20authorization_model_id: {model_id}\n\
-         \x20\x20\x20\x20session_ttl_secs: 1\n\
-         \x20\x20\x20\x20visibility:\n\
-         \x20\x20\x20\x20\x20\x20objects:\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20- type: conversation\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20column: attr.gen_ai.conversation.id\n"
-    );
+    let auth = auth_yaml(&issuer, &api_url, &store_id, &model_id);
     let (mut child, _grpc, _http, querier) =
-        spawn_with_auth_and_storage(&tmp, storage_yaml, &auth_yaml, &[]).await;
+        spawn_with_auth_and_storage(&tmp, storage_yaml, &auth, &[]).await;
     let alice = mint(&encoding, &issuer, "alice", &[], false);
     let (status, body) = query(&http, querier, &alice, "acme", ALL).await;
     assert_eq!(status, 200, "{body}");

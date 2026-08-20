@@ -6,6 +6,7 @@
 //! `tenant` argument speak the same grammar, and the graph holds the
 //! exact bytes the grammar admits.
 
+use std::io::Write as _;
 use std::time::Duration;
 
 use ourios_core::auth::openfga::{
@@ -67,6 +68,55 @@ async fn rfc0048_1_querier_header_speaks_the_grammar() {
     assert_eq!(status, 200, "graphic punctuation is inside the grammar");
     assert_eq!(kind, "", "no error object on success");
     child.kill().await.expect("kill");
+}
+
+/// RFC0048.3 (startup arms) — a graph column outside the promoted set is
+/// a startup error naming the key; so is a `self_principal_column` outside
+/// `user_columns` (refused in config validation before any store work).
+#[tokio::test]
+async fn rfc0048_3_unpromoted_identity_column_is_a_startup_error() {
+    for (yaml, needle) in [
+        (
+            "      identities:\n        user_columns: [attr.not.promoted]\n",
+            "identities.user_columns: `attr.not.promoted` is not a promoted column",
+        ),
+        (
+            "      identities:\n        agent_columns: [attr.also.missing]\n",
+            "identities.agent_columns: `attr.also.missing` is not a promoted column",
+        ),
+        (
+            "      self_principal_column: attr.gen_ai.conversation.id\n",
+            "must be one of identities.user_columns",
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let config_path = tmp.path().join("ourios.yaml");
+        let mut file = std::fs::File::create(&config_path).expect("create config");
+        write!(
+            file,
+            "storage:\n  local:\n    bucket_root: {}\n  promoted_attributes:\n    log: [gen_ai.conversation.id, user.hash, enduser.pseudo.id, gen_ai.agent.id]\n\
+             receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
+             auth:\n  tokens:\n    - name: a\n      token: ${{env:RFC0048_TOKEN}}\n      tenants: [\"*\"]\n  openfga:\n    api_url: http://openfga.invalid:8080\n    store_id: s\n    visibility:\n      objects:\n        - type: conversation\n          column: attr.gen_ai.conversation.id\n{yaml}",
+            tmp.path().display(),
+            tmp.path().join("wal").display(),
+        )
+        .expect("write config");
+        let output = timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+                .arg("--config")
+                .arg(&config_path)
+                .env("RFC0048_TOKEN", "tok-a")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("server exits before timeout")
+        .expect("run ourios-server");
+        assert!(!output.status.success(), "{yaml:?} must fail startup");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "{needle:?} not in: {stderr}");
+    }
 }
 
 /// RFC0048.2 — verbatim objects on a real graph: write → `Read`

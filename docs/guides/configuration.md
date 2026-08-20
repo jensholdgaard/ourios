@@ -83,6 +83,15 @@ auth:
       objects:
         - type: conversation
           column: attr.gen_ai.conversation.id
+      # Optional (RFC 0048 §3.2). Which promoted columns carry the
+      # principals in a conversation. An omitted list takes the semconv
+      # default shown here and is exempt from the promoted-column check;
+      # every EXPLICITLY listed entry must be a promoted column (startup
+      # error otherwise). self_principal_column, when set, must be a
+      # promoted column AND one of user_columns.
+      # identities:
+      #   user_columns: [attr.user.hash, attr.enduser.pseudo.id]
+      #   agent_columns: [attr.gen_ai.agent.id]
       self_principal_column: attr.user.hash
       # Optional. REPLACES the default set (body + the GenAI content
       # attributes) — list every column to mask; must not be empty.

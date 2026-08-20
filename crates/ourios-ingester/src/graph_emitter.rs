@@ -29,10 +29,6 @@ use ourios_semconv as semconv;
 
 /// `OpenFGA`'s cap on tuples per transactional `Write` (RFC 0047 §3.3).
 pub const WRITE_CHUNK: usize = 100;
-/// The user-identity attribute keys the emitter reads (RFC 0047 §3.3).
-pub const USER_KEYS: [&str; 2] = ["user.hash", "enduser.pseudo.id"];
-/// The agent-identity attribute key the emitter reads (RFC 0047 §3.3).
-pub const AGENT_KEY: &str = "gen_ai.agent.id";
 /// How many `Read → delete` rounds an erasure runs before giving up: a
 /// paginated `Read` is not a snapshot, so tuples written concurrently (the
 /// flush-cadence feed) are swept up by re-reading until the object is
@@ -50,14 +46,45 @@ pub struct GraphEmitter {
     client: OpenFgaClient,
     /// Which attribute family and key carries the conversation id — the
     /// same column the planner filters on.
-    conversation: ConversationKey,
+    conversation: ColumnKey,
+    /// The columns whose values become `user:` principals
+    /// (`visibility.identities.user_columns`, RFC 0048 §3.2).
+    users: Vec<ColumnKey>,
+    /// The columns whose values become `agent:` principals.
+    agents: Vec<ColumnKey>,
     tuples: Counter<u64>,
 }
 
+/// A promoted column reference, split by attribute family.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ConversationKey {
+enum ColumnKey {
     Log(String),
     Resource(String),
+}
+
+impl ColumnKey {
+    /// Parse a `attr.<key>` / `resource.<key>` promoted column name; the
+    /// config layer guarantees the shape, this is the library's own guard.
+    fn parse(section: &str, column: &str) -> Result<Self, String> {
+        if let Some(key) = column.strip_prefix(promoted::ATTR_PREFIX) {
+            Ok(Self::Log(key.to_string()))
+        } else if let Some(key) = column.strip_prefix(promoted::RESOURCE_PREFIX) {
+            Ok(Self::Resource(key.to_string()))
+        } else {
+            Err(format!(
+                "auth.openfga.visibility.{section}: column `{column}` is not a promoted \
+                 column name"
+            ))
+        }
+    }
+
+    /// The record's value under this column, if present and a string.
+    fn value<'a>(&self, record: &'a MinedRecord) -> Option<&'a str> {
+        match self {
+            Self::Log(key) => project_string_value(&record.attributes, key),
+            Self::Resource(key) => project_string_value(&record.resource_attributes, key),
+        }
+    }
 }
 
 impl std::fmt::Debug for GraphEmitter {
@@ -93,20 +120,24 @@ impl GraphEmitter {
         else {
             return Ok(None);
         };
-        let conversation = if let Some(key) = object.column().strip_prefix(promoted::ATTR_PREFIX) {
-            ConversationKey::Log(key.to_string())
-        } else if let Some(key) = object.column().strip_prefix(promoted::RESOURCE_PREFIX) {
-            ConversationKey::Resource(key.to_string())
-        } else {
-            return Err(format!(
-                "auth.openfga.visibility.objects: conversation column `{}` is not a promoted \
-                 column name",
-                object.column()
-            ));
+        let conversation = ColumnKey::parse("objects", object.column())?;
+        let column_keys = |section: &str, columns: &[String]| {
+            columns
+                .iter()
+                .map(|column| ColumnKey::parse(section, column))
+                .collect::<Result<Vec<_>, _>>()
         };
         Ok(Some(Self {
             client: OpenFgaClient::new(config)?,
             conversation,
+            users: column_keys(
+                "identities.user_columns",
+                config.visibility().user_columns(),
+            )?,
+            agents: column_keys(
+                "identities.agent_columns",
+                config.visibility().agent_columns(),
+            )?,
             tuples: global::meter("ourios.graph")
                 .u64_counter(semconv::OURIOS_GRAPH_TUPLES)
                 .with_unit("{tuple}")
@@ -125,12 +156,7 @@ impl GraphEmitter {
 
     /// The conversation id of `record` as stored, if any.
     fn raw_conversation_id<'a>(&self, record: &'a MinedRecord) -> Option<&'a str> {
-        match &self.conversation {
-            ConversationKey::Log(key) => project_string_value(&record.attributes, key),
-            ConversationKey::Resource(key) => {
-                project_string_value(&record.resource_attributes, key)
-            }
-        }
+        self.conversation.value(record)
     }
 
     /// The conversation id of `record`, when it carries one that can be a
@@ -162,8 +188,8 @@ impl GraphEmitter {
             }
             let conversation = objects.conversation(id);
             tuples.insert(TupleKey::new(objects.tenant(), "parent", &conversation));
-            for key in USER_KEYS {
-                if let Some(user) = project_string_value(&record.attributes, key)
+            for key in &self.users {
+                if let Some(user) = key.value(record)
                     && is_object_id(user)
                 {
                     let user = format!("{}:{user}", PrincipalKind::User.type_name());
@@ -171,12 +197,14 @@ impl GraphEmitter {
                     tuples.insert(TupleKey::new(&user, "scoped_reader", objects.tenant()));
                 }
             }
-            if let Some(agent) = project_string_value(&record.attributes, AGENT_KEY)
-                && is_object_id(agent)
-            {
-                let agent = format!("{}:{agent}", PrincipalKind::Agent.type_name());
-                tuples.insert(TupleKey::new(&agent, "actor", &conversation));
-                tuples.insert(TupleKey::new(&agent, "scoped_reader", objects.tenant()));
+            for key in &self.agents {
+                if let Some(agent) = key.value(record)
+                    && is_object_id(agent)
+                {
+                    let agent = format!("{}:{agent}", PrincipalKind::Agent.type_name());
+                    tuples.insert(TupleKey::new(&agent, "actor", &conversation));
+                    tuples.insert(TupleKey::new(&agent, "scoped_reader", objects.tenant()));
+                }
             }
         }
         tuples
@@ -376,8 +404,68 @@ mod tests {
             .expect("conversation bound")
     }
 
+    fn emitter_with_identities(users: &[&str], agents: &[&str]) -> GraphEmitter {
+        use ourios_core::auth::openfga::{IdentitiesSpec, VisibilityObjectSpec, VisibilitySpec};
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some("http://openfga.invalid:8080".to_string()),
+            store_id: Some("s".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                identities: IdentitiesSpec {
+                    user_columns: Some(users.iter().map(|c| (*c).to_string()).collect()),
+                    agent_columns: Some(agents.iter().map(|c| (*c).to_string()).collect()),
+                },
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("config");
+        GraphEmitter::from_config(&config)
+            .expect("client")
+            .expect("conversation bound")
+    }
+
     fn t(user: &str, relation: &str, object: &str) -> TupleKey {
         TupleKey::new(user, relation, object)
+    }
+
+    /// RFC0048.3 — identity keys are configuration: configured columns
+    /// mint the principals; the defaults mint nothing when overridden; a
+    /// resource-family column reads the resource attributes.
+    #[test]
+    fn identity_columns_are_configuration() {
+        let custom = emitter_with_identities(&["attr.enduser.id"], &["attr.bot.name"]);
+        let mut row = record(vec![
+            kv("gen_ai.conversation.id", "c-1"),
+            kv("enduser.id", "eve"),
+            kv("bot.name", "helper"),
+            kv("user.hash", "h-1"),
+            kv("gen_ai.agent.id", "a-1"),
+        ]);
+        row.resource_attributes = vec![kv("deployment.owner", "ops-1")];
+        let tuples = custom.derive("acme", std::slice::from_ref(&row));
+        assert!(tuples.contains(&t("user:eve", "participant", "conversation:acme/c-1")));
+        assert!(tuples.contains(&t("user:eve", "scoped_reader", "tenant:acme")));
+        assert!(tuples.contains(&t("agent:helper", "actor", "conversation:acme/c-1")));
+        assert!(
+            !tuples
+                .iter()
+                .any(|k| k.user.contains("h-1") || k.user.contains("a-1")),
+            "the overridden defaults mint nothing: {tuples:?}"
+        );
+        // No identities block → today's defaults, unchanged (RFC0047.10).
+        let default = emitter();
+        let tuples = default.derive("acme", std::slice::from_ref(&row));
+        assert!(tuples.contains(&t("user:h-1", "participant", "conversation:acme/c-1")));
+        assert!(tuples.contains(&t("agent:a-1", "actor", "conversation:acme/c-1")));
+        assert!(!tuples.iter().any(|k| k.user.contains("eve")));
+        // A resource-family column reads resource attributes.
+        let resource = emitter_with_identities(&["resource.deployment.owner"], &["attr.bot.name"]);
+        let tuples = resource.derive("acme", std::slice::from_ref(&row));
+        assert!(tuples.contains(&t("user:ops-1", "participant", "conversation:acme/c-1")));
     }
 
     /// A fake graph for the erase loop: `/read` answers from a script of

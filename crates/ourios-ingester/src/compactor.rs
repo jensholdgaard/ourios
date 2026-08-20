@@ -1720,13 +1720,11 @@ mod graph_tests {
         // RFC0048.4 — the completion is a structured log event; the fmt
         // mirror renders its message (the registry-backed name travels the
         // OTel Logs signal, gated by the semconv live-check in CI).
-        let log: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
-        let writer = Arc::clone(&log);
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_writer(move || LockedWriter(Arc::clone(&writer)))
-            .finish();
+        let events: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let subscriber = {
+            use tracing_subscriber::prelude::*;
+            tracing_subscriber::registry().with(CaptureEvents(Arc::clone(&events)))
+        };
         let guard = tracing::subscriber::set_default(subscriber);
         let (result, _, _) = sweep_once(
             store.clone(),
@@ -1744,27 +1742,53 @@ mod graph_tests {
         assert_eq!(outcome.tuples_deleted, Some(0));
         assert!(outcome.finished);
         assert_eq!(live_rows(&store, bucket.path()).len(), 1);
-        let rendered = String::from_utf8_lossy(&log.lock().expect("log")).to_string();
+        // The **registry-backed name** is the contract (a reword of the
+        // message must not silently drop it), and the message carries the
+        // four values RFC 0048 §3.3 names.
+        let events = events.lock().expect("events").clone();
+        let completion = events
+            .iter()
+            .find(|(name, _)| name == ourios_semconv::EVENT_OURIOS_COMPACTION_ERASURE_COMPLETED)
+            .unwrap_or_else(|| panic!("no completion event among {events:?}"));
+        assert_eq!(completion.0, "ourios.compaction.erasure.completed");
         assert!(
-            rendered.contains(
+            completion.1.contains(
                 "conversation erasure completed: tenant \"acme\" conversation \"odd id\", \
                  2 rows dropped, 0 tuples deleted"
             ),
-            "{rendered}"
+            "{completion:?}"
         );
     }
 
-    /// A `MakeWriter` into a shared buffer, for asserting rendered events.
-    struct LockedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    /// A `Layer` capturing `(event name, rendered message)` pairs — the
+    /// `fmt` mirror renders the message but not the metadata name, and the
+    /// name is what the registry pins.
+    struct CaptureEvents(Arc<std::sync::Mutex<Vec<(String, String)>>>);
 
-    impl std::io::Write for LockedWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log buffer").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .expect("events")
+                .push((event.metadata().name().to_string(), message.0));
         }
     }
 }

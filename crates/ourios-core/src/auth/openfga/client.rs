@@ -147,6 +147,30 @@ impl fmt::Display for OpenFgaError {
 
 impl std::error::Error for OpenFgaError {}
 
+/// Request-scoped, never-persisted tuples (RFC 0048 §3.5): the **only**
+/// producers are [`OpenFgaResolver::group_tuples`] — the verified OIDC
+/// groups claim, validated and capped — and [`ContextualTuples::none`].
+/// The field is private by design: no caller can hand the client an
+/// arbitrary tuple, so the RFC 0047 §3.3(b) request-carried bridge is
+/// unrepresentable, not merely rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextualTuples(Vec<TupleKey>);
+
+impl ContextualTuples {
+    /// No contextual tuples — the carrier for every non-claim call path
+    /// (tool gate for tenant-wide principals, erasure, tests).
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The carried tuples, read-only.
+    #[must_use]
+    pub fn tuples(&self) -> &[TupleKey] {
+        &self.0
+    }
+}
+
 /// A streamed `ListObjects` request.
 #[derive(Debug, Clone, Copy)]
 pub struct ListObjectsRequest<'a> {
@@ -156,12 +180,12 @@ pub struct ListObjectsRequest<'a> {
     pub relation: &'a str,
     /// The object type to enumerate.
     pub object_type: &'a str,
-    /// Request-scoped, never persisted tuples.
-    pub contextual_tuples: &'a [TupleKey],
+    /// Request-scoped, never persisted tuples (the typed carrier).
+    pub contextual_tuples: &'a ContextualTuples,
 }
 
 #[derive(Serialize)]
-struct ContextualTuples<'a> {
+struct ContextualTuplesBody<'a> {
     tuple_keys: &'a [TupleKey],
 }
 
@@ -171,7 +195,7 @@ struct CheckBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     authorization_model_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    contextual_tuples: Option<ContextualTuples<'a>>,
+    contextual_tuples: Option<ContextualTuplesBody<'a>>,
     consistency: &'static str,
 }
 
@@ -188,7 +212,7 @@ struct ListObjectsBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     authorization_model_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    contextual_tuples: Option<ContextualTuples<'a>>,
+    contextual_tuples: Option<ContextualTuplesBody<'a>>,
     consistency: &'static str,
 }
 
@@ -340,13 +364,13 @@ impl OpenFgaClient {
         Ok(request)
     }
 
-    fn contextual(tuples: &[TupleKey]) -> Result<Option<ContextualTuples<'_>>, OpenFgaError> {
+    fn contextual(tuples: &[TupleKey]) -> Result<Option<ContextualTuplesBody<'_>>, OpenFgaError> {
         match tuples.len() {
             0 => Ok(None),
             count if count > MAX_CONTEXTUAL_TUPLES => {
                 Err(OpenFgaError::TooManyContextualTuples { count })
             }
-            _ => Ok(Some(ContextualTuples { tuple_keys: tuples })),
+            _ => Ok(Some(ContextualTuplesBody { tuple_keys: tuples })),
         }
     }
 
@@ -360,12 +384,12 @@ impl OpenFgaClient {
     pub async fn check(
         &self,
         key: &TupleKey,
-        contextual_tuples: &[TupleKey],
+        contextual_tuples: &ContextualTuples,
     ) -> Result<bool, OpenFgaError> {
         let body = CheckBody {
             tuple_key: key,
             authorization_model_id: self.authorization_model_id.as_deref(),
-            contextual_tuples: Self::contextual(contextual_tuples)?,
+            contextual_tuples: Self::contextual(contextual_tuples.tuples())?,
             consistency: self.consistency.as_wire(),
         };
         let response = self
@@ -406,7 +430,7 @@ impl OpenFgaClient {
             relation: request.relation,
             user: request.user,
             authorization_model_id: self.authorization_model_id.as_deref(),
-            contextual_tuples: Self::contextual(request.contextual_tuples)?,
+            contextual_tuples: Self::contextual(request.contextual_tuples.tuples())?,
             consistency: self.consistency.as_wire(),
         };
         let response = self
@@ -713,7 +737,7 @@ impl OpenFgaResolver {
     pub fn group_tuples(
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<TupleKey>, OpenFgaError> {
+    ) -> Result<ContextualTuples, OpenFgaError> {
         if groups.len() > MAX_CONTEXTUAL_TUPLES {
             return Err(OpenFgaError::TooManyContextualTuples {
                 count: groups.len(),
@@ -725,13 +749,15 @@ impl OpenFgaResolver {
             return Err(OpenFgaError::InvalidGroup { index });
         }
         if principal.kind() == PrincipalKind::Agent {
-            return Ok(Vec::new());
+            return Ok(ContextualTuples::none());
         }
         let user = principal.to_string();
-        Ok(groups
-            .iter()
-            .map(|group| TupleKey::new(user.clone(), "member", format!("team:{group}")))
-            .collect())
+        Ok(ContextualTuples(
+            groups
+                .iter()
+                .map(|group| TupleKey::new(user.clone(), "member", format!("team:{group}")))
+                .collect(),
+        ))
     }
 
     /// Resolve `principal` (with its token's `groups`) into the tenant sets
@@ -906,7 +932,7 @@ impl OpenFgaResolver {
         &self,
         user: &str,
         tenant_object: &str,
-        contextual: &[TupleKey],
+        contextual: &ContextualTuples,
     ) -> Result<Branch, OpenFgaError> {
         let content = TupleKey::new(user, "can_read_content", tenant_object);
         if self.client.check(&content, contextual).await? {
@@ -923,7 +949,7 @@ impl OpenFgaResolver {
         &self,
         user: &str,
         relation: &str,
-        contextual_tuples: &[TupleKey],
+        contextual_tuples: &ContextualTuples,
     ) -> Result<BTreeSet<String>, OpenFgaError> {
         let prefix = format!("{TENANT_TYPE}:");
         let objects = self
@@ -964,8 +990,8 @@ mod tests {
 
     use super::super::{OpenFgaSpec, Principal, PrincipalKind, build_openfga_config};
     use super::{
-        Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient, OpenFgaError,
-        OpenFgaResolver, TupleKey, Visibility,
+        ContextualTuples, Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient,
+        OpenFgaError, OpenFgaResolver, TupleKey, Visibility,
     };
 
     /// A loopback stand-in for the `OpenFGA` HTTP API: `check` answers from
@@ -987,6 +1013,13 @@ mod tests {
         }
         let request: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(request["consistency"], "MINIMIZE_LATENCY");
+        // RFC0048.6 — as in `streamed`: only the group-claim shape.
+        if let Some(keys) = request["contextual_tuples"]["tuple_keys"].as_array() {
+            assert!(keys.iter().all(|k| {
+                k["relation"] == "member"
+                    && k["object"].as_str().is_some_and(|o| o.starts_with("team:"))
+            }));
+        }
         let allowed = request["tuple_key"]["user"] == "user:alice";
         axum::Json(json!({ "allowed": allowed })).into_response()
     }
@@ -997,9 +1030,15 @@ mod tests {
             return (fake.status, "nope").into_response();
         }
         let request: Value = serde_json::from_slice(&body).expect("json");
-        // The resolver's contextual tuples arrive as-is.
+        // RFC0048.6 — the wire carries only the group-claim shape: the
+        // sealed carrier makes any other contextual tuple (a participant
+        // self-grant, RFC 0047 §3.3(b)) unrepresentable upstream, and this
+        // fake pins that nothing else ever arrives.
         if let Some(keys) = request["contextual_tuples"]["tuple_keys"].as_array() {
-            assert!(keys.iter().all(|k| k["relation"] == "member"));
+            assert!(keys.iter().all(|k| {
+                k["relation"] == "member"
+                    && k["object"].as_str().is_some_and(|o| o.starts_with("team:"))
+            }));
         }
         let relation = request["relation"].as_str().expect("relation").to_string();
         let objects = Arc::clone(&fake.objects);
@@ -1093,7 +1132,7 @@ mod tests {
             client
                 .check(
                     &TupleKey::new("user:alice", "can_read_content", "tenant:acme"),
-                    &[]
+                    &ContextualTuples::none(),
                 )
                 .await
                 .expect("check")
@@ -1102,7 +1141,7 @@ mod tests {
             !client
                 .check(
                     &TupleKey::new("user:bob", "can_read_content", "tenant:acme"),
-                    &[]
+                    &ContextualTuples::none(),
                 )
                 .await
                 .expect("check")
@@ -1113,7 +1152,7 @@ mod tests {
                     user: "user:alice",
                     relation: "can_query",
                     object_type: "tenant",
-                    contextual_tuples: &[],
+                    contextual_tuples: &ContextualTuples::none(),
                 },
                 Duration::from_secs(1),
                 10,
@@ -1136,7 +1175,7 @@ mod tests {
             user: "user:alice",
             relation: "can_query",
             object_type: "tenant",
-            contextual_tuples: &[],
+            contextual_tuples: &ContextualTuples::none(),
         };
         assert_eq!(
             client
@@ -1179,22 +1218,19 @@ mod tests {
             client
                 .check(
                     &TupleKey::new("user:alice", "can_query", "tenant:acme"),
-                    &[]
+                    &ContextualTuples::none(),
                 )
                 .await,
             Err(OpenFgaError::Unavailable(_))
         ));
 
-        let too_many: Vec<TupleKey> = (0..=MAX_CONTEXTUAL_TUPLES)
-            .map(|i| TupleKey::new("user:alice", "member", format!("team:{i}")))
+        // The cap is enforced at the only constructor: a request past it
+        // is unrepresentable at the client API (RFC 0048 §3.5).
+        let too_many: Vec<String> = (0..=MAX_CONTEXTUAL_TUPLES)
+            .map(|i| format!("team-{i}"))
             .collect();
         assert_eq!(
-            client
-                .check(
-                    &TupleKey::new("user:alice", "can_query", "tenant:acme"),
-                    &too_many
-                )
-                .await
+            OpenFgaResolver::group_tuples(&Principal::new(PrincipalKind::User, "alice"), &too_many)
                 .expect_err("cap"),
             OpenFgaError::TooManyContextualTuples {
                 count: MAX_CONTEXTUAL_TUPLES + 1
@@ -1551,11 +1587,13 @@ mod tests {
                 &["platform".to_string()]
             )
             .expect("valid")
+            .tuples()
             .is_empty()
         );
         assert_eq!(
             OpenFgaResolver::group_tuples(&alice, &["platform".to_string()])
                 .expect("valid")
+                .tuples()
                 .len(),
             1
         );

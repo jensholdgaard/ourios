@@ -16,8 +16,8 @@ use std::time::Duration;
 mod client;
 #[cfg(feature = "openfga")]
 pub use client::{
-    Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient, OpenFgaError,
-    OpenFgaResolver, TupleKey, Visibility,
+    ContextualTuples, Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient,
+    OpenFgaError, OpenFgaResolver, TupleKey, Visibility,
 };
 
 /// The default `session_ttl_secs` (RFC 0047 §3.1): revocation latency.

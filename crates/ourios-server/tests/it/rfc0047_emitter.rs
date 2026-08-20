@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ourios_core::audit::{AuditPayload, SharedAuditSink};
 use ourios_core::auth::openfga::{
-    OpenFgaClient, OpenFgaSpec, TupleKey, VisibilityObjectSpec, VisibilitySpec,
+    ContextualTuples, OpenFgaClient, OpenFgaSpec, TupleKey, VisibilityObjectSpec, VisibilitySpec,
     build_openfga_config,
 };
 use ourios_ingester::compactor::{pending_erasures, request_erasure, sweep_once};
@@ -218,7 +218,7 @@ async fn rfc0047_10_11_emitter_and_erasure_end_to_end() {
     assert!(
         !fga.check(
             &tuple("user:alice", "can_read_content", "conversation:acme/c-1"),
-            &[]
+            &ContextualTuples::none(),
         )
         .await
         .expect("check"),

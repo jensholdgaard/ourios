@@ -16,7 +16,8 @@ superseded-by: —
 > masking, bounded enumeration), .9 (the MCP tool gate), .10–.11 (the graph
 > emitter and erasure) on the served binary against a real OpenFGA container
 > (`openfga-resolver` CI job) with the in-tree model, and .12 gating CI. The
-> RFC0047.5 request-carried contextual-tuple arm is deferred (§3.3, §7);
+> RFC0047.5 request-carried contextual-tuple arm is **struck** — rejected
+> by RFC 0048 §3.5 (the carrier is sealed);
 > the erasure request channel is the §3.6 slice-4 decision. Prerequisite: RFC 0046 (out-of-band tenancy, `green`) — the tenant is an
 > opaque, coarse, credential-selected object, which is exactly the object
 > type this RFC binds the authorization graph to. Grounded in the #688
@@ -294,7 +295,7 @@ path is disabled — never a mismatched comparison; (b) **contextual tuples** �
 passed on `Check`/`ListObjects` and never persisted. Tenant-wide readers
 (the FinOps/operator case) never wait: they resolve at layer 1.
 
-**Slice-2 decision — bridge (b) is deferred, not built.** A contextual
+**Bridge (b) is rejected (RFC 0048 §3.5; slice 2 had deferred it).** A contextual
 tuple carried *by the request* is asserted by the very principal it
 grants: any scoped caller could name any conversation id and read it —
 a self-granted escalation the graph never checked. Contextual tuples are
@@ -303,7 +304,9 @@ a caller-supplied one is not. Until a trusted carrier exists (a signed
 claim from the producer, or the emitter's flush-cadence hook closing the
 gap), freshness bridges are the self fast path (a) — verified against the
 stored `user.hash` — and the emitter cadence. The RFC0047.5 contextual arm
-is therefore deferred with this question in §7.
+was deferred with this question in §7; RFC 0048 §3.5 closes it by
+rejection — the client API's `ContextualTuples` newtype has the group
+claim as its only constructor, so the bridge is unrepresentable.
 
 ### 3.4 Layer 2 — query rewrite at plan time
 
@@ -558,8 +561,9 @@ container (testcontainers, like Dex for RFC 0029) with the in-tree model.
 > `c-1`/`c-2` return; And Given a further conversation `c-9` whose rows
 > carry `attr.user.hash = bob` (the principal's subject, prefix stripped)
 > but no tuple yet, Then those rows also return (self fast path); And
-> *(deferred — §3.3 slice-2 decision, §7)* Given a contextual tuple for
-> `c-10` on the request, Then `c-10`'s rows return too; And Given bob is
+> *(struck — rejected by RFC 0048 §3.5; the carrier is sealed)* ~~Given a
+> contextual tuple for `c-10` on the request, Then `c-10`'s rows return
+> too~~; And Given bob is
 > also participant on `globex/c-1` (another tenant), Then that id never
 > appears in the `acme` predicate.
 

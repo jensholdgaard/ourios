@@ -11,7 +11,9 @@
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
-use ourios_core::auth::openfga::{OpenFgaClient, OpenFgaSpec, TupleKey, build_openfga_config};
+use ourios_core::auth::openfga::{
+    ContextualTuples, OpenFgaClient, OpenFgaSpec, TupleKey, build_openfga_config,
+};
 use testcontainers_modules::testcontainers::core::ContainerPort;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
@@ -198,7 +200,7 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
                         user: "user:zoe",
                         relation: "can_read_content",
                         object_type: "conversation",
-                        contextual_tuples: &[],
+                        contextual_tuples: &ContextualTuples::none(),
                     },
                     Duration::from_secs(2),
                     100,
@@ -322,7 +324,7 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
         assert!(
             !fga.check(
                 &tuple(&format!("user:{who}"), "can_read_content", "tenant:acme"),
-                &[]
+                &ContextualTuples::none(),
             )
             .await
             .expect("check"),
@@ -330,9 +332,12 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
         );
     }
     assert!(
-        fga.check(&tuple("user:alice", "can_read_content", "tenant:acme"), &[])
-            .await
-            .expect("check"),
+        fga.check(
+            &tuple("user:alice", "can_read_content", "tenant:acme"),
+            &ContextualTuples::none(),
+        )
+        .await
+        .expect("check"),
         "alice does"
     );
     // A principal with no tuples is unbound — 401, never empty-but-open.

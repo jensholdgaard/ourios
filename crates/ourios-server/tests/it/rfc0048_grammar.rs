@@ -22,7 +22,10 @@ use crate::rfc0029_oidc::claim_binding::spawn_with_auth;
 use crate::rfc0047_openfga::{OPENFGA_IMAGE, OPENFGA_TAG, provision};
 use crate::rfc0047_visibility::row_at;
 
-const BAD_TENANTS: [&str; 6] = ["a/b", "a:b", "a#b", "a b", "\u{e9}-tenant", ""];
+/// Off-grammar values a client can put in an HTTP header (non-ASCII ones
+/// are refused by clients before the wire; the RFC 0046 end-to-end test
+/// covers those at the OTLP boundary).
+const OFF_GRAMMAR: [&str; 4] = ["a/b", "a:b", "a#b", "a b"];
 
 /// RFC0048.1 — the querier header applies the grammar (400, named reason).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30,43 +33,39 @@ async fn rfc0048_1_querier_header_speaks_the_grammar() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let (mut child, _grpc, _http, addr) = spawn_with_auth(&tmp, "", &[]).await;
     let http = reqwest::Client::new();
-    for bad in BAD_TENANTS {
-        let response = http
-            .post(format!("http://{addr}/v1/query"))
-            .header("content-type", "text/plain")
-            .header("x-ourios-tenant", bad.replace('\u{e9}', "e"))
-            .body("true | limit 1")
-            .send()
-            .await
-            .expect("sent");
-        if bad.contains('\u{e9}') {
-            continue; // reqwest refuses non-ASCII header values client-side
+    let query = |tenant: String| {
+        let http = http.clone();
+        async move {
+            let response = http
+                .post(format!("http://{addr}/v1/query"))
+                .header("content-type", "text/plain")
+                .header("x-ourios-tenant", tenant)
+                .body("true | limit 1")
+                .send()
+                .await
+                .expect("sent");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            (
+                status,
+                body["error"]["kind"].as_str().unwrap_or("").to_string(),
+            )
         }
-        assert_eq!(response.status(), 400, "{bad:?}");
-    }
+    };
     let long = "x".repeat(129);
-    let response = http
-        .post(format!("http://{addr}/v1/query"))
-        .header("content-type", "text/plain")
-        .header("x-ourios-tenant", long)
-        .body("true | limit 1")
-        .send()
-        .await
-        .expect("sent");
-    assert_eq!(response.status(), 400, "129 bytes");
-    let ok = http
-        .post(format!("http://{addr}/v1/query"))
-        .header("content-type", "text/plain")
-        .header("x-ourios-tenant", "team-eu.%1~x")
-        .body("true | limit 1")
-        .send()
-        .await
-        .expect("sent");
-    assert_eq!(
-        ok.status(),
-        200,
-        "graphic punctuation is inside the grammar"
-    );
+    for bad in OFF_GRAMMAR.iter().copied().chain([long.as_str()]) {
+        let (status, kind) = query(bad.to_string()).await;
+        assert_eq!(status, 400, "{bad:?}");
+        assert_eq!(kind, "invalid_tenant", "{bad:?} carries the grammar kind");
+    }
+    // Present-but-empty keeps the RFC 0026 contract: `missing_tenant`,
+    // never conflated with an off-grammar value.
+    let (status, kind) = query("   ".to_string()).await;
+    assert_eq!(status, 400);
+    assert_eq!(kind, "missing_tenant");
+    let (status, kind) = query("team-eu.%1~x".to_string()).await;
+    assert_eq!(status, 200, "graphic punctuation is inside the grammar");
+    assert_eq!(kind, "", "no error object on success");
     child.kill().await.expect("kill");
 }
 

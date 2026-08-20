@@ -924,6 +924,31 @@ pub(crate) fn mcp_router(
 
 #[cfg(test)]
 mod tests {
+    use super::normalize_tenant;
+
+    /// RFC0048.1 — the MCP `tenant` argument speaks the tenant grammar.
+    #[test]
+    fn tenant_argument_speaks_the_grammar() {
+        assert_eq!(normalize_tenant(" acme ").expect("trimmed"), "acme");
+        assert_eq!(
+            normalize_tenant("team-eu.%1~x").expect("graphic"),
+            "team-eu.%1~x"
+        );
+        for bad in [
+            "",
+            "  ",
+            "a/b",
+            "a:b",
+            "a#b",
+            "a b",
+            "\u{e9}",
+            &"x".repeat(129),
+        ] {
+            let err = normalize_tenant(bad).expect_err("refused");
+            assert!(err.message.contains("tenant argument"), "{bad:?}: {err:?}");
+        }
+    }
+
     use std::collections::BTreeSet;
 
     use ourios_core::audit::ParamType;

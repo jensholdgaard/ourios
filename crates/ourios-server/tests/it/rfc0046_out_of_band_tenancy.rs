@@ -266,6 +266,7 @@ async fn rows_for_dsl(addr: SocketAddr, tenant: &str, dsl: &str) -> u64 {
 
 /// Scenarios RFC0046.1 / .2 / .3 / .7 / .10.
 /// See `docs/rfcs/0046-out-of-band-tenancy.md` §5.
+#[allow(clippy::too_many_lines)] // one server, three phases in sequence (RFC 0046 + the RFC 0048 grammar arms)
 #[tokio::test]
 async fn rfc0046_out_of_band_tenancy_end_to_end() {
     let tmp = tempfile::TempDir::new().expect("temp");

@@ -408,6 +408,7 @@ jobs:
           rfc0047_openfga::rfc0047_1_to_3_resolver_end_to_end
           rfc0047_visibility::rfc0047_4_to_9_visibility_end_to_end
           rfc0047_emitter::rfc0047_10_11_emitter_and_erasure_end_to_end
+          rfc0048_grammar::rfc0048_2_verbatim_tenant_on_a_real_graph
 
   # Emission-time semconv conformance: boot the real `ourios-server`,
   # point its OTLP export (metrics + the dogfooded logs signal) at

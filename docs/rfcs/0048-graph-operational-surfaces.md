@@ -172,7 +172,20 @@ ourios-server graph erasures [--tenant acme]                       # lists pendi
 ```
 
 Both are `ourios-server` subcommands (clap, RFC 0004 style) that resolve
-the same `storage` config as the daemon, so they work against local and
+the same `storage` config as the daemon — **and boot the same telemetry
+stack**: an operator verb is a short-lived CLI program, the shape
+OpenTelemetry's *semantic conventions for CLI programs* cover, so the run
+is wrapped in a callee span named after the executable (`INTERNAL`, with
+`process.executable.name`, `process.pid`, `process.exit.code`, and
+`error.type` + an error status when that code is non-zero;
+`process.command_args` is **not** recorded — the convention says not to
+without sanitisation, and a verb's arguments carry tenant and conversation
+ids). The universal OTel env vars stay the only control surface
+(`OTEL_SDK_DISABLED=true`, `OTEL_*_EXPORTER=none`); a bespoke flag would
+duplicate them. The stderr `fmt` mirror is installed either way, so a
+verb's structured events reach the operator even when nothing is exported,
+and `Shutdown` (which includes `ForceFlush`) drains before the process
+exits. They resolve the same `storage` config as the daemon, so they work against local and
 S3 stores alike, and both refuse a tenant or conversation id outside the
 §3.1 grammar. `erase` is idempotent (create-if-absent, RFC 0047 §3.6). No
 HTTP or MCP surface: an erasure is an operator action against the store
@@ -200,7 +213,9 @@ driven over all partitions instead of the ones being rewritten. It never
 rewrites Parquet. Resumable by construction (every write is idempotent);
 progress is one structured event per partition and `ourios.graph.tuples`.
 Runs as a subcommand, not a daemon mode, so it cannot be left on by
-accident.
+accident. Its telemetry is the CLI-program contract above: the progress
+events reach stderr always and OTLP when the env vars say so, and the
+tuples it writes land on `ourios.graph.tuples` like the sweep's.
 
 **Backfill and erasure exclude each other.** Idempotent writes alone do
 not make backfill safe beside an erasure: a partition read before the

@@ -49,6 +49,7 @@ use ourios_parquet::{
 use ourios_server::config::file::{FileConfig, PromotedEntry, TlsSection};
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
+use tracing::Instrument as _;
 
 /// Default compaction sweep cadence when `OURIOS_COMPACTION_INTERVAL_SECS`
 /// is unset.
@@ -273,13 +274,72 @@ async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
     match &cli.command {
         None => Ok(false),
         Some(Command::Graph(verb)) => {
+            // The grammar gate first: an off-grammar invocation exits here,
+            // before any configuration, store or telemetry work.
             validate_graph_verb(verb)?;
             let config = resolve_config(cli.config.as_deref())?;
-            let store = config.store.open().map_err(|e| e.to_string())?;
-            run_graph_verb(verb, &store, &config).await?;
-            Ok(true)
+            // An operator verb is a short-lived CLI program, which
+            // OpenTelemetry's CLI semantic conventions cover explicitly. It
+            // boots the **same** stack the daemon does, so the universal
+            // OTel env vars stay the only control surface (`OTEL_SDK_DISABLED`,
+            // `OTEL_*_EXPORTER=none` to silence it) — a bespoke `--telemetry`
+            // flag would duplicate them. The stderr `fmt` mirror is installed
+            // either way, so the verb's progress events reach the operator
+            // even when nothing is exported.
+            let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))
+                .map_err(|e| e.to_string())?;
+            let outcome = run_graph_verb_traced(verb, &config).await;
+            // `Shutdown` includes the effects of `ForceFlush` (OTel SDK
+            // spec): a short-lived process must drain before it exits.
+            drop(telemetry);
+            outcome.map(|()| true)
         }
     }
+}
+
+/// One `graph` verb inside the `OTel` **CLI callee span** (semantic
+/// conventions for CLI programs): named after the executable, `INTERNAL`
+/// kind, carrying `process.executable.name`, `process.pid` and — once the
+/// verb returns — `process.exit.code`, plus `error.type` and an error
+/// status when that code is non-zero. `process.command_args` is
+/// deliberately **not** recorded: the convention says not to collect it by
+/// default without sanitisation, and a verb's arguments carry tenant and
+/// conversation ids.
+async fn run_graph_verb_traced(verb: &GraphVerb, config: &ServerConfig) -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "ourios-server".to_string());
+    // A static span name keeps cardinality flat; the convention's
+    // `{process.executable.name}` travels as the attribute.
+    let span = tracing::info_span!(
+        "ourios-server",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        process.executable.name = executable,
+        process.pid = std::process::id(),
+        process.exit.code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    let outcome = async {
+        let store = config.store.open().map_err(|e| e.to_string())?;
+        run_graph_verb(verb, &store, config).await
+    }
+    .instrument(span.clone())
+    .await;
+    if outcome.is_ok() {
+        span.record("process.exit.code", 0);
+    } else {
+        // `main` returns `Err` → exit code 1. The error class stays the
+        // `OTel` fallback until the verbs carry typed failures.
+        span.record("process.exit.code", 1);
+        span.record("error.type", "_OTHER");
+        span.record("otel.status_code", "ERROR");
+    }
+    outcome
 }
 
 /// The grammar gate for every `graph` verb's ids, run **before** the

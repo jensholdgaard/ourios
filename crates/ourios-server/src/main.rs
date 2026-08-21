@@ -320,7 +320,9 @@ async fn run_graph_verb_traced(verb: &GraphVerb, config: &ServerConfig) -> Resul
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
         process.executable.name = executable,
-        process.pid = std::process::id(),
+        // `int` per semconv — a bare `u32` records as a string through
+        // `tracing`, which weaver's live-check flags as a type mismatch.
+        process.pid = i64::from(std::process::id()),
         process.exit.code = tracing::field::Empty,
         error.type = tracing::field::Empty,
     );

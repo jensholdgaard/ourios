@@ -75,6 +75,7 @@
 - [RFC 0046 — Out-of-band tenancy](./rfcs/0046-out-of-band-tenancy.md)
 - [RFC 0047 — ReBAC resolver and graph-fed visibility](./rfcs/0047-rebac-resolver-and-graph-visibility.md)
 - [RFC 0048 — Graph operational surfaces](./rfcs/0048-graph-operational-surfaces.md)
+- [RFC 0049 — Agent delegation and the `act` claim](./rfcs/0049-agent-delegation-and-the-act-claim.md)
 
 # Talks
 

@@ -668,14 +668,20 @@ planner's returned row set equals the naive "rows whose conversation ∈
       carriers. RFC 0048 further takes over the tenant id grammar (removing
       the §3.3 percent-encoding), the identity keys as configuration, the
       erasure front door and a backfill pass.
-- [x] **OpenFGA MCP for design time — the docs MCP, not a store MCP.**
-      OpenFGA now runs an official documentation assistant at
-      `https://openfga.mcp.kapa.ai` (the kapa.ai engine, as the
-      OpenTelemetry docs do), adopted 2026-08-19 and already load-bearing:
-      it is what established that the 256-byte cap covers the whole
-      `type:id` string, which exposed a real defect (#713). A community
-      *store* MCP (`evansims/openfga-mcp`) stays unadopted — design-time
-      authoring only if ever, never a runtime dependency.
+- [x] **OpenFGA MCP for design time — a docs assistant, not a store MCP.**
+      The OpenFGA maintainers enabled a documentation assistant at
+      `https://openfga.mcp.kapa.ai` (openfga/openfga discussion #560); it
+      is **hosted by kapa.ai, not by OpenFGA** — an external, design-time
+      dependency, exactly like the OpenTelemetry docs MCP this project
+      already consults. It receives natural-language questions only: no
+      store credentials, no tuples, no tenant or conversation ids, and it
+      is never on a request path. Adopted 2026-08-19 and already
+      load-bearing — it established that the 256-byte cap covers the whole
+      `type:id` string, which exposed a real defect (#713) — with its
+      answers verified against the cited docs or a real container before
+      anything lands. A community *store* MCP (`evansims/openfga-mcp`)
+      stays unadopted; it would touch a real store, so it stays out of
+      both design time and runtime for now.
 
 ## 8. References
 

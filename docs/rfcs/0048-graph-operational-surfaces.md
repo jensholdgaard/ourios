@@ -19,9 +19,10 @@ superseded-by: —
 > authorization and operational surfaces. The graph path is inert unless
 > `auth.openfga` is configured, which the benchmark harness never does,
 > so no gate moves; the tenant grammar adds one bounded check at
-> request boundaries. The two surviving §7 questions (grammar strictness,
-> the `graph erasures` output shape) are follow-up decisions tracked
-> there, not reasons to reopen.
+> request boundaries. Every §7 question is answered — the last two
+> (grammar strictness, the `graph erasures` output shape) were settled by
+> what shipped and are recorded there with their decisions — so this RFC
+> closes with none outstanding.
 >
 > **Status: `green` (2026-08-20).** All eight §5 criteria pass:
 > RFC0048.1 (`tenant.rs` grammar table + the RFC 0046 end-to-end OTLP

@@ -14,8 +14,7 @@ superseded-by: —
 > **Status: `specified` (2026-08-21).** §5 criteria written and testable.
 > Prerequisites: RFC 0026 (OIDC, `accepted`), RFC 0047 + RFC 0048 (the
 > graph, both `accepted`). This RFC closes a gap left by those RFCs:
-> Ourios
-> derives its principal from `sub` alone, so a standards-compliant
+> Ourios derives its principal from `sub` alone, so a standards-compliant
 > delegation token authenticates as the **subject**, discarding the
 > actor — impersonation, which RFC 8693 exists to distinguish from
 > delegation.
@@ -250,13 +249,6 @@ Scenario ids `RFC0049.<n>`. Eight criteria (RFC0049.1–.8).
 > RFC0049.1 — a malformed delegation is never downgraded to the
 > subject.
 
-> **RFC0049.8 — a token without `act` is untouched.** Given
-> `delegation: actor` and a token carrying no `act` claim, When it
-> authenticates on any surface, Then the principal is the top-level
-> `sub` typed by `agent_claim`, exactly as with `delegation: reject` and
-> exactly as before this RFC — enabling the mode changes nothing for
-> ordinary tokens.
-
 > **RFC0049.4 — the actor's principal type follows the same rule.** Given
 > `delegation: actor` and `agent_claim: ourios_principal_type=agent`,
 > When the `act` object carries that claim/value, Then the principal is
@@ -276,6 +268,13 @@ Scenario ids `RFC0049.<n>`. Eight criteria (RFC0049.1–.8).
 > **RFC0049.7 — the knob is validated.** Given
 > `auth.oidc.delegation: <anything else>`, Then startup fails naming the
 > key and the accepted values.
+
+> **RFC0049.8 — a token without `act` is untouched.** Given
+> `delegation: actor` and a token carrying no `act` claim, When it
+> authenticates on any surface, Then the principal is the top-level
+> `sub` typed by `agent_claim`, exactly as with `delegation: reject` and
+> exactly as before this RFC — enabling the mode changes nothing for
+> ordinary tokens.
 
 ## 6. Testing strategy
 

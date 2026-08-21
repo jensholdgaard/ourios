@@ -648,6 +648,11 @@ impl OuriosMcp {
 }
 
 #[tool_handler]
+// `ServerHandler`'s methods are `async fn` in the upstream trait, and an
+// impl must match that signature even where the body awaits nothing —
+// including the `#[tool_handler]`-generated one (clippy 1.98's
+// `unused_async_trait_impl`, which cannot see the trait's shape here).
+#[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for OuriosMcp {
     // `ServerInfo` is `#[non_exhaustive]` upstream, so struct-update
     // syntax is a compile error (E0639); mutate-a-default is the only

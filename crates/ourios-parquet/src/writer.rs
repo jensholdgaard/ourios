@@ -725,7 +725,7 @@ pub enum WriterError {
         /// directory, the store root, or the published object path).
         path: PathBuf,
         /// Underlying `io::Error` (an object-store error is wrapped
-        /// via [`io::Error::other`] for the `put` step).
+        /// via `std::io::Error::other` for the `put` step).
         source: io::Error,
     },
     /// Parquet writer failure (footer write, codec failure).

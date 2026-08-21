@@ -805,9 +805,8 @@ mod tests {
             2,
             "records are retained, not lost — the WAL is the durability of record",
         );
-        let snapshot_written = std::fs::read_dir(&snapshots_root)
-            .ok()
-            .is_some_and(|mut d| d.next().is_some());
+        let snapshot_written =
+            std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
         assert!(
             !snapshot_written,
             "the snapshot is skipped, so the horizon cannot advance past un-flushed data",
@@ -852,9 +851,8 @@ mod tests {
             2,
             "the record flush is skipped while the audit event isn't durable (issue #302 §3.3)",
         );
-        let snapshot_written = std::fs::read_dir(&snapshots_root)
-            .ok()
-            .is_some_and(|mut d| d.next().is_some());
+        let snapshot_written =
+            std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
         assert!(!snapshot_written, "the snapshot is skipped too");
     }
 
@@ -1336,9 +1334,8 @@ mod tests {
         // stamping. Without the barrier the rotation completes within the
         // ~100 ms commit window, far inside this 800 ms observation point.
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let snapshot_written = std::fs::read_dir(&snapshots_root)
-            .ok()
-            .is_some_and(|mut d| d.next().is_some());
+        let snapshot_written =
+            std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
         assert!(
             !snapshot_written,
             "the stamp waits while the sweep's publish is in flight (issue #578)",
@@ -1406,9 +1403,8 @@ mod tests {
             2,
             "the un-flushable records are retained (the WAL is the durability of record)",
         );
-        let snapshot_written = std::fs::read_dir(&snapshots_root)
-            .ok()
-            .is_some_and(|mut d| d.next().is_some());
+        let snapshot_written =
+            std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
         assert!(
             !snapshot_written,
             "the stamp is skipped while a record ≤ the mark is buffered-but-unflushed",

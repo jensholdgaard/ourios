@@ -487,7 +487,7 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
     let gate_started = Instant::now();
     let binding = match authenticate_query(&state, &headers, gate_started).await {
         Ok(binding) => binding,
-        Err(rejection) => return rejection,
+        Err(rejection) => return *rejection,
     };
 
     // Tenant is required and checked here, before the engine is invoked
@@ -1066,11 +1066,12 @@ fn reject_visibility(
 /// The query endpoint's bearer gate: `Ok(binding)` (`None` in open mode)
 /// or the finished rejection response, recorded on `ourios.query.duration`
 /// (kind `rejected`, RFC 0026 §3.4) with the failure class as `error.type`.
+#[allow(clippy::doc_markdown)] // `Box<Response>` renders fine as prose
 async fn authenticate_query(
     state: &QuerierState,
     headers: &HeaderMap,
     gate_started: Instant,
-) -> Result<Option<AuthBinding>, Response> {
+) -> Result<Option<AuthBinding>, Box<Response>> {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
@@ -1082,11 +1083,11 @@ async fn authenticate_query(
                 gate_started.elapsed(),
                 "unauthenticated",
             );
-            Err(error_response(
+            Err(Box::new(error_response(
                 StatusCode::UNAUTHORIZED,
                 "unauthenticated",
                 "a valid bearer token is required",
-            ))
+            )))
         }
         // RFC 0047 §3.1: the resolver could not answer — fail closed.
         Err(AuthError::Unavailable) => {
@@ -1095,11 +1096,11 @@ async fn authenticate_query(
                 gate_started.elapsed(),
                 "upstream_unavailable",
             );
-            Err(error_response(
+            Err(Box::new(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "auth_unavailable",
                 "the authorization resolver is unavailable; retry later",
-            ))
+            )))
         }
     }
 }

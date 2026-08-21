@@ -238,8 +238,9 @@ CLI callee span (`process.executable.name`, `process.pid`,
 per-partition progress events reach stderr, and everything exports over
 OTLP when the standard variables point somewhere —
 `OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317`. Silence it the
-standard way: `OTEL_SDK_DISABLED=true`, or `OTEL_TRACES_EXPORTER=none`
-per signal.
+standard way: `OTEL_SDK_DISABLED=true` for everything, or per signal with
+`OTEL_TRACES_EXPORTER=none`, `OTEL_METRICS_EXPORTER=none` and
+`OTEL_LOGS_EXPORTER=none`.
 
 The binding is cached per credential for `session_ttl_secs` and is
 **fail-closed**: an unreachable or slow OpenFGA answers `503` on the

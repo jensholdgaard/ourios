@@ -171,9 +171,10 @@ ourios-server graph erase   --tenant acme --conversation c-7      # writes the m
 ourios-server graph erasures [--tenant acme]                       # lists pending markers + phase
 ```
 
-Both are `ourios-server` subcommands (clap, RFC 0004 style) that resolve
-the same `storage` config as the daemon — **and boot the same telemetry
-stack**: an operator verb is a short-lived CLI program, the shape
+Both are `ourios-server` subcommands (clap, RFC 0004 style). They resolve
+the same `storage` config as the daemon, so they work against local and S3
+stores alike, and both refuse a tenant or conversation id outside the §3.1
+grammar — **and they boot the same telemetry stack**: an operator verb is a short-lived CLI program, the shape
 OpenTelemetry's *semantic conventions for CLI programs* cover, so the run
 is wrapped in a callee span named after the executable (`INTERNAL`, with
 `process.executable.name`, `process.pid`, `process.exit.code`, and
@@ -185,9 +186,9 @@ ids). The universal OTel env vars stay the only control surface
 duplicate them. The stderr `fmt` mirror is installed either way, so a
 verb's structured events reach the operator even when nothing is exported,
 and `Shutdown` (which includes `ForceFlush`) drains before the process
-exits. They resolve the same `storage` config as the daemon, so they work against local and
-S3 stores alike, and both refuse a tenant or conversation id outside the
-§3.1 grammar. `erase` is idempotent (create-if-absent, RFC 0047 §3.6). No
+exits — configuration resolves *inside* that span, so a malformed section
+is a recorded non-zero exit rather than an untraced one. `erase` is
+idempotent (create-if-absent, RFC 0047 §3.6). No
 HTTP or MCP surface: an erasure is an operator action against the store
 of record, not a tenant-facing request; an admin API is a later RFC if a
 scenario needs one. Completion is observable three ways, all existing: the

@@ -265,11 +265,12 @@ enum GraphVerb {
 
 /// Run the CLI's operator verb, if one was given: the grammar gate runs
 /// **first** — even `resolve_config` can create the local store root, so
-/// an off-grammar invocation performs no filesystem or backend work at
-/// all — then the verb resolves the same storage config as the daemon,
-/// acts on the store of record, and the caller exits: no roles, no
-/// telemetry boot (RFC 0048 §3.3). `false` when there is no verb and the
-/// server should run its roles.
+/// an off-grammar invocation performs no filesystem, telemetry or backend
+/// work at all — then the verb boots the telemetry stack, resolves the
+/// same storage config as the daemon inside its CLI span, acts on the
+/// store of record, and the caller exits: no roles, no listeners
+/// (RFC 0048 §3.3). `false` when there is no verb and the server should
+/// run its roles.
 async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
     match &cli.command {
         None => Ok(false),
@@ -277,7 +278,6 @@ async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
             // The grammar gate first: an off-grammar invocation exits here,
             // before any configuration, store or telemetry work.
             validate_graph_verb(verb)?;
-            let config = resolve_config(cli.config.as_deref())?;
             // An operator verb is a short-lived CLI program, which
             // OpenTelemetry's CLI semantic conventions cover explicitly. It
             // boots the **same** stack the daemon does, so the universal
@@ -288,7 +288,11 @@ async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
             // even when nothing is exported.
             let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))
                 .map_err(|e| e.to_string())?;
-            let outcome = run_graph_verb_traced(verb, &config).await;
+            // Configuration resolves *inside* the span, so a malformed
+            // `storage`/TLS section is a recorded non-zero exit rather than
+            // an untraced one (the convention requires an exit code, and
+            // `error.type` whenever it is non-zero).
+            let outcome = run_graph_verb_traced(verb, cli.config.as_deref()).await;
             // `Shutdown` includes the effects of `ForceFlush` (OTel SDK
             // spec): a short-lived process must drain before it exits.
             drop(telemetry);
@@ -305,7 +309,7 @@ async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
 /// deliberately **not** recorded: the convention says not to collect it by
 /// default without sanitisation, and a verb's arguments carry tenant and
 /// conversation ids.
-async fn run_graph_verb_traced(verb: &GraphVerb, config: &ServerConfig) -> Result<(), String> {
+async fn run_graph_verb_traced(verb: &GraphVerb, config_path: Option<&Path>) -> Result<(), String> {
     let executable = std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -317,9 +321,13 @@ async fn run_graph_verb_traced(verb: &GraphVerb, config: &ServerConfig) -> Resul
     // `{process.executable.name}` travels as the attribute.
     let span = tracing::info_span!(
         "ourios-server",
+        // The convention names the span after the executable; `otel.name`
+        // is how a computed name reaches the exported span while the macro
+        // literal stays stable (as `/mcp` does).
+        otel.name = %executable,
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
-        process.executable.name = executable,
+        process.executable.name = %executable,
         // `int` per semconv — a bare `u32` records as a string through
         // `tracing`, which weaver's live-check flags as a type mismatch.
         process.pid = i64::from(std::process::id()),
@@ -327,8 +335,9 @@ async fn run_graph_verb_traced(verb: &GraphVerb, config: &ServerConfig) -> Resul
         error.type = tracing::field::Empty,
     );
     let outcome = async {
+        let config = resolve_config(config_path)?;
         let store = config.store.open().map_err(|e| e.to_string())?;
-        run_graph_verb(verb, &store, config).await
+        run_graph_verb(verb, &store, &config).await
     }
     .instrument(span.clone())
     .await;
@@ -1342,6 +1351,118 @@ mod tests {
     use super::*;
 
     use ourios_server::config::file::parse;
+
+    /// RFC 0048 §3.3 — the CLI callee span's contract: named after the
+    /// executable, `INTERNAL`, `process.*` present, a zero exit code on
+    /// success, and **no** `process.command_args` (the convention says not
+    /// to collect it without sanitisation). Current-thread runtime: the
+    /// span closes after an `.await`, which a thread-local subscriber only
+    /// sees deterministically when the task cannot migrate.
+    #[tokio::test]
+    async fn cli_span_carries_the_semconv_contract_on_success() {
+        let (spans, config_path, _tmp) =
+            run_traced_verb(&GraphVerb::Erasures { tenant: None }).await;
+        let span = spans.first().expect("one CLI span");
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Internal);
+        let attrs = span_attrs(span);
+        // The convention: the span name **is** the executable name. Under
+        // `cargo test` that is the harness binary, which is exactly why the
+        // assertion compares the two rather than a literal — a hard-coded
+        // macro name would silently drift from the attribute.
+        let executable = attrs
+            .get("process.executable.name")
+            .expect("required attribute");
+        assert_eq!(&span.name, executable);
+        assert!(
+            executable.contains("ourios"),
+            "derived from the running binary: {executable}"
+        );
+        assert_eq!(
+            attrs.get("process.exit.code").map(String::as_str),
+            Some("0")
+        );
+        assert!(attrs.contains_key("process.pid"));
+        assert!(
+            !attrs.contains_key("process.command_args"),
+            "arguments carry tenant ids and are never collected: {attrs:?}"
+        );
+        assert!(!attrs.contains_key("error.type"), "{attrs:?}");
+        drop(config_path);
+    }
+
+    /// The failure arm: a non-zero exit code **and** `error.type`, which the
+    /// convention makes conditionally required exactly then.
+    #[tokio::test]
+    async fn cli_span_records_the_failure_arm() {
+        // `backfill` without an `auth.openfga` section fails after the
+        // config resolves — inside the span, where the contract applies.
+        let verb = GraphVerb::Backfill {
+            tenant: "acme".to_string(),
+            from: None,
+            unlock: false,
+        };
+        let (spans, _config, _tmp) = run_traced_verb(&verb).await;
+        let span = spans.first().expect("one CLI span");
+        let attrs = span_attrs(span);
+        assert_eq!(
+            attrs.get("process.exit.code").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(attrs.get("error.type").map(String::as_str), Some("_OTHER"));
+        assert_eq!(
+            span.status,
+            opentelemetry::trace::Status::error(""),
+            "a non-zero exit is an error span"
+        );
+    }
+
+    /// Run one verb under an in-memory tracer and return the exported spans
+    /// (plus the temp dir, which must outlive the run).
+    async fn run_traced_verb(
+        verb: &GraphVerb,
+    ) -> (
+        Vec<opentelemetry_sdk::trace::SpanData>,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let config_path = tmp.path().join("ourios.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage:\n  local:\n    bucket_root: {}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+        let guard = tracing::subscriber::set_default(subscriber);
+        let _ = run_graph_verb_traced(verb, Some(config_path.as_path())).await;
+        drop(guard);
+        provider.force_flush().expect("spans flush");
+        let spans = exporter.get_finished_spans().expect("spans exported");
+        (spans, config_path, tmp)
+    }
+
+    /// A span's attributes as `key -> rendered value`.
+    fn span_attrs(
+        span: &opentelemetry_sdk::trace::SpanData,
+    ) -> std::collections::HashMap<String, String> {
+        span.attributes
+            .iter()
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect()
+    }
 
     /// RFC0048.3 — the promoted-set check is per identity list: a partial
     /// override checks only the listed side; the other side's defaults are

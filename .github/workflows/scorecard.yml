@@ -49,7 +49,7 @@ jobs:
               "https://api.github.com/repos/${GITHUB_REPOSITORY}"; then
             echo "use_pat=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::SCORECARD_TOKEN is set but the API rejected it (expired PAT?). Falling back to github.token; the Branch-Protection check will report -1 until the secret is rotated."
+            echo "::warning::SCORECARD_TOKEN is set but the probe did not succeed — the token may be expired or revoked, or the API call itself may have failed (network, rate limit, timeout). Falling back to github.token; Branch-Protection will report -1 for this run."
             echo "use_pat=false" >> "$GITHUB_OUTPUT"
           fi
       - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4

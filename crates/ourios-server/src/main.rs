@@ -1357,8 +1357,10 @@ mod tests {
     /// success, and **no** `process.command_args` (the convention says not
     /// to collect it without sanitisation). Current-thread runtime: the
     /// span closes after an `.await`, which a thread-local subscriber only
-    /// sees deterministically when the task cannot migrate.
-    #[tokio::test]
+    /// sees deterministically when the task cannot migrate. (Bare
+    /// `#[tokio::test]` is already current-thread — this spells the
+    /// requirement out so a future edit cannot silently relax it.)
+    #[tokio::test(flavor = "current_thread")]
     async fn cli_span_carries_the_semconv_contract_on_success() {
         let (spans, config_path, _tmp) =
             run_traced_verb(&GraphVerb::Erasures { tenant: None }).await;
@@ -1391,8 +1393,9 @@ mod tests {
     }
 
     /// The failure arm: a non-zero exit code **and** `error.type`, which the
-    /// convention makes conditionally required exactly then.
-    #[tokio::test]
+    /// convention makes conditionally required exactly then. Current-thread
+    /// for the same reason as the success case above.
+    #[tokio::test(flavor = "current_thread")]
     async fn cli_span_records_the_failure_arm() {
         // `backfill` without an `auth.openfga` section fails after the
         // config resolves — inside the span, where the contract applies.

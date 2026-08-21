@@ -187,7 +187,11 @@ duplicate them. The stderr `fmt` mirror is installed either way, so a
 verb's structured events reach the operator even when nothing is exported,
 and `Shutdown` (which includes `ForceFlush`) drains before the process
 exits — configuration resolves *inside* that span, so a malformed section
-is a recorded non-zero exit rather than an untraced one. `erase` is
+is a recorded non-zero exit rather than an untraced one. The contract
+begins **after** the §3.1 grammar check: an off-grammar `--tenant` or
+`--conversation` is refused before any telemetry (or filesystem) work, so
+it has no span and no `process.exit.code` by design — the CLI convention
+describes an executing program, and that invocation never became one. `erase` is
 idempotent (create-if-absent, RFC 0047 §3.6). No
 HTTP or MCP surface: an erasure is an operator action against the store
 of record, not a tenant-facing request; an admin API is a later RFC if a

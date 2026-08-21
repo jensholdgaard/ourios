@@ -13,7 +13,8 @@ superseded-by: —
 
 > **Status: `specified` (2026-08-21).** §5 criteria written and testable.
 > Prerequisites: RFC 0026 (OIDC, `accepted`), RFC 0047 + RFC 0048 (the
-> graph, both `accepted`). This RFC closes a gap those left: Ourios
+> graph, both `accepted`). This RFC closes a gap left by those RFCs:
+> Ourios
 > derives its principal from `sub` alone, so a standards-compliant
 > delegation token authenticates as the **subject**, discarding the
 > actor — impersonation, which RFC 8693 exists to distinguish from
@@ -99,9 +100,10 @@ its content.
 
 The OIDC verifier inspects the validated claim set for a top-level
 `act` member. When present and the deployment has not opted in (§3.2),
-verification fails with the existing fail-closed path: `401` on the
-querier and MCP surfaces, `UNAUTHENTICATED` on ingest, the stable kind
-`delegation_unsupported`, and `error.type = "unauthenticated"` on
+verification fails with each surface's existing unauthenticated path —
+`401` on the querier, `/mcp` and **OTLP/HTTP** ingest, a trailers-only
+`UNAUTHENTICATED` (grpc-status 16) on **OTLP/gRPC** — carrying the stable
+kind `delegation_unsupported` and `error.type = "unauthenticated"` on
 `ourios.auth.resolutions`. The message names the claim and the config
 key that enables handling, so an operator meets a diagnosis rather than
 a mystery.
@@ -119,6 +121,12 @@ auth:
     delegation: reject        # default; `actor` opts in
 ```
 
+`delegation` changes **nothing** for a token without an `act` claim: in
+either mode such a token keeps today's mapping — the principal is the
+top-level `sub`, typed by `agent_claim` — so enabling the mode cannot
+alter ordinary authentication. The rules below apply only when `act` is
+present.
+
 Under `delegation: actor` a token carrying `act` authenticates as the
 **current actor**:
 
@@ -133,9 +141,14 @@ Under `delegation: actor` a token carrying `act` authenticates as the
   not consulted, not intersected, not unioned. An actor with no grants
   is refused or scoped exactly as that actor would be without the token.
 
-The consequence is deliberate and is the whole security argument: a
-delegation token can only ever *narrow* what the bearer sees relative to
-today's behaviour, never widen it.
+The guarantee is precise, and narrower than "a delegation token can only
+reduce access": the **subject's grants are never inherited**. What the
+bearer sees is exactly what the actor sees authenticating alone — which
+may be less than the subject's access, and may be *more* where the actor
+holds grants the subject does not. The property that matters is that a
+delegation token is never a way to acquire someone else's visibility;
+it is only ever a way to authenticate as the actor, with attribution
+attached.
 
 ### 3.3 Attribution, not authority
 
@@ -150,8 +163,10 @@ key is settled at implementation, not asserted here.
 
 ### 3.4 `act` never reaches the graph
 
-No tuple is written from a token claim, and `act` never becomes a
-contextual tuple. RFC 0048 §3.5 sealed the contextual carrier so that
+No tuple — persisted or contextual — is ever derived from the `act`
+claim. (The OIDC *group* claim remains the system's one claim-derived
+tuple and is unchanged: request-scoped `team:<group>#member` through the
+sealed carrier.) RFC 0048 §3.5 sealed the contextual carrier so that
 its only constructor is the validated group-claim path; this RFC adds
 nothing to it. Concretely, the rejected design is `act` ⇒
 `conversation:T/<id>#delegate@agent:A` for every conversation the
@@ -179,8 +194,10 @@ identities across multiple services or agents, complicating
 attribution" — and NHI5 *Overprivileged NHI*. Ourios cannot detect
 sharing: a fleet behind one `sub` is one principal, so per-agent
 revocation and attribution both quietly disappear, and every grant is
-held by all of them. The authentication guide states the requirement
-next to `agent_claim`: **one subject per agent identity**.
+held by all of them. This RFC therefore requires the rule be written
+into the authentication guide beside `agent_claim` when it is
+implemented: **one subject per agent identity**. It is a deployment
+contract the server cannot enforce.
 
 ## 4. Alternatives considered
 
@@ -201,7 +218,7 @@ next to `agent_claim`: **one subject per agent identity**.
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0049.<n>`.
+Scenario ids `RFC0049.<n>`. Eight criteria (RFC0049.1–.8).
 
 > **RFC0049.1 — a delegation token is refused by default.** Given
 > `auth.oidc` configured without `delegation`, When a token carrying a
@@ -225,8 +242,20 @@ Scenario ids `RFC0049.<n>`.
 > `delegation: actor` and a token whose `act` nests a further `act`
 > (`alice` → `bot` → `inner`), When it is presented, Then the principal
 > is the outermost actor (`bot`) and the nested actor is ignored for
-> authorization; And Given an `act` object with no string `sub`, Then the
-> token is refused.
+> authorization — including when the *nested* `act` is itself malformed,
+> which never affects the outcome; And Given a top-level `act` that is
+> not an object (`null`, a string, a number, an array), or an object
+> whose `sub` is absent, not a string, empty, or not a valid object id,
+> Then the token is refused with the same unauthenticated path as
+> RFC0049.1 — a malformed delegation is never downgraded to the
+> subject.
+
+> **RFC0049.8 — a token without `act` is untouched.** Given
+> `delegation: actor` and a token carrying no `act` claim, When it
+> authenticates on any surface, Then the principal is the top-level
+> `sub` typed by `agent_claim`, exactly as with `delegation: reject` and
+> exactly as before this RFC — enabling the mode changes nothing for
+> ordinary tokens.
 
 > **RFC0049.4 — the actor's principal type follows the same rule.** Given
 > `delegation: actor` and `agent_claim: ourios_principal_type=agent`,

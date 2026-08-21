@@ -27,6 +27,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # `secrets.X || github.token` falls back only when the secret is
+      # *absent* — a secret that exists but is no longer accepted (an
+      # expired fine-grained PAT) is passed through and 401s the whole
+      # run, which is what happened from 2026-08-18. Probe it instead, so
+      # an expired PAT degrades the way the comment below always promised:
+      # Branch-Protection drops to -1 and the analysis still publishes.
+      - name: Select the scorecard token
+        id: token
+        env:
+          SCORECARD_TOKEN: ${{ secrets.SCORECARD_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SCORECARD_TOKEN:-}" ]; then
+            echo "use_pat=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if curl -sf -o /dev/null --max-time 20 \
+              -H "Authorization: Bearer $SCORECARD_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}"; then
+            echo "use_pat=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::SCORECARD_TOKEN is set but the probe did not succeed — the token may be expired or revoked, or the API call itself may have failed (network, rate limit, timeout). Falling back to github.token; Branch-Protection will report -1 for this run."
+            echo "use_pat=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
         with:
           results_file: results.sarif
@@ -36,9 +61,10 @@ jobs:
           # settings, so the Branch-Protection check errors out (-1).
           # A fine-grained PAT with `Administration: read` (stored as
           # the SCORECARD_TOKEN repo secret) lets the check read the
-          # rules. Until that secret exists this falls back to
-          # github.token — no break, Branch-Protection just stays -1.
-          repo_token: ${{ secrets.SCORECARD_TOKEN || github.token }}
+          # rules. Absent — or present but rejected, see above — this
+          # falls back to github.token: no break, Branch-Protection
+          # just stays -1.
+          repo_token: ${{ steps.token.outputs.use_pat == 'true' && secrets.SCORECARD_TOKEN || github.token }}
       - uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4
         with:
           sarif_file: results.sarif

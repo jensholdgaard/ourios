@@ -1,7 +1,7 @@
 ---
 rfc: 0047
 title: ReBAC resolver (OpenFGA) and graph-fed visibility inside a tenant
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
@@ -11,6 +11,19 @@ superseded-by: —
 
 # RFC 0047 — ReBAC resolver and graph-fed visibility
 
+> **Status: `accepted` (2026-08-21, maintainer sign-off).** Terminal. As
+> for RFC 0048, `validated` is vacuous — the ladder gates it on
+> `benchmarks.md` §7 (compression, query latency, reconstruction) and
+> this RFC is an authorization surface whose whole path is inert unless
+> `auth.openfga` is configured, which the benchmark harness never does.
+> The maintainer therefore advances it from `green` (RFC 0008 precedent).
+> **RFC 0048 is accepted alongside it** and amends §3.1 (one tenant
+> grammar, no percent-encoding), §3.3 (identity keys as configuration;
+> the contextual-tuple carrier sealed and bridge (b) rejected), §3.6 (an
+> operator front door for erasure, a backfill pass, and the deadline
+> assumption made observable) — read the two together. The surviving §7
+> questions below are follow-up decisions, not reasons to reopen.
+>
 > **Status: `green` (2026-08-18).** All twelve §5 criteria pass:
 > RFC0047.1–.3 (the layer-1 resolver), .4–.8 (the planner two-step,
 > masking, bounded enumeration), .9 (the MCP tool gate), .10–.11 (the graph
@@ -635,22 +648,34 @@ planner's returned row set equals the naive "rows whose conversation ∈
 - [ ] **Principal mapping for agents** — the `agent_claim` name/value
       convention; whether an agent's token may also carry a delegating
       user (`act` claim, RFC 8693) to mint `delegate` automatically.
-- [ ] **Object id namespacing** — the `T/<id>` prefix vs a per-tenant
-      store; one store is the reviewed default, prefixing is the cost.
-- [ ] **`max_objects` default** (10 000) — spike 2 streamed 100k in 0.5 s,
-      so the bound is about predicate size / plan cost, not OpenFGA.
-- [ ] **Where the emitter runs** — compaction sweep only, or also the
-      receiver flush cadence (§3.3 proposes both); the freshness bridges
-      make the answer a tuning question.
+- [x] **Object id namespacing — prefixing, one store.** Shipped and kept:
+      `conversation:<T>/<id>` in a single store per deployment. RFC 0048
+      §3.1 removed the cost that made it look expensive (the tenant
+      segment is verbatim now, not percent-encoded) and pinned the byte
+      budget it implies.
+- [x] **`max_objects` default — 10 000, shipped.** The bound is about
+      predicate size and plan cost, not OpenFGA (spike 2 streamed 100k in
+      0.5 s). No deployment has hit it; a principal that would is the one
+      the `visibility_bound` refusal tells to ask for tenant-wide read.
+- [x] **Where the emitter runs — both, plus a backfill.** The flush
+      cadence and the compaction sweep each feed it (§3.3 as proposed),
+      and RFC 0048 §3.4 adds a one-off `graph backfill` for history that
+      predates the graph. All three paths are additive and idempotent, so
+      running them together needs no coordination; only erasure is fenced.
 - [x] **Request-carried contextual tuples (§3.3 bridge b)** — deferred in
       slice 2 (a caller-asserted `participant` tuple is a self-grant);
       **rejected by RFC 0048 §3.5**, which also names the only trusted
       carriers. RFC 0048 further takes over the tenant id grammar (removing
       the §3.3 percent-encoding), the identity keys as configuration, the
       erasure front door and a backfill pass.
-- [ ] **OpenFGA MCP for design time** — community servers exist
-      (`evansims/openfga-mcp`, read-only by default); adopt for authoring the
-      `.fga.yaml` tests, never as a runtime dependency (assistant review 2 Q3).
+- [x] **OpenFGA MCP for design time — the docs MCP, not a store MCP.**
+      OpenFGA now runs an official documentation assistant at
+      `https://openfga.mcp.kapa.ai` (the kapa.ai engine, as the
+      OpenTelemetry docs do), adopted 2026-08-19 and already load-bearing:
+      it is what established that the 256-byte cap covers the whole
+      `type:id` string, which exposed a real defect (#713). A community
+      *store* MCP (`evansims/openfga-mcp`) stays unadopted — design-time
+      authoring only if ever, never a runtime dependency.
 
 ## 8. References
 

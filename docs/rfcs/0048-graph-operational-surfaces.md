@@ -1,7 +1,7 @@
 ---
 rfc: 0048
 title: Graph operational surfaces — tenant id grammar, identity keys, erasure and backfill
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-18
@@ -11,6 +11,18 @@ superseded-by: —
 
 # RFC 0048 — Graph operational surfaces
 
+> **Status: `accepted` (2026-08-21, maintainer sign-off).** Terminal. No
+> thesis-gate applies, so `validated` is vacuous here and the maintainer
+> advances the RFC directly from `green` (RFC 0008 precedent, restated in
+> RFC 0044): the ladder's `validated` stage gates on `benchmarks.md` §7
+> — compression, query latency, reconstruction — and these are
+> authorization and operational surfaces. The graph path is inert unless
+> `auth.openfga` is configured, which the benchmark harness never does,
+> so no gate moves; the tenant grammar adds one bounded check at
+> request boundaries. The two surviving §7 questions (grammar strictness,
+> the `graph erasures` output shape) are follow-up decisions tracked
+> there, not reasons to reopen.
+>
 > **Status: `green` (2026-08-20).** All eight §5 criteria pass:
 > RFC0048.1 (`tenant.rs` grammar table + the RFC 0046 end-to-end OTLP
 > arms + `rfc0048_grammar` querier/MCP arms + config/claim unit tests),
@@ -397,12 +409,21 @@ which flip to the verbatim form.
       arrives on the wire. (Docs-AI consult, 2026-08-19; settled by the
       experiment above.)
 
-- [ ] **Grammar strictness** — 128 bytes and ASCII graphic minus three
-      characters is deliberately tight; is there a known deployment that
-      needs `.`-free or longer ids? (Defaults to tight; loosening later is
-      additive, tightening later is not.)
-- [ ] **`graph erasures` output shape** — table for humans, `--json` for
-      tooling; both, or JSON only?
+- [x] **Grammar strictness — shipped tight, deliberately.** 128 bytes of
+      ASCII graphic minus `:`, `#`, `/`. No deployment has asked for more,
+      and the asymmetry decides it: loosening later is additive (old ids
+      stay valid), tightening later is not. Revisit only with a named
+      deployment that cannot express its tenant id — a `!` change either
+      way, and pre-production that is cheap (`feedback: break persisted
+      layouts pre-production`).
+- [x] **`graph erasures` output shape — human lines now, `--json` when
+      something needs it.** Shipped as one line per pending marker (and
+      per backfill lock), which is what an operator reading a terminal
+      wants; no tooling consumes the verb yet, and adding `--json` later
+      is additive. The machine-readable channels already exist for
+      automation: the `conversation_erased` audit event, the
+      `ourios.compaction.erasure.completed` log event, and
+      `ourios.graph.tuples`.
 - [x] **Backfill and the receiver's flush cadence** — the flush emit and
       backfill only ever *add* the same idempotent tuples, so no exclusion
       is needed there (unlike erasure, §3.4). Confirmed: the emitter is

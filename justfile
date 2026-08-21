@@ -340,6 +340,40 @@ jaeger-up:
     echo "Run 'just dogfood-env' for the source-side env block (traces here, logs"
     echo "straight to dogfood-server — start that too)."
 
+# Browse what `dogfood-server` stored in [Gonzo](https://github.com/control-theory/gonzo),
+# a terminal log-analysis TUI. Gonzo has no notion of querying a log store — it
+# reads stdin, files, k8s, or acts as an OTLP receiver — so this pipes an Ourios
+# query through the adapter that flattens OTLP-faithful records (attribute
+# arrays, nanosecond timestamps, structured bodies) into the flat JSON lines
+# Gonzo parses; its attribute panel then aggregates over `attr.*`/`resource.*`
+# exactly as if the fields had arrived that way. Install: `brew install gonzo`
+# or `go install github.com/control-theory/gonzo/cmd/gonzo@latest`.
+#
+#   just gonzo                                  # last hour of the dogfood tenant
+#   just gonzo agent-dogfood 'attr.model == "claude-fable-5" | range(-7d, now) | limit 5000'
+#
+# For *live* tailing instead, run Gonzo as an OTLP receiver beside the stack —
+# `gonzo --otlp-enabled --otlp-grpc-port=5317 --otlp-http-port=5318` — and add a
+# second exporter to `dev/observability/otel-collector-config.yaml` pointing at
+# `host.docker.internal:5317`. That shows the stream as it arrives; this recipe
+# shows what Ourios actually stored.
+gonzo TENANT="agent-dogfood" QUERY="true | range(-1h, now) | limit 2000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v gonzo >/dev/null || { echo "gonzo not on PATH — brew install gonzo"; exit 1; }
+    # Buffer the response so a failed query reports *why* rather than piping
+    # an error page into the TUI. The query is bounded by its own `limit`.
+    response="$(curl -sf -X POST 'http://127.0.0.1:4319/v1/query' \
+        -H 'X-Ourios-Tenant: {{TENANT}}' \
+        -H 'Content-Type: text/plain' \
+        --data '{{QUERY}}')" || {
+      echo "the query failed — is 'just dogfood-server' up on 127.0.0.1:4319, and is the DSL valid?"
+      exit 1
+    }
+    printf '%s' "$response" \
+      | python3 dev/observability/ourios-to-gonzo.py \
+      | gonzo --disable-version-check
+
 # Stop the stack `jaeger-up` started. Safe to run unconditionally: `down` on an
 # already-stopped stack is a no-op.
 jaeger-down:

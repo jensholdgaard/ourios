@@ -529,6 +529,16 @@ jobs:
             echo "::warning::MCP session not established; execute_tool span not exercised in live-check"
           fi
           sleep 1
+          # RFC 0048 §3.3: an operator verb is a short-lived CLI program and
+          # boots the same telemetry stack, so its OTel CLI-semconv callee
+          # span (process.*) must be conformant too — drive one verb through
+          # the same weaver session. It exits on its own; its shutdown flush
+          # delivers the span.
+          OURIOS_BUCKET_ROOT="$workdir/data" \
+          OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24317 \
+            ./target/debug/ourios-server graph erasures || \
+            echo "::warning::graph erasures verb failed; CLI span not exercised in live-check"
+          sleep 1
           # Best-effort: the server may already have exited; the wait +
           # status check below is what enforces the clean exit.
           kill -TERM "$server_pid" || true

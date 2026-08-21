@@ -63,6 +63,10 @@ async fn cli(config_path: &std::path::Path, args: &[&str]) -> std::process::Outp
             .arg(config_path)
             .args(args)
             .env("RFC0048_TOKEN", "tok-ops")
+            // The verb boots the same telemetry stack as the daemon
+            // (RFC 0048 §3.3); tests want its stderr mirror, not an export
+            // attempt — the universal env var is the off switch.
+            .env("OTEL_SDK_DISABLED", "true")
             .kill_on_drop(true)
             .output(),
     )
@@ -189,6 +193,18 @@ async fn rfc0048_5_8_backfill_and_fence_end_to_end() {
     // --- RFC0048.5: the full backfill feeds everything, idempotently ------
     let output = cli(&config_path, &["graph", "backfill", "--tenant", "acme"]).await;
     assert!(output.status.success(), "{output:?}");
+    // RFC 0048 §3.4 — the per-partition progress events are the run's
+    // observability contract, and they reach the operator on stderr (the
+    // `fmt` mirror is installed even with the SDK disabled).
+    let progress = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        progress.contains("backfill progress: tenant \"acme\" partition 2026-04-02T10"),
+        "{progress}"
+    );
+    assert!(
+        progress.contains("rows offered"),
+        "the event names what it fed: {progress}"
+    );
     let c1_count = fga
         .read_by_object("conversation:acme/c-1")
         .await

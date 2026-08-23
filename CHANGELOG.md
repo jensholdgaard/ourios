@@ -2,6 +2,68 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.8.0] - 2026-08-23
+
+### Added
+
+- Operator verbs are instrumented CLI programs (OTel CLI semconv) (#720) (0761666)
+- Rfc 0048 §3.6 deadline event; status green (#719) (25e6fc8)
+- Rfc 0048 slice 5 — graph backfill, fenced against erasure (#718) (236cb2f)
+- Rfc 0048 slice 4 — graph erase and erasures verbs (#717) (7b02984)
+- Rfc 0048 slice 3 — contextual tuples are a sealed carrier (#716) (25e7d84)
+- Rfc 0048 slice 2 — graph identity keys are configuration (#715) (9412a68)
+- **BREAKING** Rfc 0048 slice 1 — one tenant grammar, verbatim graph objects (#714) (f49493e)
+- Rfc 0047 slice 4 — emitter + erasure (RFC0047.10–.11), RFC green (#708) (1139009)
+- Rfc 0047 slice 3 — tool gate (RFC0047.9) (#707) (5dadcc2)
+- Rfc 0047 slice 2 — planner two-step + visibility (RFC0047.4–.8) (#706) (4452220)
+- Rfc 0047 slice 1 — openfga resolver (RFC0047.1–.3) (#705) (0aafcd1)
+- **BREAKING** Out-of-band tenancy — RFC 0046 implementation (#702) (5e7b31b)
+- **BREAKING** Composite tenant derivation — RFC 0045 implementation (#692) (69f4b3f)
+
+### CI
+
+- An expired SCORECARD_TOKEN must degrade, not 401 the whole run (#725) (611c71a)
+
+### Chore
+
+- Satisfy the lints and rustdoc of Rust 1.98 (#721) (348197a)
+- Add the OpenFGA modelling skill (openfga/agent-skills) (#701) (ead5952)
+- Update cargo (minor/patch) — futures 0.3.34, rcgen 0.14.9, uuid 1.24.1 (#698) (dbaba69)
+- Update rust:1.97-bookworm docker digest to 0e2bcae (#694) (3810bbb)
+- Update gcr.io/distroless/static-debian12 docker digest to 6447365 (#691) (e16c0f0)
+- Update gcr.io/distroless/cc-debian12 docker digest to 6e1871c (#690) (ba6cc5e)
+- Update otel/opentelemetry-collector-contrib docker tag to v0.158.0 (#697) (d5459e9)
+- Update github-actions (#693) (6fcf484)
+- Update cargo (minor/patch) (#686) (eaa0496)
+- Update dependency sigstore/cosign to v2.6.5 (#687) (a2bc540)
+- Update rust:1.97-bookworm docker digest to 14bc9c5 (#685) (99804ec)
+- Update github-actions (#684) (2a5e986)
+- Update cargo (minor/patch) (#683) (1e21e27)
+- Update ossf/scorecard-action action to v2.4.4 (#682) (4bf28f5)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 433319e (#680) (659d81f)
+- Update github-actions (#681) (bd7d36c)
+
+### Documentation
+
+- Rfc 0049 — agent delegation, refusing silent impersonation (specified) (#724) (a39a97e)
+- Rfc 0047 + 0048 accepted (maintainer sign-off) (#723) (868d179)
+- Rfc 0048 — pin the 256-cap semantics; flag streamed-deadline truncation (#712) (e021edc)
+- Rfc 0048 — graph operational surfaces (specified) (#711) (a536df7)
+- Flip RFC 0046 to green and RFC 0045 to superseded (#703) (a269df8)
+- Rfc 0047 review round 2 — in-tree evidence, fga job cwd (25d02eb)
+- Rfc 0047 review round 1 — binding, metadata branch, scoped stream (5122ab2)
+- Rfc 0047 — in-tree OpenFGA model + .fga.yaml tests, fga CI gate, yaml enum fix (b57f343)
+- Draft RFC 0047 — ReBAC resolver (OpenFGA) and graph-fed visibility inside a tenant (bdaaec1)
+- Draft RFC 0046 — out-of-band tenancy (#699) (8a0f273)
+- Flip RFC 0045 to green — all ten criteria pass (#692) (#695) (fed995a)
+- Draft RFC 0045 — operator-configured composite tenant derivation (#689) (24b478d)
+
+### Fixed
+
+- Object cap covers the full type:id string, not the id half (#713) (e01a42d)
+- Rfc 0047 erasure read→delete loop; encoded-object real-server test (#710) (0528e1a)
+- Rfc 0047 erasure rewrites count as compactions (#709) (5cc0777)
+
 ## [0.7.0] - 2026-07-31
 
 ### Added

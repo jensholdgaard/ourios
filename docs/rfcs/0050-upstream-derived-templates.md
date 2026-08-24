@@ -40,12 +40,13 @@ instances.
 This RFC makes the upstream template usable and reconciles the two
 worlds:
 
-1. **Accept it** — opt-in, per deployment, as a two-notch dial: under
-   `observe`, keep mining exactly as today but record the upstream
-   string on the mined template's registry entry, making disagreement
-   between the two clusterings queryable; under `adopt`, a record
-   carrying `log.record.template` takes that string as its template
-   instead of mining the body (§3.2).
+1. **Accept it** — per deployment, as a three-mode dial whose default
+   changes nothing: `ignore` is today's behaviour; opt-in `observe`
+   keeps mining exactly as today but records the upstream string on
+   the mined template's registry entry, making disagreement between
+   the two clusterings queryable; opt-in `adopt` takes a record's
+   `log.record.template` as its template instead of mining the body
+   (§3.2).
 2. **Reconcile it** — an adopted template is interned in the same
    registry, gets the same `template_id` key, and records its
    **provenance**, so drift (RFC 0010), aliases (RFC 0007) and the

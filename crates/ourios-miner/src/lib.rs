@@ -9,3 +9,4 @@ pub mod sim_seq;
 pub mod snapshot;
 pub mod tokenize;
 pub mod tree;
+pub mod upstream;

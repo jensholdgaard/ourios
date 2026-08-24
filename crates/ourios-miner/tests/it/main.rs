@@ -12,3 +12,4 @@
 mod rfc0004_configuration_policy;
 mod rfc0017_template_created;
 mod rfc0024_properties;
+mod rfc0050_properties;

@@ -43,7 +43,7 @@
 //! corrupting the tree. The v2 amendment resolves the hazard by
 //! routing (per-consumer offset horizons), not by refusing.
 
-use ourios_core::audit::{ParamType, SlotTypes};
+use ourios_core::audit::{ParamType, Provenance, ProvenanceSet, SlotTypes};
 use serde::{Deserialize, Serialize};
 
 use crate::tree::OwnedToken;
@@ -96,6 +96,23 @@ pub struct LeafRecord {
     /// wildcard-slot ordinal order. Each is the set of observed
     /// `ParamType`s for that slot (RFC 0001 §6.1).
     pub slot_types: Vec<Vec<ParamTypeRecord>>,
+    /// RFC 0050 §3.3 provenance origins, in
+    /// [`ProvenanceSet::iter`] order. `#[serde(default)]` so
+    /// snapshots written before RFC 0050 restore — an empty list
+    /// restores as `{Mined}`, the correct migration: every
+    /// pre-RFC leaf was minted by the Drain walk. No
+    /// `SNAPSHOT_VERSION` bump for this additive field (the
+    /// `StructuredTemplateRecord::event_name` precedent).
+    #[serde(default)]
+    pub provenance: Vec<ProvenanceRecord>,
+    /// RFC 0050 §3.2 `observe` associations: the stored upstream
+    /// strings (lexicographic) and the overflow count. Absent in
+    /// pre-RFC snapshots — defaults to none, which is what those
+    /// trees had.
+    #[serde(default)]
+    pub upstream_associations: Vec<String>,
+    #[serde(default)]
+    pub upstream_association_overflow: u64,
 }
 
 /// One `(severity_number, scope_name, event_name) → template_id`
@@ -161,6 +178,51 @@ pub enum ParamTypeRecord {
     Str,
     Overflow,
     Unknown(i32),
+}
+
+/// Serialisable mirror of [`ourios_core::audit::Provenance`] — the
+/// core type keeps its bit layout private and serde-free, same as
+/// [`SlotTypes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProvenanceRecord {
+    Mined,
+    UpstreamDerived,
+    ProducerDeclared,
+}
+
+impl From<Provenance> for ProvenanceRecord {
+    fn from(p: Provenance) -> Self {
+        match p {
+            Provenance::Mined => Self::Mined,
+            Provenance::UpstreamDerived => Self::UpstreamDerived,
+            Provenance::ProducerDeclared => Self::ProducerDeclared,
+        }
+    }
+}
+
+impl From<ProvenanceRecord> for Provenance {
+    fn from(p: ProvenanceRecord) -> Self {
+        match p {
+            ProvenanceRecord::Mined => Self::Mined,
+            ProvenanceRecord::UpstreamDerived => Self::UpstreamDerived,
+            ProvenanceRecord::ProducerDeclared => Self::ProducerDeclared,
+        }
+    }
+}
+
+/// [`ProvenanceSet`] → wire form, in the set's stable iteration
+/// order.
+pub(crate) fn provenance_set_to_record(s: ProvenanceSet) -> Vec<ProvenanceRecord> {
+    s.iter().map(ProvenanceRecord::from).collect()
+}
+
+/// Wire form → [`ProvenanceSet`]. An empty list is a pre-RFC 0050
+/// snapshot: restore as `{Mined}` (see [`LeafRecord::provenance`]).
+pub(crate) fn record_to_provenance_set(records: &[ProvenanceRecord]) -> ProvenanceSet {
+    if records.is_empty() {
+        return ProvenanceSet::singleton(Provenance::Mined);
+    }
+    records.iter().map(|r| Provenance::from(*r)).collect()
 }
 
 impl From<ParamType> for ParamTypeRecord {
@@ -372,6 +434,9 @@ mod tests {
                     severity_number: 9,
                     scope_name: Some("lib.auth".to_string()),
                     slot_types: vec![vec![ParamTypeRecord::Num, ParamTypeRecord::Str]],
+                    provenance: vec![ProvenanceRecord::Mined],
+                    upstream_associations: vec!["user <*> logged in".to_string()],
+                    upstream_association_overflow: 2,
                 },
                 LeafRecord {
                     template: vec![
@@ -383,6 +448,9 @@ mod tests {
                     severity_number: 0,
                     scope_name: None,
                     slot_types: vec![],
+                    provenance: vec![],
+                    upstream_associations: vec![],
+                    upstream_association_overflow: 0,
                 },
             ],
             structured_templates: vec![StructuredTemplateRecord {
@@ -412,6 +480,44 @@ mod tests {
         assert_eq!(record.severity_number, 17);
         assert_eq!(record.scope_name.as_deref(), Some("lib.payments"));
         assert_eq!(record.template_id, 3);
+    }
+
+    #[test]
+    fn leaf_record_without_rfc0050_fields_restores_with_defaults() {
+        // RFC 0050 §3.3 migration: a leaf record written before the
+        // provenance / association fields existed must deserialize
+        // with empty defaults — and the empty provenance list reads
+        // back as `{Mined}` (every pre-RFC leaf was minted by the
+        // Drain walk). Same shape as the RFC 0037 `event_name`
+        // migration above; no `SNAPSHOT_VERSION` bump.
+        let pre_rfc0050 = r#"{
+            "template": [{"Fixed":"disk"},{"Fixed":"full"}],
+            "template_id": 7,
+            "template_version": 1,
+            "severity_number": 0,
+            "scope_name": null,
+            "slot_types": []
+        }"#;
+        let record: LeafRecord =
+            serde_json::from_str(pre_rfc0050).expect("pre-RFC0050 record must deserialize");
+        assert!(record.provenance.is_empty());
+        assert!(record.upstream_associations.is_empty());
+        assert_eq!(record.upstream_association_overflow, 0);
+        assert_eq!(
+            record_to_provenance_set(&record.provenance),
+            ProvenanceSet::singleton(Provenance::Mined),
+        );
+    }
+
+    #[test]
+    fn provenance_records_round_trip_the_set() {
+        let set = ProvenanceSet::singleton(Provenance::Mined).insert(Provenance::UpstreamDerived);
+        let records = provenance_set_to_record(set);
+        assert_eq!(
+            records,
+            vec![ProvenanceRecord::Mined, ProvenanceRecord::UpstreamDerived],
+        );
+        assert_eq!(record_to_provenance_set(&records), set);
     }
 
     #[test]

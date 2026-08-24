@@ -124,6 +124,10 @@ pub const OURIOS_MINER_TEMPLATE_COUNT: &str = "ourios.miner.template.count";
 /// `ourios.miner.template.version_changes` (counter, unit `{change}`).
 pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES: &str = "ourios.miner.template.version_changes";
 
+/// `ourios.miner.upstream_template.processed` (counter, unit `{log_record}`).
+pub const OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED: &str =
+    "ourios.miner.upstream_template.processed";
+
 /// `ourios.query.duration` (histogram, unit `s`).
 pub const OURIOS_QUERY_DURATION: &str = "ourios.query.duration";
 

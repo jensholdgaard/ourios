@@ -127,6 +127,32 @@ groups:
       - ref: ourios.miner.parse_failure.reason
         requirement_level: required
 
+  - id: metric.ourios.miner.upstream_template.processed
+    type: metric
+    metric_name: ourios.miner.upstream_template.processed
+    stability: development
+    brief: >-
+      Records whose `log.record.template` attribute was considered under
+      RFC 0050 `observe` or `adopt` mode, whether the handling succeeded
+      or failed — the OTel processor `.processed` shape (one counter for
+      successes and failures). A successful handling (string associated
+      under `observe`, template adopted under `adopt`) carries no
+      `error.type`; a rejected one carries the cause: `byte_limit` (the
+      value exceeded `upstream_template_byte_limit` and was not parsed),
+      `grammar` (outside the RFC 0050 §3.1 v1 grammar), `alignment` (the
+      template could not be aligned byte-for-byte against the body), or
+      `template_ceiling` (adoption would exceed the RFC 0023
+      `max_templates` budget). Every rejection falls back to mining the
+      record; this counter is how a misbehaving upstream producer is
+      visible.
+    instrument: counter
+    unit: "{log_record}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
   - id: metric.ourios.miner.params.overflow
     type: metric
     metric_name: ourios.miner.params.overflow

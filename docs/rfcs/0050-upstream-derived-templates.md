@@ -91,13 +91,42 @@ thing outside one tenant of one store.
 
 ## 3. Proposed design
 
-### 3.1 The attribute Ourios reads
+### 3.1 The attribute Ourios reads, and the grammar it must be in
 
-`log.record.template` (string) on the log record, as written by the
-drainprocessor or any producer following the same convention. When
-present and adoption is enabled, it is the record's template. The
+`log.record.template` (string) on the log record. When present, usable
+(below) and adoption is enabled, it is the record's template. The
 companion attributes are read only as described in §3.4; neither is
 required.
+
+**The convention does not define a syntax, so this RFC does.** Upstream
+deliberately split the question out: #2064 proposed a
+`log.record.template.syntax` attribute and the SIG deferred it, which
+leaves `log.record.template` a bare string that might be Drain output
+(`user <*> logged in`), printf (`User %s logged in`), message-templates
+(`User {user} logged in`) or an f-string. Guessing between them is how a
+store silently mis-parses a line, so v1 accepts exactly one shape and
+refuses the rest:
+
+- **Wildcards.** `<*>`, and `<name>` for a named mask token (the
+  drainprocessor's `masking_rules` emit these). Each matches exactly
+  **one token** — a maximal run of bytes containing no delimiter — under
+  the miner's own tokenisation, so alignment is deterministic and needs
+  no backtracking.
+- **Literals.** Every other byte is literal and must match the body
+  byte for byte. Matching is over **UTF-8 bytes**: no normalisation, no
+  case folding, no whitespace collapsing.
+- **Rejected outright** (never adopted, mined instead): any other
+  placeholder syntax (`%s`, `{}`, `{name}`, `$var`), two adjacent
+  wildcards (ambiguous split), a wildcard that would match zero tokens,
+  a literal segment that does not appear in the body in order, and any
+  template that leaves body bytes unconsumed at the end.
+- **Repeats are positional.** The same mask name appearing twice yields
+  two parameters in template order; the drainprocessor's own
+  first-match-wins collapsing of `parameter.<name>` is exactly why its
+  parameter attributes are a cross-check and not the source (§3.4).
+
+When the upstream syntax attribute lands, accepting a second syntax is
+an additive change to this section.
 
 ### 3.2 Adoption is opt-in
 
@@ -112,17 +141,54 @@ miner:
   way: adopting silently would change every `template_id` in a live
   store and move the corpus gates, which is a migration, not a default.
 - **`adopt`** — a record carrying a usable `log.record.template`
-  (§3.4) skips the Drain tree; its template is the upstream string.
-  A record without the attribute is mined as before, so a mixed stream
-  works and no producer is forced to change.
+  (§3.1 grammar, §3.4 reconstruction) skips the Drain tree; its
+  template is the upstream string. A record without the attribute is
+  mined as before, so a mixed stream works and no producer is forced to
+  change.
+
+```yaml
+miner:
+  upstream_template_byte_limit: 8192   # UTF-8 bytes; 0 disables adoption
+```
+
+**The string is bounded before any work is done on it.** `max_templates`
+(RFC 0023) bounds *interned* templates and `param_byte_limit`
+(`CLAUDE.md` §3.2) bounds *extracted* parameters — neither bounds the
+inbound attribute, so without a cap a 10 MiB "template" would be
+tokenised and aligned before anything rejected it. A value longer than
+`upstream_template_byte_limit` (UTF-8 bytes, default 8 KiB) is not
+parsed, not aligned and not adopted: the record is mined instead, and
+the rejection is counted on the miner's existing parse-outcome metric so
+a misbehaving producer is visible rather than silently absorbed.
 
 ### 3.3 An adopted template is a first-class template
 
 It is interned in the tenant's registry exactly like a mined one and
 receives a `template_id` from the same space; the Parquet schema does
-not change (RFC 0005 §3.5 — no migration). The registry entry records
-**provenance** (`mined` | `upstream`), which is what lets everything
-downstream stay honest:
+not change (RFC 0005 §3.5 — no migration, and no per-row provenance
+column).
+
+**Provenance is a set on the registry entry, not a single value**, over
+three origins:
+
+| Origin | Meaning | Trust |
+|---|---|---|
+| `mined` | Ourios's Drain tree derived it | inference; confidence scored as today |
+| `upstream_derived` | a clustering processor derived it (drainprocessor) | inference made elsewhere, same failure modes |
+| `producer_declared` | the emitting library's own message template | ground truth — the developer wrote it |
+
+Two notes on that taxonomy. First, the same string can legitimately
+arrive both ways: mined on Monday, adopted on Tuesday. A single-valued
+field would then depend on ingest order, the later value overwriting the
+earlier, so drift and audit answers would differ by replay order. A set,
+unioned monotonically, is order-independent, and §5 tests both
+directions. Second, **Ourios cannot always tell `upstream_derived` from
+`producer_declared`**: the attribute key is the same either way, because
+the convention (#1283/#2064) was drafted for producer-declared templates
+and the drainprocessor reuses the name for derived ones. Until upstream
+distinguishes them, both record as `upstream_derived`; §7 tracks it.
+
+The set is what lets everything downstream stay honest:
 
 - **RFC 0023 budget** — adopted templates count against
   `max_templates` like any other. A tenant at its ceiling stops
@@ -150,7 +216,9 @@ itself documents that a mask spanning whitespace makes template and
 body impossible to align position-by-position, and skips its parameter
 attributes when that happens.
 
-So adoption is conditional on reconstruction, checked per record:
+So adoption is conditional on reconstruction, checked per record —
+after the §3.2 size cap has already rejected an oversized string, so
+none of the work below is proportional to an unbounded input:
 
 1. Align the upstream template against the body to recover the
    parameters and the inter-token separators. `log.record.template.

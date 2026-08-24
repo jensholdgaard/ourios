@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # and is published multi-arch, so it works under the QEMU cross-build.
 # Pinned by digest for reproducibility; this distroless ref has no explicit
 # tag (implicit :latest), so Renovate updates only the digest.
-FROM gcr.io/distroless/cc-debian12@sha256:6e1871c34683dc9ee996d13084497783fd98ac0200213d0826625f4e9d4be1d0
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
 # the future query endpoint (RFC 0016) and is intentionally not exposed

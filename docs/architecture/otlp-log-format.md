@@ -99,6 +99,15 @@ separators, body?, confidence, lossy_flag
 That's the entire data model. **Zero fields from the OTLP wire
 are reflected in the record.**
 
+That was the RFC 0001 record. The schema RFC 0017/0018 arrived at does
+store the OTLP fields (severity, trace context, attributes, scope), and
+`template_id` sits beside them as a *sibling column* — which is the
+thing to be clear about: it is an Ourios-derived, tenant-local `u64`,
+not an OTLP field, and not portable between stores (RFC 0010 drift and
+RFC 0007 aliases exist because of exactly that). A template's portable
+identity is its string — `log.record.template` in the emerging
+OpenTelemetry convention (RFC 0050).
+
 ---
 
 ## 3. The gaps

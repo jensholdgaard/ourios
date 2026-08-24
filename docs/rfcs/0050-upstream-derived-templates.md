@@ -48,9 +48,11 @@ worlds:
    **provenance**, so drift (RFC 0010), aliases (RFC 0007) and the
    bounded budget (RFC 0023) all keep working across both origins
    (§3.3, §3.5).
-3. **Align the vocabulary** — where Ourios exposes a template *string*
-   as an attribute, the name is `log.record.template`, tracking the
-   convention rather than inventing one (§3.6).
+3. **Align the vocabulary, and carry both identities** — the portable
+   string under the convention's name (`log.record.template`) and the
+   local key under ours (`ourios.template.id`), because they answer
+   different questions and a consumer that has only one is stuck
+   (§3.6).
 
 Nothing about `template_id` itself changes: it stays the Ourios-derived,
 tenant-local key the Parquet layout and the pruning path are built on.
@@ -172,25 +174,57 @@ RFC makes it portable — the portable identity is the string. The
 glossary and `docs/architecture/otlp-log-format.md` say so explicitly so
 the flat namespace stops implying otherwise.
 
-### 3.6 Vocabulary alignment
+### 3.6 Vocabulary alignment — carry **both**, and say which is which
 
-Where Ourios exposes a template string *as an attribute* — today: none;
-tomorrow: any span, metric or log attribute naming a template — the name
-is `log.record.template`, not an `ourios.*` invention, because the
-convention exists and a store should speak it. Two consequences:
+The two identifiers answer different questions and neither substitutes
+for the other: the **string** says *what shape this line has* and means
+the same thing in any store; the **id** says *which row group to read*
+and means nothing outside this tenant. A consumer holding only the id
+must make a second call to learn the shape (which is what
+`docs/guides/agent-telemetry.md` tells operators to do today); a
+consumer holding only the string cannot use the pruning path. So where
+Ourios names a template *as attributes*, it emits the pair:
 
-- The name is registered in `semconv/registry/` as a reference to the
-  upstream attribute (the project's standing rule: query the OTel MCP
-  and check for collisions before adding any name), and the weaver
-  live-check gate exercises it.
-- If semantic-conventions #1283 / #2064 lands with a different final
-  name, this RFC's §7 tracks the rename; the registry entry is the
-  single place it changes.
+| Attribute | Value | Why this name |
+|---|---|---|
+| `log.record.template` | the template string | the convention (§3.1); a vendor name for a concept the ecosystem is standardising is exactly what `CLAUDE.md`'s alignment rule forbids |
+| `ourios.template.id` | the `u64` local key | vendor-namespaced because it *is* vendor-specific — no convention exists or should |
+| `ourios.template.version` | the template's version | the companion the drift/alias machinery needs (RFC 0007/0010) |
+
+Note the shape of the id's name: `ourios.template.id`, not
+`ourios.template_id`. OTel's naming rules put a property under its
+object with a dot (`*{object}.{property}`) and explicitly warn against
+`{object}_{property}` "if this object could have other properties" — a
+template has at least a version, so the dotted form is the one that
+extends. It also matches the namespace the registry already uses for
+`ourios.miner.template.count`.
+
+Which surfaces carry them:
+
+- **Telemetry Ourios emits about itself** (a query span that pinned a
+  template, miner events): the pair above, registered in
+  `semconv/registry/` (`log.record.template` as a reference to the
+  upstream attribute, the `ourios.*` two as our own), exercised by the
+  weaver live-check gate.
+- **Records returned by the query API**: the string is added *beside*
+  the existing `template_id` / `template_version` response fields, so a
+  consumer stops needing the second `list_templates` call. It is **not**
+  injected into the record's `attributes` array — RFC 0018's fidelity
+  rule is that the read path returns the attributes ingest stored, and
+  a template Ourios derived was never one of them. Ourios-derived data
+  stays in Ourios-derived fields.
+- **A stored record re-exported over OTLP** (no such surface today):
+  the same rule decides it. An *adopted* template may go back out as
+  `log.record.template` because the producer sent it; a *mined* one may
+  not be presented as though the producer had, and would need an
+  explicit derived-data marker. §7 tracks that if the surface ever
+  exists.
 
 API surfaces that return a template string as *data* (the template
 registry, `list_templates`, the drift query) keep their field names —
 they are not OTel attributes, and renaming them is a query-contract
-break with no upside.
+break with no upside. The DSL keeps `template_id` for the same reason
+(RFC 0002 contract), now documented as the local key it is.
 
 ## 4. Alternatives considered
 
@@ -215,7 +249,7 @@ break with no upside.
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0050.<n>`. Seven criteria (RFC0050.1–.7).
+Scenario ids `RFC0050.<n>`. Eight criteria (RFC0050.1–.8).
 
 > **RFC0050.1 — the default is byte-identical.** Given
 > `upstream_templates` unset and a corpus whose records carry
@@ -261,7 +295,19 @@ Scenario ids `RFC0050.<n>`. Seven criteria (RFC0050.1–.7).
 > **RFC0050.7 — the vocabulary is the convention's.** Given any Ourios
 > telemetry that names a template string as an attribute, Then the key
 > is `log.record.template`, the name resolves in `semconv/registry/`,
-> and the weaver live-check reports no violation for it.
+> and the weaver live-check reports no violation for it; And Given the
+> local key on the same signal, Then it is `ourios.template.id` (with
+> `ourios.template.version`), registered as vendor attributes.
+
+> **RFC0050.8 — the read path carries both, without inventing
+> attributes.** Given a stored record whose template is known, When it
+> is returned by the query API, Then the response carries the template
+> **string** beside the existing `template_id` / `template_version`
+> fields — so no second `list_templates` call is needed — And the
+> record's `attributes` array is byte-identical to what ingest stored
+> (RFC 0018 fidelity): no `log.record.template` is injected into a
+> record whose producer did not send one, and one that *was* sent
+> survives the round trip unchanged.
 
 ## 6. Testing strategy
 

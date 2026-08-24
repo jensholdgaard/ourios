@@ -313,9 +313,20 @@ Which surfaces carry them:
 
 - **Telemetry Ourios emits about itself** (a query span that pinned a
   template, miner events): the pair above, registered in
-  `semconv/registry/` (`log.record.template` as a reference to the
-  upstream attribute, the `ourios.*` two as our own), exercised by the
-  weaver live-check gate.
+  `semconv/registry/` and exercised by the weaver live-check gate. One
+  registration nuance is load-bearing: `log.record.template` **cannot
+  be a weaver `ref:`**, because the attribute is not in the upstream
+  registry to reference — verified against the registry, whose `log`
+  namespace today holds only `log.iostream`, `log.file.*`,
+  `log.record.original` and `log.record.uid`. It is therefore a
+  **local definition** in our registry: `development` stability, a
+  `note` naming #1283/#2064 as the tracked proposal, and the explicit
+  caveat that the entry pre-adopts a proposed name exactly as the
+  drainprocessor (itself an OTel component) does. Writing a `log.*`
+  name in a vendor registry is otherwise something OTel's naming
+  guidance warns against; the tracking note is what makes it
+  pre-adoption rather than squatting, and the entry collapses to a
+  `ref:` the day the proposal lands.
 - **Records returned by the query API**: the string is added *beside*
   the existing `template_id` / `template_version` response fields, so a
   consumer stops needing the second `list_templates` call. It is **not**
@@ -502,8 +513,28 @@ covers RFC0050.7.
 - [ ] **Final attribute name.** semantic-conventions #1283 / #2064 are
       open; `log.record.template` is what collector-contrib ships today.
       If the convention lands renamed, this RFC's registry entry is the
-      one place to change — but a store that has stored the old name in
-      *data* (as a promoted attribute) also needs an alias story.
+      one place to change *for telemetry* — and OTel schema files
+      formally describe attribute renames, so the rename will arrive
+      with a machine-readable transformation to follow. The *stored
+      data* side is decided policy, not a design gap, and stays open
+      here only until the upstream name lands:
+      - **Pre-production** (the current posture): a rename is a
+        `!`-marked breaking change and old files are simply
+        regenerated. No dual-read, no migration tooling — the standing
+        rule for persisted layouts before a production deployment
+        exists.
+      - **Post-production**: old files keep the old column and readers
+        already tolerate absent/unknown columns (§3.5 schema-evolution
+        invariant), so nothing breaks on read. Query-side, the
+        promoted-attribute configuration gains an alias entry (old name
+        → canonical) resolved at planning time — the same shape as
+        template aliases (RFC 0007, hazard #5) — with the OTel schema
+        file as the authoritative mapping rather than one we invent.
+        Physical convergence rides compaction re-projection (RFC 0022),
+        which rewrites old files under the new column as they are
+        compacted anyway; no dedicated migration tool.
+      Nothing is built ahead of need: the only trigger for any of this
+      is the upstream convention actually landing.
 - [x] **Trust boundary — bounded, then verified.** Resolved in §3.2 and
       §3.4: `upstream_template_byte_limit` caps the string before any
       parsing (RFC 0023's budget bounds interned templates, not inbound

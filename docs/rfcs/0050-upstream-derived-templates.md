@@ -213,7 +213,7 @@ parse and its body was retained", which is false for a record whose
 attribute was rejected but whose body then mined cleanly — overloading
 it would corrupt the corpus-gate semantics the §3.1 counters carry.
 (Amended at implementation time from an earlier draft that named the
-parse-outcome metric, per the semconv recording-errors guidance.)
+parse-outcome metric, per the OTel recording-errors convention.)
 
 ### 3.3 An adopted template is a first-class template
 

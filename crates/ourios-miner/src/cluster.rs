@@ -1959,8 +1959,14 @@ impl MinerCluster {
                     })
                     .flatten();
                 if let Some(leaf) = mined_hit {
-                    // Mined first, adopted second (RFC0050.6).
+                    // Mined first, adopted second (RFC0050.6). The
+                    // audit event fires only on a genuine provenance
+                    // transition: a leaf adopted earlier, widened to
+                    // a new canonical and adopted again already
+                    // carries `upstream_derived` — that is a cache
+                    // fill, not a transition.
                     let pair = (leaf.template_id, leaf.template_version);
+                    let first = !leaf.provenance.contains(Provenance::UpstreamDerived);
                     leaf.provenance = leaf.provenance.insert(Provenance::UpstreamDerived);
                     state.adopted_templates.insert(
                         key,
@@ -1969,7 +1975,11 @@ impl MinerCluster {
                             template_version: pair.1,
                         },
                     );
-                    AdoptResolution::FirstOnLeaf(pair.0, pair.1)
+                    if first {
+                        AdoptResolution::FirstOnLeaf(pair.0, pair.1)
+                    } else {
+                        AdoptResolution::Existing(pair.0, pair.1)
+                    }
                 } else if state.leaf_count + state.owned_adopted_count
                     >= config.max_templates as usize
                 {
@@ -6043,6 +6053,44 @@ mod tests {
             .map(|e| e.payload.event_type().to_string())
             .collect();
         assert_eq!(kinds, vec!["template_created", "template_adopted"]);
+    }
+
+    #[test]
+    fn readoption_after_widening_emits_no_second_audit() {
+        // §3.3 "once per provenance transition": a leaf adopted at
+        // one canonical, widened to a new canonical, then adopted
+        // again under the new shape already carries
+        // `upstream_derived` — the second adoption is a cache fill,
+        // not a transition, and must not add audit noise.
+        let t = TenantId::new("tenant-x");
+        let audit = SharedAuditSink::new();
+        let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()));
+
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+        let first = cluster.ingest(&annotated_record(
+            &t,
+            "user 43 logged in",
+            "user <*> logged in",
+        ));
+        // Widen position 3: "in" vs "out" under a clean-zone match.
+        let _ = cluster.ingest(&string_record(&t, "user 44 logged out"));
+        let second = cluster.ingest(&annotated_record(
+            &t,
+            "user 45 logged off",
+            "user <*> logged <*>",
+        ));
+        assert_eq!(first, second, "both adoptions ride the one widened leaf");
+
+        let kinds: Vec<String> = audit
+            .drain()
+            .iter()
+            .map(|e| e.payload.event_type().to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["template_created", "template_adopted", "template_widened"],
+            "exactly one template_adopted — the re-adoption is silent",
+        );
     }
 
     #[test]

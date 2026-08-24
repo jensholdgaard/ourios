@@ -144,7 +144,11 @@ groups:
       `template_ceiling` (adoption would exceed the RFC 0023
       `max_templates` budget). Every rejection falls back to mining the
       record; this counter is how a misbehaving upstream producer is
-      visible.
+      visible. One deliberate exclusion: under `observe`, a validated
+      string on a record that itself fails to parse (`NO_TEMPLATE`) is
+      not counted — there is no mined entry to associate it with, and
+      the record's failure is already visible on
+      `ourios.miner.parse_failures`.
     instrument: counter
     unit: "{log_record}"
     attributes:

@@ -287,6 +287,18 @@ struct TenantState {
     /// adopted templates count against `max_templates`;
     /// tree-backed entries are already counted as leaves).
     owned_adopted_count: usize,
+    /// The canonical shapes the tenant's **mined** leaves currently
+    /// carry — the O(1) guard in front of the RFC0050.6 adopt-time
+    /// convergence scan, so a stream of unique upstream templates
+    /// (including one already at the ceiling) costs a hash miss per
+    /// canonical instead of a tree walk. Maintained at leaf
+    /// creation, on template-changing widenings, and on restore.
+    /// When two leaves ever share a canonical (distinct masked
+    /// paths converging on one shape), one widening away removes
+    /// the shared entry and later adoptions of that shape intern
+    /// separately — safe, and multi-id shapes are RFC 0007 alias
+    /// territory.
+    mined_canonicals: HashSet<(String, u8, Option<String>)>,
     template_count: usize,
     /// Drain-tree leaves only (excludes structured-template
     /// entries) — the quantity RFC 0023 §3.1's `max_templates`
@@ -311,6 +323,7 @@ impl TenantState {
             structured_templates: HashMap::new(),
             adopted_templates: HashMap::new(),
             owned_adopted_count: 0,
+            mined_canonicals: HashSet::new(),
             template_count: 0,
             leaf_count: 0,
             config,
@@ -1807,6 +1820,83 @@ impl MinerCluster {
         Some(template_id)
     }
 
+    /// Phase 1 of [`Self::attach_and_maybe_widen`]: mutate the
+    /// candidate leaf via [`plan_attach`] and apply the RFC 0050
+    /// `observe` association, holding the leaf borrow only over
+    /// the mutation. No association on a rejection — the record
+    /// exits via the parse-failure path, taking no template.
+    #[allow(clippy::too_many_arguments)] // mirrors the mining path's threading
+    fn plan_attach_on_candidate(
+        &mut self,
+        record: &OtlpLogRecord,
+        masked_strs: &[&str],
+        line_wildcard_positions: &[usize],
+        line_typed_params: &[crate::mask::TypedParam<'_>],
+        candidate: &Candidate,
+        byte_limit: u32,
+        observed: Option<&str>,
+    ) -> AttachPlan {
+        let state = self
+            .tenants
+            .get_mut(&record.tenant_id)
+            .expect("tenant present: find_best_candidate returned Some(...)");
+        let (depth, fanout) = (
+            state.config.prefix_depth as usize,
+            usize::from(state.config.max_node_children),
+        );
+        let parent = state.tree.descend_mut(masked_strs, depth, fanout);
+        let leaf = &mut parent.leaves[candidate.leaf_idx];
+        let plan = plan_attach(
+            leaf,
+            masked_strs,
+            line_wildcard_positions,
+            line_typed_params,
+            byte_limit,
+        );
+        if !matches!(plan, AttachPlan::Rejected { .. }) {
+            let bound = usize::from(state.config.upstream_association_limit);
+            leaf.associate_upstream(observed, bound);
+        }
+        plan
+    }
+
+    /// Keep the RFC0050.6 convergence index in step with a
+    /// template-changing attach: the leaf's canonical moved from
+    /// the first `Widened` event's old form to the last one's new
+    /// form. Type-expansions carry an unchanged template and need
+    /// no move.
+    fn move_mined_canonical(&mut self, record: &OtlpLogRecord, events: &[TemplateChange]) {
+        let widened_move = events
+            .iter()
+            .fold(None, |acc: Option<(String, String)>, c| {
+                if let TemplateChange::Widened {
+                    old_template,
+                    new_template,
+                    ..
+                } = c
+                {
+                    let old = acc.map_or_else(|| old_template.clone(), |(o, _)| o);
+                    Some((old, new_template.clone()))
+                } else {
+                    acc
+                }
+            });
+        if let Some((old_canonical, new_canonical)) = widened_move
+            && let Some(state) = self.tenants.get_mut(&record.tenant_id)
+        {
+            state.mined_canonicals.remove(&(
+                old_canonical,
+                record.severity_number,
+                record.scope_name.clone(),
+            ));
+            state.mined_canonicals.insert((
+                new_canonical,
+                record.severity_number,
+                record.scope_name.clone(),
+            ));
+        }
+    }
+
     /// Count one rejected upstream-template claim on the
     /// `.processed` counter and yield the "fall through to mining"
     /// signal (RFC 0050 §3.2).
@@ -1852,11 +1942,23 @@ impl MinerCluster {
                 AdoptResolution::Existing(owned.template_id, 1)
             }
             None => {
-                if let Some(leaf) = state.tree.find_exact_mut(
-                    owned_tokens,
-                    record.severity_number,
-                    record.scope_name.as_deref(),
-                ) {
+                // The index guard makes a miss O(1): the tree walk
+                // runs only when a mined leaf with this exact shape
+                // is known to exist — once per converging canonical,
+                // never for the unique-template flood (which
+                // otherwise degrades toward O(n²) at the ceiling).
+                let mined_hit = state
+                    .mined_canonicals
+                    .contains(&key)
+                    .then(|| {
+                        state.tree.find_exact_mut(
+                            owned_tokens,
+                            record.severity_number,
+                            record.scope_name.as_deref(),
+                        )
+                    })
+                    .flatten();
+                if let Some(leaf) = mined_hit {
                     // Mined first, adopted second (RFC0050.6).
                     let pair = (leaf.template_id, leaf.template_version);
                     leaf.provenance = leaf.provenance.insert(Provenance::UpstreamDerived);
@@ -2152,6 +2254,9 @@ impl MinerCluster {
                 state.template_count += 1;
             }
             state.leaf_count += 1;
+            // Index the fresh mined canonical for the RFC0050.6
+            // convergence guard.
+            state.mined_canonicals.insert(adopted_key);
             (new_id, created_template)
         };
         // RFC 0017 §3.1 — audit the leaf's initial (version 1) creation so a
@@ -2219,34 +2324,17 @@ impl MinerCluster {
         // clone.
 
         // Phase 1 — mutate the leaf and accumulate the audit-event
-        // payloads. Hold the leaf borrow only over the mutation;
-        // emitting through `self.audit_sink` happens in phase 2.
-        let plan = {
-            let state = self
-                .tenants
-                .get_mut(&record.tenant_id)
-                .expect("tenant present: find_best_candidate returned Some(...)");
-            let (depth, fanout) = (
-                state.config.prefix_depth as usize,
-                usize::from(state.config.max_node_children),
-            );
-            let assoc_limit = usize::from(state.config.upstream_association_limit);
-            let parent = state.tree.descend_mut(masked_strs, depth, fanout);
-            let leaf = &mut parent.leaves[candidate.leaf_idx];
-            let plan = plan_attach(
-                leaf,
-                masked_strs,
-                line_wildcard_positions,
-                line_typed_params,
-                byte_limit,
-            );
-            // RFC 0050 `observe` association — skipped on a degenerate
-            // rejection (the record exits via the parse-failure path).
-            if !matches!(plan, AttachPlan::Rejected { .. }) {
-                leaf.associate_upstream(observed, assoc_limit);
-            }
-            plan
-        };
+        // payloads (the helper holds the leaf borrow only over the
+        // mutation); emitting through `self.audit_sink` is phase 2.
+        let plan = self.plan_attach_on_candidate(
+            record,
+            masked_strs,
+            line_wildcard_positions,
+            line_typed_params,
+            &candidate,
+            byte_limit,
+            observed,
+        );
 
         match plan {
             AttachPlan::CleanReuse {
@@ -2308,6 +2396,7 @@ impl MinerCluster {
                 final_version,
                 params: aligned_params,
             } => {
+                self.move_mined_canonical(record, &events);
                 for change in events {
                     let counts_as_merge = change.counts_as_merge();
                     let event_type = change.event_type();
@@ -2483,9 +2572,10 @@ impl MinerCluster {
     }
 
     /// One tenant's adopted-template map (RFC 0050 §3.3), sorted by
-    /// canonical for determinism. Both entry kinds appear:
-    /// tree-backed rows carry no provenance of their own (it lives
-    /// on the leaf, visible via [`Self::templates_for`]).
+    /// the full map key — `(canonical, severity, scope)` — for
+    /// determinism. Both entry kinds appear: tree-backed rows carry
+    /// no provenance of their own (it lives on the leaf, visible
+    /// via [`Self::templates_for`]).
     #[must_use]
     pub fn adopted_templates_for(&self, tenant_id: &TenantId) -> Vec<AdoptedSnapshot> {
         self.tenants.get(tenant_id).map_or_else(Vec::new, |s| {
@@ -2521,7 +2611,13 @@ impl MinerCluster {
                     }
                 })
                 .collect();
-            out.sort_by(|a, b| a.canonical.cmp(&b.canonical));
+            out.sort_by(|a, b| {
+                (&a.canonical, a.severity_number, &a.scope_name).cmp(&(
+                    &b.canonical,
+                    b.severity_number,
+                    &b.scope_name,
+                ))
+            });
             out
         })
     }
@@ -2730,6 +2826,10 @@ impl MinerCluster {
         // only origin an owned entry can carry without having
         // converged (a converged one is tree-backed by
         // construction).
+        // Prepass for tree-backed reference validation below: the
+        // snapshot's own leaf records are exactly what was restored.
+        let leaf_by_id: HashMap<u64, &crate::snapshot::LeafRecord> =
+            state.leaves.iter().map(|l| (l.template_id, l)).collect();
         for record in &state.adopted_templates {
             if record.owned {
                 if !seen_ids.insert(record.template_id) {
@@ -2741,6 +2841,8 @@ impl MinerCluster {
                     });
                 }
                 tenant.owned_adopted_count += 1;
+            } else {
+                validate_tree_backed_adoption(record, &leaf_by_id)?;
             }
             let key = (
                 record.canonical.clone(),
@@ -2841,6 +2943,13 @@ fn restore_leaf_into(
         }
     }
 
+    // Index the restored canonical for the RFC0050.6 convergence
+    // guard, before `template` moves into the leaf.
+    tenant.mined_canonicals.insert((
+        format_template(&template),
+        record.severity_number,
+        record.scope_name.clone(),
+    ));
     let parent = tenant
         .tree
         .descend_mut(&masked, prefix_depth, usize::from(max_node_children));
@@ -2857,6 +2966,63 @@ fn restore_leaf_into(
             record.upstream_association_overflow,
         ),
     });
+    Ok(())
+}
+
+/// Reject a tree-backed adopted-template record whose leaf
+/// reference does not hold in the same snapshot (RFC 0050 §3.3):
+/// the referenced leaf must exist with the same `(severity, scope)`
+/// key, the bound version must not exceed the leaf's, and when the
+/// bind is to the leaf's *current* version the canonicals must
+/// match. (A bind to an older version is legitimate — the leaf may
+/// have widened after the adoption — and its tokens live in the
+/// audit-derived registry, not the snapshot, so only the current
+/// version is canonical-checkable here.)
+fn validate_tree_backed_adoption(
+    record: &crate::snapshot::AdoptedTemplateRecord,
+    leaf_by_id: &HashMap<u64, &crate::snapshot::LeafRecord>,
+) -> Result<(), RestoreError> {
+    let Some(leaf) = leaf_by_id.get(&record.template_id) else {
+        return Err(RestoreError::Inconsistent {
+            detail: format!(
+                "adopted canonical {:?} references template_id {} with no restored leaf",
+                record.canonical, record.template_id,
+            ),
+        });
+    };
+    if leaf.severity_number != record.severity_number || leaf.scope_name != record.scope_name {
+        return Err(RestoreError::Inconsistent {
+            detail: format!(
+                "adopted canonical {:?} references template_id {} under a different \
+                 (severity, scope) key",
+                record.canonical, record.template_id,
+            ),
+        });
+    }
+    if record.template_version > leaf.template_version {
+        return Err(RestoreError::Inconsistent {
+            detail: format!(
+                "adopted canonical {:?} binds template_id {} at version {} beyond the \
+                 leaf's version {}",
+                record.canonical,
+                record.template_id,
+                record.template_version,
+                leaf.template_version,
+            ),
+        });
+    }
+    if record.template_version == leaf.template_version {
+        let leaf_tokens: Vec<OwnedToken> = leaf.template.iter().map(OwnedToken::from).collect();
+        if format_template(&leaf_tokens) != record.canonical {
+            return Err(RestoreError::Inconsistent {
+                detail: format!(
+                    "adopted canonical {:?} disagrees with template_id {}'s tokens at \
+                     version {}",
+                    record.canonical, record.template_id, record.template_version,
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -5974,5 +6140,70 @@ mod tests {
         let again = restored.ingest(&annotated_record(&t, "job 9 finished", "job <*> finished"));
         assert_eq!(again, id);
         assert_eq!(restored.template_count(&t), 1);
+    }
+
+    #[test]
+    fn restore_rejects_dangling_tree_backed_adoption() {
+        let state = SnapshotState {
+            leaves: vec![],
+            structured_templates: vec![],
+            wal_high_water: None,
+            adopted_templates: vec![crate::snapshot::AdoptedTemplateRecord {
+                canonical: "job <*> done".to_string(),
+                severity_number: 0,
+                scope_name: None,
+                template_id: 5,
+                template_version: 1,
+                owned: false,
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
+            }],
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a tree-backed entry with no leaf must be rejected");
+        assert!(matches!(err, RestoreError::Inconsistent { .. }));
+    }
+
+    #[test]
+    fn restore_rejects_mismatched_tree_backed_adoption() {
+        // The leaf exists but its current-version tokens disagree
+        // with the recorded canonical.
+        let state = SnapshotState {
+            leaves: vec![LeafRecord {
+                template: vec![
+                    TokenRecord::Fixed("disk".to_string()),
+                    TokenRecord::Fixed("full".to_string()),
+                ],
+                template_id: 5,
+                template_version: 1,
+                severity_number: 0,
+                scope_name: None,
+                slot_types: vec![],
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
+            }],
+            structured_templates: vec![],
+            wal_high_water: None,
+            adopted_templates: vec![crate::snapshot::AdoptedTemplateRecord {
+                canonical: "job <*> done".to_string(),
+                severity_number: 0,
+                scope_name: None,
+                template_id: 5,
+                template_version: 1,
+                owned: false,
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
+            }],
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a canonical that disagrees with the leaf tokens must be rejected");
+        assert!(matches!(err, RestoreError::Inconsistent { .. }));
     }
 }

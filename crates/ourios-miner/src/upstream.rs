@@ -135,10 +135,13 @@ pub enum GrammarError {
     /// A literal token embeds the anonymous wildcard marker
     /// (`foo<*>bar`, `<*><*>`). An embedded `<*>` is unambiguously
     /// a mask over *part* of a token, which v1's
-    /// one-wildcard-one-token rule cannot align — this is also the
-    /// §3.1 "two adjacent wildcards" case, since whitespace
-    /// tokenization makes standalone wildcard tokens never
-    /// adjacent. An embedded `<name>` is *not* rejected here: it
+    /// one-wildcard-one-token rule cannot align. This is what the
+    /// §3.1 "two adjacent wildcards (ambiguous split)" rejection
+    /// means: wildcards with nothing between them, inside one
+    /// token. *Consecutive* standalone wildcard tokens
+    /// (`<*> <*>`, whitespace-separated) are fine — each consumes
+    /// exactly one body token, so there is no split to make
+    /// ambiguous. An embedded `<name>` is *not* rejected here: it
     /// is indistinguishable from legitimate literal text
     /// (`id=<null>`), so it stays literal and alignment decides.
     EmbeddedWildcard { token_index: usize },
@@ -587,12 +590,26 @@ mod tests {
             parse_template("user=<*> ok").unwrap_err(),
             GrammarError::EmbeddedWildcard { token_index: 0 },
         );
-        // The "two adjacent wildcards" case: only expressible
-        // inside one token, and that token embeds `<*>`.
+        // The §3.1 "two adjacent wildcards (ambiguous split)"
+        // case: wildcards with nothing between them, inside one
+        // token.
         assert_eq!(
             parse_template("<*><*>").unwrap_err(),
             GrammarError::EmbeddedWildcard { token_index: 0 },
         );
+    }
+
+    #[test]
+    fn consecutive_standalone_wildcards_are_unambiguous() {
+        // `<*> <*>` is NOT the §3.1 adjacency rejection: separated
+        // by whitespace, each wildcard consumes exactly one body
+        // token, so the split is deterministic and reconstruction
+        // holds.
+        let t = parse("copy <*> <*> done");
+        let a = align(&t, "copy a.txt b.txt done").expect("aligns");
+        assert_eq!(a.params[0].value, "a.txt");
+        assert_eq!(a.params[1].value, "b.txt");
+        assert_eq!(reassemble(&t, &a), "copy a.txt b.txt done");
     }
 
     #[test]

@@ -370,17 +370,12 @@ fn batch_to_audit_events(
                     slots_expanded: &slots_expanded_lists,
                     reason: &reason,
                 };
-                AuditPayload::Template {
-                    template_id: require_at(&template_id, i, audit_columns::TEMPLATE_ID, file_row)?,
-                    triggering_line_hash: require_at(
-                        &triggering_line_hash,
-                        i,
-                        audit_columns::TRIGGERING_LINE_HASH,
-                        file_row,
-                    )?,
-                    triggering_line_sample: triggering_line_sample.get(i).and_then(Clone::clone),
-                    change: decode_template_change(&cols, i, file_row)?,
-                }
+                let envelope = TemplateEnvelopeColumns {
+                    template_id: &template_id,
+                    triggering_line_hash: &triggering_line_hash,
+                    triggering_line_sample: &triggering_line_sample,
+                };
+                decode_template_payload(&cols, &envelope, i, file_row)?
             }
             EVENT_KIND_COMPACTION => {
                 let cols = CompactionColumns {
@@ -427,6 +422,41 @@ fn batch_to_audit_events(
     }
 
     Ok(events)
+}
+
+/// Borrowed envelope columns shared by every template event kind.
+struct TemplateEnvelopeColumns<'a> {
+    template_id: &'a [Option<u64>],
+    triggering_line_hash: &'a [Option<[u8; 16]>],
+    triggering_line_sample: &'a [Option<String>],
+}
+
+/// Decode one template-kind row into its [`AuditPayload::Template`].
+fn decode_template_payload(
+    cols: &TemplateColumns,
+    envelope: &TemplateEnvelopeColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    Ok(AuditPayload::Template {
+        template_id: require_at(
+            envelope.template_id,
+            i,
+            audit_columns::TEMPLATE_ID,
+            file_row,
+        )?,
+        triggering_line_hash: require_at(
+            envelope.triggering_line_hash,
+            i,
+            audit_columns::TRIGGERING_LINE_HASH,
+            file_row,
+        )?,
+        triggering_line_sample: envelope
+            .triggering_line_sample
+            .get(i)
+            .and_then(Clone::clone),
+        change: decode_template_change(cols, i, file_row)?,
+    })
 }
 
 /// Borrowed per-column slices the template-change decoder reads.
@@ -694,7 +724,12 @@ fn decode_template_change(
     // templates, the matched leaf version otherwise), not structural.
     if cols.event_kind == EVENT_KIND_TEMPLATE_ADOPTED {
         return Ok(TemplateChange::Adopted {
-            template_version: require_at(cols.new_version, i, audit_columns::NEW_VERSION, file_row)?,
+            template_version: require_at(
+                cols.new_version,
+                i,
+                audit_columns::NEW_VERSION,
+                file_row,
+            )?,
             new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
         });
     }

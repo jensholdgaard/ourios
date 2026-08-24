@@ -250,11 +250,62 @@ pub struct Tree {
 /// module-level "Depth convention" note.
 pub const DEFAULT_PREFIX_DEPTH: usize = 2;
 
+impl Leaf {
+    /// RFC 0050 §3.2 `observe` — associate a validated upstream
+    /// template string with this leaf, if one accompanied the
+    /// record. See [`UpstreamAssociations::observe`] for the
+    /// bound/overflow semantics.
+    pub fn associate_upstream(&mut self, observed: Option<&str>, bound: usize) {
+        if let Some(s) = observed {
+            let _ = self.upstream_associations.observe(s, bound);
+        }
+    }
+}
+
+impl PrefixNode {
+    fn find_exact_mut(
+        &mut self,
+        template: &[OwnedToken],
+        severity_number: u8,
+        scope_name: Option<&str>,
+    ) -> Option<&mut Leaf> {
+        if let Some(idx) = self.leaves.iter().position(|l| {
+            l.template == template
+                && l.severity_number == severity_number
+                && l.scope_name.as_deref() == scope_name
+        }) {
+            return self.leaves.get_mut(idx);
+        }
+        self.children
+            .values_mut()
+            .find_map(|child| child.find_exact_mut(template, severity_number, scope_name))
+    }
+}
+
 impl Tree {
     /// Build an empty tree.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Find the leaf whose stored template and `(severity, scope)`
+    /// key exactly match — the RFC 0050 §3.3 adopt-time convergence
+    /// lookup ("mined first, adopted second" must land on the mined
+    /// leaf, RFC0050.6). Walks every node in the matching length
+    /// bucket: `O(leaves of that length)`, run once per distinct
+    /// canonical template under `adopt` (the cluster caches the
+    /// answer), never per record.
+    pub fn find_exact_mut(
+        &mut self,
+        template: &[OwnedToken],
+        severity_number: u8,
+        scope_name: Option<&str>,
+    ) -> Option<&mut Leaf> {
+        self.by_length
+            .get_mut(&template.len())?
+            .root
+            .find_exact_mut(template, severity_number, scope_name)
     }
 
     /// Walk to the [`PrefixNode`] that owns the leaf list for

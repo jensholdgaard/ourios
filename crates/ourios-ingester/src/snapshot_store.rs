@@ -174,6 +174,7 @@ mod tests {
                 segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
                 byte: 64,
             }),
+            adopted_templates: vec![],
         }
     }
 

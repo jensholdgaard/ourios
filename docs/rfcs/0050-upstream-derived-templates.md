@@ -130,8 +130,8 @@ downstream stay honest:
   `NO_TEMPLATE`), so a producer emitting a unique template per record
   cannot grow memory without bound. §3.2 of `CLAUDE.md` in spirit: an
   untrusted-shaped input must not become unbounded cardinality.
-- **RFC 0010 drift** — the drift query reports provenance, so an
-  operator can see a shape whose template changed *because the
+- **RFC 0010 drift** — the drift query reports the provenance set, so
+  an operator can see a shape whose template changed *because the
   upstream processor changed*, not because our tree moved.
 - **RFC 0007 aliases** — an alias may bind a mined template to an
   adopted one, which is the migration path for a deployment that turns
@@ -163,8 +163,12 @@ So adoption is conditional on reconstruction, checked per record:
    mining, and if mining also cannot reconstruct it, the existing
    lossy-flag + body-retention path applies unchanged.
 
-Parameter values remain subject to the §3.2 byte limit and spill to
-`body` exactly as mined parameters do.
+Parameter values remain subject to the per-parameter byte limit that
+governs mined parameters — `param_byte_limit` (`CLAUDE.md` §3.2,
+default 256, measured in **UTF-8 bytes** of the extracted value) — and
+an overflowing value spills to the `body` column exactly as a mined one
+does. Adoption changes where a parameter came from, never what bounds
+it.
 
 ### 3.5 What stays local
 
@@ -226,6 +230,31 @@ they are not OTel attributes, and renaming them is a query-contract
 break with no upside. The DSL keeps `template_id` for the same reason
 (RFC 0002 contract), now documented as the local key it is.
 
+### 3.7 Named arguments may already be attributes
+
+#2064's accepted direction is that a *named* placeholder does **not**
+get a `log.record.template.parameter.` prefix: `{user.id}` is emitted as
+a top-level attribute `user.id`, explicitly so that templates reuse
+existing semantic conventions (`API Request by {http.request.method}
+{url.full} by user {user.id}`). Positional placeholders keep
+`log.record.template.parameter.<index>`.
+
+For Ourios that means a producer-declared template can arrive with its
+arguments *already stored as attributes* — possibly promoted ones
+(RFC 0022) that the DSL can filter and aggregate on directly. Extracting
+the same values into `params` would then store them twice: once as an
+attribute column, once in the params list.
+
+v1 does not deduplicate. The params list is what `render` consumes, and
+invariant §3.3 (bit-identical reconstruction) is worth more than the
+bytes saved — Parquet's dictionary encoding absorbs most of the
+duplication anyway. But the interaction is worth naming now, because the
+tempting optimisation (drop params that duplicate an attribute) would
+quietly make reconstruction depend on the attribute set surviving
+unchanged, which RFC 0018's fidelity rule guarantees for *stored*
+attributes but not for a projection. §7 records it as a measurement to
+take once real producer-declared traffic exists.
+
 ## 4. Alternatives considered
 
 - **Ignore upstream templates permanently.** Today's behaviour. Cheap,
@@ -251,12 +280,15 @@ break with no upside. The DSL keeps `template_id` for the same reason
 
 Scenario ids `RFC0050.<n>`. Eight criteria (RFC0050.1–.8).
 
-> **RFC0050.1 — the default is byte-identical.** Given
+> **RFC0050.1 — the default changes nothing.** Given
 > `upstream_templates` unset and a corpus whose records carry
-> `log.record.template`, When it is ingested, Then the attribute is an
-> ordinary promoted/unpromoted attribute, every `template_id` matches
-> the same corpus ingested without the attribute, and the Parquet data
-> files are byte-identical to today's.
+> `log.record.template`, When it is ingested, Then the attribute is
+> stored as an ordinary attribute like any other, and the result is
+> byte-identical to **the same corpus ingested by the pre-RFC build**
+> — the comparison is against today's behaviour on the same input, not
+> against a different corpus with the attribute stripped, which would
+> of course differ by that attribute's own bytes. Every `template_id`,
+> every miner-derived column and the file layout are unchanged.
 
 > **RFC0050.2 — adoption uses the upstream string.** Given
 > `upstream_templates: adopt` and records carrying
@@ -270,27 +302,41 @@ Scenario ids `RFC0050.<n>`. Eight criteria (RFC0050.1–.8).
 > and unannotated ones are mined, in one tenant, with both provenances
 > visible in the registry and both queryable by `template_id`.
 
-> **RFC0050.4 — reconstruction gates adoption (invariant §3.3).** Given
-> `adopt` and an upstream template that cannot be aligned to its body
-> byte for byte (a mask spanning whitespace, a template from a
-> different line), When the record is ingested, Then it is **not**
-> adopted: it falls back to mining, and if that also cannot reconstruct
-> it the row is flagged lossy with the body retained. For every adopted
-> row, `render(template, params, separators)` equals the original body
-> byte for byte — asserted as a property test over the corpus.
+> **RFC0050.4 — the grammar and reconstruction gate adoption
+> (invariant §3.3).** Given `adopt`, When a record carries a template
+> outside the §3.1 grammar — `%s`, `{}`, `{name}`, `$var`, adjacent
+> wildcards, a literal segment absent from the body, trailing
+> unconsumed body bytes — Then it is **not** adopted and the record is
+> mined as if the attribute were absent; And when a grammatical
+> template cannot be aligned byte for byte (a mask spanning
+> whitespace, a template from a different line), Then likewise, and if
+> mining also cannot reconstruct the row it is flagged lossy with the
+> body retained. For every adopted row,
+> `render(template, params, separators)` equals the original body byte
+> for byte — asserted as a property test over the corpus, with
+> alignment matching **UTF-8 bytes** and each wildcard consuming
+> exactly one token.
 
-> **RFC0050.5 — the budget holds (RFC 0023).** Given `adopt`, a
-> `max_templates` of N and a producer emitting a unique
-> `log.record.template` per record, When 10·N records are ingested,
-> Then the tenant's template count never exceeds N, memory stays
-> bounded, the overflow path is the documented fallback (mining, then
-> `NO_TEMPLATE`), and the ceiling is observable on the existing miner
-> metrics.
+> **RFC0050.5 — both bounds hold, and the string is bounded first.**
+> Given `adopt`, a `max_templates` of N and a producer emitting a
+> unique `log.record.template` per record, When 10·N records are
+> ingested, Then the tenant's template count never exceeds N, memory
+> stays bounded, the overflow path is the documented fallback (mining,
+> then `NO_TEMPLATE`), and the ceiling is observable on the existing
+> miner metrics; And Given a record whose `log.record.template` exceeds
+> `upstream_template_byte_limit`, Then it is rejected **before**
+> tokenisation or alignment — no work proportional to its length — the
+> record is mined instead, and the rejection is counted.
 
-> **RFC0050.6 — provenance is visible and audited.** Given an adopted
-> template, Then the RFC 0010 drift query reports its provenance, an
-> RFC 0007 alias can bind a mined template to it, and adoption emits
-> the §3.1 audit event naming both the template and its origin.
+> **RFC0050.6 — provenance is a set, and order cannot change it.**
+> Given a template string that arrives **mined first, adopted second**,
+> and the same string in a second tenant **adopted first, mined
+> second**, Then both registry entries end with the same provenance set
+> `{mined, upstream_derived}` and one `template_id` each — the answer
+> does not depend on ingest order; And the RFC 0010 drift query reports
+> the set, an RFC 0007 alias can bind a mined template to an adopted
+> one, and adoption emits the `CLAUDE.md` §3.1 audit event naming the
+> template and its origin.
 
 > **RFC0050.7 — the vocabulary is the convention's.** Given any Ourios
 > telemetry that names a template string as an attribute, Then the key
@@ -330,17 +376,41 @@ weaver live-check job covers RFC0050.7.
       If the convention lands renamed, this RFC's registry entry is the
       one place to change — but a store that has stored the old name in
       *data* (as a promoted attribute) also needs an alias story.
-- [ ] **Trust boundary.** The attribute arrives from the pipeline, which
-      is operator-controlled, so §3.4's reconstruction check is the only
-      validation this RFC specifies. Is a template-string byte cap
-      (separate from the §3.2 parameter limit) worth adding, or does the
-      RFC 0023 budget cover the abuse case adequately?
-- [ ] **Contributing upstream.** Ourios has run Drain in anger over real
-      corpora (RFC 0001 §5, the RFC 0024 calibration manifest). Some of
-      that — the confidence scoring, the reconstruction property, the
-      merge-audit discipline — is directly relevant to #1283/#2064 and
-      to the drainprocessor itself. Worth a contribution rather than
-      only consumption?
+- [x] **Trust boundary — bounded, then verified.** Resolved in §3.2 and
+      §3.4: `upstream_template_byte_limit` caps the string before any
+      parsing (RFC 0023's budget bounds interned templates, not inbound
+      bytes), the §3.1 grammar rejects everything it cannot parse
+      unambiguously, and reconstruction decides adoption. The attribute
+      is operator-pipeline data, but none of that trust is load-bearing.
+
+- [ ] **Telling declared from derived.** #1283/#2064 drafted
+      `log.record.template` for *producer-declared* message templates
+      (`log.info("Message {}", p)`) — ground truth. The drainprocessor
+      reuses the name for a *derived* one — an inference. The key is the
+      same, so §3.3 records both as `upstream_derived`, and a
+      producer-declared template gets less confidence than it deserves.
+      The deferred `log.record.template.syntax` (#2064) would
+      incidentally settle it, since Drain output and a message template
+      are different syntaxes; worth raising there rather than inventing
+      a marker.
+
+- [ ] **Duplicate arguments (§3.7).** Once producer-declared traffic
+      exists, measure what fraction of `params` duplicates a stored
+      attribute under #2064's named-argument rule, and decide whether
+      deduplication is worth making reconstruction depend on the
+      attribute set.
+- [ ] **Contributing upstream.** Both issues are open and quiet (last
+      activity 2026-02; #1283 since 2024-07, #2064 `triage:accepted:
+      needs-sig`), and neither addresses *derived* templates at all —
+      the drainprocessor took the name for a concept the convention was
+      not drafted for. Two things this project has that the discussion
+      lacks: the **declared-versus-derived distinction** above, and the
+      **reconstruction property** — that a template is only safe to
+      rely on if `render(template, args)` reproduces the line byte for
+      byte, which is invariant §3.3 here and is property-tested over a
+      real corpus (RFC 0024). Worth contributing rather than only
+      consuming; per `feedback: ai-disclosure-at-top-when-posting-
+      externally`, any post is maintainer-approved first.
 
 ## 8. References
 

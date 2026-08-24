@@ -202,8 +202,18 @@ inbound attribute, so without a cap a 10 MiB "template" would be
 tokenised and aligned before anything rejected it. A value longer than
 `upstream_template_byte_limit` (UTF-8 bytes, default 8 KiB) is not
 parsed, not aligned and not adopted: the record is mined instead, and
-the rejection is counted on the miner's existing parse-outcome metric so
-a misbehaving producer is visible rather than silently absorbed.
+the rejection is counted so a misbehaving producer is visible rather
+than silently absorbed. The counter is a **dedicated**
+`ourios.miner.upstream_template.processed` (the OTel processor
+`.processed` shape: one counter for successes and failures,
+`error.type` present only on rejection — `byte_limit`, `grammar`,
+`alignment`, `template_ceiling`), *not* the existing
+`ourios.miner.parse_failures`: that metric means "this line failed to
+parse and its body was retained", which is false for a record whose
+attribute was rejected but whose body then mined cleanly — overloading
+it would corrupt the corpus-gate semantics the §3.1 counters carry.
+(Amended at implementation time from an earlier draft that named the
+parse-outcome metric, per the OTel recording-errors convention.)
 
 ### 3.3 An adopted template is a first-class template
 

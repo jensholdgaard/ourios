@@ -68,7 +68,7 @@ matter, and has started producing them one hop earlier. A store that
 cannot consume an upstream template is, from the operator's point of
 view, insisting on redoing work their pipeline already did.
 
-### 2.2 Two clusterings are worse than either
+### 2.2 Two *unlinked* clusterings are worse than either
 
 If the Collector templates and Ourios re-mines, a deployment gets two
 independent trees over the same corpus with different thresholds and
@@ -76,7 +76,10 @@ different masking rules. Filtering rules written against
 `log.record.template` upstream do not select the same rows as
 `template_id == N` downstream. Nobody can tell which is "the" template
 for a line, and the drift query answers a question about only one of
-them.
+them. The problem is not that two clusterings exist — it is that
+nothing connects them. Linked (§3.2 `observe`), the pair is *richer*
+than either alone: the upstream string gives our template a portable
+identity, and disagreement between the two trees is itself a signal.
 
 ### 2.3 The portable identity is the string, and we do not expose one
 
@@ -90,6 +93,19 @@ something it currently lacks: a template identity that means the same
 thing outside one tenant of one store.
 
 ## 3. Proposed design
+
+**The positioning, before the mechanics.** The miner is the
+foundation and stays the foundation: it is always present, it is the
+component that carries every guarantee this RFC relies on —
+reconstruction (§3.4 *is* the miner's alignment machinery), confidence
+scoring, the RFC 0023 budget, the corpus gates — and Ourios remains
+fully functional, byte for byte, with **zero** upstream templating: no
+Collector, no processor, nothing in front of it. Upstream templates are
+an input Ourios can **leverage**, never a dependency, and the coupling
+is exactly one attribute read at ingest. The three modes below form a
+dial, not a migration: `ignore` (no leverage), `observe` (leverage the
+string, keep our clustering), `adopt` (leverage the clustering too).
+A deployment can sit on any of them indefinitely.
 
 ### 3.1 The attribute Ourios reads, and the grammar it must be in
 
@@ -128,11 +144,11 @@ refuses the rest:
 When the upstream syntax attribute lands, accepting a second syntax is
 an additive change to this section.
 
-### 3.2 Adoption is opt-in
+### 3.2 Three modes: ignore, observe, adopt
 
 ```yaml
 miner:
-  upstream_templates: ignore   # default; `adopt` opts in
+  upstream_templates: ignore   # default; `observe` and `adopt` opt in
 ```
 
 - **`ignore`** (default) — today's behaviour exactly: the attribute is
@@ -140,11 +156,33 @@ miner:
   bytes for a given corpus are unchanged. The default must stay this
   way: adopting silently would change every `template_id` in a live
   store and move the corpus gates, which is a migration, not a default.
+- **`observe`** — **coexistence: leverage the string, keep our
+  clustering.** The miner mines every record exactly as under `ignore`
+  — same `template_id`s, same Parquet bytes for the data columns, same
+  corpus-gate numbers — and when a record also carries a
+  `log.record.template` that passes the byte cap and the §3.1 grammar,
+  that string is recorded on the *mined* template's registry entry as
+  an **upstream association**. The registry gains, per template, a
+  bounded set of associated upstream strings (default 4; overflow is
+  counted, not stored — a template attracting many distinct upstream
+  strings is a cardinality signal, not data worth keeping). Nothing is
+  adopted, no reconstruction gate runs, and the clustering decision
+  stays Ourios's. What it buys: every mined template acquires a
+  portable identity for §3.6's surfaces, and *disagreement between the
+  two trees becomes queryable* — two upstream strings mapping to one
+  mined template (their tree is coarser here), or one upstream string
+  spread over several mined templates (ours is finer), each a concrete
+  place where thresholds or masking rules differ. `observe` is also
+  the migration on-ramp: run it, look at the associations, then decide
+  whether `adopt` is even worth it for this deployment.
 - **`adopt`** — a record carrying a usable `log.record.template`
   (§3.1 grammar, §3.4 reconstruction) skips the Drain tree; its
   template is the upstream string. A record without the attribute is
   mined as before, so a mixed stream works and no producer is forced to
-  change.
+  change. Even here the miner is not idle standby: it is the fallback
+  for every rejection in §3.1/§3.4 and the sole engine for unannotated
+  records — `adopt` narrows *when* the tree is consulted, never whether
+  it exists.
 
 ```yaml
 miner:
@@ -340,13 +378,20 @@ take once real producer-declared traffic exists.
   depend on a Collector in the ingest path and give up the corpus gates
   and confidence scoring that pillar 2's correctness rests on. The
   miner stays; upstream templates are an input, not a substitute.
+- **Only `ignore` and `adopt`, no middle mode.** The first draft of
+  this RFC. It forces a false choice — no leverage at all, or hand the
+  clustering to a component we do not run — and gives a deployment no
+  way to *evaluate* upstream quality before committing. `observe` is
+  the coexistence the design is actually after: the miner stays the
+  foundation, the upstream string is leveraged as identity and as a
+  comparison signal, and adoption becomes a decision made on evidence.
 - **Emit `ourios.template.string` instead of the conventional name.**
   Inventing a vendor name for a concept the ecosystem is standardising
   is exactly what `CLAUDE.md`'s OTel-alignment rule exists to prevent.
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0050.<n>`. Eight criteria (RFC0050.1–.8).
+Scenario ids `RFC0050.<n>`. Nine criteria (RFC0050.1–.9).
 
 > **RFC0050.1 — the default changes nothing.** Given
 > `upstream_templates` unset and a corpus whose records carry
@@ -363,7 +408,7 @@ Scenario ids `RFC0050.<n>`. Eight criteria (RFC0050.1–.8).
 > `log.record.template`, When they are ingested, Then each record's
 > template is the upstream string, two records sharing a string share
 > one `template_id`, the Drain tree gains no leaf for them, and the
-> registry reports `provenance = upstream`.
+> registry entry's provenance set contains `upstream_derived`.
 
 > **RFC0050.3 — a mixed stream works.** Given `adopt` and a stream where
 > only some records carry the attribute, Then annotated records adopt
@@ -423,19 +468,34 @@ Scenario ids `RFC0050.<n>`. Eight criteria (RFC0050.1–.8).
 > record whose producer did not send one, and one that *was* sent
 > survives the round trip unchanged.
 
+> **RFC0050.9 — observe leverages without touching the clustering.**
+> Given `upstream_templates: observe` and a corpus whose records carry
+> valid upstream templates, When it is ingested, Then every
+> `template_id`, every miner-derived column and the corpus-gate numbers
+> are identical to the same corpus under `ignore` — the clustering is
+> untouched — And the registry's mined entries carry the associated
+> upstream strings; And Given records mapping two upstream strings onto
+> one mined template and one upstream string across two mined
+> templates, Then both disagreement shapes are visible in the registry;
+> And Given more distinct upstream strings for one template than the
+> association bound, Then the set stays at the bound and the overflow
+> is counted.
+
 ## 6. Testing strategy
 
 Unit: the alignment routine (template ⇄ body) as a table — exact match,
 mask spanning whitespace, template from a different line, a template
-longer than the body, parameters over the §3.2 byte limit. Property
+longer than the body, parameters over `param_byte_limit`. Property
 (`proptest`): for any adopted row, render equals the original body, or
 the row is lossy with the body retained (RFC0050.4). Corpus: the RFC
 0024 harness run with `adopt` over a corpus pre-annotated by an actual
 `drainprocessor` pass, asserting template count, reconstruction
 accuracy and the RFC 0023 ceiling (RFC0050.2/.5). Integration: a mixed
 stream through the served binary (RFC0050.3); the byte-identical
-default asserted by ingesting the same corpus twice (RFC0050.1). The
-weaver live-check job covers RFC0050.7.
+default asserted by ingesting the same corpus twice (RFC0050.1);
+`observe` asserted by diffing its miner-derived output against
+`ignore`'s on the same corpus (RFC0050.9). The weaver live-check job
+covers RFC0050.7.
 
 ## 7. Open questions
 

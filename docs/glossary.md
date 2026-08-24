@@ -137,7 +137,8 @@ like a wire field; it is not one. The *portable* identity of a
 template is its **string**, which the OpenTelemetry ecosystem is
 converging on as `log.record.template` (collector-contrib's
 `drainprocessor`, tracking semantic-conventions #1283 / #2064) — see
-RFC 0050 for how Ourios accepts and reconciles one derived upstream.
+RFC 0050 for how Ourios accepts and reconciles a template that was
+derived upstream.
 
 **OTLP.** OpenTelemetry Protocol, the wire format for telemetry
 data. The Ourios ingest contract: incoming logs are OTLP over gRPC

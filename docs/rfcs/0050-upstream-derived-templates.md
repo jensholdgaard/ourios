@@ -125,9 +125,11 @@ refuses the rest:
 
 - **Wildcards.** `<*>`, and `<name>` for a named mask token (the
   drainprocessor's `masking_rules` emit these). Each matches exactly
-  **one token** — a maximal run of bytes containing no delimiter — under
-  the miner's own tokenisation, so alignment is deterministic and needs
-  no backtracking.
+  **one token** under the miner's own tokenisation — a maximal run of
+  bytes containing no Unicode whitespace, whitespace being every
+  codepoint `char::is_whitespace` accepts, exactly as
+  `ourios-miner`'s tokenizer defines it — so alignment is
+  deterministic and needs no backtracking.
 - **Literals.** Every other byte is literal and must match the body
   byte for byte. Matching is over **UTF-8 bytes**: no normalisation, no
   case folding, no whitespace collapsing.
@@ -186,7 +188,7 @@ miner:
 
 ```yaml
 miner:
-  upstream_template_byte_limit: 8192   # UTF-8 bytes; 0 disables adoption
+  upstream_template_byte_limit: 8192   # UTF-8 bytes; 0 disables all upstream-template handling
 ```
 
 **The string is bounded before any work is done on it.** `max_templates`
@@ -349,18 +351,24 @@ break with no upside. The DSL keeps `template_id` for the same reason
 
 ### 3.7 Named arguments may already be attributes
 
-#2064's accepted direction is that a *named* placeholder does **not**
+Issue #2064's accepted direction is that a *named* placeholder does **not**
 get a `log.record.template.parameter.` prefix: `{user.id}` is emitted as
 a top-level attribute `user.id`, explicitly so that templates reuse
 existing semantic conventions (`API Request by {http.request.method}
 {url.full} by user {user.id}`). Positional placeholders keep
 `log.record.template.parameter.<index>`.
 
-For Ourios that means a producer-declared template can arrive with its
-arguments *already stored as attributes* — possibly promoted ones
-(RFC 0022) that the DSL can filter and aggregate on directly. Extracting
-the same values into `params` would then store them twice: once as an
-attribute column, once in the params list.
+To be explicit about scope: a template written in that syntax
+(`{user.id}`) is **outside the v1 grammar** — §3.1 rejects `{name}`
+placeholders, so such a record is never adopted in v1; it is mined,
+which is the safe fallback, and accepting message-template syntax is
+the additive §3.1 extension gated on the upstream syntax attribute.
+What this section is about survives that rejection: the record's
+arguments arrive *already stored as attributes* — possibly promoted
+ones (RFC 0022) that the DSL can filter and aggregate on directly —
+while the miner independently extracts the same values into `params`.
+That stores them twice: once as an attribute column, once in the
+params list.
 
 v1 does not deduplicate. The params list is what `render` consumes, and
 invariant §3.3 (bit-identical reconstruction) is worth more than the
@@ -402,7 +410,7 @@ take once real producer-declared traffic exists.
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0050.<n>`. Nine criteria (RFC0050.1–.9).
+Scenario ids `RFC0050.<n>`, RFC0050.1–.9.
 
 > **RFC0050.1 — the default changes nothing.** Given
 > `upstream_templates` unset and a corpus whose records carry

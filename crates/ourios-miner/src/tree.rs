@@ -40,9 +40,9 @@
 //! sentinel-string risk that [`crate::sim_seq`] calls out applies
 //! identically here, so the wildcard stays a typed variant.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use ourios_core::audit::SlotTypes;
+use ourios_core::audit::{ProvenanceSet, SlotTypes};
 
 use crate::sim_seq::Token;
 
@@ -121,6 +121,96 @@ pub struct Leaf {
     /// (the new slot's entry is inserted at the corresponding
     /// ordinal, not appended).
     pub slot_types: Vec<SlotTypes>,
+    /// RFC 0050 §3.3 — which origins have produced this template.
+    /// Union-only, so order of arrival cannot change the answer
+    /// (RFC0050.6). Every leaf minted by the Drain walk starts as
+    /// `{Mined}`; adoption and observe-mode association extend it.
+    pub provenance: ProvenanceSet,
+    /// RFC 0050 §3.2 `observe` — the upstream template strings seen
+    /// on records that mined to this leaf. Bounded; see
+    /// [`UpstreamAssociations::observe`].
+    pub upstream_associations: UpstreamAssociations,
+}
+
+/// The bounded set of upstream template strings associated with one
+/// leaf under RFC 0050 §3.2 `observe` mode.
+///
+/// The bound exists because a template attracting many *distinct*
+/// upstream strings is a cardinality signal, not data worth keeping
+/// — so past the bound only a counter grows. The counter counts
+/// **observations** that could not be stored (a repeated overflow
+/// string counts each time): counting distinct strings would
+/// require storing them, which is what the bound is there to
+/// prevent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamAssociations {
+    strings: BTreeSet<String>,
+    overflow: u64,
+}
+
+/// What [`UpstreamAssociations::observe`] did with one string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociationOutcome {
+    /// Newly stored.
+    Recorded,
+    /// Already in the set — no change.
+    AlreadyKnown,
+    /// Set at the bound and the string is not in it — counted, not
+    /// stored.
+    Overflowed,
+}
+
+impl UpstreamAssociations {
+    /// Record one upstream template string against this leaf,
+    /// storing at most `bound` distinct strings.
+    pub fn observe(&mut self, template: &str, bound: usize) -> AssociationOutcome {
+        if self.strings.contains(template) {
+            return AssociationOutcome::AlreadyKnown;
+        }
+        if self.strings.len() >= bound {
+            self.overflow += 1;
+            return AssociationOutcome::Overflowed;
+        }
+        self.strings.insert(template.to_string());
+        AssociationOutcome::Recorded
+    }
+
+    /// The stored strings, in lexicographic order (deterministic
+    /// for snapshots and query surfaces regardless of arrival
+    /// order).
+    pub fn strings(&self) -> impl Iterator<Item = &str> {
+        self.strings.iter().map(String::as_str)
+    }
+
+    /// Number of stored strings.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// `true` iff nothing has been stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.strings.is_empty()
+    }
+
+    /// Observations that arrived past the bound and were counted
+    /// instead of stored.
+    #[must_use]
+    pub fn overflow(&self) -> u64 {
+        self.overflow
+    }
+
+    /// Rebuild from snapshot parts. Strings beyond `stored` order
+    /// are deduplicated by the set; the overflow counter is
+    /// restored verbatim.
+    #[must_use]
+    pub fn from_parts(stored: impl IntoIterator<Item = String>, overflow: u64) -> Self {
+        Self {
+            strings: stored.into_iter().collect(),
+            overflow,
+        }
+    }
 }
 
 /// Internal node at a prefix-token level (or the per-length root).
@@ -437,6 +527,8 @@ mod tests {
                 severity_number: 9,
                 scope_name: None,
                 slot_types: Vec::new(),
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
         }
 
@@ -628,6 +720,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
             std::ptr::from_ref(&parent.leaves)
         };
@@ -795,6 +889,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
         }
 
@@ -852,6 +948,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
         }
         {
@@ -868,6 +966,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
             p.leaves.push(Leaf {
                 template: [
@@ -881,6 +981,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
         }
 
@@ -908,6 +1010,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
         }
         {
@@ -924,6 +1028,8 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: ProvenanceSet::default(),
+                upstream_associations: UpstreamAssociations::default(),
             });
         }
 
@@ -933,5 +1039,61 @@ mod tests {
         // Assert — set semantics (HashMap iteration unordered).
         let ids: std::collections::HashSet<u64> = leaves.iter().map(|l| l.template_id).collect();
         assert_eq!(ids, std::collections::HashSet::from([10, 20]));
+    }
+
+    /// RFC 0050 §3.2 `observe`: at most `bound` distinct strings are
+    /// stored; repeats of a stored string are no-ops; everything past
+    /// the bound is counted per observation, never stored.
+    #[test]
+    fn upstream_associations_hold_the_bound_and_count_overflow() {
+        let mut a = UpstreamAssociations::default();
+        assert_eq!(
+            a.observe("user <*> logged in", 2),
+            AssociationOutcome::Recorded
+        );
+        assert_eq!(
+            a.observe("user <*> logged in", 2),
+            AssociationOutcome::AlreadyKnown
+        );
+        assert_eq!(
+            a.observe("user <ip> logged in", 2),
+            AssociationOutcome::Recorded
+        );
+        assert_eq!(
+            a.observe("a third shape", 2),
+            AssociationOutcome::Overflowed
+        );
+        assert_eq!(
+            a.observe("a third shape", 2),
+            AssociationOutcome::Overflowed
+        );
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.overflow(), 2);
+        // Lexicographic read-out, independent of arrival order.
+        assert_eq!(
+            a.strings().collect::<Vec<_>>(),
+            vec!["user <*> logged in", "user <ip> logged in"],
+        );
+    }
+
+    #[test]
+    fn upstream_associations_round_trip_through_parts() {
+        let mut a = UpstreamAssociations::default();
+        let _ = a.observe("b", 4);
+        let _ = a.observe("a", 4);
+        let _ = a.observe("c", 1_000);
+        let rebuilt = UpstreamAssociations::from_parts(
+            a.strings().map(str::to_string).collect::<Vec<_>>(),
+            a.overflow(),
+        );
+        assert_eq!(rebuilt, a);
+    }
+
+    #[test]
+    fn upstream_associations_zero_bound_stores_nothing() {
+        let mut a = UpstreamAssociations::default();
+        assert_eq!(a.observe("anything", 0), AssociationOutcome::Overflowed);
+        assert!(a.is_empty());
+        assert_eq!(a.overflow(), 1);
     }
 }

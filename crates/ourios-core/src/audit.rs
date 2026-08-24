@@ -578,6 +578,102 @@ impl FromIterator<ParamType> for SlotTypes {
     }
 }
 
+/// Where a template came from — RFC 0050 §3.3's provenance
+/// origins. `Mined` is an inference Ourios made; `UpstreamDerived`
+/// is the same inference made elsewhere (a clustering processor
+/// such as the collector-contrib drainprocessor);
+/// `ProducerDeclared` is ground truth — the emitting library's own
+/// message template. Until upstream distinguishes declared from
+/// derived on the wire, ingest records both as `UpstreamDerived`
+/// (RFC 0050 §3.3); the variant exists so the taxonomy is closed
+/// now rather than re-litigated when the syntax attribute lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provenance {
+    Mined,
+    UpstreamDerived,
+    ProducerDeclared,
+}
+
+/// The set of [`Provenance`] origins observed for one template.
+///
+/// A set rather than a single value because the same template
+/// string can legitimately arrive both ways — mined on Monday,
+/// adopted on Tuesday — and a single-valued field would depend on
+/// ingest order (RFC 0050 §3.3). The only mutation is union, so
+/// the set is monotonic: any interleaving of the same arrivals
+/// ends in the same set, which is what RFC0050.6 asserts.
+///
+/// Same design as [`SlotTypes`]: private byte layout, value-based
+/// surface, a new variant forces `Self::bit` to be updated via the
+/// exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ProvenanceSet(u8);
+
+impl ProvenanceSet {
+    /// Empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Set containing only `p`.
+    #[must_use]
+    pub const fn singleton(p: Provenance) -> Self {
+        Self(Self::bit(p))
+    }
+
+    /// Returns a copy of `self` with `p` added. Idempotent.
+    #[must_use]
+    pub const fn insert(self, p: Provenance) -> Self {
+        Self(self.0 | Self::bit(p))
+    }
+
+    /// `true` iff `p` is in the set.
+    #[must_use]
+    pub const fn contains(self, p: Provenance) -> bool {
+        (self.0 & Self::bit(p)) != 0
+    }
+
+    /// `true` iff the set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Set-union with `other`.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Iterates the variants in declaration order (`Mined,
+    /// UpstreamDerived, ProducerDeclared`) — stable, so any wire
+    /// form built by collecting this iterator is deterministic for
+    /// a given set regardless of arrival order.
+    pub fn iter(self) -> impl Iterator<Item = Provenance> {
+        const ALL: [Provenance; 3] = [
+            Provenance::Mined,
+            Provenance::UpstreamDerived,
+            Provenance::ProducerDeclared,
+        ];
+        ALL.into_iter().filter(move |p| self.contains(*p))
+    }
+
+    const fn bit(p: Provenance) -> u8 {
+        match p {
+            Provenance::Mined => 1 << 0,
+            Provenance::UpstreamDerived => 1 << 1,
+            Provenance::ProducerDeclared => 1 << 2,
+        }
+    }
+}
+
+impl FromIterator<Provenance> for ProvenanceSet {
+    fn from_iter<I: IntoIterator<Item = Provenance>>(iter: I) -> Self {
+        iter.into_iter().fold(Self::new(), Self::insert)
+    }
+}
+
 /// RFC 0001 §6.4 / RFC 0009 §3.6 audit-event schema.
 ///
 /// Splits into the shared envelope (`tenant_id`, `timestamp`) and a
@@ -1053,5 +1149,53 @@ mod tests {
                 "singleton({t:?}) must round-trip to a single-element iter",
             );
         }
+    }
+
+    #[test]
+    fn provenance_set_union_is_order_independent() {
+        // RFC0050.6's data-structure arm: mined-first-adopted-second
+        // and adopted-first-mined-second end in the same set.
+        let mined_first =
+            ProvenanceSet::singleton(Provenance::Mined).insert(Provenance::UpstreamDerived);
+        let adopted_first =
+            ProvenanceSet::singleton(Provenance::UpstreamDerived).insert(Provenance::Mined);
+        assert_eq!(mined_first, adopted_first);
+        assert_eq!(
+            mined_first.iter().collect::<Vec<_>>(),
+            vec![Provenance::Mined, Provenance::UpstreamDerived],
+        );
+    }
+
+    #[test]
+    fn provenance_set_insert_is_idempotent_and_monotonic() {
+        let s = ProvenanceSet::singleton(Provenance::Mined);
+        assert_eq!(s.insert(Provenance::Mined), s);
+        let grown = s.insert(Provenance::ProducerDeclared);
+        assert!(grown.contains(Provenance::Mined));
+        assert!(grown.contains(Provenance::ProducerDeclared));
+        assert!(!grown.contains(Provenance::UpstreamDerived));
+    }
+
+    #[test]
+    fn provenance_set_bits_are_mutually_distinct() {
+        for p in [
+            Provenance::Mined,
+            Provenance::UpstreamDerived,
+            Provenance::ProducerDeclared,
+        ] {
+            let s = ProvenanceSet::singleton(p);
+            assert_eq!(s.iter().collect::<Vec<_>>(), vec![p]);
+        }
+        assert!(ProvenanceSet::new().is_empty());
+        assert!(ProvenanceSet::default().is_empty());
+    }
+
+    #[test]
+    fn provenance_set_from_iter_round_trips() {
+        let s: ProvenanceSet = [Provenance::ProducerDeclared, Provenance::Mined]
+            .into_iter()
+            .collect();
+        let round: ProvenanceSet = s.iter().collect();
+        assert_eq!(round, s);
     }
 }

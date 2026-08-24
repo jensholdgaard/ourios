@@ -61,8 +61,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_config::MinerConfig;
 use ourios_core::audit::{
-    AuditEvent, AuditPayload, AuditSink, NoOpAuditSink, ParamType, SlotExpansion, SlotTypes,
-    TemplateChange, hash_triggering_line, sample_first_256_bytes,
+    AuditEvent, AuditPayload, AuditSink, NoOpAuditSink, ParamType, Provenance, ProvenanceSet,
+    SlotExpansion, SlotTypes, TemplateChange, hash_triggering_line, sample_first_256_bytes,
 };
 use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::confidence::ConfidenceZone;
@@ -74,7 +74,7 @@ use crate::mask::{mask, tag_str_for};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
 use crate::tokenize::tokenize;
-use crate::tree::{Leaf, OwnedToken, Tree, format_template};
+use crate::tree::{Leaf, OwnedToken, Tree, UpstreamAssociations, format_template};
 
 /// Sentinel `template_id` returned by [`MinerCluster::ingest`] when
 /// no template was allocated for the input. Three paths reach this
@@ -1705,6 +1705,8 @@ impl MinerCluster {
                 severity_number: record.severity_number,
                 scope_name: record.scope_name.clone(),
                 slot_types,
+                provenance: ProvenanceSet::singleton(Provenance::Mined),
+                upstream_associations: UpstreamAssociations::default(),
             });
             // Maintain the TenantState::template_count cache invariant —
             // every fresh allocation under `state` is mirrored here so
@@ -2022,6 +2024,13 @@ impl MinerCluster {
                     template_id: leaf.template_id,
                     template_version: leaf.template_version,
                     slot_types: leaf.slot_types.clone(),
+                    provenance: leaf.provenance,
+                    upstream_associations: leaf
+                        .upstream_associations
+                        .strings()
+                        .map(str::to_string)
+                        .collect(),
+                    upstream_association_overflow: leaf.upstream_associations.overflow(),
                 })
                 .collect()
         })
@@ -2044,7 +2053,7 @@ impl MinerCluster {
     pub fn snapshot_state(&self, tenant_id: &TenantId) -> crate::snapshot::SnapshotState {
         use crate::snapshot::{
             LeafRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
-            slot_types_vec_to_record,
+            provenance_set_to_record, slot_types_vec_to_record,
         };
 
         let Some(state) = self.tenants.get(tenant_id) else {
@@ -2071,6 +2080,13 @@ impl MinerCluster {
                 severity_number: leaf.severity_number,
                 scope_name: leaf.scope_name.clone(),
                 slot_types: slot_types_vec_to_record(&leaf.slot_types),
+                provenance: provenance_set_to_record(leaf.provenance),
+                upstream_associations: leaf
+                    .upstream_associations
+                    .strings()
+                    .map(str::to_string)
+                    .collect(),
+                upstream_association_overflow: leaf.upstream_associations.overflow(),
             })
             .collect();
         leaves.sort_by_key(|leaf| leaf.template_id);
@@ -2127,6 +2143,8 @@ impl MinerCluster {
         tenant_id: &TenantId,
         state: &crate::snapshot::SnapshotState,
     ) -> Result<(), RestoreError> {
+        use crate::snapshot::record_to_provenance_set;
+
         if self.tenants.contains_key(tenant_id) {
             return Err(RestoreError::TenantAlreadyLive);
         }
@@ -2201,6 +2219,11 @@ impl MinerCluster {
                 severity_number: record.severity_number,
                 scope_name: record.scope_name.clone(),
                 slot_types,
+                provenance: record_to_provenance_set(&record.provenance),
+                upstream_associations: UpstreamAssociations::from_parts(
+                    record.upstream_associations.iter().cloned(),
+                    record.upstream_association_overflow,
+                ),
             });
         }
 
@@ -2348,6 +2371,13 @@ pub struct LeafSnapshot {
     pub template_id: u64,
     pub template_version: u32,
     pub slot_types: Vec<SlotTypes>,
+    /// RFC 0050 §3.3 origin set for this template.
+    pub provenance: ProvenanceSet,
+    /// RFC 0050 §3.2 `observe` associations: stored upstream
+    /// strings (lexicographic) and the count of observations past
+    /// the bound.
+    pub upstream_associations: Vec<String>,
+    pub upstream_association_overflow: u64,
 }
 
 /// One leaf considered as the best match in RFC §6.2 step 4.
@@ -2842,6 +2872,75 @@ mod tests {
     }
 
     #[test]
+    fn mined_leaf_carries_mined_provenance() {
+        // RFC 0050 §3.3: every leaf minted by the Drain walk starts
+        // as `{Mined}` with no upstream associations.
+        let t = TenantId::new("tenant-x");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let _ = cluster.ingest(&string_record(&t, "hello world"));
+
+        let leaves = cluster.templates_for(&t);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaves[0].provenance,
+            ProvenanceSet::singleton(Provenance::Mined),
+        );
+        assert!(leaves[0].upstream_associations.is_empty());
+        assert_eq!(leaves[0].upstream_association_overflow, 0);
+    }
+
+    #[test]
+    fn restore_maps_pre_rfc0050_empty_provenance_to_mined() {
+        // A snapshot written before RFC 0050 carries no provenance
+        // list; restore must read that as `{Mined}` (those leaves
+        // were minted by the Drain walk) while restoring the
+        // association fields verbatim when present.
+        let state = SnapshotState {
+            leaves: vec![LeafRecord {
+                template: vec![
+                    TokenRecord::Fixed("disk".to_string()),
+                    TokenRecord::Fixed("full".to_string()),
+                ],
+                template_id: 7,
+                template_version: 1,
+                severity_number: 0,
+                scope_name: None,
+                slot_types: vec![],
+                provenance: vec![],
+                upstream_associations: vec!["disk <*>".to_string()],
+                upstream_association_overflow: 3,
+            }],
+            structured_templates: vec![],
+            wal_high_water: None,
+        };
+        let t = TenantId::new("tenant-x");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        cluster
+            .restore_tenant(&t, &state)
+            .expect("pre-RFC0050 snapshot restores");
+
+        let leaves = cluster.templates_for(&t);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaves[0].provenance,
+            ProvenanceSet::singleton(Provenance::Mined),
+        );
+        assert_eq!(
+            leaves[0].upstream_associations,
+            vec!["disk <*>".to_string()]
+        );
+        assert_eq!(leaves[0].upstream_association_overflow, 3);
+
+        // And a re-snapshot now records the provenance explicitly —
+        // the migration happens once, on read.
+        let resnap = cluster.snapshot_state(&t);
+        assert_eq!(
+            resnap.leaves[0].provenance,
+            vec![crate::snapshot::ProvenanceRecord::Mined],
+        );
+    }
+
+    #[test]
     fn restore_rejects_inconsistent_slot() {
         // A path-position wildcard can only arise from mask
         // emission, so its recorded slot set must be a singleton
@@ -2859,6 +2958,9 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![vec![ParamTypeRecord::Str]],
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
             }],
             structured_templates: vec![],
             wal_high_water: None,
@@ -2886,6 +2988,9 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
             }],
             structured_templates: vec![StructuredTemplateRecord {
                 severity_number: 9,
@@ -2964,6 +3069,9 @@ mod tests {
                 severity_number: 0,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
             }],
             structured_templates: vec![],
             wal_high_water: None,

@@ -160,6 +160,9 @@ mod tests {
                 severity_number: 9,
                 scope_name: None,
                 slot_types: vec![],
+                provenance: vec![],
+                upstream_associations: vec![],
+                upstream_association_overflow: 0,
             }],
             structured_templates: vec![StructuredTemplateRecord {
                 severity_number: 17,

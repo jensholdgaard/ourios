@@ -40,8 +40,11 @@ instances.
 This RFC makes the upstream template usable and reconciles the two
 worlds:
 
-1. **Accept it** — opt-in, per deployment: when a record carries
-   `log.record.template`, adopt that string as the record's template
+1. **Accept it** — opt-in, per deployment, as a two-notch dial: under
+   `observe`, keep mining exactly as today but record the upstream
+   string on the mined template's registry entry, making disagreement
+   between the two clusterings queryable; under `adopt`, a record
+   carrying `log.record.template` takes that string as its template
    instead of mining the body (§3.2).
 2. **Reconcile it** — an adopted template is interned in the same
    registry, gets the same `template_id` key, and records its
@@ -539,8 +542,17 @@ covers RFC0050.7.
         template aliases (RFC 0007, hazard #5) — with the OTel schema
         file as the authoritative mapping rather than one we invent.
         Physical convergence rides compaction re-projection (RFC 0022),
-        which rewrites old files under the new column as they are
-        compacted anyway; no dedicated migration tool.
+        which rewrites old files under the new *promoted column* as
+        they are compacted anyway; no dedicated migration tool. To be
+        precise about what re-projection may touch, because RFC 0018's
+        fidelity rule is at stake: a promoted column is a **physical
+        projection** derived from the stored attributes, and only that
+        projection converges to the canonical name. The record's
+        logical `attributes` array — the key and value the producer
+        actually sent — is preserved byte for byte through every
+        rewrite, old key included; a consumer reading attributes back
+        always sees what was ingested, while the alias entry maps
+        queries under either name onto the one canonical column.
       Nothing is built ahead of need: the only trigger for any of this
       is the upstream convention actually landing.
 - [x] **Trust boundary — bounded, then verified.** Resolved in §3.2 and

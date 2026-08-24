@@ -126,6 +126,19 @@ runs Drain online over ingested log lines and emits
 `(template_id, params, confidence, lossy_flag)` for each row.
 Lives in the `ourios-miner` crate. Designed in RFC 0001.
 
+**`template_id`.** The miner's key for a template: a `u64` that is
+**Ourios-derived and tenant-local**, not an OTLP field and not
+portable. Two stores — or one store after an RFC 0023 eviction or a
+re-mint — can give the same log shape different ids, which is why
+drift is a first-class query (RFC 0010) and aliases exist (RFC 0007).
+It shares the Parquet record's flat namespace with genuine OTLP
+fields (`severity_number`, `trace_id`, `body`), so the name can read
+like a wire field; it is not one. The *portable* identity of a
+template is its **string**, which the OpenTelemetry ecosystem is
+converging on as `log.record.template` (collector-contrib's
+`drainprocessor`, tracking semantic-conventions #1283 / #2064) — see
+RFC 0050 for how Ourios accepts and reconciles one derived upstream.
+
 **OTLP.** OpenTelemetry Protocol, the wire format for telemetry
 data. The Ourios ingest contract: incoming logs are OTLP over gRPC
 or HTTP. We do not invent our own format.

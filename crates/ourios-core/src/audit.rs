@@ -110,6 +110,29 @@ pub enum TemplateChange {
         /// with `<*>`.
         would_be_positions: Vec<u16>,
     },
+    /// An upstream-provided template was adopted (RFC 0050 §3.3):
+    /// a clustering decision made *outside* Ourios became a
+    /// registry entry, so it is audited like a merge — the
+    /// `template_adopted` event type names the
+    /// `upstream_derived` origin. Emitted once per provenance
+    /// transition (a fresh adoption-interned template, or the
+    /// first adoption riding an existing mined template), never
+    /// per record.
+    ///
+    /// Not a merge for `merges_total` — no existing template
+    /// changed shape.
+    Adopted {
+        /// The version the adoption binds to: `1` for a template
+        /// interned by adoption itself (adopted templates never
+        /// widen), or the existing leaf version whose tokens the
+        /// upstream shape matched. The read-time registry keys
+        /// adopted rows by `(template_id, this)`.
+        template_version: u32,
+        /// Canonical-form template (literals + `<*>`), the same
+        /// encoding `Created` carries — mask names in the upstream
+        /// string do not survive canonicalisation.
+        new_template: String,
+    },
 }
 
 /// Variant-specific payload for an [`AuditEvent`].
@@ -290,6 +313,10 @@ pub const EVENT_KIND_INGEST_DENIED: u8 = 8;
 /// `conversation_erased` — a conversation's rows were dropped by the
 /// compaction rewrite and its graph tuples deleted (RFC 0047 §3.6).
 pub const EVENT_KIND_CONVERSATION_ERASED: u8 = 9;
+/// `template_adopted` — an upstream-provided template became a registry
+/// entry (RFC 0050 §3.3). Append-only addition (next free ordinal); old
+/// readers surface it via the [`AuditPayload::Unknown`] tolerance path.
+pub const EVENT_KIND_TEMPLATE_ADOPTED: u8 = 10;
 
 /// Canonical `event_type` strings paired with the ordinals above
 /// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
@@ -313,6 +340,8 @@ pub const EVENT_TYPE_RECORD_QUARANTINED: &str = "record_quarantined";
 pub const EVENT_TYPE_INGEST_DENIED: &str = "ingest_denied";
 /// The string form of [`EVENT_KIND_CONVERSATION_ERASED`].
 pub const EVENT_TYPE_CONVERSATION_ERASED: &str = "conversation_erased";
+/// The string form of [`EVENT_KIND_TEMPLATE_ADOPTED`] (RFC 0050 §3.3).
+pub const EVENT_TYPE_TEMPLATE_ADOPTED: &str = "template_adopted";
 
 /// The `template_version` a leaf is born at (RFC 0017 §3.1). The
 /// [`TemplateChange::Created`] variant omits a version field — the invariant
@@ -334,6 +363,7 @@ impl AuditPayload {
                 TemplateChange::RejectedDegenerate { .. } => {
                     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE
                 }
+                TemplateChange::Adopted { .. } => EVENT_KIND_TEMPLATE_ADOPTED,
             },
             Self::AliasAsserted { .. } => EVENT_KIND_ALIAS_ASSERTED,
             Self::AliasRetracted { .. } => EVENT_KIND_ALIAS_RETRACTED,
@@ -359,6 +389,7 @@ impl AuditPayload {
                 TemplateChange::RejectedDegenerate { .. } => {
                     EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE
                 }
+                TemplateChange::Adopted { .. } => EVENT_TYPE_TEMPLATE_ADOPTED,
             },
             Self::AliasAsserted { .. } => EVENT_TYPE_ALIAS_ASSERTED,
             Self::AliasRetracted { .. } => EVENT_TYPE_ALIAS_RETRACTED,
@@ -412,6 +443,7 @@ impl TemplateChange {
             Self::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
             Self::TypeExpanded { .. } => EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
             Self::RejectedDegenerate { .. } => EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+            Self::Adopted { .. } => EVENT_TYPE_TEMPLATE_ADOPTED,
         }
     }
 }

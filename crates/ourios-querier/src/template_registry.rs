@@ -112,6 +112,15 @@ pub(crate) fn fold_registry(mut events: Vec<AuditEvent>) -> TemplateRegistry {
                 new_template,
                 ..
             } => (new_version, new_template),
+            // RFC 0050 §3.3 — adoption binds rows to
+            // `(template_id, template_version)` exactly like a
+            // creation; for an adoption riding an existing mined
+            // leaf the pair is already interned and this insert is
+            // an idempotent overwrite with the same tokens.
+            TemplateChange::Adopted {
+                template_version,
+                new_template,
+            } => (template_version, new_template),
             // A rejection bumps no version and changes no tokens.
             TemplateChange::RejectedDegenerate { .. } => continue,
         };
@@ -226,6 +235,43 @@ mod tests {
             },
         )]);
         assert!(registry.is_empty(), "a rejection adds no registry entry");
+    }
+
+    #[test]
+    fn adopted_keys_at_its_bound_version() {
+        // RFC 0050 §3.3 — an adoption-interned template keys at v1;
+        // an adoption riding an existing mined leaf keys at the
+        // matched version, idempotently re-asserting the same
+        // tokens the creation/widening already interned.
+        let registry = fold_registry(vec![
+            event(
+                9,
+                10,
+                TemplateChange::Adopted {
+                    template_version: 1,
+                    new_template: "copy <*> done".to_owned(),
+                },
+            ),
+            created(3, 20, "user <*>"),
+            event(
+                3,
+                30,
+                TemplateChange::Adopted {
+                    template_version: 1,
+                    new_template: "user <*>".to_owned(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            registry.get(&(9, 1)),
+            Some(&vec![fixed("copy"), OwnedToken::Wildcard, fixed("done")]),
+        );
+        assert_eq!(
+            registry.get(&(3, 1)),
+            Some(&vec![fixed("user"), OwnedToken::Wildcard]),
+            "tree-backed adoption re-asserts the mined tokens unchanged",
+        );
+        assert_eq!(registry.len(), 2);
     }
 
     #[test]

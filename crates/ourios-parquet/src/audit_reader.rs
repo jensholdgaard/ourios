@@ -44,8 +44,8 @@ use crate::audit_columns;
 use crate::audit_record_batch::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
     EVENT_KIND_CONVERSATION_ERASED, EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED,
-    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
-    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_KIND_TEMPLATE_ADOPTED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
+    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
 use crate::partition::PartitionKey;
@@ -358,7 +358,8 @@ fn batch_to_audit_events(
             EVENT_KIND_TEMPLATE_CREATED
             | EVENT_KIND_TEMPLATE_WIDENED
             | EVENT_KIND_TEMPLATE_TYPE_EXPANDED
-            | EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE => {
+            | EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE
+            | EVENT_KIND_TEMPLATE_ADOPTED => {
                 let cols = TemplateColumns {
                     event_kind: event_kind[i],
                     old_version: &old_version,
@@ -683,6 +684,17 @@ fn decode_template_change(
     // into it — the v1 contract is structural, not a decoded value.
     if cols.event_kind == EVENT_KIND_TEMPLATE_CREATED {
         return Ok(TemplateChange::Created {
+            new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
+        });
+    }
+
+    // Adoption mirrors creation's NULL `old_*` shape (RFC 0050 §3.3)
+    // but, unlike creation, reads `new_version` back: the version the
+    // adoption bound to is a decoded value (1 for adoption-interned
+    // templates, the matched leaf version otherwise), not structural.
+    if cols.event_kind == EVENT_KIND_TEMPLATE_ADOPTED {
+        return Ok(TemplateChange::Adopted {
+            template_version: require_at(cols.new_version, i, audit_columns::NEW_VERSION, file_row)?,
             new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
         });
     }

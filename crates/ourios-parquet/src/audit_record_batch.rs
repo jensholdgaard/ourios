@@ -70,8 +70,9 @@ use crate::audit_schema;
 pub use ourios_core::audit::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
     EVENT_KIND_CONVERSATION_ERASED, EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED,
-    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
-    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_ALIAS_ASSERTED,
+    EVENT_KIND_TEMPLATE_ADOPTED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
+    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_TYPE_ALIAS_ASSERTED,
     EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_CREATED,
     EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
     EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
@@ -493,6 +494,23 @@ impl Builders {
                     would_be_template,
                     would_be_positions,
                 ));
+            }
+            TemplateChange::Adopted {
+                template_version,
+                new_template,
+            } => {
+                // RFC 0050 §3.3 — adoption mirrors the Created shape:
+                // no prior template, so `old_*` are the "not
+                // applicable" NULLs; `new_version` is the version the
+                // adoption binds to (1 for adoption-interned
+                // templates, the matched leaf version otherwise).
+                self.old_version.append_null();
+                self.new_version.append_value(*template_version);
+                self.old_template.append_null();
+                self.new_template.append_value(new_template);
+                append_positions(&mut self.positions_widened, &[]);
+                append_slots(&mut self.slots_expanded, &[]);
+                self.reason.append_null();
             }
         }
         Ok(())

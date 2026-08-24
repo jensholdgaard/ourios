@@ -46,6 +46,9 @@ use std::fmt;
 /// | [`max_node_children`](Self::max_node_children) | `100` | `1..` | §3.2 — bounds tree width (RFC 0023 §3.1) |
 /// | [`max_templates`](Self::max_templates) | `20_000` | `1..` | §3.2 — bounds tree size; overflow goes parse-failure, never merge (RFC 0023 §3.1) |
 /// | [`max_line_tokens`](Self::max_line_tokens) | `512` | `1..` | §3.2 — bounds stored-template width (RFC 0023 §3.1) |
+/// | [`upstream_templates`](Self::upstream_templates) | `ignore` | `ignore` \| `observe` \| `adopt` | §3.1 — every rejection falls back to mining, never force-adopts (RFC 0050 §3.2) |
+/// | [`upstream_template_byte_limit`](Self::upstream_template_byte_limit) | `8192` | `0..` (`0` disables) | §3.2 — bounds inbound-attribute work (RFC 0050 §3.2) |
+/// | [`upstream_association_limit`](Self::upstream_association_limit) | `4` | `0..` | §3.2 — bounds stored associations, overflow counted (RFC 0050 §3.2) |
 ///
 /// The struct is `Clone + Copy + 'static`, so the cluster can
 /// hold a default and a per-tenant override map without

@@ -307,18 +307,38 @@ async fn adopted_template_ids(
     let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
         .await
         .map_err(storage_err)?;
-    let mut out = std::collections::HashSet::new();
-    for batch in &batches {
-        let column = u64_column(batch, audit_columns::TEMPLATE_ID)?;
-        for i in 0..column.len() {
-            if !column.is_null(i) {
-                out.insert(column.value(i));
-            }
-        }
-    }
+    let out = decode_adopted_ids(&batches)?;
     let stats = scan_stats(plan.as_ref());
     record_operator_spans(plan.as_ref());
     Ok((out, stats))
+}
+
+/// Decode the adoption lookup's grouped `template_id` batches into the
+/// adopted-id set. `template_adopted` events carry a `template_id` by
+/// convention, so a NULL group key means a corrupted or foreign audit
+/// file — surfaced like the main drift decode, rather than skipped
+/// (which would under-report `upstream_derived`).
+fn decode_adopted_ids(
+    batches: &[RecordBatch],
+) -> Result<std::collections::HashSet<u64>, QueryError> {
+    let mut out = std::collections::HashSet::new();
+    for batch in batches {
+        let column = u64_column(batch, audit_columns::TEMPLATE_ID)?;
+        for i in 0..column.len() {
+            if column.is_null(i) {
+                return Err(QueryError::Storage {
+                    detail: concat!(
+                        "adoption lookup: NULL template_id in a ",
+                        "template_adopted group ",
+                        "(corrupt or foreign audit file)"
+                    )
+                    .to_string(),
+                });
+            }
+            out.insert(column.value(i));
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve the drift window's `[from, to)` bounds to nanoseconds, normalising
@@ -511,6 +531,38 @@ mod tests {
             }
             other => panic!("expected a Storage NULL error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_adopted_ids_rejects_a_null_group_key() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            audit_columns::TEMPLATE_ID,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![Some(7_u64), None]))],
+        )
+        .expect("grouped batch");
+
+        match decode_adopted_ids(&[batch]) {
+            Err(QueryError::Storage { detail }) => {
+                assert!(detail.contains("NULL"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected a Storage NULL error, got {other:?}"),
+        }
+
+        // The all-non-NULL shape decodes to the id set.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt64Array::from(vec![Some(7_u64), Some(9)]))],
+        )
+        .expect("grouped batch");
+        let ids = decode_adopted_ids(&[batch]).expect("decode");
+        assert_eq!(ids, [7, 9].into_iter().collect());
     }
 
     #[test]

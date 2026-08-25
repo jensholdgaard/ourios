@@ -262,6 +262,24 @@ pub fn rejected_degenerate(tenant: &str, template_id: u64, version: u32, ts_ns: 
     }
 }
 
+/// A `template_adopted` audit event (RFC 0050 §3.3) for `template_id`
+/// at `ts_ns`.
+pub fn adopted(tenant: &str, template_id: u64, ts_ns: u64) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: at(ts_ns),
+        payload: AuditPayload::Template {
+            template_id,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Adopted {
+                template_version: 1,
+                new_template: "user <*>".to_string(),
+            },
+        },
+    }
+}
+
 /// A `compaction` audit event at `ts_ns` — not a template change, excluded
 /// from drift by the `event_type` filter (RFC0010.3).
 pub fn compaction(tenant: &str, ts_ns: u64) -> AuditEvent {

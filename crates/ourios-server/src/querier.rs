@@ -1269,6 +1269,40 @@ mod tests {
         );
     }
 
+    /// RFC 0050 §3.3 — the drift DTO serialises the provenance set
+    /// with the exact wire spellings, in the set's stable order,
+    /// regardless of insertion order.
+    #[test]
+    fn drift_dto_serialises_provenance_in_stable_order() {
+        use std::time::UNIX_EPOCH;
+
+        use ourios_core::audit::{Provenance, ProvenanceSet};
+        use ourios_querier::{DriftResult, DriftRow, QueryStats};
+
+        use super::DriftResponse;
+
+        let result = DriftResult {
+            rows: vec![DriftRow {
+                template_id: 7,
+                widening_count: 3,
+                min_old_version: 1,
+                max_new_version: 4,
+                first_seen: UNIX_EPOCH,
+                last_seen: UNIX_EPOCH,
+                // Inserted upstream-first; the set iterates in
+                // declaration order all the same.
+                provenance: ProvenanceSet::singleton(Provenance::UpstreamDerived)
+                    .insert(Provenance::Mined),
+            }],
+            stats: QueryStats::default(),
+        };
+        let json = serde_json::to_value(DriftResponse::from(&result)).expect("serialize");
+        assert_eq!(
+            json["rows"][0]["provenance"],
+            serde_json::json!(["mined", "upstream_derived"]),
+        );
+    }
+
     /// A minimal record for the DTO tests above.
     fn test_record() -> ourios_core::record::MinedRecord {
         ourios_core::record::MinedRecord {

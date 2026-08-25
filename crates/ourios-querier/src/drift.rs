@@ -138,7 +138,9 @@ pub(crate) async fn run_drift(
         return Ok(DriftResult::default());
     }
 
-    let (ctx, base) = audit_dataframe(backend, &files).await?;
+    // The base frame arrives tenant-scoped (the `CLAUDE.md` §3.7
+    // row-level guard lives in `audit_dataframe`).
+    let (ctx, base) = audit_dataframe(backend, &files, tenant).await?;
 
     // §6.3 step 1 — event_type IN ('template_widened', 'template_type_expanded')
     // AND timestamp in the half-open [start, end) window (RFC 0010 §6.5).
@@ -150,15 +152,8 @@ pub(crate) async fn run_drift(
         .clone()
         .gt_eq(lit(time_bound_scalar(start)?))
         .and(ts.lt(lit(time_bound_scalar(end)?)));
-    // Row-level tenant guard (`CLAUDE.md` §3.7): the scan is already scoped to
-    // the tenant's `audit/tenant_id=…` prefix (and, on local, the canonical-path
-    // walk), but drift aggregates in DataFusion and has no per-row backstop like
-    // the alias / registry folds. A `tenant_id = <tenant>` predicate gives the
-    // same guarantee, so a corrupt or misplaced row under the prefix can't skew
-    // (or leak into) another tenant's drift counts.
-    let tenant_match = col(audit_columns::TENANT_ID).eq(lit(tenant.as_str()));
     let filtered = base
-        .filter(widened.or(type_expanded).and(in_window).and(tenant_match))
+        .filter(widened.or(type_expanded).and(in_window))
         .map_err(storage_err)?;
 
     // §6.3 steps 2–3 — GROUP BY template_id, the five aggregates.
@@ -208,21 +203,37 @@ pub(crate) async fn run_drift(
         // Always zero from a plain scan today; folded so the
         // accounting stays complete if it ever isn't.
         stats.rows_excluded += adoption_stats.rows_excluded;
-        for row in &mut rows {
-            if adopted.contains(&row.template_id) {
-                row.provenance = row.provenance.insert(Provenance::UpstreamDerived);
-            }
-        }
+        apply_adoptions(&mut rows, &adopted);
     }
     Ok(DriftResult { rows, stats })
+}
+
+/// Union `upstream_derived` into every row whose template the
+/// adoption lookup matched (RFC 0050 §3.3); rows outside the set
+/// keep their provenance untouched.
+fn apply_adoptions(rows: &mut [DriftRow], adopted: &std::collections::HashSet<u64>) {
+    for row in rows {
+        if adopted.contains(&row.template_id) {
+            row.provenance = row.provenance.insert(Provenance::UpstreamDerived);
+        }
+    }
 }
 
 /// Register the audit file set as a `DataFusion` table and hand back
 /// the session + base frame — shared by the drift aggregation and
 /// the provenance lookup.
+///
+/// The frame comes back **tenant-scoped**: the scan is already
+/// limited to the tenant's `audit/tenant_id=…` prefix (and, on
+/// local, the canonical-path walk), but the aggregations here have
+/// no per-row backstop like the alias / registry folds, so the
+/// row-level `tenant_id = <tenant>` guard (`CLAUDE.md` §3.7) is
+/// applied at this shared data-access boundary — every consumer
+/// inherits it rather than re-remembering it.
 async fn audit_dataframe(
     backend: StoreRef<'_>,
     files: &audit_scan::AuditFiles,
+    tenant: &TenantId,
 ) -> Result<(SessionContext, datafusion::prelude::DataFrame), QueryError> {
     let ctx = SessionContext::new();
     let urls = audit_table_urls(&ctx, backend, files)?;
@@ -236,7 +247,12 @@ async fn audit_dataframe(
     let table = ListingTable::try_new(config).map_err(storage_err)?;
     ctx.register_table("audit", Arc::new(table))
         .map_err(storage_err)?;
-    let base = ctx.table("audit").await.map_err(storage_err)?;
+    let base = ctx
+        .table("audit")
+        .await
+        .map_err(storage_err)?
+        .filter(col(audit_columns::TENANT_ID).eq(lit(tenant.as_str())))
+        .map_err(storage_err)?;
     Ok((ctx, base))
 }
 
@@ -271,12 +287,12 @@ async fn adopted_template_ids(
     if files.is_empty() {
         return Ok((std::collections::HashSet::new(), QueryStats::default()));
     }
-    let (ctx, base) = audit_dataframe(backend, &files).await?;
+    // Tenant-scoped by `audit_dataframe` (`CLAUDE.md` §3.7).
+    let (ctx, base) = audit_dataframe(backend, &files, tenant).await?;
     let filtered = base
         .filter(
             col(audit_columns::EVENT_TYPE)
                 .eq(lit(EVENT_TYPE_TEMPLATE_ADOPTED))
-                .and(col(audit_columns::TENANT_ID).eq(lit(tenant.as_str())))
                 .and(
                     col(audit_columns::TEMPLATE_ID)
                         .in_list(ids.iter().map(|id| lit(*id)).collect(), false),
@@ -495,5 +511,36 @@ mod tests {
             }
             other => panic!("expected a Storage NULL error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_adoptions_unions_only_the_matched_ids() {
+        use std::time::UNIX_EPOCH;
+
+        use ourios_core::audit::{Provenance, ProvenanceSet};
+
+        let row = |id: u64| DriftRow {
+            template_id: id,
+            widening_count: 1,
+            min_old_version: 1,
+            max_new_version: 2,
+            first_seen: UNIX_EPOCH,
+            last_seen: UNIX_EPOCH,
+            provenance: ProvenanceSet::singleton(Provenance::Mined),
+        };
+        let mut rows = [row(1), row(2)];
+        let adopted: std::collections::HashSet<u64> = [2].into_iter().collect();
+
+        super::apply_adoptions(&mut rows, &adopted);
+
+        assert_eq!(
+            rows[0].provenance,
+            ProvenanceSet::singleton(Provenance::Mined),
+            "an unmatched row's provenance is untouched",
+        );
+        assert_eq!(
+            rows[1].provenance,
+            ProvenanceSet::singleton(Provenance::Mined).insert(Provenance::UpstreamDerived),
+        );
     }
 }

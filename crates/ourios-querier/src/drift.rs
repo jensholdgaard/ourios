@@ -237,6 +237,12 @@ async fn adopted_template_ids(
     tenant: &TenantId,
     ids: &[u64],
 ) -> Result<std::collections::HashSet<u64>, QueryError> {
+    if ids.is_empty() {
+        // Never compile an empty `IN ()` — the caller only asks for
+        // non-empty drift results today, but this helper must not
+        // rely on `DataFusion`'s empty-list semantics.
+        return Ok(std::collections::HashSet::new());
+    }
     let files = {
         let owned = backend.into_owned();
         let tenant = tenant.clone();

@@ -17,7 +17,11 @@ case "$ref" in
         exit 1;;
 esac
 
-dest="${SEMCONV_CHECKOUT_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ourios-semconv-$ref}"
+# SEMCONV_CHECKOUT_DIR is a BASE directory (a cache root); the
+# ref-named checkout always lives one level below it, so the rm -rf
+# on a partial checkout can never touch the base itself.
+base="${SEMCONV_CHECKOUT_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
+dest="$base/ourios-semconv-$ref"
 if [ ! -d "$dest/registry" ]; then
     rm -rf "$dest"
     git clone --quiet --depth 1 --branch "$ref" \

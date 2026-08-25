@@ -68,7 +68,7 @@ lint-commits:
 semconv-generate:
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v weaver >/dev/null || { echo "error: weaver not installed (open-telemetry/weaver)"; exit 1; }
+    command -v weaver >/dev/null || { echo "error: weaver not installed (open-telemetry/weaver)" >&2; exit 1; }
     dir="$(.github/scripts/fetch-semconv.sh)"
     weaver registry generate rust crates/ourios-semconv/src \
         -t "$dir/templates" -r "$dir/registry" --future

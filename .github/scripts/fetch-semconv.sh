@@ -8,7 +8,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 ref="$(tr -d '[:space:]' < "$repo_root/semconv/REGISTRY_REF")"
 # The pin must be a tag or branch NAME (git clone --branch takes no
-# bare SHA), and it is interpolated into a path handed to rm -rf —
+# bare SHA). Commit a TAG: a branch pin is for local development only —
+# it re-syncs on every run, and because the generated output is
+# committed and no-diff-gated, a moved branch fails CI loudly rather
+# than drifting silently. The ref is interpolated into a path handed
+# to rm -rf —
 # constrain it to a conservative charset so a malformed pin can never
 # traverse out of the checkout dir or read as a git/rm option.
 case "$ref" in
@@ -22,7 +26,7 @@ esac
 # on a partial checkout can never touch the base itself.
 base="${SEMCONV_CHECKOUT_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 dest="$base/ourios-semconv-$ref"
-if [ ! -d "$dest/registry" ]; then
+if [ ! -d "$dest/registry" ] || [ ! -d "$dest/templates" ]; then
     rm -rf "$dest"
     git clone --quiet --depth 1 --branch "$ref" \
         https://github.com/jensholdgaard/ourios-semconv.git "$dest" >&2

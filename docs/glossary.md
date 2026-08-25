@@ -193,11 +193,12 @@ but worse compression and more metadata overhead.
 Ourios telemetry name (`ourios.*` metrics and attributes), from
 which the `ourios-semconv` constants (Rust and TypeScript) are
 generated. Since 2026-08-25 it lives in the shared
-`jensholdgaard/ourios-semconv` repo, consumed by this repo and the
-dashboard plugins at the ref pinned in `semconv/REGISTRY_REF`
-(regenerate via `just semconv-generate`). RFCs written before the
-extraction reference its previous in-repo path,
-`semconv/registry/` — those references are historical, not stale.
+`jensholdgaard/ourios-semconv` repo; this repo consumes it at the ref
+pinned in `semconv/REGISTRY_REF` (regenerate via
+`just semconv-generate`), and each dashboard-plugin repo carries its
+own pin. RFCs written before the extraction reference the previous
+in-repo paths, `semconv/registry/` and `templates/registry/` — those
+references are historical, not stale.
 
 **Similarity.** The Drain match score between an incoming line and
 a *log group*'s *template*: the fraction of token positions where

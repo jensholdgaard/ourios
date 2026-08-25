@@ -115,7 +115,11 @@ impl LogRow {
     /// into the RFC0017.7 engine-free surface for no measured win.
     #[must_use]
     pub fn from_records(records: &[MinedRecord], registry: &TemplateRegistry) -> Vec<Self> {
-        let mut memo: HashMap<(u64, u32), (Option<&[OwnedToken]>, Option<String>)> = HashMap::new();
+        /// One memoised resolution: the registry tokens (borrowed)
+        /// and the formatted string for a `(template_id,
+        /// template_version)` pair.
+        type Resolved<'r> = (Option<&'r [OwnedToken]>, Option<String>);
+        let mut memo: HashMap<(u64, u32), Resolved<'_>> = HashMap::new();
         records
             .iter()
             .map(|record| {

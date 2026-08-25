@@ -5851,6 +5851,60 @@ mod tests {
     }
 
     #[test]
+    fn rfc0050_1_default_mines_as_if_unannotated_and_stores_verbatim() {
+        let t = TenantId::new("tenant-x");
+        let bodies = ["user alice logged in", "user bob logged in"];
+
+        // The pre-RFC build had no upstream-template handling at all,
+        // so its outcome on an annotated corpus is exactly what the
+        // miner produces when the attribute does not participate:
+        // mine the same bodies with and without the annotation under
+        // the unset default and require identical miner output.
+        let records = SharedRecordSink::new();
+        let mut annotated_run =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let mut plain_run = MinerCluster::new(MinerConfig::default());
+        for body in bodies {
+            let with_attr = annotated_run.ingest(&annotated_record(&t, body, "user <*> logged in"));
+            let without = plain_run.ingest(&string_record(&t, body));
+            assert_eq!(with_attr, without, "the annotation changed a template_id");
+        }
+
+        // Identical miner-derived state: same leaves, ids, versions;
+        // no adoption surface was touched.
+        let shape = |c: &MinerCluster| -> Vec<(String, u64, u32)> {
+            c.templates_for(&t)
+                .iter()
+                .map(|l| {
+                    (
+                        format_template(&l.template),
+                        l.template_id,
+                        l.template_version,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(shape(&annotated_run), shape(&plain_run));
+        assert!(annotated_run.adopted_templates_for(&t).is_empty());
+
+        // The attribute is stored as an ordinary attribute, verbatim
+        // (RFC 0018 fidelity — nothing consumed, nothing rewritten).
+        let stored = records.drain();
+        assert_eq!(stored.len(), bodies.len());
+        for record in &stored {
+            let claim = record
+                .attributes
+                .iter()
+                .find(|kv| kv.key == LOG_RECORD_TEMPLATE_ATTR)
+                .expect("the annotation survives as an ordinary attribute");
+            assert_eq!(
+                claim.value.as_ref().and_then(|v| v.value.as_ref()),
+                Some(&AvValue::StringValue("user <*> logged in".to_string())),
+            );
+        }
+    }
+
+    #[test]
     fn rfc0050_2_adoption_uses_the_upstream_string() {
         let t = TenantId::new("tenant-x");
         let records = SharedRecordSink::new();

@@ -1,7 +1,7 @@
 ---
 rfc: 0050
 title: Upstream-derived templates — accepting `log.record.template` and reconciling with semconv
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-24
@@ -11,12 +11,40 @@ superseded-by: —
 
 # RFC 0050 — Upstream-derived templates
 
-> **Status: `specified` (2026-08-24).** §5 criteria written and testable.
+> **Status: `green` (2026-08-25).** All nine §5 criteria pass, landed as
+> seven implementation PRs over two days (#730 grammar/alignment +
+> provenance, #731 modes + audit + counter, #733 config, #734 vocabulary
+> pair, #735 drift provenance, #736 served mixed stream, #737 real
+> drainprocessor pass) plus a coverage-gap closer (#738).
+> RFC0050.1 `rfc0050_1_default_mines_as_if_unannotated_and_stores_verbatim`;
+> .2 `rfc0050_2_adoption_uses_the_upstream_string` (unit) and the
+> `collector-interop` job's `drainprocessor_annotates_and_ourios_adopts`
+> (a real otelcol-contrib 0.159.0 `drain` pass, adoption discriminated by
+> the persisted `template_adopted` audit event); .3 at the cluster and
+> through the served binary (`rfc0050_3_served_mixed_stream.rs`); .4 the
+> grammar/alignment table in `upstream.rs` plus the
+> `rfc0050_properties.rs` render-equals-body proptests (construction and
+> ingest level); .5 `rfc0050_5_ceiling_stops_adoption_interning` +
+> `rfc0050_5_byte_limit_rejects_before_parsing`; .6 both convergence
+> orders, the drift set (`rfc0050_6_drift_reports_the_provenance_set`),
+> the single-audit-event assertion, and the cross-provenance alias
+> binding; .7 the semconv registry entries + the weaver live-check job;
+> .8 `rfc0050_read_path.rs` + the DTO omit-when-unresolvable tests; .9
+> `rfc0050_9_observe_associates_without_touching_the_clustering`.
+> §6's "corpus pre-annotated by an actual drainprocessor pass" is the
+> interop scenario itself. No thesis-gate applies (`validated` vacuous —
+> RFC 0008/0044/0046 precedent); `accepted` is a maintainer flip. Two
+> §7 outcomes recorded inline: rejections ride
+> `ourios.miner.upstream_template.processed` (§3.2, #732), and
+> `log.record.template` stays a **local** semconv definition until
+> upstream lands semantic-conventions#1283/#2064 (§3.6).
+>
+> *(`specified`, 2026-08-24: §5 criteria written and testable.
 > Prerequisites: RFC 0001 (the miner, `accepted`), RFC 0023 (bounded
 > template memory, `green`), RFC 0010 (drift), RFC 0007 (aliases).
 > Touches **pillar 2** (§2 of `CLAUDE.md`) and invariants §3.1 (no silent
 > merges), §3.2 (parameter cardinality) and §3.3 (bit-identical
-> reconstruction), so it is an RFC rather than a patch.
+> reconstruction), so it is an RFC rather than a patch.)*
 
 ## 1. Summary
 

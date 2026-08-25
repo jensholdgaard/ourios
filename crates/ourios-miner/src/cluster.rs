@@ -5851,6 +5851,65 @@ mod tests {
     }
 
     #[test]
+    fn rfc0050_1_default_mines_as_if_unannotated_and_stores_verbatim() {
+        let t = TenantId::new("tenant-x");
+        let bodies = ["user alice logged in", "user bob logged in"];
+
+        // The pre-RFC build had no upstream-template handling at all,
+        // so its outcome on an annotated corpus is exactly what the
+        // miner produces when the attribute does not participate:
+        // mine the same bodies with and without the annotation under
+        // the unset default and require identical miner output.
+        let records = SharedRecordSink::new();
+        let mut annotated_run =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let mut plain_run = MinerCluster::new(MinerConfig::default());
+        for body in bodies {
+            let with_attr = annotated_run.ingest(&annotated_record(&t, body, "user <*> logged in"));
+            let without = plain_run.ingest(&string_record(&t, body));
+            assert_eq!(with_attr, without, "the annotation changed a template_id");
+        }
+
+        // Identical miner-derived state: same leaves, ids, versions;
+        // no adoption surface was touched.
+        // `templates_for` carries no ordering contract — compare as
+        // a sorted set.
+        let shape = |c: &MinerCluster| -> Vec<(String, u64, u32)> {
+            let mut leaves: Vec<_> = c
+                .templates_for(&t)
+                .iter()
+                .map(|l| {
+                    (
+                        format_template(&l.template),
+                        l.template_id,
+                        l.template_version,
+                    )
+                })
+                .collect();
+            leaves.sort();
+            leaves
+        };
+        assert_eq!(shape(&annotated_run), shape(&plain_run));
+        assert!(annotated_run.adopted_templates_for(&t).is_empty());
+
+        // The attribute is stored as an ordinary attribute, verbatim
+        // (RFC 0018 fidelity — nothing consumed, nothing rewritten).
+        let stored = records.drain();
+        assert_eq!(stored.len(), bodies.len());
+        for record in &stored {
+            let claim = record
+                .attributes
+                .iter()
+                .find(|kv| kv.key == LOG_RECORD_TEMPLATE_ATTR)
+                .expect("the annotation survives as an ordinary attribute");
+            assert_eq!(
+                claim.value.as_ref().and_then(|v| v.value.as_ref()),
+                Some(&AvValue::StringValue("user <*> logged in".to_string())),
+            );
+        }
+    }
+
+    #[test]
     fn rfc0050_2_adoption_uses_the_upstream_string() {
         let t = TenantId::new("tenant-x");
         let records = SharedRecordSink::new();
@@ -6114,6 +6173,43 @@ mod tests {
         assert_eq!(adopted.len(), 1);
         assert!(!adopted[0].owned, "the entry flipped to tree-backed");
         assert_eq!(cluster.template_count(&t), 1, "the identity counted once");
+    }
+
+    #[test]
+    fn rfc0050_6_alias_binds_a_mined_template_to_an_adopted_one() {
+        use std::time::SystemTime;
+
+        use ourios_core::alias::{ActorId, AliasMap, Operator};
+
+        let t = TenantId::new("tenant-x");
+        let audit = SharedAuditSink::new();
+        let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()));
+
+        let adopted_id =
+            cluster.ingest(&annotated_record(&t, "job 7 finished", "job <*> finished"));
+        let mined_id = cluster.ingest(&string_record(&t, "task 9 done"));
+        assert_ne!(adopted_id, mined_id);
+
+        // The RFC 0007 alias surface takes both ids like any pair —
+        // adoption-interned ids live in the same id space as tree
+        // leaves, so an operator can bind across provenance.
+        let mut aliases = AliasMap::new();
+        let mut sink = audit.clone();
+        aliases
+            .assert(
+                &mut sink,
+                &t,
+                mined_id,
+                vec![adopted_id],
+                Operator {
+                    actor: ActorId::new("ops@example.com").expect("actor"),
+                    reason: "same job-completion shape".to_string(),
+                    timestamp: SystemTime::UNIX_EPOCH,
+                },
+            )
+            .expect("alias binds a mined id to an adopted id");
+        let class = aliases.resolves(&t, adopted_id);
+        assert!(class.contains(&mined_id) && class.contains(&adopted_id));
     }
 
     #[test]

@@ -43,14 +43,16 @@ without a `range(...)` stage get the server's default look-back window.
    severity >= error | count by template_id | sort count desc | limit 20
    ```
 
-6. The ten most recent lines of one template, reconstructed byte for
-   byte:
+6. The ten most recent lines of one template, rendered back to the
+   original bytes (reconstructed from the template, or the retained
+   body verbatim for lossy rows):
 
    ```text
    template_id == 42 | sort ts desc | limit 10 | render
    ```
 
-7. Lines matching a regular expression (anchored to the body):
+7. Lines matching a regular expression (matched against the body;
+   add `^`/`$` yourself if you want anchoring):
 
    ```text
    matches(body, "user [0-9]+ locked out")
@@ -65,7 +67,7 @@ without a `range(...)` stage get the server's default look-back window.
 9. Warnings and errors, excluding a known-noisy service:
 
    ```text
-   severity >= warn and not service == "vacuum-daemon"
+   severity >= warn and service != "vacuum-daemon"
    ```
 
 10. Lines carrying a specific attribute value (any OTLP attribute is

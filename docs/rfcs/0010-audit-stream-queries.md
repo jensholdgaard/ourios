@@ -20,7 +20,7 @@ superseded-by: —
 >
 > **Status note.** **`green`** (2026-06-15) — all eight §5 acceptance
 > scenarios (RFC0010.1–.8) have live, passing tests in
-> `crates/ourios-querier/tests/drift.rs`: drift returns drifted templates
+> `crates/ourios-querier/tests/it/drift.rs`: drift returns drifted templates
 > with counts (.1), half-open `[from, to)` window (.2), `event_type`
 > scoping excludes non-widenings (.3), tenant isolation (.4),
 > empty-is-empty-not-error (.5), `widening_count` desc / `template_id` asc

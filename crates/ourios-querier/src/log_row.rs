@@ -73,6 +73,14 @@ pub struct LogRow {
     /// The leaf `template_version` the row was stamped with (selects the
     /// token set the body was rendered against — RFC 0017 §3.5).
     pub template_version: u32,
+    /// The template **string** for `(template_id, template_version)` —
+    /// the portable half of the RFC 0050 §3.6 identity pair, carried
+    /// beside the local key so a consumer needs no second
+    /// `list_templates` call (RFC0050.8). `None` when the pair is not
+    /// in the read-time registry (a `NO_TEMPLATE` row, or audit not
+    /// yet visible). Ourios-derived data in an Ourios-derived field:
+    /// never injected into `attributes` (RFC 0018 fidelity).
+    pub template: Option<String>,
     /// The rendered / structured body (RFC 0017 §3.3).
     pub body: LogBody,
 }
@@ -102,6 +110,9 @@ impl LogRow {
             dropped_attributes_count: record.dropped_attributes_count,
             template_id: record.template_id,
             template_version: record.template_version,
+            template: registry
+                .get(&(record.template_id, record.template_version))
+                .map(|tokens| ourios_miner::tree::format_template(tokens)),
             body: render_log_body(record, registry),
         }
     }

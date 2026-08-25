@@ -37,3 +37,4 @@ mod rfc0036_window_materialization;
 mod rfc0042_mixed_schema;
 mod rfc0044_body_equality;
 mod rfc0047_visibility;
+mod rfc0050_read_path;

@@ -808,6 +808,14 @@ struct LogRowDto {
     dropped_attributes_count: u32,
     template_id: u64,
     template_version: u32,
+    /// The template string for `(template_id, template_version)` —
+    /// beside the local key so no second `list_templates` call is
+    /// needed (RFC 0050 §3.6 / RFC0050.8). Ourios-derived, so it
+    /// lives here as a response field and is never injected into
+    /// `attributes` (RFC 0018 fidelity). Omitted when the pair is
+    /// not in the read-time registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<String>,
     /// Omitted entirely for `body_kind = Absent` rows (RFC 0025
     /// §3.2) — a missing body key, never `""`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -835,6 +843,7 @@ impl From<&LogRow> for LogRowDto {
             dropped_attributes_count: row.dropped_attributes_count,
             template_id: row.template_id,
             template_version: row.template_version,
+            template: row.template.clone(),
             body: match &row.body {
                 LogBody::Absent => None,
                 other => Some(LogBodyDto::from(other)),

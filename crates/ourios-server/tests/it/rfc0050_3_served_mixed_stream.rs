@@ -17,7 +17,7 @@
 
 use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
@@ -30,8 +30,15 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
-/// 2026-04-02T10:58:00Z — inside the query's `-365d` look-back.
-const TS: u64 = 1_775_127_480_000_000_000;
+/// The current wall clock in unix nanos — a fixture timestamp that
+/// always falls inside the query's `-365d` look-back, whatever year
+/// the test runs in (the rfc0016_5_7 fixture pattern).
+fn now_ns() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    u64::try_from(nanos).unwrap_or(0)
+}
 
 fn string_value(s: &str) -> AnyValue {
     AnyValue {
@@ -46,10 +53,11 @@ fn mixed_request(
     template: &str,
     bare_body: &str,
 ) -> ExportLogsServiceRequest {
+    let ts = now_ns();
     let annotated = LogRecord {
         body: Some(string_value(annotated_body)),
         severity_number: 9,
-        time_unix_nano: TS,
+        time_unix_nano: ts,
         attributes: vec![KeyValue {
             key: "log.record.template".to_owned(),
             value: Some(string_value(template)),
@@ -60,7 +68,7 @@ fn mixed_request(
     let bare = LogRecord {
         body: Some(string_value(bare_body)),
         severity_number: 9,
-        time_unix_nano: TS + 1,
+        time_unix_nano: ts + 1,
         ..Default::default()
     };
     ExportLogsServiceRequest {
@@ -174,12 +182,12 @@ async fn rfc0050_3_mixed_stream_through_the_served_binary() {
             "\
 storage:
   local:
-    bucket_root: {bucket}
+    bucket_root: \"{bucket}\"
 receiver:
   enabled: true
   grpc_addr: 127.0.0.1:0
   http_addr: 127.0.0.1:0
-  wal_root: {wal}
+  wal_root: \"{wal}\"
 querier:
   enabled: true
   http_addr: 127.0.0.1:0
@@ -244,10 +252,14 @@ miner:
 
     // RFC 0018 fidelity end to end: the producer-sent attribute
     // survives verbatim; the bare record gained nothing.
-    let adopted_attrs = adopted["attributes"].to_string();
+    let adopted_attrs = adopted["attributes"].as_array().expect("attributes array");
     assert!(
-        adopted_attrs.contains("log.record.template"),
-        "producer-sent attribute survives: {adopted_attrs}",
+        adopted_attrs
+            .iter()
+            .any(|kv| kv["key"] == "log.record.template"
+                && kv["value"]["stringValue"] == "job <*> finished"),
+        "producer-sent attribute survives verbatim: {}",
+        adopted["attributes"],
     );
     assert_eq!(
         mined["attributes"].as_array().map(Vec::len),

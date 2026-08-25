@@ -228,10 +228,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # A real otelcol-contrib container exports OTLP to a served Ourios over
       # TLS + OIDC (Dex); the test asserts the lines land under the JWT tenant.
+      # The RFC 0050 scenario runs the same collector's `drain` processor and
+      # asserts the annotated stream is adopted, stored faithfully, and
+      # reconstructs.
       - run: >
           cargo test -p ourios-server --test it --
           --ignored --exact
           collector_interop::collector_exports_over_tls_and_oidc
+          collector_interop::drainprocessor_annotates_and_ourios_adopts
 
   # RFC0031.1 (comparative evaluation vs Loki): the shared OTLP fixture is
   # ingested by BOTH systems — Ourios in-process, Loki as a real container —

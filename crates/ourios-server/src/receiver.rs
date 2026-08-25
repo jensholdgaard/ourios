@@ -274,6 +274,10 @@ pub struct ReceiverConfig {
     /// (`receiver.encode_workers`; the config layer validates ≥ 1 and
     /// defaults to the host's available cores).
     pub encode_workers: usize,
+    /// RFC 0050 §3.2 — the miner configuration, carrying the
+    /// upstream-template dial (`miner.*`; defaults are byte-identical
+    /// pre-RFC behaviour).
+    pub miner: MinerConfig,
     /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
     /// graph is configured with a bound conversation object.
     pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
@@ -478,9 +482,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // the record sink and its template events into the audit sink (RFC0014.5 —
     // recovery rebuilds the in-memory buffers the crash dropped; the durability
     // of record is the WAL, never the buffers).
-    let mut miner =
-        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
-            .with_record_sink(Box::new(sink.clone()));
+    let mut miner = MinerCluster::with_audit_sink(config.miner, Box::new(audit_sink.clone()))
+        .with_record_sink(Box::new(sink.clone()));
 
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner)
         .map_err(|e| format!("startup recovery: {e}"))?;
@@ -892,6 +895,7 @@ mod tests {
             auth: AuthResolver::static_only(None),
             graph_emitter: None,
             encode_workers: 2,
+            miner: MinerConfig::default(),
         })
         .await
         .expect("serve");
@@ -924,6 +928,7 @@ mod tests {
             auth: AuthResolver::static_only(None),
             graph_emitter: None,
             encode_workers: 2,
+            miner: MinerConfig::default(),
         })
         .await
         .expect("serve");
@@ -942,6 +947,91 @@ mod tests {
             .expect("a gzip-compressed OTLP export acks");
 
         handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// RFC 0050 §3.2 — a non-default `MinerConfig` actually reaches the
+    /// served pipeline: under `adopt`, an annotated record's adoption
+    /// lands a `template_adopted` audit event in the store. Guards the
+    /// `serve` wiring regressing to `MinerConfig::default()`, which
+    /// would silently ignore the attribute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_propagates_the_miner_config() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use ourios_config::UpstreamTemplates;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: test_wal_config(wal_dir.path()),
+            store,
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt),
+        })
+        .await
+        .expect("serve");
+
+        let mut request = export_request("acme", &["user alice logged in"]);
+        request.resource_logs[0].scope_logs[0].log_records[0]
+            .attributes
+            .push(KeyValue {
+                key: "log.record.template".to_owned(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("user <*> logged in".to_owned())),
+                }),
+                ..Default::default()
+            });
+        let mut client = LogsServiceClient::connect(format!("http://{}", handle.grpc_addr))
+            .await
+            .expect("connect");
+        let mut export = tonic::Request::new(request);
+        export
+            .metadata_mut()
+            .insert("x-ourios-tenant", "acme".parse().expect("ascii"));
+        client.export(export).await.expect("export acks");
+
+        // The graceful shutdown drains the audit sink to the store.
+        handle.shutdown().await.expect("graceful shutdown");
+
+        let mut kinds = Vec::new();
+        for path in parquet_files_under(&data_dir.path().join("audit")) {
+            let events = ourios_parquet::AuditReader::open_file(&path)
+                .expect("open audit file")
+                .read_all()
+                .expect("read audit file");
+            kinds.extend(events.iter().map(|e| e.payload.event_type().to_owned()));
+        }
+        assert!(
+            kinds.iter().any(|k| k == "template_adopted"),
+            "an adopt-mode ingest must audit the adoption; saw {kinds:?}",
+        );
+    }
+
+    /// Every `*.parquet` under `root`, recursively (empty when the
+    /// directory does not exist).
+    fn parquet_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(parquet_files_under(&path));
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                out.push(path);
+            }
+        }
+        out
     }
 
     /// One OTLP/HTTP export of `bodies` for `service` (its `service.name` routes
@@ -1059,6 +1149,7 @@ mod tests {
             auth: AuthResolver::static_only(None),
             graph_emitter: None,
             encode_workers: 2,
+            miner: MinerConfig::default(),
         })
         .await
         .expect("serve");

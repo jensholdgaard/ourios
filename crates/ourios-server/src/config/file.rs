@@ -1028,6 +1028,38 @@ querier:
         assert_eq!(cfg.querier.default_window_secs.as_deref(), Some("1800"));
     }
 
+    /// RFC 0050 §3.2 — every `miner.*` leaf gets the scalar treatment:
+    /// `${env:…}` substitution resolves on all three fields.
+    #[test]
+    fn miner_section_leaves_are_substituted() {
+        let lookup = env(&[("MODE", "observe"), ("CAP", "2048"), ("ASSOC", "8")]);
+        let yaml = "
+miner:
+  upstream_templates: ${env:MODE}
+  upstream_template_byte_limit: ${env:CAP}
+  upstream_association_limit: ${env:ASSOC}
+";
+        let cfg = parse(yaml, &lookup).expect("valid");
+        assert_eq!(cfg.miner.upstream_templates.as_deref(), Some("observe"));
+        assert_eq!(
+            cfg.miner.upstream_template_byte_limit.as_deref(),
+            Some("2048")
+        );
+        assert_eq!(cfg.miner.upstream_association_limit.as_deref(), Some("8"));
+    }
+
+    /// RFC 0020 §3.4 — the `miner.*` section is strict: an unknown key
+    /// is a parse error, not a silent no-op.
+    #[test]
+    fn miner_section_rejects_unknown_keys() {
+        let yaml = "
+miner:
+  upstream_template: adopt
+";
+        let err = parse(yaml, &|_| None).expect_err("unknown miner key must fail");
+        assert!(matches!(err, FileConfigError::Schema(_)), "{err:?}");
+    }
+
     /// RFC 0022 §3.2 — `storage.promoted_attributes.{resource,log}` parse as
     /// key lists, each element getting the scalar treatment: `${env:…}`
     /// substitution applies per element, and the sub-section stays strict

@@ -1734,6 +1734,40 @@ miner:
         assert!(err.contains("miner.upstream_templates"), "{err}");
     }
 
+    /// RFC 0050 §3.2 — the numeric limits fail startup loudly on
+    /// malformed, negative, and out-of-range values, naming their
+    /// YAML keys (RFC 0001 §3.2.2).
+    #[test]
+    fn rfc0050_miner_limits_reject_invalid_values() {
+        for (raw, key) in [
+            ("abc", "miner.upstream_template_byte_limit"),
+            ("-1", "miner.upstream_template_byte_limit"),
+            ("4294967296", "miner.upstream_template_byte_limit"), // u32::MAX + 1
+        ] {
+            let err = build_miner_config(None, Some(raw), None)
+                .expect_err("invalid byte limit must fail");
+            assert!(err.contains(key), "{raw:?} → {err}");
+        }
+        for (raw, key) in [
+            ("abc", "miner.upstream_association_limit"),
+            ("-1", "miner.upstream_association_limit"),
+            ("65536", "miner.upstream_association_limit"), // u16::MAX + 1
+        ] {
+            let err = build_miner_config(None, None, Some(raw))
+                .expect_err("invalid association limit must fail");
+            assert!(err.contains(key), "{raw:?} → {err}");
+        }
+        // The documented boundary values are accepted: 0 disables all
+        // upstream-template handling; whitespace reads as unset.
+        let zero = build_miner_config(None, Some("0"), Some("0")).expect("0 is valid");
+        assert_eq!(zero.upstream_template_byte_limit, 0);
+        assert_eq!(zero.upstream_association_limit, 0);
+        assert_eq!(
+            build_miner_config(Some("  "), Some(" "), Some("")).expect("blank = unset"),
+            MinerConfig::default(),
+        );
+    }
+
     /// RFC 0020 §3.3 — the miner dial rides `${env:…}` substitution
     /// like every other scalar leaf.
     #[test]

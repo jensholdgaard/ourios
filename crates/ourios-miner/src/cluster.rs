@@ -5872,8 +5872,11 @@ mod tests {
 
         // Identical miner-derived state: same leaves, ids, versions;
         // no adoption surface was touched.
+        // `templates_for` carries no ordering contract — compare as
+        // a sorted set.
         let shape = |c: &MinerCluster| -> Vec<(String, u64, u32)> {
-            c.templates_for(&t)
+            let mut leaves: Vec<_> = c
+                .templates_for(&t)
                 .iter()
                 .map(|l| {
                     (
@@ -5882,7 +5885,9 @@ mod tests {
                         l.template_version,
                     )
                 })
-                .collect()
+                .collect();
+            leaves.sort();
+            leaves
         };
         assert_eq!(shape(&annotated_run), shape(&plain_run));
         assert!(annotated_run.adopted_templates_for(&t).is_empty());

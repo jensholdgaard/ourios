@@ -188,16 +188,23 @@ pub(crate) async fn run_drift(
         .await
         .map_err(storage_err)?;
     let mut rows = decode_drift_rows(&batches)?;
-    let stats = scan_stats(plan.as_ref());
+    let mut stats = scan_stats(plan.as_ref());
     record_operator_spans(plan.as_ref());
 
     // RFC 0050 §3.3 — grow the provenance set to `{mined,
     // upstream_derived}` for every drifting template the audit
     // stream shows an adoption for. History-wide, not
-    // window-scoped: provenance is a property of the template.
+    // window-scoped: provenance is a property of the template. The
+    // lookup's own scan folds into the result's stats (and emits
+    // its operator spans inside the helper), so the drift surface
+    // reports the query's full IO, not just the window
+    // aggregation's.
     if !rows.is_empty() {
         let ids: Vec<u64> = rows.iter().map(|r| r.template_id).collect();
-        let adopted = adopted_template_ids(backend, tenant, &ids).await?;
+        let (adopted, adoption_stats) = adopted_template_ids(backend, tenant, &ids).await?;
+        stats.row_groups_scanned += adoption_stats.row_groups_scanned;
+        stats.row_groups_pruned += adoption_stats.row_groups_pruned;
+        stats.bytes_read += adoption_stats.bytes_read;
         for row in &mut rows {
             if adopted.contains(&row.template_id) {
                 row.provenance = row.provenance.insert(Provenance::UpstreamDerived);
@@ -231,17 +238,21 @@ async fn audit_dataframe(
 }
 
 /// The subset of `ids` with at least one `template_adopted` audit
-/// event for `tenant`, over the tenant's full audit history.
+/// event for `tenant`, over the tenant's full audit history — plus
+/// the lookup scan's own IO/pruning stats, which the caller folds
+/// into the drift result so the surface reports the query's full
+/// cost. The scan's operator spans are recorded here for the same
+/// reason.
 async fn adopted_template_ids(
     backend: StoreRef<'_>,
     tenant: &TenantId,
     ids: &[u64],
-) -> Result<std::collections::HashSet<u64>, QueryError> {
+) -> Result<(std::collections::HashSet<u64>, QueryStats), QueryError> {
     if ids.is_empty() {
         // Never compile an empty `IN ()` — the caller only asks for
         // non-empty drift results today, but this helper must not
         // rely on `DataFusion`'s empty-list semantics.
-        return Ok(std::collections::HashSet::new());
+        return Ok((std::collections::HashSet::new(), QueryStats::default()));
     }
     let files = {
         let owned = backend.into_owned();
@@ -255,7 +266,7 @@ async fn adopted_template_ids(
         })??
     };
     if files.is_empty() {
-        return Ok(std::collections::HashSet::new());
+        return Ok((std::collections::HashSet::new(), QueryStats::default()));
     }
     let (ctx, base) = audit_dataframe(backend, &files).await?;
     let filtered = base
@@ -286,7 +297,9 @@ async fn adopted_template_ids(
             }
         }
     }
-    Ok(out)
+    let stats = scan_stats(plan.as_ref());
+    record_operator_spans(plan.as_ref());
+    Ok((out, stats))
 }
 
 /// Resolve the drift window's `[from, to)` bounds to nanoseconds, normalising

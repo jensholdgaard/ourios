@@ -42,10 +42,12 @@ const DEX_IMAGE: &str = "ghcr.io/dexidp/dex";
 const DEX_TAG: &str =
     "master@sha256:c382922b8f065f2f1ba142fde5b0ec1736b8fb7bc5bf18832f68c9aced95f243";
 
-// The contrib distribution carries `filelog`, `resource`, and the
-// `oauth2client` extension (the core distro does not). Pinned by digest
-// (the multi-arch manifest-list index for 0.119.0) so this required check
-// never depends on a mutable tag — same posture as the Dex pin above.
+// The contrib distribution carries `filelog`, `resource`, the
+// `oauth2client` extension, and (from 0.159.0) the `drain` processor
+// (the core distro carries none of them). Pinned by digest (the
+// multi-arch manifest-list index for the release named below) so this
+// required check never depends on a mutable tag — same posture as the
+// Dex pin above.
 const COLLECTOR_IMAGE: &str = "otel/opentelemetry-collector-contrib";
 // 0.159.0 — the first contrib release whose distribution manifest carries
 // the `drain` processor (RFC 0050's upstream templating source); the
@@ -505,6 +507,13 @@ const DRAIN_LINES: &[&str] = &[
     "user 8 logged in from 10.0.0.8",
 ];
 
+/// The independent oracle: drain's converged template for
+/// [`DRAIN_LINES`], known a priori. Every stored claim must be either
+/// this exact string or (for the records annotated before drain
+/// converged) the record's own body — anything else means a stored
+/// value was rewritten somewhere.
+const CONVERGED: &str = "user <*> logged in from <*>";
+
 /// RFC 0050 — an **actual drainprocessor pass** (the §6 corpus-arm
 /// source): otelcol-contrib runs the `drain` processor (defaults —
 /// it emits `log.record.template`) over a repetitive log file and
@@ -669,6 +678,35 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
         })
     };
 
+    // The adopt discriminator: only the RFC 0050 adopt path emits
+    // `template_adopted` audit events. Without this, "the row's
+    // template renders the claim" would be circular — the built-in
+    // miner converges on the same canonical for this corpus even
+    // under `ignore`.
+    let mut adopted_events: Vec<(u64, String)> = Vec::new();
+    for f in data_parquet_files(&tmp.path().join("audit")) {
+        let events = ourios_parquet::AuditReader::open_file(&f)
+            .expect("open audit file")
+            .read_all()
+            .expect("read audit events");
+        for event in events {
+            if let ourios_core::audit::AuditPayload::Template {
+                template_id,
+                change: ourios_core::audit::TemplateChange::Adopted { new_template, .. },
+                ..
+            } = event.payload
+            {
+                adopted_events.push((template_id, new_template));
+            }
+        }
+    }
+    assert!(
+        adopted_events
+            .iter()
+            .any(|(_, template)| template == CONVERGED),
+        "the adopt path audited the drainprocessor's converged template: {adopted_events:?}",
+    );
+
     let mut converged_adoptions = 0usize;
     let mut rendered = Vec::new();
     for f in data_parquet_files(&tmp.path().join("data")) {
@@ -678,13 +716,33 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
             .expect("read records");
         for record in records {
             // RFC 0018: the drainprocessor's annotation is stored
-            // verbatim on every record.
+            // verbatim — checked against the a-priori oracle, not
+            // against the store's own contents.
             let claim = claim_of(&record)
                 .unwrap_or_else(|| panic!("drain annotated every record: {record:?}"));
-            // A converged claim (it carries a wildcard) must have been
-            // adopted: the registry tokens at the row's key render the
-            // claimed string exactly.
-            if claim.contains("<*>") {
+            let ourios_querier::LogBody::Rendered { line, .. } =
+                ourios_querier::render_log_body(&record, &registry)
+            else {
+                panic!("a string body renders to a line");
+            };
+            let line = String::from_utf8(line).expect("utf8 line");
+            // Pre-convergence, drain annotates a line with itself.
+            assert!(
+                claim == CONVERGED || claim == line,
+                "every stored claim is drain's known output for this corpus, \
+                 got {claim:?} (line {line:?})",
+            );
+            // A converged claim was adopted: the audit stream carries
+            // its template_adopted event for this row's id, and the
+            // registry tokens at the row's key render the claim.
+            if claim == CONVERGED {
+                assert!(
+                    adopted_events
+                        .iter()
+                        .any(|(id, _)| *id == record.template_id),
+                    "row {} adopted via the audited adopt path",
+                    record.template_id,
+                );
                 let tokens = registry
                     .get(&(record.template_id, record.template_version))
                     .expect("adopted row's (id, version) resolves in the registry");
@@ -695,12 +753,7 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
                 );
                 converged_adoptions += 1;
             }
-            let ourios_querier::LogBody::Rendered { line, .. } =
-                ourios_querier::render_log_body(&record, &registry)
-            else {
-                panic!("a string body renders to a line");
-            };
-            rendered.push(String::from_utf8(line).expect("utf8 line"));
+            rendered.push(line);
         }
     }
     assert!(

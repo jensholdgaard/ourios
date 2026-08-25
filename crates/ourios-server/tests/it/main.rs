@@ -40,3 +40,4 @@ mod rfc0047_visibility;
 mod rfc0048_4_erasure_cli;
 mod rfc0048_5_backfill;
 mod rfc0048_grammar;
+mod rfc0050_3_served_mixed_stream;

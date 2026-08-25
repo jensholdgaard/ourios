@@ -274,6 +274,10 @@ pub struct ReceiverConfig {
     /// (`receiver.encode_workers`; the config layer validates ≥ 1 and
     /// defaults to the host's available cores).
     pub encode_workers: usize,
+    /// RFC 0050 §3.2 — the miner configuration, carrying the
+    /// upstream-template dial (`miner.*`; defaults are byte-identical
+    /// pre-RFC behaviour).
+    pub miner: MinerConfig,
     /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
     /// graph is configured with a bound conversation object.
     pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
@@ -478,9 +482,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // the record sink and its template events into the audit sink (RFC0014.5 —
     // recovery rebuilds the in-memory buffers the crash dropped; the durability
     // of record is the WAL, never the buffers).
-    let mut miner =
-        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
-            .with_record_sink(Box::new(sink.clone()));
+    let mut miner = MinerCluster::with_audit_sink(config.miner, Box::new(audit_sink.clone()))
+        .with_record_sink(Box::new(sink.clone()));
 
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner)
         .map_err(|e| format!("startup recovery: {e}"))?;
@@ -892,6 +895,7 @@ mod tests {
             auth: AuthResolver::static_only(None),
             graph_emitter: None,
             encode_workers: 2,
+            miner: MinerConfig::default(),
         })
         .await
         .expect("serve");
@@ -924,6 +928,7 @@ mod tests {
             auth: AuthResolver::static_only(None),
             graph_emitter: None,
             encode_workers: 2,
+            miner: MinerConfig::default(),
         })
         .await
         .expect("serve");
@@ -1059,6 +1064,7 @@ mod tests {
             auth: AuthResolver::static_only(None),
             graph_emitter: None,
             encode_workers: 2,
+            miner: MinerConfig::default(),
         })
         .await
         .expect("serve");

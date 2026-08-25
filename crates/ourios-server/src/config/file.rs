@@ -149,6 +149,39 @@ pub struct FileConfig {
     /// enables enforcement (and an empty token list inside it is a startup
     /// error) — see RFC 0026 §3.1.
     pub auth: Option<AuthSection>,
+    /// Upstream-template handling (`miner.*`, RFC 0050 §3.2 — an RFC 0020
+    /// schema extension). Only the RFC 0050 dial is file-configurable; the
+    /// miner's other tunables stay code-default per RFC 0020's deliberate
+    /// exclusion of the miner surface.
+    pub miner: MinerSection,
+}
+
+/// `miner.*` — the RFC 0050 §3.2 upstream-template dial.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MinerSection {
+    /// `ignore` (default) / `observe` / `adopt`.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub upstream_templates: Option<String>,
+    /// UTF-8 byte cap on an inbound `log.record.template` value
+    /// (default `8192`; `0` disables all upstream-template handling).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub upstream_template_byte_limit: Option<String>,
+    /// Per-template bound on stored upstream-string associations
+    /// (default `4`; overflow is counted, not stored).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub upstream_association_limit: Option<String>,
+}
+
+impl MinerSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.upstream_templates, lookup)?;
+        substitute(&mut self.upstream_template_byte_limit, lookup)?;
+        substitute(&mut self.upstream_association_limit, lookup)
+    }
 }
 
 /// `storage.*` — the data + audit store backend selection (RFC 0019 §3.1/§3.2).
@@ -716,6 +749,7 @@ impl FileConfig {
         if let Some(auth) = &mut self.auth {
             auth.substitute(lookup)?;
         }
+        self.miner.substitute(lookup)?;
         Ok(())
     }
 }

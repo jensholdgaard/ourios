@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
+use ourios_config::{MinerConfig, UpstreamTemplates};
 use ourios_ingester::Compactor;
 use ourios_ingester::receiver::tls::TlsSettings;
 
@@ -68,8 +69,9 @@ const DEFAULT_QUERIER_WINDOW_SECS: u64 = 3600;
 /// Nanoseconds per second — the unit the DSL compiler's window is in.
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
-/// Resolved server configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Resolved server configuration. `PartialEq` only — the receiver
+/// params carry the miner's `f32` thresholds.
+#[derive(Debug, Clone, PartialEq)]
 struct ServerConfig {
     /// The data + audit store backend (local or S3, RFC 0019).
     store: StoreConfig,
@@ -113,7 +115,9 @@ struct QuerierParams {
 }
 
 /// Resolved OTLP-receiver-role configuration (RFC 0003 §6.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `PartialEq` only: [`MinerConfig`] carries `f32` thresholds, which
+/// have no total equality.
+#[derive(Debug, Clone, PartialEq)]
 struct ReceiverParams {
     grpc_addr: SocketAddr,
     /// RFC 0030 §3.1 — TLS per listener (config-file only; `None` =
@@ -127,6 +131,10 @@ struct ReceiverParams {
     /// (`receiver.encode_workers` / `OURIOS_RECEIVER_ENCODE_WORKERS`;
     /// default: the host's available cores, validated ≥ 1).
     encode_workers: usize,
+    /// RFC 0050 §3.2 — the upstream-template dial (`miner.*`,
+    /// config-file only; the env path always gets the defaults, whose
+    /// `ignore` mode is byte-identical pre-RFC behaviour).
+    miner: MinerConfig,
 }
 
 /// Resolve [`ServerConfig`] from the environment:
@@ -573,6 +581,11 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
     if let Some(receiver) = config.receiver.as_mut() {
         receiver.grpc_tls = tls_settings("receiver.grpc_tls", &file.receiver.grpc_tls)?;
         receiver.http_tls = tls_settings("receiver.http_tls", &file.receiver.http_tls)?;
+        receiver.miner = build_miner_config(
+            file.miner.upstream_templates.as_deref(),
+            file.miner.upstream_template_byte_limit.as_deref(),
+            file.miner.upstream_association_limit.as_deref(),
+        )?;
     }
     config.querier = build_querier_config(
         file.querier.enabled.as_deref(),
@@ -747,7 +760,54 @@ fn build_receiver_config(
         http_tls: None,
         wal_root,
         encode_workers,
+        miner: MinerConfig::default(),
     }))
+}
+
+/// Pure miner-dial assembly + validation (RFC 0050 §3.2; config-file
+/// only). Absent values take the [`MinerConfig`] defaults — `ignore`
+/// mode, byte limit 8192, association limit 4.
+fn build_miner_config(
+    upstream_templates_raw: Option<&str>,
+    byte_limit_raw: Option<&str>,
+    association_limit_raw: Option<&str>,
+) -> Result<MinerConfig, String> {
+    let mut config = MinerConfig::default();
+    if let Some(raw) = upstream_templates_raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mode = match raw {
+            "ignore" => UpstreamTemplates::Ignore,
+            "observe" => UpstreamTemplates::Observe,
+            "adopt" => UpstreamTemplates::Adopt,
+            other => {
+                return Err(format!(
+                    "miner.upstream_templates must be 'ignore', 'observe' or 'adopt', got {other:?}"
+                ));
+            }
+        };
+        config = config.with_upstream_templates(mode);
+    }
+    if let Some(raw) = byte_limit_raw.map(str::trim).filter(|s| !s.is_empty()) {
+        let limit: u32 = raw.parse().map_err(|_| {
+            format!(
+                "miner.upstream_template_byte_limit must be an integer of UTF-8 bytes \
+                 (0 disables all upstream-template handling), got {raw:?}"
+            )
+        })?;
+        config = config.with_upstream_template_byte_limit(limit);
+    }
+    if let Some(raw) = association_limit_raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let limit: u16 = raw.parse().map_err(|_| {
+            format!("miner.upstream_association_limit must be an integer ≥ 0, got {raw:?}")
+        })?;
+        config = config.with_upstream_association_limit(limit);
+    }
+    Ok(config)
 }
 
 /// Parse the RFC 0035 encode-pool worker count: ≥ 1 when set, else the
@@ -1248,6 +1308,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 promoted: config.promoted.clone(),
                 auth: resolver.clone().expect("resolver built for enabled roles"),
                 encode_workers: params.encode_workers,
+                miner: params.miner,
                 graph_emitter: graph_emitter.clone(),
             })
             .await?;
@@ -1597,6 +1658,104 @@ querier:
             config.querier.expect("enabled").default_window_nanos,
             1800 * NANOS_PER_SEC,
             "the file value wins; the bare env var is ignored",
+        );
+    }
+
+    /// RFC 0050 §3.2 — the `miner.*` section resolves onto the
+    /// receiver's `MinerConfig`, leaving every non-dial tunable at
+    /// its code default.
+    #[test]
+    fn rfc0050_miner_section_resolves_the_dial() {
+        let config = server_config(
+            "\
+storage:
+  local:
+    bucket_root: /store
+receiver:
+  enabled: true
+  wal_root: /wal
+miner:
+  upstream_templates: adopt
+  upstream_template_byte_limit: 4096
+  upstream_association_limit: 2
+",
+        )
+        .expect("valid");
+        let receiver = config.receiver.expect("enabled");
+        assert_eq!(receiver.miner.upstream_templates, UpstreamTemplates::Adopt);
+        assert_eq!(receiver.miner.upstream_template_byte_limit, 4096);
+        assert_eq!(receiver.miner.upstream_association_limit, 2);
+        assert_eq!(
+            receiver.miner.max_templates,
+            MinerConfig::default().max_templates,
+            "non-dial tunables stay at code defaults",
+        );
+    }
+
+    /// RFC 0050 §3.2 — an absent `miner.*` section is the unchanged
+    /// default: `ignore` mode, byte-identical pre-RFC behaviour.
+    #[test]
+    fn rfc0050_miner_section_defaults_to_ignore() {
+        let config = server_config(
+            "\
+storage:
+  local:
+    bucket_root: /store
+receiver:
+  enabled: true
+  wal_root: /wal
+",
+        )
+        .expect("valid");
+        assert_eq!(
+            config.receiver.expect("enabled").miner,
+            MinerConfig::default(),
+        );
+    }
+
+    /// RFC 0050 §3.2 — an unknown mode fails startup loudly, naming
+    /// the YAML key (RFC 0001 §3.2.2: refuse to serve rather than
+    /// degrade silently).
+    #[test]
+    fn rfc0050_miner_mode_rejects_unknown_value() {
+        let err = server_config(
+            "\
+storage:
+  local:
+    bucket_root: /store
+receiver:
+  enabled: true
+  wal_root: /wal
+miner:
+  upstream_templates: maybe
+",
+        )
+        .expect_err("unknown mode must fail");
+        assert!(err.contains("miner.upstream_templates"), "{err}");
+    }
+
+    /// RFC 0020 §3.3 — the miner dial rides `${env:…}` substitution
+    /// like every other scalar leaf.
+    #[test]
+    fn rfc0050_miner_mode_rides_env_substitution() {
+        let yaml = "\
+storage:
+  local:
+    bucket_root: /store
+receiver:
+  enabled: true
+  wal_root: /wal
+miner:
+  upstream_templates: ${env:OURIOS_TEST_MODE}
+";
+        let file = parse(yaml, &|name| {
+            (name == "OURIOS_TEST_MODE").then(|| "observe".to_owned())
+        })
+        .expect("valid");
+        let config = server_config_from_file(&file).expect("valid");
+        assert_eq!(
+            config.receiver.expect("enabled").miner.upstream_templates,
+            UpstreamTemplates::Observe,
         );
     }
 

@@ -11,10 +11,13 @@ superseded-by: —
 
 # RFC 0021 — Coordinated DataFusion / Arrow upgrade, phased behind upstream
 
-> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
-> the completed-backlog batch flip. Where a thesis-gate applies it
-> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
-> vacuous for this surface (RFC 0008 precedent).
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Covers the
+> shipped **phase 1** scope (RFC0021.1–.6, the ladder this RFC ran).
+> Not unconditionally terminal: §5's own lifecycle reopens the RFC —
+> phase 2 lands `.7`–`.9` as red stubs and moves the status back to
+> `red` — when a DataFusion release accepts object_store 0.14 /
+> parquet 59. That reopening trigger is upstream-gated future work,
+> not an unresolved pre-`accepted` gate.
 
 ## 1. Summary
 

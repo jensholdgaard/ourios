@@ -557,6 +557,10 @@ concurrency).
 > RFC0003.16 — the end-to-end *served-binary* contract, which
 > the §9 *Receiver process model* resolution settles — and
 > re-enters the ladder at `specified` until RFC0003.16 lands.
+> *(Discharged: RFC0003.16 landed — the served-binary suite lives
+> at `crates/ourios-server/tests/it/rfc0003_16_served_binary.rs`
+> and all sixteen scenarios run green — so the ladder returned to
+> `green`, which is what the 2026-08-25 `accepted` flip stands on.)*
 
 > **Scenario RFC0003.16 — Served binary: both transports bind, a client export round-trips, graceful shutdown `[§3.4]`**
 > - **Given** `ourios-server` started with the receiver role

@@ -1,7 +1,7 @@
 ---
 rfc: 0037
 title: GenAI / structured-event log handling
-status: accepted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-22
@@ -11,11 +11,6 @@ superseded-by: —
 
 # RFC 0037 — GenAI / structured-event log handling
 
-> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
-> the completed-backlog batch flip. Where a thesis-gate applies it
-> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
-> vacuous for this surface (RFC 0008 precedent).
->
 > **Status: `green` (2026-07-23).** All five §5 acceptance scenarios pass.
 > Implementation landed in three slices — §3.1 event-keyed templates (#599),
 > §3.2 fidelity + `structured_body_bytes` observability (#600), §3.3

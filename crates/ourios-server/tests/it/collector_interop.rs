@@ -520,7 +520,8 @@ const DRAIN_LINES: &[&str] = &[
 ///   render exactly the claimed string (RFC0050.2, real source);
 /// - every body reconstructs byte-identically (RFC0050.4 —
 ///   adoption is alignment-gated).
-#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear end-to-end scenario, like the sibling
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Docker (real otelcol-contrib container); run by the collector-interop CI job via --ignored"]
 async fn drainprocessor_annotates_and_ourios_adopts() {
     use testcontainers_modules::testcontainers::core::Host;

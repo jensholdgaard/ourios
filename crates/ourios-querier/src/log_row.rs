@@ -106,23 +106,25 @@ impl LogRow {
     }
 
     /// Materialise a result set: like [`LogRow::from_record`] per
-    /// row, but each distinct `(template_id, template_version)` is
-    /// looked up and its string formatted **once** — the read hot
-    /// path over large results is dominated by rows sharing few
-    /// templates (pillar 2's whole premise).
+    /// row, but the registry lookup **and** the string formatting
+    /// run once per distinct `(template_id, template_version)` —
+    /// the read hot path over large results is dominated by rows
+    /// sharing few templates (pillar 2's whole premise). Each row
+    /// still clones the memoised string; the string is Ourios's own
+    /// response field, so sharing it further would leak an `Arc`
+    /// into the RFC0017.7 engine-free surface for no measured win.
     #[must_use]
     pub fn from_records(records: &[MinedRecord], registry: &TemplateRegistry) -> Vec<Self> {
-        let mut strings: HashMap<(u64, u32), Option<String>> = HashMap::new();
+        let mut memo: HashMap<(u64, u32), (Option<&[OwnedToken]>, Option<String>)> = HashMap::new();
         records
             .iter()
             .map(|record| {
                 let key = (record.template_id, record.template_version);
-                let tokens = registry.get(&key).map(Vec::as_slice);
-                let template = strings
-                    .entry(key)
-                    .or_insert_with(|| tokens.map(format_template))
-                    .clone();
-                Self::build(record, tokens, template)
+                let (tokens, template) = memo.entry(key).or_insert_with(|| {
+                    let tokens = registry.get(&key).map(Vec::as_slice);
+                    (tokens, tokens.map(format_template))
+                });
+                Self::build(record, *tokens, template.clone())
             })
             .collect()
     }
@@ -388,5 +390,41 @@ mod tests {
                 reconstruction: Reconstruction::RetainedVerbatim,
             },
         );
+    }
+
+    /// RFC0050.8 — the batch constructor is behaviourally identical
+    /// to the per-row one, for resolved and unresolvable pairs
+    /// alike; the memo changes cost, never output.
+    #[test]
+    fn from_records_matches_from_record_per_row() {
+        use super::LogRow;
+
+        let mut registry = TemplateRegistry::default();
+        registry.insert(
+            (1, 1),
+            vec![OwnedToken::Fixed("user".to_string()), OwnedToken::Wildcard],
+        );
+        let mut resolved = record(BodyKind::String);
+        resolved.template_id = 1;
+        resolved.template_version = 1;
+        resolved.body = Some("user 42".to_string());
+        let mut unresolvable = record(BodyKind::String);
+        unresolvable.template_id = 9;
+        unresolvable.body = Some("orphan row".to_string());
+
+        let records = [resolved.clone(), unresolvable.clone(), resolved];
+        let batch = LogRow::from_records(&records, &registry);
+        let singles: Vec<LogRow> = records
+            .iter()
+            .map(|r| LogRow::from_record(r, &registry))
+            .collect();
+
+        assert_eq!(batch, singles);
+        assert_eq!(batch[0].template.as_deref(), Some("user <*>"));
+        assert_eq!(
+            batch[1].template, None,
+            "unresolvable pair yields no string"
+        );
+        assert_eq!(batch[2].template.as_deref(), Some("user <*>"));
     }
 }

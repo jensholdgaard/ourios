@@ -1228,6 +1228,38 @@ mod tests {
         );
     }
 
+    /// RFC 0050 §3.6 / RFC0050.8: the DTO carries the template
+    /// string beside the id when the registry resolves the pair,
+    /// and omits the key entirely when it cannot — a missing
+    /// field, never `null` or `""`.
+    #[test]
+    fn template_string_present_when_resolved_omitted_when_not() {
+        use ourios_miner::tree::OwnedToken;
+        use ourios_querier::{LogRow, TemplateRegistry};
+
+        let mut registry = TemplateRegistry::default();
+        registry.insert(
+            (7, 1),
+            vec![OwnedToken::Fixed("user".to_string()), OwnedToken::Wildcard],
+        );
+
+        let mut resolved = test_record();
+        resolved.template_id = 7;
+        resolved.template_version = 1;
+        let row = LogRow::from_record(&resolved, &registry);
+        let json = serde_json::to_value(LogRowDto::from(&row)).expect("serialize");
+        assert_eq!(json["template"], "user <*>");
+
+        // (0, 0) is not in the registry.
+        let row = LogRow::from_record(&test_record(), &registry);
+        let json = serde_json::to_value(LogRowDto::from(&row)).expect("serialize");
+        assert!(
+            json.as_object()
+                .is_some_and(|o| !o.contains_key("template")),
+            "an unresolvable pair must omit the key: {json}",
+        );
+    }
+
     /// A minimal record for the DTO tests above.
     fn test_record() -> ourios_core::record::MinedRecord {
         ourios_core::record::MinedRecord {

@@ -1,7 +1,7 @@
 ---
 rfc: 0014
 title: Ingest write path — record sink and flush policy
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-17
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0014 — Ingest write path: record sink and flush policy
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status note.** **`green`** (2026-06-17; `red`/`specified` same day). The
 > conspicuous gap in the ingest stack is closed: the miner (RFC 0001) emits
 > each mined `MinedRecord` into a `RecordSink`, and **production formerly wired

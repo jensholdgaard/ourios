@@ -1,7 +1,7 @@
 ---
 rfc: 0016
 title: Query-serving endpoint — the HTTP query API over the logs DSL
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-19
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0016 — Query-serving endpoint: the HTTP query API over the logs DSL
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status note.** **`green`** (2026-06-22; `red` 2026-06-19). All seven §5
 > scenarios pass. The querier role is wired into `ourios-server` as an
 > env-gated HTTP endpoint (`POST /v1/query`) over the RFC 0007 engine,

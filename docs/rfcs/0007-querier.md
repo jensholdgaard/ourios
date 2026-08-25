@@ -1,7 +1,7 @@
 ---
 rfc: 0007
 title: Querier — DataFusion execution frontend for the logs DSL
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-01
@@ -11,6 +11,9 @@ superseded-by: —
 
 # RFC 0007 — Querier: DataFusion execution frontend for the logs DSL
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip; thesis-gates passed at `validated`.
+>
 > **Status note.** **`validated`** (2026-06-12, per the maintainer's
 > authorization of the same date). The `docs/verification.md` §3
 > ladder requires for `validated` that *"every thesis-gate in

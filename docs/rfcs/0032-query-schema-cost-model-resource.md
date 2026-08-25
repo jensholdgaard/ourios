@@ -1,7 +1,7 @@
 ---
 rfc: 0032
 title: Query-schema and cost-model resource for the MCP surface (RFC 0027 amendment)
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-13
@@ -10,6 +10,11 @@ superseded-by: —
 ---
 
 # RFC 0032 — Query-schema and cost-model resource for the MCP surface
+
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
 
 ## 1. Summary
 

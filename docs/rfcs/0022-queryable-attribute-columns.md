@@ -1,7 +1,7 @@
 ---
 rfc: 0022
 title: Queryable attribute columns (RFC 0005 amendment)
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-03
@@ -11,6 +11,9 @@ superseded-by: —
 
 # RFC 0022 — Queryable attribute columns (RFC 0005 amendment)
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip; thesis-gates passed at `validated`.
+>
 > **Status note.** **`validated`** (2026-07-18) — the RFC0022.5
 > no-regression contract holds on both rungs of the bench ladder:
 > `benchmarks.md` §9.9 (indicative `ci-runner`, git `6e3301b` — the

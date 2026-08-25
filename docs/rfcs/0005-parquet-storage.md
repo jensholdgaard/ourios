@@ -1,7 +1,7 @@
 ---
 rfc: 0005
 title: Parquet storage — schema, writer, reader, audit stream
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-19
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0005 — Parquet storage: schema, writer, reader, audit stream
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status note.** **`green`** (2026-06-15) — every RFC0005 §5 acceptance
 > criterion has a live, passing test. The prior `drafted` label was stale:
 > the storage layer (schema, writer, reader, audit stream) landed early

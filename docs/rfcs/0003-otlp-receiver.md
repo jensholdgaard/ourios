@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: OTLP receiver — gRPC and HTTP wire endpoints for OpenTelemetry log ingest
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-13
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0003 — OTLP receiver
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **How to read this document.** Sections §§1–4 are the design
 > contract — the *what* and the *why*. §5 lists the normative
 > `Given / When / Then` scenarios — the contract the receiver

@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Bench harness — A1 / C1 / C2 thesis-gate measurement
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-22
@@ -10,6 +10,11 @@ superseded-by: —
 ---
 
 # RFC 0006 — Bench harness: A1 / C1 / C2 thesis-gate measurement
+
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
 
 ## 1. Summary
 

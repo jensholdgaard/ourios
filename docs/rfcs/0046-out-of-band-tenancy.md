@@ -1,7 +1,7 @@
 ---
 rfc: 0046
 title: Out-of-band tenancy — the credential names the tenant, the data never does
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-17
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0046 — Out-of-band tenancy
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status: `green` (2026-08-17).** All eleven §5 criteria pass, landed in
 > one implementation PR (#702) the same day as the spec (#699): the
 > `0x03 TenantOtlpBatch` frame + codec (`ourios-wal`); the selector,

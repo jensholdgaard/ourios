@@ -32,7 +32,7 @@ use tokio::time::timeout;
 
 /// The current wall clock in unix nanos — a fixture timestamp that
 /// always falls inside the query's `-365d` look-back, whatever year
-/// the test runs in (the rfc0016_5_7 fixture pattern).
+/// the test runs in (the `rfc0016_5_7` fixture pattern).
 fn now_ns() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

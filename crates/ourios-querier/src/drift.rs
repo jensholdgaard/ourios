@@ -309,10 +309,10 @@ async fn adopted_template_ids(
         .map_err(storage_err)?;
     let mut out = std::collections::HashSet::new();
     for batch in &batches {
-        let ids = u64_column(batch, audit_columns::TEMPLATE_ID)?;
-        for i in 0..ids.len() {
-            if !ids.is_null(i) {
-                out.insert(ids.value(i));
+        let column = u64_column(batch, audit_columns::TEMPLATE_ID)?;
+        for i in 0..column.len() {
+            if !column.is_null(i) {
+                out.insert(column.value(i));
             }
         }
     }
@@ -542,5 +542,62 @@ mod tests {
             rows[1].provenance,
             ProvenanceSet::singleton(Provenance::Mined).insert(Provenance::UpstreamDerived),
         );
+    }
+
+    mod apply_adoptions_property {
+        use std::collections::HashSet;
+        use std::time::UNIX_EPOCH;
+
+        use ourios_core::audit::{Provenance, ProvenanceSet};
+        use proptest::prelude::*;
+
+        use crate::DriftRow;
+
+        fn provenance() -> impl Strategy<Value = ProvenanceSet> {
+            prop_oneof![
+                Just(ProvenanceSet::singleton(Provenance::Mined)),
+                Just(ProvenanceSet::singleton(Provenance::UpstreamDerived)),
+                Just(
+                    ProvenanceSet::singleton(Provenance::Mined).insert(Provenance::UpstreamDerived)
+                ),
+            ]
+        }
+
+        proptest! {
+            // The §3.3 set-union invariant: a matched row's set gains
+            // exactly `upstream_derived` (idempotently), an unmatched
+            // row's set is untouched — for any ids and any starting
+            // provenance.
+            #[test]
+            fn matched_rows_union_unmatched_rows_hold(
+                rows in prop::collection::vec((0_u64..16, provenance()), 0..12),
+                adopted in prop::collection::hash_set(0_u64..16, 0..12),
+            ) {
+                let mut applied: Vec<DriftRow> = rows
+                    .iter()
+                    .map(|(id, p)| DriftRow {
+                        template_id: *id,
+                        widening_count: 1,
+                        min_old_version: 1,
+                        max_new_version: 2,
+                        first_seen: UNIX_EPOCH,
+                        last_seen: UNIX_EPOCH,
+                        provenance: *p,
+                    })
+                    .collect();
+                let adopted: HashSet<u64> = adopted;
+
+                super::super::apply_adoptions(&mut applied, &adopted);
+
+                for ((id, before), after) in rows.iter().zip(&applied) {
+                    let expected = if adopted.contains(id) {
+                        before.insert(Provenance::UpstreamDerived)
+                    } else {
+                        *before
+                    };
+                    prop_assert_eq!(after.provenance, expected);
+                }
+            }
+        }
     }
 }

@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.9.0] - 2026-08-25
+
+### Added
+
+- Rfc 0050 slice 6a — drift query reports the provenance set (#735) (b0c24dd)
+- Rfc 0050 slice 5 — vocabulary pair: registry entries + read-path template string (#734) (b268808)
+- Rfc 0050 slice 4 — miner.* config section reaches the receiver (#733) (5cf3457)
+- Rfc 0050 slice 3 — ignore/observe/adopt modes, template_adopted audit, processed counter (#731) (d8694e2)
+- Rfc 0050 slices 1+2 — upstream grammar/alignment + provenance and associations (#730) (ce9d10c)
+
+### Chore
+
+- Update gcr.io/distroless/static-debian12 docker digest to d75cdd7 (#728) (6770c28)
+- Update gcr.io/distroless/cc-debian12 docker digest to e5d81dd (#727) (be6b7be)
+
+### Documentation
+
+- Resolve rfc 0010's §9 gate (accepted); rfc 0002 readability sheet (#742) (be2ba96)
+- Flip the completed backlog to accepted (maintainer sign-off) (#741) (32c8046)
+- Rfc 0050 upstream-derived templates — green (#739) (95c0e14)
+- Rfc 0050 — rejections ride a dedicated processed counter, not parse_failures (#732) (84162c3)
+- Rfc 0050 — accept upstream-derived templates; align on log.record.template (#729) (77e947d)
+
+### Tests
+
+- Rfc 0050 — full-record equivalence for .1; counter assertions for .5 (#740) (e57fbe7)
+- Rfc 0050 — close the two §5 coverage gaps (RFC0050.1, RFC0050.6 alias) (#738) (5b4e191)
+- Rfc 0050 — real drainprocessor pass through the interop harness (#737) (5f7e4b5)
+- Rfc 0050 — mixed-stream scenario through the served binary (RFC0050.3) (#736) (b86b2f1)
+
 ## [0.8.0] - 2026-08-23
 
 ### Added

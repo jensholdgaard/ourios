@@ -78,6 +78,37 @@ pub struct SnapshotState {
     /// recovery path the driver replays only the WAL tail above
     /// this mark (RFC 0008 §6.7 offset-resume).
     pub wal_high_water: Option<WalHighWater>,
+    /// RFC 0050 §3.3 adopted-template map entries.
+    /// `#[serde(default)]` — absent in pre-RFC snapshots, which had
+    /// no adopted templates. No `SNAPSHOT_VERSION` bump (additive).
+    #[serde(default)]
+    pub adopted_templates: Vec<AdoptedTemplateRecord>,
+}
+
+/// Serialisable mirror of one adopted-template map entry
+/// (RFC 0050 §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptedTemplateRecord {
+    /// Canonical template shape — the map key's template half.
+    pub canonical: String,
+    pub severity_number: u8,
+    pub scope_name: Option<String>,
+    pub template_id: u64,
+    pub template_version: u32,
+    /// `true` = adoption-interned (owns its id, no tree leaf,
+    /// counted against the RFC 0023 ceiling); `false` = rides a
+    /// tree leaf, whose own `LeafRecord` carries the provenance.
+    pub owned: bool,
+    /// Owned entries only. Written non-empty by this version; an
+    /// empty list on an owned entry restores as
+    /// `{UpstreamDerived}` — the only origin an owned entry can
+    /// have without ever having converged.
+    #[serde(default)]
+    pub provenance: Vec<ProvenanceRecord>,
+    #[serde(default)]
+    pub upstream_associations: Vec<String>,
+    #[serde(default)]
+    pub upstream_association_overflow: u64,
 }
 
 /// Serialisable mirror of one tree [`crate::tree::Leaf`]. Carries
@@ -463,6 +494,17 @@ mod tests {
                 segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
                 byte: 4096,
             }),
+            adopted_templates: vec![AdoptedTemplateRecord {
+                canonical: "copy <*> done".to_string(),
+                severity_number: 9,
+                scope_name: None,
+                template_id: 4,
+                template_version: 1,
+                owned: true,
+                provenance: vec![ProvenanceRecord::UpstreamDerived],
+                upstream_associations: vec!["copy <file> done".to_string()],
+                upstream_association_overflow: 1,
+            }],
         }
     }
 

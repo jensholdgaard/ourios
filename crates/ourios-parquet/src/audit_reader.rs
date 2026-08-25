@@ -44,8 +44,8 @@ use crate::audit_columns;
 use crate::audit_record_batch::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
     EVENT_KIND_CONVERSATION_ERASED, EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED,
-    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
-    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_KIND_TEMPLATE_ADOPTED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
+    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
 use crate::partition::PartitionKey;
@@ -358,7 +358,8 @@ fn batch_to_audit_events(
             EVENT_KIND_TEMPLATE_CREATED
             | EVENT_KIND_TEMPLATE_WIDENED
             | EVENT_KIND_TEMPLATE_TYPE_EXPANDED
-            | EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE => {
+            | EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE
+            | EVENT_KIND_TEMPLATE_ADOPTED => {
                 let cols = TemplateColumns {
                     event_kind: event_kind[i],
                     old_version: &old_version,
@@ -369,17 +370,12 @@ fn batch_to_audit_events(
                     slots_expanded: &slots_expanded_lists,
                     reason: &reason,
                 };
-                AuditPayload::Template {
-                    template_id: require_at(&template_id, i, audit_columns::TEMPLATE_ID, file_row)?,
-                    triggering_line_hash: require_at(
-                        &triggering_line_hash,
-                        i,
-                        audit_columns::TRIGGERING_LINE_HASH,
-                        file_row,
-                    )?,
-                    triggering_line_sample: triggering_line_sample.get(i).and_then(Clone::clone),
-                    change: decode_template_change(&cols, i, file_row)?,
-                }
+                let envelope = TemplateEnvelopeColumns {
+                    template_id: &template_id,
+                    triggering_line_hash: &triggering_line_hash,
+                    triggering_line_sample: &triggering_line_sample,
+                };
+                decode_template_payload(&cols, &envelope, i, file_row)?
             }
             EVENT_KIND_COMPACTION => {
                 let cols = CompactionColumns {
@@ -426,6 +422,41 @@ fn batch_to_audit_events(
     }
 
     Ok(events)
+}
+
+/// Borrowed envelope columns shared by every template event kind.
+struct TemplateEnvelopeColumns<'a> {
+    template_id: &'a [Option<u64>],
+    triggering_line_hash: &'a [Option<[u8; 16]>],
+    triggering_line_sample: &'a [Option<String>],
+}
+
+/// Decode one template-kind row into its [`AuditPayload::Template`].
+fn decode_template_payload(
+    cols: &TemplateColumns,
+    envelope: &TemplateEnvelopeColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    Ok(AuditPayload::Template {
+        template_id: require_at(
+            envelope.template_id,
+            i,
+            audit_columns::TEMPLATE_ID,
+            file_row,
+        )?,
+        triggering_line_hash: require_at(
+            envelope.triggering_line_hash,
+            i,
+            audit_columns::TRIGGERING_LINE_HASH,
+            file_row,
+        )?,
+        triggering_line_sample: envelope
+            .triggering_line_sample
+            .get(i)
+            .and_then(Clone::clone),
+        change: decode_template_change(cols, i, file_row)?,
+    })
 }
 
 /// Borrowed per-column slices the template-change decoder reads.
@@ -683,6 +714,22 @@ fn decode_template_change(
     // into it — the v1 contract is structural, not a decoded value.
     if cols.event_kind == EVENT_KIND_TEMPLATE_CREATED {
         return Ok(TemplateChange::Created {
+            new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
+        });
+    }
+
+    // Adoption mirrors creation's NULL `old_*` shape (RFC 0050 §3.3)
+    // but, unlike creation, reads `new_version` back: the version the
+    // adoption bound to is a decoded value (1 for adoption-interned
+    // templates, the matched leaf version otherwise), not structural.
+    if cols.event_kind == EVENT_KIND_TEMPLATE_ADOPTED {
+        return Ok(TemplateChange::Adopted {
+            template_version: require_at(
+                cols.new_version,
+                i,
+                audit_columns::NEW_VERSION,
+                file_row,
+            )?,
             new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
         });
     }

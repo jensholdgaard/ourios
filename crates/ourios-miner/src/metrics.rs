@@ -326,6 +326,7 @@ pub(crate) struct MinerMetrics {
     state: Arc<Mutex<MinerMetricsState>>,
     merges_total: Counter<u64>,
     parse_failures_total: Counter<u64>,
+    upstream_template_processed: Counter<u64>,
     params_overflow_total: Counter<u64>,
     template_version_changes_total: Counter<u64>,
     confidence: Histogram<f64>,
@@ -368,6 +369,10 @@ impl MinerMetrics {
             .u64_counter(semconv::OURIOS_MINER_PARSE_FAILURES)
             .with_unit("{failure}")
             .build();
+        let upstream_template_processed = meter
+            .u64_counter(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED)
+            .with_unit("{log_record}")
+            .build();
         let params_overflow_total = meter
             .u64_counter(semconv::OURIOS_MINER_PARAMS_OVERFLOW)
             .with_unit("{overflow}")
@@ -396,6 +401,7 @@ impl MinerMetrics {
             state,
             merges_total,
             parse_failures_total,
+            upstream_template_processed,
             params_overflow_total,
             template_version_changes_total,
             confidence,
@@ -630,6 +636,37 @@ impl MinerMetrics {
             reason,
         ));
         self.parse_failures_total.add(1, &attrs);
+    }
+
+    /// Record one upstream-template handling outcome (RFC 0050,
+    /// `ourios.miner.upstream_template.processed`). The `OTel`
+    /// processor `.processed` shape: one counter for successes and
+    /// failures, `error.type` present only on rejection —
+    /// `error_type: None` means the string was associated
+    /// (`observe`) or adopted (`adopt`); `Some(cause)` means it was
+    /// rejected (`byte_limit`, `grammar`, `alignment`,
+    /// `template_ceiling`) and the record was mined instead.
+    pub(crate) fn record_upstream_template_processed(
+        &self,
+        tenant: &TenantId,
+        service: Option<&str>,
+        error_type: Option<&'static str>,
+    ) {
+        const ERROR_TYPE: &str = "error.type";
+        let mut attrs = Vec::with_capacity(
+            1 + usize::from(service.is_some()) + usize::from(error_type.is_some()),
+        );
+        attrs.push(KeyValue::new(
+            semconv::OURIOS_TENANT,
+            tenant.as_str().to_owned(),
+        ));
+        if let Some(name) = service {
+            attrs.push(KeyValue::new(semconv::OURIOS_SERVICE, name.to_owned()));
+        }
+        if let Some(cause) = error_type {
+            attrs.push(KeyValue::new(ERROR_TYPE, cause));
+        }
+        self.upstream_template_processed.add(1, &attrs);
     }
 
     /// Record one body-retention event for the

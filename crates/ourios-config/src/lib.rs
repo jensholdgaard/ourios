@@ -46,6 +46,9 @@ use std::fmt;
 /// | [`max_node_children`](Self::max_node_children) | `100` | `1..` | §3.2 — bounds tree width (RFC 0023 §3.1) |
 /// | [`max_templates`](Self::max_templates) | `20_000` | `1..` | §3.2 — bounds tree size; overflow goes parse-failure, never merge (RFC 0023 §3.1) |
 /// | [`max_line_tokens`](Self::max_line_tokens) | `512` | `1..` | §3.2 — bounds stored-template width (RFC 0023 §3.1) |
+/// | [`upstream_templates`](Self::upstream_templates) | `ignore` | `ignore` \| `observe` \| `adopt` | §3.1 — every rejection falls back to mining, never force-adopts (RFC 0050 §3.2) |
+/// | [`upstream_template_byte_limit`](Self::upstream_template_byte_limit) | `8192` | `0..` (`0` disables) | §3.2 — bounds inbound-attribute work (RFC 0050 §3.2) |
+/// | [`upstream_association_limit`](Self::upstream_association_limit) | `4` | `0..` | §3.2 — bounds stored associations, overflow counted (RFC 0050 §3.2) |
 ///
 /// The struct is `Clone + Copy + 'static`, so the cluster can
 /// hold a default and a per-tenant override map without
@@ -135,6 +138,43 @@ pub struct MinerConfig {
     /// every accepted line inside the RFC 0001 §6.4 `u16` audit
     /// position width.
     pub max_line_tokens: u16,
+
+    /// RFC 0050 §3.2 — how the miner treats a record's
+    /// `log.record.template` attribute. Default
+    /// [`UpstreamTemplates::Ignore`], and the default must stay
+    /// that way: adopting silently would change every
+    /// `template_id` in a live store (RFC 0050 §3.2).
+    pub upstream_templates: UpstreamTemplates,
+
+    /// RFC 0050 §3.2 — UTF-8 byte cap on an inbound
+    /// `log.record.template` value, enforced **before** any
+    /// tokenisation or alignment so no work is proportional to an
+    /// unbounded attribute. Default `8192`. `0` disables all
+    /// upstream-template handling (observe and adopt alike).
+    /// Sits inside `CLAUDE.md` §3.2's cardinality invariant, same
+    /// as [`param_byte_limit`][Self::param_byte_limit].
+    pub upstream_template_byte_limit: u32,
+
+    /// RFC 0050 §3.2 `observe` — per-template bound on stored
+    /// upstream-string associations. Default `4`; observations
+    /// past the bound are counted, not stored (a template
+    /// attracting many distinct upstream strings is a cardinality
+    /// signal, not data worth keeping).
+    pub upstream_association_limit: u16,
+}
+
+/// RFC 0050 §3.2 — the three-mode dial for upstream-provided
+/// templates. `Ignore` is today's behaviour byte for byte;
+/// `Observe` mines as usual and records the upstream string on the
+/// mined template's registry entry; `Adopt` takes a usable
+/// upstream template as the record's template instead of mining
+/// the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamTemplates {
+    #[default]
+    Ignore,
+    Observe,
+    Adopt,
 }
 
 /// Per-`CLAUDE.md` §3.2: the project ceiling on configurable
@@ -236,6 +276,9 @@ impl Default for MinerConfig {
             max_node_children: 100,
             max_templates: 20_000,
             max_line_tokens: 512,
+            upstream_templates: UpstreamTemplates::Ignore,
+            upstream_template_byte_limit: 8192,
+            upstream_association_limit: 4,
         }
     }
 }
@@ -311,12 +354,16 @@ impl MinerConfig {
             similarity_floor: floor,
             param_byte_limit: byte_limit,
             // Picks up `MinerConfig::default()`'s prefix_depth (2,
-            // per the Drain paper) and the RFC 0023 bounds.
+            // per the Drain paper), the RFC 0023 bounds, and the
+            // RFC 0050 upstream-template dial.
             // Override with the `with_*` builders.
             prefix_depth: Self::default().prefix_depth,
             max_node_children: Self::default().max_node_children,
             max_templates: Self::default().max_templates,
             max_line_tokens: Self::default().max_line_tokens,
+            upstream_templates: Self::default().upstream_templates,
+            upstream_template_byte_limit: Self::default().upstream_template_byte_limit,
+            upstream_association_limit: Self::default().upstream_association_limit,
         })
     }
 
@@ -379,5 +426,36 @@ impl MinerConfig {
         }
         self.max_line_tokens = cap;
         Ok(self)
+    }
+
+    /// Return a copy of `self` with
+    /// [`upstream_templates`][Self::upstream_templates] replaced
+    /// (RFC 0050 §3.2). Infallible — every mode is valid.
+    #[must_use]
+    pub fn with_upstream_templates(mut self, mode: UpstreamTemplates) -> Self {
+        self.upstream_templates = mode;
+        self
+    }
+
+    /// Return a copy of `self` with
+    /// [`upstream_template_byte_limit`][Self::upstream_template_byte_limit]
+    /// replaced (RFC 0050 §3.2). Infallible — `0` is the documented
+    /// "disable all upstream-template handling" value, and there is
+    /// no upper ceiling: the cap bounds work done on an *inbound*
+    /// attribute, not stored bytes.
+    #[must_use]
+    pub fn with_upstream_template_byte_limit(mut self, limit: u32) -> Self {
+        self.upstream_template_byte_limit = limit;
+        self
+    }
+
+    /// Return a copy of `self` with
+    /// [`upstream_association_limit`][Self::upstream_association_limit]
+    /// replaced (RFC 0050 §3.2). Infallible — `0` stores nothing
+    /// and counts every observation, a valid (if blunt) setting.
+    #[must_use]
+    pub fn with_upstream_association_limit(mut self, limit: u16) -> Self {
+        self.upstream_association_limit = limit;
+        self
     }
 }

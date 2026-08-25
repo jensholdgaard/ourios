@@ -179,5 +179,15 @@ fn rfc0004_3_no_invariant_breaking_field_exists_on_miner_config() {
         max_node_children: _,
         max_templates: _,
         max_line_tokens: _,
+        // RFC 0050 §3.2 upstream-template dial — tunables *inside*
+        // the invariants: `ignore` is the default (byte-identical
+        // to pre-RFC behaviour), every rejection falls back to
+        // mining (never drops data, never force-adopts), the byte
+        // limit bounds inbound-attribute work (§3.2 cardinality)
+        // and the association limit bounds stored strings with
+        // counted overflow.
+        upstream_templates: _,
+        upstream_template_byte_limit: _,
+        upstream_association_limit: _,
     } = cfg;
 }

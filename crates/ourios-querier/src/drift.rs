@@ -205,6 +205,9 @@ pub(crate) async fn run_drift(
         stats.row_groups_scanned += adoption_stats.row_groups_scanned;
         stats.row_groups_pruned += adoption_stats.row_groups_pruned;
         stats.bytes_read += adoption_stats.bytes_read;
+        // Always zero from a plain scan today; folded so the
+        // accounting stays complete if it ever isn't.
+        stats.rows_excluded += adoption_stats.rows_excluded;
         for row in &mut rows {
             if adopted.contains(&row.template_id) {
                 row.provenance = row.provenance.insert(Provenance::UpstreamDerived);

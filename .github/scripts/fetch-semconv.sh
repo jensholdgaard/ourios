@@ -26,5 +26,11 @@ if [ ! -d "$dest/registry" ]; then
     rm -rf "$dest"
     git clone --quiet --depth 1 --branch "$ref" \
         https://github.com/jensholdgaard/ourios-semconv.git "$dest" >&2
+else
+    # A reused checkout re-syncs to the pin's current remote state, so
+    # a branch-name pin can never serve a stale cache (a tag re-fetch
+    # is a cheap no-op).
+    git -C "$dest" fetch --quiet --depth 1 origin "$ref" >&2
+    git -C "$dest" reset --quiet --hard FETCH_HEAD >&2
 fi
 echo "$dest"

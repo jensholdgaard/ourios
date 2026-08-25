@@ -319,15 +319,22 @@ jobs:
           echo "${WEAVER_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/weaver-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
-      - run: weaver registry check -r semconv/registry --future
+      # The registry lives in the shared ourios-semconv repo; every
+      # weaver invocation resolves it at the ref pinned in
+      # semconv/REGISTRY_REF via the shared fetch helper.
+      - name: Fetch the pinned semconv registry
+        id: semconv
+        run: echo "dir=$(.github/scripts/fetch-semconv.sh)" >> "$GITHUB_OUTPUT"
+      - run: weaver registry check -r "${{ steps.semconv.outputs.dir }}/registry" --future
       # Codegen no-diff: regenerate the ourios-semconv constants from the
-      # registry and fail if the checked-in file drifts (the generated
-      # module is "do not hand-edit"; the registry is the source).
+      # pinned registry and fail if the checked-in file drifts (the
+      # generated module is "do not hand-edit"; the registry is the source).
       - name: Regenerate ourios-semconv constants
         run: |
           set -euo pipefail
           weaver registry generate rust crates/ourios-semconv/src \
-            -t templates -r semconv/registry --future
+            -t "${{ steps.semconv.outputs.dir }}/templates" \
+            -r "${{ steps.semconv.outputs.dir }}/registry" --future
           cargo fmt -p ourios-semconv
       - name: Verify generated constants are in sync
         # `git status --porcelain` (not `git diff`) so the guard also
@@ -337,7 +344,7 @@ jobs:
           set -euo pipefail
           changes="$(git status --porcelain -- crates/ourios-semconv/src)"
           if [ -n "$changes" ]; then
-            echo "::error::ourios-semconv is out of sync with semconv/registry/. Regenerate (see the crate header) and commit."
+            echo "::error::ourios-semconv is out of sync with the pinned registry (semconv/REGISTRY_REF). Regenerate (see the crate header) and commit."
             echo "$changes"
             git diff -- crates/ourios-semconv/src
             exit 1
@@ -453,6 +460,9 @@ jobs:
           tar xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/weaver-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
       - run: cargo build -p ourios-server
+      - name: Fetch the pinned semconv registry
+        id: semconv
+        run: echo "dir=$(.github/scripts/fetch-semconv.sh)" >> "$GITHUB_OUTPUT"
       - name: Live-check the emitted telemetry
         run: |
           set -euo pipefail
@@ -468,7 +478,7 @@ jobs:
           # backstop (a short one could expire during a slow startup's
           # quiet period and end the session before the shutdown flush —
           # a false pass).
-          weaver registry live-check -r semconv/registry --future \
+          weaver registry live-check -r "${{ steps.semconv.outputs.dir }}/registry" --future \
             --include-unreferenced \
             --otlp-grpc-port 24317 --admin-port 24320 \
             --inactivity-timeout 120 \
@@ -595,7 +605,7 @@ jobs:
                 and ((.context.deprecation_note // "") | contains("semantic-conventions-genai")) ) | not)
             ] | length' "$report")"
           if [ "$unexpected" -ne 0 ]; then
-            echo "::error::weaver live-check found $unexpected non-exempt violation(s) — emitted telemetry drifts from semconv/registry/"
+            echo "::error::weaver live-check found $unexpected non-exempt violation(s) — emitted telemetry drifts from the pinned ourios-semconv registry"
             cat "$report" || true
           fi
           # The exempted gen_ai.*/mcp.* violations make weaver exit non-zero on

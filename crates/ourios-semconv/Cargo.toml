@@ -1,7 +1,7 @@
 [package]
 name = "ourios-semconv"
 version.workspace = true
-description = "Generated OpenTelemetry semantic-convention name constants for Ourios (weaver-generated from semconv/registry/)."
+description = "Generated OpenTelemetry semantic-convention name constants for Ourios (weaver-generated from the shared ourios-semconv registry repo)."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

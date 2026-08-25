@@ -61,6 +61,19 @@ thesis-bench *ARGS:
 lint-commits:
     committed --commit-file .git/COMMIT_EDITMSG
 
+# Regenerate the ourios-semconv constants crate from the shared
+# ourios-semconv registry repo at the ref pinned in semconv/REGISTRY_REF
+# (the same fetch + weaver invocation CI's `semconv` job no-diff-gates).
+# Requires weaver (open-telemetry/weaver) on PATH.
+semconv-generate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v weaver >/dev/null || { echo "error: weaver not installed (open-telemetry/weaver)"; exit 1; }
+    dir="$(.github/scripts/fetch-semconv.sh)"
+    weaver registry generate rust crates/ourios-semconv/src \
+        -t "$dir/templates" -r "$dir/registry" --future
+    cargo fmt -p ourios-semconv
+
 # Preview a release WITHOUT changing anything (no bump, no tag): the CHANGELOG.md
 # git-cliff would generate for vX.Y.Z, then the artifacts cargo-dist would build.
 # `dist plan --tag` parses the version and rejects anything that isn't a valid

@@ -238,7 +238,7 @@ type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry
 /// - **Transport-library internals**: `rmcp` (the MCP server SDK) instruments
 ///   its own session/notification handling with bare, non-semconv fields
 ///   (`session_id`, `peer_info`, `notification`). Exporting those would drift
-///   the telemetry from `semconv/registry/` (the live-check gate) while adding
+///   the telemetry from the pinned registry (the live-check gate) while adding
 ///   no Ourios-level signal — Ourios's own `execute_tool` span (target
 ///   `ourios_server::mcp`, untouched by this directive) is the signal.
 ///

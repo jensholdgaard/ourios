@@ -1,7 +1,7 @@
 ---
 rfc: 0009
 title: Background compaction — small-file consolidation
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-02
@@ -11,6 +11,9 @@ superseded-by: —
 
 # RFC 0009 — Background compaction: small-file consolidation
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip; thesis-gates passed at `validated`.
+>
 > **Status note.** **`validated`** (2026-06-15) — the RFC0009.7 D2/D3/B2-post
 > benches were measured authoritatively on `baseline-8vcpu-32gib`
 > (`benchmarks.md` §9.7, git `4d52288`): **D3** PASS (a band-scale compaction

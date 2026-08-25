@@ -1,7 +1,7 @@
 ---
 rfc: 0050
 title: Upstream-derived templates — accepting `log.record.template` and reconciling with semconv
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-24
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0050 — Upstream-derived templates
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status: `green` (2026-08-25).** All nine §5 criteria pass, landed as
 > seven implementation PRs over two days (#730 grammar/alignment +
 > provenance, #731 modes + audit + counter, #733 config, #734 vocabulary

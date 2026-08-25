@@ -1,7 +1,7 @@
 ---
 rfc: 0013
 title: Object-storage backend (S3-compatible) for the Parquet store
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-15
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0013 — Object-storage backend (S3-compatible) for the Parquet store
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status note.** **`green`** (2026-06-17; `red` 2026-06-15). The first
 > shipping-milestone spine: the writer/reader/compactor/audit-sink addressed a
 > single local filesystem `bucket_root: &Path`, but `CLAUDE.md` §3.6 declares

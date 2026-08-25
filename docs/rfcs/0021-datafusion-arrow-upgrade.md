@@ -1,7 +1,7 @@
 ---
 rfc: 0021
 title: Coordinated DataFusion / Arrow upgrade — phased behind upstream
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-03
@@ -10,6 +10,14 @@ superseded-by: —
 ---
 
 # RFC 0021 — Coordinated DataFusion / Arrow upgrade, phased behind upstream
+
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Covers the
+> shipped **phase 1** scope (RFC0021.1–.6, the ladder this RFC ran).
+> Not unconditionally terminal: §5's own lifecycle reopens the RFC —
+> phase 2 lands `.7`–`.9` as red stubs and moves the status back to
+> `red` — when a DataFusion release accepts object_store 0.14 /
+> parquet 59. That reopening trigger is upstream-gated future work,
+> not an unresolved pre-`accepted` gate.
 
 ## 1. Summary
 

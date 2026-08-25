@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: OTLP receiver — gRPC and HTTP wire endpoints for OpenTelemetry log ingest
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-13
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0003 — OTLP receiver
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **How to read this document.** Sections §§1–4 are the design
 > contract — the *what* and the *why*. §5 lists the normative
 > `Given / When / Then` scenarios — the contract the receiver
@@ -552,6 +557,10 @@ concurrency).
 > RFC0003.16 — the end-to-end *served-binary* contract, which
 > the §9 *Receiver process model* resolution settles — and
 > re-enters the ladder at `specified` until RFC0003.16 lands.
+> *(Discharged: RFC0003.16 landed — the served-binary suite lives
+> at `crates/ourios-server/tests/it/rfc0003_16_served_binary.rs`
+> and all sixteen scenarios run green — so the ladder returned to
+> `green`, which is what the 2026-08-25 `accepted` flip stands on.)*
 
 > **Scenario RFC0003.16 — Served binary: both transports bind, a client export round-trips, graceful shutdown `[§3.4]`**
 > - **Given** `ourios-server` started with the receiver role

@@ -1,7 +1,7 @@
 ---
 rfc: 0038
 title: Self-tracing — the OTel traces signal, disciplined to request scope
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-23
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0038 — Self-tracing — the OTel traces signal, disciplined to request scope
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status: `green` (2026-07-24).** All seven §5 acceptance criteria are
 > implemented and pass: RFC0038.1 (request-scope spans + log correlation,
 > #614/#615/#616/#617), RFC0038.2 (ingest O(1), #615), RFC0038.3 (spawn-boundary

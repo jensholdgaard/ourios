@@ -1,7 +1,7 @@
 ---
 rfc: 0039
 title: Inbound trace-context propagation — SERVER spans continue the caller's trace
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -11,6 +11,11 @@ superseded-by: —
 
 # RFC 0039 — Inbound trace-context propagation
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
+> the completed-backlog batch flip. Where a thesis-gate applies it
+> stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
+> vacuous for this surface (RFC 0008 precedent).
+>
 > **Status: `green`** — all six §5 scenarios have asserting tests, landed over
 > four slices: the query arm and the propagator install (#627), the ingest spawn
 > boundary on both OTLP transports (#628), the `/mcp` SERVER span with the tool

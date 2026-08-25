@@ -16,10 +16,13 @@
 //! verbatim; this layer only adds the registry lookup (the versioned tokens
 //! §6.6 left out) and the structured → `AnyValue` decode.
 
+use std::collections::HashMap;
+
 use ourios_core::otlp::canonical::decode_any_value;
 use ourios_core::otlp::{AnyValue, KeyValue};
 use ourios_core::record::{BodyKind, MinedRecord};
 use ourios_miner::reconstruct::{Reconstruction, render};
+use ourios_miner::tree::{OwnedToken, format_template};
 
 use crate::TemplateRegistry;
 
@@ -89,8 +92,46 @@ impl LogRow {
     /// Build a `LogRow` from a stored [`MinedRecord`], rendering its body
     /// against the read-time `registry` (RFC 0017 §3.3/§3.4). Every OTLP field
     /// the schema stored is carried through unchanged (RFC0017.8).
+    ///
+    /// One registry lookup serves both the RFC 0050 template string
+    /// and the body render. For many rows, prefer
+    /// [`LogRow::from_records`], which also memoises the formatted
+    /// string per `(template_id, template_version)`.
     #[must_use]
     pub fn from_record(record: &MinedRecord, registry: &TemplateRegistry) -> Self {
+        let tokens = registry
+            .get(&(record.template_id, record.template_version))
+            .map(Vec::as_slice);
+        Self::build(record, tokens, tokens.map(format_template))
+    }
+
+    /// Materialise a result set: like [`LogRow::from_record`] per
+    /// row, but each distinct `(template_id, template_version)` is
+    /// looked up and its string formatted **once** — the read hot
+    /// path over large results is dominated by rows sharing few
+    /// templates (pillar 2's whole premise).
+    #[must_use]
+    pub fn from_records(records: &[MinedRecord], registry: &TemplateRegistry) -> Vec<Self> {
+        let mut strings: HashMap<(u64, u32), Option<String>> = HashMap::new();
+        records
+            .iter()
+            .map(|record| {
+                let key = (record.template_id, record.template_version);
+                let tokens = registry.get(&key).map(Vec::as_slice);
+                let template = strings
+                    .entry(key)
+                    .or_insert_with(|| tokens.map(format_template))
+                    .clone();
+                Self::build(record, tokens, template)
+            })
+            .collect()
+    }
+
+    fn build(
+        record: &MinedRecord,
+        tokens: Option<&[OwnedToken]>,
+        template: Option<String>,
+    ) -> Self {
         Self {
             time_unix_nano: record.time_unix_nano,
             observed_time_unix_nano: record.observed_time_unix_nano,
@@ -110,10 +151,8 @@ impl LogRow {
             dropped_attributes_count: record.dropped_attributes_count,
             template_id: record.template_id,
             template_version: record.template_version,
-            template: registry
-                .get(&(record.template_id, record.template_version))
-                .map(|tokens| ourios_miner::tree::format_template(tokens)),
-            body: render_log_body(record, registry),
+            template,
+            body: render_body_from_tokens(record, tokens),
         }
     }
 }
@@ -166,6 +205,18 @@ pub enum LogBody {
 /// verbatim (§3.3), never a wrong reconstruction.
 #[must_use]
 pub fn render_log_body(record: &MinedRecord, registry: &TemplateRegistry) -> LogBody {
+    render_body_from_tokens(
+        record,
+        registry
+            .get(&(record.template_id, record.template_version))
+            .map(Vec::as_slice),
+    )
+}
+
+/// [`render_log_body`] with the registry lookup already done — the
+/// shared core, so [`LogRow::from_record`] resolves the tokens once
+/// for both the RFC 0050 template string and the body render.
+fn render_body_from_tokens(record: &MinedRecord, tokens: Option<&[OwnedToken]>) -> LogBody {
     if record.body_kind == BodyKind::Absent {
         // RFC 0025 §3.2: absence renders as no body at all — never
         // an empty string, which is a different legal record.
@@ -189,10 +240,7 @@ pub fn render_log_body(record: &MinedRecord, registry: &TemplateRegistry) -> Log
         };
     }
 
-    let tokens = registry
-        .get(&(record.template_id, record.template_version))
-        .map_or(&[][..], Vec::as_slice);
-    let (line, reconstruction) = render(record, tokens);
+    let (line, reconstruction) = render(record, tokens.unwrap_or(&[]));
     LogBody::Rendered {
         line,
         reconstruction,

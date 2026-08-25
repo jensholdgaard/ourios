@@ -626,6 +626,19 @@ pub enum Provenance {
     ProducerDeclared,
 }
 
+impl Provenance {
+    /// The RFC 0050 §3.3 wire spelling, used wherever a query
+    /// surface reports a provenance set.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mined => "mined",
+            Self::UpstreamDerived => "upstream_derived",
+            Self::ProducerDeclared => "producer_declared",
+        }
+    }
+}
+
 /// The set of [`Provenance`] origins observed for one template.
 ///
 /// A set rather than a single value because the same template

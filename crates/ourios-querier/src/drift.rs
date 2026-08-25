@@ -31,7 +31,10 @@ use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTable
 use datafusion::functions_aggregate::expr_fn::{count, max, min};
 use datafusion::prelude::{SessionContext, col, lit};
 
-use ourios_core::audit::{EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED};
+use ourios_core::audit::{
+    EVENT_TYPE_TEMPLATE_ADOPTED, EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
+    Provenance, ProvenanceSet,
+};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::audit_columns;
 
@@ -59,6 +62,16 @@ pub struct DriftRow {
     pub first_seen: SystemTime,
     /// `MAX(timestamp)` — last qualifying event in the window.
     pub last_seen: SystemTime,
+    /// RFC 0050 §3.3 — the template's provenance set, so an
+    /// operator can tell a shape that drifted *and* is fed by an
+    /// upstream clustering processor from one that is purely
+    /// mined. `mined` is structural for every drift row (only
+    /// Drain-tree leaves widen; adoption-interned templates never
+    /// do); `upstream_derived` joins it when the audit stream
+    /// carries a `template_adopted` event for the id — looked up
+    /// over the template's full history, not the drift window,
+    /// because provenance is a property of the template.
+    pub provenance: ProvenanceSet,
 }
 
 /// Result of a drift query: the per-template [`DriftRow`]s (ordered by
@@ -125,20 +138,7 @@ pub(crate) async fn run_drift(
         return Ok(DriftResult::default());
     }
 
-    let ctx = SessionContext::new();
-    let urls = audit_table_urls(&ctx, backend, &files)?;
-    let options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-    let config = ListingTableConfig::new_with_multi_paths(urls)
-        .with_listing_options(options)
-        .infer_schema(&ctx.state())
-        .await
-        .map_err(storage_err)?;
-    let table = ListingTable::try_new(config).map_err(storage_err)?;
-    ctx.register_table("audit", Arc::new(table))
-        .map_err(storage_err)?;
-
-    let base = ctx.table("audit").await.map_err(storage_err)?;
+    let (ctx, base) = audit_dataframe(backend, &files).await?;
 
     // §6.3 step 1 — event_type IN ('template_widened', 'template_type_expanded')
     // AND timestamp in the half-open [start, end) window (RFC 0010 §6.5).
@@ -187,10 +187,100 @@ pub(crate) async fn run_drift(
     let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
         .await
         .map_err(storage_err)?;
-    let rows = decode_drift_rows(&batches)?;
+    let mut rows = decode_drift_rows(&batches)?;
     let stats = scan_stats(plan.as_ref());
     record_operator_spans(plan.as_ref());
+
+    // RFC 0050 §3.3 — grow the provenance set to `{mined,
+    // upstream_derived}` for every drifting template the audit
+    // stream shows an adoption for. History-wide, not
+    // window-scoped: provenance is a property of the template.
+    if !rows.is_empty() {
+        let ids: Vec<u64> = rows.iter().map(|r| r.template_id).collect();
+        let adopted = adopted_template_ids(backend, tenant, &ids).await?;
+        for row in &mut rows {
+            if adopted.contains(&row.template_id) {
+                row.provenance = row.provenance.insert(Provenance::UpstreamDerived);
+            }
+        }
+    }
     Ok(DriftResult { rows, stats })
+}
+
+/// Register the audit file set as a `DataFusion` table and hand back
+/// the session + base frame — shared by the drift aggregation and
+/// the provenance lookup.
+async fn audit_dataframe(
+    backend: StoreRef<'_>,
+    files: &audit_scan::AuditFiles,
+) -> Result<(SessionContext, datafusion::prelude::DataFrame), QueryError> {
+    let ctx = SessionContext::new();
+    let urls = audit_table_urls(&ctx, backend, files)?;
+    let options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+    let config = ListingTableConfig::new_with_multi_paths(urls)
+        .with_listing_options(options)
+        .infer_schema(&ctx.state())
+        .await
+        .map_err(storage_err)?;
+    let table = ListingTable::try_new(config).map_err(storage_err)?;
+    ctx.register_table("audit", Arc::new(table))
+        .map_err(storage_err)?;
+    let base = ctx.table("audit").await.map_err(storage_err)?;
+    Ok((ctx, base))
+}
+
+/// The subset of `ids` with at least one `template_adopted` audit
+/// event for `tenant`, over the tenant's full audit history.
+async fn adopted_template_ids(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+    ids: &[u64],
+) -> Result<std::collections::HashSet<u64>, QueryError> {
+    let files = {
+        let owned = backend.into_owned();
+        let tenant = tenant.clone();
+        tokio::task::spawn_blocking(move || {
+            audit_scan::audit_files(owned.store_ref(), &tenant, None)
+        })
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit listing task: {e}"),
+        })??
+    };
+    if files.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let (ctx, base) = audit_dataframe(backend, &files).await?;
+    let filtered = base
+        .filter(
+            col(audit_columns::EVENT_TYPE)
+                .eq(lit(EVENT_TYPE_TEMPLATE_ADOPTED))
+                .and(col(audit_columns::TENANT_ID).eq(lit(tenant.as_str())))
+                .and(
+                    col(audit_columns::TEMPLATE_ID)
+                        .in_list(ids.iter().map(|id| lit(*id)).collect(), false),
+                ),
+        )
+        .map_err(storage_err)?;
+    // GROUP BY template_id with no aggregates — the distinct ids.
+    let grouped = filtered
+        .aggregate(vec![col(audit_columns::TEMPLATE_ID)], vec![])
+        .map_err(storage_err)?;
+    let plan = grouped.create_physical_plan().await.map_err(storage_err)?;
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .map_err(storage_err)?;
+    let mut out = std::collections::HashSet::new();
+    for batch in &batches {
+        let ids = u64_column(batch, audit_columns::TEMPLATE_ID)?;
+        for i in 0..ids.len() {
+            if !ids.is_null(i) {
+                out.insert(ids.value(i));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve the drift window's `[from, to)` bounds to nanoseconds, normalising
@@ -250,6 +340,10 @@ fn decode_drift_rows(batches: &[RecordBatch]) -> Result<Vec<DriftRow>, QueryErro
                 max_new_version: max_new_version.value(i),
                 first_seen: decode_ts(first_seen.value(i))?,
                 last_seen: decode_ts(last_seen.value(i))?,
+                // Structural for a drift row (only Drain-tree
+                // leaves widen); `upstream_derived` is unioned in
+                // by `run_drift`'s adoption lookup.
+                provenance: ProvenanceSet::singleton(Provenance::Mined),
             });
         }
     }

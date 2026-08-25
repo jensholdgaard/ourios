@@ -916,6 +916,10 @@ struct DriftRowDto {
     max_new_version: u32,
     first_seen_unix_nano: u64,
     last_seen_unix_nano: u64,
+    /// RFC 0050 §3.3 — the template's provenance origins, in the
+    /// set's stable order (`mined`, `upstream_derived`,
+    /// `producer_declared`).
+    provenance: Vec<&'static str>,
 }
 
 impl From<&DriftResult> for DriftResponse {
@@ -931,6 +935,11 @@ impl From<&DriftResult> for DriftResponse {
                     max_new_version: row.max_new_version,
                     first_seen_unix_nano: system_time_nanos(row.first_seen),
                     last_seen_unix_nano: system_time_nanos(row.last_seen),
+                    provenance: row
+                        .provenance
+                        .iter()
+                        .map(ourios_core::audit::Provenance::as_str)
+                        .collect(),
                 })
                 .collect(),
             stats: StatsDto::from(&r.stats),

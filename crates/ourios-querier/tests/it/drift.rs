@@ -9,7 +9,10 @@
 //! [`Querier::run_drift`] surface — no `DataFusion`/SQL appears in the test or
 //! the result (RFC0010.8).
 
-use crate::common::{compaction, rejected_degenerate, type_expanded, widened, write_audit};
+use crate::common::{
+    adopted, compaction, rejected_degenerate, type_expanded, widened, write_audit,
+};
+use ourios_core::audit::{Provenance, ProvenanceSet};
 use ourios_core::tenant::TenantId;
 use ourios_querier::dsl::{DriftQuery, Statement, parse_statement};
 use ourios_querier::{DriftRow, Querier, QueryError};
@@ -411,5 +414,44 @@ async fn drift_excludes_a_string_prefix_sibling_tenant() {
     assert!(
         rows.iter().all(|r| r.template_id != ACMEX_TEMPLATE),
         "the string-prefix sibling tenant must never appear in acme's result",
+    );
+}
+
+/// RFC0050.6 (drift arm) — the drift row reports the template's
+/// provenance set: `{mined}` for a purely mined template,
+/// `{mined, upstream_derived}` when the audit stream carries a
+/// `template_adopted` event for the id — even when the adoption
+/// happened *outside* the drift window, because provenance is a
+/// property of the template, not of the window.
+#[tokio::test]
+async fn rfc0050_6_drift_reports_the_provenance_set() {
+    const CONVERGED: u64 = 100;
+    const PURELY_MINED: u64 = 200;
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(
+        bucket.path(),
+        &[
+            widened("acme", CONVERGED, 1, MID),
+            widened("acme", PURELY_MINED, 1, MID + 1_000),
+            // Adoption before the window opens: still counts.
+            adopted("acme", CONVERGED, T1 - 5_000),
+        ],
+    );
+
+    let rows = run(bucket.path(), "acme", &drift_one_day()).await;
+
+    assert_eq!(rows.len(), 2);
+    let by_id = |id: u64| {
+        rows.iter()
+            .find(|r| r.template_id == id)
+            .expect("row present")
+    };
+    assert_eq!(
+        by_id(CONVERGED).provenance,
+        ProvenanceSet::singleton(Provenance::Mined).insert(Provenance::UpstreamDerived),
+    );
+    assert_eq!(
+        by_id(PURELY_MINED).provenance,
+        ProvenanceSet::singleton(Provenance::Mined),
     );
 }

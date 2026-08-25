@@ -189,6 +189,17 @@ locality — a horizontal partition of rows within a file. Target
 size 128 MB to 1 GB. Smaller row groups mean faster row-group skip
 but worse compression and more metadata overhead.
 
+**Semconv registry (Ourios).** The weaver registry defining every
+Ourios telemetry name (`ourios.*` metrics and attributes), from
+which the `ourios-semconv` constants (Rust and TypeScript) are
+generated. Since 2026-08-25 it lives in the shared
+`jensholdgaard/ourios-semconv` repo; this repo consumes it at the ref
+pinned in `semconv/REGISTRY_REF` (regenerate via
+`just semconv-generate`), and each dashboard-plugin repo carries its
+own pin. RFCs written before the extraction reference the previous
+in-repo paths, `semconv/registry/` and `templates/registry/` — those
+references are historical, not stale.
+
 **Similarity.** The Drain match score between an incoming line and
 a *log group*'s *template*: the fraction of token positions where
 the line matches the template (wildcards count as matches). The

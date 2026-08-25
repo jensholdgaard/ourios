@@ -62,7 +62,7 @@ pub struct CompactionMetrics {
 
 impl CompactionMetrics {
     /// Build the instruments on the `ourios.compaction` meter, with the
-    /// UCUM units the registry (`semconv/registry/metrics.yaml`)
+    /// UCUM units the registry (`metrics.yaml` in the shared `ourios-semconv` repo)
     /// declares for each.
     ///
     /// The attribute-free counters are seeded with a zero measurement so

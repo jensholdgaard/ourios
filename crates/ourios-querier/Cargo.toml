@@ -75,7 +75,7 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 # RFC 0040 — the post-hoc `ExecutionPlan` -> OTel operator-span-tree crate.
 # `datafusion` + `opentelemetry` only, no `ourios-*` deps of its own.
 ourios-df-otel = { path = "../ourios-df-otel" }
-# Generated semantic-convention name constants (`semconv/registry/` via
+# Generated semantic-convention name constants (the shared `ourios-semconv` registry repo via
 # weaver) — instrument and attribute names are never hand-written.
 ourios-semconv = { path = "../ourios-semconv" }
 # RFC 0002 §6.5 — the compiler resolves `range(...)` RFC 3339 timestamp

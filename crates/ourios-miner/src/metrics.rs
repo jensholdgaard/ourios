@@ -24,7 +24,7 @@
 //! and data-point attribute keys (`ourios.tenant`, `ourios.service`,
 //! `ourios.miner.template_change`) come from the generated
 //! [`ourios_semconv`] constants — the dotted-`ourios.*` weaver
-//! registry (`semconv/registry/`) alongside the compaction set
+//! registry (the shared `ourios-semconv` repo) alongside the compaction set
 //! (RFC 0009 §3.6).
 //!
 //! # Sync vs. observable

@@ -42,13 +42,19 @@ const DEX_IMAGE: &str = "ghcr.io/dexidp/dex";
 const DEX_TAG: &str =
     "master@sha256:c382922b8f065f2f1ba142fde5b0ec1736b8fb7bc5bf18832f68c9aced95f243";
 
-// The contrib distribution carries `filelog`, `resource`, and the
-// `oauth2client` extension (the core distro does not). Pinned by digest
-// (the multi-arch manifest-list index for 0.119.0) so this required check
-// never depends on a mutable tag — same posture as the Dex pin above.
+// The contrib distribution carries `filelog`, `resource`, the
+// `oauth2client` extension, and (from 0.159.0) the `drain` processor
+// (the core distro carries none of them). Pinned by digest (the
+// multi-arch manifest-list index for the release named below) so this
+// required check never depends on a mutable tag — same posture as the
+// Dex pin above.
 const COLLECTOR_IMAGE: &str = "otel/opentelemetry-collector-contrib";
+// 0.159.0 — the first contrib release whose distribution manifest carries
+// the `drain` processor (RFC 0050's upstream templating source); the
+// TLS + OIDC scenario rides the same pin so the file keeps one collector
+// version. Digest-pinned (multi-arch index) like the Dex pin above.
 const COLLECTOR_TAG: &str =
-    "0.119.0@sha256:36c35cc213c0f3b64d6e8a3e844dc90822f00725e0e518eaed5b08bcc2231e72";
+    "0.159.0@sha256:1f2c54a30e713fac6b3ae77a1ec84010c2007e29ced8ec666214fc2f6739c1cc";
 
 /// Dex static client: id is the token audience, `name` is the `name_claim`
 /// value, and its `groups` claim carries the tenant list.
@@ -484,4 +490,283 @@ where
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     format!("--- stdout ---\n{out}\n--- stderr ---\n{err}")
+}
+
+// --- RFC 0050: a real drainprocessor pass ---------------------------------
+
+/// The repetitive stream the `drain` processor converges on:
+/// `user <*> logged in from <*>` after a handful of lines.
+const DRAIN_LINES: &[&str] = &[
+    "user 1 logged in from 10.0.0.1",
+    "user 2 logged in from 10.0.0.2",
+    "user 3 logged in from 10.0.0.3",
+    "user 4 logged in from 10.0.0.4",
+    "user 5 logged in from 10.0.0.5",
+    "user 6 logged in from 10.0.0.6",
+    "user 7 logged in from 10.0.0.7",
+    "user 8 logged in from 10.0.0.8",
+];
+
+/// The independent oracle: drain's converged template for
+/// [`DRAIN_LINES`], known a priori. Every stored claim must be either
+/// this exact string or (for the records annotated before drain
+/// converged) the record's own body — anything else means a stored
+/// value was rewritten somewhere.
+const CONVERGED: &str = "user <*> logged in from <*>";
+
+/// RFC 0050 — an **actual drainprocessor pass** (the §6 corpus-arm
+/// source): otelcol-contrib runs the `drain` processor (defaults —
+/// it emits `log.record.template`) over a repetitive log file and
+/// exports the annotated stream to a served Ourios in `adopt` mode,
+/// over plaintext OTLP in open mode — this scenario isolates the
+/// RFC 0050 integration; the TLS + OIDC composition is the sibling
+/// test's job. Asserted on the flushed store:
+///
+/// - the drainprocessor's `log.record.template` attribute is stored
+///   verbatim on every record (RFC 0018 fidelity);
+/// - converged records (their claim carries `<*>`) were **adopted**:
+///   the registry tokens at their `(template_id, template_version)`
+///   render exactly the claimed string (RFC0050.2, real source);
+/// - every body reconstructs byte-identically (RFC0050.4 —
+///   adoption is alignment-gated).
+#[allow(clippy::too_many_lines)] // one linear end-to-end scenario, like the sibling
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Docker (real otelcol-contrib container); run by the collector-interop CI job via --ignored"]
+async fn drainprocessor_annotates_and_ourios_adopts() {
+    use testcontainers_modules::testcontainers::core::Host;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal = tmp.path().join("wal");
+    std::fs::create_dir_all(&wal).expect("wal dir");
+    let config_path = tmp.path().join("ourios.yaml");
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    write!(
+        file,
+        "storage:\n  local:\n    bucket_root: \"{bucket}\"\n\
+         receiver:\n  enabled: true\n  grpc_addr: 0.0.0.0:0\n\
+         \x20\x20http_addr: 127.0.0.1:0\n  wal_root: \"{wal}\"\n\
+         miner:\n  upstream_templates: adopt\n",
+        bucket = tmp.path().display(),
+        wal = wal.display(),
+    )
+    .expect("write config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ourios-server");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut out_lines = BufReader::new(stdout).lines();
+    let grpc_addr = timeout(Duration::from_secs(15), async {
+        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+            if let Some(a) = line.strip_prefix("receiver gRPC listening on ") {
+                return a.trim().to_string();
+            }
+        }
+        panic!("receiver announcement never appeared");
+    })
+    .await
+    .expect("ourios ready before timeout");
+    let grpc_port: u16 = grpc_addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .expect("grpc port");
+
+    let collector_config = format!(
+        "receivers:\n\
+         \x20\x20filelog:\n\
+         \x20\x20\x20\x20include: [/etc/otelcol/app.log]\n\
+         \x20\x20\x20\x20start_at: beginning\n\
+         processors:\n\
+         \x20\x20resource:\n\
+         \x20\x20\x20\x20attributes:\n\
+         \x20\x20\x20\x20\x20\x20- key: service.name\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20value: {TENANT}\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20action: upsert\n\
+         \x20\x20drain: {{}}\n\
+         exporters:\n\
+         \x20\x20otlp:\n\
+         \x20\x20\x20\x20endpoint: host.docker.internal:{grpc_port}\n\
+         \x20\x20\x20\x20headers:\n\
+         \x20\x20\x20\x20\x20\x20x-ourios-tenant: {TENANT}\n\
+         \x20\x20\x20\x20tls:\n\
+         \x20\x20\x20\x20\x20\x20insecure: true\n\
+         service:\n\
+         \x20\x20pipelines:\n\
+         \x20\x20\x20\x20logs:\n\
+         \x20\x20\x20\x20\x20\x20receivers: [filelog]\n\
+         \x20\x20\x20\x20\x20\x20processors: [resource, drain]\n\
+         \x20\x20\x20\x20\x20\x20exporters: [otlp]\n",
+    );
+    let app_log = format!("{}\n", DRAIN_LINES.join("\n"));
+
+    let wal_bytes = || dir_bytes(&wal);
+    let wal_baseline = wal_bytes();
+
+    let collector = GenericImage::new(COLLECTOR_IMAGE, COLLECTOR_TAG)
+        .with_copy_to(
+            "/etc/otelcol-contrib/config.yaml",
+            collector_config.into_bytes(),
+        )
+        .with_copy_to("/etc/otelcol/app.log", app_log.into_bytes())
+        .with_host("host.docker.internal", Host::HostGateway)
+        .start()
+        .await
+        .expect("otelcol started");
+
+    // WAL-before-ack: growth past the baseline, then quiet, means the
+    // annotated batch landed (the sibling test's ack heuristic).
+    let acked = timeout(Duration::from_secs(120), async {
+        let (mut last, mut stable) = (wal_baseline, 0u32);
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let cur = wal_bytes();
+            if cur > wal_baseline && cur == last {
+                stable += 1;
+                if stable >= 2 {
+                    return;
+                }
+            } else {
+                stable = 0;
+            }
+            last = cur;
+        }
+    })
+    .await;
+    assert!(
+        acked.is_ok(),
+        "collector never delivered a batch (WAL stayed at {} bytes).\n{}",
+        wal_bytes(),
+        container_logs(&collector).await,
+    );
+
+    let pid = child.id().expect("pid").to_string();
+    Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .await
+        .expect("kill")
+        .success()
+        .then_some(())
+        .expect("SIGTERM delivered");
+    timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("exit before timeout")
+        .expect("child exits");
+
+    let tenant = ourios_core::tenant::TenantId::new(TENANT);
+    let registry = ourios_querier::derive_template_registry(
+        ourios_querier::StoreRef::Local(tmp.path()),
+        &tenant,
+    )
+    .expect("derive registry");
+
+    let claim_of = |record: &ourios_core::record::MinedRecord| -> Option<String> {
+        record.attributes.iter().find_map(|kv| {
+            (kv.key == "log.record.template")
+                .then(|| kv.value.as_ref()?.value.as_ref())
+                .flatten()
+                .and_then(|v| match v {
+                    ourios_core::otlp::any_value::Value::StringValue(s) => Some(s.clone()),
+                    _ => None,
+                })
+        })
+    };
+
+    // The adopt discriminator: only the RFC 0050 adopt path emits
+    // `template_adopted` audit events. Without this, "the row's
+    // template renders the claim" would be circular — the built-in
+    // miner converges on the same canonical for this corpus even
+    // under `ignore`.
+    let mut adopted_events: Vec<(u64, String)> = Vec::new();
+    for f in data_parquet_files(&tmp.path().join("audit")) {
+        let events = ourios_parquet::AuditReader::open_file(&f)
+            .expect("open audit file")
+            .read_all()
+            .expect("read audit events");
+        for event in events {
+            if let ourios_core::audit::AuditPayload::Template {
+                template_id,
+                change: ourios_core::audit::TemplateChange::Adopted { new_template, .. },
+                ..
+            } = event.payload
+            {
+                adopted_events.push((template_id, new_template));
+            }
+        }
+    }
+    assert!(
+        adopted_events
+            .iter()
+            .any(|(_, template)| template == CONVERGED),
+        "the adopt path audited the drainprocessor's converged template: {adopted_events:?}",
+    );
+
+    let mut converged_adoptions = 0usize;
+    let mut rendered = Vec::new();
+    for f in data_parquet_files(&tmp.path().join("data")) {
+        let records = ourios_parquet::Reader::open_file(&f)
+            .expect("open data file")
+            .read_all()
+            .expect("read records");
+        for record in records {
+            // RFC 0018: the drainprocessor's annotation is stored
+            // verbatim — checked against the a-priori oracle, not
+            // against the store's own contents.
+            let claim = claim_of(&record)
+                .unwrap_or_else(|| panic!("drain annotated every record: {record:?}"));
+            let ourios_querier::LogBody::Rendered { line, .. } =
+                ourios_querier::render_log_body(&record, &registry)
+            else {
+                panic!("a string body renders to a line");
+            };
+            let line = String::from_utf8(line).expect("utf8 line");
+            // Pre-convergence, drain annotates a line with itself.
+            assert!(
+                claim == CONVERGED || claim == line,
+                "every stored claim is drain's known output for this corpus, \
+                 got {claim:?} (line {line:?})",
+            );
+            // A converged claim was adopted: the audit stream carries
+            // its template_adopted event for this row's id, and the
+            // registry tokens at the row's key render the claim.
+            if claim == CONVERGED {
+                assert!(
+                    adopted_events
+                        .iter()
+                        .any(|(id, _)| *id == record.template_id),
+                    "row {} adopted via the audited adopt path",
+                    record.template_id,
+                );
+                let tokens = registry
+                    .get(&(record.template_id, record.template_version))
+                    .expect("adopted row's (id, version) resolves in the registry");
+                assert_eq!(
+                    ourios_miner::tree::format_template(tokens),
+                    claim,
+                    "the row's template IS the drainprocessor's claim",
+                );
+                converged_adoptions += 1;
+            }
+            rendered.push(line);
+        }
+    }
+    assert!(
+        converged_adoptions >= DRAIN_LINES.len() / 2,
+        "most records arrive after drain converges and adopt its template \
+         (got {converged_adoptions} of {})",
+        DRAIN_LINES.len(),
+    );
+    rendered.sort();
+    let mut want: Vec<String> = DRAIN_LINES.iter().map(|s| (*s).to_owned()).collect();
+    want.sort();
+    assert_eq!(
+        rendered, want,
+        "every line reconstructs byte-identically (RFC0050.4)",
+    );
 }

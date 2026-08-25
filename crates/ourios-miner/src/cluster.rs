@@ -5861,9 +5861,11 @@ mod tests {
         // mine the same bodies with and without the annotation under
         // the unset default and require identical miner output.
         let records = SharedRecordSink::new();
+        let plain_records = SharedRecordSink::new();
         let mut annotated_run =
             MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
-        let mut plain_run = MinerCluster::new(MinerConfig::default());
+        let mut plain_run = MinerCluster::new(MinerConfig::default())
+            .with_record_sink(Box::new(plain_records.clone()));
         for body in bodies {
             let with_attr = annotated_run.ingest(&annotated_record(&t, body, "user <*> logged in"));
             let without = plain_run.ingest(&string_record(&t, body));
@@ -5893,10 +5895,18 @@ mod tests {
         assert!(annotated_run.adopted_templates_for(&t).is_empty());
 
         // The attribute is stored as an ordinary attribute, verbatim
-        // (RFC 0018 fidelity — nothing consumed, nothing rewritten).
+        // (RFC 0018 fidelity — nothing consumed, nothing rewritten),
+        // and **every other emitted field** — params, body handling,
+        // confidence, severity, the lot — is identical to the plain
+        // run's record. The Parquet layout is a pure function of this
+        // record stream and the (identical) config, so record-level
+        // equality is the §5.1 "every miner-derived column and the
+        // file layout" clause at its source.
         let stored = records.drain();
+        let plain = plain_records.drain();
         assert_eq!(stored.len(), bodies.len());
-        for record in &stored {
+        assert_eq!(plain.len(), bodies.len());
+        for (record, plain_record) in stored.iter().zip(&plain) {
             let claim = record
                 .attributes
                 .iter()
@@ -5905,6 +5915,15 @@ mod tests {
             assert_eq!(
                 claim.value.as_ref().and_then(|v| v.value.as_ref()),
                 Some(&AvValue::StringValue("user <*> logged in".to_string())),
+            );
+            let mut stripped = record.clone();
+            stripped
+                .attributes
+                .retain(|kv| kv.key != LOG_RECORD_TEMPLATE_ATTR);
+            assert_eq!(
+                &stripped, plain_record,
+                "modulo the annotation itself, the emitted record is \
+                 field-for-field the pre-RFC one",
             );
         }
     }

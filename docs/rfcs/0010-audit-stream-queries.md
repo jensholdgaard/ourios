@@ -1,7 +1,7 @@
 ---
 rfc: 0010
 title: Audit-stream queries & template drift
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-09
@@ -11,9 +11,16 @@ superseded-by: —
 
 # RFC 0010 — Audit-stream queries & template drift
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal.
+> This RFC's §9 header gated `accepted` on resolving its open
+> questions; all four are now resolved (not waived) — each was
+> embodied by the green implementation and is confirmed inline with
+> the code and test evidence. No thesis-gate applies beyond the ones
+> already standing in `docs/benchmarks.md` §7.
+>
 > **Status note.** **`green`** (2026-06-15) — all eight §5 acceptance
 > scenarios (RFC0010.1–.8) have live, passing tests in
-> `crates/ourios-querier/tests/drift.rs`: drift returns drifted templates
+> `crates/ourios-querier/tests/it/drift.rs`: drift returns drifted templates
 > with counts (.1), half-open `[from, to)` window (.2), `event_type`
 > scoping excludes non-widenings (.3), tenant isolation (.4),
 > empty-is-empty-not-error (.5), `widening_count` desc / `template_id` asc
@@ -533,25 +540,31 @@ test; ids are greppable from the test code.
       intended surface — it forecloses composing further stages onto a
       drift query by design, and is NOT the general aggregation pipeline
       (RFC 0002's deferred work).
-- [ ] **Re-use of `range` vs a head-local window.** §6.1 reuses the
-      RFC 0002 `range(from, to)` *bounds* via a `from … to …` clause rather
-      than admitting a literal `| range(...)` stage on the drift head.
-      Confirm the dedicated clause is preferable to reusing the `range`
-      stage token.
-- [ ] **Default window.** Log queries get a tenant-default window when
-      `range` is omitted (RFC 0002 §4 P5 / RFC0002.4). Should `drift`
-      *require* an explicit window (current spec: `from`/`to` are
-      mandatory), or inherit the same tenant default? Current choice:
-      mandatory, because a default-windowed drift is rarely what an operator
-      means (drift questions are deploy-relative).
-- [ ] **Tie-break stability.** §6.3 pins ties as ascending `template_id`
-      beyond RFC 0001 §6.7's `ORDER BY widening_count DESC`. Confirm this
-      is the desired stable order (vs. e.g. `last_seen DESC`).
-- [ ] **`old_version` / `new_version` on type-expansion rows.** RFC 0005
-      stores these for both template kinds; `min_old_version` /
-      `max_new_version` therefore mix widening and type-expansion version
-      deltas. Confirm that aggregating across both kinds is the intended
-      §6.7 semantics (RFC 0001 §6.7's SQL groups both, so this RFC follows).
+- [x] **Re-use of `range` vs a head-local window.** *Resolved
+      (maintainer, 2026-08-25): the dedicated clause.* The shipped
+      grammar carries `from`/`to` on the drift head itself
+      (`DriftQuery { from: Time, to: Time }` in `dsl/ir.rs` — "no `|`
+      stage to compose"), and `range` stays a log-pipeline stage
+      token. Green under the full RFC0010 §5 suite.
+- [x] **Default window.** *Resolved (maintainer, 2026-08-25):
+      mandatory, as specced.* `DriftQuery.from`/`.to` are non-optional
+      IR fields — a drift query cannot be expressed without its
+      window. The rationale stands: drift questions are
+      deploy-relative, so a tenant-default window is rarely what an
+      operator means.
+- [x] **Tie-break stability.** *Resolved (maintainer, 2026-08-25):
+      ascending `template_id`.* Implemented as
+      `widening_count DESC, template_id ASC` (`drift.rs` §6.6) and
+      pinned by the §5 ordering test — a deterministic,
+      pagination-stable order; `last_seen DESC` was rejected because
+      recency is already a visible column and would make equal-count
+      ordering non-deterministic across reruns.
+- [x] **`old_version` / `new_version` on type-expansion rows.**
+      *Resolved (maintainer, 2026-08-25): both kinds aggregate.*
+      `TemplateChange::TypeExpanded` carries `old_version` /
+      `new_version` exactly as widenings do (`ourios-core/audit.rs`),
+      and the drift aggregate groups both event kinds — RFC 0001
+      §6.7's SQL semantics, asserted green by the §5 suite.
 
 ## 10. References
 

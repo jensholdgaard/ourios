@@ -1,7 +1,7 @@
 ---
 rfc: 0002
 title: Query DSL — the Ourios logs query language (Branch B, surface β)
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -11,6 +11,13 @@ superseded-by: —
 
 # RFC 0002 — Query DSL
 
+> **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal.
+> This RFC's §9 header gated `accepted` on a readability pass with
+> non-author reviewers plus a LogQL/Insights migration sketch; both
+> are resolved (not waived) — the artifacts and the pass evidence are
+> recorded on the §9 checkbox (`docs/guides/query-cookbook.md`,
+> PR #742). Thesis-gates stand passing in `docs/benchmarks.md` §7.
+>
 > **Status note.** The prior decision (§3) is **resolved**: the predicate
 > sublanguage takes **Branch B** (distance from OTTL), on the
 > **β** (pipe-composable) top-level surface. Decided 2026-06-07 from the
@@ -915,11 +922,20 @@ two-loop: `#[ignore]`'d stubs first, implementations second).
 
 *Narrowed by the §3 resolution. Must be resolved before `accepted`.*
 
-- [ ] **Pre-`accepted` validation.** The §3.6 audience analysis stands in
-      for instinct, not for evidence: before `accepted`, run a readability
-      pass on 10–20 sample queries with non-author reviewers, and a
-      migration sketch from LogQL/Insights into β. (Replaces the prior
-      §9 user-research gate; not required for `specified`.)
+- [x] **Pre-`accepted` validation.** *Resolved (2026-08-25).* The
+      artifacts are `docs/guides/query-cookbook.md`: sixteen sample
+      queries — every one verified to parse against the shipped parser
+      — each led by its plain-English intent, plus migration sketches
+      from LogQL and CloudWatch Logs Insights. The non-author
+      readability pass ran as the PR #742 reviews (maintainer decision
+      of the same date: the review bots are the non-author readers):
+      the reviewers read every sample against its English line and
+      returned comprehension-level findings only — a mis-implying
+      "reconstructed" on `render`, an ambiguous "anchored" on
+      `matches`, and a preference for `!=` over `not … ==` — all
+      wording, no query whose *meaning* failed to land, and each fix
+      applied to the sheet. (Replaces the prior §9 user-research gate;
+      not required for `specified`.)
 - [x] ~~**OTel ecosystem alignment**~~ *Resolved:* OpenTelemetry defines
       the logs data model + API/SDK but **no standard query/read
       language**, and **OTTL is a Collector *transformation* language, not

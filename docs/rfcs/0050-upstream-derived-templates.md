@@ -15,8 +15,12 @@ superseded-by: —
 > seven implementation PRs over two days (#730 grammar/alignment +
 > provenance, #731 modes + audit + counter, #733 config, #734 vocabulary
 > pair, #735 drift provenance, #736 served mixed stream, #737 real
-> drainprocessor pass) plus a coverage-gap closer (#738).
-> RFC0050.1 `rfc0050_1_default_mines_as_if_unannotated_and_stores_verbatim`;
+> drainprocessor pass) plus two coverage closers (#738, #740).
+> RFC0050.1 `rfc0050_1_default_mines_as_if_unannotated_and_stores_verbatim`
+> (identical ids and leaves, **field-for-field record equality modulo
+> the annotation itself** — the record stream plus identical config
+> determines every miner-derived column and the file layout — and the
+> attribute stored verbatim);
 > .2 `rfc0050_2_adoption_uses_the_upstream_string` (unit) and the
 > `collector-interop` job's `drainprocessor_annotates_and_ourios_adopts`
 > (a real otelcol-contrib 0.159.0 `drain` pass, adoption discriminated by
@@ -25,14 +29,19 @@ superseded-by: —
 > grammar/alignment table in `upstream.rs` plus the
 > `rfc0050_properties.rs` render-equals-body proptests (construction and
 > ingest level); .5 `rfc0050_5_ceiling_stops_adoption_interning` +
-> `rfc0050_5_byte_limit_rejects_before_parsing`; .6 both convergence
+> `rfc0050_5_byte_limit_rejects_before_parsing`, with the counting
+> clause pinned on `ourios.miner.upstream_template.processed` by the
+> `rfc0050_processed_counter` metric binary (success `error.type`-free;
+> byte_limit / grammar / template_ceiling each counted); .6 both convergence
 > orders, the drift set (`rfc0050_6_drift_reports_the_provenance_set`),
 > the single-audit-event assertion, and the cross-provenance alias
 > binding; .7 the semconv registry entries + the weaver live-check job;
 > .8 `rfc0050_read_path.rs` + the DTO omit-when-unresolvable tests; .9
 > `rfc0050_9_observe_associates_without_touching_the_clustering`.
-> §6's "corpus pre-annotated by an actual drainprocessor pass" is the
-> interop scenario itself. No thesis-gate applies (`validated` vacuous —
+> §6's drainprocessor arm is delivered as the interop scenario (a live
+> processor rather than a pre-annotated corpus file — recorded in §6,
+> with the corpus-scale harness run named as available follow-on
+> work). No thesis-gate applies (`validated` vacuous —
 > RFC 0008/0044/0046 precedent); `accepted` is a maintainer flip. Two
 > §7 outcomes recorded inline: rejections ride
 > `ourios.miner.upstream_template.processed` (§3.2, #732), and
@@ -548,15 +557,27 @@ Unit: the alignment routine (template ⇄ body) as a table — exact match,
 mask spanning whitespace, template from a different line, a template
 longer than the body, parameters over `param_byte_limit`. Property
 (`proptest`): for any adopted row, render equals the original body, or
-the row is lossy with the body retained (RFC0050.4). Corpus: the RFC
-0024 harness run with `adopt` over a corpus pre-annotated by an actual
-`drainprocessor` pass, asserting template count, reconstruction
-accuracy and the RFC 0023 ceiling (RFC0050.2/.5). Integration: a mixed
-stream through the served binary (RFC0050.3); the byte-identical
-default asserted by ingesting the same corpus twice (RFC0050.1);
-`observe` asserted by diffing its miner-derived output against
-`ignore`'s on the same corpus (RFC0050.9). The weaver live-check job
-covers RFC0050.7.
+the row is lossy with the body retained (RFC0050.4). Real
+`drainprocessor` output: delivered as the `collector-interop` CI
+scenario — otelcol-contrib runs the `drain` processor over a
+repetitive stream and exports the annotated records to a served
+Ourios in `adopt` mode, asserting adoption (discriminated by the
+persisted `template_adopted` audit event), verbatim claims against
+the a-priori converged template, and byte-identical reconstruction
+(RFC0050.2/.4). *(As specified this arm was an RFC 0024 harness run
+over a pre-annotated corpus file; the delivered form exercises the
+same path against a live processor instead — a corpus-scale `adopt`
+run through the RFC 0024 harness remains available as follow-on
+work if adoption quality ever needs corpus-gate numbers.)* The
+ceiling and byte-limit bounds and their counting are unit-pinned
+(`rfc0050_5_*` plus the `rfc0050_processed_counter` metric binary).
+Integration: a mixed stream through the served binary (RFC0050.3);
+the byte-identical default asserted by mining the same bodies with
+and without the annotation and requiring field-for-field record
+equality modulo the annotation itself (RFC0050.1); `observe`
+asserted by diffing its miner-derived output against `ignore`'s on
+the same corpus (RFC0050.9). The weaver live-check job covers
+RFC0050.7.
 
 ## 7. Open questions
 

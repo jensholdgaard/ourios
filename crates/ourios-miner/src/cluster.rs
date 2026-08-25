@@ -6171,6 +6171,43 @@ mod tests {
     }
 
     #[test]
+    fn rfc0050_6_alias_binds_a_mined_template_to_an_adopted_one() {
+        use std::time::SystemTime;
+
+        use ourios_core::alias::{ActorId, AliasMap, Operator};
+
+        let t = TenantId::new("tenant-x");
+        let audit = SharedAuditSink::new();
+        let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()));
+
+        let adopted_id =
+            cluster.ingest(&annotated_record(&t, "job 7 finished", "job <*> finished"));
+        let mined_id = cluster.ingest(&string_record(&t, "task 9 done"));
+        assert_ne!(adopted_id, mined_id);
+
+        // The RFC 0007 alias surface takes both ids like any pair —
+        // adoption-interned ids live in the same id space as tree
+        // leaves, so an operator can bind across provenance.
+        let mut aliases = AliasMap::new();
+        let mut sink = audit.clone();
+        aliases
+            .assert(
+                &mut sink,
+                &t,
+                mined_id,
+                vec![adopted_id],
+                Operator {
+                    actor: ActorId::new("ops@example.com").expect("actor"),
+                    reason: "same job-completion shape".to_string(),
+                    timestamp: SystemTime::UNIX_EPOCH,
+                },
+            )
+            .expect("alias binds a mined id to an adopted id");
+        let class = aliases.resolves(&t, adopted_id);
+        assert!(class.contains(&mined_id) && class.contains(&adopted_id));
+    }
+
+    #[test]
     fn rfc0050_9_observe_associates_without_touching_the_clustering() {
         let t = TenantId::new("tenant-x");
         let bodies = ["user 1 logged in", "user 2 logged in", "user 3 logged in"];

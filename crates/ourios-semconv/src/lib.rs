@@ -193,6 +193,9 @@ pub const DATAFUSION_OPERATOR_ROW_GROUPS_MATCHED: &str = "datafusion.operator.ro
 /// `datafusion.operator.row_groups_pruned` attribute key.
 pub const DATAFUSION_OPERATOR_ROW_GROUPS_PRUNED: &str = "datafusion.operator.row_groups_pruned";
 
+/// `log.record.template` attribute key.
+pub const LOG_RECORD_TEMPLATE: &str = "log.record.template";
+
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
 
@@ -228,6 +231,12 @@ pub const OURIOS_SERVICE: &str = "ourios.service";
 
 /// `ourios.sink.flush.trigger` attribute key.
 pub const OURIOS_SINK_FLUSH_TRIGGER: &str = "ourios.sink.flush.trigger";
+
+/// `ourios.template.id` attribute key.
+pub const OURIOS_TEMPLATE_ID: &str = "ourios.template.id";
+
+/// `ourios.template.version` attribute key.
+pub const OURIOS_TEMPLATE_VERSION: &str = "ourios.template.version";
 
 /// `ourios.template_map.lookup.outcome` attribute key.
 pub const OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME: &str = "ourios.template_map.lookup.outcome";

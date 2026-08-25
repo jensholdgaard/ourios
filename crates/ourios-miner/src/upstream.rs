@@ -33,12 +33,11 @@
 use crate::tokenize::{TokenizeError, Tokenized, tokenize};
 use crate::tree::OwnedToken;
 
-/// The log-record attribute the RFC 0050 modes read. Tracks
-/// semantic-conventions #1283 / #2064 (the name collector-contrib's
-/// drainprocessor ships today); moves to the generated
-/// `ourios-semconv` constant once the registry entry lands
-/// (RFC0050.7).
-pub const LOG_RECORD_TEMPLATE_ATTR: &str = "log.record.template";
+/// The log-record attribute the RFC 0050 modes read — the generated
+/// registry constant (RFC0050.7; a local pre-adopted definition
+/// tracking semantic-conventions #1283 / #2064, the name
+/// collector-contrib's drainprocessor ships today).
+pub const LOG_RECORD_TEMPLATE_ATTR: &str = ourios_semconv::LOG_RECORD_TEMPLATE;
 
 /// One position of a parsed upstream template.
 #[derive(Debug, Clone, PartialEq, Eq)]

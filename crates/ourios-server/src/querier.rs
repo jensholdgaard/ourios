@@ -808,6 +808,14 @@ struct LogRowDto {
     dropped_attributes_count: u32,
     template_id: u64,
     template_version: u32,
+    /// The template string for `(template_id, template_version)` —
+    /// beside the local key so no second `list_templates` call is
+    /// needed (RFC 0050 §3.6 / RFC0050.8). Ourios-derived, so it
+    /// lives here as a response field and is never injected into
+    /// `attributes` (RFC 0018 fidelity). Omitted when the pair is
+    /// not in the read-time registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<String>,
     /// Omitted entirely for `body_kind = Absent` rows (RFC 0025
     /// §3.2) — a missing body key, never `""`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -835,6 +843,7 @@ impl From<&LogRow> for LogRowDto {
             dropped_attributes_count: row.dropped_attributes_count,
             template_id: row.template_id,
             template_version: row.template_version,
+            template: row.template.clone(),
             body: match &row.body {
                 LogBody::Absent => None,
                 other => Some(LogBodyDto::from(other)),
@@ -1216,6 +1225,38 @@ mod tests {
         assert!(
             json.as_object().is_some_and(|o| o.contains_key("body")),
             "an empty-string body keeps its field: {json}",
+        );
+    }
+
+    /// RFC 0050 §3.6 / RFC0050.8: the DTO carries the template
+    /// string beside the id when the registry resolves the pair,
+    /// and omits the key entirely when it cannot — a missing
+    /// field, never `null` or `""`.
+    #[test]
+    fn template_string_present_when_resolved_omitted_when_not() {
+        use ourios_miner::tree::OwnedToken;
+        use ourios_querier::{LogRow, TemplateRegistry};
+
+        let mut registry = TemplateRegistry::default();
+        registry.insert(
+            (7, 1),
+            vec![OwnedToken::Fixed("user".to_string()), OwnedToken::Wildcard],
+        );
+
+        let mut resolved = test_record();
+        resolved.template_id = 7;
+        resolved.template_version = 1;
+        let row = LogRow::from_record(&resolved, &registry);
+        let json = serde_json::to_value(LogRowDto::from(&row)).expect("serialize");
+        assert_eq!(json["template"], "user <*>");
+
+        // (0, 0) is not in the registry.
+        let row = LogRow::from_record(&test_record(), &registry);
+        let json = serde_json::to_value(LogRowDto::from(&row)).expect("serialize");
+        assert!(
+            json.as_object()
+                .is_some_and(|o| !o.contains_key("template")),
+            "an unresolvable pair must omit the key: {json}",
         );
     }
 

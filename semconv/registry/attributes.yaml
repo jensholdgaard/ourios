@@ -402,6 +402,66 @@ groups:
           dimension). The listener keeps the last good certificate in
           both cases (RFC0030.6).
 
+      - id: ourios.template.id
+        type: int
+        stability: development
+        brief: >-
+          The tenant-local template key (RFC 0050 §3.6): which row
+          groups to read. Vendor-namespaced because it is
+          vendor-specific — an RFC 0023 eviction, a re-mint or a second
+          store gives a different id for the same shape, so it means
+          nothing outside one tenant of one store. The portable
+          identity is the `log.record.template` string. Dotted
+          `{object}.{property}` form (not `template_id`) because a
+          template has more properties than its id.
+        examples: [42, 7031]
+      - id: ourios.template.version
+        type: int
+        stability: development
+        brief: >-
+          The template's version stamp (RFC 0050 §3.6) — the companion
+          the RFC 0007 alias and RFC 0010 drift machinery key on;
+          `(id, version)` addresses one token sequence in the
+          registry.
+        examples: [1, 3]
+
+  # `log.record.template` — a LOCAL definition, not a `ref:` (RFC 0050
+  # §3.6): the attribute is not in the upstream registry to reference
+  # (its `log` namespace holds only log.iostream, log.file.*,
+  # log.record.original, log.record.uid — verified 2026-08-24). Writing
+  # a `log.*` name in a vendor registry is otherwise against OTel
+  # naming guidance; this entry pre-adopts the name the
+  # collector-contrib drainprocessor ships today, tracked by
+  # semantic-conventions #1283 / #2064, exactly as that (OTel-owned)
+  # component does. It collapses to a `ref:` the day the proposal
+  # lands upstream.
+  - id: registry.log_record_template
+    type: attribute_group
+    display_name: Proposed log-template attribute (pre-adopted)
+    brief: >-
+      The proposed OpenTelemetry log-template attribute Ourios
+      pre-adopts (RFC 0050), pending semantic-conventions #1283 /
+      #2064.
+    attributes:
+      - id: log.record.template
+        type: string
+        stability: development
+        brief: >-
+          The template of the log record's body — the shape of the
+          line with its variable parts masked, converging to the same
+          value across instances for the same configuration and
+          patterns. The portable half of RFC 0050 §3.6's identity
+          pair; `ourios.template.id` is the local half.
+        note: >-
+          Pre-adopted local definition tracking
+          [semantic-conventions#1283](https://github.com/open-telemetry/semantic-conventions/issues/1283)
+          and
+          [#2064](https://github.com/open-telemetry/semantic-conventions/issues/2064);
+          becomes a `ref:` to the upstream registry when the proposal
+          lands. The name is what collector-contrib's `drainprocessor`
+          emits today.
+        examples: ["user <*> logged in from <*>"]
+
   # `datafusion.*` — deliberately not `ourios.*` (RFC 0040 §3.3): these
   # describe semantics owned by `DataFusion`'s execution-plan model, not
   # Ourios's, on the `ourios-df-otel` operator-span tree. The crate is

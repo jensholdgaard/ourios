@@ -1674,10 +1674,10 @@ impl Querier {
             }
         };
         Ok(CollectedRecords {
-            records: mined
-                .iter()
-                .map(|record| LogRow::from_record(record, map.registry()))
-                .collect(),
+            // The batch constructor memoises per-(id, version) work —
+            // one lookup + one formatted string per distinct template,
+            // not per row.
+            records: LogRow::from_records(&mined, map.registry()),
             scan,
             registry_bytes_read: acquisition_bytes,
         })

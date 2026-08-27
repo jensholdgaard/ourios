@@ -135,6 +135,7 @@ impl std::error::Error for FileConfigError {
 /// (`None` / an empty section), matching an unset environment variable.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct FileConfig {
     /// Data + audit store backend (`storage.*`, RFC 0019).
     pub storage: StorageSection,
@@ -159,6 +160,7 @@ pub struct FileConfig {
 /// `miner.*` — the RFC 0050 §3.2 upstream-template dial.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MinerSection {
     /// `ignore` (default) / `observe` / `adopt`.
     #[serde(deserialize_with = "scalar_opt")]
@@ -187,6 +189,7 @@ impl MinerSection {
 /// `storage.*` — the data + audit store backend selection (RFC 0019 §3.1/§3.2).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct StorageSection {
     /// `local` (default) or `s3`.
     #[serde(deserialize_with = "scalar_opt")]
@@ -207,6 +210,7 @@ pub struct StorageSection {
 /// promotion beyond `service.name` is opt-in.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct PromotedAttributesSection {
     /// Resource-attribute keys to promote (`resource.<key>` columns).
     pub resource: Vec<PromotedEntry>,
@@ -222,6 +226,7 @@ pub struct PromotedAttributesSection {
 /// (RFC0042.6), so an unknown `type` fails loudly there, after
 /// `${env:…}` substitution has run on both fields.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct PromotedEntry {
     /// The attribute key.
     pub key: String,
@@ -313,6 +318,7 @@ impl<'de> Deserialize<'de> for PromotedEntry {
 /// a `Debug` rendering never leaks a key (RFC 0020 §3.5 / RFC 0019 §3.4).
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct S3Section {
     #[serde(deserialize_with = "scalar_opt")]
     pub bucket: Option<String>,
@@ -350,6 +356,7 @@ impl fmt::Debug for S3Section {
 /// `storage.local.*` — the local store root (RFC 0019 §3.1).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct LocalSection {
     #[serde(deserialize_with = "scalar_opt")]
     pub bucket_root: Option<String>,
@@ -358,6 +365,7 @@ pub struct LocalSection {
 /// `receiver.*` — the OTLP receiver role (RFC 0003 §6.2).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ReceiverSection {
     #[serde(deserialize_with = "scalar_opt")]
     pub enabled: Option<String>,
@@ -383,6 +391,7 @@ pub struct ReceiverSection {
 /// contents never appear in config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct TlsSection {
     #[serde(deserialize_with = "scalar_opt")]
     pub cert_file: Option<String>,
@@ -412,6 +421,7 @@ impl TlsSection {
 /// `querier.*` — the query role (RFC 0016 §3.2).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct QuerierSection {
     #[serde(deserialize_with = "scalar_opt")]
     pub enabled: Option<String>,
@@ -429,6 +439,7 @@ pub struct QuerierSection {
 /// `querier.mcp.*` — the RFC 0027 MCP surface (§3.1; default off).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct McpSection {
     #[serde(deserialize_with = "scalar_opt")]
     pub enabled: Option<String>,
@@ -438,6 +449,7 @@ pub struct McpSection {
 /// §3.1), plus the OIDC layer (RFC 0029 §3.1).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct AuthSection {
     /// The configured static tokens. `Option` because absent and explicitly
     /// empty differ (RFC 0029 §3.1): omitting `tokens` is how an oidc-only
@@ -456,6 +468,7 @@ pub struct AuthSection {
 /// and claim names are deployment topology, not credentials — plain `Debug`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct OidcSection {
     /// The OIDC discovery root.
     #[serde(deserialize_with = "scalar_opt")]
@@ -485,6 +498,7 @@ pub struct OidcSection {
 /// literal (the RFC 0026 rule).
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct OpenFgaSection {
     /// The `OpenFGA` HTTP API root.
     #[serde(deserialize_with = "scalar_opt")]
@@ -519,6 +533,7 @@ pub struct OpenFgaSection {
 /// `auth.openfga.visibility.identities.*` — RFC 0048 §3.2.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct IdentitiesSection {
     /// Promoted columns whose values become `user:` principals.
     #[serde(default, deserialize_with = "scalar_vec_opt")]
@@ -531,6 +546,7 @@ pub struct IdentitiesSection {
 /// `auth.openfga.visibility.*` — RFC 0047 §3.4. Nothing here is secret.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct VisibilitySection {
     /// Object type → promoted column bindings (v1: `conversation` only).
     pub objects: Vec<VisibilityObjectSection>,
@@ -556,6 +572,7 @@ pub struct VisibilitySection {
 /// One `auth.openfga.visibility.objects[]` entry.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct VisibilityObjectSection {
     /// The `OpenFGA` object type (`conversation`).
     #[serde(rename = "type", deserialize_with = "scalar_opt")]
@@ -593,6 +610,7 @@ impl fmt::Debug for OpenFgaSection {
 /// reference.
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct TokenEntry {
     /// Audit/metric label for this token — never secret (RFC 0026 §3.4).
     #[serde(deserialize_with = "scalar_opt")]
@@ -620,6 +638,7 @@ impl fmt::Debug for TokenEntry {
 /// `compaction.*` — the background compaction sweep (RFC 0009 §3.2).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct CompactionSection {
     #[serde(deserialize_with = "scalar_opt")]
     pub enabled: Option<String>,
@@ -1711,5 +1730,163 @@ auth:
         );
         assert!(cfg.receiver.enabled.is_none());
         assert!(cfg.querier.enabled.is_none());
+    }
+
+    /// The substitution walk is nine hand-maintained field listings, and
+    /// forgetting the line for a new field is a **silent** failure — the
+    /// field simply never resolves its `${env:…}` reference (epic #745
+    /// wave 0). This census parses a maximal config carrying a reference
+    /// in every scalar leaf and asserts, generically over the serialized
+    /// tree, that (a) no reference survives and (b) every reference in
+    /// the YAML surfaced as a resolved leaf — so an omitted `substitute`
+    /// line fails here instead of in production.
+    ///
+    /// **When you add a config field:** add it to this YAML with a
+    /// `${env:…}` value. `deny_unknown_fields` keeps the document honest
+    /// in the other direction.
+    /// [`every_scalar_leaf_resolves_env_references`]'s generic tree
+    /// walk: collect surviving references, count resolved sentinels.
+    fn walk_census(v: &serde_json::Value, survivors: &mut Vec<String>, resolved: &mut usize) {
+        match v {
+            serde_json::Value::String(s) => {
+                if s.contains("${env:") {
+                    survivors.push(s.clone());
+                } else if s.starts_with("resolved+") {
+                    *resolved += 1;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk_census(item, survivors, resolved);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    walk_census(item, survivors, resolved);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The length is the maximal YAML document itself — one line per
+    // config leaf is the census.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn every_scalar_leaf_resolves_env_references() {
+        let yaml = r"
+storage:
+  backend: ${env:L01}
+  s3:
+    bucket: ${env:L02}
+    endpoint: ${env:L03}
+    region: ${env:L04}
+    prefix: ${env:L05}
+    access_key_id: ${env:L06}
+    secret_access_key: ${env:L07}
+    session_token: ${env:L08}
+  local:
+    bucket_root: ${env:L09}
+  promoted_attributes:
+    resource:
+      - key: ${env:L10}
+        type: ${env:L11}
+    log:
+      - key: ${env:L12}
+        type: ${env:L13}
+receiver:
+  enabled: ${env:L14}
+  grpc_addr: ${env:L15}
+  grpc_tls:
+    cert_file: ${env:L16}
+    key_file: ${env:L17}
+    client_ca_file: ${env:L18}
+    min_version: ${env:L19}
+    reload_interval_secs: ${env:L20}
+  http_addr: ${env:L21}
+  http_tls:
+    cert_file: ${env:L22}
+    key_file: ${env:L23}
+    client_ca_file: ${env:L24}
+    min_version: ${env:L25}
+    reload_interval_secs: ${env:L26}
+  wal_root: ${env:L27}
+  encode_workers: ${env:L28}
+querier:
+  enabled: ${env:L29}
+  http_addr: ${env:L30}
+  http_tls:
+    cert_file: ${env:L31}
+    key_file: ${env:L32}
+    client_ca_file: ${env:L33}
+    min_version: ${env:L34}
+    reload_interval_secs: ${env:L35}
+  default_window_secs: ${env:L36}
+  mcp:
+    enabled: ${env:L37}
+compaction:
+  enabled: ${env:L38}
+  interval_secs: ${env:L39}
+miner:
+  upstream_templates: ${env:L40}
+  upstream_template_byte_limit: ${env:L41}
+  upstream_association_limit: ${env:L42}
+auth:
+  tokens:
+    - name: ${env:L43}
+      token: ${env:L44}
+      tenants:
+        - ${env:L45}
+        - ${env:L46}
+  oidc:
+    issuer: ${env:L47}
+    audience: ${env:L48}
+    tenant_claim: ${env:L49}
+    name_claim: ${env:L50}
+    clock_skew_secs: ${env:L51}
+    agent_claim: ${env:L52}
+    groups_claim: ${env:L53}
+  openfga:
+    api_url: ${env:L54}
+    store_id: ${env:L55}
+    authorization_model_id: ${env:L56}
+    api_token: ${env:L57}
+    session_ttl_secs: ${env:L58}
+    consistency: ${env:L59}
+    request_timeout_secs: ${env:L60}
+    server_list_objects_deadline_ms: ${env:L61}
+    visibility:
+      objects:
+        - type: ${env:L62}
+          column: ${env:L63}
+      identities:
+        user_columns:
+          - ${env:L64}
+        agent_columns:
+          - ${env:L65}
+      self_principal_column: ${env:L66}
+      content_columns:
+        - ${env:L67}
+      max_objects: ${env:L68}
+      list_timeout_ms: ${env:L69}
+";
+        let refs_in_yaml = yaml.matches("${env:").count();
+        let config = parse(yaml, &|name| Some(format!("resolved+{name}")))
+            .expect("the maximal config parses");
+        let tree = serde_json::to_value(&config).expect("serializes");
+
+        let mut survivors = Vec::new();
+        let mut resolved = 0usize;
+        walk_census(&tree, &mut survivors, &mut resolved);
+
+        assert!(
+            survivors.is_empty(),
+            "leaves whose substitute line is missing: {survivors:?}",
+        );
+        assert_eq!(
+            resolved, refs_in_yaml,
+            "every YAML reference must surface as a resolved leaf \
+             (a mismatch means a field in this YAML never reached the tree)",
+        );
     }
 }

@@ -117,21 +117,7 @@ pub(crate) async fn run_drift(
         // (RFC0010.5).
         return Ok(DriftResult::default());
     }
-    // Resolve the audit file set off the async runtime: the S3 branch's
-    // `Store::list_blocking` (and the local `std::fs` walk) are blocking, so
-    // offload them via `spawn_blocking` rather than tie up a runtime worker.
-    // The owned `Backend` (cheap to clone) gives the task a `'static` selector.
-    let files = {
-        let owned = backend.into_owned();
-        let tenant = tenant.clone();
-        tokio::task::spawn_blocking(move || {
-            audit_scan::audit_files(owned.store_ref(), &tenant, Some((start, end)))
-        })
-        .await
-        .map_err(|e| QueryError::Storage {
-            detail: format!("audit listing task: {e}"),
-        })??
-    };
+    let files = audit_scan::audit_files_blocking(backend, tenant, Some((start, end))).await?;
     if files.is_empty() {
         // No audit files for the window ⇒ empty drift result, not an error
         // (RFC0010.5).
@@ -273,17 +259,7 @@ async fn adopted_template_ids(
         // rely on `DataFusion`'s empty-list semantics.
         return Ok((std::collections::HashSet::new(), QueryStats::default()));
     }
-    let files = {
-        let owned = backend.into_owned();
-        let tenant = tenant.clone();
-        tokio::task::spawn_blocking(move || {
-            audit_scan::audit_files(owned.store_ref(), &tenant, None)
-        })
-        .await
-        .map_err(|e| QueryError::Storage {
-            detail: format!("audit listing task: {e}"),
-        })??
-    };
+    let files = audit_scan::audit_files_blocking(backend, tenant, None).await?;
     if files.is_empty() {
         return Ok((std::collections::HashSet::new(), QueryStats::default()));
     }

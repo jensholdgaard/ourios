@@ -72,7 +72,6 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate::expr_fn::count;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;

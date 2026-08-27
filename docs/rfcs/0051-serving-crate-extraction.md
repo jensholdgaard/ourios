@@ -20,7 +20,19 @@ superseded-by: —
 > exactly. Prerequisites: RFC 0026/0027 (auth), RFC 0029 (OIDC),
 > RFC 0030 (TLS), RFC 0046/0047 (out-of-band tenancy, ReBAC).
 
-## 1. Motivation
+## 1. Summary
+
+A new crate `ourios-serving` takes the role-independent serving
+plumbing — the auth resolver, TLS settings and reloading acceptors,
+and trace-context propagation — out of `ourios-ingester`, and takes
+the reqwest-backed OpenFGA and OIDC clients out of `ourios-core`.
+The move is placement-only: every auth decision, TLS handshake,
+header name, metric, audit event and error text stays bit-identical.
+After it, the querier role no longer compiles the ingest pipeline to
+get an auth check, and the foundational-types crate carries no HTTP
+stack.
+
+## 2. Motivation
 
 Two placements survived from the era when the receiver was the only
 serving surface:
@@ -54,11 +66,9 @@ feedback is a velocity killer) and a conceptual one: the dependency
 arrows point *across* roles instead of *down* to shared
 infrastructure.
 
-## 2. Non-goals
+### Non-goals
 
-- No behaviour change anywhere: auth decisions, TLS handshakes,
-  header names, metric names, audit events and error text are all
-  bit-identical. This is a placement RFC.
+- No behaviour change anywhere. This is a placement RFC.
 - The receiver's *pipeline* (`ingest_bound`, encode pool, WAL
   coupling) stays in `ourios-ingester` — only role-independent
   serving plumbing moves.
@@ -66,7 +76,7 @@ infrastructure.
   `AuthLayer` for HTTP and the `TenantDenied` error split are
   separate Wave 3 items, deliberately sequenced after this move).
 
-## 3. Design
+## 3. Proposed design
 
 ### 3.1 What moves
 
@@ -147,44 +157,102 @@ acceptance rather than a separate waiver.
 
 ## 5. Acceptance criteria
 
-Each criterion is a test or a mechanically checkable assertion:
+Scenario ids `RFC0051.<n>`, RFC0051.1–.7.
 
-- **RFC0051.1** `ourios-server`, `ourios-querier` and their tests
-  contain no `ourios_ingester::receiver::{auth,tls,tls_serve,propagation}`
-  path (grep gate in CI or a compile-time re-export removal); the
-  querier role builds with `ourios-serving` only.
-- **RFC0051.2** `ourios-core/Cargo.toml` has no `reqwest`
-  dependency and no `openfga`/`oidc` feature; `cargo tree -i
-  reqwest` shows only `ourios-serving` (and dev-deps) as its
-  workspace entry points.
-- **RFC0051.3** Pure-move verification: the moved modules' test
-  suites pass unchanged (auth resolver unit tests, TLS reload tests,
-  propagation tests — renamed paths only), and the RFC 0026/0027
-  (enforced tenancy + MCP binding), RFC 0029 (OIDC), RFC 0030 (TLS +
-  mTLS + reload) and RFC 0039 (propagation) acceptance suites are
-  green before and after on the same corpus of scenarios.
-- **RFC0051.4** The collector-interop job (real otelcol → TLS+OIDC
-  ingest) passes unchanged — the end-to-end proof that no serving
-  behaviour moved.
-- **RFC0051.5** Graph surfaces: RFC 0047's real-container suite
-  (12/12) passes with the OpenFGA client in its new home; the graph
-  emitter and erasure paths import it from there.
-- **RFC0051.6** Compile-feedback measurement recorded in §6: warm
-  `cargo check -p ourios-server` and `-p ourios-querier` after a
-  one-line edit to `auth.rs`, before vs. after (expected: the
-  querier-role path stops rebuilding `ourios-ingester`).
-- **RFC0051.7** The deprecated re-exports exist in the release the
-  move ships in and are deleted in the next breaking release
-  (tracked by a follow-up issue at acceptance time).
+> **RFC0051.1 — the querier role sheds the ingest crate.** Given the
+> workspace after the move, When `ourios-server`, `ourios-querier`
+> and their tests are grepped for
+> `ourios_ingester::receiver::{auth,tls,tls_serve,propagation}`
+> paths, Then no match exists, And the querier role's modules build
+> against `ourios-serving` only.
+>
+> **RFC0051.2 — core carries no HTTP stack.** Given
+> `ourios-core/Cargo.toml` after the move, When inspected, Then it
+> declares no `reqwest` dependency and no `openfga`/`oidc` feature,
+> And `cargo tree -i reqwest` lists only the chosen serving crate
+> (and dev-dependencies) as its workspace entry points.
+>
+> **RFC0051.3 — pure move, proven by the standing suites.** Given
+> the moved modules, When their own test suites (auth resolver, TLS
+> reload, propagation) and the RFC 0026/0027 (enforced tenancy + MCP
+> binding), RFC 0029 (OIDC), RFC 0030 (TLS + mTLS + reload) and
+> RFC 0039 (propagation) acceptance suites run, Then every scenario
+> that passed before the move passes after it, with only import
+> paths changed in the test code.
+>
+> **RFC0051.4 — end-to-end interop unchanged.** Given the
+> collector-interop CI job (a real otelcol-contrib exporting over
+> TLS + OIDC), When it runs against the moved crate layout, Then it
+> passes unchanged.
+>
+> **RFC0051.5 — graph surfaces follow the client.** Given the
+> OpenFGA client in its new home, When RFC 0047's real-container
+> suite (12 scenarios) and the graph emitter / erasure paths run,
+> Then all pass, And both paths import the client from the serving
+> crate, not from `ourios-core`.
+>
+> **RFC0051.6 — compile feedback improves measurably.** Given a
+> one-line edit to the moved `auth.rs`, When warm
+> `cargo check -p ourios-server` and `-p ourios-querier` are timed
+> before and after the move, Then the after-times are recorded in
+> §9, And the querier-role path no longer rebuilds
+> `ourios-ingester`.
+>
+> **RFC0051.7 — the shims die on schedule.** Given the deprecated
+> `ourios_ingester::receiver::*` re-exports in the release the move
+> ships in, When the next breaking release is cut, Then the
+> re-exports are deleted, And a follow-up issue created at
+> acceptance time tracks that removal.
 
-## 6. Validation
+## 6. Testing strategy
 
-Filled as the criteria land. RFC0051.6's numbers go here.
+Per `CLAUDE.md` §6.2, mapped to the §5 ids:
 
-## 7. Open questions / decisions record
+- **RFC0051.1/.2** — mechanical gates: a grep assertion (CI step or
+  a test over the source tree) and a `cargo tree -i reqwest` check;
+  no new test code.
+- **RFC0051.3** — the existing unit + integration suites of the
+  moved modules, renamed paths only; the RFC 0026/0027/0029/0030/0039
+  scenario tests run unmodified. No test is weakened or deleted
+  (§6.2 "tests are specifications").
+- **RFC0051.4/.5** — the existing testcontainers CI jobs
+  (`collector-interop`, the RFC 0047 OpenFGA container suite) —
+  end-to-end behaviour pins.
+- **RFC0051.6** — a recorded measurement (script + numbers into §9),
+  not a CI gate: wall-clock is machine-dependent; the *dependency*
+  claim (querier path not rebuilding the ingester) is the assertable
+  half, via `cargo build --timings` unit lists.
+- **RFC0051.7** — release-process checklist item plus the tracking
+  issue; not automatable before the release exists.
 
-| # | Question | Decision |
-| --- | --- | --- |
-| 1 | §3.2 shape: Option A (one crate) or Option B (pair)? | **maintainer fork — open** |
-| 2 | Does the OIDC *client* move with OpenFGA (recommended: yes, it is what empties `reqwest` out of core)? | open |
-| 3 | Deprecation window for the `ourios_ingester::receiver::*` re-exports: one release (recommended) or none (pre-production precedent)? | open |
+## 7. Open questions
+
+- [ ] §3.2 shape: Option A (one crate, recommended) or Option B
+      (`ourios-authz` + `ourios-serving` pair)? — **maintainer fork**
+- [ ] Does the OIDC *client* move with OpenFGA (recommended: yes —
+      it is what empties `reqwest` out of core)?
+- [ ] Deprecation window for the `ourios_ingester::receiver::*`
+      re-exports: one release (recommended) or none (pre-production
+      precedent)?
+
+## 8. References
+
+- Epic #745 — the 2026-08-27 structural review (method + line-level
+  evidence; Wave 3 item 1 is this RFC).
+- RFC 0026 (auth & tenant binding), RFC 0027 (MCP surface),
+  RFC 0029 (OIDC bearer layer), RFC 0030 (TLS/mTLS listeners),
+  RFC 0039 (trace-context propagation) — the behaviour contracts the
+  moved modules implement; their §5 suites are this RFC's
+  no-regression pins.
+- RFC 0046 / RFC 0047 — out-of-band tenancy and the ReBAC resolver;
+  the OpenFGA client's consumers on both the ingest (graph emitter,
+  erasure) and serving (visibility) sides.
+- RFC 0028 — the build-feedback program; the compile-cost argument
+  and the "modules change zero compilation units" rule this RFC's
+  crate split deliberately escapes.
+- `CLAUDE.md` §3.7 (multi-tenancy constraint on every moved
+  surface), §7 (crate layout — gains the new crate on acceptance).
+
+## 9. Validation
+
+Filled as the criteria land. RFC0051.6's timing numbers go here.

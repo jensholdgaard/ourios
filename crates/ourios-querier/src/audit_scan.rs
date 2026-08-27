@@ -567,6 +567,26 @@ fn day_span_ns(year: i32, month: u32, day: u32) -> Option<(u64, u64)> {
     Some((lo, lo.saturating_add(DAY_NANOS)))
 }
 
+/// [`audit_files`] off the async runtime: the S3 branch's
+/// `Store::list_blocking` (and the local `std::fs` walk) are blocking,
+/// so they run under `spawn_blocking` rather than tying up a runtime
+/// worker. The owned [`Backend`] (cheap to clone) gives the task a
+/// `'static` selector. One wrapper for every async caller (epic #745
+/// wave 1 — this replaced two byte-identical copies in `drift.rs`).
+pub(crate) async fn audit_files_blocking(
+    backend: crate::StoreRef<'_>,
+    tenant: &ourios_core::tenant::TenantId,
+    window: Option<(u64, u64)>,
+) -> Result<AuditFiles, QueryError> {
+    let owned = backend.into_owned();
+    let tenant = tenant.clone();
+    tokio::task::spawn_blocking(move || audit_files(owned.store_ref(), &tenant, window))
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit listing task: {e}"),
+        })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

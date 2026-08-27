@@ -359,6 +359,17 @@ impl TenantState {
     }
 }
 
+/// Which §6.3 zone a fresh-leaf mint came from — the axis
+/// [`MinerCluster::emit_fresh_leaf_record`] varies on.
+#[derive(Clone, Copy)]
+enum FreshLeafZone {
+    /// No candidate existed; clean by definition.
+    Clean,
+    /// The best candidate fell in the lossy zone; the mint retains
+    /// the body and carries `similarity / threshold`.
+    Lossy { confidence: f32 },
+}
+
 impl MinerCluster {
     /// Build an empty cluster with no-op sinks for both audit
     /// events ([`NoOpAuditSink`]) and mined records
@@ -1562,17 +1573,15 @@ impl MinerCluster {
                     &masked.typed_params,
                     observed,
                 );
-                let mut rec = Self::record_envelope(record, BodyKind::String);
-                rec.template_id = new_id;
-                rec.template_version = 1;
-                rec.separators = separators;
-                rec.params = params;
-                rec.confidence = 1.0;
-                // §6.5: force body retention on this fresh-leaf
-                // record if any of its params overflowed.
-                self.apply_overflow_retention(record, service, &mut rec, raw);
-                self.emit_record(rec, service);
-                new_id
+                self.emit_fresh_leaf_record(
+                    record,
+                    service,
+                    raw,
+                    separators,
+                    params,
+                    new_id,
+                    FreshLeafZone::Clean,
+                )
             }
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
@@ -1622,8 +1631,6 @@ impl MinerCluster {
                                 "template_ceiling",
                             );
                         }
-                        self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.record_body_retention(&record.tenant_id);
                         let new_id = self.create_new_leaf(
                             record,
                             raw,
@@ -1632,22 +1639,17 @@ impl MinerCluster {
                             &masked.typed_params,
                             observed,
                         );
-                        let mut rec = Self::record_envelope(record, BodyKind::String);
-                        rec.template_id = new_id;
-                        rec.template_version = 1;
-                        rec.separators = separators;
-                        rec.params = params;
-                        rec.confidence = c.similarity / threshold;
-                        rec.body = Some(raw.to_string());
-                        // `lossy_flag` stays false — §6.6: the
-                        // §6.3 lossy zone is "body retained,
-                        // reconstruction expected to match".
-                        // §6.5: bump `params_overflow_total` for
-                        // any overflow params (body is already
-                        // retained for the §6.3 reason).
-                        self.apply_overflow_retention(record, service, &mut rec, raw);
-                        self.emit_record(rec, service);
-                        new_id
+                        self.emit_fresh_leaf_record(
+                            record,
+                            service,
+                            raw,
+                            separators,
+                            params,
+                            new_id,
+                            FreshLeafZone::Lossy {
+                                confidence: c.similarity / threshold,
+                            },
+                        )
                     }
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
@@ -1672,6 +1674,51 @@ impl MinerCluster {
                 .record_upstream_template_processed(&record.tenant_id, service, None);
         }
         template_id
+    }
+
+    /// Emit the record for a line that minted a fresh leaf — the one
+    /// place the §6.3 fresh-leaf **body-retention rule** is expressed
+    /// (epic #745 wave 1; this replaced two divergent copies in
+    /// [`Self::ingest_string`]):
+    ///
+    /// - a no-candidate mint is clean by definition — confidence 1.0,
+    ///   no body (only §6.5 overflow may retain it);
+    /// - a §6.3 lossy-zone mint retains the body, bumps both
+    ///   retention counters, and carries `similarity / threshold` as
+    ///   its confidence; `lossy_flag` stays false (§6.6: "body
+    ///   retained, reconstruction expected to match").
+    // Eight arguments: the record-emission context ingest_string holds
+    // (the same shape as its attach/parse-failure siblings, which carry
+    // the same allow).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fresh_leaf_record(
+        &mut self,
+        record: &OtlpLogRecord,
+        service: Option<&str>,
+        raw: &str,
+        separators: Vec<String>,
+        params: Vec<Param>,
+        new_id: u64,
+        zone: FreshLeafZone,
+    ) -> u64 {
+        let mut rec = Self::record_envelope(record, BodyKind::String);
+        rec.template_id = new_id;
+        rec.template_version = 1;
+        rec.separators = separators;
+        rec.params = params;
+        match zone {
+            FreshLeafZone::Clean => rec.confidence = 1.0,
+            FreshLeafZone::Lossy { confidence } => {
+                self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics.record_body_retention(&record.tenant_id);
+                rec.confidence = confidence;
+                rec.body = Some(raw.to_string());
+            }
+        }
+        // §6.5: overflowed params force retention on either zone.
+        self.apply_overflow_retention(record, service, &mut rec, raw);
+        self.emit_record(rec, service);
+        new_id
     }
 
     /// Emit the §6.3 parse-failure record for a string line — the

@@ -638,7 +638,7 @@ pub enum ReceiveError {
 /// retryable-vs-not decision instead of two independently-drifting
 /// ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngestFailure {
+pub(super) enum IngestFailure {
     /// An authenticated caller writing outside its tenant set — a
     /// permanent authz rejection, whole batch, pre-WAL (RFC 0026
     /// §3.2). HTTP 403 / gRPC `PERMISSION_DENIED`.
@@ -658,7 +658,7 @@ pub enum IngestFailure {
 impl IngestFailure {
     /// Classify `error` into the transport-agnostic outcome.
     #[must_use]
-    pub fn classify(error: &ReceiveError) -> Self {
+    pub(super) fn classify(error: &ReceiveError) -> Self {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
             ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,

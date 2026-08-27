@@ -5,12 +5,6 @@
 //! validator — the RFC 0020 §3.1 single validation path, now a lib
 //! module so it stops re-growing inside the binary.
 
-// Moved verbatim from the binary (epic #745 wave 1): the fns keep the
-// doc comments they had as bin-private items. `pub` here serves the
-// bin target, not a public-API invitation; the `# Errors` sections
-// arrive with the wave-2 input-struct rework rather than being
-// invented inside a pure-move PR.
-#![allow(clippy::missing_errors_doc)]
 use crate::config::file::{FileConfig, PromotedEntry, TlsSection};
 use ourios_config::{MinerConfig, UpstreamTemplates};
 use ourios_ingester::receiver::tls::TlsSettings;
@@ -105,6 +99,98 @@ pub struct ReceiverParams {
     pub miner: MinerConfig,
 }
 
+/// Raw inputs for [`build_store_config`]. Named fields so the env and
+/// file front-ends can't transpose the same-typed values (four of the
+/// six are `Option<&str>`); each front-end fills the struct from its
+/// own source and the builder stays the single validation path.
+#[derive(Debug, Default)]
+pub struct StoreInputs<'a> {
+    /// `OURIOS_STORAGE_BACKEND` / `storage.backend` (`local` (default)
+    /// or `s3`), trimmed and treated as unset when empty.
+    pub backend: Option<&'a str>,
+    /// `OURIOS_BUCKET_ROOT` / `storage.local.bucket_root` (required for
+    /// the `local` backend).
+    pub bucket_root: Option<PathBuf>,
+    /// `OURIOS_S3_BUCKET` / `storage.s3.bucket` (required for `s3`).
+    pub s3_bucket: Option<&'a str>,
+    pub s3_endpoint: Option<&'a str>,
+    pub s3_region: Option<&'a str>,
+    pub s3_prefix: Option<&'a str>,
+}
+
+/// Raw inputs for [`build_config`]'s compaction dial.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactionInputs<'a> {
+    /// `OURIOS_COMPACTION_ENABLED` / `compaction.enabled` — opt-*out*
+    /// (default on); a falsey value (`0`/`false`/`no`/`off`) disables
+    /// this process's sweep (RFC 0009 §3.2).
+    pub enabled: Option<&'a str>,
+    /// `OURIOS_COMPACTION_INTERVAL_SECS` / `compaction.interval_secs`
+    /// (default [`DEFAULT_COMPACTION_INTERVAL_SECS`]).
+    pub interval_secs: Option<&'a str>,
+}
+
+/// Raw inputs for [`build_receiver_config`]. TLS sections and the
+/// miner dial ride along so the builder constructs [`ReceiverParams`]
+/// in one place — nothing is patched onto the params after build, and
+/// a disabled role still never fails over settings it doesn't use
+/// (they resolve inside the enabled branch only). `None` TLS sections
+/// (the env path — TLS is config-file only, RFC 0030 §3.1) resolve to
+/// plaintext.
+#[derive(Debug, Default)]
+pub struct ReceiverInputs<'a> {
+    /// `OURIOS_RECEIVER_ENABLED` / `receiver.enabled` (`1`/`true`/`yes`
+    /// enables; default off).
+    pub enabled: Option<&'a str>,
+    /// `OURIOS_RECEIVER_GRPC_ADDR` / `receiver.grpc_addr` (default
+    /// [`DEFAULT_GRPC_ADDR`]).
+    pub grpc_addr: Option<&'a str>,
+    /// `OURIOS_RECEIVER_HTTP_ADDR` / `receiver.http_addr` (default
+    /// [`DEFAULT_HTTP_ADDR`]).
+    pub http_addr: Option<&'a str>,
+    /// `OURIOS_WAL_ROOT` / `receiver.wal_root` (required when enabled).
+    pub wal_root: Option<PathBuf>,
+    /// `OURIOS_RECEIVER_ENCODE_WORKERS` / `receiver.encode_workers`
+    /// (≥ 1; default: available cores — RFC 0035 §3.1).
+    pub encode_workers: Option<&'a str>,
+    /// `receiver.grpc_tls` (config-file only).
+    pub grpc_tls: Option<&'a TlsSection>,
+    /// `receiver.http_tls` (config-file only).
+    pub http_tls: Option<&'a TlsSection>,
+    /// `miner.*` (config-file only, RFC 0050 §3.2).
+    pub miner: MinerInputs<'a>,
+}
+
+/// Raw inputs for [`build_querier_config`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QuerierInputs<'a> {
+    /// `OURIOS_QUERIER_ENABLED` / `querier.enabled` (`1`/`true`/`yes`
+    /// enables; default off).
+    pub enabled: Option<&'a str>,
+    /// `OURIOS_QUERIER_HTTP_ADDR` / `querier.http_addr` (default
+    /// [`DEFAULT_QUERIER_HTTP_ADDR`]).
+    pub http_addr: Option<&'a str>,
+    /// `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` /
+    /// `querier.default_window_secs` (default
+    /// [`DEFAULT_QUERIER_WINDOW_SECS`]; non-zero seconds).
+    pub default_window_secs: Option<&'a str>,
+    /// `OURIOS_QUERIER_MCP_ENABLED` / `querier.mcp.enabled` (default
+    /// off — RFC 0027 §3.1).
+    pub mcp_enabled: Option<&'a str>,
+    /// `querier.http_tls` (config-file only, RFC 0030 §3.1).
+    pub http_tls: Option<&'a TlsSection>,
+}
+
+/// Raw inputs for [`build_miner_config`] (RFC 0050 §3.2; config-file
+/// only — the env front-end passes the default, whose absent values
+/// resolve to `ignore` mode / byte limit 8192 / association limit 4).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MinerInputs<'a> {
+    pub upstream_templates: Option<&'a str>,
+    pub upstream_template_byte_limit: Option<&'a str>,
+    pub upstream_association_limit: Option<&'a str>,
+}
+
 /// Resolve [`ServerConfig`] from the environment:
 /// - `OURIOS_STORAGE_BACKEND` (optional, `local` (default) or `s3`) — the data
 ///   + audit store backend (RFC 0019).
@@ -128,15 +214,25 @@ pub struct ReceiverParams {
 ///   write-ahead-log root (always local, RFC 0019 §3.1).
 /// - `OURIOS_RECEIVER_ENCODE_WORKERS` (optional, ≥ 1; default: available
 ///   cores) — the RFC 0035 §3.1 concurrent-encode pool size.
+///
+/// # Errors
+///
+/// Any `build_*` validator failure over the resolved values (see each
+/// builder's `# Errors`).
 pub fn config_from_env() -> Result<ServerConfig, String> {
-    let store = build_store_config(
-        std::env::var("OURIOS_STORAGE_BACKEND").ok().as_deref(),
-        std::env::var_os("OURIOS_BUCKET_ROOT").map(PathBuf::from),
-        std::env::var("OURIOS_S3_BUCKET").ok().as_deref(),
-        std::env::var("OURIOS_S3_ENDPOINT").ok().as_deref(),
-        std::env::var("OURIOS_S3_REGION").ok().as_deref(),
-        std::env::var("OURIOS_S3_PREFIX").ok().as_deref(),
-    )?;
+    let backend = std::env::var("OURIOS_STORAGE_BACKEND").ok();
+    let s3_bucket = std::env::var("OURIOS_S3_BUCKET").ok();
+    let s3_endpoint = std::env::var("OURIOS_S3_ENDPOINT").ok();
+    let s3_region = std::env::var("OURIOS_S3_REGION").ok();
+    let s3_prefix = std::env::var("OURIOS_S3_PREFIX").ok();
+    let store = build_store_config(StoreInputs {
+        backend: backend.as_deref(),
+        bucket_root: std::env::var_os("OURIOS_BUCKET_ROOT").map(PathBuf::from),
+        s3_bucket: s3_bucket.as_deref(),
+        s3_endpoint: s3_endpoint.as_deref(),
+        s3_region: s3_region.as_deref(),
+        s3_prefix: s3_prefix.as_deref(),
+    })?;
     // Explicit S3 credentials (RFC 0019 §3.4), layered over the standard chain.
     // Bound to locals so the `as_deref` borrows outlive the call.
     let s3_access_key_id = std::env::var("OURIOS_S3_ACCESS_KEY_ID").ok();
@@ -148,36 +244,58 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         s3_secret_access_key.as_deref(),
         s3_session_token.as_deref(),
     );
+    let receiver_enabled = std::env::var("OURIOS_RECEIVER_ENABLED").ok();
+    let grpc_addr = std::env::var("OURIOS_RECEIVER_GRPC_ADDR").ok();
+    let http_addr = std::env::var("OURIOS_RECEIVER_HTTP_ADDR").ok();
+    let encode_workers = std::env::var("OURIOS_RECEIVER_ENCODE_WORKERS").ok();
+    // TLS and the miner dial are config-file only (RFC 0030 §3.1 /
+    // RFC 0050 §3.2): the env path takes the defaults (plaintext,
+    // `ignore` mode).
+    let receiver = build_receiver_config(ReceiverInputs {
+        enabled: receiver_enabled.as_deref(),
+        grpc_addr: grpc_addr.as_deref(),
+        http_addr: http_addr.as_deref(),
+        wal_root: std::env::var_os("OURIOS_WAL_ROOT").map(PathBuf::from),
+        encode_workers: encode_workers.as_deref(),
+        ..ReceiverInputs::default()
+    })?;
+    let querier_enabled = std::env::var("OURIOS_QUERIER_ENABLED").ok();
+    let querier_http_addr = std::env::var("OURIOS_QUERIER_HTTP_ADDR").ok();
+    let window_secs = std::env::var("OURIOS_QUERIER_DEFAULT_WINDOW_SECS").ok();
+    let mcp_enabled = std::env::var("OURIOS_QUERIER_MCP_ENABLED").ok();
+    let querier = build_querier_config(QuerierInputs {
+        enabled: querier_enabled.as_deref(),
+        http_addr: querier_http_addr.as_deref(),
+        default_window_secs: window_secs.as_deref(),
+        mcp_enabled: mcp_enabled.as_deref(),
+        http_tls: None,
+    })?;
+    let compaction_enabled = std::env::var("OURIOS_COMPACTION_ENABLED").ok();
     let interval_raw = std::env::var("OURIOS_COMPACTION_INTERVAL_SECS").ok();
-    let mut config = build_config(
+    build_config(
         store,
-        std::env::var("OURIOS_COMPACTION_ENABLED").ok().as_deref(),
-        interval_raw.as_deref(),
-    )?;
-    config.receiver = build_receiver_config(
-        std::env::var("OURIOS_RECEIVER_ENABLED").ok().as_deref(),
-        std::env::var("OURIOS_RECEIVER_GRPC_ADDR").ok().as_deref(),
-        std::env::var("OURIOS_RECEIVER_HTTP_ADDR").ok().as_deref(),
-        std::env::var_os("OURIOS_WAL_ROOT").map(PathBuf::from),
-        std::env::var("OURIOS_RECEIVER_ENCODE_WORKERS")
-            .ok()
-            .as_deref(),
-    )?;
-    config.querier = build_querier_config(
-        std::env::var("OURIOS_QUERIER_ENABLED").ok().as_deref(),
-        std::env::var("OURIOS_QUERIER_HTTP_ADDR").ok().as_deref(),
-        std::env::var("OURIOS_QUERIER_DEFAULT_WINDOW_SECS")
-            .ok()
-            .as_deref(),
-        std::env::var("OURIOS_QUERIER_MCP_ENABLED").ok().as_deref(),
-    )?;
-    Ok(config)
+        CompactionInputs {
+            enabled: compaction_enabled.as_deref(),
+            interval_secs: interval_raw.as_deref(),
+        },
+        receiver,
+        querier, // The promoted set and auth are config-file only (RFC 0022
+        // §3.2 / RFC 0026 §3.1): the env path resolves the implicit
+        // `service.name`-only set and open mode.
+        PromotedAttributes::default(),
+        None,
+    )
 }
 
 /// Resolve [`ServerConfig`] from a YAML configuration file (RFC 0020). The file
 /// is the **sole** source of Ourios's configuration; the environment
 /// participates only through `${env:…}` substitution inside it (§3.2), so a bare
 /// `OURIOS_*` env var never overrides a file value.
+///
+/// # Errors
+///
+/// An unreadable file, a parse/substitution failure (unknown key,
+/// unresolvable `${env:…}`), or any [`server_config_from_file`] error.
 pub fn config_from_file(path: &Path) -> Result<ServerConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read config file {}: {e}", path.display()))?;
@@ -196,57 +314,64 @@ pub fn config_from_file(path: &Path) -> Result<ServerConfig, String> {
 /// value that fails reuses that message rather than duplicating the rule — the
 /// §3.1 trade-off of one validation path (localising the error text to YAML keys
 /// is a possible follow-up).
+///
+/// # Errors
+///
+/// Any `build_*` validator failure over the file's leaves (see each
+/// builder's `# Errors`), an invalid TLS block, or a bad `auth`
+/// section.
 pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
-    let store = build_store_config(
-        file.storage.backend.as_deref(),
-        file.storage.local.bucket_root.as_deref().map(PathBuf::from),
-        file.storage.s3.bucket.as_deref(),
-        file.storage.s3.endpoint.as_deref(),
-        file.storage.s3.region.as_deref(),
-        file.storage.s3.prefix.as_deref(),
-    )?;
+    let store = build_store_config(StoreInputs {
+        backend: file.storage.backend.as_deref(),
+        bucket_root: file.storage.local.bucket_root.as_deref().map(PathBuf::from),
+        s3_bucket: file.storage.s3.bucket.as_deref(),
+        s3_endpoint: file.storage.s3.endpoint.as_deref(),
+        s3_region: file.storage.s3.region.as_deref(),
+        s3_prefix: file.storage.s3.prefix.as_deref(),
+    })?;
     let store = with_s3_credentials(
         store,
         file.storage.s3.access_key_id.as_deref(),
         file.storage.s3.secret_access_key.as_deref(),
         file.storage.s3.session_token.as_deref(),
     );
-    let mut config = build_config(
-        store,
-        file.compaction.enabled.as_deref(),
-        file.compaction.interval_secs.as_deref(),
-    )?;
-    config.receiver = build_receiver_config(
-        file.receiver.enabled.as_deref(),
-        file.receiver.grpc_addr.as_deref(),
-        file.receiver.http_addr.as_deref(),
-        file.receiver.wal_root.as_deref().map(PathBuf::from),
-        file.receiver.encode_workers.as_deref(),
-    )?;
-    if let Some(receiver) = config.receiver.as_mut() {
-        receiver.grpc_tls = tls_settings("receiver.grpc_tls", &file.receiver.grpc_tls)?;
-        receiver.http_tls = tls_settings("receiver.http_tls", &file.receiver.http_tls)?;
-        receiver.miner = build_miner_config(
-            file.miner.upstream_templates.as_deref(),
-            file.miner.upstream_template_byte_limit.as_deref(),
-            file.miner.upstream_association_limit.as_deref(),
-        )?;
-    }
-    config.querier = build_querier_config(
-        file.querier.enabled.as_deref(),
-        file.querier.http_addr.as_deref(),
-        file.querier.default_window_secs.as_deref(),
-        file.querier.mcp.enabled.as_deref(),
-    )?;
-    if let Some(querier) = config.querier.as_mut() {
-        querier.http_tls = tls_settings("querier.http_tls", &file.querier.http_tls)?;
-    }
-    config.promoted = build_promoted_attributes(
+    let receiver = build_receiver_config(ReceiverInputs {
+        enabled: file.receiver.enabled.as_deref(),
+        grpc_addr: file.receiver.grpc_addr.as_deref(),
+        http_addr: file.receiver.http_addr.as_deref(),
+        wal_root: file.receiver.wal_root.as_deref().map(PathBuf::from),
+        encode_workers: file.receiver.encode_workers.as_deref(),
+        grpc_tls: Some(&file.receiver.grpc_tls),
+        http_tls: Some(&file.receiver.http_tls),
+        miner: MinerInputs {
+            upstream_templates: file.miner.upstream_templates.as_deref(),
+            upstream_template_byte_limit: file.miner.upstream_template_byte_limit.as_deref(),
+            upstream_association_limit: file.miner.upstream_association_limit.as_deref(),
+        },
+    })?;
+    let querier = build_querier_config(QuerierInputs {
+        enabled: file.querier.enabled.as_deref(),
+        http_addr: file.querier.http_addr.as_deref(),
+        default_window_secs: file.querier.default_window_secs.as_deref(),
+        mcp_enabled: file.querier.mcp.enabled.as_deref(),
+        http_tls: Some(&file.querier.http_tls),
+    })?;
+    let promoted = build_promoted_attributes(
         &file.storage.promoted_attributes.resource,
         &file.storage.promoted_attributes.log,
     )?;
-    config.auth = crate::auth::build_auth_config(file.auth.as_ref())?;
-    Ok(config)
+    let auth = crate::auth::build_auth_config(file.auth.as_ref())?;
+    build_config(
+        store,
+        CompactionInputs {
+            enabled: file.compaction.enabled.as_deref(),
+            interval_secs: file.compaction.interval_secs.as_deref(),
+        },
+        receiver,
+        querier,
+        promoted,
+        auth,
+    )
 }
 
 /// Pure storage-backend resolution (env reads live in [`config_from_env`];
@@ -261,19 +386,20 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
 /// an error for a **missing required** value names only the key, never a secret;
 /// other errors (an unknown backend) may echo the offending non-secret value for
 /// diagnosability.
-pub fn build_store_config(
-    backend_raw: Option<&str>,
-    bucket_root: Option<PathBuf>,
-    s3_bucket: Option<&str>,
-    s3_endpoint: Option<&str>,
-    s3_region: Option<&str>,
-    s3_prefix: Option<&str>,
-) -> Result<StoreConfig, String> {
+///
+/// # Errors
+///
+/// - The `local` backend (also the unset default) with a missing or
+///   empty `bucket_root`.
+/// - The `s3` backend with a missing or blank `s3_bucket`.
+/// - An unknown backend token (the error echoes the non-secret value).
+pub fn build_store_config(inputs: StoreInputs<'_>) -> Result<StoreConfig, String> {
     // Trim and treat empty as unset, so " s3 " selects S3 and a blank value
     // falls back to the local default rather than reading as an unknown backend.
-    match backend_raw.map(str::trim).filter(|s| !s.is_empty()) {
+    match inputs.backend.map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("local") => {
-            let root = bucket_root
+            let root = inputs
+                .bucket_root
                 .ok_or("OURIOS_BUCKET_ROOT must be set (the local data + audit store root)")?;
             if root.as_os_str().is_empty() {
                 return Err("OURIOS_BUCKET_ROOT must not be empty".to_string());
@@ -281,18 +407,19 @@ pub fn build_store_config(
             Ok(StoreConfig::Local(root))
         }
         Some("s3") => {
-            let bucket = s3_bucket
+            let bucket = inputs
+                .s3_bucket
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .ok_or("OURIOS_S3_BUCKET must be set when OURIOS_STORAGE_BACKEND=s3")?;
             let mut cfg = S3Config::new(bucket);
-            if let Some(endpoint) = s3_endpoint.map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(endpoint) = inputs.s3_endpoint.map(str::trim).filter(|v| !v.is_empty()) {
                 cfg = cfg.with_endpoint(endpoint);
             }
-            if let Some(region) = s3_region.map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(region) = inputs.s3_region.map(str::trim).filter(|v| !v.is_empty()) {
                 cfg = cfg.with_region(region);
             }
-            if let Some(prefix) = s3_prefix.map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(prefix) = inputs.s3_prefix.map(str::trim).filter(|v| !v.is_empty()) {
                 cfg = cfg.with_prefix(prefix);
             }
             Ok(StoreConfig::S3(cfg))
@@ -339,24 +466,20 @@ pub fn with_s3_credentials(
 /// Pure querier-config assembly + validation (env reads live in
 /// [`config_from_env`]). `None` when the querier role is disabled.
 ///
-/// - `enabled_raw` — `OURIOS_QUERIER_ENABLED` (`1`/`true`/`yes` enables).
-/// - `http_raw` — `OURIOS_QUERIER_HTTP_ADDR` (default
-///   [`DEFAULT_QUERIER_HTTP_ADDR`]).
-/// - `window_raw` — `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` (default
-///   [`DEFAULT_QUERIER_WINDOW_SECS`]); must be a non-zero integer of seconds.
-pub fn build_querier_config(
-    enabled_raw: Option<&str>,
-    http_raw: Option<&str>,
-    window_raw: Option<&str>,
-    mcp_enabled_raw: Option<&str>,
-) -> Result<Option<QuerierParams>, String> {
-    if !matches!(enabled_raw, Some("1" | "true" | "yes")) {
+///
+/// # Errors
+///
+/// Only when enabled (a disabled role validates nothing): a malformed
+/// address, a zero / non-numeric / nanosecond-overflowing window, or an
+/// invalid `http_tls` block.
+pub fn build_querier_config(inputs: QuerierInputs<'_>) -> Result<Option<QuerierParams>, String> {
+    if !matches!(inputs.enabled, Some("1" | "true" | "yes")) {
         return Ok(None);
     }
     // Opt-in like the roles themselves (RFC 0027 §3.1; default off).
-    let mcp_enabled = matches!(mcp_enabled_raw, Some("1" | "true" | "yes"));
-    let http_addr = parse_addr(http_raw, DEFAULT_QUERIER_HTTP_ADDR)?;
-    let window_secs = match window_raw {
+    let mcp_enabled = matches!(inputs.mcp_enabled, Some("1" | "true" | "yes"));
+    let http_addr = parse_addr(inputs.http_addr, DEFAULT_QUERIER_HTTP_ADDR)?;
+    let window_secs = match inputs.default_window_secs {
         None => DEFAULT_QUERIER_WINDOW_SECS,
         Some(raw) => {
             let secs: u64 = raw.parse().map_err(|_| {
@@ -373,9 +496,13 @@ pub fn build_querier_config(
     let default_window_nanos = window_secs
         .checked_mul(NANOS_PER_SEC)
         .ok_or("OURIOS_QUERIER_DEFAULT_WINDOW_SECS overflows when converted to nanoseconds")?;
+    let http_tls = match inputs.http_tls {
+        Some(section) => tls_settings("querier.http_tls", section)?,
+        None => None,
+    };
     Ok(Some(QuerierParams {
         http_addr,
-        http_tls: None,
+        http_tls,
         default_window_nanos,
         mcp_enabled,
     }))
@@ -383,43 +510,55 @@ pub fn build_querier_config(
 
 /// Pure receiver-config assembly + validation (env reads live in
 /// [`config_from_env`]). `None` when the receiver role is disabled.
-pub fn build_receiver_config(
-    enabled_raw: Option<&str>,
-    grpc_raw: Option<&str>,
-    http_raw: Option<&str>,
-    wal_root: Option<PathBuf>,
-    encode_workers_raw: Option<&str>,
-) -> Result<Option<ReceiverParams>, String> {
-    if !matches!(enabled_raw, Some("1" | "true" | "yes")) {
+///
+/// # Errors
+///
+/// Only when enabled (a disabled role validates nothing): a malformed
+/// address, a missing/empty WAL root, an encode-worker count below 1,
+/// an invalid TLS block, or a bad miner dial.
+pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<ReceiverParams>, String> {
+    if !matches!(inputs.enabled, Some("1" | "true" | "yes")) {
         return Ok(None);
     }
-    let grpc_addr = parse_addr(grpc_raw, DEFAULT_GRPC_ADDR)?;
-    let http_addr = parse_addr(http_raw, DEFAULT_HTTP_ADDR)?;
-    let wal_root = wal_root
+    let grpc_addr = parse_addr(inputs.grpc_addr, DEFAULT_GRPC_ADDR)?;
+    let http_addr = parse_addr(inputs.http_addr, DEFAULT_HTTP_ADDR)?;
+    let wal_root = inputs
+        .wal_root
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or("OURIOS_WAL_ROOT must be set when the receiver role is enabled")?;
-    let encode_workers = parse_encode_workers(encode_workers_raw)?;
+    let encode_workers = parse_encode_workers(inputs.encode_workers)?;
+    let grpc_tls = match inputs.grpc_tls {
+        Some(section) => tls_settings("receiver.grpc_tls", section)?,
+        None => None,
+    };
+    let http_tls = match inputs.http_tls {
+        Some(section) => tls_settings("receiver.http_tls", section)?,
+        None => None,
+    };
+    let miner = build_miner_config(inputs.miner)?;
     Ok(Some(ReceiverParams {
         grpc_addr,
-        grpc_tls: None,
+        grpc_tls,
         http_addr,
-        http_tls: None,
+        http_tls,
         wal_root,
         encode_workers,
-        miner: MinerConfig::default(),
+        miner,
     }))
 }
 
 /// Pure miner-dial assembly + validation (RFC 0050 §3.2; config-file
 /// only). Absent values take the [`MinerConfig`] defaults — `ignore`
 /// mode, byte limit 8192, association limit 4.
-pub fn build_miner_config(
-    upstream_templates_raw: Option<&str>,
-    byte_limit_raw: Option<&str>,
-    association_limit_raw: Option<&str>,
-) -> Result<MinerConfig, String> {
+///
+/// # Errors
+///
+/// An unknown `miner.upstream_templates` mode token, or a non-integer
+/// byte / association limit.
+pub fn build_miner_config(inputs: MinerInputs<'_>) -> Result<MinerConfig, String> {
     let mut config = MinerConfig::default();
-    if let Some(raw) = upstream_templates_raw
+    if let Some(raw) = inputs
+        .upstream_templates
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
@@ -435,7 +574,11 @@ pub fn build_miner_config(
         };
         config = config.with_upstream_templates(mode);
     }
-    if let Some(raw) = byte_limit_raw.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(raw) = inputs
+        .upstream_template_byte_limit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let limit: u32 = raw.parse().map_err(|_| {
             format!(
                 "miner.upstream_template_byte_limit must be an integer of UTF-8 bytes \
@@ -444,7 +587,8 @@ pub fn build_miner_config(
         })?;
         config = config.with_upstream_template_byte_limit(limit);
     }
-    if let Some(raw) = association_limit_raw
+    if let Some(raw) = inputs
+        .upstream_association_limit
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
@@ -459,6 +603,10 @@ pub fn build_miner_config(
 /// Parse the RFC 0035 encode-pool worker count: ≥ 1 when set, else the
 /// host's available cores (min 1 — `available_parallelism` can fail in
 /// constrained environments, and the pool needs at least one worker).
+///
+/// # Errors
+///
+/// A set value that is not an integer ≥ 1.
 pub fn parse_encode_workers(raw: Option<&str>) -> Result<usize, String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get));
@@ -472,6 +620,10 @@ pub fn parse_encode_workers(raw: Option<&str>) -> Result<usize, String> {
 }
 
 /// Parse a socket address, falling back to `default` when unset.
+///
+/// # Errors
+///
+/// A value that does not parse as `host:port`.
 pub fn parse_addr(raw: Option<&str>, default: &str) -> Result<SocketAddr, String> {
     let value = raw.unwrap_or(default);
     value
@@ -494,24 +646,35 @@ pub fn wal_config(root: &Path) -> WalConfig {
 }
 
 /// Pure config assembly + validation (env reads live in
-/// [`config_from_env`]; this is the testable core).
+/// [`config_from_env`]; this is the testable core). Takes the already
+/// built role params, promoted set, and auth, so the [`ServerConfig`]
+/// is constructed in one place — nothing is patched onto it after
+/// build.
+///
+/// # Errors
+///
+/// A zero or non-numeric compaction interval — and only when
+/// compaction is enabled: a pod with compaction disabled must not fail
+/// to start over an interval it never uses.
 pub fn build_config(
     store: StoreConfig,
-    compaction_enabled_raw: Option<&str>,
-    interval_raw: Option<&str>,
+    compaction: CompactionInputs<'_>,
+    receiver: Option<ReceiverParams>,
+    querier: Option<QuerierParams>,
+    promoted: PromotedAttributes,
+    auth: Option<crate::auth::AuthConfig>,
 ) -> Result<ServerConfig, String> {
     // Compaction is opt-*out* (default on), unlike the opt-in receiver/querier
     // roles: an explicit falsey value disables the sweep, anything else (incl.
     // unset) keeps it on.
     let compaction_enabled = !matches!(
-        compaction_enabled_raw.map(str::trim),
+        compaction.enabled.map(str::trim),
         Some("0" | "false" | "no" | "off")
     );
-    // Only parse/validate the interval when compaction is on — a pod with
-    // compaction disabled must not fail to start over an interval it never uses
-    // (the default is a placeholder there, never read).
+    // Only parse/validate the interval when compaction is on (the
+    // default is a placeholder there, never read).
     let compaction_interval = if compaction_enabled {
-        match interval_raw {
+        match compaction.interval_secs {
             None => Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
             Some(raw) => {
                 let secs: u64 = raw.parse().map_err(|_| {
@@ -532,10 +695,10 @@ pub fn build_config(
         store,
         compaction_enabled,
         compaction_interval,
-        receiver: None,
-        querier: None,
-        promoted: PromotedAttributes::default(),
-        auth: None,
+        receiver,
+        querier,
+        promoted,
+        auth,
     })
 }
 
@@ -548,6 +711,11 @@ pub fn build_config(
 /// startup rather than silently collapsed: an unknown `type` token, a
 /// key listed twice within a family (whatever spelling each occurrence
 /// uses), and a re-typed `service.name`.
+///
+/// # Errors
+///
+/// An empty or whitespace-padded key, an unknown `type` token, a key
+/// listed twice within a family, or a re-typed `service.name`.
 pub fn build_promoted_attributes(
     resource: &[PromotedEntry],
     log: &[PromotedEntry],
@@ -612,6 +780,11 @@ pub fn build_promoted_attributes(
 /// One `*_tls` block through the single validation path (RFC 0030
 /// §3.1): the raw file leaves into [`TlsSettings::from_parts`], with
 /// the block's YAML key as the error prefix.
+///
+/// # Errors
+///
+/// See [`TlsSettings::from_parts`]: a half-configured cert/key pair,
+/// an unknown `min_version`, or a non-integer reload interval.
 pub fn tls_settings(prefix: &str, section: &TlsSection) -> Result<Option<TlsSettings>, String> {
     TlsSettings::from_parts(
         prefix,
@@ -627,6 +800,11 @@ pub fn tls_settings(prefix: &str, section: &TlsSection) -> Result<Option<TlsSett
 /// `*_tls` block's files are read and built into a `rustls` config at
 /// startup, so an unreadable or malformed PEM is a startup error naming
 /// the block and the path — not a first-handshake surprise.
+///
+/// # Errors
+///
+/// A TLS block whose files can't be read or built into a `rustls`
+/// config, prefixed with the block's YAML key.
 pub fn preflight_tls(config: &ServerConfig) -> Result<(), String> {
     let blocks = [
         (
@@ -702,6 +880,11 @@ pub fn warn_if_open_mode(config: &ServerConfig) {
 /// an empty graph. The defaulted identity lists are exempt: they are the
 /// RFC 0047 constants, which never required promotion (the emitter reads
 /// record attributes, not the projection).
+///
+/// # Errors
+///
+/// An operator-listed identity column (or the object / self-fast-path
+/// column) absent from the effective promoted set.
 pub fn validate_graph_columns(
     openfga: &ourios_core::auth::openfga::OpenFgaConfig,
     promoted: &PromotedAttributes,
@@ -781,21 +964,48 @@ compaction:
         // The same values expressed through the env-path helpers (the shared
         // validators), as `config_from_env` would assemble them.
         let store = with_s3_credentials(
-            build_store_config(Some("s3"), None, Some("my-logs"), None, None, None).expect("s3"),
+            build_store_config(StoreInputs {
+                backend: Some("s3"),
+                bucket_root: None,
+                s3_bucket: Some("my-logs"),
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None,
+            })
+            .expect("s3"),
             None,
             None,
             None,
         );
-        let mut expected = build_config(store, None, Some("120")).expect("valid");
-        expected.receiver = build_receiver_config(
-            Some("true"),
+        let mut expected = build_config(
+            store,
+            CompactionInputs {
+                enabled: None,
+                interval_secs: Some("120"),
+            },
             None,
             None,
-            Some(PathBuf::from("/var/lib/ourios/wal")),
+            PromotedAttributes::default(),
             None,
         )
+        .expect("valid");
+        expected.receiver = build_receiver_config(ReceiverInputs {
+            enabled: Some("true"),
+            grpc_addr: None,
+            http_addr: None,
+            wal_root: Some(PathBuf::from("/var/lib/ourios/wal")),
+            encode_workers: None,
+            ..ReceiverInputs::default()
+        })
         .expect("receiver");
-        expected.querier = build_querier_config(Some("true"), None, None, None).expect("querier");
+        expected.querier = build_querier_config(QuerierInputs {
+            enabled: Some("true"),
+            http_addr: None,
+            default_window_secs: None,
+            mcp_enabled: None,
+            http_tls: None,
+        })
+        .expect("querier");
 
         assert_eq!(from_file, expected);
     }
@@ -911,8 +1121,12 @@ miner:
             ("-1", "miner.upstream_template_byte_limit"),
             ("4294967296", "miner.upstream_template_byte_limit"), // u32::MAX + 1
         ] {
-            let err = build_miner_config(None, Some(raw), None)
-                .expect_err("invalid byte limit must fail");
+            let err = build_miner_config(MinerInputs {
+                upstream_templates: None,
+                upstream_template_byte_limit: Some(raw),
+                upstream_association_limit: None,
+            })
+            .expect_err("invalid byte limit must fail");
             assert!(err.contains(key), "{raw:?} → {err}");
         }
         for (raw, key) in [
@@ -920,17 +1134,31 @@ miner:
             ("-1", "miner.upstream_association_limit"),
             ("65536", "miner.upstream_association_limit"), // u16::MAX + 1
         ] {
-            let err = build_miner_config(None, None, Some(raw))
-                .expect_err("invalid association limit must fail");
+            let err = build_miner_config(MinerInputs {
+                upstream_templates: None,
+                upstream_template_byte_limit: None,
+                upstream_association_limit: Some(raw),
+            })
+            .expect_err("invalid association limit must fail");
             assert!(err.contains(key), "{raw:?} → {err}");
         }
         // The documented boundary values are accepted: 0 disables all
         // upstream-template handling; whitespace reads as unset.
-        let zero = build_miner_config(None, Some("0"), Some("0")).expect("0 is valid");
+        let zero = build_miner_config(MinerInputs {
+            upstream_templates: None,
+            upstream_template_byte_limit: Some("0"),
+            upstream_association_limit: Some("0"),
+        })
+        .expect("0 is valid");
         assert_eq!(zero.upstream_template_byte_limit, 0);
         assert_eq!(zero.upstream_association_limit, 0);
         assert_eq!(
-            build_miner_config(Some("  "), Some(" "), Some("")).expect("blank = unset"),
+            build_miner_config(MinerInputs {
+                upstream_templates: Some("  "),
+                upstream_template_byte_limit: Some(" "),
+                upstream_association_limit: Some("")
+            })
+            .expect("blank = unset"),
             MinerConfig::default(),
         );
     }
@@ -1131,15 +1359,27 @@ auth:
     #[test]
     fn querier_mcp_flag_defaults_off_and_accepts_truthy() {
         for off in [None, Some("0"), Some("false"), Some("off"), Some("")] {
-            let params = build_querier_config(Some("1"), None, None, off)
-                .expect("valid")
-                .expect("enabled");
+            let params = build_querier_config(QuerierInputs {
+                enabled: Some("1"),
+                http_addr: None,
+                default_window_secs: None,
+                mcp_enabled: off,
+                http_tls: None,
+            })
+            .expect("valid")
+            .expect("enabled");
             assert!(!params.mcp_enabled, "{off:?} leaves MCP off");
         }
         for on in ["1", "true", "yes"] {
-            let params = build_querier_config(Some("1"), None, None, Some(on))
-                .expect("valid")
-                .expect("enabled");
+            let params = build_querier_config(QuerierInputs {
+                enabled: Some("1"),
+                http_addr: None,
+                default_window_secs: None,
+                mcp_enabled: Some(on),
+                http_tls: None,
+            })
+            .expect("valid")
+            .expect("enabled");
             assert!(params.mcp_enabled, "{on:?} enables MCP");
         }
     }
@@ -1183,7 +1423,18 @@ auth:
     #[test]
     fn build_config_defaults_the_interval() {
         // Arrange / Act
-        let config = build_config(local("/store"), None, None).expect("valid");
+        let config = build_config(
+            local("/store"),
+            CompactionInputs {
+                enabled: None,
+                interval_secs: None,
+            },
+            None,
+            None,
+            PromotedAttributes::default(),
+            None,
+        )
+        .expect("valid");
 
         // Assert
         assert_eq!(
@@ -1292,7 +1543,18 @@ auth:
     #[test]
     fn build_config_parses_a_custom_interval() {
         // Arrange / Act
-        let config = build_config(local("/store"), None, Some("60")).expect("valid");
+        let config = build_config(
+            local("/store"),
+            CompactionInputs {
+                enabled: None,
+                interval_secs: Some("60"),
+            },
+            None,
+            None,
+            PromotedAttributes::default(),
+            None,
+        )
+        .expect("valid");
 
         // Assert
         assert_eq!(config.compaction_interval, Duration::from_secs(60));
@@ -1302,11 +1564,33 @@ auth:
     fn build_config_rejects_a_zero_or_nonnumeric_interval() {
         // Arrange / Act / Assert
         assert!(
-            build_config(local("/store"), None, Some("0")).is_err(),
+            build_config(
+                local("/store"),
+                CompactionInputs {
+                    enabled: None,
+                    interval_secs: Some("0")
+                },
+                None,
+                None,
+                PromotedAttributes::default(),
+                None
+            )
+            .is_err(),
             "a zero interval would busy-loop the daemon",
         );
         assert!(
-            build_config(local("/store"), None, Some("soon")).is_err(),
+            build_config(
+                local("/store"),
+                CompactionInputs {
+                    enabled: None,
+                    interval_secs: Some("soon")
+                },
+                None,
+                None,
+                PromotedAttributes::default(),
+                None
+            )
+            .is_err(),
             "non-numeric interval is rejected",
         );
     }
@@ -1318,9 +1602,19 @@ auth:
         // opt-in receiver/querier roles.
         for raw in [None, Some("1"), Some("true"), Some("yes"), Some("anything")] {
             assert!(
-                build_config(local("/store"), raw, None)
-                    .expect("valid")
-                    .compaction_enabled,
+                build_config(
+                    local("/store"),
+                    CompactionInputs {
+                        enabled: raw,
+                        interval_secs: None
+                    },
+                    None,
+                    None,
+                    PromotedAttributes::default(),
+                    None
+                )
+                .expect("valid")
+                .compaction_enabled,
                 "compaction stays on for {raw:?}",
             );
         }
@@ -1332,9 +1626,19 @@ auth:
             Some("  off  "),
         ] {
             assert!(
-                !build_config(local("/store"), raw, None)
-                    .expect("valid")
-                    .compaction_enabled,
+                !build_config(
+                    local("/store"),
+                    CompactionInputs {
+                        enabled: raw,
+                        interval_secs: None
+                    },
+                    None,
+                    None,
+                    PromotedAttributes::default(),
+                    None
+                )
+                .expect("valid")
+                .compaction_enabled,
                 "compaction is disabled for {raw:?}",
             );
         }
@@ -1346,7 +1650,18 @@ auth:
         // rejected value must not block startup.
         for bad in [Some("0"), Some("soon")] {
             assert!(
-                build_config(local("/store"), Some("off"), bad).is_ok(),
+                build_config(
+                    local("/store"),
+                    CompactionInputs {
+                        enabled: Some("off"),
+                        interval_secs: bad
+                    },
+                    None,
+                    None,
+                    PromotedAttributes::default(),
+                    None
+                )
+                .is_ok(),
                 "a disabled pod starts despite interval {bad:?}",
             );
         }
@@ -1354,36 +1669,46 @@ auth:
 
     /// Scenario RFC0019.1 — backend selection from config.
     /// See `docs/rfcs/0019-storage-backend-selection.md` §5.
+    // One scenario per RFC criterion; the named-field input structs
+    // push the assertion table past the line lint without adding cases.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn rfc0019_1_backend_selection_from_config() {
         // Unset backend + a bucket root → local.
         assert_eq!(
-            build_store_config(None, Some(PathBuf::from("/store")), None, None, None, None)
-                .expect("local default"),
+            build_store_config(StoreInputs {
+                backend: None,
+                bucket_root: Some(PathBuf::from("/store")),
+                s3_bucket: None,
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None
+            })
+            .expect("local default"),
             local("/store"),
         );
         // Explicit `local` behaves the same.
         assert_eq!(
-            build_store_config(
-                Some("local"),
-                Some(PathBuf::from("/store")),
-                None,
-                None,
-                None,
-                None
-            )
+            build_store_config(StoreInputs {
+                backend: Some("local"),
+                bucket_root: Some(PathBuf::from("/store")),
+                s3_bucket: None,
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None
+            })
             .expect("explicit local"),
             local("/store"),
         );
         // `s3` + a bucket (and optional addressing) → an S3 backend.
-        let s3 = build_store_config(
-            Some("s3"),
-            None,
-            Some("my-bucket"),
-            Some("http://localhost:4566"),
-            Some("us-east-1"),
-            Some("ourios"),
-        )
+        let s3 = build_store_config(StoreInputs {
+            backend: Some("s3"),
+            bucket_root: None,
+            s3_bucket: Some("my-bucket"),
+            s3_endpoint: Some("http://localhost:4566"),
+            s3_region: Some("us-east-1"),
+            s3_prefix: Some("ourios"),
+        })
         .expect("s3 selected");
         assert_eq!(
             s3,
@@ -1396,37 +1721,53 @@ auth:
         );
         // `s3` without a bucket, and an unknown backend, both fail fast.
         assert!(
-            build_store_config(Some("s3"), None, None, None, None, None).is_err(),
+            build_store_config(StoreInputs {
+                backend: Some("s3"),
+                bucket_root: None,
+                s3_bucket: None,
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None
+            })
+            .is_err(),
             "s3 backend requires OURIOS_S3_BUCKET",
         );
         assert!(
-            build_store_config(
-                Some("gcs"),
-                Some(PathBuf::from("/store")),
-                None,
-                None,
-                None,
-                None
-            )
+            build_store_config(StoreInputs {
+                backend: Some("gcs"),
+                bucket_root: Some(PathBuf::from("/store")),
+                s3_bucket: None,
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None
+            })
             .is_err(),
             "an unknown backend is rejected",
         );
         // Local backend with no bucket root is rejected — "must be set" for an
         // unset var, distinct from "must not be empty" for a present-but-empty
         // one (clearer operator diagnostics).
-        let unset = build_store_config(None, None, None, None, None, None).expect_err("unset");
+        let unset = build_store_config(StoreInputs {
+            backend: None,
+            bucket_root: None,
+            s3_bucket: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_prefix: None,
+        })
+        .expect_err("unset");
         assert!(
             unset.contains("must be set"),
             "unset names the missing key, got {unset:?}",
         );
-        let empty = build_store_config(
-            Some("local"),
-            Some(PathBuf::from("")),
-            None,
-            None,
-            None,
-            None,
-        )
+        let empty = build_store_config(StoreInputs {
+            backend: Some("local"),
+            bucket_root: Some(PathBuf::from("")),
+            s3_bucket: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_prefix: None,
+        })
         .expect_err("empty");
         assert!(
             empty.contains("must not be empty"),
@@ -1435,19 +1776,26 @@ auth:
         // The backend value is trimmed; a blank value is treated as unset
         // (→ local), not as an unknown backend.
         assert_eq!(
-            build_store_config(Some("  s3  "), None, Some("b"), None, None, None)
-                .expect("trimmed s3"),
+            build_store_config(StoreInputs {
+                backend: Some("  s3  "),
+                bucket_root: None,
+                s3_bucket: Some("b"),
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None
+            })
+            .expect("trimmed s3"),
             StoreConfig::S3(S3Config::new("b")),
         );
         assert_eq!(
-            build_store_config(
-                Some("   "),
-                Some(PathBuf::from("/store")),
-                None,
-                None,
-                None,
-                None
-            )
+            build_store_config(StoreInputs {
+                backend: Some("   "),
+                bucket_root: Some(PathBuf::from("/store")),
+                s3_bucket: None,
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None
+            })
             .expect("blank backend → local"),
             local("/store"),
         );
@@ -1460,8 +1808,15 @@ auth:
         // A missing S3 bucket names only the *key*, never a value, and config
         // resolution never reads credentials (those come from the AWS chain in
         // `StoreConfig::open`), so no secret can appear in an error.
-        let err = build_store_config(Some("s3"), None, None, None, None, None)
-            .expect_err("missing bucket");
+        let err = build_store_config(StoreInputs {
+            backend: Some("s3"),
+            bucket_root: None,
+            s3_bucket: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_prefix: None,
+        })
+        .expect_err("missing bucket");
         assert!(
             err.contains("OURIOS_S3_BUCKET"),
             "the error names the missing key, got {err:?}",
@@ -1523,9 +1878,22 @@ auth:
         // receiver/querier/compactor behaviour is then guarded by their
         // existing local suites, unchanged.
         let config = build_config(
-            build_store_config(None, Some(PathBuf::from("/store")), None, None, None, None)
-                .expect("default local"),
+            build_store_config(StoreInputs {
+                backend: None,
+                bucket_root: Some(PathBuf::from("/store")),
+                s3_bucket: None,
+                s3_endpoint: None,
+                s3_region: None,
+                s3_prefix: None,
+            })
+            .expect("default local"),
+            CompactionInputs {
+                enabled: None,
+                interval_secs: None,
+            },
             None,
+            None,
+            PromotedAttributes::default(),
             None,
         )
         .expect("valid");
@@ -1538,8 +1906,15 @@ auth:
         // Arrange / Act / Assert — unset or a falsey value disables the role.
         for raw in [None, Some("0"), Some("false"), Some("nope")] {
             assert_eq!(
-                build_receiver_config(raw, None, None, Some(PathBuf::from("/wal")), None)
-                    .expect("ok"),
+                build_receiver_config(ReceiverInputs {
+                    enabled: raw,
+                    grpc_addr: None,
+                    http_addr: None,
+                    wal_root: Some(PathBuf::from("/wal")),
+                    encode_workers: None,
+                    ..ReceiverInputs::default()
+                })
+                .expect("ok"),
                 None,
                 "receiver disabled for enabled_raw = {raw:?}",
             );
@@ -1549,10 +1924,16 @@ auth:
     #[test]
     fn build_receiver_config_enabled_defaults_the_addresses() {
         // Arrange / Act
-        let params =
-            build_receiver_config(Some("1"), None, None, Some(PathBuf::from("/wal")), None)
-                .expect("ok")
-                .expect("enabled");
+        let params = build_receiver_config(ReceiverInputs {
+            enabled: Some("1"),
+            grpc_addr: None,
+            http_addr: None,
+            wal_root: Some(PathBuf::from("/wal")),
+            encode_workers: None,
+            ..ReceiverInputs::default()
+        })
+        .expect("ok")
+        .expect("enabled");
 
         // Assert
         assert_eq!(params.grpc_addr, DEFAULT_GRPC_ADDR.parse().unwrap());
@@ -1563,13 +1944,14 @@ auth:
     #[test]
     fn build_receiver_config_parses_custom_addresses() {
         // Arrange / Act
-        let params = build_receiver_config(
-            Some("yes"),
-            Some("127.0.0.1:1"),
-            Some("127.0.0.1:2"),
-            Some(PathBuf::from("/wal")),
-            None,
-        )
+        let params = build_receiver_config(ReceiverInputs {
+            enabled: Some("yes"),
+            grpc_addr: Some("127.0.0.1:1"),
+            http_addr: Some("127.0.0.1:2"),
+            wal_root: Some(PathBuf::from("/wal")),
+            encode_workers: None,
+            ..ReceiverInputs::default()
+        })
         .expect("ok")
         .expect("enabled");
 
@@ -1583,11 +1965,27 @@ auth:
         // Arrange / Act / Assert — the WAL root is mandatory (and must be
         // non-empty) once the receiver role is on.
         assert!(
-            build_receiver_config(Some("1"), None, None, None, None).is_err(),
+            build_receiver_config(ReceiverInputs {
+                enabled: Some("1"),
+                grpc_addr: None,
+                http_addr: None,
+                wal_root: None,
+                encode_workers: None,
+                ..ReceiverInputs::default()
+            })
+            .is_err(),
             "a missing WAL root is rejected",
         );
         assert!(
-            build_receiver_config(Some("1"), None, None, Some(PathBuf::from("")), None).is_err(),
+            build_receiver_config(ReceiverInputs {
+                enabled: Some("1"),
+                grpc_addr: None,
+                http_addr: None,
+                wal_root: Some(PathBuf::from("")),
+                encode_workers: None,
+                ..ReceiverInputs::default()
+            })
+            .is_err(),
             "an empty WAL root is rejected",
         );
     }
@@ -1596,32 +1994,40 @@ auth:
     fn build_receiver_config_encode_workers_defaults_and_validates() {
         // RFC 0035: unset → available cores (≥ 1); explicit values parse;
         // zero / junk are startup errors.
-        let params =
-            build_receiver_config(Some("1"), None, None, Some(PathBuf::from("/wal")), None)
-                .expect("ok")
-                .expect("enabled");
+        let params = build_receiver_config(ReceiverInputs {
+            enabled: Some("1"),
+            grpc_addr: None,
+            http_addr: None,
+            wal_root: Some(PathBuf::from("/wal")),
+            encode_workers: None,
+            ..ReceiverInputs::default()
+        })
+        .expect("ok")
+        .expect("enabled");
         assert!(params.encode_workers >= 1, "the default is at least one");
 
-        let params = build_receiver_config(
-            Some("1"),
-            None,
-            None,
-            Some(PathBuf::from("/wal")),
-            Some("3"),
-        )
+        let params = build_receiver_config(ReceiverInputs {
+            enabled: Some("1"),
+            grpc_addr: None,
+            http_addr: None,
+            wal_root: Some(PathBuf::from("/wal")),
+            encode_workers: Some("3"),
+            ..ReceiverInputs::default()
+        })
         .expect("ok")
         .expect("enabled");
         assert_eq!(params.encode_workers, 3);
 
         for bad in ["0", "-1", "many"] {
             assert!(
-                build_receiver_config(
-                    Some("1"),
-                    None,
-                    None,
-                    Some(PathBuf::from("/wal")),
-                    Some(bad),
-                )
+                build_receiver_config(ReceiverInputs {
+                    enabled: Some("1"),
+                    grpc_addr: None,
+                    http_addr: None,
+                    wal_root: Some(PathBuf::from("/wal")),
+                    encode_workers: Some(bad),
+                    ..ReceiverInputs::default()
+                })
                 .is_err(),
                 "encode_workers = {bad:?} is rejected",
             );
@@ -1632,13 +2038,14 @@ auth:
     fn build_receiver_config_rejects_a_malformed_address() {
         // Arrange / Act / Assert
         assert!(
-            build_receiver_config(
-                Some("1"),
-                Some("not-an-addr"),
-                None,
-                Some(PathBuf::from("/wal")),
-                None,
-            )
+            build_receiver_config(ReceiverInputs {
+                enabled: Some("1"),
+                grpc_addr: Some("not-an-addr"),
+                http_addr: None,
+                wal_root: Some(PathBuf::from("/wal")),
+                encode_workers: None,
+                ..ReceiverInputs::default()
+            })
             .is_err(),
             "a malformed bind address is rejected",
         );
@@ -1649,7 +2056,14 @@ auth:
         // Arrange / Act / Assert — unset or a falsey value disables the role.
         for raw in [None, Some("0"), Some("false"), Some("nope")] {
             assert_eq!(
-                build_querier_config(raw, None, None, None).expect("ok"),
+                build_querier_config(QuerierInputs {
+                    enabled: raw,
+                    http_addr: None,
+                    default_window_secs: None,
+                    mcp_enabled: None,
+                    http_tls: None
+                })
+                .expect("ok"),
                 None,
                 "querier disabled for enabled_raw = {raw:?}",
             );
@@ -1659,9 +2073,15 @@ auth:
     #[test]
     fn build_querier_config_enabled_defaults_address_and_window() {
         // Arrange / Act
-        let params = build_querier_config(Some("1"), None, None, None)
-            .expect("ok")
-            .expect("enabled");
+        let params = build_querier_config(QuerierInputs {
+            enabled: Some("1"),
+            http_addr: None,
+            default_window_secs: None,
+            mcp_enabled: None,
+            http_tls: None,
+        })
+        .expect("ok")
+        .expect("enabled");
 
         // Assert
         assert_eq!(params.http_addr, DEFAULT_QUERIER_HTTP_ADDR.parse().unwrap());
@@ -1674,9 +2094,15 @@ auth:
     #[test]
     fn build_querier_config_parses_custom_address_and_window() {
         // Arrange / Act
-        let params = build_querier_config(Some("yes"), Some("127.0.0.1:9"), Some("120"), None)
-            .expect("ok")
-            .expect("enabled");
+        let params = build_querier_config(QuerierInputs {
+            enabled: Some("yes"),
+            http_addr: Some("127.0.0.1:9"),
+            default_window_secs: Some("120"),
+            mcp_enabled: None,
+            http_tls: None,
+        })
+        .expect("ok")
+        .expect("enabled");
 
         // Assert
         assert_eq!(params.http_addr, "127.0.0.1:9".parse().unwrap());
@@ -1688,11 +2114,25 @@ auth:
         // Arrange / Act / Assert — a zero window would make every no-`range`
         // query empty; a non-numeric value is a config typo.
         assert!(
-            build_querier_config(Some("1"), None, Some("0"), None).is_err(),
+            build_querier_config(QuerierInputs {
+                enabled: Some("1"),
+                http_addr: None,
+                default_window_secs: Some("0"),
+                mcp_enabled: None,
+                http_tls: None
+            })
+            .is_err(),
             "a zero default window is rejected",
         );
         assert!(
-            build_querier_config(Some("1"), None, Some("soon"), None).is_err(),
+            build_querier_config(QuerierInputs {
+                enabled: Some("1"),
+                http_addr: None,
+                default_window_secs: Some("soon"),
+                mcp_enabled: None,
+                http_tls: None
+            })
+            .is_err(),
             "a non-numeric default window is rejected",
         );
     }
@@ -1701,7 +2141,14 @@ auth:
     fn build_querier_config_rejects_a_malformed_address() {
         // Arrange / Act / Assert
         assert!(
-            build_querier_config(Some("1"), Some("not-an-addr"), None, None).is_err(),
+            build_querier_config(QuerierInputs {
+                enabled: Some("1"),
+                http_addr: Some("not-an-addr"),
+                default_window_secs: None,
+                mcp_enabled: None,
+                http_tls: None
+            })
+            .is_err(),
             "a malformed bind address is rejected",
         );
     }

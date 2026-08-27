@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 use crate::data_schema_with_promoted;
 use crate::parquet_io::{
-    BufferedParquetWriter, ChunkError, object_key, open_local_store, write_chunked,
+    BufferedParquetWriter, ChunkError, WriteError, object_key, open_local_store, write_chunked,
 };
 use crate::partition::PartitionKey;
 use crate::promoted::PromotedAttributes;
@@ -716,6 +716,20 @@ impl std::error::Error for WriterError {
             Self::Batch(e) => Some(e),
             Self::PartitionMismatch { .. } | Self::Poisoned => None,
         }
+    }
+}
+
+impl WriteError for WriterError {
+    fn parquet(e: ParquetError) -> Self {
+        Self::Parquet(e)
+    }
+
+    fn io(op: &'static str, path: PathBuf, source: io::Error) -> Self {
+        Self::Io { op, path, source }
+    }
+
+    fn poisoned() -> Self {
+        Self::Poisoned
     }
 }
 

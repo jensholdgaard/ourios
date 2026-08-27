@@ -43,7 +43,7 @@ use parquet::schema::types::ColumnPath;
 use uuid::Uuid;
 
 use crate::audit_record_batch::{AuditBatchError, audit_events_to_batch};
-use crate::parquet_io::{BufferedParquetWriter, object_key, open_local_store};
+use crate::parquet_io::{BufferedParquetWriter, WriteError, object_key, open_local_store};
 use crate::partition::PartitionKey;
 use crate::store::Store;
 use crate::writer::ROW_GROUP_FLUSH_BYTES;
@@ -386,6 +386,25 @@ impl std::error::Error for AuditWriterError {
             Self::Batch(e) => Some(e),
             Self::PartitionMismatch { .. } | Self::Poisoned => None,
         }
+    }
+}
+
+impl WriteError for AuditWriterError {
+    fn parquet(e: ParquetError) -> Self {
+        Self::Parquet(e)
+    }
+
+    fn io(op: &'static str, path: PathBuf, source: io::Error) -> Self {
+        Self::Io {
+            op,
+            path,
+            source_path: None,
+            source,
+        }
+    }
+
+    fn poisoned() -> Self {
+        Self::Poisoned
     }
 }
 

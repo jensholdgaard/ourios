@@ -24,13 +24,14 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-use crate::audit_writer::AuditWriterError;
 use crate::store::Store;
-use crate::writer::WriterError;
 
 /// Constructors for the error cases the shared write core produces.
 /// Mirrors [`crate::decode::DecodeError`] on the read side: the core
 /// stays generic and each writer's public error enum stays intact.
+/// Each error enum implements this next to its own definition, so the
+/// core depends on no concrete writer and a new writer plugs in
+/// without editing this module.
 pub(crate) trait WriteError: Sized {
     /// The underlying Parquet writer failed (write, flush, or footer).
     fn parquet(e: ParquetError) -> Self;
@@ -39,39 +40,6 @@ pub(crate) trait WriteError: Sized {
     /// A prior append failed with a Parquet error; the buffer is
     /// undefined and the writer refuses further work.
     fn poisoned() -> Self;
-}
-
-impl WriteError for WriterError {
-    fn parquet(e: ParquetError) -> Self {
-        Self::Parquet(e)
-    }
-
-    fn io(op: &'static str, path: PathBuf, source: io::Error) -> Self {
-        Self::Io { op, path, source }
-    }
-
-    fn poisoned() -> Self {
-        Self::Poisoned
-    }
-}
-
-impl WriteError for AuditWriterError {
-    fn parquet(e: ParquetError) -> Self {
-        Self::Parquet(e)
-    }
-
-    fn io(op: &'static str, path: PathBuf, source: io::Error) -> Self {
-        Self::Io {
-            op,
-            path,
-            source_path: None,
-            source,
-        }
-    }
-
-    fn poisoned() -> Self {
-        Self::Poisoned
-    }
 }
 
 /// The `/`-delimited object key for a partition's file: the partition's
@@ -367,6 +335,7 @@ mod tests {
     use parquet::file::properties::WriterProperties;
 
     use super::*;
+    use crate::writer::WriterError;
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))

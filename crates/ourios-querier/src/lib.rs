@@ -51,13 +51,11 @@ pub mod visibility;
 
 pub use alias_store::derive_alias_map;
 pub use audit_scan::StoreRef;
-pub use body_match::{BodyLiteralMatch, body_literal_candidates};
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_map::{
-    ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME,
-    TEMPLATE_MAP_FORMAT_VERSION, TEMPLATE_MAP_V1_FILENAME, TemplateMap, derive_template_map,
-    load_or_derive,
+    ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME, TemplateMap,
+    derive_template_map, load_or_derive,
 };
 pub use template_registry::{TemplateRegistry, derive_template_registry};
 pub use visibility::{ScopedIds, SelfMatch, Visibility};

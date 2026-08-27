@@ -25,6 +25,9 @@
 //! non-breaking for readers, and folds defined over named kinds
 //! ignore unknown rows by construction.
 
+// The shared accessor family (epic #745 wave 2).
+#[allow(clippy::wildcard_imports)]
+use crate::decode::*;
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -32,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
+use arrow_array::types::Int32Type;
 use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
@@ -116,18 +119,7 @@ impl AuditReader {
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(reader).map_err(AuditReaderError::Parquet)?;
 
-        let file_schema = builder.schema();
-        for expected_field in crate::audit_schema().fields() {
-            if !expected_field.is_nullable()
-                && file_schema
-                    .column_with_name(expected_field.name())
-                    .is_none()
-            {
-                return Err(AuditReaderError::MissingRequiredColumn {
-                    name: expected_field.name().clone(),
-                });
-            }
-        }
+        require_baseline_columns(builder.schema(), &crate::audit_schema())?;
 
         let inner = builder.build().map_err(AuditReaderError::Parquet)?;
 
@@ -329,7 +321,11 @@ fn batch_to_audit_events(
     let new_template = optional_string(batch, audit_columns::NEW_TEMPLATE)?.unwrap_or_default();
     let positions_widened_lists = decode_positions_column(batch, row_offset)?;
     let slots_expanded_lists = decode_slots_column(batch, row_offset)?;
-    let triggering_line_hash = optional_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH)?;
+    // The shared accessor models an absent column as `None`; this
+    // decode's index-guarded readers want the audit reader's historical
+    // empty-vec shape.
+    let triggering_line_hash =
+        optional_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH)?.unwrap_or_default();
     let triggering_line_sample =
         optional_string(batch, audit_columns::TRIGGERING_LINE_SAMPLE)?.unwrap_or_default();
     let reason = optional_string(batch, audit_columns::REASON)?.unwrap_or_default();
@@ -1083,296 +1079,6 @@ fn decode_param_type(ord: i32) -> ParamType {
 // `UnknownEventKind` / `TimestampDecode` / `PartitionMismatch`
 // variants — the §3.9 "internal index convention" CodeRabbit
 // flagged on the first round.
-
-fn required_string(
-    batch: &RecordBatch,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<String>, AuditReaderError> {
-    let col = required_column(batch, name)?;
-    let arr = crate::reader::StrCol::try_new(col).ok_or_else(|| AuditReaderError::Conversion {
-        column: name,
-        detail: format!(
-            "expected Utf8/Utf8View string array, got {:?}",
-            col.data_type()
-        ),
-    })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for i in 0..arr.len() {
-        let Some(v) = arr.get(i) else {
-            return Err(AuditReaderError::Conversion {
-                column: name,
-                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
-            });
-        };
-        out.push(v.to_string());
-    }
-    Ok(out)
-}
-
-fn required_u8(
-    batch: &RecordBatch,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<u8>, AuditReaderError> {
-    let col = required_column(batch, name)?;
-    let arr = col
-        .as_primitive_opt::<UInt8Type>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected UInt8Array, got {:?}", col.data_type()),
-        })?;
-    materialize_required_primitive(arr, name, row_offset)
-}
-
-fn required_timestamp(
-    batch: &RecordBatch,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<i64>, AuditReaderError> {
-    let col = required_column(batch, name)?;
-    let arr = col
-        .as_primitive_opt::<TimestampNanosecondType>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!(
-                "expected TimestampNanosecondArray, got {:?}",
-                col.data_type()
-            ),
-        })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            return Err(AuditReaderError::Conversion {
-                column: name,
-                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
-            });
-        }
-        out.push(arr.value(i));
-    }
-    Ok(out)
-}
-
-fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
-    arr: &arrow_array::PrimitiveArray<T>,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<T::Native>, AuditReaderError> {
-    if arr.null_count() == 0 {
-        return Ok(arr.values().to_vec());
-    }
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            return Err(AuditReaderError::Conversion {
-                column: name,
-                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
-            });
-        }
-    }
-    Ok(arr.values().to_vec())
-}
-
-fn required_column<'a>(
-    batch: &'a RecordBatch,
-    name: &'static str,
-) -> Result<&'a dyn Array, AuditReaderError> {
-    let idx =
-        batch
-            .schema()
-            .index_of(name)
-            .map_err(|_| AuditReaderError::MissingRequiredColumn {
-                name: name.to_string(),
-            })?;
-    Ok(batch.column(idx).as_ref())
-}
-
-fn optional_string(
-    batch: &RecordBatch,
-    name: &'static str,
-) -> Result<Option<Vec<Option<String>>>, AuditReaderError> {
-    let Some(col) = optional_column(batch, name) else {
-        return Ok(None);
-    };
-    let arr = crate::reader::StrCol::try_new(col).ok_or_else(|| AuditReaderError::Conversion {
-        column: name,
-        detail: format!(
-            "expected Utf8/Utf8View string array, got {:?}",
-            col.data_type()
-        ),
-    })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for i in 0..arr.len() {
-        out.push(arr.get(i).map(str::to_string));
-    }
-    Ok(Some(out))
-}
-
-fn optional_column<'a>(batch: &'a RecordBatch, name: &'static str) -> Option<&'a dyn Array> {
-    let idx = batch.schema().index_of(name).ok()?;
-    Some(batch.column(idx).as_ref())
-}
-
-/// Per-row `Option<u64>` for a nullable `UInt64` column (the §3.7
-/// `template_id` / `compaction_generation` / `compaction_rows`
-/// columns).
-fn optional_u64(
-    batch: &RecordBatch,
-    name: &'static str,
-) -> Result<Vec<Option<u64>>, AuditReaderError> {
-    let Some(col) = optional_column(batch, name) else {
-        return Ok(Vec::new());
-    };
-    let arr = col
-        .as_primitive_opt::<UInt64Type>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected UInt64Array, got {:?}", col.data_type()),
-        })?;
-    Ok((0..arr.len())
-        .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
-        .collect())
-}
-
-/// Per-row `Option<u32>` for a nullable `UInt32` column.
-fn optional_u32(
-    batch: &RecordBatch,
-    name: &'static str,
-) -> Result<Vec<Option<u32>>, AuditReaderError> {
-    let Some(col) = optional_column(batch, name) else {
-        return Ok(Vec::new());
-    };
-    let arr = col
-        .as_primitive_opt::<UInt32Type>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected UInt32Array, got {:?}", col.data_type()),
-        })?;
-    Ok((0..arr.len())
-        .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
-        .collect())
-}
-
-/// Per-row `Option<[u8; 16]>` for the nullable `triggering_line_hash`
-/// `FixedSizeBinary(16)` column.
-fn optional_fixed_bytes16(
-    batch: &RecordBatch,
-    name: &'static str,
-) -> Result<Vec<Option<[u8; 16]>>, AuditReaderError> {
-    let Some(col) = optional_column(batch, name) else {
-        return Ok(Vec::new());
-    };
-    let arr = col
-        .as_fixed_size_binary_opt()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected FixedSizeBinaryArray, got {:?}", col.data_type()),
-        })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            out.push(None);
-        } else {
-            let mut buf = [0u8; 16];
-            buf.copy_from_slice(arr.value(i));
-            out.push(Some(buf));
-        }
-    }
-    Ok(out)
-}
-
-/// Per-row `Option<Vec<String>>` for the nullable
-/// `compaction_input_files` `LIST<STRING>` column. The element field
-/// is non-nullable, so a NULL element is a corrupt row.
-fn optional_string_list(
-    batch: &RecordBatch,
-    name: &'static str,
-) -> Result<Vec<Option<Vec<String>>>, AuditReaderError> {
-    let Some(col) = optional_column(batch, name) else {
-        return Ok(Vec::new());
-    };
-    let list = col
-        .as_list_opt::<i32>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: "column is not a LIST<STRING> as declared".to_string(),
-        })?;
-    let mut out = Vec::with_capacity(list.len());
-    for row_idx in 0..list.len() {
-        if list.is_null(row_idx) {
-            out.push(None);
-            continue;
-        }
-        let elements = list.value(row_idx);
-        let strs = crate::reader::StrCol::try_new(elements.as_ref()).ok_or_else(|| {
-            AuditReaderError::Conversion {
-                column: name,
-                detail: "list element is not Utf8/Utf8View".to_string(),
-            }
-        })?;
-        let mut row = Vec::with_capacity(strs.len());
-        for i in 0..strs.len() {
-            let Some(v) = strs.get(i) else {
-                return Err(AuditReaderError::Conversion {
-                    column: name,
-                    detail: format!(
-                        "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
-                    ),
-                });
-            };
-            row.push(v.to_string());
-        }
-        out.push(Some(row));
-    }
-    Ok(out)
-}
-
-/// Per-row `Option<Vec<u64>>` for the nullable `alias_member_ids`
-/// `LIST<UInt64>` column. NULL list ⇒ `None` (not an alias row);
-/// empty list ⇒ `Some(vec![])` — the §3.7 empty-vs-NULL distinction.
-/// The element field is non-nullable, so a NULL element is a corrupt
-/// row.
-fn optional_u64_list(
-    batch: &RecordBatch,
-    name: &'static str,
-) -> Result<Vec<Option<Vec<u64>>>, AuditReaderError> {
-    let Some(col) = optional_column(batch, name) else {
-        return Ok(Vec::new());
-    };
-    let list = col
-        .as_list_opt::<i32>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: "column is not a LIST<UInt64> as declared".to_string(),
-        })?;
-    let mut out = Vec::with_capacity(list.len());
-    for row_idx in 0..list.len() {
-        if list.is_null(row_idx) {
-            out.push(None);
-            continue;
-        }
-        let elements = list.value(row_idx);
-        let ids = elements.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
-            AuditReaderError::Conversion {
-                column: name,
-                detail: "list element is not UInt64".to_string(),
-            }
-        })?;
-        let mut row = Vec::with_capacity(ids.len());
-        for i in 0..ids.len() {
-            if ids.is_null(i) {
-                return Err(AuditReaderError::Conversion {
-                    column: name,
-                    detail: format!(
-                        "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
-                    ),
-                });
-            }
-            row.push(ids.value(i));
-        }
-        out.push(Some(row));
-    }
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {

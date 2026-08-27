@@ -1426,21 +1426,51 @@ mod tests {
     /// default flip — hard-errored on the audit path only.
     #[test]
     fn audit_events_decode_from_utf8view_batches() {
-        let valid = audit_events_to_batch(&[widened_event("acme")]).expect("batch builds");
+        // A widening (string columns) plus a compaction (populates
+        // the LIST<STRING> input-files column) so all three shared
+        // accessors — required_string, optional_string, and the
+        // list-element decode — run over view representations.
+        let compaction = AuditEvent {
+            tenant_id: ourios_core::tenant::TenantId::new("acme"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: AuditPayload::Compaction {
+                partition: "year=2026/month=04/day=02/hour=10".to_string(),
+                input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+                output_file: "c.parquet".to_string(),
+                generation: 7,
+                rows: 100,
+            },
+        };
+        let valid =
+            audit_events_to_batch(&[widened_event("acme"), compaction]).expect("batch builds");
 
-        // Cast every top-level Utf8 column to Utf8View; leave every
-        // other type (timestamps, ints, fixed-size binary, lists)
-        // untouched.
+        // Cast every Utf8 column to Utf8View and every LIST<Utf8>
+        // column to LIST<Utf8View>; leave every other type
+        // (timestamps, ints, fixed-size binary) untouched.
         let schema = valid.schema();
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (field, col) in schema.fields().iter().zip(valid.columns()) {
-            if field.data_type() == &arrow_schema::DataType::Utf8 {
-                let cast = arrow_cast::cast(col, &arrow_schema::DataType::Utf8View)
-                    .expect("Utf8 -> Utf8View cast");
+            let view_type = match field.data_type() {
+                arrow_schema::DataType::Utf8 => Some(arrow_schema::DataType::Utf8View),
+                arrow_schema::DataType::List(inner)
+                    if inner.data_type() == &arrow_schema::DataType::Utf8 =>
+                {
+                    Some(arrow_schema::DataType::List(Arc::new(
+                        arrow_schema::Field::new(
+                            inner.name(),
+                            arrow_schema::DataType::Utf8View,
+                            inner.is_nullable(),
+                        ),
+                    )))
+                }
+                _ => None,
+            };
+            if let Some(target) = view_type {
+                let cast = arrow_cast::cast(col, &target).expect("cast to a view type");
                 fields.push(arrow_schema::Field::new(
                     field.name(),
-                    arrow_schema::DataType::Utf8View,
+                    target,
                     field.is_nullable(),
                 ));
                 columns.push(cast);
@@ -1454,6 +1484,7 @@ mod tests {
 
         let from_view = batch_to_audit_events(&viewed, 0).expect("view batch decodes");
         let from_plain = batch_to_audit_events(&valid, 0).expect("plain batch decodes");
+        assert_eq!(from_view.len(), 2);
         assert_eq!(
             from_view, from_plain,
             "identical events from either representation"

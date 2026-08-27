@@ -78,9 +78,10 @@ impl<'a> BinCol<'a> {
     }
 }
 
-/// RFC 0005 §3.9: every baseline REQUIRED (non-nullable) column must be
-/// present in the file's schema, else a hard error. Shared by
-/// [`Reader::open_file`] and [`Reader::open_bytes`].
+/// RFC 0005 §3.9 / §3.7: every REQUIRED (non-nullable) column of
+/// `expected` must be present in the file's schema, else a hard
+/// error. The one copy of the baseline-schema invariant — every
+/// constructor of both readers (data and audit) enforces it here.
 pub(crate) fn require_baseline_columns<E: DecodeError>(
     file_schema: &arrow_schema::Schema,
     expected: &arrow_schema::Schema,
@@ -91,7 +92,7 @@ pub(crate) fn require_baseline_columns<E: DecodeError>(
                 .column_with_name(expected_field.name())
                 .is_none()
         {
-            return Err(E::missing_required(&expected_field.name().clone()));
+            return Err(E::missing_required(expected_field.name()));
         }
     }
     Ok(())

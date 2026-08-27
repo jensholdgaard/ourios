@@ -28,7 +28,7 @@ use opentelemetry::context::FutureExt as _;
 
 use crate::receiver::auth::{AuthError, AuthResolver};
 use crate::receiver::decode::{decode_json, decode_protobuf};
-use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
+use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
 use crate::receiver::propagation::extract_context;
 use crate::receiver::selector;
 
@@ -192,21 +192,16 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
 /// §3.4) → retryable `503`, so compliant clients re-send rather than drop
 /// data (a non-retryable `500` would tell them to drop it).
 ///
-/// Matched per-variant (exhaustive over `ReceiveError` in-crate): a future
-/// `#[non_exhaustive]` variant breaks the build here, forcing a
-/// retryable-vs-not decision rather than defaulting either way.
+/// Adapt the shared [`IngestFailure`] classification to HTTP status
+/// vocabulary — the exhaustive `ReceiveError` match (and its
+/// build-breaking-on-new-variant property) lives beside the error
+/// type in `pipeline.rs`.
 fn ingest_error_status(error: &ReceiveError) -> StatusCode {
-    match error {
-        // An authenticated caller writing outside its tenant set — a
-        // permanent authz rejection, whole batch, pre-WAL (RFC 0026 §3.2).
-        ReceiveError::TenantDenied { .. } => StatusCode::FORBIDDEN,
-        ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => {
-            StatusCode::PAYLOAD_TOO_LARGE
-        }
-        ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => StatusCode::SERVICE_UNAVAILABLE,
-        // Unreachable for a transport-validated selector; a client cannot
-        // fix it by retrying, and it is our bug — 500.
-        ReceiveError::TenantFrame(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    match IngestFailure::classify(error) {
+        IngestFailure::Denied => StatusCode::FORBIDDEN,
+        IngestFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        IngestFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        IngestFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

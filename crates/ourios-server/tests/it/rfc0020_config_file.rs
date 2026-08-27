@@ -6,16 +6,18 @@
 //!
 //! - **`.2`** (substitution semantics) is here — an end-to-end check through the
 //!   public `ourios_server::config::file::parse` entry point.
-//! - **`.1`/`.3`/`.4`/`.5`** exercise the resolved (private) `ServerConfig` — the
-//!   file→`ServerConfig` mapping (`server_config_from_file`), the `--config`
-//!   selection (the `clap` `Cli`), and the shared `build_*` validators —
-//!   so they are unit tests in `src/main.rs` (`rfc0020_1_*` … `rfc0020_5_*`),
-//!   which can reach those items. The malformed-reference / unknown-key arms of
-//!   `.5` are additionally covered in `config::file`.
+//! - **`.1`/`.3`/`.5`** exercise the resolved `ServerConfig` — the
+//!   file→`ServerConfig` mapping (`server_config_from_file`) and the shared
+//!   `build_*` validators — so they are unit tests beside that code in
+//!   `src/config/resolve.rs` (`rfc0020_1_*` … `rfc0020_5_*`; moved with
+//!   the epic #745 wave-1 extraction). **`.4`** (the `--config` `clap`
+//!   selection) stays a `src/main.rs` unit test with the `Cli` it
+//!   exercises. The malformed-reference / unknown-key arms of `.5` are
+//!   additionally covered in `config::file`.
 //! - **`.6`** (secret hygiene across the file path) is here for its public
 //!   surface — inline-literal-credential rejection (error names the key, not the
 //!   value) and `Debug` redaction; the resolved-secret-plus-sibling-error case is
-//!   a `src/main.rs` unit test.
+//!   a `config::resolve` unit test.
 //!
 //! See `docs/rfcs/0020-configuration-file.md` §5 / §6.
 

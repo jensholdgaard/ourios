@@ -32,7 +32,7 @@ use tonic::{Request, Response, Status};
 use opentelemetry::context::FutureExt as _;
 
 use crate::receiver::auth::{AuthBinding, AuthError, AuthResolver};
-use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
+use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
 use crate::receiver::propagation::extract_context_from_metadata;
 use crate::receiver::selector;
 
@@ -217,22 +217,17 @@ impl LogsService for LogsReceiver {
 /// compliant clients re-send rather than drop data (a non-retryable
 /// `INTERNAL` would tell them to drop it).
 ///
-/// Matched per-variant (exhaustive over `ReceiveError` in-crate): a future
-/// `#[non_exhaustive]` variant breaks the build here, forcing a
-/// retryable-vs-not decision rather than defaulting either way.
+/// Adapt the shared [`IngestFailure`] classification to gRPC status
+/// vocabulary (the classification itself lives beside `ReceiveError`
+/// and is exhaustive there). The message rides along on every arm.
 fn ingest_error_status(error: &ReceiveError) -> Status {
-    match error {
-        // An authenticated caller writing outside its tenant set — a
-        // permanent authz rejection, whole batch, pre-WAL (RFC 0026 §3.2).
-        e @ ReceiveError::TenantDenied { .. } => Status::permission_denied(e.to_string()),
-        e @ ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => {
-            Status::invalid_argument(e.to_string())
-        }
-        e @ (ReceiveError::WalAppend(_) | ReceiveError::WalSync(_)) => {
-            Status::unavailable(e.to_string())
-        }
-        // Unreachable for a metadata-validated selector; our bug — INTERNAL.
-        e @ ReceiveError::TenantFrame(_) => Status::internal(e.to_string()),
+    let msg = error.to_string();
+    match IngestFailure::classify(error) {
+        IngestFailure::Denied => Status::permission_denied(msg),
+        // gRPC has no payload-too-large code (RFC 0026 §3.5 mapping).
+        IngestFailure::TooLarge => Status::invalid_argument(msg),
+        IngestFailure::Unavailable => Status::unavailable(msg),
+        IngestFailure::Internal => Status::internal(msg),
     }
 }
 

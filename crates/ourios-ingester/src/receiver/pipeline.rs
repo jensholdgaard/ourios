@@ -630,6 +630,44 @@ pub enum ReceiveError {
     WalSync(ourios_wal::SyncError),
 }
 
+/// The transport-agnostic classification of a [`ReceiveError`] —
+/// one exhaustive match instead of one per transport (epic #745
+/// wave 2; this replaced twin 4-arm mappers in `http.rs`/`grpc.rs`,
+/// which now adapt these four outcomes to their status vocabularies).
+/// A future `ReceiveError` variant breaks the build HERE, forcing one
+/// retryable-vs-not decision instead of two independently-drifting
+/// ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestFailure {
+    /// An authenticated caller writing outside its tenant set — a
+    /// permanent authz rejection, whole batch, pre-WAL (RFC 0026
+    /// §3.2). HTTP 403 / gRPC `PERMISSION_DENIED`.
+    Denied,
+    /// The batch exceeds the WAL's frame bound; the client must
+    /// shrink it. HTTP 413 / gRPC `INVALID_ARGUMENT` (gRPC has no
+    /// payload-too-large code).
+    TooLarge,
+    /// Durability is temporarily unavailable; retryable. HTTP 503 /
+    /// gRPC `UNAVAILABLE`.
+    Unavailable,
+    /// Unreachable for a transport-validated selector; our bug.
+    /// HTTP 500 / gRPC `INTERNAL`.
+    Internal,
+}
+
+impl IngestFailure {
+    /// Classify `error` into the transport-agnostic outcome.
+    #[must_use]
+    pub fn classify(error: &ReceiveError) -> Self {
+        match error {
+            ReceiveError::TenantDenied { .. } => Self::Denied,
+            ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
+            ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
+            ReceiveError::TenantFrame(_) => Self::Internal,
+        }
+    }
+}
+
 impl std::fmt::Display for ReceiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

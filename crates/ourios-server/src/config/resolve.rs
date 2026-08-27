@@ -20,11 +20,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Default OTLP/gRPC bind address (port 4317, the OTLP default).
 /// Default compaction sweep cadence when `OURIOS_COMPACTION_INTERVAL_SECS`
 /// is unset.
 pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 300;
 
+/// Default OTLP/gRPC bind address (port 4317, the OTLP default).
 pub const DEFAULT_GRPC_ADDR: &str = "0.0.0.0:4317";
 /// Default OTLP/HTTP bind address (port 4318, the OTLP default).
 pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:4318";

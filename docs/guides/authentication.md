@@ -14,6 +14,31 @@ tokens and OIDC claims bind both sets identically; the graph binds them
 separately. Rejections are deliberately undifferentiated — one 401
 shape, no probing oracle.
 
+## Naming the tenant (every posture)
+
+Authentication decides *which tenants a caller may touch*; the request
+itself must still *name* the one it means
+([RFC 0046](../rfcs/0046-out-of-band-tenancy.md): tenancy is
+out-of-band — never derived from the OTLP payload). Every ingest
+export carries an `x-ourios-tenant` header (gRPC metadata key or HTTP
+header) naming the tenant the whole export lands in; an export without
+it is rejected (`INVALID_ARGUMENT` / 400) before any WAL work.
+Queries and MCP calls name their tenant the same way. With a
+Collector, set it on the exporter:
+
+```yaml
+exporters:
+  otlp:
+    endpoint: ourios.example.com:4317
+    headers:
+      x-ourios-tenant: checkout
+```
+
+One export = one tenant: a pipeline feeding several tenants runs one
+exporter per tenant (Collector `routing` connectors compose cleanly
+with this). The named tenant must fall inside the caller's write set,
+or the whole batch is a 403.
+
 ## Open mode (development only)
 
 No `auth` section at all. Every request passes unbound; the server

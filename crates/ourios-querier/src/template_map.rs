@@ -741,7 +741,7 @@ impl TemplateMap {
     ///   is [`PublishOutcome::LostRace`], never an error.
     ///
     /// A successful publish then best-effort **deletes** the stale v1
-    /// key ([`TEMPLATE_MAP_V1_FILENAME`], §3.4 amendment) —
+    /// key (`TEMPLATE_MAP_V1_FILENAME`, §3.4 amendment) —
     /// unconditional, never a query failure; a crash or failure between
     /// publish and delete leaves both keys, which is harmless (each
     /// reader population GETs only its own key), and the next

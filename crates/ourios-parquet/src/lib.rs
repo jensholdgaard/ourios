@@ -30,6 +30,7 @@ pub mod audit_record_batch;
 pub mod audit_sink;
 pub mod audit_writer;
 pub mod compaction;
+mod decode;
 pub mod manifest;
 pub mod partition;
 pub mod promoted;

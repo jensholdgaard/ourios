@@ -73,7 +73,6 @@ use datafusion::datasource::listing::{
 use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
-use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::columns;
@@ -83,6 +82,7 @@ use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
 
 mod api;
 mod decode;
+mod exec;
 mod file_set;
 mod stats;
 
@@ -92,6 +92,8 @@ mod stats;
 pub use api::{AggregateGroup, QueryError, QueryOptions, QueryRequest, QueryResult, QueryStats};
 #[allow(unused_imports, clippy::wildcard_imports)]
 pub(crate) use decode::*;
+#[allow(unused_imports, clippy::wildcard_imports)]
+pub(crate) use exec::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
 pub(crate) use file_set::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
@@ -667,47 +669,10 @@ impl Querier {
             return Ok(empty_result(terminal.aggregate()));
         }
 
-        // DataFusion's default `Utf8View` / `BinaryView` representations are
-        // fine here: the shared RFC 0005 decoder handles both view and plain
-        // string/binary arrays (RFC 0021 / RFC0021.4), so no
-        // `schema_force_view_types` override is needed.
-        let options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-        // The table schema must be the **union** across every scanned file
-        // (RFC0007.4 / RFC 0005 §3.9), and since RFC 0022 the union is
-        // load-bearing for predicate compilation: `attr_match` gates the
-        // promoted-column arms on the post-union schema (§3.4). A bare
-        // `ListingTableConfig::infer_schema` infers from the *first* table
-        // path only — with the per-file URLs `resolve_data_urls` produces,
-        // that is one arbitrary file, not the union — so infer per file and
-        // merge. The extra footer reads are already paid: the Parquet format
-        // fetches every listed file's footer for statistics at plan time.
-        let mut schemas = Vec::with_capacity(urls.len());
-        for url in &urls {
-            let schema = options
-                .infer_schema(&ctx.state(), url)
-                .await
-                .map_err(storage_err)?;
-            schemas.push(schema.as_ref().clone());
-        }
-        // RFC 0042 §3.3: a declared promoted key's class fixes its
-        // union-schema type; an undeclared promoted-column conflict
-        // resolves to Utf8; the per-file expression adapter reads a
-        // type-mismatched promoted column as absent (typed NULL) —
-        // DataFusion's default adapter would cast, and Arrow's safe
-        // Utf8→Int64 cast *parses* string content, the coercion §3.3
-        // forbids.
-        let file_schema = schema_adapt::merge_scanned_schemas(schemas, &self.promoted)
-            .map_err(|detail| QueryError::Storage { detail })?;
-        let config = ListingTableConfig::new_with_multi_paths(urls)
-            .with_listing_options(options)
-            .with_schema(Arc::new(file_schema))
-            .with_expr_adapter_factory(Arc::new(schema_adapt::PromotedNoCoercionFactory));
-        let table = ListingTable::try_new(config).map_err(storage_err)?;
-        ctx.register_table("logs", Arc::new(table))
-            .map_err(storage_err)?;
-
-        let base = ctx.table("logs").await.map_err(storage_err)?;
+        // Union schema + promoted no-coercion adapter — the rationale
+        // lives on `SchemaMode::Union` (epic #745 wave 2).
+        let base =
+            register_listing_table(&ctx, "logs", urls, SchemaMode::Union(&self.promoted)).await?;
         // A provably-empty filter (absent OPTIONAL column) ⇒ no scan.
         let Some(df) = build_filter(base)? else {
             return Ok(empty_result(terminal.aggregate()));
@@ -774,13 +739,8 @@ impl Querier {
             .clone()
             .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
             .map_err(storage_err)?;
-        let plan = counted.create_physical_plan().await.map_err(storage_err)?;
-        let batches = collect(Arc::clone(&plan), ctx.task_ctx())
-            .await
-            .map_err(storage_err)?;
+        let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
         let rows = count_value(&batches)?;
-        let stats = scan_stats(plan.as_ref());
-        record_operator_spans(plan.as_ref());
 
         // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the
         // matching rows (the same filtered frame, capped at the limit), decode
@@ -844,15 +804,7 @@ impl Querier {
                 .push(compile::scalar_agg_expr(*func, path, &df)?.alias(compile::VALUE_COLUMN));
         }
         let aggregated = df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)?;
-        let plan = aggregated
-            .create_physical_plan()
-            .await
-            .map_err(storage_err)?;
-        let batches = collect(Arc::clone(&plan), task_ctx)
-            .await
-            .map_err(storage_err)?;
-        let scan = scan_stats(plan.as_ref());
-        record_operator_spans(plan.as_ref());
+        let (batches, scan) = execute_plan(aggregated, task_ctx).await?;
         let decoded = decode_aggregate(&batches, agg.by.len(), agg.scalar.is_some())?;
         Ok(QueryResult {
             rows: decoded.rows,
@@ -918,12 +870,7 @@ impl Querier {
         // stay out of `QueryStats` so the B1 pruned fraction keeps its
         // count-scan-only meaning — except under count-scan elision, where
         // they *are* the count-scan counts (see `QueryOptions`).
-        let plan = limited.create_physical_plan().await.map_err(storage_err)?;
-        let batches = collect(Arc::clone(&plan), task_ctx)
-            .await
-            .map_err(storage_err)?;
-        let scan = scan_stats(plan.as_ref());
-        record_operator_spans(plan.as_ref());
+        let (batches, scan) = execute_plan(limited, task_ctx).await?;
         // The single RFC 0005 decode path (RFC 0021 §3.1 / RFC0021.4):
         // `ShapeValidation::Skip` because `render_log_body` handles every
         // record shape safely — this path renders rather than rejects

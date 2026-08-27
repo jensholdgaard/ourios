@@ -7,6 +7,7 @@
 // unchanged.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use datafusion::physical_plan::ExecutionPlan;
 
 /// Walk the executed physical plan and accumulate the scan
 /// pruning / IO metrics into a [`QueryStats`]. Recursive — the

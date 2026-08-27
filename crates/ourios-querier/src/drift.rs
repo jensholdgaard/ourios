@@ -19,15 +19,12 @@
 //! — is the shared [`crate::audit_scan`], also used by the §3.7.1 alias-map
 //! derivation.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use datafusion::arrow::array::{
     Array, Int64Array, TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion::functions_aggregate::expr_fn::{count, max, min};
 use datafusion::prelude::{SessionContext, col, lit};
 
@@ -40,8 +37,7 @@ use ourios_parquet::audit_columns;
 
 use crate::dsl::DriftQuery;
 use crate::{
-    QueryError, QueryStats, StoreRef, audit_scan, audit_table_urls, record_operator_spans,
-    scan_stats, storage_err, time_bound_scalar,
+    QueryError, QueryStats, StoreRef, audit_scan, audit_table_urls, storage_err, time_bound_scalar,
 };
 
 /// One drift row: a template that gained at least one version in the queried
@@ -164,13 +160,8 @@ pub(crate) async fn run_drift(
         ])
         .map_err(storage_err)?;
 
-    let plan = sorted.create_physical_plan().await.map_err(storage_err)?;
-    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
-        .await
-        .map_err(storage_err)?;
+    let (batches, mut stats) = crate::execute_plan(sorted, ctx.task_ctx()).await?;
     let mut rows = decode_drift_rows(&batches)?;
-    let mut stats = scan_stats(plan.as_ref());
-    record_operator_spans(plan.as_ref());
 
     // RFC 0050 §3.3 — grow the provenance set to `{mined,
     // upstream_derived}` for every drifting template the audit
@@ -223,20 +214,11 @@ async fn audit_dataframe(
 ) -> Result<(SessionContext, datafusion::prelude::DataFrame), QueryError> {
     let ctx = SessionContext::new();
     let urls = audit_table_urls(&ctx, backend, files)?;
-    let options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-    let config = ListingTableConfig::new_with_multi_paths(urls)
-        .with_listing_options(options)
-        .infer_schema(&ctx.state())
-        .await
-        .map_err(storage_err)?;
-    let table = ListingTable::try_new(config).map_err(storage_err)?;
-    ctx.register_table("audit", Arc::new(table))
-        .map_err(storage_err)?;
-    let base = ctx
-        .table("audit")
-        .await
-        .map_err(storage_err)?
+    // Bare inference is an explicit choice here: audit files share one
+    // schema by construction — see `SchemaMode::Infer` (epic #745
+    // wave 2).
+    let base = crate::register_listing_table(&ctx, "audit", urls, crate::SchemaMode::Infer)
+        .await?
         .filter(col(audit_columns::TENANT_ID).eq(lit(tenant.as_str())))
         .map_err(storage_err)?;
     Ok((ctx, base))
@@ -279,13 +261,8 @@ async fn adopted_template_ids(
     let grouped = filtered
         .aggregate(vec![col(audit_columns::TEMPLATE_ID)], vec![])
         .map_err(storage_err)?;
-    let plan = grouped.create_physical_plan().await.map_err(storage_err)?;
-    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
-        .await
-        .map_err(storage_err)?;
+    let (batches, stats) = crate::execute_plan(grouped, ctx.task_ctx()).await?;
     let out = decode_adopted_ids(&batches)?;
-    let stats = scan_stats(plan.as_ref());
-    record_operator_spans(plan.as_ref());
     Ok((out, stats))
 }
 
@@ -446,6 +423,7 @@ fn decode_ts(nanos: i64) -> Result<SystemTime, QueryError> {
 mod tests {
     use super::*;
     use crate::dsl::ir::Time;
+    use std::sync::Arc;
 
     #[test]
     fn resolve_window_normalises_reversed_bounds() {

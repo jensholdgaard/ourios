@@ -78,6 +78,7 @@
 - [RFC 0048 — Graph operational surfaces](./rfcs/0048-graph-operational-surfaces.md)
 - [RFC 0049 — Agent delegation and the `act` claim](./rfcs/0049-agent-delegation-and-the-act-claim.md)
 - [RFC 0050 — Upstream-derived templates](./rfcs/0050-upstream-derived-templates.md)
+- [RFC 0051 — `ourios-serving` crate extraction](./rfcs/0051-serving-crate-extraction.md)
 
 # Talks
 

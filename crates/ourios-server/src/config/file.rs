@@ -1732,7 +1732,8 @@ auth:
         assert!(cfg.querier.enabled.is_none());
     }
 
-    /// The substitution walk is nine hand-maintained field listings, and
+    /// The substitution walk is a set of hand-maintained per-section
+    /// field listings, and
     /// forgetting the line for a new field is a **silent** failure — the
     /// field simply never resolves its `${env:…}` reference (epic #745
     /// wave 0). This census parses a maximal config carrying a reference

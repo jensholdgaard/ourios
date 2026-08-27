@@ -78,7 +78,8 @@ impl<'a> BinCol<'a> {
     }
 }
 
-/// RFC 0005 §3.9 / §3.7: every REQUIRED (non-nullable) column of
+/// RFC 0005 §3.9 (the reader contract; §3.8 gives the policy):
+/// every REQUIRED (non-nullable) column of
 /// `expected` must be present in the file's schema, else a hard
 /// error. The one copy of the baseline-schema invariant — every
 /// constructor of both readers (data and audit) enforces it here.
@@ -567,4 +568,76 @@ pub(crate) fn optional_u64_list<E: DecodeError>(
         out.push(Some(row));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int64Array, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(fields: Vec<Field>, cols: Vec<std::sync::Arc<dyn Array>>) -> RecordBatch {
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("batch")
+    }
+
+    /// The one baseline-presence check errors identically through
+    /// either reader's error type.
+    #[test]
+    fn baseline_check_names_the_missing_column_for_both_errors() {
+        let expected = Schema::new(vec![Field::new("must", DataType::UInt64, false)]);
+        let file = Schema::new(vec![Field::new("other", DataType::UInt64, false)]);
+        let r: Result<(), ReaderError> = require_baseline_columns(&file, &expected);
+        assert!(matches!(r, Err(ReaderError::MissingRequiredColumn { name }) if name == "must"));
+        let a: Result<(), AuditReaderError> = require_baseline_columns(&file, &expected);
+        assert!(
+            matches!(a, Err(AuditReaderError::MissingRequiredColumn { name }) if name == "must")
+        );
+        let ok: Result<(), ReaderError> = require_baseline_columns(&expected, &expected);
+        assert!(ok.is_ok());
+    }
+
+    /// NULL on a REQUIRED column is a per-row Conversion error naming
+    /// the file-global row index.
+    #[test]
+    fn required_accessors_reject_null_with_the_offset_row_index() {
+        let b = batch(
+            vec![Field::new("s", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+        );
+        let r: Result<Vec<String>, ReaderError> = required_string(&b, "s", 10);
+        assert!(
+            matches!(r, Err(ReaderError::Conversion { column: "s", detail }) if detail.contains("row 11")),
+        );
+    }
+
+    /// §3.9 absent-OPTIONAL handling: `optional_string` models absence
+    /// as `None`; the audit-shaped list/scalar accessors keep their
+    /// historical empty-vec shape.
+    #[test]
+    fn absent_optional_columns_decode_to_their_documented_shapes() {
+        let b = batch(
+            vec![Field::new("present", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        );
+        let s: Result<Option<Vec<Option<String>>>, ReaderError> = optional_string(&b, "absent");
+        assert!(matches!(s, Ok(None)));
+        let u: Result<Vec<Option<u64>>, ReaderError> = optional_u64(&b, "absent");
+        assert!(matches!(u, Ok(v) if v.is_empty()));
+    }
+
+    /// A shape mismatch is a Conversion error naming the column and
+    /// the found type — identical text through either error.
+    #[test]
+    fn type_mismatch_is_a_conversion_error() {
+        let b = batch(
+            vec![Field::new("n", DataType::UInt64, false)],
+            vec![Arc::new(UInt64Array::from(vec![7_u64]))],
+        );
+        let r: Result<Vec<String>, ReaderError> = required_string(&b, "n", 0);
+        assert!(matches!(
+            r,
+            Err(ReaderError::Conversion { column: "n", .. })
+        ));
+    }
 }

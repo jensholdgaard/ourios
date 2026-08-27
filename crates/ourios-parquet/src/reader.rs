@@ -370,27 +370,30 @@ pub enum ShapeValidation {
 /// A string column in either arrow representation. The parquet reader
 /// yields plain `Utf8`; `DataFusion` (the querier's scan path) yields
 /// `Utf8View` by default — one decoder serves both (RFC 0021 §3.1).
-enum StrCol<'a> {
+/// `pub(crate)` so the audit reader's accessors share it rather than
+/// re-growing the plain-`Utf8`-only shape this replaced (epic #745
+/// wave 0: the audit path had exactly that divergence).
+pub(crate) enum StrCol<'a> {
     Plain(&'a arrow_array::StringArray),
     View(&'a StringViewArray),
 }
 
 impl<'a> StrCol<'a> {
-    fn try_new(col: &'a dyn Array) -> Option<Self> {
+    pub(crate) fn try_new(col: &'a dyn Array) -> Option<Self> {
         if let Some(a) = col.as_string_opt::<i32>() {
             return Some(Self::Plain(a));
         }
         col.as_string_view_opt().map(Self::View)
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Plain(a) => a.len(),
             Self::View(a) => a.len(),
         }
     }
 
-    fn get(&self, i: usize) -> Option<&str> {
+    pub(crate) fn get(&self, i: usize) -> Option<&str> {
         match self {
             Self::Plain(a) => (!a.is_null(i)).then(|| a.value(i)),
             Self::View(a) => (!a.is_null(i)).then(|| a.value(i)),

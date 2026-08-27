@@ -1090,21 +1090,22 @@ fn required_string(
     row_offset: usize,
 ) -> Result<Vec<String>, AuditReaderError> {
     let col = required_column(batch, name)?;
-    let arr = col
-        .as_string_opt::<i32>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected Utf8 string array, got {:?}", col.data_type()),
-        })?;
+    let arr = crate::reader::StrCol::try_new(col).ok_or_else(|| AuditReaderError::Conversion {
+        column: name,
+        detail: format!(
+            "expected Utf8/Utf8View string array, got {:?}",
+            col.data_type()
+        ),
+    })?;
     let mut out = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
-        if arr.is_null(i) {
+        let Some(v) = arr.get(i) else {
             return Err(AuditReaderError::Conversion {
                 column: name,
                 detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
-        }
-        out.push(arr.value(i).to_string());
+        };
+        out.push(v.to_string());
     }
     Ok(out)
 }
@@ -1192,19 +1193,16 @@ fn optional_string(
     let Some(col) = optional_column(batch, name) else {
         return Ok(None);
     };
-    let arr = col
-        .as_string_opt::<i32>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected Utf8 string array, got {:?}", col.data_type()),
-        })?;
+    let arr = crate::reader::StrCol::try_new(col).ok_or_else(|| AuditReaderError::Conversion {
+        column: name,
+        detail: format!(
+            "expected Utf8/Utf8View string array, got {:?}",
+            col.data_type()
+        ),
+    })?;
     let mut out = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
-        out.push(if arr.is_null(i) {
-            None
-        } else {
-            Some(arr.value(i).to_string())
-        });
+        out.push(arr.get(i).map(str::to_string));
     }
     Ok(Some(out))
 }
@@ -1305,23 +1303,23 @@ fn optional_string_list(
             continue;
         }
         let elements = list.value(row_idx);
-        let strs = elements
-            .as_string_opt::<i32>()
-            .ok_or_else(|| AuditReaderError::Conversion {
+        let strs = crate::reader::StrCol::try_new(elements.as_ref()).ok_or_else(|| {
+            AuditReaderError::Conversion {
                 column: name,
-                detail: "list element is not Utf8".to_string(),
-            })?;
+                detail: "list element is not Utf8/Utf8View".to_string(),
+            }
+        })?;
         let mut row = Vec::with_capacity(strs.len());
         for i in 0..strs.len() {
-            if strs.is_null(i) {
+            let Some(v) = strs.get(i) else {
                 return Err(AuditReaderError::Conversion {
                     column: name,
                     detail: format!(
                         "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
                     ),
                 });
-            }
-            row.push(strs.value(i).to_string());
+            };
+            row.push(v.to_string());
         }
         out.push(Some(row));
     }
@@ -1420,6 +1418,48 @@ mod tests {
     /// lands"); kinds 4–5 were that variant, so the deferral is
     /// resolved and the old assertion is exactly the behaviour the
     /// amendment removes (`CLAUDE.md` §6.2).
+    /// Epic #745 wave 0 regression: the audit decode accepts
+    /// `Utf8View` string columns exactly as the data path does
+    /// (RFC 0021 §3.1 single-decode posture). Before the shared
+    /// `StrCol` accessor, a view-encoded audit batch — a foreign
+    /// writer embedding a view arrow schema, or a future arrow
+    /// default flip — hard-errored on the audit path only.
+    #[test]
+    fn audit_events_decode_from_utf8view_batches() {
+        let valid = audit_events_to_batch(&[widened_event("acme")]).expect("batch builds");
+
+        // Cast every top-level Utf8 column to Utf8View; leave every
+        // other type (timestamps, ints, fixed-size binary, lists)
+        // untouched.
+        let schema = valid.schema();
+        let mut fields = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for (field, col) in schema.fields().iter().zip(valid.columns()) {
+            if field.data_type() == &arrow_schema::DataType::Utf8 {
+                let cast = arrow_cast::cast(col, &arrow_schema::DataType::Utf8View)
+                    .expect("Utf8 -> Utf8View cast");
+                fields.push(arrow_schema::Field::new(
+                    field.name(),
+                    arrow_schema::DataType::Utf8View,
+                    field.is_nullable(),
+                ));
+                columns.push(cast);
+            } else {
+                fields.push(field.as_ref().clone());
+                columns.push(Arc::clone(col));
+            }
+        }
+        let viewed = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+            .expect("view batch type-checks");
+
+        let from_view = batch_to_audit_events(&viewed, 0).expect("view batch decodes");
+        let from_plain = batch_to_audit_events(&valid, 0).expect("plain batch decodes");
+        assert_eq!(
+            from_view, from_plain,
+            "identical events from either representation"
+        );
+    }
+
     #[test]
     fn batch_to_audit_events_surfaces_unknown_event_kind_as_opaque_event() {
         // Arrange — replace the event_kind column with a single 99

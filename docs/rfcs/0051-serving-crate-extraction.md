@@ -1,7 +1,7 @@
 ---
 rfc: 0051
 title: ourios-serving — shared serving infrastructure out of the ingest crate
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-27
@@ -11,10 +11,15 @@ superseded-by: —
 
 # RFC 0051 — `ourios-serving`: shared serving infrastructure out of the ingest crate
 
-> **Status: `drafted` (2026-08-27).** Wave 3 of the 2026-08-27
-> structural review (epic #745). One §3 fork is a maintainer
-> decision: the crate shape (§3.2, single crate vs. an
-> `ourios-authz` / `ourios-serving` pair). Touches no §2 pillar and
+> **Status: `specified` (2026-08-27, maintainer sign-off on the §7
+> decisions).** §3.2 resolved to **Option A** — one `ourios-serving`
+> crate; the OIDC client moves with the OpenFGA client (core ends
+> `reqwest`-free); the `ourios_ingester::receiver::*` re-export
+> shims get one deprecation release. §5 criteria are written and
+> testable; implementation may begin.
+>
+> *(`drafted`, 2026-08-27: Wave 3 of the structural review, epic
+> #745.)* Touches no §2 pillar and
 > no §3 invariant directly; §3.7 (multi-tenancy) constrains the
 > extraction — every moved surface keeps its tenant parameter
 > exactly. Prerequisites: RFC 0026/0027 (auth), RFC 0029 (OIDC),
@@ -227,13 +232,16 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids:
 
 ## 7. Open questions
 
-- [ ] §3.2 shape: Option A (one crate, recommended) or Option B
-      (`ourios-authz` + `ourios-serving` pair)? — **maintainer fork**
-- [ ] Does the OIDC *client* move with OpenFGA (recommended: yes —
-      it is what empties `reqwest` out of core)?
-- [ ] Deprecation window for the `ourios_ingester::receiver::*`
-      re-exports: one release (recommended) or none (pre-production
-      precedent)?
+All resolved at `specified` (2026-08-27, maintainer sign-off):
+
+- [x] §3.2 shape — **Option A**: one `ourios-serving` crate. A later
+      `ourios-authz` split stays cheap because the module boundaries
+      land clean now.
+- [x] The OIDC *client* moves with OpenFGA — it is what empties
+      `reqwest` out of core (RFC0051.2).
+- [x] Deprecation window for the `ourios_ingester::receiver::*`
+      re-exports — **one release**, then deleted in the next breaking
+      release (RFC0051.7).
 
 ## 8. References
 

@@ -12,9 +12,6 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, BinaryViewArray, RecordBatch, StringViewArray};
 
-use crate::audit_reader::AuditReaderError;
-use crate::reader::ReaderError;
-
 /// A string column in either arrow representation. The parquet reader
 /// yields plain `Utf8`; `DataFusion` (the querier's scan path) yields
 /// `Utf8View` by default — one decoder serves both (RFC 0021 §3.1).
@@ -101,35 +98,15 @@ pub(crate) fn require_baseline_columns<E: DecodeError>(
 
 /// The constructor surface a reader error must offer the shared
 /// accessors. Message text is built here once, so the two readers
-/// cannot drift apart on diagnostics again.
+/// cannot drift apart on diagnostics again. Each error enum
+/// implements this next to its own definition, so the shared module
+/// depends on no concrete reader.
 pub(crate) trait DecodeError: Sized {
     /// A §3.8/§3.9 baseline REQUIRED column absent from the file.
     fn missing_required(name: &str) -> Self;
     /// A column present but shape-mismatched (type, null-on-required,
     /// list nesting).
     fn conversion(column: &'static str, detail: String) -> Self;
-}
-
-impl DecodeError for ReaderError {
-    fn missing_required(name: &str) -> Self {
-        Self::MissingRequiredColumn {
-            name: name.to_string(),
-        }
-    }
-    fn conversion(column: &'static str, detail: String) -> Self {
-        Self::Conversion { column, detail }
-    }
-}
-
-impl DecodeError for AuditReaderError {
-    fn missing_required(name: &str) -> Self {
-        Self::MissingRequiredColumn {
-            name: name.to_string(),
-        }
-    }
-    fn conversion(column: &'static str, detail: String) -> Self {
-        Self::Conversion { column, detail }
-    }
 }
 
 pub(crate) fn required_string<E: DecodeError>(
@@ -573,6 +550,8 @@ pub(crate) fn optional_u64_list<E: DecodeError>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit_reader::AuditReaderError;
+    use crate::reader::ReaderError;
     use arrow_array::{Int64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;

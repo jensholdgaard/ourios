@@ -32,6 +32,7 @@ pub mod audit_writer;
 pub mod compaction;
 mod decode;
 pub mod manifest;
+mod parquet_io;
 pub mod partition;
 pub mod promoted;
 pub mod reader;

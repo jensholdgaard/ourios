@@ -358,6 +358,17 @@ impl std::error::Error for ReaderError {
     }
 }
 
+impl crate::decode::DecodeError for ReaderError {
+    fn missing_required(name: &str) -> Self {
+        Self::MissingRequiredColumn {
+            name: name.to_string(),
+        }
+    }
+    fn conversion(column: &'static str, detail: String) -> Self {
+        Self::Conversion { column, detail }
+    }
+}
+
 /// Whether a batch decode enforces the RFC 0005 §3.2 writer-shape
 /// invariants (`validate_record_shape`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

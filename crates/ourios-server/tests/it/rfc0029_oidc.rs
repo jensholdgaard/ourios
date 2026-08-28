@@ -1005,7 +1005,6 @@ mod dex {
         let expires_in = token_response["expires_in"]
             .as_u64()
             .expect("expires_in in the response");
-        let minted_at = tokio::time::Instant::now();
 
         // Ingest: in-claim tenant acks; a cross-tenant batch is denied
         // (the audit arm below reads the denial event back).
@@ -1090,9 +1089,36 @@ mod dex {
             authenticated.status()
         );
 
-        // Expiry: sleep past the token's own `expires_in` (zero configured
-        // skew) and the same token collapses to the undifferentiated 401.
-        tokio::time::sleep_until(minted_at + Duration::from_secs(expires_in + 2)).await;
+        // Expiry: the issuer (a real Dex on the container's own clock)
+        // stamped `exp`; the verifier judges it against *this* host's
+        // clock (zero configured skew). Sleeping `minted_at + expires_in`
+        // would silently assume the two clocks agree — a 40 s host-clock
+        // drift turned exactly that assumption into a locally-still-valid
+        // token and a spurious failure of this arm. Deriving the deadline
+        // from the token's own `exp` claim leaves only the verifier's
+        // clock in the picture, so the arm is correct under arbitrary
+        // issuer/host skew. (Expiry *semantics* are unit-tested with a
+        // crafted past-`exp` token in ourios-serving's oidc tests; this
+        // arm keeps the real-issuer integration honest.)
+        let exp = {
+            use base64::Engine as _;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let payload = token.split('.').nth(1).expect("jwt payload segment");
+            let claims: serde_json::Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("base64url"))
+                    .expect("claims json");
+            claims["exp"].as_u64().expect("exp claim")
+        };
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs();
+        let wait = (exp + 1).saturating_sub(host_now);
+        assert!(
+            wait <= expires_in + 120,
+            "host clock lags the issuer's by over two minutes (waiting {wait}s to outlive a              {expires_in}s token) — fix this machine's clock before trusting the expiry arm"
+        );
+        tokio::time::sleep(Duration::from_secs(wait)).await;
         let expired = query(Some(token.clone()), "globex").await;
         assert_eq!(
             expired.status(),

@@ -1,0 +1,1 @@
+attr.decision == "deny" | range(-6h, now)

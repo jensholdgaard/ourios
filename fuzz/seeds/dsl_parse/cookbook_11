@@ -1,0 +1,1 @@
+true | range(-24h, now) | sum(attr.cost_usd) by attr.model

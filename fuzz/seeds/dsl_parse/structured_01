@@ -1,0 +1,1 @@
+{"predicate":{"field":{"attr":"http.status_code"},"op":"==","value":500}}

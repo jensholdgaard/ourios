@@ -20,6 +20,7 @@ ourios-core = { path = "../crates/ourios-core" }
 ourios-miner = { path = "../crates/ourios-miner" }
 ourios-ingester = { path = "../crates/ourios-ingester" }
 ourios-wal = { path = "../crates/ourios-wal", features = ["fuzzing"] }
+ourios-querier = { path = "../crates/ourios-querier" }
 
 # Drain-template + bit-identical reconstruction round-trip (§3.3 / §3.1).
 [[bin]]
@@ -49,6 +50,15 @@ bench = false
 [[bin]]
 name = "wal_frame"
 path = "fuzz_targets/wal_frame.rs"
+test = false
+doc = false
+bench = false
+
+# Untrusted-input boundary: the RFC 0002 DSL parsers (pipe text and the
+# structured-JSON variant) serve /v1/query and MCP; they must never panic.
+[[bin]]
+name = "dsl_parse"
+path = "fuzz_targets/dsl_parse.rs"
 test = false
 doc = false
 bench = false

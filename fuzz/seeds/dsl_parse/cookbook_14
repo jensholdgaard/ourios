@@ -1,0 +1,1 @@
+event_name == "gen_ai.client.inference.operation.details" | limit 50

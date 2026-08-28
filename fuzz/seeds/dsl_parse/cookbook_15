@@ -1,0 +1,1 @@
+lossy == true and confidence < 0.5 | project ts, service, body

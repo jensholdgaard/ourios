@@ -1,0 +1,1 @@
+{"predicate":{"field":"severity","op":">=","value":"error"}}

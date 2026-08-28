@@ -1,0 +1,1 @@
+severity >= warn and service != "vacuum-daemon"

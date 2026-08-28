@@ -1,0 +1,1 @@
+service == "checkout" | range(-15m, now)

@@ -1,0 +1,1 @@
+severity >= error | count by template_id | sort count desc | limit 20

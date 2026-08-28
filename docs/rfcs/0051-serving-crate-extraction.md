@@ -331,9 +331,14 @@ All resolved at `specified` (2026-08-27, maintainer sign-off):
   actually delivers are the dependency direction, core's freedom
   from the HTTP stack, and the cascade cut for any future
   querier-only binary.
-- **RFC0051.7** — the shims ship annotated in #762 (modules and
-  root re-exports both `#[deprecated]`); deletion in the next
-  breaking release is tracked by #764. Note: rustc's use-site
-  warnings through re-exports are limited, so the annotations
-  document intent and render in rustdoc while the teeth are the
-  RFC0051.1 gate (in-workspace) and #764 (external).
+- **RFC0051.7** — the shims shipped annotated in #762 (modules and
+  root re-exports both `#[deprecated]`); deletion was tracked by
+  #764. **Outcome (maintainer decision, 2026-08-28): deletion
+  accelerated to before any release shipped the shims** — under the
+  pre-production posture the one-release window was belt-and-braces
+  for hypothetical external consumers, and 0.10.0 now ships the
+  `ourios_serving` paths only (published 0.9.0 artifacts predate the
+  move entirely, so no published release ever carried the old paths
+  in deprecated form). With the shims gone the compiler enforces the
+  boundary everywhere; the RFC0051.1 gate remains as the
+  regression-proof for server/querier source.

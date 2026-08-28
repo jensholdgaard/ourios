@@ -11,9 +11,11 @@
 use libfuzzer_sys::fuzz_target;
 use ourios_querier::dsl::{parse, parse_structured};
 
-fuzz_target!(|data: &[u8]| {
-    if let Ok(text) = std::str::from_utf8(data) {
-        let _ = parse(text);
-        let _ = parse_structured(text);
-    }
+// A typed `&str` target: libFuzzer produces valid UTF-8 directly, so no
+// execution is wasted on byte sequences the real boundary cannot deliver
+// (axum/MCP hand the parsers `String`s, so invalid UTF-8 is rejected
+// upstream of them in production).
+fuzz_target!(|text: &str| {
+    let _ = parse(text);
+    let _ = parse_structured(text);
 });

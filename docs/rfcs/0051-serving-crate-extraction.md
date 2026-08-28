@@ -169,8 +169,9 @@ Scenario ids `RFC0051.<n>`, RFC0051.1–.7.
 > workspace after the move, When `ourios-server`, `ourios-querier`
 > and their tests are searched for any of the moved modules' path
 > fragments — `ourios_ingester::receiver::auth`,
-> `…::receiver::tls`, `…::receiver::tls_serve`,
-> `…::receiver::propagation` — **or** for the moved names formerly
+> `ourios_ingester::receiver::tls`,
+> `ourios_ingester::receiver::tls_serve`,
+> `ourios_ingester::receiver::propagation` — **or** for the moved names formerly
 > re-exported at the receiver root (`AuthBinding`, `AuthError`,
 > `AuthResolver`, `GraphIdentity`, `authenticate_bearer`,
 > `HeaderExtractor`, `MetadataExtractor`, `extract_context`,

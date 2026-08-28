@@ -272,7 +272,11 @@ impl IngestPipeline {
             return Ok(());
         };
         if let Err(e) = check_binding(tenant, binding) {
-            if let ReceiveError::TenantDenied { token_name, tenant } = &e {
+            if let ReceiveError::TenantDenied {
+                token_name,
+                tenant: denied_tenant,
+            } = &e
+            {
                 self.metrics
                     .record_rejected_batch(crate::metrics::ERROR_TYPE_PERMISSION_DENIED);
                 let mut sink = self
@@ -281,7 +285,7 @@ impl IngestPipeline {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sink) = sink.as_mut() {
                     sink.emit(ourios_core::audit::AuditEvent {
-                        tenant_id: tenant.clone(),
+                        tenant_id: denied_tenant.clone(),
                         timestamp: std::time::SystemTime::now(),
                         payload: ourios_core::audit::AuditPayload::IngestDenied {
                             token_name: token_name.clone(),

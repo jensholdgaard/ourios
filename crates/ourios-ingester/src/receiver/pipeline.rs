@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use ourios_core::otlp::OtlpLogRecord;
+use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, TenantBatch, Wal, WalOffset};
@@ -256,6 +258,42 @@ impl IngestPipeline {
         self.ingest_bound(request, tenant, None, false).await
     }
 
+    /// The RFC 0026 §3.2 per-batch tenant-binding enforcement, with the
+    /// §3.4 denial surface: the rejection counts on
+    /// `ourios.ingest.batches` (`error.type = permission_denied`) and
+    /// emits the `IngestDenied` audit event. `None` binding is open
+    /// mode — every tenant passes.
+    fn enforce_binding(
+        &self,
+        tenant: &TenantId,
+        binding: Option<&AuthBinding>,
+    ) -> Result<(), ReceiveError> {
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        if let Err(e) = check_binding(tenant, binding) {
+            if let ReceiveError::TenantDenied { token_name, tenant } = &e {
+                self.metrics
+                    .record_rejected_batch(crate::metrics::ERROR_TYPE_PERMISSION_DENIED);
+                let mut sink = self
+                    .denial_audit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(sink) = sink.as_mut() {
+                    sink.emit(ourios_core::audit::AuditEvent {
+                        tenant_id: tenant.clone(),
+                        timestamp: std::time::SystemTime::now(),
+                        payload: ourios_core::audit::AuditPayload::IngestDenied {
+                            token_name: token_name.clone(),
+                        },
+                    });
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Ingest one decoded export under the out-of-band `tenant` (RFC 0046
     /// §3.1) per the §6.5 sequence: enforce the RFC 0026 §3.2 tenant
     /// binding (when `binding` is present), materialise every record under
@@ -287,11 +325,6 @@ impl IngestPipeline {
         name = "ingest logs",
         fields(otel.kind = "server")
     )]
-    // The linear ingest orchestrator (authz → encode → fan-out → commit → miner
-    // hand-off → metrics); the RFC 0038 batch + wal.commit spans nudged it one
-    // step over 100. Splitting a straight-line sequence to satisfy the lint
-    // would hurt readability more than the length does.
-    #[allow(clippy::too_many_lines)]
     pub async fn ingest_bound(
         &self,
         request: ExportLogsServiceRequest,
@@ -300,31 +333,8 @@ impl IngestPipeline {
         lenient_json: bool,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
-        // batch does no encode, materialisation, or WAL work. §3.4: the
-        // denial counts on `ourios.ingest.batches` (`error.type =
-        // permission_denied`) and emits the audit event.
-        if let Some(binding) = binding
-            && let Err(e) = check_binding(&tenant, binding)
-        {
-            if let ReceiveError::TenantDenied { token_name, tenant } = &e {
-                self.metrics
-                    .record_rejected_batch(crate::metrics::ERROR_TYPE_PERMISSION_DENIED);
-                let mut sink = self
-                    .denial_audit
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(sink) = sink.as_mut() {
-                    sink.emit(ourios_core::audit::AuditEvent {
-                        tenant_id: tenant.clone(),
-                        timestamp: std::time::SystemTime::now(),
-                        payload: ourios_core::audit::AuditPayload::IngestDenied {
-                            token_name: token_name.clone(),
-                        },
-                    });
-                }
-            }
-            return Err(e);
-        }
+        // batch does no encode, materialisation, or WAL work.
+        self.enforce_binding(&tenant, binding)?;
         // Encode before materialisation consumes the request: the WAL frame
         // is the tenant prefix + the protobuf `ExportLogsServiceRequest`
         // (RFC 0046 §3.3 / §6.5 step 3). Byte-equality to the wire isn't
@@ -403,94 +413,9 @@ impl IngestPipeline {
                     if let Some(prev) = before
                         && prev.segment != now.segment
                     {
-                        // RFC 0035 §3.1 encode-drain-and-flush barrier,
-                        // drain half. The rotation hook stamps
-                        // `wal_high_water = prev`, which asserts every
-                        // frame ≤ prev is durably captured — so no encode
-                        // for a frame ≤ prev may still be in flight when
-                        // it runs. Draining the *whole* pool over-covers
-                        // that mark soundly: submission happens under
-                        // this same in-order gate (below), so every
-                        // frame < this seq has already submitted its
-                        // encodes, no frame ≥ this seq has, and thus
-                        // every in-flight encode is for a frame ≤ prev.
-                        // The flush half is the hook's own `flush_all` +
-                        // its snapshot-only-if-fully-drained gate (the
-                        // server's `flush_then_snapshot`): after this
-                        // drain, every record ≤ prev has completed its
-                        // emit, so any of them still *buffered* is in the
-                        // sink for `flush_all` to take, and the
-                        // high-water is stamped only when both sinks
-                        // fully drained. The one class this pool barrier
-                        // does not cover — a record ≤ prev that an
-                        // age-sweep drained out of the buffers and is
-                        // writing off-lock while the hook runs (neither
-                        // buffered nor yet durable) — is the *publish*
-                        // half of the barrier (issue #578): each sweep
-                        // drain holds the sink's in-flight publish guard,
-                        // and `flush_then_snapshot` quiesces those
-                        // publishes under this same miner lock before it
-                        // flushes and stamps. The class-by-class
-                        // coverage argument lives there. A crash at any
-                        // point before the stamp loses only buffered
-                        // Parquet, which WAL replay above the (previous)
-                        // high-water re-mines (the §6.9 posture: the WAL
-                        // is the durability of record; a snapshot is a
-                        // rebuildable cache).
-                        //
-                        // The drain can wait out seconds of queued
-                        // encodes and the hook does blocking store I/O,
-                        // all on a runtime worker — `block_in_place`
-                        // lets the runtime relocate other tasks off
-                        // this worker meanwhile. Flavor-guarded:
-                        // `block_in_place` panics on a current-thread
-                        // runtime (the crash fixtures run one; they
-                        // never rotate, but a panic here would turn a
-                        // rotation into an outage).
-                        let drain_and_hook = || {
-                            self.quiesce_encodes();
-                            self.fire_rotation_hook(&miner, prev);
-                        };
-                        if tokio::runtime::Handle::current().runtime_flavor()
-                            == tokio::runtime::RuntimeFlavor::MultiThread
-                        {
-                            tokio::task::block_in_place(drain_and_hook);
-                        } else {
-                            drain_and_hook();
-                        }
+                        self.rotate_for_segment_change(&miner, prev);
                     }
-                    if let Some(pool) = &self.encode_pool {
-                        // Ordered phase (RFC 0035 §3.1): id assignment +
-                        // audit under the gate; the sink emit is deferred
-                        // to the concurrent pool below.
-                        let mut out = Vec::with_capacity(records.len());
-                        // The whole batch is already WAL-durable, so a
-                        // miner panic mid-batch must not drop the records
-                        // mined before it — pre-split they had been
-                        // emitted inline as they were mined; deferring
-                        // the emit must not widen that failure into
-                        // whole-batch loss-until-restart-replay. Submit
-                        // what was mined, then let the panic continue
-                        // (the gate guard still releases, and `ingest`'s
-                        // caller still fails the request).
-                        let outcome =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                for record in &records {
-                                    let (_, rec) = miner.ingest_mined(record);
-                                    out.extend(rec);
-                                }
-                            }));
-                        if let Err(panic) = outcome {
-                            pool.submit(out);
-                            std::panic::resume_unwind(panic);
-                        }
-                        out
-                    } else {
-                        for record in &records {
-                            miner.ingest(record);
-                        }
-                        Vec::new()
-                    }
+                    self.mine_batch_ordered(&mut miner, &records)
                 };
                 if let Some(pool) = &self.encode_pool {
                     // Still under the ingest gate (`_gate` drops at
@@ -529,6 +454,108 @@ impl IngestPipeline {
         };
         // `_gate` releases the hand-off to `seq + 1` as it drops here.
         ack
+    }
+
+    /// The RFC 0035 §3.1 **ordered phase**, verbatim from the pre-split
+    /// `ingest_bound` body: id assignment + audit under the ingest gate
+    /// and the miner lock; the sink emit is deferred to the concurrent
+    /// pool (the caller submits the returned records). Without a pool,
+    /// mining emits inline and returns nothing to submit.
+    fn mine_batch_ordered(
+        &self,
+        miner: &mut MinerCluster,
+        records: &[OtlpLogRecord],
+    ) -> Vec<MinedRecord> {
+        if let Some(pool) = &self.encode_pool {
+            let mut out = Vec::with_capacity(records.len());
+            // The whole batch is already WAL-durable, so a
+            // miner panic mid-batch must not drop the records
+            // mined before it — pre-split they had been
+            // emitted inline as they were mined; deferring
+            // the emit must not widen that failure into
+            // whole-batch loss-until-restart-replay. Submit
+            // what was mined, then let the panic continue
+            // (the gate guard still releases, and `ingest`'s
+            // caller still fails the request).
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for record in records {
+                    let (_, rec) = miner.ingest_mined(record);
+                    out.extend(rec);
+                }
+            }));
+            if let Err(panic) = outcome {
+                pool.submit(out);
+                std::panic::resume_unwind(panic);
+            }
+            out
+        } else {
+            for record in records {
+                miner.ingest(record);
+            }
+            Vec::new()
+        }
+    }
+
+    /// The §6.9 rotation-cadence step, verbatim from the pre-split
+    /// `ingest_bound` body: fires only on a segment change, and runs
+    /// **under the miner lock and the ingest gate** — the caller holds
+    /// both, which is what makes the whole-pool drain cover the mark.
+    fn rotate_for_segment_change(&self, miner: &MinerCluster, prev: WalOffset) {
+        // RFC 0035 §3.1 encode-drain-and-flush barrier,
+        // drain half. The rotation hook stamps
+        // `wal_high_water = prev`, which asserts every
+        // frame ≤ prev is durably captured — so no encode
+        // for a frame ≤ prev may still be in flight when
+        // it runs. Draining the *whole* pool over-covers
+        // that mark soundly: submission happens under
+        // this same in-order gate (below), so every
+        // frame < this seq has already submitted its
+        // encodes, no frame ≥ this seq has, and thus
+        // every in-flight encode is for a frame ≤ prev.
+        // The flush half is the hook's own `flush_all` +
+        // its snapshot-only-if-fully-drained gate (the
+        // server's `flush_then_snapshot`): after this
+        // drain, every record ≤ prev has completed its
+        // emit, so any of them still *buffered* is in the
+        // sink for `flush_all` to take, and the
+        // high-water is stamped only when both sinks
+        // fully drained. The one class this pool barrier
+        // does not cover — a record ≤ prev that an
+        // age-sweep drained out of the buffers and is
+        // writing off-lock while the hook runs (neither
+        // buffered nor yet durable) — is the *publish*
+        // half of the barrier (issue #578): each sweep
+        // drain holds the sink's in-flight publish guard,
+        // and `flush_then_snapshot` quiesces those
+        // publishes under this same miner lock before it
+        // flushes and stamps. The class-by-class
+        // coverage argument lives there. A crash at any
+        // point before the stamp loses only buffered
+        // Parquet, which WAL replay above the (previous)
+        // high-water re-mines (the §6.9 posture: the WAL
+        // is the durability of record; a snapshot is a
+        // rebuildable cache).
+        //
+        // The drain can wait out seconds of queued
+        // encodes and the hook does blocking store I/O,
+        // all on a runtime worker — `block_in_place`
+        // lets the runtime relocate other tasks off
+        // this worker meanwhile. Flavor-guarded:
+        // `block_in_place` panics on a current-thread
+        // runtime (the crash fixtures run one; they
+        // never rotate, but a panic here would turn a
+        // rotation into an outage).
+        let drain_and_hook = || {
+            self.quiesce_encodes();
+            self.fire_rotation_hook(miner, prev);
+        };
+        if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(drain_and_hook);
+        } else {
+            drain_and_hook();
+        }
     }
 
     /// Fire the rotation hook over the current miner, swallowing a panic.

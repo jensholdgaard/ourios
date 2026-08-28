@@ -45,7 +45,7 @@ pub(super) fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
 /// stage set: a plain query is all-zero; an aggregation query carries the
 /// map the engine would produce over an empty scan — no groups when
 /// grouped, the single zero-count total for a bare `count`.
-pub(super) fn empty_result(aggregate: Option<&compile::Aggregate>) -> QueryResult {
+pub(super) fn empty_result(aggregate: Option<&plan::Aggregate>) -> QueryResult {
     let aggregate = aggregate.map(|agg| {
         if agg.by.is_empty() {
             vec![AggregateGroup {
@@ -75,8 +75,8 @@ pub(super) struct DecodedAggregate {
 }
 
 /// Decode the grouped-count batches into [`AggregateGroup`]s: the key
-/// columns are `group_0..group_{n-1}` ([`compile::group_column_name`]), the
-/// count column [`compile::COUNT_COLUMN`]. A row whose key carries a NULL
+/// columns are `group_0..group_{n-1}` ([`plan::group_column_name`]), the
+/// count column [`plan::COUNT_COLUMN`]. A row whose key carries a NULL
 /// (a short/NULL `param(n)` slot, an absent OPTIONAL field column)
 /// contributes to no group and lands in the excluded tally instead — the
 /// §6.3 amendment disposition, with no synthetic "absent" key. Groups are
@@ -95,7 +95,7 @@ pub(super) fn decode_aggregate(
     let mut excluded: u64 = 0;
     for batch in batches {
         let counts = batch
-            .column_by_name(compile::COUNT_COLUMN)
+            .column_by_name(plan::COUNT_COLUMN)
             .ok_or_else(|| bad("result is missing the count column".to_string()))?
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -106,7 +106,7 @@ pub(super) fn decode_aggregate(
         let values = if has_value {
             Some(
                 batch
-                    .column_by_name(compile::VALUE_COLUMN)
+                    .column_by_name(plan::VALUE_COLUMN)
                     .ok_or_else(|| bad("result is missing the value column".to_string()))?
                     .as_any()
                     .downcast_ref::<Float64Array>()
@@ -117,7 +117,7 @@ pub(super) fn decode_aggregate(
         };
         let key_columns = (0..n_terms)
             .map(|i| {
-                let name = compile::group_column_name(i);
+                let name = plan::group_column_name(i);
                 batch
                     .column_by_name(&name)
                     .ok_or_else(|| bad(format!("result is missing group column `{name}`")))
@@ -174,7 +174,7 @@ pub(super) fn decode_aggregate(
 /// UTF-8 bytes for the `params` extraction, RFC 3339 UTC for timestamps
 /// (the `bucket(…)` window start), hex for the fixed-size id columns, and
 /// the natural rendering for the scalar column types. The type set is
-/// exactly what [`compile::group_exprs`] can emit; anything else is a plan
+/// exactly what [`plan::group_exprs`] can emit; anything else is a plan
 /// contract drift, surfaced rather than guessed at.
 pub(super) fn group_key_string(
     array: &dyn Array,

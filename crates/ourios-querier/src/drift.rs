@@ -298,8 +298,8 @@ fn decode_adopted_ids(
 /// so the lower bound is the smaller of the two (an operator who writes the
 /// bounds reversed still gets the window they meant).
 fn resolve_window(query: &DriftQuery, now: u64) -> Result<(u64, u64), QueryError> {
-    let from = crate::compile::resolve_time(&query.from, now)?;
-    let to = crate::compile::resolve_time(&query.to, now)?;
+    let from = crate::plan::resolve_time(&query.from, now)?;
+    let to = crate::plan::resolve_time(&query.to, now)?;
     Ok((from.min(to), from.max(to)))
 }
 

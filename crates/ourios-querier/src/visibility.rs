@@ -238,7 +238,7 @@ fn promoted_expr(df: &DataFrame, name: &str) -> Result<Option<Expr>, QueryError>
     // The promoted column is literally named `attr.<key>` — the same string
     // as the DSL name — and must be addressed as an unqualified `Column`
     // (`col()` would parse the dots as a qualifier).
-    Ok(has_column(df, name).then(|| Expr::Column(Column::new_unqualified(name))))
+    Ok(has_column(df.schema(), name).then(|| Expr::Column(Column::new_unqualified(name))))
 }
 
 #[cfg(test)]

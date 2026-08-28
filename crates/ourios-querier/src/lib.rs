@@ -128,8 +128,8 @@ fn time_bound_scalar(v: u64) -> Result<ScalarValue, QueryError> {
 /// RFC 0005 column absent from every file in the set is omitted from the
 /// inferred union schema; filtering on it would fail planning, so callers
 /// short-circuit to an empty result instead (RFC 0005 §3.9 / RFC0007.4).
-fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
-    df.schema().fields().iter().any(|f| f.name() == column)
+fn has_column(schema: &datafusion::common::DFSchema, column: &str) -> bool {
+    schema.fields().iter().any(|f| f.name() == column)
 }
 
 /// The (post-union) type of `column`, when present. Since RFC 0042 the
@@ -137,10 +137,10 @@ fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
 /// ([`schema_adapt::merge_scanned_schemas`]), so this is how the DSL
 /// compiler learns a key's class.
 fn column_type(
-    df: &datafusion::dataframe::DataFrame,
+    schema: &datafusion::common::DFSchema,
     column: &str,
 ) -> Option<datafusion::arrow::datatypes::DataType> {
-    df.schema()
+    schema
         .fields()
         .iter()
         .find(|f| f.name() == column)
@@ -180,7 +180,7 @@ fn time_window_filter(
     let hi = lit(time_bound_scalar(end)?);
     let ts = || col(columns::TIME_UNIX_NANO);
     let ts_window = ts().gt_eq(lo.clone()).and(ts().lt(hi.clone()));
-    if !has_column(df, columns::EFFECTIVE_TIME_UNIX_NANO) {
+    if !has_column(df.schema(), columns::EFFECTIVE_TIME_UNIX_NANO) {
         return Ok(ts_window);
     }
     let eff = || col(columns::EFFECTIVE_TIME_UNIX_NANO);
@@ -207,7 +207,7 @@ fn apply_request_filters(
     if let Some(severity_text) = &request.severity_text {
         // An absent OPTIONAL `severity_text` reads as all-NULL, so
         // `= X` matches nothing: empty result, not a planning error.
-        if !has_column(&df, columns::SEVERITY_TEXT) {
+        if !has_column(df.schema(), columns::SEVERITY_TEXT) {
             return Ok(None);
         }
         df = df
@@ -795,13 +795,14 @@ impl Querier {
         let df = df
             .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
             .map_err(storage_err)?;
-        let group_exprs = compile::group_exprs(&agg.by, &df)?;
+        let group_exprs = compile::group_exprs(&agg.by, df.schema())?;
         // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
         // the CAST-to-Float64 promoted column) when the stage carries one.
         let mut aggr_exprs = vec![count(lit(1_i64)).alias(compile::COUNT_COLUMN)];
         if let Some((func, path)) = &agg.scalar {
-            aggr_exprs
-                .push(compile::scalar_agg_expr(*func, path, &df)?.alias(compile::VALUE_COLUMN));
+            aggr_exprs.push(
+                compile::scalar_agg_expr(*func, path, df.schema())?.alias(compile::VALUE_COLUMN),
+            );
         }
         let aggregated = df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)?;
         let (batches, scan) = execute_plan(aggregated, task_ctx).await?;

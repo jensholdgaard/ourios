@@ -58,7 +58,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{Column, ScalarValue};
+use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::dataframe::DataFrame;
 use datafusion::functions::expr_fn::{coalesce, get_field, regexp_like, starts_with};
 use datafusion::functions_aggregate::expr_fn::{avg, max, min, sum};
@@ -500,7 +500,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
     let window_filter = crate::time_window_filter(&df, start, end)?;
     let mut df = df.filter(window_filter).map_err(crate::storage_err)?;
 
-    match compile_predicate(&predicate, &df, &alias_classes, &body_equalities)? {
+    match compile_predicate(&predicate, df.schema(), &alias_classes, &body_equalities)? {
         // `true` ⇒ match-all ⇒ no predicate filter (window only).
         PredExpr::All => {}
         // `false` ⇒ match-none ⇒ short-circuit to an empty result.
@@ -550,17 +550,17 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
 ///   nanoseconds, floored to the window start `k·width`, and cast back to a
 ///   UTC timestamp. Stored timestamps are non-negative, so integer division
 ///   *is* the §6.5 floor division.
-pub(crate) fn group_exprs(by: &[GroupTerm], df: &DataFrame) -> Result<Vec<Expr>, QueryError> {
+pub(crate) fn group_exprs(by: &[GroupTerm], schema: &DFSchema) -> Result<Vec<Expr>, QueryError> {
     by.iter()
         .enumerate()
         .map(|(i, term)| {
             let expr = match term {
-                GroupTerm::Field(field) => field_group_expr(field, df)?,
+                GroupTerm::Field(field) => field_group_expr(field, schema)?,
                 GroupTerm::Param(n) => get_field(
                     array_element(col(columns::PARAMS), lit(i64::from(*n) + 1)),
                     "value",
                 ),
-                GroupTerm::Bucket(width) => bucket_expr(width, df)?,
+                GroupTerm::Bucket(width) => bucket_expr(width, schema)?,
             };
             Ok(expr.alias(group_column_name(i)))
         })
@@ -572,9 +572,9 @@ pub(crate) fn group_exprs(by: &[GroupTerm], df: &DataFrame) -> Result<Vec<Expr>,
 /// the scanned union schema; otherwise rejects with a hint pointing at
 /// promotion, so grouping never silently degrades to a single NULL bucket or
 /// an unpruned JSON scan.
-fn group_by_promoted(column: &str, key: &str, df: &DataFrame) -> Result<Expr, QueryError> {
+fn group_by_promoted(column: &str, key: &str, schema: &DFSchema) -> Result<Expr, QueryError> {
     let name = promoted_column_name(column, key);
-    if has_column(df, &name) {
+    if has_column(schema, &name) {
         Ok(Expr::Column(Column::new_unqualified(name)))
     } else {
         // Name the raw config key (no `attr.`/`resource.` prefix) and the
@@ -594,12 +594,12 @@ fn group_by_promoted(column: &str, key: &str, df: &DataFrame) -> Result<Expr, Qu
     }
 }
 
-fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
+fn field_group_expr(field: &Field, schema: &DFSchema) -> Result<Expr, QueryError> {
     match field {
         Field::Service => {
             let name =
                 promoted_column_name(columns::RESOURCE_ATTRIBUTES, promoted::SERVICE_NAME_KEY);
-            if has_column(df, &name) {
+            if has_column(schema, &name) {
                 Ok(Expr::Column(Column::new_unqualified(name)))
             } else {
                 Ok(lit(ScalarValue::Utf8(None)))
@@ -613,11 +613,11 @@ fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
         // is not a usable group key here: reject with a promotion hint rather
         // than collapse every row into one NULL bucket or group over an
         // unpruned JSON scan (hazard #6).
-        Field::Resource(key) => group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, df),
-        Field::Attr(key) => group_by_promoted(columns::ATTRIBUTES, key, df),
+        Field::Resource(key) => group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, schema),
+        Field::Attr(key) => group_by_promoted(columns::ATTRIBUTES, key, schema),
         _ => {
             let (column, optional) = column_of(field);
-            if optional && !has_column(df, column) {
+            if optional && !has_column(schema, column) {
                 Ok(lit(null_scalar_for(field)))
             } else {
                 Ok(col(column))
@@ -636,15 +636,15 @@ fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
 pub(crate) fn scalar_agg_expr(
     func: AggFn,
     path: &Field,
-    df: &DataFrame,
+    schema: &DFSchema,
 ) -> Result<Expr, QueryError> {
     let (column, name) = match path {
         Field::Attr(key) => (
-            group_by_promoted(columns::ATTRIBUTES, key, df)?,
+            group_by_promoted(columns::ATTRIBUTES, key, schema)?,
             promoted_column_name(columns::ATTRIBUTES, key),
         ),
         Field::Resource(key) => (
-            group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, df)?,
+            group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, schema)?,
             promoted_column_name(columns::RESOURCE_ATTRIBUTES, key),
         ),
         _ => return Err(agg_path_error()),
@@ -656,7 +656,7 @@ pub(crate) fn scalar_agg_expr(
     // belongs in i64 and loses precision here if summed anyway — the
     // same rule as the write-side projection); a `Utf8` promoted column
     // keeps the RFC0002.17 `try_cast` (unparseable → NULL → excluded).
-    let numeric = match column_type(df, &name) {
+    let numeric = match column_type(schema, &name) {
         Some(DataType::Float64) => column,
         Some(DataType::Int64) => cast(column, DataType::Float64),
         _ => try_cast(column, DataType::Float64),
@@ -718,12 +718,12 @@ fn null_scalar_for(field: &Field) -> ScalarValue {
     }
 }
 
-fn bucket_expr(width: &str, df: &DataFrame) -> Result<Expr, QueryError> {
+fn bucket_expr(width: &str, schema: &DFSchema) -> Result<Expr, QueryError> {
     let w = i64::try_from(duration_nanos(width)?).map_err(|_| QueryError::InvalidQuery {
         detail: format!("bucket({width}) width exceeds i64 nanoseconds"),
     })?;
     let ts = col(columns::TIME_UNIX_NANO);
-    let effective = if has_column(df, columns::EFFECTIVE_TIME_UNIX_NANO) {
+    let effective = if has_column(schema, columns::EFFECTIVE_TIME_UNIX_NANO) {
         coalesce(vec![col(columns::EFFECTIVE_TIME_UNIX_NANO), ts])
     } else {
         ts
@@ -833,31 +833,31 @@ fn timestamp_nanos(s: &str) -> Result<u64, QueryError> {
 
 fn compile_predicate(
     p: &Predicate,
-    df: &DataFrame,
+    schema: &DFSchema,
     alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
     body_eqs: &BTreeMap<String, BodyEqualityPlan>,
 ) -> Result<PredExpr, QueryError> {
     match p {
         Predicate::Bool(true) => Ok(PredExpr::All),
         Predicate::Bool(false) => Ok(PredExpr::None),
-        Predicate::Not(inner) => match compile_predicate(inner, df, alias_classes, body_eqs)? {
+        Predicate::Not(inner) => match compile_predicate(inner, schema, alias_classes, body_eqs)? {
             PredExpr::All => Ok(PredExpr::None),
             PredExpr::None => Ok(PredExpr::All),
             PredExpr::Filter(e) => Ok(PredExpr::Filter(not(e))),
         },
-        Predicate::And(terms) => combine(terms, df, alias_classes, body_eqs, true),
-        Predicate::Or(terms) => combine(terms, df, alias_classes, body_eqs, false),
+        Predicate::And(terms) => combine(terms, schema, alias_classes, body_eqs, true),
+        Predicate::Or(terms) => combine(terms, schema, alias_classes, body_eqs, false),
         Predicate::Comparison { field, op, value } => {
-            compile_comparison(field, *op, value, df, body_eqs)
+            compile_comparison(field, *op, value, schema, body_eqs)
         }
         Predicate::Severity { op, value } => Ok(compile_severity(*op, value)),
-        Predicate::Call(call) => compile_call(call, df, alias_classes),
+        Predicate::Call(call) => compile_call(call, schema, alias_classes),
     }
 }
 
 fn combine(
     terms: &[Predicate],
-    df: &DataFrame,
+    schema: &DFSchema,
     alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
     body_eqs: &BTreeMap<String, BodyEqualityPlan>,
     is_and: bool,
@@ -865,7 +865,7 @@ fn combine(
     let mut acc: Option<Expr> = None;
     for term in terms {
         match (
-            compile_predicate(term, df, alias_classes, body_eqs)?,
+            compile_predicate(term, schema, alias_classes, body_eqs)?,
             is_and,
         ) {
             // `x and true` = x ; `x or false` = x — drop the identity term.
@@ -949,26 +949,32 @@ fn compile_comparison(
     field: &Field,
     op: CmpOp,
     value: &Value,
-    df: &DataFrame,
+    schema: &DFSchema,
     body_eqs: &BTreeMap<String, BodyEqualityPlan>,
 ) -> Result<PredExpr, QueryError> {
     match (field, op, value) {
         // `body ==`/`!=` compiles to the RFC 0044 two-arm form; the plan
         // resolved the literal's template candidates eagerly.
         (Field::Body, CmpOp::Ord(OrdOp::Eq), Value::Str(literal)) => {
-            Ok(body_equality(&body_eqs[literal], literal, df, false))
+            Ok(body_equality(&body_eqs[literal], literal, schema, false))
         }
         (Field::Body, CmpOp::Ord(OrdOp::Ne), Value::Str(literal)) => {
-            Ok(body_equality(&body_eqs[literal], literal, df, true))
+            Ok(body_equality(&body_eqs[literal], literal, schema, true))
         }
         _ => match field {
             // Attribute-backed fields have no dedicated column (JSON storage).
-            Field::Service => {
-                attr_match(columns::RESOURCE_ATTRIBUTES, "service.name", op, value, df)
+            Field::Service => attr_match(
+                columns::RESOURCE_ATTRIBUTES,
+                "service.name",
+                op,
+                value,
+                schema,
+            ),
+            Field::Resource(key) => {
+                attr_match(columns::RESOURCE_ATTRIBUTES, key, op, value, schema)
             }
-            Field::Resource(key) => attr_match(columns::RESOURCE_ATTRIBUTES, key, op, value, df),
-            Field::Attr(key) => attr_match(columns::ATTRIBUTES, key, op, value, df),
-            _ => column_comparison(field, op, value, df),
+            Field::Attr(key) => attr_match(columns::ATTRIBUTES, key, op, value, schema),
+            _ => column_comparison(field, op, value, schema),
         },
     }
 }
@@ -992,11 +998,11 @@ fn compile_comparison(
 fn body_equality(
     plan: &BodyEqualityPlan,
     literal: &str,
-    df: &DataFrame,
+    schema: &DFSchema,
     negated: bool,
 ) -> PredExpr {
     let string_kind = col(columns::BODY_KIND).eq(lit(0_u8));
-    let physical_present = has_column(df, columns::BODY);
+    let physical_present = has_column(schema, columns::BODY);
     let body_lit = || lit(ScalarValue::Binary(Some(literal.as_bytes().to_vec())));
 
     let template_arm = plan
@@ -1096,7 +1102,7 @@ fn column_comparison(
     field: &Field,
     op: CmpOp,
     value: &Value,
-    df: &DataFrame,
+    schema: &DFSchema,
 ) -> Result<PredExpr, QueryError> {
     let (column, optional) = column_of(field);
     // Regex operators are defined only over text columns. A numeric /
@@ -1112,7 +1118,7 @@ fn column_comparison(
         });
     }
     // Absent OPTIONAL column ⇒ all-NULL ⇒ the leaf matches nothing.
-    if optional && !has_column(df, column) {
+    if optional && !has_column(schema, column) {
         return Ok(PredExpr::None);
     }
     let expr = match op {
@@ -1290,18 +1296,18 @@ fn attr_match(
     key: &str,
     op: CmpOp,
     value: &Value,
-    df: &DataFrame,
+    schema: &DFSchema,
 ) -> Result<PredExpr, QueryError> {
     // Both attribute columns are REQUIRED, but guard for the union schema
     // anyway (a future writer could make them OPTIONAL).
-    if !has_column(df, column) {
+    if !has_column(schema, column) {
         return Ok(PredExpr::None);
     }
     let promoted_name = promoted_column_name(column, key);
     // RFC 0042 §3.4: the union schema's type for the promoted column is
     // the declared class's type (`schema_adapt::merge_scanned_schemas`),
     // so a numeric column type routes to the numeric-class compilation.
-    match column_type(df, &promoted_name) {
+    match column_type(schema, &promoted_name) {
         Some(DataType::Int64) => {
             return numeric_attr_match(column, key, &promoted_name, op, value, NumericClass::I64);
         }
@@ -1318,7 +1324,7 @@ fn attr_match(
     // `col()` parses dotted names as qualified references, so the promoted
     // column (literally named `resource.<k>` / `attr.<k>`) must be addressed
     // as an unqualified `Column` built directly.
-    let promoted = has_column(df, &promoted_name)
+    let promoted = has_column(schema, &promoted_name)
         .then(|| Expr::Column(Column::new_unqualified(promoted_name)));
     let eq = match op {
         CmpOp::Ord(OrdOp::Eq) => true,
@@ -1503,18 +1509,22 @@ fn like_escape(s: &str) -> String {
 
 fn compile_call(
     call: &Call,
-    df: &DataFrame,
+    schema: &DFSchema,
     alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
 ) -> Result<PredExpr, QueryError> {
     match call {
-        Call::Matches { field, arg } => {
-            string_call(field, df, |lhs| regexp_like(lhs, lit(arg.clone()), None))
+        Call::Matches { field, arg } => string_call(field, schema, |lhs| {
+            regexp_like(lhs, lit(arg.clone()), None)
+        }),
+        Call::Contains { field, arg } => {
+            like_call(field, schema, &format!("%{}%", like_escape(arg)))
         }
-        Call::Contains { field, arg } => like_call(field, df, &format!("%{}%", like_escape(arg))),
         Call::StartsWith { field, arg } => {
-            string_call(field, df, |lhs| starts_with(lhs, lit(arg.clone())))
+            string_call(field, schema, |lhs| starts_with(lhs, lit(arg.clone())))
         }
-        Call::EndsWith { field, arg } => like_call(field, df, &format!("%{}", like_escape(arg))),
+        Call::EndsWith { field, arg } => {
+            like_call(field, schema, &format!("%{}", like_escape(arg)))
+        }
         // RFC0002.9 — `resolves_to(n)` matches the whole RFC 0001 §6.7 alias
         // equivalence class of `n` (resolved per-tenant at compile time, see
         // `collect_alias_classes`). It compiles to `template_id IN (class)`. A
@@ -1542,18 +1552,18 @@ fn resolves_to_expr(n: u64, alias_classes: &BTreeMap<u64, BTreeSet<u64>>) -> Exp
 /// rejected in this slice.
 fn string_call(
     field: &Field,
-    df: &DataFrame,
+    schema: &DFSchema,
     build: impl FnOnce(Expr) -> Expr,
 ) -> Result<PredExpr, QueryError> {
     let column = string_call_column(field)?;
-    if column_of(field).1 && !has_column(df, column) {
+    if column_of(field).1 && !has_column(schema, column) {
         return Ok(PredExpr::None);
     }
     Ok(PredExpr::Filter(build(col(column))))
 }
 
-fn like_call(field: &Field, df: &DataFrame, pattern: &str) -> Result<PredExpr, QueryError> {
-    string_call(field, df, |lhs| lhs.like(lit(pattern.to_string())))
+fn like_call(field: &Field, schema: &DFSchema, pattern: &str) -> Result<PredExpr, QueryError> {
+    string_call(field, schema, |lhs| lhs.like(lit(pattern.to_string())))
 }
 
 fn string_call_column(field: &Field) -> Result<&'static str, QueryError> {
@@ -1636,6 +1646,42 @@ mod tests {
             PredExpr::Filter(e) => e,
             _ => panic!("expected a Filter for a severity predicate"),
         }
+    }
+
+    /// The `&DFSchema` seam (epic #745 wave 3): predicate lowering runs
+    /// against a bare schema — no session, no `DataFrame`, no table
+    /// registration. A leaf over a present column lowers to a filter; the
+    /// same leaf over a schema missing that OPTIONAL column collapses to
+    /// match-none (the RFC 0005 §3.9 absent-column disposition), all
+    /// decided from the schema alone.
+    #[test]
+    fn lowering_needs_only_a_schema() {
+        use datafusion::arrow::datatypes::{Field as ArrowField, Schema};
+
+        let leaf = Predicate::Comparison {
+            field: Field::Scope,
+            op: CmpOp::Ord(OrdOp::Eq),
+            value: Value::Str("checkout".to_string()),
+        };
+        let with_scope = DFSchema::try_from(Schema::new(vec![ArrowField::new(
+            columns::SCOPE_NAME,
+            DataType::Utf8,
+            true,
+        )]))
+        .expect("schema");
+        let lowered = compile_predicate(&leaf, &with_scope, &BTreeMap::new(), &BTreeMap::new())
+            .expect("lowers");
+        assert!(matches!(lowered, PredExpr::Filter(_)));
+
+        let without_scope = DFSchema::try_from(Schema::new(vec![ArrowField::new(
+            columns::TEMPLATE_ID,
+            DataType::UInt64,
+            true,
+        )]))
+        .expect("schema");
+        let lowered = compile_predicate(&leaf, &without_scope, &BTreeMap::new(), &BTreeMap::new())
+            .expect("lowers");
+        assert!(matches!(lowered, PredExpr::None));
     }
 
     /// RFC0002.21 lowering: a floor admits unspecified, a ceiling excludes it,

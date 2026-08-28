@@ -25,6 +25,8 @@ ourios-config = { path = "../ourios-config" }
 # building blocks (RFC 0003 §6.2): the ingest pipeline, the axum HTTP
 # router, and the tonic `LogsService` impl the receiver role serves.
 ourios-ingester = { path = "../ourios-ingester", features = ["oidc", "openfga"] }
+# RFC 0051: auth resolution + TLS listener plumbing shared by both roles.
+ourios-serving = { path = "../ourios-serving", features = ["oidc", "openfga"] }
 # Durable compaction-audit sink (RFC 0005 §3.7) + the compaction policy.
 ourios-parquet = { path = "../ourios-parquet" }
 # RFC 3339 parsing for the `graph backfill --from` boundary (RFC 0048

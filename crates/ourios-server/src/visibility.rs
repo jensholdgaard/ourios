@@ -9,8 +9,8 @@ use axum::http::StatusCode;
 use ourios_core::auth::openfga::{
     CONVERSATION_TYPE, OpenFgaError, PrincipalKind, Visibility as GraphVisibility,
 };
-use ourios_ingester::receiver::{AuthBinding, AuthResolver};
 use ourios_querier::{ScopedIds, SelfMatch, Visibility};
+use ourios_serving::{AuthBinding, AuthResolver};
 
 use crate::querier::QuerierMetrics;
 

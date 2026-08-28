@@ -3379,6 +3379,7 @@ dependencies = [
  "ourios-miner",
  "ourios-parquet",
  "ourios-semconv",
+ "ourios-serving",
  "ourios-telemetry",
  "ourios-testgen",
  "ourios-wal",
@@ -3504,6 +3505,7 @@ dependencies = [
  "ourios-parquet",
  "ourios-querier",
  "ourios-semconv",
+ "ourios-serving",
  "ourios-telemetry",
  "ourios-wal",
  "p256",
@@ -3526,6 +3528,27 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ourios-serving"
+version = "0.9.0"
+dependencies = [
+ "axum",
+ "futures-core",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "ourios-core",
+ "ourios-semconv",
+ "ourios-telemetry",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

@@ -34,7 +34,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
-use super::tls::TlsSettings;
+use crate::tls::TlsSettings;
 
 /// A [`TlsAcceptor`] whose backing config can be hot-swapped without
 /// dropping the listener (RFC0030.6). Cheap to clone — clones share the

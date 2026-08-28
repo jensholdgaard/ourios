@@ -7,8 +7,8 @@
 
 use crate::config::file::{FileConfig, PromotedEntry, TlsSection};
 use ourios_config::{MinerConfig, UpstreamTemplates};
-use ourios_ingester::receiver::tls::TlsSettings;
 use ourios_parquet::{PromotedAttributes, S3Config, StoreConfig};
+use ourios_serving::tls::TlsSettings;
 use ourios_wal::WalConfig;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

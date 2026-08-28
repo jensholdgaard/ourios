@@ -31,6 +31,7 @@ use tracing::Instrument as _;
 use crate::metrics::IngestMetrics;
 use crate::receiver::commit::CommitCoordinator;
 use crate::receiver::tenant::assign;
+use ourios_serving::AuthBinding;
 
 /// The §6.9 rotation-cadence callback: receives the miner as it
 /// stands and the rotation-point high-water mark. See
@@ -311,7 +312,7 @@ impl IngestPipeline {
         &self,
         request: ExportLogsServiceRequest,
         tenant: TenantId,
-        binding: Option<&super::auth::AuthBinding>,
+        binding: Option<&AuthBinding>,
         lenient_json: bool,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
@@ -319,7 +320,7 @@ impl IngestPipeline {
         // denial counts on `ourios.ingest.batches` (`error.type =
         // permission_denied`) and emits the audit event.
         if let Some(binding) = binding
-            && let Err(e) = super::auth::check_binding(&tenant, binding)
+            && let Err(e) = check_binding(&tenant, binding)
         {
             if let ReceiveError::TenantDenied { token_name, tenant } = &e {
                 self.metrics
@@ -699,6 +700,29 @@ impl std::error::Error for ReceiveError {
     }
 }
 
+/// Enforce the §3.2 per-batch tenant binding: the out-of-band selected
+/// `tenant` (RFC 0046 §3.1) must fall inside the binding's write set.
+///
+/// Runs before the WAL append *and* before materialisation, so a denied
+/// batch does no ingest work at all. Lives with [`ReceiveError`] — the
+/// error it raises — since RFC 0051 moved the resolver to
+/// `ourios-serving`; the binding *decision* stays on the ingest side.
+///
+/// # Errors
+///
+/// [`ReceiveError::TenantDenied`] when `tenant` is outside the set — the
+/// whole batch is rejected (`PERMISSION_DENIED` / 403).
+pub(crate) fn check_binding(tenant: &TenantId, binding: &AuthBinding) -> Result<(), ReceiveError> {
+    if binding.may_write(tenant.as_str()) {
+        Ok(())
+    } else {
+        Err(ReceiveError::TenantDenied {
+            token_name: binding.token_name().to_string(),
+            tenant: tenant.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -794,6 +818,36 @@ mod tests {
                 }],
                 ..Default::default()
             }],
+        }
+    }
+
+    /// RFC 0026 §3.2 (relocated here by RFC 0051): `check_binding`
+    /// allows a tenant inside the binding's write set and rejects one
+    /// outside it, preserving the token's audit label and the selected
+    /// tenant in the error.
+    #[test]
+    fn check_binding_allows_inside_and_denies_outside_the_write_set() {
+        let store = ourios_core::auth::build_token_store(Some(&[ourios_core::auth::TokenSpec {
+            name: Some("edge".to_string()),
+            token: Some("tok-edge".to_string()),
+            tenants: vec!["acme".to_string()],
+        }]))
+        .expect("valid spec")
+        .expect("enabled store");
+        let binding = ourios_serving::authenticate_bearer(Some(&store), Some("Bearer tok-edge"))
+            .expect("known token")
+            .expect("bound");
+
+        let acme = ourios_core::tenant::TenantId::new("acme");
+        assert!(check_binding(&acme, &binding).is_ok());
+
+        let globex = ourios_core::tenant::TenantId::new("globex");
+        match check_binding(&globex, &binding) {
+            Err(ReceiveError::TenantDenied { token_name, tenant }) => {
+                assert_eq!(token_name, "edge", "audit label preserved");
+                assert_eq!(tenant, globex, "selected tenant preserved");
+            }
+            other => panic!("expected TenantDenied, got {other:?}"),
         }
     }
 

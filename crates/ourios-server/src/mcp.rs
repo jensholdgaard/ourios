@@ -26,11 +26,11 @@ use axum::response::{IntoResponse, Response};
 use opentelemetry::context::FutureExt as _;
 use ourios_core::auth::openfga::{OpenFgaResolver, TupleKey};
 use ourios_core::tenant::TenantId;
-use ourios_ingester::receiver::{AuthBinding, AuthError, AuthResolver, extract_context};
 use ourios_parquet::PromotedAttributes;
 use ourios_querier::Querier;
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
+use ourios_serving::{AuthBinding, AuthError, AuthResolver, extract_context};
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{

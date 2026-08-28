@@ -6,9 +6,9 @@
 //! [`TokenStore`] (`None` store = open mode, §3.1 — every request passes
 //! unbound). The gRPC interceptor and the HTTP handler run it *before any
 //! wire decode*, then attach the resulting [`AuthBinding`] to the request;
-//! the pipeline enforces the §3.2 per-batch tenant binding against it via
-//! `check_binding` (crate-internal) — every `ResourceLogs` group's derived
-//! tenant must
+//! the ingest pipeline enforces the §3.2 per-batch tenant binding
+//! against it (its `check_binding`, next to the error it raises) —
+//! every `ResourceLogs` group's derived tenant must
 //! fall inside the token's set, else the **whole batch** is rejected
 //! before the WAL append (partial acceptance would make the OTLP
 //! partial-success surface a tenancy oracle).
@@ -27,10 +27,8 @@ use std::sync::Arc;
 
 use ourios_core::auth::openfga::{Principal, PrincipalKind};
 use ourios_core::auth::{TenantSet, TokenStore};
-use ourios_core::tenant::TenantId;
 
 use crate::metrics::AuthMetrics;
-use crate::receiver::pipeline::ReceiveError;
 
 /// The authenticated identity a listener attaches to a request: the
 /// principal's audit/metric label and its tenant bindings — never the
@@ -409,27 +407,6 @@ impl AuthResolver {
         // configuration guarantees it; an absent one still fails closed.
         let tenants = identity.tenants.ok_or(AuthError::Unauthenticated)?;
         Ok(Some(AuthBinding::same(identity.name, tenants)))
-    }
-}
-
-/// Enforce the §3.2 per-batch tenant binding: the out-of-band selected
-/// `tenant` (RFC 0046 §3.1) must fall inside the binding's write set.
-///
-/// Runs before the WAL append *and* before materialisation, so a denied
-/// batch does no ingest work at all.
-///
-/// # Errors
-///
-/// [`ReceiveError::TenantDenied`] when `tenant` is outside the set — the
-/// whole batch is rejected (`PERMISSION_DENIED` / 403).
-pub(crate) fn check_binding(tenant: &TenantId, binding: &AuthBinding) -> Result<(), ReceiveError> {
-    if binding.may_write(tenant.as_str()) {
-        Ok(())
-    } else {
-        Err(ReceiveError::TenantDenied {
-            token_name: binding.token_name.clone(),
-            tenant: tenant.clone(),
-        })
     }
 }
 

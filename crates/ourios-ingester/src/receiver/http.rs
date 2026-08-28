@@ -26,11 +26,11 @@ use prost::Message;
 
 use opentelemetry::context::FutureExt as _;
 
-use crate::receiver::auth::{AuthError, AuthResolver};
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
-use crate::receiver::propagation::extract_context;
 use crate::receiver::selector;
+use ourios_serving::auth::{AuthError, AuthResolver};
+use ourios_serving::propagation::extract_context;
 
 /// OTLP/HTTP listener configuration.
 #[derive(Debug, Clone)]

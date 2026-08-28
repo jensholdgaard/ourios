@@ -9,8 +9,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsSe
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
-use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsMinVersion, TlsSettings};
-use ourios_ingester::receiver::tls_serve::{
+use ourios_serving::tls::{ALPN_GRPC, ALPN_HTTP, TlsMinVersion, TlsSettings};
+use ourios_serving::tls_serve::{
     LISTENER_HTTP, ReloadingAcceptor, TlsListener, reloading_acceptor, tls_incoming,
 };
 use prost::Message as _;

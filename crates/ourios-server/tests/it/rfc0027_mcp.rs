@@ -183,7 +183,7 @@ async fn rfc0027_1_gating_and_placement() {
     let on = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let response = on.oneshot(initialize_request(None)).await.expect("oneshot");
@@ -213,7 +213,7 @@ async fn rfc0027_1_gating_and_placement() {
         ourios_server::querier::router_with_mcp(
             bucket.path().to_path_buf(),
             3_600_000_000_000,
-            ourios_ingester::receiver::AuthResolver::static_only(Some(auth.clone())),
+            ourios_serving::AuthResolver::static_only(Some(auth.clone())),
             true,
         )
     };
@@ -250,7 +250,7 @@ async fn rfc0027_2_rfc0026_gate_applies_verbatim() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(Some(auth)),
+        ourios_serving::AuthResolver::static_only(Some(auth)),
         true,
     );
 
@@ -289,7 +289,7 @@ async fn rfc0027_2_rfc0026_gate_applies_verbatim() {
     let open = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let body = mcp_tool_call(
@@ -313,7 +313,7 @@ async fn rfc0027_3_query_logs() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         crate::rfc0016_query_endpoint::SHARED_HUGE_WINDOW,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let body = mcp_tool_call(
@@ -379,7 +379,7 @@ async fn rfc0027_3_query_logs_count_aggregation() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         crate::rfc0016_query_endpoint::SHARED_HUGE_WINDOW,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let query = "template_id == 1 | count by template_id";
@@ -422,7 +422,7 @@ async fn rfc0027_4_list_templates() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         crate::rfc0016_query_endpoint::SHARED_HUGE_WINDOW,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let body = mcp_tool_call(
@@ -473,7 +473,7 @@ async fn rfc0027_5_template_drift() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         crate::rfc0016_query_endpoint::SHARED_HUGE_WINDOW,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     // A wide fixed window covering the seeded audit timestamps.
@@ -509,7 +509,7 @@ async fn rfc0027_6_grammar_resource() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let init = serde_json::json!({
@@ -587,7 +587,7 @@ async fn rfc0027_7_output_discipline() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let init = serde_json::json!({

@@ -68,7 +68,7 @@ fn router_with_promoted(bucket: &std::path::Path, promoted: &PromotedAttributes)
     ourios_server::querier::router_with_mcp_promoted(
         bucket.to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
         promoted,
     )
@@ -82,7 +82,7 @@ async fn rfc0032_1_listed_and_readable() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
     let session = mcp_handshake(&router).await;

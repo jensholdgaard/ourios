@@ -80,6 +80,9 @@ opentelemetry = { version = "0.32", default-features = false, features = ["metri
 # Generated metric/attribute name constants (RFC 0009 §3.6); a leaf,
 # zero-dep crate.
 ourios-semconv = { path = "../ourios-semconv" }
+# RFC 0051: the shared serving plumbing (auth resolver, TLS listeners,
+# propagation) the receiver builds its listeners from.
+ourios-serving = { path = "../ourios-serving" }
 # OTLP wire decode (RFC 0003 §6.2). Same crate + version + features the
 # rest of the workspace pins (ourios-core, ourios-bench): the receiver
 # decodes the gRPC / HTTP `application/x-protobuf` payload into the
@@ -122,9 +125,9 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [features]
 # RFC 0029: OIDC bearer resolution in front of the RFC 0026 enforcement.
-oidc = ["ourios-core/oidc"]
+oidc = ["ourios-core/oidc", "ourios-serving/oidc"]
 # RFC 0047: the OpenFGA resolver binding tenants behind the same seam.
-openfga = ["ourios-core/openfga"]
+openfga = ["ourios-core/openfga", "ourios-serving/openfga"]
 
 [dev-dependencies]
 # RFC0030.2 HTTPS client: a real TLS handshake to the http listener

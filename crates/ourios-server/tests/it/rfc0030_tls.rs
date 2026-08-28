@@ -20,10 +20,10 @@ use tokio::time::timeout;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0030_3_querier_and_mcp_over_tls() {
     use ourios_core::auth::{TokenSpec, build_token_store};
-    use ourios_ingester::receiver::AuthResolver;
-    use ourios_ingester::receiver::tls::TlsSettings;
     use ourios_parquet::StoreConfig;
     use ourios_server::querier::{QuerierConfig, serve};
+    use ourios_serving::AuthResolver;
+    use ourios_serving::tls::TlsSettings;
 
     let tmp = tempfile::TempDir::new().expect("temp");
     let signed =

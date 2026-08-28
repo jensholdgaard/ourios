@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 337 |
+| `Apache-2.0` | 338 |
 | `MIT` | 72 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 8 |
@@ -6753,6 +6753,7 @@ Used by:
 - `ourios-querier` 0.9.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-semconv` 0.9.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-server` 0.9.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-serving` 0.9.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-telemetry` 0.9.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-testgen` 0.9.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-wal` 0.9.0 — <https://github.com/jensholdgaard/ourios>

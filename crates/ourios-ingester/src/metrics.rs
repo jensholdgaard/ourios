@@ -343,59 +343,12 @@ impl IngestMetrics {
     }
 }
 
-/// The `error.type` value for a missing/malformed/unknown bearer
-/// (RFC 0026 §3.4).
-pub const ERROR_TYPE_UNAUTHENTICATED: &str = "unauthenticated";
-/// The `error.type` value for an authenticated cross-tenant rejection
-/// (RFC 0026 §3.4).
-pub const ERROR_TYPE_PERMISSION_DENIED: &str = "permission_denied";
-/// The `error.type` value for a request failed closed because the
-/// RFC 0047 resolver could not answer (`OpenFGA` unreachable / timed out).
-pub const ERROR_TYPE_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
-
-/// `ourios.auth.resolutions` (RFC 0047 §5): one count per credential
-/// resolution by the [`AuthResolver`](crate::receiver::AuthResolver),
-/// tagged with `error.type` on failure. Owned by the resolver so every
-/// role — ingest listeners, querier, MCP — records through the same
-/// instrument.
-pub struct AuthMetrics {
-    resolutions: Counter<u64>,
-}
-
-impl AuthMetrics {
-    /// Build the instrument with its registry unit.
-    #[must_use]
-    pub fn new() -> Self {
-        let meter = global::meter("ourios.auth");
-        Self {
-            resolutions: meter
-                .u64_counter(semconv::OURIOS_AUTH_RESOLUTIONS)
-                .with_unit("{resolution}")
-                .build(),
-        }
-    }
-
-    /// Record one resolution: `None` for a bound credential, else the
-    /// failure class.
-    pub fn record(&self, error: Option<crate::receiver::AuthError>) {
-        match error {
-            None => self.resolutions.add(1, &[]),
-            Some(crate::receiver::AuthError::Unauthenticated) => self
-                .resolutions
-                .add(1, &[KeyValue::new(ERROR_TYPE, ERROR_TYPE_UNAUTHENTICATED)]),
-            Some(crate::receiver::AuthError::Unavailable) => self.resolutions.add(
-                1,
-                &[KeyValue::new(ERROR_TYPE, ERROR_TYPE_UPSTREAM_UNAVAILABLE)],
-            ),
-        }
-    }
-}
-
-impl Default for AuthMetrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// RFC 0051: `AuthMetrics` and the shared `error.type` class values
+// moved to `ourios-serving` with the resolver; re-imported so the
+// ingest-side rejection tagging stays on the same value space.
+pub use ourios_serving::metrics::{
+    ERROR_TYPE_PERMISSION_DENIED, ERROR_TYPE_UNAUTHENTICATED, ERROR_TYPE_UPSTREAM_UNAVAILABLE,
+};
 
 /// The OpenTelemetry-standard `error.type` attribute key (semconv, stable).
 /// Deliberately **not** in the Ourios weaver registry — it is an upstream

@@ -172,7 +172,7 @@ async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
     let router = ourios_server::querier::router_with_mcp(
         bucket.path().to_path_buf(),
         3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
+        ourios_serving::AuthResolver::static_only(None),
         true,
     );
 

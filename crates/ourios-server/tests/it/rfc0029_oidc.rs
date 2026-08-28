@@ -1116,7 +1116,8 @@ mod dex {
         let wait = (exp + 1).saturating_sub(host_now);
         assert!(
             wait <= expires_in + 120,
-            "host clock lags the issuer's by over two minutes (waiting {wait}s to outlive a              {expires_in}s token) — fix this machine's clock before trusting the expiry arm"
+            "host clock lags the issuer's by over two minutes (waiting {wait}s to outlive a \
+             {expires_in}s token) — fix this machine's clock before trusting the expiry arm"
         );
         tokio::time::sleep(Duration::from_secs(wait)).await;
         let expired = query(Some(token.clone()), "globex").await;

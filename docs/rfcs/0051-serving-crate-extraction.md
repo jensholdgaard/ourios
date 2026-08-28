@@ -312,7 +312,16 @@ All resolved at `specified` (2026-08-27, maintainer sign-off):
 - **RFC0051.6** — measured 2026-08-28 (M-series laptop, isolated
   target dirs, warm build then a one-line `auth.rs` edit):
   `cargo check -p ourios-server` before 1.37 s (rebuilds ingester +
-  server) vs after 1.82 s (serving + ingester + server). **Caveat
+  server) vs after 1.82 s (serving + ingester + server);
+  `cargo check -p ourios-querier` after the same edit: 23.5 s before
+  vs 22.3 s after — but both querier numbers are a measurement
+  artifact, not signal: a solo `-p ourios-querier` invocation
+  resolves a different feature unification than the combined warm
+  build and recompiles the DataFusion stack on both sides of the
+  move. The meaningful querier fact is structural: `ourios-querier`
+  has no `ourios-ingester` edge in its unit graph before or after
+  (`cargo build --timings` unit lists), and the auth edit therefore
+  never touches it. **Caveat
   recorded as measured:** the dual-role server binary still rebuilds
   the ingester on an auth edit — the ingester itself now depends on
   `ourios-serving` — so the criterion's "querier-role path no longer

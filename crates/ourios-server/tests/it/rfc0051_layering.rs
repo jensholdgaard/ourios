@@ -152,11 +152,16 @@ fn rfc0051_2_core_manifest_has_no_http_stack() {
     let mut offences = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let code = line.split('#').next().unwrap_or("");
-        if code.trim_start().starts_with("reqwest")
-            || code.trim_start().starts_with("jsonwebtoken")
-            || code.trim_start().starts_with("oidc =")
-            || code.trim_start().starts_with("openfga =")
-        {
+        // Exact-key match: the TOML key is everything before `=` (or
+        // `.` for dotted keys), trimmed — so `reqwest-middleware` or
+        // any future `reqwest*`-prefixed crate can't false-positive.
+        let key = code
+            .split(['=', '.'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        if matches!(key, "reqwest" | "jsonwebtoken" | "oidc" | "openfga") {
             offences.push(format!("{}: {}", lineno + 1, line.trim()));
         }
     }

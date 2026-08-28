@@ -1,0 +1,1 @@
+template_id == 42 | range(-3h, now) | count by bucket(5m)

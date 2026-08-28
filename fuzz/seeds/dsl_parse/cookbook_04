@@ -1,0 +1,1 @@
+true | range(-24h, now) | count by service | sort count desc

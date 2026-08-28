@@ -1,0 +1,1 @@
+resource["k8s.pod.name"] == "checkout-7d4b9f-x2m8p" | range(-30m, now)

@@ -1,0 +1,1 @@
+service == "checkout" and severity >= error and contains(body, "timeout")

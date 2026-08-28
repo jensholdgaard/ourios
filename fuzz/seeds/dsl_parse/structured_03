@@ -1,0 +1,1 @@
+{"predicate":{"and":[{"const":true},{"not":{"field":"lossy","op":"==","value":true}}]}}

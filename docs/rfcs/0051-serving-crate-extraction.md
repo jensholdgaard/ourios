@@ -16,7 +16,8 @@ superseded-by: —
 > crate; the OIDC client moves with the OpenFGA client (core ends
 > `reqwest`-free); the `ourios_ingester::receiver::*` re-export
 > shims get one deprecation release. §5 criteria are written and
-> testable; implementation may begin.
+> testable; next stage is `red` — the RFC0051.1/.2 gates land as
+> failing tests before any module moves.
 >
 > *(`drafted`, 2026-08-27: Wave 3 of the structural review, epic
 > #745.)* Touches no §2 pillar and

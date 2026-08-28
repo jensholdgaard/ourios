@@ -40,10 +40,10 @@
 mod alias_store;
 mod audit_scan;
 mod body_match;
-mod compile;
 mod drift;
 pub mod dsl;
 mod log_row;
+mod plan;
 mod schema_adapt;
 mod template_map;
 mod template_registry;
@@ -128,8 +128,8 @@ fn time_bound_scalar(v: u64) -> Result<ScalarValue, QueryError> {
 /// RFC 0005 column absent from every file in the set is omitted from the
 /// inferred union schema; filtering on it would fail planning, so callers
 /// short-circuit to an empty result instead (RFC 0005 §3.9 / RFC0007.4).
-fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
-    df.schema().fields().iter().any(|f| f.name() == column)
+fn has_column(schema: &datafusion::common::DFSchema, column: &str) -> bool {
+    schema.fields().iter().any(|f| f.name() == column)
 }
 
 /// The (post-union) type of `column`, when present. Since RFC 0042 the
@@ -137,10 +137,10 @@ fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
 /// ([`schema_adapt::merge_scanned_schemas`]), so this is how the DSL
 /// compiler learns a key's class.
 fn column_type(
-    df: &datafusion::dataframe::DataFrame,
+    schema: &datafusion::common::DFSchema,
     column: &str,
 ) -> Option<datafusion::arrow::datatypes::DataType> {
-    df.schema()
+    schema
         .fields()
         .iter()
         .find(|f| f.name() == column)
@@ -180,7 +180,7 @@ fn time_window_filter(
     let hi = lit(time_bound_scalar(end)?);
     let ts = || col(columns::TIME_UNIX_NANO);
     let ts_window = ts().gt_eq(lo.clone()).and(ts().lt(hi.clone()));
-    if !has_column(df, columns::EFFECTIVE_TIME_UNIX_NANO) {
+    if !has_column(df.schema(), columns::EFFECTIVE_TIME_UNIX_NANO) {
         return Ok(ts_window);
     }
     let eff = || col(columns::EFFECTIVE_TIME_UNIX_NANO);
@@ -207,7 +207,7 @@ fn apply_request_filters(
     if let Some(severity_text) = &request.severity_text {
         // An absent OPTIONAL `severity_text` reads as all-NULL, so
         // `= X` matches nothing: empty result, not a planning error.
-        if !has_column(&df, columns::SEVERITY_TEXT) {
+        if !has_column(df.schema(), columns::SEVERITY_TEXT) {
             return Ok(None);
         }
         df = df
@@ -303,11 +303,11 @@ enum Terminal {
         options: QueryOptions,
     },
     /// A validated `count [by …]` stage (RFC 0002 amendment 2026-07-15).
-    Aggregate(compile::Aggregate),
+    Aggregate(plan::Aggregate),
 }
 
 impl Terminal {
-    fn aggregate(&self) -> Option<&compile::Aggregate> {
+    fn aggregate(&self) -> Option<&plan::Aggregate> {
         match self {
             Self::Aggregate(agg) => Some(agg),
             Self::Rows { .. } => None,
@@ -492,7 +492,7 @@ impl Querier {
         // errors necessarily come after. `compile` re-runs the same
         // pure validation internally — one source of truth, negligible
         // cost.
-        compile::validate(query, now_unix_nano, default_window_nanos)?;
+        plan::validate(query, now_unix_nano, default_window_nanos)?;
         // RFC 0047 §3.4: a metadata-only reader's query must not touch a
         // content column — rejected before any IO, naming the column.
         if let Some(visibility) = &options.visibility {
@@ -505,8 +505,8 @@ impl Querier {
         // one frontier) per query — and the acquisition is skipped entirely
         // when neither is in the predicate. The blocking IO (S3 GETs / local
         // `std::fs`) offloads off the runtime worker, mirroring `run_drift`.
-        let needs_registry = compile::uses_body_equality(&query.predicate);
-        let needs_alias_fold = alias_map.is_none() && compile::uses_resolves_to(&query.predicate);
+        let needs_registry = plan::uses_body_equality(&query.predicate);
+        let needs_alias_fold = alias_map.is_none() && plan::uses_resolves_to(&query.predicate);
         let mut acquired: Option<AcquiredTemplateMap> = None;
         if needs_alias_fold || needs_registry {
             let (template_map, acquisition_bytes, _outcome) = self
@@ -542,7 +542,7 @@ impl Querier {
                 &empty_registry
             }
         };
-        let plan = compile::compile(
+        let plan = plan::compile(
             query,
             tenant,
             now_unix_nano,
@@ -564,7 +564,7 @@ impl Querier {
             },
         };
         self.execute(tenant, Some(plan.window), terminal, acquired, move |df| {
-            compile::apply(df, plan)
+            plan::apply(df, plan)
         })
         .await
     }
@@ -782,7 +782,7 @@ impl Querier {
     async fn execute_aggregate(
         &self,
         df: datafusion::dataframe::DataFrame,
-        agg: &compile::Aggregate,
+        agg: &plan::Aggregate,
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
     ) -> Result<QueryResult, QueryError> {
@@ -795,13 +795,13 @@ impl Querier {
         let df = df
             .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
             .map_err(storage_err)?;
-        let group_exprs = compile::group_exprs(&agg.by, &df)?;
+        let group_exprs = plan::group_exprs(&agg.by, df.schema())?;
         // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
         // the CAST-to-Float64 promoted column) when the stage carries one.
-        let mut aggr_exprs = vec![count(lit(1_i64)).alias(compile::COUNT_COLUMN)];
+        let mut aggr_exprs = vec![count(lit(1_i64)).alias(plan::COUNT_COLUMN)];
         if let Some((func, path)) = &agg.scalar {
             aggr_exprs
-                .push(compile::scalar_agg_expr(*func, path, &df)?.alias(compile::VALUE_COLUMN));
+                .push(plan::scalar_agg_expr(*func, path, df.schema())?.alias(plan::VALUE_COLUMN));
         }
         let aggregated = df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)?;
         let (batches, scan) = execute_plan(aggregated, task_ctx).await?;

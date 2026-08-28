@@ -331,7 +331,7 @@ All resolved at `specified` (2026-08-27, maintainer sign-off):
   actually delivers are the dependency direction, core's freedom
   from the HTTP stack, and the cascade cut for any future
   querier-only binary.
-- **RFC0051.7** — the shims shipped annotated in #762 (modules and
+- **RFC0051.7** — the shims landed annotated in #762 (modules and
   root re-exports both `#[deprecated]`); deletion was tracked by
   #764. **Outcome (maintainer decision, 2026-08-28): deletion
   accelerated to before any release shipped the shims** — under the

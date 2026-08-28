@@ -15,6 +15,10 @@
 //! §3.1) while letting concurrent requests batch their fsyncs
 //! (RFC0008.8). `ingest` is async, so the handler simply `.await`s it.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -29,7 +33,7 @@ use opentelemetry::context::FutureExt as _;
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
 use crate::receiver::selector;
-use ourios_serving::auth::{AuthError, AuthResolver};
+use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::propagation::extract_context;
 
 /// OTLP/HTTP listener configuration.
@@ -61,13 +65,12 @@ impl Default for HttpConfig {
 
 /// Handler state: the shared pipeline plus the decompressed-size cap
 /// (`DefaultBodyLimit` only bounds the *compressed* body, so gzip is
-/// bounded separately to defuse a decompression bomb) and the RFC 0026
-/// token store.
+/// bounded separately to defuse a decompression bomb). Authentication
+/// runs in [`AuthLayer`], before the handler.
 #[derive(Clone)]
 struct AppState {
     pipeline: SharedPipeline,
     max_decompressed_bytes: usize,
-    auth: AuthResolver,
 }
 
 /// Build the OTLP/HTTP router over `pipeline`.
@@ -75,12 +78,130 @@ pub fn router(pipeline: SharedPipeline, config: &HttpConfig) -> Router {
     let state = AppState {
         pipeline,
         max_decompressed_bytes: config.max_body_bytes,
-        auth: config.auth.clone(),
     };
     Router::new()
         .route(&config.path, post(handle_logs))
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
+        // Outermost: RFC 0026 §3.2 authentication precedes everything —
+        // an unauthenticated request is rejected before the body is
+        // even collected.
+        .layer(AuthLayer::new(config.auth.clone()))
         .with_state(state)
+}
+
+/// Per-request bearer authentication for the OTLP/HTTP listener — the
+/// HTTP twin of the gRPC transport's `AuthLayer` (`grpc.rs`): resolve
+/// the `Authorization` header through the shared [`AuthResolver`],
+/// reject with `401`/`503` before any body handling, and attach the
+/// resolved [`AuthBinding`] to the request's extensions for the
+/// handler's per-batch tenant check. With nothing configured every
+/// request passes through unbound (open mode, §3.1).
+#[derive(Clone)]
+pub struct AuthLayer {
+    resolver: AuthResolver,
+    /// Rejection telemetry (RFC 0026 §3.4). The instruments resolve by
+    /// name through the global meter, so this instance aggregates with
+    /// the pipeline's.
+    metrics: Arc<crate::metrics::IngestMetrics>,
+}
+
+impl AuthLayer {
+    /// A layer over `resolver` (see [`AuthResolver`] for open mode).
+    #[must_use]
+    pub fn new(resolver: AuthResolver) -> Self {
+        Self {
+            resolver,
+            metrics: Arc::new(crate::metrics::IngestMetrics::new()),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for AuthLayer {
+    type Service = AuthService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AuthService {
+            inner,
+            resolver: self.resolver.clone(),
+            metrics: Arc::clone(&self.metrics),
+        }
+    }
+}
+
+/// The [`AuthLayer`] service: authenticate, then delegate.
+#[derive(Clone)]
+pub struct AuthService<S> {
+    inner: S,
+    resolver: AuthResolver,
+    metrics: Arc<crate::metrics::IngestMetrics>,
+}
+
+impl<S, ReqBody, ResBody> tower::Service<axum::http::Request<ReqBody>> for AuthService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::http::Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    ReqBody: Send + 'static,
+    ResBody: Default,
+{
+    type Response = axum::http::Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: axum::http::Request<ReqBody>) -> Self::Future {
+        // The tower readiness dance: `poll_ready` reserved capacity on
+        // `self.inner`, so that instance (not a fresh clone) must serve
+        // this call; the clone waits for its own `poll_ready` next time.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let resolver = self.resolver.clone();
+        let metrics = Arc::clone(&self.metrics);
+        Box::pin(async move {
+            let authorization = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            match resolver.authenticate(authorization.as_deref()).await {
+                Ok(None) => {}
+                Ok(Some(binding)) => {
+                    request.extensions_mut().insert(binding);
+                }
+                // One undifferentiated rejection: missing vs malformed vs
+                // unknown would be a probing oracle (RFC 0026 §3.2). §3.4:
+                // the rejection counts on `ourios.ingest.batches`
+                // (`error.type = unauthenticated`).
+                Err(AuthError::Unauthenticated) => {
+                    metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
+                    return Ok(reject(StatusCode::UNAUTHORIZED));
+                }
+                // RFC 0047 §3.1: the resolver could not answer — fail
+                // closed, 503.
+                Err(AuthError::Unavailable) => {
+                    metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_UPSTREAM_UNAVAILABLE);
+                    return Ok(reject(StatusCode::SERVICE_UNAVAILABLE));
+                }
+            }
+            inner.call(request).await
+        })
+    }
+}
+
+/// An empty-bodied rejection response — the same surface the handler
+/// produced before the layer existed.
+fn reject<ResBody: Default>(status: StatusCode) -> axum::http::Response<ResBody> {
+    let mut response = axum::http::Response::new(ResBody::default());
+    *response.status_mut() = status;
+    response
 }
 
 /// The OTLP wire format selected by `Content-Type`.
@@ -96,26 +217,16 @@ enum Encoding {
     Gzip,
 }
 
-async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    // RFC 0026 §3.2: authentication precedes everything — media-type
-    // dispatch, decompression, and wire decode all happen only for an
-    // authenticated (or open-mode) request.
-    let authorization = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let binding = match state.auth.authenticate(authorization).await {
-        Ok(binding) => binding,
-        // RFC 0026 §3.4: the rejection counts on `ourios.ingest.batches` (`error.type = unauthenticated`).
-        Err(AuthError::Unauthenticated) => {
-            state.pipeline.record_unauthenticated();
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-        // RFC 0047 §3.1: the resolver could not answer — fail closed, 503.
-        Err(AuthError::Unavailable) => {
-            state.pipeline.record_auth_unavailable();
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
+async fn handle_logs(
+    State(state): State<AppState>,
+    binding: Option<axum::Extension<AuthBinding>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // RFC 0026 §3.2: authentication already ran in [`AuthLayer`], before
+    // the body was collected; a present extension is the bound
+    // credential, absence is open mode.
+    let binding = binding.map(|axum::Extension(b)| b);
     // RFC 0046 §3.1: the tenant selector is required, exactly once, and
     // decided before authorization against the set, before decode, before
     // any WAL work — a missing/malformed selector is a 400 with the reason.

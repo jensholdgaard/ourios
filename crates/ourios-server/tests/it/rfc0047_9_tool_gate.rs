@@ -16,9 +16,9 @@ use ourios_core::auth::openfga::{
     OpenFgaResolver, OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
 };
 use ourios_core::auth::{TokenSpec, build_token_store};
-use ourios_ingester::receiver::AuthResolver;
 use ourios_parquet::PromotedAttributes;
 use ourios_server::querier::router_with_mcp_promoted;
+use ourios_serving::AuthResolver;
 
 use crate::rfc0016_query_endpoint::SHARED_HUGE_WINDOW;
 use crate::rfc0027_mcp::{mcp_tool_call, rpc_payload};

@@ -430,8 +430,8 @@ fn startup_guards(config: &ServerConfig) {
 /// and the roles share the verifier's JWKS cache + refresh throttle.
 async fn auth_resolver(
     config: &ServerConfig,
-) -> Result<Option<ourios_ingester::receiver::AuthResolver>, String> {
-    use ourios_ingester::receiver::AuthResolver;
+) -> Result<Option<ourios_serving::AuthResolver>, String> {
+    use ourios_serving::AuthResolver;
     if config.receiver.is_none() && config.querier.is_none() {
         return Ok(None);
     }
@@ -476,7 +476,7 @@ async fn auth_resolver(
 /// stdout (an operator — or a test binding `:0` — learns the actual port).
 async fn start_querier(
     config: &ServerConfig,
-    resolver: Option<ourios_ingester::receiver::AuthResolver>,
+    resolver: Option<ourios_serving::AuthResolver>,
 ) -> Result<Option<ourios_server::querier::QuerierHandle>, String> {
     let Some(params) = &config.querier else {
         return Ok(None);

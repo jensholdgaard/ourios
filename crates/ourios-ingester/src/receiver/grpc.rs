@@ -31,10 +31,10 @@ use tonic::{Request, Response, Status};
 
 use opentelemetry::context::FutureExt as _;
 
-use crate::receiver::auth::{AuthBinding, AuthError, AuthResolver};
 use crate::receiver::pipeline::{IngestFailure, ReceiveError, SharedPipeline};
-use crate::receiver::propagation::extract_context_from_metadata;
 use crate::receiver::selector;
+use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
+use ourios_serving::propagation::extract_context_from_metadata;
 
 /// The authentication gate for the gRPC listener (RFC 0026 §3.2 /
 /// RFC 0029 §3.3), applied as a tower layer on the tonic server. A tower

@@ -32,26 +32,56 @@
 //!   wrapping the same pipeline: controlled `Status` mapping + concurrent
 //!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
-pub mod auth;
 pub mod commit;
 pub mod decode;
 pub mod grpc;
 pub mod http;
 pub mod materialize;
 pub mod pipeline;
-pub mod propagation;
 pub mod selector;
 pub mod tenant;
-pub mod tls;
-pub mod tls_serve;
 
-pub use auth::{AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate_bearer};
+// RFC 0051: the role-independent serving plumbing moved to
+// `ourios-serving`. These shims keep the old paths compiling for one
+// release (RFC0051.7); import from `ourios_serving` instead.
+#[deprecated(
+    since = "0.10.0",
+    note = "moved to ourios-serving (RFC 0051); use ourios_serving::auth"
+)]
+pub mod auth {
+    pub use ourios_serving::auth::*;
+}
+#[deprecated(
+    since = "0.10.0",
+    note = "moved to ourios-serving (RFC 0051); use ourios_serving::propagation"
+)]
+pub mod propagation {
+    pub use ourios_serving::propagation::*;
+}
+#[deprecated(
+    since = "0.10.0",
+    note = "moved to ourios-serving (RFC 0051); use ourios_serving::tls"
+)]
+pub mod tls {
+    pub use ourios_serving::tls::*;
+}
+#[deprecated(
+    since = "0.10.0",
+    note = "moved to ourios-serving (RFC 0051); use ourios_serving::tls_serve"
+)]
+pub mod tls_serve {
+    pub use ourios_serving::tls_serve::*;
+}
+
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
-pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
-pub use propagation::{
+pub use ourios_serving::auth::{
+    AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate_bearer,
+};
+pub use ourios_serving::propagation::{
     HeaderExtractor, MetadataExtractor, extract_context, extract_context_from_metadata,
 };
+pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use selector::{SelectorError, TENANT_HEADER};
 pub use tenant::assign;

@@ -23,9 +23,10 @@ use crate::ingest_support::{
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_core::auth::{TokenSpec, TokenStore, build_token_store};
 use ourios_ingester::receiver::AuthResolver;
+use ourios_ingester::receiver::ReceiveError;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
-use ourios_ingester::receiver::{AuthBinding, ReceiveError, authenticate_bearer};
+use ourios_serving::{AuthBinding, authenticate_bearer};
 use prost::Message;
 
 /// A store with one token bound to `tenants`.

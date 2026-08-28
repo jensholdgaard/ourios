@@ -20,19 +20,19 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::publish::PublishCoordinator;
-use ourios_ingester::receiver::AuthResolver;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
-use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
-use ourios_ingester::receiver::tls_serve::{
-    LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
-};
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
+use ourios_serving::AuthResolver;
+use ourios_serving::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
+use ourios_serving::tls_serve::{
+    LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
+};
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};

@@ -11,6 +11,7 @@ members = [
     "crates/ourios-querier",
     "crates/ourios-semconv",
     "crates/ourios-server",
+    "crates/ourios-serving",
     "crates/ourios-telemetry",
     "crates/ourios-testgen",
     "crates/ourios-wal",

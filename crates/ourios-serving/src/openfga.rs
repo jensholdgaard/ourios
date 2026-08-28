@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{
+use ourios_core::auth::openfga::{
     CONVERSATION_TYPE, Consistency, MAX_OBJECT_BYTES, OpenFgaConfig, Principal, PrincipalKind,
     TENANT_TYPE, TenantObjects, VisibilityConfig, is_object_id,
 };
@@ -988,11 +988,11 @@ mod tests {
     use axum::routing::post;
     use serde_json::{Value, json};
 
-    use super::super::{OpenFgaSpec, Principal, PrincipalKind, build_openfga_config};
     use super::{
         ContextualTuples, Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient,
         OpenFgaError, OpenFgaResolver, TupleKey, Visibility,
     };
+    use ourios_core::auth::openfga::{OpenFgaSpec, Principal, PrincipalKind, build_openfga_config};
 
     /// A loopback stand-in for the `OpenFGA` HTTP API: `check` answers from
     /// the requested user, `streamed-list-objects` streams a fixed object
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     fn visibility_resolver(url: &str, max_objects: &str, list_timeout_ms: &str) -> OpenFgaResolver {
-        use super::super::{VisibilityObjectSpec, VisibilitySpec};
+        use ourios_core::auth::openfga::{VisibilityObjectSpec, VisibilitySpec};
         let config = build_openfga_config(&OpenFgaSpec {
             api_url: Some(url.to_string()),
             store_id: Some("s".to_string()),

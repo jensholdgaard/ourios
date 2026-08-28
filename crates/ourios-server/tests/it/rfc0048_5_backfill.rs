@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use ourios_core::audit::SharedAuditSink;
 use ourios_core::auth::openfga::{
-    OpenFgaClient, OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
+    OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
 };
 use ourios_ingester::compactor::{
     acquire_backfill_lock, backfill_locks, pending_erasures, release_backfill_lock, sweep_once,
 };
 use ourios_ingester::graph_emitter::GraphEmitter;
 use ourios_parquet::{CompactionPolicy, Store};
+use ourios_serving::openfga::OpenFgaClient;
 use testcontainers_modules::testcontainers::core::ContainerPort;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{GenericImage, ImageExt};

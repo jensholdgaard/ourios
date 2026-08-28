@@ -6,10 +6,9 @@
 //! partial predicate, never an open door.
 
 use axum::http::StatusCode;
-use ourios_core::auth::openfga::{
-    CONVERSATION_TYPE, OpenFgaError, PrincipalKind, Visibility as GraphVisibility,
-};
+use ourios_core::auth::openfga::{CONVERSATION_TYPE, PrincipalKind};
 use ourios_querier::{ScopedIds, SelfMatch, Visibility};
+use ourios_serving::openfga::{OpenFgaError, Visibility as GraphVisibility};
 use ourios_serving::{AuthBinding, AuthResolver};
 
 use crate::querier::QuerierMetrics;
@@ -184,8 +183,8 @@ pub(crate) fn require_tenant_wide(visibility: Option<&Visibility>) -> Option<Vis
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
-    use ourios_core::auth::openfga::OpenFgaError;
     use ourios_querier::Visibility;
+    use ourios_serving::openfga::OpenFgaError;
 
     use super::{reject, require_tenant_wide};
 

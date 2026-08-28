@@ -212,7 +212,7 @@ async fn rfc0048_2_verbatim_tenant_on_a_real_graph() {
         ..OpenFgaSpec::default()
     })
     .expect("config");
-    let fga = ourios_core::auth::openfga::OpenFgaClient::new(&config).expect("client");
+    let fga = ourios_serving::openfga::OpenFgaClient::new(&config).expect("client");
     let emitter = GraphEmitter::from_config(&config)
         .expect("emitter")
         .expect("conversation bound");

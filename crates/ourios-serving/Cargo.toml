@@ -37,7 +37,27 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # Reload-loop and resolver diagnostics ride the workspace tracing setup.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
+# --- oidc / openfga client stack (feature-gated; RFC 0051) ---
+# decode pins the cached key's algorithm, so `alg: none` and HMAC are
+# rejected whatever a token's header claims.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"], optional = true }
+# JWKS discovery + rotation refetch (RFC 0029 §3.2) and the OpenFGA
+# wire calls (RFC 0047). Same rustls stack as the rest of the tree.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+serde = { version = "1", default-features = false, features = ["std", "derive"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
+
 [dev-dependencies]
+# The fixture JWKS/OpenFGA servers answer JSON — the `json` feature is
+# test-only; the library itself never serializes axum responses.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+# The OIDC verifier tests mint fixture JWKS material at test runtime
+# (no committed private-key fixtures for scanners to flag) — pins
+# moved with the module from ourios-core (RFC 0051).
+base64 = "=0.23.1"
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+rand = "=0.8.7"
+rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
 # The AuthMetrics test collects the exported stream via the in-memory
 # provider guard.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
@@ -49,10 +69,12 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [features]
-# Forwarded to ourios-core until RFC 0051's client-move slice (PR B)
-# relocates the OIDC / OpenFGA HTTP clients into this crate.
-oidc = ["ourios-core/oidc"]
-openfga = ["ourios-core/openfga"]
+# The RFC 0029 OIDC bearer layer (verifier + JWKS cache) — moved here
+# from ourios-core by RFC 0051 together with the whole HTTP stack.
+oidc = ["dep:jsonwebtoken", "dep:reqwest", "dep:serde", "dep:serde_json"]
+# The RFC 0047 OpenFGA resolver (HTTP client + session cache). Same
+# reqwest/rustls stack as `oidc`; the config types stay in ourios-core.
+openfga = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true

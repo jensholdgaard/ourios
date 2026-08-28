@@ -442,7 +442,7 @@ async fn auth_resolver(
         .map(std::sync::Arc::new);
     let mut resolver = match config.auth.as_ref().and_then(|auth| auth.oidc.clone()) {
         Some(oidc) => {
-            let verifier = ourios_core::auth::oidc::OidcVerifier::discover(oidc)
+            let verifier = ourios_serving::oidc::OidcVerifier::discover(oidc)
                 .await
                 .map_err(|e| format!("auth.oidc: {e}"))?;
             AuthResolver::with_oidc(static_store, std::sync::Arc::new(verifier))
@@ -466,7 +466,7 @@ async fn auth_resolver(
             visibility.list_timeout().as_millis(),
             visibility.server_deadline_ms(),
         );
-        let openfga = ourios_core::auth::openfga::OpenFgaResolver::new(openfga)?;
+        let openfga = ourios_serving::openfga::OpenFgaResolver::new(openfga)?;
         resolver = resolver.with_openfga(std::sync::Arc::new(openfga));
     }
     Ok(Some(resolver))

@@ -11,9 +11,8 @@
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
-use ourios_core::auth::openfga::{
-    ContextualTuples, OpenFgaClient, OpenFgaSpec, TupleKey, build_openfga_config,
-};
+use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
+use ourios_serving::openfga::{ContextualTuples, OpenFgaClient, TupleKey};
 use testcontainers_modules::testcontainers::core::ContainerPort;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
@@ -174,7 +173,8 @@ async fn rfc0047_1_to_3_resolver_end_to_end() {
     // prefix unambiguous, not an encoding; `a` and `ab` never alias, `%`
     // is a plain character, and a value with `/` has no objects at all.
     {
-        use ourios_core::auth::openfga::{ListObjectsRequest, TenantObjects};
+        use ourios_core::auth::openfga::TenantObjects;
+        use ourios_serving::openfga::ListObjectsRequest;
         let a = TenantObjects::new("a").expect("valid");
         let ab = TenantObjects::new("ab").expect("valid");
         let pct = TenantObjects::new("100%").expect("valid");

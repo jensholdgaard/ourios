@@ -183,9 +183,9 @@ fn parse_bearer(value: &str) -> Option<&str> {
 pub struct AuthResolver {
     store: Option<Arc<TokenStore>>,
     #[cfg(feature = "oidc")]
-    oidc: Option<Arc<ourios_core::auth::oidc::OidcVerifier>>,
+    oidc: Option<Arc<crate::oidc::OidcVerifier>>,
     #[cfg(feature = "openfga")]
-    openfga: Option<Arc<ourios_core::auth::openfga::OpenFgaResolver>>,
+    openfga: Option<Arc<crate::openfga::OpenFgaResolver>>,
     /// `ourios.auth.resolutions` (RFC 0047 §5, RFC0047.3). Resolves by
     /// name through the global meter, so every clone aggregates.
     metrics: Arc<AuthMetrics>,
@@ -238,10 +238,7 @@ impl AuthResolver {
     /// via its own path, carrying its own tenant binding.
     #[cfg(feature = "oidc")]
     #[must_use]
-    pub fn with_oidc(
-        store: Option<Arc<TokenStore>>,
-        oidc: Arc<ourios_core::auth::oidc::OidcVerifier>,
-    ) -> Self {
+    pub fn with_oidc(store: Option<Arc<TokenStore>>, oidc: Arc<crate::oidc::OidcVerifier>) -> Self {
         Self {
             store,
             oidc: Some(oidc),
@@ -256,10 +253,7 @@ impl AuthResolver {
     /// tenants (fail-closed).
     #[cfg(feature = "openfga")]
     #[must_use]
-    pub fn with_openfga(
-        mut self,
-        openfga: Arc<ourios_core::auth::openfga::OpenFgaResolver>,
-    ) -> Self {
+    pub fn with_openfga(mut self, openfga: Arc<crate::openfga::OpenFgaResolver>) -> Self {
         self.openfga = Some(openfga);
         self
     }
@@ -268,7 +262,7 @@ impl AuthResolver {
     /// two-step and the tool gate consult it.
     #[cfg(feature = "openfga")]
     #[must_use]
-    pub fn openfga(&self) -> Option<&Arc<ourios_core::auth::openfga::OpenFgaResolver>> {
+    pub fn openfga(&self) -> Option<&Arc<crate::openfga::OpenFgaResolver>> {
         self.openfga.as_ref()
     }
 
@@ -361,7 +355,7 @@ impl AuthResolver {
     async fn bind(&self, identity: Identity) -> Result<Option<AuthBinding>, AuthError> {
         #[cfg(feature = "openfga")]
         if let Some(openfga) = &self.openfga {
-            use ourios_core::auth::openfga::OpenFgaError;
+            use crate::openfga::OpenFgaError;
             let grants = match openfga.resolve(&identity.principal, &identity.groups).await {
                 Ok(grants) => grants,
                 // Credential defects (a group list past the cap, a group
@@ -475,10 +469,11 @@ mod tests {
 mod openfga_tests {
     use std::sync::Arc;
 
+    use crate::openfga::OpenFgaResolver;
     use axum::Router;
     use axum::extract::State;
     use axum::routing::post;
-    use ourios_core::auth::openfga::{OpenFgaResolver, OpenFgaSpec, build_openfga_config};
+    use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
     use ourios_core::auth::{TokenSpec, build_token_store};
     use serde_json::Value;
 

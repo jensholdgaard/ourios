@@ -5648,7 +5648,7 @@ Used by:
 - `base64ct` 1.8.3 — <https://github.com/RustCrypto/formats>
 - `block-buffer` 0.10.4 — <https://github.com/RustCrypto/utils>
 - `block-buffer` 0.12.1 — <https://github.com/RustCrypto/utils>
-- `chacha20` 0.10.1 — <https://github.com/RustCrypto/stream-ciphers>
+- `chacha20` 0.10.2 — <https://github.com/RustCrypto/stream-ciphers>
 - `const-oid` 0.9.6 — <https://github.com/RustCrypto/formats/tree/master/const-oid>
 - `cpufeatures` 0.2.17 — <https://github.com/RustCrypto/utils>
 - `cpufeatures` 0.3.0 — <https://github.com/RustCrypto/utils>

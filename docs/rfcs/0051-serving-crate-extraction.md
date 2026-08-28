@@ -1,7 +1,7 @@
 ---
 rfc: 0051
 title: ourios-serving — shared serving infrastructure out of the ingest crate
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-08-27
@@ -11,13 +11,31 @@ superseded-by: —
 
 # RFC 0051 — `ourios-serving`: shared serving infrastructure out of the ingest crate
 
-> **Status: `specified` (2026-08-27, maintainer sign-off on the §7
-> decisions).** §3.2 resolved to **Option A** — one `ourios-serving`
+> **Status: `green` (2026-08-28).** All seven §5 criteria pass,
+> landed as two implementation PRs: #762 (the `ourios-serving` crate
+> + the four receiver-module moves, the deprecated shims, and the
+> RFC0051.1 layering gate) and #763 (the OIDC/OpenFGA client moves +
+> the RFC0051.2 manifest gate). Both gates were demonstrated red
+> against pre-move main before going green (§9). RFC0051.3/.4/.5:
+> workspace suite 1446/1446 with the RFC 0026/0027/0029/0030/0039
+> scenarios inside; the RFC 0047 container suite and
+> collector-interop CI legs green on both PRs. RFC0051.6 recorded in
+> §9 **with an honest caveat** (the cascade win applies to
+> querier-only consumers, not the dual-role server binary).
+> RFC0051.7's shipping half holds (the shims exist, annotated); the
+> deletion is tracked by #764. `validated` is vacuous for a
+> placement RFC (RFC 0008 precedent); `accepted` is a maintainer
+> flip.
+>
+> *(`red`, 2026-08-28: the RFC0051.1/.2 gates written first and
+> shown failing on pre-move main — 8 source offences + 5 more found
+> in tests by the hardened scanner, and 4 offending manifest lines.)*
+>
+> *(`specified`, 2026-08-27, maintainer sign-off on the §7
+> decisions: §3.2 resolved to **Option A** — one `ourios-serving`
 > crate; the OIDC client moves with the OpenFGA client (core ends
 > `reqwest`-free); the `ourios_ingester::receiver::*` re-export
-> shims get one deprecation release. §5 criteria are written and
-> testable; next stage is `red` — the RFC0051.1/.2 gates land as
-> failing tests before any module moves.
+> shims get one deprecation release.)*
 >
 > *(`drafted`, 2026-08-27: Wave 3 of the structural review, epic
 > #745.)* Touches no §2 pillar and
@@ -274,4 +292,48 @@ All resolved at `specified` (2026-08-27, maintainer sign-off):
 
 ## 9. Validation
 
-Filled as the criteria land. RFC0051.6's timing numbers go here.
+- **RFC0051.1** — red on pre-move main: 8 offending source sites in
+  `ourios-server/src`; the shipped gate (a path-segment scanner, not
+  a line grep — hardened in review to see brace-grouped and
+  multi-line imports) then found 5 more in `ourios-server/tests`.
+  Green from #762 on; self-tests pin six catch shapes and three
+  legitimately-ingester-owned passes.
+- **RFC0051.2** — red on pre-move main: 4 offending manifest lines
+  (`jsonwebtoken`, `reqwest`, `oidc =`, `openfga =`). Green from
+  #763 on; exact TOML-key matching.
+- **RFC0051.3** — workspace nextest 1446/1446 after #763 (serving
+  11, ingester 158 — its 8 moved inline tests plus 2
+  formerly-feature-gated resolver tests now count in serving —
+  server 167, querier 260); only import paths changed in test code.
+- **RFC0051.4/.5** — the collector-interop and RFC 0047
+  real-container CI jobs green on both implementation PRs; the graph
+  emitter and erasure paths import the client from
+  `ourios_serving::openfga`.
+- **RFC0051.6** — measured 2026-08-28 (M-series laptop, isolated
+  target dirs, warm build then a one-line `auth.rs` edit):
+  `cargo check -p ourios-server` before 1.37 s (rebuilds ingester +
+  server) vs after 1.82 s (serving + ingester + server);
+  `cargo check -p ourios-querier` after the same edit: 23.5 s before
+  vs 22.3 s after — but both querier numbers are a measurement
+  artifact, not signal: a solo `-p ourios-querier` invocation
+  resolves a different feature unification than the combined warm
+  build and recompiles the DataFusion stack on both sides of the
+  move. The meaningful querier fact is structural: `ourios-querier`
+  has no `ourios-ingester` edge in its unit graph before or after
+  (`cargo build --timings` unit lists), and the auth edit therefore
+  never touches it. **Caveat
+  recorded as measured:** the dual-role server binary still rebuilds
+  the ingester on an auth edit — the ingester itself now depends on
+  `ourios-serving` — so the criterion's "querier-role path no longer
+  rebuilds ourios-ingester" holds structurally (`ourios-querier` has
+  no ingester edge; the RFC0051.1 gate keeps it that way) rather
+  than as a warm-check delta for `ourios-server`. The wins this RFC
+  actually delivers are the dependency direction, core's freedom
+  from the HTTP stack, and the cascade cut for any future
+  querier-only binary.
+- **RFC0051.7** — the shims ship annotated in #762 (modules and
+  root re-exports both `#[deprecated]`); deletion in the next
+  breaking release is tracked by #764. Note: rustc's use-site
+  warnings through re-exports are limited, so the annotations
+  document intent and render in rustdoc while the teeth are the
+  RFC0051.1 gate (in-workspace) and #764 (external).

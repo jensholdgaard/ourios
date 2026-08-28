@@ -76,9 +76,17 @@ pub mod tls_serve {
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
+#[deprecated(
+    since = "0.10.0",
+    note = "moved to ourios-serving (RFC 0051); import from ourios_serving"
+)]
 pub use ourios_serving::auth::{
     AuthBinding, AuthError, AuthResolver, GraphIdentity, authenticate_bearer,
 };
+#[deprecated(
+    since = "0.10.0",
+    note = "moved to ourios-serving (RFC 0051); import from ourios_serving"
+)]
 pub use ourios_serving::propagation::{
     HeaderExtractor, MetadataExtractor, extract_context, extract_context_from_metadata,
 };

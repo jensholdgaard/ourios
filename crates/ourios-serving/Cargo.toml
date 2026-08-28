@@ -38,9 +38,12 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The AuthMetrics test collects the exported stream via the in-memory
+# provider guard.
+ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # propagation's unit tests drive a concrete TraceContextPropagator —
 # same pin as the rest of the workspace.
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "metrics"] }
 # The resolver tests stand up a fake OpenFGA endpoint and speak its
 # JSON wire shape.
 serde_json = { version = "1", default-features = false, features = ["std"] }

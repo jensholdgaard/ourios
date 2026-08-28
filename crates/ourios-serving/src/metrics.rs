@@ -8,8 +8,12 @@ use opentelemetry::metrics::Counter;
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
-/// The `error.type` value for a missing/malformed/unknown bearer
-/// (RFC 0026 §3.4).
+/// The `error.type` value for every [`AuthError::Unauthenticated`]
+/// resolution — a missing, malformed, unknown, or otherwise
+/// unresolvable bearer; the classes are intentionally
+/// undifferentiated on the wire (RFC 0026 §3.4).
+///
+/// [`AuthError::Unauthenticated`]: crate::auth::AuthError::Unauthenticated
 pub const ERROR_TYPE_UNAUTHENTICATED: &str = "unauthenticated";
 /// The `error.type` value for an authenticated cross-tenant rejection
 /// (RFC 0026 §3.4).
@@ -65,5 +69,56 @@ impl AuthMetrics {
 impl Default for AuthMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use ourios_semconv as semconv;
+
+    use super::{AuthMetrics, ERROR_TYPE_UNAUTHENTICATED, ERROR_TYPE_UPSTREAM_UNAVAILABLE};
+    use crate::auth::AuthError;
+
+    /// One resolution per outcome class: success counts bare, each
+    /// failure counts under its `error.type` value. A single test owns
+    /// the in-memory provider — `init_in_memory` installs the *global*
+    /// meter, so two such tests in one binary would race.
+    #[test]
+    fn record_counts_success_bare_and_failures_by_error_type() {
+        let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-serving-test");
+        let metrics = AuthMetrics::new();
+        metrics.record(None);
+        metrics.record(None);
+        metrics.record(Some(AuthError::Unauthenticated));
+        metrics.record(Some(AuthError::Unavailable));
+        guard.force_flush().expect("force_flush succeeds");
+
+        let rms = exporter.get_finished_metrics().expect("metrics exported");
+        let metric = rms
+            .iter()
+            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|m| m.name() == semconv::OURIOS_AUTH_RESOLUTIONS)
+            .expect("resolutions counter exported");
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+            panic!("resolutions should be a u64 sum");
+        };
+
+        let value_for = |error_type: Option<&str>| {
+            sum.data_points()
+                .find(|dp| {
+                    let tagged = dp
+                        .attributes()
+                        .find(|kv| kv.key.as_str() == "error.type")
+                        .map(|kv| kv.value.as_str().to_string());
+                    tagged.as_deref() == error_type
+                })
+                .unwrap_or_else(|| panic!("missing datapoint for {error_type:?}"))
+                .value()
+        };
+        assert_eq!(value_for(None), 2, "successes count bare");
+        assert_eq!(value_for(Some(ERROR_TYPE_UNAUTHENTICATED)), 1);
+        assert_eq!(value_for(Some(ERROR_TYPE_UPSTREAM_UNAVAILABLE)), 1);
     }
 }

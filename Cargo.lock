@@ -3540,6 +3540,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ourios-core",
  "ourios-semconv",
+ "ourios-telemetry",
  "rustls",
  "rustls-pki-types",
  "serde_json",

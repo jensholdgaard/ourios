@@ -821,6 +821,36 @@ mod tests {
         }
     }
 
+    /// RFC 0026 §3.2 (relocated here by RFC 0051): `check_binding`
+    /// allows a tenant inside the binding's write set and rejects one
+    /// outside it, preserving the token's audit label and the selected
+    /// tenant in the error.
+    #[test]
+    fn check_binding_allows_inside_and_denies_outside_the_write_set() {
+        let store = ourios_core::auth::build_token_store(Some(&[ourios_core::auth::TokenSpec {
+            name: Some("edge".to_string()),
+            token: Some("tok-edge".to_string()),
+            tenants: vec!["acme".to_string()],
+        }]))
+        .expect("valid spec")
+        .expect("enabled store");
+        let binding = ourios_serving::authenticate_bearer(Some(&store), Some("Bearer tok-edge"))
+            .expect("known token")
+            .expect("bound");
+
+        let acme = ourios_core::tenant::TenantId::new("acme");
+        assert!(check_binding(&acme, &binding).is_ok());
+
+        let globex = ourios_core::tenant::TenantId::new("globex");
+        match check_binding(&globex, &binding) {
+            Err(ReceiveError::TenantDenied { token_name, tenant }) => {
+                assert_eq!(token_name, "edge", "audit label preserved");
+                assert_eq!(tenant, globex, "selected tenant preserved");
+            }
+            other => panic!("expected TenantDenied, got {other:?}"),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_synced_batch_advances_the_durable_mark() {
         let seed = offset(10);

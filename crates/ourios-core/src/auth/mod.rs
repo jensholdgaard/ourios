@@ -16,8 +16,6 @@
 //! and validation errors name an entry's `name`/index, never its token
 //! (RFC 0026 §3.1 / RFC 0020 §3.5).
 
-#[cfg(feature = "oidc")]
-pub mod oidc;
 pub mod openfga;
 
 use std::collections::BTreeSet;

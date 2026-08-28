@@ -20,12 +20,12 @@ use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::Counter;
 use ourios_core::auth::openfga::{
-    MCP_TOOL_NAMES, OpenFgaClient, OpenFgaConfig, OpenFgaError, PrincipalKind, TenantObjects,
-    TupleKey, is_object_id,
+    MCP_TOOL_NAMES, OpenFgaConfig, PrincipalKind, TenantObjects, is_object_id,
 };
 use ourios_core::record::MinedRecord;
 use ourios_parquet::promoted::{self, project_string_value};
 use ourios_semconv as semconv;
+use ourios_serving::openfga::{OpenFgaClient, OpenFgaError, TupleKey};
 
 /// `OpenFGA`'s cap on tuples per transactional `Write` (RFC 0047 §3.3).
 pub const WRITE_CHUNK: usize = 100;
@@ -336,11 +336,12 @@ pub type SharedGraphEmitter = Arc<GraphEmitter>;
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use ourios_core::auth::openfga::{OpenFgaSpec, TupleKey, build_openfga_config};
+    use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
     use ourios_core::otlp::any_value::Value;
     use ourios_core::otlp::{AnyValue, KeyValue};
     use ourios_core::record::{BodyKind, MinedRecord};
     use ourios_core::tenant::TenantId;
+    use ourios_serving::openfga::TupleKey;
 
     use super::GraphEmitter;
 
@@ -477,7 +478,7 @@ mod tests {
         use axum::Router;
         use axum::extract::State;
         use axum::routing::post;
-        use ourios_core::auth::openfga::TupleKey;
+        use ourios_serving::openfga::TupleKey;
 
         #[derive(Clone)]
         pub(super) struct Fake {
@@ -553,7 +554,7 @@ mod tests {
     async fn erase_with(
         reads: Vec<Vec<TupleKey>>,
     ) -> (
-        Result<usize, ourios_core::auth::openfga::OpenFgaError>,
+        Result<usize, ourios_serving::openfga::OpenFgaError>,
         Vec<usize>,
         usize,
     ) {
@@ -578,7 +579,7 @@ mod tests {
     /// graph object is a no-op.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn erase_loop_reads_until_empty() {
-        use ourios_core::auth::openfga::OpenFgaError;
+        use ourios_serving::openfga::OpenFgaError;
         let big: Vec<TupleKey> = (0..250)
             .map(|i| {
                 t(

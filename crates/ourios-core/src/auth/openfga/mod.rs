@@ -12,14 +12,6 @@
 use std::fmt;
 use std::time::Duration;
 
-#[cfg(feature = "openfga")]
-mod client;
-#[cfg(feature = "openfga")]
-pub use client::{
-    ContextualTuples, Grants, ListObjectsRequest, MAX_CONTEXTUAL_TUPLES, OpenFgaClient,
-    OpenFgaError, OpenFgaResolver, TupleKey, Visibility,
-};
-
 /// The default `session_ttl_secs` (RFC 0047 §3.1): revocation latency.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 60;
 /// The default per-call `OpenFGA` request timeout — the fail-closed bound

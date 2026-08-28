@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use ourios_core::audit::{AuditPayload, SharedAuditSink};
 use ourios_core::auth::openfga::{
-    ContextualTuples, OpenFgaClient, OpenFgaSpec, TupleKey, VisibilityObjectSpec, VisibilitySpec,
-    build_openfga_config,
+    OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
 };
 use ourios_ingester::compactor::{pending_erasures, request_erasure, sweep_once};
 use ourios_ingester::graph_emitter::GraphEmitter;
 use ourios_parquet::{CompactionPolicy, Store};
+use ourios_serving::openfga::{ContextualTuples, OpenFgaClient, TupleKey};
 use testcontainers_modules::testcontainers::core::ContainerPort;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{GenericImage, ImageExt};

@@ -24,7 +24,7 @@ use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use tokio::sync::RwLock;
 
-use super::{OidcConfig, TenantSet};
+use ourios_core::auth::{OidcConfig, TenantSet};
 
 /// The §3.2 asymmetric allow-list. `alg: none` and every HMAC variant are
 /// outside this set and therefore unverifiable, whatever a token's header
@@ -460,7 +460,7 @@ fn validate_tenant_list(tenants: &[String]) -> Option<TenantSet> {
     }
     if tenants
         .iter()
-        .any(|t| crate::tenant::validate_tenant_id(t).is_err())
+        .any(|t| ourios_core::tenant::validate_tenant_id(t).is_err())
     {
         return None;
     }
@@ -483,9 +483,9 @@ mod tests {
     use p256::pkcs8::EncodePrivateKey as _;
     use serde_json::{Value, json};
 
-    use super::super::openfga::OpenFgaSpec;
-    use super::super::{OidcSpec, TenantSet, build_auth_config, build_oidc_config};
-    use super::OidcVerifier;
+    use crate::oidc::OidcVerifier;
+    use ourios_core::auth::openfga::OpenFgaSpec;
+    use ourios_core::auth::{OidcSpec, TenantSet, build_auth_config, build_oidc_config};
 
     /// One fixture signing key: the private half for minting, the public
     /// half as a JWK. Generated at test runtime — no committed key

@@ -57,30 +57,13 @@ ourios-semconv = { path = "../ourios-semconv" }
 # key types but no provider, and every decode panics). The §3.2
 # asymmetric allow-list (RS256/ES256 family) is enforced by the
 # verifier: JWKS caching keeps only allow-listed key families, each
-# decode pins the cached key's algorithm, so `alg: none` and HMAC are
-# rejected whatever a token's header claims.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"], optional = true }
-# JWKS discovery + rotation refetch (§3.2: the issuer is contacted at
-# startup, on rotation, and on kid misses — never per request).
-# Already in the dep tree via `object_store`'s S3 backend, same
-# rustls stack — no new cargo-deny surface.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
-# Derive for the discovery-document subset the verifier reads.
 # Non-optional since the lenient OTLP/JSON module needs the
 # `DeserializeOwned` bound; already unconditionally in the tree via
-# `serde_json`, so this adds no crate weight. The `derive` feature
-# stays behind `oidc` (the only user of derived impls).
+# `serde_json`, so this adds no crate weight. RFC 0051 moved the last
+# derive users (the OIDC/OpenFGA clients) to ourios-serving, together
+# with the whole HTTP stack — core carries no reqwest and no
+# oidc/openfga features.
 serde = { version = "1", default-features = false }
-# Async runtime types for the JWKS cache (`RwLock`) and the verifier's
-# refresh path. Runtime-free feature set; the binary provides the runtime.
-tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
-
-[features]
-# The RFC 0029 OIDC bearer layer (verifier + JWKS cache).
-oidc = ["dep:jsonwebtoken", "dep:reqwest", "serde/derive", "dep:tokio"]
-# The RFC 0047 OpenFGA resolver (HTTP client + session cache). Same
-# reqwest/rustls stack as `oidc`; the config types are always compiled.
-openfga = ["dep:reqwest", "serde/derive"]
 
 [dev-dependencies]
 # `init_in_memory` collects the alias counters' exported metric stream

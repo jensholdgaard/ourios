@@ -136,6 +136,37 @@ fn rfc0051_1_server_and_querier_shed_the_ingest_serving_paths() {
     );
 }
 
+/// Scenario RFC0051.2 — core carries no HTTP stack.
+/// Given `ourios-core/Cargo.toml` after the client moves, When
+/// inspected, Then it declares no `reqwest` or `jsonwebtoken`
+/// dependency and no `oidc`/`openfga` feature — the clients and their
+/// stack live in `ourios-serving` (RFC 0051 §3.2).
+#[test]
+fn rfc0051_2_core_manifest_has_no_http_stack() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("ourios-core")
+        .join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).expect("readable core manifest");
+    let mut offences = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let code = line.split('#').next().unwrap_or("");
+        if code.trim_start().starts_with("reqwest")
+            || code.trim_start().starts_with("jsonwebtoken")
+            || code.trim_start().starts_with("oidc =")
+            || code.trim_start().starts_with("openfga =")
+        {
+            offences.push(format!("{}: {}", lineno + 1, line.trim()));
+        }
+    }
+    assert!(
+        offences.is_empty(),
+        "RFC0051.2: ourios-core must carry no HTTP client stack, found:\n{}",
+        offences.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod gate_self_tests {
     use super::{names_offend, reached_span};

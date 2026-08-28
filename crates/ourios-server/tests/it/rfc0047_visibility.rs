@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use ourios_core::auth::openfga::{OpenFgaClient, OpenFgaSpec, build_openfga_config};
+use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
 use ourios_core::otlp::any_value::Value as AvValue;
 use ourios_core::otlp::{AnyValue, KeyValue};
 use ourios_core::record::{BodyKind, MinedRecord, Param};
@@ -22,6 +22,7 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::{
     DEFAULT_ZSTD_LEVEL, PartitionKey, PromotedAttributes, PromotedClass, PromotedKey, Store, Writer,
 };
+use ourios_serving::openfga::OpenFgaClient;
 use testcontainers_modules::testcontainers::core::ContainerPort;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{GenericImage, ImageExt};

@@ -31,7 +31,7 @@ use crate::metrics::CompactionMetrics;
 
 /// The tuples one sweep derives for the graph (RFC 0047 §3.3).
 #[cfg(feature = "openfga")]
-type GraphTuples = BTreeSet<ourios_core::auth::openfga::TupleKey>;
+type GraphTuples = BTreeSet<ourios_serving::openfga::TupleKey>;
 /// Nothing to derive without the graph.
 #[cfg(not(feature = "openfga"))]
 #[derive(Default)]
@@ -767,13 +767,14 @@ mod graph_tests {
     use axum::extract::State;
     use axum::routing::post;
     use ourios_core::audit::{AuditPayload, SharedAuditSink};
-    use ourios_core::auth::openfga::{OpenFgaSpec, TupleKey, build_openfga_config};
+    use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
     use ourios_core::otlp::any_value::Value;
     use ourios_core::otlp::{AnyValue, KeyValue};
     use ourios_core::record::MinedRecord;
     use ourios_parquet::{
         CompactionPolicy, PartitionKey, PromotedAttributes, PromotedKey, Reader, Store, Writer,
     };
+    use ourios_serving::openfga::TupleKey;
     use serde_json::json;
 
     use super::{ErasurePhase, pending_erasures, request_erasure, sweep_once};

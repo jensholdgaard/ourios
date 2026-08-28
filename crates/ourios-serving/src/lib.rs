@@ -21,6 +21,10 @@
 
 pub mod auth;
 pub mod metrics;
+#[cfg(feature = "oidc")]
+pub mod oidc;
+#[cfg(feature = "openfga")]
+pub mod openfga;
 pub mod propagation;
 pub mod tls;
 pub mod tls_serve;

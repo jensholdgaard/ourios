@@ -140,8 +140,9 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
     // unauthenticated probe.
     #[cfg(feature = "openfga")]
     {
-        use ourios_core::auth::openfga::{OpenFgaResolver, OpenFgaSpec, build_openfga_config};
+        use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
         use ourios_ingester::receiver::AuthError;
+        use ourios_serving::openfga::OpenFgaResolver;
         let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}", closed.local_addr().expect("addr"));
         drop(closed);

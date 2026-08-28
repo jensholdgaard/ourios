@@ -270,8 +270,8 @@ fn token_store(tenants: &[&str]) -> std::sync::Arc<ourios_core::auth::TokenStore
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn rfc0030_4_mtls_require_and_verify() {
-    use ourios_ingester::receiver::AuthResolver;
     use ourios_ingester::receiver::grpc::AuthLayer;
+    use ourios_serving::AuthResolver;
 
     let tmp = tempfile::TempDir::new().expect("temp");
     let (server_cert, server_key, server_pem) = cert_pair(tmp.path());

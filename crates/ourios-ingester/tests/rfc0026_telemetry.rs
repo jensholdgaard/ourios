@@ -18,9 +18,10 @@ use ingest_support::{request, resource_logs};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use ourios_core::audit::{AuditPayload, SharedAuditSink};
 use ourios_core::auth::{TokenSpec, build_token_store};
-use ourios_ingester::receiver::AuthResolver;
+use ourios_ingester::receiver::ReceiveError;
 use ourios_ingester::receiver::grpc::AuthLayer;
-use ourios_ingester::receiver::{ReceiveError, authenticate_bearer};
+use ourios_serving::AuthResolver;
+use ourios_serving::authenticate_bearer;
 
 /// The exported `ourios.ingest.batches` datapoint value for `error.type ==
 /// wanted`, across all resource metrics.
@@ -141,7 +142,7 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
     #[cfg(feature = "openfga")]
     {
         use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
-        use ourios_ingester::receiver::AuthError;
+        use ourios_serving::AuthError;
         use ourios_serving::openfga::OpenFgaResolver;
         let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}", closed.local_addr().expect("addr"));

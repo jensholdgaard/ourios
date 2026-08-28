@@ -312,7 +312,7 @@ impl IngestPipeline {
         &self,
         request: ExportLogsServiceRequest,
         tenant: TenantId,
-        binding: Option<&ourios_serving::AuthBinding>,
+        binding: Option<&AuthBinding>,
         lenient_json: bool,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied

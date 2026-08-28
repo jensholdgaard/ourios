@@ -252,6 +252,17 @@ impl std::error::Error for AuditReaderError {
     }
 }
 
+impl crate::decode::DecodeError for AuditReaderError {
+    fn missing_required(name: &str) -> Self {
+        Self::MissingRequiredColumn {
+            name: name.to_string(),
+        }
+    }
+    fn conversion(column: &'static str, detail: String) -> Self {
+        Self::Conversion { column, detail }
+    }
+}
+
 fn validate_event_vs_partition(
     event: &AuditEvent,
     expected: &PartitionKey,

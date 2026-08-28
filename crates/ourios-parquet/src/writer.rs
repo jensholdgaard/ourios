@@ -50,6 +50,9 @@ use parquet::schema::types::ColumnPath;
 use uuid::Uuid;
 
 use crate::data_schema_with_promoted;
+use crate::parquet_io::{
+    BufferedParquetWriter, ChunkError, WriteError, object_key, open_local_store, write_chunked,
+};
 use crate::partition::PartitionKey;
 use crate::promoted::PromotedAttributes;
 use crate::record_batch::{BatchError, mined_records_to_batch_with_promoted};
@@ -224,43 +227,18 @@ impl ClusterKeys {
 /// "WAL-before-ack"); see [`Writer::close`]'s rustdoc for the full
 /// reasoning.
 pub struct Writer {
-    inner: Option<ArrowWriter<Vec<u8>>>,
+    /// Shared buffer-and-put core: in-memory `ArrowWriter`, object
+    /// key (`data/tenant_id=…/year=…/…/<uuid>.parquet`), row count,
+    /// flush threshold ([`ROW_GROUP_FLUSH_BYTES`] on the ingest side,
+    /// the RFC 0036 §3.3 adaptive threshold for compacted output),
+    /// and the poisoning contract (a failed `write`/`flush` leaves
+    /// the buffer undefined; `close` refuses to publish).
+    core: BufferedParquetWriter,
     partition: PartitionKey,
     flush_uuid: Uuid,
-    /// Object store rooted at `bucket_root`; the finished file is
-    /// `put` to [`Self::key`] on close.
-    store: Store,
-    /// `/`-delimited object key the file is published to, relative to
-    /// the store root (`data/tenant_id=…/year=…/…/<uuid>.parquet`). The
-    /// backend-agnostic address (surfaced in [`WrittenFile`]).
-    key: String,
-    /// Absolute local landing path ([`Writer::open`]); the object key rendered
-    /// as a path for [`Writer::open_in`] (which addresses by key regardless of
-    /// the store's backend). Surfaced in [`WrittenFile::path`]; address a
-    /// store-backed file by [`Self::key`], not this.
-    final_path: PathBuf,
-    /// Running count of rows written so far (incremented per
-    /// sub-batch as each `write` succeeds); reported by
-    /// [`Self::close`]. Tracked directly because `into_inner` returns
-    /// the buffer, not file metadata.
-    num_rows: i64,
     /// RFC 0022 promoted attribute set this writer projects; fixed at
     /// open time (the declared schema embeds its columns).
     promoted: PromotedAttributes,
-    /// In-progress bytes at which a row group seals:
-    /// [`ROW_GROUP_FLUSH_BYTES`] on the ingest side, the RFC 0036 §3.3
-    /// adaptive threshold ([`adaptive_flush_bytes`]) for compacted output.
-    /// Fixed at open time.
-    flush_bytes: usize,
-    /// Set to `true` once any `ArrowWriter::write` /
-    /// `ArrowWriter::flush` call returns `Err`. The underlying
-    /// `ArrowWriter`'s buffer state is undefined after such a
-    /// failure (the row group may be partially written), so
-    /// [`Self::close`] refuses to publish — putting a potentially
-    /// corrupted buffer would land a bad data file. The buffer is
-    /// discarded (there is no on-disk artifact to inspect). Mirrors
-    /// [`crate::audit_writer::AuditWriter`]'s contract.
-    poisoned: bool,
 }
 
 impl Writer {
@@ -307,26 +285,15 @@ impl Writer {
         // invalid level leaves no partition directory behind (the delegate
         // re-validates — cheap and keeps it self-contained).
         ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
-        // Ensure the store root (and the partition dir) exist:
-        // `Store::local` canonicalises `bucket_root`, which must
-        // therefore exist; the object-store `put` on close creates any
-        // remaining parents.
         let dir = partition.data_path(bucket_root);
-        std::fs::create_dir_all(&dir).map_err(|source| WriterError::Io {
-            op: "create_dir_all",
-            path: dir.clone(),
-            source,
-        })?;
-        let store = Store::local(bucket_root).map_err(|e| WriterError::Io {
-            op: "open store",
-            path: bucket_root.to_path_buf(),
-            source: io::Error::other(e),
-        })?;
+        let store = open_local_store::<WriterError>(bucket_root, &dir)?;
         let mut writer = Self::open_in_with_zstd_level(&store, partition, zstd_level)?;
         // Surface the absolute local landing path for the local backend
         // (readers/tests join the store root to find the file); the store
         // constructor leaves `final_path` as the object key rendered as a path.
-        writer.final_path = dir.join(format!("{}.parquet", writer.flush_uuid));
+        writer
+            .core
+            .set_final_path(dir.join(format!("{}.parquet", writer.flush_uuid)));
         Ok(writer)
     }
 
@@ -434,22 +401,11 @@ impl Writer {
         // validated level flows into `writer_properties` so it isn't re-checked.
         let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
         let flush_uuid = Uuid::now_v7();
-        // The object key is the partition's Hive path (relative to the store
-        // root) plus the file name, with `/` separators — object keys are
-        // `/`-delimited regardless of the host OS.
-        let key = format!(
-            "{}/{}.parquet",
-            partition
-                .data_path(Path::new(""))
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/"),
-            flush_uuid
-        );
-        // No local root to join on the store path, so the object key rendered
-        // as a path is the `final_path` here; the local constructor overrides
-        // it with the absolute landing path. For S3 this is not a filesystem
-        // path (readers address the file by `key`, surfaced in `WrittenFile`).
-        let final_path = PathBuf::from(&key);
+        // The object key is the partition's Hive path (relative to the
+        // store root) plus the file name; the core renders it as the
+        // default `final_path` (the local constructor overrides that
+        // with the absolute landing path).
+        let key = object_key(&partition.data_path(Path::new("")), flush_uuid);
 
         let (sorting, flush_bytes) = match compacted {
             Some(keys) => (
@@ -468,26 +424,19 @@ impl Writer {
             None => (None, ROW_GROUP_FLUSH_BYTES),
         };
         let props = writer_properties(zstd, &promoted, sorting);
-        // Buffer-and-put: encode into memory; nothing hits the store
-        // until `close`. A construction failure leaves no artifact.
-        let inner = ArrowWriter::try_new(
-            Vec::new(),
+        let core = BufferedParquetWriter::open::<WriterError>(
+            store,
+            key,
             data_schema_with_promoted(&promoted),
-            Some(props),
-        )
-        .map_err(WriterError::Parquet)?;
+            props,
+            flush_bytes,
+        )?;
 
         Ok(Self {
-            inner: Some(inner),
+            core,
             partition,
             flush_uuid,
-            store: store.clone(),
-            key,
-            final_path,
-            num_rows: 0,
             promoted,
-            flush_bytes,
-            poisoned: false,
         })
     }
 
@@ -555,16 +504,10 @@ impl Writer {
     /// takes ownership of `self`; `append_records` borrows
     /// `&mut self` and therefore cannot run after `close`.
     pub fn append_records(&mut self, records: &[MinedRecord]) -> Result<(), WriterError> {
-        if self.poisoned {
-            // Fail fast — touching `inner` after a prior Parquet
-            // error would call into an `ArrowWriter` whose buffer
-            // state is undefined. `close()` will refuse to publish
-            // either way; surface the same `Poisoned` error here
-            // so callers can stop driving the writer immediately
-            // instead of accumulating further (potentially
-            // doomed) Parquet operations.
-            return Err(WriterError::Poisoned);
-        }
+        // Poisoned fail-fast comes before validation so a doomed
+        // writer surfaces `Poisoned` (not `PartitionMismatch`) — the
+        // caller should stop driving it, whatever the rows look like.
+        self.core.ensure_unpoisoned::<WriterError>()?;
         if records.is_empty() {
             return Ok(());
         }
@@ -578,34 +521,18 @@ impl Writer {
                 });
             }
         }
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("inner ArrowWriter is Some until Writer::close is called");
-        // Run the Parquet-touching loop in a helper that takes a
-        // `&mut ArrowWriter<Vec<u8>>` so the outer `self.poisoned =
-        // true` assignment can run after the borrow on `self.inner`
-        // ends. `num_rows` is a disjoint field, so it can be borrowed
-        // alongside `inner`; the helper bumps it per successfully
-        // written sub-batch. Poison only on Parquet errors — `Batch`
+        // The core poisons itself on Parquet errors only — `Batch`
         // errors come from `mined_records_to_batch`, which runs on a
-        // single chunk and doesn't touch `inner` itself; the buffer's
-        // state at the moment a `Batch` error fires is whatever earlier
-        // chunks left it (clean, or holding already-written rows from
-        // this same call). Either way a follow-up `append_records` is
-        // safe — the contract is "writer remains usable", not "no rows
-        // persisted".
-        let result = append_chunks(
-            inner,
-            records,
-            &self.promoted,
-            &mut self.num_rows,
-            self.flush_bytes,
-        );
-        if matches!(result, Err(WriterError::Parquet(_))) {
-            self.poisoned = true;
-        }
-        result
+        // single chunk and doesn't touch the buffer itself; the
+        // buffer's state at the moment a `Batch` error fires is
+        // whatever earlier chunks left it (clean, or holding
+        // already-written rows from this same call). Either way a
+        // follow-up `append_records` is safe — the contract is
+        // "writer remains usable", not "no rows persisted".
+        let promoted = &self.promoted;
+        self.core.append(records, SUB_BATCH_ROWS, |chunk| {
+            mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)
+        })
     }
 
     /// Close the writer, finalising the Parquet footer in the
@@ -643,33 +570,21 @@ impl Writer {
     /// Structurally impossible. `inner` is populated by
     /// [`Writer::open`] and only consumed here; `close` takes `self`
     /// by value so it can't run twice.
-    pub fn close(mut self) -> Result<WrittenFile, WriterError> {
-        if self.poisoned {
-            // Refuse to publish a possibly-partial buffer.
-            return Err(WriterError::Poisoned);
-        }
-        let inner = self
-            .inner
-            .take()
-            .expect("Writer::close consumes self; inner is Some on entry");
-        // `into_inner` writes the footer and returns the finished
-        // bytes; the `put` is the atomic commit point.
-        let bytes = inner.into_inner().map_err(WriterError::Parquet)?;
-        let bytes_written = bytes.len() as u64;
-        self.store
-            .put_blocking(&self.key, bytes)
-            .map_err(|e| WriterError::Io {
-                op: "put",
-                path: self.final_path.clone(),
-                source: io::Error::other(e),
-            })?;
+    pub fn close(self) -> Result<WrittenFile, WriterError> {
+        let Self {
+            core,
+            partition,
+            flush_uuid,
+            ..
+        } = self;
+        let closed = core.close::<WriterError>()?;
         Ok(WrittenFile {
-            path: self.final_path.clone(),
-            key: self.key.clone(),
-            partition: self.partition.clone(),
-            flush_uuid: self.flush_uuid,
-            num_rows: self.num_rows,
-            bytes_written,
+            path: closed.path,
+            key: closed.key,
+            partition,
+            flush_uuid,
+            num_rows: closed.num_rows,
+            bytes_written: closed.bytes_written,
         })
     }
 
@@ -681,7 +596,7 @@ impl Writer {
     /// `close` — while the writer is open they live in memory.
     #[must_use]
     pub fn final_path(&self) -> &Path {
-        &self.final_path
+        self.core.final_path()
     }
 }
 
@@ -804,53 +719,18 @@ impl std::error::Error for WriterError {
     }
 }
 
-/// Inner Parquet-touching loop of [`Writer::append_records`].
-/// Borrows the `ArrowWriter` directly so the caller can set
-/// `self.poisoned = true` after the borrow ends if this returns
-/// an `Err(WriterError::Parquet(_))`. Per the §3.5 row-group
-/// sizing rule, runs a `flush()` when the in-progress buffer
-/// crosses `flush_bytes` ([`ROW_GROUP_FLUSH_BYTES`] on the ingest
-/// side, the RFC 0036 §3.3 adaptive threshold for compacted output).
-/// Symmetric helper to the audit writer's `append_chunks`.
-fn append_chunks(
-    inner: &mut ArrowWriter<Vec<u8>>,
-    records: &[MinedRecord],
-    promoted: &PromotedAttributes,
-    num_rows: &mut i64,
-    flush_bytes: usize,
-) -> Result<(), WriterError> {
-    // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
-    // flush-if-over-threshold check before every sub-batch.
-    // The bound on row-group size is therefore:
-    //   (§3.5 lower threshold) + (one sub-batch's worth) ≈
-    //   well under §3.5's 1 GiB upper bound for any reasonable
-    //   per-record size. The size check happens *before* every
-    //   sub-batch (not after), so a sub-batch that pushes the
-    //   buffer past the threshold seals the next time around —
-    //   bounded overshoot is intentional; unbounded overshoot
-    //   is what the RFC prohibits.
-    for chunk in records.chunks(SUB_BATCH_ROWS) {
-        if inner.in_progress_size() >= flush_bytes {
-            inner.flush().map_err(WriterError::Parquet)?;
-        }
-        let batch =
-            mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)?;
-        inner.write(&batch).map_err(WriterError::Parquet)?;
-        // Count rows only once the sub-batch has been accepted, so a
-        // mid-slice `Batch`/`Parquet` failure leaves `num_rows`
-        // reflecting exactly what landed in the buffer. `chunk.len()`
-        // is bounded by `SUB_BATCH_ROWS` (1024), so the cast to `i64`
-        // is lossless.
-        #[allow(clippy::cast_possible_wrap)]
-        let written = chunk.len() as i64;
-        *num_rows += written;
+impl WriteError for WriterError {
+    fn parquet(e: ParquetError) -> Self {
+        Self::Parquet(e)
     }
-    // Final post-write check so the next `append_records` call
-    // doesn't inherit an over-threshold buffer.
-    if inner.in_progress_size() >= flush_bytes {
-        inner.flush().map_err(WriterError::Parquet)?;
+
+    fn io(op: &'static str, path: PathBuf, source: io::Error) -> Self {
+        Self::Io { op, path, source }
     }
-    Ok(())
+
+    fn poisoned() -> Self {
+        Self::Poisoned
+    }
 }
 
 /// The RFC 0036 §3.4 `sorting_columns` declaration for `keys`: leaf
@@ -934,17 +814,19 @@ pub fn encode_records_to_parquet_with_promoted(
     let mut writer =
         ArrowWriter::try_new(Vec::new(), data_schema_with_promoted(promoted), Some(props))
             .map_err(WriterError::Parquet)?;
-    for chunk in records.chunks(SUB_BATCH_ROWS) {
-        // §3.5 row-group sizing: seal a row group once the in-progress
-        // buffer crosses the threshold (same guard as `Writer::append_chunks`)
-        // so large inputs don't produce one oversized row group.
-        if writer.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-            writer.flush().map_err(WriterError::Parquet)?;
-        }
-        let batch =
-            mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)?;
-        writer.write(&batch).map_err(WriterError::Parquet)?;
-    }
+    // §3.5 row-group sizing rides the shared chunk loop (the same
+    // guard as `Writer::append_records`); the row count is unused —
+    // the one-shot API reports bytes, not rows.
+    let mut num_rows = 0i64;
+    write_chunked(
+        &mut writer,
+        records,
+        SUB_BATCH_ROWS,
+        ROW_GROUP_FLUSH_BYTES,
+        &mut num_rows,
+        |chunk| mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch),
+    )
+    .map_err(ChunkError::into_write_error)?;
     // `into_inner` flushes the final row group, writes the footer, and
     // returns the buffer — the complete Parquet bytes.
     writer.into_inner().map_err(WriterError::Parquet)

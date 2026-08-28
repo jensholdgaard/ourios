@@ -165,12 +165,11 @@ where
         let resolver = self.resolver.clone();
         let metrics = Arc::clone(&self.metrics);
         Box::pin(async move {
-            let authorization = request
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            match resolver.authenticate(authorization.as_deref()).await {
+            // Clone the HeaderValue (a refcount bump on its Bytes), not
+            // an owned String — the resolver only needs an `&str`.
+            let authorization = request.headers().get(header::AUTHORIZATION).cloned();
+            let authorization = authorization.as_ref().and_then(|value| value.to_str().ok());
+            match resolver.authenticate(authorization).await {
                 Ok(None) => {}
                 Ok(Some(binding)) => {
                     // Arc, not the binding itself: axum's `Extension`

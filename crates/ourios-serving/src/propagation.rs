@@ -1,7 +1,7 @@
 //! Inbound W3C trace-context extraction (RFC 0039).
 //!
 //! Every Ourios ingress receives its caller's trace context as HTTP headers, so
-//! [`HeaderExtractor`] over [`http::HeaderMap`] serves the axum-side ingresses
+//! [`HeaderExtractor`] over [`axum::http::HeaderMap`] serves the axum-side ingresses
 //! (OTLP/HTTP, the query API, the MCP tools). gRPC metadata *is* HTTP/2 headers,
 //! but tonic models it as `HeaderMap<MetadataValue>` rather than
 //! `http::HeaderMap`, so the OTLP/gRPC ingress needs its own carrier adapter:
@@ -25,7 +25,7 @@ use opentelemetry::Context;
 use opentelemetry::propagation::Extractor;
 use tonic::metadata::{KeyRef, MetadataMap};
 
-/// Reads W3C trace-context headers out of an [`http::HeaderMap`].
+/// Reads W3C trace-context headers out of an [`axum::http::HeaderMap`].
 pub struct HeaderExtractor<'a>(pub &'a HeaderMap);
 
 impl Extractor for HeaderExtractor<'_> {

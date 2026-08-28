@@ -97,7 +97,7 @@ pub fn router(pipeline: SharedPipeline, config: &HttpConfig) -> Router {
 /// handler's per-batch tenant check. With nothing configured every
 /// request passes through unbound (open mode, §3.1).
 #[derive(Clone)]
-pub struct AuthLayer {
+struct AuthLayer {
     resolver: AuthResolver,
     /// Rejection telemetry (RFC 0026 §3.4). The instruments resolve by
     /// name through the global meter, so this instance aggregates with
@@ -107,8 +107,7 @@ pub struct AuthLayer {
 
 impl AuthLayer {
     /// A layer over `resolver` (see [`AuthResolver`] for open mode).
-    #[must_use]
-    pub fn new(resolver: AuthResolver) -> Self {
+    fn new(resolver: AuthResolver) -> Self {
         Self {
             resolver,
             metrics: Arc::new(crate::metrics::IngestMetrics::new()),
@@ -130,7 +129,7 @@ impl<S> tower::Layer<S> for AuthLayer {
 
 /// The [`AuthLayer`] service: authenticate, then delegate.
 #[derive(Clone)]
-pub struct AuthService<S> {
+struct AuthService<S> {
     inner: S,
     resolver: AuthResolver,
     metrics: Arc<crate::metrics::IngestMetrics>,
@@ -174,7 +173,12 @@ where
             match resolver.authenticate(authorization.as_deref()).await {
                 Ok(None) => {}
                 Ok(Some(binding)) => {
-                    request.extensions_mut().insert(binding);
+                    // Arc, not the binding itself: axum's `Extension`
+                    // extractor clones out of the extensions map, and
+                    // `AuthBinding` deep-clones its tenant sets — the
+                    // gRPC side borrows from extensions and pays no
+                    // per-request clone, so this keeps parity.
+                    request.extensions_mut().insert(Arc::new(binding));
                 }
                 // One undifferentiated rejection: missing vs malformed vs
                 // unknown would be a probing oracle (RFC 0026 §3.2). §3.4:
@@ -219,13 +223,14 @@ enum Encoding {
 
 async fn handle_logs(
     State(state): State<AppState>,
-    binding: Option<axum::Extension<AuthBinding>>,
+    binding: Option<axum::Extension<Arc<AuthBinding>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // RFC 0026 §3.2: authentication already ran in [`AuthLayer`], before
+    // RFC 0026 §3.2: authentication already ran in `AuthLayer`, before
     // the body was collected; a present extension is the bound
-    // credential, absence is open mode.
+    // credential, absence is open mode. (Arc: cloning the extension is
+    // a refcount bump, not a tenant-set deep-clone.)
     let binding = binding.map(|axum::Extension(b)| b);
     // RFC 0046 §3.1: the tenant selector is required, exactly once, and
     // decided before authorization against the set, before decode, before
@@ -280,7 +285,7 @@ async fn handle_logs(
     match tokio::spawn(
         async move {
             pipeline
-                .ingest_bound(request, tenant, binding.as_ref(), lenient_json)
+                .ingest_bound(request, tenant, binding.as_deref(), lenient_json)
                 .await
         }
         .with_context(parent),

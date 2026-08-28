@@ -167,10 +167,19 @@ Scenario ids `RFC0051.<n>`, RFC0051.1–.7.
 
 > **RFC0051.1 — the querier role sheds the ingest crate.** Given the
 > workspace after the move, When `ourios-server`, `ourios-querier`
-> and their tests are grepped for
-> `ourios_ingester::receiver::{auth,tls,tls_serve,propagation}`
-> paths, Then no match exists, And the querier role's modules build
-> against `ourios-serving` only.
+> and their tests are searched for any of the moved modules' path
+> fragments — `ourios_ingester::receiver::auth`,
+> `…::receiver::tls`, `…::receiver::tls_serve`,
+> `…::receiver::propagation` — **or** for the moved names formerly
+> re-exported at the receiver root (`AuthBinding`, `AuthError`,
+> `AuthResolver`, `GraphIdentity`, `authenticate_bearer`,
+> `HeaderExtractor`, `MetadataExtractor`, `extract_context`,
+> `TlsSettings`) reached through any `ourios_ingester::` path, Then
+> no match exists, And the querier role's modules build against
+> `ourios-serving` only. (The nested-path and root-re-export forms
+> are both in scope — a brace-import literal alone would miss
+> `ourios_ingester::receiver::AuthResolver::static_only(..)`-style
+> call sites.)
 >
 > **RFC0051.2 — core carries no HTTP stack.** Given
 > `ourios-core/Cargo.toml` after the move, When inspected, Then it

@@ -285,7 +285,7 @@ async fn rfc0026_3_ingest_tenant_binding() {
         .insert("x-ourios-tenant", "tenant-c".parse().expect("md"));
     denied_grpc
         .extensions_mut()
-        .insert(binding(&["tenant-a", "tenant-b"]));
+        .insert(std::sync::Arc::new(binding(&["tenant-a", "tenant-b"])));
     let status = receiver.export(denied_grpc).await.expect_err("denied");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(

@@ -112,15 +112,18 @@ where
         let resolver = self.resolver.clone();
         let metrics = Arc::clone(&self.metrics);
         Box::pin(async move {
-            let authorization = request
-                .headers()
-                .get(http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            match resolver.authenticate(authorization.as_deref()).await {
+            // Clone the HeaderValue (a refcount bump on its Bytes), not
+            // an owned String — the resolver only needs an `&str`.
+            let authorization = request.headers().get(http::header::AUTHORIZATION).cloned();
+            let authorization = authorization.as_ref().and_then(|value| value.to_str().ok());
+            match resolver.authenticate(authorization).await {
                 Ok(None) => {}
                 Ok(Some(binding)) => {
-                    request.extensions_mut().insert(binding);
+                    // Arc, not the binding itself: the handler clones it
+                    // out of extensions to move it across `tokio::spawn`,
+                    // and `AuthBinding` deep-clones its tenant sets — the
+                    // Arc makes that a refcount bump.
+                    request.extensions_mut().insert(Arc::new(binding));
                 }
                 // One undifferentiated message: missing vs malformed vs
                 // unknown would be a probing oracle (RFC 0026 §3.2). §3.4:
@@ -174,7 +177,7 @@ impl LogsService for LogsReceiver {
         let parent = extract_context_from_metadata(request.metadata());
         // The [`AuthInterceptor`]'s binding, when auth is enabled — the
         // pipeline enforces the §3.2 tenant binding against it.
-        let binding = request.extensions().get::<AuthBinding>().cloned();
+        let binding = request.extensions().get::<Arc<AuthBinding>>().cloned();
         // RFC 0046 §3.1: the tenant selector — required, exactly once,
         // visible-ASCII metadata — decided before the set check and before
         // any WAL work; a missing/malformed one is INVALID_ARGUMENT.
@@ -191,7 +194,7 @@ impl LogsService for LogsReceiver {
         match tokio::spawn(
             async move {
                 pipeline
-                    .ingest_bound(export, tenant, binding.as_ref(), false)
+                    .ingest_bound(export, tenant, binding.as_deref(), false)
                     .await
             }
             .with_context(parent),

@@ -213,22 +213,6 @@ impl IngestPipeline {
         self
     }
 
-    /// Record an authentication rejection on `ourios.ingest.batches`
-    /// (`error.type = unauthenticated`, RFC 0026 §3.4) — called by the
-    /// transports, which own the 401 surface.
-    pub fn record_unauthenticated(&self) {
-        self.metrics
-            .record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
-    }
-
-    /// Record a request failed closed because the RFC 0047 resolver could
-    /// not answer (`error.type = upstream_unavailable`) — the transports
-    /// own the 503 surface.
-    pub fn record_auth_unavailable(&self) {
-        self.metrics
-            .record_rejected_batch(crate::metrics::ERROR_TYPE_UPSTREAM_UNAVAILABLE);
-    }
-
     /// Install the §6.9 rotation-cadence hook: called once per
     /// detected WAL segment rotation with the miner as it stands
     /// and the **rotation-point high-water mark** — the last

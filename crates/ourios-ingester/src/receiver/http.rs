@@ -174,9 +174,9 @@ where
                 Ok(Some(binding)) => {
                     // Arc, not the binding itself: axum's `Extension`
                     // extractor clones out of the extensions map, and
-                    // `AuthBinding` deep-clones its tenant sets — the
-                    // gRPC side borrows from extensions and pays no
-                    // per-request clone, so this keeps parity.
+                    // `AuthBinding` deep-clones its tenant sets — the Arc
+                    // makes that a refcount bump (both transports use the
+                    // same shape; gRPC clones it across a `tokio::spawn`).
                     request.extensions_mut().insert(Arc::new(binding));
                 }
                 // One undifferentiated rejection: missing vs malformed vs

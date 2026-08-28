@@ -1,7 +1,8 @@
-//! The RFC 0047 §3.1 `OpenFGA` resolver: configuration and the principal
-//! vocabulary here (always compiled — they are plain data the config
-//! layer maps onto), the HTTP client and the session resolver in
-//! the `client` submodule behind the `openfga` feature (re-exported here).
+//! The RFC 0047 §3.1 `OpenFGA` configuration and principal vocabulary
+//! (always compiled — plain data the config layer maps onto). The HTTP
+//! client and the session resolver live in `ourios_serving::openfga`
+//! behind that crate's `openfga` feature (RFC 0051 — core carries no
+//! HTTP stack).
 //!
 //! `OpenFGA` does not authenticate: the static store or the OIDC verifier
 //! establishes *who* the bearer is, and this layer asks the graph *what*

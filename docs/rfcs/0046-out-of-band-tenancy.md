@@ -326,7 +326,7 @@ validation gets its own rejection cases. RFC0046.8 in the CI-only collector inte
 
 ## 7. Open questions
 
-All four resolved (recorded 2026-08-29; three by RFC 0048, one by the
+All four resolved (recorded 2026-08-28; three by RFC 0048, one by the
 semconv extraction — this RFC was flipped `accepted` while they still
 read open, which the resolve-never-waive rule of the ladder sweep does
 not allow):

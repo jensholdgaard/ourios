@@ -73,7 +73,7 @@ use datafusion::datasource::listing::{
 use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
-use datafusion::prelude::{SessionContext, col, lit};
+use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::columns;
 use ourios_parquet::hour_partition_in_window;
@@ -655,7 +655,7 @@ impl Querier {
         let enc = percent_encode_tenant(tenant.as_str());
         let data_prefix = format!("data/tenant_id={enc}");
 
-        let ctx = SessionContext::new();
+        let ctx = crate::exec::session();
         // Resolve the live file set under the tenant's `data/` prefix,
         // honouring the RFC 0009 §3.4 manifest (glob-fallback when absent),
         // and produce the per-file table URLs (local absolute path, or

@@ -62,6 +62,19 @@ impl ExecutionPlan for PanicsIfTouched {
         panic!("record_plan_spans must not walk the plan on the unsampled path")
     }
 
+    // DataFusion 55 made this a required method; like `children`, the
+    // unsampled path must never reach it.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        panic!("record_plan_spans must not walk the plan on the unsampled path")
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,

@@ -326,28 +326,16 @@ validation gets its own rejection cases. RFC0046.8 in the CI-only collector inte
 
 ## 7. Open questions
 
-All four resolved (recorded 2026-08-28; three by RFC 0048, one by the
-semconv extraction — this RFC was flipped `accepted` while they still
-read open, which the resolve-never-waive rule of the ladder sweep does
-not allow):
-
-- [x] **Selector length bound** — **RFC 0048 §3.1 pinned it at 1–128
-      bytes**, tighter than the 256 B floated here, and made it the one
-      tenant grammar every boundary applies at extraction
-      (`MAX_SELECTOR_BYTES = MAX_TENANT_BYTES` in the receiver).
-- [x] **Non-ASCII tenant ids over gRPC** — **caveat accepted, then
-      dissolved**: RFC 0048 §3.1's grammar admits only ASCII graphic
-      characters (minus `:`, `#`, `/`) at *every* boundary, so HTTP and
-      gRPC now reject the same inputs. No `-bin` carrier is needed;
-      parity is total because the grammar, not the transport, is the
-      bound.
-- [x] **Deprecation window for the RFC 0045 registry entries** — kept
-      deprecated, as leaned. `ourios.tenant.watch.key` /
-      `.first_value` carry `deprecated: {reason: obsoleted}` in the
-      shared `ourios-semconv` registry, noting they were never emitted
-      by a released version.
-- [x] **RFC 0003 §6.3 text** — amended in place, as leaned: §6.3 opens
-      with a "Superseded by RFC 0046 (2026-08-17)" banner.
+- [ ] **Selector length bound (256 B)** — generous for opaque ids; is a
+      shorter bound wanted so headers stay log-friendly?
+- [ ] **Non-ASCII tenant ids over gRPC** — accept the stated caveat, or
+      define a `-bin` metadata carrier so gRPC parity is total?
+- [ ] **Deprecation window for the RFC 0045 registry entries** — deprecate
+      now and delete at the next minor, or keep indefinitely per semconv
+      practice? (Leaning: keep deprecated; they were never released.)
+- [ ] **RFC 0003 §6.3 text** — amend in place with a "superseded by RFC 0046"
+      note, or leave and rely on this RFC's `supersedes:` line? (Leaning:
+      amend in place; readers start from 0003.)
 
 ## 8. References
 

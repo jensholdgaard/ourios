@@ -308,6 +308,19 @@ mod tests {
             vec![]
         }
 
+        // DataFusion 55 made this a required method: a leaf carries no
+        // physical expressions, so the walk continues untouched.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn with_new_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -437,6 +450,19 @@ mod tests {
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             panic!("record_plan_spans must not walk the plan on the unsampled path")
+        }
+
+        // DataFusion 55 made this a required method: a leaf carries no
+        // physical expressions, so the walk continues untouched.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(

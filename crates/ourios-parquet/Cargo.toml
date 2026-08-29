@@ -18,9 +18,9 @@ ourios-core = { path = "../ourios-core" }
 # `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`).
 # `parquet` carries the actual writer (`arrow` feature pulls in
 # `arrow::array::RecordBatch` integration).
-arrow-array = { version = "58", default-features = false }
-arrow-schema = { version = "58", default-features = false }
-parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
+arrow-array = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
 # Object-storage backend (RFC 0013) — one trait over LocalFileSystem (dev/
 # test) and S3-compatible stores. Already in the workspace tree via
 # DataFusion (the querier); declared here directly as the storage seam's
@@ -84,7 +84,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 ourios-miner = { path = "../ourios-miner" }
 # RFC0021.4 view-representation test: cast a plain batch's string/binary
 # columns to Utf8View/BinaryView and prove the shared decoder reads both.
-arrow-cast = { version = "=58.4.0", default-features = false }
+arrow-cast = { version = "=59.2.0", default-features = false }
 # Property tests for the compaction row-conservation invariant
 # (RFC0009.2 / CLAUDE.md §6.2 — invariants get a property test).
 proptest = "=1.11.0"

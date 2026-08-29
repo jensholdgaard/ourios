@@ -177,12 +177,21 @@ fn rfc0021_2_pre_upgrade_fixture_reads_identically() {
 /// Scenario RFC0021.1 — one arrow.
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
 ///
-/// Inspects the committed lockfile: every `arrow*` package is on the
-/// single post-upgrade major, `datafusion` is on 54.x, and the workspace
-/// MSRV is 1.88. A second arrow major sneaking back in via a transitive
-/// bump fails here, not in a human review of a renovate diff.
+/// Inspects the committed lockfile for the *invariant* the RFC actually
+/// bought: every `arrow*` package sits on **one** major and there is
+/// exactly **one** `datafusion`. A second arrow major sneaking back in
+/// via a transitive bump fails here, not in a human review of a
+/// renovate diff — that dual-major state is what forced RFC 0017's
+/// dual decoder and the `schema_force_view_types` override (#276).
+///
+/// It deliberately does **not** pin the major to a literal. A test that
+/// asserts "we are on arrow 58" is a change-detector: it fails on every
+/// intentional upgrade (as it did on the phase-2a bump) and catches no
+/// bug the invariant misses. The literal versions live where they are
+/// executable — `Cargo.toml` and the lockfile — and the *floor* the
+/// security posture depends on is asserted separately below.
 #[test]
-fn rfc0021_1_one_arrow_major_and_datafusion_54() {
+fn rfc0021_1_one_arrow_major_and_one_datafusion() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -209,26 +218,55 @@ fn rfc0021_1_one_arrow_major_and_datafusion_54() {
             datafusion_versions.push(version.to_string());
         }
     }
+    let majors: Vec<_> = arrow_majors.into_iter().collect();
     assert_eq!(
-        arrow_majors.into_iter().collect::<Vec<_>>(),
-        ["58"],
-        "exactly one arrow major (58.x) in the lockfile"
+        majors.len(),
+        1,
+        "exactly one arrow major in the lockfile, got {majors:?}"
     );
     assert_eq!(
         datafusion_versions.len(),
         1,
         "exactly one datafusion in the lockfile, got {datafusion_versions:?}"
     );
-    assert!(
-        datafusion_versions[0].starts_with("54."),
-        "datafusion 54.x, got {}",
-        datafusion_versions[0]
-    );
 
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    // Floors, not pins: phase 2a's security clearance depends on being
+    // at or above these, and nothing depends on being *at* them. A
+    // routine upgrade passes; a downgrade that would drag `thrift` back
+    // in fails.
+    let major: u32 = majors[0].parse().expect("arrow major is numeric");
     assert!(
-        manifest.contains("rust-version = \"1.88\""),
-        "workspace MSRV is 1.88"
+        major >= 59,
+        "arrow major >= 59 (phase 2a floor), got {major}"
+    );
+    let df_major: u32 = datafusion_versions[0]
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .expect("datafusion major is numeric");
+    assert!(
+        df_major >= 55,
+        "datafusion major >= 55 (phase 2a floor), got {df_major}"
+    );
+}
+
+/// Scenario RFC0021.8 (phase 2a) — thrift is gone.
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+///
+/// parquet 59 dropped its `thrift` dependency, which is the whole
+/// security case for phase 2a (GHSA-2f9f-gq7v-9h6m, #295). Asserted on
+/// the lockfile so a transitive re-introduction fails here rather than
+/// in a Dependabot alert weeks later.
+#[test]
+fn rfc0021_8_thrift_is_absent_from_the_lockfile() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root is two levels above CARGO_MANIFEST_DIR");
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+    assert!(
+        !lock.contains("name = \"thrift\""),
+        "thrift must stay out of the lockfile (GHSA-2f9f-gq7v-9h6m, #295)"
     );
 }
 

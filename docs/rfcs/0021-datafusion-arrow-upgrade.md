@@ -237,20 +237,28 @@ DataFusion 54 carries arrow 58 — reintroducing the dual-arrow split
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2 = `.7`–`.9`
-(**upstream-gated**: their stubs land red only when phase 2 opens).
+Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2a = `.8` and
+the deny half of `.9`. **This section lists only criteria whose
+trigger has fired** — `green` means all of them pass, per
+`docs/rfcs/README.md`. Phase 2b's criteria live in §5b below and are
+**inactive**: they enter this ledger (as red stubs, moving the RFC
+back to `red`) the day a released DataFusion accepts object_store
+≥ 0.14, and not before.
 
-> **Status note (2026-07-03):** phase 1 is complete — `.1`–`.6` are
-> discharged (#339 dependency bump, #340 decoder unification; indicative
-> B1/B2 ci-runner run on #340). `green` here covers phase 1; opening
-> phase 2 lands `.7`–`.9` as red stubs and moves the status back to
-> `red` until they pass.
+> **Status note (2026-08-29):** phase 1 discharged 2026-07-03 (#339,
+> #340; indicative B1/B2 ci-runner run on #340). Phase 2a discharged
+> 2026-08-29 (`.1` re-baselined per the header, `.8` landed, `.9`'s
+> deny half green). The 2026-07-03 note's "opening phase 2 moves the
+> status back to `red`" now applies to **phase 2b** — 2a opened and
+> closed within one PR, so the red window collapsed to nothing.
 
-> **Scenario RFC0021.1 — one arrow.**
-> Given the phase-1 bump,
+> **Scenario RFC0021.1 — one arrow (re-baselined, see header).**
+> Given the current dependency set,
 > When the workspace lockfile is inspected,
-> Then exactly one arrow major (58.x) and `datafusion 54.x` are
-> present, and the workspace builds with MSRV 1.88.
+> Then exactly one arrow major and exactly one `datafusion` version
+> are present, with floors arrow ≥ 59 / DataFusion ≥ 55 (a downgrade
+> that would drag `thrift` back fails), and the workspace builds with
+> the pinned MSRV (1.94).
 
 > **Scenario RFC0021.2 — old files read identically (§3.5).**
 > Given Parquet files written by the pre-upgrade writer (committed
@@ -284,25 +292,36 @@ Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2 = `.7`–`.9`
 > Then the complete suite passes — including `s3 integration
 > (localstack)` (the CAS paths, untouched) and `live-check (weaver)`.
 
-> **Scenario RFC0021.7 (phase 2b — deferred) — CAS survives
-> object_store 0.14.**
-> Given the object_store bump,
-> When the RFC0013.3/.4 conditional-PUT localstack suites run,
-> Then concurrent-sweep publish semantics are preserved.
-
 > **Scenario RFC0021.8 (phase 2a — green) — thrift is gone.**
 > Given the parquet 59 bump,
 > When the lockfile is inspected,
 > Then no `thrift` crate is present (#295 closed).
 > Asserted by `rfc0021_8_thrift_is_absent_from_the_lockfile`.
 
-> **Scenario RFC0021.9 (split) — supply chain re-cleared.**
+> **Scenario RFC0021.9 (phase 2a half) — supply chain re-cleared.**
 > Given the new transitive set,
 > When `cargo deny check` runs,
-> Then it passes — **green for phase 2a** (it does, and the dead
-> RUSTSEC-2024-0436 `paste` ignore was removed) — and, **deferred to
-> phase 2b**, with the renovate hold lifted (#313) and the quick-xml
-> ignores removed iff object_store pins quick-xml ≥ 0.41.
+> Then it passes (it does, and the dead RUSTSEC-2024-0436 `paste`
+> ignore was removed). The quick-xml half of this criterion is phase
+> 2b's — see §5b.
+
+### 5b. Phase 2b criteria (inactive — trigger not fired)
+
+These activate, as red stubs in §5, when a released DataFusion accepts
+object_store ≥ 0.14 (epic #314). Until then they are forward
+declarations, not acceptance criteria, and do not count against the
+status.
+
+> **Scenario RFC0021.7 — CAS survives object_store 0.14.**
+> Given the object_store bump,
+> When the RFC0013.3/.4 conditional-PUT localstack suites run,
+> Then concurrent-sweep publish semantics are preserved.
+
+> **Scenario RFC0021.9 (phase 2b half) — quick-xml ignores retired.**
+> Given the object_store ≥ 0.14 transitive set,
+> When `cargo deny check` runs with the renovate hold lifted (#313),
+> Then it passes with the quick-xml ignores removed iff object_store
+> pins quick-xml ≥ 0.41.
 
 ## 6. Testing strategy
 

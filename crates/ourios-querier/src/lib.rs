@@ -73,7 +73,7 @@ use datafusion::datasource::listing::{
 use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
-use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::columns;
 use ourios_parquet::hour_partition_in_window;

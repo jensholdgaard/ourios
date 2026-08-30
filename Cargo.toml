@@ -40,12 +40,6 @@ unsafe_code = "deny"
 # All member crates declare `[lints] workspace = true`, so this
 # propagates without per-crate edits; `cargo doc --workspace
 # --no-deps --all-features` is the local check.
-# `duration_suboptimal_units` (new in the toolchain the 1.94 MSRV admits)
-# suggests `Duration::from_days` / `from_mins`, which are **unstable**
-# (rust-lang/rust#120301) — the lint is un-actionable on stable, and the
-# flagged sites are honest anyway: `from_secs(86_400)` day-scale sentinels
-# and Unix-epoch fixture stamps, both of which read better in seconds.
-# Revisit when the constructors stabilise.
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
@@ -54,11 +48,12 @@ bare_urls = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# `duration_suboptimal_units` suggests `Duration::from_days` / `from_mins`,
-# which are **unstable** (rust-lang/rust#120301) — un-actionable on stable.
-# The flagged sites are honest in seconds anyway: `from_secs(86_400)`
-# day-scale "effectively never" sentinels and Unix-epoch fixture stamps.
-# Revisit when the constructors stabilise.
+# `duration_suboptimal_units` (clippy 1.95+; our clippy gate runs latest
+# stable) flags ~26 sites, every one a `from_secs` of either a
+# seconds-per-day sentinel (86_400) or a Unix-epoch fixture stamp. The
+# suggested `from_mins(1440)` / `from_mins(29585458)` rewrites lose the
+# canonical form each constant is recognised by, so the lint is noise
+# here — allowed, not fought site by site.
 duration_suboptimal_units = "allow"
 
 # The profile that 'dist' will build with

@@ -53,9 +53,21 @@ pub(crate) enum SchemaMode<'a> {
 /// depend on; the RFC0044.7/.8 and RFC0007.1 pruning tests are the
 /// gate that will catch it either way.
 pub(crate) fn session() -> SessionContext {
-    let mut config = SessionConfig::new();
+    let mut config = datafusion::prelude::SessionConfig::new();
     config.options_mut().execution.collect_statistics = false;
     SessionContext::new_with_config(config)
+}
+
+#[cfg(test)]
+mod session_tests {
+    #[test]
+    fn the_shared_session_disables_statistics_collection() {
+        let ctx = super::session();
+        assert!(
+            !ctx.state().config().options().execution.collect_statistics,
+            "collect_statistics must stay off until apache/datafusion#24769              is fixed in a release we depend on (see session())"
+        );
+    }
 }
 
 /// Register `urls` as listing table `name` on `ctx` and return its

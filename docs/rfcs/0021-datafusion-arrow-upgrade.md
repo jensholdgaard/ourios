@@ -1,7 +1,7 @@
 ---
 rfc: 0021
 title: Coordinated DataFusion / Arrow upgrade — phased behind upstream
-status: accepted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-03
@@ -11,13 +11,38 @@ superseded-by: —
 
 # RFC 0021 — Coordinated DataFusion / Arrow upgrade, phased behind upstream
 
-> **Status: `accepted` (2026-08-25, maintainer sign-off).** Covers the
-> shipped **phase 1** scope (RFC0021.1–.6, the ladder this RFC ran).
-> Not unconditionally terminal: §5's own lifecycle reopens the RFC —
-> phase 2 lands `.7`–`.9` as red stubs and moves the status back to
-> `red` — when a DataFusion release accepts object_store 0.14 /
-> parquet 59. That reopening trigger is upstream-gated future work,
-> not an unresolved pre-`accepted` gate.
+> **Status: `green` (2026-08-29) — phase 2a complete; phase 2b still
+> upstream-gated.** DataFusion 55.0.0 shipped and fired this RFC's own
+> reopening trigger, but **only half of it**: DF 55 carries
+> arrow/parquet **59.2** yet still pins `object_store ^0.13.2`. Phase 2
+> is therefore split (§3.2a/§3.2b):
+>
+> - **Phase 2a — landed.** arrow 58→59, parquet 58→59, DataFusion
+>   54→55, MSRV 1.88→1.94. `thrift` leaves the lockfile, clearing
+>   GHSA-2f9f-gq7v-9h6m (#295) and the two Dependabot alerts previously
+>   dismissed as risk-tolerated; `paste` leaves too, retiring the
+>   RUSTSEC-2024-0436 ignore. RFC0021.8 green; RFC0021.1 re-baselined
+>   (below); the deny half of RFC0021.9 green.
+> - **Phase 2b — deferred, trigger unchanged.** object_store ≥ 0.14
+>   (RFC0021.7, the CAS re-proof) and the rest of RFC0021.9 (quick-xml
+>   ignores, renovate hold #313, #310) open when a released DataFusion
+>   accepts object_store 0.14. Tracked by epic #314.
+>
+> **RFC0021.1 was re-baselined, deliberately.** It asserted literal
+> versions (`arrow 58`, `datafusion 54.x`, `MSRV 1.88`) and so failed on
+> the phase-2a bump — not because anything regressed, but because a
+> version-literal assertion is a change-detector that fails on every
+> intentional upgrade. Its *invariant* half (exactly one arrow major,
+> exactly one datafusion) passed throughout, and that is the property
+> the RFC actually bought (it is what forced RFC 0017's dual decoder
+> when it was violated, #276). The criterion now asserts the invariant
+> plus **floors** (arrow ≥ 59, DataFusion ≥ 55) — a routine upgrade
+> passes, a downgrade that would drag `thrift` back fails. Literal
+> versions live where they are executable: `Cargo.toml` and the
+> lockfile.
+>
+> *(`accepted`, 2026-08-25, maintainer sign-off: covered the shipped
+> **phase 1** scope, RFC0021.1–.6.)*
 
 ## 1. Summary
 
@@ -126,10 +151,48 @@ arrow major**. Expected churn:
 - **The compactor's conditional-PUT CAS (RFC 0013 §3.3/§3.4)** is
   untouched — object_store does not move in this phase.
 
-### 3.2 Phase 2 — object_store ≥ 0.14 + parquet 59 (upstream-gated)
+### 3.2a Phase 2a — arrow 59 + parquet 59 (landed 2026-08-28)
 
-Opens when a released DataFusion carries them (watch DataFusion 55).
-Scope, known today:
+DataFusion 55.0.0 pins arrow/parquet `^59.2`, so the parquet half of
+the original phase 2 became available on its own:
+
+- `parquet` 59 drops `thrift` → the lockfile has none, `cargo deny`
+  passes, and the GHSA ignore matches nothing (#295 closed).
+- `paste` also leaves the tree, retiring the RUSTSEC-2024-0436 ignore.
+- MSRV 1.88 → 1.94 (DataFusion 55's floor). That enables clippy's
+  `duration_suboptimal_units`, which suggests `Duration::from_days` /
+  `from_mins` — both **unstable** (rust-lang/rust#120301) — so it is
+  allowed workspace-wide with that reason rather than chased into
+  nightly-only APIs.
+- API churn was two items: an `arrow-cast` pin, and DataFusion 55's new
+  required `ExecutionPlan::apply_expressions` (three test doubles in
+  `ourios-df-otel`). No production code changed.
+- **`execution.collect_statistics` is turned off on the querier's
+  session** (`ourios_querier::exec::session`), which is the one
+  behavioural decision in this phase. DataFusion 55 substitutes
+  columns that per-file statistics prove constant; the all-NULL case
+  folds to a NULL literal, collapsing predicates like
+  `body == "…"` to a bare constant, which leaves no column reference
+  for a pruning predicate — so RFC 0044's body-equality queries scan
+  every row group instead of skipping them (pillar #1, and the
+  RFC0044.7/.8 + RFC0007.1 tests caught it). Upstream bug
+  [apache/datafusion#24769]; fix proposed in
+  [apache/datafusion#24770], bisected to DataFusion #22969 which
+  made `collect_statistics` the session-level default.
+
+  The override is not purely defensive: statistics collection also
+  costs a footer read **per file at plan time**, which a many-file log
+  store pays on every query, and Ourios derives its own pruning from
+  the RFC 0009 manifest plus partition-directory windowing rather than
+  from DataFusion's collected file statistics. Revisit when the
+  upstream fix ships in a release we depend on — the same three
+  pruning tests are the gate in both directions.
+
+### 3.2b Phase 2b — object_store ≥ 0.14 (still upstream-gated)
+
+DataFusion 55 still pins `object_store ^0.13.2`, so this half did not
+open. Trigger unchanged: a released DataFusion that accepts
+object_store 0.14. Scope, known today:
 
 - `object_store` 0.13 → 0.14+ API churn concentrated in
   `crates/ourios-parquet/src/store.rs` (`AmazonS3Builder`,
@@ -174,20 +237,28 @@ DataFusion 54 carries arrow 58 — reintroducing the dual-arrow split
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2 = `.7`–`.9`
-(**upstream-gated**: their stubs land red only when phase 2 opens).
+Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2a = `.8` and
+the deny half of `.9`. **This section lists only criteria whose
+trigger has fired** — `green` means all of them pass, per
+`docs/rfcs/README.md`. Phase 2b's criteria live in §5b below and are
+**inactive**: they enter this ledger (as red stubs, moving the RFC
+back to `red`) the day a released DataFusion accepts object_store
+≥ 0.14, and not before.
 
-> **Status note (2026-07-03):** phase 1 is complete — `.1`–`.6` are
-> discharged (#339 dependency bump, #340 decoder unification; indicative
-> B1/B2 ci-runner run on #340). `green` here covers phase 1; opening
-> phase 2 lands `.7`–`.9` as red stubs and moves the status back to
-> `red` until they pass.
+> **Status note (2026-08-29):** phase 1 discharged 2026-07-03 (#339,
+> #340; indicative B1/B2 ci-runner run on #340). Phase 2a discharged
+> 2026-08-29 (`.1` re-baselined per the header, `.8` landed, `.9`'s
+> deny half green). The 2026-07-03 note's "opening phase 2 moves the
+> status back to `red`" now applies to **phase 2b** — 2a opened and
+> closed within one PR, so the red window collapsed to nothing.
 
-> **Scenario RFC0021.1 — one arrow.**
-> Given the phase-1 bump,
+> **Scenario RFC0021.1 — one arrow (re-baselined, see header).**
+> Given the current dependency set,
 > When the workspace lockfile is inspected,
-> Then exactly one arrow major (58.x) and `datafusion 54.x` are
-> present, and the workspace builds with MSRV 1.88.
+> Then exactly one arrow major and exactly one `datafusion` version
+> are present, with floors arrow ≥ 59 / DataFusion ≥ 55 (a downgrade
+> that would drag `thrift` back fails), and the workspace builds with
+> the pinned MSRV (1.94).
 
 > **Scenario RFC0021.2 — old files read identically (§3.5).**
 > Given Parquet files written by the pre-upgrade writer (committed
@@ -221,21 +292,36 @@ Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2 = `.7`–`.9`
 > Then the complete suite passes — including `s3 integration
 > (localstack)` (the CAS paths, untouched) and `live-check (weaver)`.
 
-> **Scenario RFC0021.7 (phase 2) — CAS survives object_store 0.14.**
+> **Scenario RFC0021.8 (phase 2a — green) — thrift is gone.**
+> Given the parquet 59 bump,
+> When the lockfile is inspected,
+> Then no `thrift` crate is present (#295 closed).
+> Asserted by `rfc0021_8_thrift_is_absent_from_the_lockfile`.
+
+> **Scenario RFC0021.9 (phase 2a half) — supply chain re-cleared.**
+> Given the new transitive set,
+> When `cargo deny check` runs,
+> Then it passes (it does, and the dead RUSTSEC-2024-0436 `paste`
+> ignore was removed). The quick-xml half of this criterion is phase
+> 2b's — see §5b.
+
+### 5b. Phase 2b criteria (inactive — trigger not fired)
+
+These activate, as red stubs in §5, when a released DataFusion accepts
+object_store ≥ 0.14 (epic #314). Until then they are forward
+declarations, not acceptance criteria, and do not count against the
+status.
+
+> **Scenario RFC0021.7 — CAS survives object_store 0.14.**
 > Given the object_store bump,
 > When the RFC0013.3/.4 conditional-PUT localstack suites run,
 > Then concurrent-sweep publish semantics are preserved.
 
-> **Scenario RFC0021.8 (phase 2) — thrift is gone.**
-> Given the parquet 59 bump,
-> When the lockfile is inspected,
-> Then no `thrift` crate is present (#295 closed).
-
-> **Scenario RFC0021.9 (phase 2) — supply chain re-cleared.**
-> Given the new transitive set,
-> When `cargo deny check` runs,
-> Then it passes with the renovate hold lifted (#313) and the
-> quick-xml ignores removed iff object_store pins quick-xml ≥ 0.41.
+> **Scenario RFC0021.9 (phase 2b half) — quick-xml ignores retired.**
+> Given the object_store ≥ 0.14 transitive set,
+> When `cargo deny check` runs with the renovate hold lifted (#313),
+> Then it passes with the quick-xml ignores removed iff object_store
+> pins quick-xml ≥ 0.41.
 
 ## 6. Testing strategy
 

@@ -36,6 +36,41 @@ pub(crate) enum SchemaMode<'a> {
     Infer,
 }
 
+/// The session every query path runs on.
+///
+/// `execution.collect_statistics` is **off** deliberately (RFC 0021
+/// §3.2a). With it on, `DataFusion` substitutes columns that per-file
+/// statistics prove constant — and folding an all-NULL column to a
+/// NULL literal collapses predicates like `body == "…"` to a bare
+/// constant, which leaves no column reference for a pruning predicate
+/// to be built over, so the row groups are scanned instead of skipped
+/// (upstream apache/datafusion#24769, fix proposed in #24770). That
+/// defeats pillar #1 on exactly the queries RFC 0044 exists to make
+/// fast. Collection also costs a per-file footer read at plan time,
+/// which a many-file log store pays on every query.
+///
+/// Remove this override once the upstream fix ships in a release we
+/// depend on; the RFC0044.7/.8 and RFC0007.1 pruning tests are the
+/// gate that will catch it either way.
+pub(crate) fn session() -> SessionContext {
+    let mut config = datafusion::prelude::SessionConfig::new();
+    config.options_mut().execution.collect_statistics = false;
+    SessionContext::new_with_config(config)
+}
+
+#[cfg(test)]
+mod session_tests {
+    #[test]
+    fn the_shared_session_disables_statistics_collection() {
+        let ctx = super::session();
+        assert!(
+            !ctx.state().config().options().execution.collect_statistics,
+            "collect_statistics must stay off until apache/datafusion#24769 is \
+             fixed in a release we depend on (see session())"
+        );
+    }
+}
+
 /// Register `urls` as listing table `name` on `ctx` and return its
 /// `DataFrame`. **Tenancy** is not a parameter here by design: the
 /// §3.7 scope is enforced where URLs are *resolved* (the tenant-

@@ -19,8 +19,8 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 338 |
-| `MIT` | 72 |
+| `Apache-2.0` | 339 |
+| `MIT` | 69 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 8 |
 | `ISC` | 4 |
@@ -469,21 +469,21 @@ Used by:
 
 Used by:
 
-- `arrow-arith` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-array` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-csv` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-json` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-row` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 58.4.0 — <https://github.com/apache/arrow-rs>
-- `arrow-string` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `arrow` 58.3.0 — <https://github.com/apache/arrow-rs>
-- `parquet` 58.4.0 — <https://github.com/apache/arrow-rs>
+- `arrow-arith` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-csv` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-json` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-row` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-string` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `parquet` 59.2.0 — <https://github.com/apache/arrow-rs>
 - `utf8_iter` 1.0.4 — <https://github.com/hsivonen/utf8_iter>
 - `zeroize` 1.9.0 — <https://github.com/RustCrypto/utils>
 - `zeroize_derive` 1.5.0 — <https://github.com/RustCrypto/utils>
@@ -922,36 +922,36 @@ Used by:
 
 Used by:
 
-- `datafusion-catalog-listing` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-catalog` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-common-runtime` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-common` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-arrow` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-csv` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-json` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-parquet` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-doc` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-execution` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr-common` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate-common` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-nested` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-table` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window-common` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-macros` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-optimizer` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-adapter` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-common` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-optimizer` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-plan` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-pruning` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-session` 54.1.0 — <https://github.com/apache/datafusion>
-- `datafusion` 54.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog-listing` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-common-runtime` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-common` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-arrow` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-csv` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-json` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-parquet` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-doc` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-execution` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr-common` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate-common` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-nested` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-table` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window-common` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-macros` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-optimizer` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-adapter` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-common` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-optimizer` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-plan` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-pruning` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-session` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion` 55.0.0 — <https://github.com/apache/datafusion>
 
 <details>
 <summary>Full license text</summary>
@@ -4684,6 +4684,7 @@ Used by:
 - `atomic-waker` 1.1.2 — <https://github.com/smol-rs/atomic-waker>
 - `autocfg` 1.5.1 — <https://github.com/cuviper/autocfg>
 - `base64` 0.22.1 — <https://github.com/marshallpierce/rust-base64>
+- `base64` 0.23.1 — <https://github.com/marshallpierce/rust-base64>
 - `bitflags` 2.13.0 — <https://github.com/bitflags/bitflags>
 - `bumpalo` 3.20.3 — <https://github.com/fitzgen/bumpalo>
 - `cc` 1.2.65 — <https://github.com/rust-lang/cc-rs>
@@ -4717,6 +4718,7 @@ Used by:
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
+- `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
 - `js-sys` 0.3.103 — <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys>
 - `lazy_static` 1.5.0 — <https://github.com/rust-lang-nursery/lazy-static.rs>
@@ -4726,6 +4728,7 @@ Used by:
 - `mime` 0.3.17 — <https://github.com/hyperium/mime>
 - `num-bigint-dig` 0.8.6 — <https://github.com/dignifiedquire/num-bigint>
 - `num-bigint` 0.4.8 — <https://github.com/rust-num/num-bigint>
+- `num-bigint` 0.5.1 — <https://github.com/rust-num/num-bigint>
 - `num-complex` 0.4.6 — <https://github.com/rust-num/num-complex>
 - `num-integer` 0.1.46 — <https://github.com/rust-num/num-integer>
 - `num-iter` 0.1.45 — <https://github.com/rust-num/num-iter>
@@ -6778,7 +6781,6 @@ Used by:
 - `opentelemetry-otlp` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp>
 - `opentelemetry` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry>
 - `opentelemetry_sdk` 0.32.1 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk>
-- `paste` 1.0.15 — <https://github.com/dtolnay/paste>
 - `pastey` 0.2.3 — <https://github.com/as1100k/pastey>
 - `pin-project-internal` 1.1.13 — <https://github.com/taiki-e/pin-project>
 - `pin-project-lite` 0.2.17 — <https://github.com/taiki-e/pin-project-lite>
@@ -6816,7 +6818,6 @@ Used by:
 - `sync_wrapper` 1.0.2 — <https://github.com/Actyx/sync_wrapper>
 - `thiserror-impl` 2.0.18 — <https://github.com/dtolnay/thiserror>
 - `thiserror` 2.0.18 — <https://github.com/dtolnay/thiserror>
-- `thrift` 0.17.0 — <https://github.com/apache/thrift/tree/master/lib/rs>
 - `time-core` 0.1.9 — <https://github.com/time-rs/time>
 - `time-macros` 0.2.31 — <https://github.com/time-rs/time>
 - `time` 0.3.53 — <https://github.com/time-rs/time>
@@ -8148,46 +8149,6 @@ THE SOFTWARE.
 
 Used by:
 
-- `ordered-float` 2.10.1 — <https://github.com/reem/rust-ordered-float>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-Copyright (c) 2015 Jonathan Reem
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-</details>
-
-### MIT License (`MIT`)
-
-Used by:
-
 - `schannel` 0.1.29 — <https://github.com/steffengy/schannel-rs>
 
 <details>
@@ -9104,7 +9065,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `arrow-array` 58.4.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.2.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9396,7 +9357,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 Used by:
 
 - `aho-corasick` 1.1.4 — <https://github.com/BurntSushi/aho-corasick>
-- `byteorder` 1.5.0 — <https://github.com/BurntSushi/byteorder>
 - `csv-core` 0.1.13 — <https://github.com/BurntSushi/rust-csv>
 - `csv` 1.4.0 — <https://github.com/BurntSushi/rust-csv>
 - `memchr` 2.8.2 — <https://github.com/BurntSushi/memchr>
@@ -9546,44 +9506,6 @@ SOFTWARE.
 
 Used by:
 
-- `integer-encoding` 3.0.4 — <https://github.com/dermesser/integer-encoding-rs>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2016 Google Inc. (lewinb@google.com) -- though not an official
-Google product or in any way related!
-Copyright (c) 2018-2020 Lewin Bormann (lbo@spheniscida.de)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to
-deal in the Software without restriction, including without limitation the
-rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-sell copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
-
-```
-
-</details>
-
-### MIT License (`MIT`)
-
-Used by:
-
 - `pem` 3.0.6 — <https://github.com/jcreekmore/pem-rs.git>
 
 <details>
@@ -9657,7 +9579,7 @@ THE SOFTWARE.
 
 Used by:
 
-- `lz4_flex` 0.13.1 — <https://github.com/pseitz/lz4_flex>
+- `lz4_flex` 0.14.0 — <https://github.com/pseitz/lz4_flex>
 
 <details>
 <summary>Full license text</summary>

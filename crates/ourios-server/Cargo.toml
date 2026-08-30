@@ -140,7 +140,7 @@ jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["rus
 # real Parquet footer, so the MCP cost-model resource is pinned to the
 # writer rather than to repeated literals. Already in the tree via
 # ourios-parquet — no new compilation unit versions.
-parquet = { version = "=58.4.0", default-features = false, features = ["arrow", "zstd"] }
+parquet = { version = "=59.2.0", default-features = false, features = ["arrow", "zstd"] }
 bytes = { version = "=1.12.1", default-features = false }
 # The RFC0029.7 Dex arm mints real tokens (form POST to the container's
 # token endpoint) and polls readiness — same crate + TLS stack as the

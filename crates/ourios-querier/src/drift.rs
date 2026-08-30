@@ -212,7 +212,7 @@ async fn audit_dataframe(
     files: &audit_scan::AuditFiles,
     tenant: &TenantId,
 ) -> Result<(SessionContext, datafusion::prelude::DataFrame), QueryError> {
-    let ctx = SessionContext::new();
+    let ctx = crate::exec::session();
     let urls = audit_table_urls(&ctx, backend, files)?;
     // Bare inference is an explicit choice here: audit files share one
     // schema by construction — see `SchemaMode::Infer` (epic #745

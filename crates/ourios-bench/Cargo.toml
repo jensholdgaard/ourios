@@ -111,7 +111,7 @@ tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-t
 # tests: opens a comparative-store file's Parquet footer directly to
 # check the promoted column the writer declared. Same major as the
 # workspace arrow/parquet tree, so Cargo.lock pins one copy.
-parquet = { version = "=58.4.0", default-features = false, features = ["arrow"] }
+parquet = { version = "=59.2.0", default-features = false, features = ["arrow"] }
 # RFC0024.2 draws calibrated records through a fixed-seed
 # `TestRunner` (the strategies come from `ourios-testgen`, already a
 # regular dependency above).

@@ -65,7 +65,8 @@ mod session_tests {
         let ctx = super::session();
         assert!(
             !ctx.state().config().options().execution.collect_statistics,
-            "collect_statistics must stay off until apache/datafusion#24769              is fixed in a release we depend on (see session())"
+            "collect_statistics must stay off until apache/datafusion#24769 is \
+             fixed in a release we depend on (see session())"
         );
     }
 }

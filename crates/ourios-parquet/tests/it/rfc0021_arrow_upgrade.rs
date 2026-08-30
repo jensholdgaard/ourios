@@ -248,6 +248,33 @@ fn rfc0021_1_one_arrow_major_and_one_datafusion() {
         df_major >= 55,
         "datafusion major >= 55 (phase 2a floor), got {df_major}"
     );
+
+    // The MSRV half of the criterion: same floor semantics as above — a
+    // deliberate raise passes, an accidental downgrade (which the
+    // DataFusion 55 floor requires 1.94 for) fails.
+    let manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace Cargo.toml");
+    let msrv = manifest
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("rust-version = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .expect("workspace manifest pins rust-version");
+    let mut parts = msrv.split('.');
+    let msrv_major: u32 = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("MSRV major is numeric");
+    let msrv_minor: u32 = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("MSRV minor is numeric");
+    assert!(
+        (msrv_major, msrv_minor) >= (1, 94),
+        "workspace rust-version >= 1.94 (phase 2a floor), got {msrv}"
+    );
 }
 
 /// Scenario RFC0021.8 (phase 2a) — thrift is gone.

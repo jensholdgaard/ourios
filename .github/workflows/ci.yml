@@ -105,7 +105,7 @@ jobs:
       # (12x the warm suite wall time locally — epic #382). Doctests are not
       # in nextest's model, so `cargo test --doc` keeps them covered — the
       # pair preserves the exact suite inventory (RFC0028.5).
-      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
@@ -281,7 +281,7 @@ jobs:
       # mdbook-mermaid: RFC diagrams are Mermaid (docs/rfcs/README.md).
       # The preprocessor is declared in book.toml, so the binary must be
       # on PATH or `mdbook build` fails with "preprocessor not found".
-      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
       - run: mdbook build
@@ -646,7 +646,7 @@ jobs:
       # schema, advisory handling) can't change under us when a new release
       # lands; bump deliberately (Renovate/manual) alongside any deny.toml
       # changes the new version needs.
-      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
@@ -737,7 +737,7 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-llvm-cov
       # Collect once (runs the test suite under instrumentation), then

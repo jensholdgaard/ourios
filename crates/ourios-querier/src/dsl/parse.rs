@@ -467,11 +467,15 @@ fn lex_ident(input: &str, start: usize) -> (String, usize) {
 /// surface (RFC 0027), so the descent has to be bounded or a short query can
 /// exhaust the stack.
 ///
-/// 128 is `serde_json`'s default recursion limit, which already bounds the
+/// 128 is `serde_json`'s default recursion limit, which is what bounds the
 /// structured surface — [`super::parse_structured`] builds its tree through
-/// `serde_json`, so both DSL surfaces refuse at the same order of nesting.
-/// It is far above real queries (the deepest RFC 0002 cookbook seed nests one
-/// level) and far below the tokio worker stack this runs on.
+/// `serde_json` and has no counter of its own. The two are the same order but
+/// not the same number: the structured envelope and the innermost node each
+/// spend a level, so that surface refuses at 126 nested nodes where this one
+/// refuses at 129 (see `nesting_is_bounded_by_the_json_recursion_limit`).
+/// Either way the ceiling is far above real queries — the deepest RFC 0002
+/// cookbook seed nests one level — and far below the tokio worker stack this
+/// runs on.
 const MAX_PREDICATE_DEPTH: usize = 128;
 
 struct Parser<'a> {

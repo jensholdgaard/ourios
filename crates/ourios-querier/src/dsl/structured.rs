@@ -706,18 +706,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_json_nested_past_the_recursion_limit() {
-        // The structured surface gets its depth bound from `serde_json`, whose
-        // default recursion limit refuses the input before the `RawNode` walk
-        // ever runs — the counterpart to the string surface's
-        // `MAX_PREDICATE_DEPTH`, which is set to the same 128. The RFC 0015
-        // `dsl_parse` target feeds one input to both parsers, so both have to
-        // hold; this is the arm that covers the nested-array shape libFuzzer
-        // produced (`fuzz/seeds/dsl_parse/regression_deep_nest_01`).
-        let deep = format!("{}0{}", "[".repeat(600), "]".repeat(600));
-        assert!(parse_structured(&deep).is_err());
-        // Unterminated, the shape the fuzzer actually minimised to.
-        assert!(parse_structured(&"[".repeat(600)).is_err());
+    fn nesting_is_bounded_by_the_json_recursion_limit() {
+        // The structured surface carries no depth counter of its own:
+        // `serde_json`'s 128-level recursion limit bounds it, spent one level
+        // per `{"not":…}` object plus the envelope and the innermost node. That
+        // puts the boundary at 125 accepted / 126 rejected — the same order as
+        // the string surface's `MAX_PREDICATE_DEPTH` of 128, but not the same
+        // number, which is why the two are documented separately.
+        //
+        // Both queries are *valid-shaped*, so depth is the only thing that can
+        // reject them. A bare nested array (the shape libFuzzer minimised to)
+        // would fail as a type error even with the limit lifted, and so would
+        // prove nothing about the bound.
+        let nest = |n: usize| {
+            format!(
+                "{{\"predicate\":{}{}{}}}",
+                "{\"not\":".repeat(n),
+                r#"{"const":true}"#,
+                "}".repeat(n)
+            )
+        };
+        assert!(
+            parse_structured(&nest(125)).is_ok(),
+            "125 nested nodes are within the limit and must parse"
+        );
+        let err = parse_structured(&nest(126)).unwrap_err();
+        assert!(
+            err.message().contains("recursion limit"),
+            "126 must be refused for depth, not shape: {}",
+            err.message()
+        );
     }
 
     #[test]

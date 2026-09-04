@@ -25,6 +25,7 @@ pub fn parse_statement(input: &str) -> Result<Statement, DslError> {
     let mut parser = Parser {
         tokens: &tokens,
         pos: 0,
+        depth: 0,
     };
     // `drift` is a reserved verb head (RFC 0010 §6.1): a query that opens with
     // it is a drift query, not a `drift == …` log predicate.
@@ -460,12 +461,43 @@ fn lex_ident(input: &str, start: usize) -> (String, usize) {
 
 // ---- parser -------------------------------------------------------------
 
+/// Ceiling on predicate nesting. `not` chains and parenthesised groups both
+/// recurse through [`Parser::parse_unary`], and this is a recursive-descent
+/// parser fed untrusted query text by `/v1/query` (RFC 0016) and the MCP
+/// surface (RFC 0027), so the descent has to be bounded or a short query can
+/// exhaust the stack.
+///
+/// 128 is `serde_json`'s default recursion limit, which already bounds the
+/// structured surface — [`super::parse_structured`] builds its tree through
+/// `serde_json`, so both DSL surfaces refuse at the same order of nesting.
+/// It is far above real queries (the deepest RFC 0002 cookbook seed nests one
+/// level) and far below the tokio worker stack this runs on.
+const MAX_PREDICATE_DEPTH: usize = 128;
+
 struct Parser<'a> {
     tokens: &'a [Tok],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
+    /// Run `f` one nesting level deeper, refusing to descend past
+    /// [`MAX_PREDICATE_DEPTH`].
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, DslError>,
+    ) -> Result<T, DslError> {
+        if self.depth >= MAX_PREDICATE_DEPTH {
+            return Err(DslError::new(format!(
+                "predicate nests deeper than {MAX_PREDICATE_DEPTH} levels"
+            )));
+        }
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
+    }
+
     fn peek(&self) -> Option<&'a Tok> {
         self.tokens.get(self.pos)
     }
@@ -589,11 +621,11 @@ impl<'a> Parser<'a> {
     /// `unary = [ "not" | "!" ] , ( comparison | call | bool_lit | "(" predicate ")" )`.
     fn parse_unary(&mut self) -> Result<Predicate, DslError> {
         if self.eat(&Tok::Bang) || self.eat_keyword("not") {
-            let inner = self.parse_unary()?;
+            let inner = self.nested(Self::parse_unary)?;
             return Ok(Predicate::Not(Box::new(inner)));
         }
         if self.eat(&Tok::LParen) {
-            let inner = self.parse_predicate()?;
+            let inner = self.nested(Self::parse_predicate)?;
             self.expect(&Tok::RParen, "')' to close the group")?;
             return Ok(inner);
         }
@@ -1224,6 +1256,7 @@ pub(crate) fn parse_time_pub(s: &str) -> Result<Time, DslError> {
     let mut parser = Parser {
         tokens: &tokens,
         pos: 0,
+        depth: 0,
     };
     let time = parser.parse_time()?;
     parser.expect_eof()?;
@@ -1516,6 +1549,72 @@ mod tests {
     fn rejects_malformed_duration_and_timestamp() {
         assert!(parse("ts >= -1hour").is_err());
         assert!(parse_time_pub("2026-13-02T03:04:05Z").is_err());
+    }
+
+    #[test]
+    fn accepts_nesting_at_the_depth_ceiling() {
+        // The bound must reject only what is past it: a group nested exactly
+        // to the ceiling is still a legal query.
+        let at_limit = format!(
+            "{}body == 1{}",
+            "(".repeat(MAX_PREDICATE_DEPTH),
+            ")".repeat(MAX_PREDICATE_DEPTH)
+        );
+        assert!(
+            parse(&at_limit).is_ok(),
+            "depth {MAX_PREDICATE_DEPTH} must parse"
+        );
+    }
+
+    #[test]
+    fn rejects_nesting_past_the_depth_ceiling() {
+        // Regression (RFC 0015 fuzz target `dsl_parse`): `/v1/query` and the
+        // MCP surface hand this parser untrusted text, and every recursive
+        // head used to descend without a bound — libFuzzer drove it into both
+        // an out-of-memory and a 1611-second timeout. Each head must now come
+        // back as a typed `DslError`.
+        let over = MAX_PREDICATE_DEPTH + 1;
+        for input in [
+            format!("{}body == 1", "(".repeat(over)),
+            format!("{}body == 1", "not ".repeat(over)),
+            format!("{}body == 1", "!".repeat(over)),
+        ] {
+            let err = parse(&input).unwrap_err();
+            assert!(
+                err.message().contains("nests deeper"),
+                "expected a depth error, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn handles_the_minimised_fuzz_artifact() {
+        // The shape libFuzzer minimised to before the bound existed: 35 nested
+        // arrays split by a run of control characters, driven through the same
+        // pair of parsers the `dsl_parse` target calls. Spelled out here
+        // rather than read from the seed file, so this crate's tests do not
+        // reach into the workspace-excluded `fuzz/` tree; the byte-exact copy
+        // lives at `fuzz/seeds/dsl_parse/regression_deep_nest_01` for the
+        // corpus. Both parsers must return a typed error, not hang or abort.
+        let text = format!(
+            "[[  {}\r{}\r{}{}    0    {}",
+            "[".repeat(11),
+            "\t".repeat(34),
+            "\t".repeat(5),
+            "[".repeat(22),
+            "]".repeat(35),
+        );
+        assert!(parse(&text).is_err());
+        assert!(crate::dsl::parse_structured(&text).is_err());
+    }
+
+    #[test]
+    fn depth_ceiling_tracks_depth_not_total_groups() {
+        // The counter must unwind on the way out: a wide flat chain of sibling
+        // groups goes far past the ceiling in total yet never nests past one.
+        let wide = vec!["(body == 1)"; MAX_PREDICATE_DEPTH * 4].join(" and ");
+        assert!(parse(&wide).is_ok());
     }
 
     #[test]

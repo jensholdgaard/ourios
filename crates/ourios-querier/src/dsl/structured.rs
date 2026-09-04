@@ -13,7 +13,7 @@
 //! [`Time`]. The RFC0002.2 equivalence is over the queries both surfaces can
 //! express; a duration-valued *comparison* is a string-DSL-only construct.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::DslError;
 use super::ir::{
@@ -163,14 +163,21 @@ fn name_to_field(name: &str) -> Result<Field, DslError> {
     .ok_or_else(|| DslError::new(format!("unknown field name {name:?}")))
 }
 
-/// A predicate node (§6.4 `<node>`). `untagged` so the present keys select the
-/// variant — comparison, call, const, or boolean. `serde` forbids
-/// `deny_unknown_fields` on an `untagged` enum (and on its variants), so each
-/// variant carries a dedicated struct that denies unknown keys itself; a node
-/// with a stray extra key matches no variant and is rejected rather than
-/// silently coerced (RFC0002.2 / §6.4 surface contract).
-#[derive(Deserialize)]
-#[serde(untagged)]
+/// A predicate node (§6.4 `<node>`): the key present selects the variant —
+/// comparison, call, const, or a boolean combinator. Each variant carries a
+/// dedicated struct that denies unknown keys, so a node with a stray extra key
+/// is rejected rather than silently coerced (RFC0002.2 / §6.4 surface
+/// contract).
+///
+/// The selection is spelled out below rather than left to `#[serde(untagged)]`.
+/// Untagged buffers each node and re-tries every variant in turn, so nesting
+/// multiplies: a node `d` deep costs on the order of `2^d` time and memory.
+/// The RFC 0015 `dsl_parse` fuzz target drove that into both an out-of-memory
+/// and a 1611-second timeout from a 122-byte query, and this parser takes
+/// untrusted text from `/v1/query` (RFC 0016) and the MCP surface (RFC 0027).
+/// Dispatching on the tag makes each node constant-cost and keeps the precise
+/// per-field errors — the same reason [`parse_structured_statement`] selects
+/// the `drift` envelope by key.
 enum RawNode {
     Comparison(RawComparison),
     Call(RawCall),
@@ -178,6 +185,43 @@ enum RawNode {
     And(RawAnd),
     Or(RawOr),
     Not(RawNot),
+}
+
+/// The keys that name a node's form, in §6.4 order. Exactly one must be
+/// present.
+const NODE_TAGS: [&str; 6] = ["field", "call", "const", "and", "or", "not"];
+
+impl<'de> Deserialize<'de> for RawNode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object() else {
+            return Err(D::Error::custom("a predicate node must be a JSON object"));
+        };
+        let mut present = NODE_TAGS.iter().filter(|tag| object.contains_key(**tag));
+        let (Some(tag), None) = (present.next(), present.next()) else {
+            return Err(D::Error::custom(format!(
+                "a predicate node needs exactly one of {}",
+                NODE_TAGS
+                    .iter()
+                    .map(|tag| format!("`{tag}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        // The variant struct validates the rest of the node, unknown keys
+        // included, so a mis-keyed node still fails here rather than coercing.
+        match *tag {
+            "field" => serde_json::from_value(value).map(Self::Comparison),
+            "call" => serde_json::from_value(value).map(Self::Call),
+            "const" => serde_json::from_value(value).map(Self::Const),
+            "and" => serde_json::from_value(value).map(Self::And),
+            "or" => serde_json::from_value(value).map(Self::Or),
+            _ => serde_json::from_value(value).map(Self::Not),
+        }
+        .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Deserialize)]
@@ -636,6 +680,45 @@ fn parse_time(s: &str) -> Result<Time, DslError> {
 mod tests {
     use super::parse_structured;
     use crate::dsl::ir::{Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Stage, Value};
+
+    #[test]
+    fn nested_nodes_stay_linear() {
+        // Regression (RFC 0015 fuzz target `dsl_parse`): `RawNode` used to be
+        // `#[serde(untagged)]`, which re-tries every variant per node and so
+        // cost ~2^depth — 20 levels already took over a second, and the 35
+        // levels libFuzzer minimised to ran out of memory. Depth is what has
+        // to stay cheap, so nest well past that and hold it to a wall-clock
+        // bound loose enough not to flake on a loaded runner but far below the
+        // old curve, which would need hours here.
+        let deep = format!(
+            "{{\"predicate\":{}{}{}}}",
+            "{\"not\":".repeat(60),
+            r#"{"const":true}"#,
+            "}".repeat(60)
+        );
+        let start = std::time::Instant::now();
+        assert!(parse_structured(&deep).is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "60 nested nodes took {elapsed:?}; the untagged blow-up is back"
+        );
+    }
+
+    #[test]
+    fn rejects_json_nested_past_the_recursion_limit() {
+        // The structured surface gets its depth bound from `serde_json`, whose
+        // default recursion limit refuses the input before the `RawNode` walk
+        // ever runs — the counterpart to the string surface's
+        // `MAX_PREDICATE_DEPTH`, which is set to the same 128. The RFC 0015
+        // `dsl_parse` target feeds one input to both parsers, so both have to
+        // hold; this is the arm that covers the nested-array shape libFuzzer
+        // produced (`fuzz/seeds/dsl_parse/regression_deep_nest_01`).
+        let deep = format!("{}0{}", "[".repeat(600), "]".repeat(600));
+        assert!(parse_structured(&deep).is_err());
+        // Unterminated, the shape the fuzzer actually minimised to.
+        assert!(parse_structured(&"[".repeat(600)).is_err());
+    }
 
     #[test]
     fn parses_comparison_with_attr_object() {

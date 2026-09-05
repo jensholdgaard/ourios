@@ -43,10 +43,22 @@
         "cargo"
       ],
       "matchPackageNames": [
-        "/^arrow(-[a-z]+)*$/"
+        "/^arrow(-[a-z]+)*$/",
+        "parquet"
       ],
-      "allowedVersions": "<59",
-      "description": "Hold the arrow crate family at 58.x. DataFusion 54 pins arrow ^58, so a standalone arrow 59 bump splits the workspace's arrow types and breaks the build. Lift together with the DataFusion 55 upgrade (RFC 0021 phase 2, which also gates the thrift advisory, #295) - the same pattern as the object_store hold below."
+      "groupName": "arrow + parquet",
+      "allowedVersions": "<60",
+      "description": "arrow and parquet share one version number and must move together (parquet 59.x pins arrow-* ^59.x), so a bump to either alone fails resolution. Renovate PR #776 did exactly that: parquet 59.2 to 59.3 while arrow-* stayed on 59.2, because this rule matched only arrow. Grouping them lands both in one PR. Held below 60 because DataFusion 55 pins arrow/parquet ^59.2; the next major is the RFC 0021 phase-2 pattern and lifts together with the DataFusion bump that requires it."
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "zstd"
+      ],
+      "allowedVersions": "<0.14.0",
+      "description": "Hold zstd at 0.13.x. The direct zstd dependency in ourios-bench and ourios-querier exists to share the copy parquet already pulls in (see their Cargo.toml comments), and parquet 59 pins zstd ^0.13. A standalone bump to 0.14 resolves, but only by adding a second zstd and zstd-safe to the tree, the opposite of why the dependency is declared (Renovate PR #776). Lift together with the parquet that requires zstd 0.14."
     },
     {
       "matchManagers": [
@@ -56,7 +68,7 @@
         "object_store"
       ],
       "allowedVersions": "<0.14.0",
-      "description": "Hold object_store at 0.13.x. DataFusion 53 pins object_store ^0.13, and ourios-querier hands ourios-parquet's Store::object_store() to DataFusion's register_object_store (RFC 0013 \u00a72.2), so the two crates must share one object_store version. Bumping to 0.14 splits the Arc<dyn ObjectStore> type at that boundary and breaks the build. Lift this together with a DataFusion upgrade (which also gates the thrift advisory, #295)."
+      "description": "Hold object_store at 0.13.x. DataFusion 55 still pins object_store ^0.13.2, and ourios-querier hands ourios-parquet's Store::object_store() to DataFusion's register_object_store (RFC 0013 \u00a72.2), so the two crates must share one object_store version. Bumping to 0.14 splits the Arc<dyn ObjectStore> type at that boundary and breaks the build. This is RFC 0021 phase 2b (epic #314): lift when a released DataFusion accepts object_store 0.14. The DataFusion 55 upgrade did not open it."
     },
     {
       "matchManagers": [
@@ -66,7 +78,7 @@
         "reqwest"
       ],
       "allowedVersions": "<0.13.0",
-      "description": "Hold reqwest at 0.12.x. reqwest 0.13 drops the rustls-tls-manual-roots feature ourios-ingester's OTLP exporter path uses, and object_store 0.12/0.13 still require reqwest ^0.12, so a standalone bump fails resolution (Renovate PR #505's plan failure). Lift together with the DataFusion 55 upgrade (RFC 0021 phase 2, #295) - the same pattern as the arrow and object_store holds above."
+      "description": "Hold reqwest at 0.12.x. reqwest 0.13 drops the rustls-tls-manual-roots feature ourios-ingester's OTLP exporter path uses, and object_store 0.12/0.13 still require reqwest ^0.12, so a standalone bump fails resolution (Renovate PR #505's plan failure). Lift together with the object_store hold above (RFC 0021 phase 2b); the DataFusion 55 upgrade did not open it, because DataFusion 55 still pins object_store 0.13."
     },
     {
       "matchManagers": [

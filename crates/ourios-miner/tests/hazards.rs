@@ -1,13 +1,7 @@
-//! RFC 0001 §5.1 — Hazards. Acceptance criteria stubs for H1, H2,
-//! H5, H7. Each `#[test]` carries the scenario id in its doc
-//! comment so `grep -R "H1.1" .` resolves bidirectionally between
-//! the RFC and the tests (`docs/verification.md` §2.3).
-//!
-//! Stubs are tagged `#[ignore]` so the default `cargo test`
-//! invocation skips them (outer loop / CI stays green). The Red
-//! signal lives at the inner loop: an implementor working on a
-//! stub runs `cargo test <name> -- --ignored` and watches the
-//! `todo!()` panic. See `docs/verification.md` §3.
+//! RFC 0001 §5.1 — Hazards. Acceptance criteria for H1, H2, H5, H7.
+//! Each `#[test]` carries the scenario id in its doc comment so
+//! `grep -R "H1.1" .` resolves bidirectionally between the RFC and the
+//! tests (`docs/verification.md` §2.3).
 
 /// Scenario H1.1 — Semantically distinct templates do not silently merge.
 /// See `docs/rfcs/0001-template-miner.md` §5.

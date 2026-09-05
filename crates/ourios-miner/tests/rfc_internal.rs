@@ -1,14 +1,7 @@
-//! RFC 0001 §5.3 — RFC-internal design commitments. Acceptance
-//! criteria stubs for `RFC0001.x`. Each `#[test]` carries the
-//! scenario id in its doc comment so `grep -R "RFC0001.1" .`
-//! resolves bidirectionally between the RFC and the tests
-//! (`docs/verification.md` §2.3).
-//!
-//! Stubs are tagged `#[ignore]` so the default `cargo test`
-//! invocation skips them (outer loop / CI stays green). The Red
-//! signal lives at the inner loop: an implementor working on a
-//! stub runs `cargo test <name> -- --ignored` and watches the
-//! `todo!()` panic. See `docs/verification.md` §3.
+//! RFC 0001 §5.3 — RFC-internal design commitments. Acceptance criteria
+//! for `RFC0001.x`. Each `#[test]` carries the scenario id in its doc
+//! comment so `grep -R "RFC0001.1" .` resolves bidirectionally between
+//! the RFC and the tests (`docs/verification.md` §2.3).
 
 /// Scenario RFC0001.1 — **superseded by RFC 0017 §3.1.** The original
 /// RFC0001.1 contract was "fresh-leaf creation does not emit an audit

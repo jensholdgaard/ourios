@@ -18,3 +18,33 @@
 id = "RUSTSEC-2026-0185"
 ignoreUntil = 2026-12-31
 reason = "quinn-proto not in the build graph (lockfile-only; cargo tree --target all --all-features finds nothing); ignoreUntil re-checks in case it later enters the graph"
+
+# reason: quick-xml 0.39 (RUSTSEC-2026-0194 quadratic duplicate-attribute check;
+# RUSTSEC-2026-0195 unbounded namespace-declaration allocation) is transitive via
+# object_store, and no upgrade path exists yet: DataFusion 55 pins object_store
+# ^0.13, and even object_store 0.14 pins quick-xml ^0.40, both below the patched
+# >= 0.41. Exposure is low — quick-xml only parses XML responses from the
+# operator-configured S3 endpoint — and the impact is DoS, not corruption or
+# RCE. Mirrors the reasoned `deny.toml` ignore. Remove with the object_store
+# release that takes quick-xml >= 0.41 (RFC 0021 phase 2b, epic #314).
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0194"
+ignoreUntil = 2026-12-31
+reason = "quick-xml <0.41 DoS via object_store; no upgrade path until an object_store release takes quick-xml >=0.41 (RFC 0021 phase 2b); S3-endpoint XML only; mirrors deny.toml"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0195"
+ignoreUntil = 2026-12-31
+reason = "quick-xml <0.41 DoS via object_store; no upgrade path until an object_store release takes quick-xml >=0.41 (RFC 0021 phase 2b); S3-endpoint XML only; mirrors deny.toml"
+
+# reason: `rsa` Marvin timing side-channel (RUSTSEC-2023-0071, no patch
+# released) leaks private-key material through private-key-operation timing.
+# Ourios never performs RSA private-key operations in production: the RFC 0029
+# verifier only checks signatures against the issuer's public JWKS keys, and the
+# only signing is of throwaway per-test-process fixture keys in dev-dependencies.
+# Mirrors the reasoned `deny.toml` ignore. Re-evaluate if we ever sign
+# (issuer-side) rather than verify, or when the constant-time rewrite ships.
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2026-12-31
+reason = "rsa Marvin side-channel needs RSA private-key ops; Ourios only verifies with public JWKS keys and never signs in production; mirrors deny.toml"

@@ -2,10 +2,12 @@
 # `advisories.ignore` (which covers only the RustSec DB).
 #
 # Consumed by OpenSSF Scorecard's Vulnerabilities check (`.github/workflows/
-# scorecard.yml`), which runs OSV-Scanner; OSV-Scanner auto-discovers this file
-# at the repo root and honours its ignores. It scans the full lockfile, so it
-# flags advisories that have a GHSA/OSV id but no RustSec id (which `cargo deny`
-# misses) or that aren't in the build graph at all.
+# scorecard.yml`), which runs OSV-Scanner. OSV-Scanner looks for this file
+# beside each lockfile it scans — so it has to exist next to `fuzz/Cargo.lock`
+# too, which is why `fuzz/osv-scanner.toml` is a symlink to this one rather
+# than a second copy of the reasons that would drift. It scans the full
+# lockfile, so it flags advisories that have a GHSA/OSV id but no RustSec id
+# (which `cargo deny` misses) or that aren't in the build graph at all.
 #
 # Each entry is reviewed and accepted with a reason, and carries an `ignoreUntil`
 # so the finding re-surfaces for re-evaluation rather than being masked forever.

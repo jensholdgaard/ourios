@@ -86,7 +86,9 @@ jobs:
           # enough for the workspace, or `cargo fuzz build` fails resolution
           # before compiling anything. That is silent for a day, because
           # ClusterFuzzLite only runs on a schedule.
-          rustup toolchain install --profile minimal "$image" >/dev/null 2>&1
+          # stdout is progress noise; stderr is kept, so a failed install says
+          # why in the log rather than tripping `set -e` silently.
+          rustup toolchain install --profile minimal "$image" >/dev/null
           have="$(rustup run "$image" rustc --version | sed -E 's/^rustc ([0-9]+\.[0-9]+).*/\1/')"
           if [[ "$(printf '%s\n%s\n' "$msrv" "$have" | sort -V | head -1)" != "$msrv" ]]; then
             echo "::error::$image is rustc $have, older than the workspace MSRV of $msrv — ClusterFuzzLite will fail to build. Move both pins to a newer nightly."

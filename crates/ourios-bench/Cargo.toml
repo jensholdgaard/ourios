@@ -56,7 +56,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # bundled C library and `parquet`'s `zstd` feature already pulls
 # it into the tree, so the version is pinned by `Cargo.lock` and
 # A1 is reproducible across hosts without a system `zstd` binary.
-zstd = "0.14"
+zstd = "0.13"
 # A1 writes the Parquet output bucket somewhere measurable; when
 # `BenchConfig.bucket_dir` is `None`, `run` creates a scratch dir
 # here and (unless `--keep-parquet`) cleans it up on exit. The

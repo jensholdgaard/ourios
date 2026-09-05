@@ -94,7 +94,7 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # `zstd` feature already pulls it into the tree (via ourios-parquet, and
 # ourios-bench binds it directly as the A1 reference codec), so this
 # adds no new transitive crate and the version is pinned by `Cargo.lock`.
-zstd = "0.14"
+zstd = "0.13"
 
 [dev-dependencies]
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
@@ -133,8 +133,8 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # the same arrow/parquet 58 the whole workspace now shares
 # (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
 parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=59.2.0", default-features = false }
-arrow-schema = { version = "=59.2.0", default-features = false }
+arrow-array = { version = "=59.3.0", default-features = false }
+arrow-schema = { version = "=59.3.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
 serde_yaml_ng = { version = "=0.10.0", default-features = false }

@@ -206,7 +206,14 @@ release version:
     # bump above staled it and CI's `cargo about (no-diff)` gate would fail on
     # the release commit (it did for v0.5.0). Regenerate it in the same commit.
     cargo about generate --fail about.hbs > THIRD-PARTY-LICENSES.md
-    git add Cargo.toml Cargo.lock CHANGELOG.md THIRD-PARTY-LICENSES.md "$chart_yaml"
+    # fuzz/Cargo.lock pins the workspace crates by version too, and `fuzz/` is
+    # its own workspace, so `cargo check --workspace` above never touches it.
+    # Left alone it sits one version behind and the `deny` job's `--locked`
+    # guard fails on the release commit (it did for v0.10.0). `cargo metadata`
+    # makes the minimal lock update the bumped manifests require — nothing else
+    # moves — without needing the fuzz toolchain.
+    cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
+    git add Cargo.toml Cargo.lock fuzz/Cargo.lock CHANGELOG.md THIRD-PARTY-LICENSES.md "$chart_yaml"
     git commit -m "chore(release): v$version"
     git tag -a "v$version" -m "v$version"
     # Success: disarm the rollback trap.

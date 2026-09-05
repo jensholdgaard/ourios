@@ -19,10 +19,10 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 339 |
+| `Apache-2.0` | 338 |
 | `MIT` | 69 |
 | `Unicode-3.0` | 19 |
-| `BSD-3-Clause` | 8 |
+| `BSD-3-Clause` | 9 |
 | `ISC` | 4 |
 | `Zlib` | 3 |
 | `BSD-2-Clause` | 1 |
@@ -470,20 +470,20 @@ Used by:
 Used by:
 
 - `arrow-arith` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-array` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-buffer` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-cast` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-buffer` 59.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-cast` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `arrow-csv` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-data` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ipc` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-data` 59.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ipc` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `arrow-json` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-ord` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-ord` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `arrow-row` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-schema` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `arrow-select` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-schema` 59.3.0 — <https://github.com/apache/arrow-rs>
+- `arrow-select` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `arrow-string` 59.2.0 — <https://github.com/apache/arrow-rs>
 - `arrow` 59.2.0 — <https://github.com/apache/arrow-rs>
-- `parquet` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `parquet` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `utf8_iter` 1.0.4 — <https://github.com/hsivonen/utf8_iter>
 - `zeroize` 1.9.0 — <https://github.com/RustCrypto/utils>
 - `zeroize_derive` 1.5.0 — <https://github.com/RustCrypto/utils>
@@ -4702,7 +4702,7 @@ Used by:
 - `fastrand` 2.4.1 — <https://github.com/smol-rs/fastrand>
 - `find-msvc-tools` 0.1.9 — <https://github.com/rust-lang/cc-rs>
 - `fixedbitset` 0.5.7 — <https://github.com/petgraph/fixedbitset>
-- `flate2` 1.1.9 — <https://github.com/rust-lang/flate2-rs>
+- `flate2` 1.1.10 — <https://github.com/rust-lang/flate2-rs>
 - `fnv` 1.0.7 — <https://github.com/servo/rust-fnv>
 - `form_urlencoded` 1.2.2 — <https://github.com/servo/rust-url>
 - `glob` 0.3.3 — <https://github.com/rust-lang/glob>
@@ -6775,7 +6775,7 @@ Used by:
 - `ident_case` 1.0.1 — <https://github.com/TedDriggs/ident_case>
 - `itoa` 1.0.18 — <https://github.com/dtolnay/itoa>
 - `libc` 0.2.186 — <https://github.com/rust-lang/libc>
-- `miniz_oxide` 0.8.9 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
+- `miniz_oxide` 0.9.1 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
 - `num-conv` 0.2.2 — <https://github.com/jhpratt/num-conv>
 - `opentelemetry-appender-tracing` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-appender-tracing>
 - `opentelemetry-otlp` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp>
@@ -6791,7 +6791,7 @@ Used by:
 - `r-efi` 5.3.0 — <https://github.com/r-efi/r-efi>
 - `r-efi` 6.0.0 — <https://github.com/r-efi/r-efi>
 - `rand` 0.10.2 — <https://github.com/rust-random/rand>
-- `rand` 0.8.7 — <https://github.com/rust-random/rand>
+- `rand` 0.8.8 — <https://github.com/rust-random/rand>
 - `rand` 0.9.4 — <https://github.com/rust-random/rand>
 - `rand_chacha` 0.9.0 — <https://github.com/rust-random/rand>
 - `rand_xorshift` 0.4.0 — <https://github.com/rust-random/rngs>
@@ -6825,7 +6825,6 @@ Used by:
 - `utf8parse` 0.2.2 — <https://github.com/alacritty/vte>
 - `wasm-streams` 0.4.2 — <https://github.com/MattiasBuelens/wasm-streams/>
 - `zstd-safe` 7.2.4 — <https://github.com/gyscos/zstd-rs>
-- `zstd-sys` 2.0.16+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -7462,6 +7461,49 @@ BSD 3-Clause License
 
 Copyright (c) 2013, Julien Schmidt
 All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+</details>
+
+### BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`)
+
+Used by:
+
+- `zstd-sys` 2.1.0+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2026, Alexandre Bury
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -9065,7 +9107,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `arrow-array` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `arrow-array` 59.3.0 — <https://github.com/apache/arrow-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -9247,7 +9289,7 @@ SOFTWARE.
 Used by:
 
 - `unsafe-libyaml` 0.2.11 — <https://github.com/dtolnay/unsafe-libyaml>
-- `zmij` 1.0.21 — <https://github.com/dtolnay/zmij>
+- `zmij` 1.0.23 — <https://github.com/dtolnay/zmij>
 
 <details>
 <summary>Full license text</summary>

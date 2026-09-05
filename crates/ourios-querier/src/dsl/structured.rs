@@ -681,6 +681,105 @@ mod tests {
     use super::parse_structured;
     use crate::dsl::ir::{Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Stage, Value};
 
+    /// The "exactly one tag" rule the hand-written [`super::RawNode`] dispatch
+    /// enforces (§6.4). The deterministic tests above walk one `not` chain;
+    /// these generate whole trees, so `and`/`or` branching and mixed nesting
+    /// are covered too, and both halves of the rule get exercised rather than
+    /// just the accepting one.
+    mod node_dispatch_invariants {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::dsl::structured::NODE_TAGS;
+
+        /// A well-formed `<node>` paired with the predicate it must produce.
+        fn node() -> impl Strategy<Value = (String, Predicate)> {
+            let leaf = prop_oneof![
+                any::<bool>().prop_map(|b| (format!(r#"{{"const":{b}}}"#), Predicate::Bool(b))),
+                (0i64..4).prop_map(|n| (
+                    format!(r#"{{"field":"template_id","op":"==","value":{n}}}"#),
+                    Predicate::Comparison {
+                        field: Field::TemplateId,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Int(n),
+                    }
+                )),
+            ];
+            // Small trees on purpose: the dispatch is per-node, so breadth of
+            // shape matters here and depth is the other tests' job.
+            leaf.prop_recursive(5, 24, 3, |inner| {
+                let combinator = |kids: Vec<(String, Predicate)>| {
+                    let (json, preds): (Vec<_>, Vec<_>) = kids.into_iter().unzip();
+                    (json.join(","), preds)
+                };
+                prop_oneof![
+                    inner.clone().prop_map(|(j, p)| (
+                        format!(r#"{{"not":{j}}}"#),
+                        Predicate::Not(Box::new(p))
+                    )),
+                    prop::collection::vec(inner.clone(), 1..4).prop_map(move |kids| {
+                        let (json, preds) = combinator(kids);
+                        (format!(r#"{{"and":[{json}]}}"#), Predicate::and(preds))
+                    }),
+                    prop::collection::vec(inner, 1..4).prop_map(move |kids| {
+                        let (json, preds) = combinator(kids);
+                        (format!(r#"{{"or":[{json}]}}"#), Predicate::or(preds))
+                    }),
+                ]
+            })
+        }
+
+        /// A syntactically valid body for `tag`, so an ambiguous node is
+        /// refused for naming two forms rather than for a malformed value.
+        fn body_for(tag: &str) -> String {
+            match tag {
+                "field" => r#""body""#.to_string(),
+                "call" => r#""contains""#.to_string(),
+                "const" => "true".to_string(),
+                "not" => r#"{"const":true}"#.to_string(),
+                _ => r#"[{"const":true}]"#.to_string(),
+            }
+        }
+
+        proptest! {
+            /// Every generated tree parses, and to the predicate its shape
+            /// names: the dispatch selects one variant, and the right one.
+            #[test]
+            fn valid_trees_parse_to_their_predicate((json, expected) in node()) {
+                let query = parse_structured(&format!(r#"{{"predicate":{json}}}"#)).unwrap();
+                prop_assert_eq!(query.predicate, expected);
+            }
+
+            /// Two recognised tags name two forms, so the node is ambiguous and
+            /// must be refused rather than silently resolved by tag order.
+            #[test]
+            fn nodes_naming_two_forms_are_refused(
+                (a, b) in (0..NODE_TAGS.len(), 0..NODE_TAGS.len())
+                    .prop_filter("two distinct tags", |(a, b)| a != b),
+            ) {
+                let json = format!(
+                    r#"{{"predicate":{{"{}":{},"{}":{}}}}}"#,
+                    NODE_TAGS[a],
+                    body_for(NODE_TAGS[a]),
+                    NODE_TAGS[b],
+                    body_for(NODE_TAGS[b]),
+                );
+                let err = parse_structured(&json).unwrap_err();
+                prop_assert!(err.message().contains("exactly one"), "{}", err.message());
+            }
+
+            /// A node naming no recognised form is refused too — the other half
+            /// of the rule.
+            #[test]
+            fn nodes_naming_no_form_are_refused(key in "[a-z_]{1,8}") {
+                prop_assume!(!NODE_TAGS.contains(&key.as_str()));
+                let json = format!(r#"{{"predicate":{{"{key}":true}}}}"#);
+                let err = parse_structured(&json).unwrap_err();
+                prop_assert!(err.message().contains("exactly one"), "{}", err.message());
+            }
+        }
+    }
+
     #[test]
     fn nested_nodes_stay_linear() {
         // Regression (RFC 0015 fuzz target `dsl_parse`): `RawNode` used to be

@@ -50,7 +50,7 @@ serde_json = { version = "1", default-features = false, features = ["std"], opti
 [dev-dependencies]
 # The fixture JWKS/OpenFGA servers answer JSON — the `json` feature is
 # test-only; the library itself never serializes axum responses.
-axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+axum = { version = "=0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
 # The OIDC verifier tests mint fixture JWKS material at test runtime
 # (no committed private-key fixtures for scanners to flag) — pins
 # moved with the module from ourios-core (RFC 0051).
@@ -66,7 +66,7 @@ ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "metrics"] }
 # The resolver tests stand up a fake OpenFGA endpoint and speak its
 # JSON wire shape.
-serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 
 [features]
 # The RFC 0029 OIDC bearer layer (verifier + JWKS cache) — moved here

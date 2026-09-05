@@ -705,6 +705,18 @@ jobs:
         run: |
           cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
           cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
+      # fuzz/osv-scanner.toml must be a byte-identical copy of the root
+      # osv-scanner.toml. OSV-Scanner looks for its config beside each lockfile,
+      # and Scorecard reads repository blobs, so a symlink there is only the
+      # string of its target path and was silently ignored (#785). A copy can
+      # drift; this makes drift a PR-time failure instead of a quietly
+      # un-ignored Scorecard finding.
+      - name: fuzz osv-scanner config matches the root copy
+        run: |
+          cmp osv-scanner.toml fuzz/osv-scanner.toml || {
+            echo "::error::fuzz/osv-scanner.toml differs from osv-scanner.toml — run: cp osv-scanner.toml fuzz/osv-scanner.toml (Scorecard reads the fuzz copy for fuzz/Cargo.lock)"
+            exit 1
+          }
 
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes

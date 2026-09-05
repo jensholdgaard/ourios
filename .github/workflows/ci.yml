@@ -713,10 +713,17 @@ jobs:
       # un-ignored Scorecard finding.
       - name: fuzz osv-scanner config matches the root copy
         run: |
-          cmp osv-scanner.toml fuzz/osv-scanner.toml || {
+          # `cmp` follows symlinks, so a link back to the root file would pass
+          # the byte comparison while Scorecard still ignored it (the #785
+          # failure). Reject links first, then compare bytes.
+          if [ -L osv-scanner.toml ] || [ -L fuzz/osv-scanner.toml ]; then
+            echo "::error::osv-scanner.toml and fuzz/osv-scanner.toml must both be regular files, not symlinks — Scorecard reads repository blobs and a symlink blob is only its target path, so the ignores would be silently dropped. Replace the link with a real copy: cp osv-scanner.toml fuzz/osv-scanner.toml"
+            exit 1
+          fi
+          if ! cmp -s osv-scanner.toml fuzz/osv-scanner.toml; then
             echo "::error::fuzz/osv-scanner.toml differs from osv-scanner.toml — run: cp osv-scanner.toml fuzz/osv-scanner.toml (Scorecard reads the fuzz copy for fuzz/Cargo.lock)"
             exit 1
-          }
+          fi
 
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes

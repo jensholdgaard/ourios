@@ -685,23 +685,29 @@ mod tests {
     fn nested_nodes_stay_linear() {
         // Regression (RFC 0015 fuzz target `dsl_parse`): `RawNode` used to be
         // `#[serde(untagged)]`, which re-tries every variant per node and so
-        // cost ~2^depth — 20 levels already took over a second, and the 35
-        // levels libFuzzer minimised to ran out of memory. Depth is what has
-        // to stay cheap, so nest well past that and hold it to a wall-clock
-        // bound loose enough not to flake on a loaded runner but far below the
-        // old curve, which would need hours here.
+        // cost ~2^depth — the 35 levels libFuzzer minimised to ran out of
+        // memory.
+        //
+        // The depth is chosen so a regression *fails* rather than wedges the
+        // runner. Measured on the pre-fix parser: depth 20 took 1.13s and each
+        // further level roughly doubles, putting 24 near 18s — comfortably over
+        // the bound below, but still terminating. Nesting deeper would prove
+        // more and report less, timing the job out instead of failing it. The
+        // fixed parser does this in microseconds, so the second is ~3 orders of
+        // margin and will not flake on a loaded runner.
+        const DEPTH: usize = 24;
         let deep = format!(
             "{{\"predicate\":{}{}{}}}",
-            "{\"not\":".repeat(60),
+            "{\"not\":".repeat(DEPTH),
             r#"{"const":true}"#,
-            "}".repeat(60)
+            "}".repeat(DEPTH)
         );
         let start = std::time::Instant::now();
         assert!(parse_structured(&deep).is_ok());
         let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "60 nested nodes took {elapsed:?}; the untagged blow-up is back"
+            elapsed < std::time::Duration::from_secs(1),
+            "{DEPTH} nested nodes took {elapsed:?}; the untagged blow-up is back"
         );
     }
 

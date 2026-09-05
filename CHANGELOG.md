@@ -2,6 +2,82 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.10.0] - 2026-09-05
+
+### Security
+
+- The query DSL parsers are bounded against untrusted input (#778). A short
+  nested query could previously drive `/v1/query` and the MCP surface into
+  unbounded recursion (string surface) or exponential backtracking (structured
+  surface); both now return a typed error. Anyone running 0.9.0 with the query
+  endpoint reachable should upgrade.
+
+### Breaking (summary)
+
+- **MSRV is now Rust 1.94** (DataFusion 55 / arrow 59 / parquet 59, #773).
+  Building from source on an older toolchain fails at resolution.
+- `ourios-core` no longer hosts the OIDC and OpenFGA clients; they live in the
+  new `ourios-serving` crate (#762, #763). Library consumers update imports.
+- The RFC 0051 receiver compatibility shims are deleted (#769).
+
+### CI
+
+- Guard the fuzz nightly against drift and the workspace msrv (#780) (a827dae)
+
+### Changed
+
+- **BREAKING** Datafusion 55 / arrow 59 / parquet 59 (rfc 0021 phase 2a) (#773) (c8e9aa7)
+- **BREAKING** Delete the RFC 0051 receiver compatibility shims (#769) (9aa71d5)
+- Decompose ingest_bound into named phases (#768) (e79cab6)
+- Compile.rs becomes plan/ on a &DFSchema seam (#767) (48d3d2a)
+- Http auth as a tower layer matching the gRPC one (#766) (e08900f)
+- **BREAKING** Move the OIDC and OpenFGA clients to ourios-serving (#763) (03bde8d)
+- **BREAKING** Extract shared serving infrastructure (RFC 0051) (#762) (6bc3742)
+- Shared BufferedParquetWriter core for data + audit writers (#758) (63011a9)
+- Per-section input structs for the config builders (#759) (93d11ff)
+- One accessor family decodes for both readers (#757) (56677d3)
+- One IngestFailure classification, two thin adapters (#756) (4690cc7)
+- One execute_plan; listing-table schema as an argument (#754) (b64781b)
+- Cluster.rs becomes cluster/ with plan.rs + persist.rs (#755) (9ebb854)
+- Config resolution moves to the config::resolve lib module (#753) (5c546aa)
+- One expression of the fresh-leaf retention rule (#752) (9ecd422)
+- Lib.rs sheds four modules; audit listing dedup (#751) (d002b3e)
+- Compactor.rs becomes the compactor/ directory (#750) (e47ec91)
+- Compaction.rs becomes the compaction/ directory (#749) (d84b3cc)
+- Drop dead public surface (#748) (9082f88)
+- Consume the extracted ourios-semconv registry at a pin (#743) (dcca25d)
+
+### Chore
+
+- Mirror deny.toml's accepted advisories into osv-scanner.toml (#784) (fee37cc)
+- Retire red-gate scaffolding the criteria outgrew (#783) (f179d2a)
+- Refresh the fuzz lockfile and gate it in ci (#782) (5483b14)
+- Update cargo (minor/patch) (#776) (27815d2)
+- Group arrow with parquet and hold zstd to parquet's pin (#781) (e9920a2)
+- Pin dependencies (#774) (2154962)
+- Update otel/opentelemetry-collector-contrib docker tag to v0.160.0 (#777) (4583958)
+- Update github-actions (#775) (aed4084)
+
+### Documentation
+
+- Rfc 0046 §7 — record the four resolutions (#772) (fe2b644)
+- Rfc 0051 green — all seven criteria pass (#765) (358e732)
+- Rfc 0051 — ourios-serving crate extraction (drafted) (#760) (2255b55)
+- Auth guide names the tenant out-of-band (RFC 0046) (#744) (a5d7440)
+
+### Fixed
+
+- Override the oss-fuzz nightly that trails the workspace msrv (#779) (c21dacf)
+- Bound dsl nesting and drop the untagged predicate node (#778) (dd77e14)
+- Dex expiry arm waits on the token's own exp claim (#770) (5c5c7fb)
+- Update yanked chacha20 0.10.1 -> 0.10.2 (#761) (256d874)
+- Audit decode accepts Utf8View like the data path (#746) (9992222)
+
+### Tests
+
+- Dsl_parse target — the parsers RFC 0015 predates (#771) (4d45d24)
+- Env-substitution census over every config leaf (#747) (6d8c3b2)
+
 ## [0.9.0] - 2026-08-25
 
 ### Added

@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-bench"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -3334,11 +3334,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "ourios-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -3373,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-ingester"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "flate2",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -3456,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3491,11 +3491,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "ourios-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-serving"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-telemetry"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -3582,7 +3582,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-testgen"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ourios-config",
  "ourios-core",
@@ -3593,7 +3593,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "crc32c",
  "ourios-core",

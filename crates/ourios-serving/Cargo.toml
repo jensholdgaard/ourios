@@ -56,7 +56,7 @@ axum = { version = "=0.8.9", default-features = false, features = ["tokio", "htt
 # moved with the module from ourios-core (RFC 0051).
 base64 = "=0.23.1"
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
-rand = "=0.8.7"
+rand = "=0.8.8"
 rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
 # The AuthMetrics test collects the exported stream via the in-memory
 # provider guard.

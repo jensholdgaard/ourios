@@ -37,9 +37,10 @@ bytes = { version = "1", default-features = false }
 percent-encoding = { version = "2", default-features = false, features = ["alloc"] }
 # Pillar #3 — the execution engine. A plain dep, but its types are
 # kept strictly internal: no `datafusion`/`arrow` type appears in
-# any public signature or error (hazard §4.6). Pulls arrow/parquet
-# 58 vs ourios-parquet's 55; harmless because the two never cross
-# in memory (DataFusion reads Parquet files from disk).
+# any public signature or error (hazard §4.6). Shares the single
+# arrow/parquet version the whole workspace pins (RFC 0021 retired the
+# pre-upgrade split where DataFusion and ourios-parquet read different
+# arrow majors).
 # `string_expressions` / `regex_expressions` register the scalar
 # functions the DSL compiler emits for the string calls (`contains` /
 # `starts_with` / `ends_with`) and the `=~` / `!~` regex operators
@@ -130,11 +131,12 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # ourios-parquet `Writer` only emits the current schema, so the
 # heterogeneous fixtures are written via the raw `ArrowWriter`
 # over a batch built from the public `data_schema()`. Pinned to
-# the same arrow/parquet 58 the whole workspace now shares
-# (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
-parquet = { version = "=59.2.0", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=59.2.0", default-features = false }
-arrow-schema = { version = "=59.2.0", default-features = false }
+# the same arrow/parquet version the whole workspace shares, so
+# `Cargo.lock` carries one copy (RFC 0021 retired the pre-upgrade
+# cross-version handoff).
+parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
+arrow-array = { version = "=59.3.0", default-features = false }
+arrow-schema = { version = "=59.3.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
 serde_yaml_ng = { version = "=0.10.0", default-features = false }
@@ -142,7 +144,7 @@ serde_yaml_ng = { version = "=0.10.0", default-features = false }
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.49.9", default-features = false }
+jsonschema = { version = "=0.53.0", default-features = false }
 
 [lints]
 workspace = true

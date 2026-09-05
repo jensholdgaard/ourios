@@ -11,7 +11,6 @@
 
 mod common;
 
-mod acceptance;
 mod boundary;
 mod drift;
 mod execution;

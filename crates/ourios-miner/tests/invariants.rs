@@ -1,14 +1,7 @@
-//! RFC 0001 §5.2 — Invariants. Acceptance criteria stubs for
-//! CLAUDE.md §3.1, §3.2, §3.3, §3.5, §3.7. Each `#[test]` carries
-//! the scenario id in its doc comment so `grep -R "§3.1.1" .`
-//! resolves bidirectionally between the RFC and the tests
-//! (`docs/verification.md` §2.3).
-//!
-//! Stubs are tagged `#[ignore]` so the default `cargo test`
-//! invocation skips them (outer loop / CI stays green). The Red
-//! signal lives at the inner loop: an implementor working on a
-//! stub runs `cargo test <name> -- --ignored` and watches the
-//! `todo!()` panic. See `docs/verification.md` §3.
+//! RFC 0001 §5.2 — Invariants. Acceptance criteria for CLAUDE.md §3.1,
+//! §3.2, §3.3, §3.5, §3.7. Each `#[test]` carries the scenario id in its
+//! doc comment so `grep -R "§3.1.1" .` resolves bidirectionally between
+//! the RFC and the tests (`docs/verification.md` §2.3).
 
 /// Scenario §3.1.1 — Default similarity threshold is 0.7.
 /// See `docs/rfcs/0001-template-miner.md` §5.

@@ -37,9 +37,10 @@ bytes = { version = "1", default-features = false }
 percent-encoding = { version = "2", default-features = false, features = ["alloc"] }
 # Pillar #3 — the execution engine. A plain dep, but its types are
 # kept strictly internal: no `datafusion`/`arrow` type appears in
-# any public signature or error (hazard §4.6). Pulls arrow/parquet
-# 58 vs ourios-parquet's 55; harmless because the two never cross
-# in memory (DataFusion reads Parquet files from disk).
+# any public signature or error (hazard §4.6). Shares the single
+# arrow/parquet version the whole workspace pins (RFC 0021 retired the
+# pre-upgrade split where DataFusion and ourios-parquet read different
+# arrow majors).
 # `string_expressions` / `regex_expressions` register the scalar
 # functions the DSL compiler emits for the string calls (`contains` /
 # `starts_with` / `ends_with`) and the `=~` / `!~` regex operators
@@ -130,8 +131,9 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # ourios-parquet `Writer` only emits the current schema, so the
 # heterogeneous fixtures are written via the raw `ArrowWriter`
 # over a batch built from the public `data_schema()`. Pinned to
-# the same arrow/parquet 58 the whole workspace now shares
-# (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
+# the same arrow/parquet version the whole workspace shares, so
+# `Cargo.lock` carries one copy (RFC 0021 retired the pre-upgrade
+# cross-version handoff).
 parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
 arrow-array = { version = "=59.3.0", default-features = false }
 arrow-schema = { version = "=59.3.0", default-features = false }

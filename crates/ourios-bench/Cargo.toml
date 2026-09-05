@@ -56,7 +56,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # bundled C library and `parquet`'s `zstd` feature already pulls
 # it into the tree, so the version is pinned by `Cargo.lock` and
 # A1 is reproducible across hosts without a system `zstd` binary.
-zstd = "0.13"
+zstd = "0.14"
 # A1 writes the Parquet output bucket somewhere measurable; when
 # `BenchConfig.bucket_dir` is `None`, `run` creates a scratch dir
 # here and (unless `--keep-parquet`) cleans it up on exit. The
@@ -111,7 +111,7 @@ tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-t
 # tests: opens a comparative-store file's Parquet footer directly to
 # check the promoted column the writer declared. Same major as the
 # workspace arrow/parquet tree, so Cargo.lock pins one copy.
-parquet = { version = "=59.2.0", default-features = false, features = ["arrow"] }
+parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
 # RFC0024.2 draws calibrated records through a fixed-seed
 # `TestRunner` (the strategies come from `ourios-testgen`, already a
 # regular dependency above).
@@ -127,7 +127,7 @@ criterion = "=0.8.2"
 # flate2 streams the gzip so the measurement doesn't need the 2.9 GB
 # uncompressed sidecar. Already in the workspace lock tree (transitive), so
 # no new vendored crate.
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 
 [[bench]]
 name = "b1"

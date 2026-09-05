@@ -94,7 +94,7 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # `zstd` feature already pulls it into the tree (via ourios-parquet, and
 # ourios-bench binds it directly as the A1 reference codec), so this
 # adds no new transitive crate and the version is pinned by `Cargo.lock`.
-zstd = "0.13"
+zstd = "0.14"
 
 [dev-dependencies]
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
@@ -132,7 +132,7 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # over a batch built from the public `data_schema()`. Pinned to
 # the same arrow/parquet 58 the whole workspace now shares
 # (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
-parquet = { version = "=59.2.0", default-features = false, features = ["arrow"] }
+parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
 arrow-array = { version = "=59.2.0", default-features = false }
 arrow-schema = { version = "=59.2.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
@@ -142,7 +142,7 @@ serde_yaml_ng = { version = "=0.10.0", default-features = false }
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.49.9", default-features = false }
+jsonschema = { version = "=0.53.0", default-features = false }
 
 [lints]
 workspace = true

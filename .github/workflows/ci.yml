@@ -691,6 +691,20 @@ jobs:
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
+      # The fuzz harness is its own workspace (`exclude = ["fuzz"]`), so the
+      # step above never sees fuzz/Cargo.lock — and nothing else asserted it:
+      # neither fuzz.yml nor .clusterfuzzlite/build.sh passes `--locked`, so
+      # the committed lock sat a DataFusion major behind for a month after
+      # #773 while the containers silently re-resolved. OSV-Scanner (the
+      # Scorecard Vulnerabilities check) scans every lockfile in the repo, so
+      # the stale one kept reporting thrift and paste advisories the workspace
+      # had already shed. `--locked` fails only when the manifests have moved
+      # past the lock, not merely because newer versions exist, which makes
+      # it the PR-time signal to regenerate: `cd fuzz && cargo update`.
+      - name: fuzz lockfile is current and advisory-clean
+        run: |
+          cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
+          cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
 
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes

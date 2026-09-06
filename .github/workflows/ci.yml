@@ -716,17 +716,25 @@ jobs:
           # `cmp` follows symlinks, so a link back to the root file would pass
           # the byte comparison while Scorecard still ignored it (the #785
           # failure). Reject links first, then compare bytes.
-          if [ -L osv-scanner.toml ] || [ -L fuzz/osv-scanner.toml ]; then
-            echo "::error::osv-scanner.toml and fuzz/osv-scanner.toml must both be regular files, not symlinks — Scorecard reads repository blobs and a symlink blob is only its target path, so the ignores would be silently dropped. Replace the link with a real copy: cp osv-scanner.toml fuzz/osv-scanner.toml"
-            exit 1
-          fi
-          # `-f` follows symlinks, so this comes after the link check: it is
-          # the missing-file / directory case, which `cmp` would otherwise
-          # misreport as "differs".
-          if [ ! -f osv-scanner.toml ] || [ ! -f fuzz/osv-scanner.toml ]; then
-            echo "::error::osv-scanner.toml or fuzz/osv-scanner.toml is missing or not a regular file — the fuzz copy must exist beside fuzz/Cargo.lock: cp osv-scanner.toml fuzz/osv-scanner.toml"
-            exit 1
-          fi
+          # Each path is checked on its own so the error names the file that is
+          # actually wrong and a remedy that fixes it: copying the root over the
+          # fuzz copy cannot repair a broken root. `-L` runs before `-f` because
+          # `-f` follows symlinks.
+          for f in osv-scanner.toml fuzz/osv-scanner.toml; do
+            if [ "$f" = "osv-scanner.toml" ]; then
+              fix="restore it as a regular file from main: git checkout origin/main -- osv-scanner.toml"
+            else
+              fix="recreate it as a real copy of the root: cp osv-scanner.toml fuzz/osv-scanner.toml"
+            fi
+            if [ -L "$f" ]; then
+              echo "::error::$f is a symlink — Scorecard reads repository blobs, and a symlink blob is only its target path, so every ignore in it would be silently dropped. $fix"
+              exit 1
+            fi
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing or not a regular file — OSV-Scanner looks for it beside the lockfile it scans. $fix"
+              exit 1
+            fi
+          done
           if ! cmp -s osv-scanner.toml fuzz/osv-scanner.toml; then
             echo "::error::fuzz/osv-scanner.toml differs from osv-scanner.toml — run: cp osv-scanner.toml fuzz/osv-scanner.toml (Scorecard reads the fuzz copy for fuzz/Cargo.lock)"
             exit 1

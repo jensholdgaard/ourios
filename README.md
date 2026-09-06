@@ -391,7 +391,7 @@ modes are handled.
 
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (including
   the RFC process).
-- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — CNCF-aligned.
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — how we work together; technical conduct only.
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting.
 
 ## Licensing

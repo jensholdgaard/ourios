@@ -705,6 +705,40 @@ jobs:
         run: |
           cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
           cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
+      # fuzz/osv-scanner.toml must be a byte-identical copy of the root
+      # osv-scanner.toml. OSV-Scanner looks for its config beside each lockfile,
+      # and Scorecard reads repository blobs, so a symlink there is only the
+      # string of its target path and was silently ignored (#785). A copy can
+      # drift; this makes drift a PR-time failure instead of a quietly
+      # un-ignored Scorecard finding.
+      - name: fuzz osv-scanner config matches the root copy
+        run: |
+          # `cmp` follows symlinks, so a link back to the root file would pass
+          # the byte comparison while Scorecard still ignored it (the #785
+          # failure). Reject links first, then compare bytes.
+          # Each path is checked on its own so the error names the file that is
+          # actually wrong and a remedy that fixes it: copying the root over the
+          # fuzz copy cannot repair a broken root. `-L` runs before `-f` because
+          # `-f` follows symlinks.
+          for f in osv-scanner.toml fuzz/osv-scanner.toml; do
+            if [ "$f" = "osv-scanner.toml" ]; then
+              fix="restore it as a regular file from main: git checkout origin/main -- osv-scanner.toml"
+            else
+              fix="recreate it as a real copy of the root: cp osv-scanner.toml fuzz/osv-scanner.toml"
+            fi
+            if [ -L "$f" ]; then
+              echo "::error::$f is a symlink — Scorecard reads repository blobs, and a symlink blob is only its target path, so every ignore in it would be silently dropped. $fix"
+              exit 1
+            fi
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing or not a regular file — OSV-Scanner looks for it beside the lockfile it scans. $fix"
+              exit 1
+            fi
+          done
+          if ! cmp -s osv-scanner.toml fuzz/osv-scanner.toml; then
+            echo "::error::fuzz/osv-scanner.toml differs from osv-scanner.toml — run: cp osv-scanner.toml fuzz/osv-scanner.toml (Scorecard reads the fuzz copy for fuzz/Cargo.lock)"
+            exit 1
+          fi
 
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes

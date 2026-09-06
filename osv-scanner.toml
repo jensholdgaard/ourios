@@ -3,9 +3,11 @@
 #
 # Consumed by OpenSSF Scorecard's Vulnerabilities check (`.github/workflows/
 # scorecard.yml`), which runs OSV-Scanner. OSV-Scanner looks for this file
-# beside each lockfile it scans — so it has to exist next to `fuzz/Cargo.lock`
-# too, which is why `fuzz/osv-scanner.toml` is a symlink to this one rather
-# than a second copy of the reasons that would drift. It scans the full
+# beside each lockfile it scans, so a copy has to sit next to `fuzz/Cargo.lock`
+# as `fuzz/osv-scanner.toml`. A real copy, not a symlink: Scorecard reads the
+# repository's blobs, and a symlink blob is only the string of its target path,
+# so a link there was silently ignored (#785). The `deny` job in ci.yml fails
+# if the two files ever differ, so the copy cannot drift. It scans the full
 # lockfile, so it flags advisories that have a GHSA/OSV id but no RustSec id
 # (which `cargo deny` misses) or that aren't in the build graph at all.
 #

@@ -9,7 +9,7 @@ project spaces.
 
 1. **Contributions are judged on their merit.** Code, designs, RFCs, and
    reviews stand or fall on technical quality, correctness, and fit with the
-   project's stated direction (`CLAUDE.md`, `docs/rfcs/`). Nothing about the
+   project's stated direction ([`CLAUDE.md`](CLAUDE.md), [`docs/rfcs/`](docs/rfcs/)). Nothing about the
    contributor is a factor.
 2. **Keep it professional.** Disagree with ideas, not people. Keep discussion
    on the work. Personal attacks, harassment, and deliberate disruption are
@@ -19,7 +19,7 @@ project spaces.
    works against the project. Their decisions on project matters are final.
 4. **Assume good faith.** Ask before assuming. Give authors and reviewers the
    reading you would want yourself.
-5. **Own your work.** Sign off your commits (DCO). Say what you tested. If you
+5. **Own your work.** Sign off your commits ([DCO](CONTRIBUTING.md#developer-certificate-of-origin-sign-off)). Say what you tested. If you
    broke something, say so and fix it.
 
 ## Where this applies

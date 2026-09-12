@@ -134,10 +134,22 @@ async fn poll_until_both_services_indexed(
     let mut services = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
-        observed = loki_label_names(http, base).await;
+        // Readiness FIRST, then the label names. Fetching names before
+        // establishing readiness loses the race the other way round: if the
+        // second stream's index update lands between the two requests, the
+        // values answer says "ready" while the names snapshot was taken
+        // before it, so the loop would break on a set that is stale or empty
+        // — and the allowlist would then be checked against labels the
+        // second stream had not yet contributed.
         services = loki_label_values(http, base, "service_name").await;
         if services.len() >= 2 {
-            break;
+            observed = loki_label_names(http, base).await;
+            // The names endpoint can itself lag the values endpoint, so only
+            // a post-readiness answer that actually carries `service_name`
+            // counts as the complete set.
+            if observed.iter().any(|name| name == "service_name") {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

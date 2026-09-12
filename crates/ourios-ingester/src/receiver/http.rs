@@ -10,6 +10,20 @@
 //! / encoding → 415, malformed body → 400, oversize → 413, an
 //! unconfigured path → 404, tenant-resolution failure → 400. No panics.
 //!
+//! Every one of those carries a `google.rpc.Status` body in the request's
+//! wire format, which the OTLP spec requires of all 4xx/5xx responses —
+//! including the oversize rejection `DefaultBodyLimit` raises before this
+//! handler's body exists, which is why the handler takes the extractor's
+//! rejection rather than `Bytes`. See `error_response`.
+//!
+//! Durability failures are `503`, and that code is retryable per OTLP. It is
+//! **not** the same as transient: a WAL quiesced after a rotation failure
+//! classifies as `IngestFailure::Wedged` and nothing in-process clears it
+//! (#791), but it keeps the retryable code because the batch was never acked
+//! and every non-retryable status tells the client to discard it. The
+//! difference reaches the client as the `Status` message plus the absence of
+//! `Retry-After`.
+//!
 //! The pipeline is shared behind a plain `Arc`: its group-commit
 //! coordinator serializes the single-writer WAL internally (RFC 0008
 //! §3.1) while letting concurrent requests batch their fsyncs
@@ -224,8 +238,30 @@ async fn handle_logs(
     State(state): State<AppState>,
     binding: Option<axum::Extension<Arc<AuthBinding>>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    // The wire format is read first, and *non-fatally*, because the spec
+    // requires every error body below to mirror the request's Content-Type —
+    // including the ones raised before the body is even looked at. Only a
+    // missing or unsupported Content-Type falls back to protobuf, which is the
+    // one case where there is no request format to mirror.
+    //
+    // Read, not validated: the fatal 415 stays where it was, after the
+    // selector, so the status an ambiguous request gets does not change.
+    let requested = content_type(&headers);
+    let response_format = requested.unwrap_or(WireFormat::Protobuf);
+
+    // `DefaultBodyLimit` rejects an oversize body before this handler's
+    // `Bytes` would exist, and axum renders that rejection with its own
+    // generic body. Taking the rejection rather than `Bytes` keeps even that
+    // path inside `error_response`, so no 4xx escapes without a `Status`.
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            return error_response(response_format, rejection.status(), &rejection.body_text());
+        }
+    };
+
     // RFC 0026 §3.2: authentication already ran in `AuthLayer`, before
     // the body was collected; a present extension is the bound
     // credential, absence is open mode. (Arc: cloning the extension is
@@ -236,19 +272,12 @@ async fn handle_logs(
     // any WAL work — a missing/malformed selector is a 400 with the reason.
     let tenant = match selector::from_headers(&headers) {
         Ok(tenant) => tenant,
-        // The wire format is not known yet (the selector is decided before
-        // `Content-Type` is parsed), so the `Status` body goes out as
-        // protobuf — see `error_response`.
         Err(e) => {
-            return error_response(
-                WireFormat::Protobuf,
-                StatusCode::BAD_REQUEST,
-                &e.to_string(),
-            );
+            return error_response(response_format, StatusCode::BAD_REQUEST, &e.to_string());
         }
     };
 
-    let Some(format) = content_type(&headers) else {
+    let Some(format) = requested else {
         return error_response(
             WireFormat::Protobuf,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,

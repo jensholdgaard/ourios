@@ -135,6 +135,61 @@ async fn content_type_and_encoding_are_case_insensitive() {
     );
 }
 
+/// Which encoding an error response body must use — a named discriminant
+/// rather than a bool, so the match on it is exhaustive on intent.
+enum Expect {
+    Protobuf,
+    Json,
+}
+
+/// The OTLP spec requires a `google.rpc.Status` body on **every** 4xx/5xx.
+/// The body-limit rejection is the one that nearly escaped it: `DefaultBodyLimit`
+/// fires before the handler's body exists, so axum rendered its own generic
+/// 413 and the status-only assertion below could not tell.
+#[tokio::test]
+async fn an_oversize_body_still_carries_a_status_in_the_request_format() {
+    let config = HttpConfig {
+        max_body_bytes: 16,
+        ..HttpConfig::default()
+    };
+    for (content_type, expect) in [
+        (PROTOBUF, Expect::Protobuf),
+        ("application/json", Expect::Json),
+    ] {
+        let (pipeline, _captured) = capturing_pipeline();
+        let (status, body) = send(
+            router(pipeline, &config),
+            post_request("/v1/logs", Some(content_type), None, vec![0u8; 1024]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !body.is_empty(),
+            "{content_type}: the body-limit rejection must not render an empty body",
+        );
+        match expect {
+            // The spec also requires the response to mirror the request's
+            // Content-Type, which a layer-level rejection cannot know.
+            Expect::Json => {
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&body).expect("JSON request → JSON Status");
+                assert!(
+                    parsed["message"].as_str().is_some_and(|m| !m.is_empty()),
+                    "the Status must name the problem: {parsed}",
+                );
+            }
+            Expect::Protobuf => {
+                let decoded = tonic_types::Status::decode(body.as_slice())
+                    .expect("protobuf request → protobuf Status");
+                assert!(
+                    !decoded.message.is_empty(),
+                    "the Status must name the problem",
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn oversize_body_is_413() {
     let config = HttpConfig {

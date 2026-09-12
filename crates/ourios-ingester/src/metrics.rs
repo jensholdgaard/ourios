@@ -370,10 +370,18 @@ const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 /// for WAL rotation or shutdown, which is hazard #4's small-file and
 /// staleness problem rather than a total stop.
 ///
-/// Either way this is not a rate to watch: a single occurrence is the alert,
-/// and a restart is the remedy until the step's unwind is made safe (#796 —
-/// the drained batches are dropped on unwind, which is why the sweep stops
-/// rather than retrying).
+/// Either way this is not a rate to watch: a single occurrence is the alert.
+///
+/// **A restart restores the cadence but does not recover the panicked step's
+/// records, and a graceful one can make their loss permanent.** The step had
+/// already taken those batches out of the sink, so they are in the WAL and
+/// nowhere else (#796). `shutdown` then runs the snapshot barrier, which reads
+/// the emptied buffers as fully drained and can stamp a WAL high-water mark
+/// across them — after which recovery suppresses them. So the loss window
+/// opens with the panic; what a graceful shutdown adds is the stamp that
+/// closes it. Until #796 lands there is no sequence that both restores the
+/// cadence and preserves those records, and an operator needs to know that
+/// rather than infer from "restart" that nothing was lost.
 pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {

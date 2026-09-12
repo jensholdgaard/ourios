@@ -723,10 +723,20 @@ mod tests {
     ///
     /// These drive the real routing with real `JoinError`s and a real
     /// `PublishCoordinator`, so a regression to treating both alike fails
-    /// here. That the count reaches the exported counter is asserted
-    /// separately, by `ourios-ingester`'s `cadence_panic_metric` test — this
-    /// binary's harness cannot install a global meter without racing the
-    /// other tests in it.
+    /// here — and one of them asserts the exported counter too, so a `true`
+    /// return with the forwarding call removed fails as well.
+    ///
+    /// Installing the global meter for that is safe in this binary for a
+    /// narrow reason: its unit tests contain no other installer (the server
+    /// crate's lives in the separate `rfc0016_6_query_metrics.rs` integration
+    /// binary, a different process) and no sibling asserts on metrics. It is
+    /// still one installer only — which is why the two cases are one test
+    /// rather than two, since siblings sharing a global meter accumulate on
+    /// the same counter.
+    ///
+    /// `ourios-ingester`'s `cadence_panic_metric` covers the complementary
+    /// half: that the dimension distinguishes a dead sweep from an ordinary
+    /// store error on the same counter.
     mod count_step_panic {
         use super::super::count_step_panic;
         use ourios_ingester::publish::PublishCoordinator;

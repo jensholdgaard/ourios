@@ -6,10 +6,12 @@
 //! verbatim from `tests/*.rs`; test names gain only this harness's
 //! module-path prefix (RFC0028.1).
 //!
-//! Four binaries deliberately remain outside (RFC0028.2): they install
-//! the **process-global** `OTel` meter provider (`init_in_memory` /
-//! global-meter instruments), and two global installers in one process
-//! race — see `tests/README.md`.
+//! Eight binaries deliberately remain outside (RFC0028.2): six install a
+//! **process-global** `OTel` *meter* provider (`init_in_memory` /
+//! global-meter instruments) and two a global *tracer*, and two global
+//! installers of either kind in one process race. `tests/README.md` is the
+//! list and the authority — the count here was already stale before
+//! `cadence_panic_metric.rs` joined it, so prefer that file.
 
 mod ingest_support;
 mod otlp_strategy;

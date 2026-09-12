@@ -146,6 +146,26 @@ stamp across in-flight encodes (the barrier's own class-1 case) and lose
 exactly what it is meant to protect. "One predicate, three callers" means the
 whole sequence, not the inner function.
 
+**Calling the prologue is still not sufficient, and this is where the timer
+differs from the other two callers.** Rotation calls `quiesce_encodes()` while
+*holding the pipeline's miner lock*, and shutdown has already stopped the
+listeners; each therefore has an exclusion keeping new submissions out between
+the quiesce and the stamp. A bare timer has neither, so ingest can submit a
+fresh encode in that window and the barrier stamps across it — the same loss,
+reached by a narrower race.
+
+So the timer takes the **same exclusion rotation uses**, the pipeline's miner
+lock, and holds it across the whole sequence: quiesce, read the mark, barrier,
+checkpoint. The mark is read *inside* that exclusion and *after* the quiesce —
+`last_durable()` at that point, the offset the receiver's acks are gated on —
+so no frame above it can still be in flight. Reading it before the quiesce, or
+outside the lock, reintroduces the window from the other side.
+
+The cost is explicit: ingest stalls for the barrier's duration once per
+`housekeeping_secs`, the same stall rotation already imposes, now on a timer.
+`housekeeping_secs` is therefore the knob trading reclamation latency against
+that stall, and §3.7's per-pass cap bounds the sequence's second half.
+
 See §3.7 for the ownership path and the exact signatures, which the barrier
 does not have today:
 
@@ -181,9 +201,11 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    quiesce_encodes()                                          // the barrier's prologue
-    if barrier_succeeded and high_water is Some(mark):          // §3.1, append-free
-        journal.checkpoint(mark)
+    with_miner_lock:                       // the exclusion rotation uses
+        quiesce_encodes()                  // the barrier's prologue
+        mark = last_durable()              // read AFTER the quiesce, INSIDE the lock
+        if barrier_succeeded(mark) and mark is Some(m):   // §3.1, append-free
+            journal.checkpoint(m)
     journal.housekeeping(retain_floor(), max_unlinks_per_pass)  // Result
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
@@ -695,6 +717,14 @@ first.
 > - **And** a backlog of stale *temporary* files is also bounded by the same
 >   cap, so temp sweeping cannot make a "bounded" pass do unbounded work
 
+> **Scenario RFC0052.14 — The timer cannot stamp across a concurrent submit**
+> - **Given** the reclamation timer firing while ingest submits continuously
+> - **When** the timer runs its sequence
+> - **Then** no checkpoint is advanced past a frame whose encode had not
+>   finished its sink emit, under any interleaving
+> - **And** the mark used is the one read after the quiesce under the same
+>   exclusion, not one read before either
+
 > **Scenario RFC0052.13 — An incomplete tenant floor cannot be read as
 > unbounded**
 > - **Given** a snapshot consumer exists and one tenant with WAL data has no
@@ -823,6 +853,16 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   resume must happen with **no append at all**, which is what proves the
   timer-driven barrier can clear a state that rejects every append. Those two
   are the regression tests for #791 itself.
+- **Floor completeness (RFC0052.13)** — unit tests over the three
+  `RetainFloor` cases, asserting the incomplete case reclaims nothing and is
+  not expressible as the no-consumer case. The type makes the unsafe reading
+  unrepresentable, so the test mostly guards the *derivation* of the floor
+  from per-tenant snapshots rather than `housekeeping` itself.
+- **Timer exclusion (RFC0052.14)** — a seeded-interleaving test rather than a
+  timing one: the window is narrow, and a wall-clock test that happens to pass
+  proves nothing. Failing that, hold the timer artificially between quiesce and
+  stamp while driving ingest, and assert the submit blocks rather than
+  proceeding.
 - **Telemetry (RFC0052.7)** — the in-memory metric exporter pattern
   already used for the ingest/sink instruments, asserting every name is
   in the exported stream; plus a `weaver registry live-check` pass over

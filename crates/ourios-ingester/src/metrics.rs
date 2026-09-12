@@ -358,6 +358,39 @@ const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
+/// The `error.type` value for a cadence sweep step that panicked (#791).
+///
+/// One such count means the **age/cadence** flush trigger is dead for the
+/// life of the process: the sweep stops on a panic, because continuing would
+/// repeat #796's data-loss window every tick.
+///
+/// The size and ceiling triggers keep working, so a busy partition still
+/// flushes on its own. What is lost is the age drain, which is the only
+/// trigger a *low-volume* partition ever reaches — so those partitions wait
+/// for WAL rotation or shutdown, which is hazard #4's small-file and
+/// staleness problem rather than a total stop.
+///
+/// Either way this is not a rate to watch: a single occurrence is the alert.
+///
+/// **Whether a restart is safe depends on where the panic landed, and the
+/// counter cannot tell you.** This counts a panic anywhere in the step. One
+/// raised before `drain_aged` has taken anything — in the miner or the drain
+/// itself — loses nothing: the records are still buffered and still in the
+/// WAL, and a restart replays normally.
+///
+/// One raised *after* the drain, in the publish, is the #796 window: those
+/// batches are out of the sink and in the WAL only. `shutdown` then runs the
+/// snapshot barrier, which reads the emptied buffers as fully drained and can
+/// stamp a WAL high-water mark across them, after which recovery suppresses
+/// them. So the loss window opens with that panic and a graceful shutdown is
+/// what closes it.
+///
+/// The panic message on stderr is what distinguishes the two, which is why it
+/// matters that the default hook still prints it. Treat this count as "check
+/// where it panicked before restarting", not as confirmed loss — and until
+/// #796 lands, accept that for the publish case no restart both restores the
+/// cadence and preserves those records.
+pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {
     fn default() -> Self {

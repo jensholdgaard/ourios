@@ -117,26 +117,65 @@ fn spawn_age_sweep(
             // The drain takes the miner lock (atomic w.r.t. ingest) for only a
             // memory move; the ordered write does the blocking store I/O off the
             // lock. Run the whole step on the blocking pool rather than stalling
-            // a runtime worker. A `JoinError` means the runtime is shutting down
-            // — stop sweeping.
+            // a runtime worker.
             let pipeline = pipeline.clone();
             let coordinator = coordinator.clone();
-            if tokio::task::spawn_blocking(move || {
-                let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
-                // The cadence is best-effort: a partial write (transient store
-                // error) retains the un-published data + audit (the WAL is the
-                // durability of record) and the next tick retries — so the
-                // published-everything signal is not needed here (no snapshot is
-                // taken at the cadence; that's the rotation/shutdown path).
-                let _published = coordinator.write_ordered(drained, "age");
+            let step = tokio::task::spawn_blocking({
+                let coordinator = coordinator.clone();
+                move || {
+                    let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+                    // The cadence is best-effort: a partial write (transient store
+                    // error) retains the un-published data + audit (the WAL is the
+                    // durability of record) and the next tick retries — so the
+                    // published-everything signal is not needed here (no snapshot is
+                    // taken at the cadence; that's the rotation/shutdown path).
+                    let _published = coordinator.write_ordered(drained, "age");
+                }
             })
-            .await
-            .is_err()
-            {
+            .await;
+            // A `JoinError` is two different events and the sweep used to treat
+            // them alike: `is_cancelled` is the runtime going away, but
+            // `is_panic` is a bug in the step. Either way the loop still stops
+            // here — see below for why a panic is not yet survivable — and the
+            // point of separating them is that a panic now leaves a countable
+            // trace. Before this, a panic retired the cadence for the life of
+            // the process while the task returned `()` cleanly, so the
+            // `JoinHandle` still looked healthy, `shutdown()` ignores it anyway,
+            // and nothing logged, counted, or failed. Partitions then drained
+            // only on rotation and shutdown, and buffers grew toward an OOM kill
+            // with no trail back to the cause (#791).
+            //
+            // Surviving the panic and sweeping on is the behaviour we actually
+            // want, and it is deliberately NOT done here. `write_ordered`
+            // consumes the batches `drain_aged` has already taken out of the
+            // sink, so a panic inside it drops them: they are neither in the
+            // buffers nor in Parquet, and a later rotation seeing empty buffers
+            // can stamp a WAL high-water mark over frames that never landed
+            // (#796). Stopping bounds that to one step's records; looping would
+            // repeat it every tick, which is unbounded loss. Making it safe needs
+            // requeue-on-unwind semantics — a §3.4 decision for the #791 RFC,
+            // not something to improvise under a panic handler.
+            if let Err(join_error) = step {
+                count_step_panic(&coordinator, &join_error);
                 break;
             }
         }
     })
+}
+
+/// Count a cadence-step `JoinError` when it was a panic, and report whether
+/// it counted.
+///
+/// Cancellation must not count: it is the runtime going away, which is
+/// ordinary shutdown, and tagging it would make the "dead cadence" signal
+/// fire on every clean stop. The old code could not tell the two apart at
+/// all (#791), which is the regression the return value exists to pin.
+fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::JoinError) -> bool {
+    if !join_error.is_panic() {
+        return false;
+    }
+    coordinator.record_cadence_panic();
+    true
 }
 
 /// Quiesce the age sweep's in-flight off-lock publishes (issue #578), flush
@@ -676,6 +715,129 @@ mod tests {
     use ourios_core::tenant::TenantId;
 
     use super::*;
+
+    /// #791: the sweep could not tell a cancelled step from a panicked one —
+    /// it broke its loop on either, so a panic retired the flush cadence for
+    /// the life of the process while the task returned `()` cleanly and
+    /// nothing logged, counted, or failed.
+    ///
+    /// These drive the real routing with real `JoinError`s and a real
+    /// `PublishCoordinator`, so a regression to treating both alike fails
+    /// here — and one of them asserts the exported counter too, so a `true`
+    /// return with the forwarding call removed fails as well.
+    ///
+    /// Installing the global meter for that is safe in this binary for a
+    /// narrow reason: its unit tests contain no other installer (the server
+    /// crate's lives in the separate `rfc0016_6_query_metrics.rs` integration
+    /// binary, a different process) and no sibling asserts on metrics. It is
+    /// still one installer only — which is why the two cases are one test
+    /// rather than two, since siblings sharing a global meter accumulate on
+    /// the same counter.
+    ///
+    /// `ourios-ingester`'s `cadence_panic_metric` covers the complementary
+    /// half: that the dimension distinguishes a dead sweep from an ordinary
+    /// store error on the same counter.
+    mod count_step_panic {
+        use super::super::count_step_panic;
+        use ourios_ingester::publish::PublishCoordinator;
+        use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+        use ourios_parquet::store::Store;
+        use std::time::Duration;
+
+        fn coordinator(root: &std::path::Path) -> PublishCoordinator {
+            // `Store::local` canonicalizes, so the directories must exist.
+            for leaf in ["records", "audit"] {
+                std::fs::create_dir_all(root.join(leaf)).expect("store dir");
+            }
+            let never_flush = FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            };
+            let records = SharedParquetSink::new(ParquetRecordSink::new(
+                Store::local(root.join("records")).expect("record store"),
+                never_flush,
+            ));
+            let audit =
+                super::super::SharedParquetAuditSink::new(super::super::BufferingAuditSink::new(
+                    Store::local(root.join("audit")).expect("audit store"),
+                    super::super::AUDIT_SINK_CEILING_EVENTS,
+                ));
+            PublishCoordinator::new(records, audit)
+        }
+
+        /// A panicked step must be counted, and counted **through the
+        /// production helper**.
+        ///
+        /// Asserting only the returned boolean would leave one edge untested:
+        /// dropping the `coordinator.record_cadence_panic()` call while still
+        /// returning `true` satisfies a boolean assertion, and the integration
+        /// test calls the coordinator directly, so both would pass. Hence one
+        /// test covering both the routing and its side effect rather than two.
+        ///
+        /// It installs the **global** in-memory meter, which is safe here for a
+        /// narrow reason: this binary's unit tests contain no other installer
+        /// (the server crate's one lives in the separate
+        /// `rfc0016_6_query_metrics.rs` integration binary, a different
+        /// process), and no sibling test asserts on metrics.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn the_panic_count_reaches_the_counter_through_the_helper() {
+            use opentelemetry_sdk::metrics::data::{
+                AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
+            };
+
+            let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+            let root = tempfile::TempDir::new().expect("root");
+            let join_error = tokio::spawn(async { panic!("the step blew up") })
+                .await
+                .expect_err("a panicking task joins as an Err");
+
+            assert!(count_step_panic(&coordinator(root.path()), &join_error));
+            guard.force_flush().expect("force_flush");
+
+            let rms = exporter.get_finished_metrics().expect("metrics exported");
+            let tagged: u64 = rms
+                .iter()
+                .flat_map(ResourceMetrics::scope_metrics)
+                .flat_map(ScopeMetrics::metrics)
+                .filter(|m| m.name() == ourios_semconv::OURIOS_SINK_FLUSH_ERRORS)
+                .filter_map(|m| match m.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+                    _ => None,
+                })
+                .flat_map(opentelemetry_sdk::metrics::data::Sum::data_points)
+                .filter(|dp| {
+                    dp.attributes().any(|kv| {
+                        kv.key.as_str() == "error.type" && kv.value.as_str() == "cadence_panic"
+                    })
+                })
+                .map(SumDataPoint::value)
+                .sum();
+            assert_eq!(
+                tagged, 1,
+                "the helper must actually forward to the coordinator — a \
+                 `true` return with the call removed is the regression this \
+                 pins",
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_step_is_not_counted() {
+            let root = tempfile::TempDir::new().expect("root");
+            let handle = tokio::spawn(async {
+                // Never completes, so the abort below is what ends it.
+                std::future::pending::<()>().await;
+            });
+            handle.abort();
+            let join_error = handle.await.expect_err("an aborted task joins as an Err");
+            assert!(join_error.is_cancelled());
+            assert!(
+                !count_step_panic(&coordinator(root.path()), &join_error),
+                "cancellation is ordinary shutdown; counting it would make \
+                 the dead-cadence signal fire on every clean stop",
+            );
+        }
+    }
 
     fn rec() -> MinedRecord {
         MinedRecord {

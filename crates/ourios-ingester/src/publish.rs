@@ -78,6 +78,12 @@ pub struct PublishCoordinator {
 }
 
 impl PublishCoordinator {
+    /// Count a cadence sweep step that panicked (#791) — see
+    /// [`SharedParquetSink::record_cadence_panic`].
+    pub fn record_cadence_panic(&self) {
+        self.record.record_cadence_panic();
+    }
+
     /// Build a coordinator over the two shared sinks.
     #[must_use]
     pub fn new(record: SharedParquetSink, audit: SharedParquetAuditSink) -> Self {

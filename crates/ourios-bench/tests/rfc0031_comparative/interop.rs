@@ -3,6 +3,113 @@
 
 use crate::*;
 
+/// Scenario RFC0031.10's machine-check: the comparative Loki
+/// configuration indexes only the declared low-cardinality label set.
+/// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// The criterion asks for "a test [that] asserts the label set is drawn
+/// from a declared low-cardinality allowlist and that `trace_id`,
+/// `span_id`, and any per-template id are **absent**". Issue #792: the
+/// RFC reached `accepted` with that test an ignored `todo!()`, so the
+/// property held only by accident of the stock config — nothing failed if
+/// a later edit added a label.
+///
+/// It matters more than its size suggests. The published L-gate ratios are
+/// only meaningful if Loki's side was configured fairly, and the two ways
+/// to rig it are both label-shaped: promote a high-cardinality key and
+/// Loki's index starts doing Ourios's pruning for it (an L3 trace win over
+/// a Loki that indexes `trace_id` measures nothing), or leave only a
+/// catch-all and every query degrades to a full scan.
+///
+/// Asserted against a **running container** on the exact dispatch config,
+/// not against the config text: what matters is the label set Loki
+/// actually ends up with after an OTLP push, including anything the image
+/// promotes on its own.
+#[test]
+#[ignore = "RFC0031.10 — needs Docker (real Loki container); run by the loki-interop CI job via --ignored"]
+fn rfc0031_10_loki_label_allowlist() {
+    // Two services, so `service_name` is provably a discriminator rather
+    // than a constant: a single-valued label is the catch-all case the
+    // criterion rules out, and the other fixtures here carry one service.
+    let base_ns = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("nanos fit u64")
+    .saturating_sub(30_000_000_000);
+    let records: Vec<FixtureRecord> = ["checkout", "payment"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, service)| FixtureRecord {
+            time_unix_nano: base_ns + u64::try_from(i).expect("tiny index") * 1_000_000_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "connection established to peer 10",
+            trace_id: Some(FIXTURE_TRACE),
+            service,
+        })
+        .collect();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async {
+        use prost::Message as _;
+
+        let (_container, base, http) = start_loki(LOKI_DISPATCH_FLAGS).await;
+        let payload = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
+            resource_logs: fixture_logs_data(&records).resource_logs,
+        }
+        .encode_to_vec();
+        push_otlp(&http, &base, payload).await;
+
+        // Labels appear once the push is indexed; poll rather than sleep a
+        // fixed amount, so a slow container does not read as "no labels".
+        let mut observed = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            observed = loki_label_names(&http, &base).await;
+            if !observed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            !observed.is_empty(),
+            "Loki reported no stream labels at all after the push — the              assertions below would pass vacuously, so this is a failure",
+        );
+
+        let unexpected: Vec<&String> = observed
+            .iter()
+            .filter(|name| !LOKI_LABEL_ALLOWLIST.contains(&name.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "the comparative Loki config indexed labels outside the              RFC0031.10 allowlist {LOKI_LABEL_ALLOWLIST:?}: {unexpected:?}.              Either the config gained a label promotion (fix the config) or              the image now promotes it by default (widen the allowlist in              the same commit that re-publishes the affected §9 rows, and              say so) — do not widen it silently.",
+        );
+
+        for forbidden in LOKI_LABEL_DENYLIST {
+            assert!(
+                !observed.iter().any(|name| name == forbidden),
+                "`{forbidden}` is indexed as a Loki stream label; every                  published L-gate ratio measured against this config is                  invalid, because Loki's index is doing the pruning the                  comparison attributes to Ourios",
+            );
+        }
+
+        // Not a catch-all: the allowlisted label must actually partition
+        // the corpus. The fixture carries two services, so a config that
+        // collapsed them into one stream fails here.
+        let services = loki_label_values(&http, &base, "service_name").await;
+        assert_eq!(
+            services.len(),
+            2,
+            "`service_name` must discriminate between the fixture's two              services, else the single allowlisted label is a catch-all and              every query is a full scan: {services:?}",
+        );
+    });
+}
+
 /// Scenario RFC0031.1 — result-set equivalence gates every comparison.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 ///

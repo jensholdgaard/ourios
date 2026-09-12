@@ -487,19 +487,35 @@ fn rfc0031_9_storage_footprint_diagnostic() {
 
 /// Scenario RFC0031.10 — Loki config committed, competent, machine-checked.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// **The label machine-check — the half that guards the published numbers
+/// — now exists**: `interop::rfc0031_10_loki_label_allowlist` asserts
+/// against a running container on the exact dispatch config that the
+/// indexed label set is drawn from `LOKI_LABEL_ALLOWLIST`, that every name
+/// in `LOKI_LABEL_DENYLIST` is absent, and that the one allowlisted label
+/// actually discriminates rather than acting as a catch-all.
+///
+/// This stub remains for the criterion's **documentation-shaped** half,
+/// which is deliberately not being invented here: issue #792 asks the
+/// maintainer to decide whether the config moves to `bench/comparative/`
+/// as §5 says, or whether §5 is amended to describe where it actually
+/// lives. Today it is Rust constants — `LOKI_IMAGE`/`LOKI_TAG`
+/// (digest-pinned) plus `LOKI_DISPATCH_FLAGS` — shared by construction
+/// between the cheap CI test and the expensive dispatch run, which is
+/// arguably stronger than a parsed file but is not what the RFC claims.
 #[test]
-#[ignore = "RFC0031.10 stub — implemented in the config-check green slice"]
+#[ignore = "RFC0031.10 — label machine-check is live (see rfc0031_10_loki_label_allowlist); \
+            the config-layout / one-command / §9-commit-link half awaits the #792 decision"]
 fn rfc0031_10_loki_config_machine_checked() {
     todo!(
-        "RFC0031.10 — the exact Loki config (index, chunk target size, \
-         S3 backend, retention, frozen label set), the OTLP-into-Loki \
-         config, and the DSL<->LogQL query pairs are present under \
-         bench/comparative/ and the comparison runs with one documented \
-         command; a test asserts the label set is drawn from a declared \
-         low-cardinality allowlist and that trace_id, span_id, and any \
-         per-template id are ABSENT (no catch-all-forcing-full-scan and \
-         no high-cardinality label smuggling Ourios's columns into \
-         Loki's index); each §9 row links the config commit"
+        "RFC0031.10 (remaining) — the exact Loki config (index, chunk \
+         target size, S3 backend, retention, frozen label set), the \
+         OTLP-into-Loki config, and the DSL<->LogQL query pairs present \
+         under bench/comparative/, the comparison runnable with one \
+         documented command, and each §9 row linking the config commit. \
+         The label-set assertion this criterion also asks for is DONE: \
+         interop::rfc0031_10_loki_label_allowlist. See issue #792 — the \
+         layout question is a maintainer decision, not a missing test"
     );
 }
 

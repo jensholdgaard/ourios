@@ -74,6 +74,73 @@ pub(crate) const LOKI_DISPATCH_FLAGS: &[&str] = &[
     "-validation.max-entries-limit=2000000",
 ];
 
+/// RFC0031.10's **declared low-cardinality label allowlist** — every
+/// stream label the comparative Loki configuration is permitted to index.
+///
+/// The stock single-binary config maps OTLP `service.name` to
+/// `service_name` and promotes nothing else, which is deliberate: it is
+/// what a competent operator gets out of the box, and it is the one label
+/// that actually partitions the corpus into streams. Anything beyond this
+/// either smuggles Ourios's promoted columns into Loki's index (making the
+/// comparison flattering to us) or is a catch-all that forces Loki into a
+/// full scan (making it unflattering). Both are strawmen; the point of the
+/// program is that neither can slip in unnoticed.
+///
+/// Asserted against a running container by
+/// `rfc0031_10_loki_label_allowlist`, not merely declared here.
+pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &["service_name"];
+
+/// Label names that must never appear in Loki's index, named explicitly by
+/// RFC0031.10.
+///
+/// These are the high-cardinality keys Ourios prunes on via Parquet
+/// statistics and promoted columns. If any became a Loki stream label, our
+/// must-win classes would be measuring Loki's index against our index
+/// rather than measuring the pruning thesis — and an L3 trace-correlation
+/// win over a Loki that indexes `trace_id` would mean nothing.
+///
+/// Redundant with the allowlist by construction, and deliberately so: the
+/// allowlist could be widened in a careless edit, and this list states the
+/// names that widening must never reach.
+pub(crate) const LOKI_LABEL_DENYLIST: &[&str] =
+    &["trace_id", "span_id", "template_id", "ourios_template_id"];
+
+/// GET the stream label names Loki currently has indexed.
+pub(crate) async fn loki_label_names(http: &reqwest::Client, base: &str) -> Vec<String> {
+    loki_string_list(http, &format!("{base}/loki/api/v1/labels")).await
+}
+
+/// GET the distinct values Loki holds for one stream label.
+pub(crate) async fn loki_label_values(
+    http: &reqwest::Client,
+    base: &str,
+    label: &str,
+) -> Vec<String> {
+    loki_string_list(http, &format!("{base}/loki/api/v1/label/{label}/values")).await
+}
+
+/// Both label endpoints answer `{"status":"success","data":[...]}`; an
+/// absent `data` means "none known yet", not a failure.
+async fn loki_string_list(http: &reqwest::Client, url: &str) -> Vec<String> {
+    let body = http
+        .get(url)
+        .send()
+        .await
+        .expect("label request reaches Loki")
+        .text()
+        .await
+        .expect("label response body");
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("label response is JSON: {e}: {body}"));
+    match parsed.get("data").and_then(serde_json::Value::as_array) {
+        Some(values) => values
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Start a Loki container on the stock image config plus `extra_args`
 /// (explicit, documented CLI-flag deviations), wait for `/ready`, and
 /// hand back the container (kept alive by the caller), the base URL,

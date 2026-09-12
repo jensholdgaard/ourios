@@ -119,19 +119,32 @@ pub(crate) async fn loki_label_values(
     loki_string_list(http, &format!("{base}/loki/api/v1/label/{label}/values")).await
 }
 
-/// Both label endpoints answer `{"status":"success","data":[...]}`; an
-/// absent `data` means "none known yet", not a failure.
+/// Both label endpoints answer `{"status":"success","data":[...]}`.
+///
+/// An absent `data` means "none known yet", which is a legitimate empty
+/// answer while a push is still being indexed. An HTTP error or Loki's own
+/// `status: "error"` is **not**: folding either into an empty list would let
+/// the caller's poll burn its whole deadline and then report the vacuous
+/// no-labels failure instead of the endpoint's status and body. So both are
+/// checked first, the same way `loki_query_range` and `parse_loki_root` do.
 async fn loki_string_list(http: &reqwest::Client, url: &str) -> Vec<String> {
-    let body = http
+    let resp = http
         .get(url)
         .send()
         .await
-        .expect("label request reaches Loki")
-        .text()
-        .await
-        .expect("label response body");
+        .expect("label request reaches Loki");
+    // Check the HTTP status before parsing: a non-2xx body may not be the
+    // labels JSON at all, and "parse failed" would mask the real error.
+    let status = resp.status();
+    let body = resp.text().await.expect("label response body");
+    assert!(status.is_success(), "loki {url} returned {status}: {body}");
     let parsed: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("label response is JSON: {e}: {body}"));
+    assert_ne!(
+        parsed.get("status").and_then(serde_json::Value::as_str),
+        Some("error"),
+        "loki {url} answered 200 with an error payload: {body}",
+    );
     match parsed.get("data").and_then(serde_json::Value::as_array) {
         Some(values) => values
             .iter()

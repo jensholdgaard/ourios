@@ -177,10 +177,20 @@ fn rfc0008_6_rotation_failure_quiesces_the_wal() {
     let err = wal
         .append(FrameKind::OtlpBatch, &vec![0xBB; 2 * 1024 * 1024])
         .expect_err("rotation must fail on a read-only root");
-    assert!(
-        matches!(err, AppendError::Io { .. }),
-        "the triggering append surfaces the underlying IO error, got {err:?}",
-    );
+    // The triggering append is typed as a rotation failure, not as a generic
+    // append `Io`. The distinction is load-bearing downstream: this append has
+    // just made every later one fail, so a transport that read it as an
+    // ordinary transient I/O error told the client to retry shortly
+    // (ourios#791). `op` must still name the step that failed, since that is
+    // the only place the real cause is reported — later appends carry no
+    // source at all.
+    match &err {
+        AppendError::RotationFailed { op, .. } => assert!(
+            op.contains("rotation") || op.contains("segment"),
+            "the rotation step must be named in `op`, got {op:?}",
+        ),
+        other => panic!("the triggering append must be RotationFailed, got {other:?}"),
+    }
 
     // Restore the root: the condition is gone, but the WAL stays
     // quiesced — only operator intervention (a fresh open) clears it.

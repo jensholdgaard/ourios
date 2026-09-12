@@ -117,12 +117,14 @@ consequence — "every acked record at or below the mark is durably
 captured". That is the checkpoint precondition, already proven, already
 under the miner lock.
 
-So the checkpoint advances there and nowhere else:
+So the checkpoint advances there and nowhere else — see §3.7 for the
+ownership path and the exact signatures, which the barrier does not have
+today:
 
 ```text
-if flush_then_snapshot(..., high_water) {
-    wal.checkpoint(high_water)          // §6.7, monotonic
-}
+if barrier_succeeded and high_water is Some(mark):
+    journal.checkpoint(mark)            // §6.7, monotonic; Result
+      on Err  -> log, do NOT advance, retain every segment
 ```
 
 Three properties come free from existing code and must not be
@@ -152,7 +154,8 @@ latest durable snapshot's high-water mark as `retain_floor`:
 
 ```text
 every housekeeping_secs:
-    wal.housekeeping(latest_durable_snapshot_high_water)
+    journal.housekeeping(latest_durable_snapshot_high_water)   // Result
+      on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
 The floor is load-bearing and is the reason §3.1 can tolerate a failed
@@ -255,6 +258,54 @@ With that settled, the age sweep can survive a panic and keep sweeping
 (#795 deliberately stops, because without this it would repeat the loss
 every tick).
 
+### 3.7 Ownership and API surface
+
+§3.1 and §3.2 are not callable as written today, and saying so precisely is
+part of this RFC's job.
+
+**The barrier has no WAL handle.** `flush_then_snapshot` receives the record
+sink, the audit sink, the snapshots root, the miner, an
+`Option<WalOffset>` high-water mark and a cadence label. The WAL itself is
+boxed as a `Box<dyn Journal>` inside a `Mutex` in the commit coordinator,
+which is where the single-writer position lives (RFC 0008 §3.1).
+
+**`Journal` has no reclamation surface.** The trait is `append_batch`,
+`sync`, `unflushed_bytes`. `Wal::checkpoint` and `Wal::housekeeping` are
+inherent methods on the concrete type, so the pipeline cannot reach them
+through the trait object.
+
+So the design is:
+
+- **`Journal` gains the two reclamation methods**, mirroring the inherent
+  signatures: `checkpoint(&mut self, durable_to: WalOffset) -> Result<(), _>`
+  and `housekeeping(&mut self, retain_floor: Option<WalOffset>) -> Result<(), _>`,
+  plus the reclamation counters §3.5 exports. Adding them to the trait rather
+  than downcasting keeps the test doubles able to observe reclamation, which
+  RFC0052.1 and RFC0052.2 need.
+- **The barrier reaches them through the coordinator**, which already owns the
+  journal mutex, rather than taking a second handle to the same WAL. A second
+  handle would put two owners on a single-writer resource, which is the one
+  thing RFC 0008 §3.1 forbids.
+- **`Option<WalOffset>` skips.** `None` means no high-water mark is known
+  (the post-recovery call runs before any batch has been acked), and there is
+  then nothing to declare reclaimable. Only `Some(mark)` advances.
+- **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
+  and leaves the in-memory checkpoint unadvanced, which is already
+  `Wal::checkpoint`'s own behaviour; the WAL then keeps every segment. A
+  failed `housekeeping` logs and the next pass retries, since nothing was
+  unlinked past the bound. Neither failure fails the barrier: the data is in
+  object storage either way, and refusing to ack over a reclamation error
+  would turn a disk-space problem into an availability one.
+
+**One consequence worth naming.** Housekeeping takes the single-writer
+position, so appends stall for the duration of a directory walk plus the
+unlinks. That is acceptable and is also why §3.2 is on a timer rather than
+inline with rotation, but the pass must be bounded — either by running it on
+the blocking pool while holding the position, or by capping unlinks per pass.
+After §3.2 there should be far fewer segments than the 1,113 the incident
+node held, so the walk is small; the bound exists so that the *first* pass on
+a node that has never reclaimed does not stall ingest for seconds.
+
 ## 4. Alternatives considered
 
 **Checkpoint on its own timer, independent of the publication barrier.**
@@ -313,10 +364,14 @@ tracked separately; it is not the backpressure signal.
 >   store is healthy
 > - **When** the publication barrier completes with both sinks fully
 >   drained
-> - **Then** `Wal::checkpoint` is advanced to the barrier's high-water
->   mark
+> - **Then** the journal's checkpoint is advanced to the barrier's
+>   high-water mark
 > - **And** when either sink retains anything, no checkpoint is
 >   attempted and `last_checkpoint()` is unchanged
+> - **And** when the high-water mark is `None`, no checkpoint is attempted
+> - **And** when the checkpoint write fails, the barrier still reports
+>   success, `last_checkpoint()` is unchanged, and no segment is reclaimed
+>   on the next housekeeping pass
 
 > **Scenario RFC0052.2 — Segments are reclaimed, and never past the
 > snapshot floor**

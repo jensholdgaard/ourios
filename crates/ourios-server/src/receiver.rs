@@ -756,17 +756,58 @@ mod tests {
             PublishCoordinator::new(records, audit)
         }
 
-        #[tokio::test]
-        async fn a_panicked_step_is_counted() {
+        /// A panicked step must be counted, and counted **through the
+        /// production helper**.
+        ///
+        /// Asserting only the returned boolean would leave one edge untested:
+        /// dropping the `coordinator.record_cadence_panic()` call while still
+        /// returning `true` satisfies a boolean assertion, and the integration
+        /// test calls the coordinator directly, so both would pass. Hence one
+        /// test covering both the routing and its side effect rather than two.
+        ///
+        /// It installs the **global** in-memory meter, which is safe here for a
+        /// narrow reason: this binary's unit tests contain no other installer
+        /// (the server crate's one lives in the separate
+        /// `rfc0016_6_query_metrics.rs` integration binary, a different
+        /// process), and no sibling test asserts on metrics.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn the_panic_count_reaches_the_counter_through_the_helper() {
+            use opentelemetry_sdk::metrics::data::{
+                AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
+            };
+
+            let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
             let root = tempfile::TempDir::new().expect("root");
             let join_error = tokio::spawn(async { panic!("the step blew up") })
                 .await
                 .expect_err("a panicking task joins as an Err");
-            assert!(join_error.is_panic());
-            assert!(
-                count_step_panic(&coordinator(root.path()), &join_error),
-                "a panicked cadence step must be counted — it is the only \
-                 signal that the cadence is now dead",
+
+            assert!(count_step_panic(&coordinator(root.path()), &join_error));
+            guard.force_flush().expect("force_flush");
+
+            let rms = exporter.get_finished_metrics().expect("metrics exported");
+            let tagged: u64 = rms
+                .iter()
+                .flat_map(ResourceMetrics::scope_metrics)
+                .flat_map(ScopeMetrics::metrics)
+                .filter(|m| m.name() == ourios_semconv::OURIOS_SINK_FLUSH_ERRORS)
+                .filter_map(|m| match m.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+                    _ => None,
+                })
+                .flat_map(opentelemetry_sdk::metrics::data::Sum::data_points)
+                .filter(|dp| {
+                    dp.attributes().any(|kv| {
+                        kv.key.as_str() == "error.type" && kv.value.as_str() == "cadence_panic"
+                    })
+                })
+                .map(SumDataPoint::value)
+                .sum();
+            assert_eq!(
+                tagged, 1,
+                "the helper must actually forward to the coordinator — a \
+                 `true` return with the call removed is the regression this \
+                 pins",
             );
         }
 

@@ -14,9 +14,10 @@ superseded-by: —
 > **Status note.** `drafted`. Motivated by a production incident
 > (issue #791) and the three defects found tracing it (#791, #793,
 > #796). Amends RFC 0008 §6.5 and §6.7 with the *policy* those
-> sections left to a caller that was never written, and adds the
-> ingest-rejection contract and WAL telemetry the incident showed are
-> missing. Touches `CLAUDE.md` §3.4 throughout, which is why it is an
+> sections left to a caller that was never written, **amends RFC 0018 §3.2**
+> (whose transient class lists "post-rotation quiesce", which #791
+> disproved), and adds the ingest-rejection contract and WAL telemetry the
+> incident showed are missing. Touches `CLAUDE.md` §3.4 throughout, which is why it is an
 > RFC and not four patches.
 >
 > **Scope note for reviewers.** Successive review rounds have found most
@@ -363,7 +364,28 @@ Today the only limit on local accumulation is the volume. That is an
 implicit limit with an undefined failure mode, which is what turned an
 outage into a wedge. The WAL gains a declared local bound, and crossing it is
 a *stated* rejection, specified as a transport contract rather than gestured
-at: `ReceiveError` gains a `WalBackpressure` variant carrying the limit that
+at.
+
+**This RFC amends RFC 0018 §3.2, and that amendment is the reason it has to
+be stated here.** §3.2's transient class lists "post-rotation quiesce"
+alongside WAL append I/O and fsync failures, all mapping to
+`UNAVAILABLE` / `503` "with an optional `Retry-After` header". Classifying the
+quiesce as transient was right when the latch was assumed to be a momentary
+condition; #791 showed it is permanent until a restart, so the classification
+is now wrong in the one way that matters — it tells a client the node will
+recover on its own.
+
+The amendment is narrow and does **not** touch §3.2's binding rule, which is
+that a transient failure must never carry a non-retryable code. The status
+stays `UNAVAILABLE` / `503` for exactly the reason §3.2 gives: the batch was
+not acked, and every non-retryable OTLP status also tells the client to drop
+it. What changes is the *class*: post-rotation quiesce moves out of transient
+into a third outcome, and `Retry-After` — already optional in §3.2 — is
+withheld there, because the RFC's "optional" was written for a condition that
+clears on its own.
+
+Backpressure then joins as a fourth: `ReceiveError` gains a `WalBackpressure`
+variant carrying the limit that
 was hit and the measurement that crossed it; `IngestFailure::classify` maps it
 to a new `Backpressure` outcome, which that exhaustive match then forces both
 transports to handle; both render `503` / `UNAVAILABLE` with the limit named
@@ -717,6 +739,18 @@ first.
 > - **And** a backlog of stale *temporary* files is also bounded by the same
 >   cap, so temp sweeping cannot make a "bounded" pass do unbounded work
 
+> **Scenario RFC0052.15 — A quiesced WAL is reported as neither transient nor
+> non-retryable**
+> - **Given** a WAL quiesced by a rotation failure, and the append that caused
+>   it
+> - **When** either is reported on both transports
+> - **Then** both carry `503` / `UNAVAILABLE` — RFC0018.3 still holds, and a
+>   non-retryable code would tell the client to drop an unacked batch
+> - **And** neither carries `Retry-After`, and the message names the state
+> - **And** an ordinary append or fsync I/O failure still carries
+>   `Retry-After`, so the reclassification is narrow rather than a blanket
+>   change to RFC 0018 §3.2's transient class
+
 > **Scenario RFC0052.14 — The timer cannot stamp across a concurrent submit**
 > - **Given** the reclamation timer firing while ingest submits continuously
 > - **When** the timer runs its sequence
@@ -845,6 +879,12 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   and must keep both halves of what the original protected: no ack on an
   incomplete rotation, and a permanent refusal when the fault is
   persistent.
+- **Reclassification (RFC0052.15)** — the classifier unit tests already in
+  place for `Wedged`, extended to assert the *narrowness*: an ordinary append
+  or fsync I/O failure keeps `Retry-After` while the quiesce and the
+  rotation-failure append do not. Without that third assertion the test passes
+  on a blanket removal of `Retry-After`, which would contradict RFC 0018 §3.2
+  rather than amend it.
 - **Backpressure (RFC0052.6)** — an integration test with an unreachable
   store asserting the accept-then-refuse-then-resume sequence, the reason
   text, the `Retry-After`, and that the rotation-failure state was never
@@ -935,6 +975,10 @@ demonstrate the incident cannot recur rather than that a unit behaves.
 - RFC 0008 §6.5 (rotation), §6.6 (recovery horizon), §6.7 (checkpoint
   and housekeeping), §6.8 (counters), §6.9 (tunables) — the mechanism
   this RFC supplies the policy for.
+- RFC 0018 §3.2 (retryable error mapping) — **amended** by §3.4: its transient
+  class lists "post-rotation quiesce", which #791 disproved. RFC0018.3 stays
+  satisfied, since the status is unchanged; only the class and the optional
+  `Retry-After` move.
 - RFC 0001 §6.9 — the miner snapshot high-water mark, and the hazard-#5
   retain rule that makes it the truncation floor.
 - RFC 0014 — the record sink and its flush triggers.

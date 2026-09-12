@@ -117,9 +117,20 @@ consequence — "every acked record at or below the mark is durably
 captured". That is the checkpoint precondition, already proven, already
 under the miner lock.
 
-So the checkpoint advances there and nowhere else — see §3.7 for the
-ownership path and the exact signatures, which the barrier does not have
-today:
+So the checkpoint advances behind that barrier and nowhere else. **But the
+barrier must also be reachable without an append.** Today it runs from the
+rotation hook, which fires only after a successful append observes a segment
+change, and from shutdown. If reclamation depended on that alone, §3.4's
+backpressure would deadlock: once the bound rejects every append, no rotation
+happens, so the checkpoint cannot advance, so the bound never clears — a
+second route to exactly the wedge this RFC exists to remove. The age sweep is
+not a substitute: it deliberately takes no snapshot and so establishes nothing
+about durability.
+
+The barrier therefore also runs on §3.2's timer, which is append-independent
+by construction. One predicate, three callers (rotation, shutdown, timer).
+See §3.7 for the ownership path and the exact signatures, which the barrier
+does not have today:
 
 ```text
 if barrier_succeeded and high_water is Some(mark):
@@ -153,7 +164,9 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    journal.housekeeping(retain_floor())                       // Result
+    if barrier_succeeded and high_water is Some(mark):         // §3.1, append-free
+        journal.checkpoint(mark)
+    journal.housekeeping(retain_floor(), max_unlinks_per_pass) // Result
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
@@ -215,22 +228,45 @@ sitting there, which `Wal::open` may select as the newest segment. Either
 case contradicts RFC0052.4/.5's restart property, so the design removes the
 orphan *class* instead of cleaning up after it:
 
-**A fresh segment is created under a temporary name and renamed into place
-only once its header fsync and the parent-directory fsync have both
-succeeded.** A rotation that fails at any step therefore never leaves a file
-that looks like a segment. `list_segments` ignores the temporary name, so a
-leftover is invisible to `Wal::open`'s newest-segment selection and to
-replay, and housekeeping removes it on a later pass. This amends RFC 0008
-§6.5's on-disk create sequence and is the one on-disk behaviour change in
-this RFC; it needs no format or schema change, because the temporary name
-never becomes a segment.
+**A fresh segment is created under a temporary name, its header fsynced, then
+renamed to its final `.wal` name, and only then is the parent directory
+fsynced.** The ordering matters in both directions:
 
-The pre-existing orphans a node may already carry from a past quiesce are
-handled by the same `list_segments` rule only if they bear the temporary
-name, which they will not. Those keep today's behaviour — they are real
-zero-frame segments and replay reads them as such — so this is not a
-migration (`CLAUDE.md` §3.5 does not apply: no committed frame's encoding
-changes).
+- the header must be durable *before* the rename, or a surviving `.wal` entry
+  can have unreadable header bytes — today's hazard;
+- the parent fsync must come *after* the rename, because the rename creates
+  the directory entry and an fsync taken before it does not make that entry
+  durable. Rotation is not complete until that fsync returns, and no frame is
+  acked in a segment whose entry is not durable — the same obligation
+  `dir_fsync_pending` already carries for the segment `open` creates.
+
+A rotation that fails at any step therefore never leaves a file that looks
+like a segment. This amends RFC 0008 §6.5's on-disk create sequence and is
+the one on-disk behaviour change in this RFC; it needs no format or schema
+change, because the temporary name never becomes a segment.
+
+**Temporary files are swept explicitly, not implicitly.** `list_segments`
+returns only `*.wal`, so a temporary file is invisible to it — which is the
+point for `Wal::open`, and means housekeeping would *not* remove it either.
+Left at that, a persistently failing rotation would leave one temporary file
+per retry, consuming the same disk §3.4's bound exists to protect. So
+housekeeping gains a second, explicit step: unlink temporary files that are
+not the in-flight one. The bounded retry budget caps how many can exist
+between passes, and an unlink failure is logged and retried on the next pass
+like any other.
+
+**Pre-existing `*.wal` orphans need their own answer, and changing future
+rotations is not it.** A node wedged before this RFC lands may already hold a
+segment whose header fsync failed, so its header bytes may be partial —
+`Wal::open` validates every `*.wal` and can return `OpenError::Corrupt` on it.
+Claiming these are "real zero-frame segments" was wrong. On open, a trailing
+`*.wal` that is **the newest segment, unreadable as a header, and the only
+file in that state** is treated as a failed rotation's remnant and unlinked
+(durably, with a parent fsync) rather than reported as corruption; anything
+else still reports `OpenError::Corrupt`, because a corrupt *older* segment or
+more than one bad file is not the rotation-failure shape and must not be
+silently discarded. This is narrow on purpose: RFC0008.5 corruption
+detection is load-bearing and is not being relaxed for the general case.
 
 Retry is attempted on the next `append`, not in a background loop: the
 WAL is single-writer and has no task of its own, and a rotation is only
@@ -263,19 +299,36 @@ dropped.
 
 Today the only limit on local accumulation is the volume. That is an
 implicit limit with an undefined failure mode, which is what turned an
-outage into a wedge. The WAL gains a declared local bound — bytes
-retained below the checkpoint, and the age of the oldest unreclaimed
-frame — and crossing it is a *stated* rejection: `IngestFailure` already
-distinguishes a transient unavailability from a wedge (#794), and
-backpressure becomes a third outcome with its own reason text and a
-`Retry-After` derived from the limit rather than a fixed second.
+outage into a wedge. The WAL gains a declared local bound, and crossing it is
+a *stated* rejection: `IngestFailure` already distinguishes a transient
+unavailability from a wedge (#794), and backpressure becomes a third outcome
+with its own reason text and a `Retry-After` derived from the limit rather
+than a fixed second.
 
-The bound is configuration with a conservative default, and the
-rejection is the contract: ingest keeps accepting while the object store
-is unreachable until the declared limit, then refuses with a reason that
-names the limit it hit. Crucially, crossing the limit does **not** set
-the quiesce latch — it is a pressure state that clears itself the moment
-the checkpoint advances.
+**The bound is over ALL unreclaimed bytes and the age of the oldest
+unreclaimed frame — not over bytes retained below the checkpoint.** During
+the outage this is meant to bound, the checkpoint is precisely what stops
+advancing, so new frames pile up *above* it: a below-checkpoint limit would
+measure the one quantity that is not growing and never fire. "Unreclaimed"
+therefore means every byte housekeeping has not removed, including the
+post-checkpoint tail, the current append segment and anything the tenant
+floor is retaining.
+
+**The check is a pre-append reservation, not a post-append test.** The commit
+coordinator appends under the journal lock before waiting for the sync, so a
+limit checked after the append would leave the supposedly-rejected batch
+sitting in the WAL — and a client that retries on the rejection would then
+have the batch replayed or published twice. The reservation is taken under the
+same lock that performs the append, so a refused batch is never written at
+all. There is no rollback path, deliberately: truncating an appended frame is
+a second way to corrupt the tail.
+
+The bound is configuration with a conservative default, and the rejection is
+the contract: ingest keeps accepting while the object store is unreachable
+until the declared limit, then refuses with a reason that names the limit it
+hit. Crucially, crossing the limit does **not** set the quiesce latch — it is
+a pressure state that clears itself the moment the checkpoint advances, which
+§3.1's timer-driven barrier guarantees can happen without an append.
 
 ### 3.5 The state becomes observable
 
@@ -310,6 +363,18 @@ and says nothing against delivering it twice; the recovery driver's
 Parquet-side suppression is already the project's answer to at-least-once
 replay, and the audit-ordering barrier is preserved either way because
 the record flush is skipped whenever the audit sink has not drained.
+
+**Choosing the policy is not the same as making it hold, so the mechanism is
+specified too.** `write_ordered` moves `drained.audit` into `write_owned`
+before it can touch `drained.records`, so a panic inside that call drops
+whatever is still owned as `Drained` unwinds — the policy alone changes
+nothing. The batches are therefore held in a guard whose `Drop` requeues
+whatever it still owns: the parts move out of it one at a time as each write
+succeeds, so on any panic arm the guard requeues exactly the audit events and
+record batches that had not yet been handed over. Either optional fields or an
+`into_parts` split works; what the design requires is that *no* panic arm can
+drop an un-requeued batch, which a `Drop` impl gives and an explicit
+`catch_unwind` at one call site does not.
 
 With that settled, the age sweep can survive a panic and keep sweeping
 (#795 deliberately stops, because without this it would repeat the loss
@@ -360,9 +425,17 @@ So the design is:
   journal mutex, rather than taking a second handle to the same WAL. A second
   handle would put two owners on a single-writer resource, which is the one
   thing RFC 0008 §3.1 forbids.
-- **`Option<WalOffset>` skips.** `None` means no high-water mark is known
-  (the post-recovery call runs before any batch has been acked), and there is
-  then nothing to declare reclaimable. Only `Some(mark)` advances.
+- **`Option<WalOffset>` skips, and the post-recovery call is an explicit
+  exception.** `None` means no high-water mark is known, and there is then
+  nothing to declare reclaimable. `None` is *not* the same as "post-recovery",
+  which the earlier draft conflated: `serve` passes `report.max_delivered`,
+  which is `Some` whenever replay delivered a frame, and it does so **before
+  the commit coordinator exists**, so there is no journal owner to checkpoint
+  through. That call therefore deliberately advances no checkpoint; the first
+  timer pass after the coordinator is built does it instead, from the same
+  mark or a later one. §3.1's "behind the barrier and nowhere else" holds —
+  this is a caller that has the mark but not yet the owner, not a second
+  checkpoint site.
 - **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
   and leaves the in-memory checkpoint unadvanced, which is already
   `Wal::checkpoint`'s own behaviour; the WAL then keeps every segment. A
@@ -372,13 +445,20 @@ So the design is:
   would turn a disk-space problem into an availability one.
 
 **One consequence worth naming.** Housekeeping takes the single-writer
-position, so appends stall for the duration of a directory walk plus the
-unlinks. That is acceptable and is also why §3.2 is on a timer rather than
-inline with rotation, but the pass must be bounded — either by running it on
-the blocking pool while holding the position, or by capping unlinks per pass.
-After §3.2 there should be far fewer segments than the 1,113 the incident
-node held, so the walk is small; the bound exists so that the *first* pass on
-a node that has never reclaimed does not stall ingest for seconds.
+position, so every append stalls for the duration of the directory walk plus
+the unlinks. Running it on the blocking pool does **not** help: the stall is
+caused by holding the journal mutex, not by occupying a runtime worker, so
+moving the work to another thread while still holding the lock bounds nothing.
+
+The pass is therefore **capped**: at most `max_unlinks_per_pass` segments are
+removed, and the pass returns having made partial progress rather than
+finishing the backlog. The next timer tick continues where it left off, which
+needs no cursor because the bound is recomputed each time and the oldest
+eligible segments are always the ones taken first. That matters most on the
+*first* pass of a node that has never reclaimed — the incident node held 1,113
+segments, and an uncapped pass would have stalled ingest for as long as 1,113
+unlinks take. In steady state, after §3.2 is running, a pass has a handful of
+segments to consider and the cap never binds.
 
 ## 4. Alternatives considered
 
@@ -444,8 +524,11 @@ tracked separately; it is not the backpressure signal.
 >   attempted and `last_checkpoint()` is unchanged
 > - **And** when the high-water mark is `None`, no checkpoint is attempted
 > - **And** when the checkpoint write fails, the barrier still reports
->   success, `last_checkpoint()` is unchanged, and no segment is reclaimed
->   on the next housekeeping pass
+>   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
+>   reclaims nothing that was **not already eligible under the previous
+>   mark** — `Wal::checkpoint` leaves that mark intact on failure, so
+>   forbidding all reclamation would reject the fail-closed behaviour §3.1
+>   specifies rather than test it
 
 > **Scenario RFC0052.2 — Segments are reclaimed, and never past the
 > *minimum* tenant snapshot floor**
@@ -481,6 +564,9 @@ tracked separately; it is not the backpressure signal.
 >   remains from the failed attempt — asserted by opening the WAL again,
 >   not by inspecting the directory, since the temporary name is an
 >   implementation detail
+> - **And** the temporary files left by the failed attempts are gone after a
+>   housekeeping pass, so a persistently retrying node cannot fill its disk
+>   with retry debris
 
 > **Scenario RFC0052.5 — A persistent rotation failure gives up
 > distinguishably, and never acks**
@@ -495,6 +581,27 @@ tracked separately; it is not the backpressure signal.
 >   reporting corruption, including when the cleanup of the last attempt's
 >   temporary file never completed
 
+> **Scenario RFC0052.11 — A node already wedged before this RFC still opens**
+> - **Given** a WAL directory in the state today's rotation failure leaves:
+>   a newest `*.wal` whose header bytes are partial, written before this RFC
+>   landed
+> - **When** the WAL is opened
+> - **Then** the remnant is unlinked durably and the open succeeds on the
+>   preceding segment
+> - **And** a partial header on an **older** segment, or more than one
+>   unreadable file, still reports `OpenError::Corrupt` — the narrowing must
+>   not become a general "discard what we cannot parse"
+
+> **Scenario RFC0052.12 — A reclamation pass bounds the writer stall**
+> - **Given** a backlog far larger than `max_unlinks_per_pass` (the
+>   incident's 1,113 segments is the shape)
+> - **When** a housekeeping pass runs
+> - **Then** it unlinks at most the cap and returns, and an append taken
+>   concurrently waits for at most that much work rather than the whole
+>   backlog
+> - **And** successive passes drain the backlog to the same end state an
+>   uncapped pass would reach
+
 > **Scenario RFC0052.6 — Backpressure is a stated limit, and clears
 > itself**
 > - **Given** an unreachable object store and a configured local
@@ -503,9 +610,16 @@ tracked separately; it is not the backpressure signal.
 > - **Then** earlier batches were accepted and acked, and the rejecting
 >   batch is refused with a reason naming the limit and a `Retry-After`
 >   derived from it
+> - **And** the refused batch is **not present in the WAL** — asserted by
+>   replaying after a restart, so a post-append check that left the frame
+>   behind fails here
+> - **And** the bound fires on bytes accumulated *above* a stalled
+>   checkpoint, not only below it: a run where the checkpoint never advances
+>   must still reach the limit
 > - **And** the rejection does **not** set the rotation-failure state
-> - **And** when the store returns and the checkpoint advances, ingest
->   resumes with no restart
+> - **And** when the store returns, ingest resumes **with no append and no
+>   restart** — the timer-driven barrier advances the checkpoint, which is
+>   the only path that can clear a state that rejects every append
 
 > **Scenario RFC0052.7 — The WAL's state is exported**
 > - **Given** a running node
@@ -522,6 +636,10 @@ tracked separately; it is not the backpressure signal.
 > - **When** the unwind completes
 > - **Then** the drained records and audit events are back in their
 >   buffers
+> - **And** this holds for a panic raised **at each** point the publish can
+>   reach it — before the audit write, inside it, and inside the record
+>   publish — since the partial-move shape means only the last of those is
+>   caught by a naive guard
 > - **And** the publication barrier does not read the buffers as fully
 >   drained, so no high-water mark is stamped across them
 > - **And** a subsequent barrier with a healthy store publishes them
@@ -566,8 +684,18 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   the four rotation steps, once-failing and always-failing, asserting
   recovery in the first case and a distinguishable terminal refusal in
   the second, plus `Wal::open` succeeding afterwards in both (the
-  temporary-name property). A `proptest` over which step fails and how
-  many times keeps the four sites from being tested only one way.
+  temporary-name property) and the temp files being swept. A `proptest` over
+  which step fails and how many times keeps the four sites from being tested
+  only one way.
+- **Pre-existing orphans (RFC0052.11)** — a directory fixture hand-built in
+  the shape today's failure leaves, asserting both the unlink-and-open arm
+  and the two arms that must still report corruption. A fixture rather than
+  fault injection, because the state predates the code under test.
+- **Capped passes (RFC0052.12)** — a backlog well past the cap, asserting the
+  per-pass unlink count and that repeated passes reach the uncapped end
+  state. The concurrent-append half is asserted by timing out an append
+  against an uncapped pass in a regression guard rather than by measuring
+  wall clock, which would be flaky.
 
   These **replace** `rfc0008_6_rotation_failure_quiesces_the_wal`, whose
   "even after the underlying condition clears" assertion is the contract
@@ -575,22 +703,28 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   and must keep both halves of what the original protected: no ack on an
   incomplete rotation, and a permanent refusal when the fault is
   persistent.
-- **Backpressure (RFC0052.6)** — an integration test with an
-  unreachable store asserting the accept-then-refuse-then-resume
-  sequence, the reason text, the `Retry-After`, and that the
-  rotation-failure state was never entered. The resume leg is the
-  regression test for #791 itself.
+- **Backpressure (RFC0052.6)** — an integration test with an unreachable
+  store asserting the accept-then-refuse-then-resume sequence, the reason
+  text, the `Retry-After`, and that the rotation-failure state was never
+  entered. Two legs carry most of the value: the refused batch must be absent
+  after a restart-and-replay (a post-append check would leave it), and the
+  resume must happen with **no append at all**, which is what proves the
+  timer-driven barrier can clear a state that rejects every append. Those two
+  are the regression tests for #791 itself.
 - **Telemetry (RFC0052.7)** — the in-memory metric exporter pattern
   already used for the ingest/sink instruments, asserting every name is
   in the exported stream; plus a `weaver registry live-check` pass over
   the new log events, since an event the tests never emit is an event
   the live-check never checks (that is how #795's un-named event passed
   CI).
-- **Unwind safety (RFC0052.8, RFC0052.9)** — a publish double that
-  panics on demand, asserting the buffers are repopulated, the barrier
-  refuses to stamp, and a later healthy barrier publishes. RFC0052.9
-  drives many consecutive panicking ticks and asserts the record count
-  is conserved.
+- **Unwind safety (RFC0052.8, RFC0052.9)** — a publish double that panics on
+  demand at **each** reachable point (before the audit write, inside it,
+  inside the record publish), asserting the buffers are repopulated in every
+  case, the barrier refuses to stamp, and a later healthy barrier publishes.
+  Parameterising the panic point is the whole test: the partial-move shape
+  means a guard that only covers the last point passes a single-point test.
+  RFC0052.9 drives many consecutive panicking ticks and asserts the record
+  count is conserved.
 - **No loss (RFC0052.10)** — extends the existing `SIGKILL`
   crash-recovery test rather than adding a parallel one, with
   reclamation and a small backpressure bound configured so the kill
@@ -616,6 +750,12 @@ demonstrate the incident cannot recur rather than that a unit behaves.
       `WalMetrics` documents the directory walk as best-effort; exporting
       it on every collection may not be free on a WAL with many
       segments — though after §3.2 there should be far fewer.
+- [ ] `max_unlinks_per_pass`'s default, which trades first-pass stall against
+      how long a large backlog takes to clear.
+- [ ] Whether the RFC0052.11 narrowing is worth carrying permanently or should
+      be a one-release migration that is then removed. It relaxes corruption
+      reporting in one narrow shape, and every such relaxation is a place a
+      real corruption could hide.
 - [ ] Whether backpressure should be per-tenant rather than per-node.
       It is a local-disk property, so per-node is the natural unit, but a
       single noisy tenant can then refuse every other tenant's writes.

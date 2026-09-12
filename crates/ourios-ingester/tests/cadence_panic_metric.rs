@@ -24,6 +24,8 @@ use opentelemetry_sdk::metrics::data::{
 };
 use ourios_core::record::{BodyKind, MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
+use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_parquet::store::Store;
 use ourios_semconv as semconv;
@@ -98,6 +100,7 @@ async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
     // A real `SharedParquetSink`, so what is asserted is the wiring the age
     // sweep calls rather than `SinkMetrics` in isolation.
     let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let audit_root = tempfile::TempDir::new().expect("audit dir");
     let mut sink = SharedParquetSink::new(ParquetRecordSink::new(
         Store::local(bucket.path()).expect("local store"),
         FlushConfig {
@@ -119,7 +122,16 @@ async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
     // Restore before the TempDir drops, or its own cleanup fails.
     set_mode(bucket.path(), 0o755);
 
-    sink.record_cadence_panic();
+    // Through the **coordinator**, which is what the age sweep holds — calling
+    // the sink directly would leave `PublishCoordinator::record_cadence_panic`
+    // untested, and the receiver-side test only asserts the routing boolean,
+    // so a regression that dropped the forwarding call would pass both.
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+        Store::local(audit_root.path()).expect("audit store"),
+        1024,
+    ));
+    let coordinator = PublishCoordinator::new(sink.clone(), audit);
+    coordinator.record_cadence_panic();
     guard.force_flush().expect("force_flush");
 
     let rms = exporter.get_finished_metrics().expect("metrics exported");

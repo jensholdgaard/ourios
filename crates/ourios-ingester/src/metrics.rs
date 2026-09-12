@@ -360,13 +360,20 @@ const ERROR_TYPE: &str = "error.type";
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 /// The `error.type` value for a cadence sweep step that panicked (#791).
 ///
-/// One such count means the flush cadence is **dead** for the life of the
-/// process: the sweep stops on a panic, because continuing would repeat
-/// #796's data-loss window every tick. Partitions then drain only on WAL
-/// rotation and shutdown. So this is not a rate to watch — a single
-/// occurrence is the alert, and a restart is the remedy until the step's
-/// unwind is made safe (see #796 — the drained batches are dropped on
-/// unwind, which is why the sweep stops rather than retrying).
+/// One such count means the **age/cadence** flush trigger is dead for the
+/// life of the process: the sweep stops on a panic, because continuing would
+/// repeat #796's data-loss window every tick.
+///
+/// The size and ceiling triggers keep working, so a busy partition still
+/// flushes on its own. What is lost is the age drain, which is the only
+/// trigger a *low-volume* partition ever reaches — so those partitions wait
+/// for WAL rotation or shutdown, which is hazard #4's small-file and
+/// staleness problem rather than a total stop.
+///
+/// Either way this is not a rate to watch: a single occurrence is the alert,
+/// and a restart is the remedy until the step's unwind is made safe (#796 —
+/// the drained batches are dropped on unwind, which is why the sweep stops
+/// rather than retrying).
 pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {

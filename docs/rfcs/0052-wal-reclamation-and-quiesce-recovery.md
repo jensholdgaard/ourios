@@ -18,6 +18,16 @@ superseded-by: —
 > ingest-rejection contract and WAL telemetry the incident showed are
 > missing. Touches `CLAUDE.md` §3.4 throughout, which is why it is an
 > RFC and not four patches.
+>
+> **Scope note for reviewers.** Successive review rounds have found most
+> defects at the *seams* between the four parts — backpressure crossed with
+> checkpointing, unwind crossed with the snapshot barrier, reclamation crossed
+> with the tenant floor. That is an argument that the scope is wide, and it is
+> deliberate: those seams are where §3.4 is actually at risk, and splitting
+> them into four documents would put each seam outside every document. If the
+> maintainer would rather land this as one spec RFC plus per-part
+> implementation RFCs, §§3.1–3.2 (reclamation) and §3.3 (rotation) are the
+> natural first split, since §3.4 depends on both.
 
 ## 1. Summary
 
@@ -128,7 +138,14 @@ not a substitute: it deliberately takes no snapshot and so establishes nothing
 about durability.
 
 The barrier therefore also runs on §3.2's timer, which is append-independent
-by construction. One predicate, three callers (rotation, shutdown, timer).
+by construction. One predicate, three callers (rotation, shutdown, timer) —
+and the timer caller carries the same prologue the other two already do:
+`flush_then_snapshot` does **not** quiesce encode submissions itself, its
+callers do it first, so a timer caller that skipped `quiesce_encodes()` would
+stamp across in-flight encodes (the barrier's own class-1 case) and lose
+exactly what it is meant to protect. "One predicate, three callers" means the
+whole sequence, not the inner function.
+
 See §3.7 for the ownership path and the exact signatures, which the barrier
 does not have today:
 
@@ -164,9 +181,10 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    if barrier_succeeded and high_water is Some(mark):         // §3.1, append-free
+    quiesce_encodes()                                          // the barrier's prologue
+    if barrier_succeeded and high_water is Some(mark):          // §3.1, append-free
         journal.checkpoint(mark)
-    journal.housekeeping(retain_floor(), max_unlinks_per_pass) // Result
+    journal.housekeeping(retain_floor(), max_unlinks_per_pass)  // Result
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
@@ -240,10 +258,21 @@ fsynced.** The ordering matters in both directions:
   acked in a segment whose entry is not durable — the same obligation
   `dir_fsync_pending` already carries for the segment `open` creates.
 
-A rotation that fails at any step therefore never leaves a file that looks
-like a segment. This amends RFC 0008 §6.5's on-disk create sequence and is
-the one on-disk behaviour change in this RFC; it needs no format or schema
+A rotation that fails *before the rename* therefore never leaves a file that
+looks like a segment. This amends RFC 0008 §6.5's on-disk create sequence and
+is the one on-disk behaviour change in this RFC; it needs no format or schema
 change, because the temporary name never becomes a segment.
+
+**The post-rename window is not covered by that, and needs its own rule.** If
+the final `sync_parent_dir` fails, the `.wal` name already exists — so the
+"never looks like a segment" property does not hold there, and the temporary
+-name sweep does not reach it. That file is a *complete, header-durable*
+segment whose directory entry may not survive a crash, which is exactly the
+state `dir_fsync_pending` already exists to describe. So it is kept, not
+unlinked, and the rotation records that the directory fsync is still owed: the
+next `sync` discharges it before acking anything, as it already does for the
+segment `open` creates. A retry after this failure re-attempts the fsync
+rather than creating a second segment.
 
 **Temporary files are swept explicitly, not implicitly.** `list_segments`
 returns only `*.wal`, so a temporary file is invisible to it — which is the
@@ -255,18 +284,29 @@ not the in-flight one. The bounded retry budget caps how many can exist
 between passes, and an unlink failure is logged and retried on the next pass
 like any other.
 
-**Pre-existing `*.wal` orphans need their own answer, and changing future
-rotations is not it.** A node wedged before this RFC lands may already hold a
-segment whose header fsync failed, so its header bytes may be partial —
-`Wal::open` validates every `*.wal` and can return `OpenError::Corrupt` on it.
-Claiming these are "real zero-frame segments" was wrong. On open, a trailing
-`*.wal` that is **the newest segment, unreadable as a header, and the only
-file in that state** is treated as a failed rotation's remnant and unlinked
-(durably, with a parent fsync) rather than reported as corruption; anything
-else still reports `OpenError::Corrupt`, because a corrupt *older* segment or
-more than one bad file is not the rotation-failure shape and must not be
-silently discarded. This is narrow on purpose: RFC0008.5 corruption
-detection is load-bearing and is not being relaxed for the general case.
+**Pre-existing `*.wal` orphans need their own answer, and neither changing
+future rotations nor guessing at open is it.** A node wedged before this RFC
+lands may already hold a segment whose header fsync failed, so its header
+bytes may be partial — `Wal::open` validates every `*.wal` and can return
+`OpenError::Corrupt` on it. Claiming these are "real zero-frame segments" was
+wrong.
+
+An earlier draft of this section had `Wal::open` unlink such a file when it was
+the newest and the only unreadable one. **That is withdrawn.** An unreadable
+newest segment is indistinguishable from genuine header corruption, and
+RFC0008.5's contract is that corruption halts rather than being cleaned up;
+a heuristic that unlinks it can silently discard real data, which is a worse
+failure than the one it avoids. No shape-based guess is safe here, because the
+shape carries no evidence of which cause produced it.
+
+So: these nodes keep today's behaviour and still halt at open. What this RFC
+adds is that the halt is *actionable* — the error names the file and says it is
+the known rotation-failure remnant shape, so an operator can remove it
+deliberately. Whether that deserves a WAL verb rather than a documented manual
+step is in §7; either way the decision is a human's, because only a human can
+weigh "this is probably rotation debris" against "this might be my data".
+Future rotations cannot reach this state at all, so the population is finite
+and shrinking.
 
 Retry is attempted on the next `append`, not in a background loop: the
 WAL is single-writer and has no task of its own, and a rotation is only
@@ -300,10 +340,16 @@ dropped.
 Today the only limit on local accumulation is the volume. That is an
 implicit limit with an undefined failure mode, which is what turned an
 outage into a wedge. The WAL gains a declared local bound, and crossing it is
-a *stated* rejection: `IngestFailure` already distinguishes a transient
-unavailability from a wedge (#794), and backpressure becomes a third outcome
-with its own reason text and a `Retry-After` derived from the limit rather
-than a fixed second.
+a *stated* rejection, specified as a transport contract rather than gestured
+at: `ReceiveError` gains a `WalBackpressure` variant carrying the limit that
+was hit and the measurement that crossed it; `IngestFailure::classify` maps it
+to a new `Backpressure` outcome, which that exhaustive match then forces both
+transports to handle; both render `503` / `UNAVAILABLE` with the limit named
+in the `Status` message and a `Retry-After` derived from the limit rather than
+#794's fixed second. `503` because the batch was not acked — the same
+reasoning as `Wedged` — and a distinct outcome rather than reusing
+`Unavailable` because the remedy differs: waiting genuinely helps here, which
+is what `Retry-After` is for.
 
 **The bound is over ALL unreclaimed bytes and the age of the oldest
 unreclaimed frame — not over bytes retained below the checkpoint.** During
@@ -368,13 +414,22 @@ the record flush is skipped whenever the audit sink has not drained.
 specified too.** `write_ordered` moves `drained.audit` into `write_owned`
 before it can touch `drained.records`, so a panic inside that call drops
 whatever is still owned as `Drained` unwinds — the policy alone changes
-nothing. The batches are therefore held in a guard whose `Drop` requeues
-whatever it still owns: the parts move out of it one at a time as each write
-succeeds, so on any panic arm the guard requeues exactly the audit events and
-record batches that had not yet been handed over. Either optional fields or an
-`into_parts` split works; what the design requires is that *no* panic arm can
-drop an un-requeued batch, which a `Drop` impl gives and an explicit
-`catch_unwind` at one call site does not.
+nothing. An outer guard alone is not sufficient either, and this is the subtlety that
+makes the fix structural rather than local: `write_owned` and `publish_owned`
+take their `Vec`s **by value**, so the moment either is called the guard no
+longer owns the batch and cannot requeue it if that callee panics. A guard
+around `write_ordered` covers the panic points *between* the writes and none
+of the ones inside them — which are the likely ones, since that is where the
+store I/O and encoding live.
+
+So the requirement lands on the consuming calls, not on their caller: each
+takes the batch in a form that leaves ownership recoverable on unwind —
+`&mut Vec` drained only on success, or an owned handle the callee itself
+guards — so that after any panic the batch is still reachable and requeued.
+The caller-side guard remains, covering the between-write points. What the
+design requires is that **no** panic arm anywhere in the sequence can drop an
+un-requeued batch; a `Drop` impl at one level cannot deliver that alone, and
+neither can a `catch_unwind` at one call site.
 
 With that settled, the age sweep can survive a panic and keep sweeping
 (#795 deliberately stops, because without this it would repeat the loss
@@ -404,10 +459,32 @@ So the design is:
   ```text
   enum ReclaimError { Checkpoint(..), Housekeeping(..) }   // object-safe, one type
 
-  fn checkpoint(&mut self, durable_to: WalOffset)          -> Result<(), ReclaimError>
-  fn housekeeping(&mut self, retain_floor: Option<WalOffset>) -> Result<(), ReclaimError>
+  /// Why a floor is or is not available — `Option` cannot carry this.
+  enum RetainFloor {
+      None,                  // no snapshot consumer exists: checkpoint alone governs
+      Min(WalOffset),        // the minimum over every tenant's horizon
+      Incomplete,            // a consumer exists but some tenant has no snapshot
+  }
+
+  fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError>
+  fn housekeeping(&mut self, floor: RetainFloor, max_unlinks: usize)
+      -> Result<HousekeepingProgress, ReclaimError>
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
   ```
+
+  `RetainFloor` exists because `Option<WalOffset>` cannot distinguish the two
+  cases §3.2 requires: `None` means no snapshot consumer exists and the
+  checkpoint alone governs, which is *safe to reclaim*, while `Incomplete`
+  means a consumer exists but a tenant has no valid snapshot, which must
+  reclaim **nothing**. An `Option` makes the unsafe reading — treating
+  "incomplete" as "unbounded" — expressible, and a signature that can express
+  the data-losing case is the wrong signature.
+
+  `max_unlinks` is a parameter rather than WAL configuration because the cap
+  belongs to the caller's stall budget, and `HousekeepingProgress` reports
+  whether the pass hit the cap, so the caller can tell "backlog drained" from
+  "more to do" without re-deriving it. Without both, RFC0052.12's
+  bounded-stall contract has no way to be implemented.
 
   The concrete impl maps `CheckpointError` and `HousekeepingError` into
   `ReclaimError`; a `Box<dyn Journal>` cannot infer an associated error type,
@@ -506,9 +583,23 @@ natural place: the drain loop exits when `flush_largest()` fails and
 buffers the record anyway, so the ceiling is a hint and memory grows
 unbounded when the store is down. Blocking there instead would apply
 backpressure in the wrong unit — buffered Parquet bytes rather than
-unreclaimed WAL bytes — and would stall ingest on a condition that does
-not threaten durability. The memory-growth problem is real and is
-tracked separately; it is not the backpressure signal.
+unreclaimed WAL bytes — and would stall ingest on a condition that does not
+threaten durability.
+
+But rejecting it as the *signal* is not the same as leaving it alone, and the
+earlier draft's "tracked separately" was a hand-wave. Both the record and the
+audit sink retain past their ceilings whenever a store flush fails, so an
+outage grows memory without bound and can OOM the process **before** the WAL
+bound is anywhere near reached — in which case §3.4 never fires and this RFC
+has bounded the wrong resource. That makes it a prerequisite, not a neighbour.
+
+This RFC does not solve it, because the fix is a different decision (what does
+a full sink do — block, spill, or drop, and under whose invariant), but it
+states the dependency: §3.4's bound is only the operative limit if memory
+growth during an outage is separately bounded, and until it is, the honest
+claim is that this RFC bounds *disk* and the OOM path remains. RFC0052.6's
+unreachable-store leg should be run long enough to show which limit is hit
+first.
 
 ## 5. Acceptance criteria
 
@@ -601,6 +692,19 @@ tracked separately; it is not the backpressure signal.
 >   backlog
 > - **And** successive passes drain the backlog to the same end state an
 >   uncapped pass would reach
+> - **And** a backlog of stale *temporary* files is also bounded by the same
+>   cap, so temp sweeping cannot make a "bounded" pass do unbounded work
+
+> **Scenario RFC0052.13 — An incomplete tenant floor cannot be read as
+> unbounded**
+> - **Given** a snapshot consumer exists and one tenant with WAL data has no
+>   valid snapshot
+> - **When** housekeeping runs
+> - **Then** nothing is reclaimed, and this is distinguishable in the API from
+>   the no-consumer case, which reclaims by checkpoint alone
+> - **And** the state is exported (§3.5), so an operator seeing backpressure
+>   that will not clear can tell it is a lagging tenant rather than an
+>   unexplained refusal
 
 > **Scenario RFC0052.6 — Backpressure is a stated limit, and clears
 > itself**
@@ -675,11 +779,19 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   floor deliberately below it, asserting exactly which files survive.
   The floor case is the important one: a test that only checks
   "segments disappear" passes on a bound that ignores the floor.
-- **Bounded growth (RFC0052.3)** — the `ourios-bench` soak harness on
-  its synthetic clock, asserting the WAL's byte total and segment count
-  stay bounded over a long run. This is the one criterion a unit test
-  cannot express, because the defect is the *absence* of a periodic
-  call; only elapsed cadence reveals it.
+- **Bounded growth (RFC0052.3)** — the `ourios-bench` soak harness on its
+  synthetic clock, asserting the WAL's byte total and segment count stay
+  bounded over a long run. This is the one criterion a unit test cannot
+  express, because the defect is the *absence* of a periodic call; only
+  elapsed cadence reveals it.
+
+  **The harness cannot do this today and has to be extended first.** It builds
+  a bare WAL and coordinator whose sampler only flushes the sink and runs
+  compaction — there is no snapshot, checkpoint or housekeeping cadence in it
+  at all, and its synthetic clock advances record timestamps rather than
+  driving a timer. So the extension is part of this criterion's cost, not an
+  assumption behind it: the soak loop gains the §3.2 sequence on the synthetic
+  clock, which is also the only way to reach a multi-hour backlog in a test.
 - **Rotation retry (RFC0052.4, RFC0052.5)** — fault injection at each of
   the four rotation steps, once-failing and always-failing, asserting
   recovery in the first case and a distinguishable terminal refusal in
@@ -752,10 +864,19 @@ demonstrate the incident cannot recur rather than that a unit behaves.
       segments — though after §3.2 there should be far fewer.
 - [ ] `max_unlinks_per_pass`'s default, which trades first-pass stall against
       how long a large backlog takes to clear.
-- [ ] Whether the RFC0052.11 narrowing is worth carrying permanently or should
-      be a one-release migration that is then removed. It relaxes corruption
-      reporting in one narrow shape, and every such relaxation is a place a
-      real corruption could hide.
+- [ ] Whether the actionable halt for a pre-existing rotation remnant (§3.3)
+      deserves a WAL verb to remove the file, or stays a documented manual
+      step. The decision must remain a human's either way — no shape-based
+      heuristic can tell rotation debris from real corruption — so this is
+      about ergonomics, not safety.
+- [ ] What a full record or audit sink should do during an outage: block,
+      spill, or drop. §4 now states that §3.4's disk bound is only the
+      operative limit once memory growth is separately bounded, and that
+      question is not answered here. It may need to land *before* this RFC's
+      backpressure to be meaningful.
+- [ ] Whether a stale tenant floor blocking reclamation indefinitely should
+      itself escalate (a second, louder state) or stay a visible metric an
+      operator alerts on. §3.4 makes it visible; it does not decide.
 - [ ] Whether backpressure should be per-tenant rather than per-node.
       It is a local-disk property, so per-node is the natural unit, but a
       single noisy tenant can then refuse every other tenant's writes.

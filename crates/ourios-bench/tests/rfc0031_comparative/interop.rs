@@ -30,7 +30,7 @@ use crate::*;
 fn rfc0031_10_loki_label_allowlist() {
     let records = two_service_fixture();
     let mut logs = fixture_logs_data(&records);
-    inject_denylisted_keys(&mut logs);
+    inject_probe_attributes(&mut logs);
     assert_denylisted_keys_are_on_the_wire(&logs);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -88,15 +88,63 @@ fn two_service_fixture() -> Vec<FixtureRecord> {
         .collect()
 }
 
-/// Put every denylisted key on the wire, in the field or attribute slot a
-/// real OTLP push would carry it in — `span_id` in its protobuf field, the
-/// template ids as resource *and* record attributes, since resource
-/// attributes are where a label promotion would come from.
+/// Resource attributes the real dispatch corpus carries which are **not** on
+/// the denylist, so a future config or image that promoted one of them would
+/// be *observed* by the allowlist assertion rather than silently missed.
 ///
-/// Without this the denylist loop passes for three of its four names no
-/// matter what the config does, because those keys were never sent and so
-/// could not have become labels. A safeguard that cannot fail is not one.
-fn inject_denylisted_keys(logs: &mut opentelemetry_proto::tonic::logs::v1::LogsData) {
+/// A runtime check can only see labels its payload can produce. Without these
+/// the test guards promotions of the four denied keys and nothing else —
+/// `host.name` becoming a stream label would have passed, and it is exactly
+/// the shape that quietly multiplies Loki's index.
+const PROBE_RESOURCE_ATTRIBUTES: [(&str, &str); 13] = [
+    // A representative slice of Loki's stock resource-attributes-as-index-labels
+    // set. Not the whole set: the stock config also caps a stream at 15 label
+    // names, and sending every promoted key at once is rejected with
+    // `has 16 label names; limit 15` — which is itself how that set was
+    // established here rather than taken from documentation.
+    ("service.namespace", "shop"),
+    ("service.instance.id", "inst-1"),
+    ("deployment.environment", "prod"),
+    ("cloud.region", "eu-central-1"),
+    ("k8s.cluster.name", "cluster-a"),
+    ("k8s.namespace.name", "shop"),
+    ("k8s.pod.name", "checkout-0"),
+    ("k8s.container.name", "checkout"),
+    ("container.name", "checkout"),
+    ("k8s.job.name", "checkout-job"),
+    // Negative controls: these are NOT promoted today, so a future config or
+    // image that started promoting one of them fails the allowlist assertion.
+    // They are the reason this list exists at all.
+    ("host.name", "node-a"),
+    ("service.version", "1.4.2"),
+    ("telemetry.sdk.name", "opentelemetry"),
+];
+
+/// The same idea for record-level attributes, including a deliberately
+/// high-cardinality one: promoting `user.id` would be the most damaging
+/// possible change to this config, so the probe has to carry it.
+const PROBE_RECORD_ATTRIBUTES: [(&str, &str); 3] = [
+    ("http.request.method", "GET"),
+    ("user.id", "u-90210"),
+    ("thread.name", "worker-3"),
+];
+
+/// Put every denylisted key on the wire — in the field or attribute slot a
+/// real OTLP push would carry it in — alongside a representative set of
+/// non-denylisted attributes.
+///
+/// The denylisted half matters because without it the denylist loop passes
+/// for three of its four names no matter what the config does: those keys
+/// were never sent, so they could not have become labels. A safeguard that
+/// cannot fail is not one.
+///
+/// The non-denylisted half matters for the same reason one level up: the
+/// allowlist assertion can only reject labels the payload could have
+/// produced, so the probe carries resource, record and scope attributes from
+/// the shapes the dispatch corpus actually contains.
+fn inject_probe_attributes(logs: &mut opentelemetry_proto::tonic::logs::v1::LogsData) {
+    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+
     const TEMPLATE_ID_KEYS: [&str; 2] = ["template_id", "ourios_template_id"];
     const SPAN_ID: [u8; 8] = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
 
@@ -105,16 +153,28 @@ fn inject_denylisted_keys(logs: &mut opentelemetry_proto::tonic::logs::v1::LogsD
             resource
                 .attributes
                 .extend(TEMPLATE_ID_KEYS.map(|k| string_attribute(k, "4711")));
-        }
-        for record in resource_logs
-            .scope_logs
-            .iter_mut()
-            .flat_map(|scope| scope.log_records.iter_mut())
-        {
-            record.span_id = SPAN_ID.to_vec();
-            record
+            resource
                 .attributes
-                .extend(TEMPLATE_ID_KEYS.map(|k| string_attribute(k, "4711")));
+                .extend(PROBE_RESOURCE_ATTRIBUTES.map(|(key, value)| string_attribute(key, value)));
+        }
+        for scope in &mut resource_logs.scope_logs {
+            // Scope attributes are a third promotion surface, and the shared
+            // fixture leaves the scope unset.
+            scope.scope = Some(InstrumentationScope {
+                name: "checkout.handler".to_string(),
+                version: "1.0.0".to_string(),
+                attributes: vec![string_attribute("code.namespace", "checkout")],
+                ..InstrumentationScope::default()
+            });
+            for record in &mut scope.log_records {
+                record.span_id = SPAN_ID.to_vec();
+                record
+                    .attributes
+                    .extend(TEMPLATE_ID_KEYS.map(|k| string_attribute(k, "4711")));
+                record.attributes.extend(
+                    PROBE_RECORD_ATTRIBUTES.map(|(key, value)| string_attribute(key, value)),
+                );
+            }
         }
     }
 }

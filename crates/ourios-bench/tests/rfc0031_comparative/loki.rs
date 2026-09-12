@@ -74,21 +74,46 @@ pub(crate) const LOKI_DISPATCH_FLAGS: &[&str] = &[
     "-validation.max-entries-limit=2000000",
 ];
 
-/// RFC0031.10's **declared low-cardinality label allowlist** — every
-/// stream label the comparative Loki configuration is permitted to index.
+/// RFC0031.10's **declared label allowlist** — every stream label the
+/// comparative Loki configuration is permitted to index.
 ///
-/// The stock single-binary config maps OTLP `service.name` to
-/// `service_name` and promotes nothing else, which is deliberate: it is
-/// what a competent operator gets out of the box, and it is the one label
-/// that actually partitions the corpus into streams. Anything beyond this
-/// either smuggles Ourios's promoted columns into Loki's index (making the
-/// comparison flattering to us) or is a catch-all that forces Loki into a
-/// full scan (making it unflattering). Both are strawmen; the point of the
-/// program is that neither can slip in unnoticed.
+/// This is Loki's *stock* resource-attributes-as-index-labels set, established
+/// empirically against the pinned image rather than copied from documentation:
+/// `rfc0031_10_loki_label_allowlist` pushes these keys and reads back
+/// `/loki/api/v1/labels`. The stock config also caps a stream at 15 label
+/// names, so sending the whole set at once is rejected — which is how the
+/// cap was discovered too.
 ///
-/// Asserted against a running container by
-/// `rfc0031_10_loki_label_allowlist`, not merely declared here.
-pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &["service_name"];
+/// **It is deliberately not a one-label set.** An earlier version of this
+/// constant said `["service_name"]`, which passed only because the fixture
+/// sent nothing else; the stock config promotes every key below. Loki
+/// therefore gets a genuinely multi-dimensional index out of the box, which
+/// is the opposite of a strawman — but it means the §9 ratios must be read
+/// knowing which of these the dispatch corpus actually carries.
+///
+/// Anything *outside* this set either smuggles Ourios's promoted columns into
+/// Loki's index (making the comparison flattering to us) or is a catch-all
+/// forcing a full scan (making it unflattering). Both are strawmen; the point
+/// of the program is that neither can slip in unnoticed.
+pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &[
+    "service_name",
+    "service_namespace",
+    "service_instance_id",
+    "deployment_environment",
+    "deployment_environment_name",
+    "cloud_region",
+    "cloud_availability_zone",
+    "k8s_cluster_name",
+    "k8s_namespace_name",
+    "k8s_pod_name",
+    "k8s_container_name",
+    "k8s_replicaset_name",
+    "k8s_statefulset_name",
+    "k8s_daemonset_name",
+    "k8s_cronjob_name",
+    "k8s_job_name",
+    "container_name",
+];
 
 /// Label names that must never appear in Loki's index, named explicitly by
 /// RFC0031.10.

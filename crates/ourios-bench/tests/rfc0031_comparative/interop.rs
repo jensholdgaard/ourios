@@ -28,57 +28,9 @@ use crate::*;
 #[test]
 #[ignore = "RFC0031.10 — needs Docker (real Loki container); run by the loki-interop CI job via --ignored"]
 fn rfc0031_10_loki_label_allowlist() {
-    // Two services, so `service_name` is provably a discriminator rather
-    // than a constant: a single-valued label is the catch-all case the
-    // criterion rules out, and the other fixtures here carry one service.
-    let base_ns = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos(),
-    )
-    .expect("nanos fit u64")
-    .saturating_sub(30_000_000_000);
-    let records: Vec<FixtureRecord> = ["checkout", "payment"]
-        .into_iter()
-        .enumerate()
-        .map(|(i, service)| FixtureRecord {
-            time_unix_nano: base_ns + u64::try_from(i).expect("tiny index") * 1_000_000_000,
-            severity_number: 9,
-            severity_text: "INFO",
-            body: "connection established to peer 10",
-            trace_id: Some(FIXTURE_TRACE),
-            service,
-        })
-        .collect();
-
-    // Every denylisted key is actually SENT, through the same OTLP path a
-    // real push uses. Without this the denylist loop passes for three of its
-    // four names no matter what the config does, because `span_id` and the
-    // template ids were never on the wire and so could not have become
-    // labels. A safeguard that cannot fail is not a safeguard.
+    let records = two_service_fixture();
     let mut logs = fixture_logs_data(&records);
-    for resource_logs in &mut logs.resource_logs {
-        if let Some(resource) = resource_logs.resource.as_mut() {
-            resource
-                .attributes
-                .push(string_attribute("template_id", "4711"));
-            resource
-                .attributes
-                .push(string_attribute("ourios_template_id", "4711"));
-        }
-        for scope in &mut resource_logs.scope_logs {
-            for record in &mut scope.log_records {
-                record.span_id = vec![0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
-                record
-                    .attributes
-                    .push(string_attribute("template_id", "4711"));
-                record
-                    .attributes
-                    .push(string_attribute("ourios_template_id", "4711"));
-            }
-        }
-    }
+    inject_denylisted_keys(&mut logs);
     assert_denylisted_keys_are_on_the_wire(&logs);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -95,53 +47,135 @@ fn rfc0031_10_loki_label_allowlist() {
         .encode_to_vec();
         push_otlp(&http, &base, payload).await;
 
-        // Poll until BOTH services are visible, not merely until some label
-        // is: the push carries two `ResourceLogs` streams and the second can
-        // land later, so stopping at the first non-empty answer would read a
-        // half-indexed label set — failing the two-value assertion below
-        // intermittently, and worse, checking the allowlist against an
-        // incomplete set.
-        let mut observed = Vec::new();
-        let mut services = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            observed = loki_label_names(&http, &base).await;
-            services = loki_label_values(&http, &base, "service_name").await;
-            if services.len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        assert!(
-            !observed.is_empty(),
-            "Loki reported no stream labels at all after the push — the              assertions below would pass vacuously, so this is a failure",
-        );
-
-        let unexpected: Vec<&String> = observed
-            .iter()
-            .filter(|name| !LOKI_LABEL_ALLOWLIST.contains(&name.as_str()))
-            .collect();
-        assert!(
-            unexpected.is_empty(),
-            "the comparative Loki config indexed labels outside the              RFC0031.10 allowlist {LOKI_LABEL_ALLOWLIST:?}: {unexpected:?}.              Either the config gained a label promotion (fix the config) or              the image now promotes it by default (widen the allowlist in              the same commit that re-publishes the affected §9 rows, and              say so) — do not widen it silently.",
-        );
-
-        for forbidden in LOKI_LABEL_DENYLIST {
-            assert!(
-                !observed.iter().any(|name| name == forbidden),
-                "`{forbidden}` is indexed as a Loki stream label; every                  published L-gate ratio measured against this config is                  invalid, because Loki's index is doing the pruning the                  comparison attributes to Ourios",
-            );
-        }
-
-        // Not a catch-all: the allowlisted label must actually partition
-        // the corpus. The fixture carries two services, so a config that
-        // collapsed them into one stream fails here.
+        let (observed, services) = poll_until_both_services_indexed(&http, &base).await;
+        assert_within_allowlist(&observed);
+        assert_no_denylisted_label(&observed);
+        // Not a catch-all: the allowlisted label must actually partition the
+        // corpus, else the single label every query selects on discriminates
+        // nothing and Loki is forced into a full scan.
         assert_eq!(
             services.len(),
             2,
-            "`service_name` must discriminate between the fixture's two              services, else the single allowlisted label is a catch-all and              every query is a full scan: {services:?}",
+            "`service_name` must discriminate between the fixture's two \
+             services: {services:?}",
         );
     });
+}
+
+/// Two services, so `service_name` is provably a discriminator rather than a
+/// constant. The other fixtures here carry one service, and a single-valued
+/// label is exactly the catch-all case RFC0031.10 rules out.
+fn two_service_fixture() -> Vec<FixtureRecord> {
+    let base_ns = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("nanos fit u64")
+    .saturating_sub(30_000_000_000);
+    ["checkout", "payment"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, service)| FixtureRecord {
+            time_unix_nano: base_ns + u64::try_from(i).expect("tiny index") * 1_000_000_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "connection established to peer 10",
+            trace_id: Some(FIXTURE_TRACE),
+            service,
+        })
+        .collect()
+}
+
+/// Put every denylisted key on the wire, in the field or attribute slot a
+/// real OTLP push would carry it in — `span_id` in its protobuf field, the
+/// template ids as resource *and* record attributes, since resource
+/// attributes are where a label promotion would come from.
+///
+/// Without this the denylist loop passes for three of its four names no
+/// matter what the config does, because those keys were never sent and so
+/// could not have become labels. A safeguard that cannot fail is not one.
+fn inject_denylisted_keys(logs: &mut opentelemetry_proto::tonic::logs::v1::LogsData) {
+    const TEMPLATE_ID_KEYS: [&str; 2] = ["template_id", "ourios_template_id"];
+    const SPAN_ID: [u8; 8] = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
+
+    for resource_logs in &mut logs.resource_logs {
+        if let Some(resource) = resource_logs.resource.as_mut() {
+            resource
+                .attributes
+                .extend(TEMPLATE_ID_KEYS.map(|k| string_attribute(k, "4711")));
+        }
+        for record in resource_logs
+            .scope_logs
+            .iter_mut()
+            .flat_map(|scope| scope.log_records.iter_mut())
+        {
+            record.span_id = SPAN_ID.to_vec();
+            record
+                .attributes
+                .extend(TEMPLATE_ID_KEYS.map(|k| string_attribute(k, "4711")));
+        }
+    }
+}
+
+/// Poll until Loki has indexed **both** services, returning the label names
+/// and `service_name`'s values.
+///
+/// Waiting for both is what makes the assertions sound, not merely
+/// non-flaky: the push carries two `ResourceLogs` streams and the second can
+/// land later, so stopping at the first non-empty answer would check the
+/// allowlist against a half-indexed label set.
+async fn poll_until_both_services_indexed(
+    http: &reqwest::Client,
+    base: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut observed = Vec::new();
+    let mut services = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        observed = loki_label_names(http, base).await;
+        services = loki_label_values(http, base, "service_name").await;
+        if services.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        !observed.is_empty(),
+        "Loki reported no stream labels at all after the push — every \
+         assertion over the set would pass vacuously, so this is a failure",
+    );
+    (observed, services)
+}
+
+/// Every indexed label is one RFC0031.10 declared.
+fn assert_within_allowlist(observed: &[String]) {
+    let unexpected: Vec<&String> = observed
+        .iter()
+        .filter(|name| !LOKI_LABEL_ALLOWLIST.contains(&name.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "the comparative Loki config indexed labels outside the RFC0031.10 \
+         allowlist {LOKI_LABEL_ALLOWLIST:?}: {unexpected:?}. Either the config \
+         gained a label promotion (fix the config) or the image now promotes it \
+         by default (widen the allowlist in the same commit that re-publishes \
+         the affected §9 rows, and say so) — do not widen it silently.",
+    );
+}
+
+/// None of the high-cardinality keys Ourios prunes on is in Loki's index.
+fn assert_no_denylisted_label(observed: &[String]) {
+    for forbidden in LOKI_LABEL_DENYLIST {
+        assert!(
+            !observed.iter().any(|name| name == forbidden),
+            "`{forbidden}` is indexed as a Loki stream label; every published \
+             L-gate ratio measured against this config is invalid, because \
+             Loki's index is doing the pruning the comparison attributes to \
+             Ourios",
+        );
+    }
 }
 
 /// An OTLP string attribute.

@@ -149,21 +149,43 @@ truncation floor below is what keeps that safe.
 
 `WalConfig::housekeeping_secs` (default 60) is set in every test and
 read by nothing. RFC 0008 §6.7 says "the timer lives in the caller".
-The caller is the receiver role, on its own interval, and it passes the
-latest durable snapshot's high-water mark as `retain_floor`:
+The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    journal.housekeeping(latest_durable_snapshot_high_water)   // Result
+    journal.housekeeping(retain_floor())                       // Result
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
-The floor is load-bearing and is the reason §3.1 can tolerate a failed
-snapshot write. `housekeeping` truncates below `min(checkpoint, floor)`,
-so a stale floor makes truncation conservative — it retains frames a
-snapshot has not captured, which degrades the next start to a fuller
-replay and never to loss (hazard #5's retain rule, RFC 0001 §6.9).
-`None` is passed only where no snapshot consumer exists.
+**`retain_floor` is the MINIMUM over per-tenant snapshot horizons, not the
+latest one.** `write_snapshots` persists one snapshot per tenant and can
+partially succeed, so there is no single "latest" mark: taking the highest
+would let housekeeping unlink frames above a *lagging* tenant's horizon, and
+that tenant's miner state could then not be rebuilt. `CLAUDE.md` §3.7 is
+explicit that every path touching data is tenant-scoped, and a per-node floor
+is exactly the bolted-on form it forbids.
+
+The minimum is already this codebase's stated contract, not a new invention —
+`recovery.rs`'s stale-gap detector names it:
+
+> the §6.7 retain floor (min over tenant horizons) keeps any segment holding
+> frames above the floor, and a lagging tenant's own `S.segment` is protected
+> by its own membership in the min
+
+That detector's no-false-positive property *depends* on the minimum, so the
+earlier draft's "latest" wording would have broken stale-gap detection as
+well as losing data.
+
+**Reclamation is skipped entirely while any tenant with WAL data has no
+valid snapshot.** There is no horizon to include in the minimum, so the
+minimum is undefined, and guessing it either way is unsafe. `None` is passed
+only where no snapshot consumer exists at all.
+
+The floor is also the reason §3.1 can tolerate a failed snapshot write.
+`housekeeping` truncates below `min(checkpoint, floor)`, so a stale floor
+makes truncation conservative — it retains frames a snapshot has not
+captured, which degrades the next start to a fuller replay and never to loss
+(hazard #5's retain rule, RFC 0001 §6.9).
 
 Housekeeping takes the WAL's single-writer position, so it runs on the
 same ownership path as rotation rather than concurrently with it.
@@ -182,10 +204,33 @@ retryable, and the design treats them by what they leave behind:
 
 The orphan is why the current code quiesces rather than retrying, and the
 existing comment says so: a surviving directory entry whose header bytes
-were lost fails the next `Wal::open`'s header read, turning a benign
-crash into `OpenError::Corrupt`. The retry therefore unlinks the orphan
-*before* re-attempting, and treats a failed unlink as a failed retry
-rather than proceeding.
+were lost fails the next `Wal::open`'s header read, turning a benign crash
+into `OpenError::Corrupt`.
+
+**Unlinking the orphan before each retry is not sufficient, and this RFC
+does not rely on it.** A `remove_file` is not durable until the parent
+directory is fsynced, so a crash in between can bring the entry back; and
+after the final failed retry a partial or header-only orphan can still be
+sitting there, which `Wal::open` may select as the newest segment. Either
+case contradicts RFC0052.4/.5's restart property, so the design removes the
+orphan *class* instead of cleaning up after it:
+
+**A fresh segment is created under a temporary name and renamed into place
+only once its header fsync and the parent-directory fsync have both
+succeeded.** A rotation that fails at any step therefore never leaves a file
+that looks like a segment. `list_segments` ignores the temporary name, so a
+leftover is invisible to `Wal::open`'s newest-segment selection and to
+replay, and housekeeping removes it on a later pass. This amends RFC 0008
+§6.5's on-disk create sequence and is the one on-disk behaviour change in
+this RFC; it needs no format or schema change, because the temporary name
+never becomes a segment.
+
+The pre-existing orphans a node may already carry from a past quiesce are
+handled by the same `list_segments` rule only if they bear the temporary
+name, which they will not. Those keep today's behaviour — they are real
+zero-frame segments and replay reads them as such — so this is not a
+migration (`CLAUDE.md` §3.5 does not apply: no committed frame's encoding
+changes).
 
 Retry is attempted on the next `append`, not in a background loop: the
 WAL is single-writer and has no task of its own, and a rotation is only
@@ -201,6 +246,18 @@ hammering it obscures the real fault.
 The retry must not widen the ack surface: a rotation that has not
 completed means the append did not happen, so the batch is not acked,
 exactly as today.
+
+**This is a contract change against a passing test, and says so.**
+`rfc0008_6_rotation_failure_quiesces_the_wal` asserts that after a rotation
+failure "every subsequent append is refused ... **even after the underlying
+condition clears**". That is precisely the behaviour §3.3 replaces, so the
+test is not inconvenient — it is the specification of what we are choosing to
+change. Per `CLAUDE.md` §6.2 the implementation must surface that explicitly
+and get approval before editing it, rather than quietly adjusting it to pass.
+The replacement asserts the new contract on both sides: a transient failure
+recovers (RFC0052.4) and a persistent one still refuses forever
+(RFC0052.5), so the protection the original test provides is kept, not
+dropped.
 
 ### 3.4 Backpressure becomes explicit
 
@@ -276,12 +333,29 @@ through the trait object.
 
 So the design is:
 
-- **`Journal` gains the two reclamation methods**, mirroring the inherent
-  signatures: `checkpoint(&mut self, durable_to: WalOffset) -> Result<(), _>`
-  and `housekeeping(&mut self, retain_floor: Option<WalOffset>) -> Result<(), _>`,
-  plus the reclamation counters §3.5 exports. Adding them to the trait rather
-  than downcasting keeps the test doubles able to observe reclamation, which
-  RFC0052.1 and RFC0052.2 need.
+- **`Journal` gains the two reclamation methods and a state accessor**, with
+  a single object-safe error type rather than the concrete WAL's two:
+
+  ```text
+  enum ReclaimError { Checkpoint(..), Housekeeping(..) }   // object-safe, one type
+
+  fn checkpoint(&mut self, durable_to: WalOffset)          -> Result<(), ReclaimError>
+  fn housekeeping(&mut self, retain_floor: Option<WalOffset>) -> Result<(), ReclaimError>
+  fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
+  ```
+
+  The concrete impl maps `CheckpointError` and `HousekeepingError` into
+  `ReclaimError`; a `Box<dyn Journal>` cannot infer an associated error type,
+  which is why one enum rather than two. `ReclaimState` is a plain snapshot
+  struct carrying what §3.5 exports — the existing `unflushed_bytes`,
+  `disk_bytes` and `segment_count`, plus the bytes and age held below the
+  checkpoint and the rotation-failure state — so the server reads it without
+  reaching past the trait. `unflushed_bytes` stays its own method: the
+  group-commit coordinator reads it per batch and must not allocate a
+  snapshot struct on that path.
+
+  On the trait rather than via a downcast, because RFC0052.1 and RFC0052.2
+  need test doubles that can observe reclamation.
 - **The barrier reaches them through the coordinator**, which already owns the
   journal mutex, rather than taking a second handle to the same WAL. A second
   handle would put two owners on a single-writer resource, which is the one
@@ -374,15 +448,19 @@ tracked separately; it is not the backpressure signal.
 >   on the next housekeeping pass
 
 > **Scenario RFC0052.2 — Segments are reclaimed, and never past the
-> snapshot floor**
-> - **Given** a checkpoint advanced past several closed segments and a
->   durable snapshot whose high-water mark is *below* that checkpoint
+> *minimum* tenant snapshot floor**
+> - **Given** a checkpoint advanced past several closed segments and **two
+>   tenants** whose snapshot horizons differ, the lagging one below that
+>   checkpoint
 > - **When** housekeeping runs
-> - **Then** only segments wholly below `min(checkpoint, floor)` are
->   unlinked, the current append segment survives, and the WAL's
->   segment count falls
-> - **And** a frame above the snapshot floor is still present after the
->   pass, so a restart re-mines it rather than losing it
+> - **Then** only segments wholly below `min(checkpoint, min over tenant
+>   horizons)` are unlinked, the current append segment survives, and the
+>   WAL's segment count falls
+> - **And** a frame above the *lagging* tenant's horizon is still present
+>   after the pass, so a restart re-mines it rather than losing that
+>   tenant's miner state
+> - **And** when any tenant with WAL data has no valid snapshot, the pass
+>   reclaims nothing at all
 
 > **Scenario RFC0052.3 — Sustained ingest does not grow the WAL without
 > bound**
@@ -399,8 +477,10 @@ tracked separately; it is not the backpressure signal.
 > - **When** a later `append` arrives after the condition clears
 > - **Then** rotation is retried, succeeds, and the append is accepted
 >   and acked
-> - **And** no orphaned segment remains that a subsequent `Wal::open`
->   would read as corrupt
+> - **And** no file a subsequent `Wal::open` would select as a segment
+>   remains from the failed attempt — asserted by opening the WAL again,
+>   not by inspecting the directory, since the temporary name is an
+>   implementation detail
 
 > **Scenario RFC0052.5 — A persistent rotation failure gives up
 > distinguishably, and never acks**
@@ -411,6 +491,9 @@ tracked separately; it is not the backpressure signal.
 >   one
 > - **And** the first underlying I/O error is still recoverable from the
 >   reported state, not replaced by a generic "quiesced" message
+> - **And** `Wal::open` on the resulting directory succeeds rather than
+>   reporting corruption, including when the cleanup of the last attempt's
+>   temporary file never completed
 
 > **Scenario RFC0052.6 — Backpressure is a stated limit, and clears
 > itself**
@@ -483,8 +566,15 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   the four rotation steps, once-failing and always-failing, asserting
   recovery in the first case and a distinguishable terminal refusal in
   the second, plus `Wal::open` succeeding afterwards in both (the
-  orphan-unlink property). A `proptest` over which step fails and how
+  temporary-name property). A `proptest` over which step fails and how
   many times keeps the four sites from being tested only one way.
+
+  These **replace** `rfc0008_6_rotation_failure_quiesces_the_wal`, whose
+  "even after the underlying condition clears" assertion is the contract
+  §3.3 changes. That replacement needs explicit approval (`CLAUDE.md` §6.2)
+  and must keep both halves of what the original protected: no ack on an
+  incomplete rotation, and a permanent refusal when the fault is
+  persistent.
 - **Backpressure (RFC0052.6)** — an integration test with an
   unreachable store asserting the accept-then-refuse-then-resume
   sequence, the reason text, the `Retry-After`, and that the

@@ -10,11 +10,17 @@
 //! / encoding → 415, malformed body → 400, oversize → 413, an
 //! unconfigured path → 404, tenant-resolution failure → 400. No panics.
 //!
-//! Every one of those carries a `google.rpc.Status` body in the request's
-//! wire format, which the OTLP spec requires of all 4xx/5xx responses —
-//! including the oversize rejection `DefaultBodyLimit` raises before this
-//! handler's body exists, which is why the handler takes the extractor's
-//! rejection rather than `Bytes`. See `error_response`.
+//! Every **handler-owned** error carries a `google.rpc.Status` body in the
+//! request's wire format, which the OTLP spec requires of all 4xx/5xx
+//! responses — including the oversize rejection `DefaultBodyLimit` raises
+//! before this handler's body exists, which is why the handler takes the
+//! extractor's rejection rather than `Bytes`. See `error_response`.
+//!
+//! Two classes remain empty-bodied, and so still non-conformant: axum's
+//! router-generated 404/405, and `AuthLayer`'s 401/503. The layer's opacity is
+//! a deliberate RFC 0026 §3.2 anti-probing choice and its `reject` is generic
+//! over the inner service's body type, so giving those a `Status` is a
+//! separate change rather than part of this one.
 //!
 //! Durability failures are `503`, and that code is retryable per OTLP. It is
 //! **not** the same as transient: a WAL quiesced after a rotation failure
@@ -366,10 +372,16 @@ async fn handle_logs(
 ///
 /// Permanent client errors are non-retryable but split by class:
 /// a tenant outside the token's set → `403`; an oversize payload
-/// (`AppendError::TooLarge`, over the 16 MiB WAL frame ceiling) → `413`. Any
-/// other WAL append/sync failure is *transient* (the batch was not acked,
-/// §3.4) → retryable `503`, so compliant clients re-send rather than drop
-/// data (a non-retryable `500` would tell them to drop it).
+/// (`AppendError::TooLarge`, over the 16 MiB WAL frame ceiling) → `413`.
+///
+/// Every other WAL append/sync failure is `503`, which OTLP defines as
+/// retryable — the batch was not acked (§3.4), so compliant clients re-send
+/// rather than drop data (a non-retryable `500` would tell them to drop it).
+/// Retryable is **not** the same as transient: `IngestFailure::Wedged` keeps
+/// this status while nothing in-process clears it (#791), because OTLP has no
+/// permanently-unavailable code that does not also instruct the client to
+/// discard the batch. `ingest_error_response` is where the two diverge — the
+/// wedge gets no `Retry-After`.
 ///
 /// Seconds advertised in `Retry-After` on a *transient* 503.
 ///

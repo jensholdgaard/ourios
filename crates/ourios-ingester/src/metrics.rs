@@ -372,16 +372,24 @@ const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 ///
 /// Either way this is not a rate to watch: a single occurrence is the alert.
 ///
-/// **A restart restores the cadence but does not recover the panicked step's
-/// records, and a graceful one can make their loss permanent.** The step had
-/// already taken those batches out of the sink, so they are in the WAL and
-/// nowhere else (#796). `shutdown` then runs the snapshot barrier, which reads
-/// the emptied buffers as fully drained and can stamp a WAL high-water mark
-/// across them — after which recovery suppresses them. So the loss window
-/// opens with the panic; what a graceful shutdown adds is the stamp that
-/// closes it. Until #796 lands there is no sequence that both restores the
-/// cadence and preserves those records, and an operator needs to know that
-/// rather than infer from "restart" that nothing was lost.
+/// **Whether a restart is safe depends on where the panic landed, and the
+/// counter cannot tell you.** This counts a panic anywhere in the step. One
+/// raised before `drain_aged` has taken anything — in the miner or the drain
+/// itself — loses nothing: the records are still buffered and still in the
+/// WAL, and a restart replays normally.
+///
+/// One raised *after* the drain, in the publish, is the #796 window: those
+/// batches are out of the sink and in the WAL only. `shutdown` then runs the
+/// snapshot barrier, which reads the emptied buffers as fully drained and can
+/// stamp a WAL high-water mark across them, after which recovery suppresses
+/// them. So the loss window opens with that panic and a graceful shutdown is
+/// what closes it.
+///
+/// The panic message on stderr is what distinguishes the two, which is why it
+/// matters that the default hook still prints it. Treat this count as "check
+/// where it panicked before restarting", not as confirmed loss — and until
+/// #796 lands, accept that for the publish case no restart both restores the
+/// cadence and preserves those records.
 pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {

@@ -10,14 +10,12 @@
 //! through the **global** meter, and two global-installing tests in one
 //! binary would race.
 //!
-//! Unix-only, the whole binary. The store failure is injected by making the
-//! bucket directory read-only, and `PermissionsExt` does not exist off Unix
-//! — the same guard `rfc0008_6_rotation.rs`'s quiesce arm carries. Guarding
-//! the file rather than the test function also keeps the imports out, which a
-//! function-level `cfg` would leave behind as `unused_imports` under
-//! `-D warnings`. A portable injection would need a failing store double,
-//! which the sink does not take.
-#![cfg(unix)]
+//! The store failure is injected by replacing the bucket directory with a
+//! regular file, the same sabotage `receiver.rs`'s store-unavailable test
+//! uses. Deliberately not a read-only directory: that is bypassed by a test
+//! process running as root, which would leave the untagged datapoint absent
+//! and fail the total assertion for a reason unrelated to the code. `ENOTDIR`
+//! holds for every effective UID, and needs no `cfg(unix)` guard either.
 
 use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
@@ -87,14 +85,6 @@ fn a_record() -> MinedRecord {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    /// Set a directory's Unix mode.
-    fn set_mode(path: &std::path::Path, mode: u32) {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .expect("set bucket permissions");
-    }
-
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
 
     // A real `SharedParquetSink`, so what is asserted is the wiring the age
@@ -110,17 +100,20 @@ async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
         },
     ));
 
-    // A genuine store failure, for the *untagged* datapoint the tagged one
-    // has to be distinguishable from: buffer a record, then make the bucket
-    // directory read-only so the flush's write cannot land (removing it is
-    // not enough — the local backend recreates missing parents). The buffer
-    // is retained (the WAL is the durability of record) and the failure is
-    // counted.
+    // A genuine store failure, for the *untagged* datapoint the tagged one has
+    // to be distinguishable from: buffer a record, then replace the bucket
+    // directory with a regular file so the flush's write fails with ENOTDIR.
+    // Removing the directory is not enough — the local backend recreates
+    // missing parents, which is how an earlier version of this test silently
+    // passed with a total of 1. The buffer is retained (the WAL is the
+    // durability of record) and the failure is counted.
     sink.emit(a_record());
-    set_mode(bucket.path(), 0o555);
+    std::fs::remove_dir_all(bucket.path()).expect("remove the bucket directory");
+    std::fs::write(bucket.path(), b"not a directory").expect("write the sabotage file");
     sink.flush_all();
-    // Restore before the TempDir drops, or its own cleanup fails.
-    set_mode(bucket.path(), 0o755);
+    // Restore a directory before the TempDir drops, or its cleanup fails.
+    std::fs::remove_file(bucket.path()).expect("remove the sabotage file");
+    std::fs::create_dir(bucket.path()).expect("restore the bucket directory");
 
     // Through the **coordinator**, which is what the age sweep holds — calling
     // the sink directly would leave `PublishCoordinator::record_cadence_panic`

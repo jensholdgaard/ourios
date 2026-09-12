@@ -52,13 +52,23 @@ fn rfc0031_10_loki_label_allowlist() {
         // catches a key the probe never sends. A payload probe cannot —
         // the probe-derived version of this list was missing
         // `k8s.deployment.name`, which only `/config` revealed.
-        let effective = loki_effective_index_labels(&http, &base).await;
+        let mut effective = loki_effective_index_labels(&http, &base).await;
+        let mut declared: Vec<String> = LOKI_LABEL_ALLOWLIST
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        // Compared as a SET: label order carries no Loki semantics and
+        // RFC0031.10 describes a set, so a harmless reordering in a future
+        // pinned image must not fail this gate and force an allowlist change
+        // plus a §9 republish over an unchanged promotion surface.
+        effective.sort_unstable();
+        declared.sort_unstable();
         assert_eq!(
-            effective, LOKI_LABEL_ALLOWLIST,
+            effective, declared,
             "Loki's effective default_resource_attributes_as_index_labels no \
-             longer matches the declared RFC0031.10 allowlist. Update the \
-             allowlist in the same commit that re-publishes the affected §9 \
-             rows, and say so — every published ratio was measured against \
+             longer matches the declared RFC0031.10 allowlist as a set. Update \
+             the allowlist in the same commit that re-publishes the affected \
+             §9 rows, and say so — every published ratio was measured against \
              the old promotion surface.",
         );
 

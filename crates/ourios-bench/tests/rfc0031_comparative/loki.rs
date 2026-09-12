@@ -156,7 +156,13 @@ pub(crate) async fn loki_effective_index_labels(http: &reqwest::Client, base: &s
         .expect("config request reaches Loki");
     let status = resp.status();
     let body = resp.text().await.expect("config response body");
-    assert!(status.is_success(), "loki /config returned {status}");
+    // The body carries Loki's own config/startup diagnosis; dropping it leaves
+    // a failed CI run reporting only a bare status, the same reason
+    // `loki_query_range` and the label endpoints include it.
+    assert!(
+        status.is_success(),
+        "loki /config returned {status}: {body}"
+    );
 
     let mut out = Vec::new();
     let mut in_block = false;

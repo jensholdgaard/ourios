@@ -155,12 +155,25 @@ the quiesce and the stamp. A bare timer has neither, so ingest can submit a
 fresh encode in that window and the barrier stamps across it — the same loss,
 reached by a narrower race.
 
-So the timer takes the **same exclusion rotation uses**, the pipeline's miner
-lock, and holds it across the whole sequence: quiesce, read the mark, barrier,
-checkpoint. The mark is read *inside* that exclusion and *after* the quiesce —
-`last_durable()` at that point, the offset the receiver's acks are gated on —
-so no frame above it can still be in flight. Reading it before the quiesce, or
-outside the lock, reintroduces the window from the other side.
+**And the exclusion is the ingest gate, not the miner lock.** That distinction
+is the whole of it: `ingest_bound` releases the miner lock *before*
+`pool.submit(mined)` and before advancing `last_durable`, so a timer holding
+only that lock can quiesce the pool and then have an already-past-the-lock
+ingest submit an encode and advance the mark underneath it. The barrier would
+stamp at a mark whose encode was never quiesced — the same loss again, one
+layer down.
+
+What actually makes rotation safe is that it runs *inside* an ingest's gate
+turn, and the gate serializes turns in order: "every frame ≤ this seq submits
+its encodes before any later seq reaches the rotation check". So the timer must
+become a participant in that ordering rather than a concurrent holder of a
+narrower lock — it acquires a **barrier turn** in the gate and runs between two
+ingests, which is the position rotation already occupies.
+
+The mark is then read inside that turn and after the quiesce — `last_durable()`
+at that point, the offset the receiver's acks are gated on — so no frame above
+it can still be in flight. Reading it before the quiesce, or outside the turn,
+reopens the window from the other side.
 
 The cost is explicit: ingest stalls for the barrier's duration once per
 `housekeeping_secs`, the same stall rotation already imposes, now on a timer.
@@ -202,9 +215,10 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    with_miner_lock:                       // the exclusion rotation uses
+    with_barrier_turn:                     // a turn in the INGEST GATE, not the
+                                           // miner lock — see §3.1
         quiesce_encodes()                  // the barrier's prologue
-        mark = last_durable()              // read AFTER the quiesce, INSIDE the lock
+        mark = last_durable()              // read AFTER the quiesce, INSIDE the turn
         if barrier_succeeded(mark) and mark is Some(m):   // §3.1, append-free
             journal.checkpoint(m)
     journal.housekeeping(retain_floor(), max_unlinks_per_pass)  // Result
@@ -277,9 +291,22 @@ fsynced.** The ordering matters in both directions:
   can have unreadable header bytes — today's hazard;
 - the parent fsync must come *after* the rename, because the rename creates
   the directory entry and an fsync taken before it does not make that entry
-  durable. Rotation is not complete until that fsync returns, and no frame is
-  acked in a segment whose entry is not durable — the same obligation
-  `dir_fsync_pending` already carries for the segment `open` creates.
+  durable.
+
+**And the new segment is installed before that fsync, not after.** This is what
+makes the failure path reachable rather than a description of a state the code
+cannot be in: `rotate` sets `current_segment`/`path`/`uuid` to the renamed file
+*first*, then fsyncs the parent, and on failure sets `dir_fsync_pending` and
+returns **without quiescing**. The new segment is then genuinely current, so
+`sync` — which fsyncs `current_segment` and discharges `dir_fsync_pending` —
+closes the obligation on the next call, exactly as it already does for the
+segment `open` creates. Since no batch is acked until `sync` returns `Ok`, no
+frame is ever acked in a segment whose directory entry is not durable, and a
+retry re-attempts the fsync rather than creating a second segment.
+
+Installing *after* the fsync, as the draft implied, leaves the renamed file
+owned by nobody: `rotate` would still point at the old segment while a complete
+`.wal` sits beside it, which is the orphan case all over again.
 
 A rotation that fails *before the rename* therefore never leaves a file that
 looks like a segment. This amends RFC 0008 §6.5's on-disk create sequence and
@@ -302,10 +329,29 @@ returns only `*.wal`, so a temporary file is invisible to it — which is the
 point for `Wal::open`, and means housekeeping would *not* remove it either.
 Left at that, a persistently failing rotation would leave one temporary file
 per retry, consuming the same disk §3.4's bound exists to protect. So
-housekeeping gains a second, explicit step: unlink temporary files that are
-not the in-flight one. The bounded retry budget caps how many can exist
-between passes, and an unlink failure is logged and retried on the next pass
-like any other.
+housekeeping gains a second, explicit step — but "temporary files" is far too
+broad a selector to state loosely. The WAL root already holds `CHECKPOINT.tmp`
+and the snapshots directory holds `*.snap.tmp`; a sweep matching `*.tmp` could
+delete an in-progress checkpoint or snapshot, which is a worse failure than the
+debris it collects.
+
+So the name is **reserved and exact**: the in-progress segment is
+`<uuid>.wal.partial`, and the sweep matches that suffix and nothing else, never
+`*.tmp`, which stays the checkpoint and snapshot namespace. Two further rules
+make it safe:
+
+- the **in-flight** partial — the one the current rotation attempt owns — is
+  skipped, identified by name rather than by age, since a slow fsync must not
+  make a live file look stale;
+- the unlinks are followed by a **parent-directory fsync**, as
+  `housekeeping`'s segment unlinks already are, so a crash cannot resurrect
+  swept debris.
+
+The step runs **inside** the same per-pass cap as segment unlinking (§3.7) and
+counts against it, because it takes the same single-writer position — a backlog
+of stale partials would otherwise make a "bounded" pass do unbounded directory
+work and break RFC0052.12. An unlink failure is logged and retried on the next
+pass like any other.
 
 **Pre-existing `*.wal` orphans need their own answer, and neither changing
 future rotations nor guessing at open is it.** A node wedged before this RFC
@@ -404,21 +450,44 @@ therefore means every byte housekeeping has not removed, including the
 post-checkpoint tail, the current append segment and anything the tenant
 floor is retaining.
 
-**The check is a pre-append reservation, not a post-append test.** The commit
-coordinator appends under the journal lock before waiting for the sync, so a
-limit checked after the append would leave the supposedly-rejected batch
-sitting in the WAL — and a client that retries on the rejection would then
-have the batch replayed or published twice. The reservation is taken under the
-same lock that performs the append, so a refused batch is never written at
-all. There is no rollback path, deliberately: truncating an appended frame is
-a second way to corrupt the tail.
+**The check is a pre-append reservation, not a post-append test — and it has an
+owner.** The commit coordinator appends under the journal mutex before waiting
+for the sync, so a limit checked after the append would leave the
+supposedly-rejected batch sitting in the WAL, and a client retrying on the
+rejection would have it replayed or published twice.
+
+The check therefore lives in `CommitCoordinator`, **inside the same journal
+mutex acquisition that performs the append**, reading the bound from
+`Journal::reclaim_state()` (§3.7) immediately before calling `append_batch`.
+Not in the receiver and not in a layer above: anywhere outside that mutex races
+concurrent appends, so two batches could each observe room and both be written.
+`append_batch` itself is unchanged — the reservation is the caller's
+responsibility because the caller is what holds the mutex.
+
+There is no rollback path, deliberately: truncating an appended frame is a
+second way to corrupt the tail, so the only safe reservation is one taken
+before the write.
 
 The bound is configuration with a conservative default, and the rejection is
 the contract: ingest keeps accepting while the object store is unreachable
 until the declared limit, then refuses with a reason that names the limit it
-hit. Crucially, crossing the limit does **not** set the quiesce latch — it is
-a pressure state that clears itself the moment the checkpoint advances, which
-§3.1's timer-driven barrier guarantees can happen without an append.
+hit. Crucially, crossing the limit does **not** set the quiesce latch — it is a
+pressure state, not a fault.
+
+**It clears when a housekeeping pass actually removes bytes, not when the
+checkpoint advances.** Advancing the sidecar declares frames reclaimable; it
+does not reclaim them, and the bound is measured in bytes still on disk. So the
+clearing path is the whole §3.2 sequence — barrier, checkpoint, housekeeping —
+which §3.1's timer can drive without an append.
+
+That also exposes a way the state can persist with a healthy store: a stale
+tenant floor holds `min(checkpoint, floor)` down, so housekeeping removes
+nothing and the bound stays crossed even though the object store recovered.
+That is not a bug to paper over — a tenant whose snapshot is not advancing is a
+real problem — but it must be *visible* rather than presenting as an
+unexplained refusal, which is why §3.5 exports the floor and its lag alongside
+the bytes. RFC0052.6 asserts the healthy-store resume; the stale-floor case is a
+named open question in §7 rather than a silently accepted behaviour.
 
 ### 3.5 The state becomes observable
 
@@ -739,6 +808,16 @@ first.
 > - **And** a backlog of stale *temporary* files is also bounded by the same
 >   cap, so temp sweeping cannot make a "bounded" pass do unbounded work
 
+> **Scenario RFC0052.16 — The temp sweep touches only WAL partials**
+> - **Given** a WAL root holding a `CHECKPOINT.tmp`, a snapshots directory
+>   holding a `*.snap.tmp`, a stale `<uuid>.wal.partial`, and the in-flight
+>   partial of a rotation in progress
+> - **When** a housekeeping pass runs
+> - **Then** only the stale partial is unlinked: the checkpoint temp, the
+>   snapshot temp and the in-flight partial all survive
+> - **And** the unlink is followed by a parent-directory fsync, so a crash
+>   cannot resurrect it
+
 > **Scenario RFC0052.15 — A quiesced WAL is reported as neither transient nor
 > non-retryable**
 > - **Given** a WAL quiesced by a rotation failure, and the append that caused
@@ -879,6 +958,10 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   and must keep both halves of what the original protected: no ack on an
   incomplete rotation, and a permanent refusal when the fault is
   persistent.
+- **Temp sweep (RFC0052.16)** — a directory fixture holding all four file
+  kinds, asserting exactly one is removed. A fixture rather than a live
+  rotation, because the point is the *selector*, and the dangerous cases
+  (`CHECKPOINT.tmp`, `*.snap.tmp`) are produced by other subsystems.
 - **Reclassification (RFC0052.15)** — the classifier unit tests already in
   place for `Wedged`, extended to assert the *narrowness*: an ordinary append
   or fsync I/O failure keeps `Retry-After` while the quiesce and the

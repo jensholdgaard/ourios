@@ -71,6 +71,7 @@ fn rfc0031_10_loki_label_allowlist() {
              §9 rows, and say so — every published ratio was measured against \
              the old promotion surface.",
         );
+        assert_denylist_disjoint_from_promotion(&effective);
 
         let (observed, services) = poll_until_both_services_indexed(&http, &base).await;
         assert_within_allowlist(&observed);
@@ -238,12 +239,65 @@ async fn poll_until_both_services_indexed(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // Assert the loop's own completion condition, not a weaker proxy: on
+    // timeout it falls through with whatever it last saw, and a non-empty
+    // `/labels` answer that does not yet carry `service_name` would pass a
+    // mere is-empty check while leaving the allowlist assertion to run over an
+    // incomplete set. `services` comes from a different response, so it cannot
+    // stand in for this.
     assert!(
-        !observed.is_empty(),
-        "Loki reported no stream labels at all after the push — every \
-         assertion over the set would pass vacuously, so this is a failure",
+        observed.iter().any(|name| name == "service_name") && services.len() >= 2,
+        "the push was not fully indexed within the deadline: labels {observed:?}, \
+         service values {services:?} — every assertion over the label set would \
+         run on an incomplete snapshot, so this is a failure rather than a skip",
     );
     (observed, services)
+}
+
+/// The denylist must be disjoint from Loki's *promotion surface*, not merely
+/// absent from the labels one payload happened to produce.
+///
+/// Without this, adding a denied name to both Loki's promotion list and
+/// `LOKI_LABEL_ALLOWLIST` passes the set-equality check, and the runtime
+/// denylist assertion then passes **vacuously** for any denied name the payload
+/// carries as a `LogRecord` field rather than a resource attribute — which is
+/// exactly `trace_id` and `span_id`. This guard holds whatever the payload
+/// contains, which is why it is asserted against the effective configuration.
+///
+/// Unreachable from the container test today, because set-equality fails first
+/// on the current config; `denylist_disjointness_is_not_vacuous` is what proves
+/// it live.
+fn assert_denylist_disjoint_from_promotion(effective: &[String]) {
+    for forbidden in LOKI_LABEL_DENYLIST {
+        assert!(
+            !effective.iter().any(|name| name == forbidden),
+            "`{forbidden}` is in Loki's effective resource-attribute promotion \
+             list, so this configuration would index it as a stream label — \
+             every published L-gate ratio measured against it is invalid",
+        );
+    }
+}
+
+/// The guard above fires on a promotion list that contains a denied name, and
+/// passes on one that does not. A plain test rather than a container one: the
+/// case it defends cannot be produced by the current Loki config, so without
+/// this the guard would be unfalsifiable.
+#[test]
+fn denylist_disjointness_is_not_vacuous() {
+    let clean: Vec<String> = ["service_name", "k8s_pod_name"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_denylist_disjoint_from_promotion(&clean);
+
+    for forbidden in LOKI_LABEL_DENYLIST {
+        let poisoned = vec!["service_name".to_string(), (*forbidden).to_string()];
+        assert!(
+            std::panic::catch_unwind(|| assert_denylist_disjoint_from_promotion(&poisoned))
+                .is_err(),
+            "a promotion list containing `{forbidden}` must fail the guard",
+        );
+    }
 }
 
 /// Every indexed label is one RFC0031.10 declared.

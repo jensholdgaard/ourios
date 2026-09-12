@@ -10,6 +10,8 @@ use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
 };
 use ourios_ingester::metrics::{IngestMetrics, SinkMetrics};
+use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+use ourios_parquet::store::Store;
 use ourios_semconv as semconv;
 use std::time::Duration;
 
@@ -28,6 +30,21 @@ fn data<'a>(rms: &'a [ResourceMetrics], name: &str) -> &'a AggregatedMetrics {
         .find(|m| m.name() == name)
         .unwrap_or_else(|| panic!("metric {name} missing from the exported stream"))
         .data()
+}
+
+/// Sum of a u64 counter's datapoints whose `error.type` attribute equals
+/// `want` — the dimension that distinguishes *why* a flush failed.
+fn error_type_sum(rms: &[ResourceMetrics], name: &str, want: &str) -> u64 {
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = data(rms, name) else {
+        panic!("{name} should be a u64 sum");
+    };
+    sum.data_points()
+        .filter(|dp| {
+            dp.attributes()
+                .any(|kv| kv.key.as_str() == "error.type" && kv.value.as_str() == want)
+        })
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum()
 }
 
 /// Sum of a u64 counter's datapoints whose `trigger` attribute equals `want`
@@ -61,6 +78,20 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     sink.record_flush("rotation", 3, Duration::from_millis(9));
     sink.record_flush_error(None);
     sink.record_derive_error();
+    // #791: a panicked cadence step is counted on this same counter, tagged
+    // so it is distinguishable from a store error. Recorded through a real
+    // `SharedParquetSink` rather than `SinkMetrics` directly, so the wiring
+    // the age sweep actually calls is what gets asserted.
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let sink_handle = SharedParquetSink::new(ParquetRecordSink::new(
+        Store::local(bucket.path()).expect("local store"),
+        FlushConfig {
+            target_bytes: usize::MAX,
+            max_buffer_age: Duration::from_secs(86_400),
+            ceiling_bytes: usize::MAX,
+        },
+    ));
+    sink_handle.record_cadence_panic();
     sink.add_buffered(100);
     sink.add_buffered(-40);
     guard.force_flush().expect("force_flush");
@@ -105,7 +136,19 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     );
 
     // Errors counted; buffer usage nets the two deltas.
-    assert_eq!(u64_sum(&rms, semconv::OURIOS_SINK_FLUSH_ERRORS, None), 1);
+    assert_eq!(
+        u64_sum(&rms, semconv::OURIOS_SINK_FLUSH_ERRORS, None),
+        2,
+        "the untagged store error plus the cadence panic",
+    );
+    // The dimension is the point: a dead age sweep (#791) was previously
+    // uncountable, and an operator has to be able to tell it apart from a
+    // transient store failure on the same counter.
+    assert_eq!(
+        error_type_sum(&rms, semconv::OURIOS_SINK_FLUSH_ERRORS, "cadence_panic"),
+        1,
+        "the cadence panic is tagged error.type=cadence_panic",
+    );
     assert_eq!(u64_sum(&rms, semconv::OURIOS_SINK_DERIVE_ERRORS, None), 1);
     let AggregatedMetrics::I64(MetricData::Sum(usage)) =
         data(&rms, semconv::OURIOS_SINK_BUFFER_USAGE)

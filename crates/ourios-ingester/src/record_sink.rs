@@ -796,6 +796,18 @@ impl SharedParquetSink {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Count a cadence sweep step that panicked.
+    ///
+    /// Tagged onto the existing flush-error counter rather than given a
+    /// metric of its own, per the project's `error.type` convention. The
+    /// lock recovers from poisoning, so a panic taken while the sink was
+    /// locked still gets counted.
+    pub fn record_cadence_panic(&self) {
+        self.lock()
+            .metrics
+            .record_flush_error(Some(crate::metrics::CADENCE_PANIC));
+    }
+
     /// Force-flush every buffered partition — the WAL-segment-rotation trigger
     /// (RFC0014.3) and the graceful-shutdown drain.
     pub fn flush_all(&self) {

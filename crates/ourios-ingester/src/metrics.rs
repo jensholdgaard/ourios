@@ -358,6 +358,10 @@ const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
+/// The `error.type` value for a cadence sweep step that panicked (#791).
+/// The sweep survives it, so without a count a panic that repeats every
+/// tick is invisible — which is the failure this value exists to expose.
+pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {
     fn default() -> Self {

@@ -117,22 +117,48 @@ fn spawn_age_sweep(
             // The drain takes the miner lock (atomic w.r.t. ingest) for only a
             // memory move; the ordered write does the blocking store I/O off the
             // lock. Run the whole step on the blocking pool rather than stalling
-            // a runtime worker. A `JoinError` means the runtime is shutting down
-            // — stop sweeping.
+            // a runtime worker.
             let pipeline = pipeline.clone();
             let coordinator = coordinator.clone();
-            if tokio::task::spawn_blocking(move || {
-                let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
-                // The cadence is best-effort: a partial write (transient store
-                // error) retains the un-published data + audit (the WAL is the
-                // durability of record) and the next tick retries — so the
-                // published-everything signal is not needed here (no snapshot is
-                // taken at the cadence; that's the rotation/shutdown path).
-                let _published = coordinator.write_ordered(drained, "age");
+            let step = tokio::task::spawn_blocking({
+                let coordinator = coordinator.clone();
+                move || {
+                    let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+                    // The cadence is best-effort: a partial write (transient store
+                    // error) retains the un-published data + audit (the WAL is the
+                    // durability of record) and the next tick retries — so the
+                    // published-everything signal is not needed here (no snapshot is
+                    // taken at the cadence; that's the rotation/shutdown path).
+                    let _published = coordinator.write_ordered(drained, "age");
+                }
             })
-            .await
-            .is_err()
-            {
+            .await;
+            // A `JoinError` is two different events and the sweep used to treat
+            // them alike: `is_cancelled` is the runtime going away, but
+            // `is_panic` is a bug in the step. Either way the loop still stops
+            // here — see below for why a panic is not yet survivable — and the
+            // point of separating them is that a panic now leaves a countable
+            // trace. Before this, a panic retired the cadence for the life of
+            // the process while the task returned `()` cleanly, so the
+            // `JoinHandle` still looked healthy, `shutdown()` ignores it anyway,
+            // and nothing logged, counted, or failed. Partitions then drained
+            // only on rotation and shutdown, and buffers grew toward an OOM kill
+            // with no trail back to the cause (#791).
+            //
+            // Surviving the panic and sweeping on is the behaviour we actually
+            // want, and it is deliberately NOT done here. `write_ordered`
+            // consumes the batches `drain_aged` has already taken out of the
+            // sink, so a panic inside it drops them: they are neither in the
+            // buffers nor in Parquet, and a later rotation seeing empty buffers
+            // can stamp a WAL high-water mark over frames that never landed
+            // (#796). Stopping bounds that to one step's records; looping would
+            // repeat it every tick, which is unbounded loss. Making it safe needs
+            // requeue-on-unwind semantics — a §3.4 decision for the #791 RFC,
+            // not something to improvise under a panic handler.
+            if let Err(join_error) = step {
+                if join_error.is_panic() {
+                    coordinator.record_cadence_panic();
+                }
                 break;
             }
         }

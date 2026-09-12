@@ -9,6 +9,15 @@
 //! Its own test binary, like `perf_metrics.rs`: `SinkMetrics` resolves
 //! through the **global** meter, and two global-installing tests in one
 //! binary would race.
+//!
+//! Unix-only, the whole binary. The store failure is injected by making the
+//! bucket directory read-only, and `PermissionsExt` does not exist off Unix
+//! — the same guard `rfc0008_6_rotation.rs`'s quiesce arm carries. Guarding
+//! the file rather than the test function also keeps the imports out, which a
+//! function-level `cfg` would leave behind as `unused_imports` under
+//! `-D warnings`. A portable injection would need a failing store double,
+//! which the sink does not take.
+#![cfg(unix)]
 
 use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
@@ -41,13 +50,6 @@ fn counter_sum(rms: &[ResourceMetrics], name: &str, attribute: Option<(&str, &st
         })
         .map(SumDataPoint::value)
         .sum()
-}
-
-/// Set a directory's Unix mode.
-fn set_mode(path: &std::path::Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .expect("set bucket permissions");
 }
 
 /// One record, enough to give a partition something to fail to flush.
@@ -83,6 +85,14 @@ fn a_record() -> MinedRecord {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Set a directory's Unix mode.
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("set bucket permissions");
+    }
+
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
 
     // A real `SharedParquetSink`, so what is asserted is the wiring the age

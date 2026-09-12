@@ -364,8 +364,9 @@ const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 /// process: the sweep stops on a panic, because continuing would repeat
 /// #796's data-loss window every tick. Partitions then drain only on WAL
 /// rotation and shutdown. So this is not a rate to watch — a single
-/// occurrence is the alert, and a restart is the remedy until RFC 0052
-/// makes the step's unwind safe.
+/// occurrence is the alert, and a restart is the remedy until the step's
+/// unwind is made safe (see #796 — the drained batches are dropped on
+/// unwind, which is why the sweep stops rather than retrying).
 pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {

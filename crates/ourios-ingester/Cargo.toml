@@ -118,6 +118,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # socket transport is stood up in this slice (the service is exercised
 # in-process).
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+# `google.rpc.Status` — the body the OTLP spec REQUIRES on every 4xx/5xx
+# OTLP/HTTP response ("MUST be a Protobuf-encoded Status message that
+# describes the problem"). Taken from tonic's own types crate rather than
+# hand-rolled so the message stays the canonical one, and so richer
+# details (`RetryInfo`) are available if a later slice wants them.
+tonic-types = { version = "0.14", default-features = false }
 # Parse the snapshot-recorded WAL high-water segment id back into the
 # `uuid::Uuid` of `ourios_wal::WalOffset` (RFC 0001 §6.9 / RFC 0008
 # §6.6). Same major as ourios-wal's, so the types unify.

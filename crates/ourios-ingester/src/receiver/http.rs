@@ -236,11 +236,24 @@ async fn handle_logs(
     // any WAL work — a missing/malformed selector is a 400 with the reason.
     let tenant = match selector::from_headers(&headers) {
         Ok(tenant) => tenant,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // The wire format is not known yet (the selector is decided before
+        // `Content-Type` is parsed), so the `Status` body goes out as
+        // protobuf — see `error_response`.
+        Err(e) => {
+            return error_response(
+                WireFormat::Protobuf,
+                StatusCode::BAD_REQUEST,
+                &e.to_string(),
+            );
+        }
     };
 
     let Some(format) = content_type(&headers) else {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+        return error_response(
+            WireFormat::Protobuf,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported Content-Type: expected application/x-protobuf or application/json",
+        );
     };
     let raw = match content_encoding(&headers) {
         Some(Encoding::Identity) => body.to_vec(),
@@ -250,17 +263,35 @@ async fn handle_logs(
             // decompresses past the limit is too large (413) — a
             // decompression bomb, since DefaultBodyLimit only bounds the
             // compressed bytes.
-            Err(GunzipError::Corrupt) => return StatusCode::BAD_REQUEST.into_response(),
-            Err(GunzipError::TooLarge) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            Err(GunzipError::Corrupt) => {
+                return error_response(format, StatusCode::BAD_REQUEST, "corrupt gzip body");
+            }
+            Err(GunzipError::TooLarge) => {
+                return error_response(
+                    format,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "gzip body decompresses past the configured limit",
+                );
+            }
         },
-        None => return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(),
+        None => {
+            return error_response(
+                format,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported Content-Encoding: expected identity or gzip",
+            );
+        }
     };
     let decoded = match format {
         WireFormat::Protobuf => decode_protobuf(&raw).map(|request| (request, false)),
         WireFormat::Json => decode_json(&raw),
     };
     let Ok((request, lenient_json)) = decoded else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return error_response(
+            format,
+            StatusCode::BAD_REQUEST,
+            "body is not a decodable ExportLogsServiceRequest",
+        );
     };
     if lenient_json {
         // Rare by construction (spec-valid payloads upstream with-serde
@@ -292,9 +323,13 @@ async fn handle_logs(
     .await
     {
         Ok(Ok(_)) => success_response(format),
-        Ok(Err(e)) => ingest_error_status(&e).into_response(),
+        Ok(Err(e)) => ingest_error_response(format, &e),
         // The ingest task panicked — a genuine, non-retryable internal bug.
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => error_response(
+            format,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the ingest task panicked",
+        ),
     }
 }
 
@@ -307,6 +342,16 @@ async fn handle_logs(
 /// §3.4) → retryable `503`, so compliant clients re-send rather than drop
 /// data (a non-retryable `500` would tell them to drop it).
 ///
+/// Seconds advertised in `Retry-After` on a *transient* 503.
+///
+/// The OTLP spec lets a server "MAY include `Retry-After`" on 503 and says
+/// a client without one SHOULD back off exponentially. One second is
+/// deliberately short: durability here is unavailable for as long as a
+/// single fsync or rotation takes, not for as long as a rate limit, and a
+/// client that waits minutes to retry an unacked batch is a client whose
+/// queue fills for no reason.
+const TRANSIENT_RETRY_AFTER_SECS: u32 = 1;
+
 /// Adapt the shared [`IngestFailure`] classification to HTTP status
 /// vocabulary — the exhaustive `ReceiveError` match (and its
 /// build-breaking-on-new-variant property) lives beside the error
@@ -315,8 +360,75 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     match IngestFailure::classify(error) {
         IngestFailure::Denied => StatusCode::FORBIDDEN,
         IngestFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        IngestFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        // Both unavailabilities are 503; see `IngestFailure::Wedged` for
+        // why the permanent one is not given a non-retryable code.
+        IngestFailure::Unavailable | IngestFailure::Wedged => StatusCode::SERVICE_UNAVAILABLE,
         IngestFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The ingest-failure response: the mapped status, a `Status` body naming
+/// the reason, and `Retry-After` only where waiting is actually the
+/// remedy.
+///
+/// The reason text is `ReceiveError`'s `Display`, which the gRPC arm
+/// already puts on the wire, so this adds no disclosure the other
+/// transport did not already make (and `TenantDenied` deliberately names
+/// the tenant, not the token — RFC 0026 §3.4).
+fn ingest_error_response(format: WireFormat, error: &ReceiveError) -> Response {
+    let status = ingest_error_status(error);
+    let mut response = error_response(format, status, &error.to_string());
+    if matches!(IngestFailure::classify(error), IngestFailure::Unavailable) {
+        // `from` on a u32 cannot produce an invalid header value.
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from(TRANSIENT_RETRY_AFTER_SECS),
+        );
+    }
+    response
+}
+
+/// An error response carrying the body the OTLP spec requires.
+///
+/// > The response body for all `HTTP 4xx` and `HTTP 5xx` responses MUST be
+/// > a Protobuf-encoded `Status` message that describes the problem.
+///
+/// Every error arm here used to return a bare `StatusCode`, which axum
+/// renders with an **empty** body — a spec violation, and the reason a
+/// wedged node (#791) could 503 for eight hours while telling its operator
+/// nothing. `Status.code` is left unset: the spec says it does not use the
+/// field and the server MAY omit it, and proto3 elides a zero-valued
+/// scalar on both encodings.
+///
+/// `format` mirrors the request's `Content-Type`, as the spec requires.
+/// The two sites that reject *before* the content type is known pass
+/// protobuf, which is the only honest choice: there is no request format
+/// to mirror when the request format is what failed.
+fn error_response(format: WireFormat, status: StatusCode, message: &str) -> Response {
+    match format {
+        WireFormat::Protobuf => {
+            let body = tonic_types::Status {
+                code: 0,
+                message: message.to_string(),
+                details: Vec::new(),
+            };
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/x-protobuf")],
+                body.encode_to_vec(),
+            )
+                .into_response()
+        }
+        // Protobuf-JSON of the same message. Hand-built rather than
+        // derived: `tonic_types::Status` carries no serde impl, and the
+        // two fields we populate have no lowerCamelCase or 64-bit
+        // encoding subtleties (RFC0003.6) to get wrong.
+        WireFormat::Json => (
+            status,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "message": message }).to_string(),
+        )
+            .into_response(),
     }
 }
 
@@ -451,5 +563,123 @@ mod tests {
             source: std::io::Error::other("io"),
         });
         assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The OTLP spec's `MUST` on error bodies, and the `Retry-After`
+    /// advice that distinguishes a transient unavailability from a wedged
+    /// node (#791). Before these, every error arm returned a bare
+    /// `StatusCode`, which axum renders with an empty body.
+    mod error_body {
+        use super::super::{
+            Response, TRANSIENT_RETRY_AFTER_SECS, WireFormat, error_response, ingest_error_response,
+        };
+        use super::{AppendError, ReceiveError, StatusCode};
+        use axum::http::header;
+        use prost::Message as _;
+
+        async fn body_bytes(response: Response) -> Vec<u8> {
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("error bodies are small")
+                .to_vec()
+        }
+
+        #[tokio::test]
+        async fn protobuf_error_body_is_a_decodable_status_naming_the_problem() {
+            let response = error_response(
+                WireFormat::Protobuf,
+                StatusCode::BAD_REQUEST,
+                "corrupt gzip body",
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/x-protobuf",
+            );
+            let decoded = tonic_types::Status::decode(body_bytes(response).await.as_slice())
+                .expect("the body must be a decodable google.rpc.Status");
+            assert_eq!(decoded.message, "corrupt gzip body");
+            // The spec says it does not use `code` and the server MAY omit
+            // it; proto3 elides the zero value on the wire.
+            assert_eq!(decoded.code, 0);
+        }
+
+        #[tokio::test]
+        async fn json_error_body_mirrors_the_request_content_type() {
+            let response =
+                error_response(WireFormat::Json, StatusCode::BAD_REQUEST, "not decodable");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json",
+                "the spec requires the response Content-Type to match the request's",
+            );
+            let body = body_bytes(response).await;
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&body).expect("the body must be JSON");
+            assert_eq!(parsed["message"], "not decodable");
+        }
+
+        /// No error arm may render an empty body, whatever the status.
+        #[tokio::test]
+        async fn every_error_arm_carries_a_non_empty_body() {
+            for format in [WireFormat::Protobuf, WireFormat::Json] {
+                for status in [
+                    StatusCode::BAD_REQUEST,
+                    StatusCode::FORBIDDEN,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ] {
+                    let response = error_response(format, status, "reason");
+                    assert_eq!(response.status(), status);
+                    assert!(
+                        !body_bytes(response).await.is_empty(),
+                        "{status} must not render an empty body",
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn transient_unavailability_advertises_retry_after() {
+            let e = ReceiveError::WalAppend(AppendError::Io {
+                op: "write",
+                source: std::io::Error::other("io"),
+            });
+            let response = ingest_error_response(WireFormat::Protobuf, &e);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER).unwrap(),
+                TRANSIENT_RETRY_AFTER_SECS.to_string().as_str(),
+            );
+        }
+
+        /// The wedge is still 503 — a non-retryable code would tell the
+        /// client to drop a batch that was never acked — but it must not
+        /// advertise a retry delay, because no delay is the remedy, and the
+        /// body has to name the state so an operator reading a single
+        /// response learns what a restart is for.
+        #[tokio::test]
+        async fn wedged_wal_is_503_without_retry_after_and_says_why() {
+            let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
+            let response = ingest_error_response(WireFormat::Protobuf, &e);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response.headers().get(header::RETRY_AFTER).is_none(),
+                "a wedged WAL must not advertise a retry delay",
+            );
+            let decoded = tonic_types::Status::decode(body_bytes(response).await.as_slice())
+                .expect("decodable google.rpc.Status");
+            assert_eq!(
+                decoded.message,
+                ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure).to_string(),
+                "the reason the gRPC arm has always sent must now reach HTTP clients too",
+            );
+            assert!(
+                !decoded.message.is_empty(),
+                "an empty reason would reintroduce the #791 blind spot",
+            );
+        }
     }
 }

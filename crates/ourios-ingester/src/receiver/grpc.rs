@@ -229,7 +229,13 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
         IngestFailure::Denied => Status::permission_denied(msg),
         // gRPC has no payload-too-large code (RFC 0026 §3.5 mapping).
         IngestFailure::TooLarge => Status::invalid_argument(msg),
-        IngestFailure::Unavailable => Status::unavailable(msg),
+        // Both unavailabilities are `UNAVAILABLE`; see
+        // `IngestFailure::Wedged` for why the permanent one is not given a
+        // non-retryable code (it would tell the client to drop an unacked
+        // batch). The message is what distinguishes them, and this arm has
+        // always carried it — the HTTP arm did not, which is how #791 went
+        // eight hours without a reason anywhere.
+        IngestFailure::Unavailable | IngestFailure::Wedged => Status::unavailable(msg),
         IngestFailure::Internal => Status::internal(msg),
     }
 }

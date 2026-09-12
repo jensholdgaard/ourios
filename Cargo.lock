@@ -3398,6 +3398,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "tonic-types",
  "tower",
  "tracing",
  "tracing-opentelemetry",

@@ -19,13 +19,12 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 338 |
+| `Apache-2.0` | 339 |
 | `MIT` | 69 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 9 |
 | `ISC` | 4 |
 | `Zlib` | 3 |
-| `BSD-2-Clause` | 1 |
 | `CC0-1.0` | 1 |
 | `CDLA-Permissive-2.0` | 1 |
 
@@ -922,36 +921,36 @@ Used by:
 
 Used by:
 
-- `datafusion-catalog-listing` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-catalog` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-common-runtime` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-common` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-arrow` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-csv` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-json` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-parquet` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-doc` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-execution` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr-common` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate-common` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-nested` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-table` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window-common` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-macros` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-optimizer` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-adapter` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-common` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-optimizer` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-plan` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-pruning` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion-session` 55.0.0 — <https://github.com/apache/datafusion>
-- `datafusion` 55.0.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog-listing` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-common-runtime` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-common` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-arrow` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-csv` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-json` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-parquet` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-doc` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-execution` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr-common` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate-common` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-nested` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-table` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window-common` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-macros` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-optimizer` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-adapter` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-common` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-optimizer` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-plan` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-pruning` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-session` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion` 55.1.0 — <https://github.com/apache/datafusion>
 
 <details>
 <summary>Full license text</summary>
@@ -1185,6 +1184,7 @@ Used by:
 - `windows-result` 0.4.1 — <https://github.com/microsoft/windows-rs>
 - `windows-strings` 0.5.1 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.52.0 — <https://github.com/microsoft/windows-rs>
+- `windows-sys` 0.59.0 — <https://github.com/microsoft/windows-rs>
 - `windows-sys` 0.61.2 — <https://github.com/microsoft/windows-rs>
 - `windows-targets` 0.52.6 — <https://github.com/microsoft/windows-rs>
 - `windows_aarch64_gnullvm` 0.52.6 — <https://github.com/microsoft/windows-rs>
@@ -3381,7 +3381,7 @@ limitations under the License.
 
 Used by:
 
-- `tokio-rustls` 0.26.4 — <https://github.com/rustls/tokio-rustls>
+- `tokio-rustls` 0.26.5 — <https://github.com/rustls/tokio-rustls>
 
 <details>
 <summary>Full license text</summary>
@@ -4751,7 +4751,7 @@ Used by:
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
 - `rustix` 1.1.4 — <https://github.com/bytecodealliance/rustix>
 - `rustls-native-certs` 0.8.4 — <https://github.com/rustls/rustls-native-certs>
-- `rustls` 0.23.43 — <https://github.com/rustls/rustls>
+- `rustls` 0.23.44 — <https://github.com/rustls/rustls>
 - `rusty-fork` 0.3.1 — <https://github.com/altsysrq/rusty-fork>
 - `scopeguard` 1.2.0 — <https://github.com/bluss/scopeguard>
 - `security-framework-sys` 2.17.0 — <https://github.com/kornelski/rust-security-framework>
@@ -4765,7 +4765,7 @@ Used by:
 - `unicode-segmentation` 1.13.3 — <https://github.com/unicode-rs/unicode-segmentation>
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `url` 2.5.8 — <https://github.com/servo/rust-url>
-- `uuid` 1.24.1 — <https://github.com/uuid-rs/uuid>
+- `uuid` 1.26.1 — <https://github.com/uuid-rs/uuid>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>
 - `wait-timeout` 0.2.1 — <https://github.com/alexcrichton/wait-timeout>
 - `wasi` 0.11.1+wasi-snapshot-preview1 — <https://github.com/bytecodealliance/wasi>
@@ -6764,7 +6764,7 @@ Used by:
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
 - `async-trait` 0.1.89 — <https://github.com/dtolnay/async-trait>
-- `blake3` 1.8.6 — <https://github.com/BLAKE3-team/BLAKE3>
+- `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
 - `constant_time_eq` 0.4.2 — <https://github.com/cesarb/constant_time_eq>
 - `crc32c` 0.6.8 — <https://github.com/zowens/crc32c>
@@ -7406,47 +7406,6 @@ limitations under the License.
 
 </details>
 
-### BSD 2-Clause "Simplified" License (`BSD-2-Clause`)
-
-Used by:
-
-- `arrayref` 0.3.9 — <https://github.com/droundy/arrayref>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are
-met:
-
-1. Redistributions of source code must retain the above copyright
-   notice, this list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright
-   notice, this list of conditions and the following disclaimer in the
-   documentation and/or other materials provided with the
-   distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-```
-
-</details>
-
 ### BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`)
 
 Used by:
@@ -8018,7 +7977,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 Used by:
 
-- `rustls-webpki` 0.103.13 — <https://github.com/rustls/webpki>
+- `rustls-webpki` 0.103.15 — <https://github.com/rustls/webpki>
 
 <details>
 <summary>Full license text</summary>

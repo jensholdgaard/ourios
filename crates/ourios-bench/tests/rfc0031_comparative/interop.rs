@@ -52,6 +52,35 @@ fn rfc0031_10_loki_label_allowlist() {
         })
         .collect();
 
+    // Every denylisted key is actually SENT, through the same OTLP path a
+    // real push uses. Without this the denylist loop passes for three of its
+    // four names no matter what the config does, because `span_id` and the
+    // template ids were never on the wire and so could not have become
+    // labels. A safeguard that cannot fail is not a safeguard.
+    let mut logs = fixture_logs_data(&records);
+    for resource_logs in &mut logs.resource_logs {
+        if let Some(resource) = resource_logs.resource.as_mut() {
+            resource
+                .attributes
+                .push(string_attribute("template_id", "4711"));
+            resource
+                .attributes
+                .push(string_attribute("ourios_template_id", "4711"));
+        }
+        for scope in &mut resource_logs.scope_logs {
+            for record in &mut scope.log_records {
+                record.span_id = vec![0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
+                record
+                    .attributes
+                    .push(string_attribute("template_id", "4711"));
+                record
+                    .attributes
+                    .push(string_attribute("ourios_template_id", "4711"));
+            }
+        }
+    }
+    assert_denylisted_keys_are_on_the_wire(&logs);
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -61,18 +90,24 @@ fn rfc0031_10_loki_label_allowlist() {
 
         let (_container, base, http) = start_loki(LOKI_DISPATCH_FLAGS).await;
         let payload = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
-            resource_logs: fixture_logs_data(&records).resource_logs,
+            resource_logs: logs.resource_logs,
         }
         .encode_to_vec();
         push_otlp(&http, &base, payload).await;
 
-        // Labels appear once the push is indexed; poll rather than sleep a
-        // fixed amount, so a slow container does not read as "no labels".
+        // Poll until BOTH services are visible, not merely until some label
+        // is: the push carries two `ResourceLogs` streams and the second can
+        // land later, so stopping at the first non-empty answer would read a
+        // half-indexed label set — failing the two-value assertion below
+        // intermittently, and worse, checking the allowlist against an
+        // incomplete set.
         let mut observed = Vec::new();
+        let mut services = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             observed = loki_label_names(&http, &base).await;
-            if !observed.is_empty() {
+            services = loki_label_values(&http, &base, "service_name").await;
+            if services.len() >= 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -101,13 +136,64 @@ fn rfc0031_10_loki_label_allowlist() {
         // Not a catch-all: the allowlisted label must actually partition
         // the corpus. The fixture carries two services, so a config that
         // collapsed them into one stream fails here.
-        let services = loki_label_values(&http, &base, "service_name").await;
         assert_eq!(
             services.len(),
             2,
             "`service_name` must discriminate between the fixture's two              services, else the single allowlisted label is a catch-all and              every query is a full scan: {services:?}",
         );
     });
+}
+
+/// An OTLP string attribute.
+fn string_attribute(key: &str, value: &str) -> opentelemetry_proto::tonic::common::v1::KeyValue {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+        ..KeyValue::default()
+    }
+}
+
+/// Assert the payload really carries every `LOKI_LABEL_DENYLIST` name, so a
+/// future edit that drops one of the injections turns the corresponding
+/// denylist assertion back into a vacuous pass *loudly* rather than silently.
+///
+/// This is the limit of what is checkable locally: that the keys went out.
+/// Whether Loki then indexed them is exactly what the denylist loop against
+/// the live `/labels` answer decides.
+fn assert_denylisted_keys_are_on_the_wire(logs: &opentelemetry_proto::tonic::logs::v1::LogsData) {
+    let records = || {
+        logs.resource_logs
+            .iter()
+            .flat_map(|rl| rl.scope_logs.iter())
+            .flat_map(|sl| sl.log_records.iter())
+    };
+    let resource_keys: Vec<&str> = logs
+        .resource_logs
+        .iter()
+        .filter_map(|rl| rl.resource.as_ref())
+        .flat_map(|r| r.attributes.iter())
+        .map(|kv| kv.key.as_str())
+        .collect();
+    let record_keys: Vec<&str> = records()
+        .flat_map(|r| r.attributes.iter())
+        .map(|kv| kv.key.as_str())
+        .collect();
+    for forbidden in LOKI_LABEL_DENYLIST {
+        let on_the_wire = match *forbidden {
+            // Carried in dedicated protobuf fields, not as attributes.
+            "trace_id" => records().all(|r| !r.trace_id.is_empty()),
+            "span_id" => records().all(|r| !r.span_id.is_empty()),
+            key => resource_keys.contains(&key) && record_keys.contains(&key),
+        };
+        assert!(
+            on_the_wire,
+            "the fixture must SEND `{forbidden}` for the denylist assertion on \
+             it to mean anything; it is absent from the payload",
+        );
+    }
 }
 
 /// Scenario RFC0031.1 — result-set equivalence gates every comparison.

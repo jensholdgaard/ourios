@@ -13,6 +13,8 @@
 use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
 };
+use ourios_core::record::{BodyKind, MinedRecord, RecordSink};
+use ourios_core::tenant::TenantId;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_parquet::store::Store;
 use ourios_semconv as semconv;
@@ -41,15 +43,52 @@ fn counter_sum(rms: &[ResourceMetrics], name: &str, attribute: Option<(&str, &st
         .sum()
 }
 
+/// Set a directory's Unix mode.
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .expect("set bucket permissions");
+}
+
+/// One record, enough to give a partition something to fail to flush.
+fn a_record() -> MinedRecord {
+    MinedRecord {
+        tenant_id: TenantId::new("cadence-panic"),
+        template_id: 0,
+        template_version: 0,
+        severity_number: 9,
+        severity_text: None,
+        scope_name: None,
+        scope_version: None,
+        scope_attributes: Vec::new(),
+        resource_schema_url: None,
+        scope_schema_url: None,
+        time_unix_nano: 1_750_000_000_000_000_000,
+        observed_time_unix_nano: None,
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        resource_attributes: Vec::new(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        event_name: None,
+        body_kind: BodyKind::String,
+        params: Vec::new(),
+        separators: Vec::new(),
+        body: Some("line".to_string()),
+        confidence: 0.0,
+        lossy_flag: true,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
 
     // A real `SharedParquetSink`, so what is asserted is the wiring the age
-    // sweep calls rather than `SinkMetrics` in isolation. The bucket must
-    // outlive the sink: dropping it removes the directory the store points at.
+    // sweep calls rather than `SinkMetrics` in isolation.
     let bucket = tempfile::TempDir::new().expect("bucket dir");
-    let sink = SharedParquetSink::new(ParquetRecordSink::new(
+    let mut sink = SharedParquetSink::new(ParquetRecordSink::new(
         Store::local(bucket.path()).expect("local store"),
         FlushConfig {
             target_bytes: usize::MAX,
@@ -57,6 +96,18 @@ async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
             ceiling_bytes: usize::MAX,
         },
     ));
+
+    // A genuine store failure, for the *untagged* datapoint the tagged one
+    // has to be distinguishable from: buffer a record, then make the bucket
+    // directory read-only so the flush's write cannot land (removing it is
+    // not enough — the local backend recreates missing parents). The buffer
+    // is retained (the WAL is the durability of record) and the failure is
+    // counted.
+    sink.emit(a_record());
+    set_mode(bucket.path(), 0o555);
+    sink.flush_all();
+    // Restore before the TempDir drops, or its own cleanup fails.
+    set_mode(bucket.path(), 0o755);
 
     sink.record_cadence_panic();
     guard.force_flush().expect("force_flush");
@@ -76,7 +127,20 @@ async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
     );
     assert_eq!(
         counter_sum(&rms, semconv::OURIOS_SINK_FLUSH_ERRORS, None),
-        1,
-        "and is the only flush error recorded here",
+        2,
+        "the store error rides the same counter, so the total is both — if \
+         this is 1 the store flush silently succeeded and the distinction \
+         below is untested",
+    );
+    assert_eq!(
+        counter_sum(
+            &rms,
+            semconv::OURIOS_SINK_FLUSH_ERRORS,
+            Some(("error.type", "cadence_panic")),
+        ) + 1,
+        counter_sum(&rms, semconv::OURIOS_SINK_FLUSH_ERRORS, None),
+        "exactly one of the two carries the cadence_panic dimension: the \
+         store error must stay untagged, or alerting on a dead sweep would \
+         fire on every transient store blip",
     );
 }

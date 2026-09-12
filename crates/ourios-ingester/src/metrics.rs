@@ -359,8 +359,13 @@ const ERROR_TYPE: &str = "error.type";
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 /// The `error.type` value for a cadence sweep step that panicked (#791).
-/// The sweep survives it, so without a count a panic that repeats every
-/// tick is invisible — which is the failure this value exists to expose.
+///
+/// One such count means the flush cadence is **dead** for the life of the
+/// process: the sweep stops on a panic, because continuing would repeat
+/// #796's data-loss window every tick. Partitions then drain only on WAL
+/// rotation and shutdown. So this is not a rate to watch — a single
+/// occurrence is the alert, and a restart is the remedy until RFC 0052
+/// makes the step's unwind safe.
 pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 
 impl Default for IngestMetrics {

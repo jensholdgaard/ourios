@@ -156,13 +156,26 @@ fn spawn_age_sweep(
             // requeue-on-unwind semantics — a §3.4 decision for the #791 RFC,
             // not something to improvise under a panic handler.
             if let Err(join_error) = step {
-                if join_error.is_panic() {
-                    coordinator.record_cadence_panic();
-                }
+                count_step_panic(&coordinator, &join_error);
                 break;
             }
         }
     })
+}
+
+/// Count a cadence-step `JoinError` when it was a panic, and report whether
+/// it counted.
+///
+/// Cancellation must not count: it is the runtime going away, which is
+/// ordinary shutdown, and tagging it would make the "dead cadence" signal
+/// fire on every clean stop. The old code could not tell the two apart at
+/// all (#791), which is the regression the return value exists to pin.
+fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::JoinError) -> bool {
+    if !join_error.is_panic() {
+        return false;
+    }
+    coordinator.record_cadence_panic();
+    true
 }
 
 /// Quiesce the age sweep's in-flight off-lock publishes (issue #578), flush
@@ -702,6 +715,78 @@ mod tests {
     use ourios_core::tenant::TenantId;
 
     use super::*;
+
+    /// #791: the sweep could not tell a cancelled step from a panicked one —
+    /// it broke its loop on either, so a panic retired the flush cadence for
+    /// the life of the process while the task returned `()` cleanly and
+    /// nothing logged, counted, or failed.
+    ///
+    /// These drive the real routing with real `JoinError`s and a real
+    /// `PublishCoordinator`, so a regression to treating both alike fails
+    /// here. That the count reaches the exported counter is asserted
+    /// separately, by `ourios-ingester`'s `cadence_panic_metric` test — this
+    /// binary's harness cannot install a global meter without racing the
+    /// other tests in it.
+    mod count_step_panic {
+        use super::super::count_step_panic;
+        use ourios_ingester::publish::PublishCoordinator;
+        use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+        use ourios_parquet::store::Store;
+        use std::time::Duration;
+
+        fn coordinator(root: &std::path::Path) -> PublishCoordinator {
+            // `Store::local` canonicalizes, so the directories must exist.
+            for leaf in ["records", "audit"] {
+                std::fs::create_dir_all(root.join(leaf)).expect("store dir");
+            }
+            let never_flush = FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            };
+            let records = SharedParquetSink::new(ParquetRecordSink::new(
+                Store::local(root.join("records")).expect("record store"),
+                never_flush,
+            ));
+            let audit =
+                super::super::SharedParquetAuditSink::new(super::super::BufferingAuditSink::new(
+                    Store::local(root.join("audit")).expect("audit store"),
+                    super::super::AUDIT_SINK_CEILING_EVENTS,
+                ));
+            PublishCoordinator::new(records, audit)
+        }
+
+        #[tokio::test]
+        async fn a_panicked_step_is_counted() {
+            let root = tempfile::TempDir::new().expect("root");
+            let join_error = tokio::spawn(async { panic!("the step blew up") })
+                .await
+                .expect_err("a panicking task joins as an Err");
+            assert!(join_error.is_panic());
+            assert!(
+                count_step_panic(&coordinator(root.path()), &join_error),
+                "a panicked cadence step must be counted — it is the only \
+                 signal that the cadence is now dead",
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_step_is_not_counted() {
+            let root = tempfile::TempDir::new().expect("root");
+            let handle = tokio::spawn(async {
+                // Never completes, so the abort below is what ends it.
+                std::future::pending::<()>().await;
+            });
+            handle.abort();
+            let join_error = handle.await.expect_err("an aborted task joins as an Err");
+            assert!(join_error.is_cancelled());
+            assert!(
+                !count_step_panic(&coordinator(root.path()), &join_error),
+                "cancellation is ordinary shutdown; counting it would make \
+                 the dead-cadence signal fire on every clean stop",
+            );
+        }
+    }
 
     fn rec() -> MinedRecord {
         MinedRecord {

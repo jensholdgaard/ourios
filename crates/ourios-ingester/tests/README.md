@@ -15,6 +15,8 @@ process race each other (see the note in `perf_metrics.rs`); they stay
 one-per-binary:
 
 - `perf_metrics.rs` — ingest + sink instruments through the global meter.
+- `cadence_panic_metric.rs` — the sink's flush-error counter through the
+  global meter, for the `error.type=cadence_panic` dimension (#791).
 - `audit_sink_metrics.rs` — audit-sink instruments through the global meter.
 - `rfc0018_otlp_compliance.rs` — its `.6` telemetry arm installs the
   global in-memory provider.

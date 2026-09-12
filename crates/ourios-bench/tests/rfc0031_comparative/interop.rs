@@ -47,6 +47,21 @@ fn rfc0031_10_loki_label_allowlist() {
         .encode_to_vec();
         push_otlp(&http, &base, payload).await;
 
+        // The exhaustive half: Loki's effective configuration *is* the
+        // promotion surface, so asserting the declared allowlist against it
+        // catches a key the probe never sends. A payload probe cannot —
+        // the probe-derived version of this list was missing
+        // `k8s.deployment.name`, which only `/config` revealed.
+        let effective = loki_effective_index_labels(&http, &base).await;
+        assert_eq!(
+            effective, LOKI_LABEL_ALLOWLIST,
+            "Loki's effective default_resource_attributes_as_index_labels no \
+             longer matches the declared RFC0031.10 allowlist. Update the \
+             allowlist in the same commit that re-publishes the affected §9 \
+             rows, and say so — every published ratio was measured against \
+             the old promotion surface.",
+        );
+
         let (observed, services) = poll_until_both_services_indexed(&http, &base).await;
         assert_within_allowlist(&observed);
         assert_no_denylisted_label(&observed);

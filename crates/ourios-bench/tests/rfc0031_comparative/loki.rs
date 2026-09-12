@@ -77,12 +77,15 @@ pub(crate) const LOKI_DISPATCH_FLAGS: &[&str] = &[
 /// RFC0031.10's **declared label allowlist** — every stream label the
 /// comparative Loki configuration is permitted to index.
 ///
-/// This is Loki's *stock* resource-attributes-as-index-labels set, established
-/// empirically against the pinned image rather than copied from documentation:
-/// `rfc0031_10_loki_label_allowlist` pushes these keys and reads back
-/// `/loki/api/v1/labels`. The stock config also caps a stream at 15 label
-/// names, so sending the whole set at once is rejected — which is how the
-/// cap was discovered too.
+/// This is Loki's *stock* `default_resource_attributes_as_index_labels` set,
+/// read from the pinned image's own effective configuration rather than
+/// copied from documentation or inferred from a probe.
+/// `rfc0031_10_loki_label_allowlist` asserts this list against Loki's
+/// `/config` endpoint, which is exhaustive by construction: it reads the
+/// promotion list itself, so a future image that adds a key fails
+/// immediately, with no payload able to hide it. A probe alone cannot do
+/// that — it only ever observes keys it happens to send, and the
+/// probe-derived version of this list was missing `k8s.deployment.name`.
 ///
 /// **It is deliberately not a one-label set.** An earlier version of this
 /// constant said `["service_name"]`, which passed only because the fixture
@@ -107,12 +110,13 @@ pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &[
     "k8s_namespace_name",
     "k8s_pod_name",
     "k8s_container_name",
+    "container_name",
     "k8s_replicaset_name",
+    "k8s_deployment_name",
     "k8s_statefulset_name",
     "k8s_daemonset_name",
     "k8s_cronjob_name",
     "k8s_job_name",
-    "container_name",
 ];
 
 /// Label names that must never appear in Loki's index, named explicitly by
@@ -129,6 +133,50 @@ pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &[
 /// names that widening must never reach.
 pub(crate) const LOKI_LABEL_DENYLIST: &[&str] =
     &["trace_id", "span_id", "template_id", "ourios_template_id"];
+
+/// GET Loki's effective `default_resource_attributes_as_index_labels` list,
+/// in label form (dots become underscores, as Loki's own mapping does).
+///
+/// This is the authoritative promotion surface: every resource attribute the
+/// running configuration turns into a stream label. Asserting the declared
+/// allowlist against it is exhaustive in a way a payload probe cannot be.
+///
+/// Hand-scanned rather than YAML-parsed: the block is a flat sequence of
+/// scalars at a known key, the crate has no YAML dependency, and adding one
+/// to read eighteen strings would be the larger cost. A shape change breaks
+/// the caller's assertion loudly rather than silently returning nothing,
+/// because an empty list cannot equal the allowlist.
+pub(crate) async fn loki_effective_index_labels(http: &reqwest::Client, base: &str) -> Vec<String> {
+    const KEY: &str = "default_resource_attributes_as_index_labels:";
+
+    let resp = http
+        .get(format!("{base}/config"))
+        .send()
+        .await
+        .expect("config request reaches Loki");
+    let status = resp.status();
+    let body = resp.text().await.expect("config response body");
+    assert!(status.is_success(), "loki /config returned {status}");
+
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == KEY {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        // The block ends at the first line that is not a `- scalar` item.
+        match trimmed.strip_prefix("- ") {
+            Some(value) => out.push(value.trim().replace('.', "_")),
+            None => break,
+        }
+    }
+    out
+}
 
 /// GET the stream label names Loki currently has indexed.
 pub(crate) async fn loki_label_names(http: &reqwest::Client, base: &str) -> Vec<String> {

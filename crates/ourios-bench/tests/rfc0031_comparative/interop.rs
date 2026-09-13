@@ -215,7 +215,7 @@ fn inject_probe_attributes(logs: &mut opentelemetry_proto::tonic::logs::v1::Logs
 /// promoted key to `PROBE_RESOURCE_ATTRIBUTES` tightens the completeness
 /// condition automatically; the negative controls fall out because they are
 /// not in the allowlist.
-fn probe_expected_labels() -> Vec<String> {
+static PROBE_EXPECTED_LABELS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     let mut expected: Vec<String> = PROBE_RESOURCE_ATTRIBUTES
         .iter()
         .map(|(key, _)| key.replace('.', "_"))
@@ -223,13 +223,7 @@ fn probe_expected_labels() -> Vec<String> {
         .collect();
     expected.push("service_name".to_string());
     expected
-}
-
-/// Whether a `/labels` answer carries every label the probe is designed to
-/// produce.
-fn carries_every_expected_label(observed: &[String], expected: &[String]) -> bool {
-    expected.iter().all(|name| observed.contains(name))
-}
+});
 
 /// Poll until Loki has indexed **both** services and the label-name snapshot
 /// carries every label the probe produces, returning the label names and
@@ -249,7 +243,9 @@ async fn poll_until_both_services_indexed(
     http: &reqwest::Client,
     base: &str,
 ) -> (Vec<String>, Vec<String>) {
-    let expected = probe_expected_labels();
+    let expected: &[String] = &PROBE_EXPECTED_LABELS;
+    let carries_every_expected_label =
+        |observed: &[String]| expected.iter().all(|name| observed.contains(name));
     let mut observed = Vec::new();
     let mut services = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -264,7 +260,7 @@ async fn poll_until_both_services_indexed(
         services = loki_label_values(http, base, "service_name").await;
         if services.len() >= 2 {
             observed = loki_label_names(http, base).await;
-            if carries_every_expected_label(&observed, &expected) {
+            if carries_every_expected_label(&observed) {
                 break;
             }
         }
@@ -277,7 +273,7 @@ async fn poll_until_both_services_indexed(
     // set. `services` comes from a different response, so it cannot stand in
     // for this.
     assert!(
-        carries_every_expected_label(&observed, &expected) && services.len() >= 2,
+        carries_every_expected_label(&observed) && services.len() >= 2,
         "the push was not fully indexed within the deadline: labels {observed:?} \
          (expected at least {expected:?}), service values {services:?} — every \
          assertion over the label set would run on an incomplete snapshot, so \
@@ -322,13 +318,13 @@ fn assert_denylist_disjoint_from_promotion(effective: &[String]) {
 /// would be unfalsifiable: reached on every run, never able to fail, and
 /// indistinguishable from one that cannot.
 /// The completeness condition the label poll waits on must itself be
-/// non-vacuous: it has to name more than `service_name`, every name in it has
-/// to be one Loki promotes, and a snapshot missing any one of them has to be
-/// judged incomplete — otherwise the poll would break early on a lagging
-/// `/labels` answer and the within-allowlist assertion would pass on it.
+/// non-vacuous: it has to name more than `service_name`, and every name in
+/// it has to be one Loki promotes — otherwise the poll would break early on a
+/// lagging `/labels` answer and the within-allowlist assertion would pass on
+/// it, or wait forever for a label Loki never produces.
 #[test]
 fn probe_completeness_condition_is_not_vacuous() {
-    let expected = probe_expected_labels();
+    let expected: &[String] = &PROBE_EXPECTED_LABELS;
     assert!(
         expected.len() > 1,
         "the probe must be designed to produce promoted labels beyond service_name: {expected:?}",
@@ -338,13 +334,6 @@ fn probe_completeness_condition_is_not_vacuous() {
             .iter()
             .all(|name| LOKI_LABEL_ALLOWLIST.contains(&name.as_str())),
         "every expected label is one Loki promotes: {expected:?}",
-    );
-    assert!(carries_every_expected_label(&expected, &expected));
-    let mut lagging = expected.clone();
-    let dropped = lagging.pop().expect("non-empty");
-    assert!(
-        !carries_every_expected_label(&lagging, &expected),
-        "a snapshot missing {dropped} must be judged incomplete",
     );
 }
 

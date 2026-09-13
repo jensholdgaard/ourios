@@ -91,7 +91,9 @@ helps here.
 
 The wire shape is stated, because an empty body is how #791 hid for eight
 hours. On HTTP the rejection is the `google.rpc.Status` body the OTLP spec
-requires and #794 established — protobuf or JSON, mirroring the request's
+requires and #794 established — binary protobuf with
+`application/x-protobuf` whatever the request's encoding, because the
+Collector's exporter decodes every failure body as protobuf regardless of
 `Content-Type`, with the message naming the limit and the measurement — and
 `Retry-After` is a response header. On gRPC it is the `Status` message plus a
 `RetryInfo` detail carrying the same delay. A bare status code with no body,
@@ -143,12 +145,15 @@ heal and must not be counted — the figure is initialised as the sum over
 every surviving segment, closed and current, of its file size **less the
 24-byte segment header**, so the rebuilt number is frame bytes like the live
 one and matches what the reservation adds to it. The hook is RFC 0052 §3.7's
-`Wal::remeasure_unreclaimed()`, called at the end of recovery's heal — not
-at `Wal::open`, which runs before heal and would count torn bytes — and the
-coordinator is constructed after recovery, so the seed completes before any
-append is admitted and a node restarted mid-outage resumes refusing at the
-same bound rather than admitting from zero. RFC0053.4's restart asserts
-that.
+`Wal::remeasure_unreclaimed()`, called after every successful replay and
+after the heal when there was a torn tail to heal — not at `Wal::open`,
+which runs before either and would count torn bytes, and not only on the
+heal path, which a clean replay never enters — and the coordinator is
+constructed after recovery, so the seed completes before any append is
+admitted and a node restarted mid-outage resumes refusing at the same bound
+rather than admitting from zero. The same hook seeds the current segment's
+frame bytes (§3.1's rotation trigger) from the healed newest segment.
+RFC0053.4's restart asserts that.
 
 The age of the oldest unreclaimed frame is exported beside it (RFC 0052 §3.5)
 and is the right thing to *alert* on, but it is not an admission rule: an age
@@ -198,17 +203,24 @@ second way to corrupt the tail, so the only safe reservation is one taken
 before the write.
 
 The bound is configuration, and it has a home: `WalConfig` gains
-`unreclaimed_bytes_limit` (`wal_unreclaimed_bytes_limit` on the deployment
-surface, beside `segment_size_bytes` and `housekeeping_secs`, which the
-coordinator already receives from there). `validate_config` rejects a value
-below `segment_size_bytes`: the smallest useful bound is one full segment,
-since housekeeping never unlinks the current segment and a bound smaller than
-one would refuse before a rotation could ever reclaim anything — which also
-puts it above the largest legal frame, because the segment floor already is.
-The default is **1 GiB**: eight default segments, far above the 16 MiB frame
-ceiling, a few hours of a busy node's frames and a few weeks of the incident
-node's. Whether that should instead scale with the volume is §7's question;
-the acceptance run uses the default as stated here. The rejection is the
+`unreclaimed_bytes_limit`, and it is the first WAL knob the deployment
+surface exposes — `ReceiverSection` today carries only `wal_root`, with the
+other WAL settings hardcoded in `wal_config()`, so the section gains
+`wal_unreclaimed_bytes_limit` under its existing `deny_unknown_fields`
+struct, `wal_config()` resolves it, the value takes the config file's
+`${env:VAR}` substitution (RFC 0020) rather than a bespoke environment path,
+and the Helm chart exposes it under the receiver's config block.
+`validate_config` rejects an explicit value below `segment_size_bytes`: the
+smallest useful bound is one full segment, since housekeeping never unlinks
+the current segment and a bound smaller than one would refuse before a
+rotation could ever reclaim anything — which also puts it above the largest
+legal frame, because the segment floor already is. The default is
+**derived**, `max(1 GiB, segment_size_bytes)`, so an implicit default can
+never fail that validation whatever segment size is chosen (the range allows
+up to 2 GiB); at the default segment size that is eight segments, far above
+the 16 MiB frame ceiling, a few hours of a busy node's frames and a few
+weeks of the incident node's. Whether it should instead scale with the
+volume is §7's question; the acceptance run uses the derived default. The rejection is the
 contract: ingest keeps accepting while the object store is unreachable until
 the declared limit, then refuses with a reason that names the limit it hit.
 Crucially, crossing the limit does **not** set RFC 0052's rotation-failure
@@ -245,7 +257,9 @@ nothing, and the current segment holds at least one frame. That last
 condition needs a state surface the inherited `ReclaimState` lacks —
 `unflushed_bytes` resets on every sync, so it cannot tell a synced current
 segment from an empty one — and this RFC adds one field to it:
-`current_segment_frame_bytes`, maintained by the same append accounting. No
+`current_segment_frame_bytes`, maintained by the same append accounting and
+seeded from the healed newest segment by the post-recovery remeasure (a
+reopened WAL has frames in its current segment before any append). No
 "current segment is the only holder" predicate is needed: rotating a
 non-empty current segment while the bound is crossed and reclamation is
 stalled is harmless, happens at most once per pass, and is exactly the move
@@ -338,7 +352,11 @@ record publish — need an owner too, and today's `Drained` has none:
 its `_guard` is a `PublishGuard` that only tracks the in-flight count and
 holds neither batch. So `Drained` itself gains the destructor: its two
 batches become `Option`s the consuming calls take partition by partition as
-they settle, and `Drop` requeues whatever is still present. A pre-call or
+they settle, it carries clones of the two shared sink handles
+(`SharedParquetSink` and `SharedParquetAuditSink` are `Arc`-shared already)
+so that `Drop` can call each sink's `requeue` on whatever is still present,
+and that `Drop` path is non-panicking — it recovers a poisoned sink lock
+rather than unwinding inside an unwind. A pre-call or
 inter-call unwind then requeues everything through the destructor, and a
 panic inside a call requeues the unsettled remainder through the call's own
 handle. What the design requires is that **no** panic arm anywhere in the
@@ -362,8 +380,11 @@ boolean is enough for that boundary; the permanent-drop count the sink already
 exports is what distinguishes the two settled outcomes for an operator.
 
 With that settled, the age sweep can survive a panic and keep sweeping. #795
-deliberately stops, because without this it would repeat the loss every tick;
-that stop is reversed here, and the `cadence_panic` counter it added stays,
+deliberately stops, because without this it would repeat the loss every tick,
+and RFC 0052 §3.1 adds the `cadence_failed` latch that keeps its timer from
+stamping past a dropped batch; both the stop and the latch are reversed
+here, since the panic no longer drops anything, and the `cadence_panic`
+counter #795 added stays,
 now meaning "a step panicked and was retried" rather than "the cadence is
 dead". Only a *panicking* `JoinError` continues the sweep; a cancelled one is
 the runtime going away and still terminates it, exactly as today, so an
@@ -425,10 +446,11 @@ are kept distinct so that the remedy each advertises is the true one.
 >   is refused with a reason naming the limit, and a `Retry-After` equal to
 >   the reclamation cadence — **not** a value derived from the limit, which
 >   yields no delta-seconds
-> - **And** on HTTP the reason is a `google.rpc.Status` body in the request's
->   format with `Retry-After` as a header, and on gRPC a `Status` message
->   with a `RetryInfo` detail — a bare status code with an empty body fails
->   this scenario
+> - **And** on HTTP the reason is a binary protobuf `google.rpc.Status` body
+>   (`application/x-protobuf`, whatever the request's encoding) with
+>   `Retry-After` as a header, and on gRPC a `Status` message with a
+>   `RetryInfo` detail — a bare status code with an empty body fails this
+>   scenario
 > - **And** the refused batch is **not present in the WAL** — asserted by
 >   replaying after a restart, so a post-append check that left the frame
 >   behind fails here

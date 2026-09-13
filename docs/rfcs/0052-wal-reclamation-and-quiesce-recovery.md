@@ -379,6 +379,7 @@ retryable, and the design treats them by what they leave behind:
 | closing-segment `fdatasync` | `sync_file_data` | nothing new; current segment unchanged | directly |
 | create fresh segment | `create_fresh_segment` | at most a `.wal.partial`, never a segment | directly; the partial is swept |
 | fresh-segment header `fsync` | `sync_file_data` | a `.wal.partial` with possibly-torn bytes | directly; the partial is swept |
+| `rename(partial, final)` | `rename` | the `.wal.partial` only; nothing installed | directly; the partial is swept |
 | parent-dir `fsync` (post-rename) | `sync_parent_dir` | a **complete, installed** segment whose entry may not be durable | re-fsync it; **never unlink** |
 
 The last row is the one to read carefully. Because the rename happens before
@@ -470,11 +471,13 @@ delete an in-progress checkpoint or snapshot, which is a worse failure than the
 debris it collects.
 
 So the name is **reserved and exact**: the in-progress segment is
-`<uuid>.wal.partial`, and the sweep matches a valid UUID stem with that
-suffix and nothing else — `foo.wal.partial` or any operator-placed file is
-ignored, as non-segment files are everywhere else in the WAL — and never
-`*.tmp`, which stays the checkpoint and snapshot namespace. Two further rules
-make it safe:
+`<uuid>.wal.partial`, and every file of that shape in the WAL root belongs to
+the WAL — the sweep cannot tell rotation debris from a file an operator
+placed under a reserved name, so it does not try, and unlinks any stale one.
+A file that does not match the shape (`foo.wal.partial`, anything else) is
+ignored, as non-segment files are everywhere else in the WAL, and `*.tmp` is
+never matched: it stays the checkpoint and snapshot namespace. Two further
+rules make it safe:
 
 - the **in-flight** partial — the one the current rotation attempt owns — is
   skipped, identified by name rather than by age, since a slow fsync must not
@@ -600,7 +603,10 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   tail, the current segment and anything the floor retains. No frame carries
   a timestamp, so the age is a defined proxy: the oldest surviving segment's
   `UUIDv7` timestamp, its creation time, which is older than or equal to
-  every frame in it and therefore conservative, and `None` on an empty WAL. An earlier draft said "below the checkpoint", which would have
+  every frame in it and therefore conservative — and `None` whenever
+  unreclaimed frame bytes are zero, since the header-only current segment
+  `Wal::open` creates or retains holds no frame and an idle WAL must not
+  report a growing age. An earlier draft said "below the checkpoint", which would have
   exported the one number that does not grow during an outage;
 - **the retain floor and its lag**, including whether it is
   `RetainFloor::Incomplete` — without which RFC0052.13's "an operator can tell a
@@ -653,11 +659,24 @@ So the design is:
       Incomplete,            // a consumer exists but some tenant has no snapshot
   }
 
+  fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, AppendError>
+                                                           // returns the offset
+                                                           // Wal::append already
+                                                           // produces (§3.1's mark)
   fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError>
   fn housekeeping(&mut self, floor: RetainFloor, max_unlinks: usize)
       -> Result<HousekeepingProgress, ReclaimError>
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
   ```
+
+  **The own-frame mark needs plumbing, stated so it cannot be skipped.**
+  `Journal::append_batch` discards the `WalOffset` `Wal::append` returns
+  today, and `CommitOutcome` exposes only the group-sync result. So
+  `append_batch` returns the offset, the coordinator records each waiter's
+  own offset by sequence at append time, `CommitOutcome` carries it beside
+  the durable EOF, and every test double returns a monotonically increasing
+  offset per append. An implementation that kept storing the EOF fails
+  RFC0052.14's two-turn flush, which is what that criterion is for.
 
   `RetainFloor` exists because `Option<WalOffset>` cannot distinguish the two
   cases §3.2 requires: `None` means no snapshot consumer exists and the
@@ -834,9 +853,11 @@ memory, and nothing here claims to.
 
 > **Scenario RFC0052.3 — Sustained ingest does not grow the WAL without
 > bound**
-> - **Given** a node ingesting continuously with a healthy store, every
->   tenant with WAL data holding a valid and advancing snapshot (a complete
->   floor), run long enough to roll many segments
+> - **Given** a node ingesting continuously at a rate its publish and
+>   reclamation path can sustain (the soak is capacity-balanced and pinned
+>   as such), with a healthy store and every tenant with WAL data holding a
+>   valid and advancing snapshot (a complete floor), run long enough to
+>   roll many segments
 > - **When** the reclamation cadence has had time to act
 > - **Then** the WAL's on-disk byte total and segment count are bounded
 >   rather than monotonically increasing — the #793 signature (1,113
@@ -844,6 +865,9 @@ memory, and nothing here claims to.
 > - **And** while the floor is `Incomplete` retention is unbounded by design
 >   and the state is visible (RFC0052.13); a healthy store alone does not
 >   bound the WAL, a complete floor does
+> - **And** an offered rate above that capacity grows the WAL by
+>   construction until RFC 0053's admission bound exists; this criterion
+>   claims no bound there
 
 > **Scenario RFC0052.4 — A transient rotation failure recovers without a
 > restart**
@@ -904,7 +928,8 @@ memory, and nothing here claims to.
 > - **And** a backlog of stale *temporary* files is also bounded by the same
 >   cap, so temp sweeping cannot make a "bounded" pass do unbounded work
 
-> **Scenario RFC0052.16 — The temp sweep touches only WAL partials**
+> **Scenario RFC0052.16 — The temp sweep touches only files of the reserved
+> partial shape**
 > - **Given** a WAL root holding a `CHECKPOINT.tmp`, a snapshots directory
 >   holding a `*.snap.tmp`, a stale `<uuid>.wal.partial`, and the in-flight
 >   partial of a rotation in progress
@@ -1029,11 +1054,12 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   assumption behind it: the soak loop gains the §3.2 sequence on the synthetic
   clock, which is also the only way to reach a multi-hour backlog in a test.
 - **Rotation retry (RFC0052.4, RFC0052.5)** — fault injection at each of
-  the four rotation steps, once-failing and always-failing, asserting
+  the five rotation steps (the rename included), once-failing and
+  always-failing, asserting
   recovery in the first case and a distinguishable terminal refusal in
   the second, plus `Wal::open` succeeding afterwards in both (the
   temporary-name property) and the temp files being swept. A `proptest` over
-  which step fails and how many times keeps the four sites from being tested
+  which step fails and how many times keeps the five sites from being tested
   only one way.
 - **Pre-existing orphans (RFC0052.11)** — a directory fixture hand-built in
   the shape today's failure leaves, asserting that open still halts with

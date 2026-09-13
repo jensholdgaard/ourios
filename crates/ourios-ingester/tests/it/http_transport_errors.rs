@@ -15,12 +15,22 @@ use prost::Message;
 
 const PROTOBUF: &str = "application/x-protobuf";
 
-/// Send `request` and assert the controlled `expected` status and that
-/// nothing was appended to the WAL.
+/// Send `request` and assert the controlled `expected` status, that the
+/// handler-owned rejection carries a protobuf `google.rpc.Status` naming
+/// the problem, and that nothing was appended to the WAL.
+///
+/// Error bodies are binary protobuf whatever the request's encoding, so the
+/// decode below holds for every caller.
 async fn assert_rejected(request: axum::http::Request<axum::body::Body>, expected: StatusCode) {
     let (pipeline, captured) = capturing_pipeline();
-    let (status, _) = send(router(pipeline, &HttpConfig::default()), request).await;
+    let (status, body) = send(router(pipeline, &HttpConfig::default()), request).await;
     assert_eq!(status, expected);
+    let decoded = tonic_types::Status::decode(body.as_slice())
+        .expect("a handler-owned rejection carries a protobuf Status");
+    assert!(
+        !decoded.message.is_empty(),
+        "{expected}: the Status must name the problem",
+    );
     assert!(
         captured.lock().expect("captured").is_empty(),
         "a rejected request appends no TenantOtlpBatch frame",
@@ -74,13 +84,19 @@ async fn corrupt_gzip_is_400() {
     .await;
 }
 
+/// Router-owned, not handler-owned: axum's 404 carries no `Status` (see the
+/// module doc in `receiver/http.rs`), so only the status and the absence of
+/// a WAL frame are asserted.
 #[tokio::test]
 async fn wrong_path_is_404() {
-    assert_rejected(
+    let (pipeline, captured) = capturing_pipeline();
+    let (status, _) = send(
+        router(pipeline, &HttpConfig::default()),
         post_request("/not/the/path", Some(PROTOBUF), None, Vec::new()),
-        StatusCode::NOT_FOUND,
     )
     .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(captured.lock().expect("captured").is_empty());
 }
 
 #[tokio::test]
@@ -98,7 +114,7 @@ async fn gzip_decompression_bomb_is_413() {
         "the compressed bomb is under the body limit"
     );
     let (pipeline, captured) = capturing_pipeline();
-    let (status, _) = send(
+    let (status, body) = send(
         router(pipeline, &config),
         post_request("/v1/logs", Some(PROTOBUF), Some("gzip"), bomb),
     )
@@ -108,6 +124,11 @@ async fn gzip_decompression_bomb_is_413() {
         StatusCode::PAYLOAD_TOO_LARGE,
         "a gzip body inflating past the cap → 413",
     );
+    // This arm is the handler's own decompressed-size check, not the
+    // extractor's limit, so it needs its own body assertion.
+    let decoded = tonic_types::Status::decode(body.as_slice())
+        .expect("the decompressed-size 413 carries a protobuf Status");
+    assert!(!decoded.message.is_empty());
     assert!(captured.lock().expect("captured").is_empty());
 }
 
@@ -133,6 +154,36 @@ async fn content_type_and_encoding_are_case_insensitive() {
         StatusCode::OK,
         "uppercased Content-Type and Content-Encoding are accepted",
     );
+}
+
+/// The OTLP spec requires a `google.rpc.Status` body on **every** 4xx/5xx.
+/// The body-limit rejection is the one that nearly escaped it: `DefaultBodyLimit`
+/// fires before the handler's body exists, so axum rendered its own generic
+/// 413 and the status-only assertion below could not tell. The body is
+/// binary protobuf for a JSON request too — the Collector's exporter decodes
+/// every failure body as protobuf regardless of `Content-Type`.
+#[tokio::test]
+async fn an_oversize_body_still_carries_a_protobuf_status_for_either_request_format() {
+    let config = HttpConfig {
+        max_body_bytes: 16,
+        ..HttpConfig::default()
+    };
+    for content_type in [PROTOBUF, "application/json"] {
+        let (pipeline, _captured) = capturing_pipeline();
+        let (status, body) = send(
+            router(pipeline, &config),
+            post_request("/v1/logs", Some(content_type), None, vec![0u8; 1024]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let decoded = tonic_types::Status::decode(body.as_slice()).unwrap_or_else(|e| {
+            panic!("{content_type}: the 413 must carry a protobuf Status: {e}")
+        });
+        assert!(
+            !decoded.message.is_empty(),
+            "{content_type}: the Status must name the problem",
+        );
+    }
 }
 
 #[tokio::test]

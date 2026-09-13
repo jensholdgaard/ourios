@@ -92,6 +92,35 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
 /// Scenario RFC0018.3 (HTTP) — a transient WAL failure is `503`
 /// (retryable); a permanent tenant failure is `400`.
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
+/// The ingest arm end to end: the 503 carries a binary protobuf `Status`
+/// naming the failure, whatever the request's encoding (#791 was eight hours
+/// of an empty 503).
+#[tokio::test]
+async fn rfc0018_3_http_503_carries_a_status_naming_the_failure() {
+    // Both request encodings: a JSON request must get the same protobuf
+    // `Status`, since the Collector decodes every failure body as protobuf.
+    let json = serde_json::to_vec(&valid_request()).expect("serialise OTLP/JSON");
+    for (content_type, payload) in [
+        (PROTOBUF, valid_request().encode_to_vec()),
+        ("application/json", json),
+    ] {
+        let (status, body) = send(
+            router(failing_sync_pipeline().into(), &HttpConfig::default()),
+            post_request("/v1/logs", Some(content_type), None, payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{content_type}");
+        let decoded = tonic_types::Status::decode(body.as_slice()).unwrap_or_else(|e| {
+            panic!("{content_type}: the 503 must carry a protobuf Status: {e}")
+        });
+        assert!(
+            decoded.message.contains("WAL sync failed"),
+            "{content_type}: the Status names the WAL failure: {:?}",
+            decoded.message,
+        );
+    }
+}
+
 #[tokio::test]
 async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
     // Transient fsync failure → 503 (retryable), not 500.

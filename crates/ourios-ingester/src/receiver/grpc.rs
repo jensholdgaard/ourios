@@ -215,10 +215,15 @@ impl LogsService for LogsReceiver {
 /// Permanent client errors are non-retryable: a tenant outside the token's
 /// set → `PERMISSION_DENIED`; an oversize payload (`AppendError::TooLarge`,
 /// over the 16 MiB WAL frame ceiling) → `INVALID_ARGUMENT` — retrying an
-/// oversize batch byte-identical can never succeed. Any other WAL append/sync failure is
-/// *transient* (the batch was not acked, §3.4) → retryable `UNAVAILABLE`, so
-/// compliant clients re-send rather than drop data (a non-retryable
-/// `INTERNAL` would tell them to drop it).
+/// oversize batch byte-identical can never succeed.
+///
+/// Every other WAL append/sync failure is `UNAVAILABLE`, which OTLP defines
+/// as retryable — the batch was not acked (§3.4), so compliant clients
+/// re-send rather than drop data (a non-retryable `INTERNAL` would tell them
+/// to drop it). That includes `QuiescedAfterRotationFailure`, per RFC 0018
+/// §3.2's transient class; whether a quiesced WAL should be reported
+/// differently is RFC 0052's question, not this arm's. The message rides
+/// along, so a client at least sees which failure it was.
 ///
 /// Adapt the shared [`IngestFailure`] classification to gRPC status
 /// vocabulary (the classification itself lives beside `ReceiveError`

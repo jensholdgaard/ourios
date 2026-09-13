@@ -19,8 +19,8 @@ const PROTOBUF: &str = "application/x-protobuf";
 /// handler-owned rejection carries a protobuf `google.rpc.Status` naming
 /// the problem, and that nothing was appended to the WAL.
 ///
-/// Every caller here either sends protobuf or sends no usable
-/// `Content-Type`, so protobuf is the format the response must mirror.
+/// Error bodies are binary protobuf whatever the request's encoding, so the
+/// decode below holds for every caller.
 async fn assert_rejected(request: axum::http::Request<axum::body::Body>, expected: StatusCode) {
     let (pipeline, captured) = capturing_pipeline();
     let (status, body) = send(router(pipeline, &HttpConfig::default()), request).await;
@@ -151,27 +151,19 @@ async fn content_type_and_encoding_are_case_insensitive() {
     );
 }
 
-/// Which encoding an error response body must use — a named discriminant
-/// rather than a bool, so the match on it is exhaustive on intent.
-enum Expect {
-    Protobuf,
-    Json,
-}
-
 /// The OTLP spec requires a `google.rpc.Status` body on **every** 4xx/5xx.
 /// The body-limit rejection is the one that nearly escaped it: `DefaultBodyLimit`
 /// fires before the handler's body exists, so axum rendered its own generic
-/// 413 and the status-only assertion below could not tell.
+/// 413 and the status-only assertion below could not tell. The body is
+/// binary protobuf for a JSON request too — the Collector's exporter decodes
+/// every failure body as protobuf regardless of `Content-Type`.
 #[tokio::test]
-async fn an_oversize_body_still_carries_a_status_in_the_request_format() {
+async fn an_oversize_body_still_carries_a_protobuf_status_for_either_request_format() {
     let config = HttpConfig {
         max_body_bytes: 16,
         ..HttpConfig::default()
     };
-    for (content_type, expect) in [
-        (PROTOBUF, Expect::Protobuf),
-        ("application/json", Expect::Json),
-    ] {
+    for content_type in [PROTOBUF, "application/json"] {
         let (pipeline, _captured) = capturing_pipeline();
         let (status, body) = send(
             router(pipeline, &config),
@@ -179,31 +171,13 @@ async fn an_oversize_body_still_carries_a_status_in_the_request_format() {
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let decoded = tonic_types::Status::decode(body.as_slice()).unwrap_or_else(|e| {
+            panic!("{content_type}: the 413 must carry a protobuf Status: {e}")
+        });
         assert!(
-            !body.is_empty(),
-            "{content_type}: the body-limit rejection must not render an empty body",
+            !decoded.message.is_empty(),
+            "{content_type}: the Status must name the problem",
         );
-        match expect {
-            // The spec also requires the response to mirror the request's
-            // Content-Type: the handler reads the header before it takes the
-            // body-limit rejection, so even that one knows the format.
-            Expect::Json => {
-                let parsed: serde_json::Value =
-                    serde_json::from_slice(&body).expect("JSON request → JSON Status");
-                assert!(
-                    parsed["message"].as_str().is_some_and(|m| !m.is_empty()),
-                    "the Status must name the problem: {parsed}",
-                );
-            }
-            Expect::Protobuf => {
-                let decoded = tonic_types::Status::decode(body.as_slice())
-                    .expect("protobuf request → protobuf Status");
-                assert!(
-                    !decoded.message.is_empty(),
-                    "the Status must name the problem",
-                );
-            }
-        }
     }
 }
 

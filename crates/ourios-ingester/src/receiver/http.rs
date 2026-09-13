@@ -245,17 +245,6 @@ async fn handle_logs(
     headers: HeaderMap,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
-    // The wire format is read first, and *non-fatally*, because the spec
-    // requires every error body below to mirror the request's Content-Type —
-    // including the ones raised before the body is even looked at. Only a
-    // missing or unsupported Content-Type falls back to protobuf, which is the
-    // one case where there is no request format to mirror.
-    //
-    // Read, not validated: the fatal 415 stays where it was, after the
-    // selector, so the status an ambiguous request gets does not change.
-    let requested = content_type(&headers);
-    let response_format = requested.unwrap_or(WireFormat::Protobuf);
-
     // `DefaultBodyLimit` rejects an oversize body before this handler's
     // `Bytes` would exist, and axum renders that rejection with its own
     // generic body. Taking the rejection rather than `Bytes` keeps even that
@@ -263,7 +252,7 @@ async fn handle_logs(
     let body = match body {
         Ok(body) => body,
         Err(rejection) => {
-            return error_response(response_format, rejection.status(), &rejection.body_text());
+            return error_response(rejection.status(), &rejection.body_text());
         }
     };
 
@@ -278,13 +267,12 @@ async fn handle_logs(
     let tenant = match selector::from_headers(&headers) {
         Ok(tenant) => tenant,
         Err(e) => {
-            return error_response(response_format, StatusCode::BAD_REQUEST, &e.to_string());
+            return error_response(StatusCode::BAD_REQUEST, &e.to_string());
         }
     };
 
-    let Some(format) = requested else {
+    let Some(format) = content_type(&headers) else {
         return error_response(
-            WireFormat::Protobuf,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported Content-Type: expected application/x-protobuf or application/json",
         );
@@ -298,11 +286,10 @@ async fn handle_logs(
             // decompression bomb, since DefaultBodyLimit only bounds the
             // compressed bytes.
             Err(GunzipError::Corrupt) => {
-                return error_response(format, StatusCode::BAD_REQUEST, "corrupt gzip body");
+                return error_response(StatusCode::BAD_REQUEST, "corrupt gzip body");
             }
             Err(GunzipError::TooLarge) => {
                 return error_response(
-                    format,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "gzip body decompresses past the configured limit",
                 );
@@ -310,7 +297,6 @@ async fn handle_logs(
         },
         None => {
             return error_response(
-                format,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported Content-Encoding: expected identity or gzip",
             );
@@ -322,7 +308,6 @@ async fn handle_logs(
     };
     let Ok((request, lenient_json)) = decoded else {
         return error_response(
-            format,
             StatusCode::BAD_REQUEST,
             "body is not a decodable ExportLogsServiceRequest",
         );
@@ -357,11 +342,10 @@ async fn handle_logs(
     .await
     {
         Ok(Ok(_)) => success_response(format),
-        Ok(Err(e)) => ingest_error_response(format, &e),
+        Ok(Err(e)) => ingest_error_response(&e),
         // A `JoinError` is a panic or a cancellation, both genuine and
         // non-retryable; the message says which, as the gRPC arm's does.
         Err(join) => error_response(
-            format,
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("ingest task failed: {join}"),
         ),
@@ -400,8 +384,8 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
 /// already puts on the wire, so this adds no disclosure the other
 /// transport did not already make (and `TenantDenied` deliberately names
 /// the tenant, not the token — RFC 0026 §3.4).
-fn ingest_error_response(format: WireFormat, error: &ReceiveError) -> Response {
-    error_response(format, ingest_error_status(error), &error.to_string())
+fn ingest_error_response(error: &ReceiveError) -> Response {
+    error_response(ingest_error_status(error), &error.to_string())
 }
 
 /// An error response carrying the body the OTLP spec requires.
@@ -416,36 +400,25 @@ fn ingest_error_response(format: WireFormat, error: &ReceiveError) -> Response {
 /// field and the server MAY omit it, and proto3 elides a zero-valued
 /// scalar on both encodings.
 ///
-/// `format` mirrors the request's `Content-Type`, as the spec requires.
-/// Only a request whose `Content-Type` is missing or unsupported gets
-/// protobuf instead, which is the only honest choice: there is no request
-/// format to mirror when the request format is what failed.
-fn error_response(format: WireFormat, status: StatusCode, message: &str) -> Response {
-    match format {
-        WireFormat::Protobuf => {
-            let body = tonic_types::Status {
-                code: 0,
-                message: message.to_string(),
-                details: Vec::new(),
-            };
-            (
-                status,
-                [(header::CONTENT_TYPE, "application/x-protobuf")],
-                body.encode_to_vec(),
-            )
-                .into_response()
-        }
-        // Protobuf-JSON of the same message. Hand-built rather than
-        // derived: `tonic_types::Status` carries no serde impl, and the
-        // two fields we populate have no lowerCamelCase or 64-bit
-        // encoding subtleties (RFC0003.6) to get wrong.
-        WireFormat::Json => (
-            status,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "message": message }).to_string(),
-        )
-            .into_response(),
-    }
+/// Always binary protobuf with `application/x-protobuf`, whatever the
+/// request's encoding. The spec's "same `Content-Type` as the request" rule
+/// governs the success and partial-success bodies; for failures it says
+/// "Protobuf-encoded `Status`" and the reference client takes that
+/// literally: the Collector's OTLP/HTTP exporter decodes every 4xx/5xx body
+/// with `proto.Unmarshal` regardless of `Content-Type`, so a JSON `Status`
+/// would be discarded as undecodable by the client this exists to inform.
+fn error_response(status: StatusCode, message: &str) -> Response {
+    let body = tonic_types::Status {
+        code: 0,
+        message: message.to_string(),
+        details: Vec::new(),
+    };
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/x-protobuf")],
+        body.encode_to_vec(),
+    )
+        .into_response()
 }
 
 /// Map `Content-Type` to a wire format, ignoring any `; charset=…`
@@ -585,7 +558,7 @@ mod tests {
     /// error arm returned a bare `StatusCode`, which axum renders with an
     /// empty body.
     mod error_body {
-        use super::super::{Response, WireFormat, error_response, ingest_error_response};
+        use super::super::{Response, error_response, ingest_error_response};
         use super::{AppendError, ReceiveError, StatusCode};
         use axum::http::header;
         use prost::Message as _;
@@ -599,11 +572,7 @@ mod tests {
 
         #[tokio::test]
         async fn protobuf_error_body_is_a_decodable_status_naming_the_problem() {
-            let response = error_response(
-                WireFormat::Protobuf,
-                StatusCode::BAD_REQUEST,
-                "corrupt gzip body",
-            );
+            let response = error_response(StatusCode::BAD_REQUEST, "corrupt gzip body");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 response.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -617,40 +586,39 @@ mod tests {
             assert_eq!(decoded.code, 0);
         }
 
+        /// A JSON request still gets a binary protobuf `Status`: the
+        /// Collector's exporter protobuf-decodes every 4xx/5xx body whatever
+        /// the `Content-Type`, so mirroring JSON here would hand the most
+        /// common client an undecodable reason.
         #[tokio::test]
-        async fn json_error_body_mirrors_the_request_content_type() {
-            let response =
-                error_response(WireFormat::Json, StatusCode::BAD_REQUEST, "not decodable");
+        async fn error_body_is_protobuf_regardless_of_request_format() {
+            let response = error_response(StatusCode::BAD_REQUEST, "not decodable");
             assert_eq!(
                 response.headers().get(header::CONTENT_TYPE).unwrap(),
-                "application/json",
-                "the spec requires the response Content-Type to match the request's",
+                "application/x-protobuf",
             );
-            let body = body_bytes(response).await;
-            let parsed: serde_json::Value =
-                serde_json::from_slice(&body).expect("the body must be JSON");
-            assert_eq!(parsed["message"], "not decodable");
+            let decoded = tonic_types::Status::decode(body_bytes(response).await.as_slice())
+                .expect("decodable google.rpc.Status");
+            assert_eq!(decoded.message, "not decodable");
         }
 
         /// No error arm may render an empty body, whatever the status.
         #[tokio::test]
         async fn every_error_arm_carries_a_non_empty_body() {
-            for format in [WireFormat::Protobuf, WireFormat::Json] {
-                for status in [
-                    StatusCode::BAD_REQUEST,
-                    StatusCode::FORBIDDEN,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ] {
-                    let response = error_response(format, status, "reason");
-                    assert_eq!(response.status(), status);
-                    assert!(
-                        !body_bytes(response).await.is_empty(),
-                        "{status} must not render an empty body",
-                    );
-                }
+            for status in [
+                StatusCode::BAD_REQUEST,
+                StatusCode::FORBIDDEN,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ] {
+                let response = error_response(status, "reason");
+                assert_eq!(response.status(), status);
+                assert!(
+                    !body_bytes(response).await.is_empty(),
+                    "{status} must not render an empty body",
+                );
             }
         }
 
@@ -662,7 +630,7 @@ mod tests {
         #[tokio::test]
         async fn quiesced_wal_is_503_and_says_why() {
             let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
-            let response = ingest_error_response(WireFormat::Protobuf, &e);
+            let response = ingest_error_response(&e);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             let decoded = tonic_types::Status::decode(body_bytes(response).await.as_slice())
                 .expect("decodable google.rpc.Status");

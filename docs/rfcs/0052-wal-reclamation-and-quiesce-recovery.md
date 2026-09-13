@@ -844,8 +844,9 @@ memory, and nothing here claims to.
 > - **And** a run whose checkpoint never advances still reports growing
 >   unreclaimed bytes — exporting the below-checkpoint figure instead would
 >   read as flat during exactly the outage it exists to show
-> - **And** entering and leaving a refusing state each emit exactly one
->   log event, named from the registry
+> - **And** entering and leaving the terminal rotation state each emit
+>   exactly one log event, named from the registry — the refusing state's
+>   events are RFC0053.5's
 
 > **Scenario RFC0052.8 — moved to RFC 0053 as RFC0053.2 (unwind keeps the
 > records).** Number retained; no obligation here.

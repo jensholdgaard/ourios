@@ -76,9 +76,11 @@ fn rfc0031_10_loki_label_allowlist() {
         let (observed, services) = poll_until_both_services_indexed(&http, &base).await;
         assert_within_allowlist(&observed);
         assert_no_denylisted_label(&observed);
-        // Not a catch-all: the allowlisted label must actually partition the
-        // corpus, else the single label every query selects on discriminates
-        // nothing and Loki is forced into a full scan.
+        // Not a catch-all: `service_name` must actually partition the corpus,
+        // else the label the fixture's queries select on discriminates nothing
+        // and Loki is forced into a full scan. Only this one is checked for
+        // discrimination — it is the one the fixture varies; the other
+        // seventeen are constant across it.
         assert_eq!(
             services.len(),
             2,

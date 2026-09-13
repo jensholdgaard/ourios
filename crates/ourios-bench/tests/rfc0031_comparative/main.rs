@@ -489,11 +489,17 @@ fn rfc0031_9_storage_footprint_diagnostic() {
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 ///
 /// **The label machine-check — the half that guards the published numbers
-/// — now exists**: `interop::rfc0031_10_loki_label_allowlist` asserts
-/// against a running container on the exact dispatch config that the
-/// indexed label set is drawn from `LOKI_LABEL_ALLOWLIST`, that every name
-/// in `LOKI_LABEL_DENYLIST` is absent, and that the one allowlisted label
+/// — now exists**: `interop::rfc0031_10_loki_label_allowlist` asserts, on the
+/// exact dispatch config, that `LOKI_LABEL_ALLOWLIST` equals Loki's effective
+/// `default_resource_attributes_as_index_labels` as a set, that the indexed
+/// labels after a real push stay within it, that every name in
+/// `LOKI_LABEL_DENYLIST` is absent from both, and that **`service_name`**
 /// actually discriminates rather than acting as a catch-all.
+///
+/// `service_name` by name, not "the allowlisted label": the allowlist holds
+/// eighteen, since the stock config promotes that many resource attributes
+/// (#800). `service_name` is the one whose discrimination this gate checks,
+/// because it is the one the fixture corpus varies.
 ///
 /// This stub remains for the criterion's **documentation-shaped** half,
 /// which is deliberately not being invented here: issue #792 asks the

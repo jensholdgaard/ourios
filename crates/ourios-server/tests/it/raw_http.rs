@@ -104,8 +104,17 @@ fn is_complete(response: &[u8]) -> bool {
     // bytes.
     let head = String::from_utf8_lossy(&response[..at]);
     let body_len = response.len() - (at + SEP.len());
-    head.lines()
-        .filter_map(|line| line.split_once(':'))
+    let mut headers = head.lines().filter_map(|line| line.split_once(':'));
+    // RFC 9112 §6.3: a `Transfer-Encoding` present alongside `Content-Length`
+    // overrides it, so the response is chunk-framed and the length is not
+    // the framing — the same fall-through as a chunked response alone.
+    if headers
+        .clone()
+        .any(|(key, _)| key.trim().eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return false;
+    }
+    headers
         .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
         .is_some_and(|want| body_len == want)
@@ -295,6 +304,19 @@ mod tests {
         assert!(!is_complete(
             format!("{head}5\r\nhello\r\n0\r\n\r\n").as_bytes()
         ));
+    }
+
+    /// Both headers present: RFC 9112 §6.3 says `Transfer-Encoding` wins, so
+    /// a `Content-Length` that happens to match the encoded chunk stream must
+    /// not make the response complete.
+    #[test]
+    fn a_transfer_encoding_beside_content_length_is_not_recognised() {
+        let body = "5\r\nhello\r\n0\r\n\r\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        assert!(!is_complete(format!("{head}{body}").as_bytes()));
     }
 
     /// Close-framed: a reset cannot be told from a truncation, so it is not

@@ -13,7 +13,7 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -140,14 +140,15 @@ async fn rfc0029_1_oidc_only_starts_and_enforces() {
         )
         .await
         .expect("write request");
-    let mut response = String::new();
-    timeout(
+    // Same reset policy as the other raw readers (issue #799); the
+    // timeout stays, since these requests are rejected by the auth
+    // layer and a hang here would block the harness.
+    let response = timeout(
         Duration::from_secs(15),
-        stream.read_to_string(&mut response),
+        crate::raw_http::read_response(&mut stream),
     )
     .await
-    .expect("response before timeout")
-    .expect("read response");
+    .expect("response before timeout");
     assert!(
         response.starts_with("HTTP/1.1 401 "),
         "oidc-only enforces (401), never open: {response}",
@@ -198,7 +199,7 @@ pub(crate) mod ingest_binding {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::EncodePrivateKey as _;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tokio::time::timeout;
 
@@ -420,14 +421,15 @@ pub(crate) mod ingest_binding {
             )
             .await
             .expect("write request");
-        let mut response = String::new();
-        timeout(
+        // Same reset policy as the other raw readers (issue #799); the
+        // timeout stays, since these requests are rejected by the auth
+        // layer and a hang here would block the harness.
+        let response = timeout(
             Duration::from_secs(15),
-            stream.read_to_string(&mut response),
+            crate::raw_http::read_response(&mut stream),
         )
         .await
-        .expect("response before timeout")
-        .expect("read response");
+        .expect("response before timeout");
         assert!(
             response.starts_with("HTTP/1.1 401 "),
             "bearer-less HTTP ingest is 401: {response}",
@@ -499,7 +501,7 @@ pub(crate) mod claim_binding {
     use std::io::Write as _;
     use std::time::Duration;
 
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tokio::time::timeout;
 
@@ -597,14 +599,15 @@ pub(crate) mod claim_binding {
         );
         let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
         stream.write_all(request.as_bytes()).await.expect("write");
-        let mut response = String::new();
-        timeout(
+        // Same reset policy as the other raw readers (issue #799); the
+        // timeout stays, since these requests are rejected by the auth
+        // layer and a hang here would block the harness.
+        let response = timeout(
             Duration::from_secs(15),
-            stream.read_to_string(&mut response),
+            crate::raw_http::read_response(&mut stream),
         )
         .await
-        .expect("response before timeout")
-        .expect("read");
+        .expect("response before timeout");
         response.lines().next().unwrap_or_default().to_string()
     }
 

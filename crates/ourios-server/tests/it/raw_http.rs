@@ -64,29 +64,29 @@ pub async fn read_response(stream: &mut TcpStream) -> String {
 }
 
 /// Whether `text` is a whole HTTP/1.1 response: a full header block, plus a
-/// body matching whatever framing the headers declare.
+/// body satisfying a declared `Content-Length`.
 ///
-/// `Content-Length` and `Transfer-Encoding: chunked` are the two framings these
-/// suites can see. A response with **neither** is framed by the close itself,
-/// which a reset cannot distinguish from a truncation — so that counts as
-/// incomplete rather than being waved through.
+/// **`Content-Length` is the only framing recognised**, deliberately. Nothing
+/// these suites query answers with `Transfer-Encoding: chunked` — the served
+/// binary sets a length on every response they assert — so a chunked branch
+/// would be unreachable, and an unreachable parser that looks right is worse
+/// than none: an earlier draft's `ends_with("0\r\n\r\n")` would have rejected
+/// a perfectly valid chunked response carrying trailer fields. If a chunked
+/// response ever arrives here it falls through as incomplete and panics with
+/// the text, which is the honest outcome for a case this helper has never seen.
+///
+/// A response with no declared framing is framed by the close itself, which a
+/// reset cannot distinguish from a truncation, so that is incomplete too rather
+/// than being waved through.
 fn is_complete(text: &str) -> bool {
     let Some((head, body)) = text.split_once("\r\n\r\n") else {
         return false;
     };
-    let header_value = |name: &str| {
-        head.lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.trim().to_ascii_lowercase())
-    };
-    match header_value("content-length") {
-        Some(declared) => declared
-            .parse::<usize>()
-            .is_ok_and(|want| body.len() >= want),
-        None => header_value("transfer-encoding")
-            .is_some_and(|encoding| encoding.contains("chunked") && body.ends_with("0\r\n\r\n")),
-    }
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .is_some_and(|want| body.len() >= want)
 }
 
 #[cfg(test)]
@@ -109,11 +109,13 @@ mod tests {
         assert!(!is_complete(""));
     }
 
+    /// Chunked is not recognised, on purpose — see `is_complete`. A chunked
+    /// response reaching here should fail loudly rather than be judged by a
+    /// parser nothing exercises.
     #[test]
-    fn a_chunked_response_needs_its_terminator() {
+    fn a_chunked_response_is_not_recognised() {
         let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert!(is_complete(&format!("{head}5\r\nhello\r\n0\r\n\r\n")));
-        assert!(!is_complete(&format!("{head}5\r\nhello\r\n")));
+        assert!(!is_complete(&format!("{head}5\r\nhello\r\n0\r\n\r\n")));
     }
 
     /// Close-framed: a reset cannot be told from a truncation, so it is not

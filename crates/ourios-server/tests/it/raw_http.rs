@@ -14,8 +14,7 @@
 
 use std::io::ErrorKind;
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Read until EOF, treating a `ConnectionReset` that arrives after a
 /// **complete** response as the end of it.
@@ -31,7 +30,12 @@ use tokio::net::TcpStream;
 /// rather than this helper's problem: a rejected request must get its response
 /// flushed before the close. Keeping that loud is the point — a blanket
 /// "ignore resets" would hide exactly the bug worth finding.
-pub async fn read_response(stream: &mut TcpStream) -> String {
+/// Generic over the reader so the loop and the reset policy are testable
+/// deterministically: a socket test would depend on whether the peer's `RST`
+/// lands before or after the client drains its buffer, which is the kind of
+/// timing that makes a test about flakes flaky. Callers pass `&mut TcpStream`
+/// unchanged.
+pub async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> String {
     let mut response = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
     let mut reset = false;
@@ -91,7 +95,114 @@ fn is_complete(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_complete;
+    use super::{is_complete, read_response};
+    use std::collections::VecDeque;
+    use std::io::{Error, ErrorKind, Result};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// A reader that yields a scripted sequence of chunks and errors.
+    ///
+    /// The point of scripting it is determinism: driving the real loop over a
+    /// socket would depend on whether the peer's `RST` arrives before or after
+    /// the client drains its receive buffer, so a test about a flake would
+    /// itself be flaky.
+    struct Scripted(VecDeque<Result<&'static str>>);
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            match self.0.pop_front() {
+                // An exhausted script is EOF, which `read_response` treats as a
+                // clean close.
+                None => Poll::Ready(Ok(())),
+                Some(Ok(bytes)) => {
+                    buf.put_slice(bytes.as_bytes());
+                    Poll::Ready(Ok(()))
+                }
+                Some(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn scripted(steps: Vec<Result<&'static str>>) -> Scripted {
+        Scripted(steps.into_iter().collect())
+    }
+
+    fn reset() -> Result<&'static str> {
+        Err(Error::new(ErrorKind::ConnectionReset, "peer reset"))
+    }
+
+    const OK_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+
+    /// The flake this PR fixes: the complete response arrives, then the peer
+    /// resets instead of closing cleanly.
+    #[tokio::test]
+    async fn a_reset_after_a_complete_response_returns_it() {
+        let mut reader = scripted(vec![Ok(OK_HEAD), Ok("hello"), reset()]);
+        assert_eq!(read_response(&mut reader).await, format!("{OK_HEAD}hello"));
+    }
+
+    /// Arriving in one chunk must behave the same — the loop must not depend on
+    /// the response being split across reads.
+    #[tokio::test]
+    async fn a_reset_after_a_single_chunk_response_returns_it() {
+        let whole: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let mut reader = scripted(vec![Ok(whole), reset()]);
+        assert_eq!(read_response(&mut reader).await, whole);
+    }
+
+    /// The false-pass case: a reset mid-body must NOT be swallowed, or a caller
+    /// asserting only on the status line would accept a truncated reply.
+    #[tokio::test]
+    #[should_panic(expected = "connection reset before a complete HTTP response")]
+    async fn a_reset_inside_the_body_panics() {
+        let mut reader = scripted(vec![Ok(OK_HEAD), Ok("hel"), reset()]);
+        let _ = read_response(&mut reader).await;
+    }
+
+    /// And a reset part-way through the headers, which is the case that would
+    /// otherwise look like a passing 200.
+    #[tokio::test]
+    #[should_panic(expected = "connection reset before a complete HTTP response")]
+    async fn a_reset_inside_the_headers_panics() {
+        let mut reader = scripted(vec![Ok("HTTP/1.1 200 OK\r\nContent-Len"), reset()]);
+        let _ = read_response(&mut reader).await;
+    }
+
+    /// A reset with nothing received at all — the server-side fault the helper
+    /// must keep loud rather than report as an empty response.
+    #[tokio::test]
+    #[should_panic(expected = "connection reset before a complete HTTP response")]
+    async fn a_reset_with_no_response_panics() {
+        let mut reader = scripted(vec![reset()]);
+        let _ = read_response(&mut reader).await;
+    }
+
+    /// A clean EOF needs no completeness check: the server closed deliberately,
+    /// so whatever arrived is the whole response even without a declared
+    /// framing.
+    #[tokio::test]
+    async fn a_clean_eof_is_accepted_without_a_framing_check() {
+        let unframed: &'static str = "HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n";
+        let mut reader = scripted(vec![Ok(unframed)]);
+        assert_eq!(read_response(&mut reader).await, unframed);
+    }
+
+    /// Any other error stays fatal, reset or not.
+    #[tokio::test]
+    #[should_panic(expected = "read failed after")]
+    async fn a_non_reset_error_is_fatal() {
+        let mut reader = scripted(vec![
+            Ok(OK_HEAD),
+            Err(Error::new(ErrorKind::BrokenPipe, "broken")),
+        ]);
+        let _ = read_response(&mut reader).await;
+    }
 
     #[test]
     fn a_content_length_framed_response_is_complete_only_when_the_body_arrived() {

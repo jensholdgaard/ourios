@@ -80,6 +80,7 @@
 - [RFC 0050 — Upstream-derived templates](./rfcs/0050-upstream-derived-templates.md)
 - [RFC 0051 — `ourios-serving` crate extraction](./rfcs/0051-serving-crate-extraction.md)
 - [RFC 0052 — WAL reclamation and quiesce recovery](./rfcs/0052-wal-reclamation-and-quiesce-recovery.md)
+- [RFC 0053 — WAL backpressure and unwind safety](./rfcs/0053-wal-backpressure-and-unwind-safety.md)
 
 # Talks
 

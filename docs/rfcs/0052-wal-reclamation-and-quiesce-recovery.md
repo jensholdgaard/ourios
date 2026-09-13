@@ -167,8 +167,21 @@ What actually makes rotation safe is that it runs *inside* an ingest's gate
 turn, and the gate serializes turns in order: "every frame ≤ this seq submits
 its encodes before any later seq reaches the rotation check". So the timer must
 become a participant in that ordering rather than a concurrent holder of a
-narrower lock — it acquires a **barrier turn** in the gate and runs between two
-ingests, which is the position rotation already occupies.
+narrower lock.
+
+**The existing gate cannot give it one, so this is a change to the pipeline,
+not a use of it.** `ingest_gate` is a watch counter that append callers advance
+with their own commit sequence; `await_ingest_turn` waits for a *sequence*, and
+a timer has none to reserve. Inventing a synthetic sequence would interleave
+with real ones and could stall an ingest behind a barrier that never arrives.
+
+Instead the pipeline gains an explicit **barrier exclusion**: a lock
+`ingest_bound` holds across the span that matters — from the miner work through
+`pool.submit` and the `last_durable` update — and that the timer takes
+exclusively for its whole sequence. It is strictly wider than the miner lock and
+strictly narrower than the gate, so it does not change ingest ordering, and it
+is the smallest thing that closes the window. Rotation needs no change: it
+already runs inside an ingest's own span.
 
 The mark is then read inside that turn and after the quiesce — `last_durable()`
 at that point, the offset the receiver's acks are gated on — so no frame above
@@ -215,8 +228,8 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    with_barrier_turn:                     // a turn in the INGEST GATE, not the
-                                           // miner lock — see §3.1
+    with_barrier_exclusion:                // a NEW pipeline lock, not the miner
+                                           // lock and not the gate — see §3.1
         quiesce_encodes()                  // the barrier's prologue
         mark = last_durable()              // read AFTER the quiesce, INSIDE the turn
         if barrier_succeeded(mark) and mark is Some(m):   // §3.1, append-free
@@ -320,10 +333,18 @@ cannot be in: `rotate` sets `current_segment`/`path`/`uuid` to the renamed file
 *first*, then fsyncs the parent, and on failure sets `dir_fsync_pending` and
 returns **without quiescing**. The new segment is then genuinely current, so
 `sync` — which fsyncs `current_segment` and discharges `dir_fsync_pending` —
-closes the obligation on the next call, exactly as it already does for the
-segment `open` creates. Since no batch is acked until `sync` returns `Ok`, no
-frame is ever acked in a segment whose directory entry is not durable, and a
-retry re-attempts the fsync rather than creating a second segment.
+closes the obligation, exactly as it already does for the segment `open`
+creates. Since no batch is acked until `sync` returns `Ok`, no frame is ever
+acked in a segment whose directory entry is not durable.
+
+**The retry is the group-commit `sync`, not the next append**, and saying
+"a retry re-attempts the fsync" blurred that. Once the new empty segment is
+current, the next `append`'s rotation check is false, so it simply writes its
+frame; nothing re-enters `rotate`. What retries is the `sync` that follows,
+which is the right place: it is the operation acks are gated on, so a repeated
+directory-fsync failure repeatedly refuses to ack rather than accumulating
+unacked frames behind a rotation that never reruns. Those appends are not lost
+either — they are in the segment, and the next successful `sync` covers them.
 
 Installing *after* the fsync, as the draft implied, leaves the renamed file
 owned by nobody: `rotate` would still point at the old segment while a complete
@@ -530,9 +551,25 @@ does not reclaim them, and the bound is measured in bytes still on disk. So the
 clearing path is the whole §3.2 sequence — barrier, checkpoint, housekeeping —
 which §3.1's timer can drive without an append.
 
-That also exposes a way the state can persist with a healthy store: a stale
-tenant floor holds `min(checkpoint, floor)` down, so housekeeping removes
-nothing and the bound stays crossed even though the object store recovered.
+**It also needs the timer to be able to force a rotation, or it deadlocks on
+its own.** Housekeeping never unlinks the *current* append segment, and a
+crossed bound rejects the appends that would trigger size- or age-based
+rotation. If an outage's whole backlog sits in that one segment — the normal
+case for a low-volume node, whose segments roll on age — then every pass finds
+nothing reclaimable, the bound never clears, and no append will ever arrive to
+roll the segment. A livelock built out of two individually-correct rules.
+
+So the timer, holding the exclusion it already takes, **rotates** when the
+bound is crossed and the current segment is the only thing holding unreclaimed
+bytes. Rotation is a WAL operation rather than an append, so backpressure does
+not block it; the segment closes, the next pass can reclaim it, and the state
+clears. Nothing is acked by that rotation, so §3.4's no-ack-on-refusal property
+is untouched.
+
+A second way the state can persist, which is *not* a deadlock and is handled
+differently: a stale tenant floor holds `min(checkpoint, floor)` down, so
+housekeeping removes nothing and the bound stays crossed even though the object
+store recovered.
 That is not a bug to paper over — a tenant whose snapshot is not advancing is a
 real problem — but it must be *visible* rather than presenting as an
 unexplained refusal, which is why §3.5 exports the floor and its lag alongside
@@ -664,10 +701,19 @@ So the design is:
   The concrete impl maps `CheckpointError` and `HousekeepingError` into
   `ReclaimError`; a `Box<dyn Journal>` cannot infer an associated error type,
   which is why one enum rather than two. `ReclaimState` is a plain snapshot
-  struct carrying what §3.5 exports — the existing `unflushed_bytes`,
-  `disk_bytes` and `segment_count`, plus the bytes and age held below the
-  checkpoint and the rotation-failure state — so the server reads it without
-  reaching past the trait. `unflushed_bytes` stays its own method: the
+  struct carrying what §3.5 exports — the existing `unflushed_bytes` and
+  `segment_count`, **all unreclaimed bytes and the age of the oldest
+  unreclaimed frame** (§3.4's measurement, not a below-checkpoint figure), the
+  retain floor with its lag and `Incomplete` state, and the rotation-failure
+  state — so the server reads it without reaching past the trait.
+
+  **`disk_bytes` is not reused for the admission measurement.** `WalMetrics`
+  documents it as best-effort: its directory walk skips unreadable entries and
+  reports no error when the walk itself fails, so a silent undercount would let
+  admission sail past the bound — the one place a best-effort number is
+  unacceptable. The unreclaimed-byte figure is maintained incrementally from
+  appends and unlinks, as the WAL already does for `unflushed_bytes`, and
+  `disk_bytes` stays what it is: a diagnostic. `unflushed_bytes` stays its own method: the
   group-commit coordinator reads it per batch and must not allocate a
   snapshot struct on that path.
 
@@ -702,9 +748,13 @@ the unlinks. Running it on the blocking pool does **not** help: the stall is
 caused by holding the journal mutex, not by occupying a runtime worker, so
 moving the work to another thread while still holding the lock bounds nothing.
 
-The pass is therefore **capped**: at most `max_unlinks_per_pass` segments are
-removed, and the pass returns having made partial progress rather than
-finishing the backlog. The next timer tick continues where it left off, which
+The pass is therefore **capped on the work, not only on the removals**. Capping
+unlinks alone would not bound the stall: the current path enumerates and sorts
+every `*.wal` and inspects each candidate before unlinking any, so a
+1,113-segment backlog does 1,113 header reads under the mutex however few files
+it then removes. The cap therefore bounds **candidates inspected** as well as
+segments removed, stopping the walk once it has found that many — the oldest are
+encountered first, which is the order reclamation wants anyway. The next timer tick continues where it left off, which
 needs no cursor because the bound is recomputed each time and the oldest
 eligible segments are always the ones taken first. That matters most on the
 *first* pass of a node that has never reclaimed — the incident node held 1,113
@@ -852,11 +902,13 @@ first.
 >   a newest `*.wal` whose header bytes are partial, written before this RFC
 >   landed
 > - **When** the WAL is opened
-> - **Then** the remnant is unlinked durably and the open succeeds on the
->   preceding segment
-> - **And** a partial header on an **older** segment, or more than one
->   unreadable file, still reports `OpenError::Corrupt` — the narrowing must
->   not become a general "discard what we cannot parse"
+> - **Then** it still reports `OpenError::Corrupt` rather than unlinking
+>   anything — §3.3 withdrew the shape-based heuristic, because an unreadable
+>   newest segment is indistinguishable from real corruption
+> - **And** the error names the file and identifies it as the known
+>   rotation-remnant shape, so an operator can remove it deliberately
+> - **And** a node whose rotations all happened under this RFC cannot reach
+>   that state at all, so the population is finite and shrinking
 
 > **Scenario RFC0052.12 — A reclamation pass bounds the writer stall**
 > - **Given** a backlog far larger than `max_unlinks_per_pass` (the
@@ -880,17 +932,26 @@ first.
 > - **And** the unlink is followed by a parent-directory fsync, so a crash
 >   cannot resurrect it
 
-> **Scenario RFC0052.15 — A quiesced WAL is reported as neither transient nor
-> non-retryable**
-> - **Given** a WAL quiesced by a rotation failure, and the append that caused
->   it
-> - **When** either is reported on both transports
-> - **Then** both carry `503` / `UNAVAILABLE` — RFC0018.3 still holds, and a
->   non-retryable code would tell the client to drop an unacked batch
-> - **And** neither carries `Retry-After`, and the message names the state
+> **Scenario RFC0052.15 — Only the terminal rotation state is reported
+> non-transient**
+> - **Given** §3.3's bounded retry, a rotation failure that is still **within**
+>   the budget, and one that has exhausted it
+> - **When** each is reported on both transports
+> - **Then** all of them carry `503` / `UNAVAILABLE` — RFC0018.3 still holds,
+>   and a non-retryable code would tell the client to drop an unacked batch
+> - **And** a failure still within the retry budget carries `Retry-After`,
+>   because §3.3 means a later append genuinely can succeed
+> - **And** only the **terminal** state omits it, with the message naming that
+>   state
 > - **And** an ordinary append or fsync I/O failure still carries
 >   `Retry-After`, so the reclassification is narrow rather than a blanket
 >   change to RFC 0018 §3.2's transient class
+>
+> This is where #794 and this RFC disagree, deliberately. #794 classifies every
+> rotation failure as wedged, which is correct for **today's** permanent latch;
+> once §3.3 makes rotation retryable, only the terminal state is. The
+> implementation order matters: #794's classifier has to be revisited when §3.3
+> lands, which is the concrete form of the sequencing question in that PR.
 
 > **Scenario RFC0052.14 — The timer cannot stamp across a concurrent submit**
 > - **Given** the reclamation timer firing while ingest submits continuously
@@ -917,8 +978,9 @@ first.
 >   retention bound
 > - **When** ingest continues until the bound is crossed
 > - **Then** earlier batches were accepted and acked, and the rejecting
->   batch is refused with a reason naming the limit and a `Retry-After`
->   derived from it
+>   batch is refused with a reason naming the limit, and a `Retry-After` equal
+>   to the reclamation cadence (§3.4) — **not** a value derived from the limit,
+>   which yields no delta-seconds
 > - **And** the refused batch is **not present in the WAL** — asserted by
 >   replaying after a restart, so a post-append check that left the frame
 >   behind fails here
@@ -933,9 +995,14 @@ first.
 > **Scenario RFC0052.7 — The WAL's state is exported**
 > - **Given** a running node
 > - **When** metrics are collected
-> - **Then** the WAL's unflushed bytes, on-disk bytes, segment count,
->   bytes and age held below the checkpoint, and rotation-failure state
->   are all present in the exported stream under registry names
+> - **Then** the WAL's unflushed bytes, on-disk bytes, segment count, **all
+>   unreclaimed bytes and the age of the oldest unreclaimed frame** (§3.4's
+>   measurement, including the post-checkpoint tail), the retain floor with its
+>   lag and `Incomplete` state, and the rotation-failure state are all present
+>   in the exported stream under registry names
+> - **And** a run whose checkpoint never advances still reports growing
+>   unreclaimed bytes — exporting the below-checkpoint figure instead would
+>   read as flat while the bound was being exceeded
 > - **And** entering and leaving a refusing state each emit exactly one
 >   log event, named from the registry
 

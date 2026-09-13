@@ -220,12 +220,10 @@ impl LogsService for LogsReceiver {
 /// Every other WAL append/sync failure is `UNAVAILABLE`, which OTLP defines
 /// as retryable — the batch was not acked (§3.4), so compliant clients
 /// re-send rather than drop data (a non-retryable `INTERNAL` would tell them
-/// to drop it). That split is **not** transient-versus-permanent, though:
-/// `QuiescedAfterRotationFailure` classifies as `IngestFailure::Wedged` and
-/// nothing in-process clears it (#791), yet it keeps the retryable code for
-/// exactly the reason above. OTLP has no permanently-unavailable status that
-/// does not also instruct the client to discard the batch. What tells the two
-/// apart is the message, which this arm has always carried.
+/// to drop it). That includes `QuiescedAfterRotationFailure`, per RFC 0018
+/// §3.2's transient class; whether a quiesced WAL should be reported
+/// differently is RFC 0052's question, not this arm's. The message rides
+/// along, so a client at least sees which failure it was.
 ///
 /// Adapt the shared [`IngestFailure`] classification to gRPC status
 /// vocabulary (the classification itself lives beside `ReceiveError`
@@ -236,13 +234,7 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
         IngestFailure::Denied => Status::permission_denied(msg),
         // gRPC has no payload-too-large code (RFC 0026 §3.5 mapping).
         IngestFailure::TooLarge => Status::invalid_argument(msg),
-        // Both unavailabilities are `UNAVAILABLE`; see
-        // `IngestFailure::Wedged` for why the permanent one is not given a
-        // non-retryable code (it would tell the client to drop an unacked
-        // batch). The message is what distinguishes them, and this arm has
-        // always carried it — the HTTP arm did not, which is how #791 went
-        // eight hours without a reason anywhere.
-        IngestFailure::Unavailable | IngestFailure::Wedged => Status::unavailable(msg),
+        IngestFailure::Unavailable => Status::unavailable(msg),
         IngestFailure::Internal => Status::internal(msg),
     }
 }

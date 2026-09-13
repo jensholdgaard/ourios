@@ -666,20 +666,6 @@ pub(super) enum IngestFailure {
     /// Durability is temporarily unavailable; retryable. HTTP 503 /
     /// gRPC `UNAVAILABLE`.
     Unavailable,
-    /// Durability is unavailable and retrying will not restore it: the
-    /// WAL quiesced after a rotation failure (RFC 0008 §6.5) and nothing
-    /// in-process clears that flag, so every later append is refused
-    /// until the node is restarted (#791).
-    ///
-    /// Still HTTP 503 / gRPC `UNAVAILABLE`, deliberately. OTLP has no
-    /// "permanently unavailable" code: every status it defines as
-    /// non-retryable also instructs the client to *drop* the batch, and
-    /// the batch was never acked, so telling clients to drop it would
-    /// turn a wedged node into silent data loss. What changes is the
-    /// advice — no `Retry-After`, because no delay is the answer here —
-    /// and the message, which names the state instead of implying a
-    /// transient blip.
-    Wedged,
     /// Unreachable for a transport-validated selector; our bug.
     /// HTTP 500 / gRPC `INTERNAL`.
     Internal,
@@ -692,9 +678,6 @@ impl IngestFailure {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
             ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
-            ReceiveError::WalAppend(ourios_wal::AppendError::QuiescedAfterRotationFailure) => {
-                Self::Wedged
-            }
             ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
         }
@@ -766,57 +749,6 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ourios_config::MinerConfig;
-
-    /// The classifier's whole reason to exist is to force "one
-    /// retryable-vs-not decision" (see its doc comment). It used to fold a
-    /// permanently quiesced WAL into the transient bucket, so a node that
-    /// could only be fixed by a restart kept answering "retry later"
-    /// forever (#791).
-    mod wedged_vs_transient {
-        use super::super::{IngestFailure, ReceiveError};
-        use ourios_wal::{AppendError, SyncError};
-
-        #[test]
-        fn a_quiesced_wal_classifies_as_wedged_not_transient() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(
-                    AppendError::QuiescedAfterRotationFailure,
-                )),
-                IngestFailure::Wedged,
-            );
-        }
-
-        #[test]
-        fn other_append_and_sync_failures_stay_transient() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::Io {
-                    op: "write",
-                    source: std::io::Error::other("io"),
-                })),
-                IngestFailure::Unavailable,
-            );
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalSync(SyncError::Io {
-                    op: "fdatasync",
-                    source: std::io::Error::other("io"),
-                })),
-                IngestFailure::Unavailable,
-            );
-        }
-
-        /// The split must not have moved the oversize case, which is the
-        /// one append failure a client can fix itself.
-        #[test]
-        fn an_oversize_batch_is_still_its_own_outcome() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::TooLarge {
-                    len: 32 * 1024 * 1024,
-                    limit: 16 * 1024 * 1024,
-                })),
-                IngestFailure::TooLarge,
-            );
-        }
-    }
 
     /// Persists nothing; `sync` reports the configured offset and counts
     /// its calls, so a test can assert WAL-before-ack ordering and

@@ -22,13 +22,11 @@
 //! over the inner service's body type, so giving those a `Status` is a
 //! separate change rather than part of this one.
 //!
-//! Durability failures are `503`, and that code is retryable per OTLP. It is
-//! **not** the same as transient: a WAL quiesced after a rotation failure
-//! classifies as `IngestFailure::Wedged` and nothing in-process clears it
-//! (#791), but it keeps the retryable code because the batch was never acked
-//! and every non-retryable status tells the client to discard it. The
-//! difference reaches the client as the `Status` message plus the absence of
-//! `Retry-After`.
+//! Durability failures are `503` with a `Retry-After`, per RFC 0018 §3.2's
+//! transient class — including a WAL quiesced after a rotation failure, which
+//! today only a restart clears (#791). Reporting that case differently is
+//! RFC 0052's question; until it is decided, the `Status` message is what
+//! tells an operator which failure it was.
 //!
 //! The pipeline is shared behind a plain `Arc`: its group-commit
 //! coordinator serializes the single-writer WAL internally (RFC 0008
@@ -377,11 +375,6 @@ async fn handle_logs(
 /// Every other WAL append/sync failure is `503`, which OTLP defines as
 /// retryable — the batch was not acked (§3.4), so compliant clients re-send
 /// rather than drop data (a non-retryable `500` would tell them to drop it).
-/// Retryable is **not** the same as transient: `IngestFailure::Wedged` keeps
-/// this status while nothing in-process clears it (#791), because OTLP has no
-/// permanently-unavailable code that does not also instruct the client to
-/// discard the batch. `ingest_error_response` is where the two diverge — the
-/// wedge gets no `Retry-After`.
 ///
 /// Seconds advertised in `Retry-After` on a *transient* 503.
 ///
@@ -401,16 +394,13 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     match IngestFailure::classify(error) {
         IngestFailure::Denied => StatusCode::FORBIDDEN,
         IngestFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        // Both unavailabilities are 503; see `IngestFailure::Wedged` for
-        // why the permanent one is not given a non-retryable code.
-        IngestFailure::Unavailable | IngestFailure::Wedged => StatusCode::SERVICE_UNAVAILABLE,
+        IngestFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         IngestFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 /// The ingest-failure response: the mapped status, a `Status` body naming
-/// the reason, and `Retry-After` only where waiting is actually the
-/// remedy.
+/// the reason, and `Retry-After` on the retryable one.
 ///
 /// The reason text is `ReceiveError`'s `Display`, which the gRPC arm
 /// already puts on the wire, so this adds no disclosure the other
@@ -436,7 +426,7 @@ fn ingest_error_response(format: WireFormat, error: &ReceiveError) -> Response {
 ///
 /// Every error arm here used to return a bare `StatusCode`, which axum
 /// renders with an **empty** body — a spec violation, and the reason a
-/// wedged node (#791) could 503 for eight hours while telling its operator
+/// quiesced node (#791) could 503 for eight hours while telling its operator
 /// nothing. `Status.code` is left unset: the spec says it does not use the
 /// field and the server MAY omit it, and proto3 elides a zero-valued
 /// scalar on both encodings.
@@ -606,9 +596,8 @@ mod tests {
         assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// The OTLP spec's `MUST` on error bodies, and the `Retry-After`
-    /// advice that distinguishes a transient unavailability from a wedged
-    /// node (#791). Before these, every error arm returned a bare
+    /// The OTLP spec's `MUST` on error bodies, and the `Retry-After` on a
+    /// retryable 503 (#791). Before these, every error arm returned a bare
     /// `StatusCode`, which axum renders with an empty body.
     mod error_body {
         use super::super::{
@@ -696,20 +685,16 @@ mod tests {
             );
         }
 
-        /// The wedge is still 503 — a non-retryable code would tell the
-        /// client to drop a batch that was never acked — but it must not
-        /// advertise a retry delay, because no delay is the remedy, and the
-        /// body has to name the state so an operator reading a single
-        /// response learns what a restart is for.
+        /// A quiesced WAL is still a retryable 503 under RFC 0018 §3.2, so it
+        /// carries `Retry-After` like any other — whether it should is
+        /// RFC 0052's question. What this PR guarantees is that the body
+        /// names the state, so an operator reading a single response learns
+        /// what happened instead of seeing an empty 503 (#791).
         #[tokio::test]
-        async fn wedged_wal_is_503_without_retry_after_and_says_why() {
+        async fn quiesced_wal_is_503_and_says_why() {
             let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
             let response = ingest_error_response(WireFormat::Protobuf, &e);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(
-                response.headers().get(header::RETRY_AFTER).is_none(),
-                "a wedged WAL must not advertise a retry delay",
-            );
             let decoded = tonic_types::Status::decode(body_bytes(response).await.as_slice())
                 .expect("decodable google.rpc.Status");
             assert_eq!(

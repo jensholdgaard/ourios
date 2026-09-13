@@ -116,9 +116,12 @@ fn two_service_fixture() -> Vec<FixtureRecord> {
         .collect()
 }
 
-/// Resource attributes the real dispatch corpus carries which are **not** on
-/// the denylist, so a future config or image that promoted one of them would
-/// be *observed* by the allowlist assertion rather than silently missed.
+/// Representative synthetic resource attributes, **not** on the denylist, so
+/// a future config or image that promoted one of them would be *observed* by
+/// the allowlist assertion rather than silently missed. They stand in for
+/// the shapes real OTLP resources carry; the dispatch corpus's own
+/// resource-attribute set is not inspected here (#800 leaves that
+/// measurement open).
 ///
 /// A runtime check can only see labels its payload can produce. Without these
 /// the test guards promotions of the four denied keys and nothing else —

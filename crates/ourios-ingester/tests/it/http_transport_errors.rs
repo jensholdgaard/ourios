@@ -114,7 +114,7 @@ async fn gzip_decompression_bomb_is_413() {
         "the compressed bomb is under the body limit"
     );
     let (pipeline, captured) = capturing_pipeline();
-    let (status, _) = send(
+    let (status, body) = send(
         router(pipeline, &config),
         post_request("/v1/logs", Some(PROTOBUF), Some("gzip"), bomb),
     )
@@ -124,6 +124,11 @@ async fn gzip_decompression_bomb_is_413() {
         StatusCode::PAYLOAD_TOO_LARGE,
         "a gzip body inflating past the cap → 413",
     );
+    // This arm is the handler's own decompressed-size check, not the
+    // extractor's limit, so it needs its own body assertion.
+    let decoded = tonic_types::Status::decode(body.as_slice())
+        .expect("the decompressed-size 413 carries a protobuf Status");
+    assert!(!decoded.message.is_empty());
     assert!(captured.lock().expect("captured").is_empty());
 }
 

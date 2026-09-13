@@ -347,12 +347,11 @@ async fn handle_logs(
         Ok(Err(e)) => ingest_error_response(&e),
         // A `JoinError` is a panic or a cancellation, both genuine and
         // non-retryable. Its `Display` carries the panic payload, which is
-        // server-side detail: it goes to the log, and the client gets a
-        // fixed message, as the querier's internal 500 does.
-        Err(join) => {
-            tracing::error!(error = %join, "ingest task failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "ingest task failed")
-        }
+        // server-side detail: the panic hook has already written it to
+        // stderr, and the client gets a fixed message, as the querier's
+        // internal 500 does. No log event here — the receiver emits none,
+        // and a new one needs a registered semconv name.
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "ingest task failed"),
     }
 }
 

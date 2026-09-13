@@ -346,11 +346,13 @@ async fn handle_logs(
         Ok(Ok(_)) => success_response(format),
         Ok(Err(e)) => ingest_error_response(&e),
         // A `JoinError` is a panic or a cancellation, both genuine and
-        // non-retryable; the message says which, as the gRPC arm's does.
-        Err(join) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("ingest task failed: {join}"),
-        ),
+        // non-retryable. Its `Display` carries the panic payload, which is
+        // server-side detail: it goes to the log, and the client gets a
+        // fixed message, as the querier's internal 500 does.
+        Err(join) => {
+            tracing::error!(error = %join, "ingest task failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "ingest task failed")
+        }
     }
 }
 
@@ -502,9 +504,12 @@ fn success_response(format: WireFormat) -> Response {
             )
                 .into_response(),
             // Encoding the (trivial) success response shouldn't fail; if
-            // it ever did, a 500 is honest — never a 200 with an empty
-            // body.
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            // it ever did, a 500 with a `Status` is honest — never a 200
+            // with an empty body, and never a bare 500 either.
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode the success response",
+            ),
         },
     }
 }
@@ -556,9 +561,10 @@ mod tests {
         assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// The OTLP spec's `MUST` on error bodies (#791). Before this, every
-    /// error arm returned a bare `StatusCode`, which axum renders with an
-    /// empty body.
+    /// The OTLP spec's `MUST` on error bodies (#791). Before this, the
+    /// status-only arms returned a bare `StatusCode`, which axum renders
+    /// with an empty body, and the tenant-selector 400 carried plain text
+    /// rather than a `Status`.
     mod error_body {
         use super::super::{Response, error_response, ingest_error_response};
         use super::{AppendError, ReceiveError, StatusCode};

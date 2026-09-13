@@ -97,24 +97,28 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
 /// of an empty 503).
 #[tokio::test]
 async fn rfc0018_3_http_503_carries_a_status_naming_the_failure() {
-    let (status, body) = send(
-        router(failing_sync_pipeline().into(), &HttpConfig::default()),
-        post_request(
-            "/v1/logs",
-            Some(PROTOBUF),
-            None,
-            valid_request().encode_to_vec(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let decoded = tonic_types::Status::decode(body.as_slice())
-        .expect("the ingest-failure 503 carries a protobuf Status");
-    assert!(
-        decoded.message.contains("WAL sync failed"),
-        "the Status names the WAL failure: {:?}",
-        decoded.message,
-    );
+    // Both request encodings: a JSON request must get the same protobuf
+    // `Status`, since the Collector decodes every failure body as protobuf.
+    let json = serde_json::to_vec(&valid_request()).expect("serialise OTLP/JSON");
+    for (content_type, payload) in [
+        (PROTOBUF, valid_request().encode_to_vec()),
+        ("application/json", json),
+    ] {
+        let (status, body) = send(
+            router(failing_sync_pipeline().into(), &HttpConfig::default()),
+            post_request("/v1/logs", Some(content_type), None, payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{content_type}");
+        let decoded = tonic_types::Status::decode(body.as_slice()).unwrap_or_else(|e| {
+            panic!("{content_type}: the 503 must carry a protobuf Status: {e}")
+        });
+        assert!(
+            decoded.message.contains("WAL sync failed"),
+            "{content_type}: the Status names the WAL failure: {:?}",
+            decoded.message,
+        );
+    }
 }
 
 #[tokio::test]

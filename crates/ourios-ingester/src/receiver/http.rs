@@ -22,11 +22,12 @@
 //! over the inner service's body type, so giving those a `Status` is a
 //! separate change rather than part of this one.
 //!
-//! Durability failures are `503` with a `Retry-After`, per RFC 0018 §3.2's
-//! transient class — including a WAL quiesced after a rotation failure, which
-//! today only a restart clears (#791). Reporting that case differently is
-//! RFC 0052's question; until it is decided, the `Status` message is what
-//! tells an operator which failure it was.
+//! Durability failures are `503`, per RFC 0018 §3.2's transient class —
+//! including a WAL quiesced after a rotation failure, which today only a
+//! restart clears (#791). Reporting that case differently, and whether a
+//! `Retry-After` should accompany it, are RFC 0052's questions; until they
+//! are decided, the `Status` message is what tells an operator which failure
+//! it was.
 //!
 //! The pipeline is shared behind a plain `Arc`: its group-commit
 //! coordinator serializes the single-writer WAL internally (RFC 0008
@@ -376,16 +377,6 @@ async fn handle_logs(
 /// retryable — the batch was not acked (§3.4), so compliant clients re-send
 /// rather than drop data (a non-retryable `500` would tell them to drop it).
 ///
-/// Seconds advertised in `Retry-After` on a *transient* 503.
-///
-/// The OTLP spec lets a server "MAY include `Retry-After`" on 503 and says
-/// a client without one SHOULD back off exponentially. One second is
-/// deliberately short: durability here is unavailable for as long as a
-/// single fsync or rotation takes, not for as long as a rate limit, and a
-/// client that waits minutes to retry an unacked batch is a client whose
-/// queue fills for no reason.
-const TRANSIENT_RETRY_AFTER_SECS: u32 = 1;
-
 /// Adapt the shared [`IngestFailure`] classification to HTTP status
 /// vocabulary — the exhaustive `ReceiveError` match (and its
 /// build-breaking-on-new-variant property) lives beside the error
@@ -399,24 +390,17 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     }
 }
 
-/// The ingest-failure response: the mapped status, a `Status` body naming
-/// the reason, and `Retry-After` on the retryable one.
+/// The ingest-failure response: the mapped status and a `Status` body
+/// naming the reason. No `Retry-After`: the spec makes it optional, a client
+/// without one backs off exponentially, and what delay a durability failure
+/// should advertise is RFC 0052's question.
 ///
 /// The reason text is `ReceiveError`'s `Display`, which the gRPC arm
 /// already puts on the wire, so this adds no disclosure the other
 /// transport did not already make (and `TenantDenied` deliberately names
 /// the tenant, not the token — RFC 0026 §3.4).
 fn ingest_error_response(format: WireFormat, error: &ReceiveError) -> Response {
-    let status = ingest_error_status(error);
-    let mut response = error_response(format, status, &error.to_string());
-    if matches!(IngestFailure::classify(error), IngestFailure::Unavailable) {
-        // `from` on a u32 cannot produce an invalid header value.
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            axum::http::HeaderValue::from(TRANSIENT_RETRY_AFTER_SECS),
-        );
-    }
-    response
+    error_response(format, ingest_error_status(error), &error.to_string())
 }
 
 /// An error response carrying the body the OTLP spec requires.
@@ -432,9 +416,9 @@ fn ingest_error_response(format: WireFormat, error: &ReceiveError) -> Response {
 /// scalar on both encodings.
 ///
 /// `format` mirrors the request's `Content-Type`, as the spec requires.
-/// The two sites that reject *before* the content type is known pass
-/// protobuf, which is the only honest choice: there is no request format
-/// to mirror when the request format is what failed.
+/// Only a request whose `Content-Type` is missing or unsupported gets
+/// protobuf instead, which is the only honest choice: there is no request
+/// format to mirror when the request format is what failed.
 fn error_response(format: WireFormat, status: StatusCode, message: &str) -> Response {
     match format {
         WireFormat::Protobuf => {
@@ -596,13 +580,11 @@ mod tests {
         assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// The OTLP spec's `MUST` on error bodies, and the `Retry-After` on a
-    /// retryable 503 (#791). Before these, every error arm returned a bare
-    /// `StatusCode`, which axum renders with an empty body.
+    /// The OTLP spec's `MUST` on error bodies (#791). Before this, every
+    /// error arm returned a bare `StatusCode`, which axum renders with an
+    /// empty body.
     mod error_body {
-        use super::super::{
-            Response, TRANSIENT_RETRY_AFTER_SECS, WireFormat, error_response, ingest_error_response,
-        };
+        use super::super::{Response, WireFormat, error_response, ingest_error_response};
         use super::{AppendError, ReceiveError, StatusCode};
         use axum::http::header;
         use prost::Message as _;
@@ -671,25 +653,11 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn transient_unavailability_advertises_retry_after() {
-            let e = ReceiveError::WalAppend(AppendError::Io {
-                op: "write",
-                source: std::io::Error::other("io"),
-            });
-            let response = ingest_error_response(WireFormat::Protobuf, &e);
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(
-                response.headers().get(header::RETRY_AFTER).unwrap(),
-                TRANSIENT_RETRY_AFTER_SECS.to_string().as_str(),
-            );
-        }
-
-        /// A quiesced WAL is still a retryable 503 under RFC 0018 §3.2, so it
-        /// carries `Retry-After` like any other — whether it should is
-        /// RFC 0052's question. What this PR guarantees is that the body
-        /// names the state, so an operator reading a single response learns
-        /// what happened instead of seeing an empty 503 (#791).
+        /// A quiesced WAL is a retryable 503 under RFC 0018 §3.2 — whether it
+        /// should be, and what delay it should advertise, is RFC 0052's
+        /// question. What is guaranteed here is that the body names the
+        /// state, so an operator reading a single response learns what
+        /// happened instead of seeing an empty 503 (#791).
         #[tokio::test]
         async fn quiesced_wal_is_503_and_says_why() {
             let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);

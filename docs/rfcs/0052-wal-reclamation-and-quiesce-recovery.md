@@ -271,7 +271,20 @@ So the derivation uses the in-memory record of snapshots whose write returned
 `Incomplete`, which per the rule above reclaims nothing — conservative, and
 self-correcting on the next successful write. Reading the directory is
 legitimate only at startup, before anything has been reclaimed in this
-process's lifetime.
+process's lifetime — and even then only after one more step.
+
+**The startup listing is revalidated by a directory fsync before it is
+trusted.** The in-process rule covers failures this process observed, but a
+previous process may have renamed a snapshot into place, failed the
+parent-directory fsync, and exited cleanly; the entry is then still visible
+to a restarted process, which would load it as a horizon, reclaim on the
+strength of it, and lose the frames when a later machine crash drops the
+never-durable entry. So before any listed `.snap` is used as a horizon the
+snapshots root is fsynced once, which makes every entry the listing saw
+durable — the one property the listing lacks. If that fsync fails the floor
+is `Incomplete` and nothing is reclaimed until a later snapshot write
+succeeds. One directory fsync rather than a manifest, because a manifest
+would need the same fsync to be trustworthy itself.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` truncates below `min(checkpoint, floor)`, so a stale floor
@@ -807,6 +820,10 @@ memory, and nothing here claims to.
 > - **When** housekeeping runs
 > - **Then** nothing is reclaimed, and this is distinguishable in the API from
 >   the no-consumer case, which reclaims by checkpoint alone
+> - **And** a snapshot listed at startup is used as a horizon only after the
+>   snapshots root has been fsynced in this process; a failed startup fsync
+>   yields `Incomplete`, so a horizon whose directory entry may not be durable
+>   never governs reclamation
 > - **And** the state is exported (§3.5), so an operator seeing a WAL that
 >   will not shrink can tell it is a lagging tenant rather than an
 >   unexplained stall
@@ -911,7 +928,11 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   `RetainFloor` cases, asserting the incomplete case reclaims nothing and is
   not expressible as the no-consumer case. The type makes the unsafe reading
   unrepresentable, so the test mostly guards the *derivation* of the floor
-  from per-tenant snapshots rather than `housekeeping` itself.
+  from per-tenant snapshots rather than `housekeeping` itself. The startup
+  leg uses a snapshots-root fixture whose directory fsync is made to fail
+  (the file-in-place-of-directory technique from the rotation tests, since
+  read-only permissions do not bind under root), asserting the derived floor
+  is `Incomplete` rather than the listed horizon.
 - **Timer exclusion (RFC0052.14)** — a seeded-interleaving test rather than a
   timing one: the window is narrow, and a wall-clock test that happens to pass
   proves nothing. Failing that, hold the timer artificially between quiesce and

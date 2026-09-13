@@ -540,7 +540,7 @@ impl Wal {
     fn rotate(&mut self) -> Result<(), AppendError> {
         if let Err(source) = sync_file_data(&self.current_segment, self.config.macos_full_fsync) {
             self.quiesced = true;
-            return Err(AppendError::RotationFailed {
+            return Err(AppendError::Io {
                 op: "sync(rotation: close segment)",
                 source,
             });
@@ -551,7 +551,7 @@ impl Wal {
             Ok(fresh) => fresh,
             Err(OpenError::Io { op, source }) => {
                 self.quiesced = true;
-                return Err(AppendError::RotationFailed { op, source });
+                return Err(AppendError::Io { op, source });
             }
             Err(OpenError::InvalidConfig { .. } | OpenError::Corrupt { .. }) => {
                 unreachable!("create_fresh_segment only surfaces OpenError::Io")
@@ -567,7 +567,7 @@ impl Wal {
         // syncs the segment data first.)
         if let Err(source) = sync_file_data(&file, self.config.macos_full_fsync) {
             self.quiesced = true;
-            return Err(AppendError::RotationFailed {
+            return Err(AppendError::Io {
                 op: "sync(rotation: fresh segment header)",
                 source,
             });
@@ -577,7 +577,7 @@ impl Wal {
             // reads it as zero frames, and unlinking it here could
             // itself fail. The quiesce is what protects correctness.
             self.quiesced = true;
-            return Err(AppendError::RotationFailed {
+            return Err(AppendError::Io {
                 op: "fsync(wal_root after rotation)",
                 source,
             });
@@ -1313,28 +1313,13 @@ pub enum AppendError {
         op: &'static str,
         source: std::io::Error,
     },
-    /// A rotation step failed on *this* append and quiesced the
-    /// WAL (§6.5): the closing segment's data sync, the fresh
-    /// segment's creation or header sync, or the parent-dir
-    /// `fsync`. `op` names the step and `source` is the
-    /// underlying I/O error.
-    ///
-    /// Distinct from [`AppendError::Io`] because the
-    /// consequences differ: an ordinary append I/O failure is
-    /// transient and retrying can succeed, whereas this one has
-    /// just made every later append fail until an operator
-    /// intervenes. Folding it into `Io` left the very request
-    /// that wedged the node being told to retry shortly
-    /// (ourios#791).
-    RotationFailed {
-        op: &'static str,
-        source: std::io::Error,
-    },
-    /// A *prior* rotation failed and the WAL is quiesced per
-    /// §6.5 — operator intervention is required before further
-    /// appends are accepted. The append that triggered the
-    /// failure gets [`AppendError::RotationFailed`]; every
-    /// append after it gets this variant.
+    /// A prior rotation failed (the closing segment's
+    /// data sync, the fresh segment's creation, or the
+    /// parent-dir `fsync`) and the WAL is quiesced per §6.5 —
+    /// operator intervention is required before further appends
+    /// are accepted. The append that triggered the failed
+    /// rotation surfaced the underlying [`AppendError::Io`];
+    /// every append after it gets this variant.
     QuiescedAfterRotationFailure,
 }
 
@@ -1357,10 +1342,6 @@ impl std::fmt::Display for AppendError {
                 write!(f, "frame payload {len} B exceeds the {limit} B limit")
             }
             Self::Io { op, source } => write!(f, "WAL append failed at {op}: {source}"),
-            Self::RotationFailed { op, source } => write!(
-                f,
-                "WAL rotation failed at {op} and the WAL is now quiesced (§6.5): {source}"
-            ),
             Self::QuiescedAfterRotationFailure => {
                 write!(f, "WAL is quiesced after a rotation failure (§6.5)")
             }
@@ -1371,7 +1352,7 @@ impl std::fmt::Display for AppendError {
 impl std::error::Error for AppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } | Self::RotationFailed { source, .. } => Some(source),
+            Self::Io { source, .. } => Some(source),
             Self::TooLarge { .. } | Self::QuiescedAfterRotationFailure => None,
         }
     }

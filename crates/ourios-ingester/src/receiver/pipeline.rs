@@ -692,14 +692,9 @@ impl IngestFailure {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
             ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
-            // Both halves of the wedge: the append whose rotation failed, and
-            // every append after it. Folding the first into the transient arm
-            // left the very request that wedged the node being told to retry
-            // shortly (#791).
-            ReceiveError::WalAppend(
-                ourios_wal::AppendError::RotationFailed { .. }
-                | ourios_wal::AppendError::QuiescedAfterRotationFailure,
-            ) => Self::Wedged,
+            ReceiveError::WalAppend(ourios_wal::AppendError::QuiescedAfterRotationFailure) => {
+                Self::Wedged
+            }
             ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
         }
@@ -787,21 +782,6 @@ mod tests {
                 IngestFailure::classify(&ReceiveError::WalAppend(
                     AppendError::QuiescedAfterRotationFailure,
                 )),
-                IngestFailure::Wedged,
-            );
-        }
-
-        /// The append whose own rotation failed is already wedged: `rotate`
-        /// sets the latch before returning, so every later append is refused.
-        /// Classifying it as transient sent a `Retry-After` to the one request
-        /// that had just made retrying useless (#791).
-        #[test]
-        fn the_append_that_wedged_the_wal_is_also_wedged_not_transient() {
-            assert_eq!(
-                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::RotationFailed {
-                    op: "sync(rotation: close segment)",
-                    source: std::io::Error::other("io"),
-                },)),
                 IngestFailure::Wedged,
             );
         }

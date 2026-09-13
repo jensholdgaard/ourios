@@ -482,10 +482,10 @@ though the numbers existed in memory.
 This RFC exports the existing three and adds the state the other sections
 actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
 
-- **unreclaimed bytes and the age of the oldest unreclaimed frame** — the two
-  quantities RFC 0053's bound will be measured on, so "all unreclaimed"
-  including the post-checkpoint tail, the current segment and anything the
-  floor retains. An earlier draft said "below the checkpoint", which would have
+- **unreclaimed bytes and the age of the oldest unreclaimed frame** — the
+  bytes are what RFC 0053's bound is measured on, and the age is what an
+  operator alerts on; "all unreclaimed" means including the post-checkpoint
+  tail, the current segment and anything the floor retains. An earlier draft said "below the checkpoint", which would have
   exported the one number that does not grow during an outage;
 - **the retain floor and its lag**, including whether it is
   `RetainFloor::Incomplete` — without which RFC0052.13's "an operator can tell a
@@ -563,8 +563,8 @@ So the design is:
   which is why one enum rather than two. `ReclaimState` is a plain snapshot
   struct carrying what §3.5 exports — the existing `unflushed_bytes` and
   `segment_count`, **all unreclaimed bytes and the age of the oldest
-  unreclaimed frame** (the measurement RFC 0053's bound is taken on, not a
-  below-checkpoint figure), the
+  unreclaimed frame** (the bytes being what RFC 0053's bound is taken on,
+  and not a below-checkpoint figure), the
   retain floor with its lag and `Incomplete` state, and the rotation-failure
   state — so the server reads it without reaching past the trait.
 
@@ -820,8 +820,8 @@ memory, and nothing here claims to.
 > - **When** metrics are collected
 > - **Then** the WAL's unflushed bytes, on-disk bytes, segment count, **all
 >   unreclaimed bytes and the age of the oldest unreclaimed frame** (the
->   measurement RFC 0053's bound is taken on, including the post-checkpoint
->   tail), the retain floor with its
+>   bytes being what RFC 0053's bound is taken on, including the
+>   post-checkpoint tail), the retain floor with its
 >   lag and `Incomplete` state, and the rotation-failure state are all present
 >   in the exported stream under registry names
 > - **And** a run whose checkpoint never advances still reports growing

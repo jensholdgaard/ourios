@@ -72,8 +72,14 @@ pub async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
-/// Whether `text` is a whole HTTP/1.1 response: a full header block, plus a
-/// body satisfying a declared `Content-Length`.
+/// Whether `response` is a whole HTTP/1.1 response: a full header block, plus a
+/// body of **exactly** the declared `Content-Length`.
+///
+/// Exactly, not at least: `Content-Length` is an exact framing, and the read
+/// loop drains until the peer stops, so anything after the first body — a
+/// pipelined second response, a truncated one, protocol garbage — would
+/// otherwise be appended and still pass for a caller that only asserts on the
+/// status line.
 ///
 /// **`Content-Length` is the only framing recognised**, deliberately. Nothing
 /// these suites query answers with `Transfer-Encoding: chunked` — the served
@@ -102,7 +108,7 @@ fn is_complete(response: &[u8]) -> bool {
         .filter_map(|line| line.split_once(':'))
         .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .is_some_and(|want| body_len >= want)
+        .is_some_and(|want| body_len == want)
 }
 
 #[cfg(test)]
@@ -209,6 +215,18 @@ mod tests {
         ]);
         let text = read_response(&mut reader).await;
         assert!(text.starts_with("HTTP/1.1 200 OK"), "got {text:?}");
+    }
+
+    /// Trailing bytes after the declared body are not a complete response: the
+    /// loop drains until the peer stops, so a pipelined or truncated second
+    /// response would otherwise be appended and pass.
+    #[test]
+    fn trailing_bytes_past_the_declared_length_are_not_complete() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        assert!(is_complete(format!("{head}hello").as_bytes()));
+        assert!(!is_complete(
+            format!("{head}helloHTTP/1.1 500 Internal").as_bytes()
+        ));
     }
 
     #[test]

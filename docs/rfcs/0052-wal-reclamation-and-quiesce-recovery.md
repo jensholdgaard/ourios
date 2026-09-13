@@ -179,10 +179,41 @@ strictly narrower than the gate, so it does not change ingest ordering, and it
 is the smallest thing that closes the window. Rotation needs no change: it
 already runs inside an ingest's own span.
 
+**Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
+takes the miner lock today before the pool submission and the `last_durable`
+update; if it took the miner lock first and then waited for the exclusion
+while the timer held the exclusion and waited for the miner lock, neither
+would proceed. So every ingest turn acquires the exclusion **before** the
+miner lock, the timer follows the same order — exclusion, then miner lock,
+then the `last_durable` mutex — and the exclusion is never requested while
+the miner lock is held.
+
+**The age sweep participates in the same exclusion.** It drains under the
+miner lock alone today, so a sweep could begin after the timer's quiesce and
+before its stamp, leaving a drained-but-undurable batch outside the buffers
+that the barrier then reads as empty; `quiesce_publishes` waits only for a
+sweep already in flight and prevents no new drain. The sweep's
+drain-and-publish step therefore takes the exclusion in shared mode and the
+timer takes it exclusively: no sweep starts inside the barrier, and one in
+flight completes before it. That subsumes `quiesce_publishes` rather than
+relying on it.
+
 The mark is then read inside that turn and after the quiesce — `last_durable()`
 at that point, the offset the receiver's acks are gated on — so no frame above
 it can still be in flight. Reading it before the quiesce, or outside the turn,
 reopens the window from the other side.
+
+**And the stored mark must not over-cover.** The group-commit `sync` reports
+the WAL's EOF, and `CommitCoordinator::flush` captures `covered_seq` before it
+locks the journal, so waiter A's outcome can carry an offset that includes
+frame B, appended later by a turn that has not yet run — while B is acked on
+the same outcome. If A stored that EOF as `last_durable`, a barrier between
+A's turn and B's would checkpoint across B, and recovery would suppress a
+frame nothing had mined. So `last_durable` advances to the turn's **own**
+frame offset — the `WalOffset` its append returned, carried through
+`CommitOutcome` beside the durable EOF — and never to the EOF itself. Turns
+are sequential, so the stored mark is a contiguous-success high-water by
+construction, and that is the only mark the barrier reads.
 
 The cost is explicit: ingest stalls for the barrier's duration once per
 `housekeeping_secs`, the same stall rotation already imposes, now on a timer.
@@ -233,6 +264,15 @@ every housekeeping_secs:
     journal.housekeeping(retain_floor(), max_unlinks_per_pass)  // Result
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
+
+**The timer has the age sweep's lifecycle, stated so it cannot outlive the
+handle.** It is owned by the receiver, signalled by the same shutdown watch
+the sweep already observes, and joined **before** the final flush and
+snapshot, in the order `ReceiverHandle::shutdown` already joins the sweep; it
+holds no pipeline or journal handle after the join. A timer that was not
+joined there could race the shutdown reclamation or keep the WAL alive past
+the handle, which is why the ordering is part of the design rather than of
+the implementation.
 
 **`retain_floor` is the MINIMUM over per-tenant snapshot horizons, not the
 latest one.** `write_snapshots` persists one snapshot per tenant and can
@@ -355,6 +395,15 @@ directory-fsync failure repeatedly refuses to ack rather than accumulating
 unacked frames behind a rotation that never reruns. Those appends are not lost
 either — they are in the segment, and the next successful `sync` covers them.
 
+**That retry draws on the same budget and reaches the same terminal state.**
+Each failed discharge of `dir_fsync_pending` in `sync` consumes one unit of
+the rotation retry budget, exactly as a failed `rotate` does, and exhausting
+it enters the terminal state whichever operation gets there. Both
+`AppendError` and `SyncError` carry a typed terminal variant, and
+`IngestFailure::classify` maps both under the terminal-only rule — so a
+persistent parent-directory fsync failure is not left as an ordinary
+`WalSync` that RFC0052.5 and RFC0052.15 could never observe.
+
 Installing *after* the fsync, as the draft implied, leaves the renamed file
 owned by nobody: `rotate` would still point at the old segment while a complete
 `.wal` sits beside it, which is the orphan case all over again.
@@ -404,6 +453,19 @@ of stale partials would otherwise make a "bounded" pass do unbounded directory
 work and break RFC0052.12. An unlink failure is logged and retried on the next
 pass like any other.
 
+Two more properties of the sweep are stated because the current
+`housekeeping` has neither. **It runs on every pass**, regardless of the
+checkpoint precondition: today `housekeeping` returns at once when no
+checkpoint exists, and a rotation that fails before the first checkpoint
+would otherwise leave partials that every later pass skips; only the
+segment-unlink portion is gated on a checkpoint. **Its error path still
+makes completed removals durable**: when a pass fails part-way — a header
+read, a stat, a later unlink — the parent-directory fsync covers every unlink
+that already succeeded before the error is returned, and
+`HousekeepingProgress` reports the partial count. Today's single fsync after
+the complete scan would let a crash resurrect a partial the pass had already
+removed.
+
 **Pre-existing `*.wal` orphans need their own answer, and neither changing
 future rotations nor guessing at open is it.** A node wedged before this RFC
 lands may already hold a segment whose header fsync failed, so its header
@@ -420,9 +482,10 @@ failure than the one it avoids. No shape-based guess is safe here, because the
 shape carries no evidence of which cause produced it.
 
 So: these nodes keep today's behaviour and still halt at open. What this RFC
-adds is that the halt is *actionable* — the error names the file and says it is
-the known rotation-failure remnant shape, so an operator can remove it
-deliberately. Whether that deserves a WAL verb rather than a documented manual
+adds is that the halt is *actionable* — the error names the file, describes
+the observable shape (newest segment, unreadable header) and notes that a
+failed rotation is one way to produce it, without claiming that it did, so an
+operator can weigh removing it. Whether that deserves a WAL verb rather than a documented manual
 step is in §7; either way the decision is a human's, because only a human can
 weigh "this is probably rotation debris" against "this might be my data".
 Future rotations cannot reach this state at all, so the population is finite
@@ -498,7 +561,10 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
 - **unreclaimed bytes and the age of the oldest unreclaimed frame** — the
   bytes are what RFC 0053's bound is measured on, and the age is what an
   operator alerts on; "all unreclaimed" means including the post-checkpoint
-  tail, the current segment and anything the floor retains. An earlier draft said "below the checkpoint", which would have
+  tail, the current segment and anything the floor retains. No frame carries
+  a timestamp, so the age is a defined proxy: the oldest surviving segment's
+  `UUIDv7` timestamp, its creation time, which is older than or equal to
+  every frame in it and therefore conservative, and `None` on an empty WAL. An earlier draft said "below the checkpoint", which would have
   exported the one number that does not grow during an outage;
 - **the retain floor and its lag**, including whether it is
   `RetainFloor::Incomplete` — without which RFC0052.13's "an operator can tell a
@@ -574,8 +640,9 @@ So the design is:
   The concrete impl maps `CheckpointError` and `HousekeepingError` into
   `ReclaimError`; a `Box<dyn Journal>` cannot infer an associated error type,
   which is why one enum rather than two. `ReclaimState` is a plain snapshot
-  struct carrying what §3.5 exports — the existing `unflushed_bytes` and
-  `segment_count`, **all unreclaimed bytes and the age of the oldest
+  struct carrying what §3.5 exports — the existing `unflushed_bytes`,
+  `segment_count` and best-effort `disk_bytes` (a diagnostic, and the only
+  path the trait object has to it), **all unreclaimed bytes and the age of the oldest
   unreclaimed frame** (the bytes being what RFC 0053's bound is taken on,
   and not a below-checkpoint figure), the
   retain floor with its lag and `Incomplete` state, and the rotation-failure
@@ -587,7 +654,11 @@ So the design is:
   admission sail past the bound — the one place a best-effort number is
   unacceptable. The unreclaimed-byte figure is maintained incrementally from
   appends and unlinks, as the WAL already does for `unflushed_bytes`, and
-  `disk_bytes` stays what it is: a diagnostic. `unflushed_bytes` stays its own method: the
+  `disk_bytes` stays what it is: a diagnostic. The figure is **seeded at
+  `Wal::open`** from the size of every surviving `*.wal` the open already
+  lists — not only the newest segment it opens — before any append is
+  admitted, so a restart mid-outage resumes from the true backlog rather than
+  from zero. `unflushed_bytes` stays its own method: the
   group-commit coordinator reads it per batch and must not allocate a
   snapshot struct on that path.
 
@@ -727,17 +798,22 @@ memory, and nothing here claims to.
 > - **When** a later `append` arrives after the condition clears
 > - **Then** rotation is retried, succeeds, and the append is accepted
 >   and acked
-> - **And** no file a subsequent `Wal::open` would select as a segment
->   remains from the failed attempt — asserted by opening the WAL again,
->   not by inspecting the directory, since the temporary name is an
->   implementation detail
+> - **And** when the failure was **before the rename**, no file a subsequent
+>   `Wal::open` would select as a segment remains from the failed attempt —
+>   asserted by opening the WAL again, not by inspecting the directory, since
+>   the temporary name is an implementation detail
+> - **And** when the failure was the **post-rename directory fsync**, the
+>   installed segment is selected by a subsequent open — it is complete and
+>   valid — and the first `sync` after open discharges its pending directory
+>   fsync
 > - **And** the temporary files left by the failed attempts are gone after a
 >   housekeeping pass, so a persistently retrying node cannot fill its disk
 >   with retry debris
 
 > **Scenario RFC0052.5 — A persistent rotation failure gives up
 > distinguishably, and never acks**
-> - **Given** a WAL whose rotation fails on every attempt
+> - **Given** a WAL whose rotation fails on every attempt — in `rotate`
+>   itself, or in the directory-fsync discharge that `sync` retries
 > - **When** appends continue past the bounded retry count
 > - **Then** every append is refused, no batch is acknowledged, and the
 >   refusal is reported as the terminal state rather than as a transient
@@ -756,8 +832,9 @@ memory, and nothing here claims to.
 > - **Then** it still reports `OpenError::Corrupt` rather than unlinking
 >   anything — §3.3 withdrew the shape-based heuristic, because an unreadable
 >   newest segment is indistinguishable from real corruption
-> - **And** the error names the file and identifies it as the known
->   rotation-remnant shape, so an operator can remove it deliberately
+> - **And** the error names the file, describes the observable shape and
+>   names a failed rotation as one possible cause without asserting it, so
+>   an operator can decide deliberately
 > - **And** a node whose rotations all happened under this RFC cannot reach
 >   that state at all, so the population is finite and shrinking
 
@@ -812,6 +889,10 @@ memory, and nothing here claims to.
 >   finished its sink emit, under any interleaving
 > - **And** the mark used is the one read after the quiesce under the same
 >   exclusion, not one read before either
+> - **And** that mark is a turn's own frame offset, never the sync's reported
+>   EOF, so a later frame acked on the same flush but not yet mined is never
+>   covered — asserted by a flush whose sync covers two turns and a barrier
+>   between them
 
 > **Scenario RFC0052.13 — An incomplete tenant floor cannot be read as
 > unbounded**

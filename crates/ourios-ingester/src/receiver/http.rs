@@ -10,11 +10,13 @@
 //! / encoding → 415, malformed body → 400, oversize → 413, an
 //! unconfigured path → 404, tenant-resolution failure → 400. No panics.
 //!
-//! Every **handler-owned** error carries a `google.rpc.Status` body in the
-//! request's wire format, which the OTLP spec requires of all 4xx/5xx
-//! responses — including the oversize rejection `DefaultBodyLimit` raises
-//! before this handler's body exists, which is why the handler takes the
-//! extractor's rejection rather than `Bytes`. See `error_response`.
+//! Every **handler-owned** error carries a binary protobuf `google.rpc.Status`
+//! body with `application/x-protobuf`, whatever the request's encoding — the
+//! OTLP spec requires a `Status` on all 4xx/5xx responses and the Collector's
+//! exporter decodes it as protobuf regardless of `Content-Type`. That includes
+//! the oversize rejection `DefaultBodyLimit` raises before this handler's body
+//! exists, which is why the handler takes the extractor's rejection rather
+//! than `Bytes`. See `error_response`.
 //!
 //! Two classes remain empty-bodied, and so still non-conformant: axum's
 //! router-generated 404/405, and `AuthLayer`'s 401/503. The layer's opacity is

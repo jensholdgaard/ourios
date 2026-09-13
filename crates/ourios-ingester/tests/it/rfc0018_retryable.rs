@@ -92,8 +92,9 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
 /// Scenario RFC0018.3 (HTTP) — a transient WAL failure is `503`
 /// (retryable); a permanent tenant failure is `400`.
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
-/// The ingest arm end to end: the 503 carries a `Status` naming the failure
-/// in the request's format (#791 was eight hours of an empty 503).
+/// The ingest arm end to end: the 503 carries a binary protobuf `Status`
+/// naming the failure, whatever the request's encoding (#791 was eight hours
+/// of an empty 503).
 #[tokio::test]
 async fn rfc0018_3_http_503_carries_a_status_naming_the_failure() {
     let (status, body) = send(

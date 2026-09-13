@@ -137,11 +137,16 @@ rotation adds one, the coordinator cannot know whether an append will rotate,
 and the overhead is bounded by the segment count rather than by the outage — so
 the on-disk total exceeds the bound by at most one header per segment, and
 never by an amount that grows while the store is down. **It survives a restart
-by being rebuilt, not persisted.** At `Wal::open` it is initialised from the
-on-disk sizes of every surviving segment, closed and current, before any append
-is admitted — the walk recovery already makes, not the best-effort `disk_bytes`
-one — so a node restarted mid-outage resumes refusing at the same bound rather
-than admitting from zero. RFC0053.4's restart asserts that.
+by being rebuilt, not persisted, in the same unit.** Once replay and heal
+have settled the newest segment's tail — a torn frame there is truncated by
+heal and must not be counted — the figure is initialised as the sum over
+every surviving segment, closed and current, of its file size **less the
+24-byte segment header**, so the rebuilt number is frame bytes like the live
+one and matches what the reservation adds to it. That walk is the one
+recovery already makes, not the best-effort `disk_bytes` one, and it
+completes before any append is admitted, so a node restarted mid-outage
+resumes refusing at the same bound rather than admitting from zero.
+RFC0053.4's restart asserts that. (RFC 0052 §3.7 describes the same seed.)
 
 The age of the oldest unreclaimed frame is exported beside it (RFC 0052 §3.5)
 and is the right thing to *alert* on, but it is not an admission rule: an age
@@ -222,11 +227,20 @@ nothing reclaimable, the bound never clears, and no append will ever arrive to
 roll the segment. A livelock built out of two individually-correct rules.
 
 So the timer, holding the barrier exclusion RFC 0052 §3.1 gives it,
-**rotates** when the bound is crossed and the current segment is the only
-thing holding unreclaimed bytes. Rotation is a WAL operation rather than an
-append, so backpressure does not block it; the segment closes, the next pass
-can reclaim it, and the state clears. Nothing is acked by that rotation, so
-the no-ack-on-refusal property is untouched.
+**rotates** when the bound is crossed, the pass it has just run unlinked
+nothing, and the current segment holds at least one frame. That last
+condition needs a state surface the inherited `ReclaimState` lacks —
+`unflushed_bytes` resets on every sync, so it cannot tell a synced current
+segment from an empty one — and this RFC adds one field to it:
+`current_segment_frame_bytes`, maintained by the same append accounting. No
+"current segment is the only holder" predicate is needed: rotating a
+non-empty current segment while the bound is crossed and reclamation is
+stalled is harmless, happens at most once per pass, and is exactly the move
+that breaks the livelock when the current segment *is* the only holder.
+Rotation is a WAL operation rather than an append, so backpressure does not
+block it; the segment closes, the next pass can reclaim it, and the state
+clears. Nothing is acked by that rotation, so the no-ack-on-refusal property
+is untouched.
 
 That needs an owner, because today `Wal::rotate` is private and is reached
 only from `append`. `Journal` gains `fn rotate(&mut self) -> Result<(),
@@ -278,7 +292,13 @@ same rows, in the same process. Recovery's replay suppression is a
 restart-time mechanism over WAL frames and never sees this. This RFC accepts
 it, bounded and counted: at most one extra object per panic, visible through
 the `cadence_panic` counter beside the flushed-partition counters, and
-asserted by RFC0053.2. Making the publish idempotent — a drain-time object
+asserted by RFC0053.2. The bound holds only because settlement is
+**per partition**, stated below: a drained batch spans several record
+partitions and audit groups, and requeueing the whole batch after a panic in
+the third put would duplicate the two objects already accepted. So each
+consuming call removes a partition from the recoverable batch the moment its
+put has returned, and an unwind requeues only the partition in flight and the
+ones not yet started — one ambiguous put, hence one possible duplicate. Making the publish idempotent — a drain-time object
 key a requeued batch reuses — is a §7 question rather than part of this
 design, because a requeued batch is re-drained together with whatever arrived
 since and the key would have to survive that merge.
@@ -297,7 +317,8 @@ that is where the store I/O and encoding live.
 
 So the requirement lands on the consuming calls, not on their caller: each
 takes the batch in a form that leaves ownership recoverable on unwind — `&mut
-Vec` drained only on success, or an owned handle the callee itself guards — so
+Vec` from which each partition is removed as its put returns, or an owned
+handle the callee itself guards and settles per partition — so
 that after any panic the batch is still reachable and requeued. The
 caller-side guard remains, covering the between-write points. What the design
 requires is that **no** panic arm anywhere in the sequence can drop an
@@ -408,8 +429,13 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **When** the unwind completes
 > - **Then** the drained records are back in their buffer
 > - **And** the drained audit events are back in theirs whenever the audit
->   write had not completed; after it has, they are durable and are **not**
->   requeued, so a later panic does not duplicate them
+>   write had not completed; after it has returned `true` they are settled —
+>   durable, or dropped under the sink's own permanent-failure policy — and
+>   are **not** requeued, so a later panic neither duplicates nor resurrects
+>   them
+> - **And** a panic in the third of several partition puts requeues only the
+>   third and any not yet started; the two accepted objects are not written
+>   again
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
@@ -467,8 +493,11 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   case, the barrier refuses to stamp, and a later healthy barrier publishes.
   Parameterising the panic point is the whole test: the partial-move shape
   means a guard that only covers the last point passes a single-point test.
-  RFC0053.3 drives many consecutive panicking ticks and asserts the record
-  count is conserved.
+  The point is also parameterised **across partitions** — a drained batch of
+  several partitions with the panic in the first, a middle and the last put —
+  asserting the accepted objects are not written again and the store holds
+  at most one duplicate. RFC0053.3 drives many consecutive panicking ticks
+  and asserts the record count is conserved.
 - **No loss (RFC0053.4)** — extends RFC 0052's `SIGKILL` crash-recovery
   extension rather than adding a parallel one, with a small backpressure
   bound configured so the kill lands in the refusing regime, and a

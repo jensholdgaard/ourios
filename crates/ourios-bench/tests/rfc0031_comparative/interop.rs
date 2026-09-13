@@ -266,9 +266,12 @@ async fn poll_until_both_services_indexed(
 /// exactly `trace_id` and `span_id`. This guard holds whatever the payload
 /// contains, which is why it is asserted against the effective configuration.
 ///
-/// Unreachable from the container test today, because set-equality fails first
-/// on the current config; `denylist_disjointness_is_not_vacuous` is what proves
-/// it live.
+/// Reached on every container run and passing there — what it cannot do from a
+/// container is **fail**. Tripping it needs Loki's own promotion list to contain
+/// a denied name, which only a different image or config could produce; adding
+/// one to `LOKI_LABEL_ALLOWLIST` alone trips set-equality first, several lines
+/// earlier. So `denylist_disjointness_is_not_vacuous` is what proves the guard
+/// can fail at all.
 fn assert_denylist_disjoint_from_promotion(effective: &[String]) {
     for forbidden in LOKI_LABEL_DENYLIST {
         assert!(
@@ -281,9 +284,13 @@ fn assert_denylist_disjoint_from_promotion(effective: &[String]) {
 }
 
 /// The guard above fires on a promotion list that contains a denied name, and
-/// passes on one that does not. A plain test rather than a container one: the
-/// case it defends cannot be produced by the current Loki config, so without
-/// this the guard would be unfalsifiable.
+/// passes on one that does not.
+///
+/// A plain test rather than a container one because the failing case cannot be
+/// produced by any Loki this repo pins — it would take an image whose own
+/// promotion list names `trace_id` or a template id. Without this the guard
+/// would be unfalsifiable: reached on every run, never able to fail, and
+/// indistinguishable from one that cannot.
 #[test]
 fn denylist_disjointness_is_not_vacuous() {
     let clean: Vec<String> = ["service_name", "k8s_pod_name"]

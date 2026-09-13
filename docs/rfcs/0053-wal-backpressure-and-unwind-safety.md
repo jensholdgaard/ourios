@@ -89,8 +89,17 @@ batch was not acked — RFC 0018 §3.2's reasoning — and a distinct outcome
 rather than reusing `Unavailable` because the remedy differs: waiting genuinely
 helps here.
 
+The wire shape is stated, because an empty body is how #791 hid for eight
+hours. On HTTP the rejection is the `google.rpc.Status` body the OTLP spec
+requires and #794 established — protobuf or JSON, mirroring the request's
+`Content-Type`, with the message naming the limit and the measurement — and
+`Retry-After` is a response header. On gRPC it is the `Status` message plus a
+`RetryInfo` detail carrying the same delay. A bare status code with no body,
+which is what the HTTP arm returned before #794, does not satisfy this
+contract, and RFC0053.1 asserts the body on both transports.
+
 **`Retry-After` is the reclamation interval, not a function of the limit.**
-A byte or age bound yields no delta-seconds value, and a client cannot
+A byte bound yields no delta-seconds value, and a client cannot
 implement against it. What the server actually knows is *when it will next
 try to reclaim* — `housekeeping_secs`, RFC 0052 §3.2's cadence — so that is the
 advertised delay in seconds, and a client honouring it arrives just after the
@@ -104,16 +113,23 @@ specifies for the backpressure case. Whether that makes RFC 0018 §3.2's
 `RESOURCE_EXHAUSTED`-with-`RetryInfo` option the better code here is a §7
 question, not one this RFC settles.
 
-**The bound is over ALL unreclaimed bytes and the age of the oldest
-unreclaimed frame — not over bytes retained below the checkpoint.** During
-the outage this is meant to bound, the checkpoint is precisely what stops
-advancing, so new frames pile up *above* it: a below-checkpoint limit would
-measure the one quantity that is not growing and never fire. "Unreclaimed"
-therefore means every byte housekeeping has not removed, including the
-post-checkpoint tail, the current append segment and anything the tenant
-floor is retaining. RFC 0052 §3.7's `ReclaimState` carries exactly this
-figure, maintained incrementally rather than from the best-effort
-`disk_bytes` walk, for the reason given there.
+**The bound is a byte bound over ALL unreclaimed bytes — not over bytes
+retained below the checkpoint, and not an age.** During the outage this is
+meant to bound, the checkpoint is precisely what stops advancing, so new
+frames pile up *above* it: a below-checkpoint limit would measure the one
+quantity that is not growing and never fire. "Unreclaimed" therefore means
+every byte housekeeping has not removed, including the post-checkpoint tail,
+the current append segment and anything the tenant floor is retaining. RFC
+0052 §3.7's `ReclaimState` carries exactly this figure, maintained
+incrementally rather than from the best-effort `disk_bytes` walk, for the
+reason given there.
+
+The age of the oldest unreclaimed frame is exported beside it (RFC 0052 §3.5)
+and is the right thing to *alert* on, but it is not an admission rule: an age
+does not grow with an append, so an age limit could only fire from the timer,
+which makes it a state flip with different clearing semantics rather than a
+reservation. An earlier draft left "bytes, age, or both" open; this one is
+byte-only, and an age-driven refusal, if ever wanted, is a separate decision.
 
 **The check is a pre-append reservation, not a post-append test — and it has
 an owner.** The commit coordinator appends under the journal mutex before
@@ -135,12 +151,15 @@ responsibility because the caller is what holds the mutex.
   job is durability. `Journal` reports the *measurement*; the coordinator owns
   the *threshold*. That also keeps the limit configurable without widening the
   trait.
-- **The frame size is the coordinator's too, and it already computes it.** The
-  reservation compares `reclaim_state()`'s unreclaimed bytes plus this batch's
-  encoded frame length against the limit, using the same length `append_batch`
-  is about to write — so no separate estimate, and no chance of an estimate
-  disagreeing with the write. An oversize batch still fails as `TooLarge`
-  first, since that check precedes admission.
+- **The frame length comes from the journal, not from `payload.len()`.** The
+  coordinator sees only the encoded payload; `Wal::append` prepends a
+  12-byte frame header before it accounts the bytes, so a reservation taken
+  on the payload length alone under-reserves by the header on every batch.
+  `Journal` therefore gains `fn framed_len(&self, payload_len: usize) -> u64`,
+  and the WAL's own append accounting is rewritten to call the same function,
+  so the reservation and the write cannot disagree and a test double reports
+  the same number the real WAL would. An oversize batch still fails as
+  `TooLarge` first, since that check precedes admission.
 
 There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
@@ -172,6 +191,17 @@ thing holding unreclaimed bytes. Rotation is a WAL operation rather than an
 append, so backpressure does not block it; the segment closes, the next pass
 can reclaim it, and the state clears. Nothing is acked by that rotation, so
 the no-ack-on-refusal property is untouched.
+
+That needs an owner, because today `Wal::rotate` is private and is reached
+only from `append`. `Journal` gains `fn rotate(&mut self) -> Result<(),
+ReclaimError>`: it closes the current segment and opens a fresh one through
+the same retried path RFC 0052 §3.3 specifies for an append-driven rotation,
+so a failure enters the same bounded-retry state and the same terminal state,
+reported the same way; it is a no-op returning `Ok` when the current segment
+holds no frames, so a timer that calls it unconditionally cannot manufacture
+empty segments. The timer reaches it through the coordinator's journal mutex,
+exactly as RFC 0052 §3.7 routes `checkpoint` and `housekeeping`, so the
+single-writer position still has one owner.
 
 A second way the state can persist, which is *not* a deadlock and is handled
 differently: a stale tenant floor holds `min(checkpoint, floor)` down, so
@@ -218,6 +248,17 @@ caller-side guard remains, covering the between-write points. What the design
 requires is that **no** panic arm anywhere in the sequence can drop an
 un-requeued batch; a `Drop` impl at one level cannot deliver that alone, and
 neither can a `catch_unwind` at one call site.
+
+**What is requeued depends on where the panic lands.** The audit events are
+requeued only while the audit write has not completed; once `write_owned` has
+returned true they are durable in the audit store, and a later panic inside
+the record publish requeues the records alone. Requeueing durable audit
+events would manufacture a duplicate the policy tolerates but does not seek,
+and the ordering barrier does not need it: the next flush skips the record
+publish only when the audit sink has *undrained* events, which after a
+completed audit write it does not. So the recoverable audit handle need only
+live until that call returns; the recoverable record handle must live until
+the record publish returns.
 
 With that settled, the age sweep can survive a panic and keep sweeping. #795
 deliberately stops, because without this it would repeat the loss every tick;
@@ -280,6 +321,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   is refused with a reason naming the limit, and a `Retry-After` equal to
 >   the reclamation cadence — **not** a value derived from the limit, which
 >   yields no delta-seconds
+> - **And** on HTTP the reason is a `google.rpc.Status` body in the request's
+>   format with `Retry-After` as a header, and on gRPC a `Status` message
+>   with a `RetryInfo` detail — a bare status code with an empty body fails
+>   this scenario
 > - **And** the refused batch is **not present in the WAL** — asserted by
 >   replaying after a restart, so a post-append check that left the frame
 >   behind fails here
@@ -298,7 +343,10 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **Given** a cadence step whose publish panics after the batches have been
 >   drained out of the sink
 > - **When** the unwind completes
-> - **Then** the drained records and audit events are back in their buffers
+> - **Then** the drained records are back in their buffer
+> - **And** the drained audit events are back in theirs whenever the audit
+>   write had not completed; after it has, they are durable and are **not**
+>   requeued, so a later panic does not duplicate them
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
@@ -347,20 +395,27 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   extension rather than adding a parallel one, with a small backpressure
   bound configured so the kill lands in the refusing regime.
 
-Validation: this RFC reaches `validated` when RFC0053.1's resume legs and
-RFC0053.4 pass in CI, since those demonstrate the second half of the incident
-cannot recur.
+Maturity, per `docs/rfcs/README.md`: `green` is RFC0053.1–.4 all passing in
+CI, and this RFC touches no thesis gate in `docs/benchmarks.md` §7. It does
+**not** proceed to `validated` on those alone: §4 records that the sinks can
+exhaust memory before the WAL bound fires, so a green run could mark a bound
+validated that is never the operative limit. `validated` therefore also
+requires the §7 sink decision to have landed and RFC0053.1's
+unreachable-store leg, run under default configuration for long enough to
+show the WAL bound refusing **before** either sink exceeds its ceiling. Until
+that decision lands the RFC stops at `green`, and says so.
 
 ## 7. Open questions
 
-- [ ] The backpressure bound's default. A bytes limit, an age limit, or both?
-      The incident node held 42 MB over five days, so a default tuned for it
-      would be far too small for a busy node; the honest default may be a
-      fraction of the volume rather than an absolute.
+- [ ] The byte bound's default size. The incident node held 42 MB over five
+      days, so a default tuned for it would be far too small for a busy node;
+      the honest default may be a fraction of the volume rather than an
+      absolute.
 - [ ] What a full record or audit sink should do during an outage: block,
       spill, or drop. §4 states that §3.1's disk bound is only the operative
       limit once memory growth is separately bounded, and that question is not
-      answered here. It may need to land *before* this RFC to be meaningful.
+      answered here. §6 makes it a gate on `validated`, so it must land
+      before this RFC can be more than `green`.
 - [ ] Whether a stale tenant floor blocking reclamation indefinitely should
       itself escalate (a second, louder state) or stay a visible metric an
       operator alerts on. §3.1 makes it visible; it does not decide.

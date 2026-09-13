@@ -249,6 +249,21 @@ valid snapshot.** There is no horizon to include in the minimum, so the
 minimum is undefined, and guessing it either way is unsafe. `None` is passed
 only where no snapshot consumer exists at all.
 
+**And the floor may only be derived from snapshots known to be durable.**
+`snapshot_store::write` renames the new snapshot into place *before* its
+parent-directory fsync, so a failure there leaves the file visible to this
+process while the write returned an error. A floor derived by listing `.snap`
+files would then trust a horizon that may not survive a crash, and housekeeping
+would unlink segments on the strength of it — losing exactly the frames the
+floor exists to retain.
+
+So the derivation uses the in-memory record of snapshots whose write returned
+`Ok`, not the directory contents. A tenant whose snapshot write failed counts as
+`Incomplete`, which per the rule above reclaims nothing — conservative, and
+self-correcting on the next successful write. Reading the directory is
+legitimate only at startup, before anything has been reclaimed in this
+process's lifetime.
+
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` truncates below `min(checkpoint, floor)`, so a stale floor
 makes truncation conservative — it retains frames a snapshot has not
@@ -263,12 +278,18 @@ same ownership path as rotation rather than concurrently with it.
 A quiesce must stop being permanent. The four sites are not equally
 retryable, and the design treats them by what they leave behind:
 
-| Site | Failure | State left behind | Retryable |
+| Site | Failure | State left behind | Retry |
 |---|---|---|---|
-| closing-segment `fdatasync` | `sync_file_data` | nothing new; current segment unchanged | yes, directly |
-| create fresh segment | `create_fresh_segment` | possibly a partial file | yes, after unlinking the partial |
-| fresh-segment header `fsync` | `sync_file_data` | a fresh segment with a possibly-torn header | yes, after unlinking it |
-| parent-dir `fsync` | `sync_parent_dir` | a fresh segment with a durable header, no durable entry | yes, after unlinking it |
+| closing-segment `fdatasync` | `sync_file_data` | nothing new; current segment unchanged | directly |
+| create fresh segment | `create_fresh_segment` | at most a `.wal.partial`, never a segment | directly; the partial is swept |
+| fresh-segment header `fsync` | `sync_file_data` | a `.wal.partial` with possibly-torn bytes | directly; the partial is swept |
+| parent-dir `fsync` (post-rename) | `sync_parent_dir` | a **complete, installed** segment whose entry may not be durable | re-fsync it; **never unlink** |
+
+The last row is the one to read carefully. Because the rename happens before
+that fsync and the install happens before it too, there is no orphan to clean up
+there — the file is the live append target. Unlinking it would destroy the
+segment the WAL is currently writing to. The retry is the directory fsync alone,
+carried by `dir_fsync_pending`.
 
 The orphan is why the current code quiesces rather than retrying, and the
 existing comment says so: a surviving directory entry whose header bytes
@@ -435,11 +456,25 @@ variant carrying the limit that
 was hit and the measurement that crossed it; `IngestFailure::classify` maps it
 to a new `Backpressure` outcome, which that exhaustive match then forces both
 transports to handle; both render `503` / `UNAVAILABLE` with the limit named
-in the `Status` message and a `Retry-After` derived from the limit rather than
-#794's fixed second. `503` because the batch was not acked — the same
+in the `Status` message. `503` because the batch was not acked — the same
 reasoning as `Wedged` — and a distinct outcome rather than reusing
-`Unavailable` because the remedy differs: waiting genuinely helps here, which
-is what `Retry-After` is for.
+`Unavailable` because the remedy differs: waiting genuinely helps here.
+
+**`Retry-After` is the reclamation interval, not a function of the limit.**
+"Derived from the limit" was not a contract: a byte or age bound yields no
+delta-seconds value, and a client cannot implement against it. What the server
+actually knows is *when it will next try to reclaim* — `housekeeping_secs`, the
+§3.2 cadence — so that is the advertised delay in seconds, and a client
+honouring it arrives just after the next pass. Nothing finer would be honest,
+because whether that pass frees enough depends on the store and the tenant
+floor; a backoff estimator would be inventing a prediction the server cannot
+make.
+
+gRPC carries the same number as a `RetryInfo` detail, which is what
+[OTLP's throttling section](https://opentelemetry.io/docs/specs/otlp/#otlpgrpc-throttling)
+specifies for the backpressure case. Whether that makes RFC 0018 §3.2's
+`RESOURCE_EXHAUSTED`-with-`RetryInfo` option the better code here is a §7
+question, not one this RFC settles.
 
 **The bound is over ALL unreclaimed bytes and the age of the oldest
 unreclaimed frame — not over bytes retained below the checkpoint.** During
@@ -457,12 +492,27 @@ supposedly-rejected batch sitting in the WAL, and a client retrying on the
 rejection would have it replayed or published twice.
 
 The check therefore lives in `CommitCoordinator`, **inside the same journal
-mutex acquisition that performs the append**, reading the bound from
+mutex acquisition that performs the append**, reading the measurement from
 `Journal::reclaim_state()` (§3.7) immediately before calling `append_batch`.
 Not in the receiver and not in a layer above: anywhere outside that mutex races
 concurrent appends, so two batches could each observe room and both be written.
 `append_batch` itself is unchanged — the reservation is the caller's
 responsibility because the caller is what holds the mutex.
+
+Two pieces of state that the draft left homeless:
+
+- **The limit is the coordinator's, not the WAL's.** `CommitCoordinator::new`
+  takes it alongside the batch window and segment size it already receives, so
+  it sits with the other admission policy rather than inside a journal whose job
+  is durability. `Journal` reports the *measurement*; the coordinator owns the
+  *threshold*. That also keeps the limit configurable without widening the
+  trait.
+- **The frame size is the coordinator's too, and it already computes it.** The
+  reservation compares `reclaim_state()`'s unreclaimed bytes plus this batch's
+  encoded frame length against the limit, using the same length `append_batch`
+  is about to write — so no separate estimate, and no chance of an estimate
+  disagreeing with the write. An oversize batch still fails as `TooLarge`
+  first, since that check precedes admission.
 
 There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
@@ -499,13 +549,25 @@ internally, for the fsync-batching decision. So "the WAL stopped
 growing" — the incident's one observable symptom — was unobservable even
 though the numbers existed in memory.
 
-This RFC exports the existing three, adds the reclamation and
-rotation-health state (a quiesce/retry state and the bytes and age held
-below the checkpoint), and emits a log event on entering and leaving a
-refusing state. Names come from the shared `ourios-semconv` registry in
-one bump, not hand-written, and `error.type` continues to carry the
-failure class on existing counters rather than spawning per-error
-metrics.
+This RFC exports the existing three and adds the state the other sections
+actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
+
+- **unreclaimed bytes and the age of the oldest unreclaimed frame** — the two
+  quantities §3.4's bound is measured on, so "all unreclaimed" including the
+  post-checkpoint tail, the current segment and anything the floor retains. An
+  earlier draft said "below the checkpoint", which would have exported the one
+  number that does not grow during an outage while the bound watched another;
+- **the retain floor and its lag**, including whether it is
+  `RetainFloor::Incomplete` — without which RFC0052.13's "an operator can tell a
+  lagging tenant from an unexplained refusal" is not achievable, since that is
+  the case where backpressure persists with a healthy store;
+- **the rotation-failure state**: retrying, with its attempt count, versus
+  terminal.
+
+A log event is emitted on entering and on leaving a refusing state. Names come
+from the shared `ourios-semconv` registry in one bump, not hand-written, and
+`error.type` continues to carry the failure class on existing counters rather
+than spawning per-error metrics.
 
 ### 3.6 Requeue on unwind
 

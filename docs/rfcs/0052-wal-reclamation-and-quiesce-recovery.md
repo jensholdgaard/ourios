@@ -193,10 +193,14 @@ miner lock alone today, so a sweep could begin after the timer's quiesce and
 before its stamp, leaving a drained-but-undurable batch outside the buffers
 that the barrier then reads as empty; `quiesce_publishes` waits only for a
 sweep already in flight and prevents no new drain. The sweep's
-drain-and-publish step therefore takes the exclusion in shared mode and the
-timer takes it exclusively: no sweep starts inside the barrier, and one in
-flight completes before it. That subsumes `quiesce_publishes` rather than
-relying on it.
+drain therefore takes the exclusion in shared mode — held only across the
+drain and the in-flight registration, and released *before* the off-lock
+publish, whose PUTs can block on the store — and the timer takes it
+exclusively: no sweep drains inside the barrier, a drain in progress
+completes before it, and `quiesce_publishes` then waits for the publishes
+already registered. A slow or unavailable store stalls ingest for the length
+of a drain, never of a PUT, which is the WAL-local durability this RFC
+exists to preserve.
 
 The mark is then read inside that turn and after the quiesce — `last_durable()`
 at that point, the offset the receiver's acks are gated on — so no frame above
@@ -251,6 +255,18 @@ reimplemented:
 - **Skip-on-retain** — when either sink retains anything,
   `flush_then_snapshot` returns `false` and no checkpoint is attempted.
   The WAL keeps the frames and the next start re-mines them.
+
+**A cadence panic latches the barrier until RFC 0053.** #795 stops the age
+sweep after a panic, which was a safe interim only while nothing else could
+stamp: this RFC's timer can, and after a panic inside `write_ordered` the
+drained batches are gone and the publish guard has dropped, so a timer
+barrier would see empty buffers and no in-flight publish and stamp past
+records that never reached Parquet. So a cadence-step panic sets a
+`cadence_failed` latch; while it is set the barrier neither checkpoints nor
+snapshots — the frames stay in the WAL and a restart replays them — the
+state is exported (RFC0052.7) and only a restart clears it. RFC 0053's
+requeue-on-unwind is what removes the latch, by making the panic lose
+nothing to stamp past.
 
 A snapshot *write* failure is deliberately not a checkpoint blocker:
 `flush_then_snapshot` logs it and still returns `true`, because the data
@@ -311,21 +327,28 @@ That detector's no-false-positive property *depends* on the minimum, so the
 earlier draft's "latest" wording would have broken stale-gap detection as
 well as losing data.
 
-**Reclamation is skipped entirely while any tenant with WAL data has no
-valid snapshot.** There is no horizon to include in the minimum, so the
-minimum is undefined, and guessing it either way is unsafe. `None` is passed
-only where no snapshot consumer exists at all.
+**A tenant with WAL data and no valid snapshot pins the floor at its oldest
+surviving frame.** It does not halt reclamation outright — an earlier draft
+said "reclaim nothing", and with shared segments and tenant churn that is a
+permanent halt: a tenant that wrote once and whose snapshot never landed
+would block every other tenant forever. What hazard #5 actually requires is
+that *that tenant's* frames survive, since with no snapshot a restart must
+re-mine all of them. So the tenant contributes its oldest surviving frame
+offset to the minimum: everything of its own is retained, while segments
+below that offset — which hold only other tenants' covered frames — are
+reclaimed. The pin lifts the moment a valid snapshot for the tenant is
+written, since its horizon then replaces the pin. `None` is passed only
+where no snapshot consumer exists at all.
 
-Deriving `Incomplete` needs a ledger the recovery model does not keep:
-`recover` returns entries only for tenants that *have* a `.snap`, and nothing
-records which tenants the WAL holds, so an empty or partial snapshot set is
-indistinguishable from "no consumer" and would read as `None`. The floor
-derivation therefore keeps a per-tenant ledger of its own — tenants seen in
-WAL frames, from replay and from every live append, against tenants with a
-durable, decodable snapshot — and whenever a snapshot consumer is configured,
-a tenant present in the first set and absent from the second yields
-`Incomplete`. `None` comes only from the absence of a consumer, never from
-the absence of snapshots.
+Membership is per surviving segment, so the ledger has a lifecycle. Each
+segment carries the set of tenants with a frame in it — rebuilt at open from
+the recovery walk, maintained on every live append — and a tenant's oldest
+surviving frame is in its oldest surviving segment. A tenant leaves the
+ledger when its last surviving segment is unlinked, which can only happen
+once its snapshot horizon has passed those frames; nothing else removes it,
+and nothing needs to. `recover` returns entries only for tenants that *have*
+a `.snap`, so without this ledger an empty or partial snapshot set would be
+indistinguishable from "no consumer" and read as `None`.
 
 **And the floor may only be derived from snapshots known to be durable.**
 `snapshot_store::write` renames the new snapshot into place *before* its
@@ -336,8 +359,9 @@ would unlink segments on the strength of it — losing exactly the frames the
 floor exists to retain.
 
 So the derivation uses the in-memory record of snapshots whose write returned
-`Ok`, not the directory contents. A tenant whose snapshot write failed counts as
-`Incomplete`, which per the rule above reclaims nothing — conservative, and
+`Ok`, not the directory contents. A tenant whose snapshot write failed keeps
+its *previous* durable horizon if it has one and otherwise pins the floor at
+its oldest surviving frame, per the rule above — conservative, and
 self-correcting on the next successful write. Reading the directory is
 legitimate only at startup, before anything has been reclaimed in this
 process's lifetime — and even then only after one more step.
@@ -350,15 +374,15 @@ to a restarted process, which would load it as a horizon, reclaim on the
 strength of it, and lose the frames when a later machine crash drops the
 never-durable entry. So before any listed `.snap` is used as a horizon the
 snapshots root is fsynced once, which makes every entry the listing saw
-durable — the one property the listing lacks. If that fsync fails the floor
-is `Incomplete` and nothing is reclaimed until a later snapshot write
-succeeds. One directory fsync rather than a manifest, because a manifest
+durable — the one property the listing lacks. If that fsync fails every
+listed horizon is discarded, so each tenant with surviving frames pins the
+floor at its oldest surviving frame until a later snapshot write succeeds. One directory fsync rather than a manifest, because a manifest
 would need the same fsync to be trustworthy itself. Durability is necessary
 and not sufficient: `snapshot_store::load_all` returns raw bytes, and a
 horizon is admitted only from a snapshot that decodes and restores. A listed
-file that fails either counts as that tenant having no snapshot — hence
-`Incomplete` — rather than as a horizon, so a durable-but-invalid file can
-never authorise reclamation.
+file that fails either counts as that tenant having no snapshot — hence a
+pin at its oldest surviving frame — rather than as a horizon, so a
+durable-but-invalid file can never authorise reclamation.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` truncates below `min(checkpoint, floor)`, so a stale floor
@@ -609,7 +633,7 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   report a growing age. An earlier draft said "below the checkpoint", which would have
   exported the one number that does not grow during an outage;
 - **the retain floor and its lag**, including whether it is
-  `RetainFloor::Incomplete` — without which RFC0052.13's "an operator can tell a
+  `RetainFloor::Pinned` and by how many tenants — without which RFC0052.13's "an operator can tell a
   lagging tenant from an unexplained stall" is not achievable, since that is
   the case where reclamation stops with a healthy store;
 - **the rotation-failure state**: retrying, with its attempt count, versus
@@ -624,8 +648,8 @@ than spawning per-error metrics.
 
 The duplicate-versus-lose decision, the consuming-call ownership rule and
 the age-sweep survival that follows from them are RFC 0053 §3.2. They are
-deferred rather than dropped: the #795 stop-on-panic behaviour this RFC
-leaves in place is the safe interim, and it is what RFC 0053 replaces. The
+deferred rather than dropped: #795's stop-on-panic plus §3.1's
+`cadence_failed` latch is the safe interim, and it is what RFC 0053 replaces. The
 number is kept so the review history's section references still resolve.
 
 ### 3.7 Ownership and API surface
@@ -656,7 +680,9 @@ So the design is:
   enum RetainFloor {
       None,                  // no snapshot consumer exists: checkpoint alone governs
       Min(WalOffset),        // the minimum over every tenant's horizon
-      Incomplete,            // a consumer exists but some tenant has no snapshot
+      Pinned { offset: WalOffset, tenants: usize },
+                             // some tenant has no valid snapshot: the minimum
+                             // includes its oldest surviving frame
   }
 
   fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, AppendError>
@@ -678,13 +704,13 @@ So the design is:
   offset per append. An implementation that kept storing the EOF fails
   RFC0052.14's two-turn flush, which is what that criterion is for.
 
-  `RetainFloor` exists because `Option<WalOffset>` cannot distinguish the two
-  cases §3.2 requires: `None` means no snapshot consumer exists and the
-  checkpoint alone governs, which is *safe to reclaim*, while `Incomplete`
-  means a consumer exists but a tenant has no valid snapshot, which must
-  reclaim **nothing**. An `Option` makes the unsafe reading — treating
-  "incomplete" as "unbounded" — expressible, and a signature that can express
-  the data-losing case is the wrong signature.
+  `RetainFloor` exists because `Option<WalOffset>` cannot carry what §3.2
+  requires: `None` means no snapshot consumer exists and the checkpoint
+  alone governs, which is *safe to reclaim*; `Min` is the complete case;
+  `Pinned` says the minimum is being held down by tenants without a valid
+  snapshot, at their oldest surviving frames, which is *correct but must be
+  visible*. An `Option` collapses the last two, and a signature that hides
+  the pinned case is the wrong signature.
 
   `max_unlinks` is a parameter rather than WAL configuration because the cap
   belongs to the caller's stall budget, and `HousekeepingProgress` reports
@@ -700,7 +726,7 @@ So the design is:
   path the trait object has to it), **all unreclaimed bytes and the age of the oldest
   unreclaimed frame** (the bytes being what RFC 0053's bound is taken on,
   and not a below-checkpoint figure), the
-  retain floor with its lag and `Incomplete` state, and the rotation-failure
+  retain floor with its lag and `Pinned` state, and the rotation-failure
   state — so the server reads it without reaching past the trait.
 
   **`disk_bytes` is not reused for the admission measurement.** `WalMetrics`
@@ -829,6 +855,8 @@ memory, and nothing here claims to.
 > - **And** when either sink retains anything, no checkpoint is
 >   attempted and `last_checkpoint()` is unchanged
 > - **And** when the high-water mark is `None`, no checkpoint is attempted
+> - **And** while the `cadence_failed` latch is set, the barrier neither
+>   checkpoints nor snapshots, however many timer passes run
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -862,9 +890,9 @@ memory, and nothing here claims to.
 > - **Then** the WAL's on-disk byte total and segment count are bounded
 >   rather than monotonically increasing — the #793 signature (1,113
 >   segments, nothing ever unlinked) cannot reproduce
-> - **And** while the floor is `Incomplete` retention is unbounded by design
->   and the state is visible (RFC0052.13); a healthy store alone does not
->   bound the WAL, a complete floor does
+> - **And** while the floor is `Pinned` the pinning tenants' frames are
+>   retained by design and the state is visible (RFC0052.13); a healthy
+>   store alone does not bound the WAL, a complete floor does
 > - **And** an offered rate above that capacity grows the WAL by
 >   construction until RFC 0053's admission bound exists; this criterion
 >   claims no bound there
@@ -973,19 +1001,25 @@ memory, and nothing here claims to.
 >   covered — asserted by a flush whose sync covers two turns and a barrier
 >   between them
 
-> **Scenario RFC0052.13 — An incomplete tenant floor cannot be read as
-> unbounded**
+> **Scenario RFC0052.13 — A tenant without a snapshot pins the floor, and is
+> never read as unbounded**
 > - **Given** a snapshot consumer exists and one tenant with WAL data has no
 >   valid snapshot
 > - **When** housekeeping runs
-> - **Then** nothing is reclaimed, and this is distinguishable in the API from
->   the no-consumer case, which reclaims by checkpoint alone
+> - **Then** every frame of that tenant survives, segments below its oldest
+>   surviving frame that hold only other tenants' covered frames are
+>   reclaimed, and the floor is reported as `Pinned` — distinguishable in the
+>   API from the no-consumer case, which reclaims by checkpoint alone
+> - **And** once a valid snapshot for that tenant is written, the pin lifts
+>   and the next pass reclaims what it had held
+> - **And** a tenant leaves the ledger only when its last surviving segment
+>   is unlinked, so tenant churn cannot leave a permanent pin
 > - **And** a snapshot listed at startup is used as a horizon only after the
 >   snapshots root has been fsynced in this process; a failed startup fsync
->   yields `Incomplete`, so a horizon whose directory entry may not be durable
->   never governs reclamation
+>   pins every tenant at its oldest surviving frame, so a horizon whose
+>   directory entry may not be durable never governs reclamation
 > - **And** the state is exported (§3.5), so an operator seeing a WAL that
->   will not shrink can tell it is a lagging tenant rather than an
+>   will not shrink can tell it is a pinning tenant rather than an
 >   unexplained stall
 
 > **Scenario RFC0052.6 — moved to RFC 0053 as RFC0053.1 (backpressure).**
@@ -999,7 +1033,8 @@ memory, and nothing here claims to.
 >   unreclaimed bytes and the age of the oldest unreclaimed frame** (the
 >   bytes being what RFC 0053's bound is taken on, including the
 >   post-checkpoint tail), the retain floor with its
->   lag and `Incomplete` state, and the rotation-failure state are all present
+>   lag and `Pinned` state, the `cadence_failed` latch, and the
+>   rotation-failure state are all present
 >   in the exported stream under registry names
 > - **And** a run whose checkpoint never advances still reports growing
 >   unreclaimed bytes — exporting the below-checkpoint figure instead would
@@ -1089,15 +1124,17 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   terminal rotation state does not. Without that third assertion the test
   passes on a blanket removal of `Retry-After`, which would contradict
   RFC 0018 §3.2 rather than amend it.
-- **Floor completeness (RFC0052.13)** — unit tests over the three
-  `RetainFloor` cases, asserting the incomplete case reclaims nothing and is
-  not expressible as the no-consumer case. The type makes the unsafe reading
-  unrepresentable, so the test mostly guards the *derivation* of the floor
-  from per-tenant snapshots rather than `housekeeping` itself. The startup
-  leg uses a snapshots-root fixture whose directory fsync is made to fail
-  (the file-in-place-of-directory technique from the rotation tests, since
-  read-only permissions do not bind under root), asserting the derived floor
-  is `Incomplete` rather than the listed horizon.
+- **Floor pinning (RFC0052.13)** — unit tests over the three `RetainFloor`
+  cases, asserting a tenant without a snapshot pins the minimum at its oldest
+  surviving frame, that segments below it holding only covered frames are
+  reclaimed, that the pin lifts when its snapshot lands, and that the pinned
+  case is not expressible as the no-consumer case. A churn leg writes one
+  tenant once, snapshots it, and asserts it leaves the ledger when its last
+  segment is unlinked. The startup leg uses a snapshots-root fixture whose
+  directory fsync is made to fail (the file-in-place-of-directory technique
+  from the rotation tests, since read-only permissions do not bind under
+  root), asserting every tenant is pinned rather than any listed horizon
+  used.
 - **Timer exclusion (RFC0052.14)** — a seeded-interleaving test rather than a
   timing one: the window is narrow, and a wall-clock test that happens to pass
   proves nothing. Failing that, hold the timer artificially between quiesce and

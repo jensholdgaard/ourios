@@ -142,11 +142,13 @@ have settled the newest segment's tail — a torn frame there is truncated by
 heal and must not be counted — the figure is initialised as the sum over
 every surviving segment, closed and current, of its file size **less the
 24-byte segment header**, so the rebuilt number is frame bytes like the live
-one and matches what the reservation adds to it. That walk is the one
-recovery already makes, not the best-effort `disk_bytes` one, and it
-completes before any append is admitted, so a node restarted mid-outage
-resumes refusing at the same bound rather than admitting from zero.
-RFC0053.4's restart asserts that. (RFC 0052 §3.7 describes the same seed.)
+one and matches what the reservation adds to it. The hook is RFC 0052 §3.7's
+`Wal::remeasure_unreclaimed()`, called at the end of recovery's heal — not
+at `Wal::open`, which runs before heal and would count torn bytes — and the
+coordinator is constructed after recovery, so the seed completes before any
+append is admitted and a node restarted mid-outage resumes refusing at the
+same bound rather than admitting from zero. RFC0053.4's restart asserts
+that.
 
 The age of the oldest unreclaimed frame is exported beside it (RFC 0052 §3.5)
 and is the right thing to *alert* on, but it is not an admission rule: an age

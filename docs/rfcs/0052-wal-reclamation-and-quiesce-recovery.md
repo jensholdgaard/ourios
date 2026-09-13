@@ -655,10 +655,12 @@ So the design is:
   unacceptable. The unreclaimed-byte figure is maintained incrementally from
   appends and unlinks, as the WAL already does for `unflushed_bytes`, and
   `disk_bytes` stays what it is: a diagnostic. The figure is **seeded at
-  `Wal::open`** from the size of every surviving `*.wal` the open already
-  lists — not only the newest segment it opens — before any append is
-  admitted, so a restart mid-outage resumes from the true backlog rather than
-  from zero. `unflushed_bytes` stays its own method: the
+  `Wal::open`**, in frame bytes: once replay and heal have settled the newest
+  segment's tail, the sum over every surviving `*.wal` the open already
+  lists — not only the newest segment it opens — of file size less the
+  segment header, before any append is admitted, so a restart mid-outage
+  resumes from the true backlog rather than from zero. `unflushed_bytes`
+  stays its own method: the
   group-commit coordinator reads it per batch and must not allocate a
   snapshot struct on that path.
 

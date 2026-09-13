@@ -207,17 +207,49 @@ fn inject_probe_attributes(logs: &mut opentelemetry_proto::tonic::logs::v1::Logs
     }
 }
 
-/// Poll until Loki has indexed **both** services, returning the label names
-/// and `service_name`'s values.
+/// The label names the probe payload is *designed* to produce: every probe
+/// resource key Loki promotes, plus `service_name`. The `/labels` snapshot is
+/// complete only once it carries all of them.
 ///
-/// Waiting for both is what makes the assertions sound, not merely
+/// Derived from the constants rather than listed by hand so that adding a
+/// promoted key to `PROBE_RESOURCE_ATTRIBUTES` tightens the completeness
+/// condition automatically; the negative controls fall out because they are
+/// not in the allowlist.
+fn probe_expected_labels() -> Vec<String> {
+    let mut expected: Vec<String> = PROBE_RESOURCE_ATTRIBUTES
+        .iter()
+        .map(|(key, _)| key.replace('.', "_"))
+        .filter(|name| LOKI_LABEL_ALLOWLIST.contains(&name.as_str()))
+        .collect();
+    expected.push("service_name".to_string());
+    expected
+}
+
+/// Whether a `/labels` answer carries every label the probe is designed to
+/// produce.
+fn carries_every_expected_label(observed: &[String], expected: &[String]) -> bool {
+    expected.iter().all(|name| observed.contains(name))
+}
+
+/// Poll until Loki has indexed **both** services and the label-name snapshot
+/// carries every label the probe produces, returning the label names and
+/// `service_name`'s values.
+///
+/// Waiting for both services is what makes the assertions sound, not merely
 /// non-flaky: the push carries two `ResourceLogs` streams and the second can
 /// land later, so stopping at the first non-empty answer would check the
-/// allowlist against a half-indexed label set.
+/// allowlist against a half-indexed label set. Waiting for the expected
+/// labels closes the other gap: the `/labels` endpoint can lag the values
+/// endpoint, and a snapshot that carried `service_name` but not yet the
+/// probe's other promoted keys would pass the *within-allowlist* and
+/// *no-denylisted* assertions vacuously — fewer labels can never violate
+/// either. A stream's label set is indexed as one unit, so once every
+/// expected name is present the snapshot holds the probe's full label set.
 async fn poll_until_both_services_indexed(
     http: &reqwest::Client,
     base: &str,
 ) -> (Vec<String>, Vec<String>) {
+    let expected = probe_expected_labels();
     let mut observed = Vec::new();
     let mut services = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -232,10 +264,7 @@ async fn poll_until_both_services_indexed(
         services = loki_label_values(http, base, "service_name").await;
         if services.len() >= 2 {
             observed = loki_label_names(http, base).await;
-            // The names endpoint can itself lag the values endpoint, so only
-            // a post-readiness answer that actually carries `service_name`
-            // counts as the complete set.
-            if observed.iter().any(|name| name == "service_name") {
+            if carries_every_expected_label(&observed, &expected) {
                 break;
             }
         }
@@ -243,15 +272,16 @@ async fn poll_until_both_services_indexed(
     }
     // Assert the loop's own completion condition, not a weaker proxy: on
     // timeout it falls through with whatever it last saw, and a non-empty
-    // `/labels` answer that does not yet carry `service_name` would pass a
-    // mere is-empty check while leaving the allowlist assertion to run over an
-    // incomplete set. `services` comes from a different response, so it cannot
-    // stand in for this.
+    // `/labels` answer missing any expected name would pass a mere is-empty
+    // check while leaving the allowlist assertion to run over an incomplete
+    // set. `services` comes from a different response, so it cannot stand in
+    // for this.
     assert!(
-        observed.iter().any(|name| name == "service_name") && services.len() >= 2,
-        "the push was not fully indexed within the deadline: labels {observed:?}, \
-         service values {services:?} — every assertion over the label set would \
-         run on an incomplete snapshot, so this is a failure rather than a skip",
+        carries_every_expected_label(&observed, &expected) && services.len() >= 2,
+        "the push was not fully indexed within the deadline: labels {observed:?} \
+         (expected at least {expected:?}), service values {services:?} — every \
+         assertion over the label set would run on an incomplete snapshot, so \
+         this is a failure rather than a skip",
     );
     (observed, services)
 }
@@ -291,6 +321,33 @@ fn assert_denylist_disjoint_from_promotion(effective: &[String]) {
 /// promotion list names `trace_id` or a template id. Without this the guard
 /// would be unfalsifiable: reached on every run, never able to fail, and
 /// indistinguishable from one that cannot.
+/// The completeness condition the label poll waits on must itself be
+/// non-vacuous: it has to name more than `service_name`, every name in it has
+/// to be one Loki promotes, and a snapshot missing any one of them has to be
+/// judged incomplete — otherwise the poll would break early on a lagging
+/// `/labels` answer and the within-allowlist assertion would pass on it.
+#[test]
+fn probe_completeness_condition_is_not_vacuous() {
+    let expected = probe_expected_labels();
+    assert!(
+        expected.len() > 1,
+        "the probe must be designed to produce promoted labels beyond service_name: {expected:?}",
+    );
+    assert!(
+        expected
+            .iter()
+            .all(|name| LOKI_LABEL_ALLOWLIST.contains(&name.as_str())),
+        "every expected label is one Loki promotes: {expected:?}",
+    );
+    assert!(carries_every_expected_label(&expected, &expected));
+    let mut lagging = expected.clone();
+    let dropped = lagging.pop().expect("non-empty");
+    assert!(
+        !carries_every_expected_label(&lagging, &expected),
+        "a snapshot missing {dropped} must be judged incomplete",
+    );
+}
+
 #[test]
 fn denylist_disjointness_is_not_vacuous() {
     let clean: Vec<String> = ["service_name", "k8s_pod_name"]

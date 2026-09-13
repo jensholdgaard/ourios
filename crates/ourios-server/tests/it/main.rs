@@ -16,6 +16,7 @@
 //! same span joining the caller's trace under a `/mcp` SERVER span).
 
 mod collector_interop;
+mod raw_http;
 mod rfc0003_16_served_binary;
 mod rfc0008_10_recovery_driver;
 mod rfc0013_6_wal_stays_local;

@@ -177,14 +177,15 @@ async fn stop(mut server: Server) {
     );
 }
 
+/// The reset policy lives in `raw_http::read_response`, shared with the other
+/// suites that read a socket the same way (issue #799) — a second copy here
+/// would let this test drift from them.
 async fn raw_post(addr: SocketAddr, head: String, body: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(body).await.expect("write body");
     stream.flush().await.ok();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.expect("read");
-    String::from_utf8_lossy(&response).into_owned()
+    crate::raw_http::read_response(&mut stream).await
 }
 
 /// OTLP/HTTP export with an optional tenant selector (`None` = header

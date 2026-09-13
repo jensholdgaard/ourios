@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{PartitionKey, Writer};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -91,12 +91,7 @@ async fn http_post_query(addr: SocketAddr, tenant: &str, dsl: &str) -> String {
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(dsl.as_bytes()).await.expect("write body");
     stream.flush().await.ok();
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .expect("read HTTP response");
-    String::from_utf8_lossy(&response).into_owned()
+    crate::raw_http::read_response(&mut stream).await
 }
 
 /// SIGTERM `child` (what k8s / `nerdctl stop` send) and assert a clean exit.

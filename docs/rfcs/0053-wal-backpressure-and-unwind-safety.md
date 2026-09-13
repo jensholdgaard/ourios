@@ -195,11 +195,22 @@ There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
 before the write.
 
-The bound is configuration with a conservative default, and the rejection is
-the contract: ingest keeps accepting while the object store is unreachable
-until the declared limit, then refuses with a reason that names the limit it
-hit. Crucially, crossing the limit does **not** set RFC 0052's
-rotation-failure state — it is a pressure state, not a fault.
+The bound is configuration, and it has a home: `WalConfig` gains
+`unreclaimed_bytes_limit` (`wal_unreclaimed_bytes_limit` on the deployment
+surface, beside `segment_size_bytes` and `housekeeping_secs`, which the
+coordinator already receives from there). `validate_config` rejects a value
+below `segment_size_bytes`: the smallest useful bound is one full segment,
+since housekeeping never unlinks the current segment and a bound smaller than
+one would refuse before a rotation could ever reclaim anything — which also
+puts it above the largest legal frame, because the segment floor already is.
+The default is **1 GiB**: eight default segments, far above the 16 MiB frame
+ceiling, a few hours of a busy node's frames and a few weeks of the incident
+node's. Whether that should instead scale with the volume is §7's question;
+the acceptance run uses the default as stated here. The rejection is the
+contract: ingest keeps accepting while the object store is unreachable until
+the declared limit, then refuses with a reason that names the limit it hit.
+Crucially, crossing the limit does **not** set RFC 0052's rotation-failure
+state — it is a pressure state, not a fault.
 
 **It clears when a housekeeping pass actually removes bytes, not when the
 checkpoint advances.** Advancing the sidecar declares frames reclaimable; it
@@ -319,11 +330,18 @@ So the requirement lands on the consuming calls, not on their caller: each
 takes the batch in a form that leaves ownership recoverable on unwind — `&mut
 Vec` from which each partition is removed as its put returns, or an owned
 handle the callee itself guards and settles per partition — so
-that after any panic the batch is still reachable and requeued. The
-caller-side guard remains, covering the between-write points. What the design
-requires is that **no** panic arm anywhere in the sequence can drop an
-un-requeued batch; a `Drop` impl at one level cannot deliver that alone, and
-neither can a `catch_unwind` at one call site.
+that after any panic the batch is still reachable and requeued. The points
+*outside* the consuming calls — before the audit call, and between it and the
+record publish — need an owner too, and today's `Drained` has none:
+its `_guard` is a `PublishGuard` that only tracks the in-flight count and
+holds neither batch. So `Drained` itself gains the destructor: its two
+batches become `Option`s the consuming calls take partition by partition as
+they settle, and `Drop` requeues whatever is still present. A pre-call or
+inter-call unwind then requeues everything through the destructor, and a
+panic inside a call requeues the unsettled remainder through the call's own
+handle. What the design requires is that **no** panic arm anywhere in the
+sequence can drop an un-requeued batch; neither mechanism delivers that
+alone, and neither can a `catch_unwind` at one call site.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -422,6 +440,8 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
 >   without an append ever arriving
+> - **And** under concurrent submits the sum of admitted frame bytes never
+>   exceeds the limit, so two batches cannot both observe room
 
 > **Scenario RFC0053.2 — A publish unwind keeps the records**
 > - **Given** a cadence step whose publish panics after the batches have been
@@ -486,7 +506,12 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   resume must happen with **no append at all**, which is what proves the
   timer-driven sequence can clear a state that rejects every append; and the
   single-segment backlog must clear through the forced rotation, which is the
-  livelock case. Those are the regression tests for #791's second half.
+  livelock case. Those are the regression tests for #791's second half. A
+  fourth leg is concurrent rather than sequential: a `proptest` driving many
+  tasks that submit batches of arbitrary sizes at once against a small limit,
+  asserting after every admission that the sum of admitted frame bytes never
+  exceeds the limit — the only test a reservation taken outside the journal
+  mutex fails, since the sequential flow passes it.
 - **Unwind safety (RFC0053.2, RFC0053.3)** — a publish double that panics on
   demand at **each** reachable point (before the audit write, inside it,
   inside the record publish), asserting the buffers are repopulated in every
@@ -519,10 +544,10 @@ that decision lands the RFC stops at `green`, and says so.
 
 ## 7. Open questions
 
-- [ ] The byte bound's default size. The incident node held 42 MB over five
-      days, so a default tuned for it would be far too small for a busy node;
-      the honest default may be a fraction of the volume rather than an
-      absolute.
+- [ ] Whether the byte bound's default should scale with the volume rather
+      than be the fixed 1 GiB §3.1 sets. The incident node held 42 MB over
+      five days, so a default tuned for it would be far too small for a busy
+      node; a fraction of the volume may be the honest default.
 - [ ] What a full record or audit sink should do during an outage: block,
       spill, or drop. §4 states that §3.1's disk bound is only the operative
       limit once memory growth is separately bounded, and that question is not

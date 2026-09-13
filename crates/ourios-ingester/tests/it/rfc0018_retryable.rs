@@ -92,10 +92,34 @@ async fn rfc0018_3_grpc_transient_is_unavailable_permanent_is_invalid_argument()
 /// Scenario RFC0018.3 (HTTP) — a transient WAL failure is `503`
 /// (retryable); a permanent tenant failure is `400`.
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
+/// The ingest arm end to end: the 503 carries a `Status` naming the failure
+/// in the request's format (#791 was eight hours of an empty 503).
+#[tokio::test]
+async fn rfc0018_3_http_503_carries_a_status_naming_the_failure() {
+    let (status, body) = send(
+        router(failing_sync_pipeline().into(), &HttpConfig::default()),
+        post_request(
+            "/v1/logs",
+            Some(PROTOBUF),
+            None,
+            valid_request().encode_to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let decoded = tonic_types::Status::decode(body.as_slice())
+        .expect("the ingest-failure 503 carries a protobuf Status");
+    assert!(
+        decoded.message.contains("WAL sync failed"),
+        "the Status names the WAL failure: {:?}",
+        decoded.message,
+    );
+}
+
 #[tokio::test]
 async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
     // Transient fsync failure → 503 (retryable), not 500.
-    let (status, body) = send(
+    let (status, _) = send(
         router(failing_sync_pipeline().into(), &HttpConfig::default()),
         post_request(
             "/v1/logs",
@@ -109,16 +133,6 @@ async fn rfc0018_3_http_transient_is_503_permanent_is_400() {
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         "transient WAL-sync failure → retryable 503, not 500 (RFC 0018 §3.2)",
-    );
-    // The ingest arm end to end: the 503 carries a Status naming the
-    // failure, in the request's format (#791 was eight hours of an empty
-    // 503).
-    let decoded = tonic_types::Status::decode(body.as_slice())
-        .expect("the ingest-failure 503 carries a protobuf Status");
-    assert!(
-        decoded.message.contains("WAL sync failed"),
-        "the Status names the WAL failure: {:?}",
-        decoded.message,
     );
 
     // Transient append I/O failure → 503 (retryable) too.

@@ -358,11 +358,12 @@ async fn handle_logs(
     {
         Ok(Ok(_)) => success_response(format),
         Ok(Err(e)) => ingest_error_response(format, &e),
-        // The ingest task panicked — a genuine, non-retryable internal bug.
-        Err(_) => error_response(
+        // A `JoinError` is a panic or a cancellation, both genuine and
+        // non-retryable; the message says which, as the gRPC arm's does.
+        Err(join) => error_response(
             format,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "the ingest task panicked",
+            &format!("ingest task failed: {join}"),
         ),
     }
 }

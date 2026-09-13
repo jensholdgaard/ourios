@@ -15,12 +15,22 @@ use prost::Message;
 
 const PROTOBUF: &str = "application/x-protobuf";
 
-/// Send `request` and assert the controlled `expected` status and that
-/// nothing was appended to the WAL.
+/// Send `request` and assert the controlled `expected` status, that the
+/// handler-owned rejection carries a protobuf `google.rpc.Status` naming
+/// the problem, and that nothing was appended to the WAL.
+///
+/// Every caller here either sends protobuf or sends no usable
+/// `Content-Type`, so protobuf is the format the response must mirror.
 async fn assert_rejected(request: axum::http::Request<axum::body::Body>, expected: StatusCode) {
     let (pipeline, captured) = capturing_pipeline();
-    let (status, _) = send(router(pipeline, &HttpConfig::default()), request).await;
+    let (status, body) = send(router(pipeline, &HttpConfig::default()), request).await;
     assert_eq!(status, expected);
+    let decoded = tonic_types::Status::decode(body.as_slice())
+        .expect("a handler-owned rejection carries a protobuf Status");
+    assert!(
+        !decoded.message.is_empty(),
+        "{expected}: the Status must name the problem",
+    );
     assert!(
         captured.lock().expect("captured").is_empty(),
         "a rejected request appends no TenantOtlpBatch frame",
@@ -74,13 +84,19 @@ async fn corrupt_gzip_is_400() {
     .await;
 }
 
+/// Router-owned, not handler-owned: axum's 404 carries no `Status` (see the
+/// module doc in `receiver/http.rs`), so only the status and the absence of
+/// a WAL frame are asserted.
 #[tokio::test]
 async fn wrong_path_is_404() {
-    assert_rejected(
+    let (pipeline, captured) = capturing_pipeline();
+    let (status, _) = send(
+        router(pipeline, &HttpConfig::default()),
         post_request("/not/the/path", Some(PROTOBUF), None, Vec::new()),
-        StatusCode::NOT_FOUND,
     )
     .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(captured.lock().expect("captured").is_empty());
 }
 
 #[tokio::test]
@@ -169,7 +185,8 @@ async fn an_oversize_body_still_carries_a_status_in_the_request_format() {
         );
         match expect {
             // The spec also requires the response to mirror the request's
-            // Content-Type, which a layer-level rejection cannot know.
+            // Content-Type: the handler reads the header before it takes the
+            // body-limit rejection, so even that one knows the format.
             Expect::Json => {
                 let parsed: serde_json::Value =
                     serde_json::from_slice(&body).expect("JSON request → JSON Status");

@@ -179,40 +179,15 @@ async fn stop(mut server: Server) {
 
 /// POST a hand-written request and return the raw response text.
 ///
-/// A `ConnectionReset` **after** response bytes have arrived is treated as the
-/// end of the response, not as a failure (issue #799). `read_to_end` demands a
-/// clean FIN, and this server does not always give one: the handler can reject
-/// a request before consuming its body, and a close with unread data still in
-/// the receive queue makes the peer's stack send `RST` rather than `FIN`. The
-/// response is already complete by then, so failing on it made this test flake
-/// at roughly 30% — it asserted on the connection's termination style rather
-/// than on what the server said.
-///
-/// A reset with **nothing** received is still a failure, and a server-side one:
-/// a rejected request must get its response flushed before the close.
+/// The reset policy lives in `raw_http::read_response`, shared with the six
+/// sibling suites that read a socket the same way (issue #799) — a second copy
+/// here would let this test drift from them.
 async fn raw_post(addr: SocketAddr, head: String, body: &[u8]) -> String {
-    use std::io::ErrorKind;
-
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(body).await.expect("write body");
     stream.flush().await.ok();
-
-    let mut response = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    loop {
-        match stream.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == ErrorKind::ConnectionReset && !response.is_empty() => break,
-            Err(e) => panic!(
-                "read failed after {} response byte(s): {e:?} — a reset with no \
-                 response at all is a server-side fault, not this helper's",
-                response.len(),
-            ),
-        }
-    }
-    String::from_utf8_lossy(&response).into_owned()
+    crate::raw_http::read_response(&mut stream).await
 }
 
 /// OTLP/HTTP export with an optional tenant selector (`None` = header

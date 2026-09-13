@@ -396,11 +396,12 @@ fn ingest_error_response(error: &ReceiveError) -> Response {
 /// > The response body for all `HTTP 4xx` and `HTTP 5xx` responses MUST be
 /// > a Protobuf-encoded `Status` message that describes the problem.
 ///
-/// Every error arm here used to return a bare `StatusCode`, which axum
-/// renders with an **empty** body — a spec violation, and the reason a
+/// The status-only arms here used to return a bare `StatusCode`, which
+/// axum renders with an **empty** body — a spec violation, and the reason a
 /// quiesced node (#791) could 503 for eight hours while telling its operator
-/// nothing. `Status.code` is left unset: the spec says it does not use the
-/// field and the server MAY omit it, and proto3 elides a zero-valued
+/// nothing; the tenant-selector 400 carried plain text, which is a body but
+/// not a `Status`. `Status.code` is left unset: the spec says it does not
+/// use the field and the server MAY omit it, and proto3 elides a zero-valued
 /// scalar on both encodings.
 ///
 /// Always binary protobuf with `application/x-protobuf`, whatever the

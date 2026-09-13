@@ -215,6 +215,16 @@ frame offset — the `WalOffset` its append returned, carried through
 are sequential, so the stored mark is a contiguous-success high-water by
 construction, and that is the only mark the barrier reads.
 
+Contiguity is over *acknowledged* frames, which is the property §3.4 needs. A
+turn that fails still releases the gate — `IngestGateGuard` drops on every
+exit — so its frame can sit below a later successful turn's mark, and a
+checkpoint at that mark covers it. That is safe: a failed turn's batch was
+never acknowledged (the handler answers 5xx and the client re-sends), so
+suppressing its frame on replay loses nothing acknowledged, and the re-sent
+copy is a fresh frame above the mark. Tracking the highest contiguous
+*successful* sequence instead would hold the checkpoint back for a frame
+nobody was promised.
+
 The cost is explicit: ingest stalls for the barrier's duration once per
 `housekeeping_secs`, the same stall rotation already imposes, now on a timer.
 `housekeeping_secs` is therefore the knob trading reclamation latency against
@@ -245,7 +255,15 @@ reimplemented:
 A snapshot *write* failure is deliberately not a checkpoint blocker:
 `flush_then_snapshot` logs it and still returns `true`, because the data
 is in the store and the snapshot only governs replay depth. The
-truncation floor below is what keeps that safe.
+truncation floor below is what keeps that safe for the WAL. It is safe for
+Parquet only if recovery honours the checkpoint on the Parquet side: after a
+restart, frames at or below `X` may be re-fed to the **miner** when the
+snapshot lags (`S < X`), but must never be re-published to the record sink,
+or every row between `S` and `X` lands in Parquet twice. `recovery.rs`
+describes exactly that split and today gates only the miner on `S`; the
+Parquet-side gate on `X` is a requirement of this RFC, not an assumption, and
+RFC0052.10 asserts it — a restart after a failed snapshot write and an
+advanced checkpoint produces no duplicate rows.
 
 ### 3.2 Housekeeping on the timer that already exists
 
@@ -298,6 +316,17 @@ valid snapshot.** There is no horizon to include in the minimum, so the
 minimum is undefined, and guessing it either way is unsafe. `None` is passed
 only where no snapshot consumer exists at all.
 
+Deriving `Incomplete` needs a ledger the recovery model does not keep:
+`recover` returns entries only for tenants that *have* a `.snap`, and nothing
+records which tenants the WAL holds, so an empty or partial snapshot set is
+indistinguishable from "no consumer" and would read as `None`. The floor
+derivation therefore keeps a per-tenant ledger of its own — tenants seen in
+WAL frames, from replay and from every live append, against tenants with a
+durable, decodable snapshot — and whenever a snapshot consumer is configured,
+a tenant present in the first set and absent from the second yields
+`Incomplete`. `None` comes only from the absence of a consumer, never from
+the absence of snapshots.
+
 **And the floor may only be derived from snapshots known to be durable.**
 `snapshot_store::write` renames the new snapshot into place *before* its
 parent-directory fsync, so a failure there leaves the file visible to this
@@ -324,7 +353,12 @@ snapshots root is fsynced once, which makes every entry the listing saw
 durable — the one property the listing lacks. If that fsync fails the floor
 is `Incomplete` and nothing is reclaimed until a later snapshot write
 succeeds. One directory fsync rather than a manifest, because a manifest
-would need the same fsync to be trustworthy itself.
+would need the same fsync to be trustworthy itself. Durability is necessary
+and not sufficient: `snapshot_store::load_all` returns raw bytes, and a
+horizon is admitted only from a snapshot that decodes and restores. A listed
+file that fails either counts as that tenant having no snapshot — hence
+`Incomplete` — rather than as a horizon, so a durable-but-invalid file can
+never authorise reclamation.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` truncates below `min(checkpoint, floor)`, so a stale floor
@@ -436,7 +470,9 @@ delete an in-progress checkpoint or snapshot, which is a worse failure than the
 debris it collects.
 
 So the name is **reserved and exact**: the in-progress segment is
-`<uuid>.wal.partial`, and the sweep matches that suffix and nothing else, never
+`<uuid>.wal.partial`, and the sweep matches a valid UUID stem with that
+suffix and nothing else — `foo.wal.partial` or any operator-placed file is
+ignored, as non-segment files are everywhere else in the WAL — and never
 `*.tmp`, which stays the checkpoint and snapshot namespace. Two further rules
 make it safe:
 
@@ -654,12 +690,16 @@ So the design is:
   admission sail past the bound — the one place a best-effort number is
   unacceptable. The unreclaimed-byte figure is maintained incrementally from
   appends and unlinks, as the WAL already does for `unflushed_bytes`, and
-  `disk_bytes` stays what it is: a diagnostic. The figure is **seeded at
-  `Wal::open`**, in frame bytes: once replay and heal have settled the newest
-  segment's tail, the sum over every surviving `*.wal` the open already
-  lists — not only the newest segment it opens — of file size less the
-  segment header, before any append is admitted, so a restart mid-outage
-  resumes from the true backlog rather than from zero. `unflushed_bytes`
+  `disk_bytes` stays what it is: a diagnostic. The figure is **seeded after
+  recovery, not at `Wal::open`**: open runs before `recovery::recover`
+  replays and heals the newest segment, so a seed taken there would count
+  torn bytes. Recovery's heal step therefore ends by calling
+  `Wal::remeasure_unreclaimed()` — a concrete method, since recovery holds
+  the WAL before it is boxed — which sets the figure to the sum over every
+  surviving `*.wal` of file size less the segment header, in frame bytes.
+  The coordinator is constructed after recovery (the ordering below), so no
+  append can precede the seed, and a restart mid-outage resumes from the
+  true backlog rather than from zero. `unflushed_bytes`
   stays its own method: the
   group-commit coordinator reads it per batch and must not allocate a
   snapshot struct on that path.
@@ -701,7 +741,14 @@ every `*.wal` and inspects each candidate before unlinking any, so a
 1,113-segment backlog does 1,113 header reads under the mutex however few files
 it then removes. The cap therefore bounds **candidates inspected** as well as
 segments removed, stopping the walk once it has found that many — the oldest are
-encountered first, which is the order reclamation wants anyway. The next timer tick continues where it left off, which
+encountered first, which is the order reclamation wants anyway. What the cap
+does **not** bound is the listing itself: enumerating and sorting the names is
+O(n) in directory entries and stays under the mutex, but it is one `readdir`
+with no per-file I/O — a fraction of a millisecond at the incident's 1,113
+entries, against 1,113 header reads and fsyncs. The guarantee is therefore
+bounded *per-file* work, and RFC0052.12 is worded that way; a bounded
+oldest-first iterator would remove the sort but not the `readdir`, so it is
+not worth a second code path. The next timer tick continues where it left off, which
 needs no cursor because the bound is recomputed each time and the oldest
 eligible segments are always the ones taken first. That matters most on the
 *first* pass of a node that has never reclaimed — the incident node held 1,113
@@ -787,12 +834,16 @@ memory, and nothing here claims to.
 
 > **Scenario RFC0052.3 — Sustained ingest does not grow the WAL without
 > bound**
-> - **Given** a node ingesting continuously with a healthy store, run
->   long enough to roll many segments
+> - **Given** a node ingesting continuously with a healthy store, every
+>   tenant with WAL data holding a valid and advancing snapshot (a complete
+>   floor), run long enough to roll many segments
 > - **When** the reclamation cadence has had time to act
 > - **Then** the WAL's on-disk byte total and segment count are bounded
 >   rather than monotonically increasing — the #793 signature (1,113
 >   segments, nothing ever unlinked) cannot reproduce
+> - **And** while the floor is `Incomplete` retention is unbounded by design
+>   and the state is visible (RFC0052.13); a healthy store alone does not
+>   bound the WAL, a complete floor does
 
 > **Scenario RFC0052.4 — A transient rotation failure recovers without a
 > restart**
@@ -840,13 +891,14 @@ memory, and nothing here claims to.
 > - **And** a node whose rotations all happened under this RFC cannot reach
 >   that state at all, so the population is finite and shrinking
 
-> **Scenario RFC0052.12 — A reclamation pass bounds the writer stall**
+> **Scenario RFC0052.12 — A reclamation pass bounds its per-file work**
 > - **Given** a backlog far larger than `max_unlinks_per_pass` (the
 >   incident's 1,113 segments is the shape)
 > - **When** a housekeeping pass runs
-> - **Then** it unlinks at most the cap and returns, and an append taken
->   concurrently waits for at most that much work rather than the whole
->   backlog
+> - **Then** it reads at most the cap's worth of segment headers, unlinks at
+>   most the cap, and returns; the only O(n) step is the name listing, which
+>   does no per-file I/O — so an append taken concurrently waits for that
+>   bounded work rather than the whole backlog
 > - **And** successive passes drain the backlog to the same end state an
 >   uncapped pass would reach
 > - **And** a backlog of stale *temporary* files is also bounded by the same
@@ -945,6 +997,9 @@ memory, and nothing here claims to.
 > - **Then** every acknowledged record is present in Parquet, including
 >   those whose segments were candidates for reclamation at the moment
 >   of the kill
+> - **And** no acknowledged record is present twice: a kill that follows a
+>   failed snapshot write and an advanced checkpoint replays frames at or
+>   below the checkpoint into the miner only, never into the record sink
 
 ## 6. Testing strategy
 

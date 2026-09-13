@@ -177,11 +177,9 @@ async fn stop(mut server: Server) {
     );
 }
 
-/// POST a hand-written request and return the raw response text.
-///
-/// The reset policy lives in `raw_http::read_response`, shared with the six
-/// sibling suites that read a socket the same way (issue #799) — a second copy
-/// here would let this test drift from them.
+/// The reset policy lives in `raw_http::read_response`, shared with the other
+/// suites that read a socket the same way (issue #799) — a second copy here
+/// would let this test drift from them.
 async fn raw_post(addr: SocketAddr, head: String, body: &[u8]) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream.write_all(head.as_bytes()).await.expect("write head");

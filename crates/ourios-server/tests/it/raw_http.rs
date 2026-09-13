@@ -53,18 +53,23 @@ pub async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> String {
             ),
         }
     }
-    let text = String::from_utf8_lossy(&response).into_owned();
+    // Completeness is judged on the RAW bytes, before any lossy conversion:
+    // `Content-Length` counts bytes, while `from_utf8_lossy` expands each
+    // invalid byte to a 3-byte replacement character. Measuring the converted
+    // string would let a truncated binary body — a protobuf response, say —
+    // satisfy a larger declared length.
     if reset {
         assert!(
-            is_complete(&text),
+            is_complete(&response),
             "connection reset before a complete HTTP response ({} byte(s) \
              received). A reset AFTER a complete response is expected here, but \
              a truncated one means the server closed before flushing — a \
-             server-side fault, not this helper's. Received: {text:?}",
+             server-side fault, not this helper's. Received: {:?}",
             response.len(),
+            String::from_utf8_lossy(&response),
         );
     }
-    text
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 /// Whether `text` is a whole HTTP/1.1 response: a full header block, plus a
@@ -82,15 +87,22 @@ pub async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> String {
 /// A response with no declared framing is framed by the close itself, which a
 /// reset cannot distinguish from a truncation, so that is incomplete too rather
 /// than being waved through.
-fn is_complete(text: &str) -> bool {
-    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+fn is_complete(response: &[u8]) -> bool {
+    const SEP: &[u8] = b"\r\n\r\n";
+
+    let Some(at) = response.windows(SEP.len()).position(|w| w == SEP) else {
         return false;
     };
+    // The header block is ASCII by the grammar, so a lossy read of it cannot
+    // change a `Content-Length` value; the *body* is what must be counted in
+    // bytes.
+    let head = String::from_utf8_lossy(&response[..at]);
+    let body_len = response.len() - (at + SEP.len());
     head.lines()
         .filter_map(|line| line.split_once(':'))
         .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .is_some_and(|want| body.len() >= want)
+        .is_some_and(|want| body_len >= want)
 }
 
 #[cfg(test)]
@@ -108,7 +120,7 @@ mod tests {
     /// socket would depend on whether the peer's `RST` arrives before or after
     /// the client drains its receive buffer, so a test about a flake would
     /// itself be flaky.
-    struct Scripted(VecDeque<Result<&'static str>>);
+    struct Scripted(VecDeque<Result<&'static [u8]>>);
 
     impl AsyncRead for Scripted {
         fn poll_read(
@@ -121,7 +133,7 @@ mod tests {
                 // clean close.
                 None => Poll::Ready(Ok(())),
                 Some(Ok(bytes)) => {
-                    buf.put_slice(bytes.as_bytes());
+                    buf.put_slice(bytes);
                     Poll::Ready(Ok(()))
                 }
                 Some(Err(e)) => Poll::Ready(Err(e)),
@@ -129,11 +141,11 @@ mod tests {
         }
     }
 
-    fn scripted(steps: Vec<Result<&'static str>>) -> Scripted {
+    fn scripted(steps: Vec<Result<&'static [u8]>>) -> Scripted {
         Scripted(steps.into_iter().collect())
     }
 
-    fn reset() -> Result<&'static str> {
+    fn reset() -> Result<&'static [u8]> {
         Err(Error::new(ErrorKind::ConnectionReset, "peer reset"))
     }
 
@@ -143,7 +155,7 @@ mod tests {
     /// resets instead of closing cleanly.
     #[tokio::test]
     async fn a_reset_after_a_complete_response_returns_it() {
-        let mut reader = scripted(vec![Ok(OK_HEAD), Ok("hello"), reset()]);
+        let mut reader = scripted(vec![Ok(OK_HEAD.as_bytes()), Ok(b"hello"), reset()]);
         assert_eq!(read_response(&mut reader).await, format!("{OK_HEAD}hello"));
     }
 
@@ -151,8 +163,8 @@ mod tests {
     /// the response being split across reads.
     #[tokio::test]
     async fn a_reset_after_a_single_chunk_response_returns_it() {
-        let whole: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let mut reader = scripted(vec![Ok(whole), reset()]);
+        let whole = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let mut reader = scripted(vec![Ok(whole.as_bytes()), reset()]);
         assert_eq!(read_response(&mut reader).await, whole);
     }
 
@@ -161,7 +173,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "connection reset before a complete HTTP response")]
     async fn a_reset_inside_the_body_panics() {
-        let mut reader = scripted(vec![Ok(OK_HEAD), Ok("hel"), reset()]);
+        let mut reader = scripted(vec![Ok(OK_HEAD.as_bytes()), Ok(b"hel"), reset()]);
         let _ = read_response(&mut reader).await;
     }
 
@@ -170,8 +182,44 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "connection reset before a complete HTTP response")]
     async fn a_reset_inside_the_headers_panics() {
-        let mut reader = scripted(vec![Ok("HTTP/1.1 200 OK\r\nContent-Len"), reset()]);
+        let mut reader = scripted(vec![Ok(b"HTTP/1.1 200 OK\r\nContent-Len"), reset()]);
         let _ = read_response(&mut reader).await;
+    }
+
+    /// The bug that made the check byte-oriented: `from_utf8_lossy` expands each
+    /// invalid byte to a 3-byte replacement character, so measuring the
+    /// converted string let a truncated **binary** body satisfy a larger
+    /// declared length. Two invalid bytes become six, which would have cleared a
+    /// `Content-Length: 5`. Protobuf responses are exactly this shape.
+    #[tokio::test]
+    #[should_panic(expected = "connection reset before a complete HTTP response")]
+    async fn a_truncated_body_of_invalid_utf8_panics() {
+        let mut reader = scripted(vec![Ok(OK_HEAD.as_bytes()), Ok(b"\xff\xff"), reset()]);
+        let _ = read_response(&mut reader).await;
+    }
+
+    /// And the same body at its declared length is complete, so the fix did not
+    /// simply make every binary body fail.
+    #[tokio::test]
+    async fn a_complete_body_of_invalid_utf8_is_accepted() {
+        let mut reader = scripted(vec![
+            Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"),
+            Ok(b"\xff\xff"),
+            reset(),
+        ]);
+        let text = read_response(&mut reader).await;
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got {text:?}");
+    }
+
+    #[test]
+    fn content_length_is_measured_in_bytes_not_lossy_chars() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let mut truncated = head.as_bytes().to_vec();
+        truncated.extend_from_slice(b"\xff\xff");
+        assert!(
+            !is_complete(&truncated),
+            "two invalid bytes are 2, not the 6 they become in a lossy string",
+        );
     }
 
     /// A reset with nothing received at all — the server-side fault the helper
@@ -188,8 +236,8 @@ mod tests {
     /// framing.
     #[tokio::test]
     async fn a_clean_eof_is_accepted_without_a_framing_check() {
-        let unframed: &'static str = "HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n";
-        let mut reader = scripted(vec![Ok(unframed)]);
+        let unframed = "HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n";
+        let mut reader = scripted(vec![Ok(unframed.as_bytes())]);
         assert_eq!(read_response(&mut reader).await, unframed);
     }
 
@@ -198,7 +246,7 @@ mod tests {
     #[should_panic(expected = "read failed after")]
     async fn a_non_reset_error_is_fatal() {
         let mut reader = scripted(vec![
-            Ok(OK_HEAD),
+            Ok(OK_HEAD.as_bytes()),
             Err(Error::new(ErrorKind::BrokenPipe, "broken")),
         ]);
         let _ = read_response(&mut reader).await;
@@ -207,17 +255,17 @@ mod tests {
     #[test]
     fn a_content_length_framed_response_is_complete_only_when_the_body_arrived() {
         let head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        assert!(is_complete(&format!("{head}hello")));
-        assert!(!is_complete(&format!("{head}hel")));
+        assert!(is_complete(format!("{head}hello").as_bytes()));
+        assert!(!is_complete(format!("{head}hel").as_bytes()));
     }
 
     /// The case that motivated the check: a reset after only the status line
     /// must not read as a complete 200, because callers assert on the prefix.
     #[test]
     fn a_truncated_header_block_is_not_complete() {
-        assert!(!is_complete("HTTP/1.1 200 OK\r\nContent-Len"));
-        assert!(!is_complete("HTTP/1.1 200 OK\r\n"));
-        assert!(!is_complete(""));
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\nContent-Len"));
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\n"));
+        assert!(!is_complete(b""));
     }
 
     /// Chunked is not recognised, on purpose — see `is_complete`. A chunked
@@ -226,13 +274,15 @@ mod tests {
     #[test]
     fn a_chunked_response_is_not_recognised() {
         let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert!(!is_complete(&format!("{head}5\r\nhello\r\n0\r\n\r\n")));
+        assert!(!is_complete(
+            format!("{head}5\r\nhello\r\n0\r\n\r\n").as_bytes()
+        ));
     }
 
     /// Close-framed: a reset cannot be told from a truncation, so it is not
     /// waved through.
     #[test]
     fn a_response_with_no_declared_framing_is_not_complete() {
-        assert!(!is_complete("HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody"));
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody"));
     }
 }

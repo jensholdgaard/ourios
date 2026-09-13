@@ -28,7 +28,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_ingester::receiver::decode_protobuf;
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
 use prost::Message;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -75,12 +75,7 @@ async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(body).await.expect("write body");
     stream.flush().await.ok();
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .expect("read HTTP response");
-    String::from_utf8_lossy(&response).into_owned()
+    crate::raw_http::read_response(&mut stream).await
 }
 
 #[derive(Default)]

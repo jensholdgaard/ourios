@@ -45,7 +45,7 @@ use testcontainers_modules::localstack::LocalStack;
 use testcontainers_modules::testcontainers::core::ExecCommand;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -274,12 +274,7 @@ async fn http_post_logs(addr: SocketAddr, tenant: &str, body: &[u8]) -> String {
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(body).await.expect("write body");
     stream.flush().await.expect("flush HTTP request");
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .expect("read HTTP response");
-    String::from_utf8_lossy(&response).into_owned()
+    crate::raw_http::read_response(&mut stream).await
 }
 
 /// Hand-rolled `POST /v1/query` (no HTTP-client dependency): a `text/plain` DSL
@@ -294,12 +289,7 @@ async fn http_post_query(addr: SocketAddr, tenant: &str, dsl: &str) -> String {
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(dsl.as_bytes()).await.expect("write body");
     stream.flush().await.expect("flush querier request");
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .expect("read HTTP response");
-    String::from_utf8_lossy(&response).into_owned()
+    crate::raw_http::read_response(&mut stream).await
 }
 
 /// The JSON body of a `200` query response, parsed.

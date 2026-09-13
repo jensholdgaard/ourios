@@ -25,7 +25,7 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -153,12 +153,7 @@ async fn post_query(addr: SocketAddr, dsl: &str) -> serde_json::Value {
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(dsl.as_bytes()).await.expect("write body");
     stream.flush().await.ok();
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .expect("read response");
-    let text = String::from_utf8_lossy(&response);
+    let text = crate::raw_http::read_response(&mut stream).await;
     let (head, body) = text
         .split_once("\r\n\r\n")
         .expect("response has a header/body split");

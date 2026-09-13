@@ -738,11 +738,14 @@ So the design is:
   `disk_bytes` stays what it is: a diagnostic. The figure is **seeded after
   recovery, not at `Wal::open`**: open runs before `recovery::recover`
   replays and heals the newest segment, so a seed taken there would count
-  torn bytes. Recovery's heal step therefore ends by calling
-  `Wal::remeasure_unreclaimed()` — a concrete method, since recovery holds
-  the WAL before it is boxed — which sets the figure to the sum over every
-  surviving `*.wal` of file size less the segment header, in frame bytes.
-  The coordinator is constructed after recovery (the ordering below), so no
+  torn bytes. Recovery therefore ends — after every successful replay, and
+  after the heal when there was a torn tail to heal, since a clean replay
+  never enters that path — by calling `Wal::remeasure_unreclaimed()`, a
+  concrete method since recovery holds the WAL before it is boxed, which
+  sets the figure to the sum over every surviving `*.wal` of file size less
+  the segment header, in frame bytes, and seeds the current segment's own
+  frame bytes from the healed newest segment at the same time. The
+  coordinator is constructed after recovery (the ordering below), so no
   append can precede the seed, and a restart mid-outage resumes from the
   true backlog rather than from zero. `unflushed_bytes`
   stays its own method: the

@@ -333,7 +333,7 @@ under backpressure no append reaches `sync`, so the empty-segment no-op
 rule applies *after* the discharge, not instead of the call.
 The rotation runs inside `CommitCoordinator::maintain`, and this RFC extends
 `HousekeepingProgress` with `forced_rotation: Option<Result<(),
-AppendError>>` so the outcome — retrying or terminal — surfaces through the
+ReceiveError>>` so the outcome — retrying or terminal — surfaces through the
 same call the trigger reads `removed_segments` from. That last
 condition needs a state surface the inherited `ReclaimState` lacks —
 `unflushed_bytes` resets on every sync, so it cannot tell a synced current
@@ -350,14 +350,16 @@ block it; the segment closes, the next pass can reclaim it, and the state
 clears. Nothing is acked by that rotation, so the no-ack-on-refusal property
 is untouched.
 
-That needs an owner, because today `Wal::rotate` is private and is reached
-only from `append`. `Journal` gains `fn rotate(&mut self) -> Result<(),
-AppendError>`: it closes the current segment and opens a fresh one through
-the same retried path RFC 0052 §3.3 specifies for an append-driven rotation,
-so a failure enters the same bounded-retry state and the same terminal state,
-reported through the same typed rotation-failure variant the append path uses
-— which is why the error is `AppendError` and not `ReclaimError`, whose two
-variants are reclamation's and stay so. Before anything else it discharges a
+That needs an owner, and RFC 0052 §3.7 provides it: `Journal::rotate(&mut
+self) -> Result<(), ReceiveError>`, the object-safe, append-independent
+rotation that RFC introduces for its own idle rotation (`Wal::rotate` is
+private today). This RFC only widens who calls it. It closes the current
+segment and opens a fresh one through the same retried path RFC 0052 §3.3
+specifies for an append-driven rotation, so a failure enters the same
+bounded-retry state and the same terminal state, reported through the same
+typed rotation-failure variant behind the `ReceiveError` boundary the
+classifier already handles — not `ReclaimError`, whose variants are
+reclamation's and stay so. Before anything else it discharges a
 pending parent-directory fsync left in `dir_fsync_pending` by RFC 0052 §3.3's
 last failure row — the obligation `sync` would otherwise retry on the next
 append, which under backpressure never comes — honouring its origin: a

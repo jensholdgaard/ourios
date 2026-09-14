@@ -342,22 +342,18 @@ fn probe_completeness_condition_is_not_vacuous() {
     );
 }
 
-/// The denylist is the only source of required names for the wire injection
-/// and both live assertions, so removing an entry from the constant would
-/// silently narrow every check. This pins the four RFC0031.10 members
-/// independently of the constant.
 #[test]
-fn denylist_has_every_rfc_required_member() {
+fn denylist_disjointness_is_not_vacuous() {
+    // The denylist is the only source of required names for the wire
+    // injection and both live assertions, so removing an entry from the
+    // constant would silently narrow every check: pin the four RFC0031.10
+    // members independently of it first.
     for required in ["trace_id", "span_id", "template_id", "ourios_template_id"] {
         assert!(
             LOKI_LABEL_DENYLIST.contains(&required),
             "RFC0031.10 requires `{required}` on the denylist",
         );
     }
-}
-
-#[test]
-fn denylist_disjointness_is_not_vacuous() {
     let clean: Vec<String> = ["service_name", "k8s_pod_name"]
         .iter()
         .map(|s| (*s).to_string())

@@ -81,24 +81,29 @@ limit with an undefined failure mode. The WAL gains a declared local bound, and
 crossing it is a *stated* rejection, specified as a transport contract rather
 than gestured at.
 
-**The transport contract.** `ReceiveError` gains a `WalBackpressure` variant
-carrying a typed **cause** and the delay to advertise. The cause is an enum,
-because §3.1 refuses for three reasons that no single pair of byte
-measurements can state: `BackpressureCause::Bytes { pre, projected:
+**The transport contract.** `ReceiveError` gains two variants, because
+§3.1 refuses for reasons of two different kinds. `WalBackpressure` carries
+a typed **cause** and the delay to advertise, for the two bounds that
+reclamation clears: `BackpressureCause::Bytes { pre, projected:
 Option<u64>, limit }` — the pre-reservation unreclaimed total and the
 projected total including this batch's `framed_len` (or, when the
 projection overflows, `None` in its place), since a per-request refusal
 can happen with the live total still below the limit and a single
-"measurement" would be ambiguous — `Segments { count, limit }` for the
-`max_segments` ceiling, and `Tenants { count, limit }` for the
-`max_tenants` guard; the `Status` message renders the cause's own
+"measurement" would be ambiguous — and `Segments { count, limit }` for the
+`max_segments` ceiling; the `Status` message renders the cause's own
 measurements and names its limit, so a refusal always says which bound it
-hit; `IngestFailure::classify` maps it to a new `Backpressure` outcome, which that
-exhaustive match then forces both transports to handle; both render `503` /
-`UNAVAILABLE` with the limit named in the `Status` message. `503` because the
-batch was not acked — RFC 0018 §3.2's reasoning — and a distinct outcome
-rather than reusing `Unavailable` because the remedy differs: waiting genuinely
-helps here.
+hit. `TenantCapacity { count, limit }` is its own variant, not a cause,
+because the `max_tenants` guard is **capacity**: no pass clears it, so it
+carries no delay and sets no latch (§3.1). `IngestFailure::classify` maps
+the first to a new `Backpressure` outcome and the second to a new
+`TenantCapacity` outcome, which that exhaustive match then forces both
+transports to handle; both render `503` / `UNAVAILABLE` with the limit
+named in the `Status` message, and only `Backpressure` carries the delay.
+`503` because the batch was not acked — RFC 0018 §3.2's reasoning — and
+distinct outcomes rather than reusing `Unavailable` because the remedy
+differs: for backpressure, waiting genuinely helps; for capacity, only an
+operator does, and the client backs off as OTLP prescribes when no
+`Retry-After` / `RetryInfo` is sent.
 
 The wire shape is stated, because an empty body is how #791 hid for eight
 hours. On HTTP the rejection is the `google.rpc.Status` body the OTLP spec
@@ -106,8 +111,9 @@ requires and #794 established — binary protobuf with
 `application/x-protobuf` whatever the request's encoding, because the
 Collector's exporter decodes every failure body as protobuf regardless of
 `Content-Type`, with the message naming the limit and the measurement — and
-`Retry-After` is a response header. On gRPC it is the `Status` message plus a
-`RetryInfo` detail carrying the same delay. A bare status code with no body,
+`Retry-After` is a response header, present for `Backpressure` and absent
+for `TenantCapacity`. On gRPC it is the `Status` message plus, for
+`Backpressure` only, a `RetryInfo` detail carrying the same delay. A bare status code with no body,
 which is what the HTTP arm returned before #794, does not satisfy this
 contract, and RFC0053.1 asserts the body on both transports.
 
@@ -307,7 +313,7 @@ the caller's responsibility because the caller is what holds the mutex.
   classification without a `reclaim_state()` read, a legal payload for an
   unrecoverable tenant (§3.2) on a healthy WAL is that tenant's terminal
   classification, a legal payload for a *new* tenant at the `max_tenants`
-  guard is a `Tenants` refusal, and only a legal payload for a held,
+  guard is a `TenantCapacity` refusal, and only a legal payload for a held,
   healthy tenant against a healthy WAL reaches the reservation. The tenant check has a source too:
   the receiver resolves the tenant out of band before `ingest` (RFC 0046
   §3.1 — `Pipeline::ingest` already takes the `TenantId`), the commit path
@@ -476,19 +482,34 @@ second knob rides with it, for a different growth: in open mode (RFC 0026
 grow with traffic rather than with an operator's tenant set. `ReceiverSection`
 gains **`max_tenants`** (default 1024, same `${env:VAR}` and Helm path):
 admission of a tenant id the miner does not yet hold, when the guard is
-reached, is refused with the `Tenants` cause naming the tenant — ordered
-with §3.1's tenant check, after the terminal-rotation check and before the
-bound — and existing tenants are unaffected. The refusal is **capacity,
-not reclaimable backpressure**, and is classified as such: a `Held` slot
-is never released by reclamation, so no pass can clear the state and a
-`Retry-After` would advertise a wait that ends nowhere. So the `Tenants`
-cause carries no `Retry-After` and no `RetryInfo` — the client backs off
-exponentially, as OTLP prescribes when none is sent — it does not enter
-the refusal latch, it is counted on the ingest counter with `error.type =
-wal_tenant_cap`, and `ourios.wal.tenants` at its limit is the alert. The
-operator path is to raise `max_tenants`; a verb that releases a tenant is
-deferred to §7, with the note that under RFC 0047/0048 tenants are an
-out-of-band decision and the guard is not the place to make it. **Idle
+reached, is refused as `TenantCapacity { count, limit }` naming the tenant
+— ordered with §3.1's tenant check, after the terminal-rotation check and
+before the bound — and existing tenants are unaffected. The refusal is
+**capacity, not reclaimable backpressure**, and is its own error rather
+than a `BackpressureCause`: a `Held` slot is never released by
+reclamation, so no pass can clear the state and a `Retry-After` would
+advertise a wait that ends nowhere. So `TenantCapacity` carries no
+`Retry-After` and no `RetryInfo` — the client backs off exponentially, as
+OTLP prescribes when none is sent — it does not enter the refusal latch,
+it is counted on the ingest counter with `error.type = wal_tenant_cap`,
+and `ourios.wal.tenants` at its limit is the alert. The operator path is
+to raise `max_tenants`; a verb that releases a tenant is deferred to §7,
+with the note that under RFC 0047/0048 tenants are an out-of-band
+decision and the guard is not the place to make it. **What the guard is
+and is not.** In open mode a client can fill it with chosen ids and deny
+a later, legitimate tenant its first write. That is not a hole the guard
+introduces and not one it can close: open mode has no tenant isolation at
+all — any client that can reach a listener may write to, and read from,
+any tenant, which is exactly what `warn_if_open_mode` says at startup
+(RFC 0026 §3.1) — so cross-tenant availability is not a property open
+mode offers, and the cap exists to bound the node's disk and memory, not
+to arbitrate fairness. **Open mode is not a production posture**; the
+warning exists so that running without `auth` is a visible choice. In an
+authenticated deployment RFC 0047 §3.1 binds tenant ids to principals and
+RFC 0048 authorises them, so a client can exhaust only the tenants it is
+entitled to, and the guard is the backstop it was meant to be. No
+eviction, rate limit or per-principal quota is added here; the admin
+release verb is the §7 follow-up. **Idle
 tenants are not evicted in this stage**: a `Held` slot lasts for the
 process lifetime, and a restart rebuilds the table from what recovery
 restored. A check before the append is not enough on its own, since
@@ -586,9 +607,9 @@ exclusion is involved, since a rotation is a WAL operation and not a cut),
 **rotates** only in the single-segment livelock, stated as one predicate
 over what the coordinator holds after the commit: the refusing state is
 set **and its retained cause is `Bytes`** — the latch keeps the cause of
-the refusal that set it, so a `Segments` or `Tenants` refusal never
-rotates, since a rotation at the ceiling would breach it and one for a
-tenant would be pointless — the `HousekeepingProgress` that
+the refusal that set it, so a `Segments` refusal never
+rotates, since a rotation at the ceiling would breach it, and a
+`TenantCapacity` refusal sets no latch at all — the `HousekeepingProgress` that
 `housekeeping_commit` has just returned reports `removed_segments == 0`
 (temp-file cleanup and partial failures do not count) and
 `reclaimable_now` is false, `current_segment_frame_bytes` equals the whole
@@ -916,29 +937,33 @@ later turns do not overtake the gap — but a frame that fills the bound is
 followed by refusals, not turns, and an entry that waited for an admitted
 turn would never settle while the bytes it holds are never reclaimed. So
 the barrier task settles every unresolved entry at the start of each tick,
-before it captures its cut. Both triggers take the locks in RFC 0052
-§3.1's fixed order — the ingest gate, then the barrier exclusion, then the
-miner lock — the tick taking the gate as a turn would, so the gate already
-serialises them; the claim makes that explicit and lets the later one
-observe it: an `unmined` entry has a state, `Unresolved` or `Settling`,
-and the settler moves it to `Settling` under the miner lock before it
-touches the tenant. The claim alone does not serialise the loser with the
-rebuild, because the winner releases the locks for the bounded reads
-(below) and takes them again only for the final `replace_tenant`; so the
-entry also carries a completion signal, and the protocol is: the winner
-holds the gate for the claim only, performs the reads with no pipeline
-lock held, re-takes the fixed order for `replace_tenant`, removes the
-entry under the miner lock and signals. The gate is one global monotonic
-sequence, so a turn that *waited* inside it for a settling tenant would
-hold every other tenant's sequence behind it; instead a request for a
-`Settling` tenant is **refused at admission, before it takes a sequence**,
-under the transient-retryable class (RFC 0018 §3.2's first — the batch is
+before it captures its cut. Settlement never touches the ingest gate: RFC
+0052 §3.1 is explicit that `ingest_gate` is a watch counter of append
+sequences, that a timer has none to reserve, and that inventing one would
+interleave with real turns — so both triggers take only the **barrier
+exclusion, then the miner lock**, in that fixed order; an admitted turn
+already holds both when it finds an entry for its own tenant, and the
+tick takes them as it does for a cut. The claim makes the serialisation
+explicit and lets the later one observe it: an `unmined` entry has a
+state, `Unresolved` or `Settling`, and the settler moves it to `Settling`
+under the miner lock before it touches the tenant. The claim alone does
+not serialise the loser with the rebuild, because the winner releases the
+locks for the bounded reads (below) and takes them again only for the
+final `replace_tenant`; so the entry also carries a completion signal, and
+the protocol is: the winner holds the exclusion and the miner lock for the
+claim only, performs the reads with no pipeline lock held, re-takes the
+two in order for `replace_tenant`, removes the entry under the miner lock
+and signals. A turn for a settling tenant must not wait *inside* the gate,
+where it would hold every other tenant's sequence behind it; instead the
+coordinator keeps the **settling set** under its admission mutex, and a
+request for a `Settling` tenant is **refused at admission, before it takes
+a sequence**, under the transient-retryable class (RFC 0018 §3.2's first — the batch is
 valid and the node is healthy) with a `Retry-After` equal to the
 settlement's expected remainder, the barrier cadence at most and one
 second at least, as a non-binding hint; the tenant's live tree is
 unreachable to ingest until the rebuild has installed it, turns for other
-tenants take their sequences as usual, and only the winner ever holds a
-sequence on the tenant's behalf. The losing trigger waits on the signal
+tenants take their sequences as usual, and no sequence is ever taken on
+the tenant's behalf. The losing trigger waits on the signal
 and only then proceeds to its own work, so it never runs against a
 half-rebuilt tenant. A failed rebuild returns the entry to `Unresolved`,
 signals, and the next trigger claims it. RFC0053.1 asserts the bound-crossed
@@ -983,22 +1008,55 @@ from the installed tree, and no other tenant's state is touched. Every
 widening between the mark and the panic is re-derived *with* its event —
 but not every record is re-emitted, because the rebuild separates
 **state-only replay from publication**. The coordinator holds a per-tenant
-**publication watermark**, `published_through`: each mined record carries
-its frame's offset from the turn that mined it, a publish that settles
-durable raises the tenant's watermark to the highest frame offset among
-the records it wrote (monotonic, under the sink lock), and it is seeded
-at recovery from the Parquet-side suppression horizon `X`. Replay into
-the miner mutates the tree for every frame in the range but suppresses
-emission for frames at or below the watermark — their records are already
-durable — and emits only the **ambiguous span**: frames above it, whose
-records were buffered, in flight, or never mined. So the submitted prefix
-and a record the salvage forwarded are re-emitted only if their frame is
-above the watermark, and what the tenant published since its snapshot is
-not re-emitted at all. The at-most-twice claim is therefore narrowed to
-the ambiguous span: a record is present at most twice, never absent, and
-only a record whose frame lies above the watermark can be present twice —
-the same at-most-duplicate posture every crash between a publish and its
-stamp already has, now no wider than it. It follows that the salvage in `ingest_mined` is kept as
+**publication watermark**, `published_through`. It is **frame-granular
+and advances only on a fully settled frame**: each mined record carries
+its frame's offset *and its index within the frame* from the turn that
+mined it; a publish that settles durable marks those records settled in
+the coordinator's per-frame ledger (under the sink lock), and the
+watermark advances to a frame only when every record of that frame and of
+every frame below it is settled — a frame holds several records, the
+no-pool path publishes them one at a time, and a frame with some records
+durable and a later one lost must not be counted as published. Progress
+inside a partially published frame is kept in the `unmined` entry instead:
+at settlement the entry records `emit_from`, the index of the first record
+of its frame not yet settled, read from the same ledger. Replay into the
+miner mutates the tree for every frame in the range but suppresses
+emission for frames at or below the watermark — their records are all
+durable — emits every record of the frames above it, the **ambiguous
+span**, whose records were buffered, in flight, or never mined, and within
+the entry's own frame emits only records at or after `emit_from`. So the
+submitted prefix and a record the salvage forwarded are re-emitted only if
+they lie in the ambiguous span, and what the tenant published since its
+snapshot is not re-emitted at all. The at-most-twice claim is therefore
+narrowed: a record is present at most twice, never absent; a record at or
+below the watermark, or below `emit_from` in its frame, is present exactly
+once; and only a record in the ambiguous span — a frame above the
+watermark, or a record at or after `emit_from` — can be present twice,
+which is the same at-most-duplicate posture every crash between a publish
+and its stamp already has.
+
+**The watermark is persisted, or a crash would republish what a panic
+already retried.** With the watermark in memory only, a partition object
+`O1` accepted, a panic, a retry `O2`, and a crash before the next
+checkpoint replays from `X` and yields `O3` — three objects. So the
+watermark is written durably on the checkpoint's own path, as an
+**amendment to RFC 0052's sidecar layout**: `Journal::checkpoint` gains
+the per-tenant map, `fn checkpoint(&mut self, durable_to: WalOffset,
+published: &HashMap<TenantId, WalOffset>)`, and the WAL writes it to a
+`PUBLISHED` sidecar beside `CHECKPOINT` — a versioned, checksummed record
+of `(tenant, offset)` pairs, written to `PUBLISHED.tmp`, fsynced, renamed,
+parent fsynced, **before** `CHECKPOINT`'s own write in the same call, so a
+`CHECKPOINT` never exists without a `PUBLISHED` at least as new; `*.tmp`
+stays the sidecar namespace RFC 0052 §3.7 reserves, and the file is
+outside the byte bound like the other sidecars. Recovery seeds the
+in-memory watermark per tenant as the greater of the `PUBLISHED` entry
+and what the Parquet-side suppression horizon `X` implies, and a missing
+`PUBLISHED` beside a version-2 `CHECKPOINT` is fail-closed like a missing
+`RECLAIM`. The bound between checkpoints is then stated honestly: a panic
+costs at most one duplicate per record in the ambiguous span, and a crash
+before the next checkpoint costs at most **one more** for the records
+published since the last durable watermark, since replay from `X` cannot
+see them; the next checkpoint closes that window. It follows that the salvage in `ingest_mined` is kept as
 belt-and-braces and its count is **never read** by this path: an earlier
 draft resumed at `index + salvaged`, which was unsound twice over — against
 the unknown tree, and because the count increments before the salvage's
@@ -1103,9 +1161,17 @@ panicked publish as not-ok for `E`, so `E` does not stamp. Whichever cut
 stamps having drained them clears the latch: after its stamp, `run_cut`
 CASes `failed_epoch` from the value it read at its capture to `u64::MAX`,
 so a newer panic that lowered it meanwhile is not erased and is handled by
-the next cut. So the pre-cut skip, the "only a restart clears it" clause,
-RFC0052.1's restart-only wording and RFC0052.7's assertion of it are
-amended, and a latch set by a pre-RFC 0053 process clears on the restart
+the next cut. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
+tick with
+
+```text
+    if failed_epoch <= barrier_epoch: skip // §3.1's latch; housekeeping below still runs
+```
+
+— is **replaced** by this RFC with "proceed: the cut's drain takes the
+requeued records first, and the `ok` verdict and the epoch CAS decide";
+the "only a restart clears it" clause, RFC0052.1's restart-only wording
+and RFC0052.7's assertion of it are amended with it, and a latch set by a pre-RFC 0053 process clears on the restart
 that deploys this — while the `cadence_panic` counter #795 added stays,
 now meaning "a step panicked and was retried" rather than "the cadence is
 dead". Only a *panicking* `JoinError` continues the sweep; a cancelled one is
@@ -1153,18 +1219,18 @@ repository's review) and nothing is hand-written in the code:
 
 | Signal | Instrument | Unit | Attributes |
 |---|---|---|---|
-| `ourios.wal.backpressure.refusing` | gauge (int) | `1` | `ourios.wal.backpressure.cause` ∈ {`bytes`, `segments`} (`1` while the refusal latch is set, on the cause that set it; a `tenants` refusal is capacity and never sets the latch) |
+| `ourios.wal.backpressure.refusing` | gauge (int) | `1` | `ourios.wal.backpressure.cause` ∈ {`bytes`, `segments`} (`1` while the refusal latch is set, on the cause that set it; a `TenantCapacity` refusal is capacity and never sets the latch) |
 | `ourios.wal.backpressure.limit` | gauge | `By` | — (the byte limit; the segment and tenant limits are the gauges below, in their own units) |
 | `ourios.wal.backpressure.last_refusal` | gauge | `By` | `ourios.wal.backpressure.cause` = `bytes`, `ourios.wal.measurement` ∈ {`pre_reservation`, `projected`} |
 | `ourios.wal.backpressure.last_refusal.segments` | gauge (int) | `{segment}` | `ourios.wal.backpressure.cause` = `segments` (the retained count at the last segment refusal) |
-| `ourios.wal.backpressure.last_refusal.tenants` | gauge (int) | `{tenant}` | `ourios.wal.backpressure.cause` = `tenants` (the held count at the last tenant refusal) |
+| `ourios.wal.tenant_capacity.last_refusal` | gauge (int) | `{tenant}` | — (the held count at the last `TenantCapacity` refusal; capacity, not a backpressure cause) |
 | `ourios.wal.capacity_remaining` | gauge | `By` | — (saturating at zero; byte headroom) |
 | `ourios.wal.segments` | gauge (int) | `{segment}` | `ourios.wal.segments.limit` (retained segments against `max_segments`; headroom is the difference) |
 | `ourios.wal.tenants` | gauge (int) | `{tenant}` | `ourios.wal.tenants.limit` (held tenants against `max_tenants`; headroom is the difference) |
 | `ourios.wal.sealed_segments` | gauge (int) | `{segment}` | — (sealed segments still on disk; the cap is `max_sealed_segments`) |
 | `ourios.wal.tenant_unrecoverable` | gauge (int) | `{tenant}` | `ourios.tenant` (tenants an in-process settlement found below their `reclaimed_through`; alert on nonzero) |
 | `ourios.ingest.encode_fallback` | counter | `{batch}` | `error.type` ∈ {`encode_pool_disconnected`} |
-| `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.backpressure.cause`, plus the cause's measurements: `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` for `bytes`; the count and limit for `segments` and `tenants` |
+| `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.backpressure.cause`, plus the cause's measurements: `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` for `bytes`; the count and limit for `segments` |
 
 `error.type` continues to carry the failure class on existing counters
 rather than spawning per-error metrics: the refused batch is counted on
@@ -1255,7 +1321,7 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
 >   without an append ever arriving; the same latch set by a `Segments` or
->   `Tenants` refusal, or with closed segments holding part of the backlog,
+>   `TenantCapacity` refusal (which sets no latch at all), or with closed segments holding part of the backlog,
 >   or with the retained count at `max_segments`, forces no rotation
 > - **And** a fitting frame whose segment has aged past `segment_age_secs`
 >   reserves a segment slot: below the ceiling it is admitted and rotates,
@@ -1268,11 +1334,12 @@ are kept distinct so that the remedy each advertises is the true one.
 >   one is deferred under the terminal classification until a pass frees a
 >   slot, after which it runs and admission resumes without a restart
 > - **And** in open mode a batch for a tenant id the miner does not hold,
->   with `max_tenants` held, is refused with the `Tenants` cause naming the
->   tenant, with no `Retry-After` and no `RetryInfo`, while a batch for a
->   held tenant is admitted; the refusal is counted with `error.type =
->   wal_tenant_cap`, sets no refusal latch, and `ourios.wal.tenants` reads
->   the limit; two concurrent first writes for one new id share a slot and
+>   with `max_tenants` held, is refused naming the
+>   tenant, as `TenantCapacity` — `503` / `UNAVAILABLE` with a protobuf
+>   `Status` body and no `Retry-After` and no `RetryInfo` — while a batch
+>   for a held tenant is admitted; the refusal is counted with `error.type
+>   = wal_tenant_cap`, sets no refusal latch, and `ourios.wal.tenants`
+>   reads the limit; two concurrent first writes for one new id share a slot and
 >   a burst of new ids never overshoots the guard
 > - **And** a sealed segment's unlink subtracts exactly the amount the seal
 >   added, so a node that sealed and then reclaimed shows the same
@@ -1360,9 +1427,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   `unmined` entry produce exactly one rebuild; the loser observes the
 >   entry `Settling` and runs only after the rebuild has installed the
 >   tenant and the entry is gone; a request for that tenant issued
->   mid-rebuild is refused before it takes a sequence, with a retry hint,
+>   mid-rebuild is refused at admission — the settling set is checked under
+>   the admission mutex before any sequence is taken — with a retry hint,
 >   and admitted after settlement; a turn for another tenant takes its
->   sequence and is not held
+>   sequence and is not held; no settlement path takes the ingest gate
 > - **And** settlement rebuilds from the `SnapshotLedger`'s retained state,
 >   not the directory: a `.snap` renamed but not yet parent-fsynced, or left
 >   by a failed write, is never read
@@ -1370,8 +1438,13 @@ are kept distinct so that the remedy each advertises is the true one.
 >   before its audit event was emitted is settled by a rebuild from the
 >   tenant's last installed snapshot: the widening is re-derived with its
 >   event, the version's audit history is complete, the records at or
->   below the tenant's publication watermark are present exactly once, and
->   those above it are present at most twice, never absent; the
+>   below the tenant's publication watermark — and, in the entry's own
+>   frame, below `emit_from` — are present exactly once, and those in the
+>   ambiguous span are present at most twice, never absent; a frame with
+>   one record durable and a later one lost does not advance the
+>   watermark; a crash before the next checkpoint after a retried panic
+>   yields at most one more copy of the records published since the last
+>   durable watermark, and none once `PUBLISHED` has been written; the
 >   same panic on a tenant with **no** installed snapshot is settled by a
 >   full replay from its oldest surviving frame, and a template defined
 >   before the span is present in the rebuilt tree; `replace_tenant` leaves
@@ -1450,7 +1523,8 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **When** metrics are collected and logs are read across both transitions
 > - **Then** the refusal-latch gauge with its cause, the limit and
 >   measurement at the last refusal per cause (bytes with its measurement,
->   the retained count for segments, the held count for tenants), and `capacity_remaining` — equal to `max(limit − unreclaimed,
+>   the retained count for segments), the held count at the last
+>   `TenantCapacity` refusal on its own gauge, and `capacity_remaining` — equal to `max(limit − unreclaimed,
 >   0)` over the live unreclaimed figure at the moment of the read, not a
 >   stale value — are present in the exported stream under registry names
 > - **And** a forced disconnected-pool fallback increments
@@ -1580,9 +1654,12 @@ that decision lands the RFC stops at `green`, and says so.
       requeued batch would have to stay a unit through the next drain rather
       than merge with what arrived since.
 
-- **A verb that releases a `Held` tenant slot.** This stage never evicts an
-  idle tenant and the only operator path at the `max_tenants` guard is to
-  raise it. A release verb would need a definition of "idle" the WAL,
+- **An admin verb that releases a `Held` tenant slot.** This stage never
+  evicts an idle tenant and the only operator path at the `max_tenants`
+  guard is to raise it; in open mode, where ids are client-chosen, that is
+  also the only answer to a client that filled the guard (§3.1 states why
+  no fairness mechanism belongs there). An admin release verb is the
+  follow-up. A release verb would need a definition of "idle" the WAL,
   the snapshot ledger and the `RECLAIM` record all agree on, and under RFC
   0047/0048 tenants are an out-of-band decision, so the guard is the wrong
   place to make it; deferred.

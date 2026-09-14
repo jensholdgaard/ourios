@@ -193,9 +193,25 @@ inside the turn it quiesces the encodes, takes the mark (`prev`, the
 rotation point), drains both sinks into owned batches registered as in
 flight, serialises the snapshot bytes, and hands that cut to the barrier
 task, which runs the same store-I/O sequence the timer's own cuts run
-(§3.2's pseudocode from `cut_ok` on). The ingest turn does no store I/O;
-the mark invariant is unchanged, because the cut was captured under the
-exclusion; and there is one owner of barrier I/O rather than two. The
+(§3.2's pseudocode from `cut_ok` on). The handoff is a **single pending
+slot**, not a queue, so it is O(1) and never blocks the turn and cannot
+grow during an outage: the barrier task holds at most one pending cut
+beside the one it is running, and a rotation capture that arrives while a
+cut is pending **coalesces** into it — the new drained batches are
+appended to the pending cut's set (they are disjoint by construction, each
+drain emptying the buffers), the mark advances to the newer `prev`, the
+snapshot bytes are replaced per tenant by the newer capture's (latest
+wins; a tenant absent from the newer capture keeps the older bytes, which
+are still cut-consistent at its own horizon), and the epoch becomes the
+newer capture's, which is what makes the coalesced cut fail on any guard
+registered between the two captures. A capture that arrives while nothing
+is pending fills the slot. At shutdown the receiver joins the barrier task
+after the running `run_cut` finishes and the pending slot, if filled, has
+been run once — a store failure there requeues into the buffers as any
+cut's does, and shutdown's own final flush covers the requeue. The ingest
+turn does no store I/O; the mark invariant is unchanged, because every cut
+was captured under the exclusion; and there is one owner of barrier I/O
+rather than two. The
 rotation hook and the timer are then the same barrier with two triggers,
 which is also what lets §3.7's `Journal::rotate` fire a rotation from the
 timer without a second code path.
@@ -222,14 +238,26 @@ anything to: `publish_owned` and `write_ordered` are both synchronous on
 their caller. So this RFC adds one, and its lifecycle is stated here and
 nowhere else. The **publisher** is one dedicated thread owned by the
 `PublishCoordinator` — the object that already owns both sinks and runs the
-age sweep's `write_ordered` — fed by a bounded queue of detached batches
-(the queue's bound is the worker's backpressure: a full queue blocks the
-worker on the queue, never on a PUT). Ownership of a detached batch moves
-through three hands in a fixed order: the worker, inside `emit_concurrent`,
-registers the publish guard **before** it enqueues and before its own
-`BatchGuard` can settle, so at no instant is a pre-cut record outside both
-the buffers and the in-flight set — that ordering is the invariant the
-checkpoint argument rests on; the queue carries the guard with the batch;
+age sweep's `write_ordered` — fed by a bounded queue of detached batches.
+The worker **never blocks on that queue**: a bound the worker waited on
+would put a stuck PUT back in front of the barrier — the queue fills, the
+enqueue blocks the worker, and `quiesce_encodes()` waits on that worker
+while the exclusion is held. So on a full queue the worker parks the
+detached partition **back into the sink's buffers as a `ready` partition**
+— still under the sink's byte accounting, excluded from the size trigger
+(it is already past it), and taken by the publisher, oldest first, as the
+queue drains, or by the next drain or flush like any buffered partition —
+and moves on. Parked records are in the buffers, so they are covered by
+every cut's drain and need no guard; the queue depth and the parked
+partition count are exported (an UpDownCounter and a gauge, registry
+names in the one bump) as the mechanism's only signal — RFC 0053 owns the
+client-facing bound, and nothing here refuses a client. Ownership of a
+detached batch that *does* enqueue moves through three hands in a fixed
+order: the worker, inside `emit_concurrent`, registers the publish guard
+**before** it enqueues and before its own `BatchGuard` can settle, so at no
+instant is a pre-cut record outside both the buffers and the in-flight set
+— that ordering is the invariant the checkpoint argument rests on; the
+queue carries the guard with the batch;
 the publisher runs `write_ordered` on it — audit barrier first, then the
 records — and settles the guard on its outcome: durable, or requeued into
 the buffers under the sink lock on a transient failure (where the next
@@ -479,7 +507,14 @@ guard has reported, `u64::MAX` when clear. A guard reads `barrier_epoch` when
 it is registered — `submit` for a `BatchGuard`, `begin_publish` for a
 publish guard, both under the exclusion, so the read is ordered against the
 capture: a guard registered before cut `E`'s capture carries `E`, one
-registered after it carries `E + 1`. Its `Drop` tests
+registered after it carries `E + 1`. For the pool that means the
+`BatchGuard` is **constructed in `submit`, with its epoch, and travels
+with the queued batch** — today the worker constructs it after dequeue,
+and a batch queued before cut `E`'s capture but dequeued after it would
+then read `E + 1` and a later panic in it would fail the wrong cut.
+`submit` already increments the pending count under the exclusion; the
+guard and epoch are assigned there too, and the worker only drops what it
+received. Its `Drop` tests
 `std::thread::panicking()` and, if so, lowers `failed_epoch` to its own
 epoch (a CAS keeping the minimum) with `Release` ordering *before* it
 decrements its count — the pending count for `BatchGuard`, the in-flight
@@ -556,7 +591,8 @@ every barrier_secs (default: the sink age trigger, 300 s):
 on a rotation (inside the ingest turn that observed the segment change):
     cut = capture as above, mark = prev    // the turn already holds the exclusion;
                                            // no store I/O in the turn (§3.1)
-    hand cut to the barrier task           // which runs run_cut(cut) in order
+    hand cut to the barrier task           // one pending slot: fills it, or coalesces
+                                           // into the pending cut (§3.1); never blocks
 
 run_cut(cut):
     cut_ok   = flush(cut.batches)          // store I/O OUTSIDE the exclusion
@@ -805,10 +841,13 @@ one, because startup's fallback is exactly as trustworthy as this record:
   failed unlink or parent fsync therefore leaves `reclaimed_through` behind
   the segment — and makes no promise about the file. An `unlink` whose
   parent fsync failed is an **uncertain deletion**: the entry may or may not
-  be visible after a restart, and this process cannot tell. So
-  `housekeeping_commit` keeps `reclaimed_through` behind it, marks the
-  segment's `planned` entry `uncertain`, and keeps its bytes in the
-  in-process accounting; the next pass re-verifies presence — an `unlink`
+  be visible after a restart, and this process cannot tell. The file half
+  reports it as `ReclaimOutcome::Unlinked { fsync_failed: true }`, and since
+  one parent fsync covers every unlink of the pass, the flag marks *every*
+  path in `removed` uncertain: `housekeeping_commit` keeps
+  `reclaimed_through` behind all of them, marks each segment's `planned`
+  entry `uncertain`, and keeps their bytes in the in-process accounting —
+  the whole batch stays reclaiming; the next pass re-verifies presence — an `unlink`
   that finds the file gone completes the reclamation, one that finds it
   present retries it — and only that verified outcome moves the entry. At
   open the `uncertain` entry is reconciled like any planned one (below):
@@ -877,9 +916,17 @@ one, because startup's fallback is exactly as trustworthy as this record:
   *missing* `CHECKPOINT` is also fail-closed, naming both files — every
   unlink was gated on a checkpoint, so the checkpoint existed and is gone,
   and without `X` the Parquet-side suppression horizon cannot be rebuilt
-  and replay would republish. Only an *empty* record may coexist with a
-  missing `CHECKPOINT`: that is a post-RFC root before its first barrier,
-  which is what open creates.
+  and replay would republish. An *empty* record is not enough to tell the
+  other way: a post-RFC node can checkpoint many times while reclaiming
+  nothing, and deleting that checkpoint would otherwise read as a fresh
+  root and replay published rows. So the record header carries a
+  **`checkpoint_seen`** flag, set — with the record rewritten durably —
+  *before* the first version-2 `CHECKPOINT` is written on that root; one
+  extra record write, once per root. `RECLAIM{checkpoint_seen}` with
+  `CHECKPOINT` absent fails closed, naming both files, whatever the entries
+  say; only a record with the flag unset may coexist with a missing
+  `CHECKPOINT`, and that is exactly a post-RFC root before its first
+  barrier, which is what open creates.
 - **Corrupt is fatal.** The record carries a version byte and a checksum; a
   record failing either at open fails startup as `OpenError::Corrupt`,
   naming the file. It is not read as missing: missing means "never
@@ -1231,6 +1278,15 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   the case where reclamation stops with a healthy store;
 - **the rotation-failure state**: retrying, with its attempt count, versus
   terminal;
+- **the housekeeping backlog** — `horizon_remaining` and `unlink_remaining`
+  from the last pass's `HousekeepingProgress` (§3.7), exported as two
+  asynchronous gauges in `{segment}`: the proposed names are
+  `ourios.wal.housekeeping.horizon.remaining` and
+  `ourios.wal.housekeeping.unlink.remaining` — dotted namespace under the
+  existing `ourios.wal.*`, snake_case components, not pluralised, no unit
+  in the name — with the registry bump settling the final spelling. They
+  are what turns `capped` from a bool into a trend: a backlog that is
+  draining and one that is growing read alike on `capped`;
 - **the `cadence_failed` latch** — pipeline-owned rather than a
   `ReclaimState` field, because it is set by the ingester's unwind guards
   (§3.1: the encode pool's `BatchGuard`, the sink's publish guard, the
@@ -1312,6 +1368,16 @@ So the design is:
       removed_segments: usize,   // what the forced-rotation trigger reads (RFC 0053)
       removed_partials: usize,
       capped: bool,              // "more to do" versus "backlog drained"
+      horizon_remaining: usize,  // segments a received horizon has not yet been
+                                 // applied to: per tenant, the segments it spans
+                                 // between its cursor and its horizon, summed over
+                                 // tenants (a segment counts once per tenant behind
+                                 // on it); taken at the end of the pass from the
+                                 // cursors, O(tenants), never from a walk
+      unlink_remaining: usize,   // eligible segments not yet popped (a range count
+                                 // over the ordered structure up to the checkpoint)
+                                 // plus entries still reclaiming or uncertain, at
+                                 // the end of the pass
       floor: RetainFloor,        // derived on this pass (§3.2)
       lag_bytes: u64,            // §3.5's units, from per-segment accounting —
       lag_segments: usize,       // never from an inspection the cap would bound
@@ -1350,15 +1416,22 @@ So the design is:
   }
   enum ReclaimOutcome {                                // what the file half did
       RecordFailed(io::Error),                         // nothing unlinked
-      Unlinked { removed: Vec<PathBuf>, failed: Vec<(PathBuf, io::Error)> },
-  }
+      Unlinked {
+          removed: Vec<PathBuf>,                       // unlink returned Ok
+          failed: Vec<(PathBuf, io::Error)>,           // unlink returned Err
+          fsync_failed: bool,                          // the parent fsync after the
+      },                                               // unlinks failed: every path in
+  }                                                    // `removed` is uncertain (§3.2)
   fn housekeeping_commit(&mut self, outcome: ReclaimOutcome)
       -> Result<HousekeepingProgress, ReclaimError>   // the ledger half again, under the
                                                        // guard: removed entries leave the
-                                                       // ledger and its accounting, failed
-                                                       // ones return to eligible (record
-                                                       // failed) or stay reclaiming (unlink
-                                                       // failed), per §3.2
+                                                       // ledger and its accounting unless
+                                                       // fsync_failed, in which case the
+                                                       // whole removed set stays reclaiming
+                                                       // as uncertain, re-verified next pass;
+                                                       // failed ones return to eligible
+                                                       // (record failed) or stay reclaiming
+                                                       // (unlink failed), per §3.2
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
   fn rotate(&mut self) -> Result<(), ReceiveError>         // §3.3's retried rotation,
                                                            // callable without an append:
@@ -1606,8 +1679,9 @@ application empties it. The pass therefore does at most the cap's worth of
 horizon application plus at most the cap's worth of pops — O(cap) under the
 writer lock, with no name listing, since segments are known from the ledger
 — and `HousekeepingProgress` reports `capped` from either half hitting its
-budget, plus how much horizon application remains. RFC0052.12 is worded to
-that guarantee. The next tick continues where this one left off — the
+budget, plus the two remaining-work figures `horizon_remaining` and
+`unlink_remaining` (§3.7 defines their aggregation), both exported (§3.5).
+RFC0052.12 is worded to that guarantee. The next tick continues where this one left off — the
 per-tenant cursor is the resume point for horizon application, and the
 eligible head is re-evaluated from the ordered structure, oldest first, so
 it needs none. That matters most on
@@ -1685,6 +1759,9 @@ memory, and nothing here claims to.
 >   the worker's panic, under every schedule: a barrier that observes the
 >   pool's pending count at zero has observed the latch, because the
 >   unwinding guard stores it before the decrement that settles the count
+> - **And** a batch queued before cut `E`'s capture and dequeued after it
+>   carries epoch `E` — assigned in `submit`, not at dequeue — so a panic in
+>   it fails cut `E`, not only later ones
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -1939,9 +2016,10 @@ memory, and nothing here claims to.
 >   unreclaimed bytes and the age of the oldest unreclaimed frame** (the
 >   bytes being what RFC 0053's bound is taken on, including the
 >   post-checkpoint tail), the retain floor with its
->   lag and `Pinned` state, the `cadence_failed` latch, and the
->   rotation-failure state are all present
->   in the exported stream under registry names
+>   lag and `Pinned` state, the `cadence_failed` latch, the
+>   rotation-failure state, and the housekeeping backlog (horizon
+>   application remaining and unlinks remaining, in segments) are all
+>   present in the exported stream under registry names
 > - **And** a run whose checkpoint never advances still reports growing
 >   unreclaimed bytes — exporting the below-checkpoint figure instead would
 >   read as flat during exactly the outage it exists to show
@@ -1983,9 +2061,10 @@ memory, and nothing here claims to.
 > - **And** a root holding a version-1 `CHECKPOINT` (an RFC0008.7 fixture)
 >   and no `RECLAIM` opens as pre-RFC with an empty record, and its first
 >   checkpoint rewrites the sidecar at version 2
-> - **And** a root whose `RECLAIM` holds entries and whose `CHECKPOINT` is
->   missing fails open naming both files, while an empty `RECLAIM` beside a
->   missing `CHECKPOINT` opens as a fresh post-RFC root
+> - **And** a root whose `RECLAIM` carries `checkpoint_seen` — set before its
+>   first version-2 checkpoint, entries or none — and whose `CHECKPOINT` is
+>   missing fails open naming both files, while a `RECLAIM` with the flag
+>   unset beside a missing `CHECKPOINT` opens as a fresh post-RFC root
 > - **And** a segment whose `unlink` fails after the record was written
 >   stays on disk with `reclaimed_through` behind it: a restart with that
 >   tenant's snapshot undecodable pins the tenant rather than halting

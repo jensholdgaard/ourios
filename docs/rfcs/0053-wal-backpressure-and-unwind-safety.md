@@ -172,9 +172,9 @@ reason given there.
 
 Three boundaries of that figure are stated so the reservation and the
 measurement cannot drift apart. **It is over frame bytes**, the unit RFC
-0052 §3.7 gives `remeasure_unreclaimed()` — file size less the 24-byte
-segment header — so the live figure and the restart figure are the same
-number and this RFC amends nothing there. Segment headers are outside the
+0052 §3.7 gives `rebuild_ledger()` — the sum of the validated frames'
+lengths, never file size — so the live figure and the restart figure are
+the same number and this RFC amends nothing there. Segment headers are outside the
 measurement and the reservation alike: a pre-write rotation adds one, and
 the coordinator cannot know whether an append will rotate. Headers are
 bounded separately, because frame bytes do not bound them — §3.1's forced
@@ -204,9 +204,21 @@ the client returns after the `Retry-After` §3.1 computes — so with a
 reclaimable segment the request is refused once and admitted after the
 pass, and with nothing reclaimable it stays refused, and no forced
 rotation runs at the ceiling (below). A reservation that would not rotate
-is unaffected, since it creates no header. Header overhead is therefore
-at most 24 B × `max_segments`, and the refusal leaves with the same latch
-once a pass removes a segment. **A segment stays in it
+is unaffected, since it creates no header. **Every rotation takes the slot
+check, not only the reserved one**: RFC 0052 has two append-independent
+rotation callers — the barrier task's idle rotation (§3.2, rotate-before-
+cut under the exclusion) and the post-recovery step's owed rotation — and
+a rotation from either at `retained == max_segments` would create the
+segment the reservation refuses. So the check lives in `Wal::rotate`
+itself, under the journal mutex: at the ceiling it performs no rotation
+and returns `Err(RotationRefused::AtSegmentCap)`, a typed, non-fault
+outcome that draws on no retry budget, and every caller treats it as "no
+rotation" — the idle rotation is skipped and the tick captures its cut as
+if the segment had not aged, with the mark `last_durable` as every cut's
+mark is; the reservation path never reaches it, having refused first; and
+the owed rotation after a seal is deferred (below). Header overhead is
+therefore at most 24 B × `max_segments`, and the refusal leaves with the
+same latch once a pass removes a segment. **A segment stays in it
 until its unlink succeeds.** RFC 0052 §3.2 marks a popped ledger entry
 *reclaiming* and keeps it in the byte and segment accounting until the
 off-lock unlink has succeeded, so the bytes of a segment whose `RECLAIM`
@@ -224,20 +236,22 @@ volume — and not with the backlog. **It survives a
 restart by being rebuilt, not persisted, in the same unit.** Once replay
 and heal have settled the newest segment's tail — a torn frame there is
 truncated by heal and must not be counted — the figure is initialised as
-the sum over every surviving segment, closed and current, of its file
-size **less the 24-byte segment header**, so the rebuilt number is frame
-bytes like the live one and matches what the reservation adds to it. The hook is RFC 0052 §3.7's
-`Wal::remeasure_unreclaimed()`, called after every successful replay and
+the sum over every surviving segment, closed and current, of its
+**validated frame lengths**, so the rebuilt number is frame bytes like the
+live one and matches what the reservation adds to it. The hook is RFC 0052
+§3.7's `Wal::rebuild_ledger()` — the validated frame scan that fills the
+ledger and the partial list — called after every successful replay and
 after the heal when there was a torn tail to heal — not at `Wal::open`,
 which runs before either and would count torn bytes, and not only on the
 heal path, which a clean replay never enters — and the coordinator is
 constructed after recovery, so the seed completes before any append is
 admitted and a node restarted mid-outage resumes refusing at the same bound
-rather than admitting from zero. The same hook seeds the current segment's
+rather than admitting from zero. The same scan seeds the current segment's
 frame bytes (§3.1's rotation trigger) from the healed newest segment. And
-it fails closed: a listing, stat or header error from the remeasure fails
-startup before the coordinator or any listener is constructed, because a
-partial or zero seed is precisely a node that admits past its bound.
+it fails closed: a listing, read or frame-validation error from the scan
+fails startup before the coordinator or any listener is constructed,
+because a partial or zero seed is precisely a node that admits past its
+bound.
 RFC0053.4's restart asserts both.
 
 The age of the oldest unreclaimed frame is exported beside it (RFC 0052 §3.5)
@@ -312,15 +326,18 @@ second way to corrupt the tail, so the only safe reservation is one taken
 before the write. Two append failures need their own rules. A failure the
 WAL rolls back cleanly — the truncate-back succeeds — leaves the figure and
 the refusing state unchanged; that includes a truncate-back to the header
-of a fresh segment, which leaves an empty segment holding no frame bytes
-and counting against `max_segments` until housekeeping reclaims it. A failure after bytes reached disk whose
+of a fresh segment, which leaves an empty *current* segment holding no
+frame bytes and counting against `max_segments` — RFC 0052 never unlinks
+the current segment, so it is reclaimable only once a later rotation (an
+append's, the timer's idle one, or §3.1's forced one) closes it, and
+housekeeping reclaims it on the pass after that. A failure after bytes reached disk whose
 best-effort truncate-back *also* fails is not something the counter alone
 can absorb: the frame's full framed length is added to the unreclaimed
 figure at once — an over-count is safe, an under-count admits past the
 bound — **and the ledger records that counted amount against the sealed
 segment**, so when housekeeping unlinks it the accounting subtracts
 exactly what was added, whatever the file held, and no artificial backlog
-survives the unlink without a restart; the next `remeasure_unreclaimed()`
+survives the unlink without a restart; the next `rebuild_ledger()`
 corrects the figure to the bytes on disk in any case, and RFC0053.1
 asserts the no-restart path — **and the segment
 is sealed with a durable marker** — the WAL refuses further appends into
@@ -336,7 +353,16 @@ RFC 0052 §3.3's retry path into a fresh segment, since appending after a
 partial frame would let recovery consume later bytes as part of it. The seal is **versioned and
 segment-bound**: it carries a format version, the segment's own UUID, the
 last good length, and a checksum of those three, so a stale or corrupted
-seal cannot authorise anything. If the seal write itself fails the WAL
+seal cannot authorise anything. The rotation that follows the seal is a rotation like any other and
+takes the slot check: with a slot it rotates; **without one the seal is
+written and the rotation is deferred** — the WAL reports RFC 0052 §3.3's
+terminal classification (`RotationState::Terminal`, sub-state `Deferred {
+AtSegmentCap }`), so appends are refused under the server-terminal,
+client-retryable class, and `maintain` retries the deferred rotation
+after a pass frees a slot, on which the state clears and admission
+resumes. That is the one terminal sub-state a restart is not needed to
+clear, stated as an amendment to §3.3's "only a restart clears it", and
+RFC0053.1 covers both cases. If the seal write itself fails the WAL
 enters the terminal rotation state: it can neither repair nor mark the
 segment. That state needs no durable discriminator: the WAL is terminal, so
 the segment stays the *newest* one, and the frame at its EOF was never
@@ -373,17 +399,17 @@ truncate and before the seal is consumed, so a verifying seal whose length
 segment, and recovery consumes the seal and continues; only a seal whose
 length falls inside the segment demands the one-partial-frame shape. The
 rotation that was owed is then performed on the `Rotation` origin by the
-**post-recovery step** — the same step that calls `remeasure_unreclaimed()`,
+**post-recovery step** — the same step that calls `rebuild_ledger()`,
 after replay and heal and before the coordinator is constructed — not by
 `Wal::open`, which `serve` runs *before* `recovery::recover` and which
-therefore has neither the replay-validated boundaries nor the remeasured
+therefore has neither the replay-validated boundaries nor the rebuilt
 figure the rule depends on; so a restart never appends into a sealed
 segment either.
 
 **Seal removal is an amendment to RFC 0052 §3.7, stated here because that
 section's sweep knows only `.wal.partial` and segments.** A seal belongs
 to its segment: the per-segment ledger entry (RFC 0052 §3.2) records that
-the segment is sealed, live sealing sets it, and `remeasure_unreclaimed()`
+the segment is sealed, live sealing sets it, and `rebuild_ledger()`
 seeds it at recovery from the seals it finds — a seal whose segment is
 gone is an orphan and is pushed onto the same seeded debris list as
 partials, together with every `.wal.seal.partial`. When housekeeping
@@ -405,7 +431,7 @@ checkpoint case.
 **Repeated rollback failures are bounded, in two units.** The torn bytes
 are *inside* the bound for as long as they exist: the failed
 frame's full framed length is added at the seal, and at a restart the heal
-truncates them before `remeasure_unreclaimed()` runs, so the rebuilt figure
+truncates them before `rebuild_ledger()` runs, so the rebuilt figure
 excludes what is no longer on disk and no sequence of seals can grow the
 frame bytes past the limit.
 What sits *outside* it is a fixed-size seal per
@@ -432,11 +458,20 @@ second knob rides with it, for a different growth: in open mode (RFC 0026
 `RECLAIM` entries and the `SnapshotLedger`'s retained states (§3.2) would
 grow with traffic rather than with an operator's tenant set. `ReceiverSection`
 gains **`max_tenants`** (default 1024, same `${env:VAR}` and Helm path):
-admission of a tenant id the miner does not yet hold, when the held count
-is at the guard, is refused under the same backpressure class with the
-`Tenants` cause naming the tenant — ordered with §3.1's tenant check,
-after the terminal-rotation check and before the bound — and existing
-tenants are unaffected. Authenticated deployments bound the set out of
+admission of a tenant id the miner does not yet hold, when the guard is
+reached, is refused under the same backpressure class with the `Tenants`
+cause naming the tenant — ordered with §3.1's tenant check, after the
+terminal-rotation check and before the bound — and existing tenants are
+unaffected. A check before the append is not enough on its own, since
+concurrent first writes for different new ids would all observe the count
+below the guard; so the coordinator keeps a tenant admission table under
+the same mutex the reservation takes, with two states: a new id takes a
+**`Reserved`** slot there before its append — refused when `Reserved +
+Held` is at the guard — moves to **`Held`** when the batch's sync returns
+`Ok` and the tenant is installed in the miner, and is released on append
+failure, sync failure or an unwind before installation, so two first
+writes for one id share a single slot and a burst of new ids cannot
+overshoot by more than the guard. `ourios.wal.tenants` counts `Held` only. Authenticated deployments bound the set out of
 band (RFC 0047 §3.1's binding, RFC 0048's authorisation), so the guard is
 the open-mode backstop, not the tenancy model; the held count is exported
 (`ourios.wal.tenants`, §3.3) and RFC0053.1 asserts the refusal.
@@ -543,7 +578,7 @@ condition needs a state surface the inherited `ReclaimState` lacks —
 `unflushed_bytes` resets on every sync, so it cannot tell a synced current
 segment from an empty one — and this RFC adds one field to it:
 `current_segment_frame_bytes`, maintained by the same append accounting and
-seeded from the healed newest segment by the post-recovery remeasure (a
+seeded from the healed newest segment by the post-recovery ledger rebuild (a
 reopened WAL has frames in its current segment before any append). An
 earlier draft rotated on the latch alone and argued a spare rotation was
 harmless; it is not at the ceiling, and it is pointless when the batch
@@ -593,8 +628,8 @@ resume; the held-floor cases are normative — a tenant with no valid
 snapshot pins the floor and is reported `Pinned`, a valid but lagging
 horizon is `Min` with `lag_bytes` reported beside it — `Min` is the
 reported minimum and carries no comparison of its own; the per-segment
-rule is strict at every horizon and pin and inclusive only at the
-checkpoint — and in both the bound stays crossed for
+rule is inclusive at the checkpoint and at a durably installed horizon
+and strict at a pin — and in both the bound stays crossed for
 a batch of that size after the store returns, while the refusal latch
 itself still follows §3.1 and may leave on a smaller successful append
 (RFC0053.1) — and only the escalation policy is the §7 question.
@@ -709,12 +744,20 @@ handle. What the design requires is that **no** panic arm anywhere in the
 sequence can drop an un-requeued batch; neither mechanism delivers that
 alone, and neither can a `catch_unwind` at one call site.
 
-**The encode workers are in the contract too.** Under RFC 0052 §3.1 a
-worker performs no store I/O: `emit_concurrent` appends each record to the
-buffers, and a size- or ceiling-detached partition is registered as in
-flight and handed to the sink's off-lock publisher — the age sweep's
-`write_ordered` path — while the worker moves to its next record, so
-`quiesce` waits on encodes alone. What a worker panic can still drop is
+**The encode workers and the publisher are in the contract too.** Under
+RFC 0052 §3.1 a worker performs no store I/O: `emit_concurrent` appends
+each record to the buffers, and a size- or ceiling-detached partition is
+registered as in flight and enqueued to the **publisher** — the one
+dedicated thread the `PublishCoordinator` owns behind a bounded queue,
+which runs `write_ordered` on each batch and settles its guard as durable,
+requeued, quarantined or, on an unwind, latched — the worker registering
+the publish guard *before* the enqueue and before its own `BatchGuard` can
+settle, then moving to its next record, so `quiesce` waits on encodes
+alone. Everything this section says about `write_ordered` — the `Drained`
+destructor, the `RecoverableBatch` handle, the unwind arm — therefore
+attaches to the publisher thread for detached batches exactly as it does
+to the age sweep's step, since both run the same function on the same
+thread; nothing attaches to a worker-side PUT, because there is none. What a worker panic can still drop is
 the *unappended remainder* of its mined `Vec`, and RFC 0052 has
 `BatchGuard` latch `cadence_failed` for exactly that; with the latch
 retired here, the worker's batch takes the same recoverable shape instead —
@@ -728,14 +771,13 @@ step, so a panic in the trigger cannot requeue a record the sink already
 holds; a permanent drop in `PartitionKey::derive`, which returns before
 any insertion, comes back as an explicit `Settled::Dropped` result of the
 handoff rather than something the guard has to guess at — and a detached
-partition passes from the worker to the off-lock publisher's own
-`RecoverableBatch` at the in-flight registration, before the worker
+partition passes from the worker to the publisher's own `RecoverableBatch`
+at the in-flight registration, before the enqueue and before the worker
 continues, so a panic in the worker after that point cannot touch it and a
 panic inside the publisher settles it per partition exactly as the sweep's
 batches are. The one-duplicate bound is claimed only under those two
 transfers. RFC0053.2 asserts it with a panic inside a worker's encode loop,
-and with a panic inside the off-lock publisher of a partition a worker
-detached. Requeueing
+and with a panic inside the publisher on a batch a worker detached. Requeueing
 the batch is worthless if the pool then swallows the next one, so both
 halves of worker recovery are stated: a worker whose `emit_concurrent`
 panics exits its OS thread today, and a **pool-owned supervisor**
@@ -830,10 +872,20 @@ miner lock — the tick taking the gate as a turn would, so the gate already
 serialises them; the claim makes that explicit and lets the later one
 observe it: an `unmined` entry has a state, `Unresolved` or `Settling`,
 and the settler moves it to `Settling` under the miner lock before it
-touches the tenant, the other trigger finding the entry `Settling` or gone
-and proceeding to its own work. The entry is removed under the same lock
-when the rebuild completes, and a failed rebuild returns it to
-`Unresolved` for the next trigger. RFC0053.1 asserts the bound-crossed
+touches the tenant. The claim alone does not serialise the loser with the
+rebuild, because the winner releases the locks for the bounded reads
+(below) and takes them again only for the final `replace_tenant`; so the
+entry also carries a completion signal, and the protocol is: the winner
+holds the gate for the claim only, performs the reads with no pipeline
+lock held, re-takes the fixed order for `replace_tenant`, removes the
+entry under the miner lock and signals; while an entry is `Settling`, an
+ingest turn for one of its tenants **blocks at the gate** on that signal
+before it proceeds — the tenant's live tree is unreachable to ingest until
+the rebuild has installed it — while turns for other tenants pass; the
+losing trigger likewise waits on the signal and only then proceeds to its
+own work, so it never runs against a half-rebuilt tenant. A failed rebuild
+returns the entry to `Unresolved`, signals, and the next trigger claims
+it. RFC0053.1 asserts the bound-crossed
 case settles on the timer with no append and no restart, and RFC0053.2
 races the two triggers on one entry and asserts exactly one rebuild. **The fallback reuses RFC 0052's reclaimed-through
 check, so an unrecoverable tenant stays blocked in-process as it would at
@@ -843,12 +895,20 @@ horizon — its installed snapshot's mark, or none — with
 recorded reclaimed-through, including a tenant with an entry and no
 restorable snapshot, has state the surviving frames cannot rebuild, and
 the full replay would silently produce a tree missing what was reclaimed.
-That tenant is marked **unrecoverable**: its appends are refused under the
-server-terminal, client-retryable class naming the tenant, its entry stays
-unresolved (so its clamp holds the checkpoint and no snapshot is installed
-for it), the state is exported and alerted (`ourios.wal.tenant_unrecoverable`,
-§3.3), and only a restart — which halts naming the tenant, per RFC 0052 —
-takes it further. Every other tenant continues.
+That tenant is marked **unrecoverable**, and isolated rather than left to
+pin the node: its appends are refused under the server-terminal,
+client-retryable class naming the tenant; its entry leaves the clamp set
+for a per-tenant `Refused` state, so `last_durable` and the node-wide
+checkpoint advance for everyone else; its frames are retained instead by
+RFC 0052's own pin — the receiver drops the tenant from the
+`SnapshotHorizons` it hands to `maintain`, so the WAL pins the tenant at
+its oldest surviving frame (`RetainFloor::Pinned`, strict) and reclaims
+only segments holding no frame of it; no snapshot is installed for it;
+the state is exported and alerted (`ourios.wal.tenant_unrecoverable`,
+§3.3, with the pin visible in the floor); and the operator path is a
+restart, which halts naming the tenant per RFC 0052 and is where the
+tenant's state is decided. Every other tenant continues, checkpoints and
+reclaims.
 `restore_tenant` refuses a tenant that already has live state
 (`TenantAlreadyLive`), by design, so the rebuild goes through a new
 `MinerCluster::replace_tenant(tenant_id, Option<&SnapshotState>)`: under
@@ -1088,7 +1148,9 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** the bound fires on bytes accumulated *above* a stalled
 >   checkpoint, not only below it: a run where the checkpoint never advances
 >   must still reach the limit
-> - **And** the rejection does **not** set the rotation-failure state
+> - **And** the refusal transition itself does **not** set the
+>   rotation-failure state; a forced rotation that later fails may enter
+>   RFC 0052's retrying or terminal state on its own account
 > - **And** when the store returns and no tenant pins the floor (RFC 0052
 >   §3.2), ingest resumes **with no append and no restart** — the
 >   timer-driven sequence reclaims, which is the only path that can clear a
@@ -1108,7 +1170,12 @@ are kept distinct so that the remedy each advertises is the true one.
 >   reserves a segment slot: below the ceiling it is admitted and rotates,
 >   at the ceiling it is refused with the `Segments` cause — once and then
 >   admitted after the next pass when a segment was reclaimable, and on
->   every retry while nothing is
+>   every retry while nothing is reclaimable
+> - **And** the timer's idle rotation at the ceiling performs no rotation
+>   and the tick still captures its cut with `last_durable` as the mark;
+>   the rotation owed after a seal with a slot free proceeds, and without
+>   one is deferred under the terminal classification until a pass frees a
+>   slot, after which it runs and admission resumes without a restart
 > - **And** in open mode a batch for a tenant id the miner does not hold,
 >   with `max_tenants` held, is refused with the `Tenants` cause naming the
 >   tenant, while a batch for a held tenant is admitted; the refusal is
@@ -1160,7 +1227,7 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a panic inside an `EncodePool` worker's encode loop, after the WAL
 >   ack, requeues the unappended remainder of that worker's mined batch, and
 >   the barrier does not read the pool as idle across it; a panic inside the
->   off-lock publisher of a partition that worker detached settles it per
+>   publisher thread on a batch that worker detached settles it per
 >   partition, and the worker's own guard never touches it
 > - **And** a submit after that panic is either published by a respawned
 >   worker or placed in the record sink's buffer and acknowledged; it is
@@ -1184,9 +1251,11 @@ are kept distinct so that the remedy each advertises is the true one.
 >   through `tenant_state`, after the terminal-rotation check and before
 >   the reservation — an oversize payload for it is still `TooLarge` and a
 >   terminal WAL still reports the WAL's state — under the
->   server-terminal, client-retryable class naming it, its entry
->   and clamp remain, no snapshot is installed for it, the state is
->   exported, and other tenants ingest and snapshot normally
+>   server-terminal, client-retryable class naming it, its entry moves to
+>   `Refused` and out of the clamp set, its frames are held by the floor's
+>   pin rather than the clamp, the node-wide checkpoint advances past other
+>   tenants' frames, no snapshot is installed for it, the state is
+>   exported, and other tenants ingest, snapshot and reclaim normally
 > - **And** `read_frames_from` started at `FrameCursor::after(from)`
 >   returns the frame after `from` first and the `to` frame last, only that
 >   tenant's frames; started at `oldest_frame(tenant)` it begins at the
@@ -1195,7 +1264,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   append issued mid-replay lands between two of its calls
 > - **And** the barrier tick and an admitted ingest turn racing on one
 >   `unmined` entry produce exactly one rebuild; the loser observes the
->   entry `Settling` or gone and proceeds
+>   entry `Settling` and runs only after the rebuild has installed the
+>   tenant and the entry is gone, an ingest turn for that tenant issued
+>   mid-rebuild is admitted only after settlement, and a turn for another
+>   tenant is not held
 > - **And** settlement rebuilds from the `SnapshotLedger`'s retained state,
 >   not the directory: a `.snap` renamed but not yet parent-fsynced, or left
 >   by a failed write, is never read
@@ -1215,7 +1287,8 @@ are kept distinct so that the remedy each advertises is the true one.
 >   consulted; `read_frames_from` on a span that does not end on a frame
 >   boundary is an error that leaves the entry in place
 > - **And** this holds for a panic raised **at each** point the publish can
->   reach it — before the audit write, inside it, and inside the record
+>   reach it — during the drain itself, while taking the second of the two
+>   batches, before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
 >   caught by a naive guard
 > - **And** the publication barrier does not read the buffers as fully
@@ -1245,12 +1318,12 @@ are kept distinct so that the remedy each advertises is the true one.
 >   batch is present in Parquet or in the WAL
 > - **And** the restarted node's admission starts from the rebuilt unreclaimed
 >   figure, so a batch the bound refused before the kill is refused after it
-> - **And** a restart whose remeasure fails does not come up: no coordinator,
+> - **And** a restart whose ledger rebuild fails does not come up: no coordinator,
 >   no listener, and no batch admitted
 > - **And** a kill after a seal's parent fsync and before its rotation
 >   leaves the sealed tail in the newest segment: recovery heals it to the
 >   seal's length, consumes the seal, and the post-recovery step — after
->   the remeasure, before the coordinator exists — performs the owed
+>   the ledger rebuild, before the coordinator exists — performs the owed
 >   rotation before the first append; a newest segment whose seal does not
 >   verify halts; a `.wal.seal.partial` is swept and never consulted
 > - **And** a kill after the heal's truncate and before the seal is consumed
@@ -1335,10 +1408,10 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
 - **No loss (RFC0053.4)** — extends RFC 0052's `SIGKILL` crash-recovery
   extension rather than adding a parallel one, in **both** restart shapes —
   a clean replay and a torn newest tail, since the existing crash test has
-  no torn tail and a remeasure hook placed only on the heal path would pass
+  no torn tail and a rebuild hook placed only on the heal path would pass
   it — plus a third, the sealed closed segment: a fixture with a torn tail
   in a non-newest segment and a matching `.wal.seal`, asserting the frames
-  before the seal are delivered, the remeasure excludes the torn bytes, and
+  before the seal are delivered, the rebuild excludes the torn bytes, and
   the same fixture *without* the seal halts as corruption — and a fourth,
   the sealed *newest* segment (the seal durable, the rotation not yet
   performed), asserting the heal to the seal's length, the consumed seal,
@@ -1350,8 +1423,8 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   post-restart append that asserts the rebuilt figure still refuses, and
   an exact-figure assertion against a fixture with several closed segments,
   a header-only current segment (contributing nothing) and a torn newest
-  tail — a refused-stays-refused check alone would pass a remeasure that
-  counted headers or torn bytes; a fault-injected leg makes the remeasure's listing fail and asserts
+  tail — a refused-stays-refused check alone would pass a rebuild that
+  counted headers or torn bytes; a fault-injected leg makes the rebuild's scan fail and asserts
   startup refuses to construct the coordinator.
 - **Telemetry (RFC0053.5)** — the in-memory metric exporter pattern used for
   the ingest instruments, driving one enter and one leave and asserting the

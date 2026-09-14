@@ -179,18 +179,49 @@ Instead the pipeline gains an explicit **barrier exclusion**: a lock
 exclusively to **capture a cut**, and for nothing else. It is strictly wider
 than the miner lock and strictly narrower than the gate, so it does not
 change ingest ordering, and it is the smallest thing that closes the window.
-Rotation needs no change: it already runs inside an ingest's own span.
+Rotation's *exclusion* needs no change — it already runs inside an ingest's
+own span — but its *I/O* does. Today `rotate_for_segment_change` runs under
+the miner lock and the gate and performs the whole of `flush_then_snapshot`
+there, PUTs included; under this RFC that span is also the barrier
+exclusion, so leaving the hook as it is would hold the exclusion across
+store I/O at every rotation — exactly the stall the next paragraph takes the
+timer out of, and with §3.3's retry it would recur on every retried
+rotation during an outage. So the rotation hook becomes **capture-only**:
+inside the turn it quiesces the encodes, takes the mark (`prev`, the
+rotation point), drains both sinks into owned batches registered as in
+flight, serialises the snapshot bytes, and hands that cut to the barrier
+task, which runs the same store-I/O sequence the timer's own cuts run
+(§3.2's pseudocode from `cut_ok` on). The ingest turn does no store I/O;
+the mark invariant is unchanged, because the cut was captured under the
+exclusion; and there is one owner of barrier I/O rather than two. The
+rotation hook and the timer are then the same barrier with two triggers,
+which is also what lets §3.7's `Journal::rotate` fire a rotation from the
+timer without a second code path.
 
 **The cut is captured under the exclusion; the store I/O is not.** Under the
-exclusion the timer stops new submissions and waits for the *encode* steps
-to finish — not for the workers' store I/O: `EncodePool::quiesce` today
-waits for a worker even while it is inside a `put_blocking`, and the sink's
-in-flight guard today covers only `PublishCoordinator::drain_*`, not the
-`publish_owned` calls `emit_concurrent` makes itself — so that guard is
-extended to those calls, taken inside `emit_concurrent` around each
-publish, and the pool's quiesce is redefined to return once every worker
-has registered its pending publish there, whose PUTs then settle outside
-the exclusion under `quiesce_publishes` like any other — reads the mark, drains
+exclusion the timer stops new submissions and waits for the *encode phase*
+of every batch submitted before the cut to finish — not for store I/O. The
+unit is the batch, not the worker: a batch is encode-complete when each of
+its records has been appended to the buffers or detached into a registered
+publish, and the pool already counts exactly that (`submit` increments the
+pending count, `BatchGuard` decrements it when the worker's loop over the
+batch ends), so `quiesce`'s unit stays what it is. Waiting on anything
+finer is unsound: a worker takes a batch record by record, and
+`emit_concurrent` detaches and publishes partitions one at a time, so a
+quiesce that returned once a worker had *registered* a publish would leave
+the rest of that worker's pre-cut batch unemitted — records at or below the
+mark that the cut's drain cannot see and the checkpoint would stamp past.
+What changes is that the worker no longer performs store I/O:
+`EncodePool::quiesce` today waits for a worker even while it is inside a
+`put_blocking`, and the sink's in-flight guard today covers only
+`PublishCoordinator::drain_*`, not the `publish_owned` calls
+`emit_concurrent` makes itself. So a size- or ceiling-detached partition is
+registered as in flight inside `emit_concurrent` and handed to the sink's
+off-lock publisher — the path the age sweep's `write_ordered` already uses,
+audit barrier first, requeue on transient failure, quarantine on poison —
+and the worker moves to its next record. A worker is then never inside a
+PUT, the quiesce waits on encodes alone, and the PUTs settle outside the
+exclusion under `quiesce_publishes` like any other. The barrier — reads the mark, drains
 both sinks into owned batches, registers that publish as in flight, and
 serialises each tenant's miner snapshot state — the bytes `write_snapshots`
 would write — then releases. The flush of those batches, the snapshot *file* writes from
@@ -442,11 +473,20 @@ every barrier_secs (default: the sink age trigger, 300 s):
     if cadence_failed: skip                // §3.1; housekeeping below still runs
     cut = with_barrier_exclusion:          // a NEW pipeline lock, not the miner
                                            // lock and not the gate — see §3.1
-        quiesce_encodes()                  // the barrier's prologue
+        quiesce_encodes()                  // the barrier's prologue: every pre-cut
+                                           // batch encode-complete (§3.1)
         mark = last_durable()              // read AFTER the quiesce, INSIDE the turn
         batches = drain both sinks         // owned; registered as in flight
         snaps = serialise miner snapshots  // cut-consistent S (§3.1)
         (mark, batches, snaps)             // release the exclusion here
+    run_cut(cut)
+
+on a rotation (inside the ingest turn that observed the segment change):
+    cut = capture as above, mark = prev    // the turn already holds the exclusion;
+                                           // no store I/O in the turn (§3.1)
+    hand cut to the barrier task           // which runs run_cut(cut) in order
+
+run_cut(cut):
     cut_ok   = flush(cut.batches)          // store I/O OUTSIDE the exclusion
     prior_ok = quiesce_publishes().all_ok() // earlier in-flight publishes: outcome, not a wait;
                                            // always evaluated, so a failed cut flush cannot
@@ -634,13 +674,30 @@ persists, per tenant, the horizon it reclaimed under — a `RECLAIM` sidecar
 beside `CHECKPOINT`, under the same contract as that file and not a looser
 one, because startup's fallback is exactly as trustworthy as this record:
 
-- **Atomic and durable, before the unlinks.** Written whole to `RECLAIM.tmp`
-  (a fixed name, like `CHECKPOINT.tmp`: housekeeping is the single writer,
-  so a temp left by a crash is simply truncated by the next write, and
-  RFC0052.16's selector leaves it alone), fsynced, renamed over `RECLAIM`,
-  parent fsynced — and only then does the pass unlink. The record is on disk
-  before any frame it accounts for is gone; a torn write is a temp and never
-  the record.
+- **Atomic and durable, before the unlinks — and off the writer position.**
+  Written whole to `RECLAIM.tmp` (a fixed name, like `CHECKPOINT.tmp`:
+  housekeeping is the single writer, so a temp left by a crash is simply
+  truncated by the next write, and RFC0052.16's selector leaves it alone),
+  fsynced, renamed over `RECLAIM`, parent fsynced — and only then does the
+  pass unlink. The record is on disk before any frame it accounts for is
+  gone; a torn write is a temp and never the record. None of that file work
+  happens under the journal mutex: serialising every tenant's entry and
+  three fsyncs is O(tenant count) plus disk latency, which would put fsync
+  time in front of every concurrent append and break RFC0052.12's O(cap)
+  claim. The pass therefore has two halves. Under the writer position it
+  pops at most the cap's worth of eligible segments and stale partials from
+  the ledger's structures — removing them from the ledger and its
+  accounting, and noting the horizon each popped segment was reclaimed
+  under per tenant — and releases. Off the writer position it merges those
+  horizons into the record, writes and fsyncs it, and only then unlinks the
+  popped files and fsyncs the parent. The ordering rule is what the
+  startup contract needs and it is unchanged: the record is durable before
+  the segments it covers are gone. A file whose unlink fails stays in a
+  small pending-unlink list outside the ledger and is retried by the next
+  pass's off-lock half, still within that pass's cap; it is already out of
+  the ledger, so it can neither be popped twice nor counted as retained.
+  Housekeeping's ledger half is the only half that takes the writer
+  position, which is what "runs on rotation's ownership path" means below.
 - **Monotonic per tenant, by merge.** The pass reads the record, raises each
   tenant it is about to reclaim under to that horizon, and never lowers an
   entry; a tenant absent from the record has never had a frame reclaimed
@@ -674,8 +731,10 @@ never past the checkpoint, so a stale floor makes truncation conservative — it
 captured, which degrades the next start to a fuller replay and never to loss
 (hazard #5's retain rule, RFC 0001 §6.9).
 
-Housekeeping takes the WAL's single-writer position, so it runs on the
-same ownership path as rotation rather than concurrently with it.
+Housekeeping's ledger half takes the WAL's single-writer position, so it
+runs on the same ownership path as rotation rather than concurrently with
+it; its file half — the record write, the unlinks, the parent fsync — runs
+after that position is released, on the housekeeping task alone.
 
 ### 3.3 Rotation failure becomes recoverable, under a bounded retry
 
@@ -831,10 +890,11 @@ rules make it safe:
   swept debris.
 
 The step runs **inside** the same per-pass cap as segment unlinking (§3.7) and
-counts against it, because it takes the same single-writer position — a backlog
-of stale partials would otherwise make a "bounded" pass do unbounded directory
-work and break RFC0052.12. An unlink failure is logged and retried on the next
-pass like any other.
+counts against it, because it pops from the same ledger under the same
+single-writer position — a backlog of stale partials would otherwise make a
+"bounded" pass do unbounded directory work and break RFC0052.12; the unlink
+itself runs in the pass's off-lock half like a segment's (§3.2). An unlink
+failure is logged and retried on the next pass like any other.
 
 Two more properties of the sweep are stated because the current
 `housekeeping` has neither. **It runs on every pass**, regardless of the
@@ -1272,7 +1332,18 @@ capped**: at most the cap's worth of segments per pass, resumed from a
 per-tenant cursor on the next, so a tenant whose snapshot catches up after
 the incident's 1,113-segment outage cannot hold the writer position for the
 whole backlog — and empty-set segments sit in an ordered structure keyed by
-highest offset. There is **no promotion pass**: a checkpoint advance stores
+highest offset. The cursor is defined once, here. Per tenant it holds the
+highest segment offset up to which that tenant's horizon has been applied;
+horizons are monotonic per tenant and a tenant's last offsets rise with the
+segments, so application is a prefix walk oldest-first, and a higher
+horizon only extends the walk's target — the cursor never moves backwards
+and is never reset by a checkpoint advance, which touches no set. Each pass
+spends its application budget round-robin across the tenants whose cursor
+is behind their horizon, so one tenant cannot starve another's. The only
+rebuild is at open, when `remeasure_unreclaimed()` rebuilds the ledger and
+every cursor starts at the oldest surviving segment; the first pass after
+startup applies from there. The eligible head needs no cursor of its own:
+it is re-evaluated from the ordered structure on every pass. There is **no promotion pass**: a checkpoint advance stores
 the new mark, O(1) under the mutex, and a segment is eligible when it is
 empty-set *and* its key is at or below the stored mark — a predicate the
 pass evaluates lazily at the head of the ordered structure, popping while
@@ -1290,9 +1361,10 @@ horizon application plus at most the cap's worth of pops — O(cap) under the
 writer lock, with no name listing, since segments are known from the ledger
 — and `HousekeepingProgress` reports `capped` from either half hitting its
 budget, plus how much horizon application remains. RFC0052.12 is worded to
-that guarantee. The next tick continues where this one left off
-without a cursor, because eligibility is recomputed from the ledger each
-time and the eligible segments are taken oldest first. That matters most on
+that guarantee. The next tick continues where this one left off — the
+per-tenant cursor is the resume point for horizon application, and the
+eligible head is re-evaluated from the ordered structure, oldest first, so
+it needs none. That matters most on
 the *first* pass of a node that has never reclaimed — the incident node held
 1,113 segments, and an uncapped pass would have stalled ingest for as long as
 1,113 unlinks take. In steady state, after §3.2 is running, a pass has a
@@ -1477,8 +1549,10 @@ memory, and nothing here claims to.
 > - **Then** it unlinks at most the cap and returns, having read no segment
 >   header and listed no directory — eligibility comes from the incremental
 >   index, and the pass pops at most the cap from the eligible queue — so an
->   append taken concurrently waits for O(cap) work under the writer lock
->   whatever the backlog; applying changed horizons is itself capped —
+>   append taken concurrently waits for O(cap) ledger work under the writer
+>   lock whatever the backlog, and never for the `RECLAIM` write, an unlink
+>   or an fsync, which run after the position is released; applying changed
+>   horizons is itself capped —
 >   at most the cap's worth of segments per pass, resumed from a per-tenant
 >   cursor next pass, so a tenant catching up after a long outage cannot
 >   hold the writer position for the whole backlog — and an unchanged
@@ -1543,6 +1617,14 @@ memory, and nothing here claims to.
 >   (nor acknowledged) is never
 >   covered — asserted by a flush whose sync covers two turns and a barrier
 >   between them
+> - **And** a pre-cut batch whose first record detached a partition mid-batch
+>   has its remaining records in the cut, under any interleaving: the
+>   quiesce waits for the batch's encode phase, not for a worker to register
+>   a publish, and the detached partition's PUT is not waited on
+> - **And** a rotation-fired cut performs no store I/O inside the ingest
+>   turn: the turn hands the captured cut to the barrier task, and an append
+>   admitted after the turn is neither in that cut's checkpoint nor in its
+>   snapshot
 
 > **Scenario RFC0052.13 — A tenant without a snapshot pins the floor, and is
 > never read as unbounded**

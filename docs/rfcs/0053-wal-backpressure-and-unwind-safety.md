@@ -201,10 +201,24 @@ also rotates a *fitting* frame once the current segment's age has passed
 reserved on size would let an age rotation create a segment past the
 ceiling, or block the forced rotation and keep the livelock. So `Journal`
 exposes the complete predicate, `fn rotation_due(&self, framed_len: u64)
--> bool` — size or age, the same function `append` consults, taken under
-the mutex immediately before the reservation — and the reservation
-reserves a segment slot exactly when it is true: `retained + 1 ≤
-max_segments`, else refuse. `validate_config` rejects `max_segments < 2`:
+-> bool` — size or age, the same function `append` consults — and the
+reservation reserves a segment slot exactly when it is true: `retained +
+1 ≤ max_segments`, else refuse. **The predicate is evaluated once, and
+the append acts on that answer**: asking twice is not equivalent, because
+the age half is a function of wall time, so a segment can cross
+`segment_age_secs` between the reservation and the write and rotate
+without the slot the reservation refused — the exact case the ceiling
+exists to prevent. So the decision travels as a token rather than being
+recomputed: the reservation's evaluation produces `RotationDecision::{
+Rotate, Reuse }` and `Journal::append_batch` takes it —
+`fn append_batch(&mut self, payload: &[u8], rotation: RotationDecision)
+-> Result<WalOffset, ReceiveError>`, an **amendment to RFC 0052 §3.7's
+signature** — honouring it instead of consulting `rotation_due` again,
+with the size half kept inside the WAL as a fail-closed assertion (a
+frame that does not fit the current segment under a `Reuse` token is a
+caller error, not a silent rotation, since size cannot change between the
+two while the journal mutex is held). Both run under one hold of that
+mutex, so no append interleaves between them either. `validate_config` rejects `max_segments < 2`:
 the current segment always holds one slot and is never unlinked, so a
 ceiling of one leaves no room for the segment a rotation must create —
 every due rotation would be refused, the forced-rotation predicate's
@@ -677,7 +691,11 @@ rotates, since a rotation at the ceiling would breach it, and a
 the version-2 witness exists, returning zero counts, and a skipped pass is
 "no progress", not "nothing left to reclaim"; forcing a rotation on the
 strength of it would rotate a legacy root that has not yet upgraded, so
-the trigger requires a pass that planned
+the trigger requires a pass that planned segments. RFC 0052 §3.2 gates
+only *segment planning* on the witness, so a skipped pass still sweeps
+partials: `removed_partials > 0` beside `removed_segments == 0` is exactly
+the migration window and is not progress for this trigger or for §3.1's
+latch, both of which read segments
 (temp-file cleanup and partial failures do not count; RFC 0052's
 `horizon_remaining` and `unlink_remaining` say whether the pass merely ran
 out of budget, and a pass that did is not a stalled one — the trigger
@@ -954,8 +972,11 @@ whose enqueue finds the queue **disconnected** (the publisher gone for
 shutdown, or between death and respawn) follows RFC 0052 §3.1's park
 rather than a settle: the failed send returns the item to the worker,
 which puts the batch back into the buffers as a **`ready` partition**
-under the sink lock *before* releasing its guard — keeping its
-`audit_watermark` in the buffer entry, since a park that stripped the
+under the sink lock *before* releasing its guard — **recording the current
+`barrier_epoch` on the parked partition exactly as RFC 0052 §3.1 has a
+requeue record it**, so a cut captured before the park fails its
+`all_ok(cut.epoch)` and cannot stamp across records it never saw; keeping
+its `audit_watermark` in the buffer entry, since a park that stripped the
 dependency would let a later drain publish the records ahead of their
 template events, and a `Drained` that takes it carries the maximum
 watermark over the partitions it took — and signals the
@@ -1063,21 +1084,31 @@ and signals. A turn for a settling tenant must not wait *inside* the gate,
 where it would hold every other tenant's sequence behind it; instead the
 coordinator keeps the **settling set** under its admission mutex, and a
 request for a `Settling` tenant is **refused at admission, before it takes
-a sequence**. The check and the reservation are **one critical section**,
-not two: the admission mutex covers reading the settling set *and*
-reserving the request's commit sequence, so no request can pass the check
-and then take a sequence behind a settler that has already claimed the
-entry, and no settler can insert between a check and its reservation. (The
-gate itself is untouched: the sequence is reserved under the mutex and
-awaited outside it.)
+a sequence**. The check and the append are **one critical section**,
+not two: the admission mutex covers reading the settling set, the tenant
+slots and the byte and segment reservations *and* is held across the
+`append_batch` that follows, so no request can pass the check and then
+append behind a settler that has already claimed the entry, and no settler
+can insert between a check and its append. **The commit sequence is not
+reserved there**, and that is deliberate: `CommitCoordinator::append` today
+takes the journal lock, appends, and only *then* allocates `seq` from
+`FlushState`, returning `CommitOutcome { seq: None }` when the append
+failed — no sequence is consumed, so the gate never waits on one that was
+never used and `FlushState` has no gap to tolerate. Reserving a sequence
+before the append would introduce exactly that hole, needing a no-op
+completion on every failure path to keep the gate advancing. So sequence
+allocation stays where it is, after a successful append, inside the same
+admission hold; the gate itself is untouched, awaited outside the mutex as
+today.
 
 **One lock order covers all four locks**, since this RFC adds the first of
 them to the three RFC 0052 §3.1 fixes. Top to bottom: **admission mutex →
 barrier exclusion → miner lock → `last_durable`**, with the **journal
 mutex** taken below the admission mutex and never above it — an ingest
 turn takes the admission mutex for its checks and reservations (max-frame,
-terminal state, tenant, settling set, byte reservation, sequence), takes
-the journal mutex under it for `append_batch`, releases both, then follows
+terminal state, tenant, settling set, byte and segment reservation), takes
+the journal mutex under it for `append_batch` — whose success allocates
+the sequence — releases both, then follows
 RFC 0052's order for the mining span; `maintain` takes the admission mutex
 and then the journal mutex for its halves, in that order, which is why the
 forced rotation and the leave transition can be evaluated together; and a
@@ -1117,12 +1148,17 @@ since RFC 0052 §3.2 records it: an entry written under
 covered it, so a tenant whose horizon is below it — including one with an
 entry and no restorable snapshot — has state the surviving frames cannot
 rebuild, and the full replay would silently produce a tree missing what
-was reclaimed; an entry written under `NoConsumer` was checkpoint-covered,
-no snapshot was ever expected, and a missing or stale one is not a fault —
-that tenant rebuilds from empty and pins at its oldest surviving frame
-like any unsnapshotted tenant, exactly as recovery treats it at startup.
-Reading the mode is what keeps a supported configuration from being
-classified as loss.
+was reclaimed; an entry written under `NoConsumer` is checkpoint-covered,
+which is sound *because* RFC 0052 §3.2 makes that mode a **precondition**
+— it means the caller held no miner state at all — so no snapshot was ever
+expected and that tenant rebuilds from empty and pins at its oldest
+surviving frame, exactly as recovery treats it at startup. This RFC adds
+no path that passes `NoConsumer`: the receiver always holds a
+`MinerCluster`, so it always passes `Known` and expresses an unsnapshotted
+tenant as the `Pinned` floor, and the WAL refuses a `NoConsumer` pass on a
+root holding any `Known` entry. A `NoConsumer` entry can therefore only
+predate a miner on that root, which is why reading the mode classifies
+nothing a running node did as loss.
 That tenant is marked **unrecoverable**, and isolated rather than left to
 pin the node: its appends are refused under the server-terminal,
 client-retryable class naming the tenant; its entry leaves the clamp set
@@ -1263,7 +1299,12 @@ first `checkpoint` call is exactly what either looks like — the root is
 fresh, no rows were published under a horizon anything reads — so the
 record is discarded and the next attempt rewrites it, as when neither
 flag is set. Only `seen` makes its absence a fault. One
-witness governs both sidecars, which is why this RFC adds no second flag. The bound between checkpoints is then stated honestly: a panic
+witness governs both sidecars, which is why this RFC adds no second flag
+beyond the migration marker above. Beside these rows sits RFC 0052 §3.2's
+own: a root holding **segments with neither sidecar** fails closed, since
+frames exist that no witness accounts for — `PUBLISHED` adds nothing there
+and inherits the verdict, because a root that cannot say what it reclaimed
+certainly cannot say what it published. The bound between checkpoints is then stated honestly: a panic
 costs at most one duplicate per record in the ambiguous span, and a crash
 before the next checkpoint costs at most **one more** for the records
 published since the last durable watermark, since replay from `X` cannot
@@ -1623,7 +1664,8 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a tenant whose `reclaimed_through` entry was written under
 >   `NoConsumer` is not marked unrecoverable when its snapshot is missing:
 >   it rebuilds from empty and pins, while the same shape under `Known`
->   is refused
+>   is refused; no ingest path passes `NoConsumer`, the receiver always
+>   passing `Known` with unsnapshotted tenants expressed as `Pinned`
 > - **And** a housekeeping pass skipped for a missing version-2 witness
 >   forces no rotation: a legacy root that has not yet upgraded is left
 >   alone

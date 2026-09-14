@@ -268,8 +268,10 @@ case for a low-volume node, whose segments roll on age — then every pass finds
 nothing reclaimable, the bound never clears, and no append will ever arrive to
 roll the segment. A livelock built out of two individually-correct rules.
 
-So the timer, holding the barrier exclusion RFC 0052 §3.1 gives it,
-**rotates** when the refusing state is set — a reservation has been refused,
+So the housekeeping pass, through `CommitCoordinator::maintain` and its
+journal mutex (RFC 0052 §3.7; no barrier exclusion is involved, since a
+rotation is a WAL operation and not a cut), **rotates** when the refusing
+state is set — a reservation has been refused,
 which a per-request check can do while `unreclaimed_bytes` is still below
 the limit, so the trigger is the latch and never `unreclaimed_bytes >=
 limit` — the pass it has just run reported `removed_segments == 0` in its
@@ -408,7 +410,16 @@ decrements the pending count, so `quiesce_encodes` reports idle and the
 barrier could stamp over records that never reached a sink. A worker's batch
 therefore takes the same recoverable shape — held by a guard that releases
 partitions as each publish returns and requeues the rest to the record sink
-on unwind — and RFC0053.2 asserts it with a panic inside a worker.
+on unwind — and RFC0053.2 asserts it with a panic inside a worker. Requeueing
+the batch is worthless if the pool then swallows the next one, so both
+halves of worker recovery are stated: a worker whose `emit_concurrent`
+panics exits its OS thread today, and the pool's supervisor **respawns** it
+(the closed handle is noticed, a replacement started, the panic counted);
+and `EncodePool::submit` on a closed or full channel is an **error
+propagated to the ingest turn before the acknowledgement** — the WAL frame
+is durable, the client is told to retry, and the retry is a fresh frame
+under RFC0003.2's at-least-once contract — never a silently dropped
+`Vec<MinedRecord>` behind a success.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -541,6 +552,9 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a panic inside an `EncodePool` worker's publish, after the WAL
 >   ack, requeues the remainder of that worker's mined batch, and the
 >   barrier does not read the pool as idle across it
+> - **And** a submit after that panic is either published by a respawned
+>   worker or refused before the acknowledgement; it is never dropped
+>   behind a success
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is

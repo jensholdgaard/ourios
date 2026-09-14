@@ -203,7 +203,25 @@ source, since the WAL ledger says which frames exist and not which were
 folded — a frame whose group fsync failed is in the WAL, never acknowledged
 and never mined: each ingest turn advances the tenant's **folded horizon**
 to its own frame offset after its mining step, the cut captures those
-horizons, and the WAL ledger stays the eligibility source only. Each writer
+horizons, and the WAL ledger stays the eligibility source only. The field
+that carries the mark is the artefact's existing `wal_high_water`, and its
+meaning changes: today every tenant's artefact holds the one global mark,
+after this RFC it holds that tenant's own folded horizon. The snapshot
+format version is bumped (`SNAPSHOT_VERSION` 1 → 2) so the two readings can
+never meet in one reader: a version-1 artefact takes the existing
+unknown-version path — it is never a horizon; its tenant is discarded, logged
+by tenant and version byte, and fully replayed from the WAL — and that path
+is safe for one reason, which startup checks rather than assumes (§3.2's
+`RECLAIM` record): a version-1 artefact can only predate this RFC, nothing
+was ever reclaimed before it (#793), so its tenant has no reclaim entry and
+pins at its oldest surviving frame like any tenant without a snapshot.
+Reading the old global mark as a folded horizon would in fact be sound —
+that mark was stamped only after every tenant's frames at or below it had
+been drained and mined under the miner lock — but one byte with two meanings
+across two versions is a rule the next change breaks, and pre-production a
+persisted layout is broken rather than dual-read: the implementing PR
+carries the `!` marker for the version bump, and no migration tooling is
+written. Each writer
 uses a **unique** temp
 name (`<tenant>.<mark>.snap.tmp`, since today's one fixed `.snap.tmp` could
 be truncated or interleaved by a concurrent cut before either rename — and
@@ -357,18 +375,42 @@ sweep after a panic, which was a safe interim only while nothing else could
 stamp: this RFC's timer can, and after a panic inside `write_ordered` the
 drained batches are gone and the publish guard has dropped, so a timer
 barrier would see empty buffers and no in-flight publish and stamp past
-records that never reached Parquet. So a cadence-step panic sets a
-`cadence_failed` latch — set on the unwind path itself, by a guard's `Drop`
-that runs *before* the publish guard is released, never by the joining task
-observing the panic later, or a barrier could acquire the exclusion, see
-empty buffers and stamp in that window; while it is set the barrier neither
-checkpoints nor snapshots — the frames stay in the WAL and a restart replays them — the
-state is exported (RFC0052.7) and only a restart clears it. The check lives
-inside `flush_then_snapshot`, the one function the timer, the rotation hook
-and shutdown all call, so every stamping caller honours it rather than the
-timer alone. RFC 0053's
-requeue-on-unwind is what removes the latch, by making the panic lose
-nothing to stamp past.
+records that never reached Parquet. So a panic on **any** path that holds
+records outside both the buffers and Parquet sets a `cadence_failed` latch —
+set on the unwind path itself, by a guard's `Drop` that runs *before* the
+publish guard is released, never by the joining task observing the panic
+later, or a barrier could acquire the exclusion, see empty buffers and stamp
+in that window. Three paths hold records that way, and all three set it:
+the age sweep's step, from the in-flight registration `drain_aged` takes
+through `write_ordered` — one guard wraps the whole step, so a panic
+mid-drain, with records in a half-built batch, latches too; the barrier's
+own detached flush; and an **encode worker**. The worker is the one the
+earlier drafts missed: `emit_concurrent` runs after `ingest_bound` has
+acknowledged the frame, and the pool's `BatchGuard` today only settles the
+pending count on unwind, so a worker panic mid-batch leaves `quiesce` seeing
+no pending work while the batch's unemitted remainder is in neither the
+buffers nor Parquet — a barrier after it would stamp across the frame. The
+`BatchGuard` therefore sets the latch when it drops unwinding, before it
+decrements, so worker unwind feeds the same failed-cut path as a cadence
+panic in this stage; RFC0052.10 is not gated on RFC 0053 for it. While the
+latch is set the barrier neither checkpoints nor snapshots — the frames stay
+in the WAL and a restart replays them — the state is exported (RFC0052.7)
+and only a restart clears it. The check lives inside `flush_then_snapshot`,
+the one function the timer, the rotation hook and shutdown all call, so
+every stamping caller honours it rather than the timer alone, and it is made
+**twice**: before the cut, and again immediately before the snapshot install
+and the checkpoint, after `quiesce_publishes` has returned. The second check
+is not redundant. A publish registered before the barrier began can panic
+*while the barrier is waiting on it*, and the latch it sets lands after the
+first check; a latch observed at the recheck is a **failed cut** — no
+install, no stamp; the cut's own batches are in the store already and the
+WAL still holds every frame, so a restart replays them into the `max(X, S)`
+gate like any other. The same unwind guard also records that publish's
+outcome as failed, so `quiesce_publishes().all_ok()` is false for it
+independently of the latch: the recheck defends the ordering, the outcome
+defends the data, and either alone refuses the stamp. RFC 0053's
+requeue-on-unwind is what removes the latch, by making every one of those
+panics lose nothing to stamp past.
 
 A snapshot *write* failure is deliberately not a checkpoint blocker:
 `flush_then_snapshot` logs it and still returns `true`, because the data
@@ -403,7 +445,9 @@ every barrier_secs (default: the sink age trigger, 300 s):
     prior_ok = quiesce_publishes().all_ok() // earlier in-flight publishes: outcome, not a wait;
                                            // always evaluated, so a failed cut flush cannot
                                            // skip their outcome and requeue path
-    ok = cut_ok and prior_ok
+    ok = cut_ok and prior_ok and not cadence_failed
+                                           // the recheck (§3.1): a panic while this
+                                           // barrier waited is a failed cut
     if ok and cut.mark is Some(_):
         install_snapshots(cut.snaps)       // under the install lock, monotonic in mark;
                                            // failure logged, not a blocker (§3.1); with
@@ -425,9 +469,14 @@ the sweep observes, and joined **before** the final flush and snapshot, in
 the order `ReceiverHandle::shutdown` already joins the sweep; they hold no
 pipeline or journal handle after the join. They are *separate tasks* from
 the sweep, and from each other: the sweep's stop-on-panic (#795) must not
-stop reclamation, and a panic in a barrier step sets `cadence_failed` and
-leaves the housekeeping loop running housekeeping-only passes, which is the
-branch the pseudocode's skip relies on. A timer that was not joined at
+stop reclamation, and a panic in a barrier step — or in the sweep's own
+step, or in an encode worker (§3.1's three latching paths) — sets
+`cadence_failed` and leaves the housekeeping loop running housekeeping-only
+passes, which is the branch the pseudocode's skip relies on. The sweep's
+panic is the one #795 already stops the sweep on; what this RFC adds is that
+the same unwind now latches *before* the sweep's publish guard drops, so the
+barrier that #795 could not foresee cannot stamp past the batch the panic
+dropped, whether the barrier was waiting on that publish or arrives later. A timer that was not joined at
 shutdown could race the shutdown reclamation or keep the WAL alive past the
 handle, which is why the ordering is part of the design rather than of the
 implementation.
@@ -576,12 +625,42 @@ file that fails either is never a horizon — but whether the node may then
 frames below that tenant's previous horizon are gone and a pin at its oldest
 surviving frame cannot rebuild the state they held. So `housekeeping`
 persists, per tenant, the horizon it reclaimed under — a `RECLAIM` sidecar
-beside `CHECKPOINT`, written and fsynced *before* the unlinks — and startup
-compares: a tenant whose restorable horizon is below its recorded
-reclaimed-through has unrecoverable state and recovery **halts**, naming the
-tenant; a tenant with no reclaim record has lost nothing and pins at its
-oldest surviving frame as before. An undecodable or missing snapshot is
-therefore safe to fall back from exactly when the record proves it is.
+beside `CHECKPOINT`, under the same contract as that file and not a looser
+one, because startup's fallback is exactly as trustworthy as this record:
+
+- **Atomic and durable, before the unlinks.** Written whole to `RECLAIM.tmp`
+  (a fixed name, like `CHECKPOINT.tmp`: housekeeping is the single writer,
+  so a temp left by a crash is simply truncated by the next write, and
+  RFC0052.16's selector leaves it alone), fsynced, renamed over `RECLAIM`,
+  parent fsynced — and only then does the pass unlink. The record is on disk
+  before any frame it accounts for is gone; a torn write is a temp and never
+  the record.
+- **Monotonic per tenant, by merge.** The pass reads the record, raises each
+  tenant it is about to reclaim under to that horizon, and never lowers an
+  entry; a tenant absent from the record has never had a frame reclaimed
+  under a horizon. One writer holds the writer position, so the
+  read-modify-write cannot interleave.
+- **Created at open.** The WAL writes an empty record, durably, when it opens
+  a root that has none — before the first pass can run — so the record
+  exists on every root this RFC's code has ever reclaimed from. A root with
+  no record at startup is therefore a layout that predates this RFC, on
+  which nothing was ever reclaimed (#793), and that is the *only* case read
+  as "no reclaimed state". There is no second witness to fall back on, which
+  is why the record is created before it is needed rather than at first use.
+- **Corrupt is fatal.** The record carries a version byte and a checksum; a
+  record failing either at open fails startup as `OpenError::Corrupt`,
+  naming the file. It is not read as missing: missing means "never
+  reclaimed", damaged means "reclaimed, extent unknown", and only the first
+  is safe to proceed from.
+
+The WAL exposes the record's per-tenant horizons as
+`ReclaimState::reclaimed_through`, and recovery compares: a tenant whose
+restorable horizon is below its recorded reclaimed-through — including a
+tenant with an entry and no restorable snapshot at all — has unrecoverable
+state and recovery **halts**, naming the tenant; a tenant with no entry has
+lost nothing and pins at its oldest surviving frame as before. An
+undecodable or missing snapshot is therefore safe to fall back from exactly
+when the record proves it is, and RFC0052.17 holds each of those cases.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` reclaims only segments every tenant's horizon covers, and
@@ -1181,14 +1260,25 @@ capped**: at most the cap's worth of segments per pass, resumed from a
 per-tenant cursor on the next, so a tenant whose snapshot catches up after
 the incident's 1,113-segment outage cannot hold the writer position for the
 whole backlog — and empty-set segments sit in an ordered structure keyed by
-highest offset, from which a segment moves to an **eligible queue** when
-its highest offset is at or below the checkpoint: a checkpoint advance
-promotes every empty-set segment at or below the new mark in one ordered
-pass, so both events populate the queue and nothing is stranded. The pass
-pops at most `max_unlinks` from that queue — O(cap) under the writer lock,
-with no name listing, since segments are known from the ledger — and the
-`HousekeepingProgress` reports how much horizon application remains.
-RFC0052.12 is worded to that guarantee. The next tick continues where this one left off
+highest offset. There is **no promotion pass**: a checkpoint advance stores
+the new mark, O(1) under the mutex, and a segment is eligible when it is
+empty-set *and* its key is at or below the stored mark — a predicate the
+pass evaluates lazily at the head of the ordered structure, popping while
+the head's key is at or below the checkpoint and at most `max_unlinks`
+times. An earlier draft promoted every newly covered empty-set segment into
+an eligible queue on the checkpoint advance, in one ordered pass; that pass
+is O(backlog) under the journal mutex — on the incident's 1,113 segments it
+stalls every append before the capped unlink even starts — and contradicts
+the bound this section exists to give, so it is withdrawn. Nothing is
+stranded without it: a segment whose set empties above the checkpoint waits
+in the ordered structure and is at its head once the mark passes it, and a
+segment the mark passed while its set was non-empty is found once a horizon
+application empties it. The pass therefore does at most the cap's worth of
+horizon application plus at most the cap's worth of pops — O(cap) under the
+writer lock, with no name listing, since segments are known from the ledger
+— and `HousekeepingProgress` reports `capped` from either half hitting its
+budget, plus how much horizon application remains. RFC0052.12 is worded to
+that guarantee. The next tick continues where this one left off
 without a cursor, because eligibility is recomputed from the ledger each
 time and the eligible segments are taken oldest first. That matters most on
 the *first* pass of a node that has never reclaimed — the incident node held
@@ -1252,6 +1342,14 @@ memory, and nothing here claims to.
 > - **And** when the high-water mark is `None`, no checkpoint is attempted
 > - **And** while the `cadence_failed` latch is set, the barrier neither
 >   checkpoints nor snapshots, however many timer passes run
+> - **And** an age-sweep publish registered before the barrier began, which
+>   panics while the barrier waits in `quiesce_publishes`, leaves the
+>   checkpoint and every snapshot unchanged: the latch set after the
+>   barrier's first check is observed at its recheck before stamping, and
+>   the publish's outcome is reported failed independently of it
+> - **And** an encode worker panicking mid-batch, followed by a barrier,
+>   leaves the checkpoint and every snapshot unchanged, and the batch's
+>   unemitted records are replayed on restart
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -1373,9 +1471,10 @@ memory, and nothing here claims to.
 >   cursor next pass, so a tenant catching up after a long outage cannot
 >   hold the writer position for the whole backlog — and an unchanged
 >   pinned backlog costs none
-> - **And** a checkpoint advance promotes every empty-set segment at or
->   below the new mark, so a segment observed above the old checkpoint is
->   not stranded when horizons stop changing
+> - **And** a checkpoint advance is O(1) under the mutex — it promotes
+>   nothing eagerly, whatever the backlog — and a segment whose set emptied
+>   above the old checkpoint is reclaimed by the first pass after the mark
+>   passes it, so it is not stranded when horizons stop changing
 > - **And** stale partials left by a previous process are removed from the
 >   list seeded at recovery, without a directory listing on the pass
 > - **And** a pinned oldest segment does not shadow a later eligible one: the
@@ -1387,11 +1486,12 @@ memory, and nothing here claims to.
 
 > **Scenario RFC0052.16 — The temp sweep touches only files of the reserved
 > partial shape**
-> - **Given** a WAL root holding a `CHECKPOINT.tmp`, a snapshots directory
->   holding a `*.snap.tmp`, and a stale `<uuid>.wal.partial`
+> - **Given** a WAL root holding a `CHECKPOINT.tmp` and a `RECLAIM.tmp`, a
+>   snapshots directory holding a `*.snap.tmp`, and a stale
+>   `<uuid>.wal.partial`
 > - **When** a housekeeping pass runs
-> - **Then** only the partial is unlinked: the checkpoint temp and the
->   snapshot temp survive
+> - **Then** only the partial is unlinked: the checkpoint, reclaim and
+>   snapshot temps survive
 > - **And** the unlink is followed by a parent-directory fsync, so a crash
 >   cannot resurrect it
 
@@ -1488,6 +1588,27 @@ memory, and nothing here claims to.
 > **Scenario RFC0052.9 — moved to RFC 0053 as RFC0053.3 (the cadence
 > survives a panic).** Number retained; no obligation here.
 
+> **Scenario RFC0052.17 — The reclaim record is the only startup witness,
+> and it is fail-closed**
+> - **Given** a WAL root housekeeping has reclaimed from under per-tenant
+>   horizons, so `RECLAIM` holds an entry per reclaimed tenant
+> - **When** the node restarts with one tenant's snapshot undecodable
+> - **Then** recovery halts naming that tenant when the record holds an entry
+>   for it, and proceeds with that tenant pinned at its oldest surviving
+>   frame when the record holds none
+> - **And** a root with no record at all — the pre-RFC layout — opens, gains
+>   an empty record durably before its first housekeeping pass, and pins
+>   rather than halts
+> - **And** a record failing its checksum or version byte fails open as
+>   `OpenError::Corrupt` naming the file, and is never read as missing
+> - **And** a pass reclaiming under a higher horizon for one tenant leaves
+>   every other entry unchanged, and no pass ever lowers an entry
+> - **And** a crash injected between the record's rename and the first
+>   unlink leaves a record whose entries every restorable snapshot satisfies,
+>   so the restart proceeds; a crash injected between the temp write and the
+>   rename leaves the previous record intact and the temp truncated by the
+>   next pass
+
 > **Scenario RFC0052.10 — No acknowledged record is lost across the whole
 > cycle**
 > - **Given** a node killed with `SIGKILL` mid-batch while reclamation and
@@ -1520,8 +1641,14 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   second; plus a third leg that fails the checkpoint sidecar write and its
   directory fsync with a healthy store, asserting the barrier still reports
   success, the previous mark stays usable and the next pass reclaims only
-  under it — the fail-closed branch a partition-write failure cannot reach. The retain path is already exercised by the existing
-  skip-the-snapshot tests, so these extend them rather than duplicating.
+  under it — the fail-closed branch a partition-write failure cannot reach.
+  Two unwind legs use seeded interleaving, as RFC0052.14 does: a test sink
+  whose publish panics once the barrier is inside `quiesce_publishes`,
+  asserting no install and no stamp and a failed outcome; and a record that
+  panics the encode worker mid-batch, asserting the next barrier stamps
+  nothing and a restart replays the remainder. The retain path is already
+  exercised by the existing skip-the-snapshot tests, so these extend them
+  rather than duplicating.
 - **Truncation bounds (RFC0052.2)** — an integration test building a WAL
   with several closed segments, a checkpoint above them and a snapshot
   floor deliberately below it, asserting exactly which files survive.
@@ -1565,7 +1692,13 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   and must keep both halves of what the original protected: no ack on an
   incomplete rotation, and a permanent refusal when the fault is
   persistent.
-- **Temp sweep (RFC0052.16)** — a directory fixture holding all four file
+- **Reclaim record (RFC0052.17)** — directory fixtures for the four record
+  states (absent, empty, valid with entries, corrupt) crossed with a
+  restorable and an undecodable snapshot, asserting halt-or-pin per case and
+  the `Corrupt` error's file name; fault injection at the two crash points
+  (before rename, before first unlink) through the same hook the rotation
+  tests use; and a two-pass monotonicity leg reading the record back.
+- **Temp sweep (RFC0052.16)** — a directory fixture holding all five file
   kinds, asserting exactly one is removed. A fixture rather than a live
   rotation, because the point is the *selector*, and the dangerous cases
   (`CHECKPOINT.tmp`, `*.snap.tmp`) are produced by other subsystems.

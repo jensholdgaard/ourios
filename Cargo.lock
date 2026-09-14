@@ -3312,6 +3312,7 @@ dependencies = [
  "ourios-miner",
  "ourios-parquet",
  "ourios-querier",
+ "ourios-semconv",
  "ourios-testgen",
  "ourios-wal",
  "parquet",

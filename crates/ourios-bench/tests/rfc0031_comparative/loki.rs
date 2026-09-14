@@ -74,15 +74,176 @@ pub(crate) const LOKI_DISPATCH_FLAGS: &[&str] = &[
     "-validation.max-entries-limit=2000000",
 ];
 
+/// RFC0031.10's **declared label allowlist** — every stream label the
+/// comparative Loki configuration is permitted to index.
+///
+/// This is Loki's *stock* `default_resource_attributes_as_index_labels` set,
+/// read from the pinned image's own effective configuration rather than
+/// copied from documentation or inferred from a probe.
+/// `rfc0031_10_loki_label_allowlist` asserts this list against Loki's
+/// `/config` endpoint, which is exhaustive by construction: it reads the
+/// promotion list itself, so a future image that adds a key fails
+/// immediately, with no payload able to hide it. A probe alone cannot do
+/// that — it only ever observes keys it happens to send, and the
+/// probe-derived version of this list was missing `k8s.deployment.name`.
+///
+/// **It is deliberately not a one-label set.** An earlier version of this
+/// constant said `["service_name"]`, which passed only because the fixture
+/// sent nothing else; the stock config promotes every key below. Loki
+/// therefore gets a genuinely multi-dimensional index out of the box, which
+/// is the opposite of a strawman — but it means the §9 ratios must be read
+/// knowing which of these the dispatch corpus actually carries.
+///
+/// Anything *outside* this set either smuggles Ourios's promoted columns into
+/// Loki's index (making the comparison flattering to us) or is a catch-all
+/// forcing a full scan (making it unflattering). Both are strawmen; the point
+/// of the program is that neither can slip in unnoticed.
+pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &[
+    "service_name",
+    "service_namespace",
+    "service_instance_id",
+    "deployment_environment",
+    "deployment_environment_name",
+    "cloud_region",
+    "cloud_availability_zone",
+    "k8s_cluster_name",
+    "k8s_namespace_name",
+    "k8s_pod_name",
+    "k8s_container_name",
+    "container_name",
+    "k8s_replicaset_name",
+    "k8s_deployment_name",
+    "k8s_statefulset_name",
+    "k8s_daemonset_name",
+    "k8s_cronjob_name",
+    "k8s_job_name",
+];
+
+/// Label names that must never appear in Loki's index, named explicitly by
+/// RFC0031.10.
+///
+/// These are the high-cardinality keys Ourios prunes on via Parquet
+/// statistics and promoted columns. If any became a Loki stream label, our
+/// must-win classes would be measuring Loki's index against our index
+/// rather than measuring the pruning thesis — and an L3 trace-correlation
+/// win over a Loki that indexes `trace_id` would mean nothing.
+///
+/// Redundant with the allowlist by construction, and deliberately so: the
+/// allowlist could be widened in a careless edit, and this list states the
+/// names that widening must never reach.
+pub(crate) const LOKI_LABEL_DENYLIST: &[&str] =
+    &["trace_id", "span_id", "template_id", "ourios_template_id"];
+
+/// GET Loki's effective `default_resource_attributes_as_index_labels` list,
+/// in label form (dots become underscores, as Loki's own mapping does).
+///
+/// This is the authoritative promotion surface: every resource attribute the
+/// running configuration turns into a stream label. Asserting the declared
+/// allowlist against it is exhaustive in a way a payload probe cannot be.
+///
+/// Hand-scanned rather than YAML-parsed: the block is a flat sequence of
+/// scalars at a known key, the crate has no YAML dependency, and adding one
+/// to read eighteen strings would be the larger cost. A shape change breaks
+/// the caller's assertion loudly rather than silently returning nothing,
+/// because an empty list cannot equal the allowlist.
+pub(crate) async fn loki_effective_index_labels(http: &reqwest::Client, base: &str) -> Vec<String> {
+    const KEY: &str = "default_resource_attributes_as_index_labels:";
+
+    let resp = http
+        .get(format!("{base}/config"))
+        .send()
+        .await
+        .expect("config request reaches Loki");
+    let status = resp.status();
+    let body = resp.text().await.expect("config response body");
+    // The body carries Loki's own config/startup diagnosis; dropping it leaves
+    // a failed CI run reporting only a bare status, the same reason
+    // `loki_query_range` and the label endpoints include it.
+    assert!(
+        status.is_success(),
+        "loki /config returned {status}: {body}"
+    );
+
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == KEY {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        // The block ends at the first line that is not a `- scalar` item.
+        match trimmed.strip_prefix("- ") {
+            Some(value) => out.push(value.trim().replace('.', "_")),
+            None => break,
+        }
+    }
+    out
+}
+
+/// GET the stream label names Loki currently has indexed.
+pub(crate) async fn loki_label_names(http: &reqwest::Client, base: &str) -> Vec<String> {
+    loki_string_list(http, &format!("{base}/loki/api/v1/labels")).await
+}
+
+/// GET the distinct values Loki holds for one stream label.
+pub(crate) async fn loki_label_values(
+    http: &reqwest::Client,
+    base: &str,
+    label: &str,
+) -> Vec<String> {
+    loki_string_list(http, &format!("{base}/loki/api/v1/label/{label}/values")).await
+}
+
+/// Both label endpoints answer `{"status":"success","data":[...]}`.
+///
+/// An absent `data` means "none known yet", which is a legitimate empty
+/// answer while a push is still being indexed. An HTTP error or Loki's own
+/// `status: "error"` is **not**: folding either into an empty list would let
+/// the caller's poll burn its whole deadline and then report the vacuous
+/// no-labels failure instead of the endpoint's status and body. So both are
+/// checked first, the same way `loki_query_range` and `parse_loki_root` do.
+async fn loki_string_list(http: &reqwest::Client, url: &str) -> Vec<String> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .expect("label request reaches Loki");
+    // Check the HTTP status before parsing: a non-2xx body may not be the
+    // labels JSON at all, and "parse failed" would mask the real error.
+    let status = resp.status();
+    let body = resp.text().await.expect("label response body");
+    assert!(status.is_success(), "loki {url} returned {status}: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("label response is JSON: {e}: {body}"));
+    assert_ne!(
+        parsed.get("status").and_then(serde_json::Value::as_str),
+        Some("error"),
+        "loki {url} answered 200 with an error payload: {body}",
+    );
+    match parsed.get("data").and_then(serde_json::Value::as_array) {
+        Some(values) => values
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Start a Loki container on the stock image config plus `extra_args`
 /// (explicit, documented CLI-flag deviations), wait for `/ready`, and
 /// hand back the container (kept alive by the caller), the base URL,
 /// and a timeout-bearing HTTP client.
 ///
 /// The stock image config (schema v13 / TSDB) serves the native OTLP
-/// endpoint and maps `service.name` → the `service_name` stream label;
-/// auth is disabled. Exactly what a competent single-binary operator
-/// gets out of the box.
+/// endpoint and promotes every resource attribute in
+/// `LOKI_LABEL_ALLOWLIST` (18 names, `service.name` → `service_name` among
+/// them) to a stream label, capped at 15 labels per stream; auth is
+/// disabled. Exactly what a competent single-binary operator gets out of
+/// the box — a multi-dimensional index, not a one-label one.
 pub(crate) async fn start_loki(
     extra_args: &[&str],
 ) -> (

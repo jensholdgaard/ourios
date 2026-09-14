@@ -309,8 +309,9 @@ jobs:
             --ignored --exact \
             interop::rfc0031_1_result_set_equivalence \
             interop::rfc0031_backdated_wide_range_interop \
+            interop::rfc0031_10_loki_label_allowlist \
             2>&1 | tee loki-interop.log
-          grep -q "test result: ok. 2 passed" loki-interop.log
+          grep -q "test result: ok. 3 passed" loki-interop.log
 
   book:
     name: mdbook build

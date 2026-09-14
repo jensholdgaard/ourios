@@ -1111,10 +1111,18 @@ startup.** Before rebuilding, settlement compares the tenant's restorable
 horizon — its installed snapshot's mark, or none — with
 `ReclaimState::reclaimed_through` — the map RFC 0052 §3.2 exposes after
 open has reconciled `planned` against the directory, the only proof of
-loss — : a tenant whose horizon is below its
-recorded reclaimed-through, including a tenant with an entry and no
-restorable snapshot, has state the surviving frames cannot rebuild, and
-the full replay would silently produce a tree missing what was reclaimed.
+loss — **per entry, by the retention mode that entry was written under**,
+since RFC 0052 §3.2 records it: an entry written under
+`SnapshotHorizons::Known` was unlinked because every tenant's snapshot
+covered it, so a tenant whose horizon is below it — including one with an
+entry and no restorable snapshot — has state the surviving frames cannot
+rebuild, and the full replay would silently produce a tree missing what
+was reclaimed; an entry written under `NoConsumer` was checkpoint-covered,
+no snapshot was ever expected, and a missing or stale one is not a fault —
+that tenant rebuilds from empty and pins at its oldest surviving frame
+like any unsnapshotted tenant, exactly as recovery treats it at startup.
+Reading the mode is what keeps a supported configuration from being
+classified as loss.
 That tenant is marked **unrecoverable**, and isolated rather than left to
 pin the node: its appends are refused under the server-terminal,
 client-retryable class naming the tenant; its entry leaves the clamp set
@@ -1209,16 +1217,29 @@ case**: a node that ran RFC 0052 alone has a version-2 `CHECKPOINT` and a
 `RECLAIM` carrying `checkpoint_seen`, and no `PUBLISHED`, because nothing
 wrote one. Failing closed there would refuse to start every node that
 upgrades. So `PUBLISHED` absent beside a version-2 `CHECKPOINT` **and** a
-`RECLAIM` whose `checkpoint_seen` is set is **accepted exactly once**: the
-watermarks seed from `X`, the checkpoint horizon, which is what RFC 0052
-already guarantees replay suppresses below; the sidecar is created by the
-next checkpoint, and from then on its absence is fail-closed as above. The
-consequence is stated rather than hidden: in that first window the
-watermarks are as coarse as `X`, so records published between the last
-pre-upgrade checkpoint and the first post-upgrade one are re-emitted if a
-panic or crash makes the rebuild replay them — the at-most-twice bound
-holds, the exactly-once refinement does not, and it is one window per
-upgrade. Per the pre-production layout policy there is no migration
+`RECLAIM` whose `checkpoint_seen` is set is **accepted**: the watermarks
+seed from `X`, the checkpoint horizon, which is what RFC 0052 already
+guarantees replay suppresses below, and the sidecar is created by the next
+checkpoint. "Once" needs a witness of its own, though, because the
+`CHECKPOINT`/`RECLAIM` pair cannot supply it: a crash before that next
+checkpoint leaves exactly the state the accepting start read, so every
+restart would take the same coarse-`X` branch and repeat its window. So
+the record carries one more flag, on the same two-state pattern its
+checkpoint witness already uses and as an **amendment to RFC 0052 §3.2's
+record header**: **`published_seeded`**, written durably on the accepting
+start *before* any batch is admitted, and confirmed — a second durable
+write, at the next record write after the first `PUBLISHED` write
+succeeded — exactly as `checkpoint_armed` and `checkpoint_seen` are. A
+root whose flag is set but unconfirmed, with `PUBLISHED` absent, is a
+crash inside the window: it seeds from `X` again, which is correct because
+nothing has been published under a finer horizon yet. A root whose flag is
+**confirmed** with `PUBLISHED` absent is a lost sidecar and fails closed,
+exactly as a lost `RECLAIM` does. The coarse window therefore happens once
+per upgrade, and the consequence is stated rather than hidden: in that
+window the watermarks are as coarse as `X`, so records published between
+the last pre-upgrade checkpoint and the first post-upgrade one are
+re-emitted if a panic or crash makes the rebuild replay them — the
+at-most-twice bound holds, the exactly-once refinement does not. Per the pre-production layout policy there is no migration
 tooling; the read path is the whole migration, and the implementing PR
 carries the `!` marker. A **version-1 root** carries neither sidecar: RFC 0052 opens it
 without creating a `RECLAIM`, and `PUBLISHED` follows the same rule, both
@@ -1232,12 +1253,16 @@ and takes RFC 0052 §3.2's two-state witness rather than a rule of its own:
 `PUBLISHED` present with no version-2 `CHECKPOINT` fails closed — naming
 both files — exactly when `RECLAIM` carries `checkpoint_seen`, because
 that root has checkpointed and lost it. It reads against `seen`, never
-`armed`: `armed` without `seen` is RFC 0052's crash window between the
-arming write and the checkpoint's rename, and a `PUBLISHED` written
-moments earlier in that same first `checkpoint` call is exactly what the
-window looks like — the root is fresh, no rows were published under a
-horizon anything reads, and the record is discarded, as it is when
-neither flag is set. One
+`armed`, which is what keeps RFC 0052 §3.2's two non-fault `armed` rows
+non-faults here as well: `armed` without `seen` beside a **version-1**
+`CHECKPOINT` is that RFC's migration retry state — nothing can have been
+reclaimed, since housekeeping is a no-op until the witness exists — and
+`armed` without `seen` with `CHECKPOINT` **absent** is its crash window
+before the rename. A `PUBLISHED` written moments earlier in that same
+first `checkpoint` call is exactly what either looks like — the root is
+fresh, no rows were published under a horizon anything reads — so the
+record is discarded and the next attempt rewrites it, as when neither
+flag is set. Only `seen` makes its absence a fault. One
 witness governs both sidecars, which is why this RFC adds no second flag. The bound between checkpoints is then stated honestly: a panic
 costs at most one duplicate per record in the ambiguous span, and a crash
 before the next checkpoint costs at most **one more** for the records
@@ -1479,12 +1504,19 @@ fires and this RFC has bounded the wrong resource. That makes it a
 prerequisite, not a neighbour.
 
 This RFC does not solve it, because the fix is a different decision (what does
-a full sink do — block, spill, or drop, and under whose invariant), but it
-states the dependency: §3.1's bound is only the operative limit if memory
-growth during an outage is separately bounded, and until it is, the honest
-claim is that this RFC bounds *disk* and the OOM path remains. RFC0053.1's
-unreachable-store leg should be run long enough to show which limit is hit
-first.
+a full sink do — block, spill, or drop, and under whose invariant) and that
+decision is a maintainer's, not this RFC's; it belongs to a **separate RFC**,
+and §7 carries the question. What this RFC states instead is the scope of
+its own claim, narrowed to what it can deliver: **it bounds local disk, not
+process memory.** §3.1's bound is the operative limit for the WAL directory
+and for nothing else, the OOM path during a long outage remains open, and
+the incident's end-to-end property — ingest that stays bounded and keeps
+refusing rather than dying — needs both this RFC and that one. So the sink
+decision is named here as the **blocking follow-up for the end-to-end
+claim**, §6 keeps it as the gate on `validated`, and §5 asserts only the
+disk bound; RFC0053.1's unreachable-store leg should still be run long
+enough to show which limit is hit first, which is what makes the follow-up
+concrete rather than theoretical.
 
 **Backpressure as a rotation-failure state.** Rejected: it would reuse RFC
 0052's terminal-state reporting for a condition that is not a fault and clears
@@ -1495,7 +1527,9 @@ are kept distinct so that the remedy each advertises is the true one.
 
 > **Scenario RFC0053.1 — Backpressure is a stated limit, and clears itself**
 > - **Given** an unreachable object store and a configured local retention
->   bound, on a node running RFC 0052
+>   bound, on a node running RFC 0052 — the scenario asserts the **local
+>   disk** bound only, memory growth in the sinks being §4's separate
+>   follow-up and §6's gate on `validated`
 > - **When** ingest continues until a reservation would exceed the bound
 > - **Then** earlier batches were accepted and acked, and the rejecting batch
 >   is refused with a reason naming the bound it hit and that cause's measurements (for bytes, the
@@ -1545,8 +1579,10 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** the timer's idle rotation at the ceiling performs no rotation
 >   and the tick still captures its cut with `last_durable` as the mark;
 >   the rotation owed after a seal with a slot free proceeds, and without
->   one is deferred under the terminal classification until a pass frees a
->   slot, after which it runs and admission resumes without a restart
+>   one is deferred — `RotationState::Deferred`, reported as backpressure
+>   with the housekeeping delay and never as the terminal class — until a
+>   pass frees a slot, after which it runs and admission resumes without a
+>   restart
 > - **And** in open mode a batch for a tenant id the miner does not hold,
 >   with `max_tenants` held, is refused naming the
 >   tenant, as `TenantCapacity` — `503` / `UNAVAILABLE` with a protobuf
@@ -1578,9 +1614,16 @@ are kept distinct so that the remedy each advertises is the true one.
 >   `Healthy` once a pass frees a slot — while an exhausted retry budget is
 >   still `Terminal`, with no hint
 > - **And** a node upgrading from RFC 0052 — version-2 `CHECKPOINT`,
->   `RECLAIM` with `checkpoint_seen`, no `PUBLISHED` — starts, seeds its
->   watermarks from `X`, and writes `PUBLISHED` at its next checkpoint;
->   a later start with the sidecar missing again fails closed
+>   `RECLAIM` with `checkpoint_seen`, no `PUBLISHED` — starts, arms
+>   `published_seeded` before admitting a batch, seeds its watermarks from
+>   `X`, and writes `PUBLISHED` at its next checkpoint, confirming the flag
+>   at the next record write; a restart *inside* that window seeds from `X`
+>   again, and a start with the flag confirmed and the sidecar missing
+>   fails closed
+> - **And** a tenant whose `reclaimed_through` entry was written under
+>   `NoConsumer` is not marked unrecoverable when its snapshot is missing:
+>   it rebuilds from empty and pins, while the same shape under `Known`
+>   is refused
 > - **And** a housekeeping pass skipped for a missing version-2 witness
 >   forces no rotation: a legacy root that has not yet upgraded is left
 >   alone

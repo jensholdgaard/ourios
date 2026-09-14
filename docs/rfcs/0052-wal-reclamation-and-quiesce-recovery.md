@@ -236,8 +236,12 @@ sub-target object per active partition per `barrier_secs`** beyond RFC
 buffered frame durable, and RFC0052.3 records the objects written per
 interval so it is measured rather than assumed. A busy partition still
 flushes on size between barriers. Housekeeping runs on `housekeeping_secs`
-against the last checkpoint, and reclamation lags a publication by at most
-`barrier_secs + housekeeping_secs`, the sum RFC0052.3's idle leg asserts.
+against the last checkpoint, and reclamation of a **closed** segment lags a
+publication by at most `barrier_secs + housekeeping_secs`. The current
+append segment is never unlinked, so on an idle node its bytes are reclaimed
+only after it rotates on `segment_age_secs` (600 s by default): the idle
+bound is `barrier_secs + housekeeping_secs + segment_age_secs`, which
+RFC0052.3's idle leg asserts.
 
 **Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
 takes the miner lock today before the pool submission and the `last_durable`
@@ -253,7 +257,11 @@ miner lock alone today, so a sweep could begin after the timer's quiesce and
 before its stamp, leaving a drained-but-undurable batch outside the buffers
 that the barrier then reads as empty; `quiesce_publishes` waits only for a
 sweep already in flight and prevents no new drain. The sweep's
-drain therefore takes the exclusion in shared mode — held only across the
+drain therefore takes the exclusion in shared mode — **before** the miner
+lock, which means the drain helper changes rather than the shared hold being
+added inside today's `with_miner(drain_aged)`: taken inside it, the sweep
+would hold the miner lock waiting for the shared exclusion while the timer
+held the exclusive lock waiting for the miner, and both would deadlock — — held only across the
 drain and the in-flight registration, and released *before* the off-lock
 publish, whose PUTs can block on the store — and the timer takes it
 exclusively: no sweep drains inside the barrier, a drain in progress
@@ -414,6 +422,15 @@ The minimum is already this codebase's stated contract, not a new invention —
 > frames above the floor, and a lagging tenant's own `S.segment` is protected
 > by its own membership in the min
 
+Under tenant-aware retention that argument survives only if each tenant's
+snapshot horizon `S` is **that tenant's own last folded frame offset**, not
+the cut's global mark — a global mark's segment can hold none of the
+tenant's frames and be legitimately unlinked, and the detector would then
+report external mutation for `S < X`. So snapshots record per-tenant
+horizons: `S.segment` always holds one of that tenant's frames, is retained
+until the tenant's horizon covers it, and is unlinked only under the
+checkpoint, so its absence implies `S ≤ X` and the detector stays quiet.
+
 That detector's no-false-positive property *depends* on the minimum, so the
 earlier draft's "latest" wording would have broken stale-gap detection as
 well as losing data.
@@ -500,8 +517,12 @@ saw durable, the one property the listing lacks. This is an explicit
 operation, `snapshot_store::load_all_durable()`, which fsyncs before it
 lists, so an implementation can neither keep trusting the bare listing nor
 turn the fsync error into a generic recovery failure: if either fsync fails
-every listed horizon is discarded, so each tenant with surviving frames pins the
-floor at its oldest surviving frame until a later snapshot write succeeds. One directory fsync rather than a manifest, because a manifest
+every listed horizon is discarded **and so is the restored miner state** —
+the node starts empty and replays every surviving frame — so each tenant
+with surviving frames pins the floor at its oldest surviving frame until a
+later snapshot write succeeds. Keeping the state while discarding its
+horizon would leave replay without an `S` gate and double-apply every frame
+the snapshot had already folded. One directory fsync rather than a manifest, because a manifest
 would need the same fsync to be trustworthy itself. Durability is necessary
 and not sufficient: `snapshot_store::load_all` returns raw bytes, and a
 horizon is admitted only from a snapshot that decodes and restores. A listed
@@ -1018,7 +1039,12 @@ So the design is:
   the commit coordinator exists**, so there is no journal owner to checkpoint
   through. That call therefore deliberately advances no checkpoint; the first
   timer pass after the coordinator is built does it instead, from the same
-  mark or a later one. §3.1's "behind the barrier and nowhere else" holds —
+  mark or a later one. And when replay delivers **nothing** — the normal
+  shape once housekeeping has reclaimed every closed frame and the node
+  restarts idle — that post-recovery snapshot write preserves each tenant's
+  *restored* horizon rather than writing `None` over it, which would have
+  discarded the snapshots on the next restart and forced a full replay every
+  time. §3.1's "behind the barrier and nowhere else" holds —
   this is a caller that has the mark but not yet the owner, not a second
   checkpoint site.
 - **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
@@ -1037,26 +1063,30 @@ the unlinks. Running it on the blocking pool does **not** help: the stall is
 caused by holding the journal mutex, not by occupying a runtime worker, so
 moving the work to another thread while still holding the lock bounds nothing.
 
-The pass is therefore **capped on the work, not only on the removals**. Capping
-unlinks alone would not bound the stall: the current path enumerates and sorts
-every `*.wal` and inspects each candidate before unlinking any, so a
-1,113-segment backlog does 1,113 header reads under the mutex however few files
-it then removes. The cap therefore bounds **candidates inspected** as well as
-segments removed, stopping the walk once it has found that many — the oldest are
-encountered first, which is the order reclamation wants anyway. What the cap
-does **not** bound is the listing itself: enumerating and sorting the names is
-O(n) in directory entries and stays under the mutex, but it is one `readdir`
-with no per-file I/O — a fraction of a millisecond at the incident's 1,113
-entries, against 1,113 header reads and fsyncs. The guarantee is therefore
-bounded *per-file* work, and RFC0052.12 is worded that way; a bounded
-oldest-first iterator would remove the sort but not the `readdir`, so it is
-not worth a second code path. The next timer tick continues where it left off, which
-needs no cursor because the bound is recomputed each time and the oldest
-eligible segments are always the ones taken first. That matters most on the
-*first* pass of a node that has never reclaimed — the incident node held 1,113
-segments, and an uncapped pass would have stalled ingest for as long as 1,113
-unlinks take. In steady state, after §3.2 is running, a pass has a handful of
-segments to consider and the cap never binds.
+The pass is therefore **capped on the unlinks, and the eligibility
+evaluation costs no I/O at all.** The current path enumerates and sorts every
+`*.wal` and reads each candidate's header before unlinking any, so a
+1,113-segment backlog did 1,113 header reads under the mutex however few files
+it then removed — which is why an earlier draft capped the *inspected*
+candidates too. That cap is withdrawn, because it conflicts with tenant-aware
+eligibility: the oldest segment may be pinned while a later one is eligible,
+and a pass that inspected only the oldest few would stop at the pinned one
+every tick and never reach the eligible one. It is also no longer needed:
+everything a header read supplied — the segment's highest offset, each
+tenant's last offset in it, its frame bytes — lives in the per-segment ledger
+the WAL maintains in memory (§3.2), so eligibility is evaluated over *all*
+surviving segments from the ledger, an O(n) memory pass with no per-file
+I/O, and only the unlinks are capped. What the cap does **not** bound is the
+name listing and that memory pass: both are O(n) in segments and stay under
+the mutex, but neither touches a file — a fraction of a millisecond at the
+incident's 1,113 entries, against 1,113 unlinks and fsyncs. RFC0052.12 is
+worded to that guarantee. The next tick continues where this one left off
+without a cursor, because eligibility is recomputed from the ledger each
+time and the eligible segments are taken oldest first. That matters most on
+the *first* pass of a node that has never reclaimed — the incident node held
+1,113 segments, and an uncapped pass would have stalled ingest for as long as
+1,113 unlinks take. In steady state, after §3.2 is running, a pass has a
+handful of segments to consider and the cap never binds.
 
 ## 4. Alternatives considered
 
@@ -1160,8 +1190,10 @@ memory, and nothing here claims to.
 >   claims no bound there
 > - **And** after the last append, with no further traffic, one
 >   `barrier_secs` plus one `housekeeping_secs` later the checkpoint has
->   advanced and every eligible segment is reclaimed — the append-independent
->   path, which continuous traffic alone cannot prove
+>   advanced and every eligible **closed** segment is reclaimed — the
+>   append-independent path, which continuous traffic alone cannot prove —
+>   and one `segment_age_secs` later the last segment has rotated and been
+>   reclaimed too
 
 > **Scenario RFC0052.4 — A transient rotation failure recovers without a
 > restart**
@@ -1218,10 +1250,13 @@ memory, and nothing here claims to.
 > - **Given** a backlog far larger than `max_unlinks_per_pass` (the
 >   incident's 1,113 segments is the shape)
 > - **When** a housekeeping pass runs
-> - **Then** it reads at most the cap's worth of segment headers, unlinks at
->   most the cap, and returns; the only O(n) step is the name listing, which
->   does no per-file I/O — so an append taken concurrently waits for that
->   bounded work rather than the whole backlog
+> - **Then** it unlinks at most the cap and returns, having read no segment
+>   header at all — eligibility comes from the in-memory ledger — and the
+>   only O(n) steps are the name listing and that memory pass, neither of
+>   which touches a file; so an append taken concurrently waits for the
+>   capped unlinks rather than the whole backlog
+> - **And** a pinned oldest segment does not shadow a later eligible one: the
+>   pass reclaims the eligible segment on its first tick
 > - **And** successive passes drain the backlog to the same end state an
 >   uncapped pass would reach
 > - **And** a backlog of stale *temporary* files is also bounded by the same
@@ -1293,8 +1328,9 @@ memory, and nothing here claims to.
 >   frames is reclaimed
 > - **And** a snapshot listed at startup is used as a horizon only after the
 >   snapshots root has been fsynced in this process; a failed startup fsync
->   pins every tenant at its oldest surviving frame, so a horizon whose
->   directory entry may not be durable never governs reclamation
+>   pins every tenant at its oldest surviving frame **and restores no miner
+>   state**, so a horizon whose directory entry may not be durable never
+>   governs reclamation and no frame is double-applied
 > - **And** the state is exported (§3.5), so an operator seeing a WAL that
 >   will not shrink can tell it is a pinning tenant rather than an
 >   unexplained stall

@@ -802,19 +802,31 @@ one, because startup's fallback is exactly as trustworthy as this record:
   advanced only by `housekeeping_commit`, after the unlink and the parent
   fsync succeeded, and made durable by the next record write (the next pass
   that plans, or the pass's own second write when nothing is pending). A
-  failed unlink or parent fsync therefore leaves the segment on disk *and*
-  `reclaimed_through` behind it: startup will not halt on a tenant whose
-  frames are still there. An entry leaves the ledger and its accounting
-  only when its unlink has succeeded, under the writer position at
-  `housekeeping_commit` (§3.7), and its `planned` entry is dropped in the
-  same commit. The two failure points differ: a failed record
-  write or fsync means nothing was unlinked, so every popped entry is put
-  back to eligible under the writer position and the next pass pops it
+  failed unlink or parent fsync therefore leaves `reclaimed_through` behind
+  the segment — and makes no promise about the file. An `unlink` whose
+  parent fsync failed is an **uncertain deletion**: the entry may or may not
+  be visible after a restart, and this process cannot tell. So
+  `housekeeping_commit` keeps `reclaimed_through` behind it, marks the
+  segment's `planned` entry `uncertain`, and keeps its bytes in the
+  in-process accounting; the next pass re-verifies presence — an `unlink`
+  that finds the file gone completes the reclamation, one that finds it
+  present retries it — and only that verified outcome moves the entry. At
+  open the `uncertain` entry is reconciled like any planned one (below):
+  present ⇒ retained and re-planned; absent ⇒ the data is gone and is
+  treated exactly like a completed reclamation, `reclaimed_through` raised,
+  no halt — a planned segment held only covered frames by construction, so
+  its loss is a reclamation that finished, not data lost. An entry leaves
+  the ledger and its accounting only when its deletion is verified, under
+  the writer position at `housekeeping_commit` (§3.7), and its `planned`
+  entry is dropped in the same commit. The failure points differ: a failed
+  record write or fsync means nothing was unlinked, so every popped entry is
+  put back to eligible under the writer position and the next pass pops it
   again — the entry was never out of the ledger, so the no-listing rule
-  costs nothing here; a failed unlink after a durable record leaves the
+  costs nothing here; a failed `unlink` after a durable record leaves the
   entry reclaiming, still counted, retried by the next pass's off-lock half
-  within its cap. Nothing a pass has touched can become undiscoverable,
-  which is what a ledger with no directory scan behind it needs.
+  within its cap; a failed parent fsync after the `unlink` is the uncertain
+  case above. Nothing a pass has touched can become undiscoverable, which
+  is what a ledger with no directory scan behind it needs.
   Housekeeping's ledger half is the only half that takes the writer
   position, which is what "runs on rotation's ownership path" means below.
 - **Monotonic per tenant, by merge.** `reclaimed_through` only rises: the
@@ -823,15 +835,18 @@ one, because startup's fallback is exactly as trustworthy as this record:
   it has never had a frame reclaimed. `planned` entries come and go with
   their segments. One writer holds the writer position, so the
   read-modify-write cannot interleave.
-- **Reconciled at open.** A crash between the record write and the commit
-  leaves `planned` entries whose segments may or may not be gone. Open
-  reconciles them against the directory before anything reads the record:
-  a planned segment still present is retained — it is in the ledger
-  `rebuild_ledger()` builds, still eligible, and the next pass re-plans it
-  — and its entry is dropped; a planned segment absent was unlinked, so its
-  per-tenant last offsets raise `reclaimed_through` as the commit would
-  have. The reconciled record is written durably before the first pass, and
-  only `reclaimed_through` is ever read as proof of loss.
+- **Reconciled at open.** A crash between the record write and the commit,
+  or an uncertain deletion, leaves `planned` entries whose segments may or
+  may not be gone. Open reconciles every planned entry against the
+  directory before anything reads the record: a planned segment still
+  present is retained — it is in the ledger `rebuild_ledger()` builds,
+  still eligible, and the next pass re-plans it — and its entry is dropped;
+  a planned segment absent is gone, and is treated exactly like a completed
+  reclamation: its per-tenant last offsets raise `reclaimed_through` as the
+  commit would have, and nothing halts on it, since a planned segment held
+  only covered frames by construction. The reconciled record is written
+  durably before the first pass, and only `reclaimed_through` is ever read
+  as proof of loss.
 - **Created at open, and witnessed by `CHECKPOINT`.** The WAL writes an
   empty record, durably, when it opens a root that has none — before the
   first pass can run — so the record exists on every root this RFC's code
@@ -840,21 +855,31 @@ one, because startup's fallback is exactly as trustworthy as this record:
   sidecars, a restore from a partial backup) would open, recreate an empty
   record, and turn a missing snapshot into a pin over frames already gone.
   So the record has a second witness, one that needs no new file: the
-  `CHECKPOINT` sidecar. Every unlink is gated on a checkpoint, a checkpoint
-  is written only by this RFC's barrier (`Wal::checkpoint` is unreachable
-  from the pipeline today, #793), and on a post-RFC root the record is
-  created at open, before the first checkpoint can exist — so `CHECKPOINT`
-  present with `RECLAIM` absent is a post-RFC root that has lost its record,
-  and open **fails closed** on it as `OpenError::Corrupt`, naming the missing
-  file; both absent is the pre-RFC layout, on which nothing was ever
-  reclaimed, and the only case read as "no reclaimed state". The matrix is
-  symmetric: a `RECLAIM` with any `reclaimed_through` or `planned` entry
-  beside a *missing* `CHECKPOINT` is also fail-closed, naming both files —
-  every unlink was gated on a checkpoint, so the checkpoint existed and is
-  gone, and without `X` the Parquet-side suppression horizon cannot be
-  rebuilt and replay would republish. Only an *empty* record may coexist
-  with a missing `CHECKPOINT`: that is a post-RFC root before its first
-  barrier, which is what open creates.
+  `CHECKPOINT` sidecar's **format version**. Presence alone would not do —
+  `Wal::checkpoint` is unreachable from the pipeline today (#793), but the
+  RFC0008.7 tests and the crash fixture write one, and a root with a
+  version-1 `CHECKPOINT` and no `RECLAIM` is a legitimate pre-RFC root, not
+  a lost record. So this RFC bumps the sidecar's `VERSION` field (the `u16`
+  at bytes 4–6 of the 32-byte `OWCK` record, 1 today) to 2, and the read
+  path accepts both: a version-1 `CHECKPOINT` with `RECLAIM` absent is a
+  pre-RFC root — nothing was ever reclaimed on it (#793) — opened with an
+  empty record and its `CHECKPOINT` rewritten at version 2 by the first
+  checkpoint; a version-2 `CHECKPOINT` with `RECLAIM` absent is a post-RFC
+  root that has lost its record — every unlink is gated on a checkpoint, and
+  on a post-RFC root the record is created at open, before the first
+  checkpoint can exist — and open **fails closed** on it as
+  `OpenError::Corrupt`, naming the missing file; both absent is the
+  pre-RFC layout with no checkpoint, also opened with an empty record. Per
+  the pre-production layout policy that read path is the whole migration
+  — no tooling — and the implementing PR carries the `!` marker for the
+  sidecar version bump beside the snapshot one. The matrix is symmetric: a
+  `RECLAIM` with any `reclaimed_through` or `planned` entry beside a
+  *missing* `CHECKPOINT` is also fail-closed, naming both files — every
+  unlink was gated on a checkpoint, so the checkpoint existed and is gone,
+  and without `X` the Parquet-side suppression horizon cannot be rebuilt
+  and replay would republish. Only an *empty* record may coexist with a
+  missing `CHECKPOINT`: that is a post-RFC root before its first barrier,
+  which is what open creates.
 - **Corrupt is fatal.** The record carries a version byte and a checksum; a
   record failing either at open fails startup as `OpenError::Corrupt`,
   naming the file. It is not read as missing: missing means "never
@@ -1953,19 +1978,27 @@ memory, and nothing here claims to.
 >   rename leaves the previous record intact and the temp truncated by the
 >   next pass
 > - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
->   fails open naming the missing record — `CHECKPOINT` is present, so the
->   root is post-RFC — rather than recreating an empty record and pinning
+>   fails open naming the missing record — its `CHECKPOINT` is version 2, so
+>   the root is post-RFC — rather than recreating an empty record and pinning
+> - **And** a root holding a version-1 `CHECKPOINT` (an RFC0008.7 fixture)
+>   and no `RECLAIM` opens as pre-RFC with an empty record, and its first
+>   checkpoint rewrites the sidecar at version 2
 > - **And** a root whose `RECLAIM` holds entries and whose `CHECKPOINT` is
 >   missing fails open naming both files, while an empty `RECLAIM` beside a
 >   missing `CHECKPOINT` opens as a fresh post-RFC root
-> - **And** a segment whose unlink or parent fsync fails after the record
->   was written stays on disk with `reclaimed_through` behind it: a restart
->   with that tenant's snapshot undecodable pins the tenant rather than
->   halting, because the record proves nothing was lost
+> - **And** a segment whose `unlink` fails after the record was written
+>   stays on disk with `reclaimed_through` behind it: a restart with that
+>   tenant's snapshot undecodable pins the tenant rather than halting
+> - **And** a segment whose parent fsync fails after its `unlink` is an
+>   uncertain deletion: `reclaimed_through` stays behind it and its bytes
+>   stay counted; the next pass re-verifies presence and completes or
+>   retries; a restart reconciles it — present ⇒ retained and re-planned,
+>   absent ⇒ `reclaimed_through` raised and no halt, as a completed
+>   reclamation — under both outcomes of the injected fsync failure
 > - **And** a crash between the record write and the commit is reconciled at
->   open: a planned segment still present is retained and re-planned, an
->   absent one raises `reclaimed_through` as the commit would have, and the
->   reconciled record is durable before the first pass
+>   open the same way: a planned segment still present is retained and
+>   re-planned, an absent one raises `reclaimed_through` as the commit
+>   would have, and the reconciled record is durable before the first pass
 > - **And** a record write or fsync that *fails* unlinks nothing, leaves the
 >   WAL's byte and segment accounting unchanged, and the segments that pass
 >   popped are reclaimed by a later pass once the write succeeds — they are

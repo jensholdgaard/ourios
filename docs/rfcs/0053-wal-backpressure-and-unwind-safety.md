@@ -117,9 +117,12 @@ it from there. No new state is threaded through either receiver.
 
 gRPC carries the same number as a `RetryInfo` detail, which is what
 [OTLP's throttling section](https://opentelemetry.io/docs/specs/otlp/#otlpgrpc-throttling)
-specifies for the backpressure case. Whether that makes RFC 0018 §3.2's
-`RESOURCE_EXHAUSTED`-with-`RetryInfo` option the better code here is a §7
-question, not one this RFC settles.
+specifies for the backpressure case, and the code is `UNAVAILABLE` — chosen
+here rather than left open, so both adapters carry one retry semantics and
+RFC0053.1 can assert it. RFC 0018 §3.2's `RESOURCE_EXHAUSTED` option is
+not taken: it is the saturation code, and a client that maps it to a
+different backoff than the `503` its HTTP twin receives would treat the
+same condition two ways.
 
 **The bound is a byte bound over ALL unreclaimed bytes — not over bytes
 retained below the checkpoint, and not an age.** During the outage this is
@@ -227,7 +230,12 @@ volume is §7's question; the acceptance run uses the derived default. The rejec
 contract: ingest keeps accepting while the object store is unreachable until
 the declared limit, then refuses with a reason that names the limit it hit.
 Crucially, crossing the limit does **not** set RFC 0052's rotation-failure
-state — it is a pressure state, not a fault.
+state — it is a pressure state, not a fault. The converse precedence is
+stated too: once the WAL is in RFC 0052's terminal rotation state — which
+the timer's own `rotate` can reach after the bound is crossed — the
+pre-append check reports that terminal classification, with no
+`Retry-After`, before it consults the bound at all. Backpressure never masks
+a state no retry can clear.
 
 **It clears when a housekeeping pass actually removes bytes, not when the
 checkpoint advances.** Advancing the sidecar declares frames reclaimable; it
@@ -242,9 +250,12 @@ refused, and no batch is ever refused on the strength of an earlier refusal.
 The *state* §3.3 exports is entered by the first refused reservation and left
 by whichever comes first: a housekeeping pass that brings unreclaimed bytes
 strictly below the limit, evaluated by the timer after each pass under the
-same mutex (which is how the state leaves with no append arriving), or a
-reservation that succeeds. The enter and leave events fire on exactly those
-transitions, once each, and the gauge follows them.
+same mutex (which is how the state leaves with no append arriving), or an
+append that *succeeds*. A reservation that passes its check but whose append
+then fails on rotation or write I/O leaves the figure and the state
+unchanged, so the preflight check is never the leave transition. The enter
+and leave events fire on exactly those transitions, once each, and the gauge
+follows them.
 
 **It also needs the timer to be able to force a rotation, or it deadlocks on
 its own.** Housekeeping never unlinks the *current* append segment, and a
@@ -362,7 +373,11 @@ holds neither batch. So `Drained` itself gains the destructor: its two
 batches become `Option`s the consuming calls take partition by partition as
 they settle, it carries clones of the two shared sink handles
 (`SharedParquetSink` and `SharedParquetAuditSink` are `Arc`-shared already)
-so that `Drop` can call each sink's `requeue` on whatever is still present,
+so that `Drop` can call the record sink's `requeue` and a new public
+`SharedParquetAuditSink::requeue_ahead` — prepending the recovered events
+ahead of concurrent emits and restoring the buffered gauge, which today only
+the private `BufferingAuditSink::requeue_ahead` does — on whatever is still
+present,
 and that `Drop` path is non-panicking — it recovers a poisoned sink lock
 rather than unwinding inside an unwind. A pre-call or
 inter-call unwind then requeues everything through the destructor, and a
@@ -370,6 +385,15 @@ panic inside a call requeues the unsettled remainder through the call's own
 handle. What the design requires is that **no** panic arm anywhere in the
 sequence can drop an un-requeued batch; neither mechanism delivers that
 alone, and neither can a `catch_unwind` at one call site.
+
+**The encode workers are in the contract too.** `EncodePool` calls
+`publish_owned` after the WAL batch has been acknowledged, and a worker
+panic there drops the remainder of its mined `Vec`; `BatchGuard` only
+decrements the pending count, so `quiesce_encodes` reports idle and the
+barrier could stamp over records that never reached a sink. A worker's batch
+therefore takes the same recoverable shape — held by a guard that releases
+partitions as each publish returns and requeues the rest to the record sink
+on unwind — and RFC0053.2 asserts it with a panic inside a worker.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -449,7 +473,7 @@ are kept distinct so that the remedy each advertises is the true one.
 > **Scenario RFC0053.1 — Backpressure is a stated limit, and clears itself**
 > - **Given** an unreachable object store and a configured local retention
 >   bound, on a node running RFC 0052
-> - **When** ingest continues until the bound is crossed
+> - **When** ingest continues until a reservation would exceed the bound
 > - **Then** earlier batches were accepted and acked, and the rejecting batch
 >   is refused with a reason naming the limit, and a `Retry-After` equal to
 >   the reclamation cadence — **not** a value derived from the limit, which
@@ -466,9 +490,13 @@ are kept distinct so that the remedy each advertises is the true one.
 >   checkpoint, not only below it: a run where the checkpoint never advances
 >   must still reach the limit
 > - **And** the rejection does **not** set the rotation-failure state
-> - **And** when the store returns, ingest resumes **with no append and no
->   restart** — the timer-driven sequence reclaims, which is the only path
->   that can clear a state that rejects every append
+> - **And** when the store returns and no tenant pins the floor (RFC 0052
+>   §3.2), ingest resumes **with no append and no restart** — the
+>   timer-driven sequence reclaims, which is the only path that can clear a
+>   state that rejects every append
+> - **And** when a tenant does pin the floor, the state persists after the
+>   store returns, by design, and is reported as pinned rather than as an
+>   unexplained refusal
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
 >   without an append ever arriving
@@ -491,6 +519,9 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a transient failure on the first put followed by a panic on the
 >   third leaves the first partition requeued too: a failed partition is
 >   never outside the recoverable batch while it awaits requeue
+> - **And** a panic inside an `EncodePool` worker's publish, after the WAL
+>   ack, requeues the remainder of that worker's mined batch, and the
+>   barrier does not read the pool as idle across it
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
@@ -548,11 +579,24 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   tasks that submit batches of arbitrary sizes at once against a small limit,
   asserting after every admission that the sum of admitted frame bytes never
   exceeds the limit — the only test a reservation taken outside the journal
-  mutex fails, since the sequential flow passes it.
+  mutex fails, since the sequential flow passes it. A fifth leg fills the
+  limit and submits an oversize payload, asserting `TooLarge` with no
+  `reclaim_state()` read and no append — the reversed-check regression. The
+  sequence is driven through **both** adapters: on HTTP the protobuf
+  `Status`, `application/x-protobuf` and the exact `Retry-After`; on gRPC
+  `UNAVAILABLE` with the `RetryInfo` detail carrying the same seconds. A test
+  through one adapter leaves the other's contract unverified.
+- **Configuration (RFC0053.1's precondition)** — resolver tests for an
+  explicit value, an `${env:VAR}`-substituted one, the derived default at a
+  2 GiB segment, and an invalid below-segment value, plus a Helm render leg
+  that the chart value reaches the config file; a missing field under
+  `deny_unknown_fields` would otherwise leave the limit at its default while
+  every scenario passed.
 - **Unwind safety (RFC0053.2, RFC0053.3)** — a publish double that panics on
   demand at **each** reachable point (before the audit write, inside it,
-  inside the record publish), asserting the buffers are repopulated in every
-  case, the barrier refuses to stamp, and a later healthy barrier publishes.
+  inside the record publish), asserting the records and any unsettled audit
+  events are back in their buffers, settled audit events are absent, the
+  barrier refuses to stamp, and a later healthy barrier publishes.
   Parameterising the panic point is the whole test: the partial-move shape
   means a guard that only covers the last point passes a single-point test.
   The point is also parameterised **across partitions** — a drained batch of
@@ -560,9 +604,14 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   asserting the accepted objects are not written again and the store holds
   at most one duplicate; one leg fails the first put transiently and panics
   on a later one, asserting the failed partition is back in its buffer. RFC0053.3 drives many consecutive panicking ticks
-  and asserts the record count is conserved.
+  and asserts logical no-loss by unique record ids plus at most one extra
+  object per panic — not an exact row count, which the accepted duplicate
+  would fail.
 - **No loss (RFC0053.4)** — extends RFC 0052's `SIGKILL` crash-recovery
-  extension rather than adding a parallel one, with a small backpressure
+  extension rather than adding a parallel one, in **both** restart shapes —
+  a clean replay and a torn newest tail, since the existing crash test has
+  no torn tail and a remeasure hook placed only on the heal path would pass
+  it — with a small backpressure
   bound configured so the kill lands in the refusing regime, and a
   post-restart append that asserts the rebuilt figure still refuses; a
   fault-injected leg makes the remeasure's listing fail and asserts startup
@@ -573,7 +622,7 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   the `weaver registry live-check` pass over those events.
 
 Maturity, per `docs/rfcs/README.md`: `green` is RFC0053.1–.5 all passing in
-CI, and this RFC touches no thesis gate in `docs/benchmarks.md` §7. It does
+CI with the unit, property and corpus suites green, and this RFC touches no thesis gate in `docs/benchmarks.md` §7. It does
 **not** proceed to `validated` on those alone: §4 records that the sinks can
 exhaust memory before the WAL bound fires, so a green run could mark a bound
 validated that is never the operative limit. `validated` therefore also
@@ -604,9 +653,6 @@ that decision lands the RFC stops at `green`, and says so.
       byte-identical overwrite instead of a second object. The cost is that a
       requeued batch would have to stay a unit through the next drain rather
       than merge with what arrived since.
-- [ ] Whether `RESOURCE_EXHAUSTED` with `RetryInfo` is the better gRPC code
-      for the backpressure outcome, as RFC 0018 §3.2 allows for saturation,
-      rather than `UNAVAILABLE`. The HTTP side has no such choice to make.
 
 ## 8. References
 
@@ -619,7 +665,8 @@ that decision lands the RFC stops at `green`, and says so.
 - PR #795 — counts a cadence panic and stops the sweep; §3.2 is what makes
   reversing that stop safe.
 - RFC 0018 §3.2 (retryable error mapping) — the reasoning for `503` on an
-  unacked batch, and the `RESOURCE_EXHAUSTED` option §7 leaves open.
+  unacked batch; §3.1 takes `UNAVAILABLE` over its `RESOURCE_EXHAUSTED`
+  option.
 - RFC 0014 — the record sink and its flush triggers.
 - `CLAUDE.md` §3.4 (WAL-before-ack), §6.3 (observability of ourselves).
 - `docs/hazards.md` #3 (WAL durability versus latency), #4 (small files).

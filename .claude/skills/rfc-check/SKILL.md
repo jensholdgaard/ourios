@@ -38,16 +38,18 @@ name files and sections.
    | Trigger | Where it lives | Verdict |
    |---|---|---|
    | Pillar — Parquet on-disk format, Drain-derived miner, DataFusion as the engine (§2) | `ourios-parquet`, `ourios-miner`, `ourios-querier` | **Required** |
-   | Invariant §3.1 template merges, §3.2 `params` cardinality, §3.3 bit-identical reconstruction | `ourios-miner` | **Required** |
+   | Invariant §3.1 template merges, §3.2 `params` cardinality, §3.3 bit-identical reconstruction | `ourios-miner`; for §3.3 also the body decode boundary `ourios-core/src/otlp.rs` and the read-path renderer `ourios-querier/src/log_row.rs`, which must return retained bodies for lossy rows | **Required** |
    | Invariant §3.4 WAL-before-ack: ack ordering, fsync, checkpoint, truncation, rotation, recovery | `ourios-wal`, `ourios-ingester` commit/recovery/publish paths, `ourios-server/src/receiver.rs` (startup recovery and the post-recovery, rotation and shutdown `flush_then_snapshot` barriers) | **Required** |
    | Invariant §3.5 Parquet schema, §3.6 object storage as truth, §3.7 tenancy | `ourios-parquet`, storage, every tenant-bearing path | **Required** |
-   | Every hazard section of `docs/hazards.md` (`## H1` … `## H8` today — enumerate the file, do not assume the count) | as listed there | **Required** |
-   | Wire contract: OTLP receiver behaviour, error mapping, query DSL surface, HTTP and MCP query endpoints | `ourios-ingester/src/receiver/*`, `ourios-querier/src/dsl` and `api.rs`, `ourios-server/src/{querier,mcp}.rs`, `ourios-serving` | **Required** if it changes what a client observes; a conformance fix that only makes existing behaviour spec-correct is **Recommended** (open an issue naming the spec clause) |
+   | Every hazard section of `docs/hazards.md` — enumerate the file, do not assume the count. Today: H1 miner correctness → `ourios-miner`; H2 params cardinality → `ourios-miner` params limit, `ourios-parquet` overflow column; H3 WAL durability → `ourios-wal`, `ourios-ingester/src/receiver/commit.rs`, `ourios-server/src/receiver.rs`; H4 small files → `ourios-ingester/src/record_sink.rs`, compaction in `ourios-core/src/alias.rs` and `ourios-bench/src/store.rs`; H5 template schema evolution → `ourios-miner/src/snapshot.rs`, `ourios-querier/src/{alias_store,drift}.rs`; H6 DSL vs SQL → `ourios-querier/src/{dsl,plan,exec.rs}`; H7 reconstruction → as §3.3; H8 replication dedup → no surface yet, any replication proposal trips it | **Required** |
+   | Wire contract: OTLP receiver behaviour, error mapping, query DSL surface, HTTP and MCP query endpoints | `ourios-ingester/src/receiver/*`, `ourios-core/src/otlp.rs` (the OTLP decode boundary, RFC 0003/0043), `ourios-querier/src/dsl` and `api.rs`, `ourios-server/src/{querier,mcp,visibility}.rs` (`visibility::reject` picks the 401/403/503 the query surfaces return), `ourios-serving` | **Required** if it changes what a client observes; a conformance fix that only makes existing behaviour spec-correct is **Recommended** (open an issue naming the spec clause) |
    | New crate | `Cargo.toml`, `crates/` | **Required** |
-   | New or changed persisted layout — WAL segment/checkpoint/snapshot format, Parquet partition or object layout | `ourios-wal/src`, `ourios-parquet/src`, `ourios-ingester/src/snapshot_store.rs` | **Required** |
+   | New or changed persisted layout — WAL segment/checkpoint/snapshot format, Parquet partition or object layout | `ourios-wal/src`, `ourios-parquet/src` (`parquet_io::object_key`), `ourios-ingester/src/record_sink.rs` (`object_key`), `ourios-miner/src/snapshot.rs` (the snapshot byte format and its version dispatch; `snapshot_store.rs` only persists it) | **Required** |
    | New config field on the deployment surface | `ourios-server/src/config`, `ourios-config`, Helm | **Recommended** |
-   | Telemetry: new metric, log event or attribute *name* | anywhere | Not an RFC trigger by itself, but the name goes through the shared `ourios-semconv` registry — say so in the verdict. Span names are not registry-backed here; they follow the OTel semantic conventions for their kind instead |
-   | Bug fix, dependency bump, refactor preserving every public signature and every on-disk byte, test-only change, docs | — | **Not required** |
+   | Telemetry: new metric, log event or attribute *name* | anywhere | Not an RFC trigger by itself, but the name goes through the shared `ourios-semconv` registry — say so in the verdict. Span names are not registry-backed here; they follow the OTel semantic conventions for their kind |
+   | Span lifecycle: adding, removing, renaming or re-scoping a span | `ourios-server`, `ourios-ingester`, `ourios-df-otel`, `ourios-telemetry` | **Recommended**, and cross-reference RFC 0038 §3.5 and RFC 0040, which specify the spans; **Required** if it contradicts either |
+   | Bug fix, dependency bump, refactor preserving every public signature and every on-disk byte, test-only change, non-normative docs (guides, talks, benchmarks records) | — | **Not required** |
+   | Process and contract documents: `CLAUDE.md` (its footer requires a `meta:` RFC), an *accepted* RFC's text (an amendment, per `docs/rfcs/README.md` §Relationship), `docs/hazards.md` | those files | **Required** for `CLAUDE.md` and accepted RFCs; **Recommended** for `hazards.md` |
 
 3. **Cross-reference the accepted RFCs.** For each trigger marked, grep
    `docs/rfcs/` for the section that specifies that surface — the RFC's
@@ -60,9 +62,10 @@ name files and sections.
    and section it amends ("amends RFC NNNN §X" belongs in the new RFC's
    status note and §8); an overlap with a `drafted`, `specified`, `red`,
    `green` or `validated` RFC is reported as "coordinate with RFC NNNN",
-   never as an amendment; and `superseded` or `rejected` text is never
-   cited as live — follow `superseded-by:` to the current RFC instead (RFC
-   0045 → RFC 0046 is the case in the tree). This is the step that finds
+   never as an amendment; `superseded` text is never cited as live — follow
+   `superseded-by:` to the current RFC instead (RFC 0045 → RFC 0046 is the
+   case in the tree); and `rejected` text is simply ignored, since a
+   rejected RFC has no replacement to follow. This is the step that finds
    the hidden amendment before review does.
 
 4. **Check the PR description** (when there is one). `CLAUDE.md` §4 makes it
@@ -87,8 +90,8 @@ RFC check — <branch or plan name>
 
 Files: <list, grouped by crate>
 Triggers: <each matched trigger, one line, with the file:line that trips it — or the planned file and symbol when the input is a plan>
-Amends: <RFC NNNN §X (accepted) — "<quoted sentence>"> or "none found in docs/rfcs/"
-Coordinate: <RFC NNNN (status) — overlap> or "none"
+Amends: <one line per accepted RFC: RFC NNNN §X — "<quoted sentence>"> or "none found in docs/rfcs/"
+Coordinate: <one line per pre-accepted RFC: RFC NNNN (status) — overlap> or "none"
 PR description: <invariants/hazards touched> / <silent on: …> or "no PR yet"
 
 Verdict: Not required | Recommended | Required

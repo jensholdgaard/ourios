@@ -81,8 +81,10 @@ crossing it is a *stated* rejection, specified as a transport contract rather
 than gestured at.
 
 **The transport contract.** `ReceiveError` gains a `WalBackpressure` variant
-carrying the limit that was hit, the measurement that crossed it and the delay
-to advertise; `IngestFailure::classify` maps it to a new `Backpressure` outcome, which that
+carrying the limit, both measurements — the pre-reservation unreclaimed total
+and the projected total including this batch's `framed_len`, since a
+per-request refusal can happen with the live total still below the limit
+and a single "measurement" would be ambiguous — and the delay to advertise; `IngestFailure::classify` maps it to a new `Backpressure` outcome, which that
 exhaustive match then forces both transports to handle; both render `503` /
 `UNAVAILABLE` with the limit named in the `Status` message. `503` because the
 batch was not acked — RFC 0018 §3.2's reasoning — and a distinct outcome
@@ -223,12 +225,21 @@ the caller's responsibility because the caller is what holds the mutex.
 
 There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
-before the write. One append failure needs its own accounting rule: when
-`Wal::append` fails after bytes reached disk and its best-effort truncate
-back also fails — the case the WAL documents and repairs only on the next
-open — the frame's full framed length is added to the unreclaimed figure at
-once. An over-count is safe and an under-count admits past the bound; the
-next `remeasure_unreclaimed()` corrects it.
+before the write. Two append failures need their own rules. A failure the
+WAL rolls back cleanly — the truncate-back succeeds — leaves the figure and
+the refusing state unchanged. A failure after bytes reached disk whose
+best-effort truncate-back *also* fails is not something the counter alone
+can absorb: the frame's full framed length is added to the unreclaimed
+figure at once (an over-count is safe, an under-count admits past the
+bound; the next `remeasure_unreclaimed()` corrects it), **and the segment
+is sealed** — the WAL records the last good EOF in memory, refuses further
+appends into that segment, and the next append rotates through RFC 0052
+§3.3's retry path into a fresh one, since appending after a partial frame
+would let recovery consume later bytes as part of it. The torn frame then
+sits at the EOF of a *closed* segment, so RFC 0052's replay heal is
+extended, as an amendment from this RFC, to exactly that shape — one
+partial frame at the end of a segment that is immediately followed by a
+newer one — rather than halting on it as mid-history corruption.
 
 The bound is configuration, and it has a home: `WalConfig` gains
 `unreclaimed_bytes_limit`, and it is the first WAL knob the deployment
@@ -342,9 +353,12 @@ object store recovered. That is not a bug to paper over — a tenant whose
 snapshot is not advancing is a real problem — but it must be *visible* rather
 than presenting as an unexplained refusal, which is why RFC 0052 §3.5 exports
 the floor and its lag alongside the bytes. RFC0053.1 asserts the healthy-store
-resume; the pinned-floor case is normative — the state persists after the
-store returns and is reported `Pinned` (RFC0053.1) — and only its
-escalation policy is the §7 question.
+resume; the held-floor cases are normative — a tenant with no valid
+snapshot pins the floor and is reported `Pinned`, a valid but lagging
+horizon is `Min` with nonzero lag, and in both the bound stays crossed for
+a batch of that size after the store returns, while the refusal latch
+itself still follows §3.1 and may leave on a smaller successful append
+(RFC0053.1) — and only the escalation policy is the §7 question.
 
 ### 3.2 Requeue on unwind
 
@@ -418,7 +432,9 @@ record publish — need an owner too, and today's `Drained` has none:
 its `_guard` is a `PublishGuard` that only tracks the in-flight count and
 holds neither batch. So `Drained` itself gains the destructor: its two
 batches become `Option`s the consuming calls take partition by partition as
-they settle, it carries clones of the two shared sink handles
+they settle — and that every normal requeue arm (the audit-failure arm
+that requeues the records today included) `take()`s what it requeues, so
+`Drop` handles remaining ownership only and nothing is requeued twice — it carries clones of the two shared sink handles
 (`SharedParquetSink` and `SharedParquetAuditSink` are `Arc`-shared already)
 so that `Drop` can call the record sink's `requeue` and a new public
 `SharedParquetAuditSink::requeue_ahead` — prepending the recovered events
@@ -448,19 +464,31 @@ on unwind — and so does the inner emit path: `emit_concurrent` takes its
 record by value and can produce both a ceiling-taken and a size-taken batch,
 calling `publish_owned` twice, so a guard at the worker boundary alone could
 not reach the second batch or the in-flight record after the first call
-panicked; every batch the emit produces, and the record it holds, is owned
-by a guard until its put returns. RFC0053.2 asserts it with a panic inside a
+panicked; ownership is transferred explicitly — the worker's guard owns the
+record only until `append_off_lock` returns, since insertion into the sink
+buffer *is* the handoff and a panic in the trigger step after it must not
+requeue a record the sink already holds, and it owns each trigger batch
+from the moment `append_off_lock` returns it until that batch's put
+completes — and the one-duplicate bound is claimed only under that
+transfer. RFC0053.2 asserts it with a panic inside a
 worker, and with a panic before the second trigger's batch is consumed. Requeueing
 the batch is worthless if the pool then swallows the next one, so both
 halves of worker recovery are stated: a worker whose `emit_concurrent`
 panics exits its OS thread today, and the pool's supervisor **respawns** it
 (the closed handle is noticed, a replacement started, the panic counted);
-and `EncodePool::submit` on a closed or full channel is **not a failure the
-client sees at all**: the mined batch goes straight into the record sink's
+and `EncodePool::submit` on a **disconnected** pool is not a failure the
+client sees at all: the mined batch goes straight into the record sink's
 buffer — the durability handoff the pool would have reached — the turn
 acknowledges normally, since the frame is WAL-durable and the batch will be
-published by the next barrier, and the event is counted on the existing
-ingest failure counter under `error.type=encode_pool_unavailable`. An
+published by the next barrier, and the event is counted on a new registry
+counter, `ourios.ingest.encode_fallback` (added in the same semconv bump),
+since no existing instrument fits an accepted batch on a degraded path. A
+*full* channel is not a fallback case: `submit` keeps blocking on the
+bounded `sync_channel` as today, because that bound is what caps in-flight
+memory during exactly the outage §4 says the sink cannot yet bound, and
+the respawn keeps the pool from staying disconnected; a submit after the
+pool has closed for shutdown is the disconnected case and takes the sink
+path. An
 earlier draft refused the turn before the ack; that would have told a
 client to re-send a frame that was already durable and already on its way
 to Parquet, and it still needed the requeue, because `mine_batch_ordered`
@@ -521,8 +549,10 @@ lossless and bounded in exactly that failure mode would be the wrong
 shape — so there is no queue: the coordinator **emits the enter and leave
 events itself, synchronously at the transition, under the journal mutex**.
 The order is the mutex order and every transition emits exactly once at a
-real call site; RFC 0052's tick-based emitter keeps only the states that
-change on ticks. RFC0053.5 counts every transition. Names come from the shared `ourios-semconv`
+real call site; RFC 0052 §3.5's tick-based projection is amended by this
+RFC to exclude the refusal latch explicitly — its "latch" was
+`cadence_failed`, which this RFC retires — so there is one emitter per
+transition and never two events for one. RFC0053.5 counts every transition. Names come from the shared `ourios-semconv`
 registry in one bump with RFC 0052's, not hand-written, and `error.type`
 continues to carry the failure class on existing counters rather than
 spawning per-error metrics.
@@ -568,9 +598,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   bound, on a node running RFC 0052
 > - **When** ingest continues until a reservation would exceed the bound
 > - **Then** earlier batches were accepted and acked, and the rejecting batch
->   is refused with a reason naming the limit, and a `Retry-After` equal to
->   the reclamation cadence — **not** a value derived from the limit, which
->   yields no delta-seconds
+>   is refused with a reason naming the limit and both measurements (the
+>   pre-reservation total and the projected total), on both transports, and
+>   a `Retry-After` equal to the reclamation cadence — **not** a value
+>   derived from the limit, which yields no delta-seconds
 > - **And** on HTTP the reason is a binary protobuf `google.rpc.Status` body
 >   (`application/x-protobuf`, whatever the request's encoding) with
 >   `Retry-After` as a header, and on gRPC the status code is `UNAVAILABLE`
@@ -587,9 +618,12 @@ are kept distinct so that the remedy each advertises is the true one.
 >   §3.2), ingest resumes **with no append and no restart** — the
 >   timer-driven sequence reclaims, which is the only path that can clear a
 >   state that rejects every append
-> - **And** when a tenant does pin the floor, the state persists after the
->   store returns, by design, and is reported as pinned rather than as an
->   unexplained refusal
+> - **And** when a tenant pins the floor (no valid snapshot), or a valid
+>   horizon lags so that the bytes cannot be reclaimed, the bound stays
+>   crossed for a batch of that size after the store returns, by design; the
+>   floor is reported `Pinned` in the first case and `Min` with its lag in
+>   the second, rather than as an unexplained refusal, and the latch itself
+>   still leaves on a smaller successful append as §3.1 defines
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
 >   without an append ever arriving
@@ -698,11 +732,12 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   refusal persists after the store returns and the state is reported
   `Pinned`, which is the behaviour RFC0053.1 makes normative.
 - **Configuration (RFC0053.1's precondition)** — resolver tests for an
-  explicit value, an `${env:VAR}`-substituted one, the derived default at a
-  2 GiB segment, and an invalid below-segment value, plus a Helm render leg
+  explicit value and an `${env:VAR}`-substituted one, plus a Helm render leg
   that the chart value reaches the config file; a missing field under
   `deny_unknown_fields` would otherwise leave the limit at its default while
-  every scenario passed.
+  every scenario passed. The derived default at a 2 GiB segment and the
+  invalid below-segment value are `WalConfig` validation tests, since the
+  resolver has no segment-size input (`wal_config()` hardcodes it).
 - **Unwind safety (RFC0053.2, RFC0053.3)** — a publish double that panics on
   demand at **each** reachable point (before the audit write, inside it,
   inside the record publish), asserting the records and any unsettled audit
@@ -741,7 +776,10 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   live headroom, and exactly one event per transition — including a refusal
   and a smaller successful append inside one tick; plus the `weaver registry
   live-check` pass over those events, and an assertion that every injected
-  cadence or worker panic in RFC0053.2/.3 increments `cadence_panic`.
+  cadence panic in RFC0053.2/.3 increments `cadence_panic` while every
+  injected worker panic increments `error.type=encode_worker_panic` on the
+  same counter — separately, since a respawned worker's panic is not a dead
+  cadence and must not read as one.
 
 Maturity, per `docs/rfcs/README.md`: `green` is RFC0053.1–.5 all passing in
 CI with the unit, property and corpus suites green, and this RFC touches no thesis gate in `docs/benchmarks.md` §7. It does

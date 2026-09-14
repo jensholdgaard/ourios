@@ -313,9 +313,15 @@ of a drain, never of a PUT, which is the WAL-local durability this RFC
 exists to preserve.
 
 The mark is then read inside that turn and after the quiesce — `last_durable()`
-at that point, the offset the receiver's acks are gated on — so no frame above
-it can still be in flight. Reading it before the quiesce, or outside the turn,
-reopens the window from the other side.
+at that point, the offset the receiver's acks are gated on — so every frame
+at or below it has finished its turn: mined under the miner lock the barrier
+now holds, drained, and its publish waited for. Frames above it may well
+exist — appended and synced by turns admitted after the cut, waiting on the
+exclusion — and that is the point: they have not touched the miner state the
+snapshot serialises, so the snapshot excludes them and replay re-mines them.
+Reading the mark before the quiesce, or outside the turn, reopens the window
+from the other side: a frame at or below the mark whose encode or publish is
+still in flight.
 
 **And the stored mark must not over-cover.** The group-commit `sync` reports
 the WAL's EOF, and `CommitCoordinator::flush` captures `covered_seq` before it
@@ -1182,7 +1188,13 @@ So the design is:
   carries no offset and `ingest_mined` diverts only records — forwarding
   events only for frames above `X` (the barrier drains the audit sink before
   it stamps, so `X` is the audit horizon): events for `(S, X]` are suppressed
-  and counted, events above `X` forwarded, and neither duplicated nor lost;
+  and counted, events above `X` forwarded, and neither duplicated nor lost.
+  Regeneration by the miner is the **only** source of replayed events:
+  stored `AuditEvent` frames are not replayed — nothing writes them today
+  (`encode_audit_event` is `unimplemented!()`, RFC 0008 §9's deferral) and
+  recovery keeps ignoring the kind — and an encoder that lands later must
+  either keep replay on regeneration or amend this leg, never feed both,
+  or an event would be injected twice;
   RFC0052.10 gains the audit leg — `max`, because the
   snapshot is written before the checkpoint is persisted, so a successful
   snapshot followed by a failed checkpoint write leaves `S > X` with `(X, S]`
@@ -1628,10 +1640,12 @@ memory, and nothing here claims to.
 >   checkpoint write then failed, so a tenant restarts with `S > X`: nothing
 >   in `(X, S]` is republished
 > - **And** the audit stream is gated the same way: no template event for a
->   frame at or below `X` is emitted again on replay, and every event for a
->   frame above `X` is emitted exactly once, in frame order, through the
->   capture sink; the test asserts the emitted set equals the events of the
->   frames in `(X, tail]`
+>   frame at or below `X` is forwarded again on replay, and every event the
+>   miner regenerates for a frame above `X` is forwarded exactly once, in
+>   frame order, through the capture sink, with stored `AuditEvent` frames
+>   ignored as a source; the test mines the same frames from the same
+>   snapshot with the same injected clock as a reference and asserts the
+>   forwarded set equals the reference's events for `(X, tail]`
 
 ## 6. Testing strategy
 

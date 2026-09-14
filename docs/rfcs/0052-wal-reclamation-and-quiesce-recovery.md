@@ -272,10 +272,25 @@ partition count are exported (an UpDownCounter and a gauge, registry
 names in the one bump) as the mechanism's only signal — RFC 0053 owns the
 client-facing bound, and nothing here refuses a client. Ownership of a
 detached batch that *does* enqueue moves through three hands in a fixed
-order: the worker, inside `emit_concurrent`, registers the publish guard
-**before** it enqueues and before its own `BatchGuard` can settle, so at no
-instant is a pre-cut record outside both the buffers and the in-flight set
-— that ordering is the invariant the checkpoint argument rests on; the
+order, and the first hand is **not** the worker. `append_off_lock` takes
+the ceiling and size partitions out of the buffers — dropping their bytes
+from the accounting — and returns them, all inside one sink-lock section
+and before `emit_concurrent` could register anything; the worker runs
+after `pool.submit` released `ingest_bound`, so a barrier can capture in
+the window where a pre-cut partition is out of the buffers and not yet in
+the in-flight set. Taking the exclusion in the worker to close that window
+would deadlock against `quiesce_encodes`, which holds it while waiting for
+that same worker. So the publish guard follows the route the `BatchGuard`
+already takes: it is **created in `submit`, under the exclusion, with the
+same epoch**, and travels with the queued batch; the worker's detach
+*consumes* that pre-made guard instead of creating one, and a batch whose
+records detach nothing releases it unused at the end of the batch. No
+detach therefore happens outside a guard's lifetime: the guard exists
+before the turn releases the exclusion, so every partition the batch
+detaches is in the in-flight set from the instant it leaves the buffers,
+and a cut captured at any point either drains it or waits for it. One
+guard per batch covers however many partitions that batch detaches, which
+is also why `emit_concurrent` needs no registration of its own; the
 queue carries the guard with the batch.
 What the queue carries is **not** a `Drained`: that value is the audit
 buffer's own snapshot taken under the miner lock beside the records, and a
@@ -288,14 +303,23 @@ barrier's existing value, written by `write_ordered` unchanged. The
 lock at detach time** — the count of events the sink has accepted for that
 tenant when the partition left the buffers, which is at or above every
 event the partition's records produced, since emission precedes the
-append. Before writing a detached partition the publisher drains and
-writes the audit buffer up to at least that watermark, ordered ahead of
-the records and under the sink lock, so audit-before-record (issue #302)
-holds for this path exactly as `write_ordered`'s audit-first step gives it
-for `Drained`. The sink lock serialises that against a concurrent age
-drain: whichever takes the lock first writes its audit prefix, and a drain
-that took the buffer already satisfies a lower watermark, so the publisher
-finds nothing left to write and proceeds. The publisher then settles the
+append. Before writing a detached partition the publisher requires the
+events up to that watermark to be **durable**, not merely gone from the
+buffer: a concurrent age drain can be holding exactly those events in an
+unfinished store write while this publisher sees an empty buffer, and
+publishing then would put records in Parquet ahead of their template
+events — the failure issue #302 fixed. So the audit sink tracks
+`audit_durable_through`, advanced only after a store write returns
+success, beside the range of events currently in flight. A publisher whose
+`audit_watermark` is at or below `audit_durable_through` proceeds; one
+above it either writes the missing events itself, when it still holds
+them in the buffer (under the sink lock, ordered ahead of its records, the
+audit-first step `write_ordered` gives `Drained`), or waits on the
+in-flight write that covers them. A failed in-flight write leaves
+`audit_durable_through` where it was and requeues its events, and every
+dependent record publish is refused and requeues with it — the same
+refusal `write_ordered` already makes when its audit half fails, now
+reaching publishes that did not take the events themselves. The publisher then settles the
 guard on the outcome: durable, or requeued into the
 buffers under the sink lock on a transient failure (where the next
 drain or flush covers it), or quarantined per record on a poison rejection,
@@ -569,7 +593,10 @@ holds the `Arc`) and handed at construction to the encode pool, to the
 sink's publish guards and to the barrier task: `barrier_epoch: AtomicU64`,
 the number of the next cut, incremented at every cut capture under the
 exclusion; and `failed_epoch: AtomicU64`, the lowest epoch any unwinding
-guard has reported, `u64::MAX` when clear. A guard reads `barrier_epoch` when
+guard has reported, `u64::MAX` when clear. (RFC 0053 §3.2 adds a third,
+`failure_generation`, so its clear can be a CAS on the pair rather than on
+`failed_epoch` alone; stage 1 has no clear to race, so the pair is not
+needed here.) A guard reads `barrier_epoch` when
 it is registered — `submit` for a `BatchGuard`, `begin_publish` for a
 publish guard, both under the exclusion, so the read is ordered against the
 capture: a guard registered before cut `E`'s capture carries `E`, one
@@ -992,9 +1019,15 @@ one, because startup's fallback is exactly as trustworthy as this record:
   a lost record. So this RFC bumps the sidecar's `VERSION` field (the `u16`
   at bytes 4–6 of the 32-byte `OWCK` record, 1 today) to 2, and the read
   path accepts both: a version-1 `CHECKPOINT` with `RECLAIM` absent is a
-  pre-RFC root — nothing was ever reclaimed on it (#793) — opened with an
-  empty record and its `CHECKPOINT` rewritten at version 2 by the first
-  checkpoint; a version-2 `CHECKPOINT` with `RECLAIM` absent is a post-RFC
+  pre-RFC root — nothing was ever reclaimed on it (#793) — opened **without
+  creating a record**, and its `CHECKPOINT` is rewritten at version 2 by the
+  first checkpoint, the record being created (empty, armed) on that same
+  path. Creating it eagerly at open would leave a state the matrix cannot
+  read — a version-1 `CHECKPOINT` beside an unarmed `RECLAIM` — for as long
+  as the node runs before its first barrier; deferring the creation to the
+  upgrade keeps a restart in that window on the legacy branch, which is
+  exactly where it belongs. "Created at open" below therefore means *on a
+  root with no version-1 checkpoint to migrate*. A version-2 `CHECKPOINT` with `RECLAIM` absent is a post-RFC
   root that has lost its record — every unlink is gated on a checkpoint, and
   on a post-RFC root the record is created at open, before the first
   checkpoint can exist — and open **fails closed** on it as
@@ -1880,6 +1913,11 @@ memory, and nothing here claims to.
 > - **And** a batch queued before cut `E`'s capture and dequeued after it
 >   carries epoch `E` — assigned in `submit`, not at dequeue — so a panic in
 >   it fails cut `E`, not only later ones
+> - **And** a partition detached by that batch's first record, with the cut
+>   captured between the detach and the enqueue, is covered: the publish
+>   guard was created in `submit` before the exclusion was released, so the
+>   cut waits for it rather than stamping past it, and a batch that
+>   detaches nothing releases its guard unused
 > - **And** a publisher panic with batches still queued behind the failing
 >   one latches only the failing batch's epoch, parks every queued batch in
 >   the buffers with its guard released, and a `quiesce_publishes` started
@@ -1888,6 +1926,11 @@ memory, and nothing here claims to.
 >   in the buffers under the sink lock before releasing its guard, so the
 >   records are covered by the next drain rather than silently settled, and
 >   the publisher is respawned
+> - **And** a detached partition whose `audit_watermark` is covered by
+>   another writer's *in-flight* audit write is not published until that
+>   write is durable: an empty audit buffer is not read as a durable
+>   prefix, and when that write fails the dependent partition requeues
+>   rather than landing in Parquet ahead of its template events
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -2194,8 +2237,12 @@ memory, and nothing here claims to.
 >   fails open naming the missing record — its `CHECKPOINT` is version 2, so
 >   the root is post-RFC — rather than recreating an empty record and pinning
 > - **And** a root holding a version-1 `CHECKPOINT` (an RFC0008.7 fixture)
->   and no `RECLAIM` opens as pre-RFC with an empty record, and its first
->   checkpoint rewrites the sidecar at version 2
+>   and no `RECLAIM` opens as pre-RFC **without** creating a record, and its
+>   first checkpoint rewrites the sidecar at version 2 and creates the
+>   record armed on the same path
+> - **And** a restart in that migration window — still a version-1
+>   `CHECKPOINT`, still no record — takes the legacy branch again rather
+>   than any fail-closed row
 > - **And** a root whose `RECLAIM` carries `checkpoint_seen` — written after
 >   its first version-2 checkpoint succeeded, entries or none — and whose
 >   `CHECKPOINT` is missing fails open naming both files
@@ -2414,13 +2461,20 @@ they are not substitutes for the rest.
 - PR #795 — counts a cadence panic (makes a dead sweep alertable;
   deliberately still stops, pending RFC0053.2).
 - RFC 0053 — WAL backpressure and unwind safety; the stage that depends on
-  this one, and which **amends** this RFC in two places:
+  this one, and which **amends** this RFC in these places:
   - *RFC 0053 §3.2* amends §3.7's `Journal` surface and this RFC's sidecar
     layout: `checkpoint` takes a per-tenant published map, `fn
     checkpoint(&mut self, durable_to: WalOffset, published: &HashMap<TenantId,
     WalOffset>)`, persisted to a `PUBLISHED` sidecar written before
     `CHECKPOINT` in the same call, and joining §3.2's sidecar matrix on the
-    same fail-closed footing as `RECLAIM`.
+    same fail-closed footing as `RECLAIM`. The map's value is a per-tenant
+    `{records, audit}` pair, not a records offset alone, written on the
+    checkpoint's own durable path.
+  - *RFC 0053 §3.2* also amends §3.1's latch: it gains
+    `failure_generation: AtomicU64`, bumped by every reporting guard between
+    lowering `failed_epoch` and decrementing its count, so its clear can be
+    a CAS on the pair — which stage 1 never performs (only a restart
+    clears) and stage 2 does.
   - *RFC 0053 §3.2* also replaces the timer's pre-cut guard — §3.2's `if
     failed_epoch <= barrier_epoch: skip` — with proceed-and-decide, once its
     requeue makes the panicked batch's records available to the next cut's

@@ -1,7 +1,7 @@
 ---
 name: rfc-check
 description: Decide whether a proposed change to Ourios needs an RFC before implementation, which accepted RFCs it would amend, and whether the PR description addresses the invariants and hazards it touches. Use when planning a change, before opening a PR, when splitting a PR, or when asked "does this need an RFC?".
-allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*), Bash(git status:*)
+allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*), Bash(git status:*), Bash(gh pr diff:*), Bash(gh api:*)
 metadata:
   adapted-from: huggingface/openenv .claude/skills/rfc-check
 ---
@@ -90,12 +90,17 @@ name files and sections.
    successor; and `rejected` text is simply ignored, since a rejected RFC
    has no replacement to follow. A change that merely *implements* an RFC
    — it is what RFC NNNN §X and its §5 criteria specify, and contradicts
-   or extends nothing — is reported as "covered by RFC NNNN §X": no new
-   RFC, the gate is that RFC's own ladder, `Amends` stays reserved for
-   text an accepted RFC would have to change, and a direct implementation
-   of a `red`, `green` or `validated` RFC is the explicit exception to
-   "coordinate", which is kept for a change that touches such an RFC's
-   surface without implementing it. Covered-by overrides the trigger
+   or extends nothing — is reported as "covered by RFC NNNN §X" **only
+   when that RFC's status permits implementation**: `red`, `green`,
+   `validated` or `accepted` (README §Lifecycle: implementation begins at
+   Red). Then no new RFC is needed, the gate is that RFC's own ladder, and
+   `Amends` stays reserved for text an accepted RFC would have to change.
+   A direct implementation of such an RFC is the explicit exception to
+   "coordinate", which is kept for a change that touches an in-ladder
+   RFC's surface without implementing it — and for an implementation of a
+   `drafted` or `specified` RFC, which stays "coordinate with RFC NNNN"
+   until that RFC reaches `red`, with the verdict naming the red gate as
+   what blocks the code. Covered-by overrides the trigger
    table's verdict: a matched Required trigger whose behaviour the
    covering RFC's §5 already specifies yields `Not required (covered by
    RFC NNNN)`. This is the step that finds
@@ -128,7 +133,7 @@ Files: <list, grouped by crate>
 Triggers: <each matched trigger, one line, with the file:line that trips it — or the planned file and symbol when the input is a plan>
 Amends: <one line per accepted RFC: RFC NNNN §X — "<quoted sentence>"> or "none"
 Covered by: <one line per RFC the change implements: RFC NNNN (status) §X, criteria <ids as the RFC writes them: `RFC<NNNN>.<m>`, `H1.1` or `§3.4.2`, per `docs/rfcs/README.md` §Required sections>> or "none"
-Coordinate: <one line per pre-accepted RFC the change touches without implementing: RFC NNNN (status) — overlap> or "none"   (a direct implementation of a `red`/`green`/`validated` RFC goes under Covered by, not here)
+Coordinate: <one line per pre-accepted RFC the change touches without implementing: RFC NNNN (status) — overlap> or "none"   (a direct implementation of a `red`/`green`/`validated`/`accepted` RFC goes under Covered by, not here; an implementation of a `drafted`/`specified` RFC stays here until its red gate)
 PR description: <invariants/hazards touched> / <silent on: …> or "no PR yet"
 
 Verdict: Not required | Not required (covered by RFC NNNN) | Recommended | Required   (the question is "is a new RFC or an amendment required?"; a `Covered by` result overrides the trigger ranking, so a change fully covered by an RFC's §5 is Not required with that RFC's ladder as the gate; Required only when a matched trigger has no covering RFC or accepted text must change; otherwise Required outranks Recommended outranks Not required)

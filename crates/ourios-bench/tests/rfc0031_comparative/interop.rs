@@ -176,7 +176,9 @@ const PROBE_RECORD_ATTRIBUTES: [(&str, &str); 3] = [
 fn inject_probe_attributes(logs: &mut opentelemetry_proto::tonic::logs::v1::LogsData) {
     use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
 
-    const TEMPLATE_ID_KEYS: [&str; 2] = ["template_id", "ourios_template_id"];
+    // The canonical dotted key, so the real per-template attribute path is
+    // what reaches Loki; the wire guard normalises it to the label name.
+    const TEMPLATE_ID_KEYS: [&str; 2] = ["template_id", ourios_semconv::OURIOS_TEMPLATE_ID];
     const SPAN_ID: [u8; 8] = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
 
     for resource_logs in &mut logs.resource_logs {
@@ -340,6 +342,20 @@ fn probe_completeness_condition_is_not_vacuous() {
     );
 }
 
+/// The denylist is the only source of required names for the wire injection
+/// and both live assertions, so removing an entry from the constant would
+/// silently narrow every check. This pins the four RFC0031.10 members
+/// independently of the constant.
+#[test]
+fn denylist_has_every_rfc_required_member() {
+    for required in ["trace_id", "span_id", "template_id", "ourios_template_id"] {
+        assert!(
+            LOKI_LABEL_DENYLIST.contains(&required),
+            "RFC0031.10 requires `{required}` on the denylist",
+        );
+    }
+}
+
 #[test]
 fn denylist_disjointness_is_not_vacuous() {
     let clean: Vec<String> = ["service_name", "k8s_pod_name"]
@@ -405,7 +421,10 @@ fn string_attribute(key: &str, value: &str) -> opentelemetry_proto::tonic::commo
 ///
 /// This is the limit of what is checkable locally: that the keys went out.
 /// Whether Loki then indexed them is exactly what the denylist loop against
-/// the live `/labels` answer decides.
+/// the live `/labels` answer decides. Attribute keys are normalised the way
+/// Loki names labels (dots become underscores) before they are compared
+/// with the denylist, so the dotted `ourios.template.id` on the wire matches
+/// the `ourios_template_id` entry.
 fn assert_denylisted_keys_are_on_the_wire(logs: &opentelemetry_proto::tonic::logs::v1::LogsData) {
     let records = || {
         logs.resource_logs
@@ -413,23 +432,23 @@ fn assert_denylisted_keys_are_on_the_wire(logs: &opentelemetry_proto::tonic::log
             .flat_map(|rl| rl.scope_logs.iter())
             .flat_map(|sl| sl.log_records.iter())
     };
-    let resource_keys: Vec<&str> = logs
+    let resource_keys: Vec<String> = logs
         .resource_logs
         .iter()
         .filter_map(|rl| rl.resource.as_ref())
         .flat_map(|r| r.attributes.iter())
-        .map(|kv| kv.key.as_str())
+        .map(|kv| kv.key.replace('.', "_"))
         .collect();
-    let record_keys: Vec<&str> = records()
+    let record_keys: Vec<String> = records()
         .flat_map(|r| r.attributes.iter())
-        .map(|kv| kv.key.as_str())
+        .map(|kv| kv.key.replace('.', "_"))
         .collect();
     for forbidden in LOKI_LABEL_DENYLIST {
         let on_the_wire = match *forbidden {
             // Carried in dedicated protobuf fields, not as attributes.
             "trace_id" => records().all(|r| !r.trace_id.is_empty()),
             "span_id" => records().all(|r| !r.span_id.is_empty()),
-            key => resource_keys.contains(&key) && record_keys.contains(&key),
+            key => resource_keys.iter().any(|k| k == key) && record_keys.iter().any(|k| k == key),
         };
         assert!(
             on_the_wire,

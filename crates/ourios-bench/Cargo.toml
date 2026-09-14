@@ -94,6 +94,7 @@ ourios-ingester = { path = "../ourios-ingester" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+ourios-semconv = { path = "../ourios-semconv" }
 # RFC0031.1 Loki container integration (CI-only, like the dex-oidc job):
 # testcontainers spins grafana/loki, reqwest pushes the OTLP fixture and
 # runs the LogQL query, prost encodes the OTLP protobuf payload (0.14 is

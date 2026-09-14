@@ -204,7 +204,14 @@ exposes the complete predicate, `fn rotation_due(&self, framed_len: u64)
 -> bool` — size or age, the same function `append` consults, taken under
 the mutex immediately before the reservation — and the reservation
 reserves a segment slot exactly when it is true: `retained + 1 ≤
-max_segments`, else refuse. At the ceiling a due rotation is **refused,
+max_segments`, else refuse. `validate_config` rejects `max_segments < 2`:
+the current segment always holds one slot and is never unlinked, so a
+ceiling of one leaves no room for the segment a rotation must create —
+every due rotation would be refused, the forced-rotation predicate's
+"below the ceiling" leg could never hold, and the node would wedge with a
+backlog it cannot close. Two is the smallest ceiling that admits one
+closed segment beside the current one; the derived default is far above
+it. RFC0053.1 asserts the validation. At the ceiling a due rotation is **refused,
 never squeezed in**: the request path runs no housekeeping, since prepare,
 file half and commit put fsyncs in front of every concurrent append; the
 refusal sets the latch, the next `maintain` pass reclaims what it can, and
@@ -243,7 +250,14 @@ until its unlink succeeds.** RFC 0052 §3.2 marks a popped ledger entry
 *reclaiming* and keeps it in the byte and segment accounting until the
 off-lock unlink has succeeded, so the bytes of a segment whose `RECLAIM`
 write or unlink failed are still `unreclaimed` here and a refusal is never
-computed against bytes that are still on disk. This is a **segment
+computed against bytes that are still on disk. An **uncertain deletion**
+holds the same way and for longer: when the pass's parent fsync fails
+(`ReclaimOutcome::Unlinked { fsync_failed: true }`), every path it removed
+may or may not survive a restart, so RFC 0052 keeps those entries
+`uncertain` with their bytes counted until a later pass re-verifies them
+gone. The bound therefore charges them too — conservative in exactly the
+direction the bound needs, since the alternative is admitting against
+bytes that may still be on disk. This is a **segment
 admission bound, not a directory cap**: the `CHECKPOINT` and `RECLAIM`
 sidecars, their temp files, the `.wal.seal` sidecars §3.1 introduces below
 and their `.wal.seal.partial` temps, and rotation partials awaiting RFC
@@ -535,7 +549,17 @@ first write**, so concurrent first writes for one id share it; it moves to
 **`Held`** when any of them has its sync return `Ok` and the tenant is
 installed in the miner, and it is released only when the *last* in-flight
 first write for that id has settled without a success — append failure,
-sync failure or an unwind before installation. `ourios.wal.tenants`
+sync failure or an unwind before installation — **and that id has no
+unresolved `unmined` entry**. The exception matters because settlement
+installs a tenant outside any admission path: a first write that appends,
+panics in mining and unwinds would otherwise release its slot, another id
+could take it and become `Held`, and the rebuild would then install the
+first tenant past the guard. So an unwind that leaves an `unmined` entry
+**retains** the reservation, in a `Reserved { pending_settlement }` form
+that the guard counts like any other; the entry's settlement converts it
+to `Held` when it installs the tenant, and releases it when the entry
+resolves without installing one. No reacquisition is needed, because the
+slot was never given up. `ourios.wal.tenants`
 counts `Held` only. **Recovery seeds the table**: after restore and
 replay, and before any listener is constructed, every tenant the miner
 holds is entered as `Held`, so a restarted node neither admits past the
@@ -606,9 +630,17 @@ then fails was never acked and its frame is not durable; so the leave
 transition is the ack path, the append *and* its covering sync succeeding,
 and the `.left` event says the state left on an acknowledged batch. A
 reservation that passes its check but whose append then fails on rotation
-or write I/O, or whose sync fails, leaves the figure and the state
-unchanged, so neither the preflight check nor a bare `append_batch` is the
-leave transition. The enter
+or write I/O, or whose sync fails, leaves the *state* unchanged, so
+neither the preflight check nor a bare `append_batch` is the leave
+transition. The *figure* is another matter, and the two must not be
+conflated: an append that reached the segment and whose covering sync
+then failed leaves those bytes on disk — the frame is in the segment,
+unacknowledged but present, and the ledger rebuild will count it — so the
+reservation stays charged until the segment is reclaimed, exactly as for
+an acknowledged frame. Only an append that never reached the segment (a
+rotation failure, or a write whose truncate-back succeeded) releases its
+reservation. Charging a present frame is what keeps the bound honest
+about disk; leaving the latch alone is what keeps it honest about acks. The enter
 and leave events fire on exactly those transitions, once each, and the gauge
 follows them.
 
@@ -631,19 +663,37 @@ the refusal that set it, so a `Segments` refusal never
 rotates, since a rotation at the ceiling would breach it, and a
 `TenantCapacity` refusal sets no latch at all — the `HousekeepingProgress` that
 `housekeeping_commit` has just returned reports `removed_segments == 0`
-(temp-file cleanup and partial failures do not count) and
-`reclaimable_now` is false, `current_segment_frame_bytes` equals the whole
+(temp-file cleanup and partial failures do not count; RFC 0052's
+`horizon_remaining` and `unlink_remaining` say whether the pass merely ran
+out of budget, and a pass that did is not a stalled one — the trigger
+requires both at zero) and `reclaimable_now` is false, `current_segment_frame_bytes` equals the whole
 `unreclaimed_bytes` — the current segment holds the only unreclaimed
 bytes, which is the case no other rule can clear — and the retained count
 is below `max_segments`. The trigger is the latch and its cause, never
 `unreclaimed_bytes >= limit`, since a per-request refusal can happen with
-the live total still below the limit. The rotation runs
+the live total still below the limit. **A pending rotation fsync is its own trigger, ahead of that predicate.**
+RFC 0052 §3.3 keeps a post-rename parent-fsync failure as
+`dir_fsync_pending` with origin `Rotation`, discharged by the next `sync`
+or `rotate`; under a crossed bound no append reaches `sync`, and the
+predicate above cannot call `rotate` either, because a forced rotation
+that hit exactly that failure has left an *empty* current segment while
+the backlog sits in the closed one — `current_segment_frame_bytes` is no
+longer the whole `unreclaimed_bytes`, so the only-holder leg is false for
+good and nothing acks again. So, as an **amendment to RFC 0052 §3.3 and
+§3.7**, the housekeeping pass discharges a pending `Rotation`-origin fsync
+**before** it evaluates the forced-rotation predicate: `maintain`, under
+the guard it already holds for `housekeeping_commit`, calls `rotate`,
+whose first step is that discharge (§3.7's definition), whenever
+`ReclaimState` reports the obligation outstanding — a discharge, not a new
+segment, since the empty-segment no-op rule applies once the fsync is
+owed no more. A failed discharge draws on the same rotation retry budget
+it does on the append path and can reach the terminal state, which the
+next request reports; a successful one lets the next append ack. The
+predicate then runs as stated, on a WAL that owes nothing. RFC0053.1
+asserts the wedge: a forced rotation whose parent fsync fails is
+discharged by a later pass with no append arriving. The rotation itself runs
 **under the guard `maintain` still holds for the commit**, so no append
-interleaves between the commit's verdict and the rotation, and it calls
-`rotate` even when the current segment is empty: a post-rename directory-fsync failure installs an empty
-segment whose pending fsync only `rotate` or `sync` can discharge, and
-under backpressure no append reaches `sync`, so the empty-segment no-op
-rule applies *after* the discharge, not instead of the call.
+interleaves between the commit's verdict and the rotation.
 `maintain` keeps RFC 0052's signature, and this RFC has it stamp
 `forced_rotation: Option<Result<RotationOutcome, ReceiveError>>` into the
 `HousekeepingProgress` it returns — the coordinator's field, set after
@@ -825,13 +875,17 @@ alone, and neither can a `catch_unwind` at one call site.
 **The encode workers and the publisher are in the contract too.** Under
 RFC 0052 §3.1 a worker performs no store I/O: `emit_concurrent` appends
 each record to the buffers, and a size- or ceiling-detached partition is
-registered as in flight and enqueued to the **publisher** — the one
-dedicated thread the `PublishCoordinator` owns behind a bounded queue,
-which runs `write_ordered` on each batch and settles its guard as durable,
-requeued, quarantined or, on an unwind, latched — the worker registering
-the publish guard *before* the enqueue and before its own `BatchGuard` can
-settle, then moving to its next record, so `quiesce` waits on encodes
-alone. Everything this section says about `write_ordered` — the `Drained`
+enqueued to the **publisher** — the one dedicated thread the
+`PublishCoordinator` owns behind a bounded queue, which runs
+`write_ordered` on each batch and settles its guard as durable, requeued,
+quarantined or, on an unwind, latched. The guard is **not** the worker's
+to create: RFC 0052 §3.1 has `submit` create it under the exclusion with
+the batch's own epoch, and it travels with the queued item
+(`PublishItem::{ Drained(Drained), Detached { records, guard,
+audit_watermark } }`), the worker's detach consuming the pre-made guard
+and a batch that detaches nothing releasing it unused — so no partition is
+ever outside both the buffers and the in-flight set, and the worker moves
+to its next record with `quiesce` waiting on encodes alone. Everything this section says about `write_ordered` — the `Drained`
 destructor, the `RecoverableBatch` handle, the unwind arm — therefore
 attaches to the publisher thread for detached batches exactly as it does
 to the age sweep's step, since both run the same function on the same
@@ -870,14 +924,22 @@ that died would leave `quiesce_publishes` and shutdown waiting on guards
 nothing will ever settle: the `PublishCoordinator` runs each batch under
 `catch_unwind`, settles a panicking batch through its `RecoverableBatch`
 (requeued, latched per §3.1's guard rule), counts it with `error.type =
-publisher_panic`, and continues; if the thread itself dies, the
-coordinator — which owns it — respawns it and the batches still in the
-queue are settled by the new thread, their guards intact; and a worker
+publisher_panic`, and continues. RFC 0052 §3.1 already defines what a
+dying thread does — it drains every batch still queued back into the
+buffers as `ready` partitions, releasing each guard as its records land,
+and the coordinator respawns it on the next enqueue — and this RFC changes
+only the failing batch's own arm, from latched-and-settled to requeued
+through its `RecoverableBatch`; and a worker
 whose enqueue finds the queue **disconnected** (the publisher gone for
-shutdown, or between death and respawn) takes the `buffer_only` handoff
-for its detached batch — appended into the sink's buffers under the sink
-lock, its guard settled as requeued, for the next drain to publish — so no
-guard is ever left registered with no owner and no wait is unbounded.
+shutdown, or between death and respawn) follows RFC 0052 §3.1's park
+rather than a settle: the failed send returns the item to the worker,
+which puts the batch back into the buffers as a **`ready` partition**
+under the sink lock *before* releasing its guard, and signals the
+coordinator to respawn — a park, not a requeue-and-settle, because a guard
+released before the records are back in the buffers is a window in which a
+cut would read them as neither buffered nor in flight. Parked partitions
+are covered by every drain, so no guard is left registered with no owner
+and no wait is unbounded.
 And `EncodePool::submit` on a **disconnected** pool is not a failure the
 client sees at all: the mined batch goes into the record sink's buffer
 through an **append-only** handoff (`SharedParquetSink::buffer_only`: no
@@ -978,13 +1040,32 @@ where it would hold every other tenant's sequence behind it; instead the
 coordinator keeps the **settling set** under its admission mutex, and a
 request for a `Settling` tenant is **refused at admission, before it takes
 a sequence**. The check and the reservation are **one critical section**,
-not two: the admission mutex — the same one the byte reservation and the
-tenant table take — covers reading the settling set *and* reserving the
-request's commit sequence, and a settler adds a tenant to the set under
-that same mutex, so no request can pass the check and then take a sequence
-behind a settler that has already claimed the entry, and no settler can
-insert between a check and its reservation. (The gate itself is untouched:
-the sequence is reserved under the mutex and awaited outside it.) The
+not two: the admission mutex covers reading the settling set *and*
+reserving the request's commit sequence, so no request can pass the check
+and then take a sequence behind a settler that has already claimed the
+entry, and no settler can insert between a check and its reservation. (The
+gate itself is untouched: the sequence is reserved under the mutex and
+awaited outside it.)
+
+**One lock order covers all four locks**, since this RFC adds the first of
+them to the three RFC 0052 §3.1 fixes. Top to bottom: **admission mutex →
+barrier exclusion → miner lock → `last_durable`**, with the **journal
+mutex** taken below the admission mutex and never above it — an ingest
+turn takes the admission mutex for its checks and reservations (max-frame,
+terminal state, tenant, settling set, byte reservation, sequence), takes
+the journal mutex under it for `append_batch`, releases both, then follows
+RFC 0052's order for the mining span; `maintain` takes the admission mutex
+and then the journal mutex for its halves, in that order, which is why the
+forced rotation and the leave transition can be evaluated together; and a
+settler **publishes its claim under the admission mutex — adding the
+tenant to the settling set — before it takes the barrier exclusion**, so
+the claim is visible to admission from the instant it exists and no
+request can be admitted for a tenant whose rebuild has begun. The miner
+lock still carries the `Unresolved`/`Settling` transition on the entry
+itself, which is what makes exactly one trigger the settler; the
+admission-mutex insertion is what makes that decision visible to requests.
+No path takes the admission mutex while holding any of the other three,
+which is what makes the order a total one. The
 refusal is its own error, `ReceiveError::SettlementInProgress { tenant }`,
 mapped by `IngestFailure::classify` to a `Settling` outcome: `503` /
 `UNAVAILABLE` with the protobuf `Status` body naming the tenant, and —
@@ -1076,22 +1157,44 @@ watermark is written durably on the checkpoint's own path, as an
 the per-tenant map, `fn checkpoint(&mut self, durable_to: WalOffset,
 published: &HashMap<TenantId, WalOffset>)`, and the WAL writes it to a
 `PUBLISHED` sidecar beside `CHECKPOINT` — a versioned, checksummed record
-of `(tenant, offset)` pairs, written to `PUBLISHED.tmp`, fsynced, renamed,
+of per-tenant `{records, audit}` offsets, written to `PUBLISHED.tmp`, fsynced, renamed,
 parent fsynced, **before** `CHECKPOINT`'s own write in the same call, so a
 `CHECKPOINT` never exists without a `PUBLISHED` at least as new; `*.tmp`
 stays the sidecar namespace RFC 0052 §3.7 reserves, and the file is
-outside the byte bound like the other sidecars. Recovery seeds the
-in-memory watermark per tenant as the greater of the `PUBLISHED` entry
+outside the byte bound like the other sidecars. **Audit has its own watermark in the same record**, because the record one
+does not cover it: an audit group can be durable in the audit store while
+the record publish of the same batch panics, and a crash before the next
+checkpoint would replay the frame and regenerate an event the store
+already holds. So the audit sink's settlement raises a per-tenant `audit`
+offset the way the record sink raises `records` — highest fully settled
+frame, monotonic, under the sink lock, and advanced only from RFC 0052
+§3.1's `audit_durable_through`, the position a store write has actually
+returned success for, never from an emptied buffer, since a concurrent
+drain can hold exactly those events in an unfinished write — both are
+written in the one `PUBLISHED` write, and **audit replay is gated on
+`max(X, audit watermark)`** while record replay is gated on the record
+watermark. The §3.2 claim that a settled audit group is never requeued
+therefore holds across a restart too, not only in-process. Recovery seeds both
+in-memory watermarks per tenant as the greater of the `PUBLISHED` entry
 and what the Parquet-side suppression horizon `X` implies, and a missing
 `PUBLISHED` beside a version-2 `CHECKPOINT` is fail-closed like a missing
-`RECLAIM`. The converse is reachable, since `PUBLISHED` is written first,
+`RECLAIM` — RFC 0052 §3.2 names `PUBLISHED` in that matrix on the same
+footing. A **version-1 root** carries neither sidecar: RFC 0052 opens it
+without creating a `RECLAIM`, and `PUBLISHED` follows the same rule, both
+being created on the path that rewrites the sidecar at version 2 — the
+first checkpoint — so a restart inside that migration window stays on the
+legacy branch, with no watermark to seed and nothing published under a
+horizon anything reads. The converse is reachable, since `PUBLISHED` is written first,
 and takes RFC 0052 §3.2's two-state witness rather than a rule of its own:
 `PUBLISHED` present with no version-2 `CHECKPOINT` fails closed — naming
 both files — exactly when `RECLAIM` carries `checkpoint_seen`, because
-that root has checkpointed and lost it; with `checkpoint_seen` unset the
-root has never checkpointed, so a `PUBLISHED` there can only be the one
-written moments before a crash in the first `checkpoint` call, no rows
-were published under a horizon anything reads, and it is discarded. One
+that root has checkpointed and lost it. It reads against `seen`, never
+`armed`: `armed` without `seen` is RFC 0052's crash window between the
+arming write and the checkpoint's rename, and a `PUBLISHED` written
+moments earlier in that same first `checkpoint` call is exactly what the
+window looks like — the root is fresh, no rows were published under a
+horizon anything reads, and the record is discarded, as it is when
+neither flag is set. One
 witness governs both sidecars, which is why this RFC adds no second flag. The bound between checkpoints is then stated honestly: a panic
 costs at most one duplicate per record in the ambiguous span, and a crash
 before the next checkpoint costs at most **one more** for the records
@@ -1196,8 +1299,10 @@ they are drainable, and **the clear is defined**: a cut with `failed_epoch
 `prior_ok`, as every cut does. A `BatchGuard` drop completes its requeue
 before `quiesce_encodes` returns, so cut `E`'s own drain took those
 records; a publish guard that settles after the capture leaves its
-requeued records in the buffers for cut `E + 1`, and `prior_ok` counts the
-panicked publish as not-ok for `E`, so `E` does not stamp. Whichever cut
+requeued records in the buffers for cut `E + 1`, and
+`quiesce_publishes().all_ok(cut.epoch)` — RFC 0052 §3.2's epoch-scoped
+verdict — counts the panicked publish as not-ok for `E`, so `E` does not
+stamp and its pending slot is invalidated as that RFC defines. Whichever cut
 stamps having drained them clears the latch, and the clear cannot erase a
 failure it never drained. A CAS on `failed_epoch` alone would: a cut that
 captured `E` and observed `failed_epoch = E` can be overtaken by a guard
@@ -1230,10 +1335,10 @@ now meaning "a step panicked and was retried" rather than "the cadence is
 dead". Only a *panicking* `JoinError` continues the sweep; a cancelled one is
 the runtime going away and still terminates it, exactly as today, so an
 implementation that merely deleted the `break` — and let shutdown spin — would
-not satisfy this section. **The barrier task gets the same semantics**,
-because retiring the latch removes the only thing that kept its cadence
-alive after a panic in a cut: each tick's body — the capture and the
-`run_cut` — runs under `catch_unwind`; a panicking cut is dropped, and
+not satisfy this section. **The barrier task gets the same semantics**, and RFC 0052 §3.2 already
+runs the barrier and housekeeping ticks under `catch_unwind`, so what this
+RFC adds is the consequence rather than the mechanism: in each tick's body
+— the capture and the `run_cut` — a panicking cut is dropped, and
 dropping it is what requeues it, since the cut's batches are held in a
 `Drained` whose destructor requeues and the snapshot bytes are a
 rebuildable cache; the task continues on the next tick, and the panic is
@@ -1412,6 +1517,17 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** the lagging-floor leg above is built so the surviving segments
 >   are the ones holding the lagging tenant's frames; segments holding only
 >   other tenants' covered frames are reclaimed even then
+> - **And** `max_segments < 2` is rejected at config validation, naming the
+>   reason: the current segment holds one slot and is never unlinked, so a
+>   ceiling of one admits no rotation at all
+> - **And** a forced rotation whose post-rename parent fsync fails does not
+>   wedge the node: a later pass discharges the pending `Rotation`-origin
+>   fsync before it evaluates the predicate, with no append arriving, and
+>   the next append acks
+> - **And** a first write that appends, panics in mining and unwinds keeps
+>   its tenant reservation: another new id cannot take that slot, and the
+>   entry's settlement converts the reservation to `Held` when it installs
+>   the tenant
 > - **And** under repeated rollback failures the byte accounting stays
 >   within the limit — the torn bytes count inside it — and the fixed
 >   overhead outside it is capped separately: headers by `max_segments`,

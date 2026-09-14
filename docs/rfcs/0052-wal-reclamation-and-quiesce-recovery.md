@@ -1629,7 +1629,9 @@ memory, and nothing here claims to.
 >   in `(X, S]` is republished
 > - **And** the audit stream is gated the same way: no template event for a
 >   frame at or below `X` is emitted again on replay, and every event for a
->   frame above `X` is
+>   frame above `X` is emitted exactly once, in frame order, through the
+>   capture sink; the test asserts the emitted set equals the events of the
+>   frames in `(X, tail]`
 
 ## 6. Testing strategy
 

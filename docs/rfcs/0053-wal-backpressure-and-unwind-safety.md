@@ -232,14 +232,20 @@ best-effort truncate-back *also* fails is not something the counter alone
 can absorb: the frame's full framed length is added to the unreclaimed
 figure at once (an over-count is safe, an under-count admits past the
 bound; the next `remeasure_unreclaimed()` corrects it), **and the segment
-is sealed** — the WAL records the last good EOF in memory, refuses further
-appends into that segment, and the next append rotates through RFC 0052
-§3.3's retry path into a fresh one, since appending after a partial frame
-would let recovery consume later bytes as part of it. The torn frame then
-sits at the EOF of a *closed* segment, so RFC 0052's replay heal is
-extended, as an amendment from this RFC, to exactly that shape — one
-partial frame at the end of a segment that is immediately followed by a
-newer one — rather than halting on it as mid-history corruption.
+is sealed with a durable marker** — the WAL refuses further appends into
+that segment, writes and fsyncs a `<uuid>.wal.seal` sidecar carrying the
+last good length (and fsyncs the parent), and only then rotates through
+RFC 0052 §3.3's retry path into a fresh segment, since appending after a
+partial frame would let recovery consume later bytes as part of it. If the
+seal write itself fails the WAL enters the terminal rotation state: it can
+neither repair nor mark the segment. The torn frame then sits at the EOF
+of a *closed* segment, and RFC 0052's replay heal is extended, as an
+amendment from this RFC, to **exactly the sealed shape**: a closed segment
+whose seal names precisely the length at which the torn frame begins is
+truncated there and replayed; an unmarked closed-segment tail stays fatal
+as RFC0008.5 requires, because an in-memory "sealed" state cannot tell
+rollback debris from a torn acknowledged frame after a restart, and healing
+on shape alone would lose data exactly where the contract says to halt.
 
 The bound is configuration, and it has a home: `WalConfig` gains
 `unreclaimed_bytes_limit`, and it is the first WAL knob the deployment
@@ -280,10 +286,15 @@ housekeeping — which that RFC's timer can drive without an append.
 leave condition.** Each reservation is its own decision — `unreclaimed +
 framed_len ≤ limit` — so a smaller batch can be admitted while a larger one is
 refused, and no batch is ever refused on the strength of an earlier refusal.
+The comparison and every accounting update use checked or saturating
+arithmetic and fail closed: a sum that would wrap refuses, never admits.
 The *state* §3.3 exports is entered by the first refused reservation and left
-by whichever comes first: a housekeeping pass that brings unreclaimed bytes
-strictly below the limit, evaluated by the timer after each pass under the
-same mutex (which is how the state leaves with no append arriving), or an
+by whichever comes first: a housekeeping pass that actually removed a
+segment (`removed_segments > 0`) *and* left the unreclaimed total strictly
+below the limit — a no-op pass cannot clear it, since a refusal can occur
+with the total already below the limit — evaluated by the timer after each
+pass under the same mutex (which is how the state leaves with no append
+arriving), or an
 append that *succeeds*. A reservation that passes its check but whose append
 then fails on rotation or write I/O leaves the figure and the state
 unchanged, so the preflight check is never the leave transition. The enter
@@ -306,7 +317,11 @@ which a per-request check can do while `unreclaimed_bytes` is still below
 the limit, so the trigger is the latch and never `unreclaimed_bytes >=
 limit` — the pass it has just run reported `removed_segments == 0` in its
 `HousekeepingProgress` (RFC 0052 §3.7; temp-file cleanup and partial
-failures do not count), and the current segment holds at least one frame.
+failures do not count) — and it calls `rotate` even when the current
+segment is empty: a post-rename directory-fsync failure installs an empty
+segment whose pending fsync only `rotate` or `sync` can discharge, and
+under backpressure no append reaches `sync`, so the empty-segment no-op
+rule applies *after* the discharge, not instead of the call.
 The rotation runs inside `CommitCoordinator::maintain`, and this RFC extends
 `HousekeepingProgress` with `forced_rotation: Option<Result<(),
 AppendError>>` so the outcome — retrying or terminal — surfaces through the
@@ -422,11 +437,17 @@ panics. A guard around `write_ordered` covers the panic points *between* the
 writes and none of the ones inside them — which are the likely ones, since
 that is where the store I/O and encoding live.
 
-So the requirement lands on the consuming calls, not on their caller: each
-takes the batch in a form that leaves ownership recoverable on unwind — `&mut
-Vec` from which each partition is removed as its put returns, or an owned
-handle the callee itself guards and settles per partition — so
-that after any panic the batch is still reachable and requeued. The points
+So the requirement lands on the consuming calls, not on their caller, and
+the ownership shape is **one** state machine rather than an either/or: a
+`RecoverableBatch` handle holding each partition in one of `Pending`,
+`InFlight`, `Settled { durable | dropped }` or `Requeued`. The consumer that
+holds the handle moves a partition to `InFlight` when its put starts, to
+`Settled` when the call returns `Ok` or the sink drops it permanently, and
+takes it out of the handle only in `Settled`; the handle's `Drop` requeues
+every `Pending` and `InFlight` partition and marks it `Requeued`, so after
+any panic the batch is still reachable and requeued, and nothing settled is
+requeued twice. A barrier can observe a sink only after the handle has been
+dropped or fully settled. The points
 *outside* the consuming calls — before the audit call, and between it and the
 record publish — need an owner too, and today's `Drained` has none:
 its `_guard` is a `PublishGuard` that only tracks the in-flight count and
@@ -458,27 +479,38 @@ alone, and neither can a `catch_unwind` at one call site.
 panic there drops the remainder of its mined `Vec`; `BatchGuard` only
 decrements the pending count, so `quiesce_encodes` reports idle and the
 barrier could stamp over records that never reached a sink. A worker's batch
-therefore takes the same recoverable shape — held by a guard that releases
-partitions as each publish returns and requeues the rest to the record sink
-on unwind — and so does the inner emit path: `emit_concurrent` takes its
+therefore takes the same recoverable shape — held in a `RecoverableBatch`
+whose `Drop` requeues the remainder to the record sink **before**
+`BatchGuard` decrements `pending`, so `quiesce` can never observe idle while
+records sit in a panicking worker's dropped iterator — and so does the inner emit path: `emit_concurrent` takes its
 record by value and can produce both a ceiling-taken and a size-taken batch,
 calling `publish_owned` twice, so a guard at the worker boundary alone could
 not reach the second batch or the in-flight record after the first call
 panicked; ownership is transferred explicitly — the worker's guard owns the
-record only until `append_off_lock` returns, since insertion into the sink
-buffer *is* the handoff and a panic in the trigger step after it must not
-requeue a record the sink already holds, and it owns each trigger batch
-from the moment `append_off_lock` returns it until that batch's put
-completes — and the one-duplicate bound is claimed only under that
-transfer. RFC0053.2 asserts it with a panic inside a
+record only until `append_off_lock` **inserts** it: the handoff happens
+inside that call, before its post-append trigger step, so a panic in the
+trigger cannot requeue a record the sink already holds; a permanent drop in
+`PartitionKey::derive`, which returns before any insertion, comes back as
+an explicit `Settled::Dropped` result of the handoff rather than something
+the guard has to guess at; and the guard owns each trigger batch from the
+moment `append_off_lock` returns it until that batch's put completes — and
+the one-duplicate bound is claimed only under that transfer. RFC0053.2 asserts it with a panic inside a
 worker, and with a panic before the second trigger's batch is consumed. Requeueing
 the batch is worthless if the pool then swallows the next one, so both
 halves of worker recovery are stated: a worker whose `emit_concurrent`
-panics exits its OS thread today, and the pool's supervisor **respawns** it
-(the closed handle is noticed, a replacement started, the panic counted);
+panics exits its OS thread today, and a **pool-owned supervisor**
+respawns it: the supervisor, not the worker closures, holds the receiver,
+so when a worker dies the batches still queued in the `sync_channel` are
+drained and requeued and their `Pending` accounting settled rather than
+dropped with the last worker's receiver; it respawns only when the join
+result reports a panic — never on the normal exit a closed `tx` produces —
+and it stops before teardown, so `Drop` can join; the panic is counted;
 and `EncodePool::submit` on a **disconnected** pool is not a failure the
-client sees at all: the mined batch goes straight into the record sink's
-buffer — the durability handoff the pool would have reached — the turn
+client sees at all: the mined batch goes into the record sink's buffer
+through an **append-only** handoff (`SharedParquetSink::buffer_only`: no
+trigger and no `publish_owned`, since `emit_concurrent` can block on store
+I/O and this runs on the async ingest path) — the durability handoff the
+pool would have reached, published by the next barrier or sweep — the turn
 acknowledges normally, since the frame is WAL-durable and the batch will be
 published by the next barrier, and the event is counted on a new registry
 counter, `ourios.ingest.encode_fallback` (added in the same semconv bump),
@@ -495,10 +527,14 @@ to Parquet, and it still needed the requeue, because `mine_batch_ordered`
 has already mutated the miner and a later successful append can carry
 `last_durable` past the frame. The `catch_unwind` arm of
 `mine_batch_ordered`, which submits its partially mined `out` and then
-resumes the panic, takes the same path: `out` reaches the sink before the
-panic is resumed, so nothing mined before the panic can be dropped under a
-later mark. RFC0053.2 covers a swallowed submit followed by a successful
-append, and the unwind arm.
+resumes the panic, takes the same path for `out` — but the prefix is not
+enough, because the frame's *unmined suffix* still exists only in the WAL
+and a later successful append would carry the mark past it. So the
+coordinator records that frame's offset in an `unmined` set, the barrier
+re-mines every frame in that set from the WAL (`Journal::read_frame`)
+before it computes its mark, and the mark never crosses an unmined frame.
+RFC0053.2 covers a swallowed submit followed by a successful append, and a
+mining panic followed by a successful append.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -539,7 +575,9 @@ RFC 0052 §3.5 already exports the measurement this RFC's bound is taken on and
 the floor state that explains a bound that will not clear. This RFC adds the
 backpressure state itself, named for what it is: a **refusal latch** (set
 by a refused reservation, cleared as §3.1 defines), the limit and
-measurement at the last refusal, and a separate `capacity_remaining` gauge
+measurement at the last refusal, and a separate `capacity_remaining` gauge,
+saturating at zero — the live figure may legitimately sit above the limit
+after a lowered limit or a conservative over-count —
 — because admission is per request, a cleared latch at 900 of 1,000 bytes
 still refuses a 200-byte batch, and a dashboard must not read `0` as "every
 request is admitted" — and a log event on entering and leaving the latch.
@@ -552,10 +590,25 @@ The order is the mutex order and every transition emits exactly once at a
 real call site; RFC 0052 §3.5's tick-based projection is amended by this
 RFC to exclude the refusal latch explicitly — its "latch" was
 `cadence_failed`, which this RFC retires — so there is one emitter per
-transition and never two events for one. RFC0053.5 counts every transition. Names come from the shared `ourios-semconv`
-registry in one bump with RFC 0052's, not hand-written, and `error.type`
-continues to carry the failure class on existing counters rather than
-spawning per-error metrics.
+transition and never two events for one. RFC0053.5 counts every transition.
+
+The contract is enumerated here, as RFC 0009 §3.6 does, rather than
+deferred to the registry bump; the names are proposals for the shared
+`ourios-semconv` registry (one bump with RFC 0052's, through that
+repository's review) and nothing is hand-written in the code:
+
+| Signal | Instrument | Unit | Attributes |
+|---|---|---|---|
+| `ourios.wal.backpressure.refusing` | gauge (int) | `1` | — (`1` while the refusal latch is set) |
+| `ourios.wal.backpressure.limit` | gauge | `By` | — |
+| `ourios.wal.backpressure.last_refusal` | gauge | `By` | `ourios.wal.measurement` ∈ {`pre_reservation`, `projected`} |
+| `ourios.wal.capacity_remaining` | gauge | `By` | — (saturating at zero) |
+| `ourios.ingest.encode_fallback` | counter | `{batch}` | `error.type` ∈ {`encode_pool_disconnected`} |
+| `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` |
+
+`error.type` continues to carry the failure class on existing counters
+rather than spawning per-error metrics; `encode_worker_panic` joins
+`cadence_panic` as a value on the flush-error counter.
 
 ## 4. Alternatives considered
 
@@ -640,8 +693,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   drained out of the sink
 > - **When** the unwind completes
 > - **Then** the records of the in-flight and not-yet-started partitions are
->   back in their buffer, and a partition whose put had already succeeded
->   stays out
+>   back in their buffer, and a partition whose put had already returned
+>   `Ok` stays out — a put the store had accepted but that had not returned
+>   is the ambiguous case and is requeued
 > - **And** the audit groups not yet settled are back in theirs; a group
 >   that had settled — durable, or dropped under the sink's own
 >   permanent-failure policy — is **not** requeued, so a later panic neither
@@ -698,6 +752,8 @@ are kept distinct so that the remedy each advertises is the true one.
 >   refusal, and `capacity_remaining` — equal to the limit minus the live
 >   unreclaimed figure at the moment of the read, not a stale value — are
 >   present in the exported stream under registry names
+> - **And** a forced disconnected-pool fallback increments
+>   `ourios.ingest.encode_fallback` by exactly one datapoint
 > - **And** entering and leaving each emit exactly one log event, named from
 >   the registry, on the transitions §3.1 defines and on no other tick
 > - **And** a `weaver registry live-check` over the emitted events passes,
@@ -762,7 +818,11 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   extension rather than adding a parallel one, in **both** restart shapes —
   a clean replay and a torn newest tail, since the existing crash test has
   no torn tail and a remeasure hook placed only on the heal path would pass
-  it — with a small backpressure
+  it — plus a third, the sealed closed segment: a fixture with a torn tail
+  in a non-newest segment and a matching `.wal.seal`, asserting the frames
+  before the seal are delivered, the remeasure excludes the torn bytes, and
+  the same fixture *without* the seal halts as corruption — with a small
+  backpressure
   bound configured so the kill lands in the refusing regime, and a
   post-restart append that asserts the rebuilt figure still refuses, and
   an exact-figure assertion against a fixture with several closed segments,

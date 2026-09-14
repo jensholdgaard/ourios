@@ -1,7 +1,7 @@
 ---
 rfc: 0052
 title: WAL reclamation and quiesce recovery
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-12
@@ -11,7 +11,9 @@ superseded-by: —
 
 # RFC 0052 — WAL reclamation and quiesce recovery
 
-> **Status note.** `drafted`. **Stage 1 of two.** Motivated by a production
+> **Status note.** `specified` — §5 and §6 are complete, every invariant
+> and hazard this RFC touches has a scenario, and review has confirmed the
+> criteria testable (`docs/rfcs/README.md` §Lifecycle). **Stage 1 of two.** Motivated by a production
 > incident (issue #791) and the defects found tracing it (#791, #793). Amends
 > RFC 0008 §6.5 and §6.7 with the *policy* those sections left to a caller
 > that was never written, **amends RFC 0001 §6.9** (per-tenant own-frame
@@ -488,9 +490,12 @@ on a rotation (inside the ingest turn that observed the segment change):
 
 run_cut(cut):
     cut_ok   = flush(cut.batches)          // store I/O OUTSIDE the exclusion
-    prior_ok = quiesce_publishes().all_ok() // earlier in-flight publishes: outcome, not a wait;
-                                           // always evaluated, so a failed cut flush cannot
-                                           // skip their outcome and requeue path
+    prior_ok = quiesce_publishes().all_ok() // publishes registered BEFORE the cut: outcome,
+                                           // not a wait; always evaluated, so a failed cut
+                                           // flush cannot skip their outcome and requeue
+                                           // path. A publish registered after the cut holds
+                                           // only frames above cut.mark (§3.1's invariant),
+                                           // so it is neither waited on nor stamped past
     ok = cut_ok and prior_ok and not cadence_failed
                                            // the recheck (§3.1): a panic while this
                                            // barrier waited is a failed cut
@@ -577,13 +582,17 @@ are retained — equality can never unlink the pinned frame —
 while segments holding only other tenants' covered frames are reclaimed
 whatever their offset. `RetainFloor` is the *reported* summary of that
 rule (the minimum over horizons and pins), not the predicate. The pin lifts the moment a valid snapshot for the tenant is
-written, since its horizon then replaces the pin. The pin is an
-**exclusive** bound: `housekeeping` removes a closed segment only when its
-highest offset is strictly below it, whereas a `Min` horizon stays
-inclusive as `Wal::housekeeping` compares today — otherwise a segment
-holding exactly one frame for the pinning tenant, whose highest offset
-*equals* the pin, would be unlinked. `None` is passed only where no
-snapshot consumer exists at all.
+written, since its horizon then replaces the pin. Pins and horizons are
+both **strict** bounds in the predicate, the same comparison for the same
+reason: a pinning tenant's last offset in a segment is at or above its pin
+exactly when the segment holds a frame the tenant needs, and a snapshotted
+tenant's last offset *equal* to its horizon is the horizon frame itself,
+which the rule above retains. Only the checkpoint comparison is inclusive.
+`RetainFloor::Min` carries no comparison of its own — it is the reported
+minimum, and today's `min(checkpoint, floor)` bound in `Wal::housekeeping`,
+which compared a segment's highest offset inclusively against that
+minimum, is replaced by the per-segment rule rather than kept beside it.
+`None` is passed only where no snapshot consumer exists at all.
 
 **The ledger is WAL-owned, so the floor is derived where the frames are.**
 Neither the `Journal` API nor `RecoveryReport` could otherwise tell the
@@ -686,16 +695,23 @@ one, because startup's fallback is exactly as trustworthy as this record:
   time in front of every concurrent append and break RFC0052.12's O(cap)
   claim. The pass therefore has two halves. Under the writer position it
   pops at most the cap's worth of eligible segments and stale partials from
-  the ledger's structures — removing them from the ledger and its
-  accounting, and noting the horizon each popped segment was reclaimed
-  under per tenant — and releases. Off the writer position it merges those
-  horizons into the record, writes and fsyncs it, and only then unlinks the
-  popped files and fsyncs the parent. The ordering rule is what the
-  startup contract needs and it is unchanged: the record is durable before
-  the segments it covers are gone. A file whose unlink fails stays in a
-  small pending-unlink list outside the ledger and is retried by the next
-  pass's off-lock half, still within that pass's cap; it is already out of
-  the ledger, so it can neither be popped twice nor counted as retained.
+  the ledger's structures — marking each popped entry **reclaiming**, so it
+  cannot be popped again, while it stays in the ledger and in the byte and
+  segment accounting — and notes the horizon each popped segment is to be
+  reclaimed under per tenant, then releases. Off the writer position it
+  merges those horizons into the record, writes and fsyncs it, and only then
+  unlinks the popped files and fsyncs the parent. The ordering rule is what
+  the startup contract needs and it is unchanged: the record is durable
+  before the segments it covers are gone. An entry leaves the ledger and its
+  accounting only when its unlink has succeeded, under the writer position
+  on the next ledger step. The two failure points differ: a failed record
+  write or fsync means nothing was unlinked, so every popped entry is put
+  back to eligible under the writer position and the next pass pops it
+  again — the entry was never out of the ledger, so the no-listing rule
+  costs nothing here; a failed unlink after a durable record leaves the
+  entry reclaiming, still counted, retried by the next pass's off-lock half
+  within its cap. Nothing a pass has touched can become undiscoverable,
+  which is what a ledger with no directory scan behind it needs.
   Housekeeping's ledger half is the only half that takes the writer
   position, which is what "runs on rotation's ownership path" means below.
 - **Monotonic per tenant, by merge.** The pass reads the record, raises each
@@ -893,8 +909,14 @@ The step runs **inside** the same per-pass cap as segment unlinking (§3.7) and
 counts against it, because it pops from the same ledger under the same
 single-writer position — a backlog of stale partials would otherwise make a
 "bounded" pass do unbounded directory work and break RFC0052.12; the unlink
-itself runs in the pass's off-lock half like a segment's (§3.2). An unlink
-failure is logged and retried on the next pass like any other.
+itself runs in the pass's off-lock half like a segment's (§3.2). Within the
+cap, **partials are popped first** and segments take what remains: a
+partial is bounded per rotation by the retry budget and holds no frame,
+while a segment backlog is unbounded, so the other order would let the
+incident's backlog consume every pass's cap and leave rotation debris on
+disk for as long as the backlog lasts — contradicting RFC0052.4's "one
+rotation's debris clears in one pass". An unlink failure is logged and
+retried on the next pass like any other.
 
 Two more properties of the sweep are stated because the current
 `housekeeping` has neither. **It runs on every pass**, regardless of the
@@ -992,15 +1014,24 @@ The amendment is narrow and does **not** touch §3.2's binding rule, which is
 that a transient failure must never carry a non-retryable code. The status
 stays `UNAVAILABLE` / `503` for exactly the reason §3.2 gives: the batch was
 not acked, and every non-retryable OTLP status also tells the client to drop
-it. What changes is the *class* — and under this section's bounded retry, only
-the **terminal** state leaves the transient class. A rotation failure still
-within its retry budget genuinely is transient: a later append can succeed, so
-it stays in the transient class and its message says it is retrying. Only
-once the budget is exhausted is the node in a state no delay fixes, and only
-there does the classification change, with the message naming the state. No
-retry hint is carried on either — the server schedules no retry of its own
-(§3.7), so the client backs off as OTLP prescribes — and RFC0052.15 pins
-both halves on class and message.
+it. OTLP's retryable axis is about the *data* — whether the client may
+resend the same batch — and here it may and must: the batch is valid and
+will be accepted once an operator has cleared the node, so a non-retryable
+mapping would be wrong on the spec's own terms. What changes is the *class*,
+and §3.2's two classes cannot say it: the state is neither transient (no
+delay fixes it) nor permanent in §3.2's sense (nothing is wrong with the
+batch). So this RFC adds a third class to §3.2's table — **server-terminal,
+client-retryable**: the node needs an operator; the client keeps its data
+and retries with exponential backoff, which is what OTLP prescribes when no
+`Retry-After` / `RetryInfo` is sent, and none is, because the server cannot
+predict when the state clears. Under this section's bounded retry, only the
+**terminal** state enters that class. A rotation failure still within its
+retry budget genuinely is transient: a later append can succeed, so it stays
+in the transient class and its message says it is retrying. Only once the
+budget is exhausted is the node in a state no delay fixes, and only there
+does the classification change, with the message naming the state. No retry
+hint is carried on either — the server schedules no retry of its own
+(§3.7) — and RFC0052.15 pins both halves on class and message.
 
 ### 3.4 Backpressure — moved to RFC 0053
 
@@ -1569,6 +1600,9 @@ memory, and nothing here claims to.
 >   uncapped pass would reach
 > - **And** a backlog of stale *temporary* files is also bounded by the same
 >   cap, so temp sweeping cannot make a "bounded" pass do unbounded work
+> - **And** with a segment backlog larger than the cap *and* stale partials
+>   present, the first pass removes the partials and spends only the
+>   remainder of its cap on segments
 
 > **Scenario RFC0052.16 — The temp sweep touches only files of the reserved
 > partial shape**
@@ -1582,7 +1616,7 @@ memory, and nothing here claims to.
 >   cannot resurrect it
 
 > **Scenario RFC0052.15 — Only the terminal rotation state is reported
-> non-transient**
+> server-terminal, client-retryable**
 > - **Given** §3.3's bounded retry, a rotation failure that is still **within**
 >   the budget, and one that has exhausted it
 > - **When** each is reported on both transports
@@ -1592,8 +1626,10 @@ memory, and nothing here claims to.
 >   and its message says it is retrying, because §3.3 means a later append
 >   genuinely can succeed; no retry hint is carried, since the server
 >   schedules no retry of its own
-> - **And** only the **terminal** state is classified non-transient, with
->   the message naming that state
+> - **And** only the **terminal** state is classified server-terminal,
+>   client-retryable — RFC 0018 §3.2's third class — with the message naming
+>   that state and still no retry hint, so a conforming client keeps the
+>   batch and backs off exponentially
 > - **And** an ordinary append or fsync I/O failure stays transient, so the
 >   reclassification is narrow rather than a blanket change to RFC 0018
 >   §3.2's transient class
@@ -1625,6 +1661,12 @@ memory, and nothing here claims to.
 >   turn: the turn hands the captured cut to the barrier task, and an append
 >   admitted after the turn is neither in that cut's checkpoint nor in its
 >   snapshot
+> - **And** an age-sweep publish registered *after* the cut — between the
+>   barrier's `quiesce_publishes` and its checkpoint — that fails
+>   transiently or panics is neither covered by that checkpoint nor lost:
+>   every frame it holds is above the cut's mark, a transient failure
+>   requeues it, and a panic latches the *next* barrier; the barrier does
+>   not re-take the exclusion around its store I/O to reach that
 
 > **Scenario RFC0052.13 — A tenant without a snapshot pins the floor, and is
 > never read as unbounded**
@@ -1702,6 +1744,10 @@ memory, and nothing here claims to.
 >   so the restart proceeds; a crash injected between the temp write and the
 >   rename leaves the previous record intact and the temp truncated by the
 >   next pass
+> - **And** a record write or fsync that *fails* unlinks nothing, leaves the
+>   WAL's byte and segment accounting unchanged, and the segments that pass
+>   popped are reclaimed by a later pass once the write succeeds — they are
+>   never lost to the ledger
 
 > **Scenario RFC0052.10 — No acknowledged record is lost across the whole
 > cycle**
@@ -1780,9 +1826,11 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   the state predates the code under test.
 - **Capped passes (RFC0052.12)** — a backlog well past the cap, asserting the
   per-pass unlink count and that repeated passes reach the uncapped end
-  state. The concurrent-append half is asserted by timing out an append
-  against an uncapped pass in a regression guard rather than by measuring
-  wall clock, which would be flaky.
+  state; a leg seeds stale partials beside that backlog and asserts the
+  first pass removes every partial and only cap-minus-partials segments.
+  The concurrent-append half is asserted by timing out an append against an
+  uncapped pass in a regression guard rather than by measuring wall clock,
+  which would be flaky.
 
   These **replace** `rfc0008_6_rotation_failure_quiesces_the_wal`, whose
   "even after the underlying condition clears" assertion is the contract
@@ -1894,9 +1942,10 @@ they are not substitutes for the rest.
   Scenario RFC0008.6's permanent refusal are **superseded** by §3.3 and
   RFC0052.4/.5.
 - RFC 0018 §3.2 (retryable error mapping) — **amended** by §3.3: its transient
-  class lists "post-rotation quiesce", which #791 disproved. RFC0018.3 stays
-  satisfied, since the status is unchanged; only the class and the optional
-  `Retry-After` move.
+  class lists "post-rotation quiesce", which #791 disproved, and its two
+  classes gain a third, *server-terminal, client-retryable*, for the terminal
+  rotation state. RFC0018.3 stays satisfied, since the status is unchanged;
+  only the class and the optional `Retry-After` move.
 - RFC 0001 §6.9 — the miner snapshot high-water mark, and the hazard-#5
   retain rule that makes it the truncation floor — **amended** by §3.2:
   horizons are per tenant (each tenant's own last folded frame), the retain

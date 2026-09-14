@@ -242,7 +242,7 @@ reservation path never reaches it, having refused first. An **owed**
 rotation is one the current segment's state requires — after a seal, where
 that segment must never take another frame, and the post-recovery step's
 discharge of an owed rotation — and there a refusal is a durability fault,
-not a shrug: the WAL enters `Terminal { Deferred { AtSegmentCap } }`
+not a shrug: the WAL enters `RotationState::Deferred { AtSegmentCap }`
 (below) and admits nothing until a pass frees a slot. Header overhead is
 therefore at most 24 B × `max_segments`, and the refusal leaves with the
 same latch once a pass removes a segment. **A segment stays in it
@@ -264,9 +264,14 @@ and their `.wal.seal.partial` temps, and rotation partials awaiting RFC
 0052's sweep are all outside it, so `disk_bytes` can exceed the bound by
 those and by the headers — each is either a small record or debris the
 sweep removes: headers are capped by `max_segments`, the seal count is
-capped below, and `RECLAIM` is one entry per tenant, so it grows with the
-tenant set — finite and operator-defined under RFC 0047, never with ingest
-volume — and not with the backlog. **It survives a
+capped below, and `RECLAIM` holds two kinds of entry, both bounded —
+`reclaimed_through`, one offset per tenant, and `planned`, one entry per
+*popped segment* carrying that segment's per-tenant last offsets, so the
+record's size is O(tenants) plus O(segments popped by the outstanding
+pass × tenants in them). The planned half lives only between a pass's two
+halves and is capped by `max_unlinks_per_pass`; the tenant half is finite
+and operator-defined under RFC 0047. Neither grows with ingest volume or
+with the backlog. **It survives a
 restart by being rebuilt, not persisted, in the same unit.** Once replay
 and heal have settled the newest segment's tail — a torn frame there is
 truncated by heal and must not be counted — the figure is initialised as
@@ -391,14 +396,19 @@ seal cannot authorise anything. The rotation that follows the seal takes the slo
 but it is an **owed** rotation in §3.1's sense — the sealed segment must
 never take another frame — so the refusal is a fault rather than a shrug:
 with a slot it rotates; **without one the seal is written and the
-rotation is deferred** — the WAL reports RFC 0052 §3.3's terminal
-classification (`RotationState::Terminal`, sub-state `Deferred {
-AtSegmentCap }`), so appends are refused under the server-terminal,
-client-retryable class, and `maintain` retries the deferred rotation
-after a pass frees a slot, on which the state clears and admission
-resumes. That is the one terminal sub-state a restart is not needed to
-clear, stated as an amendment to §3.3's "only a restart clears it", and
-RFC0053.1 covers both cases. If the seal write itself fails the WAL
+rotation is deferred**. That state is *not* terminal, and calling it so
+would break RFC 0052 §3.3's contract in both directions: terminal means a
+node an operator must clear and carries no retry hint, while this one
+clears itself the moment housekeeping frees a slot. So `RotationState`
+gains a third variant beside `Healthy` and `Retrying`, **`Deferred {
+AtSegmentCap }`** — an amendment to RFC 0052 §3.3 — and the admission
+order reports it as **reclaimable backpressure**: `WalBackpressure` with
+the `Segments` cause and the housekeeping delay §3.1 computes, not the
+server-terminal class, so a client retries on the hint and no operator is
+summoned. `maintain` retries the deferred rotation after a pass frees a
+slot, on which the state returns to `Healthy` and admission resumes;
+`Terminal` keeps its own meaning, the exhausted retry budget, with no hint
+and a restart to clear it. RFC0053.1 covers both cases. If the seal write itself fails the WAL
 enters the terminal rotation state: it can neither repair nor mark the
 segment. That state needs no durable discriminator: the WAL is terminal, so
 the segment stays the *newest* one, and the frame at its EOF was never
@@ -519,7 +529,7 @@ advertise a wait that ends nowhere. So `TenantCapacity` carries no
 `Retry-After` and no `RetryInfo` — the client backs off exponentially, as
 OTLP prescribes when none is sent — it does not enter the refusal latch,
 it is counted on the ingest counter with `error.type = wal_tenant_cap`,
-and `ourios.wal.tenants` at its limit is the alert. The operator path is
+and `ourios.wal.tenants.usage` with no `free` left is the alert. The operator path is
 to raise `max_tenants`; a verb that releases a tenant is deferred to §7,
 with the note that under RFC 0047/0048 tenants are an out-of-band
 decision and the guard is not the place to make it. **What the guard is
@@ -559,15 +569,15 @@ first tenant past the guard. So an unwind that leaves an `unmined` entry
 that the guard counts like any other; the entry's settlement converts it
 to `Held` when it installs the tenant, and releases it when the entry
 resolves without installing one. No reacquisition is needed, because the
-slot was never given up. `ourios.wal.tenants`
-counts `Held` only. **Recovery seeds the table**: after restore and
+slot was never given up. `ourios.wal.tenants.usage` carries `held` and
+`reserved` as separate states, since admission consumes both. **Recovery seeds the table**: after restore and
 replay, and before any listener is constructed, every tenant the miner
 holds is entered as `Held`, so a restarted node neither admits past the
 guard nor refuses a tenant it already serves; RFC0053.4 asserts it.
 Authenticated deployments bound the set out of band (RFC 0047 §3.1's
 binding, RFC 0048's authorisation), so the guard is the open-mode
-backstop, not the tenancy model; the held count is exported
-(`ourios.wal.tenants`, §3.3) and RFC0053.1 asserts the refusal.
+backstop, not the tenancy model; the held and reserved counts are exported
+(`ourios.wal.tenants.usage`, §3.3) and RFC0053.1 asserts the refusal.
 `validate_config` rejects an explicit value below `segment_size_bytes`: the
 smallest useful bound is one full segment, since housekeeping never unlinks
 the current segment and a bound smaller than one would refuse before a
@@ -663,6 +673,11 @@ the refusal that set it, so a `Segments` refusal never
 rotates, since a rotation at the ceiling would breach it, and a
 `TenantCapacity` refusal sets no latch at all — the `HousekeepingProgress` that
 `housekeeping_commit` has just returned reports `removed_segments == 0`
+**and the pass actually ran** — RFC 0052 §3.2 makes a pass a no-op before
+the version-2 witness exists, returning zero counts, and a skipped pass is
+"no progress", not "nothing left to reclaim"; forcing a rotation on the
+strength of it would rotate a legacy root that has not yet upgraded, so
+the trigger requires a pass that planned
 (temp-file cleanup and partial failures do not count; RFC 0052's
 `horizon_remaining` and `unlink_remaining` say whether the pass merely ran
 out of budget, and a pass that did is not a stalled one — the trigger
@@ -716,7 +731,8 @@ clears. Nothing is acked by that rotation, so the no-ack-on-refusal property
 is untouched.
 
 That needs an owner, and RFC 0052 §3.7 provides it: `Journal::rotate(&mut
-self) -> Result<(), ReceiveError>`, the object-safe, append-independent
+self) -> Result<RotationOutcome, ReceiveError>` as §3.1 amends it, the
+object-safe, append-independent
 rotation that RFC introduces for its own idle rotation (`Wal::rotate` is
 private today). This RFC only widens who calls it. It closes the current
 segment and opens a fresh one through the same retried path RFC 0052 §3.3
@@ -880,11 +896,15 @@ enqueued to the **publisher** — the one dedicated thread the
 `write_ordered` on each batch and settles its guard as durable, requeued,
 quarantined or, on an unwind, latched. The guard is **not** the worker's
 to create: RFC 0052 §3.1 has `submit` create it under the exclusion with
-the batch's own epoch, and it travels with the queued item
+the batch's own epoch. Nor is it moved into one item, since a batch can
+detach several partitions into several queue slots; it is a **shared
+completion**, an `Arc` holding the guard and a count incremented per
+detach and decremented per completion (durable, requeued, parked or
+dropped), settling the guard when the count reaches zero and the batch's
+encode phase has ended. Each queued item
 (`PublishItem::{ Drained(Drained), Detached { records, guard,
-audit_watermark } }`), the worker's detach consuming the pre-made guard
-and a batch that detaches nothing releasing it unused — so no partition is
-ever outside both the buffers and the in-flight set, and the worker moves
+audit_watermark } }`) carries a handle to that completion — so no
+partition is ever outside both the buffers and the in-flight set, and the worker moves
 to its next record with `quiesce` waiting on encodes alone. Everything this section says about `write_ordered` — the `Drained`
 destructor, the `RecoverableBatch` handle, the unwind arm — therefore
 attaches to the publisher thread for detached batches exactly as it does
@@ -934,7 +954,11 @@ whose enqueue finds the queue **disconnected** (the publisher gone for
 shutdown, or between death and respawn) follows RFC 0052 §3.1's park
 rather than a settle: the failed send returns the item to the worker,
 which puts the batch back into the buffers as a **`ready` partition**
-under the sink lock *before* releasing its guard, and signals the
+under the sink lock *before* releasing its guard — keeping its
+`audit_watermark` in the buffer entry, since a park that stripped the
+dependency would let a later drain publish the records ahead of their
+template events, and a `Drained` that takes it carries the maximum
+watermark over the partitions it took — and signals the
 coordinator to respawn — a park, not a requeue-and-settle, because a guard
 released before the records are back in the buffers is a window in which a
 cut would read them as neither buffered nor in flight. Parked partitions
@@ -1155,9 +1179,10 @@ checkpoint replays from `X` and yields `O3` — three objects. So the
 watermark is written durably on the checkpoint's own path, as an
 **amendment to RFC 0052's sidecar layout**: `Journal::checkpoint` gains
 the per-tenant map, `fn checkpoint(&mut self, durable_to: WalOffset,
-published: &HashMap<TenantId, WalOffset>)`, and the WAL writes it to a
+published: &HashMap<TenantId, PublishedMarks>)` where `PublishedMarks {
+records: WalOffset, audit: WalOffset }` names the pair the rules need, and the WAL writes it to a
 `PUBLISHED` sidecar beside `CHECKPOINT` — a versioned, checksummed record
-of per-tenant `{records, audit}` offsets, written to `PUBLISHED.tmp`, fsynced, renamed,
+of `(tenant, PublishedMarks)` entries, written to `PUBLISHED.tmp`, fsynced, renamed,
 parent fsynced, **before** `CHECKPOINT`'s own write in the same call, so a
 `CHECKPOINT` never exists without a `PUBLISHED` at least as new; `*.tmp`
 stays the sidecar namespace RFC 0052 §3.7 reserves, and the file is
@@ -1179,10 +1204,28 @@ in-memory watermarks per tenant as the greater of the `PUBLISHED` entry
 and what the Parquet-side suppression horizon `X` implies, and a missing
 `PUBLISHED` beside a version-2 `CHECKPOINT` is fail-closed like a missing
 `RECLAIM` — RFC 0052 §3.2 names `PUBLISHED` in that matrix on the same
-footing. A **version-1 root** carries neither sidecar: RFC 0052 opens it
+footing — with **one stated exception, which is this RFC's own migration
+case**: a node that ran RFC 0052 alone has a version-2 `CHECKPOINT` and a
+`RECLAIM` carrying `checkpoint_seen`, and no `PUBLISHED`, because nothing
+wrote one. Failing closed there would refuse to start every node that
+upgrades. So `PUBLISHED` absent beside a version-2 `CHECKPOINT` **and** a
+`RECLAIM` whose `checkpoint_seen` is set is **accepted exactly once**: the
+watermarks seed from `X`, the checkpoint horizon, which is what RFC 0052
+already guarantees replay suppresses below; the sidecar is created by the
+next checkpoint, and from then on its absence is fail-closed as above. The
+consequence is stated rather than hidden: in that first window the
+watermarks are as coarse as `X`, so records published between the last
+pre-upgrade checkpoint and the first post-upgrade one are re-emitted if a
+panic or crash makes the rebuild replay them — the at-most-twice bound
+holds, the exactly-once refinement does not, and it is one window per
+upgrade. Per the pre-production layout policy there is no migration
+tooling; the read path is the whole migration, and the implementing PR
+carries the `!` marker. A **version-1 root** carries neither sidecar: RFC 0052 opens it
 without creating a `RECLAIM`, and `PUBLISHED` follows the same rule, both
 being created on the path that rewrites the sidecar at version 2 — the
-first checkpoint — so a restart inside that migration window stays on the
+first checkpoint, including the case RFC 0052 §3.2 calls out where that
+checkpoint's mark *equals* the one on disk, since an idle node must still
+be able to upgrade — so a restart inside that migration window stays on the
 legacy branch, with no watermark to seed and nothing published under a
 horizon anything reads. The converse is reachable, since `PUBLISHED` is written first,
 and takes RFC 0052 §3.2's two-state witness rather than a rule of its own:
@@ -1383,13 +1426,25 @@ repository's review) and nothing is hand-written in the code:
 | `ourios.wal.backpressure.last_refusal.segments` | gauge (int) | `{segment}` | `ourios.wal.backpressure.cause` = `segments` (the retained count at the last segment refusal) |
 | `ourios.wal.tenant_capacity.last_refusal` | gauge (int) | `{tenant}` | — (the held count at the last `TenantCapacity` refusal; capacity, not a backpressure cause) |
 | `ourios.wal.capacity_remaining` | gauge | `By` | — (saturating at zero; byte headroom) |
-| `ourios.wal.segments` | gauge (int) | `{segment}` | `ourios.wal.segments.limit` (retained segments against `max_segments`; headroom is the difference) |
-| `ourios.wal.tenants` | gauge (int) | `{tenant}` | `ourios.wal.tenants.limit` (held tenants against `max_tenants`; headroom is the difference) |
+| `ourios.wal.segments.usage` | gauge (int) | `{segment}` | `ourios.wal.segment.state` ∈ {`retained`, `free`} (sums to the limit) |
+| `ourios.wal.segments.limit` | gauge (int) | `{segment}` | — (`max_segments`) |
+| `ourios.wal.tenants.usage` | gauge (int) | `{tenant}` | `ourios.wal.tenant.state` ∈ {`held`, `reserved`, `free`} (sums to the limit; admission consumes `held + reserved`) |
+| `ourios.wal.tenants.limit` | gauge (int) | `{tenant}` | — (`max_tenants`) |
 | `ourios.wal.sealed_segments` | gauge (int) | `{segment}` | — (sealed segments still on disk; the cap is `max_sealed_segments`) |
 | `ourios.wal.tenant_unrecoverable` | gauge (int) | `{tenant}` | `ourios.tenant` (tenants an in-process settlement found below their `reclaimed_through`; alert on nonzero) |
 | `ourios.ingest.encode_fallback` | counter | `{batch}` | `error.type` ∈ {`encode_pool_disconnected`} |
 | `ourios.wal.settling_tenants` | gauge (int) | `{tenant}` | — (tenants with a `Settling` entry; refusals carry `error.type = wal_settling`) |
 | `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.backpressure.cause`, plus the cause's measurements: `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` for `bytes`; the count and limit for `segments` |
+
+Those two pairs follow the OTel instrument-naming rule for a measured
+amount out of a known total — `entity.usage` with a `state` attribute
+whose values sum to `entity.limit`, beside `entity.limit` itself, as
+`system.memory.usage` / `.limit` do — rather than carrying the limit as an
+attribute of the usage gauge, which an earlier draft did and which reads
+as a dimension rather than a total. The `reserved` state is why the pair
+matters here: admission consumes `held + reserved`, so a dashboard reading
+`held` alone would show headroom that does not exist. Names go through
+`ourios-semconv` with the rest.
 
 `error.type` continues to carry the failure class on existing counters
 rather than spawning per-error metrics: the refused batch is counted on
@@ -1497,8 +1552,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   tenant, as `TenantCapacity` — `503` / `UNAVAILABLE` with a protobuf
 >   `Status` body and no `Retry-After` and no `RetryInfo` — while a batch
 >   for a held tenant is admitted; the refusal is counted with `error.type
->   = wal_tenant_cap`, sets no refusal latch, and `ourios.wal.tenants`
->   reads the limit; two concurrent first writes for one new id share a slot and
+>   = wal_tenant_cap`, sets no refusal latch, and
+>   `ourios.wal.tenants.usage` over its states sums to
+>   `ourios.wal.tenants.limit` with `free` at zero; two concurrent first writes for one new id share a slot and
 >   a burst of new ids never overshoots the guard
 > - **And** a sealed segment's unlink subtracts exactly the amount the seal
 >   added, so a node that sealed and then reclaimed shows the same
@@ -1517,6 +1573,17 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** the lagging-floor leg above is built so the surviving segments
 >   are the ones holding the lagging tenant's frames; segments holding only
 >   other tenants' covered frames are reclaimed even then
+> - **And** a deferred rotation is reported as backpressure with the
+>   housekeeping delay, never as the server-terminal class, and returns to
+>   `Healthy` once a pass frees a slot — while an exhausted retry budget is
+>   still `Terminal`, with no hint
+> - **And** a node upgrading from RFC 0052 — version-2 `CHECKPOINT`,
+>   `RECLAIM` with `checkpoint_seen`, no `PUBLISHED` — starts, seeds its
+>   watermarks from `X`, and writes `PUBLISHED` at its next checkpoint;
+>   a later start with the sidecar missing again fails closed
+> - **And** a housekeeping pass skipped for a missing version-2 witness
+>   forces no rotation: a legacy root that has not yet upgraded is left
+>   alone
 > - **And** `max_segments < 2` is rejected at config validation, naming the
 >   reason: the current segment holds one slot and is never unlinked, so a
 >   ceiling of one admits no rotation at all

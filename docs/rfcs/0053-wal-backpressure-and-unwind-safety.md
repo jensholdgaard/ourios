@@ -139,9 +139,11 @@ Two boundaries of that figure are stated so the reservation and the
 measurement cannot drift apart. **It is over frame bytes.** Segment headers
 (24 B each) are outside the measurement and the reservation alike: a pre-write
 rotation adds one, the coordinator cannot know whether an append will rotate,
-and the overhead is bounded by the segment count rather than by the outage — so
-the on-disk total exceeds the bound by at most one header per segment, and
-never by an amount that grows while the store is down. **It survives a restart
+and the overhead is one header per surviving segment — which does grow by
+24 B per rotation while the store is down, a quantity the limit's
+segment-size floor makes negligible against the bound and which no frame
+can inflate; the on-disk total exceeds the bound by exactly that much and
+by nothing else. **It survives a restart
 by being rebuilt, not persisted, in the same unit.** Once replay and heal
 have settled the newest segment's tail — a torn frame there is truncated by
 heal and must not be counted — the figure is initialised as the sum over
@@ -179,8 +181,9 @@ mutex acquisition that performs the append**, reading the measurement from
 `Journal::reclaim_state()` immediately before calling `append_batch`. Not in
 the receiver and not in a layer above: anywhere outside that mutex races
 concurrent appends, so two batches could each observe room and both be
-written. `append_batch` itself is unchanged — the reservation is the caller's
-responsibility because the caller is what holds the mutex.
+written. `append_batch`'s responsibility is unchanged — it appends, and per
+RFC 0052 §3.7 now returns the frame's `WalOffset` — and the reservation is
+the caller's responsibility because the caller is what holds the mutex.
 
 - **The limit is the coordinator's, not the WAL's.** `CommitCoordinator::new`
   takes it alongside the batch window and segment size it already receives, so
@@ -266,8 +269,12 @@ nothing reclaimable, the bound never clears, and no append will ever arrive to
 roll the segment. A livelock built out of two individually-correct rules.
 
 So the timer, holding the barrier exclusion RFC 0052 §3.1 gives it,
-**rotates** when the bound is crossed, the pass it has just run unlinked
-nothing, and the current segment holds at least one frame. That last
+**rotates** when the refusing state is set — a reservation has been refused,
+which a per-request check can do while `unreclaimed_bytes` is still below
+the limit, so the trigger is the latch and never `unreclaimed_bytes >=
+limit` — the pass it has just run reported `removed_segments == 0` in its
+`HousekeepingProgress` (RFC 0052 §3.7; temp-file cleanup and partial
+failures do not count), and the current segment holds at least one frame. That last
 condition needs a state surface the inherited `ReclaimState` lacks —
 `unflushed_bytes` resets on every sync, so it cannot tell a synced current
 segment from an empty one — and this RFC adds one field to it:
@@ -293,7 +300,10 @@ reported through the same typed rotation-failure variant the append path uses
 variants are reclamation's and stay so. Before anything else it discharges a
 pending parent-directory fsync left in `dir_fsync_pending` by RFC 0052 §3.3's
 last failure row — the obligation `sync` would otherwise retry on the next
-append, which under backpressure never comes — and only then applies the
+append, which under backpressure never comes — honouring its origin: a
+failed `Open`-origin discharge is an ordinary retryable sync failure outside
+the budget, a failed `Rotation`-origin one draws on it, exactly as RFC 0052
+§3.3 says for `sync` — and only then applies the
 no-op rule: `Ok` without a new segment when the current one holds no frames,
 so a timer that calls it unconditionally cannot manufacture empty segments.
 The timer reaches it through the coordinator's journal mutex,
@@ -338,7 +348,12 @@ asserted by RFC0053.2. The bound holds only because settlement is
 partitions and audit groups, and requeueing the whole batch after a panic in
 the third put would duplicate the two objects already accepted. So each
 consuming call removes a partition from the recoverable batch only when its
-put has **succeeded** or its requeue has **completed** — a partition whose
+put has **succeeded**, its requeue has **completed**, or the sink has
+**permanently dropped** it under its own policy (the audit sink's
+permanent and derivation-failure path) — that drop is settlement too, at
+the same per-partition boundary, so a later panic neither resurrects a
+dropped group through the destructor nor loses it without a defined
+state — a partition whose
 put failed transiently is requeued at once, under the sink lock, before the
 next put starts, never parked in a local vector to be requeued after the
 loop as the record and audit paths do today, since a panic in a later
@@ -414,9 +429,12 @@ exports is what distinguishes the two settled outcomes for an operator.
 With that settled, the age sweep can survive a panic and keep sweeping. #795
 deliberately stops, because without this it would repeat the loss every tick,
 and RFC 0052 §3.1 adds the `cadence_failed` latch that keeps its timer from
-stamping past a dropped batch; both the stop and the latch are reversed
-here, since the panic no longer drops anything, and the `cadence_panic`
-counter #795 added stays,
+stamping past a dropped batch. Both are retired here, and the transition
+is explicit: with requeue-on-unwind a recovered panic sets nothing, so
+`cadence_failed` ceases to exist as a barrier guard — RFC 0052's contract is
+amended by this RFC to remove it, RFC0052.1's latch clause with it, and a
+latch set by a pre-RFC 0053 process clears on the restart that deploys
+this — while the `cadence_panic` counter #795 added stays,
 now meaning "a step panicked and was retried" rather than "the cadence is
 dead". Only a *panicking* `JoinError` continues the sweep; a cancelled one is
 the runtime going away and still terminates it, exactly as today, so an
@@ -480,9 +498,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   yields no delta-seconds
 > - **And** on HTTP the reason is a binary protobuf `google.rpc.Status` body
 >   (`application/x-protobuf`, whatever the request's encoding) with
->   `Retry-After` as a header, and on gRPC a `Status` message with a
->   `RetryInfo` detail — a bare status code with an empty body fails this
->   scenario
+>   `Retry-After` as a header, and on gRPC the status code is `UNAVAILABLE`
+>   with a `RetryInfo` detail — a bare status code with an empty body, or
+>   any other gRPC code, fails this scenario
 > - **And** the refused batch is **not present in the WAL** — asserted by
 >   replaying after a restart, so a post-append check that left the frame
 >   behind fails here
@@ -507,12 +525,13 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **Given** a cadence step whose publish panics after the batches have been
 >   drained out of the sink
 > - **When** the unwind completes
-> - **Then** the drained records are back in their buffer
-> - **And** the drained audit events are back in theirs whenever the audit
->   write had not completed; after it has returned `true` they are settled —
->   durable, or dropped under the sink's own permanent-failure policy — and
->   are **not** requeued, so a later panic neither duplicates nor resurrects
->   them
+> - **Then** the records of the in-flight and not-yet-started partitions are
+>   back in their buffer, and a partition whose put had already succeeded
+>   stays out
+> - **And** the audit groups not yet settled are back in theirs; a group
+>   that had settled — durable, or dropped under the sink's own
+>   permanent-failure policy — is **not** requeued, so a later panic neither
+>   duplicates nor resurrects it
 > - **And** a panic in the third of several partition puts requeues only the
 >   third and any not yet started; the two accepted objects are not written
 >   again
@@ -599,11 +618,14 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   barrier refuses to stamp, and a later healthy barrier publishes.
   Parameterising the panic point is the whole test: the partial-move shape
   means a guard that only covers the last point passes a single-point test.
-  The point is also parameterised **across partitions** — a drained batch of
-  several partitions with the panic in the first, a middle and the last put —
-  asserting the accepted objects are not written again and the store holds
-  at most one duplicate; one leg fails the first put transiently and panics
-  on a later one, asserting the failed partition is back in its buffer. RFC0053.3 drives many consecutive panicking ticks
+  The point is also parameterised **across partitions, for each consumer
+  separately** — record partitions and audit groups each get a drained batch
+  of several with the panic in the first, a middle and the last put —
+  asserting the accepted objects are not written again, the store holds at
+  most one duplicate, the corresponding buffer is restored and the other
+  consumer's settled items stay out; each consumer also gets a leg that
+  fails the first put transiently and panics on a later one, asserting the
+  failed partition or group is back in its buffer. RFC0053.3 drives many consecutive panicking ticks
   and asserts logical no-loss by unique record ids plus at most one extra
   object per panic — not an exact row count, which the accepted duplicate
   would fail.

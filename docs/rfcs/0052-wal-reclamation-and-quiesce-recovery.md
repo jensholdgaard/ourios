@@ -1105,11 +1105,18 @@ one, because startup's fallback is exactly as trustworthy as this record:
   version 2 is the ordinary post-upgrade state — the checkpoint is durable,
   the crash simply landed before the record's next write — so open promotes
   it, setting `seen` durably before anything reads the matrix, and it is
-  never a fault; `armed` without `seen` and `CHECKPOINT` absent is the
-  crash window *before* the rename and is **recoverable** — the root is
-  fresh, the record is opened empty and re-armed by the next attempt;
-  neither flag with `CHECKPOINT` absent is the post-RFC root before its
-  first barrier, which is what open creates. Entries and `seen` cannot disagree, since every
+  never a fault; `armed` without `seen` and `CHECKPOINT` still at **version
+  1** is the migration's own retry state, which this ordering creates when
+  the upgrade write fails between the arming and the rename — the record is
+  armed, no version-2 checkpoint exists, and nothing can have been
+  reclaimed, since housekeeping is a no-op until the witness exists — so
+  the root opens normally on the legacy branch and the next checkpoint
+  retries the upgrade, re-using the arming already on disk; `armed` without
+  `seen` and `CHECKPOINT` absent is the crash window *before* the rename on
+  a root that had no checkpoint at all, and is **recoverable** the same
+  way — the root is fresh, the record is opened empty and re-armed by the
+  next attempt; neither flag with `CHECKPOINT` absent is the post-RFC root
+  before its first barrier, which is what open creates. Entries and `seen` cannot disagree, since every
   unlink is gated on a checkpoint that must have succeeded to produce
   them. **RFC 0053 adds `PUBLISHED` to this matrix** on the same footing:
   its §3.2 makes a missing `PUBLISHED` beside a version-2 `CHECKPOINT`
@@ -1120,14 +1127,31 @@ one, because startup's fallback is exactly as trustworthy as this record:
   reclaimed", damaged means "reclaimed, extent unknown", and only the first
   is safe to proceed from.
 
+Each entry also records **which rule the pass reclaimed under**, because
+the two are not equivalent evidence. Under `SnapshotHorizons::Known` a
+segment is unlinked because every tenant's snapshot covered it, so a
+missing snapshot afterwards means state that cannot be rebuilt. Under
+`NoConsumer` — the documented mode where no snapshot consumer exists and
+the checkpoint alone governs (§3.2) — no snapshot was ever expected, and
+treating the entry as snapshot-backed would make a node that reclaimed
+correctly fail closed on its next start, turning a supported
+configuration into a halt. So an entry written by a `NoConsumer` pass
+carries that mode, per tenant, beside its horizon.
+
 The WAL exposes the reconciled `reclaimed_through` as
-`ReclaimState::reclaimed_through`, and recovery compares: a tenant whose
-restorable horizon is below its recorded reclaimed-through — including a
-tenant with an entry and no restorable snapshot at all — has unrecoverable
-state and recovery **halts**, naming the tenant; a tenant with no entry has
-lost nothing and pins at its oldest surviving frame as before. An
-undecodable or missing snapshot is therefore safe to fall back from exactly
-when the record proves it is, and RFC0052.17 holds each of those cases.
+`ReclaimState::reclaimed_through`, and recovery compares **per entry, by
+its mode**: an entry written with a consumer whose tenant's restorable
+horizon is below it — including a tenant with an entry and no restorable
+snapshot at all — is unrecoverable state and recovery **halts**, naming
+the tenant; an entry written under `NoConsumer` is checkpoint-covered, so
+a missing or undecodable snapshot is not a fault and the tenant pins at
+its oldest surviving frame like any unsnapshotted tenant. A tenant with no
+entry has lost nothing and pins the same way. A mode change between runs
+needs no special case: entries keep the mode they were written under, so a
+node that later gains a consumer halts only on what was reclaimed under
+one. An undecodable or missing snapshot is therefore safe to fall back
+from exactly when the record proves it is, and RFC0052.17 holds each of
+those cases.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` reclaims only segments every tenant's horizon covers, and
@@ -2329,6 +2353,16 @@ memory, and nothing here claims to.
 >   the crash after the rename and before the record's next write — opens
 >   normally and is promoted to `seen` durably at open, never read as a
 >   fault
+> - **And** an armed record beside a still-**version-1** `CHECKPOINT` — the
+>   upgrade write failing between the arming and the rename — opens on the
+>   legacy branch, reclaims nothing until the next checkpoint retries the
+>   upgrade, and that retry succeeds against the arming already on disk;
+>   asserted by restarting the node in that state
+> - **And** a node reclaiming under `SnapshotHorizons::NoConsumer` restarts
+>   without a snapshot and does **not** halt: its entries carry that mode
+>   and are read as checkpoint-covered, the tenant pinning at its oldest
+>   surviving frame; an entry written with a consumer, on the same root,
+>   still halts when its snapshot is missing
 > - **And** a segment whose `unlink` fails after the record was written
 >   stays on disk with `reclaimed_through` behind it: a restart with that
 >   tenant's snapshot undecodable pins the tenant rather than halting
@@ -2545,14 +2579,20 @@ they are not substitutes for the rest.
     checkpoint(&mut self, durable_to: WalOffset, published: &HashMap<TenantId,
     WalOffset>)`, persisted to a `PUBLISHED` sidecar written before
     `CHECKPOINT` in the same call, and joining §3.2's sidecar matrix on the
-    same fail-closed footing as `RECLAIM`. The map's value is a per-tenant
-    `{records, audit}` pair, not a records offset alone, written on the
+    same fail-closed footing as `RECLAIM`. The map is
+    `HashMap<TenantId, PublishedMarks>` with `PublishedMarks { records,
+    audit }` — a per-tenant pair, not a bare offset — written on the
     checkpoint's own durable path.
   - *RFC 0053 §3.2* also amends §3.1's latch: it gains
     `failure_generation: AtomicU64`, bumped by every reporting guard between
     lowering `failed_epoch` and decrementing its count, so its clear can be
     a CAS on the pair — which stage 1 never performs (only a restart
     clears) and stage 2 does.
+  - *RFC 0053 §3.1* adds a non-terminal `Deferred { AtSegmentCap }` variant
+    to §3.3's rotation state, reported as reclaimable backpressure and
+    cleared when a pass frees a slot; §3.3's `Terminal` keeps its meaning,
+    the exhausted retry budget, and RFC0052.15's terminal-only
+    classification is unchanged by it.
   - *RFC 0053 §3.2* also replaces the timer's pre-cut guard — §3.2's `if
     failed_epoch <= barrier_epoch: skip` — with proceed-and-decide, once its
     requeue makes the panicked batch's records available to the next cut's

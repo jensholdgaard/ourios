@@ -205,10 +205,29 @@ wins; a tenant absent from the newer capture keeps the older bytes, which
 are still cut-consistent at its own horizon), and the epoch becomes the
 newer capture's, which is what makes the coalesced cut fail on any guard
 registered between the two captures. A capture that arrives while nothing
-is pending fills the slot. At shutdown the receiver joins the barrier task
-after the running `run_cut` finishes and the pending slot, if filled, has
-been run once — a store failure there requeues into the buffers as any
-cut's does, and shutdown's own final flush covers the requeue. The ingest
+is pending fills the slot. **Cuts are strictly ordered, and a pending cut
+inherits the running cut's outcome.** The pending cut was captured while
+the running cut's batches were still in flight, so its snapshot bytes
+already fold frames whose only durable copy is the running cut's batches:
+if it installed or stamped first — or after the running cut had failed —
+those frames would be suppressed on replay while sitting requeued in the
+buffers. So the pending cut never installs or checkpoints before the
+running cut's outcome is known, and when the running cut **fails** (a
+partition's flush fails and requeues) the pending cut is **invalidated**:
+its snapshot bytes are discarded, its batches — none of them flushed yet,
+the task being sequential — are merged into the buffers with the requeued
+ones under the sink lock, its mark is withdrawn, and its epoch is spent;
+the barrier task then re-captures a fresh cut from the buffers under the
+exclusion, which covers everything either cut held. The same rule reaches
+the timer's own cuts through `prior_ok` (§3.2): a failed publish is
+consumed by its requeue, which records the `barrier_epoch` current at the
+requeue, and a cut is valid only if no publish registered before its
+capture requeued at an epoch above the cut's — a cut captured *after* the
+requeue covers the records and is valid, one captured before it is not.
+At shutdown the receiver joins the barrier task after the running
+`run_cut` finishes and the pending slot, if filled, has been run once — a
+store failure there requeues into the buffers as any cut's does, and
+shutdown's own final flush covers the requeue. The ingest
 turn does no store I/O; the mark invariant is unchanged, because every cut
 was captured under the exclusion; and there is one owner of barrier I/O
 rather than two. The
@@ -269,8 +288,19 @@ exclusion under `quiesce_publishes` like any other. At shutdown the order
 is the one the barrier already needs: stop the workers, quiesce the
 encodes, `quiesce_publishes` (which now also means the queue is empty),
 then join the publisher — a publish still queued at that point is never
-dropped, because the join waits for it. RFC 0053's requeue-on-unwind
-replaces only the unwind arm of this; the thread, the queue and the
+dropped, because the join waits for it. The publisher's own unwind is
+defined, because a bare thread panic would strand every guard still in the
+queue and `quiesce_publishes` with them: the thread body runs each publish
+under `catch_unwind`, so a panic settles only the failing batch through
+its guard's drop — latched (§3.1's guard rule; its records stay in the WAL
+until a restart re-mines them, the stage-1 posture for every unwind) — and
+the same thread then drains every batch still queued back into the
+buffers as `ready` partitions, releasing each guard as its records land,
+and only then exits; the coordinator respawns it on the next enqueue.
+`quiesce_publishes` therefore always terminates: every guard is settled
+by a durable write, a requeue, a park, or the failing batch's own drop.
+RFC 0053's requeue-on-unwind replaces only the failing batch's arm of
+this; the thread, the queue, the drain-on-unwind and the
 guard-before-enqueue order stay. The barrier — reads the mark, drains
 both sinks into owned batches, registers that publish as in flight, and
 serialises each tenant's miner snapshot state — the bytes `write_snapshots`
@@ -338,7 +368,12 @@ returns the outcome of those registered publishes rather than merely
 waiting, and a failure in any of them means no stamp even though the cut's
 own flush succeeded — by re-taking the journal mutex for the stamp alone; a
 failed publish requeues (RFC 0053 §3.2 makes that hold on unwind too) and no
-stamp happens.
+stamp happens. A failure is not sticky: the requeue **consumes** it by
+recording the `barrier_epoch` current when the records re-entered the
+buffers, and only a cut captured before that epoch — one whose drain could
+not have seen them — is refused by it. A cut captured after the requeue
+drained them itself and stamps normally; without that rule one transient
+failure would refuse every later cut for the life of the process.
 
 **Two cadences, so the barrier is not a force-all flush cadence.** A cut
 drains every buffered partition, and running it on the 60-second
@@ -596,16 +631,24 @@ on a rotation (inside the ingest turn that observed the segment change):
 
 run_cut(cut):
     cut_ok   = flush(cut.batches)          // store I/O OUTSIDE the exclusion
-    prior_ok = quiesce_publishes().all_ok() // publishes registered BEFORE the cut: outcome,
+    prior_ok = quiesce_publishes().all_ok(cut.epoch)
+                                           // publishes registered BEFORE the cut: outcome,
                                            // not a wait; always evaluated, so a failed cut
                                            // flush cannot skip their outcome and requeue
-                                           // path. A publish registered after the cut holds
-                                           // only frames above cut.mark (§3.1's invariant),
-                                           // so it is neither waited on nor stamped past
+                                           // path. False iff one of them failed and requeued
+                                           // at an epoch ABOVE cut.epoch — a requeue this
+                                           // cut's drain could not have seen (§3.1); a
+                                           // publish registered after the cut holds only
+                                           // frames above cut.mark, so it is neither waited
+                                           // on nor stamped past
     ok = cut_ok and prior_ok and failed_epoch > cut.epoch
                                            // the recheck (§3.1): a panic in a guard of
                                            // this cut's epoch or lower is a failed cut;
                                            // a later epoch's panic fails later cuts
+    if not ok and pending slot is filled:  // strict ordering (§3.1): the pending cut
+        invalidate pending                 // folded this cut's frames; discard its snaps,
+                                           // merge its batches into the buffers, withdraw
+                                           // its mark, re-capture under the exclusion
     if ok and cut.mark is Some(_):
         install_snapshots(cut.snaps)       // under the install lock, monotonic in mark;
                                            // failure logged, not a blocker (§3.1); with
@@ -1372,12 +1415,21 @@ So the design is:
                                  // applied to: per tenant, the segments it spans
                                  // between its cursor and its horizon, summed over
                                  // tenants (a segment counts once per tenant behind
-                                 // on it); taken at the end of the pass from the
-                                 // cursors, O(tenants), never from a walk
-      unlink_remaining: usize,   // eligible segments not yet popped (a range count
-                                 // over the ordered structure up to the checkpoint)
-                                 // plus entries still reclaiming or uncertain, at
-                                 // the end of the pass
+                                 // on it) — a counter the ledger keeps INCREMENTALLY,
+                                 // raised when a horizon arrives and lowered as the
+                                 // cursor moves, so reading it is O(1) under the
+                                 // guard, never a per-tenant sum on the pass
+      unlink_remaining: usize,   // empty-set segments not yet popped (waiting on the
+                                 // checkpoint or on a pass — counting only those at
+                                 // or below the mark would cost a range count on
+                                 // every checkpoint advance, which §3.7 keeps O(1))
+                                 // plus entries reclaiming or uncertain — likewise an
+                                 // incremental counter, moved when a set empties and
+                                 // on every entry state change (eligible, reclaiming,
+                                 // uncertain, removed), O(1) to read.
+                                 // Both are the values as of the END of the ledger
+                                 // half that produced this struct (prepare's plan
+                                 // or commit's return), never re-derived off-lock
       floor: RetainFloor,        // derived on this pass (§3.2)
       lag_bytes: u64,            // §3.5's units, from per-segment accounting —
       lag_segments: usize,       // never from an inspection the cap would bound
@@ -1762,6 +1814,10 @@ memory, and nothing here claims to.
 > - **And** a batch queued before cut `E`'s capture and dequeued after it
 >   carries epoch `E` — assigned in `submit`, not at dequeue — so a panic in
 >   it fails cut `E`, not only later ones
+> - **And** a publisher panic with batches still queued behind the failing
+>   one latches only the failing batch's epoch, parks every queued batch in
+>   the buffers with its guard released, and a `quiesce_publishes` started
+>   during the panic returns; the next enqueue finds a respawned publisher
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -1969,6 +2025,15 @@ memory, and nothing here claims to.
 >   turn: the turn hands the captured cut to the barrier task, and an append
 >   admitted after the turn is neither in that cut's checkpoint nor in its
 >   snapshot
+> - **And** cuts are strictly ordered: with cut A's flush held at a
+>   fault-injection point and cut B captured behind it, B neither installs
+>   nor checkpoints before A's outcome; when A then fails, B is invalidated
+>   — no snapshot of B's is installed, no mark of B's is stamped, A's and
+>   B's records are all in the buffers — and the re-captured cut covers
+>   them all; when A succeeds instead, B runs unchanged
+> - **And** a failed publish refuses only cuts captured before its requeue:
+>   the first cut captured after the requeue stamps, so one transient
+>   failure cannot refuse every later cut
 > - **And** an age-sweep publish registered *after* the cut — between the
 >   barrier's `quiesce_publishes` and its checkpoint — that fails
 >   transiently or panics is neither covered by that checkpoint nor lost:

@@ -142,8 +142,10 @@ rotation adds one, the coordinator cannot know whether an append will rotate,
 and the overhead is one header per surviving segment — which does grow by
 24 B per rotation while the store is down, a quantity the limit's
 segment-size floor makes negligible against the bound and which no frame
-can inflate; the on-disk total exceeds the bound by exactly that much and
-by nothing else. **It survives a restart
+can inflate. This is a **segment-frame admission bound, not a directory
+cap**: the `CHECKPOINT` sidecar, its temp file and rotation partials
+awaiting RFC 0052's sweep are outside it, so `disk_bytes` can exceed the
+bound by those as well as by the headers. **It survives a restart
 by being rebuilt, not persisted, in the same unit.** Once replay and heal
 have settled the newest segment's tail — a torn frame there is truncated by
 heal and must not be counted — the figure is initialised as the sum over
@@ -206,6 +208,12 @@ the caller's responsibility because the caller is what holds the mutex.
   exposes `fn max_frame_bytes(&self) -> usize`, and the coordinator rejects
   `payload_len > max_frame_bytes()` as `TooLarge` before it reads
   `reclaim_state()` at all; the WAL's own check remains as the backstop.
+  The full admission order is one sequence, stated once: **max-frame
+  validation, then the terminal-rotation check, then the bound** — so an
+  oversize payload against a terminal WAL is `TooLarge`, a legal payload
+  against a terminal WAL is the terminal classification without a
+  `reclaim_state()` read, and only a legal payload against a healthy WAL
+  reaches the reservation. RFC0053.1 covers the combined case.
 
 There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
@@ -276,7 +284,11 @@ which a per-request check can do while `unreclaimed_bytes` is still below
 the limit, so the trigger is the latch and never `unreclaimed_bytes >=
 limit` — the pass it has just run reported `removed_segments == 0` in its
 `HousekeepingProgress` (RFC 0052 §3.7; temp-file cleanup and partial
-failures do not count), and the current segment holds at least one frame. That last
+failures do not count), and the current segment holds at least one frame.
+The rotation runs inside `CommitCoordinator::maintain`, and this RFC extends
+`HousekeepingProgress` with `forced_rotation: Option<Result<(),
+AppendError>>` so the outcome — retrying or terminal — surfaces through the
+same call the trigger reads `removed_segments` from. That last
 condition needs a state surface the inherited `ReclaimState` lacks —
 `unflushed_bytes` resets on every sync, so it cannot tell a synced current
 segment from an empty one — and this RFC adds one field to it:
@@ -352,10 +364,16 @@ the third put would duplicate the two objects already accepted. So each
 consuming call removes a partition from the recoverable batch only when its
 put has **succeeded**, its requeue has **completed**, or the sink has
 **permanently dropped** it under its own policy (the audit sink's
-permanent and derivation-failure path) — that drop is settlement too, at
-the same per-partition boundary, so a later panic neither resurrects a
-dropped group through the destructor nor loses it without a defined
-state — a partition whose
+permanent and derivation-failure path, and the record sink's RFC 0025
+§3.3 quarantine) — that drop is settlement too, at the same per-partition
+boundary, so a later panic neither resurrects a dropped group through the
+destructor nor loses it without a defined state. The record sink's
+quarantine has a second boundary of its own: `publish_owned` can quarantine
+some records and then issue a second put for the remainder, so the
+quarantined records are settled the moment they are quarantined and the
+remainder is settled when *its* put returns; a panic in that put requeues
+the remainder alone, and the one-duplicate bound holds per put — a
+partition whose
 put failed transiently is requeued at once, under the sink lock, before the
 next put starts, never parked in a local vector to be requeued after the
 loop as the record and audit paths do today, since a panic in a later
@@ -394,9 +412,13 @@ so that `Drop` can call the record sink's `requeue` and a new public
 `SharedParquetAuditSink::requeue_ahead` — prepending the recovered events
 ahead of concurrent emits and restoring the buffered gauge, which today only
 the private `BufferingAuditSink::requeue_ahead` does — on whatever is still
-present,
-and that `Drop` path is non-panicking — it recovers a poisoned sink lock
-rather than unwinding inside an unwind. A pre-call or
+present, **audit events first and records second**: the two buffers are
+locked independently, the audit barrier treats an empty audit buffer as
+"nothing pending", and a concurrent inline or size publish that observed
+the record buffer restored before the audit buffer would make the
+recovered rows visible ahead of their template events; and that `Drop`
+path is non-panicking — it recovers a poisoned sink lock rather than
+unwinding inside an unwind. A pre-call or
 inter-call unwind then requeues everything through the destructor, and a
 panic inside a call requeues the unsettled remainder through the call's own
 handle. What the design requires is that **no** panic arm anywhere in the
@@ -410,7 +432,13 @@ decrements the pending count, so `quiesce_encodes` reports idle and the
 barrier could stamp over records that never reached a sink. A worker's batch
 therefore takes the same recoverable shape — held by a guard that releases
 partitions as each publish returns and requeues the rest to the record sink
-on unwind — and RFC0053.2 asserts it with a panic inside a worker. Requeueing
+on unwind — and so does the inner emit path: `emit_concurrent` takes its
+record by value and can produce both a ceiling-taken and a size-taken batch,
+calling `publish_owned` twice, so a guard at the worker boundary alone could
+not reach the second batch or the in-flight record after the first call
+panicked; every batch the emit produces, and the record it holds, is owned
+by a guard until its put returns. RFC0053.2 asserts it with a panic inside a
+worker, and with a panic before the second trigger's batch is consumed. Requeueing
 the batch is worthless if the pool then swallows the next one, so both
 halves of worker recovery are stated: a worker whose `emit_concurrent`
 panics exits its OS thread today, and the pool's supervisor **respawns** it
@@ -419,7 +447,13 @@ and `EncodePool::submit` on a closed or full channel is an **error
 propagated to the ingest turn before the acknowledgement** — the WAL frame
 is durable, the client is told to retry, and the retry is a fresh frame
 under RFC0003.2's at-least-once contract — never a silently dropped
-`Vec<MinedRecord>` behind a success.
+`Vec<MinedRecord>` behind a success. Refusing is not enough on its own:
+`mine_batch_ordered` has already mutated the miner, and a later successful
+append can carry `last_durable` past the failed frame, after which a barrier
+would stamp past the only WAL copy. So the failed-submit path **requeues the
+mined batch to the record sink** — the same recoverable shape as an unwind —
+before it returns the error, and the next barrier drains and publishes it.
+RFC0053.2 covers a failed submit followed by a successful append.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -443,9 +477,11 @@ and RFC 0052 §3.1 adds the `cadence_failed` latch that keeps its timer from
 stamping past a dropped batch. Both are retired here, and the transition
 is explicit: with requeue-on-unwind a recovered panic sets nothing, so
 `cadence_failed` ceases to exist as a barrier guard — RFC 0052's contract is
-amended by this RFC to remove it, RFC0052.1's latch clause with it, and a
-latch set by a pre-RFC 0053 process clears on the restart that deploys
-this — while the `cadence_panic` counter #795 added stays,
+amended by this RFC to remove it: §3.1's latch, RFC0052.1's latch clause,
+§3.5's receiver-exported item and RFC0052.7's assertion of it all go
+together, so the two RFCs can be implemented together, and a latch set by a
+pre-RFC 0053 process clears on the restart that deploys this — while the
+`cadence_panic` counter #795 added stays,
 now meaning "a step panicked and was retried" rather than "the cadence is
 dead". Only a *panicking* `JoinError` continues the sweep; a cancelled one is
 the runtime going away and still terminates it, exactly as today, so an
@@ -456,9 +492,17 @@ not satisfy this section.
 
 RFC 0052 §3.5 already exports the measurement this RFC's bound is taken on and
 the floor state that explains a bound that will not clear. This RFC adds the
-backpressure state itself — whether the node is currently refusing on the
-bound, and the limit and measurement at the last refusal — and a log event on
-entering and leaving that state. Names come from the shared `ourios-semconv`
+backpressure state itself, named for what it is: a **refusal latch** (set
+by a refused reservation, cleared as §3.1 defines), the limit and
+measurement at the last refusal, and a separate `capacity_remaining` gauge
+— because admission is per request, a cleared latch at 900 of 1,000 bytes
+still refuses a 200-byte batch, and a dashboard must not read `0` as "every
+request is admitted" — and a log event on entering and leaving the latch.
+Transitions can happen entirely on request paths between ticks (a refusal
+and then a smaller successful append), so the coordinator **queues each
+transition atomically at the call site** and RFC 0052's single emitter
+drains that queue on its tick rather than sampling the state; RFC0053.5
+counts every transition. Names come from the shared `ourios-semconv`
 registry in one bump with RFC 0052's, not hand-written, and `error.type`
 continues to carry the failure class on existing counters rather than
 spawning per-error metrics.
@@ -529,8 +573,13 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
 >   without an append ever arriving
-> - **And** under concurrent submits the sum of admitted frame bytes never
->   exceeds the limit, so two batches cannot both observe room
+> - **And** under concurrent submits the live unreclaimed total — admitted
+>   frame bytes not yet reclaimed, not a cumulative sum reclamation would
+>   legitimately let grow — never exceeds the limit, so two batches cannot
+>   both observe room
+> - **And** an oversize payload against a terminal WAL is `TooLarge`, and a
+>   legal payload against a terminal WAL is the terminal classification with
+>   no `reclaim_state()` read — the admission order §3.1 states
 
 > **Scenario RFC0053.2 — A publish unwind keeps the records**
 > - **Given** a cadence step whose publish panics after the batches have been
@@ -649,9 +698,12 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   no torn tail and a remeasure hook placed only on the heal path would pass
   it — with a small backpressure
   bound configured so the kill lands in the refusing regime, and a
-  post-restart append that asserts the rebuilt figure still refuses; a
-  fault-injected leg makes the remeasure's listing fail and asserts startup
-  refuses to construct the coordinator.
+  post-restart append that asserts the rebuilt figure still refuses, and
+  an exact-figure assertion against a fixture with several closed segments,
+  a header-only current segment and a torn newest tail — a refused-stays-
+  refused check alone would pass a remeasure that counted headers or torn
+  bytes; a fault-injected leg makes the remeasure's listing fail and asserts
+  startup refuses to construct the coordinator.
 - **Telemetry (RFC0053.5)** — the in-memory metric exporter pattern used for
   the ingest instruments, driving one enter and one leave and asserting the
   gauge, the last-refusal figures and exactly one event per transition; plus

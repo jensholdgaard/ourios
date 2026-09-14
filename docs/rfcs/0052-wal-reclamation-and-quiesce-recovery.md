@@ -198,7 +198,13 @@ those bytes, and the checkpoint all run *outside* the exclusion. Snapshot
 *installation* is serialised even so: every snapshot file carries that
 tenant's own last folded frame from the cut (per-tenant marks, never the
 checkpoint's global mark — a tenant with no frame near the cut must not be
-stamped past frames it has not folded), each writer uses a **unique** temp
+stamped past frames it has not folded). Those marks have a receiver-side
+source, since the WAL ledger says which frames exist and not which were
+folded — a frame whose group fsync failed is in the WAL, never acknowledged
+and never mined: each ingest turn advances the tenant's **folded horizon**
+to its own frame offset after its mining step, the cut captures those
+horizons, and the WAL ledger stays the eligibility source only. Each writer
+uses a **unique** temp
 name (`<tenant>.<mark>.snap.tmp`, since today's one fixed `.snap.tmp` could
 be truncated or interleaved by a concurrent cut before either rename), the
 whole temp write, fsync and rename runs under a snapshot-install lock
@@ -488,6 +494,15 @@ frames in `append_batch`, and `remeasure_unreclaimed()` rebuilds the ledger
 from every surviving frame's prefix at the end of recovery; the receiver
 passes only what it knows — the per-tenant snapshot horizons, or "no
 consumer" — and the WAL derives `RetainFloor` from the two and reports it.
+The accounting is frame-kind-specific: only `TenantOtlpBatch` frames carry
+tenant membership and drive the per-tenant horizon rule, because they are
+what a restart re-mines. `AuditEvent` frames are governed by the checkpoint
+alone — their consumer is the audit sink, which the barrier drains before it
+stamps, so an audit frame at or below `X` is published and reclaimable and
+one above `X` is retained by the checkpoint rule with no snapshot horizon
+involved; a segment holding only a pinned tenant's audit frames is
+reclaimable once below `X`, since the pin protects re-mining input and audit
+frames are not that.
 Membership is per surviving segment, so the ledger has a lifecycle. Each
 segment carries, per tenant, the `WalOffset` of that tenant's **first and
 last** frame in it — the first is what `Pinned.offset` needs, the last is
@@ -540,16 +555,15 @@ RFC adds a parent fsync on creation — which makes every entry the listing
 saw durable, the one property the listing lacks. This is an explicit
 operation, `snapshot_store::load_all_durable()`, which fsyncs before it
 lists, treats a missing `snapshots_root` as the empty store (a cold start
-has no directory yet, and that is not a durability failure), and returns a
-**non-fatal** `SnapshotLoad::Discarded { reason }` rather than the
-`RecoveryDriverError::Store` today's recovery propagates before replay — so
-an implementation can neither keep trusting the bare listing nor abort on
-the fsync error: if either fsync fails every listed horizon is discarded
-**and so is the restored miner state** — the node starts empty and replays
-every surviving frame — so each tenant with surviving frames pins the floor
-at its oldest surviving frame until a later snapshot write succeeds. Keeping the state while discarding its
-horizon would leave replay without an `S` gate and double-apply every frame
-the snapshot had already folded. One directory fsync rather than a manifest, because a manifest
+has no directory yet, and that is not a durability failure), and **fails
+startup** when either fsync fails, as a `RecoveryDriverError` — so an
+implementation cannot keep trusting the bare listing. An earlier draft
+discarded every snapshot and started empty instead; that is not fail-closed
+once reclamation is live, because a tenant's older durable snapshot may be
+the only thing that can rebuild its state, the frames below that horizon
+being gone, and a node that starts empty then replays a tail that cannot
+restore it. A disk that cannot fsync the snapshots directory at startup is
+a fault to surface, not to continue past. One directory fsync rather than a manifest, because a manifest
 would need the same fsync to be trustworthy itself. Durability is necessary
 and not sufficient: `snapshot_store::load_all` returns raw bytes, and a
 horizon is admitted only from a snapshot that decodes and restores. A listed
@@ -958,10 +972,12 @@ So the design is:
                              // includes its oldest surviving frame
   }
 
-  fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, AppendError>
-                                                           // returns the offset
-                                                           // Wal::append already
-                                                           // produces (§3.1's mark)
+  fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError>
+                                                           // the ReceiveError boundary the
+                                                           // coordinator and both transports
+                                                           // classify against is kept; only
+                                                           // the offset Wal::append already
+                                                           // produces is added (§3.1's mark)
   fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError>
   enum SnapshotHorizons { NoConsumer, Known(HashMap<TenantId, WalOffset>) }
   fn housekeeping(&mut self, horizons: &SnapshotHorizons, max_unlinks: usize)
@@ -1125,13 +1141,19 @@ and a pass that inspected only the oldest few would stop at the pinned one
 every tick and never reach the eligible one. It is also no longer needed:
 everything a header read supplied — the segment's highest offset, each
 tenant's last offset in it, its frame bytes — lives in the per-segment ledger
-the WAL maintains in memory (§3.2), so eligibility is evaluated over *all*
-surviving segments from the ledger, an O(n) memory pass with no per-file
-I/O, and only the unlinks are capped. What the cap does **not** bound is the
-name listing and that memory pass: both are O(n) in segments and stay under
-the mutex, but neither touches a file — a fraction of a millisecond at the
-incident's 1,113 entries, against 1,113 unlinks and fsyncs. RFC0052.12 is
-worded to that guarantee. The next tick continues where this one left off
+the WAL maintains in memory (§3.2). An O(n) walk of that ledger under the
+writer lock would still not be a bound — `n` is exactly what a pinned tenant
+or a store outage leaves unbounded — so eligibility is **indexed
+incrementally** rather than evaluated per pass: the WAL keeps, per segment,
+the set of tenants whose horizon is still below their last offset in it;
+applying new horizons (the `SnapshotHorizons` input, under the mutex)
+shrinks those sets for the segments those tenants span, and a segment whose
+set is empty and whose highest offset is at or below the checkpoint moves to
+an **eligible queue**. The pass pops at most `max_unlinks` from that queue —
+O(cap) under the writer lock, with no name listing, since segments are known
+from the ledger — and the horizon application costs are proportional to the
+horizons that changed, which on an idle pinned backlog is nothing.
+RFC0052.12 is worded to that guarantee. The next tick continues where this one left off
 without a cursor, because eligibility is recomputed from the ledger each
 time and the eligible segments are taken oldest first. That matters most on
 the *first* pass of a node that has never reclaimed — the incident node held
@@ -1304,13 +1326,11 @@ memory, and nothing here claims to.
 >   incident's 1,113 segments is the shape)
 > - **When** a housekeeping pass runs
 > - **Then** it unlinks at most the cap and returns, having read no segment
->   header at all — eligibility comes from the in-memory ledger — and the
->   only O(n) steps are the name listing and that memory pass, neither of
->   which touches a file; an append taken concurrently waits for the capped
->   unlinks plus that pass, whose work bound is deterministic — each ledger
->   entry is touched exactly once and no file is opened — and whose
->   wall-clock cost at 10,000 entries is recorded by the bench as a
->   diagnostic, not asserted as a gate
+>   header and listed no directory — eligibility comes from the incremental
+>   index, and the pass pops at most the cap from the eligible queue — so an
+>   append taken concurrently waits for O(cap) work under the writer lock
+>   whatever the backlog; applying changed horizons costs work proportional
+>   to those horizons, and an unchanged pinned backlog costs none
 > - **And** a pinned oldest segment does not shadow a later eligible one: the
 >   pass reclaims the eligible segment on its first tick
 > - **And** successive passes drain the backlog to the same end state an
@@ -1383,10 +1403,11 @@ memory, and nothing here claims to.
 >   never unlink its frame — while a later segment holding none of its
 >   frames is reclaimed
 > - **And** a snapshot listed at startup is used as a horizon only after the
->   snapshots root has been fsynced in this process; a failed startup fsync
->   pins every tenant at its oldest surviving frame **and restores no miner
->   state**, so a horizon whose directory entry may not be durable never
->   governs reclamation and no frame is double-applied
+>   snapshots root and its parent have been fsynced in this process; a failed
+>   startup fsync **fails startup** rather than discarding snapshots whose
+>   frames reclamation may already have removed, so a horizon whose directory
+>   entry may not be durable never governs reclamation and no state that
+>   only a snapshot could rebuild is thrown away
 > - **And** the state is exported (§3.5), so an operator seeing a WAL that
 >   will not shrink can tell it is a pinning tenant rather than an
 >   unexplained stall

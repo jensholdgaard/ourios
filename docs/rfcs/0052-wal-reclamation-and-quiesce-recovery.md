@@ -276,12 +276,33 @@ order: the worker, inside `emit_concurrent`, registers the publish guard
 **before** it enqueues and before its own `BatchGuard` can settle, so at no
 instant is a pre-cut record outside both the buffers and the in-flight set
 — that ordering is the invariant the checkpoint argument rests on; the
-queue carries the guard with the batch;
-the publisher runs `write_ordered` on it — audit barrier first, then the
-records — and settles the guard on its outcome: durable, or requeued into
-the buffers under the sink lock on a transient failure (where the next
+queue carries the guard with the batch.
+What the queue carries is **not** a `Drained`: that value is the audit
+buffer's own snapshot taken under the miner lock beside the records, and a
+worker holds neither — it sees `MinedRecord`s after their template events
+were already emitted into the audit sink. So the queue's item is
+`PublishItem::{ Drained(Drained), Detached { records, guard,
+audit_watermark } }`. The `Drained` arm is the age sweep's and the
+barrier's existing value, written by `write_ordered` unchanged. The
+`Detached` arm carries the **audit-sink position observed under the miner
+lock at detach time** — the count of events the sink has accepted for that
+tenant when the partition left the buffers, which is at or above every
+event the partition's records produced, since emission precedes the
+append. Before writing a detached partition the publisher drains and
+writes the audit buffer up to at least that watermark, ordered ahead of
+the records and under the sink lock, so audit-before-record (issue #302)
+holds for this path exactly as `write_ordered`'s audit-first step gives it
+for `Drained`. The sink lock serialises that against a concurrent age
+drain: whichever takes the lock first writes its audit prefix, and a drain
+that took the buffer already satisfies a lower watermark, so the publisher
+finds nothing left to write and proceeds. The publisher then settles the
+guard on the outcome: durable, or requeued into the
+buffers under the sink lock on a transient failure (where the next
 drain or flush covers it), or quarantined per record on a poison rejection,
-or, on an unwind, latched (§3.1's guard rule) and settled. The worker moves
+or, on an unwind, latched (§3.1's guard rule) and settled. An audit write
+that fails transiently is the same refusal `write_ordered` already makes:
+the records are not published, they requeue, and the guard settles on the
+requeue. The worker moves
 to its next record as soon as the enqueue returns, so it is never inside a
 PUT, the quiesce waits on encodes alone, and the PUTs settle outside the
 exclusion under `quiesce_publishes` like any other. At shutdown the order
@@ -299,6 +320,16 @@ buffers as `ready` partitions, releasing each guard as its records land,
 and only then exits; the coordinator respawns it on the next enqueue.
 `quiesce_publishes` therefore always terminates: every guard is settled
 by a durable write, a requeue, a park, or the failing batch's own drop.
+The worker's side of that window is defined too, because a send can fail
+after the publisher drained the queue and dropped the receiver, and the
+batch is then in no panic at all — a bare guard drop would settle it
+silently and the checkpoint would stamp over records in neither the
+buffers nor the store. So a failed send **returns the item to the
+worker**, which parks the batch into the buffers as a `ready` partition
+under the sink lock *before* releasing its guard — the same park the full
+queue takes — and signals the coordinator to respawn the publisher. No
+path releases a publish guard without the records being durable,
+requeued, or parked.
 RFC 0053's requeue-on-unwind replaces only the failing batch's arm of
 this; the thread, the queue, the drain-on-unwind and the
 guard-before-enqueue order stay. The barrier — reads the mark, drains
@@ -612,6 +643,8 @@ The caller is the receiver role, on its own interval:
 ```text
 every barrier_secs (default: the sink age trigger, 300 s):
     if failed_epoch <= barrier_epoch: skip // §3.1's latch; housekeeping below still runs
+                                           // (RFC 0053 §3.2 replaces this guard with
+                                           //  proceed-and-decide once its requeue exists)
     cut = with_barrier_exclusion:          // a NEW pipeline lock, not the miner
                                            // lock and not the gate — see §3.1
         quiesce_encodes()                  // the barrier's prologue: every pre-cut
@@ -680,7 +713,22 @@ the sweep, and from each other: the sweep's stop-on-panic (#795) must not
 stop reclamation, and a panic in a barrier step — or in the sweep's own
 step, or in an encode worker (§3.1's three latching paths) — sets
 `cadence_failed` and leaves the housekeeping loop running housekeeping-only
-passes, which is the branch the pseudocode's skip relies on. The sweep's
+passes, which is the branch the pseudocode's skip relies on. That promise
+needs an owner, since the per-batch guards cover only what a batch holds
+and a panic between them would still kill the task: **each task runs every
+tick under `catch_unwind`**. A barrier tick that panics stores
+`failed_epoch = min(failed_epoch, this tick's epoch)` — the same CAS the
+guards use, so the cut and every later one are refused until §3.1's clear
+— invalidates the pending slot by the rule above, and the task takes the
+next tick. A housekeeping tick that panics counts on the existing cadence
+counter with `error.type = cadence_panic` (§3.5's naming rule: the class
+rides `error.type`, not a new metric) and takes the next tick; any
+uncommitted plan is re-planned by the next `housekeeping_prepare`, which
+is exactly the case §3.7 already defines. At shutdown a `JoinError` from
+either task is logged and read as a failed cut — no stamp, nothing
+assumed drained — rather than as a clean join. The sweep keeps #795's
+stop-on-panic until RFC 0053 makes it survivable; what changes here is
+that stopping the sweep no longer stops reclamation or the barrier. The sweep's
 panic is the one #795 already stops the sweep on; what this RFC adds is that
 the same unwind now latches *before* the sweep's publish guard drops, so the
 barrier that #795 could not foresee cannot stamp past the batch the panic
@@ -963,13 +1011,24 @@ one, because startup's fallback is exactly as trustworthy as this record:
   other way: a post-RFC node can checkpoint many times while reclaiming
   nothing, and deleting that checkpoint would otherwise read as a fresh
   root and replay published rows. So the record header carries a
-  **`checkpoint_seen`** flag, set — with the record rewritten durably —
-  *before* the first version-2 `CHECKPOINT` is written on that root; one
-  extra record write, once per root. `RECLAIM{checkpoint_seen}` with
-  `CHECKPOINT` absent fails closed, naming both files, whatever the entries
-  say; only a record with the flag unset may coexist with a missing
-  `CHECKPOINT`, and that is exactly a post-RFC root before its first
-  barrier, which is what open creates.
+  **two-state witness**, because one flag written before the checkpoint
+  would make the window between that write and the checkpoint's rename
+  read as a lost checkpoint — a crash there is ordinary, not corruption.
+  `checkpoint_armed` is written, durably, before the first version-2
+  `CHECKPOINT` **attempt**; `checkpoint_seen` is written at the next record
+  write after that checkpoint **succeeded** (the next pass's write, or an
+  immediate one when no pass is pending), and once seen the flag never
+  clears. The matrix reads them in that order: `seen` with `CHECKPOINT`
+  absent is a lost checkpoint and fails closed, naming both files, whatever
+  the entries say; `armed` without `seen` and `CHECKPOINT` absent is the
+  crash window and is **recoverable** — the root is fresh, the record is
+  opened empty and re-armed by the next attempt; neither flag with
+  `CHECKPOINT` absent is the post-RFC root before its first barrier, which
+  is what open creates. Entries and `seen` cannot disagree, since every
+  unlink is gated on a checkpoint that must have succeeded to produce
+  them. **RFC 0053 adds `PUBLISHED` to this matrix** on the same footing:
+  its §3.2 makes a missing `PUBLISHED` beside a version-2 `CHECKPOINT`
+  fail-closed like a missing `RECLAIM`.
 - **Corrupt is fatal.** The record carries a version byte and a checksum; a
   record failing either at open fails startup as `OpenError::Corrupt`,
   naming the file. It is not read as missing: missing means "never
@@ -1811,6 +1870,13 @@ memory, and nothing here claims to.
 >   the worker's panic, under every schedule: a barrier that observes the
 >   pool's pending count at zero has observed the latch, because the
 >   unwinding guard stores it before the decrement that settles the count
+> - **And** a panic in the barrier tick itself — outside any batch guard —
+>   lowers `failed_epoch` to that tick's epoch, invalidates the pending
+>   slot, and the barrier task takes the next tick; a panic in a
+>   housekeeping tick counts with `error.type = cadence_panic`, leaves the
+>   checkpoint untouched, and the next pass re-plans the uncommitted plan;
+>   a `JoinError` from either task at shutdown is logged and read as a
+>   failed cut
 > - **And** a batch queued before cut `E`'s capture and dequeued after it
 >   carries epoch `E` — assigned in `submit`, not at dequeue — so a panic in
 >   it fails cut `E`, not only later ones
@@ -1818,6 +1884,10 @@ memory, and nothing here claims to.
 >   one latches only the failing batch's epoch, parks every queued batch in
 >   the buffers with its guard released, and a `quiesce_publishes` started
 >   during the panic returns; the next enqueue finds a respawned publisher
+> - **And** a worker whose send fails on a closed channel parks that batch
+>   in the buffers under the sink lock before releasing its guard, so the
+>   records are covered by the next drain rather than silently settled, and
+>   the publisher is respawned
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -2126,10 +2196,14 @@ memory, and nothing here claims to.
 > - **And** a root holding a version-1 `CHECKPOINT` (an RFC0008.7 fixture)
 >   and no `RECLAIM` opens as pre-RFC with an empty record, and its first
 >   checkpoint rewrites the sidecar at version 2
-> - **And** a root whose `RECLAIM` carries `checkpoint_seen` — set before its
->   first version-2 checkpoint, entries or none — and whose `CHECKPOINT` is
->   missing fails open naming both files, while a `RECLAIM` with the flag
->   unset beside a missing `CHECKPOINT` opens as a fresh post-RFC root
+> - **And** a root whose `RECLAIM` carries `checkpoint_seen` — written after
+>   its first version-2 checkpoint succeeded, entries or none — and whose
+>   `CHECKPOINT` is missing fails open naming both files
+> - **And** a root whose `RECLAIM` carries `checkpoint_armed` but not
+>   `checkpoint_seen` with `CHECKPOINT` absent — a crash in the window
+>   between arming and the checkpoint's rename — opens as a fresh root with
+>   an empty record and is re-armed by the next attempt, and a `RECLAIM`
+>   with neither flag beside a missing `CHECKPOINT` opens the same way
 > - **And** a segment whose `unlink` fails after the record was written
 >   stays on disk with `reclaimed_through` behind it: a restart with that
 >   tenant's snapshot undecodable pins the tenant rather than halting
@@ -2340,7 +2414,18 @@ they are not substitutes for the rest.
 - PR #795 — counts a cadence panic (makes a dead sweep alertable;
   deliberately still stops, pending RFC0053.2).
 - RFC 0053 — WAL backpressure and unwind safety; the stage that depends on
-  this one.
+  this one, and which **amends** this RFC in two places:
+  - *RFC 0053 §3.2* amends §3.7's `Journal` surface and this RFC's sidecar
+    layout: `checkpoint` takes a per-tenant published map, `fn
+    checkpoint(&mut self, durable_to: WalOffset, published: &HashMap<TenantId,
+    WalOffset>)`, persisted to a `PUBLISHED` sidecar written before
+    `CHECKPOINT` in the same call, and joining §3.2's sidecar matrix on the
+    same fail-closed footing as `RECLAIM`.
+  - *RFC 0053 §3.2* also replaces the timer's pre-cut guard — §3.2's `if
+    failed_epoch <= barrier_epoch: skip` — with proceed-and-decide, once its
+    requeue makes the panicked batch's records available to the next cut's
+    drain; the "only a restart clears it" wording in §3.1, RFC0052.1 and
+    RFC0052.7 is amended with it.
 - RFC 0008 §6.5 (rotation), §6.6 (recovery horizon), §6.7 (checkpoint
   and housekeeping), §6.8 (counters), §6.9 (tunables) — the mechanism
   this RFC supplies the policy for; §6.5's durable-entry-first rule and

@@ -152,8 +152,11 @@ heal path, which a clean replay never enters — and the coordinator is
 constructed after recovery, so the seed completes before any append is
 admitted and a node restarted mid-outage resumes refusing at the same bound
 rather than admitting from zero. The same hook seeds the current segment's
-frame bytes (§3.1's rotation trigger) from the healed newest segment.
-RFC0053.4's restart asserts that.
+frame bytes (§3.1's rotation trigger) from the healed newest segment. And
+it fails closed: a listing, stat or header error from the remeasure fails
+startup before the coordinator or any listener is constructed, because a
+partial or zero seed is precisely a node that admits past its bound.
+RFC0053.4's restart asserts both.
 
 The age of the oldest unreclaimed frame is exported beside it (RFC 0052 §3.5)
 and is the right thing to *alert* on, but it is not an admission rule: an age
@@ -323,9 +326,14 @@ asserted by RFC0053.2. The bound holds only because settlement is
 **per partition**, stated below: a drained batch spans several record
 partitions and audit groups, and requeueing the whole batch after a panic in
 the third put would duplicate the two objects already accepted. So each
-consuming call removes a partition from the recoverable batch the moment its
-put has returned, and an unwind requeues only the partition in flight and the
-ones not yet started — one ambiguous put, hence one possible duplicate. Making the publish idempotent — a drain-time object
+consuming call removes a partition from the recoverable batch only when its
+put has **succeeded** or its requeue has **completed** — a partition whose
+put failed transiently is requeued at once, under the sink lock, before the
+next put starts, never parked in a local vector to be requeued after the
+loop as the record and audit paths do today, since a panic in a later
+partition would drop that vector. An unwind then requeues only the
+partition in flight and the ones not yet started — one ambiguous put, hence
+one possible duplicate. Making the publish idempotent — a drain-time object
 key a requeued batch reuses — is a §7 question rather than part of this
 design, because a requeued batch is re-drained together with whatever arrived
 since and the key would have to survive that merge.
@@ -480,6 +488,9 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a panic in the third of several partition puts requeues only the
 >   third and any not yet started; the two accepted objects are not written
 >   again
+> - **And** a transient failure on the first put followed by a panic on the
+>   third leaves the first partition requeued too: a failed partition is
+>   never outside the recoverable batch while it awaits requeue
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
@@ -507,6 +518,8 @@ are kept distinct so that the remedy each advertises is the true one.
 >   batch is present in Parquet or in the WAL
 > - **And** the restarted node's admission starts from the rebuilt unreclaimed
 >   figure, so a batch the bound refused before the kill is refused after it
+> - **And** a restart whose remeasure fails does not come up: no coordinator,
+>   no listener, and no batch admitted
 
 > **Scenario RFC0053.5 — The backpressure state is observable**
 > - **Given** a node that enters and then leaves the refusing state
@@ -545,12 +558,15 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   The point is also parameterised **across partitions** — a drained batch of
   several partitions with the panic in the first, a middle and the last put —
   asserting the accepted objects are not written again and the store holds
-  at most one duplicate. RFC0053.3 drives many consecutive panicking ticks
+  at most one duplicate; one leg fails the first put transiently and panics
+  on a later one, asserting the failed partition is back in its buffer. RFC0053.3 drives many consecutive panicking ticks
   and asserts the record count is conserved.
 - **No loss (RFC0053.4)** — extends RFC 0052's `SIGKILL` crash-recovery
   extension rather than adding a parallel one, with a small backpressure
   bound configured so the kill lands in the refusing regime, and a
-  post-restart append that asserts the rebuilt figure still refuses.
+  post-restart append that asserts the rebuilt figure still refuses; a
+  fault-injected leg makes the remeasure's listing fail and asserts startup
+  refuses to construct the coordinator.
 - **Telemetry (RFC0053.5)** — the in-memory metric exporter pattern used for
   the ingest instruments, driving one enter and one leave and asserting the
   gauge, the last-refusal figures and exactly one event per transition; plus

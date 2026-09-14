@@ -266,8 +266,16 @@ detached partition **back into the sink's buffers as a `ready` partition**
 — still under the sink's byte accounting, excluded from the size trigger
 (it is already past it), and taken by the publisher, oldest first, as the
 queue drains, or by the next drain or flush like any buffered partition —
-and moves on. Parked records are in the buffers, so they are covered by
-every cut's drain and need no guard; the queue depth and the parked
+and moves on. A `ready` partition is **not** a plain record partition: it
+keeps its `audit_watermark`, carried in the buffer entry beside the
+records, because parking must not strip the dependency that makes the
+records publishable. Every consumer of a `ready` partition — the
+publisher, an age drain, the barrier's own flush — honours the same
+wait-or-write rule §3.1 states below: the events up to that watermark must
+be durable before the records are written, and a `Drained` that includes a
+`ready` partition carries the maximum watermark over the partitions it
+took. Parked records are in the buffers, so they are covered by
+every cut's drain and need no publish guard; the queue depth and the parked
 partition count are exported (an UpDownCounter and a gauge, registry
 names in the one bump) as the mechanism's only signal — RFC 0053 owns the
 client-facing bound, and nothing here refuses a client. Ownership of a
@@ -289,9 +297,18 @@ detach therefore happens outside a guard's lifetime: the guard exists
 before the turn releases the exclusion, so every partition the batch
 detaches is in the in-flight set from the instant it leaves the buffers,
 and a cut captured at any point either drains it or waits for it. One
-guard per batch covers however many partitions that batch detaches, which
-is also why `emit_concurrent` needs no registration of its own; the
-queue carries the guard with the batch.
+guard per batch covers however many partitions that batch detaches — and
+a batch detaches them one at a time, each going to a different queue slot,
+so the guard cannot be *moved* into any single item. It is therefore a
+**shared completion**: an `Arc` created at `submit` holding the publish
+guard and a count, incremented once per detach and decremented once per
+completion (durable, requeued, parked, or dropped), settling the guard
+when the count returns to zero *and* the batch's encode phase has ended —
+so a batch that detaches nothing settles at the end of its own loop, and
+one that detaches five settles when the last of the five finishes,
+whichever order they finish in. Each `Detached` item carries a handle to
+that completion, which is also why `emit_concurrent` needs no registration
+of its own; the queue carries the handle with the records.
 What the queue carries is **not** a `Drained`: that value is the audit
 buffer's own snapshot taken under the miner lock beside the records, and a
 worker holds neither — it sees `MinedRecord`s after their template events
@@ -731,6 +748,20 @@ every housekeeping_secs (default 60 s), in its own task:
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
+**Housekeeping does nothing until the witness exists.** The two timers are
+independent, so on a legacy root the housekeeping timer can fire before the
+first barrier has upgraded the sidecar — and reclaiming there would unlink
+segments under a version-1 checkpoint, the one shape §3.2's matrix reads as
+"nothing was ever reclaimed". So a pass whose root still has a version-1
+`CHECKPOINT`, or no `RECLAIM` record, **plans nothing and unlinks
+nothing**: it returns a progress with `capped` false and zero counts,
+counted as a skipped pass with its reason on the existing cadence counter
+(`error.type` carries the reason, §3.5's rule), and the partial sweep is
+skipped with it, since a partial unlink is also a reclamation. The first
+barrier's checkpoint establishes the witness and the next pass runs
+normally. This is not a new gate so much as a narrower one: today's
+`housekeeping` is already a no-op before the first checkpoint.
+
 **The timers have the age sweep's shutdown lifecycle but not its task.**
 Both loops are owned by the receiver, signalled by the same shutdown watch
 the sweep observes, and joined **before** the final flush and snapshot, in
@@ -1016,13 +1047,30 @@ one, because startup's fallback is exactly as trustworthy as this record:
   `Wal::checkpoint` is unreachable from the pipeline today (#793), but the
   RFC0008.7 tests and the crash fixture write one, and a root with a
   version-1 `CHECKPOINT` and no `RECLAIM` is a legitimate pre-RFC root, not
-  a lost record. So this RFC bumps the sidecar's `VERSION` field (the `u16`
+  a lost record. The legacy branch rests on a deployment invariant worth
+  stating, because `Wal::housekeeping` is public and *does* unlink under a
+  version-1 checkpoint when called: **no production path calls it** — the
+  only callers in the tree are `ourios-wal`'s own tests and the crash
+  fixture (#793 is exactly that finding), so no served root can have
+  reclaimed under version 1. The invariant is belted rather than trusted:
+  on a legacy root, a tenant whose snapshot is missing *and* whose oldest
+  surviving frame is above its last recorded snapshot horizon fails closed,
+  naming the tenant — the stale-gap shape, which is what reclamation under
+  a version-1 checkpoint would leave behind — so a hand-built or
+  test-derived root that did reclaim is caught rather than silently pinned. So this RFC bumps the sidecar's `VERSION` field (the `u16`
   at bytes 4–6 of the 32-byte `OWCK` record, 1 today) to 2, and the read
   path accepts both: a version-1 `CHECKPOINT` with `RECLAIM` absent is a
   pre-RFC root — nothing was ever reclaimed on it (#793) — opened **without
   creating a record**, and its `CHECKPOINT` is rewritten at version 2 by the
   first checkpoint, the record being created (empty, armed) on that same
-  path. Creating it eagerly at open would leave a state the matrix cannot
+  path. That upgrade is **version-aware, not mark-aware**: `Wal::checkpoint`
+  returns `Ok(())` without writing when the offered mark equals the current
+  one, which on an idle node is every barrier after the first, so a root
+  whose first barrier stamps an unchanged mark would never reach version 2
+  and housekeeping would stay skipped forever. So an equal mark still
+  rewrites the sidecar — and arms the record — whenever the on-disk version
+  is 1; only an equal mark on an already-version-2 sidecar keeps the
+  no-write fast path. Creating it eagerly at open would leave a state the matrix cannot
   read — a version-1 `CHECKPOINT` beside an unarmed `RECLAIM` — for as long
   as the node runs before its first barrier; deferring the creation to the
   upgrade keeps a restart in that window on the legacy branch, which is
@@ -1053,11 +1101,15 @@ one, because startup's fallback is exactly as trustworthy as this record:
   immediate one when no pass is pending), and once seen the flag never
   clears. The matrix reads them in that order: `seen` with `CHECKPOINT`
   absent is a lost checkpoint and fails closed, naming both files, whatever
-  the entries say; `armed` without `seen` and `CHECKPOINT` absent is the
-  crash window and is **recoverable** — the root is fresh, the record is
-  opened empty and re-armed by the next attempt; neither flag with
-  `CHECKPOINT` absent is the post-RFC root before its first barrier, which
-  is what open creates. Entries and `seen` cannot disagree, since every
+  the entries say; `armed` without `seen` and `CHECKPOINT` **present** at
+  version 2 is the ordinary post-upgrade state — the checkpoint is durable,
+  the crash simply landed before the record's next write — so open promotes
+  it, setting `seen` durably before anything reads the matrix, and it is
+  never a fault; `armed` without `seen` and `CHECKPOINT` absent is the
+  crash window *before* the rename and is **recoverable** — the root is
+  fresh, the record is opened empty and re-armed by the next attempt;
+  neither flag with `CHECKPOINT` absent is the post-RFC root before its
+  first barrier, which is what open creates. Entries and `seen` cannot disagree, since every
   unlink is gated on a checkpoint that must have succeeded to produce
   them. **RFC 0053 adds `PUBLISHED` to this matrix** on the same footing:
   its §3.2 makes a missing `PUBLISHED` beside a version-2 `CHECKPOINT`
@@ -1768,10 +1820,15 @@ So the design is:
   would turn a disk-space problem into an availability one.
 
 **One consequence worth naming.** Housekeeping takes the single-writer
-position, so every append stalls for the duration of the directory walk plus
-the unlinks. Running it on the blocking pool does **not** help: the stall is
-caused by holding the journal mutex, not by occupying a runtime worker, so
-moving the work to another thread while still holding the lock bounds nothing.
+position for its ledger half, so every append stalls for that half's
+duration — which is why §3.2 and §3.7 put the whole file half (the
+`RECLAIM` write, the unlinks and the parent fsync) *outside* the journal
+mutex, between `housekeeping_prepare` and `housekeeping_commit`, and why
+the ledger half does no directory walk at all. Running the file half on
+the blocking pool while still holding the lock would bound nothing: the
+stall is caused by holding the journal mutex, not by occupying a runtime
+worker. What remains under the lock is the capped ledger work RFC0052.12
+bounds.
 
 The pass is therefore **capped on the unlinks, and the eligibility
 evaluation costs no I/O at all.** The current path enumerates and sorts every
@@ -1918,6 +1975,9 @@ memory, and nothing here claims to.
 >   guard was created in `submit` before the exclusion was released, so the
 >   cut waits for it rather than stamping past it, and a batch that
 >   detaches nothing releases its guard unused
+> - **And** a batch that detaches several partitions settles its guard only
+>   when the last of them completes, in any completion order, so a cut
+>   started after the first completes still waits for the rest
 > - **And** a publisher panic with batches still queued behind the failing
 >   one latches only the failing batch's epoch, parks every queued batch in
 >   the buffers with its guard released, and a `quiesce_publishes` started
@@ -2134,6 +2194,9 @@ memory, and nothing here claims to.
 >   has its remaining records in the cut, under any interleaving: the
 >   quiesce waits for the batch's encode phase, not for a worker to register
 >   a publish, and the detached partition's PUT is not waited on
+> - **And** with several partitions detached from one pre-cut batch and
+>   completing in any order, the cut covers every record: the batch's shared
+>   completion holds the in-flight count until the last of them finishes
 > - **And** a rotation-fired cut performs no store I/O inside the ingest
 >   turn: the turn hands the captured cut to the barrier task, and an append
 >   admitted after the turn is neither in that cut's checkpoint nor in its
@@ -2240,9 +2303,20 @@ memory, and nothing here claims to.
 >   and no `RECLAIM` opens as pre-RFC **without** creating a record, and its
 >   first checkpoint rewrites the sidecar at version 2 and creates the
 >   record armed on the same path
+> - **And** that first checkpoint upgrades the sidecar even when its mark
+>   **equals** the one on disk — the idle-node case — while an equal mark on
+>   an already-version-2 sidecar still takes the no-write path
+> - **And** on a legacy root a tenant whose snapshot is missing and whose
+>   oldest surviving frame is above its last recorded horizon fails closed
+>   naming the tenant, so a root that reclaimed under a version-1 checkpoint
+>   is caught rather than pinned
 > - **And** a restart in that migration window — still a version-1
 >   `CHECKPOINT`, still no record — takes the legacy branch again rather
 >   than any fail-closed row
+> - **And** a housekeeping pass that fires in that window plans nothing,
+>   unlinks nothing (segments and partials alike) and is counted as a
+>   skipped pass with its reason; the pass after the first checkpoint runs
+>   normally
 > - **And** a root whose `RECLAIM` carries `checkpoint_seen` — written after
 >   its first version-2 checkpoint succeeded, entries or none — and whose
 >   `CHECKPOINT` is missing fails open naming both files
@@ -2251,6 +2325,10 @@ memory, and nothing here claims to.
 >   between arming and the checkpoint's rename — opens as a fresh root with
 >   an empty record and is re-armed by the next attempt, and a `RECLAIM`
 >   with neither flag beside a missing `CHECKPOINT` opens the same way
+> - **And** the same record beside a **present** version-2 `CHECKPOINT` —
+>   the crash after the rename and before the record's next write — opens
+>   normally and is promoted to `seen` durably at open, never read as a
+>   fault
 > - **And** a segment whose `unlink` fails after the record was written
 >   stays on disk with `reclaimed_through` behind it: a restart with that
 >   tenant's snapshot undecodable pins the tenant rather than halting

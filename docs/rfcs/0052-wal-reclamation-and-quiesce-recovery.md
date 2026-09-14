@@ -395,8 +395,9 @@ same ownership path as rotation rather than concurrently with it.
 
 ### 3.3 Rotation failure becomes recoverable, under a bounded retry
 
-A quiesce must stop being permanent. The four sites are not equally
-retryable, and the design treats them by what they leave behind:
+A quiesce must stop being permanent. The five sites — the four the code has
+today and the `rename(partial, final)` step the temporary name adds — are
+not equally retryable, and the design treats them by what they leave behind:
 
 | Site | Failure | State left behind | Retry |
 |---|---|---|---|
@@ -454,10 +455,17 @@ directory-fsync failure repeatedly refuses to ack rather than accumulating
 unacked frames behind a rotation that never reruns. Those appends are not lost
 either — they are in the segment, and the next successful `sync` covers them.
 
-**That retry draws on the same budget and reaches the same terminal state.**
-Each failed discharge of `dir_fsync_pending` in `sync` consumes one unit of
-the rotation retry budget, exactly as a failed `rotate` does, and exhausting
-it enters the terminal state whichever operation gets there. Both
+**That retry draws on the same budget and reaches the same terminal state —
+when the obligation came from a rotation.** `dir_fsync_pending` starts
+`true` on *every* `Wal::open`, fresh or reopened, so the flag alone cannot
+say where the obligation came from; it therefore carries its origin,
+`Open` or `Rotation`. A failed discharge of an `Open` obligation is an
+ordinary retryable sync failure outside the budget, exactly as today. A
+failed discharge of a `Rotation` obligation consumes one unit of the
+rotation retry budget, exactly as a failed `rotate` does, and exhausting it
+enters the terminal state whichever operation gets there — which is what
+keeps RFC0052.15's narrowness true: an ordinary fsync failure never
+becomes terminal. Both
 `AppendError` and `SyncError` carry a typed terminal variant, and
 `IngestFailure::classify` maps both under the terminal-only rule — so a
 persistent parent-directory fsync failure is not left as an ordinary
@@ -712,6 +720,15 @@ So the design is:
   visible*. An `Option` collapses the last two, and a signature that hides
   the pinned case is the wrong signature.
 
+  **The floor the export reports is the floor the WAL was last handed.** The
+  receiver derives `RetainFloor` from its ledger and passes it to
+  `housekeeping`; `reclaim_state(&self)` has no input for it, so the WAL
+  records the floor each `housekeeping` call was given and reports that
+  last-used value, with its lag against the checkpoint and its `Pinned`
+  count. Between passes that is by definition the floor governing
+  retention, so the export is never stale and needs no hidden coupling;
+  before the first pass it reports "no floor yet".
+
   `max_unlinks` is a parameter rather than WAL configuration because the cap
   belongs to the caller's stall budget, and `HousekeepingProgress` reports
   whether the pass hit the cap, so the caller can tell "backlog drained" from
@@ -754,6 +771,14 @@ So the design is:
 
   On the trait rather than via a downcast, because RFC0052.1 and RFC0052.2
   need test doubles that can observe reclamation.
+- **Recovery gains the Parquet-side gate §3.1 requires.** `recovery::DriverSink`
+  owns only the miner today and merely records `parquet_horizon`; it gains
+  the record-sink handle and routes each replayed frame twice — to the
+  miner when above that tenant's snapshot horizon `S`, as now, and to the
+  record sink only when above the checkpoint `X`. Frames at or below `X` are
+  suppressed on the Parquet side and counted, so a restart after an
+  advanced checkpoint never republishes a row, and RFC0052.10's
+  no-duplicate leg is what proves the gate exists rather than assumes it.
 - **The barrier reaches them through the coordinator**, which already owns the
   journal mutex, rather than taking a second handle to the same WAL. A second
   handle would put two owners on a single-writer resource, which is the one

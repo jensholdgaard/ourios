@@ -233,19 +233,28 @@ can absorb: the frame's full framed length is added to the unreclaimed
 figure at once (an over-count is safe, an under-count admits past the
 bound; the next `remeasure_unreclaimed()` corrects it), **and the segment
 is sealed with a durable marker** — the WAL refuses further appends into
-that segment, writes and fsyncs a `<uuid>.wal.seal` sidecar carrying the
-last good length (and fsyncs the parent), and only then rotates through
-RFC 0052 §3.3's retry path into a fresh segment, since appending after a
-partial frame would let recovery consume later bytes as part of it. If the
-seal write itself fails the WAL enters the terminal rotation state: it can
-neither repair nor mark the segment. The torn frame then sits at the EOF
-of a *closed* segment, and RFC 0052's replay heal is extended, as an
-amendment from this RFC, to **exactly the sealed shape**: a closed segment
-whose seal names precisely the length at which the torn frame begins is
-truncated there and replayed; an unmarked closed-segment tail stays fatal
-as RFC0008.5 requires, because an in-memory "sealed" state cannot tell
-rollback debris from a torn acknowledged frame after a restart, and healing
-on shape alone would lose data exactly where the contract says to halt.
+that segment, writes and fsyncs a `<uuid>.wal.seal` sidecar (and fsyncs the
+parent), and only then rotates through RFC 0052 §3.3's retry path into a
+fresh segment, since appending after a partial frame would let recovery
+consume later bytes as part of it. The seal is **versioned and
+segment-bound**: it carries a format version, the segment's own UUID, the
+last good length, and a checksum of those three, so a stale or corrupted
+seal cannot authorise anything. If the seal write itself fails the WAL
+enters the terminal rotation state: it can neither repair nor mark the
+segment. The torn frame then sits at the EOF of a *closed* segment, and RFC
+0052's replay heal is extended, as an amendment from this RFC, to **exactly
+the sealed shape** and nothing looser: the seal must verify, must name
+this segment, its length must fall on a frame boundary of the frames
+replay has already validated, and the bytes past it must be exactly one
+partial frame — on any mismatch the segment is RFC0008.5 corruption and
+recovery halts, never truncates. An unmarked closed-segment tail stays
+fatal as well, because an in-memory "sealed" state cannot tell rollback
+debris from a torn acknowledged frame after a restart, and healing on shape
+alone would lose data exactly where the contract says to halt. The seal is
+consumed when the heal truncates the segment (unlinked, parent fsynced) and
+otherwise unlinked together with its segment by RFC 0052's housekeeping,
+under the same parent fsync, so repeated rollback failures cannot grow the
+directory outside the frame-byte bound.
 
 The bound is configuration, and it has a home: `WalConfig` gains
 `unreclaimed_bytes_limit`, and it is the first WAL knob the deployment
@@ -529,12 +538,21 @@ has already mutated the miner and a later successful append can carry
 `mine_batch_ordered`, which submits its partially mined `out` and then
 resumes the panic, takes the same path for `out` — but the prefix is not
 enough, because the frame's *unmined suffix* still exists only in the WAL
-and a later successful append would carry the mark past it. So the
-coordinator records that frame's offset in an `unmined` set, the barrier
-re-mines every frame in that set from the WAL (`Journal::read_frame`)
-before it computes its mark, and the mark never crosses an unmined frame.
-RFC0053.2 covers a swallowed submit followed by a successful append, and a
-mining panic followed by a successful append.
+and a later successful append would carry the mark past it. So the unwind
+arm records the frame's offset and the number of records it already
+submitted in an `unmined` entry, and the **next ingest turn** re-mines
+that frame's suffix first — before its own batch, in WAL order, so the
+miner sees the records in the sequence they were appended and later turns
+do not overtake the gap — resuming at the recorded index so the submitted
+prefix is never emitted twice. The frame's bytes are read through
+`Journal::read_frame(offset) -> Result<Bytes, ReceiveError>`, added to the
+object-safe trait for this purpose and taking the journal mutex only for
+the read. An `unmined` entry is removed only once the suffix's records have
+been submitted or buffered — retained across a failure or a second panic —
+and the mark never crosses a frame with an entry, so an entry that never
+settles blocks the checkpoint visibly rather than silently. RFC0053.2
+covers a swallowed submit followed by a successful append, and a mining
+panic followed by a successful append.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has

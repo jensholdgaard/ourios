@@ -217,13 +217,33 @@ What changes is that the worker no longer performs store I/O:
 `EncodePool::quiesce` today waits for a worker even while it is inside a
 `put_blocking`, and the sink's in-flight guard today covers only
 `PublishCoordinator::drain_*`, not the `publish_owned` calls
-`emit_concurrent` makes itself. So a size- or ceiling-detached partition is
-registered as in flight inside `emit_concurrent` and handed to the sink's
-off-lock publisher — the path the age sweep's `write_ordered` already uses,
-audit barrier first, requeue on transient failure, quarantine on poison —
-and the worker moves to its next record. A worker is then never inside a
+`emit_concurrent` makes itself, and today there is no publisher to hand
+anything to: `publish_owned` and `write_ordered` are both synchronous on
+their caller. So this RFC adds one, and its lifecycle is stated here and
+nowhere else. The **publisher** is one dedicated thread owned by the
+`PublishCoordinator` — the object that already owns both sinks and runs the
+age sweep's `write_ordered` — fed by a bounded queue of detached batches
+(the queue's bound is the worker's backpressure: a full queue blocks the
+worker on the queue, never on a PUT). Ownership of a detached batch moves
+through three hands in a fixed order: the worker, inside `emit_concurrent`,
+registers the publish guard **before** it enqueues and before its own
+`BatchGuard` can settle, so at no instant is a pre-cut record outside both
+the buffers and the in-flight set — that ordering is the invariant the
+checkpoint argument rests on; the queue carries the guard with the batch;
+the publisher runs `write_ordered` on it — audit barrier first, then the
+records — and settles the guard on its outcome: durable, or requeued into
+the buffers under the sink lock on a transient failure (where the next
+drain or flush covers it), or quarantined per record on a poison rejection,
+or, on an unwind, latched (§3.1's guard rule) and settled. The worker moves
+to its next record as soon as the enqueue returns, so it is never inside a
 PUT, the quiesce waits on encodes alone, and the PUTs settle outside the
-exclusion under `quiesce_publishes` like any other. The barrier — reads the mark, drains
+exclusion under `quiesce_publishes` like any other. At shutdown the order
+is the one the barrier already needs: stop the workers, quiesce the
+encodes, `quiesce_publishes` (which now also means the queue is empty),
+then join the publisher — a publish still queued at that point is never
+dropped, because the join waits for it. RFC 0053's requeue-on-unwind
+replaces only the unwind arm of this; the thread, the queue and the
+guard-before-enqueue order stay. The barrier — reads the mark, drains
 both sinks into owned batches, registers that publish as in flight, and
 serialises each tenant's miner snapshot state — the bytes `write_snapshots`
 would write — then releases. The flush of those batches, the snapshot *file* writes from
@@ -256,7 +276,9 @@ persisted layout is broken rather than dual-read: the implementing PR
 carries the `!` marker for the version bump, and no migration tooling is
 written. Each writer
 uses a **unique** temp
-name (`<tenant>.<mark>.snap.tmp`, since today's one fixed `.snap.tmp` could
+name (`<stem>.<mark>.snap.tmp`, where `<stem>` is the percent-encoded tenant
+id `snapshot_store` already derives for `<stem>.snap` — the raw id is not a
+safe path segment — and `<mark>` is the byte offset; since today's one fixed `.snap.tmp` could
 be truncated or interleaved by a concurrent cut before either rename — and
 the writer unlinks its own temp on any write, fsync or rename failure, with
 `load_all_durable()` removing any `*.snap.tmp` left by a previous process,
@@ -316,7 +338,20 @@ today, so the barrier task also calls `Journal::rotate` when the current
 segment's age exceeds `segment_age_secs` and it holds a frame — an idle
 node's last segment then rotates, and its bytes are reclaimed within
 `barrier_secs + housekeeping_secs + segment_age_secs`, which RFC0052.3's
-idle leg asserts.
+idle leg asserts. That rotation is ordered with the cut, not beside it:
+`Journal::rotate` returns nothing the cut could use, so the idle path
+rotates **first, under the barrier exclusion**, then captures the cut, and
+the cut's mark is what every cut's mark is — `last_durable`, the last
+*acknowledged* turn's own frame offset — never the rotation boundary. The
+exclusion is what makes the order mean something: no turn can run between
+the rotate and the mark read, so every frame at or below the mark is in the
+closed segment and every frame appended after the release is in the new
+one, above it. A frame the WAL holds but never acknowledged — a turn whose
+group sync failed — is never a mark, and if an earlier such frame sits
+below a later acknowledged turn's offset it is suppressed on replay like
+any frame below the gate, which loses nothing acknowledged: the client was
+told to retry it. RFC0052.14 asserts the rotate-before-cut order and the
+mark's source.
 
 **Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
 takes the miner lock today before the pool submission and the `last_durable`
@@ -576,9 +611,17 @@ snapshot horizon `S` is **that tenant's own last folded frame offset**, not
 the cut's global mark — a global mark's segment can hold none of the
 tenant's frames and be legitimately unlinked, and the detector would then
 report external mutation for `S < X`. So snapshots record per-tenant
-horizons: `S.segment` always holds one of that tenant's frames, is retained
-until the tenant's horizon covers it, and is unlinked only under the
-checkpoint, so its absence implies `S ≤ X` and the detector stays quiet.
+horizons, and the detector is **restated on the `RECLAIM` record** rather
+than on segment presence, because under per-tenant horizons `S < X` is the
+normal case and `S`'s own segment is legitimately unlinked once the
+tenant's horizon covers it (§3.2's inclusive rule). Today's predicate —
+`S < X` and `S.segment` unseen — would fire on every idle tenant after its
+last segment is reclaimed. The amended detector asks the record instead:
+`S.segment` absent is *explained* when the tenant's recorded
+reclaimed-through is at or above `S`, and it is `S > reclaimed-through`
+with the segment absent that is external mutation. The record's own
+comparison (a restorable horizon *below* its reclaimed-through halts) is
+the other half of the same check, so the two read one witness.
 
 That detector's no-false-positive property *depends* on the minimum, so the
 earlier draft's "latest" wording would have broken stale-gap detection as
@@ -597,21 +640,27 @@ holding only other tenants, which is the permanent growth this section
 exists to end. The rule, stated once: a closed segment is reclaimable when
 its highest offset is at or below the checkpoint (**inclusive**, a
 post-append horizon), and for every tenant with a frame in it that tenant's
-last offset in that segment is **strictly below** its valid horizon — strict,
-so the segment holding the horizon frame itself is retained, which is what
-keeps the stale-gap detector's argument true: `S`'s segment is present on
-every restart, and an absent segment implies the tenant's frames in it were
-all below `S`. A pinned tenant has no horizon, so exactly its own segments
-are retained — equality can never unlink the pinned frame —
-while segments holding only other tenants' covered frames are reclaimed
-whatever their offset. `RetainFloor` is the *reported* summary of that
-rule (the minimum over horizons and pins), not the predicate. The pin lifts the moment a valid snapshot for the tenant is
-written, since its horizon then replaces the pin. Pins and horizons are
-both **strict** bounds in the predicate, the same comparison for the same
-reason: a pinning tenant's last offset in a segment is at or above its pin
-exactly when the segment holds a frame the tenant needs, and a snapshotted
-tenant's last offset *equal* to its horizon is the horizon frame itself,
-which the rule above retains. Only the checkpoint comparison is inclusive.
+last offset in that segment is **at or below** its valid horizon —
+inclusive at the horizon, because the horizon frame is the last frame the
+snapshot folded and the snapshot recording it is durable: `SnapshotHorizons`
+is built from the `SnapshotLedger`, which holds only marks whose install
+returned `Ok` after the parent fsync, so every horizon `housekeeping_prepare`
+ever sees is a durably installed one, and "inclusive once the install is
+durable, strict while it is not" collapses to inclusive. An earlier draft
+compared strictly so that `S`'s segment stayed present for the stale-gap
+detector; that left the segment holding an *idle* tenant's horizon frame
+permanently ineligible — the idle node RFC0052.3 requires to reclaim its
+last segment could not — and the detector no longer needs the segment,
+because the `RECLAIM` record (below) says why it is gone. A pinned tenant
+has no horizon, so exactly its own segments are retained — the pin is
+**strict**: a pinning tenant's last offset in a segment at or above its pin
+is a frame the tenant needs, and equality can never unlink it — while
+segments holding only other tenants' covered frames are reclaimed whatever
+their offset. `RetainFloor` is the *reported* summary of that rule (the
+minimum over horizons and pins), not the predicate. The pin lifts the
+moment a valid snapshot for the tenant is written, since its horizon then
+replaces the pin. So the three comparisons are: checkpoint inclusive,
+horizon inclusive, pin strict.
 `RetainFloor::Min` carries no comparison of its own — it is the reported
 minimum, and today's `min(checkpoint, floor)` bound in `Wal::housekeeping`,
 which compared a segment's highest offset inclusively against that
@@ -622,7 +671,7 @@ minimum, is replaced by the per-segment rule rather than kept beside it.
 Neither the `Journal` API nor `RecoveryReport` could otherwise tell the
 receiver which tenants have surviving frames or at what offset. The WAL
 learns a frame's tenant from the `TenantOtlpBatch` prefix it already
-frames in `append_batch`, and `remeasure_unreclaimed()` rebuilds the ledger
+frames in `append_batch`, and `rebuild_ledger()` rebuilds the ledger
 from every surviving frame's prefix at the end of recovery; the receiver
 passes only what it knows — the per-tenant snapshot horizons, or "no
 consumer" — and the WAL derives `RetainFloor` from the two and reports it.
@@ -743,13 +792,22 @@ one, because startup's fallback is exactly as trustworthy as this record:
   entry; a tenant absent from the record has never had a frame reclaimed
   under a horizon. One writer holds the writer position, so the
   read-modify-write cannot interleave.
-- **Created at open.** The WAL writes an empty record, durably, when it opens
-  a root that has none — before the first pass can run — so the record
-  exists on every root this RFC's code has ever reclaimed from. A root with
-  no record at startup is therefore a layout that predates this RFC, on
-  which nothing was ever reclaimed (#793), and that is the *only* case read
-  as "no reclaimed state". There is no second witness to fall back on, which
-  is why the record is created before it is needed rather than at first use.
+- **Created at open, and witnessed by `CHECKPOINT`.** The WAL writes an
+  empty record, durably, when it opens a root that has none — before the
+  first pass can run — so the record exists on every root this RFC's code
+  has ever reclaimed from. "Missing means pre-RFC" is not safe on its own:
+  a root that has reclaimed and then lost its record (an operator deleting
+  sidecars, a restore from a partial backup) would open, recreate an empty
+  record, and turn a missing snapshot into a pin over frames already gone.
+  So the record has a second witness, one that needs no new file: the
+  `CHECKPOINT` sidecar. Every unlink is gated on a checkpoint, a checkpoint
+  is written only by this RFC's barrier (`Wal::checkpoint` is unreachable
+  from the pipeline today, #793), and on a post-RFC root the record is
+  created at open, before the first checkpoint can exist — so `CHECKPOINT`
+  present with `RECLAIM` absent is a post-RFC root that has lost its record,
+  and open **fails closed** on it as `OpenError::Corrupt`, naming the missing
+  file; both absent is the pre-RFC layout, on which nothing was ever
+  reclaimed, and the only case read as "no reclaimed state".
 - **Corrupt is fatal.** The record carries a version byte and a checksum; a
   record failing either at open fails startup as `OpenError::Corrupt`,
   naming the file. It is not read as missing: missing means "never
@@ -949,7 +1007,7 @@ checkpoint exists, and a rotation that fails before the first checkpoint
 would otherwise leave partials that every later pass skips; only the
 segment-unlink portion is gated on a checkpoint. **And it lists nothing on
 the pass**: partials left by a previous process are seeded into an
-in-memory partial list by `remeasure_unreclaimed()`, which walks the
+in-memory partial list by `rebuild_ledger()`, which walks the
 directory at the end of recovery anyway, live rotations register the
 partial they create, and the sweep pops from that list under the same cap
 — so restart debris is found without a directory scan under the writer
@@ -1093,7 +1151,7 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   segments the floor retains below the checkpoint, and `lag_segments`, their
   count; `WalOffset` is a `(UUIDv7, byte)` pair and has no subtraction of its
   own, and the figures come from per-segment frame-byte accounting the WAL
-  keeps incrementally (seeded by `remeasure_unreclaimed()`, updated on every
+  keeps incrementally (seeded by `rebuild_ledger()`, updated on every
   append and unlink) — never from an inspection, which §3.7's cap would
   bound and a large backlog would make untrustworthy — including whether it is `RetainFloor::Pinned` and by how many
   tenants — without which RFC0052.13's "an operator can tell a
@@ -1297,11 +1355,22 @@ So the design is:
   replays and heals the newest segment, so a seed taken there would count
   torn bytes. Recovery therefore ends — after every successful replay, and
   after the heal when there was a torn tail to heal, since a clean replay
-  never enters that path — by calling `Wal::remeasure_unreclaimed()`, a
-  concrete method since recovery holds the WAL before it is boxed, which
-  sets the figure to the sum over every surviving `*.wal` of file size less
-  the segment header, in frame bytes, and seeds the current segment's own
-  frame bytes from the healed newest segment at the same time. The
+  never enters that path — by calling `Wal::rebuild_ledger()`, a concrete
+  method since recovery holds the WAL before it is boxed. A size figure is
+  not enough for it: the ledger §3.2 relies on needs, per surviving
+  segment, which tenants have frames in it and each one's first and last
+  offset, and the partial list needs the directory's `.wal.partial`
+  entries. So `rebuild_ledger()` is a scan, not a `stat`: it walks every
+  surviving segment oldest-first, validates each frame prefix (length,
+  checksum) exactly as replay does, decodes the tenant from the
+  `TenantOtlpBatch` prefix `append_batch` framed, and records the per-tenant
+  offsets and the frame bytes into the ledger; the unreclaimed-byte figure
+  is the sum of the validated frames' lengths — never file size less
+  header, which would count a torn tail — and the current segment's own
+  frame bytes are seeded from the healed newest segment in the same pass.
+  Replay already reads every frame, so an implementation may build the
+  ledger as a by-product of the replay pass rather than a second scan; the
+  contract is the ledger's content, not the number of passes. The
   coordinator is constructed after recovery (the ordering below), so no
   append can precede the seed, and a restart mid-outage resumes from the
   true backlog rather than from zero. `unflushed_bytes`
@@ -1365,7 +1434,7 @@ So the design is:
   of anything newly eligible, the record merge is idempotent and monotonic,
   and an unlink that finds the file already gone counts as removed. A crash
   between the halves reconciles at open the same way, with no special
-  case: `remeasure_unreclaimed()` rebuilds the ledger from the segments
+  case: `rebuild_ledger()` rebuilds the ledger from the segments
   that survive, so a segment unlinked before the crash is simply absent and
   one not yet unlinked is present and still eligible under the horizons the
   durable `RECLAIM` record already carries, since the record was written
@@ -1437,7 +1506,7 @@ horizon only extends the walk's target — the cursor never moves backwards
 and is never reset by a checkpoint advance, which touches no set. Each pass
 spends its application budget round-robin across the tenants whose cursor
 is behind their horizon, so one tenant cannot starve another's. The only
-rebuild is at open, when `remeasure_unreclaimed()` rebuilds the ledger and
+rebuild is at open, when `rebuild_ledger()` rebuilds the ledger and
 every cursor starts at the oldest surviving segment; the first pass after
 startup applies from there. The eligible head needs no cursor of its own:
 it is re-evaluated from the ordered structure on every pass. There is **no promotion pass**: a checkpoint advance stores
@@ -1549,13 +1618,16 @@ memory, and nothing here claims to.
 >   checkpoint
 > - **When** housekeeping runs
 > - **Then** only segments at or below the checkpoint (inclusive) whose
->   every tenant's last frame in them is strictly below that tenant's
->   horizon are unlinked, the current append segment survives, and the
+>   every tenant's last frame in them is at or below that tenant's horizon
+>   (inclusive) are unlinked, the current append segment survives, and the
 >   WAL's segment count falls
-> - **And** a segment holding the frame that sits exactly at a tenant's
->   horizon is retained — the per-tenant comparison is strict, only the
->   checkpoint comparison is inclusive — and is unlinked once the tenant's
->   horizon has moved past it
+> - **And** a segment whose only frame for an *idle* tenant is exactly that
+>   tenant's horizon frame is unlinked — the horizon is durably installed by
+>   construction, so its segment is not needed — and a restart afterwards
+>   restores the tenant from its snapshot with no stale-gap report, the
+>   `RECLAIM` entry at or above `S` explaining the absent segment
+> - **And** a segment holding a frame *above* a tenant's horizon is retained
+>   until the tenant's horizon reaches it
 > - **And** a frame above the *lagging* tenant's horizon is still present
 >   after the pass, so a restart re-mines it rather than losing that
 >   tenant's miner state
@@ -1726,6 +1798,11 @@ memory, and nothing here claims to.
 >   (nor acknowledged) is never
 >   covered — asserted by a flush whose sync covers two turns and a barrier
 >   between them
+> - **And** an idle rotation on the barrier tick rotates before the cut,
+>   under the exclusion: the mark is the last acknowledged turn's frame
+>   offset in the closed segment, never the rotation boundary, a frame
+>   appended after the release lands in the new segment above the mark, and
+>   a frame written but never acknowledged is never a mark
 > - **And** a pre-cut batch whose first record detached a partition mid-batch
 >   has its remaining records in the cut, under any interleaving: the
 >   quiesce waits for the batch's encode phase, not for a worker to register
@@ -1817,6 +1894,9 @@ memory, and nothing here claims to.
 >   so the restart proceeds; a crash injected between the temp write and the
 >   rename leaves the previous record intact and the temp truncated by the
 >   next pass
+> - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
+>   fails open naming the missing record — `CHECKPOINT` is present, so the
+>   root is post-RFC — rather than recreating an empty record and pinning
 > - **And** a record write or fsync that *fails* unlinks nothing, leaves the
 >   WAL's byte and segment accounting unchanged, and the segments that pass
 >   popped are reclaimed by a later pass once the write succeeds — they are
@@ -2025,8 +2105,9 @@ they are not substitutes for the rest.
 - RFC 0001 §6.9 — the miner snapshot high-water mark, and the hazard-#5
   retain rule that makes it the truncation floor — **amended** by §3.2:
   horizons are per tenant (each tenant's own last folded frame), the retain
-  rule is tenant-aware and strict at the horizon, and the stale-gap
-  detector's argument is restated on that basis.
+  rule is tenant-aware and inclusive at a durably installed horizon (pins
+  strict), and the stale-gap detector is restated on the `RECLAIM` record
+  rather than on segment presence.
 - RFC 0014 — the record sink and its flush triggers.
 - `CLAUDE.md` §3.4 (WAL-before-ack), §3.6 (object storage is the source
   of truth), §6.3 (observability of ourselves).

@@ -181,18 +181,39 @@ Rotation needs no change: it already runs inside an ingest's own span.
 
 **The cut is captured under the exclusion; the store I/O is not.** Under the
 exclusion the timer quiesces encodes, reads the mark, drains both sinks into
-owned batches and registers that publish as in flight — then releases. The
-flush of those batches, the snapshot write and the checkpoint all run
-*outside* the exclusion, so a slow or unavailable object store stalls ingest
+owned batches, registers that publish as in flight, and serialises each
+tenant's miner snapshot state — the bytes `write_snapshots` would write —
+then releases. The flush of those batches, the snapshot *file* writes from
+those bytes, and the checkpoint all run *outside* the exclusion. Capturing
+the snapshot bytes at the cut is what makes `S` cut-consistent: it never
+runs past the mark, and every row at or below it is in the detached
+batches, so a turn admitted after the cut is neither in the snapshot nor
+suppressed by the `max(X, S)` gate on replay. Detaching only the file I/O
+keeps that property while so a slow or unavailable object store stalls ingest
 for the length of a drain and never for a PUT; holding the exclusion across
 `flush_then_snapshot`'s PUTs would let every retry during an outage recreate
 the local ingest outage, and would keep RFC 0053's admission bound from
 running at all. The mark stays correct because every frame at or below it
 was drained into the detached batches, and every append after the release
 lands above it. The checkpoint is taken only after the detached publish
-*and* every publish registered before the cut have succeeded, by re-taking
-the journal mutex for the stamp alone; a failed publish requeues (RFC 0053
-§3.2 makes that hold on unwind too) and no stamp happens.
+*and* every publish registered before the cut have succeeded — `quiesce_publishes`
+returns the outcome of those registered publishes rather than merely
+waiting, and a failure in any of them means no stamp even though the cut's
+own flush succeeded — by re-taking the journal mutex for the stamp alone; a
+failed publish requeues (RFC 0053 §3.2 makes that hold on unwind too) and no
+stamp happens.
+
+**Two cadences, so the barrier is not a force-all flush cadence.** A cut
+drains every buffered partition, and running it on the 60-second
+`housekeeping_secs` would create a sub-target Parquet object per low-volume
+partition per tick — RFC 0014's small-file hazard reintroduced by the
+reclamation path. So the barrier (cut, flush, snapshot, checkpoint) runs on
+its own `barrier_secs`, defaulting to the sink's age trigger (300 s): for a
+partition holding data that old the age trigger would flush it anyway, so
+the barrier adds no objects beyond RFC 0014's policy, and a busy partition
+still flushes on size between barriers. Housekeeping runs on
+`housekeeping_secs` against the last checkpoint, and reclamation lags a
+publication by at most one barrier interval.
 
 **Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
 takes the miner lock today before the pool submission and the `last_durable`
@@ -281,7 +302,10 @@ barrier would see empty buffers and no in-flight publish and stamp past
 records that never reached Parquet. So a cadence-step panic sets a
 `cadence_failed` latch; while it is set the barrier neither checkpoints nor
 snapshots — the frames stay in the WAL and a restart replays them — the
-state is exported (RFC0052.7) and only a restart clears it. RFC 0053's
+state is exported (RFC0052.7) and only a restart clears it. The check lives
+inside `flush_then_snapshot`, the one function the timer, the rotation hook
+and shutdown all call, so every stamping caller honours it rather than the
+timer alone. RFC 0053's
 requeue-on-unwind is what removes the latch, by making the panic lose
 nothing to stamp past.
 
@@ -305,33 +329,41 @@ read by nothing. RFC 0008 §6.7 says "the timer lives in the caller".
 The caller is the receiver role, on its own interval:
 
 ```text
-every housekeeping_secs:
-    if cadence_failed: skip the barrier (§3.1); still run housekeeping below
+every barrier_secs (default: the sink age trigger, 300 s):
+    if cadence_failed: skip                // §3.1; housekeeping below still runs
     cut = with_barrier_exclusion:          // a NEW pipeline lock, not the miner
                                            // lock and not the gate — see §3.1
         quiesce_encodes()                  // the barrier's prologue
         mark = last_durable()              // read AFTER the quiesce, INSIDE the turn
         batches = drain both sinks         // owned; registered as in flight
-        (mark, batches)                    // release the exclusion here
-    published = flush(cut.batches)         // store I/O OUTSIDE the exclusion
-                 and quiesce_publishes()   // earlier in-flight publishes settle
-    if published: write_snapshots()        // failure logged, not a blocker (§3.1)
-    if published and cut.mark is Some(m):  // §3.1, append-free
-        coordinator.maintain(Some(m), retain_floor(), max_unlinks_per_pass)
-    else:
-        coordinator.maintain(None, retain_floor(), max_unlinks_per_pass)
-                                           // housekeeping still runs; no stamp
+        snaps = serialise miner snapshots  // cut-consistent S (§3.1)
+        (mark, batches, snaps)             // release the exclusion here
+    ok = flush(cut.batches)                // store I/O OUTSIDE the exclusion
+         and quiesce_publishes().all_ok()  // earlier in-flight publishes: outcome, not a wait
+    if ok: write_snapshot_files(cut.snaps) // failure logged, not a blocker (§3.1)
+    if ok and cut.mark is Some(m):
+        coordinator.checkpoint(m)          // re-takes the journal mutex for the stamp alone
+      on Err -> log, do NOT advance (fail-closed, §3.1)
+
+every housekeeping_secs (default 60 s), in its own task:
+    coordinator.maintain(snapshot_horizons(), max_unlinks_per_pass)
+                                           // derives the floor (§3.7), unlinks below
+                                           // min(checkpoint, floor), sweeps partials
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
-**The timer has the age sweep's lifecycle, stated so it cannot outlive the
-handle.** It is owned by the receiver, signalled by the same shutdown watch
-the sweep already observes, and joined **before** the final flush and
-snapshot, in the order `ReceiverHandle::shutdown` already joins the sweep; it
-holds no pipeline or journal handle after the join. A timer that was not
-joined there could race the shutdown reclamation or keep the WAL alive past
-the handle, which is why the ordering is part of the design rather than of
-the implementation.
+**The timers have the age sweep's shutdown lifecycle but not its task.**
+Both loops are owned by the receiver, signalled by the same shutdown watch
+the sweep observes, and joined **before** the final flush and snapshot, in
+the order `ReceiverHandle::shutdown` already joins the sweep; they hold no
+pipeline or journal handle after the join. They are *separate tasks* from
+the sweep, and from each other: the sweep's stop-on-panic (#795) must not
+stop reclamation, and a panic in a barrier step sets `cadence_failed` and
+leaves the housekeeping loop running housekeeping-only passes, which is the
+branch the pseudocode's skip relies on. A timer that was not joined at
+shutdown could race the shutdown reclamation or keep the WAL alive past the
+handle, which is why the ordering is part of the design rather than of the
+implementation.
 
 **`retain_floor` is the MINIMUM over per-tenant snapshot horizons, not the
 latest one.** `write_snapshots` persists one snapshot per tenant and can
@@ -362,9 +394,22 @@ re-mine all of them. So the tenant contributes its oldest surviving frame
 offset to the minimum: everything of its own is retained, while segments
 below that offset — which hold only other tenants' covered frames — are
 reclaimed. The pin lifts the moment a valid snapshot for the tenant is
-written, since its horizon then replaces the pin. `None` is passed only
-where no snapshot consumer exists at all.
+written, since its horizon then replaces the pin. The pin is an
+**exclusive** bound: `housekeeping` removes a closed segment only when its
+highest offset is strictly below it, whereas a `Min` horizon stays
+inclusive as `Wal::housekeeping` compares today — otherwise a segment
+holding exactly one frame for the pinning tenant, whose highest offset
+*equals* the pin, would be unlinked. `None` is passed only where no
+snapshot consumer exists at all.
 
+**The ledger is WAL-owned, so the floor is derived where the frames are.**
+Neither the `Journal` API nor `RecoveryReport` could otherwise tell the
+receiver which tenants have surviving frames or at what offset. The WAL
+learns a frame's tenant from the `TenantOtlpBatch` prefix it already
+frames in `append_batch`, and `remeasure_unreclaimed()` rebuilds the ledger
+from every surviving frame's prefix at the end of recovery; the receiver
+passes only what it knows — the per-tenant snapshot horizons, or "no
+consumer" — and the WAL derives `RetainFloor` from the two and reports it.
 Membership is per surviving segment, so the ledger has a lifecycle. Each
 segment carries, per tenant, the `WalOffset` of that tenant's **first** frame
 in it — a membership set alone could not recover the byte offset
@@ -681,8 +726,11 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   `Wal::open` creates or retains holds no frame and an idle WAL must not
   report a growing age. An earlier draft said "below the checkpoint", which would have
   exported the one number that does not grow during an outage;
-- **the retain floor and its lag**, including whether it is
-  `RetainFloor::Pinned` and by how many tenants — without which RFC0052.13's "an operator can tell a
+- **the retain floor and its lag** — `lag_bytes`, the frame bytes in the
+  segments the floor retains below the checkpoint, and `lag_segments`, their
+  count; `WalOffset` is a `(UUIDv7, byte)` pair and has no subtraction of its
+  own — including whether it is `RetainFloor::Pinned` and by how many
+  tenants — without which RFC0052.13's "an operator can tell a
   lagging tenant from an unexplained stall" is not achievable, since that is
   the case where reclamation stops with a healthy store;
 - **the rotation-failure state**: retrying, with its attempt count, versus
@@ -699,9 +747,11 @@ than spawning per-error metrics.
 
 **Transitions have an observer, so "exactly one event" is implementable.**
 A state snapshot alone cannot emit anything. The receiver's timer task is
-the single emission owner: it compares `ReclaimState` before and after each
-`maintain` call and emits on change (floor pinned or lifted, latch set,
-terminal state entered), and the ingest path reports a rotation-terminal
+the single emission owner: it compares a **categorical projection** of
+`ReclaimState` — floor kind, latch, rotation state, never the byte, age or
+lag figures, which change on every pass — before and after each `maintain`
+call and emits on change (floor pinned or lifted, latch set, terminal state
+entered), and the ingest path reports a rotation-terminal
 entry through the coordinator's `FlushOutcome`, which the same task
 observes on its next tick. One owner, real call sites, registry names.
 
@@ -759,8 +809,9 @@ So the design is:
                                                            // Wal::append already
                                                            // produces (§3.1's mark)
   fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError>
-  fn housekeeping(&mut self, floor: RetainFloor, max_unlinks: usize)
-      -> Result<HousekeepingProgress, ReclaimError>
+  enum SnapshotHorizons { NoConsumer, Known(HashMap<TenantId, WalOffset>) }
+  fn housekeeping(&mut self, horizons: &SnapshotHorizons, max_unlinks: usize)
+      -> Result<HousekeepingProgress, ReclaimError>   // derives RetainFloor itself
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
   ```
 
@@ -781,14 +832,14 @@ So the design is:
   visible*. An `Option` collapses the last two, and a signature that hides
   the pinned case is the wrong signature.
 
-  **The floor the export reports is the floor the WAL was last handed.** The
-  receiver derives `RetainFloor` from its ledger and passes it to
-  `housekeeping`; `reclaim_state(&self)` has no input for it, so the WAL
-  records the floor each `housekeeping` call was given and reports that
-  last-used value, with its lag against the checkpoint and its `Pinned`
-  count. Between passes that is by definition the floor governing
-  retention, so the export is never stale and needs no hidden coupling;
-  before the first pass it reports "no floor yet".
+  **The floor the export reports is the floor the WAL derived on its last
+  pass.** The receiver passes `SnapshotHorizons` — what it knows — and the
+  WAL combines them with its own ledger (§3.2) into `RetainFloor`, returns
+  it in `HousekeepingProgress` and keeps it for `reclaim_state()`, with its
+  lag against the checkpoint and its `Pinned` count. Between passes that
+  is by definition the floor governing retention, so the export is never
+  stale and needs no hidden coupling; before the first pass it reports "no
+  floor yet".
 
   `max_unlinks` is a parameter rather than WAL configuration because the cap
   belongs to the caller's stall budget, and `HousekeepingProgress` reports
@@ -851,9 +902,10 @@ So the design is:
   journal mutex, rather than taking a second handle to the same WAL. A second
   handle would put two owners on a single-writer resource, which is the one
   thing RFC 0008 §3.1 forbids. Concretely, `CommitCoordinator` gains
-  `maintain(&self, mark: Option<WalOffset>, floor: RetainFloor, cap: usize)
-  -> MaintenanceReport`, the one operation that runs `checkpoint` and
-  `housekeeping` on its private journal mutex; `serve` reaches it from the
+  `maintain(&self, horizons: &SnapshotHorizons, cap: usize) ->
+  MaintenanceReport` and `checkpoint(&self, mark: WalOffset)`, the two
+  operations that run `housekeeping` and `checkpoint` on its private journal
+  mutex; `serve` reaches it from the
   timer through `SharedPipeline`, and runs it on the blocking pool because
   it does file I/O while holding a `std` mutex — the stall is the mutex,
   not the thread, as the cap paragraph below says.
@@ -999,13 +1051,21 @@ memory, and nothing here claims to.
 > - **And** an offered rate above that capacity grows the WAL by
 >   construction until RFC 0053's admission bound exists; this criterion
 >   claims no bound there
+> - **And** after the last append, with no further traffic, one
+>   `barrier_secs` plus one `housekeeping_secs` later the checkpoint has
+>   advanced and every eligible segment is reclaimed — the append-independent
+>   path, which continuous traffic alone cannot prove
 
 > **Scenario RFC0052.4 — A transient rotation failure recovers without a
 > restart**
 > - **Given** a WAL whose rotation fails once with a transient I/O error
-> - **When** a later `append` arrives after the condition clears
-> - **Then** rotation is retried, succeeds, and the append is accepted
->   and acked
+> - **When** the condition clears and, for a failure **before the rename**,
+>   a later `append` arrives — or, for the post-rename directory fsync, the
+>   next `sync` runs
+> - **Then** the pre-rename case re-enters `rotate`, which succeeds, and the
+>   append is accepted and acked; the post-rename case discharges the
+>   pending directory fsync in `sync` without re-entering `rotate`, and the
+>   batches behind it are acked
 > - **And** when the failure was **before the rename**, no file a subsequent
 >   `Wal::open` would select as a segment remains from the failed attempt —
 >   asserted by opening the WAL again, not by inspecting the directory, since
@@ -1120,6 +1180,8 @@ memory, and nothing here claims to.
 >   and the next pass reclaims what it had held
 > - **And** a tenant leaves the ledger only when its last surviving segment
 >   is unlinked, so tenant churn cannot leave a permanent pin
+> - **And** a segment holding exactly one frame for the pinning tenant, at
+>   the pin's own offset, survives the pass — the pin is exclusive
 > - **And** a snapshot listed at startup is used as a horizon only after the
 >   snapshots root has been fsynced in this process; a failed startup fsync
 >   pins every tenant at its oldest surviving frame, so a horizon whose
@@ -1251,9 +1313,11 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   used.
 - **Timer exclusion (RFC0052.14)** — a seeded-interleaving test rather than a
   timing one: the window is narrow, and a wall-clock test that happens to pass
-  proves nothing. Failing that, hold the timer artificially between quiesce and
-  stamp while driving ingest, and assert the submit blocks rather than
-  proceeding.
+  proves nothing. Failing that, hold the timer artificially between the
+  quiesce and the *end of the cut* while driving ingest, assert the submit
+  blocks until the cut is captured and proceeds afterwards, and assert the
+  records admitted after the cut are in neither the checkpoint nor the
+  snapshot that barrier writes — the lock is never held across store I/O.
 - **Telemetry (RFC0052.7)** — the in-memory metric exporter pattern
   already used for the ingest/sink instruments, asserting every name is
   in the exported stream; plus a `weaver registry live-check` pass over

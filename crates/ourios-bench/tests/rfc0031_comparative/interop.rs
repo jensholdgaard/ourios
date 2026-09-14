@@ -301,7 +301,7 @@ async fn poll_until_both_services_indexed(
 /// container is **fail**. Tripping it needs Loki's own promotion list to contain
 /// a denied name, which only a different image or config could produce; adding
 /// one to `LOKI_LABEL_ALLOWLIST` alone trips set-equality first, several lines
-/// earlier. So `denylist_disjointness_is_not_vacuous` is what proves the guard
+/// earlier. So `label_guards_are_not_vacuous` is what proves the guard
 /// can fail at all.
 fn assert_denylist_disjoint_from_promotion(effective: &[String]) {
     for forbidden in LOKI_LABEL_DENYLIST {
@@ -347,7 +347,7 @@ fn probe_completeness_condition_is_not_vacuous() {
 /// Three things are pinned here. The four RFC0031.10 denylist members stay in
 /// the constant (it is the only source of required names for the wire
 /// injection and both live assertions, so removing one would narrow every
-/// check silently). The compile-time disjointness guard trips on a poisoned
+/// check silently). The effective-config disjointness guard trips on a poisoned
 /// promotion list — from a container it is reached on every run but cannot
 /// fail, since tripping it needs Loki's own promotion list to contain a
 /// denied name. And the two runtime guards reject what the pinned image never

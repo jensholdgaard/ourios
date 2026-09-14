@@ -266,7 +266,18 @@ detached partition **back into the sink's buffers as a `ready` partition**
 — still under the sink's byte accounting, excluded from the size trigger
 (it is already past it), and taken by the publisher, oldest first, as the
 queue drains, or by the next drain or flush like any buffered partition —
-and moves on. A `ready` partition is **not** a plain record partition: it
+and moves on. A park is a **settlement with a date on it**, exactly like a
+requeue: it records the `barrier_epoch` current when the records re-entered
+the buffers, and `quiesce_publishes().all_ok(cut.epoch)` is false for any
+cut captured before that epoch. Without that, parking would be the one way
+out of §3.1's predicate — a pre-cut guard could park its partition after
+this cut had already drained the buffers, the guard would settle
+successfully, and the barrier would checkpoint over acknowledged records
+that exist only in the buffers it no longer holds. Every one of the three
+park sites takes the rule: the full-queue park here, the publisher's
+unwind park, and the closed-channel park. A cut captured *after* the park
+drained those records itself and stamps normally. A `ready` partition is
+**not** a plain record partition: it
 keeps its `audit_watermark`, carried in the buffer entry beside the
 records, because parking must not strip the dependency that makes the
 records publishable. Every consumer of a `ready` partition — the
@@ -357,8 +368,9 @@ under `catch_unwind`, so a panic settles only the failing batch through
 its guard's drop — latched (§3.1's guard rule; its records stay in the WAL
 until a restart re-mines them, the stage-1 posture for every unwind) — and
 the same thread then drains every batch still queued back into the
-buffers as `ready` partitions, releasing each guard as its records land,
-and only then exits; the coordinator respawns it on the next enqueue.
+buffers as `ready` partitions, each park recording the current
+`barrier_epoch` (§3.1's park rule) and releasing its guard as its records
+land, and only then exits; the coordinator respawns it on the next enqueue.
 `quiesce_publishes` therefore always terminates: every guard is settled
 by a durable write, a requeue, a park, or the failing batch's own drop.
 The worker's side of that window is defined too, because a send can fail
@@ -368,7 +380,7 @@ silently and the checkpoint would stamp over records in neither the
 buffers nor the store. So a failed send **returns the item to the
 worker**, which parks the batch into the buffers as a `ready` partition
 under the sink lock *before* releasing its guard — the same park the full
-queue takes — and signals the coordinator to respawn the publisher. No
+queue takes, recording the current `barrier_epoch` with it — and signals the coordinator to respawn the publisher. No
 path releases a publish guard without the records being durable,
 requeued, or parked.
 RFC 0053's requeue-on-unwind replaces only the failing batch's arm of
@@ -753,12 +765,19 @@ independent, so on a legacy root the housekeeping timer can fire before the
 first barrier has upgraded the sidecar — and reclaiming there would unlink
 segments under a version-1 checkpoint, the one shape §3.2's matrix reads as
 "nothing was ever reclaimed". So a pass whose root still has a version-1
-`CHECKPOINT`, or no `RECLAIM` record, **plans nothing and unlinks
-nothing**: it returns a progress with `capped` false and zero counts,
-counted as a skipped pass with its reason on the existing cadence counter
-(`error.type` carries the reason, §3.5's rule), and the partial sweep is
-skipped with it, since a partial unlink is also a reclamation. The first
-barrier's checkpoint establishes the witness and the next pass runs
+`CHECKPOINT`, or no `RECLAIM` record, **plans no segment and writes no
+record**: it returns a progress with zero segment counts, counted as a
+skipped pass with its reason on the existing cadence counter (`error.type`
+carries the reason, §3.5's rule). The gate is on segment planning and the
+record write, and on nothing else: the **partial sweep still runs on every
+pass**, witness or not. A `.wal.partial` is debris from a rotation that
+never installed a segment — no reader has ever been able to depend on it,
+no `reclaimed_through` accounts for it, and removing it loses nothing —
+so gating it would let rotation debris created before the first checkpoint
+survive forever, against RFC0052.4's one-pass clearance and RFC0052.16.
+Partials are popped first within the cap as always, and the cap's
+remainder simply goes unused while the gate holds. The first barrier's
+checkpoint establishes the witness and the next pass reclaims segments
 normally. This is not a new gate so much as a narrower one: today's
 `housekeeping` is already a no-op before the first checkpoint.
 
@@ -1080,7 +1099,14 @@ one, because startup's fallback is exactly as trustworthy as this record:
   on a post-RFC root the record is created at open, before the first
   checkpoint can exist — and open **fails closed** on it as
   `OpenError::Corrupt`, naming the missing file; both absent is the
-  pre-RFC layout with no checkpoint, also opened with an empty record. Per
+  pre-RFC layout with no checkpoint — but only on an **empty** directory.
+  Both sidecars absent while any `*.wal` segment is present is
+  `OpenError::Corrupt` too, naming both files: a served root writes a
+  checkpoint on its first barrier, so segments without either sidecar is
+  either a partial backup or a hand-edited directory, and reading it as
+  "fresh" would replay frames whose Parquet rows may already exist. The
+  legitimate pre-RFC root reaches this open with segments *and* a
+  version-1 `CHECKPOINT`, which is the row above. Per
   the pre-production layout policy that read path is the whole migration
   — no tooling — and the implementing PR carries the `!` marker for the
   sidecar version bump beside the snapshot one. The matrix is symmetric: a
@@ -1127,31 +1153,42 @@ one, because startup's fallback is exactly as trustworthy as this record:
   reclaimed", damaged means "reclaimed, extent unknown", and only the first
   is safe to proceed from.
 
-Each entry also records **which rule the pass reclaimed under**, because
-the two are not equivalent evidence. Under `SnapshotHorizons::Known` a
-segment is unlinked because every tenant's snapshot covered it, so a
-missing snapshot afterwards means state that cannot be rebuilt. Under
-`NoConsumer` — the documented mode where no snapshot consumer exists and
-the checkpoint alone governs (§3.2) — no snapshot was ever expected, and
-treating the entry as snapshot-backed would make a node that reclaimed
-correctly fail closed on its next start, turning a supported
-configuration into a halt. So an entry written by a `NoConsumer` pass
-carries that mode, per tenant, beside its horizon.
+**`NoConsumer` means no miner state exists, and that is a precondition,
+not a hint.** The previous draft read a `NoConsumer` reclaim as
+"checkpoint-covered" and let a later start pin instead of halting. That is
+unsafe wherever a miner is running: hazard #5's retain rule (RFC 0001
+§6.9) makes a missing snapshot survivable *because* the WAL still holds
+the frames to re-mine, and a pass that reclaimed by checkpoint alone has
+removed exactly those frames — the tree cannot be rebuilt, and wiring
+snapshots up afterwards does not bring it back. Nothing in the code
+prevents that combination today: `Wal::housekeeping`'s `retain_floor`
+(what `SnapshotHorizons` replaces) is a plain `Option`, its only `None`
+callers are `ourios-wal`'s own tests, and the one WAL-bearing role the
+server ships — the ingester — always holds a `MinerCluster`.
 
-The WAL exposes the reconciled `reclaimed_through` as
-`ReclaimState::reclaimed_through`, and recovery compares **per entry, by
-its mode**: an entry written with a consumer whose tenant's restorable
-horizon is below it — including a tenant with an entry and no restorable
-snapshot at all — is unrecoverable state and recovery **halts**, naming
-the tenant; an entry written under `NoConsumer` is checkpoint-covered, so
-a missing or undecodable snapshot is not a fault and the tenant pins at
-its oldest surviving frame like any unsnapshotted tenant. A tenant with no
-entry has lost nothing and pins the same way. A mode change between runs
-needs no special case: entries keep the mode they were written under, so a
-node that later gains a consumer halts only on what was reclaimed under
-one. An undecodable or missing snapshot is therefore safe to fall back
-from exactly when the record proves it is, and RFC0052.17 holds each of
-those cases.
+So the mode is given a precondition rather than a reading. `NoConsumer`
+means **the caller holds no miner state at all**: a WAL used without a
+miner (the crate's own tests and benches today, a WAL-only role if one is
+ever added). The ingest receiver is never in that position and therefore
+**always passes `Known`** — a tenant with no valid snapshot is expressed
+by the `Pinned` floor §3.2 already defines, never by `NoConsumer`, which
+is the distinction RFC0052.13 exists to hold. The precondition is
+asserted where `SnapshotHorizons` is built, and the WAL fail-closes on the
+combination it can check for itself: a `NoConsumer` pass on a root whose
+`RECLAIM` holds any `Known` entry is refused as `ReclaimError`, since a
+miner demonstrably existed there.
+
+Entries still record their mode, and recovery reads them by it: an entry
+written under `Known` whose tenant's restorable horizon is below it —
+including a tenant with an entry and no restorable snapshot at all — is
+unrecoverable state and recovery **halts**, naming the tenant; a
+`NoConsumer` entry is checkpoint-covered, which is sound *because* the
+precondition says no miner state existed when it was written, and the
+`Known`-entry refusal keeps the two from mixing on one root. A tenant with
+no entry has lost nothing and pins at its oldest surviving frame. An
+undecodable or missing snapshot is therefore safe to fall back from
+exactly when the record proves it is, and RFC0052.17 holds each of those
+cases.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` reclaims only segments every tenant's horizon covers, and
@@ -2323,6 +2360,8 @@ memory, and nothing here claims to.
 > - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
 >   fails open naming the missing record — its `CHECKPOINT` is version 2, so
 >   the root is post-RFC — rather than recreating an empty record and pinning
+> - **And** a root holding segments but neither sidecar fails open naming
+>   both, while an empty directory with neither opens as a fresh root
 > - **And** a root holding a version-1 `CHECKPOINT` (an RFC0008.7 fixture)
 >   and no `RECLAIM` opens as pre-RFC **without** creating a record, and its
 >   first checkpoint rewrites the sidecar at version 2 and creates the
@@ -2337,10 +2376,11 @@ memory, and nothing here claims to.
 > - **And** a restart in that migration window — still a version-1
 >   `CHECKPOINT`, still no record — takes the legacy branch again rather
 >   than any fail-closed row
-> - **And** a housekeeping pass that fires in that window plans nothing,
->   unlinks nothing (segments and partials alike) and is counted as a
->   skipped pass with its reason; the pass after the first checkpoint runs
->   normally
+> - **And** a housekeeping pass that fires in that window plans no segment,
+>   writes no record and is counted as a skipped pass with its reason,
+>   while still sweeping stale `.wal.partial` files, so rotation debris
+>   from before the first checkpoint does not survive the window; the pass
+>   after the first checkpoint reclaims segments normally
 > - **And** a root whose `RECLAIM` carries `checkpoint_seen` — written after
 >   its first version-2 checkpoint succeeded, entries or none — and whose
 >   `CHECKPOINT` is missing fails open naming both files
@@ -2358,11 +2398,16 @@ memory, and nothing here claims to.
 >   legacy branch, reclaims nothing until the next checkpoint retries the
 >   upgrade, and that retry succeeds against the arming already on disk;
 >   asserted by restarting the node in that state
-> - **And** a node reclaiming under `SnapshotHorizons::NoConsumer` restarts
->   without a snapshot and does **not** halt: its entries carry that mode
->   and are read as checkpoint-covered, the tenant pinning at its oldest
->   surviving frame; an entry written with a consumer, on the same root,
->   still halts when its snapshot is missing
+> - **And** a WAL used with no miner state reclaims under
+>   `SnapshotHorizons::NoConsumer` and restarts without a snapshot without
+>   halting: its entries carry that mode and are checkpoint-covered
+> - **And** a `NoConsumer` pass on a root whose `RECLAIM` already holds a
+>   `Known` entry is refused as a `ReclaimError` rather than reclaiming, so
+>   the two modes cannot mix on one root
+> - **And** the ingest receiver never passes `NoConsumer`: a tenant with no
+>   valid snapshot is expressed as `Pinned` (RFC0052.13) and its frames are
+>   retained, so no miner-bearing tenant can be reclaimed past its replay
+>   need
 > - **And** a segment whose `unlink` fails after the record was written
 >   stays on disk with `reclaimed_through` behind it: a restart with that
 >   tenant's snapshot undecodable pins the tenant rather than halting
@@ -2577,12 +2622,11 @@ they are not substitutes for the rest.
   - *RFC 0053 §3.2* amends §3.7's `Journal` surface and this RFC's sidecar
     layout: `checkpoint` takes a per-tenant published map, `fn
     checkpoint(&mut self, durable_to: WalOffset, published: &HashMap<TenantId,
-    WalOffset>)`, persisted to a `PUBLISHED` sidecar written before
-    `CHECKPOINT` in the same call, and joining §3.2's sidecar matrix on the
-    same fail-closed footing as `RECLAIM`. The map is
-    `HashMap<TenantId, PublishedMarks>` with `PublishedMarks { records,
-    audit }` — a per-tenant pair, not a bare offset — written on the
-    checkpoint's own durable path.
+    PublishedMarks>)` with `PublishedMarks { records, audit }` — a
+    per-tenant pair, not a bare offset — persisted to a `PUBLISHED` sidecar
+    written before `CHECKPOINT` in the same call, on the checkpoint's own
+    durable path, and joining §3.2's sidecar matrix on the same fail-closed
+    footing as `RECLAIM`.
   - *RFC 0053 §3.2* also amends §3.1's latch: it gains
     `failure_generation: AtomicU64`, bumped by every reporting guard between
     lowering `failed_epoch` and decrementing its count, so its clear can be

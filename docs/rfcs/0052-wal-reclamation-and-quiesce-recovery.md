@@ -206,8 +206,11 @@ to its own frame offset after its mining step, the cut captures those
 horizons, and the WAL ledger stays the eligibility source only. Each writer
 uses a **unique** temp
 name (`<tenant>.<mark>.snap.tmp`, since today's one fixed `.snap.tmp` could
-be truncated or interleaved by a concurrent cut before either rename), the
-whole temp write, fsync and rename runs under a snapshot-install lock
+be truncated or interleaved by a concurrent cut before either rename — and
+the writer unlinks its own temp on any write, fsync or rename failure, with
+`load_all_durable()` removing any `*.snap.tmp` left by a previous process,
+so a failed barrier cannot leak one snapshot per attempt), the whole temp
+write, fsync and rename runs under a snapshot-install lock
 shared by the timer, the rotation hook and shutdown, and a writer installs
 only when its mark is not below the installed snapshot's — so an older cut
 can neither overwrite a newer snapshot nor share its temp file, and the
@@ -332,7 +335,7 @@ does not have today:
 ```text
 if barrier_succeeded and high_water is Some(mark):
     journal.checkpoint(mark)            // §6.7, monotonic; Result
-      on Err  -> log, do NOT advance, retain every segment
+      on Err  -> log, do NOT advance; nothing past the PREVIOUS mark is reclaimed
 ```
 
 Three properties come free from existing code and must not be
@@ -342,8 +345,9 @@ reimplemented:
   and no-ops on a re-assert, so a repeated stamp at the same mark is
   safe.
 - **Fail-closed** — on a sidecar write error the in-memory checkpoint is
-  not advanced, so the WAL conservatively keeps every segment rather
-  than risk a post-crash duplicate.
+  not advanced, so nothing past the *previous* mark is reclaimed — segments
+  already eligible under that mark still are (RFC0052.1) — rather than risk
+  a post-crash duplicate.
 - **Skip-on-retain** — when either sink retains anything,
   `flush_then_snapshot` returns `false` and no checkpoint is attempted.
   The WAL keeps the frames and the next start re-mines them.
@@ -567,9 +571,17 @@ a fault to surface, not to continue past. One directory fsync rather than a mani
 would need the same fsync to be trustworthy itself. Durability is necessary
 and not sufficient: `snapshot_store::load_all` returns raw bytes, and a
 horizon is admitted only from a snapshot that decodes and restores. A listed
-file that fails either counts as that tenant having no snapshot — hence a
-pin at its oldest surviving frame — rather than as a horizon, so a
-durable-but-invalid file can never authorise reclamation.
+file that fails either is never a horizon — but whether the node may then
+*continue* needs durable evidence, because once reclamation has run, the
+frames below that tenant's previous horizon are gone and a pin at its oldest
+surviving frame cannot rebuild the state they held. So `housekeeping`
+persists, per tenant, the horizon it reclaimed under — a `RECLAIM` sidecar
+beside `CHECKPOINT`, written and fsynced *before* the unlinks — and startup
+compares: a tenant whose restorable horizon is below its recorded
+reclaimed-through has unrecoverable state and recovery **halts**, naming the
+tenant; a tenant with no reclaim record has lost nothing and pins at its
+oldest surviving frame as before. An undecodable or missing snapshot is
+therefore safe to fall back from exactly when the record proves it is.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` reclaims only segments every tenant's horizon covers, and
@@ -744,7 +756,13 @@ Two more properties of the sweep are stated because the current
 checkpoint precondition: today `housekeeping` returns at once when no
 checkpoint exists, and a rotation that fails before the first checkpoint
 would otherwise leave partials that every later pass skips; only the
-segment-unlink portion is gated on a checkpoint. **Its error path still
+segment-unlink portion is gated on a checkpoint. **And it lists nothing on
+the pass**: partials left by a previous process are seeded into an
+in-memory partial list by `remeasure_unreclaimed()`, which walks the
+directory at the end of recovery anyway, live rotations register the
+partial they create, and the sweep pops from that list under the same cap
+— so restart debris is found without a directory scan under the writer
+lock. **Its error path still
 makes completed removals durable**: when a pass fails part-way — a header
 read, a stat, a later unlink — the parent-directory fsync covers every unlink
 that already succeeded before the error is returned, and
@@ -780,8 +798,12 @@ and shrinking.
 
 A pre-rename retry is attempted on the next `append`, and a post-rename
 directory-fsync retry by the next `sync` (above); neither runs in a
-background loop: the WAL is single-writer and has no task of its own, and a
-rotation is only needed when there is something to write. `quiesced` becomes a typed state
+background loop of its own: the WAL is single-writer and has no task, and a
+rotation is only needed when there is something to write. The one
+append-independent caller is the barrier task's idle rotation (§3.2,
+`Journal::rotate`), and it is not exempt: a timer-triggered rotation that
+fails draws on the same budget and can reach the terminal state without an
+append ever arriving, which RFC0052.4/.5 cover. `quiesced` becomes a typed state
 carrying the attempt count and the first underlying error, so the
 distinction between "retrying" and "given up" is representable rather
 than a bool. The budget is a **count**: three consecutive failed attempts
@@ -983,6 +1005,13 @@ So the design is:
   fn housekeeping(&mut self, horizons: &SnapshotHorizons, max_unlinks: usize)
       -> Result<HousekeepingProgress, ReclaimError>   // derives RetainFloor itself
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
+  fn rotate(&mut self) -> Result<(), ReceiveError>         // §3.3's retried rotation,
+                                                           // callable without an append:
+                                                           // discharges a pending directory
+                                                           // fsync first, no-op when the
+                                                           // current segment holds no frame;
+                                                           // Wal::rotate is private today.
+                                                           // RFC 0053 uses this definition.
   ```
 
   **The own-frame mark needs plumbing, stated so it cannot be skipped.**
@@ -1147,12 +1176,18 @@ or a store outage leaves unbounded — so eligibility is **indexed
 incrementally** rather than evaluated per pass: the WAL keeps, per segment,
 the set of tenants whose horizon is still below their last offset in it;
 applying new horizons (the `SnapshotHorizons` input, under the mutex)
-shrinks those sets for the segments those tenants span, and a segment whose
-set is empty and whose highest offset is at or below the checkpoint moves to
-an **eligible queue**. The pass pops at most `max_unlinks` from that queue —
-O(cap) under the writer lock, with no name listing, since segments are known
-from the ledger — and the horizon application costs are proportional to the
-horizons that changed, which on an idle pinned backlog is nothing.
+shrinks those sets for the segments those tenants span — **lazily and
+capped**: at most the cap's worth of segments per pass, resumed from a
+per-tenant cursor on the next, so a tenant whose snapshot catches up after
+the incident's 1,113-segment outage cannot hold the writer position for the
+whole backlog — and empty-set segments sit in an ordered structure keyed by
+highest offset, from which a segment moves to an **eligible queue** when
+its highest offset is at or below the checkpoint: a checkpoint advance
+promotes every empty-set segment at or below the new mark in one ordered
+pass, so both events populate the queue and nothing is stranded. The pass
+pops at most `max_unlinks` from that queue — O(cap) under the writer lock,
+with no name listing, since segments are known from the ledger — and the
+`HousekeepingProgress` reports how much horizon application remains.
 RFC0052.12 is worded to that guarantee. The next tick continues where this one left off
 without a cursor, because eligibility is recomputed from the ledger each
 time and the eligible segments are taken oldest first. That matters most on
@@ -1234,8 +1269,10 @@ memory, and nothing here claims to.
 >   horizon is at or above that tenant's last frame in them (both
 >   inclusive) are unlinked, the current append segment survives, and the
 >   WAL's segment count falls
-> - **And** a segment whose highest frame sits exactly at a tenant's horizon
->   is unlinked — `Min` horizons are post-append and inclusive
+> - **And** a segment holding the frame that sits exactly at a tenant's
+>   horizon is retained — the per-tenant comparison is strict, only the
+>   checkpoint comparison is inclusive — and is unlinked once the tenant's
+>   horizon has moved past it
 > - **And** a frame above the *lagging* tenant's horizon is still present
 >   after the pass, so a restart re-mines it rather than losing that
 >   tenant's miner state
@@ -1265,12 +1302,14 @@ memory, and nothing here claims to.
 >   `barrier_secs` plus one `housekeeping_secs` later the checkpoint has
 >   advanced and every eligible **closed** segment is reclaimed — the
 >   append-independent path, which continuous traffic alone cannot prove —
->   and one `segment_age_secs` later the last segment has rotated and been
->   reclaimed too
+>   and within `segment_age_secs + barrier_secs + housekeeping_secs` the
+>   last segment has rotated on a barrier tick and been reclaimed by the
+>   following pass
 
 > **Scenario RFC0052.4 — A transient rotation failure recovers without a
 > restart**
-> - **Given** a WAL whose rotation fails once with a transient I/O error
+> - **Given** a WAL whose rotation fails once with a transient I/O error —
+>   triggered by an append, or by the barrier task's idle rotation
 > - **When** the condition clears and, for a failure **before the rename**,
 >   a later `append` arrives — or, for the post-rename directory fsync, the
 >   next `sync` runs
@@ -1329,8 +1368,16 @@ memory, and nothing here claims to.
 >   header and listed no directory — eligibility comes from the incremental
 >   index, and the pass pops at most the cap from the eligible queue — so an
 >   append taken concurrently waits for O(cap) work under the writer lock
->   whatever the backlog; applying changed horizons costs work proportional
->   to those horizons, and an unchanged pinned backlog costs none
+>   whatever the backlog; applying changed horizons is itself capped —
+>   at most the cap's worth of segments per pass, resumed from a per-tenant
+>   cursor next pass, so a tenant catching up after a long outage cannot
+>   hold the writer position for the whole backlog — and an unchanged
+>   pinned backlog costs none
+> - **And** a checkpoint advance promotes every empty-set segment at or
+>   below the new mark, so a segment observed above the old checkpoint is
+>   not stranded when horizons stop changing
+> - **And** stale partials left by a previous process are removed from the
+>   list seeded at recovery, without a directory listing on the pass
 > - **And** a pinned oldest segment does not shadow a later eligible one: the
 >   pass reclaims the eligible segment on its first tick
 > - **And** successive passes drain the backlog to the same end state an

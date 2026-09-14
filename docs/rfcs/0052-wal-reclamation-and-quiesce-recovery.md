@@ -14,7 +14,9 @@ superseded-by: —
 > **Status note.** `drafted`. **Stage 1 of two.** Motivated by a production
 > incident (issue #791) and the defects found tracing it (#791, #793). Amends
 > RFC 0008 §6.5 and §6.7 with the *policy* those sections left to a caller
-> that was never written, **amends RFC 0018 §3.2** (whose transient class
+> that was never written, **amends RFC 0001 §6.9** (per-tenant own-frame
+> snapshot horizons and the tenant-aware retain rule supersede its global
+> high-water wording; §8), **amends RFC 0018 §3.2** (whose transient class
 > lists "post-rotation quiesce", which #791 disproved), and exports the WAL
 > telemetry the incident showed is missing. Touches `CLAUDE.md` §3.4
 > throughout, which is why it is an RFC and not patches.
@@ -193,12 +195,17 @@ both sinks into owned batches, registers that publish as in flight, and
 serialises each tenant's miner snapshot state — the bytes `write_snapshots`
 would write — then releases. The flush of those batches, the snapshot *file* writes from
 those bytes, and the checkpoint all run *outside* the exclusion. Snapshot
-*installation* is serialised even so: every snapshot file carries the cut's
-mark, the `.snap.tmp` → `.snap` rename is taken under a snapshot-install
-lock shared by the timer, the rotation hook and shutdown, and a writer
-installs only when its mark is not below the installed snapshot's — so an
-older cut can neither overwrite a newer snapshot nor share its temp file,
-and the in-memory horizon advances only on an install that happened.
+*installation* is serialised even so: every snapshot file carries that
+tenant's own last folded frame from the cut (per-tenant marks, never the
+checkpoint's global mark — a tenant with no frame near the cut must not be
+stamped past frames it has not folded), each writer uses a **unique** temp
+name (`<tenant>.<mark>.snap.tmp`, since today's one fixed `.snap.tmp` could
+be truncated or interleaved by a concurrent cut before either rename), the
+whole temp write, fsync and rename runs under a snapshot-install lock
+shared by the timer, the rotation hook and shutdown, and a writer installs
+only when its mark is not below the installed snapshot's — so an older cut
+can neither overwrite a newer snapshot nor share its temp file, and the
+in-memory horizon advances only on an install that happened.
 Capturing the snapshot bytes at the cut is what makes `S` cut-consistent: it never
 runs past the mark, and every row at or below it is in the detached
 batches, so a turn admitted after the cut is neither in the snapshot nor
@@ -208,8 +215,8 @@ stated, because it is narrower than "no duplicates": a frame published
 sits above `max(X, S)` and is re-published on replay. That is RFC 0008 and
 RFC 0014's existing at-least-once contract above the checkpoint, unchanged
 here and not claimed otherwise; a published high-water mark persisted with
-every flush would bound it and is the §7 follow-on it would be. Detaching only the file I/O
-keeps that property while so a slow or unavailable object store stalls ingest
+every flush would bound it and is recorded in §7 as the follow-on. Detaching only the file I/O
+keeps that property, and it means a slow or unavailable object store stalls ingest
 for the length of a drain and never for a PUT; holding the exclusion across
 `flush_then_snapshot`'s PUTs would let every retry during an outage recreate
 the local ingest outage, and would keep RFC 0053's admission bound from
@@ -239,12 +246,17 @@ sub-target object per active partition per `barrier_secs`** beyond RFC
 buffered frame durable, and RFC0052.3 records the objects written per
 interval so it is measured rather than assumed. A busy partition still
 flushes on size between barriers. Housekeeping runs on `housekeeping_secs`
-against the last checkpoint, and reclamation of a **closed** segment lags a
-publication by at most `barrier_secs + housekeeping_secs`. The current
-append segment is never unlinked, so on an idle node its bytes are reclaimed
-only after it rotates on `segment_age_secs` (600 s by default): the idle
-bound is `barrier_secs + housekeeping_secs + segment_age_secs`, which
-RFC0052.3's idle leg asserts.
+against the last checkpoint, and an eligible closed segment is reclaimed
+by the first capped pass that reaches it — at most `barrier_secs +
+housekeeping_secs` after its publication when the backlog is within the
+cap, later ones waiting through further passes, and segments a pinned
+tenant or a failed snapshot holds retained by design. The current append
+segment is never unlinked, and rotation is checked only on an append
+today, so the barrier task also calls `Journal::rotate` when the current
+segment's age exceeds `segment_age_secs` and it holds a frame — an idle
+node's last segment then rotates, and its bytes are reclaimed within
+`barrier_secs + housekeeping_secs + segment_age_secs`, which RFC0052.3's
+idle leg asserts.
 
 **Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
 takes the miner lock today before the pool submission and the `last_durable`
@@ -264,7 +276,7 @@ drain therefore takes the exclusion in shared mode — **before** the miner
 lock, which means the drain helper changes rather than the shared hold being
 added inside today's `with_miner(drain_aged)`: taken inside it, the sweep
 would hold the miner lock waiting for the shared exclusion while the timer
-held the exclusive lock waiting for the miner, and both would deadlock — — held only across the
+held the exclusive lock waiting for the miner, and both would deadlock — held only across the
 drain and the in-flight registration, and released *before* the off-lock
 publish, whose PUTs can block on the store — and the timer takes it
 exclusively: no sweep drains inside the barrier, a drain in progress
@@ -450,10 +462,13 @@ rule would let one unsnapshotted frame pin every later segment, even those
 holding only other tenants, which is the permanent growth this section
 exists to end. The rule, stated once: a closed segment is reclaimable when
 its highest offset is at or below the checkpoint (**inclusive**, a
-post-append horizon), and for every tenant with a frame in it that tenant
-has a valid horizon at or above its last offset in that segment
-(**inclusive**, likewise). A pinned tenant has no horizon, so exactly its
-own segments are retained — equality can never unlink the pinned frame —
+post-append horizon), and for every tenant with a frame in it that tenant's
+last offset in that segment is **strictly below** its valid horizon — strict,
+so the segment holding the horizon frame itself is retained, which is what
+keeps the stale-gap detector's argument true: `S`'s segment is present on
+every restart, and an absent segment implies the tenant's frames in it were
+all below `S`. A pinned tenant has no horizon, so exactly its own segments
+are retained — equality can never unlink the pinned frame —
 while segments holding only other tenants' covered frames are reclaimed
 whatever their offset. `RetainFloor` is the *reported* summary of that
 rule (the minimum over horizons and pins), not the predicate. The pin lifts the moment a valid snapshot for the tenant is
@@ -634,7 +649,9 @@ the type: `CommitCoordinator::flush` collapses every sync error into
 `ReceiveError::WalSync`. `FlushOutcome` therefore gains the error's class —
 terminal or transient — beside the detail, and waiters rebuild a
 `ReceiveError` that carries it, so the classifier sees the terminal state
-rather than a string. The retry hint is settled honestly: an append, sync
+rather than a string; §6 drives both a rotation-origin terminal sync
+failure and an ordinary transient one through `flush` and the waiter, so
+the production path cannot erase the class while the classifier tests pass. The retry hint is settled honestly: an append, sync
 or still-retrying rotation failure has **no scheduled retry** on the server
 — the next attempt is the client's next request — so those transient
 classes carry no hint and the client backs off as OTLP prescribes, exactly
@@ -797,9 +814,12 @@ not acked, and every non-retryable OTLP status also tells the client to drop
 it. What changes is the *class* — and under this section's bounded retry, only
 the **terminal** state leaves the transient class. A rotation failure still
 within its retry budget genuinely is transient: a later append can succeed, so
-it keeps `Retry-After`. Only once the budget is exhausted is the node in a state
-no delay fixes, and only there is `Retry-After` — already optional in §3.2 —
-withheld, with the message naming the state. RFC0052.15 pins both halves.
+it stays in the transient class and its message says it is retrying. Only
+once the budget is exhausted is the node in a state no delay fixes, and only
+there does the classification change, with the message naming the state. No
+retry hint is carried on either — the server schedules no retry of its own
+(§3.7), so the client backs off as OTLP prescribes — and RFC0052.15 pins
+both halves on class and message.
 
 ### 3.4 Backpressure — moved to RFC 0053
 
@@ -879,9 +899,10 @@ monotonically by `covered_seq` rather than by completion, so an older
 transient outcome cannot overwrite a newer terminal one — and the
 projection is built from that cell, from
 `ReclaimState`, and from the task's own `cadence_failed` latch — an explicit
-input, not a `ReclaimState` field — so a terminal entry reached on the
-append path is emitted once, at most one `housekeeping_secs` late. One
-owner, real call sites, registry names.
+input, not a `ReclaimState` field. Rotation-state edges, including the
+terminal entry, are emitted synchronously at the transition as stated
+above — never sampled, never late. One owner per state, real call sites,
+registry names.
 
 ### 3.6 Requeue on unwind — moved to RFC 0053
 
@@ -1031,12 +1052,14 @@ So the design is:
   so that replay emits nothing implicitly, feeds the miner only above that
   tenant's snapshot horizon `S`, as now, and forwards the captured records to
   the record sink only above **`max(X, S)` per tenant**, and captures the
-  miner's **audit events** the same way, forwarding them only for frames
-  above `X` — the barrier drains the audit sink before it stamps, so `X` is
-  the audit horizon — since `ingest_mined` diverts only records and the
-  miner's `ingest` would otherwise emit the audit rows for `(S, X]` a second
-  time, while a disconnected sink would drop the audit events above the gate
-  — `max`, because the
+  miner's **audit events** the same way — through a replay capture sink the
+  driver installs, which receives both mined records and audit events
+  tagged with the offset of the frame being replayed, since `AuditEvent`
+  carries no offset and `ingest_mined` diverts only records — forwarding
+  events only for frames above `X` (the barrier drains the audit sink before
+  it stamps, so `X` is the audit horizon): events for `(S, X]` are suppressed
+  and counted, events above `X` forwarded, and neither duplicated nor lost;
+  RFC0052.10 gains the audit leg — `max`, because the
   snapshot is written before the checkpoint is persisted, so a successful
   snapshot followed by a failed checkpoint write leaves `S > X` with `(X, S]`
   already in Parquet. Frames below that gate are suppressed on the Parquet
@@ -1068,7 +1091,11 @@ So the design is:
   restarts idle — that post-recovery snapshot write preserves each tenant's
   *restored* horizon rather than writing `None` over it, which would have
   discarded the snapshots on the next restart and forced a full replay every
-  time. §3.1's "behind the barrier and nowhere else" holds —
+  time. The mixed case needs the same care: a replay that delivered frames
+  for tenant A only must record A's progress and keep B's restored horizon,
+  which one global `max_delivered` cannot express, so `RecoveryReport`
+  returns **per-tenant delivered horizons** and the post-recovery write is
+  driven from those. §3.1's "behind the barrier and nowhere else" holds —
   this is a caller that has the mark but not yet the owner, not a second
   checkpoint site.
 - **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
@@ -1237,9 +1264,11 @@ memory, and nothing here claims to.
 >   installed segment is selected by a subsequent open — it is complete and
 >   valid — and the first `sync` after open discharges its pending directory
 >   fsync
-> - **And** the temporary files left by the failed attempts are gone after a
->   housekeeping pass, so a persistently retrying node cannot fill its disk
->   with retry debris
+> - **And** the temporary files left by the failed attempts are gone after
+>   successive capped housekeeping passes — `max_unlinks_per_pass` is
+>   validated to be at least the retry budget, so one rotation's debris
+>   clears in one pass — and a persistently retrying node cannot fill its
+>   disk with retry debris
 
 > **Scenario RFC0052.5 — A persistent rotation failure gives up
 > distinguishably, and never acks**
@@ -1278,8 +1307,10 @@ memory, and nothing here claims to.
 >   header at all — eligibility comes from the in-memory ledger — and the
 >   only O(n) steps are the name listing and that memory pass, neither of
 >   which touches a file; an append taken concurrently waits for the capped
->   unlinks plus that pass, which is bounded by measurement rather than by
->   the cap: at 10,000 ledger entries the pass completes within 1 ms
+>   unlinks plus that pass, whose work bound is deterministic — each ledger
+>   entry is touched exactly once and no file is opened — and whose
+>   wall-clock cost at 10,000 entries is recorded by the bench as a
+>   diagnostic, not asserted as a gate
 > - **And** a pinned oldest segment does not shadow a later eligible one: the
 >   pass reclaims the eligible segment on its first tick
 > - **And** successive passes drain the backlog to the same end state an
@@ -1407,6 +1438,9 @@ memory, and nothing here claims to.
 > - **And** the same holds when the snapshot write succeeded and the
 >   checkpoint write then failed, so a tenant restarts with `S > X`: nothing
 >   in `(X, S]` is republished
+> - **And** the audit stream is gated the same way: no template event for a
+>   frame at or below `X` is emitted again on replay, and every event for a
+>   frame above `X` is
 
 ## 6. Testing strategy
 
@@ -1470,8 +1504,8 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
 - **Reclassification (RFC0052.15)** — the classifier unit tests held on
   `hold/794-wedged-classification`, rewritten to the terminal-only rule and
   extended to assert the *narrowness*: an ordinary append or fsync I/O
-  failure and a still-retrying rotation keep `Retry-After` while only the
-  terminal rotation state does not. Without that third assertion the test
+  failure and a still-retrying rotation stay in the transient class while
+  only the terminal rotation state leaves it; no arm carries a retry hint. Without that third assertion the test
   passes on a blanket removal of `Retry-After`, which would contradict
   RFC 0018 §3.2 rather than amend it.
 - **Floor pinning (RFC0052.13)** — unit tests over the three `RetainFloor`
@@ -1565,7 +1599,10 @@ they are not substitutes for the rest.
   satisfied, since the status is unchanged; only the class and the optional
   `Retry-After` move.
 - RFC 0001 §6.9 — the miner snapshot high-water mark, and the hazard-#5
-  retain rule that makes it the truncation floor.
+  retain rule that makes it the truncation floor — **amended** by §3.2:
+  horizons are per tenant (each tenant's own last folded frame), the retain
+  rule is tenant-aware and strict at the horizon, and the stale-gap
+  detector's argument is restated on that basis.
 - RFC 0014 — the record sink and its flush triggers.
 - `CLAUDE.md` §3.4 (WAL-before-ack), §3.6 (object storage is the source
   of truth), §6.3 (observability of ourselves).

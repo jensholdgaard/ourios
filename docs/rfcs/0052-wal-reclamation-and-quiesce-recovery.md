@@ -180,12 +180,23 @@ change ingest ordering, and it is the smallest thing that closes the window.
 Rotation needs no change: it already runs inside an ingest's own span.
 
 **The cut is captured under the exclusion; the store I/O is not.** Under the
-exclusion the timer quiesces encodes, reads the mark, drains both sinks into
-owned batches, registers that publish as in flight, and serialises each
-tenant's miner snapshot state — the bytes `write_snapshots` would write —
-then releases. The flush of those batches, the snapshot *file* writes from
-those bytes, and the checkpoint all run *outside* the exclusion. Capturing
-the snapshot bytes at the cut is what makes `S` cut-consistent: it never
+exclusion the timer stops new submissions and waits for the *encode* steps
+to finish — not for the workers' store I/O: `EncodePool::quiesce` today
+waits for a worker even while it is inside a `put_blocking`, so the pool's
+quiesce is redefined to return once every worker has handed its pending
+publish to the registered in-flight set, whose PUTs then settle outside the
+exclusion under `quiesce_publishes` like any other — reads the mark, drains
+both sinks into owned batches, registers that publish as in flight, and
+serialises each tenant's miner snapshot state — the bytes `write_snapshots`
+would write — then releases. The flush of those batches, the snapshot *file* writes from
+those bytes, and the checkpoint all run *outside* the exclusion. Snapshot
+*installation* is serialised even so: every snapshot file carries the cut's
+mark, the `.snap.tmp` → `.snap` rename is taken under a snapshot-install
+lock shared by the timer, the rotation hook and shutdown, and a writer
+installs only when its mark is not below the installed snapshot's — so an
+older cut can neither overwrite a newer snapshot nor share its temp file,
+and the in-memory horizon advances only on an install that happened.
+Capturing the snapshot bytes at the cut is what makes `S` cut-consistent: it never
 runs past the mark, and every row at or below it is in the detached
 batches, so a turn admitted after the cut is neither in the snapshot nor
 suppressed by the `max(X, S)` gate on replay. The scope of that guarantee is
@@ -360,15 +371,18 @@ every barrier_secs (default: the sink age trigger, 300 s):
                                            // always evaluated, so a failed cut flush cannot
                                            // skip their outcome and requeue path
     ok = cut_ok and prior_ok
-    if ok: write_snapshot_files(cut.snaps) // failure logged, not a blocker (§3.1)
+    if ok and cut.mark is Some(_):
+        install_snapshots(cut.snaps)       // under the install lock, monotonic in mark;
+                                           // failure logged, not a blocker (§3.1); with
+                                           // no mark the previous snapshots stay
     if ok and cut.mark is Some(m):
         coordinator.checkpoint(m)          // re-takes the journal mutex for the stamp alone
       on Err -> log, do NOT advance (fail-closed, §3.1)
 
 every housekeeping_secs (default 60 s), in its own task:
     coordinator.maintain(snapshot_horizons(), max_unlinks_per_pass)
-                                           // derives the floor (§3.7), unlinks below
-                                           // min(checkpoint, floor), sweeps partials
+                                           // derives the floor (§3.7), unlinks by the
+                                           // per-segment tenant-aware rule (§3.2), sweeps partials
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
@@ -410,10 +424,19 @@ said "reclaim nothing", and with shared segments and tenant churn that is a
 permanent halt: a tenant that wrote once and whose snapshot never landed
 would block every other tenant forever. What hazard #5 actually requires is
 that *that tenant's* frames survive, since with no snapshot a restart must
-re-mine all of them. So the tenant contributes its oldest surviving frame
-offset to the minimum: everything of its own is retained, while segments
-below that offset — which hold only other tenants' covered frames — are
-reclaimed. The pin lifts the moment a valid snapshot for the tenant is
+re-mine all of them. So eligibility is **per segment and tenant-aware**,
+not a single global bound — a global "highest offset below the minimum"
+rule would let one unsnapshotted frame pin every later segment, even those
+holding only other tenants, which is the permanent growth this section
+exists to end. The rule, stated once: a closed segment is reclaimable when
+its highest offset is at or below the checkpoint (**inclusive**, a
+post-append horizon), and for every tenant with a frame in it that tenant
+has a valid horizon at or above its last offset in that segment
+(**inclusive**, likewise). A pinned tenant has no horizon, so exactly its
+own segments are retained — equality can never unlink the pinned frame —
+while segments holding only other tenants' covered frames are reclaimed
+whatever their offset. `RetainFloor` is the *reported* summary of that
+rule (the minimum over horizons and pins), not the predicate. The pin lifts the moment a valid snapshot for the tenant is
 written, since its horizon then replaces the pin. The pin is an
 **exclusive** bound: `housekeeping` removes a closed segment only when its
 highest offset is strictly below it, whereas a `Min` horizon stays
@@ -487,8 +510,8 @@ pin at its oldest surviving frame — rather than as a horizon, so a
 durable-but-invalid file can never authorise reclamation.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
-`housekeeping` truncates below `min(checkpoint, floor)`, so a stale floor
-makes truncation conservative — it retains frames a snapshot has not
+`housekeeping` reclaims only segments every tenant's horizon covers, and
+never past the checkpoint, so a stale floor makes truncation conservative — it retains frames a snapshot has not
 captured, which degrades the next start to a fuller replay and never to loss
 (hazard #5's retain rule, RFC 0001 §6.9).
 
@@ -576,12 +599,15 @@ the type: `CommitCoordinator::flush` collapses every sync error into
 `ReceiveError::WalSync`. `FlushOutcome` therefore gains the error's class —
 terminal or transient — beside the detail, and waiters rebuild a
 `ReceiveError` that carries it, so the classifier sees the terminal state
-rather than a string. The retry hint has a source as well: a transient
-`AppendError` or `SyncError` carries `retry_after`, the WAL's
-`batch_window_ms` — the time until the next sync attempt — propagated the
-same way to both transports (`Retry-After` on HTTP, `RetryInfo` on gRPC),
-and the terminal variant carries none, which is how the transports know to
-omit it — so a
+rather than a string. The retry hint is settled honestly: an append, sync
+or still-retrying rotation failure has **no scheduled retry** on the server
+— the next attempt is the client's next request — so those transient
+classes carry no hint and the client backs off as OTLP prescribes, exactly
+as the merged #794 left them; a hint appears only where a real server-side
+cadence exists, which in stage 1 is nowhere and in RFC 0053 is the
+backpressure state's housekeeping cadence. The transient/terminal
+distinction therefore rides the classification and the `Status` message,
+not a header — so a
 persistent parent-directory fsync failure is not left as an ordinary
 `WalSync` that RFC0052.5 and RFC0052.15 could never observe.
 
@@ -590,9 +616,17 @@ owned by nobody: `rotate` would still point at the old segment while a complete
 `.wal` sits beside it, which is the orphan case all over again.
 
 A rotation that fails *before the rename* therefore never leaves a file that
-looks like a segment. This amends RFC 0008 §6.5's on-disk create sequence and
-is the one on-disk behaviour change in this RFC; it needs no format or schema
-change, because the temporary name never becomes a segment.
+looks like a segment. This amends RFC 0008 §6.5 explicitly, and the
+amendment is wider than the create sequence: §6.5 required the new
+segment's directory entry to be durable before any frame landed and a
+permanent refusal after a rotation failure, and Scenario RFC0008.6 asserts
+both. Under this RFC the segment is installed before its parent fsync,
+frames may land while `dir_fsync_pending` is retried (none acked until
+`sync` discharges it), and the refusal is bounded rather than permanent —
+so RFC0008.6 is superseded by RFC0052.4/.5 and §6.5's durable-entry-first
+wording by §3.3 here. It is the one on-disk behaviour change in this RFC;
+it needs no format or schema change, because the temporary name never
+becomes a segment.
 
 **The post-rename window is not covered by that, and needs its own rule.** If
 the final `sync_parent_dir` fails, the `.wal` name already exists — so the
@@ -767,7 +801,10 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
 - **the retain floor and its lag** — `lag_bytes`, the frame bytes in the
   segments the floor retains below the checkpoint, and `lag_segments`, their
   count; `WalOffset` is a `(UUIDv7, byte)` pair and has no subtraction of its
-  own — including whether it is `RetainFloor::Pinned` and by how many
+  own, and the figures come from per-segment frame-byte accounting the WAL
+  keeps incrementally (seeded by `remeasure_unreclaimed()`, updated on every
+  append and unlink) — never from an inspection, which §3.7's cap would
+  bound and a large backlog would make untrustworthy — including whether it is `RetainFloor::Pinned` and by how many
   tenants — without which RFC0052.13's "an operator can tell a
   lagging tenant from an unexplained stall" is not achievable, since that is
   the case where reclamation stops with a healthy store;
@@ -778,7 +815,11 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   observes it; the receiver exports it beside the `ReclaimState` fields,
   and RFC0052.7 names which surface each item comes from.
 
-A log event is emitted on entering and on leaving a refusing state. Names come
+A log event is emitted on entering and on leaving a refusing state — for
+transitions observable within one process; the terminal rotation state's
+only exit today is a restart a fresh WAL cannot observe, so it has an entry
+event and no leave event until §7's operator verb exists to emit one
+(RFC0052.7 says the same). Names come
 from the shared `ourios-semconv` registry in one bump, not hand-written, and
 `error.type` continues to carry the failure class on existing counters rather
 than spawning per-error metrics.
@@ -791,7 +832,11 @@ lag figures, which change on every pass — before and after each `maintain`
 call and emits on change (floor pinned or lifted, latch set, terminal state
 entered). The channel is defined: the coordinator records the WAL's
 rotation state after every append and sync outcome into a shared
-`IngestState` cell, and the projection is built from that cell, from
+`IngestState` cell — written by the WAL itself under its own mutex, in the
+order it observed the outcomes, never from flush outcomes that publish
+monotonically by `covered_seq` rather than by completion, so an older
+transient outcome cannot overwrite a newer terminal one — and the
+projection is built from that cell, from
 `ReclaimState`, and from the task's own `cadence_failed` latch — an explicit
 input, not a `ReclaimState` field — so a terminal entry reached on the
 append path is emitted once, at most one `housekeeping_secs` late. One
@@ -836,13 +881,14 @@ So the design is:
       removed_partials: usize,
       capped: bool,              // "more to do" versus "backlog drained"
       floor: RetainFloor,        // derived on this pass (§3.2)
-      lag_bytes: u64,            // §3.5's units
-      lag_segments: usize,
+      lag_bytes: u64,            // §3.5's units, from per-segment accounting —
+      lag_segments: usize,       // never from an inspection the cap would bound
   }                              // carried on Err too, so partial work, floor and
                                  // lag stay observable on the failure path
 
   /// Why a floor is or is not available — `Option` cannot carry this.
   enum RetainFloor {
+      Unknown,               // no pass has derived it yet: reclaim nothing, report as such
       None,                  // no snapshot consumer exists: checkpoint alone governs
       Min(WalOffset),        // the minimum over every tenant's horizon
       Pinned { offset: WalOffset, tenants: usize },
@@ -884,8 +930,10 @@ So the design is:
   it in `HousekeepingProgress` and keeps it for `reclaim_state()`, with its
   lag against the checkpoint and its `Pinned` count. Between passes that
   is by definition the floor governing retention, so the export is never
-  stale and needs no hidden coupling; before the first pass it reports "no
-  floor yet".
+  stale and needs no hidden coupling; before the first pass it reports
+  `Unknown`, which `maintain` treats as "reclaim nothing" and the export
+  shows as its own state — not `None`, which would claim no consumer
+  exists.
 
   `max_unlinks` is a parameter rather than WAL configuration because the cap
   belongs to the caller's stall budget, and `HousekeepingProgress` reports
@@ -1079,15 +1127,19 @@ memory, and nothing here claims to.
 >   tenants** whose snapshot horizons differ, the lagging one below that
 >   checkpoint
 > - **When** housekeeping runs
-> - **Then** only segments wholly below `min(checkpoint, min over tenant
->   horizons)` are unlinked, the current append segment survives, and the
+> - **Then** only segments at or below the checkpoint whose every tenant's
+>   horizon is at or above that tenant's last frame in them (both
+>   inclusive) are unlinked, the current append segment survives, and the
 >   WAL's segment count falls
+> - **And** a segment whose highest frame sits exactly at a tenant's horizon
+>   is unlinked — `Min` horizons are post-append and inclusive
 > - **And** a frame above the *lagging* tenant's horizon is still present
 >   after the pass, so a restart re-mines it rather than losing that
 >   tenant's miner state
 > - **And** when a tenant with WAL data has no valid snapshot, the pass
->   reclaims nothing at or above that tenant's oldest surviving frame
->   (RFC0052.13's pin), while the temp sweep still runs
+>   retains exactly that tenant's segments (RFC0052.13's pin) and still
+>   reclaims a later segment holding only other tenants' covered frames,
+>   while the temp sweep still runs
 
 > **Scenario RFC0052.3 — Sustained ingest does not grow the WAL without
 > bound**
@@ -1192,14 +1244,15 @@ memory, and nothing here claims to.
 > - **When** each is reported on both transports
 > - **Then** all of them carry `503` / `UNAVAILABLE` — RFC0018.3 still holds,
 >   and a non-retryable code would tell the client to drop an unacked batch
-> - **And** a failure still within the retry budget carries the retry hint —
->   `Retry-After` on HTTP, a `RetryInfo` detail on gRPC —
->   because §3.3 means a later append genuinely can succeed
-> - **And** only the **terminal** state omits both, with the message naming that
->   state
-> - **And** an ordinary append or fsync I/O failure still carries the
->   per-transport hint, so the reclassification is narrow rather than a blanket
->   change to RFC 0018 §3.2's transient class
+> - **And** a failure still within the retry budget is classified transient
+>   and its message says it is retrying, because §3.3 means a later append
+>   genuinely can succeed; no retry hint is carried, since the server
+>   schedules no retry of its own
+> - **And** only the **terminal** state is classified non-transient, with
+>   the message naming that state
+> - **And** an ordinary append or fsync I/O failure stays transient, so the
+>   reclassification is narrow rather than a blanket change to RFC 0018
+>   §3.2's transient class
 >
 > #794 originally classified every rotation failure as wedged, which was
 > correct for **today's** permanent latch and wrong the moment §3.3 makes
@@ -1234,8 +1287,10 @@ memory, and nothing here claims to.
 >   and the next pass reclaims what it had held
 > - **And** a tenant leaves the ledger only when its last surviving segment
 >   is unlinked, so tenant churn cannot leave a permanent pin
-> - **And** a segment holding exactly one frame for the pinning tenant, at
->   the pin's own offset, survives the pass — the pin is exclusive
+> - **And** a segment holding exactly one frame for the pinning tenant
+>   survives the pass — a pinned tenant has no horizon, so equality can
+>   never unlink its frame — while a later segment holding none of its
+>   frames is reclaimed
 > - **And** a snapshot listed at startup is used as a horizon only after the
 >   snapshots root has been fsynced in this process; a failed startup fsync
 >   pins every tenant at its oldest surviving frame, so a horizon whose
@@ -1438,7 +1493,9 @@ they are not substitutes for the rest.
   this one.
 - RFC 0008 §6.5 (rotation), §6.6 (recovery horizon), §6.7 (checkpoint
   and housekeeping), §6.8 (counters), §6.9 (tunables) — the mechanism
-  this RFC supplies the policy for.
+  this RFC supplies the policy for; §6.5's durable-entry-first rule and
+  Scenario RFC0008.6's permanent refusal are **superseded** by §3.3 and
+  RFC0052.4/.5.
 - RFC 0018 §3.2 (retryable error mapping) — **amended** by §3.3: its transient
   class lists "post-rotation quiesce", which #791 disproved. RFC0018.3 stays
   satisfied, since the status is unchanged; only the class and the optional

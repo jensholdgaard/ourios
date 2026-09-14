@@ -210,8 +210,9 @@ reopens the window from the other side.
 **And the stored mark must not over-cover.** The group-commit `sync` reports
 the WAL's EOF, and `CommitCoordinator::flush` captures `covered_seq` before it
 locks the journal, so waiter A's outcome can carry an offset that includes
-frame B, appended later by a turn that has not yet run — while B is acked on
-the same outcome. If A stored that EOF as `last_durable`, a barrier between
+frame B, appended later by a turn that has not yet run — while B is made
+durable by that same outcome and will be acknowledged once its own turn
+completes. If A stored that EOF as `last_durable`, a barrier between
 A's turn and B's would checkpoint across B, and recovery would suppress a
 frame nothing had mined. So `last_durable` advances to the turn's **own**
 frame offset — the `WalOffset` its append returned, carried through
@@ -467,7 +468,14 @@ enters the terminal state whichever operation gets there — which is what
 keeps RFC0052.15's narrowness true: an ordinary fsync failure never
 becomes terminal. Both
 `AppendError` and `SyncError` carry a typed terminal variant, and
-`IngestFailure::classify` maps both under the terminal-only rule — so a
+`IngestFailure::classify` maps both under the terminal-only rule. The
+plumbing through group commit is stated too, because today it would lose
+the type: `CommitCoordinator::flush` collapses every sync error into
+`SyncFailure { detail: String }` and waiters rebuild a generic
+`ReceiveError::WalSync`. `FlushOutcome` therefore gains the error's class —
+terminal or transient — beside the detail, and waiters rebuild a
+`ReceiveError` that carries it, so the classifier sees the terminal state
+rather than a string — so a
 persistent parent-directory fsync failure is not left as an ordinary
 `WalSync` that RFC0052.5 and RFC0052.15 could never observe.
 
@@ -540,8 +548,9 @@ removed.
 **Pre-existing `*.wal` orphans need their own answer, and neither changing
 future rotations nor guessing at open is it.** A node wedged before this RFC
 lands may already hold a segment whose header fsync failed, so its header
-bytes may be partial — `Wal::open` validates every `*.wal` and can return
-`OpenError::Corrupt` on it. Claiming these are "real zero-frame segments" was
+bytes may be partial — `Wal::open` validates the newest segment's header
+and can return `OpenError::Corrupt` on it, while older segments are checked
+by `Wal::replay` and surface as recovery errors; either path halts. Claiming these are "real zero-frame segments" was
 wrong.
 
 An earlier draft of this section had `Wal::open` unlink such a file when it was
@@ -562,14 +571,19 @@ weigh "this is probably rotation debris" against "this might be my data".
 Future rotations cannot reach this state at all, so the population is finite
 and shrinking.
 
-Retry is attempted on the next `append`, not in a background loop: the
-WAL is single-writer and has no task of its own, and a rotation is only
-needed when there is something to write. `quiesced` becomes a typed state
+A pre-rename retry is attempted on the next `append`, and a post-rename
+directory-fsync retry by the next `sync` (above); neither runs in a
+background loop: the WAL is single-writer and has no task of its own, and a
+rotation is only needed when there is something to write. `quiesced` becomes a typed state
 carrying the attempt count and the first underlying error, so the
 distinction between "retrying" and "given up" is representable rather
-than a bool. After a bounded number of consecutive failed retries the
-WAL enters a terminal state that is still reported distinctly (see §3.5)
-and still refuses appends — a disk that has failed the same fsync a
+than a bool. The budget is a **count**: three consecutive failed attempts
+by default (`rotation_retry_attempts`, beside the other rotation knobs),
+counting a failed `rotate` and a failed `Rotation`-origin fsync discharge
+alike, reset to zero by any success, with no backoff of its own — each
+retry rides the next append or sync, whose cadence is the backoff. After
+the budget is exhausted the WAL enters a terminal state that is still
+reported distinctly (see §3.5) and still refuses appends — a disk that has failed the same fsync a
 dozen times is not going to be fixed by a thirteenth attempt, and
 hammering it obscures the real fault.
 
@@ -651,6 +665,14 @@ A log event is emitted on entering and on leaving a refusing state. Names come
 from the shared `ourios-semconv` registry in one bump, not hand-written, and
 `error.type` continues to carry the failure class on existing counters rather
 than spawning per-error metrics.
+
+**Transitions have an observer, so "exactly one event" is implementable.**
+A state snapshot alone cannot emit anything. The receiver's timer task is
+the single emission owner: it compares `ReclaimState` before and after each
+`maintain` call and emits on change (floor pinned or lifted, latch set,
+terminal state entered), and the ingest path reports a rotation-terminal
+entry through the coordinator's `FlushOutcome`, which the same task
+observes on its next tick. One owner, real call sites, registry names.
 
 ### 3.6 Requeue on unwind — moved to RFC 0053
 
@@ -782,7 +804,13 @@ So the design is:
 - **The barrier reaches them through the coordinator**, which already owns the
   journal mutex, rather than taking a second handle to the same WAL. A second
   handle would put two owners on a single-writer resource, which is the one
-  thing RFC 0008 §3.1 forbids.
+  thing RFC 0008 §3.1 forbids. Concretely, `CommitCoordinator` gains
+  `maintain(&self, mark: Option<WalOffset>, floor: RetainFloor, cap: usize)
+  -> MaintenanceReport`, the one operation that runs `checkpoint` and
+  `housekeeping` on its private journal mutex; `serve` reaches it from the
+  timer through `SharedPipeline`, and runs it on the blocking pool because
+  it does file I/O while holding a `std` mutex — the stall is the mutex,
+  not the thread, as the cap paragraph below says.
 - **`Option<WalOffset>` skips, and the post-recovery call is an explicit
   exception.** `None` means no high-water mark is known, and there is then
   nothing to declare reclaimable. `None` is *not* the same as "post-recovery",
@@ -904,8 +932,9 @@ memory, and nothing here claims to.
 > - **And** a frame above the *lagging* tenant's horizon is still present
 >   after the pass, so a restart re-mines it rather than losing that
 >   tenant's miner state
-> - **And** when any tenant with WAL data has no valid snapshot, the pass
->   reclaims nothing at all
+> - **And** when a tenant with WAL data has no valid snapshot, the pass
+>   reclaims nothing at or above that tenant's oldest surviving frame
+>   (RFC0052.13's pin), while the temp sweep still runs
 
 > **Scenario RFC0052.3 — Sustained ingest does not grow the WAL without
 > bound**
@@ -957,7 +986,8 @@ memory, and nothing here claims to.
 >   reporting corruption, including when the cleanup of the last attempt's
 >   temporary file never completed
 
-> **Scenario RFC0052.11 — A node already wedged before this RFC still opens**
+> **Scenario RFC0052.11 — A node already wedged before this RFC halts
+> actionably at open**
 > - **Given** a WAL directory in the state today's rotation failure leaves:
 >   a newest `*.wal` whose header bytes are partial, written before this RFC
 >   landed
@@ -1025,7 +1055,8 @@ memory, and nothing here claims to.
 > - **And** the mark used is the one read after the quiesce under the same
 >   exclusion, not one read before either
 > - **And** that mark is a turn's own frame offset, never the sync's reported
->   EOF, so a later frame acked on the same flush but not yet mined is never
+>   EOF, so a later frame made durable by the same flush but not yet mined
+>   (nor acknowledged) is never
 >   covered — asserted by a flush whose sync covers two turns and a barrier
 >   between them
 
@@ -1067,8 +1098,10 @@ memory, and nothing here claims to.
 > - **And** a run whose checkpoint never advances still reports growing
 >   unreclaimed bytes — exporting the below-checkpoint figure instead would
 >   read as flat during exactly the outage it exists to show
-> - **And** entering and leaving the terminal rotation state each emit
->   exactly one log event, named from the registry — the refusing state's
+> - **And** entering the terminal rotation state emits exactly one log event,
+>   named from the registry; leaving it is a restart today, which a fresh
+>   WAL cannot observe, so no leave event exists until §7's operator verb
+>   does, and that verb is where it would be emitted — the refusing state's
 >   events are RFC0053.5's
 
 > **Scenario RFC0052.8 — moved to RFC 0053 as RFC0053.2 (unwind keeps the
@@ -1085,9 +1118,12 @@ memory, and nothing here claims to.
 > - **Then** every acknowledged record is present in Parquet, including
 >   those whose segments were candidates for reclamation at the moment
 >   of the kill
-> - **And** no acknowledged record is present twice: a kill that follows a
+> - **And** recovery itself republishes nothing: a kill that follows a
 >   failed snapshot write and an advanced checkpoint replays frames at or
->   below the checkpoint into the miner only, never into the record sink
+>   below the checkpoint into the miner only, never into the record sink —
+>   a client retry that wrote a second equivalent frame (RFC0003.2's
+>   at-least-once contract) is unchanged by this RFC and is not what this
+>   leg counts
 
 ## 6. Testing strategy
 
@@ -1180,15 +1216,18 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   regime this RFC introduces. The #791 regression tests (refuse-then-resume
   with no append) move with the bound to RFC 0053.
 
-Validation: this RFC reaches `validated` when RFC0052.3's soak run is
-recorded and RFC0052.10 passes in CI, since those two are the ones that
-demonstrate the incident cannot recur rather than that a unit behaves.
+Maturity, per `docs/rfcs/README.md`: `green` is every §5 criterion passing
+with the unit, property and corpus tests green — none of the live scenarios
+is optional. RFC0052.3's recorded soak run and RFC0052.10 are *additional*
+incident-regression gates this RFC requires before `validated`, since those
+two demonstrate the incident cannot recur rather than that a unit behaves;
+they are not substitutes for the rest.
 
 ## 7. Open questions
 
-- [ ] The retry budget in §3.3. A fixed count, or a time budget with
-      backoff? A count is simpler to test; a time budget degrades better
-      on a disk that is slow rather than broken.
+- [ ] Whether §3.3's count budget (three consecutive attempts) should become
+      a time budget with backoff. A count is simpler to test; a time budget
+      degrades better on a disk that is slow rather than broken.
 - [ ] Whether the terminal rotation state also gets an operator verb to
       clear it without a restart, or whether a restart remains the
       documented recovery for a persistent durability fault.

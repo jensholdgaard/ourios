@@ -82,11 +82,18 @@ crossing it is a *stated* rejection, specified as a transport contract rather
 than gestured at.
 
 **The transport contract.** `ReceiveError` gains a `WalBackpressure` variant
-carrying the limit, both measurements — the pre-reservation unreclaimed total
-and the projected total including this batch's `framed_len` (or, when the
-projection overflows, the overflow indication in its place), since a
-per-request refusal can happen with the live total still below the limit
-and a single "measurement" would be ambiguous — and the delay to advertise; `IngestFailure::classify` maps it to a new `Backpressure` outcome, which that
+carrying a typed **cause** and the delay to advertise. The cause is an enum,
+because §3.1 refuses for three reasons that no single pair of byte
+measurements can state: `BackpressureCause::Bytes { pre, projected:
+Option<u64>, limit }` — the pre-reservation unreclaimed total and the
+projected total including this batch's `framed_len` (or, when the
+projection overflows, `None` in its place), since a per-request refusal
+can happen with the live total still below the limit and a single
+"measurement" would be ambiguous — `Segments { count, limit }` for the
+`max_segments` ceiling, and `Tenants { count, limit }` for the
+`max_tenants` guard; the `Status` message renders the cause's own
+measurements and names its limit, so a refusal always says which bound it
+hit; `IngestFailure::classify` maps it to a new `Backpressure` outcome, which that
 exhaustive match then forces both transports to handle; both render `503` /
 `UNAVAILABLE` with the limit named in the `Status` message. `503` because the
 batch was not acked — RFC 0018 §3.2's reasoning — and a distinct outcome
@@ -125,10 +132,10 @@ that the barrier and housekeeping tasks update with their next due instants
 each tick, so the coordinator never derives a due time from a cadence
 alone. The delay is then the least of the opportunities the state admits:
 when `reclaimable_now`, the time to the next housekeeping due instant; when
-the refusal latch is set and `removed_segments` was zero — the case §3.1's
-forced rotation handles, where a checkpoint-covered current segment is
-rotated by the next pass and reclaimed by the one after — the time to the
-next housekeeping due instant plus one housekeeping cadence; otherwise the
+§3.1's forced-rotation predicate holds — the latch set by a byte refusal,
+nothing reclaimable, the current segment the only holder — so the next
+pass rotates and the one after reclaims, the time to the next housekeeping
+due instant plus one housekeeping cadence; otherwise the
 time to the next barrier due instant plus one housekeeping cadence, since
 nothing becomes reclaimable before the barrier runs. Seconds are rounded
 up, with a minimum of one. The value is a **non-binding hint**: whether
@@ -177,13 +184,28 @@ stand still: `WalConfig` gains **`max_segments`**, a ceiling on retained
 segments (closed, current and sealed alike), defaulting to
 `unreclaimed_bytes_limit / segment_size_bytes + 16` so a bound's worth of
 full segments always fits with slack for the near-empty ones, and a
-reservation whose append would need a rotation — `framed_len` does not fit
-the current segment's remaining room, which the coordinator computes from
-`current_segment_frame_bytes` and the segment size — while the retained
-count is at the ceiling is refused under the same backpressure class,
-naming the ceiling; a reservation that fits the current segment is
-unaffected, since it creates no header. Header overhead is therefore at
-most 24 B × `max_segments`, and the refusal leaves with the same latch
+reservation whose append would rotate, while the retained count is at the
+ceiling, is refused under the same backpressure class with the `Segments`
+cause. Whether the append would rotate is the WAL's question, not the
+coordinator's, and the WAL's predicate is not size alone: `Wal::rotation_due`
+also rotates a *fitting* frame once the current segment's age has passed
+`segment_age_secs` (a header-only segment excepted), so a coordinator that
+reserved on size would let an age rotation create a segment past the
+ceiling, or block the forced rotation and keep the livelock. So `Journal`
+exposes the complete predicate, `fn rotation_due(&self, framed_len: u64)
+-> bool` — size or age, the same function `append` consults, taken under
+the mutex immediately before the reservation — and the reservation
+reserves a segment slot exactly when it is true: `retained + 1 ≤
+max_segments`, else refuse. At the ceiling a due rotation is **refused,
+never squeezed in**: the request path runs no housekeeping, since prepare,
+file half and commit put fsyncs in front of every concurrent append; the
+refusal sets the latch, the next `maintain` pass reclaims what it can, and
+the client returns after the `Retry-After` §3.1 computes — so with a
+reclaimable segment the request is refused once and admitted after the
+pass, and with nothing reclaimable it stays refused, and no forced
+rotation runs at the ceiling (below). A reservation that would not rotate
+is unaffected, since it creates no header. Header overhead is therefore
+at most 24 B × `max_segments`, and the refusal leaves with the same latch
 once a pass removes a segment. **A segment stays in it
 until its unlink succeeds.** RFC 0052 §3.2 marks a popped ledger entry
 *reclaiming* and keeps it in the byte and segment accounting until the
@@ -267,8 +289,9 @@ the caller's responsibility because the caller is what holds the mutex.
   `TooLarge`, a legal payload against a terminal WAL is the terminal
   classification without a `reclaim_state()` read, a legal payload for an
   unrecoverable tenant (§3.2) on a healthy WAL is that tenant's terminal
-  classification, and only a legal payload for a healthy tenant against a
-  healthy WAL reaches the reservation. The tenant check has a source too:
+  classification, a legal payload for a *new* tenant at the `max_tenants`
+  guard is a `Tenants` refusal, and only a legal payload for a held,
+  healthy tenant against a healthy WAL reaches the reservation. The tenant check has a source too:
   the receiver resolves the tenant out of band before `ingest` (RFC 0046
   §3.1 — `Pipeline::ingest` already takes the `TenantId`), the commit path
   carries it to the coordinator, and the coordinator consults its own
@@ -293,8 +316,13 @@ of a fresh segment, which leaves an empty segment holding no frame bytes
 and counting against `max_segments` until housekeeping reclaims it. A failure after bytes reached disk whose
 best-effort truncate-back *also* fails is not something the counter alone
 can absorb: the frame's full framed length is added to the unreclaimed
-figure at once (an over-count is safe, an under-count admits past the
-bound; the next `remeasure_unreclaimed()` corrects it), **and the segment
+figure at once — an over-count is safe, an under-count admits past the
+bound — **and the ledger records that counted amount against the sealed
+segment**, so when housekeeping unlinks it the accounting subtracts
+exactly what was added, whatever the file held, and no artificial backlog
+survives the unlink without a restart; the next `remeasure_unreclaimed()`
+corrects the figure to the bytes on disk in any case, and RFC0053.1
+asserts the no-restart path — **and the segment
 is sealed with a durable marker** — the WAL refuses further appends into
 that segment, **fsyncs the segment's data first**, so the length the seal
 names is a length that survives a crash (a seal naming bytes past the
@@ -398,7 +426,20 @@ other WAL settings hardcoded in `wal_config()`, so the section gains
 `wal_unreclaimed_bytes_limit` under its existing `deny_unknown_fields`
 struct, `wal_config()` resolves it, the value takes the config file's
 `${env:VAR}` substitution (RFC 0020) rather than a bespoke environment path,
-and the Helm chart exposes it under the receiver's config block.
+and the Helm chart exposes it under the receiver's config block. A
+second knob rides with it, for a different growth: in open mode (RFC 0026
+§3.1, no `auth` configured) tenant ids are client-chosen, so the per-tenant
+`RECLAIM` entries and the `SnapshotLedger`'s retained states (§3.2) would
+grow with traffic rather than with an operator's tenant set. `ReceiverSection`
+gains **`max_tenants`** (default 1024, same `${env:VAR}` and Helm path):
+admission of a tenant id the miner does not yet hold, when the held count
+is at the guard, is refused under the same backpressure class with the
+`Tenants` cause naming the tenant — ordered with §3.1's tenant check,
+after the terminal-rotation check and before the bound — and existing
+tenants are unaffected. Authenticated deployments bound the set out of
+band (RFC 0047 §3.1's binding, RFC 0048's authorisation), so the guard is
+the open-mode backstop, not the tenancy model; the held count is exported
+(`ourios.wal.tenants`, §3.3) and RFC0053.1 asserts the refusal.
 `validate_config` rejects an explicit value below `segment_size_bytes`: the
 smallest useful bound is one full segment, since housekeeping never unlinks
 the current segment and a bound smaller than one would refuse before a
@@ -472,12 +513,20 @@ So the housekeeping pass, through `CommitCoordinator::maintain` (RFC 0052
 §3.7: the journal guard is taken for `housekeeping_prepare`, released for
 the file half, and taken again for `housekeeping_commit`; no barrier
 exclusion is involved, since a rotation is a WAL operation and not a cut),
-**rotates** when the refusing state is set — a reservation has been
-refused, which a per-request check can do while `unreclaimed_bytes` is
-still below the limit, so the trigger is the latch and never
-`unreclaimed_bytes >= limit` — and the `HousekeepingProgress` that
+**rotates** only in the single-segment livelock, stated as one predicate
+over what the coordinator holds after the commit: the refusing state is
+set **and its retained cause is `Bytes`** — the latch keeps the cause of
+the refusal that set it, so a `Segments` or `Tenants` refusal never
+rotates, since a rotation at the ceiling would breach it and one for a
+tenant would be pointless — the `HousekeepingProgress` that
 `housekeeping_commit` has just returned reports `removed_segments == 0`
-(temp-file cleanup and partial failures do not count). The rotation runs
+(temp-file cleanup and partial failures do not count) and
+`reclaimable_now` is false, `current_segment_frame_bytes` equals the whole
+`unreclaimed_bytes` — the current segment holds the only unreclaimed
+bytes, which is the case no other rule can clear — and the retained count
+is below `max_segments`. The trigger is the latch and its cause, never
+`unreclaimed_bytes >= limit`, since a per-request refusal can happen with
+the live total still below the limit. The rotation runs
 **under the guard `maintain` still holds for the commit**, so no append
 interleaves between the commit's verdict and the rotation, and it calls
 `rotate` even when the current segment is empty: a post-rename directory-fsync failure installs an empty
@@ -495,12 +544,12 @@ condition needs a state surface the inherited `ReclaimState` lacks —
 segment from an empty one — and this RFC adds one field to it:
 `current_segment_frame_bytes`, maintained by the same append accounting and
 seeded from the healed newest segment by the post-recovery remeasure (a
-reopened WAL has frames in its current segment before any append). No
-"current segment is the only holder" predicate is needed: rotating a
-non-empty current segment while the bound is crossed and reclamation is
-stalled is harmless, happens at most once per pass, and is exactly the move
-that breaks the livelock when the current segment *is* the only holder.
-Rotation is a WAL operation rather than an append, so backpressure does not
+reopened WAL has frames in its current segment before any append). An
+earlier draft rotated on the latch alone and argued a spare rotation was
+harmless; it is not at the ceiling, and it is pointless when the batch
+still fits or closed segments hold the backlog, so the predicate is the
+only-holder case exactly. Rotation is a WAL operation rather than an
+append, so backpressure does not
 block it; the segment closes, the next pass can reclaim it, and the state
 clears. Nothing is acked by that rotation, so the no-ack-on-refusal property
 is untouched.
@@ -823,27 +872,31 @@ belt-and-braces and its count is **never read** by this path: an earlier
 draft resumed at `index + salvaged`, which was unsound twice over — against
 the unknown tree, and because the count increments before the salvage's
 own `emit` returns, so a panic inside that emit would report a record as
-forwarded that no buffer holds. The frame's bytes are read through
-`Journal::read_frames(from: Option<WalOffset>, to: FrameSpan, tenant:
-&TenantId) -> Box<dyn Iterator<Item = Result<(WalOffset, Bytes),
-ReceiveError>> + '_>`, added to the object-safe trait for this purpose. It
-is a **bounded stream, not an eager `Vec`**: for `(None, to]` the range
-can be the whole retained WAL, which must not be materialised, and must
-not be read under one held guard. The iterator reads **one segment at a
-time** — it takes the journal mutex to read a segment's frames into a
-window of at most that segment, releases it, yields, and re-takes it for
-the next segment, so appends and rotations interleave between segments;
-segments below the range are skipped from the ledger, never scanned. The
-tenant filter is applied at the frame's `TenantOtlpBatch` prefix, the
-same field the ledger reads, so other tenants' frames are neither decoded
-nor yielded; every yielded frame's header and checksum are verified. Its
-range is **`(from, to]`**: `from` is a post-frame offset — the snapshot's
-mark, the horizon frame itself already folded — so the first frame
-yielded is the one *after* it, and `to` is the panicking frame's span,
-yielded last; `None` means from the tenant's oldest surviving frame, the
-full-replay arm. A span that does not end on a frame boundary is an error
-that leaves the entry in place, since it means the entry, not the WAL, is
-wrong. RFC0053.2 tests both ends of the range and the one-segment bound.
+forwarded that no buffer holds. The frame's bytes are read through an **owned cursor, not a borrowed
+iterator**: the coordinator's journal is `Mutex<Box<dyn Journal>>`, so any
+`Box<dyn Iterator + '_>` borrowing the journal would hold that guard for
+the whole replay — the very thing a bounded read exists to avoid. `Journal`
+gains `fn read_frames_from(&self, cursor: FrameCursor, to: FrameSpan,
+tenant: &TenantId, limit: usize) -> Result<(Vec<(WalOffset, Bytes)>,
+Option<FrameCursor>), ReceiveError>`, where `FrameCursor { segment, byte }`
+is an owned position — the start of the next frame to read — and the
+returned cursor is `None` once the `to` frame has been yielded. The
+coordinator takes the guard for one call, releases it, and re-takes it for
+the next, so appends and rotations interleave between calls; a call
+returns at most `limit` frames and never crosses a segment boundary,
+whichever comes first, so the window is bounded by one segment or `limit`
+frames; segments below the cursor are skipped from the ledger, never
+scanned. The tenant filter is applied at the frame's `TenantOtlpBatch`
+prefix, the same field the ledger reads, so other tenants' frames are
+neither decoded nor returned; every returned frame's header and checksum
+are verified. The range is **`(from, to]`**: the first cursor is
+`FrameCursor::after(from)` for a post-frame offset — the snapshot's mark,
+the horizon frame itself already folded — so the first frame returned is
+the one *after* it, or `Journal::oldest_frame(tenant)` for the full-replay
+arm; `to` is the panicking frame's span, returned last. A span that does
+not end on a frame boundary is an error that leaves the entry in place,
+since it means the entry, not the WAL, is wrong. RFC0053.2 tests both ends
+of the range and the per-call bound.
 
 **While an entry is unresolved the marks are clamped, by one rule at one
 site.** The entry also records `clamp`: the value of `last_durable` at the
@@ -953,18 +1006,25 @@ repository's review) and nothing is hand-written in the code:
 
 | Signal | Instrument | Unit | Attributes |
 |---|---|---|---|
-| `ourios.wal.backpressure.refusing` | gauge (int) | `1` | — (`1` while the refusal latch is set) |
-| `ourios.wal.backpressure.limit` | gauge | `By` | — |
-| `ourios.wal.backpressure.last_refusal` | gauge | `By` | `ourios.wal.measurement` ∈ {`pre_reservation`, `projected`} |
-| `ourios.wal.capacity_remaining` | gauge | `By` | — (saturating at zero) |
+| `ourios.wal.backpressure.refusing` | gauge (int) | `1` | `ourios.wal.backpressure.cause` ∈ {`bytes`, `segments`, `tenants`} (`1` while the refusal latch is set, on the cause that set it) |
+| `ourios.wal.backpressure.limit` | gauge | `By` | — (the byte limit; the segment and tenant limits are the gauges below, in their own units) |
+| `ourios.wal.backpressure.last_refusal` | gauge | `By` | `ourios.wal.measurement` ∈ {`pre_reservation`, `projected`} (byte refusals only) |
+| `ourios.wal.capacity_remaining` | gauge | `By` | — (saturating at zero; byte headroom) |
+| `ourios.wal.segments` | gauge (int) | `{segment}` | `ourios.wal.segments.limit` (retained segments against `max_segments`; headroom is the difference) |
+| `ourios.wal.tenants` | gauge (int) | `{tenant}` | `ourios.wal.tenants.limit` (held tenants against `max_tenants`; headroom is the difference) |
 | `ourios.wal.sealed_segments` | gauge (int) | `{segment}` | — (sealed segments still on disk; the cap is `max_sealed_segments`) |
 | `ourios.wal.tenant_unrecoverable` | gauge (int) | `{tenant}` | `ourios.tenant` (tenants an in-process settlement found below their `reclaimed_through`; alert on nonzero) |
 | `ourios.ingest.encode_fallback` | counter | `{batch}` | `error.type` ∈ {`encode_pool_disconnected`} |
-| `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` |
+| `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.backpressure.cause`, plus the cause's measurements: `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` for `bytes`; the count and limit for `segments` and `tenants` |
 
 `error.type` continues to carry the failure class on existing counters
-rather than spawning per-error metrics; `encode_worker_panic` joins
-`cadence_panic` as a value on the flush-error counter.
+rather than spawning per-error metrics: the refused batch is counted on
+the ingest counter with `error.type` ∈ {`wal_backpressure_bytes`,
+`wal_backpressure_segments`, `wal_backpressure_tenants`}, and
+`encode_worker_panic` joins `cadence_panic` as a value on the flush-error
+counter. The names follow the registry's rules — `ourios.*` is the system
+namespace, dotted, snake_case — and go through `ourios-semconv` like the
+rest.
 
 ## 4. Alternatives considered
 
@@ -1007,7 +1067,7 @@ are kept distinct so that the remedy each advertises is the true one.
 >   bound, on a node running RFC 0052
 > - **When** ingest continues until a reservation would exceed the bound
 > - **Then** earlier batches were accepted and acked, and the rejecting batch
->   is refused with a reason naming the limit and both measurements (the
+>   is refused with a reason naming the bound it hit and that cause's measurements (for bytes, the
 >   pre-reservation total, and the projected total when representable or
 >   the overflow indication otherwise), on both transports, and
 >   a `Retry-After` computed from the reclaim schedule §3.1 states —
@@ -1041,7 +1101,21 @@ are kept distinct so that the remedy each advertises is the true one.
 >   still leaves on a smaller successful append as §3.1 defines
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
->   without an append ever arriving
+>   without an append ever arriving; the same latch set by a `Segments` or
+>   `Tenants` refusal, or with closed segments holding part of the backlog,
+>   or with the retained count at `max_segments`, forces no rotation
+> - **And** a fitting frame whose segment has aged past `segment_age_secs`
+>   reserves a segment slot: below the ceiling it is admitted and rotates,
+>   at the ceiling it is refused with the `Segments` cause — once and then
+>   admitted after the next pass when a segment was reclaimable, and on
+>   every retry while nothing is
+> - **And** in open mode a batch for a tenant id the miner does not hold,
+>   with `max_tenants` held, is refused with the `Tenants` cause naming the
+>   tenant, while a batch for a held tenant is admitted; the refusal is
+>   counted with `error.type = wal_backpressure_tenants`
+> - **And** a sealed segment's unlink subtracts exactly the amount the seal
+>   added, so a node that sealed and then reclaimed shows the same
+>   `unreclaimed` as one that never sealed, with no restart
 > - **And** when the frame that crossed the bound is the one whose mining
 >   panicked, the barrier task settles its entry on the next tick with no
 >   append admitted, the checkpoint then advances past it, and the bound
@@ -1113,12 +1187,12 @@ are kept distinct so that the remedy each advertises is the true one.
 >   server-terminal, client-retryable class naming it, its entry
 >   and clamp remain, no snapshot is installed for it, the state is
 >   exported, and other tenants ingest and snapshot normally
-> - **And** `read_frames(from, to, tenant)` yields the frame after `from`
->   first and the `to` frame last, only that tenant's frames,
->   `read_frames(None, to, tenant)` starts at the tenant's oldest surviving
->   frame, and a full replay over many segments holds the journal guard for
->   at most one segment at a time — an append issued mid-replay lands
->   between two of its segments
+> - **And** `read_frames_from` started at `FrameCursor::after(from)`
+>   returns the frame after `from` first and the `to` frame last, only that
+>   tenant's frames; started at `oldest_frame(tenant)` it begins at the
+>   tenant's oldest surviving frame; each call returns at most `limit`
+>   frames within one segment and the guard is released between calls — an
+>   append issued mid-replay lands between two of its calls
 > - **And** the barrier tick and an admitted ingest turn racing on one
 >   `unmined` entry produce exactly one rebuild; the loser observes the
 >   entry `Settling` or gone and proceeds
@@ -1138,7 +1212,7 @@ are kept distinct so that the remedy each advertises is the true one.
 >   — inside the no-pool branch's inline `emit`, or the pool branch's
 >   `submit` — and for a panic inside the salvage's own `emit`: the record
 >   is present at most twice, never absent, and the salvage count is not
->   consulted; `read_frames` on a span that does not end on a frame
+>   consulted; `read_frames_from` on a span that does not end on a frame
 >   boundary is an error that leaves the entry in place
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record

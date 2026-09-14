@@ -174,10 +174,25 @@ with real ones and could stall an ingest behind a barrier that never arrives.
 Instead the pipeline gains an explicit **barrier exclusion**: a lock
 `ingest_bound` holds across the span that matters — from the miner work through
 `pool.submit` and the `last_durable` update — and that the timer takes
-exclusively for its whole sequence. It is strictly wider than the miner lock and
-strictly narrower than the gate, so it does not change ingest ordering, and it
-is the smallest thing that closes the window. Rotation needs no change: it
-already runs inside an ingest's own span.
+exclusively to **capture a cut**, and for nothing else. It is strictly wider
+than the miner lock and strictly narrower than the gate, so it does not
+change ingest ordering, and it is the smallest thing that closes the window.
+Rotation needs no change: it already runs inside an ingest's own span.
+
+**The cut is captured under the exclusion; the store I/O is not.** Under the
+exclusion the timer quiesces encodes, reads the mark, drains both sinks into
+owned batches and registers that publish as in flight — then releases. The
+flush of those batches, the snapshot write and the checkpoint all run
+*outside* the exclusion, so a slow or unavailable object store stalls ingest
+for the length of a drain and never for a PUT; holding the exclusion across
+`flush_then_snapshot`'s PUTs would let every retry during an outage recreate
+the local ingest outage, and would keep RFC 0053's admission bound from
+running at all. The mark stays correct because every frame at or below it
+was drained into the detached batches, and every append after the release
+lands above it. The checkpoint is taken only after the detached publish
+*and* every publish registered before the cut have succeeded, by re-taking
+the journal mutex for the stamp alone; a failed publish requeues (RFC 0053
+§3.2 makes that hold on unwind too) and no stamp happens.
 
 **Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
 takes the miner lock today before the pool submission and the `last_durable`
@@ -230,10 +245,11 @@ copy is a fresh frame above the mark. Tracking the highest contiguous
 *successful* sequence instead would hold the checkpoint back for a frame
 nobody was promised.
 
-The cost is explicit: ingest stalls for the barrier's duration once per
-`housekeeping_secs`, the same stall rotation already imposes, now on a timer.
-`housekeeping_secs` is therefore the knob trading reclamation latency against
-that stall, and §3.7's per-pass cap bounds the sequence's second half.
+The cost is explicit: ingest stalls for the cut's duration — a quiesce and
+two drains, no I/O — once per `housekeeping_secs`, comparable to the stall
+rotation already imposes, now on a timer. `housekeeping_secs` is therefore
+the knob trading reclamation latency against that stall, and §3.7's per-pass
+cap bounds the sequence's second half.
 
 See §3.7 for the ownership path and the exact signatures, which the barrier
 does not have today:
@@ -290,13 +306,21 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every housekeeping_secs:
-    with_barrier_exclusion:                // a NEW pipeline lock, not the miner
+    if cadence_failed: skip the barrier (§3.1); still run housekeeping below
+    cut = with_barrier_exclusion:          // a NEW pipeline lock, not the miner
                                            // lock and not the gate — see §3.1
         quiesce_encodes()                  // the barrier's prologue
         mark = last_durable()              // read AFTER the quiesce, INSIDE the turn
-        if barrier_succeeded(mark) and mark is Some(m):   // §3.1, append-free
-            journal.checkpoint(m)
-    journal.housekeeping(retain_floor(), max_unlinks_per_pass)  // Result
+        batches = drain both sinks         // owned; registered as in flight
+        (mark, batches)                    // release the exclusion here
+    published = flush(cut.batches)         // store I/O OUTSIDE the exclusion
+                 and quiesce_publishes()   // earlier in-flight publishes settle
+    if published: write_snapshots()        // failure logged, not a blocker (§3.1)
+    if published and cut.mark is Some(m):  // §3.1, append-free
+        coordinator.maintain(Some(m), retain_floor(), max_unlinks_per_pass)
+    else:
+        coordinator.maintain(None, retain_floor(), max_unlinks_per_pass)
+                                           // housekeeping still runs; no stamp
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
@@ -342,9 +366,12 @@ written, since its horizon then replaces the pin. `None` is passed only
 where no snapshot consumer exists at all.
 
 Membership is per surviving segment, so the ledger has a lifecycle. Each
-segment carries the set of tenants with a frame in it — rebuilt at open from
-the recovery walk, maintained on every live append — and a tenant's oldest
-surviving frame is in its oldest surviving segment. A tenant leaves the
+segment carries, per tenant, the `WalOffset` of that tenant's **first** frame
+in it — a membership set alone could not recover the byte offset
+`Pinned.offset` needs, and a segment-wide boundary would be a different
+contract — rebuilt at open from the recovery walk, maintained on every live
+append; a tenant's oldest surviving frame is its first offset in its oldest
+surviving segment. A tenant leaves the
 ledger when its last surviving segment is unlinked, which can only happen
 once its snapshot horizon has passed those frames; nothing else removes it,
 and nothing needs to. `recover` returns entries only for tenants that *have*
@@ -659,7 +686,11 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   lagging tenant from an unexplained stall" is not achievable, since that is
   the case where reclamation stops with a healthy store;
 - **the rotation-failure state**: retrying, with its attempt count, versus
-  terminal.
+  terminal;
+- **the `cadence_failed` latch** — receiver-owned rather than a
+  `ReclaimState` field, because the timer task sets it and no WAL call
+  observes it; the receiver exports it beside the `ReclaimState` fields,
+  and RFC0052.7 names which surface each item comes from.
 
 A log event is emitted on entering and on leaving a refusing state. Names come
 from the shared `ourios-semconv` registry in one bump, not hand-written, and
@@ -704,7 +735,15 @@ So the design is:
   a single object-safe error type rather than the concrete WAL's two:
 
   ```text
-  enum ReclaimError { Checkpoint(..), Housekeeping(..) }   // object-safe, one type
+  enum ReclaimError {
+      Checkpoint(..),
+      Housekeeping { progress: HousekeepingProgress, source: .. },
+  }                                                        // object-safe, one type
+  struct HousekeepingProgress {
+      removed_segments: usize,   // what the forced-rotation trigger reads (RFC 0053)
+      removed_partials: usize,
+      capped: bool,              // "more to do" versus "backlog drained"
+  }                              // carried on Err too, so partial work is visible
 
   /// Why a floor is or is not available — `Option` cannot carry this.
   enum RetainFloor {
@@ -794,13 +833,20 @@ So the design is:
   On the trait rather than via a downcast, because RFC0052.1 and RFC0052.2
   need test doubles that can observe reclamation.
 - **Recovery gains the Parquet-side gate §3.1 requires.** `recovery::DriverSink`
-  owns only the miner today and merely records `parquet_horizon`; it gains
-  the record-sink handle and routes each replayed frame twice — to the
-  miner when above that tenant's snapshot horizon `S`, as now, and to the
-  record sink only when above the checkpoint `X`. Frames at or below `X` are
-  suppressed on the Parquet side and counted, so a restart after an
-  advanced checkpoint never republishes a row, and RFC0052.10's
-  no-duplicate leg is what proves the gate exists rather than assumes it.
+  owns only the miner today and merely records `parquet_horizon` — and
+  `MinerCluster::ingest` already emits every mined record to the sink `serve`
+  wired in before recovery, so a second sink handle in the driver would emit
+  replayed rows twice. Recovery therefore drives the miner through a capture
+  path (`ingest_mined`, or the configured sink disconnected for the replay)
+  so that replay emits nothing implicitly, feeds the miner only above that
+  tenant's snapshot horizon `S`, as now, and forwards the captured records to
+  the record sink only above **`max(X, S)` per tenant** — `max`, because the
+  snapshot is written before the checkpoint is persisted, so a successful
+  snapshot followed by a failed checkpoint write leaves `S > X` with `(X, S]`
+  already in Parquet. Frames below that gate are suppressed on the Parquet
+  side and counted, so a restart never republishes a row, and RFC0052.10's
+  no-duplicate leg — including the `S > X` ordering — is what proves the gate
+  exists rather than assumes it.
 - **The barrier reaches them through the coordinator**, which already owns the
   journal mutex, rather than taking a second handle to the same WAL. A second
   handle would put two owners on a single-writer resource, which is the one
@@ -1032,12 +1078,13 @@ memory, and nothing here claims to.
 > - **When** each is reported on both transports
 > - **Then** all of them carry `503` / `UNAVAILABLE` — RFC0018.3 still holds,
 >   and a non-retryable code would tell the client to drop an unacked batch
-> - **And** a failure still within the retry budget carries `Retry-After`,
+> - **And** a failure still within the retry budget carries the retry hint —
+>   `Retry-After` on HTTP, a `RetryInfo` detail on gRPC —
 >   because §3.3 means a later append genuinely can succeed
-> - **And** only the **terminal** state omits it, with the message naming that
+> - **And** only the **terminal** state omits both, with the message naming that
 >   state
-> - **And** an ordinary append or fsync I/O failure still carries
->   `Retry-After`, so the reclassification is narrow rather than a blanket
+> - **And** an ordinary append or fsync I/O failure still carries the
+>   per-transport hint, so the reclassification is narrow rather than a blanket
 >   change to RFC 0018 §3.2's transient class
 >
 > #794 originally classified every rotation failure as wedged, which was
@@ -1124,6 +1171,9 @@ memory, and nothing here claims to.
 >   a client retry that wrote a second equivalent frame (RFC0003.2's
 >   at-least-once contract) is unchanged by this RFC and is not what this
 >   leg counts
+> - **And** the same holds when the snapshot write succeeded and the
+>   checkpoint write then failed, so a tenant restarts with `S > X`: nothing
+>   in `(X, S]` is republished
 
 ## 6. Testing strategy
 

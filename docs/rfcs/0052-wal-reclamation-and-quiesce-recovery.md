@@ -188,7 +188,13 @@ those bytes, and the checkpoint all run *outside* the exclusion. Capturing
 the snapshot bytes at the cut is what makes `S` cut-consistent: it never
 runs past the mark, and every row at or below it is in the detached
 batches, so a turn admitted after the cut is neither in the snapshot nor
-suppressed by the `max(X, S)` gate on replay. Detaching only the file I/O
+suppressed by the `max(X, S)` gate on replay. The scope of that guarantee is
+stated, because it is narrower than "no duplicates": a frame published
+*after* the cut and *before* the next checkpoint — by a size or age flush —
+sits above `max(X, S)` and is re-published on replay. That is RFC 0008 and
+RFC 0014's existing at-least-once contract above the checkpoint, unchanged
+here and not claimed otherwise; a published high-water mark persisted with
+every flush would bound it and is the §7 follow-on it would be. Detaching only the file I/O
 keeps that property while so a slow or unavailable object store stalls ingest
 for the length of a drain and never for a PUT; holding the exclusion across
 `flush_then_snapshot`'s PUTs would let every retry during an outage recreate
@@ -208,12 +214,19 @@ drains every buffered partition, and running it on the 60-second
 `housekeeping_secs` would create a sub-target Parquet object per low-volume
 partition per tick — RFC 0014's small-file hazard reintroduced by the
 reclamation path. So the barrier (cut, flush, snapshot, checkpoint) runs on
-its own `barrier_secs`, defaulting to the sink's age trigger (300 s): for a
-partition holding data that old the age trigger would flush it anyway, so
-the barrier adds no objects beyond RFC 0014's policy, and a busy partition
-still flushes on size between barriers. Housekeeping runs on
-`housekeeping_secs` against the last checkpoint, and reclamation lags a
-publication by at most one barrier interval.
+its own `barrier_secs`, defaulting to the sink's age trigger (300 s) and
+living beside `housekeeping_secs` in `WalConfig`, surfaced by `wal_config()`
+like the other WAL knobs, validated to at least one second, and owned by the
+receiver's barrier task. For a partition holding data that old the age
+trigger would flush it anyway; a partition that received its first data just
+before the tick is written young, so the barrier does add **at most one
+sub-target object per active partition per `barrier_secs`** beyond RFC
+0014's policy — the explicit trade-off for a checkpoint that needs every
+buffered frame durable, and RFC0052.3 records the objects written per
+interval so it is measured rather than assumed. A busy partition still
+flushes on size between barriers. Housekeeping runs on `housekeeping_secs`
+against the last checkpoint, and reclamation lags a publication by at most
+`barrier_secs + housekeeping_secs`, the sum RFC0052.3's idle leg asserts.
 
 **Acquisition order is fixed, or the two locks deadlock.** `ingest_bound`
 takes the miner lock today before the pool submission and the `last_durable`
@@ -267,10 +280,11 @@ copy is a fresh frame above the mark. Tracking the highest contiguous
 nobody was promised.
 
 The cost is explicit: ingest stalls for the cut's duration — a quiesce and
-two drains, no I/O — once per `housekeeping_secs`, comparable to the stall
-rotation already imposes, now on a timer. `housekeeping_secs` is therefore
-the knob trading reclamation latency against that stall, and §3.7's per-pass
-cap bounds the sequence's second half.
+two drains, no I/O — once per `barrier_secs`, comparable to the stall
+rotation already imposes, now on a timer. `barrier_secs` is therefore the
+knob trading reclamation latency against that stall; `housekeeping_secs`
+schedules only the capped unlink pass, whose own stall §3.7's per-pass cap
+bounds.
 
 See §3.7 for the ownership path and the exact signatures, which the barrier
 does not have today:
@@ -300,8 +314,11 @@ stamp: this RFC's timer can, and after a panic inside `write_ordered` the
 drained batches are gone and the publish guard has dropped, so a timer
 barrier would see empty buffers and no in-flight publish and stamp past
 records that never reached Parquet. So a cadence-step panic sets a
-`cadence_failed` latch; while it is set the barrier neither checkpoints nor
-snapshots — the frames stay in the WAL and a restart replays them — the
+`cadence_failed` latch — set on the unwind path itself, by a guard's `Drop`
+that runs *before* the publish guard is released, never by the joining task
+observing the panic later, or a barrier could acquire the exclusion, see
+empty buffers and stamp in that window; while it is set the barrier neither
+checkpoints nor snapshots — the frames stay in the WAL and a restart replays them — the
 state is exported (RFC0052.7) and only a restart clears it. The check lives
 inside `flush_then_snapshot`, the one function the timer, the rotation hook
 and shutdown all call, so every stamping caller honours it rather than the
@@ -338,8 +355,11 @@ every barrier_secs (default: the sink age trigger, 300 s):
         batches = drain both sinks         // owned; registered as in flight
         snaps = serialise miner snapshots  // cut-consistent S (§3.1)
         (mark, batches, snaps)             // release the exclusion here
-    ok = flush(cut.batches)                // store I/O OUTSIDE the exclusion
-         and quiesce_publishes().all_ok()  // earlier in-flight publishes: outcome, not a wait
+    cut_ok   = flush(cut.batches)          // store I/O OUTSIDE the exclusion
+    prior_ok = quiesce_publishes().all_ok() // earlier in-flight publishes: outcome, not a wait;
+                                           // always evaluated, so a failed cut flush cannot
+                                           // skip their outcome and requeue path
+    ok = cut_ok and prior_ok
     if ok: write_snapshot_files(cut.snaps) // failure logged, not a blocker (§3.1)
     if ok and cut.mark is Some(m):
         coordinator.checkpoint(m)          // re-takes the journal mutex for the stamp alone
@@ -432,7 +452,10 @@ would unlink segments on the strength of it — losing exactly the frames the
 floor exists to retain.
 
 So the derivation uses the in-memory record of snapshots whose write returned
-`Ok`, not the directory contents. A tenant whose snapshot write failed keeps
+`Ok`, not the directory contents — and `write_snapshots` returns a
+**per-tenant** report rather than short-circuiting on the first error into a
+single `Result<()>`, so the ledger advances exactly the tenants whose new
+snapshot completed and keeps the previous durable horizon for the rest. A tenant whose snapshot write failed keeps
 its *previous* durable horizon if it has one and otherwise pins the floor at
 its oldest surviving frame, per the rule above — conservative, and
 self-correcting on the next successful write. Reading the directory is
@@ -446,9 +469,15 @@ parent-directory fsync, and exited cleanly; the entry is then still visible
 to a restarted process, which would load it as a horizon, reclaim on the
 strength of it, and lose the frames when a later machine crash drops the
 never-durable entry. So before any listed `.snap` is used as a horizon the
-snapshots root is fsynced once, which makes every entry the listing saw
-durable — the one property the listing lacks. If that fsync fails every
-listed horizon is discarded, so each tenant with surviving frames pins the
+snapshots root **and its parent** are fsynced once — `snapshot_store::write`
+creates the directory with `create_dir_all` and fsyncs only the child, so
+the directory's own entry in `wal_root` is not durable either until this
+RFC adds a parent fsync on creation — which makes every entry the listing
+saw durable, the one property the listing lacks. This is an explicit
+operation, `snapshot_store::load_all_durable()`, which fsyncs before it
+lists, so an implementation can neither keep trusting the bare listing nor
+turn the fsync error into a generic recovery failure: if either fsync fails
+every listed horizon is discarded, so each tenant with surviving frames pins the
 floor at its oldest surviving frame until a later snapshot write succeeds. One directory fsync rather than a manifest, because a manifest
 would need the same fsync to be trustworthy itself. Durability is necessary
 and not sufficient: `snapshot_store::load_all` returns raw bytes, and a
@@ -547,7 +576,12 @@ the type: `CommitCoordinator::flush` collapses every sync error into
 `ReceiveError::WalSync`. `FlushOutcome` therefore gains the error's class —
 terminal or transient — beside the detail, and waiters rebuild a
 `ReceiveError` that carries it, so the classifier sees the terminal state
-rather than a string — so a
+rather than a string. The retry hint has a source as well: a transient
+`AppendError` or `SyncError` carries `retry_after`, the WAL's
+`batch_window_ms` — the time until the next sync attempt — propagated the
+same way to both transports (`Retry-After` on HTTP, `RetryInfo` on gRPC),
+and the terminal variant carries none, which is how the transports know to
+omit it — so a
 persistent parent-directory fsync failure is not left as an ordinary
 `WalSync` that RFC0052.5 and RFC0052.15 could never observe.
 
@@ -591,9 +625,10 @@ ignored, as non-segment files are everywhere else in the WAL, and `*.tmp` is
 never matched: it stays the checkpoint and snapshot namespace. Two further
 rules make it safe:
 
-- the **in-flight** partial — the one the current rotation attempt owns — is
-  skipped, identified by name rather than by age, since a slow fsync must not
-  make a live file look stale;
+- there is no in-flight partial to protect: housekeeping takes the
+  single-writer position, so no rotation attempt is in progress while it
+  runs, and every partial it sees is debris — an earlier draft's name-based
+  "skip the live one" rule had no ownership path and is withdrawn;
 - the unlinks are followed by a **parent-directory fsync**, as
   `housekeeping`'s segment unlinks already are, so a crash cannot resurrect
   swept debris.
@@ -652,7 +687,10 @@ distinction between "retrying" and "given up" is representable rather
 than a bool. The budget is a **count**: three consecutive failed attempts
 by default (`rotation_retry_attempts`, beside the other rotation knobs),
 counting a failed `rotate` and a failed `Rotation`-origin fsync discharge
-alike, reset to zero by any success, with no backoff of its own — each
+alike, reset to zero only when the pending obligation itself succeeds — the
+rotation, or the directory-fsync discharge — never by an unrelated
+successful operation, or a parent fsync failing behind succeeding data syncs
+would never reach the terminal state; with no backoff of its own — each
 retry rides the next append or sync, whose cadence is the backoff. After
 the budget is exhausted the WAL enters a terminal state that is still
 reported distinctly (see §3.5) and still refuses appends — a disk that has failed the same fsync a
@@ -751,9 +789,13 @@ the single emission owner: it compares a **categorical projection** of
 `ReclaimState` — floor kind, latch, rotation state, never the byte, age or
 lag figures, which change on every pass — before and after each `maintain`
 call and emits on change (floor pinned or lifted, latch set, terminal state
-entered), and the ingest path reports a rotation-terminal
-entry through the coordinator's `FlushOutcome`, which the same task
-observes on its next tick. One owner, real call sites, registry names.
+entered). The channel is defined: the coordinator records the WAL's
+rotation state after every append and sync outcome into a shared
+`IngestState` cell, and the projection is built from that cell, from
+`ReclaimState`, and from the task's own `cadence_failed` latch — an explicit
+input, not a `ReclaimState` field — so a terminal entry reached on the
+append path is emitted once, at most one `housekeeping_secs` late. One
+owner, real call sites, registry names.
 
 ### 3.6 Requeue on unwind — moved to RFC 0053
 
@@ -793,7 +835,11 @@ So the design is:
       removed_segments: usize,   // what the forced-rotation trigger reads (RFC 0053)
       removed_partials: usize,
       capped: bool,              // "more to do" versus "backlog drained"
-  }                              // carried on Err too, so partial work is visible
+      floor: RetainFloor,        // derived on this pass (§3.2)
+      lag_bytes: u64,            // §3.5's units
+      lag_segments: usize,
+  }                              // carried on Err too, so partial work, floor and
+                                 // lag stay observable on the failure path
 
   /// Why a floor is or is not available — `Option` cannot carry this.
   enum RetainFloor {
@@ -891,7 +937,13 @@ So the design is:
   path (`ingest_mined`, or the configured sink disconnected for the replay)
   so that replay emits nothing implicitly, feeds the miner only above that
   tenant's snapshot horizon `S`, as now, and forwards the captured records to
-  the record sink only above **`max(X, S)` per tenant** — `max`, because the
+  the record sink only above **`max(X, S)` per tenant**, and captures the
+  miner's **audit events** the same way, forwarding them only for frames
+  above `X` — the barrier drains the audit sink before it stamps, so `X` is
+  the audit horizon — since `ingest_mined` diverts only records and the
+  miner's `ingest` would otherwise emit the audit rows for `(S, X]` a second
+  time, while a disconnected sink would drop the audit events above the gate
+  — `max`, because the
   snapshot is written before the checkpoint is persisted, so a successful
   snapshot followed by a failed checkpoint write leaves `S > X` with `(X, S]`
   already in Parquet. Frames below that gate are suppressed on the Parquet
@@ -903,9 +955,10 @@ So the design is:
   handle would put two owners on a single-writer resource, which is the one
   thing RFC 0008 §3.1 forbids. Concretely, `CommitCoordinator` gains
   `maintain(&self, horizons: &SnapshotHorizons, cap: usize) ->
-  MaintenanceReport` and `checkpoint(&self, mark: WalOffset)`, the two
-  operations that run `housekeeping` and `checkpoint` on its private journal
-  mutex; `serve` reaches it from the
+  Result<HousekeepingProgress, ReclaimError>` — the documented housekeeping
+  contract, no separate report type — and `checkpoint(&self, mark:
+  WalOffset) -> Result<(), ReclaimError>`, the two operations that run
+  `housekeeping` and `checkpoint` on its private journal mutex; `serve` reaches it from the
   timer through `SharedPipeline`, and runs it on the blocking pool because
   it does file I/O while holding a `std` mutex — the stall is the mutex,
   not the thread, as the cap paragraph below says.
@@ -922,7 +975,9 @@ So the design is:
   checkpoint site.
 - **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
   and leaves the in-memory checkpoint unadvanced, which is already
-  `Wal::checkpoint`'s own behaviour; the WAL then keeps every segment. A
+  `Wal::checkpoint`'s own behaviour; the WAL then reclaims nothing past the
+  *previous* mark, which stays usable — RFC0052.1 requires exactly that,
+  not that every segment is kept. A
   failed `housekeeping` logs and the next pass retries, since nothing was
   unlinked past the bound. Neither failure fails the barrier: the data is in
   object storage either way, and refusing to ack over a reclamation error
@@ -1123,11 +1178,10 @@ memory, and nothing here claims to.
 > **Scenario RFC0052.16 — The temp sweep touches only files of the reserved
 > partial shape**
 > - **Given** a WAL root holding a `CHECKPOINT.tmp`, a snapshots directory
->   holding a `*.snap.tmp`, a stale `<uuid>.wal.partial`, and the in-flight
->   partial of a rotation in progress
+>   holding a `*.snap.tmp`, and a stale `<uuid>.wal.partial`
 > - **When** a housekeeping pass runs
-> - **Then** only the stale partial is unlinked: the checkpoint temp, the
->   snapshot temp and the in-flight partial all survive
+> - **Then** only the partial is unlinked: the checkpoint temp and the
+>   snapshot temp survive
 > - **And** the unlink is followed by a parent-directory fsync, so a crash
 >   cannot resurrect it
 
@@ -1227,7 +1281,8 @@ memory, and nothing here claims to.
 > - **Then** every acknowledged record is present in Parquet, including
 >   those whose segments were candidates for reclamation at the moment
 >   of the kill
-> - **And** recovery itself republishes nothing: a kill that follows a
+> - **And** recovery itself republishes nothing at or below `max(X, S)`: a
+>   kill that follows a
 >   failed snapshot write and an advanced checkpoint replays frames at or
 >   below the checkpoint into the miner only, never into the record sink —
 >   a client retry that wrote a second equivalent frame (RFC0003.2's
@@ -1244,7 +1299,10 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
 - **Checkpoint policy (RFC0052.1)** — unit tests over the barrier with a
   healthy store and with a store that fails a partition write, asserting
   `last_checkpoint()` advances in the first case and is untouched in the
-  second. The retain path is already exercised by the existing
+  second; plus a third leg that fails the checkpoint sidecar write and its
+  directory fsync with a healthy store, asserting the barrier still reports
+  success, the previous mark stays usable and the next pass reclaims only
+  under it — the fail-closed branch a partition-write failure cannot reach. The retain path is already exercised by the existing
   skip-the-snapshot tests, so these extend them rather than duplicating.
 - **Truncation bounds (RFC0052.2)** — an integration test building a WAL
   with several closed segments, a checkpoint above them and a snapshot
@@ -1359,6 +1417,10 @@ they are not substitutes for the rest.
 - [ ] Whether a stale tenant floor blocking reclamation indefinitely should
       itself escalate (a second, louder state) or stay a visible metric an
       operator alerts on. §3.5 makes it visible; it does not decide.
+- [ ] Whether to persist a published high-water mark with every flush, so
+      that frames published between two barriers are not re-published on
+      replay. Today that is RFC 0008/0014's at-least-once contract above the
+      checkpoint; this RFC narrows nothing there and bounds nothing there.
 
 ## 8. References
 

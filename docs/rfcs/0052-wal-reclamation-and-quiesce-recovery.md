@@ -182,10 +182,13 @@ Rotation needs no change: it already runs inside an ingest's own span.
 **The cut is captured under the exclusion; the store I/O is not.** Under the
 exclusion the timer stops new submissions and waits for the *encode* steps
 to finish — not for the workers' store I/O: `EncodePool::quiesce` today
-waits for a worker even while it is inside a `put_blocking`, so the pool's
-quiesce is redefined to return once every worker has handed its pending
-publish to the registered in-flight set, whose PUTs then settle outside the
-exclusion under `quiesce_publishes` like any other — reads the mark, drains
+waits for a worker even while it is inside a `put_blocking`, and the sink's
+in-flight guard today covers only `PublishCoordinator::drain_*`, not the
+`publish_owned` calls `emit_concurrent` makes itself — so that guard is
+extended to those calls, taken inside `emit_concurrent` around each
+publish, and the pool's quiesce is redefined to return once every worker
+has registered its pending publish there, whose PUTs then settle outside
+the exclusion under `quiesce_publishes` like any other — reads the mark, drains
 both sinks into owned batches, registers that publish as in flight, and
 serialises each tenant's miner snapshot state — the bytes `write_snapshots`
 would write — then releases. The flush of those batches, the snapshot *file* writes from
@@ -471,11 +474,14 @@ from every surviving frame's prefix at the end of recovery; the receiver
 passes only what it knows — the per-tenant snapshot horizons, or "no
 consumer" — and the WAL derives `RetainFloor` from the two and reports it.
 Membership is per surviving segment, so the ledger has a lifecycle. Each
-segment carries, per tenant, the `WalOffset` of that tenant's **first** frame
-in it — a membership set alone could not recover the byte offset
-`Pinned.offset` needs, and a segment-wide boundary would be a different
-contract — rebuilt at open from the recovery walk, maintained on every live
-append; a tenant's oldest surviving frame is its first offset in its oldest
+segment carries, per tenant, the `WalOffset` of that tenant's **first and
+last** frame in it — the first is what `Pinned.offset` needs, the last is
+what the eligibility rule compares the tenant's horizon with, since a
+horizon between the two must not unlink the later frames; a membership set
+alone could recover neither, and a segment-wide boundary would be a
+different contract — rebuilt at open from the recovery walk, the last
+updated on every live append; a tenant's oldest surviving frame is its
+first offset in its oldest
 surviving segment. A tenant leaves the
 ledger when its last surviving segment is unlinked, which can only happen
 once its snapshot horizon has passed those frames; nothing else removes it,
@@ -492,10 +498,13 @@ would unlink segments on the strength of it — losing exactly the frames the
 floor exists to retain.
 
 So the derivation uses the in-memory record of snapshots whose write returned
-`Ok`, not the directory contents — and `write_snapshots` returns a
-**per-tenant** report rather than short-circuiting on the first error into a
-single `Result<()>`, so the ledger advances exactly the tenants whose new
-snapshot completed and keeps the previous durable horizon for the rest. A tenant whose snapshot write failed keeps
+`Ok`, not the directory contents. That record has an owner: a receiver-side
+`SnapshotLedger`, restored from `load_all_durable()` at startup, updated by
+`write_snapshots`' **per-tenant** report — returned instead of
+short-circuiting on the first error into a single `Result<()>` — so it
+advances exactly the tenants whose new snapshot completed and keeps the
+previous durable horizon for the rest, and read as the `SnapshotHorizons`
+handed to `maintain`. No path re-reads the files after a failed fsync. A tenant whose snapshot write failed keeps
 its *previous* durable horizon if it has one and otherwise pins the floor at
 its oldest surviving frame, per the rule above — conservative, and
 self-correcting on the next successful write. Reading the directory is
@@ -515,12 +524,15 @@ the directory's own entry in `wal_root` is not durable either until this
 RFC adds a parent fsync on creation — which makes every entry the listing
 saw durable, the one property the listing lacks. This is an explicit
 operation, `snapshot_store::load_all_durable()`, which fsyncs before it
-lists, so an implementation can neither keep trusting the bare listing nor
-turn the fsync error into a generic recovery failure: if either fsync fails
-every listed horizon is discarded **and so is the restored miner state** —
-the node starts empty and replays every surviving frame — so each tenant
-with surviving frames pins the floor at its oldest surviving frame until a
-later snapshot write succeeds. Keeping the state while discarding its
+lists, treats a missing `snapshots_root` as the empty store (a cold start
+has no directory yet, and that is not a durability failure), and returns a
+**non-fatal** `SnapshotLoad::Discarded { reason }` rather than the
+`RecoveryDriverError::Store` today's recovery propagates before replay — so
+an implementation can neither keep trusting the bare listing nor abort on
+the fsync error: if either fsync fails every listed horizon is discarded
+**and so is the restored miner state** — the node starts empty and replays
+every surviving frame — so each tenant with surviving frames pins the floor
+at its oldest surviving frame until a later snapshot write succeeds. Keeping the state while discarding its
 horizon would leave replay without an `S` gate and double-apply every frame
 the snapshot had already folded. One directory fsync rather than a manifest, because a manifest
 would need the same fsync to be trustworthy itself. Durability is necessary
@@ -567,8 +579,10 @@ into `OpenError::Corrupt`.
 **Unlinking the orphan before each retry is not sufficient, and this RFC
 does not rely on it.** A `remove_file` is not durable until the parent
 directory is fsynced, so a crash in between can bring the entry back; and
-after the final failed retry a partial or header-only orphan can still be
-sitting there, which `Wal::open` may select as the newest segment. Either
+after the final failed retry a header-only orphan under the *final* name
+can still be sitting there, which `Wal::open` may select as the newest
+segment — that is the legacy shape RFC0052.11 handles; a `.wal.partial` is
+never selectable, since `list_segments` returns only `*.wal`. Either
 case contradicts RFC0052.4/.5's restart property, so the design removes the
 orphan *class* instead of cleaning up after it:
 
@@ -847,11 +861,17 @@ than spawning per-error metrics.
 
 **Transitions have an observer, so "exactly one event" is implementable.**
 A state snapshot alone cannot emit anything. The receiver's timer task is
-the single emission owner: it compares a **categorical projection** of
-`ReclaimState` — floor kind, latch, rotation state, never the byte, age or
-lag figures, which change on every pass — before and after each `maintain`
-call and emits on change (floor pinned or lifted, latch set, terminal state
-entered). The channel is defined: the coordinator records the WAL's
+the single emission owner for the states that change on ticks: it compares
+a **categorical projection** of `ReclaimState` — floor kind and latch, never
+the byte, age or lag figures, which change on every pass — before and after
+each `maintain` call and emits on change (floor pinned or lifted, latch
+set). Rotation-state transitions are *not* sampled that way, because a
+rotation can fail on one append and recover on the next before either
+sample and the sampler would see no change: the coordinator emits those
+edges **synchronously at the transition**, under the journal mutex, as RFC
+0053 does for its refusal latch, so entry into `Retrying` or `Terminal` and
+the recovery out of `Retrying` each emit exactly once at the point they
+happen. The channel is defined: the coordinator records the WAL's
 rotation state after every append and sync outcome into a shared
 `IngestState` cell — written by the WAL itself under its own mutex, in the
 order it observed the outcomes, never from flush outcomes that publish
@@ -934,7 +954,11 @@ So the design is:
   `append_batch` returns the offset, the coordinator records each waiter's
   own offset by sequence at append time, `CommitOutcome` carries it beside
   the durable EOF, and every test double returns a monotonically increasing
-  offset per append. An implementation that kept storing the EOF fails
+  offset per append. The call site uses that own offset for everything it
+  compares with `last_durable` — the segment-change detection that fires
+  the rotation hook included — so a flush spanning an old-segment turn and
+  a new-segment turn fires the hook once, on the new-segment turn, with the
+  old segment's mark, rather than on both. An implementation that kept storing the EOF fails
   RFC0052.14's two-turn flush, which is what that criterion is for.
 
   `RetainFloor` exists because `Option<WalOffset>` cannot carry what §3.2
@@ -1253,8 +1277,9 @@ memory, and nothing here claims to.
 > - **Then** it unlinks at most the cap and returns, having read no segment
 >   header at all — eligibility comes from the in-memory ledger — and the
 >   only O(n) steps are the name listing and that memory pass, neither of
->   which touches a file; so an append taken concurrently waits for the
->   capped unlinks rather than the whole backlog
+>   which touches a file; an append taken concurrently waits for the capped
+>   unlinks plus that pass, which is bounded by measurement rather than by
+>   the cap: at 10,000 ledger entries the pass completes within 1 ms
 > - **And** a pinned oldest segment does not shadow a later eligible one: the
 >   pass reclaims the eligible segment on its first tick
 > - **And** successive passes drain the backlog to the same end state an
@@ -1469,10 +1494,13 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   snapshot that barrier writes — the lock is never held across store I/O.
 - **Telemetry (RFC0052.7)** — the in-memory metric exporter pattern
   already used for the ingest/sink instruments, asserting every name is
-  in the exported stream; plus a `weaver registry live-check` pass over
-  the new log events, since an event the tests never emit is an event
-  the live-check never checks (that is how #795's un-named event passed
-  CI).
+  in the exported stream; a runtime tracing assertion that drives each
+  transition — terminal entry on the append path, floor pinned and lifted,
+  latch set — and verifies event count, name and state, since the
+  live-check validates definitions rather than emission; plus a `weaver
+  registry live-check` pass over the new log events, since an event the
+  tests never emit is an event the live-check never checks (that is how
+  #795's un-named event passed CI).
 - **No loss (RFC0052.10)** — extends the existing `SIGKILL`
   crash-recovery test rather than adding a parallel one, with
   reclamation configured on a short cadence so the kill lands in the

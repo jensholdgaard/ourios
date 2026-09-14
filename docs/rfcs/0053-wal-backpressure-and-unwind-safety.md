@@ -268,9 +268,19 @@ consumed; a newest segment with no seal keeps RFC 0008's existing
 torn-tail heal; a newest segment with a seal that does *not* verify halts
 as corruption, since a seal that exists but disagrees with its segment is
 evidence of a state the process did not reach cleanly, and a `.partial`
-seal beside any segment is debris and never consulted. The rotation that
-was owed is then performed by `Wal::open` before the first append, on the
-`Rotation` origin, so a restart never appends into a sealed segment either.
+seal beside any segment is debris and never consulted. The heal itself is
+crash-idempotent by an explicit third shape: a process can die after the
+truncate and before the seal is consumed, so a verifying seal whose length
+*equals* the segment's length — no bytes past it — is the already-healed
+segment, and recovery consumes the seal and continues; only a seal whose
+length falls inside the segment demands the one-partial-frame shape. The
+rotation that was owed is then performed on the `Rotation` origin by the
+**post-recovery step** — the same step that calls `remeasure_unreclaimed()`,
+after replay and heal and before the coordinator is constructed — not by
+`Wal::open`, which `serve` runs *before* `recovery::recover` and which
+therefore has neither the replay-validated boundaries nor the remeasured
+figure the rule depends on; so a restart never appends into a sealed
+segment either.
 
 **Seal removal is an amendment to RFC 0052 §3.7, stated here because that
 section's sweep knows only `.wal.partial` and segments.** A seal belongs
@@ -279,11 +289,12 @@ the segment is sealed, live sealing sets it, and `remeasure_unreclaimed()`
 seeds it at recovery from the seals it finds — a seal whose segment is
 gone is an orphan and is pushed onto the same seeded debris list as
 partials, together with every `.wal.seal.partial`. When housekeeping
-unlinks a sealed segment it unlinks the seal in the same step, **before**
-the segment (a seal without a segment is debris the next pass removes; a
-segment without its seal would be an unmarked closed tail, which halts
-recovery), each counted as its own unlink against the per-pass cap, under
-the same parent-directory fsync; orphan seals and `.partial` seals are
+unlinks a sealed segment it unlinks the **segment first, then the seal**,
+in the same step: a crash between the two leaves an orphan seal, which the
+next pass sweeps, whereas the other order would leave a segment without its
+seal — an unmarked closed tail, which §3.1 says halts recovery. Each is
+counted as its own unlink against the per-pass cap, under the same
+parent-directory fsync; orphan seals and `.partial` seals are
 swept on every pass regardless of the checkpoint precondition, exactly as
 partials are, so a restart with no checkpoint yet still clears them.
 RFC0053.4 covers the crash window, the orphan and the restart-before-
@@ -609,32 +620,45 @@ pool branch collects the returned records for `submit` and the no-pool
 branch emits each returned record inline as it is mined, so there is one
 unwind arm and one entry, whichever branch is configured.
 
-The unwind arm records an `unmined` entry with three things. **The frame's
-span**, `FrameSpan { segment, start, len }`: RFC 0008 defines `WalOffset`
-as the *post-frame* byte, so the offset `append_batch` returns cannot
-locate the frame's start by itself, and the caller computes the span from
-what it already holds — `start = offset.byte − (frame header + encoded
-payload length)`, `len` the same sum — rather than adding a per-frame
-index to the WAL. **The index of the record whose `ingest_mined` call
-panicked**, counted by position in the batch rather than by `out.len()`,
-since a `None` capture would make the two differ. **And whether the
-salvage forwarded that record**: `ingest_mined` settles its capture slot
-on unwind and, when the panicking record had already been captured,
-emits it to the record sink before re-raising, so the entry takes the
-delta of `mined_capture_salvages_total()` across the call (0 or 1) and the
-resume index is `index + salvaged` — the salvaged record is never mined
-twice, and a record the panic caught before capture is. The **next ingest
-turn** re-mines that frame's suffix first — before its own batch, in WAL
-order, so the miner sees the records in the sequence they were appended
-and later turns do not overtake the gap — starting at the resume index,
-so neither the submitted prefix nor the salvaged record is emitted twice.
-The frame's bytes are read through `Journal::read_frame(span: FrameSpan)
--> Result<Bytes, ReceiveError>`, added to the object-safe trait for this
-purpose and taking the journal mutex only for the read; it verifies the
-frame header at `start` (kind, length equal to `len`) and the checksum
-before returning, and a mismatch is an error that leaves the entry in
-place, since a span that does not land on a frame means the entry, not
-the WAL, is wrong.
+The unwind arm records an `unmined` entry for **any** panic inside that
+loop — inside `ingest_mined`, or after it returned and before the inline
+`emit` or the collected `submit` completed — with three things. **The
+frame's span**, `FrameSpan { segment, start, len }`: RFC 0008 defines
+`WalOffset` as the *post-frame* byte, so the offset `append_batch` returns
+cannot locate the frame's start by itself, and the caller computes the
+span from what it already holds — `start = offset.byte − (frame header +
+encoded payload length)`, `len` the same sum — rather than adding a
+per-frame index to the WAL. **The tenants whose records the frame holds.**
+**And `clamp`**, below.
+
+Settlement is a **rebuild, not a resume at an index**, because a panic
+inside `ingest` leaves the tenant's tree in an unknown state: a leaf can
+have been widened or created before the audit event that records it was
+emitted, and resuming against that tree would match the widened leaf
+cleanly and emit no event — a template version with no audit history,
+which RFC 0017's versioned rendering cannot fold. So the **next ingest
+turn**, before its own batch, restores each of the entry's tenants from
+its last *installed* snapshot (or from empty) and replays that tenant's
+frames from the snapshot's mark through the end of the span, in WAL order,
+through the same per-tenant restore-and-replay `recovery::recover`
+performs at startup, factored to run for one tenant in-process. Every
+widening between the mark and the panic is re-derived *with* its event,
+and every record in that range is re-emitted: the submitted prefix, a
+record the salvage forwarded, and anything the tenant published since its
+snapshot are duplicates at worst, never a loss — the same at-most-duplicate
+posture every crash between a publish and its stamp already has, only
+wider. It follows that the salvage in `ingest_mined` is kept as
+belt-and-braces and its count is **never read** by this path: an earlier
+draft resumed at `index + salvaged`, which was unsound twice over — against
+the unknown tree, and because the count increments before the salvage's
+own `emit` returns, so a panic inside that emit would report a record as
+forwarded that no buffer holds. The frame's bytes are read through
+`Journal::read_frames(from: WalOffset, to: FrameSpan) -> Result<Vec<Bytes>,
+ReceiveError>`, added to the object-safe trait for this purpose, taking the
+journal mutex only for the read and verifying every frame header and
+checksum it returns; a span that does not end on a frame boundary is an
+error that leaves the entry in place, since it means the entry, not the
+WAL, is wrong.
 
 **While an entry is unresolved the marks are clamped, by one rule at one
 site.** The entry also records `clamp`: the value of `last_durable` at the
@@ -646,16 +670,24 @@ later successful append cannot carry the mark past the frame; the latest
 successful offset is kept separately and becomes the mark again the
 moment the entry settles. Every barrier, rotation, shutdown and
 `flush_then_snapshot` mark reads `last_durable`, so they inherit the clamp
-without a rule of their own, and a snapshot stamped under it replays the
-frame's whole span after a restart — a duplicate of the submitted prefix
-at worst, which is the same at-most-duplicate posture every crash between
-a publish and its stamp already has, never a loss. An `unmined` entry is
-removed only once the suffix's records have been submitted or buffered —
-retained across a failure or a second panic — so an entry that never
-settles holds the checkpoint visibly rather than silently. RFC0053.2
-covers a swallowed submit followed by a successful append, a mining panic
-followed by a successful append, a clean barrier taken while an entry is
-unresolved, and the salvaged-record boundary.
+without a rule of their own. The clamp is necessary and not sufficient:
+the snapshot serialises the *live* miner, so a barrier taken while an
+entry is unresolved would capture the unknown tree under the clamped mark,
+and a restart would restore the widened leaf and replay the frame as a
+clean match with no event. So while an entry is unresolved **no snapshot
+is installed for the entry's tenants** — the barrier skips them and
+snapshots every other tenant as usual, since trees are scoped per tenant
+(§3.7) and the panic touched only the frame's — and a restart in that
+window restores those tenants from their previous snapshot and replays the
+frame from the pre-frame state, which is the same rebuild the in-process
+settlement performs. An `unmined` entry is removed only once the rebuild
+has replayed through the span and its records have been submitted or
+buffered — retained across a failure or a second panic — so an entry that
+never settles holds the checkpoint, and those tenants' snapshots, visibly
+rather than silently. RFC0053.2 covers a swallowed submit followed by a
+successful append, a mining panic followed by a successful append, a clean
+barrier taken while an entry is unresolved, a panic after `ingest_mined`
+returned, and a panic between a widening and its audit event.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -846,14 +878,22 @@ are kept distinct so that the remedy each advertises is the true one.
 >   submits from its unwind arm reaches the sink before the panic resumes,
 >   on the pool branch and the no-pool branch alike
 > - **And** a barrier taken while an `unmined` entry is unresolved, with a
->   healthy store, stamps no mark past the entry's clamp, and a restart from
->   that snapshot re-mines the frame; once the suffix is re-mined the next
->   barrier stamps the latest successful offset
-> - **And** a panic whose salvage forwarded the panicking record re-mines
->   from the record after it, and a panic caught before the capture re-mines
->   from that record — in neither case is a record emitted twice by the
->   suffix path, and `read_frame` on a span that is not a frame boundary is
->   an error that leaves the entry in place
+>   healthy store, stamps no mark past the entry's clamp and installs no
+>   snapshot for the entry's tenants while installing the others'; a restart
+>   from that state restores those tenants from their previous snapshot and
+>   replays the frame; once the rebuild settles the next barrier stamps the
+>   latest successful offset and snapshots them again
+> - **And** a panic raised inside `ingest` after a leaf was widened and
+>   before its audit event was emitted is settled by a rebuild from the
+>   tenant's last installed snapshot: the widening is re-derived with its
+>   event, the version's audit history is complete, and the records between
+>   the mark and the frame are present at most twice, never absent
+> - **And** the same holds for a panic raised after `ingest_mined` returned
+>   — inside the no-pool branch's inline `emit`, or the pool branch's
+>   `submit` — and for a panic inside the salvage's own `emit`: the record
+>   is present at most twice, never absent, and the salvage count is not
+>   consulted; `read_frames` on a span that does not end on a frame
+>   boundary is an error that leaves the entry in place
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
@@ -885,20 +925,25 @@ are kept distinct so that the remedy each advertises is the true one.
 >   no listener, and no batch admitted
 > - **And** a kill after a seal's parent fsync and before its rotation
 >   leaves the sealed tail in the newest segment: recovery heals it to the
->   seal's length, consumes the seal and performs the owed rotation before
->   the first append; a newest segment whose seal does not verify halts; a
->   `.wal.seal.partial` is swept and never consulted
-> - **And** a sealed segment is unlinked with its seal, seal first, both
->   counted against the pass cap; an orphan seal and a `.wal.seal.partial`
->   are swept on a pass with no checkpoint yet
+>   seal's length, consumes the seal, and the post-recovery step — after
+>   the remeasure, before the coordinator exists — performs the owed
+>   rotation before the first append; a newest segment whose seal does not
+>   verify halts; a `.wal.seal.partial` is swept and never consulted
+> - **And** a kill after the heal's truncate and before the seal is consumed
+>   leaves a verifying seal whose length equals the segment's: the next
+>   start consumes it and continues, and the frames before it are delivered
+> - **And** a sealed segment is unlinked with its seal, segment first, both
+>   counted against the pass cap; a kill between the two leaves an orphan
+>   seal that the next pass sweeps, and an orphan seal and a
+>   `.wal.seal.partial` are swept on a pass with no checkpoint yet
 
 > **Scenario RFC0053.5 — The backpressure state is observable**
 > - **Given** a node that enters and then leaves the refusing state
 > - **When** metrics are collected and logs are read across both transitions
 > - **Then** the refusal-latch gauge, the limit and measurement at the last
->   refusal, and `capacity_remaining` — equal to the limit minus the live
->   unreclaimed figure at the moment of the read, not a stale value — are
->   present in the exported stream under registry names
+>   refusal, and `capacity_remaining` — equal to `max(limit − unreclaimed,
+>   0)` over the live unreclaimed figure at the moment of the read, not a
+>   stale value — are present in the exported stream under registry names
 > - **And** a forced disconnected-pool fallback increments
 >   `ourios.ingest.encode_fallback` by exactly one datapoint
 > - **And** entering and leaving each emit exactly one log event, named from
@@ -971,8 +1016,9 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   the same fixture *without* the seal halts as corruption — and a fourth,
   the sealed *newest* segment (the seal durable, the rotation not yet
   performed), asserting the heal to the seal's length, the consumed seal,
-  the rotation `Wal::open` performs before the first append, and that a
-  non-verifying seal on the newest segment halts — with a small
+  the rotation the post-recovery step performs before the first append,
+  the already-healed shape (seal length equal to the segment's) on a second
+  start, and that a non-verifying seal on the newest segment halts — with a small
   backpressure
   bound configured so the kill lands in the refusing regime, and a
   post-restart append that asserts the rebuilt figure still refuses, and

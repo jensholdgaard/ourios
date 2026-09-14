@@ -213,11 +213,22 @@ the caller's responsibility because the caller is what holds the mutex.
   oversize payload against a terminal WAL is `TooLarge`, a legal payload
   against a terminal WAL is the terminal classification without a
   `reclaim_state()` read, and only a legal payload against a healthy WAL
-  reaches the reservation. RFC0053.1 covers the combined case.
+  reaches the reservation. The terminal check has a named source: `Journal`
+  gains `fn rotation_state(&self) -> RotationState` (`Healthy`, `Retrying {
+  attempts }`, `Terminal`), a cheap categorical read with no snapshot
+  struct on the append path, taken under the journal mutex immediately
+  before the reservation, so it can neither race outside the mutex nor be
+  confused with `reclaim_state()`; the test doubles implement it. RFC0053.1
+  covers the combined case.
 
 There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
-before the write.
+before the write. One append failure needs its own accounting rule: when
+`Wal::append` fails after bytes reached disk and its best-effort truncate
+back also fails — the case the WAL documents and repairs only on the next
+open — the frame's full framed length is added to the unreclaimed figure at
+once. An over-count is safe and an under-count admits past the bound; the
+next `remeasure_unreclaimed()` corrects it.
 
 The bound is configuration, and it has a home: `WalConfig` gains
 `unreclaimed_bytes_limit`, and it is the first WAL knob the deployment
@@ -331,8 +342,9 @@ object store recovered. That is not a bug to paper over — a tenant whose
 snapshot is not advancing is a real problem — but it must be *visible* rather
 than presenting as an unexplained refusal, which is why RFC 0052 §3.5 exports
 the floor and its lag alongside the bytes. RFC0053.1 asserts the healthy-store
-resume; the stale-floor case is a named open question in §7 rather than a
-silently accepted behaviour.
+resume; the pinned-floor case is normative — the state persists after the
+store returns and is reported `Pinned` (RFC0053.1) — and only its
+escalation policy is the §7 question.
 
 ### 3.2 Requeue on unwind
 
@@ -443,17 +455,22 @@ the batch is worthless if the pool then swallows the next one, so both
 halves of worker recovery are stated: a worker whose `emit_concurrent`
 panics exits its OS thread today, and the pool's supervisor **respawns** it
 (the closed handle is noticed, a replacement started, the panic counted);
-and `EncodePool::submit` on a closed or full channel is an **error
-propagated to the ingest turn before the acknowledgement** — the WAL frame
-is durable, the client is told to retry, and the retry is a fresh frame
-under RFC0003.2's at-least-once contract — never a silently dropped
-`Vec<MinedRecord>` behind a success. Refusing is not enough on its own:
-`mine_batch_ordered` has already mutated the miner, and a later successful
-append can carry `last_durable` past the failed frame, after which a barrier
-would stamp past the only WAL copy. So the failed-submit path **requeues the
-mined batch to the record sink** — the same recoverable shape as an unwind —
-before it returns the error, and the next barrier drains and publishes it.
-RFC0053.2 covers a failed submit followed by a successful append.
+and `EncodePool::submit` on a closed or full channel is **not a failure the
+client sees at all**: the mined batch goes straight into the record sink's
+buffer — the durability handoff the pool would have reached — the turn
+acknowledges normally, since the frame is WAL-durable and the batch will be
+published by the next barrier, and the event is counted on the existing
+ingest failure counter under `error.type=encode_pool_unavailable`. An
+earlier draft refused the turn before the ack; that would have told a
+client to re-send a frame that was already durable and already on its way
+to Parquet, and it still needed the requeue, because `mine_batch_ordered`
+has already mutated the miner and a later successful append can carry
+`last_durable` past the frame. The `catch_unwind` arm of
+`mine_batch_ordered`, which submits its partially mined `out` and then
+resumes the panic, takes the same path: `out` reaches the sink before the
+panic is resumed, so nothing mined before the panic can be dropped under a
+later mark. RFC0053.2 covers a swallowed submit followed by a successful
+append, and the unwind arm.
 
 **What is requeued depends on where the panic lands.** The audit events are
 requeued only while the audit write has not completed. Once `write_owned` has
@@ -499,10 +516,13 @@ measurement at the last refusal, and a separate `capacity_remaining` gauge
 still refuses a 200-byte batch, and a dashboard must not read `0` as "every
 request is admitted" — and a log event on entering and leaving the latch.
 Transitions can happen entirely on request paths between ticks (a refusal
-and then a smaller successful append), so the coordinator **queues each
-transition atomically at the call site** and RFC 0052's single emitter
-drains that queue on its tick rather than sampling the state; RFC0053.5
-counts every transition. Names come from the shared `ourios-semconv`
+and then a smaller successful append), and a queue that had to be both
+lossless and bounded in exactly that failure mode would be the wrong
+shape — so there is no queue: the coordinator **emits the enter and leave
+events itself, synchronously at the transition, under the journal mutex**.
+The order is the mutex order and every transition emits exactly once at a
+real call site; RFC 0052's tick-based emitter keeps only the states that
+change on ticks. RFC0053.5 counts every transition. Names come from the shared `ourios-semconv`
 registry in one bump with RFC 0052's, not hand-written, and `error.type`
 continues to carry the failure class on existing counters rather than
 spawning per-error metrics.
@@ -602,8 +622,11 @@ are kept distinct so that the remedy each advertises is the true one.
 >   ack, requeues the remainder of that worker's mined batch, and the
 >   barrier does not read the pool as idle across it
 > - **And** a submit after that panic is either published by a respawned
->   worker or refused before the acknowledgement; it is never dropped
->   behind a success
+>   worker or placed in the record sink's buffer and acknowledged; it is
+>   never dropped behind a success, and a later successful append never
+>   carries the mark past it
+> - **And** the partially mined batch a panicking `mine_batch_ordered`
+>   submits from its unwind arm reaches the sink before the panic resumes
 > - **And** this holds for a panic raised **at each** point the publish can
 >   reach it — before the audit write, inside it, and inside the record
 >   publish — since the partial-move shape means only the last of those is
@@ -637,8 +660,10 @@ are kept distinct so that the remedy each advertises is the true one.
 > **Scenario RFC0053.5 — The backpressure state is observable**
 > - **Given** a node that enters and then leaves the refusing state
 > - **When** metrics are collected and logs are read across both transitions
-> - **Then** the state gauge, and the limit and measurement at the last
->   refusal, are present in the exported stream under registry names
+> - **Then** the refusal-latch gauge, the limit and measurement at the last
+>   refusal, and `capacity_remaining` — equal to the limit minus the live
+>   unreclaimed figure at the moment of the read, not a stale value — are
+>   present in the exported stream under registry names
 > - **And** entering and leaving each emit exactly one log event, named from
 >   the registry, on the transitions §3.1 defines and on no other tick
 > - **And** a `weaver registry live-check` over the emitted events passes,
@@ -659,15 +684,19 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   livelock case. Those are the regression tests for #791's second half. A
   fourth leg is concurrent rather than sequential: a `proptest` driving many
   tasks that submit batches of arbitrary sizes at once against a small limit,
-  asserting after every admission that the sum of admitted frame bytes never
-  exceeds the limit — the only test a reservation taken outside the journal
+  asserting after every admission that the live unreclaimed figure —
+  admitted minus reclaimed, since housekeeping legitimately lets a cumulative
+  sum grow — never exceeds the limit — the only test a reservation taken outside the journal
   mutex fails, since the sequential flow passes it. A fifth leg fills the
   limit and submits an oversize payload, asserting `TooLarge` with no
   `reclaim_state()` read and no append — the reversed-check regression. The
   sequence is driven through **both** adapters: on HTTP the protobuf
   `Status`, `application/x-protobuf` and the exact `Retry-After`; on gRPC
   `UNAVAILABLE` with the `RetryInfo` detail carrying the same seconds. A test
-  through one adapter leaves the other's contract unverified.
+  through one adapter leaves the other's contract unverified. A sixth leg
+  pins a tenant's floor (a lagging or invalid horizon) and asserts that
+  refusal persists after the store returns and the state is reported
+  `Pinned`, which is the behaviour RFC0053.1 makes normative.
 - **Configuration (RFC0053.1's precondition)** — resolver tests for an
   explicit value, an `${env:VAR}`-substituted one, the derived default at a
   2 GiB segment, and an invalid below-segment value, plus a Helm render leg
@@ -678,7 +707,9 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   demand at **each** reachable point (before the audit write, inside it,
   inside the record publish), asserting the records and any unsettled audit
   events are back in their buffers, settled audit events are absent, the
-  barrier refuses to stamp, and a later healthy barrier publishes.
+  no mark crosses unrequeued data (a healthy barrier may publish the
+  restored batches in the same call, so an unconditional refusal is not the
+  contract), and a later healthy barrier publishes.
   Parameterising the panic point is the whole test: the partial-move shape
   means a guard that only covers the last point passes a single-point test.
   The point is also parameterised **across partitions, for each consumer
@@ -706,8 +737,11 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   startup refuses to construct the coordinator.
 - **Telemetry (RFC0053.5)** — the in-memory metric exporter pattern used for
   the ingest instruments, driving one enter and one leave and asserting the
-  gauge, the last-refusal figures and exactly one event per transition; plus
-  the `weaver registry live-check` pass over those events.
+  latch gauge, the last-refusal figures, `capacity_remaining` against the
+  live headroom, and exactly one event per transition — including a refusal
+  and a smaller successful append inside one tick; plus the `weaver registry
+  live-check` pass over those events, and an assertion that every injected
+  cadence or worker panic in RFC0053.2/.3 increments `cadence_panic`.
 
 Maturity, per `docs/rfcs/README.md`: `green` is RFC0053.1–.5 all passing in
 CI with the unit, property and corpus suites green, and this RFC touches no thesis gate in `docs/benchmarks.md` §7. It does

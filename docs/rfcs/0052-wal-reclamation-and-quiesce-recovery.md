@@ -431,7 +431,24 @@ no pending work while the batch's unemitted remainder is in neither the
 buffers nor Parquet — a barrier after it would stamp across the frame. The
 `BatchGuard` therefore sets the latch when it drops unwinding, before it
 decrements, so worker unwind feeds the same failed-cut path as a cadence
-panic in this stage; RFC0052.10 is not gated on RFC 0053 for it. While the
+panic in this stage; RFC0052.10 is not gated on RFC 0053 for it. The
+signal has to be concrete, because nothing else can carry it: the pool's
+workers are detached `std` threads whose join handles are kept only for
+drop, so a worker panic is invisible to the receiver while it serves. The
+latch is one shared `AtomicBool`, owned by the pipeline (`SharedPipeline`
+holds the `Arc`) and handed at construction to the encode pool, to the
+sink's publish guards and to the barrier task. Each guard holds a handle;
+its `Drop` tests `std::thread::panicking()` and, if so, stores `true` with
+`Release` ordering *before* it decrements its count — the pending count for
+`BatchGuard`, the in-flight count for the publish guard — and it is that
+decrement, under the count's mutex and condvar, that wakes `quiesce` or
+`quiesce_publishes`. `flush_then_snapshot` loads the latch with `Acquire` at
+both of its checks. The race contract follows from the order: a barrier
+that observes a count at zero after a panic observed a decrement that
+happened after the store, so it observes the latch; there is no schedule
+in which the count settles and the latch is still clear. RFC0052.1 holds
+that race directly, with the panic injected in a worker and the barrier
+started concurrently. While the
 latch is set the barrier neither checkpoints nor snapshots — the frames stay
 in the WAL and a restart replays them — the state is exported (RFC0052.7)
 and only a restart clears it. The check lives inside `flush_then_snapshot`,
@@ -508,9 +525,16 @@ run_cut(cut):
       on Err -> log, do NOT advance (fail-closed, §3.1)
 
 every housekeeping_secs (default 60 s), in its own task:
-    coordinator.maintain(snapshot_horizons(), max_unlinks_per_pass)
-                                           // derives the floor (§3.7), unlinks by the
-                                           // per-segment tenant-aware rule (§3.2), sweeps partials
+    coordinator.maintain(snapshot_horizons(), max_unlinks_per_pass):
+        plan    = journal.lock().housekeeping_prepare(horizons, cap)
+                                           // ledger half under the guard: horizons applied
+                                           // (capped), floor derived, partials then segments
+                                           // popped and marked reclaiming (§3.2, §3.7)
+        outcome = file half on plan        // guard RELEASED: RECLAIM write + fsync + rename +
+                                           // parent fsync, then unlinks, then parent fsync
+        journal.lock().housekeeping_commit(outcome)
+                                           // ledger half under the guard: removed entries
+                                           // leave the ledger, failed ones return/stay (§3.2)
       on Err -> log; the next pass retries (nothing was unlinked past the bound)
 ```
 
@@ -704,7 +728,7 @@ one, because startup's fallback is exactly as trustworthy as this record:
   the startup contract needs and it is unchanged: the record is durable
   before the segments it covers are gone. An entry leaves the ledger and its
   accounting only when its unlink has succeeded, under the writer position
-  on the next ledger step. The two failure points differ: a failed record
+  at `housekeeping_commit` (§3.7). The two failure points differ: a failed record
   write or fsync means nothing was unlinked, so every popped entry is put
   back to eligible under the writer position and the next pass pops it
   again — the entry was never out of the ledger, so the no-listing rule
@@ -1077,10 +1101,12 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   the case where reclamation stops with a healthy store;
 - **the rotation-failure state**: retrying, with its attempt count, versus
   terminal;
-- **the `cadence_failed` latch** — receiver-owned rather than a
-  `ReclaimState` field, because the timer task sets it and no WAL call
-  observes it; the receiver exports it beside the `ReclaimState` fields,
-  and RFC0052.7 names which surface each item comes from.
+- **the `cadence_failed` latch** — pipeline-owned rather than a
+  `ReclaimState` field, because it is set by the ingester's unwind guards
+  (§3.1: the encode pool's `BatchGuard`, the sink's publish guard, the
+  barrier's own step) and no WAL call observes it; the receiver exports it
+  beside the `ReclaimState` fields, and RFC0052.7 names which surface each
+  item comes from.
 
 A log event is emitted on entering and on leaving a refusing state — for
 transitions observable within one process; the terminal rotation state's
@@ -1178,8 +1204,29 @@ So the design is:
                                                            // produces is added (§3.1's mark)
   fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError>
   enum SnapshotHorizons { NoConsumer, Known(HashMap<TenantId, WalOffset>) }
-  fn housekeeping(&mut self, horizons: &SnapshotHorizons, max_unlinks: usize)
-      -> Result<HousekeepingProgress, ReclaimError>   // derives RetainFloor itself
+  fn housekeeping_prepare(&mut self, horizons: &SnapshotHorizons, max_unlinks: usize)
+      -> Result<ReclaimPlan, ReclaimError>             // the ledger half, under the guard:
+                                                       // applies horizons (capped), derives
+                                                       // RetainFloor, pops partials then
+                                                       // segments, marks them reclaiming
+  struct ReclaimPlan {                                 // owned paths: the file half needs
+      segments: Vec<PlannedUnlink>,                    // no guard and no WAL handle
+      partials: Vec<PathBuf>,
+      record: ReclaimRecord,                           // the merged per-tenant horizons
+      root: PathBuf,                                   // for RECLAIM.tmp and the parent fsync
+      progress: HousekeepingProgress,                  // floor, lag, capped — as of prepare
+  }
+  enum ReclaimOutcome {                                // what the file half did
+      RecordFailed(io::Error),                         // nothing unlinked
+      Unlinked { removed: Vec<PathBuf>, failed: Vec<(PathBuf, io::Error)> },
+  }
+  fn housekeeping_commit(&mut self, outcome: ReclaimOutcome)
+      -> Result<HousekeepingProgress, ReclaimError>   // the ledger half again, under the
+                                                       // guard: removed entries leave the
+                                                       // ledger and its accounting, failed
+                                                       // ones return to eligible (record
+                                                       // failed) or stay reclaiming (unlink
+                                                       // failed), per §3.2
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
   fn rotate(&mut self) -> Result<(), ReceiveError>         // §3.3's retried rotation,
                                                            // callable without an append:
@@ -1300,11 +1347,30 @@ So the design is:
   `maintain(&self, horizons: &SnapshotHorizons, cap: usize) ->
   Result<HousekeepingProgress, ReclaimError>` — the documented housekeeping
   contract, no separate report type — and `checkpoint(&self, mark:
-  WalOffset) -> Result<(), ReclaimError>`, the two operations that run
-  `housekeeping` and `checkpoint` on its private journal mutex; `serve` reaches it from the
-  timer through `SharedPipeline`, and runs it on the blocking pool because
-  it does file I/O while holding a `std` mutex — the stall is the mutex,
-  not the thread, as the cap paragraph below says.
+  WalOffset) -> Result<(), ReclaimError>`; `serve` reaches it from the
+  timer through `SharedPipeline` and runs it on the blocking pool because
+  it does file I/O. `maintain` is where §3.2's two halves become a
+  protocol, because the coordinator's journal is `Mutex<Box<dyn Journal>>`
+  and a single `Journal` call would keep every unlink and fsync inside that
+  guard, in front of every concurrent append: `maintain` locks the journal
+  for `housekeeping_prepare` and releases it; runs the file half itself on
+  the plan's owned paths — merge and write `RECLAIM.tmp`, fsync, rename,
+  parent fsync, then the unlinks, then the parent fsync — with no guard
+  held; and locks again for `housekeeping_commit` with the outcome. Between
+  the two the WAL keeps serving appends and rotations, which never touch an
+  entry marked reclaiming. One plan is outstanding at a time by
+  construction (one housekeeping task), and a plan that is never committed
+  — the task panicked between the halves — strands nothing: the next
+  `housekeeping_prepare` re-plans every entry still marked reclaiming ahead
+  of anything newly eligible, the record merge is idempotent and monotonic,
+  and an unlink that finds the file already gone counts as removed. A crash
+  between the halves reconciles at open the same way, with no special
+  case: `remeasure_unreclaimed()` rebuilds the ledger from the segments
+  that survive, so a segment unlinked before the crash is simply absent and
+  one not yet unlinked is present and still eligible under the horizons the
+  durable `RECLAIM` record already carries, since the record was written
+  before the first unlink; the open-time directory fsync makes the surviving
+  set definite before the walk.
 - **`Option<WalOffset>` skips, and the post-recovery call is an explicit
   exception.** `None` means no high-water mark is known, and there is then
   nothing to declare reclaimable. `None` is *not* the same as "post-recovery",
@@ -1465,6 +1531,10 @@ memory, and nothing here claims to.
 > - **And** an encode worker panicking mid-batch, followed by a barrier,
 >   leaves the checkpoint and every snapshot unchanged, and the batch's
 >   unemitted records are replayed on restart
+> - **And** the same holds when the barrier is started *concurrently* with
+>   the worker's panic, under every schedule: a barrier that observes the
+>   pool's pending count at zero has observed the latch, because the
+>   unwinding guard stores it before the decrement that settles the count
 > - **And** when the checkpoint write fails, the barrier still reports
 >   success, `last_checkpoint()` is unchanged, and the next housekeeping pass
 >   reclaims nothing that was **not already eligible under the previous
@@ -1478,9 +1548,9 @@ memory, and nothing here claims to.
 >   tenants** whose snapshot horizons differ, the lagging one below that
 >   checkpoint
 > - **When** housekeeping runs
-> - **Then** only segments at or below the checkpoint whose every tenant's
->   horizon is at or above that tenant's last frame in them (both
->   inclusive) are unlinked, the current append segment survives, and the
+> - **Then** only segments at or below the checkpoint (inclusive) whose
+>   every tenant's last frame in them is strictly below that tenant's
+>   horizon are unlinked, the current append segment survives, and the
 >   WAL's segment count falls
 > - **And** a segment holding the frame that sits exactly at a tenant's
 >   horizon is retained — the per-tenant comparison is strict, only the
@@ -1582,7 +1652,10 @@ memory, and nothing here claims to.
 >   index, and the pass pops at most the cap from the eligible queue — so an
 >   append taken concurrently waits for O(cap) ledger work under the writer
 >   lock whatever the backlog, and never for the `RECLAIM` write, an unlink
->   or an fsync, which run after the position is released; applying changed
+>   or an fsync, which run between `housekeeping_prepare` and
+>   `housekeeping_commit` with the journal guard released — asserted by an
+>   append that completes while the file half is held at a fault-injection
+>   point; applying changed
 >   horizons is itself capped —
 >   at most the cap's worth of segments per pass, resumed from a per-tenant
 >   cursor next pass, so a tenant catching up after a long outage cannot
@@ -1790,7 +1863,10 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   whose publish panics once the barrier is inside `quiesce_publishes`,
   asserting no install and no stamp and a failed outcome; and a record that
   panics the encode worker mid-batch, asserting the next barrier stamps
-  nothing and a restart replays the remainder. The retain path is already
+  nothing and a restart replays the remainder — run once with the barrier
+  after the panic and once started concurrently with it, the seeded
+  scheduler covering the store-before-decrement order, so a latch set after
+  the count settles would fail the test rather than pass by timing. The retain path is already
   exercised by the existing skip-the-snapshot tests, so these extend them
   rather than duplicating.
 - **Truncation bounds (RFC0052.2)** — an integration test building a WAL

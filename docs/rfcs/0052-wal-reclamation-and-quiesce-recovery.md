@@ -470,23 +470,40 @@ panic in this stage; RFC0052.10 is not gated on RFC 0053 for it. The
 signal has to be concrete, because nothing else can carry it: the pool's
 workers are detached `std` threads whose join handles are kept only for
 drop, so a worker panic is invisible to the receiver while it serves. The
-latch is one shared `AtomicBool`, owned by the pipeline (`SharedPipeline`
+latch is a pair of shared atomics owned by the pipeline (`SharedPipeline`
 holds the `Arc`) and handed at construction to the encode pool, to the
-sink's publish guards and to the barrier task. Each guard holds a handle;
-its `Drop` tests `std::thread::panicking()` and, if so, stores `true` with
-`Release` ordering *before* it decrements its count — the pending count for
-`BatchGuard`, the in-flight count for the publish guard — and it is that
-decrement, under the count's mutex and condvar, that wakes `quiesce` or
-`quiesce_publishes`. `flush_then_snapshot` loads the latch with `Acquire` at
-both of its checks. The race contract follows from the order: a barrier
-that observes a count at zero after a panic observed a decrement that
-happened after the store, so it observes the latch; there is no schedule
-in which the count settles and the latch is still clear. RFC0052.1 holds
-that race directly, with the panic injected in a worker and the barrier
-started concurrently. While the
-latch is set the barrier neither checkpoints nor snapshots — the frames stay
-in the WAL and a restart replays them — the state is exported (RFC0052.7)
-and only a restart clears it. The check lives inside `flush_then_snapshot`,
+sink's publish guards and to the barrier task: `barrier_epoch: AtomicU64`,
+the number of the next cut, incremented at every cut capture under the
+exclusion; and `failed_epoch: AtomicU64`, the lowest epoch any unwinding
+guard has reported, `u64::MAX` when clear. A guard reads `barrier_epoch` when
+it is registered — `submit` for a `BatchGuard`, `begin_publish` for a
+publish guard, both under the exclusion, so the read is ordered against the
+capture: a guard registered before cut `E`'s capture carries `E`, one
+registered after it carries `E + 1`. Its `Drop` tests
+`std::thread::panicking()` and, if so, lowers `failed_epoch` to its own
+epoch (a CAS keeping the minimum) with `Release` ordering *before* it
+decrements its count — the pending count for `BatchGuard`, the in-flight
+count for the publish guard — and it is that decrement, under the count's
+mutex and condvar, that wakes `quiesce` or `quiesce_publishes`.
+`flush_then_snapshot` loads `failed_epoch` with `Acquire` at both of its
+checks, and a cut with epoch `E` **fails when `failed_epoch ≤ E`**. The
+epoch is what keeps the latch honest about scope: a guard carries the
+epoch of the first cut whose mark could cover its records, so a panic in
+a publish registered *after* cut `E` (its frames are above `E`'s mark,
+§3.1's invariant) fails no cut at or below `E` — the cut in flight
+proceeds — and fails every cut from `E + 1` on. The race contract follows
+from the order: a barrier that observes a count at zero after a panic
+observed a decrement that happened after the store, so it observes the
+epoch; there is no schedule in which the count settles and the latch is
+still clear. RFC0052.1 holds that race directly, with the panic injected
+in a worker and the barrier started concurrently. In this stage the
+dropped batch's records exist only in the WAL, so nothing can clear the
+latch short of re-mining them: every barrier with an epoch at or above
+`failed_epoch` neither checkpoints nor snapshots — the frames stay in the
+WAL and a restart replays them — the state is exported (RFC0052.7) and
+**only a restart clears it**. That is the conservative behaviour, stated as
+such; RFC 0053's requeue-on-unwind is what makes a later cut able to clear
+it, by draining the requeued batch, and it defines that clear. The check lives inside `flush_then_snapshot`,
 the one function the timer, the rotation hook and shutdown all call, so
 every stamping caller honours it rather than the timer alone, and it is made
 **twice**: before the cut, and again immediately before the snapshot install
@@ -524,7 +541,7 @@ The caller is the receiver role, on its own interval:
 
 ```text
 every barrier_secs (default: the sink age trigger, 300 s):
-    if cadence_failed: skip                // §3.1; housekeeping below still runs
+    if failed_epoch <= barrier_epoch: skip // §3.1's latch; housekeeping below still runs
     cut = with_barrier_exclusion:          // a NEW pipeline lock, not the miner
                                            // lock and not the gate — see §3.1
         quiesce_encodes()                  // the barrier's prologue: every pre-cut
@@ -532,7 +549,8 @@ every barrier_secs (default: the sink age trigger, 300 s):
         mark = last_durable()              // read AFTER the quiesce, INSIDE the turn
         batches = drain both sinks         // owned; registered as in flight
         snaps = serialise miner snapshots  // cut-consistent S (§3.1)
-        (mark, batches, snaps)             // release the exclusion here
+        epoch = barrier_epoch.fetch_add(1) // this cut's epoch (§3.1)
+        (mark, batches, snaps, epoch)      // release the exclusion here
     run_cut(cut)
 
 on a rotation (inside the ingest turn that observed the segment change):
@@ -548,9 +566,10 @@ run_cut(cut):
                                            // path. A publish registered after the cut holds
                                            // only frames above cut.mark (§3.1's invariant),
                                            // so it is neither waited on nor stamped past
-    ok = cut_ok and prior_ok and not cadence_failed
-                                           // the recheck (§3.1): a panic while this
-                                           // barrier waited is a failed cut
+    ok = cut_ok and prior_ok and failed_epoch > cut.epoch
+                                           // the recheck (§3.1): a panic in a guard of
+                                           // this cut's epoch or lower is a failed cut;
+                                           // a later epoch's panic fails later cuts
     if ok and cut.mark is Some(_):
         install_snapshots(cut.snaps)       // under the install lock, monotonic in mark;
                                            // failure logged, not a blocker (§3.1); with
@@ -560,7 +579,7 @@ run_cut(cut):
       on Err -> log, do NOT advance (fail-closed, §3.1)
 
 every housekeeping_secs (default 60 s), in its own task:
-    coordinator.maintain(snapshot_horizons(), max_unlinks_per_pass):
+    coordinator.maintain(snapshot_horizons(), config.max_unlinks_per_pass):
         plan    = journal.lock().housekeeping_prepare(horizons, cap)
                                            // ledger half under the guard: horizons applied
                                            // (capped), floor derived, partials then segments
@@ -775,9 +794,20 @@ one, because startup's fallback is exactly as trustworthy as this record:
   merges those horizons into the record, writes and fsyncs it, and only then
   unlinks the popped files and fsyncs the parent. The ordering rule is what
   the startup contract needs and it is unchanged: the record is durable
-  before the segments it covers are gone. An entry leaves the ledger and its
-  accounting only when its unlink has succeeded, under the writer position
-  at `housekeeping_commit` (§3.7). The two failure points differ: a failed record
+  before the segments it covers are gone. What the record says about them
+  must not run ahead of the unlinks, though, so it keeps **planned and
+  completed apart**: a `planned` list — one entry per popped segment, its
+  uuid and each tenant's last offset in it, written *before* the unlinks —
+  and `reclaimed_through`, per tenant, which is the proof of loss and is
+  advanced only by `housekeeping_commit`, after the unlink and the parent
+  fsync succeeded, and made durable by the next record write (the next pass
+  that plans, or the pass's own second write when nothing is pending). A
+  failed unlink or parent fsync therefore leaves the segment on disk *and*
+  `reclaimed_through` behind it: startup will not halt on a tenant whose
+  frames are still there. An entry leaves the ledger and its accounting
+  only when its unlink has succeeded, under the writer position at
+  `housekeeping_commit` (§3.7), and its `planned` entry is dropped in the
+  same commit. The two failure points differ: a failed record
   write or fsync means nothing was unlinked, so every popped entry is put
   back to eligible under the writer position and the next pass pops it
   again — the entry was never out of the ledger, so the no-listing rule
@@ -787,11 +817,21 @@ one, because startup's fallback is exactly as trustworthy as this record:
   which is what a ledger with no directory scan behind it needs.
   Housekeeping's ledger half is the only half that takes the writer
   position, which is what "runs on rotation's ownership path" means below.
-- **Monotonic per tenant, by merge.** The pass reads the record, raises each
-  tenant it is about to reclaim under to that horizon, and never lowers an
-  entry; a tenant absent from the record has never had a frame reclaimed
-  under a horizon. One writer holds the writer position, so the
+- **Monotonic per tenant, by merge.** `reclaimed_through` only rises: the
+  commit raises each tenant to the highest last-offset among the segments
+  whose unlink succeeded, never lowers an entry, and a tenant absent from
+  it has never had a frame reclaimed. `planned` entries come and go with
+  their segments. One writer holds the writer position, so the
   read-modify-write cannot interleave.
+- **Reconciled at open.** A crash between the record write and the commit
+  leaves `planned` entries whose segments may or may not be gone. Open
+  reconciles them against the directory before anything reads the record:
+  a planned segment still present is retained — it is in the ledger
+  `rebuild_ledger()` builds, still eligible, and the next pass re-plans it
+  — and its entry is dropped; a planned segment absent was unlinked, so its
+  per-tenant last offsets raise `reclaimed_through` as the commit would
+  have. The reconciled record is written durably before the first pass, and
+  only `reclaimed_through` is ever read as proof of loss.
 - **Created at open, and witnessed by `CHECKPOINT`.** The WAL writes an
   empty record, durably, when it opens a root that has none — before the
   first pass can run — so the record exists on every root this RFC's code
@@ -807,14 +847,21 @@ one, because startup's fallback is exactly as trustworthy as this record:
   present with `RECLAIM` absent is a post-RFC root that has lost its record,
   and open **fails closed** on it as `OpenError::Corrupt`, naming the missing
   file; both absent is the pre-RFC layout, on which nothing was ever
-  reclaimed, and the only case read as "no reclaimed state".
+  reclaimed, and the only case read as "no reclaimed state". The matrix is
+  symmetric: a `RECLAIM` with any `reclaimed_through` or `planned` entry
+  beside a *missing* `CHECKPOINT` is also fail-closed, naming both files —
+  every unlink was gated on a checkpoint, so the checkpoint existed and is
+  gone, and without `X` the Parquet-side suppression horizon cannot be
+  rebuilt and replay would republish. Only an *empty* record may coexist
+  with a missing `CHECKPOINT`: that is a post-RFC root before its first
+  barrier, which is what open creates.
 - **Corrupt is fatal.** The record carries a version byte and a checksum; a
   record failing either at open fails startup as `OpenError::Corrupt`,
   naming the file. It is not read as missing: missing means "never
   reclaimed", damaged means "reclaimed, extent unknown", and only the first
   is safe to proceed from.
 
-The WAL exposes the record's per-tenant horizons as
+The WAL exposes the reconciled `reclaimed_through` as
 `ReclaimState::reclaimed_through`, and recovery compares: a tenant whose
 restorable horizon is below its recorded reclaimed-through — including a
 tenant with an entry and no restorable snapshot at all — has unrecoverable
@@ -1162,9 +1209,11 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
 - **the `cadence_failed` latch** — pipeline-owned rather than a
   `ReclaimState` field, because it is set by the ingester's unwind guards
   (§3.1: the encode pool's `BatchGuard`, the sink's publish guard, the
-  barrier's own step) and no WAL call observes it; the receiver exports it
-  beside the `ReclaimState` fields, and RFC0052.7 names which surface each
-  item comes from.
+  barrier's own step) and no WAL call observes it; exported as the failed
+  epoch (absent when clear) beside the current barrier epoch, so an
+  operator can see that the latch is set and which cuts it fails; the
+  receiver exports it beside the `ReclaimState` fields, and RFC0052.7 names
+  which surface each item comes from.
 
 A log event is emitted on entering and on leaving a refusing state — for
 transitions observable within one process; the terminal rotation state's
@@ -1327,10 +1376,16 @@ So the design is:
   shows as its own state — not `None`, which would claim no consumer
   exists.
 
-  `max_unlinks` is a parameter rather than WAL configuration because the cap
-  belongs to the caller's stall budget, and `HousekeepingProgress` reports
-  whether the pass hit the cap, so the caller can tell "backlog drained" from
-  "more to do" without re-deriving it. Without both, RFC0052.12's
+  The cap's *value* is WAL configuration — `WalConfig::max_unlinks_per_pass`,
+  proposed default 128, validated at `Wal::open` to be at least
+  `rotation_retry_attempts` (RFC0052.4's one-pass debris clearance depends
+  on it), refusing to open with `OpenError::InvalidConfig` like the other
+  §6.9 tunables, because only the WAL knows both numbers — and the
+  coordinator passes it to `housekeeping_prepare` explicitly rather than
+  the trait reading it, so a test can drive any cap through a double and
+  the trait stays free of configuration. `HousekeepingProgress` reports
+  whether the pass hit the cap, so the caller can tell "backlog drained"
+  from "more to do" without re-deriving it. Without both, RFC0052.12's
   bounded-stall contract has no way to be implemented.
 
   The concrete impl maps `CheckpointError` and `HousekeepingError` into
@@ -1590,8 +1645,9 @@ memory, and nothing here claims to.
 > - **And** when either sink retains anything, no checkpoint is
 >   attempted and `last_checkpoint()` is unchanged
 > - **And** when the high-water mark is `None`, no checkpoint is attempted
-> - **And** while the `cadence_failed` latch is set, the barrier neither
->   checkpoints nor snapshots, however many timer passes run
+> - **And** while the `cadence_failed` latch holds an epoch at or below the
+>   cut's, the barrier neither checkpoints nor snapshots, however many timer
+>   passes run, until a restart
 > - **And** an age-sweep publish registered before the barrier began, which
 >   panics while the barrier waits in `quiesce_publishes`, leaves the
 >   checkpoint and every snapshot unchanged: the latch set after the
@@ -1681,10 +1737,10 @@ memory, and nothing here claims to.
 >   valid — and the first `sync` after open discharges its pending directory
 >   fsync
 > - **And** the temporary files left by the failed attempts are gone after
->   successive capped housekeeping passes — `max_unlinks_per_pass` is
->   validated to be at least the retry budget, so one rotation's debris
->   clears in one pass — and a persistently retrying node cannot fill its
->   disk with retry debris
+>   successive capped housekeeping passes — `WalConfig::max_unlinks_per_pass`
+>   is validated at `Wal::open` to be at least `rotation_retry_attempts`
+>   (open refuses otherwise), so one rotation's debris clears in one pass —
+>   and a persistently retrying node cannot fill its disk with retry debris
 
 > **Scenario RFC0052.5 — A persistent rotation failure gives up
 > distinguishably, and never acks**
@@ -1815,8 +1871,10 @@ memory, and nothing here claims to.
 >   barrier's `quiesce_publishes` and its checkpoint — that fails
 >   transiently or panics is neither covered by that checkpoint nor lost:
 >   every frame it holds is above the cut's mark, a transient failure
->   requeues it, and a panic latches the *next* barrier; the barrier does
->   not re-take the exclusion around its store I/O to reach that
+>   requeues it, and a panic — carrying the next epoch — fails no cut at or
+>   below the current one, which proceeds, and fails every later barrier
+>   until restart; the barrier does not re-take the exclusion around its
+>   store I/O to reach that
 
 > **Scenario RFC0052.13 — A tenant without a snapshot pins the floor, and is
 > never read as unbounded**
@@ -1897,6 +1955,17 @@ memory, and nothing here claims to.
 > - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
 >   fails open naming the missing record — `CHECKPOINT` is present, so the
 >   root is post-RFC — rather than recreating an empty record and pinning
+> - **And** a root whose `RECLAIM` holds entries and whose `CHECKPOINT` is
+>   missing fails open naming both files, while an empty `RECLAIM` beside a
+>   missing `CHECKPOINT` opens as a fresh post-RFC root
+> - **And** a segment whose unlink or parent fsync fails after the record
+>   was written stays on disk with `reclaimed_through` behind it: a restart
+>   with that tenant's snapshot undecodable pins the tenant rather than
+>   halting, because the record proves nothing was lost
+> - **And** a crash between the record write and the commit is reconciled at
+>   open: a planned segment still present is retained and re-planned, an
+>   absent one raises `reclaimed_through` as the commit would have, and the
+>   reconciled record is durable before the first pass
 > - **And** a record write or fsync that *fails* unlinks nothing, leaves the
 >   WAL's byte and segment accounting unchanged, and the segments that pass
 >   popped are reclaimed by a later pass once the write succeeds — they are
@@ -2063,8 +2132,11 @@ they are not substitutes for the rest.
       `WalMetrics` documents the directory walk as best-effort; exporting
       it on every collection may not be free on a WAL with many
       segments — though after §3.2 there should be far fewer.
-- [ ] `max_unlinks_per_pass`'s default, which trades first-pass stall against
-      how long a large backlog takes to clear.
+- [ ] `max_unlinks_per_pass`'s default *value*, which trades first-pass
+      stall against how long a large backlog takes to clear. The knob is
+      settled — a `WalConfig` tunable validated at `Wal::open` against
+      `rotation_retry_attempts` (§3.7) — and 128 is the proposed default; the
+      soak run (RFC0052.3) is what should confirm or move the number.
 - [ ] Whether the actionable halt for a pre-existing rotation remnant (§3.3)
       deserves a WAL verb to remove the file, or stays a documented manual
       step. The decision must remain a human's either way — no shape-based

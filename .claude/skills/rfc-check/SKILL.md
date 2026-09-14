@@ -1,7 +1,7 @@
 ---
 name: rfc-check
 description: Decide whether a proposed change to Ourios needs an RFC before implementation, which accepted RFCs it would amend, and whether the PR description addresses the invariants and hazards it touches. Use when planning a change, before opening a PR, when splitting a PR, or when asked "does this need an RFC?".
-allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*)
+allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*), Bash(git status:*)
 metadata:
   adapted-from: huggingface/openenv .claude/skills/rfc-check
 ---
@@ -23,10 +23,13 @@ name files and sections.
 
 ## Steps
 
-1. **Establish the change.** For a branch, `git diff --stat main...HEAD`
-   **and** `git diff HEAD --stat` (staged and unstaged work, since triage
-   runs before the PR exists), then the diffs themselves; for a plan, the
-   files and functions it names. List every crate touched.
+1. **Establish the change.** For a branch, `git diff --stat main...HEAD`,
+   `git diff HEAD --stat` (staged and unstaged work, since triage runs
+   before the PR exists) **and** `git status --porcelain` for untracked
+   files — a new RFC or source file is usually still untracked at this
+   point, and `git diff --no-index /dev/null <file>` shows its content —
+   then the diffs themselves; for a plan, the files and functions it names.
+   List every crate touched.
 
 2. **Apply the triggers.** Grep the touched code for the surfaces below and
    mark each trigger that applies. A trigger is "touched" if the diff changes
@@ -36,7 +39,7 @@ name files and sections.
    |---|---|---|
    | Pillar — Parquet on-disk format, Drain-derived miner, DataFusion as the engine (§2) | `ourios-parquet`, `ourios-miner`, `ourios-querier` | **Required** |
    | Invariant §3.1 template merges, §3.2 `params` cardinality, §3.3 bit-identical reconstruction | `ourios-miner` | **Required** |
-   | Invariant §3.4 WAL-before-ack: ack ordering, fsync, checkpoint, truncation, rotation, recovery | `ourios-wal`, `ourios-ingester` commit/recovery/publish paths | **Required** |
+   | Invariant §3.4 WAL-before-ack: ack ordering, fsync, checkpoint, truncation, rotation, recovery | `ourios-wal`, `ourios-ingester` commit/recovery/publish paths, `ourios-server/src/receiver.rs` (startup recovery and the post-recovery, rotation and shutdown `flush_then_snapshot` barriers) | **Required** |
    | Invariant §3.5 Parquet schema, §3.6 object storage as truth, §3.7 tenancy | `ourios-parquet`, storage, every tenant-bearing path | **Required** |
    | Every hazard section of `docs/hazards.md` (`## H1` … `## H8` today — enumerate the file, do not assume the count) | as listed there | **Required** |
    | Wire contract: OTLP receiver behaviour, error mapping, query DSL surface, HTTP and MCP query endpoints | `ourios-ingester/src/receiver/*`, `ourios-querier/src/dsl` and `api.rs`, `ourios-server/src/{querier,mcp}.rs`, `ourios-serving` | **Required** if it changes what a client observes; a conformance fix that only makes existing behaviour spec-correct is **Recommended** (open an issue naming the spec clause) |
@@ -50,14 +53,17 @@ name files and sections.
    `docs/rfcs/` for the section that specifies that surface — the RFC's
    *design* section and its §5 acceptance criteria, wherever the design
    lives (RFC 0003's is §6, not §3) — and quote the sentence the change
-   would contradict or extend. Read the `status:` frontmatter first: only an
-   RFC at `accepted` is binding (`docs/rfcs/README.md` §Lifecycle), so a
-   contradiction with an *accepted* RFC's criterion is **Required** whatever
-   the table says and the verdict must name the RFC and section it amends
-   ("amends RFC NNNN §X" belongs in the new RFC's status note and §8),
-   while an overlap with a `drafted`, `specified`, `red` or `green` RFC is
-   reported as "coordinate with RFC NNNN", never as an amendment. This is
-   the step that finds the hidden amendment before review does.
+   would contradict or extend. Read the `status:` frontmatter first and
+   route every status `docs/rfcs/README.md` defines: only `accepted` is
+   binding, so a contradiction with an *accepted* RFC's criterion is
+   **Required** whatever the table says and the verdict must name the RFC
+   and section it amends ("amends RFC NNNN §X" belongs in the new RFC's
+   status note and §8); an overlap with a `drafted`, `specified`, `red`,
+   `green` or `validated` RFC is reported as "coordinate with RFC NNNN",
+   never as an amendment; and `superseded` or `rejected` text is never
+   cited as live — follow `superseded-by:` to the current RFC instead (RFC
+   0045 → RFC 0046 is the case in the tree). This is the step that finds
+   the hidden amendment before review does.
 
 4. **Check the PR description** (when there is one). `CLAUDE.md` §4 makes it
    review-blocking: for every §3 invariant or §4 hazard the change touches,

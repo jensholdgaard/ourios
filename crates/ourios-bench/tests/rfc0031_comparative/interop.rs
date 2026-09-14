@@ -342,32 +342,56 @@ fn probe_completeness_condition_is_not_vacuous() {
     );
 }
 
+/// The label guards must be able to fail, or they guard nothing.
+///
+/// Three things are pinned here. The four RFC0031.10 denylist members stay in
+/// the constant (it is the only source of required names for the wire
+/// injection and both live assertions, so removing one would narrow every
+/// check silently). The compile-time disjointness guard trips on a poisoned
+/// promotion list — from a container it is reached on every run but cannot
+/// fail, since tripping it needs Loki's own promotion list to contain a
+/// denied name. And the two runtime guards reject what the pinned image never
+/// supplies: an unexpected label and each forbidden one — without these
+/// negative cases either guard could regress to a no-op while the live
+/// happy path stayed green.
 #[test]
-fn denylist_disjointness_is_not_vacuous() {
-    // The denylist is the only source of required names for the wire
-    // injection and both live assertions, so removing an entry from the
-    // constant would silently narrow every check: pin the four RFC0031.10
-    // members independently of it first.
+fn label_guards_are_not_vacuous() {
     for required in ["trace_id", "span_id", "template_id", "ourios_template_id"] {
         assert!(
             LOKI_LABEL_DENYLIST.contains(&required),
             "RFC0031.10 requires `{required}` on the denylist",
         );
     }
-    let clean: Vec<String> = ["service_name", "k8s_pod_name"]
+
+    let mut poisoned: Vec<String> = LOKI_LABEL_ALLOWLIST
         .iter()
-        .map(|s| (*s).to_string())
+        .map(|name| (*name).to_string())
+        .collect();
+    poisoned.push("trace_id".to_string());
+    assert!(
+        std::panic::catch_unwind(|| assert_denylist_disjoint_from_promotion(&poisoned)).is_err(),
+        "the disjointness guard must trip on a promotion list carrying a denied name",
+    );
+    let clean: Vec<String> = LOKI_LABEL_ALLOWLIST
+        .iter()
+        .map(|name| (*name).to_string())
         .collect();
     assert_denylist_disjoint_from_promotion(&clean);
 
+    let unexpected = vec!["service_name".to_string(), "host_name".to_string()];
+    assert!(
+        std::panic::catch_unwind(|| assert_within_allowlist(&unexpected)).is_err(),
+        "the allowlist guard must reject a label outside the allowlist",
+    );
+    assert_within_allowlist(&clean);
     for forbidden in LOKI_LABEL_DENYLIST {
-        let poisoned = vec!["service_name".to_string(), (*forbidden).to_string()];
+        let observed = vec!["service_name".to_string(), (*forbidden).to_string()];
         assert!(
-            std::panic::catch_unwind(|| assert_denylist_disjoint_from_promotion(&poisoned))
-                .is_err(),
-            "a promotion list containing `{forbidden}` must fail the guard",
+            std::panic::catch_unwind(|| assert_no_denylisted_label(&observed)).is_err(),
+            "the denylist guard must reject `{forbidden}`",
         );
     }
+    assert_no_denylisted_label(&clean);
 }
 
 /// Every indexed label is one RFC0031.10 declared.

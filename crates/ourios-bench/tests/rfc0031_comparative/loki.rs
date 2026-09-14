@@ -239,9 +239,11 @@ async fn loki_string_list(http: &reqwest::Client, url: &str) -> Vec<String> {
 /// and a timeout-bearing HTTP client.
 ///
 /// The stock image config (schema v13 / TSDB) serves the native OTLP
-/// endpoint and maps `service.name` → the `service_name` stream label;
-/// auth is disabled. Exactly what a competent single-binary operator
-/// gets out of the box.
+/// endpoint and promotes every resource attribute in
+/// `LOKI_LABEL_ALLOWLIST` (18 names, `service.name` → `service_name` among
+/// them) to a stream label, capped at 15 labels per stream; auth is
+/// disabled. Exactly what a competent single-binary operator gets out of
+/// the box — a multi-dimensional index, not a one-label one.
 pub(crate) async fn start_loki(
     extra_args: &[&str],
 ) -> (

@@ -65,10 +65,10 @@ name files and sections.
 3. **Cross-reference the accepted RFCs.** For each trigger marked, grep
    `docs/rfcs/` for the section that specifies that surface; when the plan
    or PR names an RFC the tree does not hold yet (an open RFC PR), fetch
-   its file from that PR (`gh pr diff <n>`, or `gh api -X GET -H "Accept: application/vnd.github.raw+json" repos/<owner>/<repo>/contents/<path>?ref=<branch>` for the file text — without the raw media type the Contents API returns base64 in `.content`; the skill is read-only, so only the GET form is allowed),
+   the complete file from the PR's head branch with `gh api -X GET -H "Accept: application/vnd.github.raw+json" repos/<owner>/<repo>/contents/<path>?ref=<branch>` (without the raw media type the Contents API returns base64 in `.content`; the skill is read-only, so only the GET form is allowed) — `gh pr diff <n>` yields a patch, so use it only for patch context or a file the PR adds whole —,
    or take its status and the relevant text as input, and route it by
-   status exactly like an in-tree RFC — `red`/`green`/`validated` and
-   implemented by the change goes under `Covered by`, `drafted` or
+   status exactly like an in-tree RFC — `red`/`green`/`validated`/`accepted`
+   and implemented by the change goes under `Covered by`, `drafted` or
    `specified` under `Coordinate` with the `Blocked` verdict, any other
    overlap under `Coordinate` — rather than reporting "none" — the RFC's
    *design* section and its §5 acceptance criteria, wherever the design
@@ -79,8 +79,11 @@ name files and sections.
    "Superseded by RFC 0046" banner while the file stays `accepted`; RFC
    0001 keeps a v1 paragraph marked superseded by its v2 amendment), and
    route every status `docs/rfcs/README.md` defines: only `accepted` is
-   binding, so a contradiction with an *accepted* RFC's criterion is
-   **Required** whatever the table says and the verdict must name the RFC
+   binding (README §Relationship to architecture docs: "An accepted RFC is
+   a contract for how something will be built"), so a contradiction with an
+   *accepted* RFC's design text or §5 criterion — a format or algorithm
+   clause counts even when no criterion duplicates it — is **Required**
+   whatever the table says and the verdict must name the RFC
    and section it amends ("amends RFC NNNN §X" belongs in the new RFC's
    status note and §8); an overlap with a `drafted`, `specified`, `red`,
    `green` or `validated` RFC is reported as "coordinate with RFC NNNN",
@@ -101,8 +104,8 @@ name files and sections.
    A direct implementation of such an RFC is the explicit exception to
    "coordinate", which is kept for a change that touches an in-ladder
    RFC's surface without implementing it — and for an implementation of a
-   `drafted` or `specified` RFC, whose verdict is `Blocked (RFC NNNN not
-   yet red)`: no new RFC, the existing RFC's red gate is unsatisfied, and
+   `drafted` or `specified` RFC, whose verdict is `Blocked (RFC NNNN[, RFC
+   MMMM] not yet red)`: no new RFC, the existing RFC's red gate is unsatisfied, and
    `Coordinate` names it until it reaches `red`. Covered-by overrides the trigger
    table's verdict: a matched Required trigger whose behaviour the
    covering RFC's §5 already specifies yields `Not required (covered by
@@ -141,7 +144,7 @@ Covered by: <one line per RFC the change implements: RFC NNNN (status) §X, crit
 Coordinate: <one line per pre-accepted RFC the change touches without implementing: RFC NNNN (status) — overlap> or "none"   (a direct implementation of a `red`/`green`/`validated`/`accepted` RFC goes under Covered by, not here; an implementation of a `drafted`/`specified` RFC stays here until its red gate)
 PR description: <invariants/hazards touched> / <silent on: …> or "no PR yet"
 
-Verdict: Not required | Not required (covered by RFC NNNN[, RFC MMMM]) | Blocked (RFC NNNN not yet red) | Recommended | Required   (the question is "is a new RFC or an amendment required?"; a `Covered by` result overrides the trigger ranking, so a change fully covered by an RFC's §5 is Not required with that RFC's ladder as the gate; Required only when a matched trigger has no covering RFC or accepted text must change; otherwise Required outranks Recommended outranks Not required)
+Verdict: Not required | Not required (covered by RFC NNNN[, RFC MMMM]) | Blocked (RFC NNNN[, RFC MMMM] not yet red) | Recommended | Required   (the question is "is a new RFC or an amendment required?"; a `Covered by` result overrides the trigger ranking, so a change fully covered by an RFC's §5 is Not required with that RFC's ladder as the gate; Required only when a matched trigger has no covering RFC or accepted text must change; otherwise Required outranks Recommended outranks Not required)
 Because: <two sentences at most>
 Gate: <one line per gate: "none" | "RFC NNNN: blocked until its `red` gate" | "issue #… naming the spec clause" | "new RFC required (no number yet): <one-line scope>; implementation waits for its `red` gate" | "RFC NNNN: `red` is the implementation gate (a red-stage branch is landable), `green` the acceptance-test gate (all §5 criteria plus unit, property and corpus tests pass), `validated` the thesis gate (`benchmarks.md` §7 on representative corpora), `validated → accepted` the maintainer sign-off" (`docs/verification.md` §3) | "RFC NNNN amends RFC MMMM §X: code gates on NNNN's `red`; MMMM's criterion X is flipped when NNNN is `accepted`" (no rule in `docs/rfcs/README.md` or `docs/verification.md` treats an amendment differently from any other RFC)>
 Split: <"none" | "<part A> ships now; <part B> waits for the RFC">

@@ -111,9 +111,11 @@ requires and #794 established — binary protobuf with
 `application/x-protobuf` whatever the request's encoding, because the
 Collector's exporter decodes every failure body as protobuf regardless of
 `Content-Type`, with the message naming the limit and the measurement — and
-`Retry-After` is a response header, present for `Backpressure` and absent
-for `TenantCapacity`. On gRPC it is the `Status` message plus, for
-`Backpressure` only, a `RetryInfo` detail carrying the same delay. A bare status code with no body,
+`Retry-After` is a response header, present for `Backpressure` and for
+§3.2's `SettlementInProgress` — both self-clearing — and absent for
+`TenantCapacity`, which only an operator clears. On gRPC it is the
+`Status` message plus, for those two, a `RetryInfo` detail carrying the
+same delay. A bare status code with no body,
 which is what the HTTP arm returned before #794, does not satisfy this
 contract, and RFC0053.1 asserts the body on both transports.
 
@@ -220,12 +222,21 @@ itself, under the journal mutex: at the ceiling it performs no rotation
 and returns `Ok(RotationOutcome::RefusedAtSegmentCap)`. RFC 0052 §3.7
 defines `Journal::rotate` as `Result<(), ReceiveError>`; this RFC amends
 it to `Result<RotationOutcome, ReceiveError>` with `RotationOutcome::{
-Rotated, RefusedAtSegmentCap }`, so that a refusal at the cap is a typed,
-non-fault outcome on the `Ok` arm — it draws on no retry budget and is
-never a rotation failure — and every caller treats it as "no rotation" — the idle rotation is skipped and the tick captures its cut as
-if the segment had not aged, with the mark `last_durable` as every cut's
-mark is; the reservation path never reaches it, having refused first; and
-the owed rotation after a seal is deferred (below). Header overhead is
+Rotated, RefusedAtSegmentCap }`, so that a refusal at the cap is a typed
+outcome on the `Ok` arm rather than a rotation failure: it draws on no
+retry budget. **What a caller makes of it depends on why it rotated**, and
+the two classes are named here and at the seal site. A **discretionary**
+rotation — append-driven, the barrier task's idle one, §3.1's forced one —
+has no obligation to close the current segment, so a refusal is simply
+"no rotation": the idle rotation is skipped and the tick captures its cut
+as if the segment had not aged, with the mark `last_durable` as every
+cut's mark is; the forced one reports it and the next pass retries; the
+reservation path never reaches it, having refused first. An **owed**
+rotation is one the current segment's state requires — after a seal, where
+that segment must never take another frame, and the post-recovery step's
+discharge of an owed rotation — and there a refusal is a durability fault,
+not a shrug: the WAL enters `Terminal { Deferred { AtSegmentCap } }`
+(below) and admits nothing until a pass frees a slot. Header overhead is
 therefore at most 24 B × `max_segments`, and the refusal leaves with the
 same latch once a pass removes a segment. **A segment stays in it
 until its unlink succeeds.** RFC 0052 §3.2 marks a popped ledger entry
@@ -362,10 +373,12 @@ RFC 0052 §3.3's retry path into a fresh segment, since appending after a
 partial frame would let recovery consume later bytes as part of it. The seal is **versioned and
 segment-bound**: it carries a format version, the segment's own UUID, the
 last good length, and a checksum of those three, so a stale or corrupted
-seal cannot authorise anything. The rotation that follows the seal is a rotation like any other and
-takes the slot check: with a slot it rotates; **without one the seal is
-written and the rotation is deferred** — the WAL reports RFC 0052 §3.3's
-terminal classification (`RotationState::Terminal`, sub-state `Deferred {
+seal cannot authorise anything. The rotation that follows the seal takes the slot check like any other,
+but it is an **owed** rotation in §3.1's sense — the sealed segment must
+never take another frame — so the refusal is a fault rather than a shrug:
+with a slot it rotates; **without one the seal is written and the
+rotation is deferred** — the WAL reports RFC 0052 §3.3's terminal
+classification (`RotationState::Terminal`, sub-state `Deferred {
 AtSegmentCap }`), so appends are refused under the server-terminal,
 client-retryable class, and `maintain` retries the deferred rotation
 after a pass frees a slot, on which the state clears and admission
@@ -586,9 +599,16 @@ below the limit — a no-op pass cannot clear it, since a refusal can occur
 with the total already below the limit — evaluated by `maintain` under the guard it
 holds for `housekeeping_commit`, from the `HousekeepingProgress` that
 commit returns (which is how the state leaves with no append arriving), or
-an append that *succeeds*. A reservation that passes its check but whose append
-then fails on rotation or write I/O leaves the figure and the state
-unchanged, so the preflight check is never the leave transition. The enter
+an append that is **acknowledged** — `append_batch` returning `Ok` is not
+enough, since it returns before the group sync that makes the frame
+durable (RFC 0052 §3.7's `CommitOutcome`), and a batch whose covering sync
+then fails was never acked and its frame is not durable; so the leave
+transition is the ack path, the append *and* its covering sync succeeding,
+and the `.left` event says the state left on an acknowledged batch. A
+reservation that passes its check but whose append then fails on rotation
+or write I/O, or whose sync fails, leaves the figure and the state
+unchanged, so neither the preflight check nor a bare `append_batch` is the
+leave transition. The enter
 and leave events fire on exactly those transitions, once each, and the gauge
 follows them.
 
@@ -957,10 +977,22 @@ and signals. A turn for a settling tenant must not wait *inside* the gate,
 where it would hold every other tenant's sequence behind it; instead the
 coordinator keeps the **settling set** under its admission mutex, and a
 request for a `Settling` tenant is **refused at admission, before it takes
-a sequence**, under the transient-retryable class (RFC 0018 §3.2's first — the batch is
-valid and the node is healthy) with a `Retry-After` equal to the
-settlement's expected remainder, the barrier cadence at most and one
-second at least, as a non-binding hint; the tenant's live tree is
+a sequence**. The check and the reservation are **one critical section**,
+not two: the admission mutex — the same one the byte reservation and the
+tenant table take — covers reading the settling set *and* reserving the
+request's commit sequence, and a settler adds a tenant to the set under
+that same mutex, so no request can pass the check and then take a sequence
+behind a settler that has already claimed the entry, and no settler can
+insert between a check and its reservation. (The gate itself is untouched:
+the sequence is reserved under the mutex and awaited outside it.) The
+refusal is its own error, `ReceiveError::SettlementInProgress { tenant }`,
+mapped by `IngestFailure::classify` to a `Settling` outcome: `503` /
+`UNAVAILABLE` with the protobuf `Status` body naming the tenant, and —
+unlike the tenant cap — **with** `Retry-After` on HTTP and a `RetryInfo`
+detail on gRPC, because a settlement is short and self-clearing, carrying
+the settlement's expected remainder, the barrier cadence at most and one
+second at least, as a non-binding hint; it is counted on the ingest
+counter with `error.type = wal_settling`; the tenant's live tree is
 unreachable to ingest until the rebuild has installed it, turns for other
 tenants take their sequences as usual, and no sequence is ever taken on
 the tenant's behalf. The losing trigger waits on the signal
@@ -1052,7 +1084,15 @@ outside the byte bound like the other sidecars. Recovery seeds the
 in-memory watermark per tenant as the greater of the `PUBLISHED` entry
 and what the Parquet-side suppression horizon `X` implies, and a missing
 `PUBLISHED` beside a version-2 `CHECKPOINT` is fail-closed like a missing
-`RECLAIM`. The bound between checkpoints is then stated honestly: a panic
+`RECLAIM`. The converse is reachable, since `PUBLISHED` is written first,
+and takes RFC 0052 §3.2's two-state witness rather than a rule of its own:
+`PUBLISHED` present with no version-2 `CHECKPOINT` fails closed — naming
+both files — exactly when `RECLAIM` carries `checkpoint_seen`, because
+that root has checkpointed and lost it; with `checkpoint_seen` unset the
+root has never checkpointed, so a `PUBLISHED` there can only be the one
+written moments before a crash in the first `checkpoint` call, no rows
+were published under a horizon anything reads, and it is discarded. One
+witness governs both sidecars, which is why this RFC adds no second flag. The bound between checkpoints is then stated honestly: a panic
 costs at most one duplicate per record in the ambiguous span, and a crash
 before the next checkpoint costs at most **one more** for the records
 published since the last durable watermark, since replay from `X` cannot
@@ -1158,10 +1198,23 @@ before `quiesce_encodes` returns, so cut `E`'s own drain took those
 records; a publish guard that settles after the capture leaves its
 requeued records in the buffers for cut `E + 1`, and `prior_ok` counts the
 panicked publish as not-ok for `E`, so `E` does not stamp. Whichever cut
-stamps having drained them clears the latch: after its stamp, `run_cut`
-CASes `failed_epoch` from the value it read at its capture to `u64::MAX`,
-so a newer panic that lowered it meanwhile is not erased and is handled by
-the next cut. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
+stamps having drained them clears the latch, and the clear cannot erase a
+failure it never drained. A CAS on `failed_epoch` alone would: a cut that
+captured `E` and observed `failed_epoch = E` can be overtaken by a guard
+reporting `E + 1`, which leaves `failed_epoch` at `E` — the minimum — so
+the CAS would succeed and the newer failure would vanish. So the latch
+carries a **generation** beside it: `failure_generation: AtomicU64`, which
+every reporting guard increments (with `Release`, after lowering
+`failed_epoch` and before it decrements its count, so a barrier that
+observes the count settled observes both), and a cut records the pair
+`(failed_epoch, failure_generation)` it read at its capture. After its
+stamp, `run_cut` clears only by a CAS that succeeds when **both** still
+hold the values it read — a `compare_exchange` on a single `AtomicU64`
+packing the two would do, or a short mutex; the ordering requirement is
+that the generation is read after the epoch at capture and written before
+the epoch's own release at report. Any report in between, whatever epoch
+it carried, bumps the generation, the CAS fails, and the failure survives
+for the next cut to drain and clear. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
 tick with
 
 ```text
@@ -1230,6 +1283,7 @@ repository's review) and nothing is hand-written in the code:
 | `ourios.wal.sealed_segments` | gauge (int) | `{segment}` | — (sealed segments still on disk; the cap is `max_sealed_segments`) |
 | `ourios.wal.tenant_unrecoverable` | gauge (int) | `{tenant}` | `ourios.tenant` (tenants an in-process settlement found below their `reclaimed_through`; alert on nonzero) |
 | `ourios.ingest.encode_fallback` | counter | `{batch}` | `error.type` ∈ {`encode_pool_disconnected`} |
+| `ourios.wal.settling_tenants` | gauge (int) | `{tenant}` | — (tenants with a `Settling` entry; refusals carry `error.type = wal_settling`) |
 | `ourios.wal.backpressure.entered` / `.left` | log events | — | `ourios.wal.backpressure.cause`, plus the cause's measurements: `ourios.wal.limit` (By), `ourios.wal.unreclaimed` (By), `ourios.wal.measurement` for `bytes`; the count and limit for `segments` |
 
 `error.type` continues to carry the failure class on existing counters
@@ -1427,10 +1481,13 @@ are kept distinct so that the remedy each advertises is the true one.
 >   `unmined` entry produce exactly one rebuild; the loser observes the
 >   entry `Settling` and runs only after the rebuild has installed the
 >   tenant and the entry is gone; a request for that tenant issued
->   mid-rebuild is refused at admission — the settling set is checked under
->   the admission mutex before any sequence is taken — with a retry hint,
->   and admitted after settlement; a turn for another tenant takes its
->   sequence and is not held; no settlement path takes the ingest gate
+>   mid-rebuild is refused at admission as `SettlementInProgress` — `503` /
+>   `UNAVAILABLE`, protobuf `Status` naming the tenant, `Retry-After` and
+>   `RetryInfo` carrying the settlement remainder, `error.type =
+>   wal_settling` — with the settling set read and the sequence reserved
+>   under one hold of the admission mutex, so a settler cannot interleave
+>   between them, and admitted after settlement; a turn for another tenant
+>   takes its sequence and is not held; no settlement path takes the gate
 > - **And** settlement rebuilds from the `SnapshotLedger`'s retained state,
 >   not the directory: a `.snap` renamed but not yet parent-fsynced, or left
 >   by a failed write, is never read
@@ -1482,9 +1539,11 @@ are kept distinct so that the remedy each advertises is the true one.
 >   a disconnected queue buffers its batch instead, and `quiesce_publishes`
 >   and shutdown return
 > - **And** the epoch latch clears without a restart: a worker panic
->   lowers `failed_epoch`, the cut that drains the requeued records stamps
->   and CASes it back, and a panic raised during that cut leaves the
->   lowered value in place for the next
+>   lowers `failed_epoch` and bumps `failure_generation`, the cut that
+>   drains the requeued records stamps and clears by a CAS on the pair it
+>   read at its capture, and a panic raised during that cut — at the same
+>   epoch or a later one — bumps the generation so the CAS fails and the
+>   failure survives for the next cut
 
 > **Scenario RFC0053.4 — No acknowledged record is lost with backpressure
 > live**

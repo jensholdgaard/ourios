@@ -399,7 +399,21 @@ silently and the checkpoint would stamp over records in neither the
 buffers nor the store. So a failed send **returns the item to the
 worker**, which parks the batch into the buffers as a `ready` partition
 under the sink lock *before* releasing its guard — the same park the full
-queue takes, recording the current `barrier_epoch` with it — and signals the coordinator to respawn the publisher. No
+queue takes, recording the current `barrier_epoch` with it — and then asks
+the coordinator to restart the publisher. That ask is **a claim, not a
+spawn**, because several workers can observe the same closed channel: the
+coordinator holds the publisher slot — the channel sender and the thread
+handle — behind one mutex, and a worker that finds the channel closed
+takes the lock and re-reads the slot. The claimant is whichever worker
+finds the slot still holding the closed sender: it creates the new
+channel and thread, stores both, and releases. Every other worker finds a
+sender that is no longer the one it failed on, and simply retries its send
+against it — its batch is already parked, so a retry that fails again
+parks nothing twice and loops back through the same gate. The queue is
+owned by the slot throughout: the old receiver dies with the old
+publisher, which has already drained it into the buffers (§3.1's unwind
+drain), so no item is stranded in a channel being replaced, and an item
+enqueued after the new sender is stored is the new publisher's. No
 path releases a publish guard without the records being durable,
 requeued, or parked.
 RFC 0053's requeue-on-unwind replaces only the failing batch's arm of
@@ -642,7 +656,14 @@ publish guards and to the barrier task: `barrier_epoch: AtomicU64`, the
 number of the next cut, incremented at every cut capture under the
 exclusion; and **one packed `AtomicU64`** carrying the failure state —
 the failed epoch in the high 32 bits, a failure generation in the low 32 —
-rather than two words. Two words would not be safe to clear: a report
+rather than two words. Its **clear encoding is `u32::MAX` in the high half
+with the generation zero**, and that matters: a default-zero word would
+read as "epoch 0 failed", which is at or below every cut's epoch and
+would refuse every cut on a node that had never panicked. Epoch
+`u32::MAX` is reserved and never assigned to a cut — `barrier_epoch` stops
+before it, as the overflow note below says — so the sentinel cannot
+collide with a real failure, and a clear restores exactly that word
+(sentinel high, generation zero), not merely a high half. Two words would not be safe to clear: a report
 landing between a reader's two loads can be missed, and a clear written
 against the epoch alone would then erase a failure that was never acted
 on. Packed, the operations are exact. A guard **reports** with a CAS loop
@@ -1018,22 +1039,27 @@ one, because startup's fallback is exactly as trustworthy as this record:
   then its payload — and `RECLAIM` follows it rather than inventing a
   shape. The file is **two fixed-size slots** behind one 32-byte file
   header: 4 B magic `b"OWRC"`, 2 B version (`= 1`), 2 B reserved flags,
-  8 B slot length, 8 B reserved, 8 B CRC32-C of the header's first 24
-  bytes. Each slot is `[u64 generation][u32 entry_count][u32
-  planned_count][u16 header_flags][u16 consumer_mode][4 B reserved]`, then
-  `entry_count` entries and `planned_count` planned records, then a
-  trailing 8 B CRC32-C over the whole slot — checksum coverage is the slot,
-  header included, so a torn write can never read as a shorter valid one.
+  8 B slot length, 8 B reserved, then `u32` CRC32-C over bytes `[0..24)` of
+  the file — the header's own preceding bytes — and 4 B reserved, 32 B in
+  all. Each slot is `[u64 generation][u32 entry_count][u32
+  planned_count][u16 header_flags][u16 consumer_mode][4 B reserved]` (24 B),
+  then `entry_count` entries and `planned_count` planned records, then a
+  `u32` CRC32-C and 4 B reserved (8 B). The checksum covers bytes
+  `[0 .. slot_len - 8)` **of that slot** — everything before the trailer,
+  never the trailer itself, since a checksum cannot cover its own bytes —
+  and because `entry_count` and `planned_count` are inside that range, a
+  torn write cannot present as a shorter valid slot.
   `header_flags` carries `checkpoint_armed` (bit 0) and `checkpoint_seen`
   (bit 1), with the rest reserved and zero; `consumer_mode` is `0`
   unrecorded, `1` `Known`, `2` `NoConsumer` (§3.2), so "unrecorded" is a
   value rather than an absence. An entry is `[16 B tenant UUID][16 B
   WalOffset: segment UUID][8 B byte][u16 mode][6 B reserved]` — the mode
   per entry as well as per root, since §3.2 reads entries by the mode they
-  were written under. A planned record is `[16 B segment UUID][u16
-  tenant_count][6 B reserved]` followed by `tenant_count` pairs of
-  `[16 B tenant UUID][16 B WalOffset]`, plus a `uncertain` bit in its
-  reserved word. `RECLAIM` is the fourth Invariant row in §3.8; the
+  were written under; a `WalOffset` is its 16 B segment UUID plus its 8 B
+  byte offset, 24 B, wherever it appears. A planned record is `[16 B
+  segment UUID][u16 tenant_count][6 B reserved]` (24 B) followed by
+  `tenant_count` pairs of `[16 B tenant UUID][24 B WalOffset]` (40 B each),
+  with the `uncertain` bit in the record's reserved word. `RECLAIM` is the fourth Invariant row in §3.8; the
   polynomial is RFC 0008 §6.9's Castagnoli, as everywhere else in the WAL.
 - **Committed without allocating, because ENOSPC is the case this exists
   for.** A temp-write-and-rename commit needs new blocks, and a full disk
@@ -1048,18 +1074,31 @@ one, because startup's fallback is exactly as trustworthy as this record:
   no temp and no new block on the commit path. `RECLAIM.tmp` therefore
   does not exist, and §3.2's temp-sweep selector is unchanged by this
   record. The size bound follows from two numbers the config already
-  fixes: a slot is `24 + 48 × tenants + 24 × max_unlinks_per_pass + 32 ×
-  (tenants × max_unlinks_per_pass)` bytes at worst — the planned list holds
-  at most `max_unlinks_per_pass` segments, each naming at most every
-  tenant — and the file is two slots plus the 32-byte header. At the
-  proposed cap of 128 and a hundred tenants that is under 900 KiB, which
-  `Wal::open` allocates once. Growth is the one case that can still need
+  fixes: a slot is `32 + 48 × tenants + 24 × max_unlinks_per_pass + 40 ×
+  (tenants × max_unlinks_per_pass)` bytes at worst — its 24 B header and
+  8 B trailer, one 48 B entry per tenant, and a planned list of at most
+  `max_unlinks_per_pass` records of 24 B each naming at most every tenant
+  at 40 B a pair — and the file is two slots plus the 32-byte file header.
+  At the proposed cap of 128 and a hundred tenants a slot is 519,904 B, so
+  the file is 1,039,840 B, about 1 MiB, which `Wal::open` allocates once. Growth is the one case that can still need
   blocks: a tenant set that outgrows the preallocation is extended and
   fsynced **before** the pass that needs it plans anything, and a failed
   extension refuses that pass (logged, counted, retried next tick) rather
   than reclaiming without a durable record — reclamation stalls, which is
   the conservative direction, and the extension is attempted again on
-  every later pass. RFC0052.17 injects ENOSPC on both paths.
+  every later pass. The limit is worth stating plainly rather than
+  claiming more than the design gives: **this removes allocation from the
+  steady-state commit, not from the WAL's lifetime.** A pass on an
+  unchanged tenant set never needs a block, which is the case that matters
+  — a node whose disk filled while its tenants stayed the same reclaims
+  its way out. A volume that is already full when the WAL is *opened*, or
+  when the tenant set grows, cannot allocate the file or its extension:
+  that refuses the pass, surfaces the rotation path's terminal class
+  (§3.3) so the operator sees a node that needs space rather than one
+  quietly not reclaiming, and waits for a human to free some. No design
+  that needs a durable record before unlinking can do better on a volume
+  with no room for the record. RFC0052.17 injects ENOSPC on all three
+  paths.
 - **Durable before the unlinks — and off the writer position.**
   The record's slot write and fsync complete before the
   pass unlinks anything. The record is on disk before any frame it accounts
@@ -2135,7 +2174,7 @@ existing tunables do.
 | `segment_age_secs` (RFC 0008 §6.9; second caller here, §3.2's idle rotation) | Tunable | `600` (unchanged) | `1..=86_400` (unchanged) | §3.4 — bounds recovery window; the idle rotation makes an idle node's last segment reclaimable within `segment_age_secs + barrier_secs + housekeeping_secs` |
 | `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
-| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, two CRC32-C-checksummed slots with a `u64` generation, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated and rewritten in place | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
+| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated and rewritten in place | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
 | Segment-header format **version 2** (§3.2) | Invariant | `2` (was `1`; the reader accepts both) | n/a | format compat — the version every root with a segment carries, and so the witness that separates a pre-RFC root from one that lost both sidecars, including a `NoConsumer` root with no snapshots |
 | Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
@@ -2572,9 +2611,14 @@ memory, and nothing here claims to.
 >   version-2 segment, so no restart ever finds a version-2 segment beside
 >   no record — asserted by injecting a crash between the two steps
 > - **And** a record write that fails with `ENOSPC` reclaims nothing and
->   refuses the pass rather than unlinking without a durable record, on
->   both the slot write and the growth path, and a later pass on a disk
->   with room completes normally
+>   refuses the pass rather than unlinking without a durable record — on
+>   the slot write, on the tenant-growth extension, and on the allocation
+>   `Wal::open` itself performs — and a later pass on a disk with room
+>   completes normally
+> - **And** a pass on an unchanged tenant set writes its slot without
+>   allocating, so a node whose volume filled after open still reclaims;
+>   only the at-open and growth allocations can be refused for space, and
+>   those surface the terminal class
 > - **And** a node's own first start is never that state: the empty record
 >   is durable before the initial segment is created, so a restart
 >   immediately after a fresh `Wal::open` — with or without a crash between
@@ -2849,6 +2893,10 @@ they are not substitutes for the rest.
     written before `CHECKPOINT` in the same call, on the checkpoint's own
     durable path, and joining §3.2's sidecar matrix on the same fail-closed
     footing as `RECLAIM`.
+  - *RFC 0053 §3.2* adds `Journal::publish_marks(&HashMap<TenantId,
+    PublishedMarks>)` — a `PUBLISHED`-only write with its own crash
+    ordering, used by settlement and by the migration startup path — so
+    `checkpoint` is not called merely to advance a publication watermark.
   - *RFC 0053 §3.2* makes a **permanently** failed audit write a distinct
     outcome that refuses the dependent record publish, naming RFC 0005's
     audit-sink contract; §3.1's wait-or-write rule here covers only the

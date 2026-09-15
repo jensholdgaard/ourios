@@ -1101,7 +1101,22 @@ final `replace_tenant`; so the entry also carries a completion signal, and
 the protocol is: the winner holds the exclusion and the miner lock for the
 claim only, performs the reads with no pipeline lock held, re-takes the
 two in order for `replace_tenant`, removes the entry under the miner lock
-and signals. A turn for a settling tenant must not wait *inside* the gate,
+and signals. **A panic inside the settlement has its own arm**, because
+the replay runs the same mining path that panicked in the first place and
+`replace_tenant` runs under the miner lock: without one, the barrier
+tick's `catch_unwind` would resume the task with the entry still
+`Settling`, its waiters parked and the tenant refused for the life of the
+process. So the settlement runs under its own `catch_unwind` inside the
+tick's: an unwind returns the entry to `Unresolved` — or marks the tenant
+unrecoverable, when the rebuild had already reached §3.2's
+`reclaimed_through` rule — **and signals the waiters** before the panic is
+counted and the tick resumes, so the next trigger claims the entry and a
+waiting request is refused with a fresh hint rather than held. The miner
+lock's poisoning is recovered the way the pipeline already recovers it
+(`lock_miner` takes `PoisonError::into_inner`), and the tenant's tree is
+whatever the failed rebuild left, which the next settlement replaces
+wholesale. RFC0053.2 drives a panic in the replay and in
+`replace_tenant`. A turn for a settling tenant must not wait *inside* the gate,
 where it would hold every other tenant's sequence behind it; instead the
 coordinator keeps the **settling set** under its admission mutex, and a
 request for a `Settling` tenant is **refused at admission, before it takes
@@ -1131,8 +1146,18 @@ terminal state, tenant, settling set, byte and segment reservation), takes
 the journal mutex under it for `append_batch` — whose success allocates
 the sequence — releases both, then follows
 RFC 0052's order for the mining span; `maintain` takes the admission mutex
-and then the journal mutex for its halves, in that order, which is why the
-forced rotation and the leave transition can be evaluated together; and a
+and then the journal mutex for its **ledger** halves, in that order, which
+is why the forced rotation and the leave transition can be evaluated
+together — and **releases both across the file half**, which is the point
+of RFC 0052 §3.7's prepare/commit split: the `RECLAIM` write, its fsync
+and rename, the unlinks and the parent fsync all run with no admission
+mutex and no journal mutex held, so a reservation never queues behind an
+fsync. Holding the admission mutex there would put every ingest request
+behind the pass's disk I/O and reintroduce exactly the stall the split
+exists to remove. The rule, stated as part of the order: **no lock in this
+hierarchy is held across store or directory I/O** — not the admission
+mutex over the file half, not the barrier exclusion over a cut's flush
+(§3.2), not the miner lock over a snapshot write; and a
 settler **publishes its claim under the admission mutex — adding the
 tenant to the settling set — before it takes the barrier exclusion**, so
 the claim is visible to admission from the instant it exists and no
@@ -1286,17 +1311,26 @@ checkpoint witness already uses and as an **amendment to RFC 0052 §3.2's
 record header**: **`published_seeded`**, written durably on the accepting
 start *before* any batch is admitted, and confirmed — a second durable
 write, at the next record write after the first `PUBLISHED` write
-succeeded — exactly as `checkpoint_armed` and `checkpoint_seen` are. A
-root whose flag is set but unconfirmed, with `PUBLISHED` absent, is a
-crash inside the window: it seeds from `X` again, which is correct because
-nothing has been published under a finer horizon yet. A root whose flag is
-**confirmed** with `PUBLISHED` absent is a lost sidecar and fails closed,
-exactly as a lost `RECLAIM` does. The coarse window therefore happens once
-per upgrade, and the consequence is stated rather than hidden: in that
-window the watermarks are as coarse as `X`, so records published between
-the last pre-upgrade checkpoint and the first post-upgrade one are
-re-emitted if a panic or crash makes the rebuild replay them — the
-at-most-twice bound holds, the exactly-once refinement does not. Per the pre-production layout policy there is no migration
+succeeded — exactly as `checkpoint_armed` and `checkpoint_seen` are. And the
+window is closed by a **write**, not by the next checkpoint: waiting for
+one would leave the flag armed-but-unconfirmed across every crash in
+between, and an armed flag proves nothing about what reached Parquet above
+`X`, so repeated crashes could each add a copy. So the accepting start
+**writes `PUBLISHED` itself, carrying the seeded marks, before it admits
+the first batch** — one extra sidecar write at startup, on the same
+durable path a checkpoint uses — and confirms the flag at the next record
+write. A crash *before* that write leaves the flag armed with `PUBLISHED`
+absent and nothing published under a finer horizon, so the next start
+seeds from `X` again, correctly; a crash *after* it finds a `PUBLISHED`
+whose marks are the seed and proceeds from there like any other start. A
+root whose flag is **confirmed** with `PUBLISHED` absent is a lost sidecar
+and fails closed, exactly as a lost `RECLAIM` does. The coarse window is
+therefore bounded by that single write rather than by a checkpoint that
+may never come, and the consequence is stated rather than hidden: within
+it the watermarks are as coarse as `X`, so records published between the
+last pre-upgrade checkpoint and the seeding write are re-emitted if a
+panic or crash makes the rebuild replay them — the at-most-twice bound
+holds, the exactly-once refinement does not, once per upgrade. Per the pre-production layout policy there is no migration
 tooling; the read path is the whole migration, and the implementing PR
 carries the `!` marker. A **version-1 root** carries neither sidecar: RFC 0052 opens it
 without creating a `RECLAIM`, and `PUBLISHED` follows the same rule, both
@@ -1452,21 +1486,33 @@ the CAS would succeed and the newer failure would vanish. So the epoch latch
 carries a **generation** beside it, `failure_generation: AtomicU64`, and
 the publication order is stated once and holds everywhere. **At report**, a
 guard increments `failure_generation` **first**, then lowers
-`failed_epoch` with a `Release` store, then decrements its count. **At
-capture**, a cut reads `failed_epoch` with `Acquire` **first**, then the
-generation. That order is what makes the pair readable: a report that
-lands between the two reads has already bumped the generation before it
-published the epoch, so a capture can never pair a *new* epoch with an
-*old* generation — the pair it holds is either wholly before the report or
-wholly after it, and in the latter case the epoch it read is the new one.
-The reverse order would allow exactly the erasure this guards against. The
-cut records the pair `(failed_epoch, failure_generation)` it read at its
-capture. After its
-stamp, `run_cut` clears only by a CAS that succeeds when **both** still
-hold the values it read — a `compare_exchange` on a single `AtomicU64`
-packing the two would do, or a short mutex. Any report in between, whatever epoch
-it carried, bumps the generation, the CAS fails, and the failure survives
-for the next cut to drain and clear. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
+`failed_epoch` and the generation together. **Two atomics cannot carry
+this**, whatever the ordering between them: a cut that reads the epoch and
+then the generation can be overtaken by a report at the *same* epoch,
+which bumps the generation and leaves the epoch unchanged — the cut's
+second load picks up the new generation, its captured pair equals the
+current pair, and its CAS erases a failure it never drained. Ordering the
+stores the other way only moves the window. So the latch is **one**
+atomic, not two: a single `AtomicU64` packing **the epoch in the high 32
+bits and the generation in the low 32**, and report, capture and clear are
+each a single-word operation on it. A report is a CAS loop that lowers the
+epoch half to the minimum of its own and what it read *and* increments the
+generation half in the same word, with `Release`, before it decrements its
+count; a capture is one `Acquire` load of the word, which is by
+construction a coherent pair; the clear after a stamp is a
+`compare_exchange` against **the exact word the cut captured**, so any
+report in between — a lower epoch, the same epoch, or neither — changes
+the word, the CAS fails, and the failure survives for the next cut to
+drain and clear. The clear value stays the all-ones epoch half, the
+generation half being ignored while the epoch half is clear. Overflow is
+stated rather than assumed: the generation half wraps at 2^32 and wrapping
+is harmless, since it is only ever compared for equality inside one
+capture-to-clear window and a wrap would need four billion reports inside
+it; the epoch half is the barrier's own counter, which at one cut per
+`barrier_secs` cannot reach 2^32 in any deployment's lifetime, and an
+implementation that needs either half wider moves to a 128-bit word or a
+short mutex rather than splitting the pair again. RFC0053.3's leg drives a
+same-epoch report between a capture and its clear. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
 tick with
 
 ```text
@@ -1699,11 +1745,12 @@ are kept distinct so that the remedy each advertises is the true one.
 >   still `Terminal`, with no hint
 > - **And** a node upgrading from RFC 0052 — version-2 `CHECKPOINT`,
 >   `RECLAIM` with `checkpoint_seen`, no `PUBLISHED` — starts, arms
->   `published_seeded` before admitting a batch, seeds its watermarks from
->   `X`, and writes `PUBLISHED` at its next checkpoint, confirming the flag
->   at the next record write; a restart *inside* that window seeds from `X`
->   again, and a start with the flag confirmed and the sidecar missing
->   fails closed
+>   `published_seeded`, seeds its watermarks from `X` and writes
+>   `PUBLISHED` with those marks **before admitting the first batch**,
+>   confirming the flag at the next record write; a crash before that write
+>   seeds from `X` again on the next start, a crash after it proceeds from
+>   the written marks, and a start with the flag confirmed and the sidecar
+>   missing fails closed — so repeated crashes add no further copies
 > - **And** a tenant whose `reclaimed_through` entry was written under
 >   `NoConsumer` is not marked unrecoverable when its snapshot is missing:
 >   it rebuilds from empty and pins, while the same shape under `Known`
@@ -1788,6 +1835,11 @@ are kept distinct so that the remedy each advertises is the true one.
 >   tenant's oldest surviving frame; each call returns at most `limit`
 >   frames within one segment and the guard is released between calls — an
 >   append issued mid-replay lands between two of its calls
+> - **And** a panic inside the settlement — in the bounded replay or in
+>   `replace_tenant` — returns the entry to `Unresolved` (or marks the
+>   tenant unrecoverable) and signals the waiters before the tick resumes,
+>   so the next trigger settles it and a waiting request is refused with a
+>   fresh hint rather than held forever
 > - **And** the barrier tick and an admitted ingest turn racing on one
 >   `unmined` entry produce exactly one rebuild; the loser observes the
 >   entry `Settling` and runs only after the rebuild has installed the
@@ -1853,10 +1905,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   `failure_generation` and then lowers `failed_epoch`, in that order, the cut that
 >   drains the requeued records stamps and clears by a CAS on the pair it
 >   read at its capture, and a panic raised during that cut — at the same
->   epoch or a later one — bumps the generation so the CAS fails and the
->   failure survives for the next cut; a report interleaved between a
->   capture's two reads is never seen as a new epoch with an old
->   generation
+>   epoch or a later one — changes the packed word so the CAS fails and
+>   the failure survives for the next cut; a **same-epoch** report between
+>   a capture and its clear is caught, which a two-atomic pair would miss
 
 > **Scenario RFC0053.4 — No acknowledged record is lost with backpressure
 > live**

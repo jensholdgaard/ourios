@@ -20,7 +20,13 @@ superseded-by: —
 > reclamation removes bytes, its livelock fix needs the timer RFC 0052
 > introduces, and unwind safety is what lets the age sweep survive a panic
 > once the records it drops have somewhere safe to go. Touches `CLAUDE.md`
-> §3.4 throughout, and **amends accepted RFC 0005's audit-sink durability
+> §3.4 throughout. It **amends accepted RFC 0046**: its replay validation
+> and criterion RFC0046.11 reject a tenant length above 256, which
+> contradicts that RFC's own resolved-questions note recording RFC 0048
+> §3.1's 1–128-byte grammar, so both are amended from 256 to 128 — making
+> the text consistent with a decision RFC 0046 already records, not a new
+> one — alongside the frame codec §3.2 lowers to the same bound. It also
+> **amends accepted RFC 0005's audit-sink durability
 > clause** (§7, "The writer guarantees no audit event is lost across
 > crashes…"): a permanent audit write failure stops being a silent drop
 > that reports success and becomes a third outcome that refuses the
@@ -1062,9 +1068,28 @@ reason it cannot serve a permanent write failure: it works by writing an
 event into the same audit sink. So a derive failure marks that event's
 **tenant permanently failed**, exactly as a permanent write does —
 `write_owned` reports it in the failed-tenant set, `write_ordered`
-refuses that tenant's dependent records and requeues them, the tenant
-enters the server-terminal, client-retryable class, and a restart is what
-clears it. RFC0053.2 covers the derive failure beside the write failure. The record sink's
+refuses that tenant's dependent records and requeues them, and the tenant
+enters the server-terminal, client-retryable class.
+
+**What a restart clears, stated precisely, because "a restart clears it"
+is too strong on its own.** A restart is the *mechanism* — recovery
+re-mines the frames and regeneration produces the events again — but it
+cures nothing by itself: it clears the state only once the **underlying
+condition is repaired**, and the two conditions differ. A permanent write
+failure needs the audit store to accept writes again. A derive failure
+needs the clock, because the event's timestamp is **not carried in the
+frame**: `MinerCluster` stamps every audit event from its own wall-clock
+source (`self.clock.now()`), so the failing timestamp is a property of
+when the event was emitted, not of the record being mined. A restart
+therefore re-mines the same frame and stamps a *fresh* timestamp, which
+derives normally on a node whose clock has recovered — and fails again,
+identically, on one whose clock is still wrong, which is the same shape as
+a store that is still rejecting. So the rule is one sentence: the terminal
+state clears on the first restart *after* the condition behind it is
+repaired, and a restart into an unrepaired condition simply re-enters it,
+visibly, on the same alert. Nothing is lost either way, because the
+records stay in the WAL unpublished for as long as the state holds.
+RFC0053.2 covers the derive failure beside the write failure. The record sink's
 quarantine has a second boundary of its own: `publish_owned` can quarantine
 some records and then issue a second put for the remainder, so the
 quarantined records are settled the moment they are quarantined and the
@@ -1076,7 +1101,19 @@ next put starts, never parked in a local vector to be requeued after the
 loop as the record and audit paths do today, since a panic in a later
 partition would drop that vector. An unwind then requeues only the
 partition in flight and the ones not yet started — one ambiguous put, hence
-one possible duplicate. Making the publish idempotent — a drain-time object
+one possible duplicate.
+
+**An ambiguous requeue keeps its own identity**, which the deterministic
+key of §3.2 depends on: that key is derived over the partition's frame
+range, so a requeue prepended into the live buffer would take whatever
+arrived during the in-flight PUT along on the retry, changing the range,
+changing the key, and leaving both objects behind — the very duplicate the
+key exists to collapse. So a batch requeued from the **ambiguous** arm is
+held as its own unit against that partition rather than merged into it,
+and the next publish writes that unit first and alone, under the key its
+original range derives; records that arrived meanwhile stay behind it and
+publish as their own batch after. Only the ambiguous arm needs this — a
+clean failure wrote nothing, so its records may merge freely. Making the publish idempotent — a drain-time object
 key a requeued batch reuses — is a §7 question rather than part of this
 design, because a requeued batch is re-drained together with whatever arrived
 since and the key would have to survive that merge.
@@ -1372,6 +1409,13 @@ moved — and the rollback is local to that hold: an append that fails,
 whether on rotation or on write, releases its byte and segment
 reservation before the mutex is dropped, and a rotation inside the append
 does its create, rename and parent fsync under the journal mutex alone.
+That is not an exception to the rule but the reason for its wording: the
+journal mutex **is** the WAL's single-writer lock, so a rotation
+necessarily holds it while it touches the directory, and no arrangement
+of locks can change that. What the rule forbids is a lock *above* it
+being held across that work, and the admission mutex is released before
+the append for exactly that reason — so an fsync inside a rotation
+delays that one append and not every other request's admission.
 That keeps the admission mutex clear of directory I/O, which this RFC's
 lock order requires, and keeps reservation and append inseparable, which
 §3.1 requires; the earlier draft that held the admission mutex across the
@@ -1428,7 +1472,8 @@ mutex and no journal mutex held, so a reservation never queues behind an
 fsync. Holding the admission mutex there would put every ingest request
 behind the pass's disk I/O and reintroduce exactly the stall the split
 exists to remove. The rule, stated as part of the order: **no lock in this
-hierarchy is held across store or directory I/O** — not the admission
+hierarchy **above the journal mutex** is held across store or directory
+I/O — not the admission
 mutex over the file half, not the barrier exclusion over a cut's flush
 (§3.2), not the miner lock over a snapshot write; and a
 settler **publishes its claim under the admission mutex — adding the
@@ -1637,7 +1682,9 @@ variable offset, so a reader would have to trust `entry_count` — a field
 inside the bytes the checksum protects — to find the checksum that
 validates it, which is not self-delimiting and is the shape `RECLAIM`
 avoids for the same reason. So **`entry_count` is a count, not a
-length**: entries `0..entry_count` are live, the rest are **zeroed**, and
+length**: entries in the half-open range `[0, entry_count)` are live —
+exclusive of `entry_count` itself, so a reader cannot take it inclusively
+and walk one entry past the live set — the rest are **zeroed**, and
 the trailer sits at a fixed offset a reader computes from the header's
 `max_tenants` alone (Castagnoli, as everywhere in the WAL). The
 encoding rules are RFC 0052 §3.2's, adopted verbatim so one reader serves
@@ -1703,7 +1750,14 @@ both sidecars to carry ids no accepted grammar admits: this RFC
 constant RFC 0048 §3.1 silently superseded) to lower it to **128 on
 encode and decode**, matching the grammar and `ourios-core`'s own
 `MAX_TENANT_BYTES` — the same amendment RFC 0052 §3.2 states, worded to
-match so the two cannot drift. A root whose replay yields a tenant longer than that
+match so the two cannot drift. **The amendment reaches RFC 0046's own
+text, not only the constant**: its replay clause and its criterion
+RFC0046.11 still reject a length above *256*, which contradicts that
+RFC's own resolved-questions note recording that RFC 0048 §3.1 pinned the
+grammar at 1–128 bytes as the one tenant grammar every boundary applies
+at. So this RFC amends RFC 0046's replay validation and RFC0046.11 from
+**256 to 128**, which makes that document consistent with a decision it
+already records rather than making a new one. A root whose replay yields a tenant longer than that
 **fails closed at open**, naming the offending frame's offset and the
 length it carried, rather than being truncated into a dictionary that
 cannot hold it. That is the pre-production posture — no migration tooling
@@ -2814,6 +2868,13 @@ that decision lands the RFC stops at `green`, and says so.
 - RFC 0018 §3.2 (retryable error mapping) — the reasoning for `503` on an
   unacked batch; §3.1 takes `UNAVAILABLE` over its `RESOURCE_EXHAUSTED`
   option.
+- RFC 0046 §3.1 (tenant selector) and criterion RFC0046.11 — **amended by
+  §3.2 of this RFC** from a 256-byte replay bound to **128**, the grammar
+  RFC 0048 §3.1 pinned and which RFC 0046's own resolved-questions note
+  records as "the one tenant grammar every boundary applies at". The
+  amendment is a consistency fix rather than a new decision: the replay
+  clause and RFC0046.11 were left at the superseded number, and the frame
+  codec was left with them.
 - RFC 0005 §7 (audit files and their durability clause) — **amended by §3.2
   of this RFC**: the audit sink's permanent-failure path reports a third
   outcome rather than success, `write_ordered` refuses the dependent record

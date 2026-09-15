@@ -64,7 +64,7 @@
 - [RFC 0034 — D1 re-scope](./rfcs/0034-d1-rescope.md)
 - [RFC 0035 — Ingest concurrency](./rfcs/0035-ingest-concurrency.md)
 - [RFC 0036 — Write-side layout](./rfcs/0036-write-side-layout.md)
-- [RFC 0037 — GenAI / structured-event logs](./rfcs/0037-genai-structured-log-events.md)
+- [RFC 0037 — GenAI / structured-event logs](./rfcs/0037-genai-structured-event-logs.md)
 - [RFC 0038 — Self-tracing](./rfcs/0038-self-tracing.md)
 - [RFC 0039 — Inbound trace-context propagation](./rfcs/0039-inbound-trace-context-propagation.md)
 - [RFC 0040 — DataFusion operator instrumentation](./rfcs/0040-datafusion-operator-instrumentation.md)
@@ -80,7 +80,11 @@
 - [RFC 0050 — Upstream-derived templates](./rfcs/0050-upstream-derived-templates.md)
 - [RFC 0051 — `ourios-serving` crate extraction](./rfcs/0051-serving-crate-extraction.md)
 - [RFC 0052 — WAL reclamation and quiesce recovery](./rfcs/0052-wal-reclamation-and-quiesce-recovery.md)
-- [RFC 0053 — WAL backpressure and unwind safety](./rfcs/0053-wal-backpressure-and-unwind-safety.md)
+- [RFC 0053 — WAL backpressure](./rfcs/0053-wal-backpressure-and-unwind-safety.md)
+- [RFC 0053 split brief](./rfcs/0053-SPLIT.md)
+- [RFC 0054 — Publish unwind safety](./rfcs/0054-publish-unwind-safety.md)
+- [RFC 0055 — Publication frontiers and tenant settlement](./rfcs/0055-publication-frontiers.md)
+- [RFC 0056 — Audit-sink durability on permanent write failure](./rfcs/0056-audit-durability.md)
 
 # Talks
 

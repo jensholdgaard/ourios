@@ -416,7 +416,10 @@ crash mid-write leaves a `.partial` that is debris, never a seal that
 half-verifies — and only then rotates through
 RFC 0052 §3.3's retry path into a fresh segment, since appending after a
 partial frame would let recovery consume later bytes as part of it. The seal is **versioned and
-segment-bound**: it carries a format version, the segment's own UUID, the
+segment-bound**, and it is written against RFC 0052 §3.3's bumped
+`SEGMENT_VERSION` — 1 → 2, both accepted on read — so a seal names a
+version-2 segment and the frameless base case above sits on that same
+version: it carries a format version, the segment's own UUID, the
 last good length, and a checksum of those three, so a stale or corrupted
 seal cannot authorise anything. The rotation that follows the seal takes the slot check like any other,
 but it is an **owed** rotation in §3.1's sense — the sealed segment must
@@ -584,9 +587,22 @@ Held` is at the guard — and the slot is **reference-counted per in-flight
 first write**, so concurrent first writes for one id share it; it moves to
 **`Held`** when any of them has its sync return `Ok` and the tenant is
 installed in the miner, and it is released only when the *last* in-flight
-first write for that id has settled without a success — append failure,
-sync failure or an unwind before installation — **and that id has no
-unresolved `unmined` entry**. The exception matters because settlement
+first write for that id has settled without a success **and left no frame
+behind** — **and that id has no unresolved `unmined` entry**. The
+frame clause matters because the two failure shapes differ: an append that
+failed never reached the segment, so nothing survives and the slot is
+released; a *sync* that failed leaves the frame in the segment
+unacknowledged, and replay after a restart re-mines it and seeds that
+tenant `Held`, so releasing the slot on a sync failure could let another
+id take it and put the recovered set over `max_tenants`. So a sync
+failure keeps the reservation for as long as its frame can be replayed —
+until the frame is reclaimed or a later write for that id succeeds and
+converts the reservation to `Held` — which is exactly the retain rule the
+entry case below uses. The recovered set can therefore never exceed the
+cap by this path; a set that exceeds it for any other reason (an operator
+lowering `max_tenants` between runs) is seeded whole and the guard
+refuses only *new* ids until it drains, since refusing a tenant the node
+already holds data for would be the worse failure. The exception matters because settlement
 installs a tenant outside any admission path: a first write that appends,
 panics in mining and unwinds would otherwise release its slot, another id
 could take it and become `Held`, and the rebuild would then install the
@@ -822,6 +838,29 @@ nothing against delivering it twice, and the audit-ordering barrier is
 preserved either way because the record flush is skipped whenever the audit
 sink has not drained.
 
+**"Not drained" has to include a permanent drop, and today it does not.**
+`AuditSink::write_owned` reports `fully_durable` as `retained.is_empty()`,
+and `route_partition_result` puts a *permanent* write error on neither
+path: it counts `permanent_errors`, logs the batch, and retains nothing —
+so `write_owned` returns `true`, `write_ordered` proceeds, and the records
+whose template events were just dropped are published anyway. That breaks
+the ordering the barrier exists to give and, worse, the `CLAUDE.md` §3.1
+invariant behind it: a merge with no audit event is exactly the silent
+merge the project forbids, and RFC 0005's audit contract says no audit
+event is lost. So this RFC **amends the audit sink's permanent-failure
+policy** (RFC 0005's audit-sink contract, the flush routing in
+`audit_sink.rs`): a permanent audit write failure is *not* a settled
+outcome for the dependent records. `write_owned` returns a three-way
+result — fully durable, retained-for-retry, or **permanently failed** —
+and `write_ordered` refuses the record publish on the third exactly as it
+does on the second, requeueing the records rather than publishing them
+under a missing event; the dropped events are still counted and logged,
+and the quarantine path RFC 0025 §3.3 defines is what turns a genuinely
+unwritable event into an operator-visible record rather than a silent
+gap. The per-partition settlement below reads that third outcome as *not*
+settled. RFC0053.2 asserts a permanent audit failure leaving the records
+unpublished and requeued.
+
 The duplicate this creates is a new class, and it is stated rather than
 handed to recovery. Record and audit publishes write fresh `UUIDv7` object
 keys, so a panic *after* the store accepted an object but *before* the publish
@@ -983,8 +1022,11 @@ that died would leave `quiesce_publishes` and shutdown waiting on guards
 nothing will ever settle: the `PublishCoordinator` runs each batch under
 `catch_unwind`, settles a panicking batch through its `RecoverableBatch`
 (requeued, latched per §3.1's guard rule), counts it with `error.type =
-publisher_panic`, and continues. RFC 0052 §3.1 already defines what a
-dying thread does — it drains every batch still queued back into the
+publisher_panic`, and continues. The publisher enters the cloned Tokio `Handle` RFC 0052 §3.1 gives it, so
+a requeue taken on that thread — RFC 0047's graph update included — is not
+silently skipped for running off-runtime; this RFC's requeue-on-unwind
+inherits that entry rather than adding one of its own. RFC 0052 §3.1
+already defines what a dying thread does — it drains every batch still queued back into the
 buffers as `ready` partitions, releasing each guard as its records land,
 and the coordinator respawns it on the next enqueue — and this RFC changes
 only the failing batch's own arm, from latched-and-settled to requeued
@@ -1370,11 +1412,20 @@ both sidecars. `PUBLISHED` adds nothing to that judgement and inherits
 whichever verdict the witness gives, because a root that cannot say what
 it reclaimed certainly cannot say what it published. RFC 0052's own
 criterion needs the same scoping, and this is stated as an **amendment**
-to it rather than a difference between the two documents. The bound between checkpoints is then stated honestly: a panic
-costs at most one duplicate per record in the ambiguous span, and a crash
-before the next checkpoint costs at most **one more** for the records
-published since the last durable watermark, since replay from `X` cannot
-see them; the next checkpoint closes that window. It follows that the salvage in `ingest_mined` is kept as
+to it rather than a difference between the two documents. The bound between checkpoints is then stated honestly, and made a bound
+rather than a per-crash cost. A panic costs at most one duplicate per
+record in the ambiguous span. A crash before the watermark is durable
+costs at most **one more** for the records published since the last
+durable watermark — but "one more per crash" is not a bound if the window
+stays open, so **the settlement forces the write**: after a rebuild
+settles, the coordinator writes `PUBLISHED` with the raised marks on the
+same durable path a checkpoint uses, before it removes the entry. Each
+window therefore closes with a durable frontier at the moment the
+ambiguity is resolved, not at whatever checkpoint happens next, and
+repeated crashes cannot accumulate copies of the same records: each
+replays only what lies above the last written frontier. The write is one
+sidecar write per settlement, which is a rare path by construction — it
+follows a panic — and the checkpoint's own write is unchanged. It follows that the salvage in `ingest_mined` is kept as
 belt-and-braces and its count is **never read** by this path: an earlier
 draft resumed at `index + salvaged`, which was unsound twice over — against
 the unknown tree, and because the count increments before the salvage's
@@ -1633,10 +1684,17 @@ fails, so an outage grows memory without bound and can OOM the process
 fires and this RFC has bounded the wrong resource. That makes it a
 prerequisite, not a neighbour.
 
-This RFC does not solve it, because the fix is a different decision (what does
-a full sink do — block, spill, or drop, and under whose invariant) and that
-decision is a maintainer's, not this RFC's; it belongs to a **separate RFC**,
-and §7 carries the question. What this RFC states instead is the scope of
+**The decision is not open, though — it is unimplemented.** RFC 0014 §3.4
+is accepted and already specifies exactly this: the sink tracks total
+buffered bytes against a *hard* ceiling, force-flushes the largest or
+oldest partitions under soft pressure, and when early flush cannot keep up
+`emit` **blocks** until an in-flight flush frees memory, so the buffer can
+never exceed the ceiling. What the code does today — retaining past the
+ceiling when a flush fails — is a gap against that contract, not a gap in
+the design. So this RFC does not decide block-versus-spill-versus-drop,
+because RFC 0014 §3.4 decided it; it names that section as the governing
+contract and its implementation as a **prerequisite** for the end-to-end
+bounded-ingest claim. What this RFC states instead is the scope of
 its own claim, narrowed to what it can deliver: **it bounds local disk, not
 process memory.** §3.1's bound is the operative limit for the WAL directory
 and for nothing else, the OOM path during a long outage remains open, and
@@ -1864,7 +1922,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   one record durable and a later one lost does not advance the
 >   watermark; a crash before the next checkpoint after a retried panic
 >   yields at most one more copy of the records published since the last
->   durable watermark, and none once `PUBLISHED` has been written; the
+>   durable watermark, and none once the settlement's forced `PUBLISHED`
+>   write has landed — repeated crashes replay only above the last written
+>   frontier and add no further copies; the
 >   same panic on a tenant with **no** installed snapshot is settled by a
 >   full replay from its oldest surviving frame, and a template defined
 >   before the span is present in the rebuilt tree; `replace_tenant` leaves
@@ -1894,8 +1954,13 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a repeating panic loses no records, however many ticks it spans
 > - **And** the same holds for the barrier task: a panic inside a cut —
 >   timer-triggered or rotation-captured — requeues the cut's batches,
->   installs no snapshot, advances no checkpoint, is counted, and the task
->   captures the next tick's cut on schedule
+>   advances no checkpoint, is counted, and the task captures the next
+>   tick's cut on schedule; it installs no snapshot when it precedes the
+>   first install, and a panic *after* one leaves that tenant's snapshot
+>   ahead of the checkpoint, which is the `S > X` case recovery already
+>   handles by replaying from `max(X, S)` per tenant — nothing is lost and
+>   nothing is republished, so the criterion asserts the pre-install points
+>   rather than an undo that cannot exist
 > - **And** the same holds for the publisher thread: a panic inside a
 >   batch requeues it and the thread continues; a dead publisher is
 >   respawned and settles the batches still queued; a worker enqueuing on
@@ -2049,7 +2114,8 @@ CI with the unit, property and corpus suites green, and this RFC touches no thes
 **not** proceed to `validated` on those alone: §4 records that the sinks can
 exhaust memory before the WAL bound fires, so a green run could mark a bound
 validated that is never the operative limit. `validated` therefore also
-requires the §7 sink decision to have landed and RFC0053.1's
+requires **RFC 0014 §3.4's hard ceiling to be implemented** (§7 tracks the
+confirmation, not a decision) and RFC0053.1's
 unreachable-store leg, run under default configuration for long enough to
 show the WAL bound refusing **before** either sink exceeds its ceiling. Until
 that decision lands the RFC stops at `green`, and says so.
@@ -2060,11 +2126,13 @@ that decision lands the RFC stops at `green`, and says so.
       than be the fixed 1 GiB §3.1 sets. The incident node held 42 MB over
       five days, so a default tuned for it would be far too small for a busy
       node; a fraction of the volume may be the honest default.
-- [ ] What a full record or audit sink should do during an outage: block,
-      spill, or drop. §4 states that §3.1's disk bound is only the operative
-      limit once memory growth is separately bounded, and that question is not
-      answered here. §6 makes it a gate on `validated`, so it must land
-      before this RFC can be more than `green`.
+- [ ] Confirm RFC 0014 §3.4's hard ceiling is implemented — the blocking
+      `emit` that makes buffered bytes never exceed the ceiling. It is not a
+      design question: §3.4 is accepted and decided it, and today's sinks
+      retain past their ceilings when a flush fails, which is a gap against
+      that contract. §4 states that §3.1's disk bound is only the operative
+      limit once memory growth is bounded by §3.4, and §6 makes it a gate on
+      `validated`, so it must land before this RFC can be more than `green`.
 - [ ] Whether a stale tenant floor blocking reclamation indefinitely should
       itself escalate (a second, louder state) or stay a visible metric an
       operator alerts on. §3.1 makes it visible; it does not decide.

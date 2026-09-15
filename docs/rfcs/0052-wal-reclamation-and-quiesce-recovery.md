@@ -558,12 +558,12 @@ housekeeping_secs` after its publication when the backlog is within the
 cap, later ones waiting through further passes, and segments a pinned
 tenant or a failed snapshot holds retained by design. The current append
 segment is never unlinked, and rotation is checked only on an append
-today, so the barrier task also calls `Journal::rotate` when the current
+today, so the barrier task also calls `Journal::rotate(Discretionary)` when the current
 segment's age exceeds `segment_age_secs` and it holds a frame — an idle
 node's last segment then rotates, and its bytes are reclaimed within
 `barrier_secs + housekeeping_secs + segment_age_secs`, which RFC0052.3's
 idle leg asserts. That rotation is ordered with the cut, not beside it:
-`Journal::rotate` returns nothing the cut could use, so the idle path
+`Journal::rotate(Discretionary)` returns nothing the cut could use, so the idle path
 rotates **first, under the barrier exclusion**, then captures the cut, and
 the cut's mark is what every cut's mark is — `last_durable`, the last
 *acknowledged* turn's own frame offset — never the rotation boundary. The
@@ -1089,14 +1089,23 @@ one, because startup's fallback is exactly as trustworthy as this record:
   4 B reserved, 32 B in all. The capacities are in the file because the
   configuration can change across restarts while the file cannot grow:
   `Wal::open` compares the configured pair against the stored one and
-  **refuses to open** when either configured value exceeds what the file
-  was built for — `OpenError::InvalidConfig` naming both the configured
-  and the stored value, so the operator either lowers it back or starts a
-  fresh root — while a configured value at or below the stored capacity
-  opens normally and simply uses less of each slot. Refusing is the only
-  safe direction: a raised `max_tenants` would need a longer slot, and
-  silently truncating the dictionary would lose the mapping this record
-  exists to prove. Each slot is `[u64 generation][u32 entry_count][u32
+  **rebuilds the file at the larger geometry** when either configured
+  value exceeds what it was built for, rather than refusing: refusing
+  would strand a root whose operator legitimately raised a limit the other
+  sidecars can grow into. The rebuild is crash-safe and is the one place
+  this record does use a temp: the new geometry is written whole to
+  `RECLAIM.new` — both slots, the live one's contents re-encoded at the
+  wider dictionary stride and the other zeroed — fsynced, renamed over
+  `RECLAIM`, and the parent fsynced, before anything else reads it. A
+  crash at any point leaves either the old file or the new one, both
+  complete, since the rename is atomic and the temp is never read; a
+  `RECLAIM.new` left by a crash is truncated by the next rebuild and swept
+  by §3.2's selector, which already reserves that namespace. Growth is
+  therefore an open-time cost paid once, not a per-pass allocation, and
+  the steady-state commit still never allocates. A configured value at or
+  below the stored capacity opens normally and simply uses less of each
+  slot; the file is never shrunk, since a smaller geometry buys nothing
+  and a rewrite risks something. Each slot is `[u64 generation][u32 entry_count][u32
   planned_count][u16 header_flags][u16 consumer_mode][4 B reserved]` (24 B),
   then `entry_count` entries and `planned_count` planned records, then a
   `u32` CRC32-C and 4 B reserved (8 B). The checksum covers bytes
@@ -1116,17 +1125,26 @@ one, because startup's fallback is exactly as trustworthy as this record:
   distinct tenants onto one entry — and this record is read as proof of
   loss, where a collision silently pins the wrong tenant. Each slot
   therefore opens with a **dictionary** of `max_tenants` fixed records,
-  `[u16 len][256 B key bytes][2 B reserved]` (260 B), `len` naming how
+  `[u16 len][128 B key bytes][2 B reserved]` (132 B), `len` naming how
   many of the key bytes are significant and the rest zero; an unused
-  dictionary record has `len = 0`. The key field is **256 bytes, the
-  spec bound, not the 128 of `MAX_TENANT_BYTES`**: RFC 0046 §3.1 defines
-  the tenant prefix and RFC0046.11 rejects a length *above 256*, so 256 is
-  the format's limit and `ourios-core`'s 128 is a stricter runtime check
-  that a later release may relax. A file that can never grow must be sized
-  to the spec, or relaxing that constant becomes a format change; the
-  60-odd percent of each dictionary record that a 128-byte deployment
-  never uses is the price of that. RFC 0053's `PUBLISHED` carries the same
-  correction for the same reason. Every other reference is a `u16`
+  dictionary record has `len = 0`. The key field is **128 bytes, and the
+  governing spec is RFC 0048 §3.1**, whose title says what it does —
+  "Tenant id grammar (amends RFC 0046 §3.1)" — setting a tenant id at 1 to
+  128 bytes of ASCII graphic characters with `:`, `#` and `/` excluded.
+  RFC 0046 §3.1's 256 is the amended text, not the live bound;
+  `ourios-core`'s `MAX_TENANT_BYTES = 128` is the spec, not a stricter
+  local choice, so sizing the record to 256 would double a preallocated
+  file for a length no boundary admits.
+
+  **The frame codec is amended to match.** `ourios-wal`'s
+  `TenantBatch::MAX_TENANT_BYTES` is `256` today, its comment still citing
+  RFC 0046 §3.1, so a frame can carry a 129-to-256-byte tenant that no
+  request boundary would have produced and that a 132 B dictionary record
+  cannot represent. This RFC lowers it to **128 on encode and decode**,
+  and a replay that yields a longer tenant **fails closed at open**,
+  naming the frame offset and the length rather than truncating a key or
+  silently dropping a frame. Pre-production, that is the whole migration —
+  no tooling, no dual-read — and RFC 0053 states it the same way. Every other reference is a `u16`
   **slot id** into it. The mapping is injective by construction — each id
   names one record, each record holds the exact bytes and length of one
   tenant id — so it round-trips to the original `TenantId` with no
@@ -1166,8 +1184,8 @@ one, because startup's fallback is exactly as trustworthy as this record:
   | | 18 | 2 | `u16 consumer_mode` (0 unrecorded, 1 `Known`, 2 `NoConsumer`) |
   | | 20 | 4 | reserved, zero |
   | Dictionary record | 0 | 2 | `u16 len` |
-  | | 2 | 256 | key bytes, `len` significant, remainder zero |
-  | | 258 | 2 | reserved, zero |
+  | | 2 | 128 | key bytes, `len` significant, remainder zero |
+  | | 130 | 2 | reserved, zero |
   | Entry | 0 | 2 | `u16 tenant_slot` |
   | | 2 | 2 | `u16 mode` |
   | | 4 | 4 | reserved, zero |
@@ -1221,13 +1239,13 @@ one, because startup's fallback is exactly as trustworthy as this record:
   (§3.8) and **`max_tenants`**, the ceiling RFC 0053 §3.1 introduces with
   a default of 1024 — the two RFCs land as one pair, and until 0053's knob
   exists the implementation uses that same constant. A slot is then
-  `32 + 292 × max_tenants + 24 × max_unlinks_per_pass + 32 ×
+  `32 + 164 × max_tenants + 24 × max_unlinks_per_pass + 32 ×
   (max_tenants × max_unlinks_per_pass)` bytes — the **one** normative
-  definition of `slot_len`: its 24 B header and 8 B trailer, a 260 B
+  definition of `slot_len`: its 24 B header and 8 B trailer, a 132 B
   dictionary record and a 32 B entry per tenant, and a planned list of at
   most `max_unlinks_per_pass` records of 24 B each naming at most every
   tenant at 32 B a pair. At the defaults — 1024 tenants, a cap of 128 — a
-  slot is 4,496,416 B and the file 8,992,864 B, about 8.6 MiB, next to
+  slot is 4,365,344 B and the file 8,730,720 B, about 8.3 MiB, next to
   segments of 128 MiB each. It scales with the product of the two knobs, so an
   operator who raises both sees it grow; that is the price of a geometry
   that never moves. `Wal::open` allocates it once and **no later write
@@ -1585,7 +1603,8 @@ append or timer tick can find the segment due for rotation again. Starting
 that second rotation would install a segment whose predecessor's directory
 entry is still not durable, and a crash there loses the ordering the first
 obligation exists to restore. So **any path that begins a rotation — an
-append that observes the size or age trigger, and `Journal::rotate` —
+append that observes the size or age trigger, and `Journal::rotate` of
+either kind —
 first discharges a pending `Rotation` obligation, and refuses the rotation
 if the discharge fails.** The refusal is not a new class: it consumes one
 unit of the retry budget like a failed `rotate`, so it is reported
@@ -1791,7 +1810,7 @@ directory-fsync retry by the next `sync` (above); neither runs in a
 background loop of its own: the WAL is single-writer and has no task, and a
 rotation is only needed when there is something to write. The one
 append-independent caller is the barrier task's idle rotation (§3.2,
-`Journal::rotate`), and it is not exempt: a timer-triggered rotation that
+`Journal::rotate(Discretionary)`), and it is not exempt: a timer-triggered rotation that
 fails draws on the same budget and can reach the terminal state without an
 append ever arriving, which RFC0052.4/.5 cover. `quiesced` becomes a typed state
 carrying the attempt count and the first underlying error, so the
@@ -2065,13 +2084,20 @@ So the design is:
                                                        // (record failed) or stay reclaiming
                                                        // (unlink failed), per §3.2
   fn reclaim_state(&self) -> ReclaimState                  // §3.5's export surface
-  fn rotate(&mut self) -> Result<(), ReceiveError>         // §3.3's retried rotation,
+  enum RotationKind { Discretionary, Owed }                // §3.3: the cap applies to
+                                                           // Discretionary only
+  fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError>
+                                                           // §3.3's retried rotation,
                                                            // callable without an append:
                                                            // discharges a pending directory
                                                            // fsync first, no-op when the
                                                            // current segment holds no frame;
                                                            // Wal::rotate is private today.
-                                                           // RFC 0053 uses this definition.
+                                                           // RFC 0053 uses this definition, and
+                                                           // its segment cap defers only a
+                                                           // Discretionary rotation — an Owed
+                                                           // one (a seal, or a recovery
+                                                           // requirement) always proceeds.
   ```
 
   **The own-frame mark needs plumbing, stated so it cannot be skipped.**
@@ -2361,7 +2387,7 @@ existing tunables do.
 | `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
 | `max_tenants` (RFC 0053 §3.1; sizes this RFC's record, §3.2) | Tunable | `1024` (RFC 0053's default) | `1..=65_536` — the **format ceiling**, since `RECLAIM`'s dictionary is addressed by `u16` slot ids and slot id 0 is usable; a larger value is refused at config validation naming that reason, and `Wal::open` separately refuses a value above the capacity the file was built for | §3.6 — a raised value needs a longer slot than the preallocated file has, so it is an open-time decision rather than a free edit |
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
-| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, a per-slot tenant dictionary (`u16` slot ids over 256 B keys, RFC 0046 §3.1's bound), the two capacities it was built for, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated at a fixed `slot_len` from `max_tenants` × `max_unlinks_per_pass` and rewritten in place, never extended | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
+| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, a per-slot tenant dictionary (`u16` slot ids over 128 B keys, RFC 0048 §3.1's bound), the two capacities it was built for and rebuilt at when they rise, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated at a fixed `slot_len` from `max_tenants` × `max_unlinks_per_pass` and rewritten in place, never extended | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
 | Segment-header format **version 2** (§3.2) | Invariant | `2` (was `1`; the reader accepts both) | n/a | format compat — the version every root with a segment carries, and so the witness that separates a pre-RFC root from one that lost both sidecars, including a `NoConsumer` root with no snapshots |
 | Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
@@ -2794,6 +2820,10 @@ memory, and nothing here claims to.
 > - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
 >   fails open naming the missing record — its `CHECKPOINT` is version 2, so
 >   the root is post-RFC — rather than recreating an empty record and pinning
+> - **And** a replay that yields a tenant longer than 128 bytes — a frame
+>   written before the codec was amended — fails open naming the frame
+>   offset and the length, rather than truncating the key or dropping the
+>   frame
 > - **And** a root holding segments and neither sidecar fails open naming
 >   both **when any segment header carries version 2**, while a root whose
 >   segments are all version 1 — every live pre-RFC root — opens on the
@@ -2807,6 +2837,12 @@ memory, and nothing here claims to.
 >   openable: the rotation writes and fsyncs the record before creating the
 >   version-2 segment, so no restart ever finds a version-2 segment beside
 >   no record — asserted by injecting a crash between the two steps
+> - **And** a configured `max_tenants` or `max_unlinks_per_pass` above the
+>   capacity stored in the header rebuilds the file at the larger geometry
+>   through `RECLAIM.new` — write, fsync, rename, parent fsync — so a crash
+>   at any point leaves either the old file or the new one complete and the
+>   entries survive; a configured value at or below the stored capacity
+>   opens without rewriting
 > - **And** a full volume at `Wal::open` fails the allocation as
 >   `OpenError::Io` naming the file, so the node does not start — not as a
 >   rotation state, which no running process exists to report — and it
@@ -3090,15 +3126,16 @@ they are not substitutes for the rest.
     checkpoint(&mut self, durable_to: WalOffset, published: &HashMap<TenantId,
     PublishedMarks>)` with `PublishedMarks { records, audit }` — a
     per-tenant pair, not a bare offset — persisted to a `PUBLISHED` sidecar
-    written before `CHECKPOINT` in the same call, on the checkpoint's own
+    written **after** `CHECKPOINT` in the same call, on the checkpoint's own
     durable path, and joining §3.2's sidecar matrix on the same fail-closed
     footing as `RECLAIM`.
   - *RFC 0053 §3.2*'s `PUBLISHED` mirrors this RFC's record layout field
     for field and keys on the same tenant key, so the per-slot dictionary
     and its `u16` slot ids apply there too — the derivation has to be
     injective over the admissible tenant set, which a 16-byte digest of a
-    256-byte id is not — and its key field is sized to RFC 0046 §3.1's
-    256-byte bound, not to `MAX_TENANT_BYTES`, for the reason §3.2 gives.
+    128-byte id is not — and its key field is sized to RFC 0048 §3.1's
+    128-byte bound, which amends RFC 0046 §3.1 and is what
+    `MAX_TENANT_BYTES` already encodes.
   - *RFC 0053 §3.1* makes `max_segments` count **closed retained**
     segments, with the current segment and the segment an owed rotation
     creates outside the cap, so an owed rotation always has room.

@@ -1024,7 +1024,24 @@ recoverable batch when its put has **succeeded**, its requeue has
 **completed**, or the sink has **permanently dropped** it under its own
 policy (the audit sink's derivation-failure path and the record sink's
 RFC 0025 §3.3 quarantine) — that is the *ownership* boundary and nothing
-more; what advances the watermark is publication settlement alone. The record sink's
+more; what advances the watermark is publication settlement alone.
+
+**The audit sink's derivation failure is not a quarantine, and this RFC
+gives it the same terminal treatment as a permanent write.**
+`derive_audit_partition` can fail *before* a `PartitionKey` exists — a
+timestamp that will not resolve to a partition — so the event never
+reaches `route_partition_result` and the sink counts it and drops it.
+Ownership-settled, certainly; but treating that as the end of the story
+would let the dependent records publish with no template event behind
+them, which is the failure §3.2 exists to close and `CLAUDE.md` §3.1
+forbids. RFC 0025 §3.3's quarantine cannot serve here either, for the
+reason it cannot serve a permanent write failure: it works by writing an
+event into the same audit sink. So a derive failure marks that event's
+**tenant permanently failed**, exactly as a permanent write does —
+`write_owned` reports it in the failed-tenant set, `write_ordered`
+refuses that tenant's dependent records and requeues them, the tenant
+enters the server-terminal, client-retryable class, and a restart is what
+clears it. RFC0053.2 covers the derive failure beside the write failure. The record sink's
 quarantine has a second boundary of its own: `publish_owned` can quarantine
 some records and then issue a second put for the remainder, so the
 quarantined records are settled the moment they are quarantined and the
@@ -1619,9 +1636,10 @@ still cites RFC 0046 §3.1 as its authority. The fix is to bound the
 source rather than widen the layout, because widening it would double
 both sidecars to carry ids no accepted grammar admits: this RFC
 **amends the frame codec** (RFC 0046's `TenantOtlpBatch` payload, whose
-constant RFC 0048 §3.1 silently superseded) to enforce **128 bytes** on
-encode and decode, matching the grammar and `ourios-core`'s own
-`MAX_TENANT_BYTES`. A root whose replay yields a tenant longer than that
+constant RFC 0048 §3.1 silently superseded) to lower it to **128 on
+encode and decode**, matching the grammar and `ourios-core`'s own
+`MAX_TENANT_BYTES` — the same amendment RFC 0052 §3.2 states, worded to
+match so the two cannot drift. A root whose replay yields a tenant longer than that
 **fails closed at open**, naming the offending frame's offset and the
 length it carried, rather than being truncated into a dictionary that
 cannot hold it. That is the pre-production posture — no migration tooling
@@ -1630,11 +1648,23 @@ predated this change. RFC0053.4 asserts both halves: the codec refuses a
 129-byte tenant on encode, and a fixture root carrying one fails open
 naming the offset.
 
-An entry is then `[u16 slot id][u16 flags][4 B reserved][24 B records
-WalOffset][24 B audit WalOffset]` — 56 B, unchanged, since it names a
-tenant by slot id rather than by key — where a `WalOffset` is its
+An entry is then `[u16 slot id][u16 flags][u32 generation][24 B records
+WalOffset][24 B audit WalOffset]` — 56 B, since it names a tenant by slot
+id rather than by key — where a `WalOffset` is its
 16 B segment UUID plus its 8 B byte offset, the pinned 24 B, and `flags`
-carries the `publishing` bit §3.2's settlement uses. **Recovery maps
+carries three bits: the `publishing` bit §3.2's settlement uses, and one
+**validity bit per frontier**, `records_valid` and `audit_valid`. The
+validity bits exist because the two frontiers advance independently and a
+frame can produce records with no audit event at all, so "no mark yet" is
+a real state that an unconditional offset cannot express — a zeroed
+`WalOffset` is a legitimate position, not an absence. A frontier whose
+bit is clear is **absent**, and recovery treats that side of the entry as
+though the tenant had no entry at all, falling back to the node-wide
+horizon for it while still honouring the other side. Both bits sit inside
+the entry area, so the slot's trailer checksum covers them like every
+other byte before it: a flipped validity bit fails the slot's CRC and the
+other slot is read, which is what keeps "absent" from being forgeable by
+a torn write. The `u32 generation` is §3.2's staleness witness, below. **Recovery maps
 through the dictionary**, not through a live tenant set: a slot id reads
 its key, the key is a tenant id verbatim, and that tenant takes its marks;
 an id naming a dictionary record with `len = 0` is a corrupt slot and the
@@ -1657,11 +1687,18 @@ version, so a reader never infers the shape from configuration, and
 refusal would strand every existing root the day an operator needs more
 tenants, and the copy is crash-safe with the same primitives the WAL
 already uses. `Wal::open`, finding a configured `max_tenants` above the
-recorded one, writes a **new file under a temp name** at the larger
-geometry with the old dictionary and entries copied in, fsyncs it,
-renames it over the old name, fsyncs the parent, and only then proceeds —
-so a crash at any point leaves either the old file intact or the new one
-complete, and a leftover temp is swept like any other. This is the one
+recorded one, rebuilds **both sidecars as one operation**, because the
+knob sizes `RECLAIM` as well and resizing only this one would let
+admission accept tenants reclamation cannot persist — a root that starts
+and then cannot record what it reclaimed. So the two rebuilds run
+together, each writing its new geometry under the temp name its own RFC
+reserves — RFC 0052's `RECLAIM.new` and, in parallel, `PUBLISHED.new`, a
+name the sweep selector already covers — with the old dictionary and
+entries copied in, fsyncing, renaming over the old name and fsyncing the
+parent, and **the node refuses to start if either rebuild fails**, naming
+the file that failed. A crash at any point leaves either the old file
+intact or the new one complete, and a leftover temp is truncated by the
+next rebuild and swept like any other. This is the one
 supported procedure; the file still never grows *in place*, which is what
 the two-slot protocol depends on. **And `max_tenants` has a format ceiling**, because a
 slot id is a `u16`: `validate_config` rejects `max_tenants > 65_536` with
@@ -1715,16 +1752,35 @@ settled frame, monotonic, under the sink lock, advanced only from
 drain can hold exactly those events in an unfinished write — both are
 written in the one `PUBLISHED` write, and **audit replay is gated the same
 per-tenant way the record side is**: a tenant with a `PUBLISHED` entry is
-gated on `max(S, audit watermark)` from its own entry, and only a tenant
-without one falls back to the node-wide `X`. The node-wide form alone
+gated on `max(S, audit watermark)` from its own entry — the entry
+governing, never maxed against `X` — and only a tenant without one, or a
+frontier whose validity bit is clear, falls back to the node-wide `X`. The node-wide form alone
 would carry the defect §3.2 fixed for records one round earlier — once
 `X` advances for everyone else, a lagging or unrecoverable tenant's
 regeneration would be suppressed for events that were never written, and
 a template event lost that way is `CLAUDE.md` §3.1's silent merge. The
 record gate is `max(S, records watermark)` per tenant on the same rule. The §3.2 claim that a settled audit group is never requeued
-therefore holds across a restart too, not only in-process. Recovery seeds both
-in-memory watermarks per tenant as the greater of the `PUBLISHED` entry
-and what the Parquet-side suppression horizon `X` implies — the read
+therefore holds across a restart too, not only in-process. **A present entry is authoritative for its tenant, and is not maxed
+against the node-wide horizon.** Taking `max(X, PUBLISHED)` would let a
+checkpoint advanced for everyone else override a lagging tenant's stale
+entry — precisely the suppression this sidecar exists to prevent, and
+reachable by an ordinary crash, since `CHECKPOINT` is written first and a
+power loss before the `PUBLISHED` write leaves exactly that state. The
+rule is therefore the other way: **where the entry is present and its
+validity bit set, it governs**, and the node-wide horizon applies only to
+a tenant with no entry, or per frontier to a side whose validity bit is
+clear. The direction is the safe one — a stale entry replays frames that
+may already be published, the at-most-twice case the rest of §3.2 bounds,
+where an over-advanced horizon would suppress frames that never published,
+which is loss. Staleness is legible rather than guessed at: each entry
+carries a **`u32 generation`**, set to the slot's generation at the write
+that last changed that entry's marks, so recovery can tell an entry never
+written (generation zero, validity bits clear) from one written and
+unchanged since, and can report how far behind a tenant's frontier is
+instead of silently papering over it. With that, recovery seeds both
+in-memory watermarks per tenant from the entry where it governs, and from
+what the Parquet-side suppression horizon `X` implies only where it does
+not — the read
 sitting behind RFC 0052's startup fsync of the WAL root, which precedes
 any sidecar read, so a sidecar whose rename or creation was not durable
 is not read as present — and a missing
@@ -2384,7 +2440,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   frame, below `emit_from` — are present exactly once, the gate being
 >   that tenant's own `max(S, watermark)` for records and for audit alike
 >   and never the node-wide `X`, so a tenant whose frontier lags has its
->   events regenerated rather than suppressed, and those in the
+>   events regenerated rather than suppressed — a crash after `CHECKPOINT`
+>   and before the `PUBLISHED` write leaving a stale entry that still
+>   governs, its generation saying how far behind it is, while a cleared
+>   validity bit falls back to `X` for that frontier alone — and those in the
 >   ambiguous span are present at most twice, never absent; a frame with
 >   one record durable and a later one lost does not advance the
 >   watermark; a crash before the next checkpoint after a retried panic

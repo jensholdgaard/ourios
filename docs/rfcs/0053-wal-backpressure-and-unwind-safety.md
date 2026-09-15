@@ -21,8 +21,10 @@ superseded-by: —
 > which stays the quarry. This RFC **depends on RFC 0052** and cannot land
 > before it: backpressure clears only when reclamation removes bytes, and
 > its livelock fix needs the timer RFC 0052 introduces — §3.2 lists what
-> this RFC asks of that one rather than specifying it here. Touches
-> `CLAUDE.md` §3.4 throughout. It amends no accepted RFC.
+> this RFC asks of that one rather than specifying it here. It **also
+> depends on RFC 0055** for the tenant guard, the admission order and the
+> lock order §3.1 defers to and RFC0053.1/.5 assert. Touches `CLAUDE.md`
+> §3.4 throughout. It amends no accepted RFC.
 
 ## 1. Summary
 
@@ -478,6 +480,10 @@ cannot land without them, they were never this RFC's.
   condition are computed from.
 - Retirement of `cadence_failed`, and `failure_generation` if RFC 0052
   still needs it.
+- A ceiling on **sealed** segments, where the seal that would exceed it
+  puts the WAL in the terminal rotation state — the one unit this RFC
+  cannot bound, since an owed rotation enters `max_segments` ungated
+  (§3.1), and a disk failing a write *and* its truncate-back is a fault.
 
 Unwind safety, publication frontiers and the audit-durability amendment
 that shared this document are RFC 0054, RFC 0055 and RFC 0056; each states
@@ -664,11 +670,13 @@ are kept distinct so that the remedy each advertises is the true one.
 >   fsync before it evaluates the predicate, with no append arriving, and
 >   the next append acks
 > - **And** under repeated rollback failures the byte accounting stays
->   within the limit — the torn bytes count inside it — and the fixed
->   overhead outside it is capped separately: headers by `max_segments`,
->   under which a reservation needing a rotation at the ceiling is refused
->   as backpressure naming the ceiling while one that fits the current
->   segment is admitted
+>   within the limit — the torn bytes count inside it — while the fixed
+>   overhead outside it is capped for **discretionary** rotations only:
+>   at the ceiling `max_segments` refuses a reservation needing one,
+>   naming it, and admits one that fits the current segment. The seals a
+>   rollback failure leaves sit outside that cap — each forces an owed
+>   rotation, which enters it ungated (§3.1) — so their ceiling is §3.2's
+>   request of RFC 0052, and this leg asserts only the frame bytes
 
 > **Scenario RFC0053.4 — No acknowledged record is lost with backpressure
 > live**

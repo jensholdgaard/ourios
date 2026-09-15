@@ -18,7 +18,11 @@ superseded-by: —
 > Extract that wording. Do not invent a new protocol.
 >
 > Depends on RFC 0052 (barrier / sweep) and RFC 0053 (the node still
-> accepts or refuses; this RFC does not decide the bound).
+> accepts or refuses; this RFC does not decide the bound). It **amends
+> RFC 0052**: §3 replaces that RFC's timer pre-cut guard with
+> proceed-and-decide, and amends its "only a restart clears it" clause,
+> RFC0052.1's restart-only wording and RFC0052.7's assertion of it. It
+> amends no accepted RFC.
 
 ## 1. Summary
 
@@ -61,6 +65,23 @@ normative API.
 **Sweep.** Once the invariant holds, a recovered panic does not
 permanently stop the cadence. Cancellation still terminates it.
 
+**Amendment to RFC 0052 — the timer's pre-cut guard.** The stop (#795) is
+retired here and RFC 0052 §3.1's epoch latch is kept, and the transition is
+explicit: with requeue-on-unwind a recovered panic no longer strands
+records, so the latch stops being a restart-only fault and becomes a signal
+a cut can clear. The epoch pair stays as it is — what changes is the
+consequence. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode
+opens every tick with `if failed_epoch <= barrier_epoch: skip` — is
+**replaced** by this RFC with "proceed: the cut's drain takes the requeued
+records first, and the `ok` verdict and the epoch CAS decide"; the "only a
+restart clears it" clause, RFC0052.1's restart-only wording and RFC0052.7's
+assertion of it are amended with it, and a latch set by a pre-RFC 0054
+process clears on the restart that deploys this. The `cadence_panic`
+counter #795 added stays, now meaning "a step panicked and was retried"
+rather than "the cadence is dead". Only a *panicking* `JoinError` continues
+the sweep; a cancelled one still terminates it. §9.6 carries the reviewed
+reasoning in full.
+
 **Out of scope.** `PUBLISHED` watermarks, tenant settlement, encode-pool
 channel policy except as needed to not drop a mined batch on worker
 death.
@@ -93,6 +114,16 @@ death.
 > - **Then** every record id is present at least once; extras are
 >   allowed and counted; absence is a failure
 
+> **RFC0054.4 — A cut clears the latch**
+> - **Given** a recovered publish panic that set RFC 0052's epoch latch,
+>   and no guard outstanding
+> - **When** the next barrier tick runs
+> - **Then** it proceeds rather than skipping: its drain takes the
+>   requeued records first, the `ok` verdict and the epoch CAS decide, and
+>   the latch is cleared without a restart
+> - **And** a latch set by a process predating this RFC clears on the
+>   restart that deploys it
+
 ## 6. Testing strategy
 
 Fault injection at the consumer boundary, parameterised per consumer
@@ -106,7 +137,12 @@ Fault injection at the consumer boundary, parameterised per consumer
 
 ## 8. References
 
-- RFC 0052, RFC 0053, `#795`, `#796`, `CLAUDE.md` §3.4
+- RFC 0052 — **amended** by §3: the timer's pre-cut guard
+  (`if failed_epoch <= barrier_epoch: skip`) is replaced with
+  proceed-and-decide, and with it the "only a restart clears it" clause,
+  RFC0052.1's restart-only wording and RFC0052.7's assertion of it.
+  RFC0054.4 asserts the replacement.
+- RFC 0053, `#795`, `#796`, `CLAUDE.md` §3.4
 - Source quarry: RFC 0053 draft on #802 @ `30a21f80`
 
 ## 9. Extracted wording (RFC 0053 draft, `30a21f80`)

@@ -1079,26 +1079,43 @@ one, because startup's fallback is exactly as trustworthy as this record:
   8 B trailer, one 48 B entry per tenant, and a planned list of at most
   `max_unlinks_per_pass` records of 24 B each naming at most every tenant
   at 40 B a pair — and the file is two slots plus the 32-byte file header.
-  At the proposed cap of 128 and a hundred tenants a slot is 519,904 B, so
-  the file is 1,039,840 B, about 1 MiB, which `Wal::open` allocates once. Growth is the one case that can still need
-  blocks: a tenant set that outgrows the preallocation is extended and
-  fsynced **before** the pass that needs it plans anything, and a failed
-  extension refuses that pass (logged, counted, retried next tick) rather
-  than reclaiming without a durable record — reclamation stalls, which is
-  the conservative direction, and the extension is attempted again on
-  every later pass. The limit is worth stating plainly rather than
-  claiming more than the design gives: **this removes allocation from the
-  steady-state commit, not from the WAL's lifetime.** A pass on an
-  unchanged tenant set never needs a block, which is the case that matters
-  — a node whose disk filled while its tenants stayed the same reclaims
-  its way out. A volume that is already full when the WAL is *opened*, or
-  when the tenant set grows, cannot allocate the file or its extension:
-  that refuses the pass, surfaces the rotation path's terminal class
-  (§3.3) so the operator sees a node that needs space rather than one
-  quietly not reclaiming, and waits for a human to free some. No design
-  that needs a durable record before unlinking can do better on a volume
-  with no room for the record. RFC0052.17 injects ENOSPC on all three
-  paths.
+  **`slot_len` is fixed for the life of the file**, and that is what makes
+  the two-slot protocol safe: an earlier draft grew the file as the tenant
+  set grew, which moves the second slot's offset — a crash mid-extension
+  would leave the previously valid slot unparseable at its new position,
+  destroying exactly the torn-write guarantee the two slots exist for. So
+  the slots are sized once, at their bounded maximum, from two configured
+  numbers rather than from the live tenant set: `max_unlinks_per_pass`
+  (§3.8) and **`max_tenants`**, the ceiling RFC 0053 §3.1 introduces with
+  a default of 1024 — the two RFCs land as one pair, and until 0053's knob
+  exists the implementation uses that same constant. A slot is then
+  `32 + 48 × max_tenants + 24 × max_unlinks_per_pass + 40 ×
+  (max_tenants × max_unlinks_per_pass)` bytes: its 24 B header and 8 B
+  trailer, one 48 B entry per tenant, and a planned list of at most
+  `max_unlinks_per_pass` records of 24 B each naming at most every tenant
+  at 40 B a pair. At the defaults — 1024 tenants, a cap of 128 — a slot is
+  5,295,136 B and the file 10,590,304 B, about 10.1 MiB, next to segments
+  of 128 MiB each. It scales with the product of the two knobs, so an
+  operator who raises both sees it grow; that is the price of a geometry
+  that never moves. `Wal::open` allocates it once and **no later write
+  ever extends it**: a tenant set that reaches `max_tenants` is refused by
+  RFC 0053's admission guard, not by this file.
+
+  The limit is worth stating plainly rather than claiming more than the
+  design gives: **this removes allocation from every pass, not from the
+  WAL's lifetime.** Once the file exists, no pass needs a block, whatever
+  the tenant set does — which is the case that matters, a node whose disk
+  filled reclaiming its way out. A volume that is already full when the
+  WAL is *opened* cannot allocate it at all, and that failure has nowhere
+  to hide: it happens before any receiver, timer or rotation state exists,
+  so it cannot be "reported" as the rotation path's terminal class the way
+  an earlier draft claimed. It is its own startup failure —
+  `OpenError::Io` naming the allocation and the file, the same shape every
+  other open-time I/O failure takes — and the node does not start. The
+  operator frees space and restarts; there is no in-process recovery,
+  because there is no process yet. No design that needs a durable record
+  before unlinking can do better on a volume with no room for the record.
+  RFC0052.17 covers both the at-open failure and the steady-state pass.
 - **Durable before the unlinks — and off the writer position.**
   The record's slot write and fsync complete before the
   pass unlinks anything. The record is on disk before any frame it accounts
@@ -1238,7 +1255,15 @@ one, because startup's fallback is exactly as trustworthy as this record:
   with any segment necessarily carries: `SEGMENT_VERSION` is bumped from 1
   to 2 for segments created under this RFC, and the reader accepts both —
   version 1 is a segment written before this RFC, version 2 one written
-  after. The ordering rule that makes this witness safe is the one the
+  after. A visible `CHECKPOINT` is not yet a durable one: its rename's
+  parent fsync can fail after the entry is visible to this process,
+  exactly as §3.2 says for the snapshots root, so startup **revalidates
+  the WAL root the same way** — one directory fsync before the sidecars
+  are read, which makes every entry the listing saw durable — and **fails
+  startup** when that fsync fails, as a `RecoveryDriverError`, rather than
+  trusting a version-2 sidecar that may not survive the next crash. The
+  same fsync covers `RECLAIM`, which lives in the same directory.
+  The ordering rule that makes this witness safe is the one the
   fresh-root case already established, generalised: **no version-2 segment
   is ever created before the record is durable.** A legacy root rotates
   before it ever checkpoints — rotation is append-driven and the first
@@ -1255,7 +1280,17 @@ one, because startup's fallback is exactly as trustworthy as this record:
   segments and neither sidecar is the legacy shape and takes the legacy
   branch, belted by the same stale-gap check every legacy root gets (a
   tenant whose snapshot is missing and whose oldest surviving frame is
-  above its last recorded horizon fails closed). Accepting both versions is
+  above the horizon its snapshot records fails closed). That check needs a
+  horizon on a root whose snapshots are version 1, which §3.1 discards as
+  unknown-version — so for this check only, the legacy artefact's global
+  `wal_high_water` **is decoded**: it is a mark the old writer stamped only
+  after every tenant's frames at or below it were drained and mined, which
+  makes it a sound lower bound on what that tenant had folded, and reading
+  it here restores nothing and feeds no miner. A snapshot that cannot be
+  decoded even for that field, or is absent entirely, has no horizon to
+  compare and **fails closed** naming the tenant rather than being read as
+  "nothing reclaimed" — the one direction that could replay past reclaimed
+  data. Accepting both versions is
   the whole migration, as with the other two bumps, and a fresh root of
   either mode stays bootable because its record is durable before its first
   segment exists. A
@@ -1292,10 +1327,17 @@ one, because startup's fallback is exactly as trustworthy as this record:
   reclaimed, since housekeeping is a no-op until the witness exists — so
   the root opens normally on the legacy branch and the next checkpoint
   retries the upgrade, re-using the arming already on disk; `armed` without
-  `seen` and `CHECKPOINT` absent is the crash window *before* the rename on
-  a root that had no checkpoint at all, and is **recoverable** the same
-  way — the root is fresh, the record is opened empty and re-armed by the
-  next attempt; neither flag with `CHECKPOINT` absent is the post-RFC root
+  `seen` and `CHECKPOINT` absent splits on whether the directory holds
+  segments. With **no segments** it is a genuinely fresh root whose arming
+  preceded a checkpoint that never landed: the record is opened empty and
+  re-armed by the next attempt. With **segments present** it is not fresh
+  at all — the first rotation on a legacy root writes the record *before*
+  it creates its version-2 segment (below), so this is that root, mid
+  migration, with the upgrade still owed — and the state is **retained**,
+  not reset: the record keeps its arming and its mode, the root opens on
+  the legacy branch, and the next checkpoint retries the upgrade. Emptying
+  the record there would discard a mode the first pass may already have
+  adopted; neither flag with `CHECKPOINT` absent is the post-RFC root
   before its first barrier, which is what open creates. Entries and `seen` cannot disagree, since every
   unlink is gated on a checkpoint that must have succeeded to produce
   them. **RFC 0053 adds `PUBLISHED` to this matrix** on the same footing:
@@ -2174,7 +2216,7 @@ existing tunables do.
 | `segment_age_secs` (RFC 0008 §6.9; second caller here, §3.2's idle rotation) | Tunable | `600` (unchanged) | `1..=86_400` (unchanged) | §3.4 — bounds recovery window; the idle rotation makes an idle node's last segment reclaimable within `segment_age_secs + barrier_secs + housekeeping_secs` |
 | `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
-| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated and rewritten in place | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
+| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated at a fixed `slot_len` from `max_tenants` × `max_unlinks_per_pass` and rewritten in place, never extended | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
 | Segment-header format **version 2** (§3.2) | Invariant | `2` (was `1`; the reader accepts both) | n/a | format compat — the version every root with a segment carries, and so the witness that separates a pre-RFC root from one that lost both sidecars, including a `NoConsumer` root with no snapshots |
 | Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
@@ -2589,11 +2631,13 @@ memory, and nothing here claims to.
 >   `OpenError::Corrupt` naming the file, and is never read as missing
 > - **And** a pass reclaiming under a higher horizon for one tenant leaves
 >   every other entry unchanged, and no pass ever lowers an entry
-> - **And** a crash injected between the record's rename and the first
+> - **And** a crash injected between the record's write and the first
 >   unlink leaves a record whose entries every restorable snapshot satisfies,
->   so the restart proceeds; a crash injected between the temp write and the
->   rename leaves the previous record intact and the temp truncated by the
->   next pass
+>   so the restart proceeds; a crash injected **inside the inactive slot's
+>   write, or between that write and its fsync**, leaves the previous slot
+>   live — the torn slot fails its CRC or carries the lower generation, and
+>   the reader takes the other one — so the next pass re-plans from the
+>   record the previous pass left
 > - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
 >   fails open naming the missing record — its `CHECKPOINT` is version 2, so
 >   the root is post-RFC — rather than recreating an empty record and pinning
@@ -2610,15 +2654,14 @@ memory, and nothing here claims to.
 >   openable: the rotation writes and fsyncs the record before creating the
 >   version-2 segment, so no restart ever finds a version-2 segment beside
 >   no record — asserted by injecting a crash between the two steps
-> - **And** a record write that fails with `ENOSPC` reclaims nothing and
->   refuses the pass rather than unlinking without a durable record — on
->   the slot write, on the tenant-growth extension, and on the allocation
->   `Wal::open` itself performs — and a later pass on a disk with room
->   completes normally
-> - **And** a pass on an unchanged tenant set writes its slot without
->   allocating, so a node whose volume filled after open still reclaims;
->   only the at-open and growth allocations can be refused for space, and
->   those surface the terminal class
+> - **And** a full volume at `Wal::open` fails the allocation as
+>   `OpenError::Io` naming the file, so the node does not start — not as a
+>   rotation state, which no running process exists to report — and it
+>   starts normally once space is freed
+> - **And** every pass writes its slot without allocating, whatever the
+>   tenant set does, so a node whose volume filled after open still
+>   reclaims its way out; `slot_len` never changes for the life of the
+>   file
 > - **And** a node's own first start is never that state: the empty record
 >   is durable before the initial segment is created, so a restart
 >   immediately after a fresh `Wal::open` — with or without a crash between
@@ -2893,6 +2936,9 @@ they are not substitutes for the rest.
     written before `CHECKPOINT` in the same call, on the checkpoint's own
     durable path, and joining §3.2's sidecar matrix on the same fail-closed
     footing as `RECLAIM`.
+  - *RFC 0053 §3.1* makes `max_segments` count **closed retained**
+    segments, with the current segment and the segment an owed rotation
+    creates outside the cap, so an owed rotation always has room.
   - *RFC 0053 §3.2* adds `Journal::publish_marks(&HashMap<TenantId,
     PublishedMarks>)` — a `PUBLISHED`-only write with its own crash
     ordering, used by settlement and by the migration startup path — so

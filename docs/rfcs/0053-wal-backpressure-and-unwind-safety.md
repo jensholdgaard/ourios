@@ -394,9 +394,15 @@ the caller's responsibility because the caller is what holds the mutex.
   coordinator makes that so.** Because the reservation now runs before
   `append_batch`, a refused request never reaches `Wal::append`'s own
   `MAX_FRAME_BYTES` check, so the ordering cannot be left to the WAL. `Journal`
-  exposes `fn max_frame_bytes(&self) -> usize`, and the coordinator rejects
-  `payload_len > max_frame_bytes()` as `TooLarge` before it reads
-  `reclaim_state()` at all; the WAL's own check remains as the backstop.
+  gives the coordinator the number **at construction** rather than on the
+  path: `CommitCoordinator::new` takes `max_frame_bytes` beside the
+  batch window, the segment size and the byte limit it already receives,
+  and the coordinator rejects `payload_len > max_frame_bytes` as
+  `TooLarge` under the admission mutex, before any journal lock is taken.
+  It is configuration, not mutable journal state — `MAX_FRAME_BYTES` is a
+  constant of the format — so reading it through `Journal` would have
+  forced the oversize check under the journal mutex and made the stated
+  precedence unimplementable; the WAL's own check remains as the backstop.
   The full admission order is one sequence, stated once, and it spans the
   two locks §3.2 fixes rather than living in either alone: under the
   **admission mutex**, *max-frame validation, then the tenant checks* —
@@ -1022,13 +1028,38 @@ every ambiguous retry**, not settlements alone: when a publish is
 requeued after its put may have been accepted — the ambiguous arm, which
 the `RecoverableBatch` already distinguishes from a clean failure — the
 retry names its object by the same name-based (RFC 4122 v5) derivation
-§3.2 uses, over the tenant, the partition key and the partition's frame
-range, rather than a fresh `UUIDv7`. Every later attempt at those rows,
-in this process or after a restart, writes that same name, and the
-store's last-writer-wins overwrite collapses them. The bound is then
-truthful rather than optimistic: an ambiguous publish costs **at most one
-object**, however many times it is retried or replayed, and a clean
-failure costs none, since nothing was written. Only a publish that has
+§3.2 uses, rather than a fresh `UUIDv7` — and the name is derived over
+the **subspan, not the frame range**: the tenant, the partition key, the
+frame range *and the record-index range within the first and last
+frames*. The index range is what makes the identity stable, because a
+frame can be partially published: §3.2's `emit_from` means a retry may
+carry records `[emit_from, end]` of a frame whose earlier records went
+out in another object, and a key over the frame range alone would derive
+one name for two different sets of rows — the store would overwrite one
+with the other rather than collapse a duplicate, which is worse than the
+duplicate it was meant to prevent. **It survives replay** because the
+index range is reconstructed, not remembered: `emit_from` is recorded in
+the `unmined` entry and the replay emits from exactly that index, so a
+restart re-derives the same first index, the same last index and the same
+name for the same rows. Every later attempt at those rows writes that same name, and the store's
+last-writer-wins overwrite collapses them. **The cross-restart half needs
+durable backing, and gets it**: the ambiguity itself lives in memory — the
+`RecoverableBatch` knows the put may have been accepted, and a crash takes
+that knowledge with it — so a retry after a restart would only re-derive
+the same name if something on disk said which subspan was ambiguous. So
+**every ambiguous publish writes the durable intent before it retries**,
+through the same `publish_marks` call and `publishing` bit §3.2 defines
+for settlement: the marks it will advance to, written in place, fsynced,
+then the retry. That is one in-place sidecar write on a path that is
+exceptional by construction — an ambiguous put follows a panic or a
+store timeout, not ordinary operation — which is why the intent is
+affordable here where it would not be on the common path. The bound is
+then truthful rather than optimistic: an ambiguous publish costs **at
+most one object**, however many times it is retried or replayed *across
+restarts*, and a clean failure costs none, since nothing was written. An
+implementation that skipped the intent write would keep the in-process
+bound and lose the cross-restart one, and the RFC says so rather than
+letting the stronger claim rest on nothing. Only a publish that has
 never been ambiguous keeps its `UUIDv7`. This RFC accepts the one object,
 counted through the `cadence_panic` counter beside the flushed-partition
 counters, and asserted by RFC0053.2. The bound holds only because settlement is
@@ -1070,6 +1101,25 @@ event into the same audit sink. So a derive failure marks that event's
 `write_owned` reports it in the failed-tenant set, `write_ordered`
 refuses that tenant's dependent records and requeues them, and the tenant
 enters the server-terminal, client-retryable class.
+
+**A requeue alone would spin, so a terminal tenant's buffers are set
+aside.** Requeued records go back into the sink, the next drain picks them
+up, the same audit write fails the same way, and the node burns store
+calls on a failure nothing in-process can fix. So while a tenant is
+terminal its partitions are **excluded from every drain** — the age
+sweep's, the barrier's and the publisher's alike — rather than retried:
+they stay in the buffers, under the sink's byte accounting, doing nothing
+until a restart re-mines the frames behind them. Two consequences follow
+and are stated rather than left implicit. Its **WAL frames stay
+unsuppressed**: the tenant's publication frontier does not advance, so
+recovery replays them, which is what makes the set-aside lossless rather
+than a quiet drop. And **the barrier does not advance past them**: the
+tenant's own frontier holds where it is, so no checkpoint or snapshot
+mark claims its records are durable — the node-wide checkpoint still
+advances for every healthy tenant, per §3.2's per-tenant horizon.
+RFC0053.2 asserts it: a terminal tenant's partitions are not re-drained,
+its records are still in the WAL after a restart, and its frontier has
+not moved.
 
 **What a restart clears, stated precisely, because "a restart clears it"
 is too strong on its own.** A restart is the *mechanism* — recovery
@@ -2299,7 +2349,7 @@ repository's review) and nothing is hand-written in the code:
 | `ourios.wal.backpressure.last_refusal.segments` | gauge (int) | `{segment}` | `ourios.wal.backpressure.cause` = `segments` (the retained count at the last segment refusal) |
 | `ourios.wal.tenant_capacity.last_refusal` | gauge (int) | `{tenant}` | — (the held count at the last `TenantCapacity` refusal; capacity, not a backpressure cause) |
 | `ourios.wal.capacity_remaining` | gauge | `By` | — (saturating at zero; byte headroom) |
-| `ourios.wal.segments.usage` | gauge (int) | `{segment}` | `ourios.wal.segment.state` ∈ {`retained`, `free`} (sums to the limit) |
+| `ourios.wal.segments.usage` | gauge (int) | `{segment}` | `ourios.wal.segment.state` ∈ {`retained`, `free`, `over_cap`} — `retained + free = limit + over_cap`, with `free` saturating at zero and `over_cap` carrying the overrun an owed rotation may create |
 | `ourios.wal.segments.limit` | gauge (int) | `{segment}` | — (`max_segments`) |
 | `ourios.wal.tenants.usage` | gauge (int) | `{tenant}` | `ourios.wal.tenant.state` ∈ {`held`, `reserved`, `free`} (sums to the limit; admission consumes `held + reserved`) |
 | `ourios.wal.tenants.limit` | gauge (int) | `{tenant}` | — (`max_tenants`) |
@@ -2487,6 +2537,10 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** `max_segments < 1` is rejected at config validation, naming the
 >   reason: a ceiling of zero admits no retained closed segment, so the
 >   first closed segment refuses every later discretionary rotation
+> - **And** the segment gauge stays consistent across the overrun an owed
+>   rotation creates: `free` saturates at zero, `over_cap` carries the
+>   excess, and `retained + free = limit + over_cap` holds while the
+>   rotation is outstanding and after the next pass reclaims
 > - **And** an owed rotation proceeds at the cap: with every older segment
 >   pinned or ineligible and the sealed current segment's own frames
 >   checkpoint-covered — the state no pass can relieve — the rotation still
@@ -2657,12 +2711,14 @@ are kept distinct so that the remedy each advertises is the true one.
 >   a disconnected queue buffers its batch instead, and `quiesce_publishes`
 >   and shutdown return
 > - **And** the epoch latch clears without a restart: a worker panic bumps
->   `failure_generation` and then lowers `failed_epoch`, in that order, the cut that
->   drains the requeued records stamps and clears by a CAS on the pair it
->   read at its capture, and a panic raised during that cut — at the same
->   epoch or a later one — changes the packed word so the CAS fails and
->   the failure survives for the next cut; a **same-epoch** report between
->   a capture and its clear is caught, which a two-atomic pair would miss
+>   the packed word in one CAS — the epoch half lowered to the minimum and
+>   the generation half incremented together — the cut that drains the
+>   requeued records stamps and clears by a `compare_exchange` against the
+>   exact word it loaded at its capture, and a panic raised during that cut
+>   — at the same epoch or a later one — changes that word so the clear
+>   fails and the failure survives for the next cut; a **same-epoch**
+>   report between a capture and its clear is caught, which two separate
+>   atomics would miss
 
 > **Scenario RFC0053.4 — No acknowledged record is lost with backpressure
 > live**

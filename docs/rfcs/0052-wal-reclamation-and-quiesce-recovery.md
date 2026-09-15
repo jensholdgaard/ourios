@@ -1139,7 +1139,65 @@ one, because startup's fallback is exactly as trustworthy as this record:
   planned record is `[16 B segment UUID][u16 tenant_count][6 B reserved]`
   (24 B) followed by `tenant_count` pairs of `[u16 tenant_slot][6 B
   reserved][24 B WalOffset]` (32 B each), with the `uncertain` bit in the
-  record's reserved word. `RECLAIM` is the fourth Invariant row in §3.8; the
+  record's reserved word — **byte 22 of the planned record, bit 0**, the
+  first byte of its 6 B reserved field.
+
+  **Every field is at a fixed offset, little-endian, and every reserved
+  byte is zero and checked.** Two implementations must produce the same
+  bytes, so the layout is pinned rather than described. All multi-byte
+  integers are **little-endian**, matching the `OWCK` record and the
+  segment header, which encode their `u16`s with `to_le_bytes` today.
+  Offsets, relative to the start of each structure:
+
+  | Structure | Offset | Size | Field |
+  |---|---|---|---|
+  | File header | 0 | 4 | magic `b"OWRC"` |
+  | | 4 | 2 | `u16` version (`= 1`) |
+  | | 6 | 2 | reserved, zero |
+  | | 8 | 8 | `u64 slot_len` |
+  | | 16 | 4 | `u32 max_tenants` |
+  | | 20 | 4 | `u32 max_unlinks_per_pass` |
+  | | 24 | 4 | `u32` CRC32-C over bytes `[0..24)` |
+  | | 28 | 4 | reserved, zero |
+  | Slot header | 0 | 8 | `u64 generation` |
+  | | 8 | 4 | `u32 entry_count` |
+  | | 12 | 4 | `u32 planned_count` |
+  | | 16 | 2 | `u16 header_flags` (bit 0 `checkpoint_armed`, bit 1 `checkpoint_seen`) |
+  | | 18 | 2 | `u16 consumer_mode` (0 unrecorded, 1 `Known`, 2 `NoConsumer`) |
+  | | 20 | 4 | reserved, zero |
+  | Dictionary record | 0 | 2 | `u16 len` |
+  | | 2 | 256 | key bytes, `len` significant, remainder zero |
+  | | 258 | 2 | reserved, zero |
+  | Entry | 0 | 2 | `u16 tenant_slot` |
+  | | 2 | 2 | `u16 mode` |
+  | | 4 | 4 | reserved, zero |
+  | | 8 | 24 | `WalOffset`: 16 B segment UUID then `u64` byte |
+  | Planned record | 0 | 16 | segment UUID |
+  | | 16 | 2 | `u16 tenant_count` |
+  | | 18 | 4 | reserved, zero |
+  | | 22 | 1 | flags: bit 0 `uncertain`, bits 1–7 zero |
+  | | 23 | 1 | reserved, zero |
+  | Planned pair | 0 | 2 | `u16 tenant_slot` |
+  | | 2 | 6 | reserved, zero |
+  | | 8 | 24 | `WalOffset` |
+  | Slot trailer | 0 | 4 | `u32` CRC32-C over `[0 .. slot_len - 8)` of the slot |
+  | | 4 | 4 | reserved, zero |
+
+  A UUID is its 16 bytes in RFC 4122 order, as the segment header and
+  `CHECKPOINT` already store them, not a little-endian integer.
+
+  **A non-zero reserved byte is a format error**, refused at open like a
+  bad checksum. That is the rule that makes the reserved space usable: a
+  future version may define a field there, and a reader of this version
+  must refuse an artefact carrying it rather than parse around it and act
+  on a record whose meaning it does not know. The `len = 0` dictionary
+  record is the one place a zero *value* is meaningful rather than
+  reserved — it marks an unused slot id — and **slot id 0 is a usable
+  id**, so a dictionary position is never reserved as a sentinel.
+  Because slot ids are `u16`, `max_tenants` has a format ceiling of
+  **65,536**, refused at config validation with that reason (§3.8).
+
+  `RECLAIM` is the fourth Invariant row in §3.8; the
   polynomial is RFC 0008 §6.9's Castagnoli, as everywhere else in the WAL.
 - **Committed without allocating, because ENOSPC is the case this exists
   for.** A temp-write-and-rename commit needs new blocks, and a full disk
@@ -2301,6 +2359,7 @@ existing tunables do.
 | `housekeeping_secs` (RFC 0008 §6.9; first caller here, §3.2) | Tunable | `60` (unchanged) | `1..=3_600` (unchanged) | §3.6 — bounds local-disk pressure; this RFC supplies the pass the knob was always meant to drive |
 | `segment_age_secs` (RFC 0008 §6.9; second caller here, §3.2's idle rotation) | Tunable | `600` (unchanged) | `1..=86_400` (unchanged) | §3.4 — bounds recovery window; the idle rotation makes an idle node's last segment reclaimable within `segment_age_secs + barrier_secs + housekeeping_secs` |
 | `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
+| `max_tenants` (RFC 0053 §3.1; sizes this RFC's record, §3.2) | Tunable | `1024` (RFC 0053's default) | `1..=65_536` — the **format ceiling**, since `RECLAIM`'s dictionary is addressed by `u16` slot ids and slot id 0 is usable; a larger value is refused at config validation naming that reason, and `Wal::open` separately refuses a value above the capacity the file was built for | §3.6 — a raised value needs a longer slot than the preallocated file has, so it is an open-time decision rather than a free edit |
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
 | `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, a per-slot tenant dictionary (`u16` slot ids over 256 B keys, RFC 0046 §3.1's bound), the two capacities it was built for, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated at a fixed `slot_len` from `max_tenants` × `max_unlinks_per_pass` and rewritten in place, never extended | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
@@ -2783,10 +2842,14 @@ memory, and nothing here claims to.
 >   its first version-2 checkpoint succeeded, entries or none — and whose
 >   `CHECKPOINT` is missing fails open naming both files
 > - **And** a root whose `RECLAIM` carries `checkpoint_armed` but not
->   `checkpoint_seen` with `CHECKPOINT` absent — a crash in the window
->   between arming and the checkpoint's rename — opens as a fresh root with
->   an empty record and is re-armed by the next attempt, and a `RECLAIM`
->   with neither flag beside a missing `CHECKPOINT` opens the same way
+>   `checkpoint_seen` with `CHECKPOINT` absent splits on whether segments
+>   exist: with **no segments** — a crash between arming and the
+>   checkpoint's rename on a root that never held one — it opens as a fresh
+>   root with an empty record and is re-armed by the next attempt, as does
+>   a `RECLAIM` with neither flag beside a missing `CHECKPOINT`; with
+>   **segments present** it is a legacy root mid migration and the record
+>   is **retained** with its arming and its mode, the root opening on the
+>   legacy branch with the upgrade retried by the next checkpoint
 > - **And** the same record beside a **present** version-2 `CHECKPOINT` —
 >   the crash after the rename and before the record's next write — opens
 >   normally and is promoted to `seen` durably at open, never read as a

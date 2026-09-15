@@ -265,11 +265,21 @@ rotation callers — the barrier task's idle rotation (§3.2, rotate-before-
 cut under the exclusion) and the post-recovery step's owed rotation — and
 a *discretionary* rotation from either at `closed_retained ==
 max_segments` would create the closed segment the reservation refuses. So the check lives in `Wal::rotate`
-itself, under the journal mutex: at the ceiling it performs no rotation
-and returns `Ok(RotationOutcome::RefusedAtSegmentCap)`. RFC 0052 §3.7
-defines `Journal::rotate` as `Result<(), ReceiveError>`; this RFC amends
-it to `Result<RotationOutcome, ReceiveError>` with `RotationOutcome::{
-Rotated, RefusedAtSegmentCap }`, so that a refusal at the cap is a typed
+itself, under the journal mutex — **and the call says which kind of
+rotation it is**, because the WAL cannot infer the owed exception from a
+bare request and an implementation given no reason would defer the sealed
+and recovery-required cases too. `Journal::rotate` therefore takes it:
+`fn rotate(&mut self, kind: RotationKind) -> Result<RotationOutcome,
+ReceiveError>` with `RotationKind::{ Discretionary, Owed }`, the cap
+**checked only for `Discretionary`**; an `Owed` call rotates whatever the
+count, which is the invariant §3.1 states. At the ceiling a
+`Discretionary` call performs no rotation and returns
+`Ok(RotationOutcome::RefusedAtSegmentCap)`. RFC 0052 §3.7
+defines `Journal::rotate` as `fn rotate(&mut self) -> Result<(),
+ReceiveError>`; this RFC amends it to `fn rotate(&mut self, kind:
+RotationKind) -> Result<RotationOutcome, ReceiveError>` — the argument
+naming the exception and the return naming the outcome, `RotationOutcome::{
+Rotated, RefusedAtSegmentCap }` — so that a refusal at the cap is a typed
 outcome on the `Ok` arm rather than a rotation failure: it draws on no
 retry budget. **What a caller makes of it depends on why it rotated**, and
 the two classes are named here and at the seal site. A **discretionary**
@@ -1535,9 +1545,17 @@ with a CRC32-C per slot, **preallocated at open and rewritten in place**,
 so a torn write is caught by the slot's checksum and the older slot still
 reads. The layout follows `RECLAIM`'s exactly, field for field, so the two files
 never need two readers. A 32-byte file header, then two slots; each slot a
-24-byte header, `entry_count` entries, and an 8-byte trailer whose
-checksum is a `u32` followed by four reserved bytes and covers **only the
-bytes preceding it** (Castagnoli, as everywhere in the WAL). The
+24-byte header, a **fixed entry area of exactly `max_tenants` entries**,
+and an 8-byte trailer whose checksum is a `u32` followed by four reserved
+bytes and covers **only the bytes preceding it**. The entry area is fixed,
+not `entry_count` long: a variable area would put the trailer at a
+variable offset, so a reader would have to trust `entry_count` — a field
+inside the bytes the checksum protects — to find the checksum that
+validates it, which is not self-delimiting and is the shape `RECLAIM`
+avoids for the same reason. So **`entry_count` is a count, not a
+length**: entries `0..entry_count` are live, the rest are **zeroed**, and
+the trailer sits at a fixed offset a reader computes from the header's
+`max_tenants` alone (Castagnoli, as everywhere in the WAL). The
 encoding rules are RFC 0052 §3.2's, adopted verbatim so one reader serves
 both files: **byte offsets are pinned** for every structure rather than
 implied by field order, integers are **little-endian** (matching the
@@ -1569,6 +1587,26 @@ earlier round of this RFC read RFC 0046 alone and sized the record at
 260 B; reading an amended section without following its amendment is the
 mistake, and the `rfc-check` skill's status routing exists to catch it.)
 
+**The frame codec has to be brought to the same bound, and this RFC
+requires it.** `ourios-wal`'s `TenantBatch::MAX_TENANT_BYTES` is **256**
+and rejects only above that, so a frame can carry a 129–256-byte tenant
+that the 132-byte dictionary cannot represent — a real exposure, not a
+theoretical one, since the constant predates RFC 0048 and its doc comment
+still cites RFC 0046 §3.1 as its authority. The fix is to bound the
+source rather than widen the layout, because widening it would double
+both sidecars to carry ids no accepted grammar admits: this RFC
+**amends the frame codec** (RFC 0046's `TenantOtlpBatch` payload, whose
+constant RFC 0048 §3.1 silently superseded) to enforce **128 bytes** on
+encode and decode, matching the grammar and `ourios-core`'s own
+`MAX_TENANT_BYTES`. A root whose replay yields a tenant longer than that
+**fails closed at open**, naming the offending frame's offset and the
+length it carried, rather than being truncated into a dictionary that
+cannot hold it. That is the pre-production posture — no migration tooling
+— and it is only reachable on a root written by a build whose codec
+predated this change. RFC0053.4 asserts both halves: the codec refuses a
+129-byte tenant on encode, and a fixture root carrying one fails open
+naming the offset.
+
 An entry is then `[u16 slot id][u16 flags][4 B reserved][24 B records
 WalOffset][24 B audit WalOffset]` — 56 B, unchanged, since it names a
 tenant by slot id rather than by key — where a `WalOffset` is its
@@ -1579,9 +1617,9 @@ its key, the key is a tenant id verbatim, and that tenant takes its marks;
 an id naming a dictionary record with `len = 0` is a corrupt slot and the
 other slot is read. A tenant with no entry seeds from `X`, as one with no
 record always has. **Positions are not allocated or reused per tenant**:
-`entry_count` says how many of the `max_tenants` positions are live,
-dictionary and entries are written in tenant-id order on every write, and
-a write rewrites the whole slot — no free list, no position to leak, which
+`entry_count` says how many of the `max_tenants` positions are live, the
+rest being zeroed and skipped, dictionary and entries are written in
+tenant-id order on every write, and a write rewrites the whole slot — no free list, no position to leak, which
 is what keeps the geometry fixed. The file's size is therefore decided at
 open by `max_tenants` alone: a slot is `24 + (132 + 56) × max_tenants + 8`
 bytes and the file `32 + 2 × slot`, which at the default 1024 tenants is
@@ -1690,8 +1728,13 @@ the first batch** — one extra sidecar write at startup, on the same
 durable path a checkpoint uses — and confirms the flag at the next record
 write. A crash *before* that write leaves the flag armed with `PUBLISHED`
 absent and nothing published under a finer horizon, so the next start
-seeds from `X` again, correctly; a crash *after* it finds a `PUBLISHED`
-whose marks are the seed and proceeds from there like any other start. A
+seeds from `X` again, correctly. **A crash after the write but before the
+flag is confirmed** — armed *and* present — is the row the state machine
+owed and now states: the sidecar is authoritative, the seed has already
+happened and is durable, so recovery **confirms the flag** and proceeds
+from the written marks rather than re-seeding from `X`, which would
+discard a finer horizon the file already holds. A crash after the confirm
+is an ordinary start. A
 root whose flag is **confirmed** with `PUBLISHED` absent is a lost sidecar
 and fails closed, exactly as a lost `RECLAIM` does. The coarse window is
 therefore bounded by that single write rather than by a checkpoint that
@@ -1710,9 +1753,21 @@ be able to upgrade — so a restart inside that migration window stays on the
 legacy branch, with no watermark to seed and nothing published under a
 horizon anything reads. The converse is reachable, since `PUBLISHED` is written first,
 and takes RFC 0052 §3.2's two-state witness rather than a rule of its own:
-`PUBLISHED` present with no version-2 `CHECKPOINT` fails closed — naming
-both files — exactly when `RECLAIM` carries `checkpoint_seen`, because
-that root has checkpointed and lost it. It reads against `seen`, never
+`PUBLISHED` present with no version-2 `CHECKPOINT` is read against the
+current write order, **checkpoint first**, which changes what it can mean.
+Under that order the sidecar is never written ahead of the checkpoint by
+`Journal::checkpoint`, so a present sidecar beside no version-2 checkpoint
+has exactly two sources: a **`publish_marks` write**, which §3.2's
+settlement and the accepting start both make without touching the
+checkpoint, or a **deleted checkpoint**. The first is ordinary and the
+second is a fault, and `checkpoint_seen` is what separates them: with the
+flag **set** the root has checkpointed and lost it, so open fails closed
+naming both files; with it **unset** no checkpoint has ever succeeded
+there, so the sidecar can only have come from a `publish_marks` write on a
+root that has not yet checkpointed, and it is kept and seeded from rather
+than discarded — an earlier draft discarded it, which was right only under
+the superseded sidecar-first order, where such a file was always a torn
+first checkpoint. It reads against `seen`, never
 `armed`, which is what keeps RFC 0052 §3.2's two non-fault `armed` rows
 non-faults here as well: `armed` without `seen` beside a **version-1**
 `CHECKPOINT` is that RFC's migration retry state — nothing can have been
@@ -1722,11 +1777,14 @@ before the rename. A `PUBLISHED` written moments earlier in that same
 first `checkpoint` call is what either looks like **on a root with no
 segments** — genuinely fresh, nothing published under a horizon anything
 reads — so there the record is discarded and the next attempt rewrites it,
-as when neither flag is set. **With segments present it is not fresh**:
+as when neither flag is set. **With segments present it is likewise retained**:
 RFC 0052 §3.2 reads armed-and-unseen beside segments as a retained
-migration state, so the marks are *kept* and seeded from, not reset —
-discarding them there would re-open the coarse window on a root that
-already has frames to replay. Only `seen` makes its absence a fault. One
+migration state, so the marks are *kept* and seeded from — discarding them
+would re-open the coarse window on a root that already has frames to
+replay. Under checkpoint-first ordering the two readings agree, which is
+why this matrix has one rule rather than a fresh-root exception:
+`checkpoint_seen` decides the fault, and everything short of it keeps the
+marks. Only `seen` makes its absence a fault. One
 witness governs both sidecars, which is why this RFC adds no second flag
 beyond the migration marker above. Beside these rows sits RFC 0052 §3.2's
 own, with one scoping this RFC states because `PUBLISHED` would otherwise
@@ -2193,6 +2251,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   *discretionary* rotations are refused while the pins hold
 > - **And** `Deferred { AtSegmentCap }` is never entered from the ceiling
 >   itself: the only route to it is an exhausted rotation retry budget
+> - **And** the kind travels in the call: `rotate(Discretionary)` at the
+>   ceiling returns `RefusedAtSegmentCap` and creates nothing, while
+>   `rotate(Owed)` at the same count rotates — the seal path and the
+>   post-recovery discharge both passing `Owed`
 > - **And** a forced rotation whose post-rename parent fsync fails does not
 >   wedge the node: a later pass discharges the pending `Rotation`-origin
 >   fsync before it evaluates the predicate, with no append arriving, and
@@ -2359,6 +2421,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   figure, so a batch the bound refused before the kill is refused after it
 > - **And** a restart whose ledger rebuild fails does not come up: no coordinator,
 >   no listener, and no batch admitted
+> - **And** the frame codec refuses a tenant longer than 128 bytes on
+>   encode and on decode, and a fixture root whose replay yields one fails
+>   closed at open naming the frame's offset and the length it carried
 > - **And** a restart seeds the tenant admission table from the tenants
 >   recovery restored, before any listener is constructed: a held tenant
 >   is admitted at once and a new id at the guard is refused, with no

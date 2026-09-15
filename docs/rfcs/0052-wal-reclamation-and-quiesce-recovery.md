@@ -1094,8 +1094,9 @@ one, because startup's fallback is exactly as trustworthy as this record:
   would strand a root whose operator legitimately raised a limit the other
   sidecars can grow into. The rebuild is crash-safe and is the one place
   this record does use a temp: the new geometry is written whole to
-  `RECLAIM.new` — both slots, the live one's contents re-encoded at the
-  wider dictionary stride and the other zeroed — fsynced, renamed over
+  `RECLAIM.new` — both slots, the live one's contents copied into the
+  wider dictionary stride **at the same index, so every slot id survives
+  unchanged**, and the other zeroed — fsynced, renamed over
   `RECLAIM`, and the parent fsynced, before anything else reads it. A
   crash at any point leaves either the old file or the new one, both
   complete, since the rename is atomic and the temp is never read; a
@@ -1136,8 +1137,23 @@ one, because startup's fallback is exactly as trustworthy as this record:
   trusted either as a length would be reading a torn or stale slot's
   arithmetic; it reads the fixed strides instead, and the slot's CRC is
   what says the bytes are the ones the writer wrote.
-  `header_flags` carries `checkpoint_armed` (bit 0) and `checkpoint_seen`
-  (bit 1), with the rest reserved and zero; `consumer_mode` is `0`
+  `header_flags` carries four witness bits and nothing else:
+  `checkpoint_armed` (bit 0), `checkpoint_seen` (bit 1),
+  **`published_seeded_armed` (bit 2)** and
+  **`published_seeded_confirmed` (bit 3)**, with bits 4–15 reserved and
+  zero. The second pair is RFC 0053's, amending this header: its
+  `PUBLISHED` seeding needs a durable two-state witness and this is where
+  the other witnesses live, so it takes two bits of the reserved range
+  rather than a field of its own — no width change. Its meaning is the
+  one the checkpoint pair already establishes: **armed** is written
+  durably on the accepting start *before* any batch is admitted,
+  **confirmed** at the next record write after the first `PUBLISHED`
+  write succeeded, and once confirmed it never clears. The crash rows
+  follow the checkpoint witness's exactly — armed with `PUBLISHED` absent
+  is the window before that write, and the next start seeds again
+  correctly; armed with `PUBLISHED` present is the ordinary post-write
+  state, promoted to confirmed at open — while RFC 0053 §3.2 owns what
+  the seeding itself does. `consumer_mode` is `0`
   unrecorded, `1` `Known`, `2` `NoConsumer` (§3.2), so "unrecorded" is a
   value rather than an absence.
 
@@ -1207,7 +1223,7 @@ one, because startup's fallback is exactly as trustworthy as this record:
   | Slot header | 0 | 8 | `u64 generation` |
   | | 8 | 4 | `u32 entry_count` |
   | | 12 | 4 | `u32 planned_count` |
-  | | 16 | 2 | `u16 header_flags` (bit 0 `checkpoint_armed`, bit 1 `checkpoint_seen`) |
+  | | 16 | 2 | `u16 header_flags` (bit 0 `checkpoint_armed`, bit 1 `checkpoint_seen`, bit 2 `published_seeded_armed`, bit 3 `published_seeded_confirmed`, bits 4–15 zero) |
   | | 18 | 2 | `u16 consumer_mode` (0 unrecorded, 1 `Known`, 2 `NoConsumer`) |
   | | 20 | 4 | reserved, zero |
   | Dictionary record | 0 | 2 | `u16 len` |
@@ -1256,9 +1272,20 @@ one, because startup's fallback is exactly as trustworthy as this record:
   that leaves one but remains in the other keeps its id. `PUBLISHED` is
   written from that same in-memory table, so its dictionary is this
   dictionary, at the same ids, by construction rather than by convention.
-  **A rebuild is the one place ids may be reassigned**, and it is safe
-  precisely because the rebuild above rewrites *both* files as one
-  operation from the one table.
+  **No operation reassigns an id, not even a rebuild.** An earlier draft
+  of this paragraph made the rebuild the one place ids could move; that
+  was wrong, and wrong in a way the resize depends on. A rebuild copies
+  each dictionary record into the wider stride **at the same index**, so
+  ids are identical before and after — which is exactly what makes a
+  crash *between* the two files' renames recoverable, since the
+  half-rebuilt pair still agrees on every id it names. A rebuild that
+  renumbered would have to rewrite every reference in both files
+  atomically, and there is no third witness that could make that
+  crash-safe. A rebuild does still rewrite **both files together, from
+  the one in-memory table** — that is what keeps their dictionaries the
+  same dictionary across a geometry change — but it copies rather than
+  reassigns, so a pair caught mid-rename comes up at the larger geometry
+  with every id unchanged.
 
   A tenant introduced by one file alone is the ordinary case, not an
   error: the two are written at different moments — `publish_marks`
@@ -1276,10 +1303,12 @@ one, because startup's fallback is exactly as trustworthy as this record:
   the dictionary would renumber every id above it, so a removed tenant is
   **tombstoned** instead: its dictionary record keeps its key with the
   `tombstoned` bit set (bit 0 of the record's flags field at offset 130),
-  its entries are dropped, and the id is **retired, not freed** — no later
-  tenant takes it until a rebuild compacts, which is the one operation
-  allowed to renumber because it rewrites both files together from one
-  table.
+  its entries are dropped, and the id is **retired for the life of the
+  root** — no later tenant takes it, and no rebuild reclaims it, since
+  reclaiming a tombstoned id means renumbering. An operator who exhausts
+  the id space raises `max_tenants`, which the rebuild path already
+  handles, or starts a fresh root. This design would rather spend ids
+  than invent the witness renumbering would need.
 
   `RECLAIM` is the fourth Invariant row in §3.8; the
   polynomial is RFC 0008 §6.9's Castagnoli, as everywhere else in the WAL.
@@ -2454,7 +2483,7 @@ existing tunables do.
 | `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
 | `max_tenants` (RFC 0053 §3.1; sizes this RFC's record, §3.2) | Tunable | `1024` (RFC 0053's default) | `1..=65_536` — the **format ceiling**, since `RECLAIM`'s dictionary is addressed by `u16` slot ids and slot id 0 is usable; a larger value is refused at config validation naming that reason, and `Wal::open` separately refuses a value above the capacity the file was built for | §3.6 — a raised value needs a longer slot than the preallocated file has, so it is an open-time decision rather than a free edit |
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
-| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, a per-slot tenant dictionary (`u16` slot ids over 128 B keys, RFC 0048 §3.1's bound), the two capacities it was built for and rebuilt at when they rise, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated at a fixed `slot_len` from `max_tenants` × `max_unlinks_per_pass` and rewritten in place, never extended | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
+| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, a 32 B file header and two slots each closed by a `u32` CRC32-C over its own preceding bytes, with a `u64` generation, a per-slot tenant dictionary (`u16` slot ids over 128 B keys, RFC 0048 §3.1's bound), the two capacities it was built for and rebuilt at when they rise, `header_flags` (`checkpoint_armed`, `checkpoint_seen`, and RFC 0053's `published_seeded_armed` / `published_seeded_confirmed`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated at a fixed `slot_len` from `max_tenants` × `max_unlinks_per_pass` and rewritten in place, never extended | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
 | Segment-header format **version 2** (§3.2) | Invariant | `2` (was `1`; the reader accepts both) | n/a | format compat — the version every root with a segment carries, and so the witness that separates a pre-RFC root from one that lost both sidecars, including a `NoConsumer` root with no snapshots |
 | Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
@@ -2953,6 +2982,12 @@ memory, and nothing here claims to.
 >   **segments present** it is a legacy root mid migration and the record
 >   is **retained** with its arming and its mode, the root opening on the
 >   legacy branch with the upgrade retried by the next checkpoint
+> - **And** a record carrying `published_seeded_armed` without
+>   `published_seeded_confirmed` with `PUBLISHED` **absent** — the crash
+>   before the accepting start's own `PUBLISHED` write — leaves the next
+>   start free to seed again, while the same record with `PUBLISHED`
+>   **present** is the ordinary post-write state and is promoted to
+>   confirmed durably at open, never read as a fault
 > - **And** the same record beside a **present** version-2 `CHECKPOINT` —
 >   the crash after the rename and before the record's next write — opens
 >   normally and is promoted to `seen` durably at open, never read as a

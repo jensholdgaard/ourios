@@ -206,8 +206,23 @@ reserved on size would let an age rotation create a segment past the
 ceiling, or block the forced rotation and keep the livelock. So `Journal`
 exposes the complete predicate, `fn rotation_due(&self, framed_len: u64)
 -> bool` — size or age, the same function `append` consults — and the
-reservation reserves a segment slot exactly when it is true: `retained +
-1 ≤ max_segments`, else refuse. **The predicate is evaluated once, and
+reservation reserves a segment slot exactly when it is true:
+`closed_retained + 1 ≤ max_segments`, else refuse. **The cap counts
+*closed* retained segments, and the current segment is outside it**, which
+is what keeps an owed rotation from deadlocking: housekeeping never
+unlinks the current segment, so a cap that counted it could be reached in
+a state no pass can relieve — every older segment pinned or ineligible
+while the sealed current segment's own frames are checkpoint-covered — and
+the deferred owed rotation would wait for a slot that never comes, with
+the WAL unable to accept anything at all. Capacity is therefore reserved
+rather than hoped for. The invariant, stated once: **an owed rotation
+always has room.** The segment it creates becomes the new current segment
+and is outside the cap; the segment it closes was outside the cap and
+enters it, which is the one admission the cap does not gate, since
+refusing it would mean refusing to close a segment that must never take
+another frame. A *discretionary* rotation is gated as before, so the cap
+still bounds retained header overhead and still refuses an append that
+would grow it. **The predicate is evaluated once, and
 the append acts on that answer**: asking twice is not equivalent, because
 the age half is a function of wall time, so a segment can cross
 `segment_age_secs` between the reservation and the write and rotate
@@ -222,14 +237,15 @@ with the size half kept inside the WAL as a fail-closed assertion (a
 frame that does not fit the current segment under a `Reuse` token is a
 caller error, not a silent rotation, since size cannot change between the
 two while the journal mutex is held). Both run under one hold of that
-mutex, so no append interleaves between them either. `validate_config` rejects `max_segments < 2`:
-the current segment always holds one slot and is never unlinked, so a
-ceiling of one leaves no room for the segment a rotation must create —
-every due rotation would be refused, the forced-rotation predicate's
-"below the ceiling" leg could never hold, and the node would wedge with a
-backlog it cannot close. Two is the smallest ceiling that admits one
-closed segment beside the current one; the derived default is far above
-it. RFC0053.1 asserts the validation. At the ceiling a due rotation is **refused,
+mutex, so no append interleaves between them either. `validate_config` rejects `max_segments < 1`:
+a ceiling of zero admits no retained closed segment at all, so the first
+closed segment would refuse every later discretionary rotation and the
+node would stall on any frame needing one. One is the smallest ceiling
+that admits a closed segment beside the current one, and the derived
+default is far above it. (An earlier draft required two, because the cap
+then counted the current segment; with the current segment outside it the
+floor is one, and the two rules move together.) RFC0053.1 asserts the
+validation. At the ceiling a due rotation is **refused,
 never squeezed in**: the request path runs no housekeeping, since prepare,
 file half and commit put fsyncs in front of every concurrent append; the
 refusal sets the latch, the next `maintain` pass reclaims what it can, and
@@ -261,9 +277,12 @@ rotation is one the current segment's state requires — after a seal, where
 that segment must never take another frame, and the post-recovery step's
 discharge of an owed rotation — and there a refusal is a durability fault,
 not a shrug: the WAL enters `RotationState::Deferred { AtSegmentCap }`
-(below) and admits nothing until a pass frees a slot. Header overhead is
-therefore at most 24 B × `max_segments`, and the refusal leaves with the
-same latch once a pass removes a segment. **A segment stays in it
+(below) — which, with the cap counting closed segments only, is now
+reachable *only* through the retry budget and never through the ceiling,
+since an owed rotation always has room. Header overhead is therefore at
+most 24 B × (`max_segments` + 2) — the retained closed segments, the
+current one, and the one an owed rotation may create — and a discretionary
+refusal leaves with the same latch once a pass removes a segment. **A segment stays in it
 until its unlink succeeds.** RFC 0052 §3.2 marks a popped ledger entry
 *reclaiming* and keeps it in the byte and segment accounting until the
 off-lock unlink has succeeded, so the bytes of a segment whose `RECLAIM`
@@ -1048,8 +1067,12 @@ silently skipped for running off-runtime; this RFC's requeue-on-unwind
 inherits that entry rather than adding one of its own. RFC 0052 §3.1
 already defines what a dying thread does — it drains every batch still queued back into the
 buffers as `ready` partitions, releasing each guard as its records land,
-and the coordinator respawns it on the next enqueue — and this RFC changes
-only the failing batch's own arm, from latched-and-settled to requeued
+and the restart is a **claim behind the coordinator's publisher-slot
+mutex** rather than a spawn by whoever noticed: whichever worker still
+sees the closed sender takes that mutex and replaces channel and thread,
+the others retry against the new sender with their batches parked
+meanwhile. This RFC's requeue-on-unwind goes through that same gate and
+adds no spawn of its own; it changes only the failing batch's arm, from latched-and-settled to requeued
 through its `RecoverableBatch`; and a worker
 whose enqueue finds the queue **disconnected** (the publisher gone for
 shutdown, or between death and respawn) follows RFC 0052 §3.1's park
@@ -1349,9 +1372,20 @@ without a `PUBLISHED` at least as new. The sidecar takes RFC 0052 §3.2's
 its own magic, two slots written alternately under a generation counter
 with a CRC32-C per slot, **preallocated at open and rewritten in place**,
 so a torn write is caught by the slot's checksum and the older slot still
-reads — which also makes the settlement write below cheap, one in-place
-write and an fsync rather than a file creation. The file is outside the
-byte bound like the other sidecars. **Settlement needs to write it without
+reads. The widths follow `RECLAIM`'s exactly: the checksum is a `u32`
+followed by four reserved bytes and covers **only the bytes preceding
+it**, and each entry's two marks are `WalOffset`s at their pinned 24 B, so
+a slot is a fixed size per tenant and the file's size is decided at open
+by `max_tenants` rather than by what a write happens to carry — which also makes the settlement write below cheap, one in-place
+write and an fsync rather than a file creation. The file is outside the byte bound like the other sidecars, and that
+exclusion has a stated limit: preallocation can fail. A volume full at
+open, or full when tenant growth needs the file grown, blocks the write —
+and with it reclamation, since RFC 0052's pass writes its record before it
+unlinks. So the byte limit promises bounded *growth*, not recovery from a
+full volume: with no room for a sidecar write, a crossed bound stays
+crossed and the refusal stands until an operator frees space, which §3.3
+makes visible through the floor and the unreclaimed figure rather than
+leaving it as an unexplained stall. **Settlement needs to write it without
 a checkpoint**, so the surface gains one more call, another **amendment to
 RFC 0052 §3.7's list**: `fn publish_marks(&mut self, published:
 &HashMap<TenantId, PublishedMarks>) -> Result<(), ReclaimError>`, which
@@ -1620,8 +1654,10 @@ construction a coherent pair; the clear after a stamp is a
 `compare_exchange` against **the exact word the cut captured**, so any
 report in between — a lower epoch, the same epoch, or neither — changes
 the word, the CAS fails, and the failure survives for the next cut to
-drain and clear. The clear value stays the all-ones epoch half, the
-generation half being ignored while the epoch half is clear. Overflow is
+drain and clear. The clear is written as RFC 0052 §3.1 encodes it — **`u32::MAX` in the
+epoch half with the generation half zero**, never a zero word — and epoch
+`u32::MAX` is reserved, so no real cut's epoch can collide with the clear
+value and a CAS to it is unambiguous. Overflow is
 stated rather than assumed: the generation half wraps at 2^32 and wrapping
 is harmless, since it is only ever compared for equality inside one
 capture-to-clear window and a wrap would need four billion reports inside
@@ -1883,9 +1919,14 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** a housekeeping pass skipped for a missing version-2 witness
 >   forces no rotation: a legacy root that has not yet upgraded is left
 >   alone
-> - **And** `max_segments < 2` is rejected at config validation, naming the
->   reason: the current segment holds one slot and is never unlinked, so a
->   ceiling of one admits no rotation at all
+> - **And** `max_segments < 1` is rejected at config validation, naming the
+>   reason: a ceiling of zero admits no retained closed segment, so the
+>   first closed segment refuses every later discretionary rotation
+> - **And** an owed rotation proceeds at the cap: with every older segment
+>   pinned or ineligible and the sealed current segment's own frames
+>   checkpoint-covered — the state no pass can relieve — the rotation still
+>   creates its segment, the WAL keeps accepting, and only *discretionary*
+>   rotations are refused while the pins hold
 > - **And** a forced rotation whose post-rename parent fsync fails does not
 >   wedge the node: a later pass discharges the pending `Rotation`-origin
 >   fsync before it evaluates the predicate, with no append arriving, and

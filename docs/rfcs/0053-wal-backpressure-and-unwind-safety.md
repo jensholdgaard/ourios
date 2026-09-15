@@ -855,9 +855,14 @@ it does on the append path and can reach the terminal state, which the
 next request reports; a successful one lets the next append ack. The
 predicate then runs as stated, on a WAL that owes nothing. RFC0053.1
 asserts the wedge: a forced rotation whose parent fsync fails is
-discharged by a later pass with no append arriving. The rotation itself runs
-**under the guard `maintain` still holds for the commit**, so no append
-interleaves between the commit's verdict and the rotation.
+discharged by a later pass with no append arriving. The rotation itself runs **under the journal mutex alone** — the guard
+`maintain` still holds for the commit — with the **admission mutex
+released**, matching the invariant §3.2 states: `rotate` does directory
+work, so a lock above the journal mutex must not span it, and holding
+admission there would queue every request behind the rotation's fsync.
+The journal hold is what keeps an append from interleaving between the
+commit's verdict and the rotation; admission is not needed for that and
+is not taken.
 `maintain` keeps RFC 0052's signature, and this RFC has it stamp
 `forced_rotation: Option<Result<RotationOutcome, ReceiveError>>` into the
 `HousekeepingProgress` it returns — the coordinator's field, set after
@@ -1041,25 +1046,48 @@ duplicate it was meant to prevent. **It survives replay** because the
 index range is reconstructed, not remembered: `emit_from` is recorded in
 the `unmined` entry and the replay emits from exactly that index, so a
 restart re-derives the same first index, the same last index and the same
-name for the same rows. Every later attempt at those rows writes that same name, and the store's
-last-writer-wins overwrite collapses them. **The cross-restart half needs
-durable backing, and gets it**: the ambiguity itself lives in memory — the
-`RecoverableBatch` knows the put may have been accepted, and a crash takes
-that knowledge with it — so a retry after a restart would only re-derive
-the same name if something on disk said which subspan was ambiguous. So
-**every ambiguous publish writes the durable intent before it retries**,
-through the same `publish_marks` call and `publishing` bit §3.2 defines
-for settlement: the marks it will advance to, written in place, fsynced,
-then the retry. That is one in-place sidecar write on a path that is
-exceptional by construction — an ambiguous put follows a panic or a
-store timeout, not ordinary operation — which is why the intent is
-affordable here where it would not be on the common path. The bound is
-then truthful rather than optimistic: an ambiguous publish costs **at
-most one object**, however many times it is retried or replayed *across
-restarts*, and a clean failure costs none, since nothing was written. An
-implementation that skipped the intent write would keep the in-process
-bound and lose the cross-restart one, and the RFC says so rather than
-letting the stronger claim rest on nothing. Only a publish that has
+name for the same rows. Every later attempt at those rows writes that same name.
+
+**Three limits on that claim are stated here rather than discovered
+later, because each of them bounds what the key can buy.**
+
+*It bounds keys, not objects.* Whether two PUTs under one key leave one
+object is the backend's business, and the accepted storage contract does
+not promise it: RFC 0013's conditional PUT is specified for
+*create-if-absent* (`If-None-Match: *`) and its compare-and-swap half for
+manifest generations, while the plain `Store::put` documents no overwrite
+semantics at all. So the bound this RFC claims is **one object per
+distinct key, with every retry of the same rows producing the same key** —
+on a backend whose same-key PUT overwrites, that is one object; on one
+that does not, it is one object per attempt but never a *different* set
+of rows under a name already used. The RFC does not require overwrite
+semantics of a backend, and does not test for them.
+
+*It is a records bound.* The identity is a record subspan, and audit
+groups have no record indexes to range over, so the key does not apply to
+them. Audit retries are bounded differently and separately: an audit
+group is regenerated per frame by the miner (RFC 0052's regeneration-only
+replay), and the per-tenant audit frontier §3.2 defines is what stops a
+restart re-emitting a group already durable. Within a process an
+ambiguous audit write costs at most one duplicate group, which the sink's
+own permanent-drop counters make visible.
+
+*It is an in-process bound, and the cross-restart half is dropped.* The
+ambiguity lives in the `RecoverableBatch` — it knows the put may have been
+accepted — and a crash takes that knowledge with it, so a retry after a
+restart could only re-derive the same name if something on disk recorded
+which subspan was ambiguous. Recording it would mean a sidecar write
+**before every potentially ambiguous PUT**, which is every PUT: a cost on
+the normal publish path, paid always, to bound a case that arises after a
+panic or a store timeout. That trade is not worth making, so this RFC does
+not make it, and it does not claim what it cannot back — **the key bounds
+retries within a process; across a restart the bound is the per-tenant
+publication frontier**, which is durable and which §3.2 already relies on:
+a frame at or below it is not re-emitted, and one above it may be
+published again, at most once per restart that replays it. The one place a
+cross-restart identity *is* durable is the settlement's own intent span,
+where `publish_marks` writes the marks before the rebuild publishes — that
+path keeps its stronger claim precisely because it already pays for it. Only a publish that has
 never been ambiguous keeps its `UUIDv7`. This RFC accepts the one object,
 counted through the `cadence_panic` counter beside the flushed-partition
 counters, and asserted by RFC0053.2. The bound holds only because settlement is
@@ -1732,11 +1760,11 @@ variable offset, so a reader would have to trust `entry_count` — a field
 inside the bytes the checksum protects — to find the checksum that
 validates it, which is not self-delimiting and is the shape `RECLAIM`
 avoids for the same reason. So **`entry_count` is a count, not a
-length**: entries in the half-open range `[0, entry_count)` are live —
-exclusive of `entry_count` itself, so a reader cannot take it inclusively
-and walk one entry past the live set — the rest are **zeroed**, and
-the trailer sits at a fixed offset a reader computes from the header's
-`max_tenants` alone (Castagnoli, as everywhere in the WAL). The
+length**, and not an index either: it reports how many entries are live
+and no reader walks by it, since an entry's position is its slot id and
+its occupancy is its own flags (below). Unused positions are **zeroed**,
+and the trailer sits at a fixed offset a reader computes from the
+header's `max_tenants` alone (Castagnoli, as everywhere in the WAL). The
 encoding rules are RFC 0052 §3.2's, adopted verbatim so one reader serves
 both files: **byte offsets are pinned** for every structure rather than
 implied by field order, integers are **little-endian** (matching the
@@ -1770,12 +1798,20 @@ is written from that same in-memory table, so its dictionary is that
 dictionary, at the same ids, by construction rather than by convention.
 **A rebuild is the one place ids may be reassigned**, and it is safe
 precisely because §3.2 makes it rewrite *both* files as one operation from
-the one table. And the claim is enforced rather than trusted: at open,
-after both files are read, every id the two dictionaries both name must
-carry the same key, and a mismatch is **fail-closed**, `OpenError::Corrupt`
-naming both files and the offending id — a state no correct writer can
-produce, and one that silently crosses two tenants' marks if it is read
-past.
+the one table.
+
+**A tenant introduced by one file alone is the ordinary case, not an
+error**, and the rule says which disagreement is which. The two files are
+written at different moments — `publish_marks` touches `PUBLISHED` without
+`RECLAIM`, a pass touches `RECLAIM` without `PUBLISHED` — so at any
+instant one may name an id the other does not. That is benign: the file
+lacking it simply has no entry for that tenant, reads as "no frontier" or
+"nothing reclaimed" accordingly, and the next write of that file adds it.
+What is **fail-closed** is narrower and unambiguous: an id that **both**
+dictionaries name with **different keys**, which no correct writer can
+produce and which silently crosses two tenants' marks if read past —
+`OpenError::Corrupt`, naming both files and the id. A crash between the
+two writes therefore leaves a readable pair, never a halt.
 
 **The key is 128 bytes, which is what the governing spec says.** RFC 0046
 §3.1 caps a normalised tenant id at 256 bytes, but it is not the last word:
@@ -1828,7 +1864,16 @@ a real state that an unconditional offset cannot express — a zeroed
 `WalOffset` is a legitimate position, not an absence. A frontier whose
 bit is clear is **absent**, and recovery treats that side of the entry as
 though the tenant had no entry at all, falling back to the node-wide
-horizon for it while still honouring the other side. Both bits sit inside
+horizon for it while still honouring the other side — **except for a
+tenant the entry marks terminal**, where the fallback would be unsafe.
+The flags therefore carry a `terminal` bit beside the validity ones, set
+when §3.2 puts a tenant in the server-terminal class, and a terminal
+tenant with a clear validity bit means *nothing of that side was ever
+published*, not "consult the node-wide horizon": its events were never
+written, so `X` — advanced by every healthy tenant's progress — would
+suppress exactly what must be replayed. Its horizon is its oldest
+surviving frame, the same position RFC 0052's pin holds it at, so a
+restart re-mines everything that tenant has. Both bits sit inside
 the entry area, so the slot's trailer checksum covers them like every
 other byte before it: a flipped validity bit fails the slot's CRC and the
 other slot is read, which is what keeps "absent" from being forgeable by
@@ -1837,10 +1882,18 @@ through the dictionary**, not through a live tenant set: a slot id reads
 its key, the key is a tenant id verbatim, and that tenant takes its marks;
 an id naming a dictionary record with `len = 0` is a corrupt slot and the
 other slot is read. A tenant with no entry seeds from `X`, as one with no
-record always has. **Positions are not allocated or reused per tenant**:
-`entry_count` says how many of the `max_tenants` positions are live, the
-rest being zeroed and skipped, dictionary and entries are written in
-tenant-id order on every write, and a write rewrites the whole slot — no free list, no position to leak, which
+record always has. **An entry's position *is* its slot id**, which is what lets ids be
+stable: entry `i` belongs to slot id `i`, occupancy is the entry's own
+`records_valid` / `audit_valid` bits rather than its position, and
+`entry_count` is a **count for reporting only**, never a length to walk.
+An earlier draft made the live entries a dense prefix `[0, entry_count)`,
+which cannot survive a stable id: removing a tenant would renumber every
+id above it. A **tombstone** covers removal instead — the dictionary
+record keeps its key with a `tombstoned` bit set, the entry is zeroed, and
+the id is **retired, not freed**: no later tenant takes it until a rebuild
+compacts, which is the one operation allowed to renumber because it
+rewrites both files together from one table. A write rewrites the whole
+slot — no free list, no position to leak, which
 is what keeps the geometry fixed. The file's size is therefore decided at
 open by `max_tenants` alone: a slot is `24 + (132 + 56) × max_tenants + 8`
 bytes and the file `32 + 2 × slot`, which at the default 1024 tenants is
@@ -2272,14 +2325,18 @@ the word, the CAS fails, and the failure survives for the next cut to
 drain and clear. The clear is written as RFC 0052 §3.1 encodes it — **`u32::MAX` in the
 epoch half with the generation half zero**, never a zero word — and epoch
 `u32::MAX` is reserved, so no real cut's epoch can collide with the clear
-value and a CAS to it is unambiguous. Overflow is
-stated rather than assumed: the generation half wraps at 2^32 and wrapping
-is harmless, since it is only ever compared for equality inside one
-capture-to-clear window and a wrap would need four billion reports inside
-it; the epoch half is the barrier's own counter, which at one cut per
-`barrier_secs` cannot reach 2^32 in any deployment's lifetime, and an
-implementation that needs either half wider moves to a 128-bit word or a
-short mutex rather than splitting the pair again. RFC0053.3's leg drives a
+value and a CAS to it is unambiguous. Overflow is given a defined path rather than argued away: a wrap *is*
+reachable in principle — four billion reports is a large number, not an
+impossible one — and equality on a wrapped value would let a clear erase
+a failure it never drained. So the generation half is **sticky at its
+maximum**: a report that would carry it past `u32::MAX - 1` leaves it at
+`u32::MAX` instead, and **no clear may CAS from a word whose generation
+half is `u32::MAX`** — the latch holds, the state is exported, and a
+restart is what resets it, which is the same fail-closed posture every
+other unclearable state here takes. The epoch half needs no such rule: it is the barrier's own counter, which at one cut per `barrier_secs`
+cannot reach 2^32 in any deployment's lifetime, and an implementation that
+needs either half wider moves to a 128-bit word or a short mutex rather
+than splitting the pair again. RFC0053.3's leg drives a
 same-epoch report between a capture and its clear. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
 tick with
 

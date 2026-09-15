@@ -59,9 +59,14 @@ Extract from the 0053 draft, then stop:
   (normative in-process; cross-restart claim already dropped).
 - Tombstone a removed tenant's dictionary slot.
 
-**Amendments this RFC may make**, each as a one-line pointer, not a
-new essay: RFC 0046.11 tenant-id length 256→128 to match RFC 0048
-§3.1 (already recorded as a resolved question in 0046).
+**Amendments this RFC makes: none.** The 128-byte tenant key its
+dictionary is sized to rests on the RFC 0046 / RFC0046.11 length
+amendment (256→128, matching RFC 0048 §3.1, already recorded as a
+resolved question in 0046) — and that amendment is **RFC 0052's**, stated
+normatively in its §8. This RFC **cites** it and must not restate it: one
+clause amended by two documents is the contradiction this split exists to
+prevent. §9.7's extracted prose predates the split and reads as though
+this RFC makes it; it does not.
 
 ## 4. Alternatives considered
 
@@ -94,7 +99,11 @@ settlement race with two triggers. Details in the quarry draft §6.
 
 ## 8. References
 
-- RFC 0005, 0046, 0048, 0052, 0053, 0054
+- RFC 0005, 0048, 0053, 0054
+- RFC 0046 — **not amended here.** The RFC0046.11 length amendment
+  (256→128) is RFC 0052's, in its §8; this RFC's 128-byte key cites it.
+- RFC 0052 — owns that amendment, the `RECLAIM` record this RFC's
+  `PUBLISHED` shares rules with, and the tenant id space.
 - Source quarry: #802 @ `30a21f80`
 
 ## 9. Extracted wording (RFC 0053 draft, `30a21f80`)

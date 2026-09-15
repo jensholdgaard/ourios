@@ -1107,16 +1107,23 @@ one, because startup's fallback is exactly as trustworthy as this record:
   on a post-RFC root the record is created at open, before the first
   checkpoint can exist — and open **fails closed** on it as
   `OpenError::Corrupt`, naming the missing file; both absent is the
-  pre-RFC layout with no checkpoint — but only on an **empty** directory.
-  Both sidecars absent while any `*.wal` segment is present is
-  `OpenError::Corrupt` too, naming both files: a served root writes a
-  checkpoint on its first barrier, so segments without either sidecar is
-  either a partial backup or a hand-edited directory, and reading it as
-  "fresh" would replay frames whose Parquet rows may already exist. The
-  legitimate pre-RFC root reaches this open with segments *and* a
-  version-1 `CHECKPOINT`, which is the row above; a fresh root under this
-  RFC reaches it with a record already on disk, since the record is written
-  before the first segment is created (the bullet above). Per
+  pre-RFC layout with no checkpoint — and that is the shape **every live
+  pre-RFC root has**, since `Wal::checkpoint` has no production caller
+  (#793): a served node today holds segments and neither sidecar. An
+  earlier draft of this row failed such a root closed, which would have
+  refused to start every existing deployment; the rule is therefore scoped
+  to roots that carry a **post-RFC witness**. The witness that survives
+  when both sidecars are gone is the snapshot artefact's format version:
+  this RFC bumps it to 2 (§3.1), so a root whose `snapshots/` holds a
+  version-2 artefact has run under this RFC and its missing sidecars are a
+  loss — `OpenError::Corrupt`, naming both files, because reading it as
+  "fresh" would replay frames whose Parquet rows may already exist. With
+  no version-2 artefact, segments and neither sidecar is the legacy shape
+  and takes the legacy branch, belted by the same stale-gap check every
+  legacy root gets (a tenant whose snapshot is missing and whose oldest
+  surviving frame is above its last recorded horizon fails closed). A
+  fresh root under this RFC never reaches that row at all: its record is
+  written before the first segment is created (the bullet above). Per
   the pre-production layout policy that read path is the whole migration
   — no tooling — and the implementing PR carries the `!` marker for the
   sidecar version bump beside the snapshot one. The matrix is symmetric: a
@@ -1972,6 +1979,36 @@ the *first* pass of a node that has never reclaimed — the incident node held
 1,113 unlinks take. In steady state, after §3.2 is running, a pass has a
 handful of segments to consider and the cap never binds.
 
+### 3.8 Tunables classification
+
+RFC 0008 §6.9 classifies every operator-visible WAL knob as exactly one of
+**Tunable** or **Invariant**, with a startup-validated range and the
+`CLAUDE.md` §3 invariant it lives inside (RFC 0004 §3.1's schema). This RFC
+adds knobs and gives two existing ones their first caller, so it carries its
+own rows in the same schema. Names are the `WalConfig` fields; §6.9's
+`wal_`-prefixed spellings are the same knobs on the operator surface. All
+are **process-global**, as §6.9 requires — the WAL is one workspace-wide
+log — and every range below is validated in `Wal::open`, which refuses to
+open with `OpenError::InvalidConfig` rather than clamping, exactly as the
+existing tunables do.
+
+| Knob | Class | Default | Validated range | Inside invariant |
+|---|---|---|---|---|
+| `barrier_secs` (new, §3.1) | Tunable | `300` — the record sink's age trigger, so the barrier adds no sub-target object a size or age flush would not already write | `1..=3_600` | §3.4 — sets how long an acknowledged frame can sit unpublished before the checkpoint can advance past it, and with it the recovery replay depth |
+| `housekeeping_secs` (RFC 0008 §6.9; first caller here, §3.2) | Tunable | `60` (unchanged) | `1..=3_600` (unchanged) | §3.6 — bounds local-disk pressure; this RFC supplies the pass the knob was always meant to drive |
+| `segment_age_secs` (RFC 0008 §6.9; second caller here, §3.2's idle rotation) | Tunable | `600` (unchanged) | `1..=86_400` (unchanged) | §3.4 — bounds recovery window; the idle rotation makes an idle node's last segment reclaimable within `segment_age_secs + barrier_secs + housekeeping_secs` |
+| `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
+| `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
+| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — version byte, checksum, consumer mode, `checkpoint_armed` / `checkpoint_seen`, per-tenant entries and `planned` list | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape |
+| `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
+| Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
+
+`max_unlinks_per_pass` is the one row whose validation reads another knob,
+which is why it lives in the WAL rather than in the caller: only `Wal::open`
+sees both numbers. The three Invariant rows are the persisted shapes this
+RFC introduces or bumps; each carries the `!` marker for the implementing
+PR under the pre-production layout policy, and none is operator-settable.
+
 ## 4. Alternatives considered
 
 **Checkpoint on its own timer, independent of the publication barrier.**
@@ -2380,8 +2417,11 @@ memory, and nothing here claims to.
 > - **And** a root that has reclaimed and whose `RECLAIM` is then deleted
 >   fails open naming the missing record — its `CHECKPOINT` is version 2, so
 >   the root is post-RFC — rather than recreating an empty record and pinning
-> - **And** a root holding segments but neither sidecar fails open naming
->   both, while an empty directory with neither opens as a fresh root
+> - **And** a root holding segments and neither sidecar fails open naming
+>   both **when its snapshots carry the version-2 format**, while the same
+>   directory with version-1 (or no) snapshot artefacts — every live
+>   pre-RFC root — opens on the legacy branch, and an empty directory with
+>   neither sidecar opens as a fresh root
 > - **And** a node's own first start is never that state: the empty record
 >   is durable before the initial segment is created, so a restart
 >   immediately after a fresh `Wal::open` — with or without a crash between
@@ -2615,11 +2655,11 @@ they are not substitutes for the rest.
       `WalMetrics` documents the directory walk as best-effort; exporting
       it on every collection may not be free on a WAL with many
       segments — though after §3.2 there should be far fewer.
-- [ ] `max_unlinks_per_pass`'s default *value*, which trades first-pass
+- [ ] `max_unlinks_per_pass`'s default *value* only, which trades first-pass
       stall against how long a large backlog takes to clear. The knob is
-      settled — a `WalConfig` tunable validated at `Wal::open` against
-      `rotation_retry_attempts` (§3.7) — and 128 is the proposed default; the
-      soak run (RFC0052.3) is what should confirm or move the number.
+      settled — §3.8 classifies it, with its class, proposed default and
+      validated range — and the soak run (RFC0052.3) is what should confirm
+      or move the number.
 - [ ] Whether the actionable halt for a pre-existing rotation remnant (§3.3)
       deserves a WAL verb to remove the file, or stays a documented manual
       step. The decision must remain a human's either way — no shape-based
@@ -2660,6 +2700,14 @@ they are not substitutes for the rest.
     lowering `failed_epoch` and decrementing its count, so its clear can be
     a CAS on the pair — which stage 1 never performs (only a restart
     clears) and stage 2 does.
+  - *RFC 0053 §3.2* adds an eligibility case §3.2's predicate cannot
+    express: a closed segment holding **no valid frame** — one its seal
+    truncated back to a header — has no tenant offsets and no highest
+    frame offset to compare, so it is unconditionally eligible and popped
+    ahead of the horizon-driven candidates. That state cannot arise under
+    this RFC alone, since rotation closes a segment only when it holds a
+    frame, which is the assumption §3.2's predicate rests on; it is RFC
+    0053's sealing that creates it, so the case belongs there.
   - *RFC 0053 §3.1* also amends §3.7's `append_batch`: it takes a
     `RotationDecision` (`Rotate` / `Reuse`) produced once by the
     reservation under the journal mutex, so the age-sensitive rotation

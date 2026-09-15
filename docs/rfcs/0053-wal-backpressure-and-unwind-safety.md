@@ -1800,9 +1800,13 @@ shape RFC 0052 §3.2 settled on and for the same reason: `TenantId` is a
 validated string, not a UUID, so any fixed-width *digest* of it either
 truncates or collides, and a collision would silently merge two tenants'
 marks. So each slot opens with a **dictionary** of `max_tenants` fixed
-records, `[u16 len][128 B key bytes][2 B reserved]` (132 B), `len` naming
-how many of the key bytes are live and an unused record carrying `len =
-0`; every entry then references a tenant by a **`u16` slot id** into it.
+records, `[u16 len][128 B key bytes][u16 flags]` (132 B, the layout RFC
+0052 §3.2 pins at those offsets), `len` naming how many of the key bytes
+are live and an unused record carrying `len = 0`. The trailing field is
+**flags, not reserved space**: **bit 0 `tombstoned`**, bits 1–15
+reserved, zero and checked on read like every other reserved field — the
+tombstone below needs an encoded home, and this is it, typed identically
+to `RECLAIM`'s record so one reader serves both files. every entry then references a tenant by a **`u16` slot id** into it.
 The mapping is injective by construction and round-trips exactly — the
 key is the tenant id itself, not a derivation.
 
@@ -1926,7 +1930,8 @@ stable: entry `i` belongs to slot id `i`, occupancy is the entry's own
 An earlier draft made the live entries a dense prefix `[0, entry_count)`,
 which cannot survive a stable id: removing a tenant would renumber every
 id above it. A **tombstone** covers removal instead — the dictionary
-record keeps its key with a `tombstoned` bit set, the entry is zeroed, and
+record keeps its key with its `tombstoned` bit set (bit 0 of the record's
+flags field, at offset 130 within the record), the entry is zeroed, and
 the id is **retired, not freed**: no later tenant ever takes it, since
 nothing in this design renumbers — a resize preserves ids and there is no
 compaction pass. A tombstone therefore holds its id for the life of the

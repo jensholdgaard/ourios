@@ -884,8 +884,16 @@ append, which under backpressure never comes — honouring its origin: a
 failed `Open`-origin discharge is an ordinary retryable sync failure outside
 the budget, a failed `Rotation`-origin one draws on it, exactly as RFC 0052
 §3.3 says for `sync` — and only then applies the
-no-op rule: `Ok` without a new segment when the current one holds no frames,
-so a timer that calls it unconditionally cannot manufacture empty segments.
+no-op rule — **for a `Discretionary` call only**: `Ok` without a new
+segment when the current one holds no frames, so a timer that calls it
+unconditionally cannot manufacture empty segments. An **`Owed`** call has
+the opposite need and takes the opposite answer: the segment a seal has
+closed must never take another frame *whether or not it holds one*, and a
+frameless sealed segment is exactly what a rollback to the header leaves,
+so an unconditional no-op would refuse the rotation that seal requires and
+leave the WAL writing into a segment it has just forbidden. So `Owed`
+rotates regardless of the frame count, and the frameless segment it leaves
+behind is the one §3.1 makes unconditionally eligible.
 The timer reaches it through the coordinator's journal mutex,
 exactly as RFC 0052 §3.7 routes `checkpoint` and `housekeeping`, so the
 single-writer position still has one owner.
@@ -999,10 +1007,25 @@ keys, so a panic *after* the store accepted an object but *before* the publish
 returned leaves that object in place and requeues its rows; the next publish
 writes them again under a new key, and two query-visible objects carry the
 same rows, in the same process. Recovery's replay suppression is a
-restart-time mechanism over WAL frames and never sees this. This RFC accepts
-it, bounded and counted: at most one extra object per panic, visible through
-the `cadence_panic` counter beside the flushed-partition counters, and
-asserted by RFC0053.2. The bound holds only because settlement is
+restart-time mechanism over WAL frames and never sees this. That is bounded within a process, but a **crash** after the ambiguous PUT
+turns it unbounded: the rows are requeued, a normal drain republishes them
+under a third key, and a restart replays the frame and publishes a fourth
+— the intent-and-frontier protocol §3.2 defines covers an `unmined`
+settlement and reaches none of this. So the **deterministic key covers
+every ambiguous retry**, not settlements alone: when a publish is
+requeued after its put may have been accepted — the ambiguous arm, which
+the `RecoverableBatch` already distinguishes from a clean failure — the
+retry names its object by the same name-based (RFC 4122 v5) derivation
+§3.2 uses, over the tenant, the partition key and the partition's frame
+range, rather than a fresh `UUIDv7`. Every later attempt at those rows,
+in this process or after a restart, writes that same name, and the
+store's last-writer-wins overwrite collapses them. The bound is then
+truthful rather than optimistic: an ambiguous publish costs **at most one
+object**, however many times it is retried or replayed, and a clean
+failure costs none, since nothing was written. Only a publish that has
+never been ambiguous keeps its `UUIDv7`. This RFC accepts the one object,
+counted through the `cadence_panic` counter beside the flushed-partition
+counters, and asserted by RFC0053.2. The bound holds only because settlement is
 **per partition**, stated below: a drained batch spans several record
 partitions and audit groups, and requeueing the whole batch after a panic in
 the third put would duplicate the two objects already accepted. **Two settlements are meant by that word, and this RFC keeps them apart.**
@@ -1418,15 +1441,24 @@ admission-mutex insertion is what makes that decision visible to requests.
 **And every completion path removes it again**, under the admission mutex
 alone, in the same reacquisition pattern the tenant table uses: a rebuild
 that **succeeded** removes the tenant from the settling set after it has
-removed the entry, so the next request is admitted; a rebuild that
-**unwound** removes it too, since the entry has gone back to `Unresolved`
-and the next trigger will claim it afresh — leaving it in would refuse the
-tenant while nothing is settling it; and a rebuild that found the tenant
+removed the entry, so the next request is admitted; a rebuild that found the tenant
 **unrecoverable** removes it as well, because that tenant is refused by
 its own terminal state from then on and two refusal reasons for one tenant
-is one too many. So `ourios.wal.settling_tenants` returns to zero on every
-path, and a tenant is never refused by a set entry no settlement owns.
-RFC0053.2 asserts the removal on all three.
+is one too many. A rebuild that **unwound** is the exception, and
+deliberately so: the entry goes back to `Unresolved` but the tenant
+**stays refused**, because the tree is half-mutated — the panic left it
+between the widening and its audit event, which is the state the rebuild
+exists to repair — and admitting a request into that window is exactly the
+defect the claim prevents. So admission is refused for as long as the
+tenant has an `unmined` entry at all, `Unresolved` or `Settling` alike,
+and the set is really "tenants with an unresolved entry" rather than
+"tenants a settler is holding". The **retry is the barrier tick**: it
+settles every unresolved entry at the start of each tick (§3.2), so the
+next tick claims the entry afresh, and no ingest path has to coordinate a
+retry it cannot perform while refused. So
+`ourios.wal.settling_tenants` returns to zero when a rebuild succeeds or
+the tenant goes terminal, and stays nonzero — visibly — while a panicked
+rebuild awaits its next tick. RFC0053.2 asserts all three paths.
 No path takes the admission mutex while holding any of the other three,
 which is what makes the order a total one. The
 refusal is its own error, `ReceiveError::SettlementInProgress { tenant }`,
@@ -1469,8 +1501,17 @@ predate a miner on that root, which is why reading the mode classifies
 nothing a running node did as loss.
 That tenant is marked **unrecoverable**, and isolated rather than left to
 pin the node: its appends are refused under the server-terminal,
-client-retryable class naming the tenant; its entry leaves the clamp set
-for a per-tenant `Refused` state, so `last_durable` and the node-wide
+client-retryable class naming the tenant — **and a turn already admitted
+re-tests that before it mines**, since no replacement tree is installed in
+this branch and a turn that passed admission before the settler ran would
+otherwise mine and publish against the poisoned tree once the exclusion is
+released. The check sits at the top of the mining span, immediately after
+the turn takes the miner lock and before its first `ingest_mined`: it
+re-reads the tenant's admission state and, finding `Refused`, abandons the
+batch with the same terminal error rather than mining it. The frame is
+already durable and unacknowledged, so abandoning loses nothing a restart
+will not replay — and a restart is what clears the state. Its entry leaves
+the clamp set for a per-tenant `Refused` state, so `last_durable` and the node-wide
 checkpoint advance for everyone else; its frames are retained instead by
 RFC 0052's own pin — the receiver drops the tenant from the
 `SnapshotHorizons` it hands to `maintain`, so the WAL pins the tenant at
@@ -1615,9 +1656,29 @@ records, `[u16 len][128 B key bytes][2 B reserved]` (132 B), `len` naming
 how many of the key bytes are live and an unused record carrying `len =
 0`; every entry then references a tenant by a **`u16` slot id** into it.
 The mapping is injective by construction and round-trips exactly — the
-key is the tenant id itself, not a derivation — and the dictionary is the
-same one `RECLAIM` carries, so the two files agree tenant for tenant and
-a slot id means the same thing in both.
+key is the tenant id itself, not a derivation.
+
+**The two files share one id space, and that needs saying rather than
+assuming.** Each carries its own copy of the dictionary — both must be
+readable alone — but a copy is not agreement: if each compacted its own
+tenant list on write, the same tenant would take different ids in the two
+files and every cross-reading of them would be wrong. So the id space has
+an owner and a lifetime. **`RECLAIM` owns it**: the WAL assigns a tenant
+its slot id when that tenant is first recorded in either sidecar, in
+`RECLAIM`'s dictionary, from the in-memory table open seeds from that
+file. **Ids are never renumbered and never reused while the tenant is
+recorded in either file** — neither file may compact on its own, and a
+tenant that leaves one but remains in the other keeps its id. `PUBLISHED`
+is written from that same in-memory table, so its dictionary is that
+dictionary, at the same ids, by construction rather than by convention.
+**A rebuild is the one place ids may be reassigned**, and it is safe
+precisely because §3.2 makes it rewrite *both* files as one operation from
+the one table. And the claim is enforced rather than trusted: at open,
+after both files are read, every id the two dictionaries both name must
+carry the same key, and a mismatch is **fail-closed**, `OpenError::Corrupt`
+naming both files and the offending id — a state no correct writer can
+produce, and one that silently crosses two tenants' marks if it is read
+past.
 
 **The key is 128 bytes, which is what the governing spec says.** RFC 0046
 §3.1 caps a normalised tenant id at 256 bytes, but it is not the last word:
@@ -1716,7 +1777,16 @@ slot id is a `u16`: `validate_config` rejects `max_tenants > 65_536` with
 that reason. The bound is 65,536 rather than 65,535 because **slot id 0 is
 usable** — a position is marked unused by its dictionary record's `len =
 0`, not by a reserved id — so every id in `0..=65_535` names a real
-position. Lowering the knob below the recorded `entry_count` is
+position. **The recovered tenant set is validated too, not just the
+recorded count**: recovery seeds `Held` from every tenant restored from
+snapshots and replay, which can exceed a lowered `max_tenants` while
+`entry_count` alone passes — a sidecar records only the tenants that have
+a frontier, and a root can hold more tenants than that. So before the
+coordinator is constructed, open counts the tenants recovery restored and
+**refuses to start** when that count exceeds the configured cap, naming
+the recovered count and the cap, on the same fail-closed posture as every
+other geometry mismatch; the operator raises the knob back or starts a
+fresh root. Lowering the knob below the recorded `entry_count` is
 **refused at `Wal::open`** too, as the same error, naming both numbers, since the marks of the
 tenants that no longer fit cannot be dropped without losing their
 frontiers; raising it needs a **new file, written at open before the first

@@ -631,9 +631,20 @@ the same mutex the reservation takes, with two states: a new id takes a
 Held` is at the guard — and the slot is **reference-counted per in-flight
 first write**, so concurrent first writes for one id share it; it moves to
 **`Held`** when any of them has its sync return `Ok` and the tenant is
-installed in the miner, and it is released only when the *last* in-flight
-first write for that id has settled without a success **and left no frame
-behind** — **and that id has no unresolved `unmined` entry**. The
+installed in the miner — and **the transition has a stated home**, because
+both of those happen outside the admission mutex and the lock order
+forbids reaching back for it while the miner lock is held. So the turn
+records the transition *after* it releases the miner lock, **reacquiring
+the admission mutex alone**, which the order permits precisely because
+nothing else is then held; the same reacquisition carries the rollback,
+releasing the reservation when the sync failed or the install did not
+happen. The table and the exported count cannot diverge because they are
+one write: `ourios.wal.tenants.usage`'s `held` and `reserved` states are
+derived from the table under that same hold, never counted separately, so
+a reader sees `Reserved` or `Held` for a given id and never a total that
+disagrees with the table it came from. The slot is released only when the
+*last* in-flight first write for that id has settled without a success
+**and left no frame behind** — **and that id has no unresolved `unmined` entry**. The
 frame clause matters because the two failure shapes differ: an append that
 failed never reached the segment, so nothing survives and the slot is
 released; a *sync* that failed leaves the frame in the segment
@@ -1354,6 +1365,18 @@ request can be admitted for a tenant whose rebuild has begun. The miner
 lock still carries the `Unresolved`/`Settling` transition on the entry
 itself, which is what makes exactly one trigger the settler; the
 admission-mutex insertion is what makes that decision visible to requests.
+**And every completion path removes it again**, under the admission mutex
+alone, in the same reacquisition pattern the tenant table uses: a rebuild
+that **succeeded** removes the tenant from the settling set after it has
+removed the entry, so the next request is admitted; a rebuild that
+**unwound** removes it too, since the entry has gone back to `Unresolved`
+and the next trigger will claim it afresh — leaving it in would refuse the
+tenant while nothing is settling it; and a rebuild that found the tenant
+**unrecoverable** removes it as well, because that tenant is refused by
+its own terminal state from then on and two refusal reasons for one tenant
+is one too many. So `ourios.wal.settling_tenants` returns to zero on every
+path, and a tenant is never refused by a set entry no settlement owns.
+RFC0053.2 asserts the removal on all three.
 No path takes the admission mutex while holding any of the other three,
 which is what makes the order a total one. The
 refusal is its own error, `ReceiveError::SettlementInProgress { tenant }`,
@@ -1527,7 +1550,7 @@ shape RFC 0052 §3.2 settled on and for the same reason: `TenantId` is a
 validated string, not a UUID, so any fixed-width *digest* of it either
 truncates or collides, and a collision would silently merge two tenants'
 marks. So each slot opens with a **dictionary** of `max_tenants` fixed
-records, `[u16 len][256 B key bytes][2 B reserved]` (260 B), `len` naming
+records, `[u16 len][128 B key bytes][2 B reserved]` (132 B), `len` naming
 how many of the key bytes are live and an unused record carrying `len =
 0`; every entry then references a tenant by a **`u16` slot id** into it.
 The mapping is injective by construction and round-trips exactly — the
@@ -1535,18 +1558,20 @@ key is the tenant id itself, not a derivation — and the dictionary is the
 same one `RECLAIM` carries, so the two files agree tenant for tenant and
 a slot id means the same thing in both.
 
-**The key is 256 bytes because the accepted spec says so**, not 128: RFC
-0046 §3.1 — accepted — normalises a tenant id at extraction and requires
-the result to be "non-empty, at most 256 bytes", and its replay prefix
-rejects a length above 256. `ourios-core`'s `MAX_TENANT_BYTES = 128` is a
-*stricter* runtime check, which is allowed and refuses ids the spec would
-admit, but a persisted layout that can never grow must be sized to the
-spec's bound: sizing to 128 would mean a format change the day that
-constant is relaxed to match RFC 0046. RFC 0052's dictionary record is
-132 B against the same reasoning and needs the same correction.
+**The key is 128 bytes, which is what the governing spec says.** RFC 0046
+§3.1 caps a normalised tenant id at 256 bytes, but it is not the last word:
+**RFC 0048 §3.1 — accepted, and titled "Tenant id grammar (amends RFC 0046
+§3.1)" — narrows the grammar to 1–128 bytes of ASCII graphic characters**,
+which is why `ourios-core`'s `MAX_TENANT_BYTES = 128` matches the spec
+rather than being stricter than it. Sizing the record at 128 is therefore
+sizing it to the accepted bound, not to an implementation detail. (An
+earlier round of this RFC read RFC 0046 alone and sized the record at
+260 B; reading an amended section without following its amendment is the
+mistake, and the `rfc-check` skill's status routing exists to catch it.)
 
 An entry is then `[u16 slot id][u16 flags][4 B reserved][24 B records
-WalOffset][24 B audit WalOffset]` — 56 B — where a `WalOffset` is its
+WalOffset][24 B audit WalOffset]` — 56 B, unchanged, since it names a
+tenant by slot id rather than by key — where a `WalOffset` is its
 16 B segment UUID plus its 8 B byte offset, the pinned 24 B, and `flags`
 carries the `publishing` bit §3.2's settlement uses. **Recovery maps
 through the dictionary**, not through a live tenant set: a slot id reads
@@ -1558,10 +1583,10 @@ record always has. **Positions are not allocated or reused per tenant**:
 dictionary and entries are written in tenant-id order on every write, and
 a write rewrites the whole slot — no free list, no position to leak, which
 is what keeps the geometry fixed. The file's size is therefore decided at
-open by `max_tenants` alone: a slot is `24 + (260 + 56) × max_tenants + 8`
+open by `max_tenants` alone: a slot is `24 + (132 + 56) × max_tenants + 8`
 bytes and the file `32 + 2 × slot`, which at the default 1024 tenants is
-323,616 B a slot and 647,264 B — about 632 KiB — for the file, still small
-beside `RECLAIM`'s 10.1 MiB and a 128 MiB segment. **Changing `max_tenants` therefore changes
+192,544 B a slot and 385,120 B — about 376 KiB — for the file, small
+beside `RECLAIM` and a 128 MiB segment. **Changing `max_tenants` therefore changes
 a persisted layout**, and two rules follow, both mirroring `RECLAIM`'s.
 **The file describes its own geometry**: the 32-byte file header carries a
 `u32 max_tenants` (the value it was preallocated for) beside the magic and
@@ -2526,8 +2551,9 @@ that decision lands the RFC stops at `green`, and says so.
 - RFC 0005 §7 (audit files and their durability clause) — **amended by §3.2
   of this RFC**: the audit sink's permanent-failure path reports a third
   outcome rather than success, `write_ordered` refuses the dependent record
-  publish on it, and the tenant becomes terminal until an operator or a
-  restart clears it. Without the amendment a dropped event is reported as
+  publish on it, and the tenant becomes terminal until a **restart** clears
+  it — restart alone, per §3.2, because the dropped events are out of the
+  sink's buffer and only recovery's re-mining regenerates them. Without the amendment a dropped event is reported as
   fully durable and its records publish anyway, which breaks both that
   clause and `CLAUDE.md` §3.1.
 - RFC 0014 §3.4 (sink memory ceiling) — the governing contract for the

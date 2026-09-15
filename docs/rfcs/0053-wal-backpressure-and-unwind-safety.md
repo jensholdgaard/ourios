@@ -1574,11 +1574,14 @@ that witness rather than universal: with the flag **armed but
 unconfirmed** the sidecar was never durably written, so seeding from `X`
 is correct; with it **confirmed** a sidecar that is now missing is a lost
 file and fails closed, as the matrix says. Only the first branch seeds
-from `X`, and a *stale* sidecar under either flag is not a fault at all,
-since `max(X, PUBLISHED)` takes the newer.
-Neither order is unsafe for the seed itself, which takes `max(X,
-PUBLISHED)` per tenant, so the newer of the two always dominates; the
-order is chosen for which crash window it leaves. The sidecar takes RFC 0052 §3.2's
+from `X`, and a *stale* sidecar under either flag is not a fault at all:
+its entries still **govern** for the tenants they name, per the
+authoritative-entry rule below, which replays a little more rather than
+suppressing what was never published.
+Neither order is unsafe for the seed itself — a present, valid entry
+governs its tenant either way, and the node-wide horizon reaches only the
+tenants without one — so the order is chosen for which crash window it
+leaves, not for which file wins. The sidecar takes RFC 0052 §3.2's
 `RECLAIM` shape rather than a temp-and-rename: a fixed byte layout with
 its own magic, two slots written alternately under a generation counter
 with a CRC32-C per slot, **preallocated at open and rewritten in place**,
@@ -1686,11 +1689,19 @@ version, so a reader never infers the shape from configuration, and
 **raising the knob is supported by a copy at open, not by a refusal**: a
 refusal would strand every existing root the day an operator needs more
 tenants, and the copy is crash-safe with the same primitives the WAL
-already uses. `Wal::open`, finding a configured `max_tenants` above the
-recorded one, rebuilds **both sidecars as one operation**, because the
-knob sizes `RECLAIM` as well and resizing only this one would let
-admission accept tenants reclamation cannot persist — a root that starts
-and then cannot record what it reclaimed. So the two rebuilds run
+already uses. `Wal::open` compares **both dimensions**, not one: `max_tenants`, which
+sizes this sidecar and `RECLAIM` alike, and **`max_unlinks_per_pass`**,
+which sizes `RECLAIM`'s planned list. Checking only the first was this
+RFC's gap rather than a format one — RFC 0052's header already records
+both — and it mattered: raising the unlink cap on an existing root would
+let a pass plan more entries than the fixed file can hold, with nothing
+detecting it. So the recorded pair is compared against the configured
+pair, a configured value **above** either recorded one triggers the
+rebuild and a value **below** the recorded `entry_count` is refused as
+before. Finding either dimension raised, open rebuilds **both sidecars as
+one operation**, because `max_tenants` sizes them both and resizing one
+alone would let admission accept tenants reclamation cannot persist — a
+root that starts and then cannot record what it reclaimed. So the two rebuilds run
 together, each writing its new geometry under the temp name its own RFC
 reserves — RFC 0052's `RECLAIM.new` and, in parallel, `PUBLISHED.new`, a
 name the sweep selector already covers — with the old dictionary and
@@ -1987,7 +1998,31 @@ settlement performs. An `unmined` entry is removed only once the rebuild
 has replayed through the span and its records have been submitted or
 buffered — retained across a failure or a second panic — so an entry that
 never settles holds the checkpoint, and those tenants' snapshots, visibly
-rather than silently. RFC0053.2 covers a swallowed submit followed by a
+rather than silently.
+
+**The replay is authoritative, and the tree it replaces takes its
+in-memory products with it.** `replace_tenant` discards the tree the
+panic left, but records mined from that tree can still be sitting in the
+sink — forwarded by `ingest_mined`'s salvage, or requeued by an unwind —
+and they carry that tree's `template_id`s while the replay allocates
+fresh ones from the never-rewound allocator. Publishing them later would
+put a row in Parquet whose template has no audit history to fold (RFC
+0017's versioned rendering), or a stale row beside the regenerated one
+for the same line. So the settlement has a handoff, stated in order:
+**before `replace_tenant` runs**, it quiesces the publisher for that
+tenant — waiting on the partitions already detached for it, which settle
+durable or requeue into the buffers — and then, **under the sink lock and
+in the same section as the tree swap**, drops every buffered record for
+that tenant from both sinks, including anything the quiesce just
+requeued. Only then is the tree replaced and the entry removed. Nothing
+is un-published, and nothing needs to be: a partition that settled
+*durable* is at or below the tenant's publication frontier by
+construction — publication settlement requires its audit events first —
+which is exactly the range the rebuild suppresses re-emission for. So
+after a rebuild the replay is the single source for everything above that
+frontier, and the discarded tree contributes nothing. RFC0053.2 asserts
+it: a salvaged record buffered before the rebuild is not published under
+its old `template_id`, and the regenerated row appears exactly once. RFC0053.2 covers a swallowed submit followed by a
 successful append, a mining panic followed by a successful append, a clean
 barrier taken while an entry is unresolved, a panic after `ingest_mined`
 returned, and a panic between a widening and its audit event.
@@ -2432,6 +2467,11 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** settlement rebuilds from the `SnapshotLedger`'s retained state,
 >   not the directory: a `.snap` renamed but not yet parent-fsynced, or left
 >   by a failed write, is never read
+> - **And** the rebuild drops the discarded tree's buffered records: the
+>   publisher is quiesced for that tenant, its detached partitions settle
+>   or requeue, every buffered record for it is dropped under the sink
+>   lock in the same section as `replace_tenant`, and no row is published
+>   under a `template_id` the replay did not allocate
 > - **And** a panic raised inside `ingest` after a leaf was widened and
 >   before its audit event was emitted is settled by a rebuild from the
 >   tenant's last installed snapshot: the widening is re-derived with its

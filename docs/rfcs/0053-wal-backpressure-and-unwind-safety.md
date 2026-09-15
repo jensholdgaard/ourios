@@ -20,7 +20,11 @@ superseded-by: —
 > reclamation removes bytes, its livelock fix needs the timer RFC 0052
 > introduces, and unwind safety is what lets the age sweep survive a panic
 > once the records it drops have somewhere safe to go. Touches `CLAUDE.md`
-> §3.4 throughout.
+> §3.4 throughout, and **amends accepted RFC 0005's audit-sink durability
+> clause** (§7, "The writer guarantees no audit event is lost across
+> crashes…"): a permanent audit write failure stops being a silent drop
+> that reports success and becomes a third outcome that refuses the
+> dependent record publish and makes the tenant terminal, per §3.2.
 
 ## 1. Summary
 
@@ -273,7 +277,9 @@ gone. The bound therefore charges them too — conservative in exactly the
 direction the bound needs, since the alternative is admitting against
 bytes that may still be on disk. This is a **segment
 admission bound, not a directory cap**: the `CHECKPOINT` and `RECLAIM`
-sidecars, their temp files, the `.wal.seal` sidecars §3.1 introduces below
+sidecars and the `CHECKPOINT` temp — RFC 0052 §3.2's `RECLAIM` is
+preallocated at open and rewritten in place, so it has none, and
+`PUBLISHED` takes the same shape — the `.wal.seal` sidecars §3.1 introduces below
 and their `.wal.seal.partial` temps, and rotation partials awaiting RFC
 0052's sweep are all outside it, so `disk_bytes` can exceed the bound by
 those and by the headers — each is either a small record or debris the
@@ -421,7 +427,13 @@ segment-bound**, and it is written against RFC 0052 §3.3's bumped
 version-2 segment and the frameless base case above sits on that same
 version: it carries a format version, the segment's own UUID, the
 last good length, and a checksum of those three, so a stale or corrupted
-seal cannot authorise anything. The rotation that follows the seal takes the slot check like any other,
+seal cannot authorise anything. The rotation that follows the seal obeys RFC 0052 §3.3's two standing
+rules for every rotation path: it **discharges a pending `Rotation` fsync
+obligation before starting another rotation**, refusing against the retry
+budget if that discharge fails, and it creates **no version-2 segment
+before the `RECLAIM` record is durable**, so a sealed segment never becomes
+the predecessor of a segment the record cannot account for. With those
+satisfied it takes the slot check like any other,
 but it is an **owed** rotation in §3.1's sense — the sealed segment must
 never take another frame — so the refusal is a fault rather than a shrug:
 with a slot it rotates; **without one the seal is written and the
@@ -854,12 +866,20 @@ outcome for the dependent records. `write_owned` returns a three-way
 result — fully durable, retained-for-retry, or **permanently failed** —
 and `write_ordered` refuses the record publish on the third exactly as it
 does on the second, requeueing the records rather than publishing them
-under a missing event; the dropped events are still counted and logged,
-and the quarantine path RFC 0025 §3.3 defines is what turns a genuinely
-unwritable event into an operator-visible record rather than a silent
-gap. The per-partition settlement below reads that third outcome as *not*
+under a missing event. **Refusing forever is not a contract, so the third
+outcome is terminal for that tenant**, not a retry loop: RFC 0025 §3.3's
+quarantine is for permanent `BatchError`s on *data records*, and it works
+by writing a `record_quarantined` event — into the very audit sink that is
+failing — so it cannot be the escape hatch here. Instead a permanently
+failed audit write puts the tenant in the **server-terminal,
+client-retryable** class §3.1 already defines: its records stay in the
+WAL, unpublished and unacknowledged-past, its appends are refused with
+the tenant named, the state is exported and alerted beside
+`ourios.wal.tenant_unrecoverable`, and it clears by operator action or a
+restart — a node whose audit store rejects writes permanently needs one.
+The per-partition settlement below reads that third outcome as *not*
 settled. RFC0053.2 asserts a permanent audit failure leaving the records
-unpublished and requeued.
+unpublished and requeued and the tenant terminal.
 
 The duplicate this creates is a new class, and it is stated rather than
 handed to recovery. Record and audit publishes write fresh `UUIDv7` object
@@ -1283,7 +1303,16 @@ its frame's offset *and its index within the frame* from the turn that
 mined it; a publish that settles durable marks those records settled in
 the coordinator's per-frame ledger (under the sink lock), and the
 watermark advances to a frame only when every record of that frame and of
-every frame below it is settled — a frame holds several records, the
+every frame below it is settled — **and only a durably published record
+counts**: a record the sink quarantined under RFC 0025 §3.3 is settled for
+*ownership* but is not in Parquet, so counting it would let recovery
+suppress a frame whose row never landed. Quarantine has its own
+disposition instead: such a frame advances the watermark once the
+quarantined record's `record_quarantined` event is **durable in the audit
+store**, because that event is the durable record of the row's fate and
+replaying the frame would only re-quarantine it — at most a duplicate
+quarantine event, never a lost row — and until then the watermark stops
+below that frame — a frame holds several records, the
 no-pool path publishes them one at a time, and a frame with some records
 durable and a later one lost must not be counted as published. Progress
 inside a partially published frame is kept in the `unmined` entry instead:
@@ -1312,21 +1341,46 @@ watermark is written durably on the checkpoint's own path, as an
 **amendment to RFC 0052's sidecar layout**: `Journal::checkpoint` gains
 the per-tenant map, `fn checkpoint(&mut self, durable_to: WalOffset,
 published: &HashMap<TenantId, PublishedMarks>)` where `PublishedMarks {
-records: WalOffset, audit: WalOffset }` names the pair the rules need, and the WAL writes it to a
-`PUBLISHED` sidecar beside `CHECKPOINT` — a versioned, checksummed record
-of `(tenant, PublishedMarks)` entries, written to `PUBLISHED.tmp`, fsynced, renamed,
-parent fsynced, **before** `CHECKPOINT`'s own write in the same call, so a
-`CHECKPOINT` never exists without a `PUBLISHED` at least as new; `*.tmp`
-stays the sidecar namespace RFC 0052 §3.7 reserves, and the file is
-outside the byte bound like the other sidecars. **Audit has its own watermark in the same record**, because the record one
+records: WalOffset, audit: WalOffset }` names the pair the rules need, and
+the WAL writes it to a `PUBLISHED` sidecar beside `CHECKPOINT`, **before**
+`CHECKPOINT`'s own write in the same call, so a `CHECKPOINT` never exists
+without a `PUBLISHED` at least as new. The sidecar takes RFC 0052 §3.2's
+`RECLAIM` shape rather than a temp-and-rename: a fixed byte layout with
+its own magic, two slots written alternately under a generation counter
+with a CRC32-C per slot, **preallocated at open and rewritten in place**,
+so a torn write is caught by the slot's checksum and the older slot still
+reads — which also makes the settlement write below cheap, one in-place
+write and an fsync rather than a file creation. The file is outside the
+byte bound like the other sidecars. **Settlement needs to write it without
+a checkpoint**, so the surface gains one more call, another **amendment to
+RFC 0052 §3.7's list**: `fn publish_marks(&mut self, published:
+&HashMap<TenantId, PublishedMarks>) -> Result<(), ReclaimError>`, which
+writes and fsyncs the sidecar alone and advances no checkpoint. Its
+crash-ordering contract is what the marks need and nothing more: the write
+is durable before it returns, the marks are monotonic per tenant, and a
+crash mid-write leaves the previous slot readable, so a start reads either
+the old marks or the new and never a mixture. The migration start below
+uses the same call. **Audit has its own watermark in the same record**, because the record one
 does not cover it: an audit group can be durable in the audit store while
 the record publish of the same batch panics, and a crash before the next
 checkpoint would replay the frame and regenerate an event the store
-already holds. So the audit sink's settlement raises a per-tenant `audit`
-offset the way the record sink raises `records` — highest fully settled
-frame, monotonic, under the sink lock, and advanced only from RFC 0052
-§3.1's `audit_durable_through`, the position a store write has actually
-returned success for, never from an emptied buffer, since a concurrent
+already holds. **Both marks are frame offsets**, which is what RFC 0052's replay model
+requires: audit replay there is **regeneration-only** — the miner
+regenerates a frame's events as it re-mines it, and stored `AuditEvent`
+frames are never a source — so an event's identity comes from the frame
+that produced it, and a gate expressed in audit-stream positions would
+have nothing to compare a regenerated event against. RFC 0052 §3.1's
+`audit_durable_through` is the sink's own in-flight cursor over *events*,
+so the coordinator maps it to frames rather than storing it: emission
+records the source frame beside each event in the same per-frame ledger
+the records use (in-process only — no change to the audit row schema), and
+the audit mark advances to a frame when **every** event that frame
+produced is covered by `audit_durable_through`. A partially settled group
+therefore advances nothing, exactly as a partially settled frame does on
+the record side. So the audit sink's settlement raises a per-tenant
+`audit` offset the way the record sink raises `records` — highest fully
+settled frame, monotonic, under the sink lock, advanced only from
+`audit_durable_through`, never from an emptied buffer, since a concurrent
 drain can hold exactly those events in an unfinished write — both are
 written in the one `PUBLISHED` write, and **audit replay is gated on
 `max(X, audit watermark)`** while record replay is gated on the record
@@ -1423,7 +1477,17 @@ same durable path a checkpoint uses, before it removes the entry. Each
 window therefore closes with a durable frontier at the moment the
 ambiguity is resolved, not at whatever checkpoint happens next, and
 repeated crashes cannot accumulate copies of the same records: each
-replays only what lies above the last written frontier. The write is one
+replays only what lies above the last written frontier. **A failed forced
+write is a fail-closed park**, because neither obvious move is safe once
+the rebuild has already published: removing the entry loses the frontier
+and lets a later crash republish, and retaining it while carrying on lets
+the next settlement republish the same span. So the entry **stays**, the
+tenant is refused under the server-terminal, client-retryable class until
+the write succeeds, and the coordinator retries the same marks — the
+attempt is idempotent because the marks are already known and
+`publish_marks` is monotonic per tenant, so a retry writes the same
+frontier and a crash in between leaves the previous slot readable.
+RFC0053.2 covers it. The write is one
 sidecar write per settlement, which is a rare path by construction — it
 follows a panic — and the checkpoint's own write is unchanged. It follows that the salvage in `ingest_mined` is kept as
 belt-and-braces and its count is **never read** by this path: an earlier
@@ -1489,12 +1553,14 @@ barrier taken while an entry is unresolved, a panic after `ingest_mined`
 returned, and a panic between a widening and its audit event.
 
 **What is requeued depends on where the panic lands.** The audit events are
-requeued only while the audit write has not completed. Once `write_owned` has
-returned `true` every event is *settled* — durable in the audit store, or
-dropped by the sink's own permanent-failure policy, which is the fate a
-non-panicking publish gives it too; `true` means nothing is retained for
-retry, not that everything was written, and both non-retained outcomes are
-final. A later panic inside the record publish therefore requeues the records
+requeued only while the audit write has not completed. Once `write_owned`
+has returned **fully durable** — the only one of its three outcomes that
+lets the record phase proceed, per the amendment above — every event it
+covered is *settled*, durable in the audit store. The other two are not
+settlement: `retained` requeues the events and refuses the record publish
+as it always has, and `permanently failed` refuses it too and makes the
+tenant terminal, so no path treats a lost event as final while publishing
+the records that depended on it. A later panic inside the record publish therefore requeues the records
 alone. Requeueing settled audit events would manufacture a duplicate the
 policy tolerates but does not seek, and the ordering barrier does not need it:
 the next flush skips the record publish only when the audit sink has
@@ -2168,6 +2234,20 @@ that decision lands the RFC stops at `green`, and says so.
 - RFC 0018 §3.2 (retryable error mapping) — the reasoning for `503` on an
   unacked batch; §3.1 takes `UNAVAILABLE` over its `RESOURCE_EXHAUSTED`
   option.
+- RFC 0005 §7 (audit files and their durability clause) — **amended by §3.2
+  of this RFC**: the audit sink's permanent-failure path reports a third
+  outcome rather than success, `write_ordered` refuses the dependent record
+  publish on it, and the tenant becomes terminal until an operator or a
+  restart clears it. Without the amendment a dropped event is reported as
+  fully durable and its records publish anyway, which breaks both that
+  clause and `CLAUDE.md` §3.1.
+- RFC 0014 §3.4 (sink memory ceiling) — the governing contract for the
+  memory half of the bound; §4 and §6 make its implementation a
+  prerequisite for this RFC's end-to-end claim.
+- RFC 0025 §3.3 (permanent-encode quarantine) — the disposition for a
+  poisoned *data record*; §3.2 states why it cannot serve an audit-write
+  failure, and §3.2's watermark rule states how a quarantined record is
+  covered.
 - RFC 0014 — the record sink and its flush triggers.
 - `CLAUDE.md` §3.4 (WAL-before-ack), §6.3 (observability of ourselves).
 - `docs/hazards.md` #3 (WAL durability versus latency), #4 (small files).

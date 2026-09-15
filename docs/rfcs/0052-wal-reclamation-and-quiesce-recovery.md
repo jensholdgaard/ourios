@@ -1107,12 +1107,35 @@ one, because startup's fallback is exactly as trustworthy as this record:
   slot; the file is never shrunk, since a smaller geometry buys nothing
   and a rewrite risks something. Each slot is `[u64 generation][u32 entry_count][u32
   planned_count][u16 header_flags][u16 consumer_mode][4 B reserved]` (24 B),
-  then `entry_count` entries and `planned_count` planned records, then a
+  then three **fixed arrays** — the dictionary, the entries and the
+  planned records — then a
   `u32` CRC32-C and 4 B reserved (8 B). The checksum covers bytes
   `[0 .. slot_len - 8)` **of that slot** — everything before the trailer,
-  never the trailer itself, since a checksum cannot cover its own bytes —
-  and because `entry_count` and `planned_count` are inside that range, a
-  torn write cannot present as a shorter valid slot.
+  never the trailer itself, since a checksum cannot cover its own bytes.
+
+  **Nothing in a slot is walked by a count: a position *is* an identity.**
+  The entry array holds `max_tenants` entries at a fixed 32 B stride, and
+  **entry `i` belongs to dictionary record `i`** — the same id, by
+  position — so an entry carries no tenant field at all and occupancy is
+  the entry's own `occupied` flag. That is what makes an id survive a
+  tombstone: a removed tenant leaves its entry zeroed in place, the ids
+  above it do not move, and nothing renumbers until a rebuild. A dense
+  `[0, entry_count)` prefix cannot do both — a hole either skips an id or
+  shifts every id above it — which is why `entry_count` is a **count of
+  live entries for reporting, never a length to walk**.
+
+  The planned array is the same shape for the same reason, and costs
+  nothing to make so: `max_unlinks_per_pass` records at a fixed
+  `24 + 32 × max_tenants` stride, each with a fixed array of
+  `max_tenants` pairs where **pair `i` is dictionary record `i`'s**, so a
+  pair carries no tenant field either and its presence is its own flag.
+  The worst case was already preallocated — a variable stride would
+  occupy the identical bytes while making a record findable only by
+  walking its predecessors — so `planned_count` and a record's
+  `tenant_count` are likewise reported counts, not lengths. A reader that
+  trusted either as a length would be reading a torn or stale slot's
+  arithmetic; it reads the fixed strides instead, and the slot's CRC is
+  what says the bytes are the ones the writer wrote.
   `header_flags` carries `checkpoint_armed` (bit 0) and `checkpoint_seen`
   (bit 1), with the rest reserved and zero; `consumer_mode` is `0`
   unrecorded, `1` `Known`, `2` `NoConsumer` (§3.2), so "unrecorded" is a
@@ -1150,15 +1173,19 @@ one, because startup's fallback is exactly as trustworthy as this record:
   tenant id — so it round-trips to the original `TenantId` with no
   normalisation and no lossy comparison.
 
-  An entry is then `[u16 tenant_slot][u16 mode][4 B reserved][24 B
-  WalOffset]` (32 B) — the mode per entry as well as per root, since §3.2
+  An entry is then `[u16 flags][u16 mode][4 B reserved][24 B
+  WalOffset]` (32 B), its position naming its tenant and bit 0 of its
+  flags marking it `occupied` — the mode per entry as well as per root, since §3.2
   reads entries by the mode they were written under; a `WalOffset` is its
   16 B segment UUID plus its 8 B byte offset, 24 B, wherever it appears. A
-  planned record is `[16 B segment UUID][u16 tenant_count][6 B reserved]`
-  (24 B) followed by `tenant_count` pairs of `[u16 tenant_slot][6 B
-  reserved][24 B WalOffset]` (32 B each), with the `uncertain` bit in the
-  record's reserved word — **byte 22 of the planned record, bit 0**, the
-  first byte of its 6 B reserved field.
+  planned record is `[16 B segment UUID][u16 tenant_count][4 B reserved]
+  [u8 flags][1 B reserved]` (24 B) followed by its fixed array of
+  `max_tenants` pairs, each `[u16 flags][6 B reserved][24 B WalOffset]`
+  (32 B). The record's flags are at **byte 22**: bit 0 `uncertain`, bit 1
+  `occupied` — a planned array position that no segment occupies is
+  zeroed, which is how a pass shorter than the cap is represented. A
+  pair's flags bit 0 is `present`, and a pair's position is its tenant, so
+  an absent pair is simply a zeroed 32 B run.
 
   **Every field is at a fixed offset, little-endian, and every reserved
   byte is zero and checked.** Two implementations must produce the same
@@ -1186,16 +1213,16 @@ one, because startup's fallback is exactly as trustworthy as this record:
   | Dictionary record | 0 | 2 | `u16 len` |
   | | 2 | 128 | key bytes, `len` significant, remainder zero |
   | | 130 | 2 | `u16` flags: bit 0 `tombstoned`, bits 1–15 zero |
-  | Entry | 0 | 2 | `u16 tenant_slot` |
+  | Entry (array of `max_tenants`, entry `i` = dictionary record `i`) | 0 | 2 | `u16` flags: bit 0 `occupied`, bits 1–15 zero |
   | | 2 | 2 | `u16 mode` |
   | | 4 | 4 | reserved, zero |
   | | 8 | 24 | `WalOffset`: 16 B segment UUID then `u64` byte |
-  | Planned record | 0 | 16 | segment UUID |
-  | | 16 | 2 | `u16 tenant_count` |
+  | Planned record (array of `max_unlinks_per_pass`, stride `24 + 32 × max_tenants`) | 0 | 16 | segment UUID |
+  | | 16 | 2 | `u16 tenant_count` (reported, not a length) |
   | | 18 | 4 | reserved, zero |
-  | | 22 | 1 | flags: bit 0 `uncertain`, bits 1–7 zero |
+  | | 22 | 1 | flags: bit 0 `uncertain`, bit 1 `occupied`, bits 2–7 zero |
   | | 23 | 1 | reserved, zero |
-  | Planned pair | 0 | 2 | `u16 tenant_slot` |
+  | Planned pair (array of `max_tenants`, pair `i` = dictionary record `i`) | 0 | 2 | `u16` flags: bit 0 `present`, bits 1–15 zero |
   | | 2 | 6 | reserved, zero |
   | | 8 | 24 | `WalOffset` |
   | Slot trailer | 0 | 4 | `u32` CRC32-C over `[0 .. slot_len - 8)` of the slot |
@@ -1281,11 +1308,12 @@ one, because startup's fallback is exactly as trustworthy as this record:
   `32 + 164 × max_tenants + 24 × max_unlinks_per_pass + 32 ×
   (max_tenants × max_unlinks_per_pass)` bytes — the **one** normative
   definition of `slot_len`: its 24 B header and 8 B trailer, a 132 B
-  dictionary record and a 32 B entry per tenant, and a planned list of at
-  most `max_unlinks_per_pass` records of 24 B each naming at most every
-  tenant at 32 B a pair. At the defaults — 1024 tenants, a cap of 128 — a
-  slot is 4,365,344 B and the file 8,730,720 B, about 8.3 MiB, next to
-  segments of 128 MiB each. It scales with the product of the two knobs, so an
+  dictionary record and a 32 B entry per tenant, and `max_unlinks_per_pass`
+  planned records at a `24 + 32 × max_tenants` stride. Fixing those strides
+  changed no arithmetic — the worst case was always what the file
+  reserved — so the figures stand: at the defaults, 1024 tenants and a cap
+  of 128, a slot is 4,365,344 B and the file 8,730,720 B, about 8.3 MiB,
+  next to segments of 128 MiB each. It scales with the product of the two knobs, so an
   operator who raises both sees it grow; that is the price of a geometry
   that never moves. `Wal::open` allocates it once and **no later write
   ever extends it**: a tenant set that reaches `max_tenants` is refused by

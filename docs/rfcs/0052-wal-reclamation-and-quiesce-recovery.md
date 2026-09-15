@@ -1013,13 +1013,57 @@ persists, per tenant, the horizon it reclaimed under — a `RECLAIM` sidecar
 beside `CHECKPOINT`, under the same contract as that file and not a looser
 one, because startup's fallback is exactly as trustworthy as this record:
 
-- **Atomic and durable, before the unlinks — and off the writer position.**
-  Written whole to `RECLAIM.tmp` (a fixed name, like `CHECKPOINT.tmp`:
-  housekeeping is the single writer, so a temp left by a crash is simply
-  truncated by the next write, and RFC0052.16's selector leaves it alone),
-  fsynced, renamed over `RECLAIM`, parent fsynced — and only then does the
-  pass unlink. The record is on disk before any frame it accounts for is
-  gone; a torn write is a temp and never the record. None of that file work
+- **A fixed format, in the house style.** `CHECKPOINT` is a 32-byte record
+  — 4 B magic `b"OWCK"`, 2 B little-endian version, 2 B reserved flags,
+  then its payload — and `RECLAIM` follows it rather than inventing a
+  shape. The file is **two fixed-size slots** behind one 32-byte file
+  header: 4 B magic `b"OWRC"`, 2 B version (`= 1`), 2 B reserved flags,
+  8 B slot length, 8 B reserved, 8 B CRC32-C of the header's first 24
+  bytes. Each slot is `[u64 generation][u32 entry_count][u32
+  planned_count][u16 header_flags][u16 consumer_mode][4 B reserved]`, then
+  `entry_count` entries and `planned_count` planned records, then a
+  trailing 8 B CRC32-C over the whole slot — checksum coverage is the slot,
+  header included, so a torn write can never read as a shorter valid one.
+  `header_flags` carries `checkpoint_armed` (bit 0) and `checkpoint_seen`
+  (bit 1), with the rest reserved and zero; `consumer_mode` is `0`
+  unrecorded, `1` `Known`, `2` `NoConsumer` (§3.2), so "unrecorded" is a
+  value rather than an absence. An entry is `[16 B tenant UUID][16 B
+  WalOffset: segment UUID][8 B byte][u16 mode][6 B reserved]` — the mode
+  per entry as well as per root, since §3.2 reads entries by the mode they
+  were written under. A planned record is `[16 B segment UUID][u16
+  tenant_count][6 B reserved]` followed by `tenant_count` pairs of
+  `[16 B tenant UUID][16 B WalOffset]`, plus a `uncertain` bit in its
+  reserved word. `RECLAIM` is the fourth Invariant row in §3.8; the
+  polynomial is RFC 0008 §6.9's Castagnoli, as everywhere else in the WAL.
+- **Committed without allocating, because ENOSPC is the case this exists
+  for.** A temp-write-and-rename commit needs new blocks, and a full disk
+  is exactly when reclamation must run — writing the record would fail,
+  the pass would unlink nothing, and the WAL would wedge at the one moment
+  the operator needs it to drain. So the record is **preallocated once and
+  rewritten in place**, never renamed: `Wal::open` creates (or extends) it
+  to its full two-slot size and fsyncs it, and every pass writes the
+  *inactive* slot, fsyncs, and the higher `generation` makes it live — the
+  reader takes the valid slot with the greater generation, so a torn
+  in-place write leaves the previous slot intact and there is no rename,
+  no temp and no new block on the commit path. `RECLAIM.tmp` therefore
+  does not exist, and §3.2's temp-sweep selector is unchanged by this
+  record. The size bound follows from two numbers the config already
+  fixes: a slot is `24 + 48 × tenants + 24 × max_unlinks_per_pass + 32 ×
+  (tenants × max_unlinks_per_pass)` bytes at worst — the planned list holds
+  at most `max_unlinks_per_pass` segments, each naming at most every
+  tenant — and the file is two slots plus the 32-byte header. At the
+  proposed cap of 128 and a hundred tenants that is under 900 KiB, which
+  `Wal::open` allocates once. Growth is the one case that can still need
+  blocks: a tenant set that outgrows the preallocation is extended and
+  fsynced **before** the pass that needs it plans anything, and a failed
+  extension refuses that pass (logged, counted, retried next tick) rather
+  than reclaiming without a durable record — reclamation stalls, which is
+  the conservative direction, and the extension is attempted again on
+  every later pass. RFC0052.17 injects ENOSPC on both paths.
+- **Durable before the unlinks — and off the writer position.**
+  The record's slot write and fsync complete before the
+  pass unlinks anything. The record is on disk before any frame it accounts
+  for is gone; a torn write leaves the previous slot live. None of that file work
   happens under the journal mutex: serialising every tenant's entry and
   three fsyncs is O(tenant count) plus disk latency, which would put fsync
   time in front of every concurrent append and break RFC0052.12's O(cap)
@@ -1155,8 +1199,18 @@ one, because startup's fallback is exactly as trustworthy as this record:
   with any segment necessarily carries: `SEGMENT_VERSION` is bumped from 1
   to 2 for segments created under this RFC, and the reader accepts both —
   version 1 is a segment written before this RFC, version 2 one written
-  after. A root holding any version-2 segment with both sidecars absent
-  has run under this RFC and its missing sidecars are a loss —
+  after. The ordering rule that makes this witness safe is the one the
+  fresh-root case already established, generalised: **no version-2 segment
+  is ever created before the record is durable.** A legacy root rotates
+  before it ever checkpoints — rotation is append-driven and the first
+  barrier may be minutes away — so a first rotation that installed a
+  version-2 segment while the root still had no sidecar would leave
+  exactly the shape this row rejects, and the node would refuse to open
+  after a restart: a live root bricked by rotating. So the first rotation
+  on a legacy root writes the record (armed, mode unrecorded) and fsyncs
+  it before it creates the fresh segment, the same order `Wal::open` uses
+  on a fresh root. A root holding any version-2 segment with both sidecars
+  absent has run under this RFC and its missing sidecars are a loss —
   `OpenError::Corrupt`, naming both files, because reading it as "fresh"
   would replay frames whose Parquet rows may already exist. Only version-1
   segments and neither sidecar is the legacy shape and takes the legacy
@@ -1299,6 +1353,22 @@ that fsync and the install happens before it too, there is no orphan to clean up
 there — the file is the live append target. Unlinking it would destroy the
 segment the WAL is currently writing to. The retry is the directory fsync alone,
 carried by `dir_fsync_pending`.
+
+**One rotation obligation at a time.** A `Rotation`-origin
+`dir_fsync_pending` outlives the rotation that created it, and a later
+append or timer tick can find the segment due for rotation again. Starting
+that second rotation would install a segment whose predecessor's directory
+entry is still not durable, and a crash there loses the ordering the first
+obligation exists to restore. So **any path that begins a rotation — an
+append that observes the size or age trigger, and `Journal::rotate` —
+first discharges a pending `Rotation` obligation, and refuses the rotation
+if the discharge fails.** The refusal is not a new class: it consumes one
+unit of the retry budget like a failed `rotate`, so it is reported
+transient while the budget holds and server-terminal, client-retryable
+once it is exhausted (§3.3's classification, RFC0052.15) — and no batch is
+acknowledged in either case. An `Open`-origin obligation does not gate a
+rotation: it is an ordinary retryable sync failure outside the budget, and
+the rotation's own parent fsync discharges it.
 
 The orphan is why the current code quiesces rather than retrying, and the
 existing comment says so: a surviving directory entry whose header bytes
@@ -1747,7 +1817,8 @@ So the design is:
       segments: Vec<PlannedUnlink>,                    // no guard and no WAL handle
       partials: Vec<PathBuf>,
       record: ReclaimRecord,                           // the merged per-tenant horizons
-      root: PathBuf,                                   // for RECLAIM.tmp and the parent fsync
+      root: PathBuf,                                   // for the RECLAIM slot write and the
+                                                       // parent fsync after the unlinks
       progress: HousekeepingProgress,                  // floor, lag, capped — as of prepare
   }
   enum ReclaimOutcome {                                // what the file half did
@@ -1912,8 +1983,8 @@ So the design is:
   and a single `Journal` call would keep every unlink and fsync inside that
   guard, in front of every concurrent append: `maintain` locks the journal
   for `housekeeping_prepare` and releases it; runs the file half itself on
-  the plan's owned paths — merge and write `RECLAIM.tmp`, fsync, rename,
-  parent fsync, then the unlinks, then the parent fsync — with no guard
+  the plan's owned paths — merge and write the inactive `RECLAIM` slot in
+  place, fsync, then the unlinks, then the parent fsync — with no guard
   held; and locks again for `housekeeping_commit` with the outcome. Between
   the two the WAL keeps serving appends and rotations, which never touch an
   entry marked reclaiming. One plan is outstanding at a time by
@@ -1938,11 +2009,14 @@ So the design is:
   bytes survived the crash, its batch was never acknowledged — and §3.1's
   rule is that such a frame is never a mark. The seed is therefore the
   highest offset that is both delivered *and* covered by a sync known to
-  have succeeded, which in practice is the durable mark the WAL recorded
-  before the crash: the checkpoint, or the `last_durable` the sidecar
-  carries. When replay surfaces nothing at or below such a mark — a node
-  whose first sync never completed — the seed is `None` and the first
-  successful turn establishes it, which costs one barrier and never
+  have succeeded — and the only such offset that survives a crash is the
+  **`CHECKPOINT` mark**. `last_durable` is in-memory state the running
+  process rebuilds, persisted nowhere, so it cannot seed anything after a
+  restart; an earlier draft said "the checkpoint, or the `last_durable`
+  the sidecar carries", and the second half of that was wrong. So the seed
+  is the checkpoint mark when one exists and `None` otherwise — a node
+  whose first barrier never ran — with the first successful turn
+  establishing it, which costs one barrier and never
   stamps across an unacknowledged frame. The call runs **before
   the commit coordinator exists**, so there is no journal owner to checkpoint
   through. That call therefore deliberately advances no checkpoint; the first
@@ -2061,7 +2135,7 @@ existing tunables do.
 | `segment_age_secs` (RFC 0008 §6.9; second caller here, §3.2's idle rotation) | Tunable | `600` (unchanged) | `1..=86_400` (unchanged) | §3.4 — bounds recovery window; the idle rotation makes an idle node's last segment reclaimable within `segment_age_secs + barrier_secs + housekeeping_secs` |
 | `rotation_retry_attempts` (new, §3.3) | Tunable | `3` consecutive failed attempts | `1..=16` — a budget of zero would make the first transient failure terminal, and a large one delays the terminal state an operator must act on | §3.4 — decides when a rotation failure stops being retried and starts refusing appends; no batch is acknowledged in either state |
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
-| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — version byte, checksum, consumer mode, `checkpoint_armed` / `checkpoint_seen`, per-tenant entries and `planned` list | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape |
+| `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — `b"OWRC"` magic, `u16` version `1`, two CRC32-C-checksummed slots with a `u64` generation, `header_flags` (`checkpoint_armed`, `checkpoint_seen`), `consumer_mode`, per-tenant entries and the `planned` list; preallocated and rewritten in place | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape, and the in-place rewrite is what keeps the commit allocation-free on a full disk |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
 | Segment-header format **version 2** (§3.2) | Invariant | `2` (was `1`; the reader accepts both) | n/a | format compat — the version every root with a segment carries, and so the witness that separates a pre-RFC root from one that lost both sidecars, including a `NoConsumer` root with no snapshots |
 | Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
@@ -2319,12 +2393,12 @@ memory, and nothing here claims to.
 
 > **Scenario RFC0052.16 — The temp sweep touches only files of the reserved
 > partial shape**
-> - **Given** a WAL root holding a `CHECKPOINT.tmp` and a `RECLAIM.tmp`, a
->   snapshots directory holding a `*.snap.tmp`, and a stale
->   `<uuid>.wal.partial`
+> - **Given** a WAL root holding a `CHECKPOINT.tmp` and a `RECLAIM` (which
+>   has no temp of its own — it is rewritten in place, §3.2), a snapshots
+>   directory holding a `*.snap.tmp`, and a stale `<uuid>.wal.partial`
 > - **When** a housekeeping pass runs
-> - **Then** only the partial is unlinked: the checkpoint, reclaim and
->   snapshot temps survive
+> - **Then** only the partial is unlinked: the checkpoint temp, the reclaim
+>   record and the snapshot temp survive
 > - **And** the unlink is followed by a parent-directory fsync, so a crash
 >   cannot resurrect it
 
@@ -2493,6 +2567,14 @@ memory, and nothing here claims to.
 >   artefacts to witness with: its version-2 segments are the witness, so
 >   losing both sidecars fails closed rather than recreating an empty
 >   record over its reclaimed-through proof
+> - **And** a legacy root that rotates before its first checkpoint stays
+>   openable: the rotation writes and fsyncs the record before creating the
+>   version-2 segment, so no restart ever finds a version-2 segment beside
+>   no record — asserted by injecting a crash between the two steps
+> - **And** a record write that fails with `ENOSPC` reclaims nothing and
+>   refuses the pass rather than unlinking without a durable record, on
+>   both the slot write and the growth path, and a later pass on a disk
+>   with room completes normally
 > - **And** a node's own first start is never that state: the empty record
 >   is durable before the initial segment is created, so a restart
 >   immediately after a fresh `Wal::open` — with or without a crash between
@@ -2663,8 +2745,9 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   the `Corrupt` error's file name; fault injection at the two crash points
   (before rename, before first unlink) through the same hook the rotation
   tests use; and a two-pass monotonicity leg reading the record back.
-- **Temp sweep (RFC0052.16)** — a directory fixture holding all five file
-  kinds, asserting exactly one is removed. A fixture rather than a live
+- **Temp sweep (RFC0052.16)** — a directory fixture holding all four file
+  kinds (`CHECKPOINT.tmp`, `RECLAIM`, a `*.snap.tmp` and the partial; the
+  record has no temp of its own), asserting exactly one is removed. A fixture rather than a live
   rotation, because the point is the *selector*, and the dangerous cases
   (`CHECKPOINT.tmp`, `*.snap.tmp`) are produced by other subsystems.
 - **Reclassification (RFC0052.15)** — the classifier unit tests held on
@@ -2766,6 +2849,10 @@ they are not substitutes for the rest.
     written before `CHECKPOINT` in the same call, on the checkpoint's own
     durable path, and joining §3.2's sidecar matrix on the same fail-closed
     footing as `RECLAIM`.
+  - *RFC 0053 §3.2* makes a **permanently** failed audit write a distinct
+    outcome that refuses the dependent record publish, naming RFC 0005's
+    audit-sink contract; §3.1's wait-or-write rule here covers only the
+    transient case, which requeues.
   - *RFC 0053 §3.2* defines the **clear** arm of §3.1's packed failure
     word — which cut may CAS it back, and against which captured value —
     since stage 1 never clears and only a restart does. The packing itself

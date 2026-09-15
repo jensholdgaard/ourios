@@ -391,27 +391,45 @@ the caller's responsibility because the caller is what holds the mutex.
   exposes `fn max_frame_bytes(&self) -> usize`, and the coordinator rejects
   `payload_len > max_frame_bytes()` as `TooLarge` before it reads
   `reclaim_state()` at all; the WAL's own check remains as the backstop.
-  The full admission order is one sequence, stated once: **max-frame
-  validation, then the terminal-rotation check, then the tenant check,
-  then the bound** — so an oversize payload against a terminal WAL is
-  `TooLarge`, a legal payload against a terminal WAL is the terminal
-  classification without a `reclaim_state()` read, a legal payload for an
-  unrecoverable tenant (§3.2) on a healthy WAL is that tenant's terminal
-  classification, a legal payload for a *new* tenant at the `max_tenants`
-  guard is a `TenantCapacity` refusal, and only a legal payload for a held,
-  healthy tenant against a healthy WAL reaches the reservation. The tenant check has a source too:
+  The full admission order is one sequence, stated once, and it spans the
+  two locks §3.2 fixes rather than living in either alone: under the
+  **admission mutex**, *max-frame validation, then the tenant checks* —
+  the unrecoverable state and the `max_tenants` guard — and the settling
+  set; then, under the **journal mutex** and in the same hold as
+  everything else that reads journal state, *the terminal-rotation check,
+  then the bound*, then the rotation decision, the reservation and the
+  append. So an oversize payload against a terminal WAL is `TooLarge`, a
+  legal payload against a terminal WAL is the terminal classification
+  without a `reclaim_state()` read, a legal payload for an unrecoverable
+  tenant (§3.2) is that tenant's terminal classification, a legal payload
+  for a *new* tenant at the `max_tenants` guard is a `TenantCapacity`
+  refusal, and only a legal payload for a held, healthy tenant against a
+  healthy WAL reaches the reservation. **Terminal still precedes
+  backpressure**, which is the precedence that carries weight: both are
+  read in the same journal hold, terminal first, so a terminal WAL is
+  never reported as a bound. What moved is the tenant-versus-terminal
+  order — a tenant refusal now wins over a WAL-terminal one, where an
+  earlier draft had it the other way — and that is harmless by
+  construction: `TenantCapacity` and both terminal classifications render
+  the same `503` / `UNAVAILABLE` with no retry hint, so a client's remedy
+  is identical and only the named reason differs, where the tenant is the
+  more specific of the two. The tenant check has a source too:
   the receiver resolves the tenant out of band before `ingest` (RFC 0046
   §3.1 — `Pipeline::ingest` already takes the `TenantId`), the commit path
   carries it to the coordinator, and the coordinator consults its own
   `fn tenant_state(&self, tenant: &TenantId) -> TenantAdmission` (`Healthy`
-  or `Unrecoverable`, set by §3.2's settlement), under the same mutex —
-  the WAL-global `rotation_state()` cannot say it, since the journal has
-  no tenant in view. The classification is the same server-terminal,
+  or `Unrecoverable`, set by §3.2's settlement) under the **admission**
+  mutex, with the rest of its policy — the WAL-global `rotation_state()`
+  cannot say it, since the journal has no tenant in view, and the
+  coordinator's own map is not journal state. The classification is the same server-terminal,
   client-retryable class, naming the tenant; other tenants are unaffected. The terminal check has a named source: `Journal`
   gains `fn rotation_state(&self) -> RotationState` (`Healthy`, `Retrying {
   attempts }`, `Terminal`), a cheap categorical read with no snapshot
-  struct on the append path, taken under the journal mutex immediately
-  before the reservation, so it can neither race outside the mutex nor be
+  struct on the append path, taken **under the journal mutex, in the same
+  hold as the reservation and the append** — one acquisition, stated here
+  and in §3.2 the same way, because the alternatives both fail: read under
+  the admission mutex the state can change before the reservation, and
+  read under a separate journal acquisition the hold is no longer one, so it can neither race outside the mutex nor be
   confused with `reclaim_state()`; the test doubles implement it. RFC0053.1
   covers the combined case.
 
@@ -1298,12 +1316,16 @@ request for a `Settling` tenant is **refused at admission, before it takes
 a sequence**. **One protocol, stated once and the same in both sections.** The work
 splits by which state it reads, not by convenience. The **admission
 mutex** covers the coordinator's own policy — max-frame validation, the
-terminal-rotation and tenant checks, the settling set, and the tenant
-slot — and is released before the journal is touched. The **journal
-mutex** covers everything that reads or mutates journal state: the
-rotation-due evaluation, the byte and segment reservation taken from
-`reclaim_state()`, and the `append_batch` that consumes the resulting
-`RotationDecision`, all in **one hold**, which is what §3.1 requires and
+tenant checks, the settling set, and the tenant slot — and is released
+before the journal is touched. The **journal mutex** covers everything
+that reads or mutates journal state, and that includes the
+**terminal-rotation check**, which an earlier draft put under admission:
+`rotation_state()` reads the journal, so reading it under the admission
+mutex leaves the state free to change before the reservation. So the
+journal hold is the terminal check, the rotation-due evaluation, the byte
+and segment reservation taken from `reclaim_state()`, and the
+`append_batch` that consumes the resulting `RotationDecision`, all in
+**one hold**, which is what §3.1 requires and
 what makes the token sound. The binding is therefore atomic where it must
 be — a reservation cannot be made against a journal another append has
 moved — and the rollback is local to that hold: an append that fails,
@@ -1350,9 +1372,10 @@ them to the three RFC 0052 §3.1 fixes. Top to bottom: **admission mutex →
 barrier exclusion → miner lock → `last_durable`**, with the **journal
 mutex** taken below the admission mutex and never above it — an ingest
 turn takes the admission mutex for the coordinator's policy checks
-(max-frame, terminal state, tenant slot, settling set) and **releases
-it**, then takes the journal mutex alone for the rotation decision, the
-byte and segment reservation and `append_batch` in one hold — whose
+(max-frame, tenant state, tenant slot, settling set) and **releases
+it**, then takes the journal mutex alone for the terminal check, the
+rotation decision, the byte and segment reservation and `append_batch` in
+one hold — whose
 success allocates the sequence, and inside which a rotation does its
 directory work under that mutex only — then follows
 RFC 0052's order for the mining span; `maintain` takes the admission mutex
@@ -1690,9 +1713,15 @@ the record side. So the audit sink's settlement raises a per-tenant
 settled frame, monotonic, under the sink lock, advanced only from
 `audit_durable_through`, never from an emptied buffer, since a concurrent
 drain can hold exactly those events in an unfinished write — both are
-written in the one `PUBLISHED` write, and **audit replay is gated on
-`max(X, audit watermark)`** while record replay is gated on the record
-watermark. The §3.2 claim that a settled audit group is never requeued
+written in the one `PUBLISHED` write, and **audit replay is gated the same
+per-tenant way the record side is**: a tenant with a `PUBLISHED` entry is
+gated on `max(S, audit watermark)` from its own entry, and only a tenant
+without one falls back to the node-wide `X`. The node-wide form alone
+would carry the defect §3.2 fixed for records one round earlier — once
+`X` advances for everyone else, a lagging or unrecoverable tenant's
+regeneration would be suppressed for events that were never written, and
+a template event lost that way is `CLAUDE.md` §3.1's silent merge. The
+record gate is `max(S, records watermark)` per tenant on the same rule. The §3.2 claim that a settled audit group is never requeued
 therefore holds across a restart too, not only in-process. Recovery seeds both
 in-memory watermarks per tenant as the greater of the `PUBLISHED` entry
 and what the Parquet-side suppression horizon `X` implies — the read
@@ -2352,7 +2381,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   tenant's last installed snapshot: the widening is re-derived with its
 >   event, the version's audit history is complete, the records at or
 >   below the tenant's publication watermark — and, in the entry's own
->   frame, below `emit_from` — are present exactly once, and those in the
+>   frame, below `emit_from` — are present exactly once, the gate being
+>   that tenant's own `max(S, watermark)` for records and for audit alike
+>   and never the node-wide `X`, so a tenant whose frontier lags has its
+>   events regenerated rather than suppressed, and those in the
 >   ambiguous span are present at most twice, never absent; a frame with
 >   one record durable and a later one lost does not advance the
 >   watermark; a crash before the next checkpoint after a retried panic

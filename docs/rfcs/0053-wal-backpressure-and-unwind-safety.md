@@ -193,10 +193,12 @@ bounded separately, because frame bytes do not bound them — §3.1's forced
 rotation and age-based rotation both close near-empty segments, so an
 outage on a low-volume node accumulates headers while its frame bytes
 stand still: `WalConfig` gains **`max_segments`**, a ceiling on retained
-segments (closed, current and sealed alike), defaulting to
+**closed** segments — sealed ones among them, since a sealed segment is
+closed; the *current* segment is outside the cap, for the reason §3.1
+gives below — defaulting to
 `unreclaimed_bytes_limit / segment_size_bytes + 16` so a bound's worth of
-full segments always fits with slack for the near-empty ones, and a
-reservation whose append would rotate, while the retained count is at the
+full closed segments always fits with slack for the near-empty ones, and a
+reservation whose append would rotate, while `closed_retained` is at the
 ceiling, is refused under the same backpressure class with the `Segments`
 cause. Whether the append would rotate is the WAL's question, not the
 coordinator's, and the WAL's predicate is not size alone: `Wal::rotation_due`
@@ -245,20 +247,24 @@ that admits a closed segment beside the current one, and the derived
 default is far above it. (An earlier draft required two, because the cap
 then counted the current segment; with the current segment outside it the
 floor is one, and the two rules move together.) RFC0053.1 asserts the
-validation. At the ceiling a due rotation is **refused,
-never squeezed in**: the request path runs no housekeeping, since prepare,
-file half and commit put fsyncs in front of every concurrent append; the
-refusal sets the latch, the next `maintain` pass reclaims what it can, and
-the client returns after the `Retry-After` §3.1 computes — so with a
-reclaimable segment the request is refused once and admitted after the
-pass, and with nothing reclaimable it stays refused, and no forced
-rotation runs at the ceiling (below). A reservation that would not rotate
+validation. At the ceiling a **discretionary** due rotation is **refused,
+never squeezed in** — an *owed* rotation is the stated exception and
+proceeds regardless, since closing the current segment necessarily adds a
+closed one and refusing that is the deadlock §3.1 removes; the exception
+is why `Deferred { AtSegmentCap }` is now reachable only through the retry
+budget. For the discretionary case: the request path runs no housekeeping,
+since prepare, file half and commit put fsyncs in front of every
+concurrent append; the refusal sets the latch, the next `maintain` pass
+reclaims what it can, and the client returns after the `Retry-After` §3.1
+computes — so with a reclaimable segment the request is refused once and
+admitted after the pass, and with nothing reclaimable it stays refused,
+and no forced rotation runs at the ceiling (below). A reservation that would not rotate
 is unaffected, since it creates no header. **Every rotation takes the slot
 check, not only the reserved one**: RFC 0052 has two append-independent
 rotation callers — the barrier task's idle rotation (§3.2, rotate-before-
 cut under the exclusion) and the post-recovery step's owed rotation — and
-a rotation from either at `retained == max_segments` would create the
-segment the reservation refuses. So the check lives in `Wal::rotate`
+a *discretionary* rotation from either at `closed_retained ==
+max_segments` would create the closed segment the reservation refuses. So the check lives in `Wal::rotate`
 itself, under the journal mutex: at the ceiling it performs no rotation
 and returns `Ok(RotationOutcome::RefusedAtSegmentCap)`. RFC 0052 §3.7
 defines `Journal::rotate` as `Result<(), ReceiveError>`; this RFC amends
@@ -577,7 +583,15 @@ second knob rides with it, for a different growth: in open mode (RFC 0026
 §3.1, no `auth` configured) tenant ids are client-chosen, so the per-tenant
 `RECLAIM` entries and the `SnapshotLedger`'s retained states (§3.2) would
 grow with traffic rather than with an operator's tenant set. `ReceiverSection`
-gains **`max_tenants`** (default 1024, same `${env:VAR}` and Helm path):
+gains **`max_tenants`** (default 1024, same `${env:VAR}` and Helm path) —
+a knob that **sizes two persisted layouts**, not just an admission rule:
+RFC 0052 §3.2's `RECLAIM` slots are sized from it and
+`max_unlinks_per_pass` (5,295,136 B a slot, 10,590,304 B the file at the
+defaults), and `PUBLISHED` below is sized from it alone, both fixed for
+the life of the file. Neither file can grow, so **the admission guard is
+what prevents record overflow**: a new tenant id at the cap is refused
+here rather than overrunning a slot there, which is why the two RFCs land
+as a pair and why lowering the knob is an open-time decision (below):
 admission of a tenant id the miner does not yet hold, when the guard is
 reached, is refused as `TenantCapacity { count, limit }` naming the tenant
 — ordered with §3.1's tenant check, after the terminal-rotation check and
@@ -1372,11 +1386,43 @@ without a `PUBLISHED` at least as new. The sidecar takes RFC 0052 §3.2's
 its own magic, two slots written alternately under a generation counter
 with a CRC32-C per slot, **preallocated at open and rewritten in place**,
 so a torn write is caught by the slot's checksum and the older slot still
-reads. The widths follow `RECLAIM`'s exactly: the checksum is a `u32`
-followed by four reserved bytes and covers **only the bytes preceding
-it**, and each entry's two marks are `WalOffset`s at their pinned 24 B, so
-a slot is a fixed size per tenant and the file's size is decided at open
-by `max_tenants` rather than by what a write happens to carry — which also makes the settlement write below cheap, one in-place
+reads. The layout follows `RECLAIM`'s exactly, field for field, so the two files
+never need two readers. A 32-byte file header, then two slots; each slot a
+24-byte header, `entry_count` entries, and an 8-byte trailer whose
+checksum is a `u32` followed by four reserved bytes and covers **only the
+bytes preceding it** (Castagnoli, as everywhere in the WAL). An entry is
+`[16 B tenant key][24 B records WalOffset][24 B audit WalOffset][u16
+flags][6 B reserved]` — 72 B — where a `WalOffset` is its 16 B segment
+UUID plus its 8 B byte offset, the pinned 24 B, and the **tenant key is
+the same 16 B key `RECLAIM`'s entries use**, not a second encoding: the
+two files are read together, so a tenant that hashes one way there and
+another way here would be two tenants. `TenantId` is a variable-length
+string, so that key is a derivation rather than the id itself, and this
+RFC takes whichever derivation RFC 0052 §3.2 fixes — with the one
+requirement it must carry, stated here because both files depend on it:
+the derivation must be **injective over the admissible tenant set**, since
+a collision would silently merge two tenants' marks. Recovery maps a key
+back the only way a digest allows — **through the live tenant set**:
+restore and replay produce the tenants, their keys are derived the same
+way, and each match takes its marks; a key matching no restored tenant is
+a tenant that no longer exists and is dropped, and a restored tenant with
+no key seeds from `X` like any tenant with no entry. **Slots are not
+allocated or reused per tenant**: `entry_count` says how many of the
+`max_tenants` entry positions are live, entries are written in tenant-key
+order on every write, and a write rewrites the whole slot — there is no
+free list and no position to leak, which is what keeps the geometry fixed.
+The file's size is therefore decided at open by `max_tenants` alone: a
+slot is `32 + 72 × max_tenants` bytes and the file `32 + 2 × (32 + 72 ×
+max_tenants)`, which at the default 1024 tenants is 73,760 B a slot and
+147,552 B — about 144 KiB — for the file, small beside `RECLAIM`'s
+10.1 MiB and a 128 MiB segment. **Changing `max_tenants` therefore changes
+a persisted layout**, and the rule mirrors `RECLAIM`'s: lowering it below
+the recorded `entry_count` is **refused at `Wal::open`** as
+`OpenError::InvalidConfig`, naming both numbers, since the marks of the
+tenants that no longer fit cannot be dropped without losing their
+frontiers; raising it needs a **new file, written at open before the first
+pass**, carrying the old entries into the larger geometry — never an
+extension of the live file, whose second slot would move under a crash — which also makes the settlement write below cheap, one in-place
 write and an fsync rather than a file creation. The file is outside the byte bound like the other sidecars, and that
 exclusion has a stated limit: preallocation can fail. A volume full at
 open, or full when tenant growth needs the file grown, blocks the write —
@@ -1421,7 +1467,10 @@ written in the one `PUBLISHED` write, and **audit replay is gated on
 watermark. The §3.2 claim that a settled audit group is never requeued
 therefore holds across a restart too, not only in-process. Recovery seeds both
 in-memory watermarks per tenant as the greater of the `PUBLISHED` entry
-and what the Parquet-side suppression horizon `X` implies, and a missing
+and what the Parquet-side suppression horizon `X` implies — the read
+sitting behind RFC 0052's startup fsync of the WAL root, which precedes
+any sidecar read, so a sidecar whose rename or creation was not durable
+is not read as present — and a missing
 `PUBLISHED` beside a version-2 `CHECKPOINT` is fail-closed like a missing
 `RECLAIM` — RFC 0052 §3.2 names `PUBLISHED` in that matrix on the same
 footing — with **one stated exception, which is this RFC's own migration
@@ -1480,10 +1529,14 @@ non-faults here as well: `armed` without `seen` beside a **version-1**
 reclaimed, since housekeeping is a no-op until the witness exists — and
 `armed` without `seen` with `CHECKPOINT` **absent** is its crash window
 before the rename. A `PUBLISHED` written moments earlier in that same
-first `checkpoint` call is exactly what either looks like — the root is
-fresh, no rows were published under a horizon anything reads — so the
-record is discarded and the next attempt rewrites it, as when neither
-flag is set. Only `seen` makes its absence a fault. One
+first `checkpoint` call is what either looks like **on a root with no
+segments** — genuinely fresh, nothing published under a horizon anything
+reads — so there the record is discarded and the next attempt rewrites it,
+as when neither flag is set. **With segments present it is not fresh**:
+RFC 0052 §3.2 reads armed-and-unseen beside segments as a retained
+migration state, so the marks are *kept* and seeded from, not reset —
+discarding them there would re-open the coarse window on a root that
+already has frames to replay. Only `seen` makes its absence a fault. One
 witness governs both sidecars, which is why this RFC adds no second flag
 beyond the migration marker above. Beside these rows sits RFC 0052 §3.2's
 own, with one scoping this RFC states because `PUBLISHED` would otherwise
@@ -1925,8 +1978,11 @@ are kept distinct so that the remedy each advertises is the true one.
 > - **And** an owed rotation proceeds at the cap: with every older segment
 >   pinned or ineligible and the sealed current segment's own frames
 >   checkpoint-covered — the state no pass can relieve — the rotation still
->   creates its segment, the WAL keeps accepting, and only *discretionary*
->   rotations are refused while the pins hold
+>   creates its segment even though closing the current one takes
+>   `closed_retained` past the ceiling, the WAL keeps accepting, and only
+>   *discretionary* rotations are refused while the pins hold
+> - **And** `Deferred { AtSegmentCap }` is never entered from the ceiling
+>   itself: the only route to it is an exhausted rotation retry budget
 > - **And** a forced rotation whose post-rename parent fsync fails does not
 >   wedge the node: a later pass discharges the pending `Rotation`-origin
 >   fsync before it evaluates the predicate, with no append arriving, and

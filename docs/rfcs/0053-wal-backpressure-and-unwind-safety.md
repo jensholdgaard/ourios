@@ -46,7 +46,7 @@ longer wedges permanently on one failed fsync. It does not say what happens
 when the object store is unreachable for long enough that the WAL *cannot* be
 reclaimed — frames accumulate above a checkpoint that cannot advance — and the
 only thing that eventually stops accepting them is `ENOSPC`. That is the
-incident's shape with the permanent latch removed: the node degrades into a
+incident's shape with the permanent quiesce removed: the node degrades into a
 rotation-failure state rather than an unrecoverable one, but it still gets
 there by running out of disk, with no warning and no stated limit.
 
@@ -388,7 +388,19 @@ best-effort truncate-back *also* fails is not something the counter alone
 can absorb: the frame's full framed length is added to the unreclaimed
 figure at once — an over-count is safe, an under-count admits past the
 bound — **and the ledger records that counted amount against the sealed
-segment**, so when housekeeping unlinks it the accounting subtracts
+segment** — and, when the failure was the *first* frame of a fresh
+segment, the seal's `last_good_length` is the header alone, leaving a
+closed segment with **no valid frame**. RFC 0052 §3.2's predicate is
+expressed over a segment's highest offset and its per-tenant last offsets,
+neither of which exists there, so such a segment could never become
+eligible: it would hold a `max_segments` slot for the life of the root and
+strand the very owed rotation §3.1 defers on that slot. So the predicate
+gains a base case, as an **amendment to RFC 0052 §3.2**: a *closed*
+segment holding no valid frame is **unconditionally eligible** — no
+tenant has a frame in it and no checkpoint comparison applies, because
+nothing references it — and the pass pops it ahead of the horizon-driven
+candidates, which costs nothing since it can never be retained by any
+horizon. RFC0053.1 covers it. Where a frame does survive the seal, so when housekeeping unlinks it the accounting subtracts
 exactly what was added, whatever the file held, and no artificial backlog
 survives the unlink without a restart; the next `rebuild_ledger()`
 corrects the figure to the bytes on disk in any case, and RFC0053.1
@@ -938,9 +950,18 @@ iterator. The inner emit path has two transfer boundaries, both explicit:
 the worker's guard owns a record only until `append_off_lock` **inserts**
 it — the handoff happens inside that call, before its post-append trigger
 step, so a panic in the trigger cannot requeue a record the sink already
-holds; a permanent drop in `PartitionKey::derive`, which returns before
-any insertion, comes back as an explicit `Settled::Dropped` result of the
-handoff rather than something the guard has to guess at — and a detached
+holds; a permanent failure in `PartitionKey::derive`, which returns before any
+insertion, comes back as an explicit `Settled::Dropped` result of the
+handoff rather than something the guard has to guess at — but *dropped*
+here means quarantined, never discarded: RFC 0025 §3.3 requires every
+permanent encode rejection, a timestamp that will not derive included, to
+emit a `record_quarantined` audit event carrying the tenant, the partition
+key and the error text, with the WAL retaining the record and the
+flush-error counter taking the `BatchError` variant as `error.type`. So
+this handoff routes through that same path rather than beside it, and the
+partition is settled only **after** the quarantine emission returns; a
+failed emission leaves it unsettled and requeued, so no record leaves the
+system without its operator-facing pointer. RFC0053.2 asserts it — and a detached
 partition passes from the worker to the publisher's own `RecoverableBatch`
 at the in-flight registration, before the enqueue and before the worker
 continues, so a panic in the worker after that point cannot touch it and a
@@ -1301,10 +1322,21 @@ record is discarded and the next attempt rewrites it, as when neither
 flag is set. Only `seen` makes its absence a fault. One
 witness governs both sidecars, which is why this RFC adds no second flag
 beyond the migration marker above. Beside these rows sits RFC 0052 §3.2's
-own: a root holding **segments with neither sidecar** fails closed, since
-frames exist that no witness accounts for — `PUBLISHED` adds nothing there
-and inherits the verdict, because a root that cannot say what it reclaimed
-certainly cannot say what it published. The bound between checkpoints is then stated honestly: a panic
+own, with one scoping this RFC states because `PUBLISHED` would otherwise
+inherit it too widely: **segments with neither sidecar** is a fault only
+on a root that carries a **post-RFC witness** — a version-2 `CHECKPOINT`,
+or a `RECLAIM` that is armed or seen — and has lost its companion, where
+frames exist that no surviving witness accounts for. A root with segments
+and *no* post-RFC witness at all is the ordinary live pre-RFC node —
+`Wal::checkpoint` is unreachable from the pipeline today (#793), so a
+running root has segments and no checkpoint — and failing it closed would
+block exactly the upgrade this RFC's migration case exists to allow. It
+stays on the legacy branch until its first version-2 checkpoint creates
+both sidecars. `PUBLISHED` adds nothing to that judgement and inherits
+whichever verdict the witness gives, because a root that cannot say what
+it reclaimed certainly cannot say what it published. RFC 0052's own
+criterion needs the same scoping, and this is stated as an **amendment**
+to it rather than a difference between the two documents. The bound between checkpoints is then stated honestly: a panic
 costs at most one duplicate per record in the ambiguous span, and a crash
 before the next checkpoint costs at most **one more** for the records
 published since the last durable watermark, since replay from `X` cannot
@@ -1416,17 +1448,23 @@ stamps having drained them clears the latch, and the clear cannot erase a
 failure it never drained. A CAS on `failed_epoch` alone would: a cut that
 captured `E` and observed `failed_epoch = E` can be overtaken by a guard
 reporting `E + 1`, which leaves `failed_epoch` at `E` — the minimum — so
-the CAS would succeed and the newer failure would vanish. So the latch
-carries a **generation** beside it: `failure_generation: AtomicU64`, which
-every reporting guard increments (with `Release`, after lowering
-`failed_epoch` and before it decrements its count, so a barrier that
-observes the count settled observes both), and a cut records the pair
-`(failed_epoch, failure_generation)` it read at its capture. After its
+the CAS would succeed and the newer failure would vanish. So the epoch latch
+carries a **generation** beside it, `failure_generation: AtomicU64`, and
+the publication order is stated once and holds everywhere. **At report**, a
+guard increments `failure_generation` **first**, then lowers
+`failed_epoch` with a `Release` store, then decrements its count. **At
+capture**, a cut reads `failed_epoch` with `Acquire` **first**, then the
+generation. That order is what makes the pair readable: a report that
+lands between the two reads has already bumped the generation before it
+published the epoch, so a capture can never pair a *new* epoch with an
+*old* generation — the pair it holds is either wholly before the report or
+wholly after it, and in the latter case the epoch it read is the new one.
+The reverse order would allow exactly the erasure this guards against. The
+cut records the pair `(failed_epoch, failure_generation)` it read at its
+capture. After its
 stamp, `run_cut` clears only by a CAS that succeeds when **both** still
 hold the values it read — a `compare_exchange` on a single `AtomicU64`
-packing the two would do, or a short mutex; the ordering requirement is
-that the generation is read after the epoch at capture and written before
-the epoch's own release at report. Any report in between, whatever epoch
+packing the two would do, or a short mutex. Any report in between, whatever epoch
 it carried, bumps the generation, the CAS fails, and the failure survives
 for the next cut to drain and clear. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
 tick with
@@ -1475,8 +1513,13 @@ shape — so there is no queue: the coordinator **emits the enter and leave
 events itself, synchronously at the transition, under the journal mutex**.
 The order is the mutex order and every transition emits exactly once at a
 real call site; RFC 0052 §3.5's tick-based projection is amended by this
-RFC to exclude the refusal latch explicitly — its latch is
-`failed_epoch`, which this RFC keeps and lets a cut clear — so there is one emitter per
+RFC to exclude the **backpressure refusal latch** explicitly. The two
+latches are distinct and this RFC never merges them: the refusal latch is
+§3.1's, set by a refused reservation and left by reclamation or an
+acknowledged append, and it is what the tick-based projection must stop
+carrying; the **epoch latch** is RFC 0052 §3.1's `failed_epoch`, set by a
+panicking guard and cleared by the cut that drains its records, and it is
+untouched here except for the clear §3.2 defines. So there is one emitter per
 transition and never two events for one. RFC0053.5 counts every transition.
 
 The contract is enumerated here, as RFC 0009 §3.6 does, rather than
@@ -1806,12 +1849,14 @@ are kept distinct so that the remedy each advertises is the true one.
 >   respawned and settles the batches still queued; a worker enqueuing on
 >   a disconnected queue buffers its batch instead, and `quiesce_publishes`
 >   and shutdown return
-> - **And** the epoch latch clears without a restart: a worker panic
->   lowers `failed_epoch` and bumps `failure_generation`, the cut that
+> - **And** the epoch latch clears without a restart: a worker panic bumps
+>   `failure_generation` and then lowers `failed_epoch`, in that order, the cut that
 >   drains the requeued records stamps and clears by a CAS on the pair it
 >   read at its capture, and a panic raised during that cut — at the same
 >   epoch or a later one — bumps the generation so the CAS fails and the
->   failure survives for the next cut
+>   failure survives for the next cut; a report interleaved between a
+>   capture's two reads is never seen as a new epoch with an old
+>   generation
 
 > **Scenario RFC0053.4 — No acknowledged record is lost with backpressure
 > live**

@@ -1032,11 +1032,34 @@ settlement and reaches none of this. So the **deterministic key covers
 every ambiguous retry**, not settlements alone: when a publish is
 requeued after its put may have been accepted — the ambiguous arm, which
 the `RecoverableBatch` already distinguishes from a clean failure — the
-retry names its object by the same name-based (RFC 4122 v5) derivation
-§3.2 uses, rather than a fresh `UUIDv7` — and the name is derived over
-the **subspan, not the frame range**: the tenant, the partition key, the
-frame range *and the record-index range within the first and last
-frames*. The index range is what makes the identity stable, because a
+retry names its object by a **name-based (RFC 4122 v5) UUID**, rather
+than a fresh `UUIDv7`, derived over the **subspan, not the frame range**:
+the tenant, the partition key, the frame range *and the record-index
+range within the first and last frames*. Two implementations must derive
+the same name from the same rows, so the derivation is normative rather
+than descriptive — a sketch would let two builds, or a rebuilt client,
+produce different names for one span and defeat the whole point. The
+**namespace UUID** is a constant of this RFC,
+`6f757269-6f73-5057-424c-000000000001` (`ourios` in the first field,
+`PUBL` in the third), fixed for the life of the format and never derived
+from configuration. The **name** is the canonical serialisation below,
+hashed as RFC 4122 v5 prescribes; integers are **little-endian**, as
+everywhere else in this stack, and every variable-length part carries its
+own `u16` length before its bytes so no two field sequences can alias:
+
+| # | Field | Bytes |
+|---|---|---|
+| 1 | tenant id | `u16 len` then `len` bytes, the id verbatim |
+| 2 | partition key | `u16 len` then `len` bytes, the key's canonical string form |
+| 3 | first frame | 16 B segment UUID (RFC 4122 byte order) then `u64` byte offset |
+| 4 | first record index | `u32` |
+| 5 | last frame | 16 B segment UUID then `u64` byte offset |
+| 6 | last record index | `u32` |
+
+Fields are concatenated in that order with no padding and no separators,
+the lengths making the encoding unambiguous. Nothing else enters the
+name — not a timestamp, not a retry count, not the record contents —
+because a retry must reproduce it exactly. The index range is what makes the identity stable, because a
 frame can be partially published: §3.2's `emit_from` means a retry may
 carry records `[emit_from, end]` of a frame whose earlier records went
 out in another object, and a key over the frame range alone would derive
@@ -1796,9 +1819,13 @@ recorded in either file** — neither file may compact on its own, and a
 tenant that leaves one but remains in the other keeps its id. `PUBLISHED`
 is written from that same in-memory table, so its dictionary is that
 dictionary, at the same ids, by construction rather than by convention.
-**A rebuild is the one place ids may be reassigned**, and it is safe
-precisely because §3.2 makes it rewrite *both* files as one operation from
-the one table.
+**No operation reassigns an id**, not even a rebuild: a resize copies each
+dictionary record into the wider stride at the same index, so ids survive
+it unchanged. That is what makes a crash between the two files' renames
+recoverable (§3.2), and it is why a tombstoned id is retired rather than
+reclaimed — renumbering across two files cannot be made crash-safe
+without a third witness, and this design would rather spend ids than
+invent one.
 
 **A tenant introduced by one file alone is the ordinary case, not an
 error**, and the rule says which disagreement is which. The two files are
@@ -1856,8 +1883,18 @@ An entry is then `[u16 slot id][u16 flags][u32 generation][24 B records
 WalOffset][24 B audit WalOffset]` — 56 B, since it names a tenant by slot
 id rather than by key — where a `WalOffset` is its
 16 B segment UUID plus its 8 B byte offset, the pinned 24 B, and `flags`
-carries three bits: the `publishing` bit §3.2's settlement uses, and one
-**validity bit per frontier**, `records_valid` and `audit_valid`. The
+carries four bits, assigned once here so no other paragraph has to
+enumerate them:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `records_valid` | the records frontier in this entry is present |
+| 1 | `audit_valid` | the audit frontier in this entry is present |
+| 2 | `publishing` | an intent is outstanding for this tenant (§3.2) |
+| 3 | `terminal` | the tenant is in the server-terminal class (§3.2) |
+
+Bits 4–15 are **reserved, zero, and checked on read**, a non-zero one
+failing the slot's parse as every other reserved field does. The
 validity bits exist because the two frontiers advance independently and a
 frame can produce records with no audit event at all, so "no mark yet" is
 a real state that an unconditional offset cannot express — a zeroed
@@ -1866,7 +1903,7 @@ bit is clear is **absent**, and recovery treats that side of the entry as
 though the tenant had no entry at all, falling back to the node-wide
 horizon for it while still honouring the other side — **except for a
 tenant the entry marks terminal**, where the fallback would be unsafe.
-The flags therefore carry a `terminal` bit beside the validity ones, set
+The flags' `terminal` bit (bit 3 above) is set
 when §3.2 puts a tenant in the server-terminal class, and a terminal
 tenant with a clear validity bit means *nothing of that side was ever
 published*, not "consult the node-wide horizon": its events were never
@@ -1890,10 +1927,11 @@ An earlier draft made the live entries a dense prefix `[0, entry_count)`,
 which cannot survive a stable id: removing a tenant would renumber every
 id above it. A **tombstone** covers removal instead — the dictionary
 record keeps its key with a `tombstoned` bit set, the entry is zeroed, and
-the id is **retired, not freed**: no later tenant takes it until a rebuild
-compacts, which is the one operation allowed to renumber because it
-rewrites both files together from one table. A write rewrites the whole
-slot — no free list, no position to leak, which
+the id is **retired, not freed**: no later tenant ever takes it, since
+nothing in this design renumbers — a resize preserves ids and there is no
+compaction pass. A tombstone therefore holds its id for the life of the
+root, and an operator who exhausts the space raises `max_tenants` or
+starts a fresh root. A write rewrites the whole slot — no free list, no position to leak, which
 is what keeps the geometry fixed. The file's size is therefore decided at
 open by `max_tenants` alone: a slot is `24 + (132 + 56) × max_tenants + 8`
 bytes and the file `32 + 2 × slot`, which at the default 1024 tenants is
@@ -1925,9 +1963,28 @@ reserves — RFC 0052's `RECLAIM.new` and, in parallel, `PUBLISHED.new`, a
 name the sweep selector already covers — with the old dictionary and
 entries copied in, fsyncing, renaming over the old name and fsyncing the
 parent, and **the node refuses to start if either rebuild fails**, naming
-the file that failed. A crash at any point leaves either the old file
-intact or the new one complete, and a leftover temp is truncated by the
-next rebuild and swept like any other. This is the one
+the file that failed.
+
+**A crash between the two renames is the state that needs a rule**, and
+it has one, because each file's header records the geometry it was built
+for. A crash there leaves the pair at *different* geometries — one
+rebuilt, one not — which open detects by comparing the two recorded
+capacities rather than by trusting a temp to still exist. The reconciling
+rule is **complete, never roll back**: open rebuilds whichever file is at
+the smaller geometry, from its own contents, at the larger one, then
+renames and fsyncs as the first rebuild did; the pair is then consistent
+and the configured capacity is in force. Completion is always safe
+because **a resize never renumbers**: it copies each dictionary record
+into the wider stride at the same index, so slot ids are identical before
+and after and the half-rebuilt pair still agrees on every id it names.
+That is also why ids are never reassigned at all in this design —
+reclaiming a tombstoned id would mean renumbering, which cannot be made
+crash-safe across two files without a third witness, so a tombstone holds
+its id for the life of the root and an operator who exhausts the space
+raises `max_tenants` or starts a fresh root. A leftover `.new` from
+either file is truncated by the next rebuild and swept. RFC0053.4
+asserts the mixed-geometry restart: a pair crashed between renames comes
+up at the larger geometry with every id unchanged. This is the one
 supported procedure; the file still never grows *in place*, which is what
 the two-slot protocol depends on. **And `max_tenants` has a format ceiling**, because a
 slot id is a `u16`: `validate_config` rejects `max_tenants > 65_536` with
@@ -2151,15 +2208,17 @@ with each attempt. Repeated crashes replay the same bounded span, and **the copi
 bounded too, because the republish is idempotent**: a normal publish names
 its object with a fresh `UUIDv7`, so a replay would add a copy each time,
 but the intent span's republish derives its key deterministically instead
-— a name-based (RFC 4122 v5) UUID over the tenant, the intent's marks and
-the partition key — so every attempt at the same span writes the *same*
-object name and the store's last-writer-wins overwrite collapses them.
-Each partition of the span has its own such key, so a first attempt that
-published some partitions and died is overwritten partition for
-partition. Repeated crashes therefore leave **one** copy of the span, not
-one per crash, and the first confirm closes the window; the guarantee is
-claimed only for the span under an intent, since a publish outside one
-keeps its `UUIDv7` and the at-most-twice rule. **A failed write is a fail-closed park**: the entry **stays**,
+— the same derivation §3.2 makes normative below — so every attempt at
+the same span writes the *same* object name. Each partition of the span
+has its own such key, so a first attempt that published some partitions
+and died reuses those names rather than inventing new ones. The claim is
+the **keys-not-objects** one §3.2 states: repeated crashes produce **one
+distinct key per partition of the span**, however many times they replay
+it, and never a different set of rows under a name already used — whether
+the store leaves one object or one per attempt is the backend's business,
+which this RFC does not require. The first confirm closes the window, and
+the guarantee is claimed only for the span under an intent, since a
+publish outside one keeps its `UUIDv7`. **A failed write is a fail-closed park**: the entry **stays**,
 the tenant is refused under the server-terminal, client-retryable class
 until the write succeeds, and the coordinator retries the same marks,
 which is idempotent because they are already recorded and `publish_marks`
@@ -2333,10 +2392,20 @@ maximum**: a report that would carry it past `u32::MAX - 1` leaves it at
 `u32::MAX` instead, and **no clear may CAS from a word whose generation
 half is `u32::MAX`** — the latch holds, the state is exported, and a
 restart is what resets it, which is the same fail-closed posture every
-other unclearable state here takes. The epoch half needs no such rule: it is the barrier's own counter, which at one cut per `barrier_secs`
-cannot reach 2^32 in any deployment's lifetime, and an implementation that
-needs either half wider moves to a 128-bit word or a short mutex rather
-than splitting the pair again. RFC0053.3's leg drives a
+other unclearable state here takes. The epoch half needs no such rule: it is the barrier's own counter, but "one cut per `barrier_secs`" is not
+the whole story — a rotation capture takes an epoch too, and a busy node
+rotates far more often than it ticks — so the epoch is given a reset
+rather than an argument. When `barrier_epoch` reaches `u32::MAX - 1` the
+next cut performs an **epoch reset** instead of an increment: under the
+barrier exclusion, after `quiesce_encodes` and `quiesce_publishes` have
+returned, **no guard is outstanding** — that is exactly what those two
+calls establish — so no epoch is held by anything, and the counter may be
+set back to zero and the latch word cleared without any comparison losing
+meaning. The reset is therefore an ordinary cut with one extra step, not
+a special mode, and it keeps `u32::MAX` reserved as the clear sentinel
+that no live epoch can collide with. An implementation that needs either
+half wider moves to a 128-bit word or a short mutex rather than splitting
+the pair again. RFC0053.3's leg drives a
 same-epoch report between a capture and its clear. So the timer's pre-cut guard — RFC 0052 §3.2's pseudocode opens every
 tick with
 

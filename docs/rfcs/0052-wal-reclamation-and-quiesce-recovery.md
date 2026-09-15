@@ -1107,7 +1107,7 @@ one, because startup's fallback is exactly as trustworthy as this record:
   below the stored capacity opens normally and simply uses less of each
   slot; the file is never shrunk, since a smaller geometry buys nothing
   and a rewrite risks something. Each slot is `[u64 generation][u32 entry_count][u32
-  planned_count][u16 header_flags][u16 consumer_mode][4 B reserved]` (24 B),
+  planned_count][u16 header_flags][u16 consumer_mode][u32 next_slot_id]` (24 B),
   then three **fixed arrays** — the dictionary, the entries and the
   planned records — then a
   `u32` CRC32-C and 4 B reserved (8 B). The checksum covers bytes
@@ -1225,7 +1225,7 @@ one, because startup's fallback is exactly as trustworthy as this record:
   | | 12 | 4 | `u32 planned_count` |
   | | 16 | 2 | `u16 header_flags` (bit 0 `checkpoint_armed`, bit 1 `checkpoint_seen`, bit 2 `published_seeded_armed`, bit 3 `published_seeded_confirmed`, bits 4–15 zero) |
   | | 18 | 2 | `u16 consumer_mode` (0 unrecorded, 1 `Known`, 2 `NoConsumer`) |
-  | | 20 | 4 | reserved, zero |
+  | | 20 | 4 | `u32 next_slot_id` — the id high-water mark |
   | Dictionary record | 0 | 2 | `u16 len` |
   | | 2 | 128 | key bytes, `len` significant, remainder zero |
   | | 130 | 2 | `u16` flags: bit 0 `tombstoned`, bits 1–15 zero |
@@ -1266,7 +1266,22 @@ one, because startup's fallback is exactly as trustworthy as this record:
   of them would be wrong. So the id space has an owner and a lifetime.
   **`RECLAIM` owns it**: the WAL assigns a tenant its slot id when that
   tenant is first recorded in **either** sidecar, in `RECLAIM`'s
-  dictionary, from the in-memory table open seeds from this file.
+  dictionary, from the in-memory table open seeds.
+
+  That table is seeded from the **union of both dictionaries**, not from
+  this file alone, and the difference is not tidiness. RFC 0053's
+  `publish_marks` writes `PUBLISHED` without touching `RECLAIM`, so a
+  tenant can be assigned an id and recorded only there; seeding from
+  `RECLAIM` alone would lose that id at the next open and hand it to
+  another tenant, crossing two tenants' marks in the file that still
+  names the first. So a record in either file — live or tombstoned —
+  reserves its id. **A high-water mark backs it**: the slot header carries
+  `u32 next_slot_id`, the lowest id never yet assigned, written by
+  whichever file is written and taken at open as the **maximum** of the
+  two, so allocation never goes backwards even if one file lags the other
+  by a write. It lives in the four bytes the slot header already reserved
+  at offset 20, so the geometry does not move. That is what makes the
+  ordinary one-file-alone case safe rather than merely usually safe.
   **Ids are never renumbered and never reused while the tenant is recorded
   in either file** — neither file may compact on its own, and a tenant
   that leaves one but remains in the other keeps its id. `PUBLISHED` is
@@ -2982,6 +2997,11 @@ memory, and nothing here claims to.
 >   **segments present** it is a legacy root mid migration and the record
 >   is **retained** with its arming and its mode, the root opening on the
 >   legacy branch with the upgrade retried by the next checkpoint
+> - **And** a tenant introduced by a `PUBLISHED`-only write — no
+>   intervening `RECLAIM` write — keeps its slot id across a restart: the
+>   table is seeded from the union of both dictionaries and `next_slot_id`
+>   is the maximum of the two headers, so the id is never reissued to a
+>   different tenant
 > - **And** a record carrying `published_seeded_armed` without
 >   `published_seeded_confirmed` with `PUBLISHED` **absent** — the crash
 >   before the accepting start's own `PUBLISHED` write — leaves the next
@@ -3231,8 +3251,11 @@ they are not substitutes for the rest.
     written **after** `CHECKPOINT` in the same call, on the checkpoint's own
     durable path, and joining §3.2's sidecar matrix on the same fail-closed
     footing as `RECLAIM`.
-  - *RFC 0053 §3.2*'s `PUBLISHED` mirrors this RFC's record layout field
-    for field and keys on the same tenant key, so the per-slot dictionary
+  - *RFC 0053 §3.2*'s `PUBLISHED` has its own pinned layout under its own
+    magic `b"OWPB"`, **sharing this record's rules rather than being
+    identical to it** — the two-slot generation protocol, the per-slot
+    dictionary, the fixed-stride arrays and the position-is-the-id rule —
+    and keys on the same tenant key, so the dictionary
     and its `u16` slot ids apply there too — the derivation has to be
     injective over the admissible tenant set, which a 16-byte digest of a
     128-byte id is not — and its key field is sized to RFC 0048 §3.1's
@@ -3267,11 +3290,6 @@ they are not substitutes for the rest.
     reservation under the journal mutex, so the age-sensitive rotation
     predicate is decided in one place rather than recomputed inside the
     append.
-  - *RFC 0053 §3.1* adds a non-terminal `Deferred { AtSegmentCap }` variant
-    to §3.3's rotation state, reported as reclaimable backpressure and
-    cleared when a pass frees a slot; §3.3's `Terminal` keeps its meaning,
-    the exhausted retry budget, and RFC0052.15's terminal-only
-    classification is unchanged by it.
   - *RFC 0053 §3.2* also replaces the timer's pre-cut guard — §3.2's `if
     failed_epoch <= barrier_epoch: skip` — with proceed-and-decide, once its
     requeue makes the panicked batch's records available to the next cut's

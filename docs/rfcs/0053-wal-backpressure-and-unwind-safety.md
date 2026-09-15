@@ -950,14 +950,26 @@ the `cadence_panic` counter beside the flushed-partition counters, and
 asserted by RFC0053.2. The bound holds only because settlement is
 **per partition**, stated below: a drained batch spans several record
 partitions and audit groups, and requeueing the whole batch after a panic in
-the third put would duplicate the two objects already accepted. So each
-consuming call removes a partition from the recoverable batch only when its
-put has **succeeded**, its requeue has **completed**, or the sink has
-**permanently dropped** it under its own policy (the audit sink's
-permanent and derivation-failure path, and the record sink's RFC 0025
-§3.3 quarantine) — that drop is settlement too, at the same per-partition
-boundary, so a later panic neither resurrects a dropped group through the
-destructor nor loses it without a defined state. The record sink's
+the third put would duplicate the two objects already accepted. **Two settlements are meant by that word, and this RFC keeps them apart.**
+*Ownership* settlement answers "is anything stranded?" — the recoverable
+batch has released this partition, so no destructor will resurrect it and
+no panic can lose it without a defined state. *Publication* settlement
+answers "are the rows durable?" — the put succeeded and the publication
+watermark may advance. Every path records both, and they are not always
+the same: a put that succeeded is settled on both counts; a requeue that
+completed is ownership-settled and publication-unsettled, the buffer
+holding it; a record the sink quarantined (RFC 0025 §3.3) is
+ownership-settled and publication-unsettled until its
+`record_quarantined` event is durable, per §3.2's watermark rule; and a
+**permanently failed audit write** is ownership-settled — the batch is
+not stranded, its records are back in the buffer — and emphatically
+*not* publication-settled, since §3.2 requeues those records and makes
+the tenant terminal. So each consuming call removes a partition from the
+recoverable batch when its put has **succeeded**, its requeue has
+**completed**, or the sink has **permanently dropped** it under its own
+policy (the audit sink's derivation-failure path and the record sink's
+RFC 0025 §3.3 quarantine) — that is the *ownership* boundary and nothing
+more; what advances the watermark is publication settlement alone. The record sink's
 quarantine has a second boundary of its own: `publish_owned` can quarantine
 some records and then issue a second put for the remainder, so the
 quarantined records are settled the moment they are quarantined and the
@@ -1118,7 +1130,10 @@ rather than a settle: the failed send returns the item to the worker,
 which puts the batch back into the buffers as a **`ready` partition**
 under the sink lock *before* releasing its guard — **recording the current
 `barrier_epoch` on the parked partition exactly as RFC 0052 §3.1 has a
-requeue record it**, so a cut captured before the park fails its
+requeue record it** — and parking is **all-or-nothing per capture**, as
+that RFC settles it: a capture that would carry the sink past its ceiling
+parks everything and advances nothing, never a partial take, which the
+capture a forced rotation triggers inherits unchanged — so a cut captured before the park fails its
 `all_ok(cut.epoch)` and cannot stamp across records it never saw; keeping
 its `audit_watermark` in the buffer entry, since a park that stripped the
 dependency would let a later drain publish the records ahead of their
@@ -1243,12 +1258,25 @@ wholesale. RFC0053.2 drives a panic in the replay and in
 where it would hold every other tenant's sequence behind it; instead the
 coordinator keeps the **settling set** under its admission mutex, and a
 request for a `Settling` tenant is **refused at admission, before it takes
-a sequence**. The check and the append are **one critical section**,
-not two: the admission mutex covers reading the settling set, the tenant
-slots and the byte and segment reservations *and* is held across the
-`append_batch` that follows, so no request can pass the check and then
-append behind a settler that has already claimed the entry, and no settler
-can insert between a check and its append. **The commit sequence is not
+a sequence**. The check and the append are **two sections, not one**, and an earlier
+draft had that wrong: holding the admission mutex across `append_batch`
+means holding it across a rotation inside that append — its create, its
+rename, its parent fsync — which contradicts this RFC's own rule that no
+lock in the hierarchy is held across directory I/O, and would put every
+concurrent reservation behind an fsync. So the **admission mutex covers
+the checks and the reservations only** (max-frame, terminal state, tenant
+slot, settling set, byte and segment reservation), and is released before
+the journal mutex is taken; the **journal mutex covers the append**, and a
+rotation inside it runs under that mutex alone. What the admission mutex
+then guarantees is that the reservations are consistent with each other,
+not that the append is atomic with them — and the settling case does not
+need it to be, because the **miner lock is the backstop**: a turn that
+passed the settling check and then finds the tenant `Settling` when it
+takes the miner lock to mine waits on the entry's completion signal, as
+the losing trigger does, and mines against the rebuilt tree afterwards.
+That ordering is the correct one anyway — its frame lies above the
+rebuild's span, so it must be mined after it — and the admission-time
+refusal is the optimisation that keeps most turns from waiting at all. **The commit sequence is not
 reserved there**, and that is deliberate: `CommitCoordinator::append` today
 takes the journal lock, appends, and only *then* allocates `seq` from
 `FlushState`, returning `CommitOutcome { seq: None }` when the append
@@ -1256,18 +1284,22 @@ failed — no sequence is consumed, so the gate never waits on one that was
 never used and `FlushState` has no gap to tolerate. Reserving a sequence
 before the append would introduce exactly that hole, needing a no-op
 completion on every failure path to keep the gate advancing. So sequence
-allocation stays where it is, after a successful append, inside the same
-admission hold; the gate itself is untouched, awaited outside the mutex as
-today.
+allocation stays where it is, after a successful append and under the
+journal mutex; the gate itself is untouched, awaited outside both locks as
+today. RFC0053.1 drives the concurrency: a settler claiming a tenant while
+a turn for it is between its admission check and its append, asserting the
+turn's records land after the rebuild and nothing is mined into a tree
+that is about to be replaced.
 
 **One lock order covers all four locks**, since this RFC adds the first of
 them to the three RFC 0052 §3.1 fixes. Top to bottom: **admission mutex →
 barrier exclusion → miner lock → `last_durable`**, with the **journal
 mutex** taken below the admission mutex and never above it — an ingest
 turn takes the admission mutex for its checks and reservations (max-frame,
-terminal state, tenant, settling set, byte and segment reservation), takes
-the journal mutex under it for `append_batch` — whose success allocates
-the sequence — releases both, then follows
+terminal state, tenant, settling set, byte and segment reservation) and
+**releases it**, then takes the journal mutex alone for `append_batch` —
+whose success allocates the sequence, and inside which a rotation does its
+directory work under that mutex only — then follows
 RFC 0052's order for the mining span; `maintain` takes the admission mutex
 and then the journal mutex for its **ledger** halves, in that order, which
 is why the forced rotation and the leave transition can be evaluated
@@ -1413,7 +1445,13 @@ closed on. Writing it second makes `PUBLISHED`-without-a-version-2-
 `CHECKPOINT` reachable only by deleting the checkpoint, which *is* the
 fault the matrix should catch, while the new window — a version-2
 `CHECKPOINT` with `PUBLISHED` absent or stale — is exactly what
-`published_seeded` already governs and is recoverable by seeding from `X`.
+`published_seeded` already governs, and the recovery is conditional on
+that witness rather than universal: with the flag **armed but
+unconfirmed** the sidecar was never durably written, so seeding from `X`
+is correct; with it **confirmed** a sidecar that is now missing is a lost
+file and fails closed, as the matrix says. Only the first branch seeds
+from `X`, and a *stale* sidecar under either flag is not a fault at all,
+since `max(X, PUBLISHED)` takes the newer.
 Neither order is unsafe for the seed itself, which takes `max(X,
 PUBLISHED)` per tenant, so the newer of the two always dominates; the
 order is chosen for which crash window it leaves. The sidecar takes RFC 0052 §3.2's
@@ -1465,9 +1503,21 @@ open by `max_tenants` alone: a slot is `24 + (260 + 56) × max_tenants + 8`
 bytes and the file `32 + 2 × slot`, which at the default 1024 tenants is
 323,616 B a slot and 647,264 B — about 632 KiB — for the file, still small
 beside `RECLAIM`'s 10.1 MiB and a 128 MiB segment. **Changing `max_tenants` therefore changes
-a persisted layout**, and the rule mirrors `RECLAIM`'s: lowering it below
-the recorded `entry_count` is **refused at `Wal::open`** as
-`OpenError::InvalidConfig`, naming both numbers, since the marks of the
+a persisted layout**, and two rules follow, both mirroring `RECLAIM`'s.
+**The file describes its own geometry**: the 32-byte file header carries a
+`u32 max_tenants` (the value it was preallocated for) beside the magic and
+version, so a reader never infers the shape from configuration, and
+`Wal::open` **refuses a configuration exceeding it** as
+`OpenError::InvalidConfig`, naming both the configured and the recorded
+value — the file can never grow, so a raised knob needs a fresh root,
+which the pre-production layout policy accepts rather than shipping
+migration tooling. **And `max_tenants` has a format ceiling**, because a
+slot id is a `u16`: `validate_config` rejects `max_tenants > 65_536` with
+that reason. The bound is 65,536 rather than 65,535 because **slot id 0 is
+usable** — a position is marked unused by its dictionary record's `len =
+0`, not by a reserved id — so every id in `0..=65_535` names a real
+position. Lowering the knob below the recorded `entry_count` is
+**refused at `Wal::open`** too, as the same error, naming both numbers, since the marks of the
 tenants that no longer fit cannot be dropped without losing their
 frontiers; raising it needs a **new file, written at open before the first
 pass**, carrying the old entries into the larger geometry — never an

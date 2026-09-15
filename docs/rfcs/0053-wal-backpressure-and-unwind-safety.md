@@ -257,8 +257,9 @@ validation. At the ceiling a **discretionary** due rotation is **refused,
 never squeezed in** — an *owed* rotation is the stated exception and
 proceeds regardless, since closing the current segment necessarily adds a
 closed one and refusing that is the deadlock §3.1 removes; the exception
-is why `Deferred { AtSegmentCap }` is now reachable only through the retry
-budget. For the discretionary case: the request path runs no housekeeping,
+is why the ceiling reaches no rotation-failure state at all, and why the
+`Deferred { AtSegmentCap }` variant an earlier draft proposed is
+withdrawn. For the discretionary case: the request path runs no housekeeping,
 since prepare, file half and commit put fsyncs in front of every
 concurrent append; the refusal sets the latch, the next `maintain` pass
 reclaims what it can, and the client returns after the `Retry-After` §3.1
@@ -297,11 +298,12 @@ cut's mark is; the forced one reports it and the next pass retries; the
 reservation path never reaches it, having refused first. An **owed**
 rotation is one the current segment's state requires — after a seal, where
 that segment must never take another frame, and the post-recovery step's
-discharge of an owed rotation — and there a refusal is a durability fault,
-not a shrug: the WAL enters `RotationState::Deferred { AtSegmentCap }`
-(below) — which, with the cap counting closed segments only, is now
-reachable *only* through the retry budget and never through the ceiling,
-since an owed rotation always has room. Header overhead is therefore at
+discharge of an owed rotation — and there the cap does not apply at all: an owed rotation **always has
+room**, because the cap counts closed segments and the one it creates
+becomes the current segment (§3.1's invariant). There is no refusal to
+classify, which is why the `Deferred { AtSegmentCap }` state an earlier
+draft proposed is withdrawn and `RotationState` keeps `Healthy`,
+`Retrying` and `Terminal` alone. Header overhead is therefore at
 most 24 B × (`max_segments` + 2) — the retained closed segments, the
 current one, and the one an owed rotation may create — and a discretionary
 refusal leaves with the same latch once a pass removes a segment. **A segment stays in it
@@ -501,20 +503,20 @@ the predecessor of a segment the record cannot account for. With those
 satisfied it takes the slot check like any other,
 but it is an **owed** rotation in §3.1's sense — the sealed segment must
 never take another frame — so the refusal is a fault rather than a shrug:
-with a slot it rotates; **without one the seal is written and the
-rotation is deferred**. That state is *not* terminal, and calling it so
-would break RFC 0052 §3.3's contract in both directions: terminal means a
-node an operator must clear and carries no retry hint, while this one
-clears itself the moment housekeeping frees a slot. So `RotationState`
-gains a third variant beside `Healthy` and `Retrying`, **`Deferred {
-AtSegmentCap }`** — an amendment to RFC 0052 §3.3 — and the admission
-order reports it as **reclaimable backpressure**: `WalBackpressure` with
-the `Segments` cause and the housekeeping delay §3.1 computes, not the
-server-terminal class, so a client retries on the hint and no operator is
-summoned. `maintain` retries the deferred rotation after a pass frees a
-slot, on which the state returns to `Healthy` and admission resumes;
-`Terminal` keeps its own meaning, the exhausted retry budget, with no hint
-and a restart to clear it. RFC0053.1 covers both cases. If the seal write itself fails the WAL
+and it **rotates whether or not a slot is free**, because it is an `Owed`
+rotation and §3.1's exemption is what removed the deadlock: the cap
+counts closed retained segments, the segment an owed rotation creates
+becomes the *current* one and is outside the cap, and refusing to close a
+segment that must never take another frame is the wedge this design
+exists to prevent. The overrun it may leave is bounded — one segment,
+until the next pass reclaims — and §3.3's gauge carries it as `over_cap`.
+An earlier draft deferred the rotation here under a `RotationState::
+Deferred { AtSegmentCap }`; that variant is **withdrawn**, since with the
+exemption there is no state to represent: the cap can no longer stop an
+owed rotation, so nothing reaches it through the ceiling. `RotationState`
+therefore keeps `Healthy`, `Retrying` and `Terminal`, and only the
+exhausted retry budget reaches the last. RFC0053.1 asserts the exemption
+rather than a deferral. If the seal write itself fails the WAL
 enters the terminal rotation state: it can neither repair nor mark the
 segment. That state needs no durable discriminator: the WAL is terminal, so
 the segment stays the *newest* one, and the frame at its EOF was never
@@ -1040,9 +1042,10 @@ the same name from the same rows, so the derivation is normative rather
 than descriptive — a sketch would let two builds, or a rebuilt client,
 produce different names for one span and defeat the whole point. The
 **namespace UUID** is a constant of this RFC,
-`6f757269-6f73-5057-424c-000000000001` (`ourios` in the first field,
-`PUBL` in the third), fixed for the life of the format and never derived
-from configuration. The **name** is the canonical serialisation below,
+`6f757269-6f73-5055-424c-000000000001`, fixed for the life of the format
+and never derived from configuration. Its bytes spell the name: `6f 75 72
+69` and `6f 73` are `ourios` across the first two fields, `50 55` and `42
+4c` are `PUBL` across the third and fourth. The **name** is the canonical serialisation below,
 hashed as RFC 4122 v5 prescribes; integers are **little-endian**, as
 everywhere else in this stack, and every variable-length part carries its
 own `u16` length before its bytes so no two field sequences can alias:
@@ -1652,9 +1655,19 @@ re-tests that before it mines**, since no replacement tree is installed in
 this branch and a turn that passed admission before the settler ran would
 otherwise mine and publish against the poisoned tree once the exclusion is
 released. The check sits at the top of the mining span, immediately after
-the turn takes the miner lock and before its first `ingest_mined`: it
-re-reads the tenant's admission state and, finding `Refused`, abandons the
-batch with the same terminal error rather than mining it. The frame is
+the turn takes the miner lock and before its first `ingest_mined` — and
+it reads an **atomic**, not the admission table, since the lock order
+forbids reaching for the admission mutex while the miner lock is held.
+The coordinator publishes each tenant's admission state as a per-tenant
+`AtomicU8` the settler stores with `Release` **under the admission mutex
+before it releases the barrier exclusion**, and the turn loads with
+`Acquire` after taking the miner lock. That linearises without a second
+lock: a turn holds the exclusion across its mining span, so the settler's
+store precedes its release of the exclusion, which precedes the turn's
+acquisition of it, which precedes the load — a turn either ran wholly
+before the settler claimed the tenant or sees `Refused`. Finding it, the
+turn abandons the batch with the same terminal error rather than mining
+it. The frame is
 already durable and unacknowledged, so abandoning loses nothing a restart
 will not replay — and a restart is what clears the state. Its entry leaves
 the clamp set for a per-tenant `Refused` state, so `last_durable` and the node-wide
@@ -1773,8 +1786,49 @@ leaves, not for which file wins. The sidecar takes RFC 0052 §3.2's
 its own magic, two slots written alternately under a generation counter
 with a CRC32-C per slot, **preallocated at open and rewritten in place**,
 so a torn write is caught by the slot's checksum and the older slot still
-reads. The layout follows `RECLAIM`'s exactly, field for field, so the two files
-never need two readers. A 32-byte file header, then two slots; each slot a
+reads. The layout is `RECLAIM`'s **shape**, not its bytes: the two files hold
+different things, so claiming identity would be false. What they share is
+stated, and then `PUBLISHED`'s own layout is pinned in full. **Shared:**
+the two-slot protocol with a `u64 generation` and the higher live, a
+CRC32-C per slot over its own preceding bytes, preallocation and in-place
+rewrite with a `.new` only for a resize, pinned offsets, little-endian
+integers, RFC 4122 byte order for UUIDs, and every reserved byte zero and
+checked on read. **Different:** `PUBLISHED` has no planned area, so its
+`slot_len` derives from `max_tenants` alone and its trailer sits at an
+offset a reader computes from that; its entry carries two frontiers and
+two validity bits where `RECLAIM`'s carries one `occupied` bit; and its
+file header records only the capacity that sizes it.
+
+| Structure | Offset | Size | Field |
+|---|---|---|---|
+| File header | 0 | 4 | magic `b"OWPB"` |
+| | 4 | 2 | `u16` version (`= 1`) |
+| | 6 | 2 | reserved, zero |
+| | 8 | 8 | `u64 slot_len` |
+| | 16 | 4 | `u32 max_tenants` |
+| | 20 | 4 | reserved, zero |
+| | 24 | 4 | `u32` CRC32-C over bytes `[0..24)` |
+| | 28 | 4 | reserved, zero |
+| Slot header | 0 | 8 | `u64 generation` |
+| | 8 | 4 | `u32 entry_count` (reported, not a length) |
+| | 12 | 4 | `u32 next_slot_id` — the id high-water mark (below) |
+| | 16 | 2 | `u16 header_flags`, reserved and zero (the `published_seeded` witness lives in `RECLAIM`) |
+| | 18 | 2 | reserved, zero |
+| | 20 | 4 | reserved, zero |
+| Dictionary record (array of `max_tenants`) | 0 | 2 | `u16 len` |
+| | 2 | 128 | key bytes, `len` significant, remainder zero |
+| | 130 | 2 | `u16` flags: bit 0 `tombstoned`, bits 1–15 zero |
+| Entry (array of `max_tenants`, entry `i` = dictionary record `i`) | 0 | 2 | `u16` flags, per the table below |
+| | 2 | 2 | reserved, zero |
+| | 4 | 4 | `u32 generation` of the write that last changed these marks |
+| | 8 | 24 | records `WalOffset`: 16 B segment UUID then `u64` byte |
+| | 32 | 24 | audit `WalOffset` |
+| Slot trailer | 0 | 4 | `u32` CRC32-C over `[0 .. slot_len - 8)` of the slot |
+| | 4 | 4 | reserved, zero |
+
+A slot is therefore `24 + 132 × max_tenants + 56 × max_tenants + 8` bytes
+and the file `32 + 2 × slot_len`. The entry carries no slot-id field,
+since its position is its id. A 32-byte file header, then two slots; each slot a
 24-byte header, a **fixed entry area of exactly `max_tenants` entries**,
 and an 8-byte trailer whose checksum is a `u32` followed by four reserved
 bytes and covers **only the bytes preceding it**. The entry area is fixed,
@@ -1817,8 +1871,19 @@ tenant list on write, the same tenant would take different ids in the two
 files and every cross-reading of them would be wrong. So the id space has
 an owner and a lifetime. **`RECLAIM` owns it**: the WAL assigns a tenant
 its slot id when that tenant is first recorded in either sidecar, in
-`RECLAIM`'s dictionary, from the in-memory table open seeds from that
-file. **Ids are never renumbered and never reused while the tenant is
+`RECLAIM`'s dictionary. **The table open seeds from is the union of both
+dictionaries, not `RECLAIM`'s alone**, and that matters rather than being
+tidy: `publish_marks` writes `PUBLISHED` without touching `RECLAIM`, so a
+tenant can be assigned an id and recorded only there. Seeding from
+`RECLAIM` alone would lose that id at the next open and hand it to another
+tenant, crossing two tenants' marks in the file that still names the
+first. So the table is the union, and a record in either file — live or
+tombstoned — reserves its id. **A high-water mark backs it**: each slot
+header carries `u32 next_slot_id`, the lowest id never yet assigned,
+written by whichever file is written and taken at open as the **maximum**
+of the two, so allocation never goes backwards even if one file lags the
+other by a write. That is what makes the ordinary one-file-alone case
+safe rather than merely usually safe. **Ids are never renumbered and never reused while the tenant is
 recorded in either file** — neither file may compact on its own, and a
 tenant that leaves one but remains in the other keeps its id. `PUBLISHED`
 is written from that same in-memory table, so its dictionary is that
@@ -1908,7 +1973,23 @@ though the tenant had no entry at all, falling back to the node-wide
 horizon for it while still honouring the other side — **except for a
 tenant the entry marks terminal**, where the fallback would be unsafe.
 The flags' `terminal` bit (bit 3 above) is set
-when §3.2 puts a tenant in the server-terminal class, and a terminal
+when §3.2 puts a tenant in the server-terminal class, **and a restart
+clears it rather than honouring it forever** — persisting a refusal with
+no exit would be a durable outage. The transition is stated so it stays
+safe: at open the bit is read **for the horizon and not for admission**.
+It is what tells recovery that a clear validity bit means "nothing of
+that side was ever published" rather than "consult `X`", so the tenant's
+frames are replayed in full; and then the tenant is admitted normally,
+because the condition that made it terminal — an audit store rejecting
+writes, a clock that would not resolve — is re-evaluated by the first
+publish after the restart rather than assumed to persist. If it does
+persist, that publish re-enters the terminal class and re-sets the bit,
+visibly, on the same alert. The persisted bit is cleared on the first
+`publish_marks` write that follows a successful publish for that tenant,
+so the flag on disk tracks the last *known* state rather than the last
+bad one. Publication stays safe throughout, because the horizon reading
+happens before any admission and does not depend on the clear. That bit
+is set and a terminal
 tenant with a clear validity bit means *nothing of that side was ever
 published*, not "consult the node-wide horizon": its events were never
 written, so `X` — advanced by every healthy tenant's progress — would
@@ -2005,7 +2086,15 @@ coordinator is constructed, open counts the tenants recovery restored and
 **refuses to start** when that count exceeds the configured cap, naming
 the recovered count and the cap, on the same fail-closed posture as every
 other geometry mismatch; the operator raises the knob back or starts a
-fresh root. Lowering the knob below the recorded `entry_count` is
+fresh root. **Lowering is checked against the id space, not the live count.** A
+tombstoned id persists, and ids are never reused, so `entry_count` — live
+entries only — can sit far below the highest id in use: a root whose only
+assigned slot is id 900 has an `entry_count` of one and would pass a cap
+of two, then address entry 900 in a file sized for two. So the check is
+against **the highest assigned or tombstoned slot plus one, taken across
+both files** — which is exactly `next_slot_id`, the high-water mark each
+slot header carries — and a configured `max_tenants` below that is
+refused at `Wal::open`, naming both numbers. Lowering the knob below the recorded `entry_count` is
 **refused at `Wal::open`** too, as the same error, naming both numbers, since the marks of the
 tenants that no longer fit cannot be dropped without losing their
 frontiers; raising it needs a **new file, written at open before the first
@@ -2614,11 +2703,10 @@ are kept distinct so that the remedy each advertises is the true one.
 >   every retry while nothing is reclaimable
 > - **And** the timer's idle rotation at the ceiling performs no rotation
 >   and the tick still captures its cut with `last_durable` as the mark;
->   the rotation owed after a seal with a slot free proceeds, and without
->   one is deferred — `RotationState::Deferred`, reported as backpressure
->   with the housekeeping delay and never as the terminal class — until a
->   pass frees a slot, after which it runs and admission resumes without a
->   restart
+>   the rotation owed after a seal proceeds whether or not a slot is free,
+>   leaving at most a one-segment overrun the gauge reports as `over_cap`
+>   and the next pass reclaims — no rotation-failure state is entered from
+>   the ceiling, and admission continues throughout
 > - **And** in open mode a batch for a tenant id the miner does not hold,
 >   with `max_tenants` held, is refused naming the
 >   tenant, as `TenantCapacity` — `503` / `UNAVAILABLE` with a protobuf
@@ -2678,8 +2766,9 @@ are kept distinct so that the remedy each advertises is the true one.
 >   creates its segment even though closing the current one takes
 >   `closed_retained` past the ceiling, the WAL keeps accepting, and only
 >   *discretionary* rotations are refused while the pins hold
-> - **And** `Deferred { AtSegmentCap }` is never entered from the ceiling
->   itself: the only route to it is an exhausted rotation retry budget
+> - **And** no rotation-failure state is entered from the ceiling at all:
+>   `Terminal` is reached only by an exhausted rotation retry budget, and
+>   no `Deferred` state exists
 > - **And** the kind travels in the call: `rotate(Discretionary)` at the
 >   ceiling returns `RefusedAtSegmentCap` and creates nothing, while
 >   `rotate(Owed)` at the same count rotates — the seal path and the

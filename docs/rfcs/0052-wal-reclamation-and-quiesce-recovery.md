@@ -1185,7 +1185,7 @@ one, because startup's fallback is exactly as trustworthy as this record:
   | | 20 | 4 | reserved, zero |
   | Dictionary record | 0 | 2 | `u16 len` |
   | | 2 | 128 | key bytes, `len` significant, remainder zero |
-  | | 130 | 2 | reserved, zero |
+  | | 130 | 2 | `u16` flags: bit 0 `tombstoned`, bits 1–15 zero |
   | Entry | 0 | 2 | `u16 tenant_slot` |
   | | 2 | 2 | `u16 mode` |
   | | 4 | 4 | reserved, zero |
@@ -1214,6 +1214,45 @@ one, because startup's fallback is exactly as trustworthy as this record:
   id**, so a dictionary position is never reserved as a sentinel.
   Because slot ids are `u16`, `max_tenants` has a format ceiling of
   **65,536**, refused at config validation with that reason (§3.8).
+
+  **The two files share one id space, and that needs saying rather than
+  assuming.** RFC 0053's `PUBLISHED` carries its own copy of this
+  dictionary — both files must be readable alone — but a copy is not
+  agreement: if each compacted its own tenant list on write, the same
+  tenant would take different ids in the two files and every cross-reading
+  of them would be wrong. So the id space has an owner and a lifetime.
+  **`RECLAIM` owns it**: the WAL assigns a tenant its slot id when that
+  tenant is first recorded in **either** sidecar, in `RECLAIM`'s
+  dictionary, from the in-memory table open seeds from this file.
+  **Ids are never renumbered and never reused while the tenant is recorded
+  in either file** — neither file may compact on its own, and a tenant
+  that leaves one but remains in the other keeps its id. `PUBLISHED` is
+  written from that same in-memory table, so its dictionary is this
+  dictionary, at the same ids, by construction rather than by convention.
+  **A rebuild is the one place ids may be reassigned**, and it is safe
+  precisely because the rebuild above rewrites *both* files as one
+  operation from the one table.
+
+  A tenant introduced by one file alone is the ordinary case, not an
+  error: the two are written at different moments — `publish_marks`
+  touches `PUBLISHED` without `RECLAIM`, a pass touches `RECLAIM` without
+  `PUBLISHED` — so at any instant one may name an id the other does not,
+  and the file lacking it simply has no entry for that tenant and reads as
+  "nothing reclaimed" or "no frontier" accordingly. What is **fail-closed**
+  is narrower: an id that **both** dictionaries name with **different
+  keys**, which no correct writer can produce and which silently crosses
+  two tenants' marks if read past — `OpenError::Corrupt`, naming both
+  files and the id. A crash between the two writes therefore leaves a
+  readable pair, never a halt.
+
+  Removal follows from the same stability. Dropping a tenant by compacting
+  the dictionary would renumber every id above it, so a removed tenant is
+  **tombstoned** instead: its dictionary record keeps its key with the
+  `tombstoned` bit set (bit 0 of the record's flags field at offset 130),
+  its entries are dropped, and the id is **retired, not freed** — no later
+  tenant takes it until a rebuild compacts, which is the one operation
+  allowed to renumber because it rewrites both files together from one
+  table.
 
   `RECLAIM` is the fourth Invariant row in §3.8; the
   polynomial is RFC 0008 §6.9's Castagnoli, as everywhere else in the WAL.
@@ -3180,6 +3219,16 @@ they are not substitutes for the rest.
   this RFC supplies the policy for; §6.5's durable-entry-first rule and
   Scenario RFC0008.6's permanent refusal are **superseded** by §3.3 and
   RFC0052.4/.5.
+- RFC 0046 (the tenant-prefixed frame) — **amended** by §3.2:
+
+  > This RFC amends RFC 0046's replay validation and criterion RFC0046.11
+  > from a 256-byte tenant length to **128**, the grammar RFC 0048 §3.1
+  > pinned and which RFC 0046's own resolved-questions note records as "the
+  > one tenant grammar every boundary applies at". The amendment is a
+  > consistency fix rather than a new decision: the replay clause and
+  > RFC0046.11 were left at the superseded number, and the frame codec was
+  > left with them.
+
 - RFC 0018 §3.2 (retryable error mapping) — **amended** by §3.3: its transient
   class lists "post-rotation quiesce", which #791 disproved, and its two
   classes gain a third, *server-terminal, client-retryable*, for the terminal

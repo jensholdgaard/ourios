@@ -644,10 +644,17 @@ failure keeps the reservation for as long as its frame can be replayed —
 until the frame is reclaimed or a later write for that id succeeds and
 converts the reservation to `Held` — which is exactly the retain rule the
 entry case below uses. The recovered set can therefore never exceed the
-cap by this path; a set that exceeds it for any other reason (an operator
-lowering `max_tenants` between runs) is seeded whole and the guard
-refuses only *new* ids until it drains, since refusing a tenant the node
-already holds data for would be the worse failure. The exception matters because settlement
+cap by this path, and the other way it could — an operator lowering
+`max_tenants` between runs — is **refused at `Wal::open`**, the single
+rule §3.2's sidecar states: the file is sized from the knob, so a recorded
+set larger than the new limit cannot be represented at all, and with no
+eviction in this stage it could never drain. The node does not start; the
+operator raises the limit back or starts a fresh root. An earlier draft
+said the set was seeded whole and only new ids refused, which contradicted
+that and left an over-limit set with no way down; the open-time rejection
+is the rule everywhere — admission, sidecar and the
+`ourios.wal.tenants.usage` states alike, which can therefore never report
+`held` above `limit`. The exception matters because settlement
 installs a tenant outside any admission path: a first write that appends,
 panics in mining and unwinds would otherwise release its slot, another id
 could take it and become `Held`, and the rebuild would then install the
@@ -899,7 +906,16 @@ outcome for the dependent records. `write_owned` returns a three-way
 result — fully durable, retained-for-retry, or **permanently failed** —
 and `write_ordered` refuses the record publish on the third exactly as it
 does on the second, requeueing the records rather than publishing them
-under a missing event. **Refusing forever is not a contract, so the third
+under a missing event. **The outcome is per tenant, not per batch**: a
+drained batch spans tenants, and one tenant's unwritable audit partition
+must not stop every other tenant's records from publishing — that would
+turn a single bad partition into a node-wide stall. So the result carries
+a **failed-tenant set**, the outcome is evaluated per tenant (per audit
+partition, which is keyed by tenant and day), and `write_ordered`
+publishes the record partitions of every tenant whose audit events are
+fully durable while refusing and requeueing only those of the tenants in
+that set. Retained-for-retry is already per partition on the existing
+path and stays so. **Refusing forever is not a contract, so the third
 outcome is terminal for that tenant**, not a retry loop: RFC 0025 §3.3's
 quarantine is for permanent `BatchError`s on *data records*, and it works
 by writing a `record_quarantined` event — into the very audit sink that is
@@ -908,8 +924,16 @@ failed audit write puts the tenant in the **server-terminal,
 client-retryable** class §3.1 already defines: its records stay in the
 WAL, unpublished and unacknowledged-past, its appends are refused with
 the tenant named, the state is exported and alerted beside
-`ourios.wal.tenant_unrecoverable`, and it clears by operator action or a
-restart — a node whose audit store rejects writes permanently needs one.
+`ourios.wal.tenant_unrecoverable`, and **a restart is the only thing that
+clears it**. Not an in-process operator action: the events are gone from
+the sink's buffer, so clearing the flag while the process runs would let
+the tenant's requeued records publish under events that were dropped —
+precisely the ordering the flag exists to protect. A restart is different
+in kind, because recovery re-mines the frames from the WAL and RFC 0052's
+regeneration-only replay produces those template events again, so the
+records publish under events that exist. The rule is therefore stated
+flatly: a permanent audit failure is cleared by restart alone, after the
+operator has fixed whatever made the store reject writes.
 The per-partition settlement below reads that third outcome as *not*
 settled. RFC0053.2 asserts a permanent audit failure leaving the records
 unpublished and requeued and the tenant terminal.
@@ -1379,9 +1403,20 @@ watermark is written durably on the checkpoint's own path, as an
 the per-tenant map, `fn checkpoint(&mut self, durable_to: WalOffset,
 published: &HashMap<TenantId, PublishedMarks>)` where `PublishedMarks {
 records: WalOffset, audit: WalOffset }` names the pair the rules need, and
-the WAL writes it to a `PUBLISHED` sidecar beside `CHECKPOINT`, **before**
-`CHECKPOINT`'s own write in the same call, so a `CHECKPOINT` never exists
-without a `PUBLISHED` at least as new. The sidecar takes RFC 0052 §3.2's
+the WAL writes it to a `PUBLISHED` sidecar beside `CHECKPOINT`, **after**
+`CHECKPOINT`'s own write in the same call. The order is the other way
+round from an earlier draft, and the reason is a crash window that draft
+bricked: writing `PUBLISHED` first leaves, on a power loss before the
+rename, a `PUBLISHED` beside a still-version-1 `CHECKPOINT` — an ordinary
+crash that the matrix would have read as a lost checkpoint and failed
+closed on. Writing it second makes `PUBLISHED`-without-a-version-2-
+`CHECKPOINT` reachable only by deleting the checkpoint, which *is* the
+fault the matrix should catch, while the new window — a version-2
+`CHECKPOINT` with `PUBLISHED` absent or stale — is exactly what
+`published_seeded` already governs and is recoverable by seeding from `X`.
+Neither order is unsafe for the seed itself, which takes `max(X,
+PUBLISHED)` per tenant, so the newer of the two always dominates; the
+order is chosen for which crash window it leaves. The sidecar takes RFC 0052 §3.2's
 `RECLAIM` shape rather than a temp-and-rename: a fixed byte layout with
 its own magic, two slots written alternately under a generation counter
 with a CRC32-C per slot, **preallocated at open and rewritten in place**,
@@ -1390,32 +1425,46 @@ reads. The layout follows `RECLAIM`'s exactly, field for field, so the two files
 never need two readers. A 32-byte file header, then two slots; each slot a
 24-byte header, `entry_count` entries, and an 8-byte trailer whose
 checksum is a `u32` followed by four reserved bytes and covers **only the
-bytes preceding it** (Castagnoli, as everywhere in the WAL). An entry is
-`[16 B tenant key][24 B records WalOffset][24 B audit WalOffset][u16
-flags][6 B reserved]` — 72 B — where a `WalOffset` is its 16 B segment
-UUID plus its 8 B byte offset, the pinned 24 B, and the **tenant key is
-the same 16 B key `RECLAIM`'s entries use**, not a second encoding: the
-two files are read together, so a tenant that hashes one way there and
-another way here would be two tenants. `TenantId` is a variable-length
-string, so that key is a derivation rather than the id itself, and this
-RFC takes whichever derivation RFC 0052 §3.2 fixes — with the one
-requirement it must carry, stated here because both files depend on it:
-the derivation must be **injective over the admissible tenant set**, since
-a collision would silently merge two tenants' marks. Recovery maps a key
-back the only way a digest allows — **through the live tenant set**:
-restore and replay produce the tenants, their keys are derived the same
-way, and each match takes its marks; a key matching no restored tenant is
-a tenant that no longer exists and is dropped, and a restored tenant with
-no key seeds from `X` like any tenant with no entry. **Slots are not
-allocated or reused per tenant**: `entry_count` says how many of the
-`max_tenants` entry positions are live, entries are written in tenant-key
-order on every write, and a write rewrites the whole slot — there is no
-free list and no position to leak, which is what keeps the geometry fixed.
-The file's size is therefore decided at open by `max_tenants` alone: a
-slot is `32 + 72 × max_tenants` bytes and the file `32 + 2 × (32 + 72 ×
-max_tenants)`, which at the default 1024 tenants is 73,760 B a slot and
-147,552 B — about 144 KiB — for the file, small beside `RECLAIM`'s
-10.1 MiB and a 128 MiB segment. **Changing `max_tenants` therefore changes
+bytes preceding it** (Castagnoli, as everywhere in the WAL). **Tenants are referenced through a per-slot dictionary, not inline**, the
+shape RFC 0052 §3.2 settled on and for the same reason: `TenantId` is a
+validated string, not a UUID, so any fixed-width *digest* of it either
+truncates or collides, and a collision would silently merge two tenants'
+marks. So each slot opens with a **dictionary** of `max_tenants` fixed
+records, `[u16 len][256 B key bytes][2 B reserved]` (260 B), `len` naming
+how many of the key bytes are live and an unused record carrying `len =
+0`; every entry then references a tenant by a **`u16` slot id** into it.
+The mapping is injective by construction and round-trips exactly — the
+key is the tenant id itself, not a derivation — and the dictionary is the
+same one `RECLAIM` carries, so the two files agree tenant for tenant and
+a slot id means the same thing in both.
+
+**The key is 256 bytes because the accepted spec says so**, not 128: RFC
+0046 §3.1 — accepted — normalises a tenant id at extraction and requires
+the result to be "non-empty, at most 256 bytes", and its replay prefix
+rejects a length above 256. `ourios-core`'s `MAX_TENANT_BYTES = 128` is a
+*stricter* runtime check, which is allowed and refuses ids the spec would
+admit, but a persisted layout that can never grow must be sized to the
+spec's bound: sizing to 128 would mean a format change the day that
+constant is relaxed to match RFC 0046. RFC 0052's dictionary record is
+132 B against the same reasoning and needs the same correction.
+
+An entry is then `[u16 slot id][u16 flags][4 B reserved][24 B records
+WalOffset][24 B audit WalOffset]` — 56 B — where a `WalOffset` is its
+16 B segment UUID plus its 8 B byte offset, the pinned 24 B, and `flags`
+carries the `publishing` bit §3.2's settlement uses. **Recovery maps
+through the dictionary**, not through a live tenant set: a slot id reads
+its key, the key is a tenant id verbatim, and that tenant takes its marks;
+an id naming a dictionary record with `len = 0` is a corrupt slot and the
+other slot is read. A tenant with no entry seeds from `X`, as one with no
+record always has. **Positions are not allocated or reused per tenant**:
+`entry_count` says how many of the `max_tenants` positions are live,
+dictionary and entries are written in tenant-id order on every write, and
+a write rewrites the whole slot — no free list, no position to leak, which
+is what keeps the geometry fixed. The file's size is therefore decided at
+open by `max_tenants` alone: a slot is `24 + (260 + 56) × max_tenants + 8`
+bytes and the file `32 + 2 × slot`, which at the default 1024 tenants is
+323,616 B a slot and 647,264 B — about 632 KiB — for the file, still small
+beside `RECLAIM`'s 10.1 MiB and a 128 MiB segment. **Changing `max_tenants` therefore changes
 a persisted layout**, and the rule mirrors `RECLAIM`'s: lowering it below
 the recorded `entry_count` is **refused at `Wal::open`** as
 `OpenError::InvalidConfig`, naming both numbers, since the marks of the
@@ -1564,17 +1613,28 @@ same durable path a checkpoint uses, before it removes the entry. Each
 window therefore closes with a durable frontier at the moment the
 ambiguity is resolved, not at whatever checkpoint happens next, and
 repeated crashes cannot accumulate copies of the same records: each
-replays only what lies above the last written frontier. **A failed forced
-write is a fail-closed park**, because neither obvious move is safe once
-the rebuild has already published: removing the entry loses the frontier
-and lets a later crash republish, and retaining it while carrying on lets
-the next settlement republish the same span. So the entry **stays**, the
-tenant is refused under the server-terminal, client-retryable class until
-the write succeeds, and the coordinator retries the same marks — the
-attempt is idempotent because the marks are already known and
-`publish_marks` is monotonic per tenant, so a retry writes the same
-frontier and a crash in between leaves the previous slot readable.
-RFC0053.2 covers it. The write is one
+replays only what lies above the last written frontier. **The write is in two steps, because a crash between the publish and the
+write would otherwise lose the frontier.** A rebuild that has already
+handed its batch to the store and then dies before `publish_marks` leaves
+nothing on disk saying so, and the next start replays the same span again
+— and again on the next crash, with no ceiling. So the marks are written
+**before** the publish as an *intent* and confirmed after it: the entry
+format's `u16 flags` carries a `publishing` bit, `publish_marks` writes
+the intended marks with that bit set, the rebuild publishes, and a second
+`publish_marks` clears the bit. Recovery reads a set bit as "this span was
+attempted": it seeds the watermark from the **previous** durable marks, so
+nothing that may not have landed is ever suppressed, and it re-publishes
+**only the intent span**, which is fixed and recorded rather than growing
+with each attempt. Repeated crashes therefore replay the same bounded
+span, one extra copy each, and the first confirm closes the window for
+good — the honest bound, rather than an unbounded one dressed as a
+guarantee. **A failed write is a fail-closed park**: the entry **stays**,
+the tenant is refused under the server-terminal, client-retryable class
+until the write succeeds, and the coordinator retries the same marks,
+which is idempotent because they are already recorded and `publish_marks`
+is monotonic per tenant, so a retry writes the same frontier and a crash
+in between leaves the previous slot readable. RFC0053.2 covers both the
+intent-set restart and the failed write. The write is one
 sidecar write per settlement, which is a rare path by construction — it
 follows a panic — and the checkpoint's own write is unchanged. It follows that the salvage in `ingest_mined` is kept as
 belt-and-braces and its count is **never read** by this path: an earlier

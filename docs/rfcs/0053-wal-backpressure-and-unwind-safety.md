@@ -934,6 +934,22 @@ regeneration-only replay produces those template events again, so the
 records publish under events that exist. The rule is therefore stated
 flatly: a permanent audit failure is cleared by restart alone, after the
 operator has fixed whatever made the store reject writes.
+
+**That argument covers the record-dependent audit stream and nothing
+else, which this RFC states rather than over-claims.** The events it
+reasons about are the ones the miner regenerates from frames — template
+merges and widenings, which accompany published records. RFC 0026's
+binding denials do not fit it: `Pipeline::enforce_binding` emits an
+`IngestDenied` event to the denial sink and returns the error *before any
+frame is appended*, so there is nothing in the WAL for replay to
+regenerate and the restart argument simply does not apply. A permanent
+drop there is a real gap against RFC 0005 §7's no-loss contract, and it
+is **out of this RFC's scope** — its subject is the ordering between
+records and the events that describe them, not the denial stream, which
+has no records to order against. The gap is named here rather than papered
+over, and §7 carries it as a follow-up: denial events need either their
+own durable path or an explicit exemption in RFC 0005's contract, and
+that is RFC 0026's ground to settle.
 The per-partition settlement below reads that third outcome as *not*
 settled. RFC0053.2 asserts a permanent audit failure leaving the records
 unpublished and requeued and the tenant terminal.
@@ -1258,25 +1274,40 @@ wholesale. RFC0053.2 drives a panic in the replay and in
 where it would hold every other tenant's sequence behind it; instead the
 coordinator keeps the **settling set** under its admission mutex, and a
 request for a `Settling` tenant is **refused at admission, before it takes
-a sequence**. The check and the append are **two sections, not one**, and an earlier
-draft had that wrong: holding the admission mutex across `append_batch`
-means holding it across a rotation inside that append — its create, its
-rename, its parent fsync — which contradicts this RFC's own rule that no
-lock in the hierarchy is held across directory I/O, and would put every
-concurrent reservation behind an fsync. So the **admission mutex covers
-the checks and the reservations only** (max-frame, terminal state, tenant
-slot, settling set, byte and segment reservation), and is released before
-the journal mutex is taken; the **journal mutex covers the append**, and a
-rotation inside it runs under that mutex alone. What the admission mutex
-then guarantees is that the reservations are consistent with each other,
-not that the append is atomic with them — and the settling case does not
-need it to be, because the **miner lock is the backstop**: a turn that
-passed the settling check and then finds the tenant `Settling` when it
-takes the miner lock to mine waits on the entry's completion signal, as
-the losing trigger does, and mines against the rebuilt tree afterwards.
-That ordering is the correct one anyway — its frame lies above the
-rebuild's span, so it must be mined after it — and the admission-time
-refusal is the optimisation that keeps most turns from waiting at all. **The commit sequence is not
+a sequence**. **One protocol, stated once and the same in both sections.** The work
+splits by which state it reads, not by convenience. The **admission
+mutex** covers the coordinator's own policy — max-frame validation, the
+terminal-rotation and tenant checks, the settling set, and the tenant
+slot — and is released before the journal is touched. The **journal
+mutex** covers everything that reads or mutates journal state: the
+rotation-due evaluation, the byte and segment reservation taken from
+`reclaim_state()`, and the `append_batch` that consumes the resulting
+`RotationDecision`, all in **one hold**, which is what §3.1 requires and
+what makes the token sound. The binding is therefore atomic where it must
+be — a reservation cannot be made against a journal another append has
+moved — and the rollback is local to that hold: an append that fails,
+whether on rotation or on write, releases its byte and segment
+reservation before the mutex is dropped, and a rotation inside the append
+does its create, rename and parent fsync under the journal mutex alone.
+That keeps the admission mutex clear of directory I/O, which this RFC's
+lock order requires, and keeps reservation and append inseparable, which
+§3.1 requires; the earlier draft that held the admission mutex across the
+append satisfied the second at the cost of the first. **The claim that carries the correctness is the one taken under the
+barrier exclusion and the miner lock**, not the admission-set insertion.
+Publishing `Settling` under the admission mutex refuses *later* requests
+early, which is worth doing, but it cannot order a turn that is already
+past that point: such a turn could mine after the claim and have its work
+discarded by `replace_tenant`. What closes that is RFC 0052 §3.1's own
+span — an ingest turn holds the exclusion from the miner work through
+`pool.submit` and the `last_durable` update — so a settler that takes the
+**exclusion and then the miner lock** to claim the entry cannot interleave
+with any mining span at all: no turn is mid-mine while it holds them, and
+no turn can start one until it releases. A turn that appended before the
+claim but had not yet mined waits at the exclusion and mines afterwards,
+correctly, because the rebuild replays only to the entry's own span and
+that turn's frame lies above it. So the mining span is excluded whole, the
+admission-time refusal is an optimisation with no correctness weight, and
+post-claim appends need no special handling. **The commit sequence is not
 reserved there**, and that is deliberate: `CommitCoordinator::append` today
 takes the journal lock, appends, and only *then* allocates `seq` from
 `FlushState`, returning `CommitOutcome { seq: None }` when the append
@@ -1288,17 +1319,20 @@ allocation stays where it is, after a successful append and under the
 journal mutex; the gate itself is untouched, awaited outside both locks as
 today. RFC0053.1 drives the concurrency: a settler claiming a tenant while
 a turn for it is between its admission check and its append, asserting the
-turn's records land after the rebuild and nothing is mined into a tree
-that is about to be replaced.
+turn's frame is appended, waits at the exclusion, and is mined against the
+rebuilt tree afterwards — nothing mined into a tree about to be replaced,
+and nothing replayed twice, since its frame lies above the rebuild's
+span.
 
 **One lock order covers all four locks**, since this RFC adds the first of
 them to the three RFC 0052 §3.1 fixes. Top to bottom: **admission mutex →
 barrier exclusion → miner lock → `last_durable`**, with the **journal
 mutex** taken below the admission mutex and never above it — an ingest
-turn takes the admission mutex for its checks and reservations (max-frame,
-terminal state, tenant, settling set, byte and segment reservation) and
-**releases it**, then takes the journal mutex alone for `append_batch` —
-whose success allocates the sequence, and inside which a rotation does its
+turn takes the admission mutex for the coordinator's policy checks
+(max-frame, terminal state, tenant slot, settling set) and **releases
+it**, then takes the journal mutex alone for the rotation decision, the
+byte and segment reservation and `append_batch` in one hold — whose
+success allocates the sequence, and inside which a rotation does its
 directory work under that mutex only — then follows
 RFC 0052's order for the mining span; `maintain` takes the admission mutex
 and then the journal mutex for its **ledger** halves, in that order, which
@@ -1368,7 +1402,22 @@ checkpoint advance for everyone else; its frames are retained instead by
 RFC 0052's own pin — the receiver drops the tenant from the
 `SnapshotHorizons` it hands to `maintain`, so the WAL pins the tenant at
 its oldest surviving frame (`RetainFloor::Pinned`, strict) and reclaims
-only segments holding no frame of it; no snapshot is installed for it;
+only segments holding no frame of it. **Retaining the frames is not
+enough on its own**, and this is the half an earlier draft missed: the
+pin governs which WAL segments survive, while what a restart *replays* is
+governed by the Parquet-side suppression horizon, and letting the
+node-wide checkpoint advance past this tenant's unpublished frames would
+make a restart suppress records that never reached Parquet — acknowledged
+data lost, which no isolation is worth. So the suppression horizon is
+**per tenant**, and the `PUBLISHED` sidecar is what makes that cheap: a
+tenant's replay gate is `max(S, records watermark)` from its own entry,
+falling back to the checkpoint `X` only for a tenant with no entry, so a
+refused tenant whose records never published has a watermark that stays
+behind and its frames are replayed in full. The node-wide checkpoint may
+then advance for everyone else without loss — which is the point of the
+isolation, and holding `X` back for every tenant instead would
+reintroduce exactly the node-wide stall this paragraph exists to
+prevent; no snapshot is installed for it;
 the state is exported and alerted (`ourios.wal.tenant_unrecoverable`,
 §3.3, with the pin visible in the floor); and the operator path is a
 restart, which halts naming the tenant per RFC 0052 and is where the
@@ -1436,7 +1485,9 @@ the per-tenant map, `fn checkpoint(&mut self, durable_to: WalOffset,
 published: &HashMap<TenantId, PublishedMarks>)` where `PublishedMarks {
 records: WalOffset, audit: WalOffset }` names the pair the rules need, and
 the WAL writes it to a `PUBLISHED` sidecar beside `CHECKPOINT`, **after**
-`CHECKPOINT`'s own write in the same call. The order is the other way
+`CHECKPOINT`'s own write in the same call — the order every statement of
+it in this RFC now gives, including the amendment §8 stages for RFC 0052,
+which an earlier draft left saying the opposite. The order is the other way
 round from an earlier draft, and the reason is a crash window that draft
 bricked: writing `PUBLISHED` first leaves, on a power loss before the
 rename, a `PUBLISHED` beside a still-version-1 `CHECKPOINT` — an ordinary
@@ -1463,7 +1514,15 @@ reads. The layout follows `RECLAIM`'s exactly, field for field, so the two files
 never need two readers. A 32-byte file header, then two slots; each slot a
 24-byte header, `entry_count` entries, and an 8-byte trailer whose
 checksum is a `u32` followed by four reserved bytes and covers **only the
-bytes preceding it** (Castagnoli, as everywhere in the WAL). **Tenants are referenced through a per-slot dictionary, not inline**, the
+bytes preceding it** (Castagnoli, as everywhere in the WAL). The
+encoding rules are RFC 0052 §3.2's, adopted verbatim so one reader serves
+both files: **byte offsets are pinned** for every structure rather than
+implied by field order, integers are **little-endian** (matching the
+existing checkpoint and segment encoders), UUIDs are in RFC 4122 byte
+order, and **every reserved byte is zero and is checked on read** — a
+non-zero reserved byte is a format error and `Wal::open` refuses the file
+rather than ignoring the field, which is what keeps a later version from
+colliding with sloppy writers. **Tenants are referenced through a per-slot dictionary, not inline**, the
 shape RFC 0052 §3.2 settled on and for the same reason: `TenantId` is a
 validated string, not a UUID, so any fixed-width *digest* of it either
 truncates or collides, and a collision would silently merge two tenants'
@@ -1507,11 +1566,18 @@ a persisted layout**, and two rules follow, both mirroring `RECLAIM`'s.
 **The file describes its own geometry**: the 32-byte file header carries a
 `u32 max_tenants` (the value it was preallocated for) beside the magic and
 version, so a reader never infers the shape from configuration, and
-`Wal::open` **refuses a configuration exceeding it** as
-`OpenError::InvalidConfig`, naming both the configured and the recorded
-value — the file can never grow, so a raised knob needs a fresh root,
-which the pre-production layout policy accepts rather than shipping
-migration tooling. **And `max_tenants` has a format ceiling**, because a
+`Wal::open` reads that value rather than assuming the configured one, and
+**raising the knob is supported by a copy at open, not by a refusal**: a
+refusal would strand every existing root the day an operator needs more
+tenants, and the copy is crash-safe with the same primitives the WAL
+already uses. `Wal::open`, finding a configured `max_tenants` above the
+recorded one, writes a **new file under a temp name** at the larger
+geometry with the old dictionary and entries copied in, fsyncs it,
+renames it over the old name, fsyncs the parent, and only then proceeds —
+so a crash at any point leaves either the old file intact or the new one
+complete, and a leftover temp is swept like any other. This is the one
+supported procedure; the file still never grows *in place*, which is what
+the two-slot protocol depends on. **And `max_tenants` has a format ceiling**, because a
 slot id is a `u16`: `validate_config` rejects `max_tenants > 65_536` with
 that reason. The bound is 65,536 rather than 65,535 because **slot id 0 is
 usable** — a position is marked unused by its dictionary record's `len =
@@ -1675,10 +1741,19 @@ the intended marks with that bit set, the rebuild publishes, and a second
 attempted": it seeds the watermark from the **previous** durable marks, so
 nothing that may not have landed is ever suppressed, and it re-publishes
 **only the intent span**, which is fixed and recorded rather than growing
-with each attempt. Repeated crashes therefore replay the same bounded
-span, one extra copy each, and the first confirm closes the window for
-good — the honest bound, rather than an unbounded one dressed as a
-guarantee. **A failed write is a fail-closed park**: the entry **stays**,
+with each attempt. Repeated crashes replay the same bounded span, and **the copies are
+bounded too, because the republish is idempotent**: a normal publish names
+its object with a fresh `UUIDv7`, so a replay would add a copy each time,
+but the intent span's republish derives its key deterministically instead
+— a name-based (RFC 4122 v5) UUID over the tenant, the intent's marks and
+the partition key — so every attempt at the same span writes the *same*
+object name and the store's last-writer-wins overwrite collapses them.
+Each partition of the span has its own such key, so a first attempt that
+published some partitions and died is overwritten partition for
+partition. Repeated crashes therefore leave **one** copy of the span, not
+one per crash, and the first confirm closes the window; the guarantee is
+claimed only for the span under an intent, since a publish outside one
+keeps its `UUIDv7` and the at-most-twice rule. **A failed write is a fail-closed park**: the entry **stays**,
 the tenant is refused under the server-terminal, client-retryable class
 until the write succeeds, and the coordinator retries the same marks,
 which is idempotent because they are already recorded and `publish_marks`
@@ -2399,6 +2474,13 @@ that decision lands the RFC stops at `green`, and says so.
       than be the fixed 1 GiB §3.1 sets. The incident node held 42 MB over
       five days, so a default tuned for it would be far too small for a busy
       node; a fraction of the volume may be the honest default.
+- [ ] Where RFC 0026's binding-denial events go when the audit store
+      rejects writes permanently. §3.2's three-way outcome and its terminal
+      rule cover the record-dependent stream only, because a denial is
+      emitted before any frame exists and replay cannot regenerate it — so
+      a permanent drop there is an open gap against RFC 0005 §7. It needs
+      either a durable path of its own or an explicit exemption in that
+      contract; either is RFC 0026's to settle, not this RFC's.
 - [ ] Confirm RFC 0014 §3.4's hard ceiling is implemented — the blocking
       `emit` that makes buffered bytes never exceed the ceiling. It is not a
       design question: §3.4 is accepted and decided it, and today's sinks

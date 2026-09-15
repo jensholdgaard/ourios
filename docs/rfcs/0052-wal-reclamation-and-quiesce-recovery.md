@@ -3290,11 +3290,12 @@ they are not substitutes for the rest.
     reservation under the journal mutex, so the age-sensitive rotation
     predicate is decided in one place rather than recomputed inside the
     append.
-  - *RFC 0053 §3.2* also replaces the timer's pre-cut guard — §3.2's `if
+  - *RFC 0054 §3* replaces the timer's pre-cut guard — §3.2's `if
     failed_epoch <= barrier_epoch: skip` — with proceed-and-decide, once its
     requeue makes the panicked batch's records available to the next cut's
     drain; the "only a restart clears it" wording in §3.1, RFC0052.1 and
-    RFC0052.7 is amended with it.
+    RFC0052.7 is amended with it, and RFC0054.4 asserts it. The unwind half
+    of RFC 0053 moved there in the 2026-09-15 split.
 - RFC 0008 §6.5 (rotation), §6.6 (recovery horizon), §6.7 (checkpoint
   and housekeeping), §6.8 (counters), §6.9 (tunables) — the mechanism
   this RFC supplies the policy for; §6.5's durable-entry-first rule and

@@ -354,7 +354,26 @@ drain or flush covers it), or quarantined per record on a poison rejection,
 or, on an unwind, latched (§3.1's guard rule) and settled. An audit write
 that fails transiently is the same refusal `write_ordered` already makes:
 the records are not published, they requeue, and the guard settles on the
-requeue. The worker moves
+requeue.
+
+**The publisher thread needs a runtime handle, or it silently drops the
+graph feed.** `write_ordered` hands every published batch to the RFC 0047
+§3.3 flush-cadence graph emitter through
+`tokio::runtime::Handle::try_current()`, spawning the update off the
+publish path — and a bare `std::thread` has no current runtime, so
+`try_current` fails and the update is skipped with no error. Today that
+call always runs on a runtime worker; moving publishes to a dedicated
+thread would make every detached partition skip graph emission on exactly
+the deployments that configure OpenFGA. So the publisher **carries a
+`Handle` cloned at construction and enters it** (`handle.enter()`) for the
+duration of each write, which makes `try_current` succeed and leaves
+`write_ordered` untouched. The alternative — queueing graph updates back
+to the runtime through a receiver-owned channel — was rejected as a second
+queue with its own shutdown and overflow semantics for a feed that is
+already fire-and-forget; entering the handle is one line and keeps one
+code path for both callers. The verification plan covers it: the publisher
+test asserts the emitter is fed for a detached partition, which fails on a
+thread that never entered a runtime. The worker moves
 to its next record as soon as the enqueue returns, so it is never inside a
 PUT, the quiesce waits on encodes alone, and the PUTs settle outside the
 exclusion under `quiesce_publishes` like any other. At shutdown the order
@@ -617,15 +636,30 @@ panic in this stage; RFC0052.10 is not gated on RFC 0053 for it. The
 signal has to be concrete, because nothing else can carry it: the pool's
 workers are detached `std` threads whose join handles are kept only for
 drop, so a worker panic is invisible to the receiver while it serves. The
-latch is a pair of shared atomics owned by the pipeline (`SharedPipeline`
-holds the `Arc`) and handed at construction to the encode pool, to the
-sink's publish guards and to the barrier task: `barrier_epoch: AtomicU64`,
-the number of the next cut, incremented at every cut capture under the
-exclusion; and `failed_epoch: AtomicU64`, the lowest epoch any unwinding
-guard has reported, `u64::MAX` when clear. (RFC 0053 §3.2 adds a third,
-`failure_generation`, so its clear can be a CAS on the pair rather than on
-`failed_epoch` alone; stage 1 has no clear to race, so the pair is not
-needed here.) A guard reads `barrier_epoch` when
+latch is two shared atomics owned by the pipeline (`SharedPipeline` holds
+the `Arc`) and handed at construction to the encode pool, to the sink's
+publish guards and to the barrier task: `barrier_epoch: AtomicU64`, the
+number of the next cut, incremented at every cut capture under the
+exclusion; and **one packed `AtomicU64`** carrying the failure state —
+the failed epoch in the high 32 bits, a failure generation in the low 32 —
+rather than two words. Two words would not be safe to clear: a report
+landing between a reader's two loads can be missed, and a clear written
+against the epoch alone would then erase a failure that was never acted
+on. Packed, the operations are exact. A guard **reports** with a CAS loop
+that lowers the epoch to its own and bumps the generation in the same
+word, so no report is lost to a concurrent one. A cut **captures** the
+state with a single acquire load and decides against that word. A
+**clear** is a CAS on the exact word the cut captured, so a report that
+landed in between makes the CAS fail and the latch stays set. Stage 1
+never clears — only a restart does, as §3.1 says below — so the clear arm
+exists for RFC 0053 §3.2, which defines when a cut may perform it; what
+stage 1 needs from the packing is that its capture and its two checks read
+one indivisible value. The generation wraps at `u32::MAX` and that is
+harmless: it is compared only for equality inside a CAS, never ordered,
+so a wrap can at worst make one clear spuriously fail, which leaves the
+latch set — the safe direction. The epoch half bounds a node at 2^32 cuts,
+about 40,000 years at the 300-second default, and a node that somehow
+reached it would stop stamping rather than wrap into a stale comparison. A guard reads `barrier_epoch` when
 it is registered — `submit` for a `BatchGuard`, `begin_publish` for a
 publish guard, both under the exclusion, so the read is ordered against the
 capture: a guard registered before cut `E`'s capture carries `E`, one
@@ -1112,16 +1146,26 @@ one, because startup's fallback is exactly as trustworthy as this record:
   (#793): a served node today holds segments and neither sidecar. An
   earlier draft of this row failed such a root closed, which would have
   refused to start every existing deployment; the rule is therefore scoped
-  to roots that carry a **post-RFC witness**. The witness that survives
-  when both sidecars are gone is the snapshot artefact's format version:
-  this RFC bumps it to 2 (§3.1), so a root whose `snapshots/` holds a
-  version-2 artefact has run under this RFC and its missing sidecars are a
-  loss — `OpenError::Corrupt`, naming both files, because reading it as
-  "fresh" would replay frames whose Parquet rows may already exist. With
-  no version-2 artefact, segments and neither sidecar is the legacy shape
-  and takes the legacy branch, belted by the same stale-gap check every
-  legacy root gets (a tenant whose snapshot is missing and whose oldest
-  surviving frame is above its last recorded horizon fails closed). A
+  to roots that carry a **post-RFC witness** — and the witness has to be
+  one every post-RFC root has, which a snapshot artefact is not: a
+  `NoConsumer` root (§3.2) writes no snapshots at all, so keying on them
+  would read a WAL-only root that lost both sidecars as legacy and
+  recreate an empty record over real reclaimed-through proof. The witness
+  is therefore the **segment header's format version**, which every root
+  with any segment necessarily carries: `SEGMENT_VERSION` is bumped from 1
+  to 2 for segments created under this RFC, and the reader accepts both —
+  version 1 is a segment written before this RFC, version 2 one written
+  after. A root holding any version-2 segment with both sidecars absent
+  has run under this RFC and its missing sidecars are a loss —
+  `OpenError::Corrupt`, naming both files, because reading it as "fresh"
+  would replay frames whose Parquet rows may already exist. Only version-1
+  segments and neither sidecar is the legacy shape and takes the legacy
+  branch, belted by the same stale-gap check every legacy root gets (a
+  tenant whose snapshot is missing and whose oldest surviving frame is
+  above its last recorded horizon fails closed). Accepting both versions is
+  the whole migration, as with the other two bumps, and a fresh root of
+  either mode stays bootable because its record is durable before its first
+  segment exists. A
   fresh root under this RFC never reaches that row at all: its record is
   written before the first segment is created (the bullet above). Per
   the pre-production layout policy that read path is the whole migration
@@ -1199,11 +1243,19 @@ anything is planned or unlinked. An earlier draft refused only a
 not fail-closed: a miner-bearing root that has checkpointed but never
 reclaimed has no entry at all, so the first mistaken `NoConsumer` pass
 would pass the check and delete frames the miner needs. The header does
-not depend on an entry existing. It is written when the record is created
-— at open on a fresh root, or on the upgrade path for a migrating one —
-and a root whose mode is somehow unrecorded (a record from an earlier
-draft of this RFC, before the field) **adopts the first pass's mode and
-persists it durably before that pass unlinks anything**, so the first
+not depend on an entry existing. It does depend on knowing the mode, and
+`Wal::open` does not: the mode arrives with `SnapshotHorizons` at
+`housekeeping_prepare` and nowhere else, and threading it into `WalConfig`
+would put a receiver-side fact into the WAL's construction — where a
+mismatch would have to be an open-time error on a root that has not yet
+reclaimed anything. So the record is **created with the mode unrecorded**,
+and the **first pass adopts its own mode and persists it durably before
+unlinking anything**. The crash matrix for that window is one row: a root
+that dies between the adoption write and the first unlink comes back with
+a mode, no entries and every segment present, which is exactly a
+first-pass-never-ran root and is read as such. §3.7's surface list matches
+— no mode on `Wal::open`, the mode on `housekeeping_prepare`'s horizons —
+and the first
 reclamation on any root is already governed by a durable mode.
 
 Entries still record their mode too, and recovery reads them by it: an
@@ -1880,8 +1932,18 @@ So the design is:
 - **`Option<WalOffset>` skips, and the post-recovery call is an explicit
   exception.** `None` means no high-water mark is known, and there is then
   nothing to declare reclaimable. `None` is *not* the same as "post-recovery",
-  which the earlier draft conflated: `serve` passes `report.max_delivered`,
-  which is `Some` whenever replay delivered a frame, and it does so **before
+  which the earlier draft conflated. The post-recovery call passes a mark
+  derived from replay, and **not** `report.max_delivered` on its own: a
+  frame can be delivered by replay whose group sync never completed — its
+  bytes survived the crash, its batch was never acknowledged — and §3.1's
+  rule is that such a frame is never a mark. The seed is therefore the
+  highest offset that is both delivered *and* covered by a sync known to
+  have succeeded, which in practice is the durable mark the WAL recorded
+  before the crash: the checkpoint, or the `last_durable` the sidecar
+  carries. When replay surfaces nothing at or below such a mark — a node
+  whose first sync never completed — the seed is `None` and the first
+  successful turn establishes it, which costs one barrier and never
+  stamps across an unacknowledged frame. The call runs **before
   the commit coordinator exists**, so there is no journal owner to checkpoint
   through. That call therefore deliberately advances no checkpoint; the first
   timer pass after the coordinator is built does it instead, from the same
@@ -2001,11 +2063,12 @@ existing tunables do.
 | `max_unlinks_per_pass` (new, §3.7) | Tunable | `128` proposed (§7 leaves the *value* open; the knob, its class and its range are settled here) | `rotation_retry_attempts..=65_536`, validated **against the retry budget in the same config** so RFC0052.4's one-pass debris clearance holds | §3.6 — bounds how long one pass holds the journal mutex, and so the stall an append can see |
 | `RECLAIM` sidecar format (§3.2) | Invariant | per §3.2 — version byte, checksum, consumer mode, `checkpoint_armed` / `checkpoint_seen`, per-tenant entries and `planned` list | n/a | format compat — startup's fail-closed reading is only as trustworthy as a fixed shape |
 | `CHECKPOINT` sidecar format **version 2** (§3.2) | Invariant | `2` (was `1`; RFC 0008 §6.9's row is amended) | n/a | format compat — the version is the witness that separates a pre-RFC root from a lost record |
+| Segment-header format **version 2** (§3.2) | Invariant | `2` (was `1`; the reader accepts both) | n/a | format compat — the version every root with a segment carries, and so the witness that separates a pre-RFC root from one that lost both sidecars, including a `NoConsumer` root with no snapshots |
 | Snapshot artefact format **version 2** (§3.1) | Invariant | `2` (was `1`) | n/a | format compat — `wal_high_water` changes meaning from a global mark to a per-tenant folded horizon, and one byte must not carry both |
 
 `max_unlinks_per_pass` is the one row whose validation reads another knob,
 which is why it lives in the WAL rather than in the caller: only `Wal::open`
-sees both numbers. The three Invariant rows are the persisted shapes this
+sees both numbers. The four Invariant rows are the persisted shapes this
 RFC introduces or bumps; each carries the `!` marker for the implementing
 PR under the pre-production layout policy, and none is operator-settable.
 
@@ -2299,7 +2362,11 @@ memory, and nothing here claims to.
 > - **And** the mark used is the one read after the quiesce under the same
 >   exclusion, not one read before either
 > - **And** that mark is a turn's own frame offset, never the sync's reported
->   EOF, so a later frame made durable by the same flush but not yet mined
+>   EOF, and the post-recovery seed is a delivered offset covered by a
+>   successful sync — never `max_delivered` alone, so a replayed frame whose
+>   group sync failed before the crash is not seeded as a mark, and a node
+>   with no such offset seeds `None` and lets its first turn establish one —
+>   so a later frame made durable by the same flush but not yet mined
 >   (nor acknowledged) is never
 >   covered — asserted by a flush whose sync covers two turns and a barrier
 >   between them
@@ -2418,10 +2485,14 @@ memory, and nothing here claims to.
 >   fails open naming the missing record — its `CHECKPOINT` is version 2, so
 >   the root is post-RFC — rather than recreating an empty record and pinning
 > - **And** a root holding segments and neither sidecar fails open naming
->   both **when its snapshots carry the version-2 format**, while the same
->   directory with version-1 (or no) snapshot artefacts — every live
->   pre-RFC root — opens on the legacy branch, and an empty directory with
->   neither sidecar opens as a fresh root
+>   both **when any segment header carries version 2**, while a root whose
+>   segments are all version 1 — every live pre-RFC root — opens on the
+>   legacy branch, and an empty directory with neither sidecar opens as a
+>   fresh root
+> - **And** the same holds for a `NoConsumer` root, which has no snapshot
+>   artefacts to witness with: its version-2 segments are the witness, so
+>   losing both sidecars fails closed rather than recreating an empty
+>   record over its reclaimed-through proof
 > - **And** a node's own first start is never that state: the empty record
 >   is durable before the initial segment is created, so a restart
 >   immediately after a fresh `Wal::open` — with or without a crash between
@@ -2695,11 +2766,11 @@ they are not substitutes for the rest.
     written before `CHECKPOINT` in the same call, on the checkpoint's own
     durable path, and joining §3.2's sidecar matrix on the same fail-closed
     footing as `RECLAIM`.
-  - *RFC 0053 §3.2* also amends §3.1's latch: it gains
-    `failure_generation: AtomicU64`, bumped by every reporting guard between
-    lowering `failed_epoch` and decrementing its count, so its clear can be
-    a CAS on the pair — which stage 1 never performs (only a restart
-    clears) and stage 2 does.
+  - *RFC 0053 §3.2* defines the **clear** arm of §3.1's packed failure
+    word — which cut may CAS it back, and against which captured value —
+    since stage 1 never clears and only a restart does. The packing itself
+    is §3.1's, adopted here so a same-epoch report cannot be lost between a
+    reader's loads.
   - *RFC 0053 §3.2* adds an eligibility case §3.2's predicate cannot
     express: a closed segment holding **no valid frame** — one its seal
     truncated back to a header — has no tenant offsets and no highest

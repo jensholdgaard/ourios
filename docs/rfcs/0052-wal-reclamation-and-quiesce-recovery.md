@@ -1057,7 +1057,15 @@ one, because startup's fallback is exactly as trustworthy as this record:
 - **Created at open, and witnessed by `CHECKPOINT`.** The WAL writes an
   empty record, durably, when it opens a root that has none — before the
   first pass can run — so the record exists on every root this RFC's code
-  has ever reclaimed from. "Missing means pre-RFC" is not safe on its own:
+  has ever reclaimed from. Its **ordering inside `open` is part of the
+  contract**, not an implementation detail: `Wal::open` reads the sidecars
+  and only then creates the initial segment, so a record written after that
+  step would leave a first-ever node one crash away from a root holding a
+  segment and neither sidecar — the state the matrix below rejects. The
+  empty record and its parent fsync therefore come **before**
+  `create_fresh_segment`, so every directory that has ever held a segment
+  has held a record too, and the fail-closed row can never fire on a node's
+  own first start. "Missing means pre-RFC" is not safe on its own:
   a root that has reclaimed and then lost its record (an operator deleting
   sidecars, a restore from a partial backup) would open, recreate an empty
   record, and turn a missing snapshot into a pin over frames already gone.
@@ -1106,7 +1114,9 @@ one, because startup's fallback is exactly as trustworthy as this record:
   either a partial backup or a hand-edited directory, and reading it as
   "fresh" would replay frames whose Parquet rows may already exist. The
   legitimate pre-RFC root reaches this open with segments *and* a
-  version-1 `CHECKPOINT`, which is the row above. Per
+  version-1 `CHECKPOINT`, which is the row above; a fresh root under this
+  RFC reaches it with a record already on disk, since the record is written
+  before the first segment is created (the bullet above). Per
   the pre-production layout policy that read path is the whole migration
   — no tooling — and the implementing PR carries the `!` marker for the
   sidecar version bump beside the snapshot one. The matrix is symmetric: a
@@ -1173,18 +1183,28 @@ ever added). The ingest receiver is never in that position and therefore
 **always passes `Known`** — a tenant with no valid snapshot is expressed
 by the `Pinned` floor §3.2 already defines, never by `NoConsumer`, which
 is the distinction RFC0052.13 exists to hold. The precondition is
-asserted where `SnapshotHorizons` is built, and the WAL fail-closes on the
-combination it can check for itself: a `NoConsumer` pass on a root whose
-`RECLAIM` holds any `Known` entry is refused as `ReclaimError`, since a
-miner demonstrably existed there.
+asserted where `SnapshotHorizons` is built, and the WAL enforces it from
+**durable state rather than from inference**: the `RECLAIM` header records
+the root's **consumer mode**, and any pass whose mode disagrees with the
+recorded one is refused as a `ReclaimError` naming both modes, before
+anything is planned or unlinked. An earlier draft refused only a
+`NoConsumer` pass on a root that already held a `Known` *entry*, which is
+not fail-closed: a miner-bearing root that has checkpointed but never
+reclaimed has no entry at all, so the first mistaken `NoConsumer` pass
+would pass the check and delete frames the miner needs. The header does
+not depend on an entry existing. It is written when the record is created
+— at open on a fresh root, or on the upgrade path for a migrating one —
+and a root whose mode is somehow unrecorded (a record from an earlier
+draft of this RFC, before the field) **adopts the first pass's mode and
+persists it durably before that pass unlinks anything**, so the first
+reclamation on any root is already governed by a durable mode.
 
-Entries still record their mode, and recovery reads them by it: an entry
-written under `Known` whose tenant's restorable horizon is below it —
+Entries still record their mode too, and recovery reads them by it: an
+entry written under `Known` whose tenant's restorable horizon is below it —
 including a tenant with an entry and no restorable snapshot at all — is
 unrecoverable state and recovery **halts**, naming the tenant; a
 `NoConsumer` entry is checkpoint-covered, which is sound *because* the
-precondition says no miner state existed when it was written, and the
-`Known`-entry refusal keeps the two from mixing on one root. A tenant with
+header's mode made every pass on that root a no-miner pass. A tenant with
 no entry has lost nothing and pins at its oldest surviving frame. An
 undecodable or missing snapshot is therefore safe to fall back from
 exactly when the record proves it is, and RFC0052.17 holds each of those
@@ -2362,6 +2382,10 @@ memory, and nothing here claims to.
 >   the root is post-RFC — rather than recreating an empty record and pinning
 > - **And** a root holding segments but neither sidecar fails open naming
 >   both, while an empty directory with neither opens as a fresh root
+> - **And** a node's own first start is never that state: the empty record
+>   is durable before the initial segment is created, so a restart
+>   immediately after a fresh `Wal::open` — with or without a crash between
+>   the two — finds the record and opens normally
 > - **And** a root holding a version-1 `CHECKPOINT` (an RFC0008.7 fixture)
 >   and no `RECLAIM` opens as pre-RFC **without** creating a record, and its
 >   first checkpoint rewrites the sidecar at version 2 and creates the
@@ -2401,9 +2425,13 @@ memory, and nothing here claims to.
 > - **And** a WAL used with no miner state reclaims under
 >   `SnapshotHorizons::NoConsumer` and restarts without a snapshot without
 >   halting: its entries carry that mode and are checkpoint-covered
-> - **And** a `NoConsumer` pass on a root whose `RECLAIM` already holds a
->   `Known` entry is refused as a `ReclaimError` rather than reclaiming, so
->   the two modes cannot mix on one root
+> - **And** a pass whose mode disagrees with the mode recorded in the
+>   `RECLAIM` header is refused as a `ReclaimError` naming both modes,
+>   before anything is planned or unlinked — including on a root that has
+>   checkpointed but never reclaimed, where no entry exists to infer from
+> - **And** a root whose header carries no mode adopts the first pass's
+>   mode and persists it durably before that pass unlinks anything, so no
+>   reclamation is ever governed by an unrecorded mode
 > - **And** the ingest receiver never passes `NoConsumer`: a tenant with no
 >   valid snapshot is expressed as `Pinned` (RFC0052.13) and its frames are
 >   retained, so no miner-bearing tenant can be reclaimed past its replay
@@ -2632,6 +2660,11 @@ they are not substitutes for the rest.
     lowering `failed_epoch` and decrementing its count, so its clear can be
     a CAS on the pair — which stage 1 never performs (only a restart
     clears) and stage 2 does.
+  - *RFC 0053 §3.1* also amends §3.7's `append_batch`: it takes a
+    `RotationDecision` (`Rotate` / `Reuse`) produced once by the
+    reservation under the journal mutex, so the age-sensitive rotation
+    predicate is decided in one place rather than recomputed inside the
+    append.
   - *RFC 0053 §3.1* adds a non-terminal `Deferred { AtSegmentCap }` variant
     to §3.3's rotation state, reported as reclaimable backpressure and
     cleared when a pass frees a slot; §3.3's `Terminal` keeps its meaning,

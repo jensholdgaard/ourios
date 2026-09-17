@@ -792,7 +792,7 @@ are live and an unused record carrying `len = 0`. The trailing field is
 **flags, not reserved space**: **bit 0 `tombstoned`**, bits 1–15
 reserved, zero and checked on read like every other reserved field — the
 tombstone below needs an encoded home, and this is it, typed identically
-to `RECLAIM`'s record so one reader serves both files. every entry then references a tenant by a **`u16` slot id** into it.
+to `RECLAIM`'s record so one reader serves both files. Every entry then belongs to the dictionary record at the same index — its position is its slot id, and it carries no id field.
 The mapping is injective by construction and round-trips exactly — the
 key is the tenant id itself, not a derivation.
 
@@ -861,19 +861,19 @@ that the 132-byte dictionary cannot represent — a real exposure, not a
 theoretical one, since the constant predates RFC 0048 and its doc comment
 still cites RFC 0046 §3.1 as its authority. The fix is to bound the
 source rather than widen the layout, because widening it would double
-both sidecars to carry ids no accepted grammar admits: this RFC
-**amends the frame codec** (RFC 0046's `TenantOtlpBatch` payload, whose
-constant RFC 0048 §3.1 silently superseded) to lower it to **128 on
-encode and decode**, matching the grammar and `ourios-core`'s own
-`MAX_TENANT_BYTES` — the same amendment RFC 0052 §3.2 states, worded to
-match so the two cannot drift. **The amendment reaches RFC 0046's own
-text, not only the constant**: its replay clause and its criterion
-RFC0046.11 still reject a length above *256*, which contradicts that
-RFC's own resolved-questions note recording that RFC 0048 §3.1 pinned the
-grammar at 1–128 bytes as the one tenant grammar every boundary applies
-at. So this RFC amends RFC 0046's replay validation and RFC0046.11 from
-**256 to 128**, which makes that document consistent with a decision it
-already records rather than making a new one. A root whose replay yields a tenant longer than that
+both sidecars to carry ids no accepted grammar admits: the frame codec
+(RFC 0046's `TenantOtlpBatch` payload, whose constant RFC 0048 §3.1
+silently superseded) is lowered to **128 on encode and decode** by
+**RFC 0052 §8's amendment**, which this RFC cites and depends on, matching
+the grammar and `ourios-core`'s own `MAX_TENANT_BYTES`. **That amendment
+reaches RFC 0046's own text, not only the constant**: its replay clause
+and its criterion RFC0046.11 still reject a length above *256*, which
+contradicts that RFC's own resolved-questions note recording that RFC
+0048 §3.1 pinned the grammar at 1–128 bytes as the one tenant grammar
+every boundary applies at. RFC 0052 §8 amends RFC 0046's replay
+validation and RFC0046.11 from **256 to 128**, which makes that document
+consistent with a decision it already records rather than making a new
+one; this RFC makes no amendment of its own. A root whose replay yields a tenant longer than that
 **fails closed at open**, naming the offending frame's offset and the
 length it carried, rather than being truncated into a dictionary that
 cannot hold it. That is the pre-production posture — no migration tooling
@@ -882,9 +882,10 @@ predated this change. RFC0053.4 asserts both halves: the codec refuses a
 129-byte tenant on encode, and a fixture root carrying one fails open
 naming the offset.
 
-An entry is then `[u16 slot id][u16 flags][u32 generation][24 B records
-WalOffset][24 B audit WalOffset]` — 56 B, since it names a tenant by slot
-id rather than by key — where a `WalOffset` is its
+An entry is then `[u16 flags][2 B reserved][u32 generation][24 B records
+WalOffset][24 B audit WalOffset]` — 56 B, matching the layout table, and
+it names no tenant at all: entry `i` belongs to dictionary record `i`,
+its position being its slot id — where a `WalOffset` is its
 16 B segment UUID plus its 8 B byte offset, the pinned 24 B, and `flags`
 carries four bits, assigned once here so no other paragraph has to
 enumerate them:
@@ -1484,7 +1485,7 @@ returned, and a panic between a widening and its audit event.
 §8's**, not this RFC's.*
 
 - RFC 0046 §3.1 (tenant selector) and criterion RFC0046.11 — **amended by
-  §3.2 of this RFC** from a 256-byte replay bound to **128**, the grammar
+  RFC 0052 §8, which this RFC cites** (not by this RFC), from a 256-byte replay bound to **128**, the grammar
   RFC 0048 §3.1 pinned and which RFC 0046's own resolved-questions note
   records as "the one tenant grammar every boundary applies at". The
   amendment is a consistency fix rather than a new decision: the replay

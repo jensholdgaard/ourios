@@ -628,9 +628,13 @@ The two stay distinct so each advertises the true remedy.
 >   still leaves on a smaller successful append as §3.1 defines
 > - **And** when the whole backlog sits in the current append segment, the
 >   timer's forced rotation lets the next pass reclaim it, so the state clears
->   without an append ever arriving; the same latch set by a `Segments` or
->   `TenantCapacity` refusal (which sets no latch at all), or with closed segments holding part of the backlog,
->   or with the retained count at `max_segments`, forces no rotation
+>   without an append ever arriving. The cases are explicit: only a latch
+>   whose retained cause is `Bytes` can force a rotation; a `Segments`
+>   refusal sets the latch with cause `Segments` and forces none, since a
+>   rotation at the ceiling would breach it; a `TenantCapacity` refusal
+>   sets no latch and forces none; and a `Bytes` latch with closed
+>   segments holding part of the backlog, or with the retained count at
+>   `max_segments`, forces none either
 > - **And** a fitting frame whose segment has aged past `segment_age_secs`
 >   reserves a segment slot: below the ceiling it is admitted and rotates,
 >   at the ceiling it is refused with the `Segments` cause — once and then

@@ -112,7 +112,9 @@ Moved here unedited from the RFC 0053 quarry so the reviewed sentences
 survive the split rather than being rewritten from memory. §3 above is
 the shape of this RFC and §5 above governs acceptance; the section
 numbers inside these paragraphs ("§3.1", "§3.2") and the `RFC0053.n`
-ids are the draft's own.
+ids are the draft's own. Where this prose reads as though **this** RFC
+amends RFC 0046 / RFC0046.11, it predates the split: §3 above makes no
+amendment, and RFC 0052 §8 owns that one.
 
 ### 9.1 The tenant-slot guard (draft §3.1)
 
@@ -834,9 +836,11 @@ instant one may name an id the other does not. That is benign: the file
 lacking it simply has no entry for that tenant, reads as "no frontier" or
 "nothing reclaimed" accordingly, and the next write of that file adds it.
 What is **fail-closed** is narrower and unambiguous: an id that **both**
-dictionaries name with **different keys**, which no correct writer can
-produce and which silently crosses two tenants' marks if read past —
-`OpenError::Corrupt`, naming both files and the id. A crash between the
+dictionaries name with **different keys**, or one key the two dictionaries
+place at **different ids** — either crosses two tenants' marks if read
+past, the first by resolving one id to two tenants and the second by
+resolving one tenant to two frontier entries, and no correct writer can
+produce either — `OpenError::Corrupt`, naming both files and the id. A crash between the
 two writes therefore leaves a readable pair, never a halt.
 
 **The key is 128 bytes, which is what the governing spec says.** RFC 0046
@@ -1475,6 +1479,9 @@ returned, and a panic between a widening and its audit event.
   place to make it; deferred.
 
 ### 9.7 The RFC 0046 amendment (draft §8)
+
+*Draft wording, kept for the record: the amendment below is **RFC 0052
+§8's**, not this RFC's.*
 
 - RFC 0046 §3.1 (tenant selector) and criterion RFC0046.11 — **amended by
   §3.2 of this RFC** from a 256-byte replay bound to **128**, the grammar

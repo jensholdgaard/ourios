@@ -38,23 +38,22 @@ reclamation rather than by restart.
 ## 2. Motivation
 
 RFC 0052 makes the WAL reclaim segments and makes a rotation failure
-recoverable. After it, a node no longer fills its volume in steady state and no
-longer wedges permanently on one failed fsync. It does not say what happens
-when the object store is unreachable for long enough that the WAL *cannot* be
-reclaimed — frames accumulate above a checkpoint that cannot advance — and the
-only thing that eventually stops accepting them is `ENOSPC`. That is the
-incident's shape with the permanent quiesce removed: the node degrades into a
-rotation-failure state rather than an unrecoverable one, but it still gets
-there by running out of disk, with no warning and no stated limit.
+recoverable, so a node no longer fills its volume in steady state or wedges
+permanently on one failed fsync. It does not say what happens when the object
+store is unreachable for long enough that the WAL *cannot* be reclaimed —
+frames accumulate above a checkpoint that cannot advance — and the only thing
+that eventually stops accepting them is `ENOSPC`. That is the incident's shape
+with the permanent quiesce removed: the node degrades into a rotation-failure
+state rather than an unrecoverable one, but still gets there by running out of
+disk, with no warning and no stated limit.
 
 ## 3. Proposed design
 
 ### 3.1 Backpressure becomes explicit
 
-Today the only limit on local accumulation is the volume. That is an implicit
-limit with an undefined failure mode. The WAL gains a declared local bound, and
-crossing it is a *stated* rejection, specified as a transport contract rather
-than gestured at.
+Today the only limit on local accumulation is the volume — an implicit limit
+with an undefined failure mode. The WAL gains a declared local bound, and
+crossing it is a *stated* rejection, specified as a transport contract.
 
 **The transport contract.** `ReceiveError` gains two variants, because
 §3.1 refuses for reasons of two different kinds. `WalBackpressure` carries
@@ -254,11 +253,11 @@ the caller's responsibility because the caller is what holds the mutex.
   `append_batch`, a refused request never reaches `Wal::append`'s own
   `MAX_FRAME_BYTES` check, so the ordering cannot be left to the WAL. `Journal`
   gives the coordinator the number **at construction** rather than on the
-  path: `CommitCoordinator::new` takes `max_frame_bytes` beside the
-  batch window, the segment size and the byte limit it already receives,
-  and the coordinator rejects `payload_len > max_frame_bytes` as
-  `TooLarge` under the admission mutex, before any journal lock is taken.
-  The WAL's own check remains as the backstop.
+  path: `CommitCoordinator::new` takes `max_frame_bytes` beside the batch
+  window, the segment size and the byte limit it already receives, and the
+  coordinator rejects `payload_len > max_frame_bytes` as `TooLarge` under
+  the admission mutex, before any journal lock is taken — the WAL's own
+  check remaining as the backstop.
   The full admission order is one sequence, stated once, and it spans the
   two locks RFC 0055 fixes rather than living in either alone: under the
   **admission mutex**, *max-frame validation, then the tenant checks*
@@ -268,33 +267,30 @@ the caller's responsibility because the caller is what holds the mutex.
   append. So an oversize payload against a terminal WAL is `TooLarge`, a
   legal payload against a terminal WAL is the terminal classification
   without a `reclaim_state()` read, and only a legal payload against a healthy
-  WAL reaches the reservation. **Terminal still precedes
-  backpressure**, which is the precedence that carries weight: both are
-  read in the same journal hold, terminal first, so a terminal WAL is
-  never reported as a bound. The terminal check has a named source: `Journal`
+  WAL reaches the reservation. **Terminal still precedes backpressure** —
+  both are read in the same journal hold, terminal first, so a terminal WAL
+  is never reported as a bound. That check has a named source: `Journal`
   gains `fn rotation_state(&self) -> RotationState` (`Healthy`, `Retrying {
-  attempts }`, `Terminal`), a cheap categorical read with no snapshot
-  struct on the append path, taken **under the journal mutex, in the same
-  hold as the reservation and the append** — one acquisition, so it can neither race outside the mutex nor be
-  confused with `reclaim_state()`. RFC0053.1
-  covers the combined case.
+  attempts }`, `Terminal`), a cheap categorical read with no snapshot struct
+  on the append path, taken **under the journal mutex in the same hold as
+  the reservation and the append** — one acquisition, so it can neither race
+  outside the mutex nor be confused with `reclaim_state()`. RFC0053.1 covers
+  the combined case.
 
 There is no rollback path, deliberately: truncating an appended frame is a
 second way to corrupt the tail, so the only safe reservation is one taken
-before the write. Two append failures need their own rules. A failure the
-WAL rolls back cleanly — the truncate-back succeeds — leaves the figure and
-the refusing state unchanged. A failure after bytes reached disk whose
+before the write. Two append failures need their own rules. A failure the WAL
+rolls back cleanly leaves the figure and the refusing state unchanged. A failure after bytes reached disk whose
 best-effort truncate-back *also* fails is not something the counter alone
 can absorb: the frame's full framed length is added to the unreclaimed
 figure at once — an over-count is safe, an under-count admits past the
 bound.
 
-**Repeated rollback failures are bounded.** The torn bytes
-are *inside* the bound for as long as they exist: the failed
-frame's full framed length is added, and at a restart the heal
-truncates them before `rebuild_ledger()` runs, so the rebuilt figure
-excludes what is no longer on disk and no sequence of failed rollbacks can grow
-the frame bytes past the limit.
+**Repeated rollback failures are bounded.** The torn bytes are *inside* the
+bound for as long as they exist: the failed frame's full framed length is
+added, and at a restart the heal truncates them before `rebuild_ledger()`
+runs, so the rebuilt figure excludes what is no longer on disk and no
+sequence of failed rollbacks grows the frame bytes past the limit.
 The bound is configuration, and it has a home: `WalConfig` gains
 `unreclaimed_bytes_limit`, and it is the first WAL knob the deployment
 surface exposes — `ReceiverSection` carries only `wal_root` today, so it
@@ -323,13 +319,12 @@ pre-append check reports that terminal classification — RFC 0052 §3.3's
 client keeps its data and backs off exponentially, and neither
 `Retry-After` nor `RetryInfo` is sent, since the server cannot predict when
 an operator clears the node — before it consults the bound at all.
-Backpressure never masks a state no delay can clear.
 
 **It clears when a housekeeping pass actually removes bytes, not when the
-checkpoint advances.** Advancing the sidecar declares frames reclaimable; it
-does not reclaim them, and the bound is measured in bytes still on disk. So
-the clearing path is the whole RFC 0052 §3.2 sequence — barrier, checkpoint,
-housekeeping — which that RFC's timer can drive without an append.
+checkpoint advances.** Advancing the sidecar declares frames reclaimable
+without reclaiming them, and the bound is measured in bytes still on disk,
+so the clearing path is the whole RFC 0052 §3.2 sequence — barrier,
+checkpoint, housekeeping — which that RFC's timer drives without an append.
 
 **Admission is per request; the reported state is a latch with a defined
 leave condition.** Each reservation is its own decision — `unreclaimed +
@@ -340,14 +335,14 @@ fail closed: a projected total that would wrap is a refusal, never an
 admission — saturating would not do, since a sum saturated to `u64::MAX`
 still passes `≤ u64::MAX` — and `validate_config` rejects a limit of
 `u64::MAX` outright, so the boundary is unreachable from both sides. An
-overflowing refusal has no projected total to report, and the shape says
-so rather than inventing one: `WalBackpressure::projected` is an
-`Option<u64>`, `None` on overflow; the message then names the limit and
-the pre-reservation total and says the projected total overflows; the
-`last_refusal` gauge records only its `pre_reservation` datapoint for that
-refusal; and the entered event carries `ourios.wal.unreclaimed` without a
-projected value. The refusal latch and `Retry-After` behave as for any
-other refusal. Only `capacity_remaining` (§3.3) saturates, and it is a report, not a decision.
+overflowing refusal has no projected total to report, and the shape says so
+rather than inventing one: `WalBackpressure::projected` is an
+`Option<u64>`, `None` on overflow; the message names the limit and the
+pre-reservation total and says the projected total overflows; the
+`last_refusal` gauge records only its `pre_reservation` datapoint; and the
+entered event carries `ourios.wal.unreclaimed` without a projected value.
+The refusal latch and `Retry-After` behave as for any other refusal. Only
+`capacity_remaining` (§3.3) saturates, being a report, not a decision.
 The *state* §3.3 exports is entered by the first refused reservation and left
 by whichever comes first: a housekeeping pass that actually removed a
 segment (`removed_segments > 0`) *and* left the unreclaimed total strictly
@@ -480,10 +475,12 @@ cannot land without them, they were never this RFC's.
   condition are computed from.
 - Retirement of `cadence_failed`, and `failure_generation` if RFC 0052
   still needs it.
-- A ceiling on **sealed** segments, where the seal that would exceed it
-  puts the WAL in the terminal rotation state — the one unit this RFC
-  cannot bound, since an owed rotation enters `max_segments` ungated
-  (§3.1), and a disk failing a write *and* its truncate-back is a fault.
+- A ceiling on **sealed** segments, reached only by a fault and so
+  terminal, unlike `max_segments`: the segment cap governs *discretionary*
+  rotations and never becomes a fault, while a seal happens only when an
+  append's write *and* its truncate-back both failed. It is the one unit
+  this RFC cannot bound, an owed rotation entering `max_segments` ungated
+  (§3.1).
 
 Unwind safety, publication frontiers and the audit-durability amendment
 that shared this document are RFC 0054, RFC 0055 and RFC 0056; each states
@@ -557,37 +554,34 @@ Blocking there instead would apply backpressure in the wrong unit — buffered
 Parquet bytes rather than unreclaimed WAL bytes — and would stall ingest on a
 condition that does not threaten durability.
 
-But rejecting it as the *signal* is not the same as leaving it alone. Both the
-record and the audit sink retain past their ceilings whenever a store flush
-fails, so an outage grows memory without bound and can OOM the process
-**before** the WAL bound is anywhere near reached — in which case §3.1 never
-fires and this RFC has bounded the wrong resource. That makes it a
-prerequisite, not a neighbour.
+But rejecting it as the *signal* is not the same as leaving it alone. Both
+sinks retain past their ceilings whenever a store flush fails, so an outage
+grows memory without bound and can OOM the process **before** the WAL bound
+is anywhere near reached — in which case §3.1 never fires and this RFC has
+bounded the wrong resource. That makes it a prerequisite, not a neighbour.
 
 **The decision is not open, though — it is unimplemented.** RFC 0014 §3.4
-is accepted and already specifies exactly this: the sink tracks total
-buffered bytes against a *hard* ceiling, force-flushes the largest or
-oldest partitions under soft pressure, and when early flush cannot keep up
-`emit` **blocks** until an in-flight flush frees memory, so the buffer can
-never exceed the ceiling. What the code does today — retaining past the
-ceiling when a flush fails — is a gap against that contract, not a gap in
-the design. So this RFC does not decide block-versus-spill-versus-drop:
-RFC 0014 §3.4 decided it, and its implementation is a **prerequisite** for
-the end-to-end bounded-ingest claim. What this RFC states instead is the
-scope of its own claim: **it bounds local disk, not process memory.** §3.1's bound is the operative limit for the WAL directory
-and for nothing else, the OOM path during a long outage remains open, and
-the incident's end-to-end property — ingest that stays bounded and keeps
-refusing rather than dying — needs both this RFC and that one. So the sink
-decision is named here as the **blocking follow-up for the end-to-end
-claim**, §6 keeps it as the gate on `validated`, and §5 asserts only the
-disk bound; RFC0053.1's unreachable-store leg should still be run long
-enough to show which limit is hit first, which is what makes the follow-up
-concrete rather than theoretical.
+is accepted and specifies exactly this: the sink tracks buffered bytes
+against a *hard* ceiling, force-flushes the largest or oldest partitions
+under soft pressure, and when early flush cannot keep up `emit` **blocks**
+until an in-flight flush frees memory, so the buffer never exceeds the
+ceiling. Today's retention past the ceiling is a gap against that contract,
+not a gap in the design. So this RFC does not decide
+block-versus-spill-versus-drop — RFC 0014 §3.4 decided it — and states
+instead the scope of its own claim: **it bounds local disk, not process
+memory.** §3.1's bound is the operative limit for the WAL directory and
+nothing else, the OOM path during a long outage stays open, and the
+incident's end-to-end property — ingest that stays bounded and keeps
+refusing rather than dying — needs both RFCs. The sink decision is
+therefore the **blocking follow-up for the end-to-end claim**: §6 keeps it
+as the gate on `validated` and §5 asserts only the disk bound, with
+RFC0053.1's unreachable-store leg run long enough to show which limit is
+hit first, which is what makes the follow-up concrete.
 
 **Backpressure as a rotation-failure state.** Rejected: it would reuse RFC
-0052's terminal-state reporting for a condition that is not a fault and clears
-on its own, telling clients a node is broken when it is merely full. The two
-are kept distinct so that the remedy each advertises is the true one.
+0052's terminal-state reporting for a condition that is not a fault and
+clears on its own, telling clients a node is broken when it is merely full.
+The two stay distinct so each advertises the true remedy.
 
 ## 5. Acceptance criteria
 
@@ -662,7 +656,8 @@ are kept distinct so that the remedy each advertises is the true one.
 >   rotation creates: `free` saturates at zero, `over_cap` carries the
 >   excess, and `retained + free = limit + over_cap` holds while the
 >   rotation is outstanding and after the next pass reclaims
-> - **And** no rotation-failure state is entered from the ceiling at all:
+> - **And** no rotation-failure state is entered from the **segment cap**
+>   at all (§3.2's sealed-segment ceiling is a fault and is not this cap):
 >   `Terminal` is reached only by an exhausted rotation retry budget, and
 >   no `Deferred` state exists
 > - **And** a forced rotation whose post-rename parent fsync fails does not
@@ -717,21 +712,21 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   resume must happen with **no append at all**, which is what proves the
   timer-driven sequence can clear a state that rejects every append; and the
   single-segment backlog must clear through the forced rotation, which is the
-  livelock case. A
-  fourth leg is concurrent rather than sequential: a `proptest` driving many
-  tasks that submit batches of arbitrary sizes at once against a small limit,
-  asserting after every admission that the live unreclaimed figure —
-  admitted minus reclaimed, since housekeeping legitimately lets a cumulative
-  sum grow — never exceeds the limit — the only test a reservation taken outside the journal
-  mutex fails, since the sequential flow passes it. A fifth leg fills the
-  limit and submits an oversize payload, asserting `TooLarge` with no
-  `reclaim_state()` read and no append — the reversed-check regression. The
-  sequence is driven through **both** adapters: on HTTP the protobuf
-  `Status`, `application/x-protobuf` and the exact `Retry-After`; on gRPC
-  `UNAVAILABLE` with the `RetryInfo` detail carrying the same seconds. A sixth leg
-  pins a tenant's floor (a lagging or invalid horizon) and asserts that
-  refusal persists after the store returns and the state is reported
-  `Pinned`, which is the behaviour RFC0053.1 makes normative.
+  livelock case. A fourth leg is concurrent rather than sequential: a
+  `proptest` driving many tasks that submit arbitrary-sized batches at once
+  against a small limit, asserting after every admission that the live
+  unreclaimed figure — admitted minus reclaimed, since housekeeping
+  legitimately lets a cumulative sum grow — never exceeds the limit. It is
+  the only test a reservation taken outside the journal mutex fails, the
+  sequential flow passing it. A fifth leg fills the limit and submits an
+  oversize payload, asserting `TooLarge` with no `reclaim_state()` read and
+  no append — the reversed-check regression. The sequence is driven through
+  **both** adapters: on HTTP the protobuf `Status`,
+  `application/x-protobuf` and the exact `Retry-After`; on gRPC
+  `UNAVAILABLE` with the `RetryInfo` detail carrying the same seconds. A
+  sixth leg pins a tenant's floor (a lagging or invalid horizon) and asserts
+  that refusal persists after the store returns and the state is reported
+  `Pinned`, as RFC0053.1 makes normative.
 - **Configuration (RFC0053.1's precondition)** — resolver tests for an
   explicit value and an `${env:VAR}`-substituted one, plus a Helm render leg
   that the chart value reaches the config file; a missing field under
@@ -776,10 +771,10 @@ that decision lands the RFC stops at `green`, and says so.
       five days, so a default tuned for it would be far too small for a busy
       node; a fraction of the volume may be the honest default.
 - [ ] Confirm RFC 0014 §3.4's hard ceiling is implemented — the blocking
-      `emit` that makes buffered bytes never exceed the ceiling. Not a
-      design question (§3.4 decided it; today's sinks retain past their
-      ceilings when a flush fails), but §4 and §6 make it the gate on
-      `validated`, so it must land before this RFC can be more than `green`.
+      `emit` that keeps buffered bytes under the ceiling. Not a design
+      question (§3.4 decided it; today's sinks retain past it when a flush
+      fails), but §4 and §6 gate `validated` on it, so it must land before
+      this RFC can be more than `green`.
 - [ ] Whether a stale tenant floor blocking reclamation indefinitely should
       itself escalate (a second, louder state) or stay a visible metric an
       operator alerts on. §3.1 makes it visible; it does not decide.
@@ -796,9 +791,9 @@ that decision lands the RFC stops at `green`, and says so.
 - RFC 0018 §3.2 (retryable error mapping) — the reasoning for `503` on an
   unacked batch; §3.1 takes `UNAVAILABLE` over its `RESOURCE_EXHAUSTED`
   option.
-- RFC 0014 §3.4 (sink memory ceiling) — the governing contract for the
-  memory half of the bound; §4 and §6 make its implementation a
-  prerequisite for this RFC's end-to-end claim.
-- RFC 0014 — the record sink and its flush triggers.
+- RFC 0014 — the record sink and its flush triggers; its §3.4 sink memory
+  ceiling is the governing contract for the memory half of the bound, and
+  §4 and §6 make its implementation a prerequisite for the end-to-end
+  claim.
 - `CLAUDE.md` §3.4 (WAL-before-ack), §6.3 (observability of ourselves).
 - `docs/hazards.md` #3 (WAL durability versus latency), #4 (small files).

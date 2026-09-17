@@ -14,6 +14,8 @@ superseded-by: —
 > **Status note.** `drafted`. Split out of RFC 0053's status note so an
 > amendment to an *accepted* RFC is not hidden. Source wording: #802 @
 > `30a21f80`, status note + the three-way `write_owned` result in §3.2.
+> **Blocked from `validated` by #809** — RFC 0026's denial-audit
+> durability, which §7 explains this RFC cannot close.
 
 ## 1. Summary
 
@@ -58,16 +60,37 @@ An accepted RFC needs its own amendment and criterion.
 >   tenant is terminal, other tenants publish, and the RFC 0005 §7
 >   clause is the amended one
 
+> **RFC0056.2**
+> - **Given** an audit event whose `derive_audit_partition` fails
+>   permanently — a pre-epoch or nanosecond-overflow timestamp, so no
+>   partition key exists to write under
+> - **When** `write_ordered` returns
+> - **Then** that tenant takes the same path as a permanent write
+>   failure: its records are unpublished and requeued, the tenant is
+>   terminal, and other tenants publish
+
 ## 6. Testing strategy
 
 One fault-injected permanent audit failure beside a healthy second
-tenant. Implementing PR.
+tenant, and a second injection on the derive path — a record timestamped
+outside the representable range — asserting RFC0056.2 rather than the
+write path. Implementing PR.
 
 ## 7. Open questions
 
-- Operator repair path for a terminal tenant (restart vs explicit
-  clear).
-- RFC 0026 `IngestDenied` durability, owned by 0026.
+- RFC 0026 `IngestDenied` durability — **#809**, and owned by RFC 0026.
+  The path emits before any frame exists, so replay cannot regenerate it
+  and §3's mechanism does not reach it; closing it takes an amendment to
+  RFC 0026's denial-audit durability, not a widening of this RFC. It is
+  not a deferral but a standing contradiction with RFC 0005 §7 and RFC
+  0026's own accepted criterion, so **this RFC cannot reach `validated`
+  until #809 lands**.
+
+Not open, recorded so it is not reopened: the operator repair path for a
+terminal tenant is a **restart**, which §3 already decides — the dropped
+events are gone and only recovery regenerates them, so an in-process
+clear would release requeued records under events that were never
+written. A future operator repair still ends in a restart.
 
 ## 8. References
 

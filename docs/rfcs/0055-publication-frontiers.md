@@ -76,7 +76,9 @@ this RFC makes it; it does not.
 
 ## 5. Acceptance criteria
 
-Write `Given / When / Then` when extracting. Minimum:
+> **Stage note.** This RFC is `drafted`; full `Given / When / Then`
+> criteria are written at the `specified` gate. The four labels below are
+> the plan for that gate, not the final criteria text.
 
 - RFC0055.1 restart does not republish a settled audit group
 - RFC0055.2 mixed-geometry sidecar restart comes up at the larger

@@ -678,7 +678,7 @@ spec:
             - name: OPERATOR_NAME
               value: "node-disk-operator"
             - name: CLEANUP_JOB_IMAGE
-              value: "openebs/linux-utils:3.5.0"
+              value: "openebs/linux-utils@sha256:d58e52a6a9e745074548a5978dd805db8b75200246f5851f6d22fb858c963c55" # 3.5.0
             # OPENEBS_IO_IMAGE_PULL_SECRETS environment variable is used to pass the image pull secrets
             # to the cleanup pod launched by NDM operator
             #- name: OPENEBS_IO_IMAGE_PULL_SECRETS
@@ -908,7 +908,7 @@ spec:
         - name: OPENEBS_IO_INSTALLER_TYPE
           value: "openebs-operator-lite"
         - name: OPENEBS_IO_HELPER_IMAGE
-          value: "openebs/linux-utils:3.5.0"
+          value: "openebs/linux-utils@sha256:d58e52a6a9e745074548a5978dd805db8b75200246f5851f6d22fb858c963c55" # 3.5.0
         - name: OPENEBS_IO_BASE_PATH
           value: "/var/openebs/local"
         # LEADER_ELECTION_ENABLED is used to enable/disable leader election. By default

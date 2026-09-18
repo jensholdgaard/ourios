@@ -92,7 +92,7 @@ jobs:
           helm upgrade --install kubescape \
             .github/workflows/bob-capture/kubescape-operator-1.29.0.tgz \
             -n "${KS_NAMESPACE}" --create-namespace \
-            --values - <<'YAML'
+            --values - <<YAML
           nodeAgent:
             config:
               maxLearningPeriod: 6m
@@ -110,8 +110,8 @@ jobs:
             installDefault: true
             scopeClustered: true
           clusterName: ourios-bob-capture
-          ksNamespace: honey
-          excludeNamespaces: "kubescape,kube-system,kube-public,kube-node-lease,kubeconfig,gmp-system,gmp-public,storm,lightening,cert-manager,kube-flannel,ingress-nginx"
+          ksNamespace: ${KS_NAMESPACE}
+          excludeNamespaces: "${KS_NAMESPACE},kube-system,kube-public,kube-node-lease,kubeconfig,gmp-system,gmp-public,storm,lightening,cert-manager,kube-flannel,ingress-nginx"
           YAML
           sleep 5
           kubectl rollout restart -n "${KS_NAMESPACE}" ds node-agent

@@ -78,19 +78,22 @@ jobs:
           volumeBindingMode: WaitForFirstConsumer
           YAML
           kubectl patch storageclass local-hostpath -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+          kubectl rollout status deployment/openebs-localpv-provisioner -n openebs --timeout=180s
 
       # Kubescape operator + node-agent (eBPF). Learning window kept short
       # (this is a one-off capture, not a production tuning run) — long
       # enough to observe a handful of ingest/query/compaction cycles.
-      # Chart is vendored (not `helm repo add` + live install) for the same
-      # reason as the OpenEBS manifest above — a classic index.yaml Helm repo
-      # has no digest-pin mechanism, so the tarball itself is the pin;
-      # re-vendor deliberately (helm pull kubescape/kubescape-operator
-      # --version <new>) in the PR that bumps it.
+      # Chart is vendored unpacked (not `helm repo add` + live install, and not
+      # the opaque .tgz `helm pull` produces) for the same reason as the
+      # OpenEBS manifest above — a classic index.yaml Helm repo has no
+      # digest-pin mechanism, so the chart's extracted contents are the pin,
+      # and unpacked they're reviewable in the PR diff like any other vendored
+      # manifest; re-vendor deliberately (helm pull kubescape/kubescape-operator
+      # --version <new> --untar) in the PR that bumps it.
       - name: Install Kubescape operator
         run: |
           helm upgrade --install kubescape \
-            .github/workflows/bob-capture/kubescape-operator-1.29.0.tgz \
+            .github/workflows/bob-capture/kubescape-operator-1.29.0 \
             -n "${KS_NAMESPACE}" --create-namespace \
             --values - <<YAML
           nodeAgent:
@@ -111,10 +114,8 @@ jobs:
             scopeClustered: true
           clusterName: ourios-bob-capture
           ksNamespace: ${KS_NAMESPACE}
-          excludeNamespaces: "${KS_NAMESPACE},kube-system,kube-public,kube-node-lease,kubeconfig,gmp-system,gmp-public,storm,lightening,cert-manager,kube-flannel,ingress-nginx"
+          excludeNamespaces: "${KS_NAMESPACE},otlp-gen,kube-system,kube-public,kube-node-lease,kubeconfig,gmp-system,gmp-public,storm,lightening,cert-manager,kube-flannel,ingress-nginx"
           YAML
-          sleep 5
-          kubectl rollout restart -n "${KS_NAMESPACE}" ds node-agent
           kubectl wait --for=condition=ready pod -l app=kubevuln -n "${KS_NAMESPACE}" --timeout=180s
           kubectl wait --for=condition=ready pod -l app=node-agent -n "${KS_NAMESPACE}" --timeout=180s
 
@@ -138,20 +139,32 @@ jobs:
           kubectl rollout status deploy/ourios-querier --timeout=180s
           kubectl rollout status deploy/ourios-compactor --timeout=180s
 
+      # Restart node-agent here, not right after the operator install: its
+      # maxLearningPeriod clock starts on pod start, and we want that window
+      # to cover real Ourios traffic, not the time spent installing the chart
+      # and waiting for PVCs/rollouts.
+      - name: Reset node-agent learning window
+        run: |
+          kubectl rollout restart -n "${KS_NAMESPACE}" ds node-agent
+          kubectl rollout status -n "${KS_NAMESPACE}" ds node-agent --timeout=180s
+
       # Drive a realistic mix of ingest + query traffic across the learning
       # window so the recorded profile reflects steady-state behaviour, not
       # just startup. No receiver restarts here on purpose — a restart is
       # itself atypical behaviour we don't want baked into the profile.
+      # telemetrygen runs in its own namespace, excluded above, so node-agent
+      # profiles the Ourios workloads only — not the traffic generator.
       - name: Drive traffic for the learning window
         run: |
+          kubectl create namespace otlp-gen
           kubectl port-forward svc/ourios-querier 4319:4319 >/tmp/pf-q.log 2>&1 &
           pf=$!; trap 'kill $pf 2>/dev/null || true' EXIT
           for _ in $(seq 1 30); do if (echo > /dev/tcp/127.0.0.1/4319) >/dev/null 2>&1; then break; fi; sleep 1; done
 
           query_successes=0
           for i in $(seq 1 9); do
-            kubectl delete job otlp-ingest --ignore-not-found >/dev/null
-            kubectl apply -f - <<YAML
+            kubectl delete job otlp-ingest -n otlp-gen --ignore-not-found >/dev/null
+            kubectl apply -n otlp-gen -f - <<YAML
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -166,17 +179,17 @@ jobs:
                     image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.155.0@sha256:32d1762abb401e36dd8cfdf60a71075b41bd996a0cfb7c8d2e6eac4d609625b9
                     args:
                       - logs
-                      - --otlp-endpoint=ourios-receiver:4317
+                      - --otlp-endpoint=ourios-receiver.default.svc.cluster.local:4317
                       - --otlp-insecure
                       - --logs=20
                       - --otlp-header=x-ourios-tenant="${TENANT}"
                       - --otlp-attributes=service.name="${TENANT}"
                       - --body=${LOG_BODY}
           YAML
-            if ! kubectl wait --for=condition=complete job/otlp-ingest --timeout=60s; then
+            if ! kubectl wait --for=condition=complete job/otlp-ingest -n otlp-gen --timeout=60s; then
               echo "telemetrygen job did not complete on round $i/9"
-              kubectl logs job/otlp-ingest --tail=100 || true
-              kubectl describe job/otlp-ingest || true
+              kubectl logs job/otlp-ingest -n otlp-gen --tail=100 || true
+              kubectl describe job/otlp-ingest -n otlp-gen || true
               exit 1
             fi
 
@@ -199,6 +212,13 @@ jobs:
             echo "no query round succeeded across 9 attempts"
             exit 1
           fi
+
+          # The ingester's Parquet age-flush trigger is 300s (the size trigger,
+          # 128 MiB, is unreachable at this volume) and the compactor above is
+          # set to a 30s interval — give both time to actually run at least
+          # once before the profile capture window closes, so the profile
+          # reflects real flush/compaction behaviour, not just ingest.
+          sleep 120
 
       # maxLearningPeriod (6m) plus slack for Kubescape to flip the status
       # annotation. Poll rather than a fixed sleep — completion timing isn't
@@ -241,3 +261,4 @@ jobs:
           echo "=== receiver logs ==="; kubectl logs -l app.kubernetes.io/component=receiver --tail=200 || true
           echo "=== querier logs ===";  kubectl logs -l app.kubernetes.io/component=querier --tail=200 || true
           echo "=== node-agent logs ==="; kubectl logs -n "${KS_NAMESPACE}" -l app=node-agent --tail=200 || true
+          echo "=== telemetrygen logs ==="; kubectl logs -n otlp-gen job/otlp-ingest --tail=200 || true

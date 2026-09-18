@@ -82,12 +82,16 @@ jobs:
       # Kubescape operator + node-agent (eBPF). Learning window kept short
       # (this is a one-off capture, not a production tuning run) — long
       # enough to observe a handful of ingest/query/compaction cycles.
+      # Chart is vendored (not `helm repo add` + live install) for the same
+      # reason as the OpenEBS manifest above — a classic index.yaml Helm repo
+      # has no digest-pin mechanism, so the tarball itself is the pin;
+      # re-vendor deliberately (helm pull kubescape/kubescape-operator
+      # --version <new>) in the PR that bumps it.
       - name: Install Kubescape operator
         run: |
-          helm repo add kubescape https://kubescape.github.io/helm-charts/
-          helm repo update
-          helm upgrade --install kubescape kubescape/kubescape-operator \
-            --version 1.29.0 -n "${KS_NAMESPACE}" --create-namespace \
+          helm upgrade --install kubescape \
+            .github/workflows/bob-capture/kubescape-operator-1.29.0.tgz \
+            -n "${KS_NAMESPACE}" --create-namespace \
             --values - <<'YAML'
           nodeAgent:
             config:
@@ -144,6 +148,7 @@ jobs:
           pf=$!; trap 'kill $pf 2>/dev/null || true' EXIT
           for _ in $(seq 1 30); do if (echo > /dev/tcp/127.0.0.1/4319) >/dev/null 2>&1; then break; fi; sleep 1; done
 
+          query_successes=0
           for i in $(seq 1 9); do
             kubectl delete job otlp-ingest --ignore-not-found >/dev/null
             kubectl apply -f - <<YAML
@@ -180,13 +185,20 @@ jobs:
               -H 'Content-Type: text/plain' \
               --data "service == \"${TENANT}\" | range(-1h, now) | limit 50")"
             query_status="$(printf '%s' "$query_out" | tail -1)"
-            if [ "$query_status" != "200" ]; then
+            if [ "$query_status" = "200" ]; then
+              query_successes=$((query_successes + 1))
+            else
               echo "query round $i/9 failed (http $query_status): $(printf '%s' "$query_out" | head -n -1)"
             fi
 
             echo "traffic round $i/9 done"
             sleep 30
           done
+
+          if [ "$query_successes" -eq 0 ]; then
+            echo "no query round succeeded across 9 attempts"
+            exit 1
+          fi
 
       # maxLearningPeriod (6m) plus slack for Kubescape to flip the status
       # annotation. Poll rather than a fixed sleep — completion timing isn't
@@ -202,6 +214,10 @@ jobs:
             sleep 20
           done
           kubectl get applicationprofile -o wide || true
+          if [ "${total}" -eq 0 ] || [ "${done_count}" != "${total}" ]; then
+            echo "ApplicationProfiles did not all complete within the deadline (${done_count}/${total})"
+            exit 1
+          fi
 
       - name: Export ApplicationProfiles
         run: |

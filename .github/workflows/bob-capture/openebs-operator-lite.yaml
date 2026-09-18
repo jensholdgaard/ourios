@@ -539,7 +539,7 @@ spec:
       #hostPID: true
       containers:
       - name: node-disk-manager
-        image: openebs/node-disk-manager:2.1.0
+        image: openebs/node-disk-manager@sha256:f6c18b0f8c8a523a1e307e9f355c1557ac3fb713fb06486f95942b12924d3034 # 2.1.0
         args:
           - -v=4
         # The feature-gate is used to enable the new UUID algorithm.
@@ -659,7 +659,7 @@ spec:
       serviceAccountName: openebs-maya-operator
       containers:
         - name: node-disk-operator
-          image: openebs/node-disk-operator:2.1.0
+          image: openebs/node-disk-operator@sha256:6afe2123c457d863e5db0f29a4b071f750d2570d3d240373aa9ad0a04db9b929 # 2.1.0
           imagePullPolicy: IfNotPresent
           env:
             - name: WATCH_NAMESPACE
@@ -726,7 +726,7 @@ spec:
       serviceAccountName: openebs-maya-operator
       containers:
         - name: ndm-cluster-exporter
-          image: openebs/node-disk-exporter:2.1.0
+          image: openebs/node-disk-exporter@sha256:873d8bedbceac4d5cc7b01f1a0935ee9e1ddeeb25e7337fdc695fe774a3a952a # 2.1.0
           command:
             - /usr/local/bin/exporter
           args:
@@ -797,7 +797,7 @@ spec:
       serviceAccountName: openebs-maya-operator
       containers:
         - name: node-disk-exporter
-          image: openebs/node-disk-exporter:2.1.0
+          image: openebs/node-disk-exporter@sha256:873d8bedbceac4d5cc7b01f1a0935ee9e1ddeeb25e7337fdc695fe774a3a952a # 2.1.0
           command:
             - /usr/local/bin/exporter
           args:
@@ -869,7 +869,7 @@ spec:
       containers:
       - name: openebs-provisioner-hostpath
         imagePullPolicy: IfNotPresent
-        image: openebs/provisioner-localpv:3.5.0
+        image: openebs/provisioner-localpv@sha256:aea39e49bb97a8ad3f7eddf044a78326b176c56d986109f243ced4c8968a4329 # 3.5.0
         args:
           - "--bd-time-out=$(BDC_BD_BIND_RETRIES)"
         env:

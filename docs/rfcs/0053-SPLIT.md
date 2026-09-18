@@ -6,8 +6,8 @@ audit-durability amendment together, in one 3172-line document
 (`rfc/0053-wal-backpressure-unwind` @ `30a21f80`). It was split into four
 RFCs so each could reach its own maturity gate independently; this page
 records what moved where. That original draft is the source of the
-reviewed prose each of the four RFCs extracts into its own §9 (cited
-there as "the quarry").
+reviewed prose each of the three new RFCs (0054–0056) extracts into its
+own §9 (cited there as "the quarry"); RFC 0053 itself ends at §8.
 
 ## Resulting files
 
@@ -40,9 +40,10 @@ forced rotation predicate; `unreclaimed_bytes_limit` / `max_segments`;
 RFC0053.1, .4 (WAL restart figure only), .5; §4 sink-ceiling as a
 `validated` prerequisite.
 
-It dropped, to the three new RFCs: `.wal.seal`; `RecoverableBatch` / pool
-supervisor; `PUBLISHED` and settlement; the RFC 0005 / 0046 / 0048
-amendments; `max_tenants` slot reservation (now RFC 0055).
+It dropped, to the three new RFCs: `RecoverableBatch` / pool supervisor;
+`PUBLISHED` and settlement; the RFC 0005 / 0046 / 0048 amendments;
+`max_tenants` slot reservation (now RFC 0055). `.wal.seal` is not among
+these — it is requested of RFC 0052, per the section above.
 
 ## Review discipline applied during the split
 
@@ -56,7 +57,7 @@ at status `drafted`; RFC 0053 itself dropped from `specified` back to
 
 ## Result
 
-Four markdown files exist, indexed in `docs/SUMMARY.md`. RFC 0053 is
-under 800 lines at `drafted`. The split was announced on
+Four markdown files exist, indexed in `docs/SUMMARY.md`, and RFC 0053 is
+at `drafted`. The split was announced on
 [`#802`](https://github.com/jensholdgaard/ourios/pull/802), which lists
 what moved where.

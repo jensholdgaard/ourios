@@ -115,6 +115,16 @@ jobs:
           clusterName: ourios-bob-capture
           ksNamespace: ${KS_NAMESPACE}
           excludeNamespaces: "${KS_NAMESPACE},otlp-gen,kube-system,kube-public,kube-node-lease,kubeconfig,gmp-system,gmp-public,storm,lightening,cert-manager,kube-flannel,ingress-nginx"
+          # storage.mtls.enabled defaults true, but apiservice.yaml (which
+          # reads global.storageCA to build caBundle) renders alphabetically
+          # before ca-secret.yaml (which is what actually populates
+          # global.storageCA) — a template-render-order bug in the chart as
+          # published. Disabling mtls skips both branches; the aggregated
+          # Storage API only needs to be reachable inside this ephemeral
+          # cluster, not defended against a real adversary.
+          storage:
+            mtls:
+              enabled: false
           YAML
           kubectl wait --for=condition=ready pod -l app=kubevuln -n "${KS_NAMESPACE}" --timeout=180s
           kubectl wait --for=condition=ready pod -l app=node-agent -n "${KS_NAMESPACE}" --timeout=180s

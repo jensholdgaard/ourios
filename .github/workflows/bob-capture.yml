@@ -50,10 +50,17 @@ jobs:
       # OpenEBS local-hostpath: the StorageClass Kubescape's own storage
       # component needs. Mirrors Vad1mo/bobctl's `make storage` target
       # (openebs-operator-lite + a local-hostpath SC, set as cluster default).
+      # The operator manifest is vendored (not fetched from the mutable
+      # openebs.github.io Pages URL at run time) so this dispatch-only,
+      # cluster-admin-privileged install is pinned to reviewed content;
+      # re-vendor deliberately by re-running the curl in the PR that bumps it.
+      # bobctl's other manifest (openebs-lite-sc.yaml) only defines sample
+      # `openebs-hostpath`/`openebs-device` StorageClasses this workflow
+      # never uses — the `local-hostpath` class below is the one Kubescape
+      # actually gets pointed at, so that file is skipped entirely.
       - name: Install OpenEBS (local-hostpath StorageClass)
         run: |
-          kubectl apply -f https://openebs.github.io/charts/openebs-operator-lite.yaml
-          kubectl apply -f https://openebs.github.io/charts/openebs-lite-sc.yaml
+          kubectl apply -f .github/workflows/bob-capture/openebs-operator-lite.yaml
           kubectl apply -f - <<'YAML'
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -161,12 +168,21 @@ jobs:
                       - --otlp-attributes=service.name="${TENANT}"
                       - --body=${LOG_BODY}
           YAML
-            kubectl wait --for=condition=complete job/otlp-ingest --timeout=60s || true
+            if ! kubectl wait --for=condition=complete job/otlp-ingest --timeout=60s; then
+              echo "telemetrygen job did not complete on round $i/9"
+              kubectl logs job/otlp-ingest --tail=100 || true
+              kubectl describe job/otlp-ingest || true
+              exit 1
+            fi
 
-            curl -s -X POST 'http://127.0.0.1:4319/v1/query' \
+            query_out="$(curl -sS -w '\n%{http_code}' -X POST 'http://127.0.0.1:4319/v1/query' \
               -H "X-Ourios-Tenant: ${TENANT}" \
               -H 'Content-Type: text/plain' \
-              --data "service == \"${TENANT}\" | range(-1h, now) | limit 50" >/dev/null || true
+              --data "service == \"${TENANT}\" | range(-1h, now) | limit 50")"
+            query_status="$(printf '%s' "$query_out" | tail -1)"
+            if [ "$query_status" != "200" ]; then
+              echo "query round $i/9 failed (http $query_status): $(printf '%s' "$query_out" | head -n -1)"
+            fi
 
             echo "traffic round $i/9 done"
             sleep 30
@@ -195,7 +211,7 @@ jobs:
             | jq -r '.items[] | .metadata.name' > bob-out/profile-names.txt
           cat bob-out/profile-names.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ourios-bob-capture
           path: bob-out/

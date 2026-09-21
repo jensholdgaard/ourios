@@ -114,8 +114,15 @@ pub struct TenantBatch<'a> {
 }
 
 impl<'a> TenantBatch<'a> {
-    /// The RFC 0046 §3.1 selector bound, enforced on encode and decode.
-    pub const MAX_TENANT_BYTES: usize = 256;
+    /// The tenant-id bound, enforced on encode and decode. RFC 0048
+    /// §3.1 ("Tenant id grammar (amends RFC 0046 §3.1)") lowers it to
+    /// 128, and RFC 0052 §3.2 amends this codec to match: a frame
+    /// carrying a 129-to-256-byte tenant is one no request boundary
+    /// would have produced and one the `RECLAIM` dictionary record
+    /// cannot represent. Aliased to `ourios-core`'s constant rather
+    /// than repeated, since that is the spec the boundary validates
+    /// against and two numbers could drift apart.
+    pub const MAX_TENANT_BYTES: usize = ourios_core::tenant::MAX_TENANT_BYTES;
 
     /// Encode `tenant` + `protobuf` into a `TenantOtlpBatch` payload.
     ///
@@ -132,7 +139,7 @@ impl<'a> TenantBatch<'a> {
         if len > Self::MAX_TENANT_BYTES {
             return Err(TenantBatchError::TenantTooLong { found: len });
         }
-        // `len <= 256` fits u16 by the check above.
+        // `len <= MAX_TENANT_BYTES` fits u16 by the check above.
         #[allow(clippy::cast_possible_truncation)]
         let prefix = (len as u16).to_le_bytes();
         let mut out = Vec::with_capacity(2 + len + protobuf.len());
@@ -373,7 +380,7 @@ impl Wal {
         // treated as None — that would drop the Parquet
         // suppression horizon and duplicate every
         // already-published record on the data side.
-        let checkpoint = checkpoint::read(&config.root)?;
+        let checkpoint = checkpoint::read(&config.root)?.map(|sidecar| sidecar.offset);
         let existing_segments = list_segments(&config.root)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             if let Some(newest) = existing_segments.into_iter().next_back() {

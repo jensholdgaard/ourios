@@ -48,7 +48,9 @@ fn fresh_root_creates_one_segment_with_a_valid_header() {
     // (frames land with the `append` slice).
     assert_eq!(bytes.len(), 24, "fresh segment has only the header");
     assert_eq!(&bytes[0..4], b"OWAL", "magic");
-    assert_eq!(&bytes[4..6], &[0x01, 0x00], "version = 1");
+    // RFC 0052 §3.8's segment-header Invariant row: 2, the witness
+    // that separates a post-RFC root from a pre-RFC one.
+    assert_eq!(&bytes[4..6], &[0x02, 0x00], "version = 2");
     assert_eq!(&bytes[6..8], &[0x00, 0x00], "flags = 0");
     // The UUID in the header matches the filename stem — pin
     // the cross-check that lets a renamed file still decode.

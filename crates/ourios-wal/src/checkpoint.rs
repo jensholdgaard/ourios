@@ -2,7 +2,8 @@
 //! §6.7).
 //!
 //! The sidecar is a fixed 32 B record: 4 B magic `b"OWCK"`,
-//! 2 B version (`= 1`), 2 B flags (reserved, zero), 16 B
+//! 2 B version (`= 2` since RFC 0052 §3.2; version 1 still
+//! reads), 2 B flags (reserved, zero), 16 B
 //! segment `UUIDv7`, 8 B little-endian byte-in-segment —
 //! matching the `(segment, byte)` [`WalOffset`] pair. Storing
 //! the segment UUID rather than a synthetic global counter is
@@ -24,7 +25,30 @@ pub(crate) const SIDECAR_NAME: &str = "CHECKPOINT";
 const TMP_NAME: &str = "CHECKPOINT.tmp";
 pub(crate) const SIDECAR_LEN: usize = 32;
 const MAGIC: [u8; 4] = *b"OWCK";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
+const VERSION_LEGACY: u16 = 1;
+
+/// Which format version a `CHECKPOINT` on disk carries. RFC 0052 §3.2
+/// reads it as a witness, not as a decoding detail: a version-1 sidecar
+/// beside a missing `RECLAIM` is a legitimate pre-RFC root, while a
+/// version-2 one beside a missing record is a root that lost its
+/// record. Pre-production, accepting both on read is the whole
+/// migration (§3.8) — there is no dual-write and no tooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarVersion {
+    /// Written before RFC 0052. Nothing writes it now; the next
+    /// checkpoint rewrites the sidecar at [`SidecarVersion::Current`].
+    Legacy,
+    Current,
+}
+
+/// A `CHECKPOINT` that decoded: the mark and the version it was
+/// written at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sidecar {
+    pub(crate) offset: WalOffset,
+    pub(crate) version: SidecarVersion,
+}
 
 pub(crate) fn encode(offset: WalOffset) -> [u8; SIDECAR_LEN] {
     let mut out = [0u8; SIDECAR_LEN];
@@ -36,7 +60,7 @@ pub(crate) fn encode(offset: WalOffset) -> [u8; SIDECAR_LEN] {
     out
 }
 
-fn decode(bytes: &[u8]) -> Result<WalOffset, String> {
+fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if bytes.len() != SIDECAR_LEN {
         return Err(format!("size {} B, expected {SIDECAR_LEN} B", bytes.len()));
     }
@@ -46,10 +70,15 @@ fn decode(bytes: &[u8]) -> Result<WalOffset, String> {
             &bytes[0..4]
         ));
     }
-    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != VERSION {
-        return Err(format!("unknown version {version}, expected {VERSION}"));
-    }
+    let version = match u16::from_le_bytes([bytes[4], bytes[5]]) {
+        VERSION_LEGACY => SidecarVersion::Legacy,
+        VERSION => SidecarVersion::Current,
+        found => {
+            return Err(format!(
+                "unknown version {found}, expected {VERSION_LEGACY} or {VERSION}"
+            ));
+        }
+    };
     let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
     if flags != 0 {
         return Err(format!("non-zero flags {flags:#06x}"));
@@ -58,9 +87,12 @@ fn decode(bytes: &[u8]) -> Result<WalOffset, String> {
     segment.copy_from_slice(&bytes[8..24]);
     let mut byte = [0u8; 8];
     byte.copy_from_slice(&bytes[24..32]);
-    Ok(WalOffset {
-        segment: uuid::Uuid::from_bytes(segment),
-        byte: u64::from_le_bytes(byte),
+    Ok(Sidecar {
+        offset: WalOffset {
+            segment: uuid::Uuid::from_bytes(segment),
+            byte: u64::from_le_bytes(byte),
+        },
+        version,
     })
 }
 
@@ -70,7 +102,7 @@ fn decode(bytes: &[u8]) -> Result<WalOffset, String> {
 /// the operator restores or removes the sidecar knowingly;
 /// removal is an explicit acceptance of at-least-once
 /// re-publish to Parquet).
-pub(crate) fn read(root: &Path) -> Result<Option<WalOffset>, OpenError> {
+pub(crate) fn read(root: &Path) -> Result<Option<Sidecar>, OpenError> {
     let path = root.join(SIDECAR_NAME);
     let mut file = match File::open(&path) {
         Ok(file) => file,
@@ -92,7 +124,7 @@ pub(crate) fn read(root: &Path) -> Result<Option<WalOffset>, OpenError> {
             source,
         })?;
     match decode(&bytes) {
-        Ok(offset) => Ok(Some(offset)),
+        Ok(sidecar) => Ok(Some(sidecar)),
         Err(detail) => Err(OpenError::Corrupt {
             detail: format!("CHECKPOINT sidecar at {}: {detail}", path.display()),
         }),
@@ -135,7 +167,22 @@ mod tests {
         let original = offset();
         let bytes = encode(original);
         assert_eq!(bytes.len(), SIDECAR_LEN);
-        assert_eq!(decode(&bytes).expect("decode"), original);
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.offset, original);
+        assert_eq!(decoded.version, SidecarVersion::Current);
+    }
+
+    /// A sidecar written before RFC 0052 still decodes, and names the
+    /// version that makes it §3.2's migration witness. Refusing it
+    /// would refuse to start every pre-RFC root that ever checkpointed.
+    #[test]
+    fn decode_accepts_the_legacy_version_and_names_it() {
+        let original = offset();
+        let mut bytes = encode(original);
+        bytes[4..6].copy_from_slice(&VERSION_LEGACY.to_le_bytes());
+        let decoded = decode(&bytes).expect("legacy sidecar");
+        assert_eq!(decoded.offset, original);
+        assert_eq!(decoded.version, SidecarVersion::Legacy);
     }
 
     #[test]
@@ -143,7 +190,8 @@ mod tests {
         let original = offset();
         let bytes = encode(original);
         assert_eq!(&bytes[0..4], b"OWCK");
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 1);
+        // RFC 0052 §3.8's `CHECKPOINT` Invariant row bumps this to 2.
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 2);
         assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 0);
         assert_eq!(&bytes[8..24], original.segment.as_bytes());
         assert_eq!(
@@ -159,7 +207,9 @@ mod tests {
         bad_magic[0] = b'X';
         assert!(decode(&bad_magic).expect_err("magic").contains("bad magic"));
         let mut bad_version = valid;
-        bad_version[4] = 2;
+        // 3: version 2 is this build's own and version 1 is the
+        // accepted legacy, so the arm needs a genuinely unknown one.
+        bad_version[4] = 3;
         assert!(
             decode(&bad_version)
                 .expect_err("version")
@@ -184,7 +234,13 @@ mod tests {
         assert!(read(tmp.path()).expect("absent").is_none());
         let original = offset();
         write(tmp.path(), original).expect("write");
-        assert_eq!(read(tmp.path()).expect("present"), Some(original));
+        assert_eq!(
+            read(tmp.path()).expect("present"),
+            Some(Sidecar {
+                offset: original,
+                version: SidecarVersion::Current,
+            }),
+        );
         std::fs::write(tmp.path().join(SIDECAR_NAME), b"garbage").expect("poison");
         match read(tmp.path()) {
             Err(OpenError::Corrupt { detail }) => {

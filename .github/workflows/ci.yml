@@ -162,7 +162,7 @@ jobs:
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           report_type: test_results
           files: target/nextest/ci/junit.xml
@@ -851,7 +851,7 @@ jobs:
       # that means removing this job's main-only `if`, a separate cost
       # decision. `fail_ci_if_error: false` — an uploader outage must
       # not fail even this informational job's step list.
-      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}

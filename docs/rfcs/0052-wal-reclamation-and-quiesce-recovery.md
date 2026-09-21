@@ -19,16 +19,21 @@ superseded-by: —
 > .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry.rs` (.7, its own
 > binary per RFC0028.2) and `ourios-bench/tests/rfc0052_3_bounded_growth.rs`
 > (.3). Implementation proceeds in six green slices, each un-ignoring the
-> stubs it discharges:
+> stubs it discharges. Where a criterion's legs span slices, the mapping
+> below is by leg and each stub's `#[ignore]` reason names its slice:
 > **A** reclaim record and sidecars (§3.2 `RECLAIM`, `CHECKPOINT` v2,
-> `SEGMENT_VERSION` 2, open-time reconciliation → .11, .16, .17);
+> `SEGMENT_VERSION` 2, open-time reconciliation → .16, .11's open-time
+> leg, .17's format and open-time legs);
 > **B** housekeeping (ledger, `RetainFloor`, capped passes,
-> prepare/commit split → .2, .12, .13);
+> prepare/commit split → .2, .12, .13's floor legs, .17's pass legs:
+> migration-window skip, failed or uncertain unlink, failed record write);
 > **C** rotation (temporary name, bounded retry, terminal state, the
-> `hold/794-wedged-classification` reintroduction → .4, .5, .15);
+> `hold/794-wedged-classification` reintroduction → .4, .5, .15, .11's
+> post-RFC rotation leg, .17's legacy-root rotation leg);
 > **D** barrier (guard-at-submit, publisher thread, epoch latch,
-> ingest exclusion → .1, .14, .13's startup leg);
-> **E** timer and telemetry (§3.5 instruments and events → .7);
+> ingest exclusion → .1's cut legs, .14, .13's startup leg);
+> **E** timer and telemetry (§3.5 instruments and events → .7, .1's
+> cadence-tick panic leg);
 > **F** crash and soak (.10 on the rfc0014_5 fixture, .3 on the extended
 > soak harness). A before B; B before D and E; F last.
 > **Stage 1 of two.** Motivated by a production

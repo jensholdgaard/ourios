@@ -319,27 +319,47 @@ pub(crate) fn arm(
             held.commit(&record).map_err(record_failed)
         }
         Some(_) => Ok(()),
-        None => {
-            let record = reclaim::ReclaimRecord {
-                witness: armed,
-                ..reclaim::ReclaimRecord::default()
-            };
-            let geometry = configured_geometry().map_err(|e| CheckpointError::Io {
-                op: "size(RECLAIM)",
-                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-            })?;
-            *store = Some(
-                reclaim_store::ReclaimStore::create(
-                    &config.root,
-                    geometry,
-                    &record,
-                    config.macos_full_fsync,
-                )
-                .map_err(record_failed)?,
-            );
-            Ok(())
-        }
+        None => ensure_record(store, config).map_err(record_failed),
     }
+}
+
+/// RFC 0052 §3.2's ordering rule, which reaches rotation and not only
+/// open: **no version-2 segment is ever created before the record is
+/// durable.** A legacy root rotates before it ever checkpoints —
+/// rotation is append-driven and the first barrier may be minutes
+/// away — so a rotation that installed a version-2 segment while the
+/// root still had no sidecar would leave exactly the shape the
+/// open-time matrix fails closed on, and the node would refuse to
+/// open after a restart: a live root bricked by rotating.
+///
+/// The record is created armed and with its mode unrecorded, which
+/// the matrix reads as a legacy root mid migration and **retains**.
+/// A root that already has one is left alone; arming it is the
+/// checkpoint's job.
+pub(crate) fn ensure_record(
+    store: &mut Option<reclaim_store::ReclaimStore>,
+    config: &WalConfig,
+) -> Result<(), reclaim_store::StoreError> {
+    if store.is_some() {
+        return Ok(());
+    }
+    let record = reclaim::ReclaimRecord {
+        witness: reclaim::WitnessFlags {
+            checkpoint: reclaim::Witness::Armed,
+            ..reclaim::WitnessFlags::default()
+        },
+        ..reclaim::ReclaimRecord::default()
+    };
+    let geometry = configured_geometry().map_err(|e| reclaim_store::StoreError::Corrupt {
+        detail: format!("RECLAIM sidecar: sizing the file: {e}"),
+    })?;
+    *store = Some(reclaim_store::ReclaimStore::create(
+        &config.root,
+        geometry,
+        &record,
+        config.macos_full_fsync,
+    )?);
+    Ok(())
 }
 
 /// Write `checkpoint_seen` at the next record write after the

@@ -10,13 +10,75 @@
 //! The three rows whose decision also needs a *snapshot* stay
 //! `#[ignore]`d stubs, each naming the green slice that discharges it.
 
-use ourios_wal::{FrameKind, OpenError, Wal};
+use ourios_wal::{FrameKind, MIN_SEGMENT_SIZE_BYTES, OpenError, Wal};
 
 use crate::rfc0052_support::{
     CHECKPOINT, CHECKPOINT_ARMED, CHECKPOINT_SEEN, MODE_KNOWN, MODE_UNRECORDED, RECLAIM,
     build_closed_segment, checkpoint_version, default_config, downgrade_segments, live_slot, open,
     segment_files, set_live_witness, write_legacy_checkpoint,
 };
+
+/// Scenario RFC0052.17 — a legacy root that rotates before its first
+/// checkpoint stays openable.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+///
+/// §3.2's ordering rule reaches rotation, not only open: **no
+/// version-2 segment is ever created before the record is durable.**
+/// Rotation is append-driven and the first barrier may be minutes
+/// away, so without this a live pre-RFC root would be bricked by
+/// rotating — it would come back holding a version-2 segment beside
+/// no sidecar, the one shape
+/// `rfc0052_17_no_sidecars_fails_closed_only_beside_version_2_segments`
+/// fails closed on.
+///
+/// The crash-injected half of this row — a kill *between* the record
+/// write and the segment's creation — stays
+/// `rfc0052_17_legacy_root_rotation_writes_the_record_before_the_v2_segment`,
+/// on the rotation slice that owns the injection hook.
+#[test]
+fn rfc0052_17_legacy_root_rotation_stays_openable_without_a_checkpoint() {
+    // Given: a pre-RFC root — version-1 segments, neither sidecar —
+    // that has never checkpointed.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    build_closed_segment(root, &[b"written before this RFC"]);
+    std::fs::remove_file(root.join(RECLAIM)).expect("a pre-RFC root has no record");
+    downgrade_segments(root);
+    let mut config = default_config(root);
+    config.segment_size_bytes = MIN_SEGMENT_SIZE_BYTES;
+    let mut wal = Wal::open(config.clone()).expect("a legacy root opens");
+    assert!(
+        !root.join(RECLAIM).exists(),
+        "the legacy branch creates no record at open; the rotation does",
+    );
+
+    // When: an append rotates it, long before any checkpoint. 16 MiB
+    // fits a fresh 17 MiB segment; the next 2 MiB would straddle the
+    // cap, so it triggers the rotation.
+    wal.append(FrameKind::OtlpBatch, &vec![0xAA; 16 * 1024 * 1024])
+        .expect("first append");
+    wal.append(FrameKind::OtlpBatch, &vec![0xBB; 2 * 1024 * 1024])
+        .expect("second append rotates");
+    wal.sync().expect("sync");
+    drop(wal);
+
+    // Then: the record is durable beside the version-2 segment the
+    // rotation created, so the restart opens rather than halting.
+    assert!(
+        root.join(RECLAIM).exists(),
+        "the rotation writes and fsyncs the record before the version-2 segment",
+    );
+    assert_eq!(
+        live_slot(&std::fs::read(root.join(RECLAIM)).expect("read RECLAIM")).1,
+        CHECKPOINT_ARMED,
+        "armed with its mode unrecorded, which the matrix reads as a root mid migration",
+    );
+    let wal = Wal::open(config).expect("the rotated legacy root still opens");
+    assert!(
+        !wal.reclaim_state().reclaimable,
+        "and stays on the legacy branch until the first checkpoint upgrades the sidecar",
+    );
+}
 
 /// Scenario RFC0052.17 — a deleted record on a post-RFC root fails open.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.

@@ -638,6 +638,16 @@ impl Wal {
         }
         // The closing data sync flushed everything appended so far.
         self.unflushed_bytes = 0;
+        // RFC 0052 §3.2: no version-2 segment is ever created before
+        // the record is durable. A legacy root rotates long before it
+        // ever checkpoints, and a rotation that installed a version-2
+        // segment beside no sidecar would leave the one shape the
+        // open-time matrix fails closed on — a live pre-RFC root
+        // bricked by rotating.
+        if let Err(e) = reconcile::ensure_record(&mut self.reclaim, &self.config) {
+            self.quiesced = true;
+            return Err(rotation_record_failed(e));
+        }
         let (file, path, uuid) = match create_fresh_segment(&self.config.root) {
             Ok(fresh) => fresh,
             Err(OpenError::Io { op, source }) => {
@@ -1085,6 +1095,19 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
     }
     // `macos_full_fsync` is a `bool`; nothing to validate.
     Ok(())
+}
+
+/// Map a sidecar failure onto the rotation's error surface. A
+/// rotation that cannot make the record durable has created nothing,
+/// so it is reported exactly as a failed `create_fresh_segment` is.
+fn rotation_record_failed(e: reclaim_store::StoreError) -> AppendError {
+    match e {
+        reclaim_store::StoreError::Io { op, source } => AppendError::Io { op, source },
+        reclaim_store::StoreError::Corrupt { detail } => AppendError::Io {
+            op: "write(RECLAIM before rotation)",
+            source: std::io::Error::new(ErrorKind::InvalidData, detail),
+        },
+    }
 }
 
 /// Create the WAL root and make its directory entries durable before

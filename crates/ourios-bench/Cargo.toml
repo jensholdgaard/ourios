@@ -32,7 +32,7 @@ ourios-parquet = { path = "../ourios-parquet" }
 # feature list; declaring the dep here just lets us name the
 # types directly (Rust's resolver requires explicit
 # declaration to import from an otherwise-transitive crate).
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
 # The RFC 0024 §3.1 calibration accumulator + manifest types the
 # `--calibrate` pass folds a corpus into. A regular dependency (the
 # binary path uses it), which pulls `proptest` into this crate's

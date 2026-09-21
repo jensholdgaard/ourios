@@ -20,7 +20,7 @@ publish = false
 # — the same pattern rotel's OTLP HTTP receiver uses on
 # `ExportLogsServiceRequest`. Keeps OTLP-JSON parsing as one feature
 # flag, not a hand-rolled struct that could drift from the spec.
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
 # Hash function for `AuditEvent::triggering_line_hash` per RFC 0001
 # §6.4. Truncated blake3 (first 16 bytes) joins audit events back to
 # the data record(s) that triggered them in the §6.7 drift query.
@@ -43,7 +43,7 @@ serde_json = { version = "1", default-features = false, features = ["std", "floa
 # `ourios-telemetry`). Drives the alias map's
 # `ourios.miner.alias.assertions` / `ourios.miner.alias.retractions`
 # counters (§6.8 telemetry table).
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
 # Generated dotted-`ourios.*` semconv name constants for the alias
 # counters' metric names + `ourios.tenant` attribute key (§6.8).
 # Zero-dep leaf crate.
@@ -92,7 +92,7 @@ rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"]
 rand = "=0.8.8"
 # base64url (no pad) for the fixture issuer's JWK coordinates.
 base64 = "=0.23.1"
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["metrics", "testing"] }
 
 [lints]
 workspace = true

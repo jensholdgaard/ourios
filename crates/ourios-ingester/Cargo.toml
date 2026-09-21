@@ -76,7 +76,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "time", "ma
 # instruments through the global meter). `trace` is the API half only —
 # `Context` + `propagation::Extractor` for inbound trace-context extraction
 # (RFC 0039 §3.5); the SDK's propagator install stays in ourios-telemetry.
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace"] }
 # Generated metric/attribute name constants (RFC 0009 §3.6); a leaf,
 # zero-dep crate.
 ourios-semconv = { path = "../ourios-semconv" }
@@ -91,7 +91,7 @@ ourios-serving = { path = "../ourios-serving" }
 # (RFC0003.6). `gen-tonic` (not just `-messages`) supplies the
 # `logs_service_server::LogsService` trait the gRPC listener implements
 # (RFC0003.11/.15).
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "with-serde"] }
 # `prost::Message::{decode, encode_to_vec}` for the protobuf payload.
 # `std` is explicit (not relied on via workspace feature unification):
 # `DecodeError::source` returns `prost::DecodeError` as `&dyn
@@ -167,10 +167,10 @@ ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # The SDK data types (`ResourceMetrics` etc.) the metrics test reads;
 # `trace` adds the `InMemorySpanExporter`/`SdkTracerProvider` the RFC0038.2
 # request-span test collects the ingest batch span through.
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["metrics", "trace", "testing"] }
 # RFC0038.2: the `TracerProvider::tracer` trait method + `SpanId`/`TraceId`
 # the batch-span assertions read (the crate's non-dev dep is metrics-only).
-opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
 # RFC0038.2: bridge the ingest path's `#[tracing::instrument]` spans onto
 # the in-memory span exporter — matches ourios-telemetry's pinned layer.
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }

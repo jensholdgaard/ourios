@@ -38,7 +38,7 @@ ourios-telemetry = { path = "../ourios-telemetry" }
 # lives in ourios-telemetry, library code resolves against the global meter.
 # `trace` is the API half only — `Context` + `FutureExt::with_context` for
 # inbound trace-context propagation (RFC 0039 §3.5).
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace"] }
 # Generated semantic-convention name constants for the query metrics.
 ourios-semconv = { path = "../ourios-semconv" }
 # The receiver role's durable WAL + miner + miner config (one pipeline
@@ -79,7 +79,7 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 # it too. MIT-licensed, so the cargo-deny license allow-list is unchanged.
 serde_yaml_ng = { version = "0.10", default-features = false }
 # `LogsServiceServer` to host the receiver's `LogsService` impl over gRPC.
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs"] }
 # gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16). `gzip`
 # so the receiver accepts the OTel Collector's default-gzip OTLP exporter
 # (tests/it/collector_interop.rs).
@@ -118,13 +118,13 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # In-memory metric exporter for the RFC0016.6 query-metrics test: install a
 # global meter provider and read the exported stream (the ingester pattern).
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["metrics", "trace", "testing"] }
 # RFC0038.1 request-span tests: capture the query/MCP spans on a scoped
 # `InMemorySpanExporter` (no process-global tracer), matching the ingester's
 # slice-2 pattern. `opentelemetry` `trace` supplies `SpanKind`/`TracerProvider`.
 # The `tracing-opentelemetry` layer these tests install is no longer listed
 # here: RFC0039.6 promoted it to `[dependencies]`, which tests can reach too.
-opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
 # RFC 0019 server-level S3 integration tests (rfc0019_storage_backend): spin
 # LocalStack (S3-compatible, Apache-2.0) via testcontainers, spawn the server

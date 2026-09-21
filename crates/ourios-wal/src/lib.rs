@@ -33,6 +33,10 @@ pub(crate) mod checkpoint;
 pub(crate) mod frame;
 #[cfg(feature = "fuzzing")]
 pub mod frame;
+// The codec lands ahead of its callers: `Wal::open` wires the sidecar
+// in the next RFC 0052 slice, which removes this allow.
+#[allow(dead_code)]
+pub(crate) mod reclaim;
 pub(crate) mod segment;
 
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};

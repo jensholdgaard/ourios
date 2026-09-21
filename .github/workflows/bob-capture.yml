@@ -203,11 +203,15 @@ jobs:
               exit 1
             fi
 
-            query_out="$(curl -sS -w '\n%{http_code}' -X POST 'http://127.0.0.1:4319/v1/query' \
+            if query_out="$(curl -sS -w '\n%{http_code}' -X POST 'http://127.0.0.1:4319/v1/query' \
               -H "X-Ourios-Tenant: ${TENANT}" \
               -H 'Content-Type: text/plain' \
-              --data "service == \"${TENANT}\" | range(-1h, now) | limit 50")"
-            query_status="$(printf '%s' "$query_out" | tail -1)"
+              --data "service == \"${TENANT}\" | range(-1h, now) | limit 50")"; then
+              query_status="$(printf '%s' "$query_out" | tail -1)"
+            else
+              query_status="curl-failed"
+              query_out=""
+            fi
             if [ "$query_status" = "200" ]; then
               query_successes=$((query_successes + 1))
             else
@@ -242,11 +246,17 @@ jobs:
       - name: Wait for ContainerProfiles to complete
         run: |
           deadline=$((SECONDS + 600))
+          total=0
+          done_count=0
           while [ "$SECONDS" -lt "$deadline" ]; do
-            total="$(kubectl get containerprofile -o json | jq '.items | length')"
-            done_count="$(kubectl get containerprofile -o json | jq '[.items[] | select(.metadata.annotations["kubescape.io/status"] == "completed")] | length')"
-            echo "containerprofiles: ${done_count}/${total} completed"
-            if [ "${total}" -gt 0 ] && [ "${done_count}" = "${total}" ]; then break; fi
+            if items_json="$(kubectl get containerprofile -o json)"; then
+              total="$(printf '%s' "$items_json" | jq '.items | length')"
+              done_count="$(printf '%s' "$items_json" | jq '[.items[] | select(.metadata.annotations["kubescape.io/status"] == "completed")] | length')"
+              echo "containerprofiles: ${done_count}/${total} completed"
+              if [ "${total}" -gt 0 ] && [ "${done_count}" = "${total}" ]; then break; fi
+            else
+              echo "kubectl get containerprofile failed, retrying"
+            fi
             sleep 20
           done
           kubectl get containerprofile -o wide || true

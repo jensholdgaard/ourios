@@ -6,6 +6,9 @@
 //! naming the files it read; every row that can is opened and, where
 //! the crash left a witness half-written, promoted durably before
 //! anything else reads it.
+//!
+//! The three rows whose decision also needs a *snapshot* stay
+//! `#[ignore]`d stubs, each naming the green slice that discharges it.
 
 use ourios_wal::{FrameKind, OpenError, Wal};
 

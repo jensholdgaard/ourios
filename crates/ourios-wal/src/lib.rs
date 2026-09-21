@@ -33,12 +33,11 @@ pub(crate) mod checkpoint;
 pub(crate) mod frame;
 #[cfg(feature = "fuzzing")]
 pub mod frame;
-// The codec's dictionary-mutation surface (assign, tombstone, union,
-// raise_reclaimed) lands ahead of its callers: the housekeeping pass
-// that merges horizons into the record is RFC 0052's next slice, which
-// removes this allow.
-#[allow(dead_code)]
 pub(crate) mod ledger;
+// The codec's dictionary-mutation surface (assign, tombstone, union)
+// lands ahead of its callers: the housekeeping pass that merges
+// horizons into the record is RFC 0052's next slice, which removes
+// this allow.
 #[allow(dead_code)]
 pub(crate) mod reclaim;
 pub(crate) mod reclaim_store;

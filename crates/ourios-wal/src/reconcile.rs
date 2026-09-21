@@ -69,7 +69,7 @@ pub(crate) fn root(
 ) -> Result<RootWitness, OpenError> {
     let version = sidecar.map(|s| s.version);
     if reclaim_store::present(&config.root)? {
-        return record(config, version, segments);
+        return recorded_root(config, version, segments);
     }
     match version {
         // Every unlink is gated on a checkpoint, and on a post-RFC
@@ -85,7 +85,7 @@ pub(crate) fn root(
 /// The record is there: promote or retain its checkpoint witness by
 /// the `CHECKPOINT` beside it, and reconcile its `planned` entries
 /// against the directory before anything reads it as proof of loss.
-fn record(
+fn recorded_root(
     config: &WalConfig,
     version: Option<checkpoint::SidecarVersion>,
     segments: &[PathBuf],

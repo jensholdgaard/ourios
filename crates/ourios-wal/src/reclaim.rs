@@ -13,7 +13,7 @@
 //! 16 bytes in RFC 4122 order — the same conventions as the segment
 //! header and the `CHECKPOINT` sidecar.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use ourios_core::tenant::{MAX_TENANT_BYTES, TenantId};
@@ -831,6 +831,12 @@ pub enum FormatError {
         stored: u32,
         found: u32,
     },
+    /// Two live records name one tenant, so its id is ambiguous.
+    DuplicateKey {
+        first: SlotId,
+        id: SlotId,
+        key: TenantId,
+    },
     /// Planned records beside an unrecorded mode.
     PlannedWithoutMode {
         found: u32,
@@ -887,7 +893,8 @@ impl fmt::Display for FormatError {
             | Self::EntryFlags { .. }
             | Self::EntryWithoutTenant { .. }
             | Self::EntryModeDisagrees { .. }
-            | Self::EntryCount { .. } => self.fmt_dictionary(f),
+            | Self::EntryCount { .. }
+            | Self::DuplicateKey { .. } => self.fmt_dictionary(f),
             Self::PlannedWithoutMode { .. }
             | Self::PlannedFlags { .. }
             | Self::PlannedCount { .. }
@@ -987,6 +994,10 @@ impl FormatError {
                     "entry_count {stored} stored, {found} occupied entries found"
                 )
             }
+            Self::DuplicateKey { first, id, key } => write!(
+                f,
+                "dictionary records {first} and {id} both name live tenant {key:?}"
+            ),
             other => write!(f, "{other:?}"),
         }
     }
@@ -1162,9 +1173,13 @@ pub fn encode_slot_into(
         return Err(EncodeError::PlannedWithoutMode);
     }
     out.fill(0);
-    let entry_count = encode_dictionary(out, record, geometry)?;
+    let mut writer = SlotWriter {
+        out: &mut *out,
+        geometry,
+    };
+    let entry_count = writer.dictionary(record)?;
     for (position, planned) in record.planned.iter().enumerate() {
-        encode_planned(out, planned, position, &record.dictionary, geometry)?;
+        writer.planned(position, planned, &record.dictionary)?;
     }
     out[0..8].copy_from_slice(&generation.to_le_bytes());
     out[8..12].copy_from_slice(&entry_count.to_le_bytes());
@@ -1180,33 +1195,83 @@ pub fn encode_slot_into(
     Ok(())
 }
 
-/// The dictionary and entry arrays; returns the occupied-entry count.
-/// An entry is written only under the mode the root recorded, since
-/// recovery reads it by that mode (§3.2).
-fn encode_dictionary(
-    out: &mut [u8],
-    record: &ReclaimRecord,
+/// One slot being laid out: the buffer and the geometry that says
+/// where each structure lives.
+struct SlotWriter<'a> {
+    out: &'a mut [u8],
     geometry: Geometry,
-) -> Result<u32, EncodeError> {
-    let mut entry_count = 0u32;
-    for (id, dict) in record.dictionary.iter() {
-        encode_dict_record(&mut out[Geometry::dictionary_at(id)..], id, dict)?;
-        if let SlotState::Live {
+}
+
+impl SlotWriter<'_> {
+    /// The dictionary and entry arrays; returns the occupied-entry
+    /// count. An entry is written only under the mode the root
+    /// recorded, since recovery reads it by that mode (§3.2).
+    fn dictionary(&mut self, record: &ReclaimRecord) -> Result<u32, EncodeError> {
+        let mut entry_count = 0u32;
+        for (id, dict) in record.dictionary.iter() {
+            encode_dict_record(&mut self.out[Geometry::dictionary_at(id)..], id, dict)?;
+            entry_count += self.entry(id, dict, record.consumer_mode)?;
+        }
+        Ok(entry_count)
+    }
+
+    /// One position's entry, if its record carries one; returns how
+    /// many entries were written (0 or 1).
+    fn entry(
+        &mut self,
+        id: SlotId,
+        dict: &DictRecord,
+        recorded: RecordedMode,
+    ) -> Result<u32, EncodeError> {
+        let SlotState::Live {
             reclaimed_through: Some(entry),
         } = dict.state
-        {
-            if !record.consumer_mode.admits(entry.mode) {
-                return Err(EncodeError::EntryModeDisagrees {
-                    id,
-                    entry: entry.mode,
-                    recorded: record.consumer_mode,
-                });
-            }
-            encode_entry(&mut out[geometry.entry_at(id)..], entry);
-            entry_count += 1;
+        else {
+            return Ok(0);
+        };
+        if !recorded.admits(entry.mode) {
+            return Err(EncodeError::EntryModeDisagrees {
+                id,
+                entry: entry.mode,
+                recorded,
+            });
         }
+        let at = self.geometry.entry_at(id);
+        self.out[at..at + 2].copy_from_slice(&ENTRY_OCCUPIED.to_le_bytes());
+        self.out[at + 2..at + 4].copy_from_slice(&entry.mode.code().to_le_bytes());
+        write_offset(&mut self.out[at + 8..at + 8 + OFFSET_LEN], entry.offset);
+        Ok(1)
     }
-    Ok(entry_count)
+
+    /// One planned record and its pairs.
+    fn planned(
+        &mut self,
+        position: usize,
+        planned: &PlannedUnlink,
+        dictionary: &Dictionary,
+    ) -> Result<(), EncodeError> {
+        check_pairs(planned, dictionary)?;
+        let at = self.geometry.planned_at(position);
+        self.out[at..at + 16].copy_from_slice(planned.segment.as_bytes());
+        let tenant_count =
+            u16::try_from(planned.last_offsets.len()).map_err(|_| EncodeError::TooManyPairs {
+                segment: planned.segment,
+                found: planned.last_offsets.len(),
+            })?;
+        self.out[at + 16..at + 18].copy_from_slice(&tenant_count.to_le_bytes());
+        let uncertain = if planned.uncertain {
+            PLANNED_UNCERTAIN
+        } else {
+            0
+        };
+        self.out[at + 22] = PLANNED_OCCUPIED | uncertain;
+        for (&id, &offset) in &planned.last_offsets {
+            let at = self.geometry.pair_at(position, id);
+            self.out[at..at + 2].copy_from_slice(&PAIR_PRESENT.to_le_bytes());
+            write_offset(&mut self.out[at + 8..at + 8 + OFFSET_LEN], offset);
+        }
+        Ok(())
+    }
 }
 
 fn encode_dict_record(out: &mut [u8], id: SlotId, dict: &DictRecord) -> Result<(), EncodeError> {
@@ -1226,33 +1291,9 @@ fn encode_dict_record(out: &mut [u8], id: SlotId, dict: &DictRecord) -> Result<(
     Ok(())
 }
 
-fn encode_entry(out: &mut [u8], entry: Entry) {
-    out[0..2].copy_from_slice(&ENTRY_OCCUPIED.to_le_bytes());
-    out[2..4].copy_from_slice(&entry.mode.code().to_le_bytes());
-    write_offset(&mut out[8..8 + OFFSET_LEN], entry.offset);
-}
-
-fn encode_planned(
-    out: &mut [u8],
-    planned: &PlannedUnlink,
-    position: usize,
-    dictionary: &Dictionary,
-    geometry: Geometry,
-) -> Result<(), EncodeError> {
-    let at = geometry.planned_at(position);
-    out[at..at + 16].copy_from_slice(planned.segment.as_bytes());
-    let tenant_count =
-        u16::try_from(planned.last_offsets.len()).map_err(|_| EncodeError::TooManyPairs {
-            segment: planned.segment,
-            found: planned.last_offsets.len(),
-        })?;
-    out[at + 16..at + 18].copy_from_slice(&tenant_count.to_le_bytes());
-    let uncertain = if planned.uncertain {
-        PLANNED_UNCERTAIN
-    } else {
-        0
-    };
-    out[at + 22] = PLANNED_OCCUPIED | uncertain;
+/// Every pair names a live tenant and lies in its record's segment —
+/// a pair is that tenant's last offset *in* that segment (§3.2).
+fn check_pairs(planned: &PlannedUnlink, dictionary: &Dictionary) -> Result<(), EncodeError> {
     for (&id, &offset) in &planned.last_offsets {
         if !dictionary.is_live(id) {
             return Err(EncodeError::PairWithoutTenant {
@@ -1267,9 +1308,6 @@ fn encode_planned(
                 found: offset.segment,
             });
         }
-        let at = geometry.pair_at(position, id);
-        out[at..at + 2].copy_from_slice(&PAIR_PRESENT.to_le_bytes());
-        write_offset(&mut out[at + 8..at + 8 + OFFSET_LEN], offset);
     }
     Ok(())
 }
@@ -1341,23 +1379,59 @@ fn decode_dictionary(
     entry_count: u32,
 ) -> Result<Dictionary, FormatError> {
     let mut records = Vec::with_capacity(to_usize(u64::from(next_slot_id)));
-    let mut entries_found = 0u32;
     for id in geometry.ids() {
         let key = decode_dict_record(&bytes[Geometry::dictionary_at(id)..], id, next_slot_id)?;
         let entry = decode_entry(&bytes[geometry.entry_at(id)..], id)?;
-        let Some(record) = slot_record(id, key, entry)? else {
-            continue;
-        };
-        entries_found += u32::from(entry.is_some());
-        records.push(record);
+        records.extend(slot_record(id, key, entry)?);
     }
-    if entries_found != entry_count {
+    let dictionary = Dictionary { records };
+    let found = occupied_entries(&dictionary);
+    if found != entry_count {
         return Err(FormatError::EntryCount {
             stored: entry_count,
-            found: entries_found,
+            found,
         });
     }
-    Ok(Dictionary { records })
+    live_keys_are_distinct(&dictionary)?;
+    Ok(dictionary)
+}
+
+/// How many positions carry a `reclaimed_through`, which is what the
+/// slot header's `entry_count` states.
+fn occupied_entries(dictionary: &Dictionary) -> u32 {
+    let found = dictionary
+        .iter()
+        .filter(|(_, record)| {
+            matches!(
+                record.state,
+                SlotState::Live {
+                    reclaimed_through: Some(_)
+                }
+            )
+        })
+        .count();
+    // One entry per position, and positions are capped at `u16::MAX + 1`.
+    u32::try_from(found).unwrap_or(u32::MAX)
+}
+
+/// One key holds at most one live id (§3.2): ids are assigned through
+/// [`Dictionary::id_of`], which answers with the first live match, so
+/// a second live record for the same tenant makes its
+/// `reclaimed_through` unreachable and reconciliation reads the wrong
+/// proof. A tombstoned record beside a live one is the ordinary case —
+/// a retired id keeps its key — and is left alone.
+fn live_keys_are_distinct(dictionary: &Dictionary) -> Result<(), FormatError> {
+    let mut seen: HashMap<&TenantId, SlotId> = HashMap::new();
+    for (id, record) in dictionary.live() {
+        if let Some(first) = seen.insert(&record.key, id) {
+            return Err(FormatError::DuplicateKey {
+                first,
+                id,
+                key: record.key.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Every entry was written under the mode the slot recorded (§3.2):
@@ -1651,6 +1725,8 @@ fn reserved_zero(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use proptest::prelude::*;
 
@@ -2107,6 +2183,37 @@ mod tests {
         ));
     }
 
+    /// Rewrite dictionary record `id` as a live record for `key`.
+    fn write_live_key(bytes: &mut [u8], id: usize, key: &str) {
+        let at = DICT + id * 132;
+        bytes[at..at + 132].fill(0);
+        let len = u16::try_from(key.len()).expect("key length");
+        bytes[at..at + 2].copy_from_slice(&len.to_le_bytes());
+        bytes[at + 2..at + 2 + key.len()].copy_from_slice(key.as_bytes());
+    }
+
+    #[test]
+    fn decode_refuses_a_second_live_record_for_one_tenant() {
+        let g = geometry(8, 4);
+        // Record 0 is a live "acme"; make record 1 a second one.
+        let duplicate = resealed(g, |b| write_live_key(b, 1, "acme"));
+        assert!(matches!(
+            duplicate,
+            Err(FormatError::DuplicateKey {
+                first: SlotId(0),
+                id: SlotId(1),
+                ..
+            })
+        ));
+        // Record 2 is the tombstoned "gone": a live record for the same
+        // tenant at a lower id is not a duplicate, and holds the id.
+        let revived = resealed(g, |b| write_live_key(b, 1, "gone")).expect("decode");
+        assert_eq!(
+            revived.record.dictionary.id_of(&tenant("gone")),
+            Some(SlotId(1))
+        );
+    }
+
     #[test]
     fn decode_refuses_each_entry_inconsistency() {
         let g = geometry(8, 4);
@@ -2335,15 +2442,25 @@ mod tests {
             "[\\x21-\\x7e]{1,128}",
         ];
         prop::collection::vec((key, arb_state(mode)), 0..=max_tenants).prop_map(|records| {
-            Dictionary {
-                records: records
-                    .into_iter()
-                    .map(|(key, state)| DictRecord {
+            // A key holds at most one live id, so a repeat becomes the
+            // retired record that case allows (§3.2).
+            let mut claimed = HashSet::new();
+            let records = records
+                .into_iter()
+                .map(|(key, state)| {
+                    let state = match state {
+                        SlotState::Live { .. } if !claimed.insert(key.clone()) => {
+                            SlotState::Tombstoned
+                        }
+                        state => state,
+                    };
+                    DictRecord {
                         key: TenantId::new(key),
                         state,
-                    })
-                    .collect(),
-            }
+                    }
+                })
+                .collect();
+            Dictionary { records }
         })
     }
 

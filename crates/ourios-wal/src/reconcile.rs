@@ -30,9 +30,9 @@ pub(crate) fn configured_geometry() -> Result<reclaim::Geometry, reclaim::Geomet
 /// What RFC 0052 §3.2's open-time matrix decided about this root.
 pub(crate) struct RootWitness {
     pub(crate) store: Option<reclaim_store::ReclaimStore>,
-    /// A version-2 `CHECKPOINT` beside a record — the only shape a
+    /// A version-2 `CHECKPOINT` beside a record is the only shape a
     /// pass may plan segments under.
-    pub(crate) reclaimable: bool,
+    pub(crate) gate: crate::ReclaimGate,
 }
 
 impl RootWitness {
@@ -41,7 +41,7 @@ impl RootWitness {
     fn legacy() -> Self {
         Self {
             store: None,
-            reclaimable: false,
+            gate: crate::ReclaimGate::Unwitnessed,
         }
     }
 
@@ -49,14 +49,14 @@ impl RootWitness {
     fn with_record(store: reclaim_store::ReclaimStore) -> Self {
         Self {
             store: Some(store),
-            reclaimable: false,
+            gate: crate::ReclaimGate::Unwitnessed,
         }
     }
 
     fn witnessed(store: reclaim_store::ReclaimStore) -> Self {
         Self {
             store: Some(store),
-            reclaimable: true,
+            gate: crate::ReclaimGate::Open,
         }
     }
 }
@@ -334,7 +334,7 @@ fn lost_record(root: &Path) -> OpenError {
 fn lost_checkpoint(root: &Path) -> OpenError {
     OpenError::Corrupt {
         detail: format!(
-            "{} carries checkpoint_seen but {} is missing (RFC 0052 §3.2): a version-2 checkpoint succeeded on this root, so the sidecar is a loss — without it the Parquet-side suppression horizon cannot be rebuilt and replay would republish",
+            "{} carries proof that a version-2 checkpoint existed — checkpoint_seen, a planned unlink, or a tenant's reclaimed_through — but {} is missing (RFC 0052 §3.2): every unlink was gated on a checkpoint, so the sidecar is a loss, and without it the Parquet-side suppression horizon cannot be rebuilt and replay would republish",
             root.join(reclaim::SIDECAR_NAME).display(),
             root.join(checkpoint::SIDECAR_NAME).display(),
         ),

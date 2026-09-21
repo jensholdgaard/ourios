@@ -292,6 +292,27 @@ pub const MAX_SEGMENT_AGE_SECS: u64 = 86_400;
 pub const MIN_HOUSEKEEPING_SECS: u64 = 1;
 pub const MAX_HOUSEKEEPING_SECS: u64 = 3_600;
 
+/// Whether a housekeeping pass may plan segments (RFC 0052 §3.2), as
+/// one value rather than two flags — "the sidecar's entry is not yet
+/// durable" is only meaningful once the witness exists, and a pair of
+/// bools can hold that contradiction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimGate {
+    /// No version-2 `CHECKPOINT` beside a record yet: a legacy root,
+    /// or a post-RFC one before its first checkpoint. A pass sweeps
+    /// partials and plans nothing — unlinking under a version-1
+    /// checkpoint would leave exactly the shape the open-time matrix
+    /// reads as "nothing was ever reclaimed".
+    Unwitnessed,
+    /// The witness exists, but the sidecar carrying it is only
+    /// renamed: its directory entry is not durable until the parent
+    /// fsync returns, and a crash that lost the rename would revert
+    /// the checkpoint beneath frames whose segments a pass had
+    /// already unlinked.
+    FsyncPending,
+    Open,
+}
+
 /// The append-only write-ahead log itself. One per ingester
 /// process; the §6.1 API is `open → replay? → append* →
 /// sync* → checkpoint*`.
@@ -349,13 +370,8 @@ pub struct Wal {
     /// A legacy root opens without a record and the first checkpoint
     /// creates it on the upgrade path.
     reclaim: Option<reclaim_store::ReclaimStore>,
-    /// Whether a housekeeping pass may plan segments: RFC 0052 §3.2's
-    /// witness, a version-2 `CHECKPOINT` beside a record. Until it
-    /// exists a pass sweeps partials and plans nothing, since
-    /// unlinking under a version-1 checkpoint would leave exactly the
-    /// shape the open-time matrix reads as "nothing was ever
-    /// reclaimed".
-    reclaimable: bool,
+    /// Whether a housekeeping pass may plan segments (RFC 0052 §3.2).
+    reclaim_gate: ReclaimGate,
     /// Stale `<uuid>.wal.partial` files, seeded by
     /// [`Self::rebuild_ledger`] and popped by the housekeeping sweep.
     /// §3.3: the sweep lists nothing on the pass, so restart debris is
@@ -436,7 +452,9 @@ impl Wal {
             checkpoint: sidecar.map(|s| s.offset),
             checkpoint_version: sidecar.map(|s| s.version),
             reclaim: witness.store,
-            reclaimable: witness.reclaimable,
+            // `prepare_root` fsynced the root before the sidecars
+            // were read, so whatever is on disk there is durable.
+            reclaim_gate: witness.gate,
             stale_partials: Vec::new(),
             unreclaimed_bytes: 0,
             appends_total: 0,
@@ -483,7 +501,7 @@ impl Wal {
             unreclaimed_bytes: self.unreclaimed_bytes,
             checkpoint: self.checkpoint,
             stale_partials: self.stale_partials.len(),
-            reclaimable: self.reclaimable,
+            reclaimable: self.may_reclaim(),
         }
     }
 
@@ -815,8 +833,12 @@ impl Wal {
         checkpoint::write(&self.config.root, durable_to)?;
         self.checkpoint = Some(durable_to);
         self.checkpoint_version = Some(checkpoint::SidecarVersion::Current);
-        self.reclaimable = true;
+        // Advancing the mark is not the same as being allowed to
+        // reclaim under it: the rename is visible but its directory
+        // entry is not durable until the fsync below returns.
+        self.reclaim_gate = ReclaimGate::FsyncPending;
         checkpoint::sync_root(&self.config.root)?;
+        self.reclaim_gate = ReclaimGate::Open;
         // The witness is a third durable write and its own failure:
         // reported, never rolled back. `checkpoint_seen` governs only
         // the open-time matrix, and an armed record beside a version-2
@@ -833,6 +855,9 @@ impl Wal {
     /// skip it for the life of the process. A legacy root with no
     /// record has no witness and is never settled.
     fn checkpoint_is_settled(&self) -> bool {
+        if self.reclaim_gate != ReclaimGate::Open {
+            return false;
+        }
         if self.checkpoint_version != Some(checkpoint::SidecarVersion::Current) {
             return false;
         }
@@ -881,17 +906,23 @@ impl Wal {
         let Some(cp) = self.checkpoint else {
             return Ok(());
         };
-        // §3.2: a pass whose root still has a version-1 `CHECKPOINT`,
-        // or no record, plans no segment. Unlinking there would leave
-        // exactly the shape the open-time matrix reads as "nothing was
-        // ever reclaimed".
-        if !self.reclaimable {
+        if !self.may_reclaim() {
             return Ok(());
         }
         self.unlink_at_or_below(match retain_floor {
             Some(floor) => cp.min(floor),
             None => cp,
         })
+    }
+
+    /// Whether a pass may plan segments at all: §3.2's witness exists
+    /// — a version-2 `CHECKPOINT` beside a record, since unlinking
+    /// under a version-1 one would leave exactly the shape the
+    /// open-time matrix reads as "nothing was ever reclaimed" — **and**
+    /// that checkpoint's own directory entry is durable rather than
+    /// merely renamed.
+    fn may_reclaim(&self) -> bool {
+        self.reclaim_gate == ReclaimGate::Open
     }
 
     /// Unlink every closed segment whose highest frame offset is at or
@@ -1787,6 +1818,65 @@ mod tests {
     }
 
     use super::*;
+
+    /// RFC 0052 §3.2 with §6.3: no segment is reclaimed under a
+    /// checkpoint whose directory entry is only renamed, not fsynced.
+    /// The mark advances in memory at the rename so a later lower one
+    /// cannot rewrite the sidecar backwards, but a crash that lost
+    /// that rename would revert the checkpoint beneath frames whose
+    /// segments the pass had already unlinked.
+    #[test]
+    fn housekeeping_waits_for_the_checkpoint_directory_fsync() {
+        let dest = tempfile::TempDir::new().expect("temp");
+        let offsets = mint_closed_segment(dest.path(), &[b"a1", b"a2"]);
+        mint_closed_segment(dest.path(), &[b"b1"]);
+        let mut wal = Wal::open(default_config(dest.path())).expect("open");
+        wal.checkpoint(*offsets.last().expect("offsets"))
+            .expect("checkpoint");
+        assert!(wal.may_reclaim(), "a completed checkpoint is reclaimable");
+
+        wal.reclaim_gate = ReclaimGate::FsyncPending;
+        wal.housekeeping(None).expect("housekeeping");
+        assert_eq!(
+            list_segments(dest.path()).expect("list").len(),
+            2,
+            "nothing is reclaimed while the sidecar's entry is not durable",
+        );
+
+        wal.reclaim_gate = ReclaimGate::Open;
+        wal.housekeeping(None).expect("housekeeping");
+        assert_eq!(
+            list_segments(dest.path()).expect("list").len(),
+            1,
+            "and the next pass reclaims once it is",
+        );
+    }
+
+    /// Build a closed segment in a scratch root and move it into
+    /// `dest`, bringing the record the producing root created with it
+    /// (RFC 0052 §3.2 fails closed on a version-2 segment beside no
+    /// sidecar). Returns the frames' append offsets.
+    fn mint_closed_segment(dest: &std::path::Path, payloads: &[&[u8]]) -> Vec<WalOffset> {
+        let scratch = tempfile::TempDir::new().expect("scratch");
+        let mut wal = Wal::open(default_config(scratch.path())).expect("open scratch");
+        let offsets = payloads
+            .iter()
+            .map(|p| wal.append(FrameKind::OtlpBatch, p).expect("append"))
+            .collect();
+        wal.sync().expect("sync");
+        drop(wal);
+        let seg = list_segments(scratch.path())
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("one segment");
+        std::fs::rename(&seg, dest.join(seg.file_name().expect("name"))).expect("move");
+        let record = dest.join(reclaim::SIDECAR_NAME);
+        if !record.exists() {
+            std::fs::copy(scratch.path().join(reclaim::SIDECAR_NAME), &record).expect("record");
+        }
+        offsets
+    }
 
     /// §6.3 macOS strong durability (#125): with the knob set, the
     /// segment sync goes through `fcntl(F_FULLFSYNC)` and the

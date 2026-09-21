@@ -320,7 +320,15 @@ fn decode_file(
             "size {found} B, expected {expected} B at the stored capacities"
         )));
     }
-    let mut slot = vec![0u8; slot_bytes(geometry)];
+    // The length check above bounds this by the file that really
+    // exists, but a sparse file at §3.2's 65,536 × 65,536 format
+    // ceilings is a legal shape describing a ~128 GiB slot. Reserve
+    // fallibly so that is a refusal naming the file rather than an
+    // allocation abort during startup.
+    let mut slot = Vec::new();
+    slot.try_reserve_exact(slot_bytes(geometry))
+        .map_err(|_| corrupt(&format!("cannot hold a {} B slot", slot_bytes(geometry))))?;
+    slot.resize(slot_bytes(geometry), 0);
     let mut read = |index: SlotIndex| -> Result<_, StoreError> {
         file.seek(SeekFrom::Start(geometry.slot_offset(index)))
             .map_err(io("seek(RECLAIM slot)"))?;

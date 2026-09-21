@@ -96,9 +96,9 @@ fn recorded_root(
     })?;
     let mut store =
         reclaim_store::ReclaimStore::open(&config.root, geometry, config.macos_full_fsync)?;
-    match (version, store.record().witness.checkpoint) {
-        (Some(checkpoint::SidecarVersion::Current), witness) => {
-            promote_checkpoint_witness(&mut store, witness)?;
+    match (version, proves_a_checkpoint(store.record())) {
+        (Some(checkpoint::SidecarVersion::Current), _) => {
+            promote_checkpoint_witness(&mut store)?;
             planned(&mut store, &config.root)?;
             Ok(RootWitness::witnessed(store))
         }
@@ -110,31 +110,50 @@ fn recorded_root(
             planned(&mut store, &config.root)?;
             Ok(RootWitness::with_record(store))
         }
-        (None, reclaim::Witness::Terminal) => Err(lost_checkpoint(&config.root)),
+        (None, true) => Err(lost_checkpoint(&config.root)),
         // Not fresh at all: the first rotation on a legacy root writes
         // the record before it creates its version-2 segment, so this
         // is that root mid migration. Emptying the record here would
         // discard a mode the first pass may already have adopted.
-        (None, _) if !segments.is_empty() => {
+        (None, false) if !segments.is_empty() => {
             planned(&mut store, &config.root)?;
             Ok(RootWitness::with_record(store))
         }
-        (None, _) => {
+        (None, false) => {
             reset_record(&mut store)?;
             Ok(RootWitness::with_record(store))
         }
     }
 }
 
+/// Whether the record proves a version-2 `CHECKPOINT` once existed.
+/// §3.2's symmetric row: `checkpoint_seen`, **any** tenant's
+/// `reclaimed_through`, or **any** planned unlink. Every unlink was
+/// gated on a checkpoint, so a record carrying any of the three beside
+/// a missing `CHECKPOINT` is a checkpoint that existed and is gone —
+/// without `X` the Parquet-side suppression horizon cannot be rebuilt
+/// and replay would republish. Reading it as a fresh root would reset
+/// exactly that proof.
+fn proves_a_checkpoint(record: &reclaim::ReclaimRecord) -> bool {
+    if record.witness.checkpoint == reclaim::Witness::Terminal || !record.planned.is_empty() {
+        return true;
+    }
+    record.dictionary.iter().any(|(_, held)| {
+        matches!(
+            held.state,
+            reclaim::SlotState::Live {
+                reclaimed_through: Some(_)
+            }
+        )
+    })
+}
+
 /// An armed record beside a present version-2 `CHECKPOINT` is the
 /// ordinary post-upgrade state — the crash simply landed before the
 /// record's next write — so open promotes it durably before anything
 /// reads the matrix, and it is never a fault.
-fn promote_checkpoint_witness(
-    store: &mut reclaim_store::ReclaimStore,
-    witness: reclaim::Witness,
-) -> Result<(), OpenError> {
-    if witness == reclaim::Witness::Terminal {
+fn promote_checkpoint_witness(store: &mut reclaim_store::ReclaimStore) -> Result<(), OpenError> {
+    if store.record().witness.checkpoint == reclaim::Witness::Terminal {
         return Ok(());
     }
     let record = reclaim::ReclaimRecord {
@@ -416,13 +435,86 @@ mod tests {
 
     use ourios_core::tenant::TenantId;
 
-    use super::planned;
+    use super::{planned, proves_a_checkpoint};
     use crate::WalOffset;
     use crate::reclaim::{
         Dictionary, Entry, EntryMode, Geometry, PlannedUnlink, ReclaimRecord, RecordedMode,
-        SlotState, WitnessFlags,
+        SlotState, Witness, WitnessFlags,
     };
     use crate::reclaim_store::ReclaimStore;
+
+    /// §3.2's symmetric row: a record carrying **any** proof that a
+    /// version-2 checkpoint once existed — `checkpoint_seen`, a
+    /// tenant's `reclaimed_through`, or a planned unlink — beside a
+    /// missing `CHECKPOINT` is a lost checkpoint. Every unlink was
+    /// gated on one, so reading such a record as a fresh root would
+    /// reset exactly the proof that says frames are already gone.
+    #[test]
+    fn every_kind_of_reclaim_proof_says_a_checkpoint_existed() {
+        let geometry = Geometry::new(2, 2).expect("geometry");
+        let segment = uuid::Uuid::now_v7();
+        let tenant = TenantId::try_new("checkout").expect("tenant");
+
+        let mut reclaimed = Dictionary::default();
+        let id = reclaimed.assign(&tenant, geometry).expect("slot id");
+        reclaimed
+            .raise_reclaimed(
+                id,
+                Entry {
+                    mode: EntryMode::Known,
+                    offset: WalOffset { segment, byte: 64 },
+                },
+            )
+            .expect("raise");
+
+        let seen = ReclaimRecord {
+            witness: WitnessFlags {
+                checkpoint: Witness::Terminal,
+                ..WitnessFlags::default()
+            },
+            ..ReclaimRecord::default()
+        };
+        let with_plan = ReclaimRecord {
+            consumer_mode: RecordedMode::Known,
+            planned: vec![PlannedUnlink {
+                segment,
+                uncertain: false,
+                last_offsets: BTreeMap::new(),
+            }],
+            ..ReclaimRecord::default()
+        };
+        let with_entry = ReclaimRecord {
+            consumer_mode: RecordedMode::Known,
+            dictionary: reclaimed,
+            ..ReclaimRecord::default()
+        };
+        for (what, record) in [
+            ("checkpoint_seen", &seen),
+            ("a planned unlink", &with_plan),
+            ("a reclaimed_through entry", &with_entry),
+        ] {
+            assert!(proves_a_checkpoint(record), "{what} is proof");
+        }
+
+        // A record that only records a tenant, or is merely armed,
+        // proves nothing: no pass has reclaimed under it.
+        let mut recorded = Dictionary::default();
+        recorded.assign(&tenant, geometry).expect("slot id");
+        let armed = ReclaimRecord {
+            witness: WitnessFlags {
+                checkpoint: Witness::Armed,
+                ..WitnessFlags::default()
+            },
+            dictionary: recorded,
+            ..ReclaimRecord::default()
+        };
+        for (what, record) in [
+            ("an empty record", &ReclaimRecord::default()),
+            ("an armed record naming a tenant", &armed),
+        ] {
+            assert!(!proves_a_checkpoint(record), "{what} is not proof");
+        }
+    }
 
     /// RFC 0052 §3.2's open-time reconciliation of the `planned` list.
     /// A planned segment still present is retained and its entry

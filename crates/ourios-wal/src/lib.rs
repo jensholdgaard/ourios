@@ -1609,10 +1609,23 @@ impl std::error::Error for SyncError {
 /// Errors from [`Wal::checkpoint`].
 #[derive(Debug)]
 pub enum CheckpointError {
-    /// Sidecar atomic-write / fsync failed. The in-memory
-    /// high-water-mark is **not** advanced when this fires —
-    /// the WAL conservatively keeps all segments rather than
-    /// risk a post-crash replay-induced data-side dup.
+    /// A step of the checkpoint failed. Whether the in-memory
+    /// high-water mark advanced depends on **which** step, and a
+    /// caller that treats them alike is reading a contract that does
+    /// not hold:
+    ///
+    /// - up to and including the sidecar's rename, nothing is visible
+    ///   under the final name, so the mark is **not** advanced — the
+    ///   WAL conservatively keeps all segments rather than risk a
+    ///   post-crash replay-induced data-side dup;
+    /// - the parent-directory fsync *after* that rename, and RFC 0052
+    ///   §3.2's `checkpoint_seen` write after it, both fail with the
+    ///   new mark already durable-or-visible, so the mark **has**
+    ///   advanced. Leaving it behind would let a later, lower mark
+    ///   pass the monotonicity check and rewrite the sidecar
+    ///   backwards.
+    ///
+    /// `op` names the step in every case.
     Io {
         op: &'static str,
         source: std::io::Error,

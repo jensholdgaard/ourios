@@ -35,6 +35,11 @@ const SLOT_HEADER_LEN: u64 = 24;
 const SLOT_TRAILER_LEN: u64 = 8;
 const KEY_LEN: usize = MAX_TENANT_BYTES;
 const DICT_RECORD_LEN: u64 = 132;
+// §3.2 pins the record at `u16 len`, the key padded to `KEY_LEN`, then
+// `u16 flags` at offset 130. Widening the tenant bound moves those
+// offsets, which is a format change; it fails here rather than letting
+// a key run into the flags field.
+const _: () = assert!(2 + KEY_LEN + 2 == 132);
 const ENTRY_LEN: u64 = 32;
 const PLANNED_HEADER_LEN: u64 = 24;
 const PAIR_LEN: u64 = 32;

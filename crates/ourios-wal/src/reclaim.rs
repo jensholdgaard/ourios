@@ -1874,7 +1874,16 @@ mod tests {
         for (found, expected) in refused {
             assert_eq!(found, Err(expected));
         }
+        // Both ceilings together describe a ~137 GB file, which is a
+        // geometry only a 64-bit target can address; the same call is
+        // `Unrepresentable` where `usize` is narrower.
+        #[cfg(target_pointer_width = "64")]
         assert!(Geometry::new(65_536, 65_536).is_ok());
+        #[cfg(not(target_pointer_width = "64"))]
+        assert!(matches!(
+            Geometry::new(65_536, 65_536),
+            Err(GeometryError::Unrepresentable { .. })
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # RFC 0053 split — history and file map
 
 RFC 0053 originally specified WAL backpressure, publish-time unwind
-safety, publication frontiers and tenant settlement, and an RFC 0005 §7
+safety, publication frontiers and tenant settlement, and an RFC 0005 §3.7
 audit-durability amendment together, in one 3172-line document
 (`rfc/0053-wal-backpressure-unwind` @ `30a21f80`). It was split into four
 RFCs so each could reach its own maturity gate independently; this page
@@ -16,7 +16,7 @@ own §9 (cited there as "the quarry"); RFC 0053 itself ends at §8.
 | `docs/rfcs/0053-wal-backpressure.md` | Bound, reservation, wire contract, latch, forced-rotation livelock, `max_segments` as a header cap, backpressure telemetry. | §1 first half, §2.1, §3.1 minus seal/owed-rotation essay, §3.3 backpressure rows, RFC0053.1 / .4 / .5, §6 backpressure legs |
 | `docs/rfcs/0054-publish-unwind-safety.md` | Invariant: no acknowledged batch becomes unreachable on panic; duplicates over loss; sweep may continue. | §2.2, §3.2 ownership / drain / worker / publisher panic, RFC0053.2 / .3 |
 | `docs/rfcs/0055-publication-frontiers.md` | `PUBLISHED` sidecar, per-tenant record+audit watermarks, settlement rebuild, tenant slots, object-key intent, sidecar geometry. | The rest of §3.2, restart/sidecar legs of RFC0053.4 |
-| `docs/rfcs/0056-audit-durability.md` | Amends RFC 0005 §7: permanent audit failure is not a successful drop; dependent records stay unpublished; tenant becomes terminal. | Status-note amendment + the three-way `write_owned` result |
+| `docs/rfcs/0056-audit-durability.md` | Amends RFC 0005 §3.7: permanent audit failure is not a successful drop; dependent records stay unpublished; tenant becomes terminal. | Status-note amendment + the three-way `write_owned` result |
 
 ## What moved to RFC 0052 instead
 

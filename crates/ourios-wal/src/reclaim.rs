@@ -170,20 +170,34 @@ impl Geometry {
         FILE_HEADER_LEN + slot.ordinal() * self.slot_len()
     }
 
-    fn entries_offset(self) -> u64 {
-        SLOT_HEADER_LEN + DICT_RECORD_LEN * self.tenants()
+    fn dictionary_at(id: SlotId) -> usize {
+        to_usize(SLOT_HEADER_LEN + DICT_RECORD_LEN * u64::from(id.0))
     }
 
-    fn planned_offset(self) -> u64 {
-        self.entries_offset() + ENTRY_LEN * self.tenants()
+    fn entry_at(self, id: SlotId) -> usize {
+        to_usize(SLOT_HEADER_LEN + DICT_RECORD_LEN * self.tenants() + ENTRY_LEN * u64::from(id.0))
+    }
+
+    fn planned_at(self, position: usize) -> usize {
+        let base = SLOT_HEADER_LEN + (DICT_RECORD_LEN + ENTRY_LEN) * self.tenants();
+        to_usize(base) + position * to_usize(self.planned_stride())
+    }
+
+    fn pair_at(self, position: usize, id: SlotId) -> usize {
+        self.planned_at(position) + to_usize(PLANNED_HEADER_LEN + PAIR_LEN * u64::from(id.0))
     }
 
     fn planned_stride(self) -> u64 {
         PLANNED_HEADER_LEN + PAIR_LEN * self.tenants()
     }
 
-    fn trailer_offset(self) -> u64 {
-        self.slot_len() - SLOT_TRAILER_LEN
+    fn trailer_offset(self) -> usize {
+        to_usize(self.slot_len() - SLOT_TRAILER_LEN)
+    }
+
+    /// Every slot id the geometry addresses, in order.
+    fn ids(self) -> impl Iterator<Item = SlotId> {
+        (0..to_usize(self.tenants())).filter_map(|index| u16::try_from(index).ok().map(SlotId))
     }
 }
 
@@ -224,6 +238,12 @@ impl SlotId {
 
     fn index(self) -> usize {
         usize::from(self.0)
+    }
+}
+
+impl fmt::Display for SlotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -303,6 +323,17 @@ pub enum RecordedMode {
 }
 
 impl RecordedMode {
+    /// Whether an entry written under `entry` can sit in a record whose
+    /// root recorded `self`: every pass on a root runs under the
+    /// recorded mode, and no pass runs under an unrecorded one.
+    #[must_use]
+    pub fn admits(self, entry: EntryMode) -> bool {
+        matches!(
+            (self, entry),
+            (Self::Known, EntryMode::Known) | (Self::NoConsumer, EntryMode::NoConsumer)
+        )
+    }
+
     fn code(self) -> u16 {
         match self {
             Self::Unrecorded => 0,
@@ -379,6 +410,12 @@ pub struct DictRecord {
     pub state: SlotState,
 }
 
+impl DictRecord {
+    fn is_live(&self) -> bool {
+        matches!(self.state, SlotState::Live { .. })
+    }
+}
+
 /// A tenant's key and whether it is tombstoned — the part of a
 /// dictionary record both sidecars carry, used to seed the shared id
 /// space from the union of the two (§3.2).
@@ -410,7 +447,7 @@ impl fmt::Display for DictionaryConflict {
         write!(
             f,
             "slot id {} names {:?} in one dictionary and {:?} in the other",
-            self.id.0, self.left, self.right
+            self.id, self.left, self.right
         )
     }
 }
@@ -452,21 +489,26 @@ impl Dictionary {
         self.records.get_mut(id.index())
     }
 
+    /// Whether `id` names a recorded, non-tombstoned tenant.
+    #[must_use]
+    pub fn is_live(&self, id: SlotId) -> bool {
+        self.get(id).is_some_and(DictRecord::is_live)
+    }
+
     /// The live id of `key`, if it holds one. A tombstoned record never
     /// answers: its tenant is gone and its id retired.
     #[must_use]
     pub fn id_of(&self, key: &TenantId) -> Option<SlotId> {
         self.records
             .iter()
-            .position(|record| record.key == *key && record.state != SlotState::Tombstoned)
+            .position(|record| record.key == *key && record.is_live())
             .and_then(|index| u16::try_from(index).ok())
             .map(SlotId)
     }
 
     /// Every live record with its id, in id order.
     pub fn live(&self) -> impl Iterator<Item = (SlotId, &DictRecord)> {
-        self.iter()
-            .filter(|(_, record)| record.state != SlotState::Tombstoned)
+        self.iter().filter(|(_, record)| record.is_live())
     }
 
     /// Every record with its id, in id order.
@@ -497,19 +539,13 @@ impl Dictionary {
             return Ok(id);
         }
         let next = self.records.len();
-        let id = match u16::try_from(next) {
-            Ok(id) if next < geometry.tenants().try_into().unwrap_or(usize::MAX) => SlotId(id),
-            _ if next == MAX_TENANTS_CEILING as usize => {
-                return Err(DictionaryFull {
-                    max_tenants: geometry.max_tenants,
-                });
-            }
-            Ok(_) | Err(_) => {
-                return Err(DictionaryFull {
-                    max_tenants: geometry.max_tenants,
-                });
-            }
+        let full = DictionaryFull {
+            max_tenants: geometry.max_tenants,
         };
+        if next >= to_usize(geometry.tenants()) {
+            return Err(full);
+        }
+        let id = u16::try_from(next).map(SlotId).map_err(|_| full)?;
         self.records.push(DictRecord {
             key: key.clone(),
             state: SlotState::Live {
@@ -539,7 +575,7 @@ impl Dictionary {
             .iter()
             .map(|record| SeedKey {
                 key: record.key.clone(),
-                tombstoned: record.state == SlotState::Tombstoned,
+                tombstoned: !record.is_live(),
             })
             .collect()
     }
@@ -593,7 +629,7 @@ pub struct UnknownSlotId {
 
 impl fmt::Display for UnknownSlotId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "slot id {} is not in the dictionary", self.id.0)
+        write!(f, "slot id {} is not in the dictionary", self.id)
     }
 }
 
@@ -630,6 +666,8 @@ pub struct DecodedSlot {
 /// Why a record cannot be laid out at a geometry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
+    /// The caller's buffer is not exactly one slot.
+    BufferLength { found: usize, slot_len: u64 },
     /// More dictionary records than `max_tenants`.
     TooManyTenants { found: usize, max_tenants: u32 },
     /// More planned records than `max_unlinks_per_pass`.
@@ -637,8 +675,27 @@ pub enum EncodeError {
         found: usize,
         max_unlinks_per_pass: u32,
     },
+    /// A planned record's present pairs exceed what its `u16`
+    /// `tenant_count` can report.
+    TooManyPairs { segment: Uuid, found: usize },
     /// A planned pair names an id that is not live in the dictionary.
     PairWithoutTenant { segment: Uuid, id: SlotId },
+    /// A planned pair's offset lies in a segment other than the one
+    /// the record names.
+    PairSegment {
+        segment: Uuid,
+        id: SlotId,
+        found: Uuid,
+    },
+    /// An entry's mode is not the mode the root recorded.
+    EntryModeDisagrees {
+        id: SlotId,
+        entry: EntryMode,
+        recorded: RecordedMode,
+    },
+    /// Planned records beside an unrecorded mode: no pass can have
+    /// written them.
+    PlannedWithoutMode,
     /// A dictionary key is empty or longer than `KEY_LEN`.
     KeyLength { id: SlotId, found: usize },
     /// A generation of zero marks a slot never written.
@@ -648,12 +705,13 @@ pub enum EncodeError {
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooManyTenants { found, max_tenants } => {
-                write!(
-                    f,
-                    "{found} dictionary records exceed max_tenants {max_tenants}"
-                )
+            Self::BufferLength { found, slot_len } => {
+                write!(f, "buffer is {found} B, a slot is {slot_len} B")
             }
+            Self::TooManyTenants { found, max_tenants } => write!(
+                f,
+                "{found} dictionary records exceed max_tenants {max_tenants}"
+            ),
             Self::TooManyPlanned {
                 found,
                 max_unlinks_per_pass,
@@ -661,16 +719,33 @@ impl fmt::Display for EncodeError {
                 f,
                 "{found} planned records exceed max_unlinks_per_pass {max_unlinks_per_pass}"
             ),
+            Self::TooManyPairs { segment, found } => write!(
+                f,
+                "planned segment {segment} carries {found} pairs; tenant_count reports at most {}",
+                u16::MAX
+            ),
             Self::PairWithoutTenant { segment, id } => write!(
                 f,
-                "planned segment {segment} carries a pair for slot id {} which is not live",
-                id.0
+                "planned segment {segment} carries a pair for slot id {id} which is not live"
             ),
-            Self::KeyLength { id, found } => write!(
+            Self::PairSegment { segment, id, found } => write!(
                 f,
-                "slot id {} key is {found} B; a key is 1..={KEY_LEN} B",
-                id.0
+                "planned segment {segment} pair {id} names offset segment {found}"
             ),
+            Self::EntryModeDisagrees {
+                id,
+                entry,
+                recorded,
+            } => write!(
+                f,
+                "entry {id} was written under {entry:?} but the root recorded {recorded:?}"
+            ),
+            Self::PlannedWithoutMode => {
+                f.write_str("planned records beside an unrecorded consumer mode")
+            }
+            Self::KeyLength { id, found } => {
+                write!(f, "slot id {id} key is {found} B; a key is 1..={KEY_LEN} B")
+            }
             Self::ZeroGeneration => f.write_str("generation 0 marks a slot never written"),
         }
     }
@@ -746,8 +821,18 @@ pub enum FormatError {
     EntryWithoutTenant {
         id: SlotId,
     },
+    /// An entry's mode is not the mode the slot header recorded.
+    EntryModeDisagrees {
+        id: SlotId,
+        entry: EntryMode,
+        recorded: RecordedMode,
+    },
     EntryCount {
         stored: u32,
+        found: u32,
+    },
+    /// Planned records beside an unrecorded mode.
+    PlannedWithoutMode {
         found: u32,
     },
     PlannedFlags {
@@ -766,6 +851,12 @@ pub enum FormatError {
     PairWithoutTenant {
         position: usize,
         id: SlotId,
+    },
+    /// A pair's offset lies in a segment other than its record's.
+    PairSegment {
+        position: usize,
+        id: SlotId,
+        found: Uuid,
     },
     TenantCount {
         position: usize,
@@ -786,16 +877,37 @@ pub enum FormatError {
 }
 
 impl fmt::Display for FormatError {
-    // One arm per variant; a split would only hide which arm renders which.
-    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Length { found, expected } => {
-                write!(f, "size {found} B, expected {expected} B")
-            }
-            Self::BadMagic { found } => {
-                write!(f, "bad magic {found:02x?}, expected {MAGIC:02x?}")
-            }
+            Self::DictionaryHole { .. }
+            | Self::DictionaryPastNext { .. }
+            | Self::KeyLength { .. }
+            | Self::KeyNotUtf8 { .. }
+            | Self::DictionaryFlags { .. }
+            | Self::EntryFlags { .. }
+            | Self::EntryWithoutTenant { .. }
+            | Self::EntryModeDisagrees { .. }
+            | Self::EntryCount { .. } => self.fmt_dictionary(f),
+            Self::PlannedWithoutMode { .. }
+            | Self::PlannedFlags { .. }
+            | Self::PlannedCount { .. }
+            | Self::PairFlags { .. }
+            | Self::PairWithoutTenant { .. }
+            | Self::PairSegment { .. }
+            | Self::TenantCount { .. } => self.fmt_planned(f),
+            _ => self.fmt_header(f),
+        }
+    }
+}
+
+impl FormatError {
+    /// The file-header, slot-header and slot-selection arms. A variant
+    /// routed here by mistake renders as its `Debug` form rather than
+    /// silently as nothing.
+    fn fmt_header(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Length { found, expected } => write!(f, "size {found} B, expected {expected} B"),
+            Self::BadMagic { found } => write!(f, "bad magic {found:02x?}, expected {MAGIC:02x?}"),
             Self::UnknownVersion { found } => {
                 write!(f, "unknown version {found}, expected {VERSION}")
             }
@@ -821,39 +933,71 @@ impl fmt::Display for FormatError {
             Self::NextSlotId { found, max_tenants } => {
                 write!(f, "next_slot_id {found} exceeds max_tenants {max_tenants}")
             }
+            Self::ZeroGeneration => f.write_str("generation 0: the slot was never written"),
+            Self::NoValidSlot { first, second } => {
+                write!(
+                    f,
+                    "neither slot is valid (first: {first}; second: {second})"
+                )
+            }
+            Self::EqualGenerations { generation } => {
+                write!(f, "both slots carry generation {generation}")
+            }
+            other => write!(f, "{other:?}"),
+        }
+    }
+
+    /// The dictionary and entry arms.
+    fn fmt_dictionary(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Self::DictionaryHole { id } => {
-                write!(f, "dictionary record {} is unused below next_slot_id", id.0)
+                write!(f, "dictionary record {id} is unused below next_slot_id")
             }
             Self::DictionaryPastNext { id, next_slot_id } => write!(
                 f,
-                "dictionary record {} is used at or above next_slot_id {next_slot_id}",
-                id.0
+                "dictionary record {id} is used at or above next_slot_id {next_slot_id}"
             ),
             Self::KeyLength { id, found } => write!(
                 f,
-                "dictionary record {} key length {found} outside 1..={KEY_LEN}",
-                id.0
+                "dictionary record {id} key length {found} outside 1..={KEY_LEN}"
             ),
-            Self::KeyNotUtf8 { id } => {
-                write!(f, "dictionary record {} key is not UTF-8", id.0)
-            }
+            Self::KeyNotUtf8 { id } => write!(f, "dictionary record {id} key is not UTF-8"),
             Self::DictionaryFlags { id, found } => write!(
                 f,
-                "dictionary record {} flags {found:#06x} sets a reserved bit",
-                id.0
+                "dictionary record {id} flags {found:#06x} sets a reserved bit"
             ),
             Self::EntryFlags { id, found } => {
-                write!(f, "entry {} flags {found:#06x} sets a reserved bit", id.0)
+                write!(f, "entry {id} flags {found:#06x} sets a reserved bit")
             }
             Self::EntryWithoutTenant { id } => write!(
                 f,
-                "entry {} is occupied but its dictionary record is not live",
-                id.0
+                "entry {id} is occupied but its dictionary record is not live"
+            ),
+            Self::EntryModeDisagrees {
+                id,
+                entry,
+                recorded,
+            } => write!(
+                f,
+                "entry {id} was written under {entry:?} but the slot recorded {recorded:?}"
             ),
             Self::EntryCount { stored, found } => {
                 write!(
                     f,
                     "entry_count {stored} stored, {found} occupied entries found"
+                )
+            }
+            other => write!(f, "{other:?}"),
+        }
+    }
+
+    /// The planned-record and pair arms.
+    fn fmt_planned(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlannedWithoutMode { found } => {
+                write!(
+                    f,
+                    "{found} planned records beside an unrecorded consumer mode"
                 )
             }
             Self::PlannedFlags { position, found } => write!(
@@ -870,13 +1014,19 @@ impl fmt::Display for FormatError {
                 found,
             } => write!(
                 f,
-                "planned record {position} pair {} flags {found:#06x} sets a reserved bit",
-                id.0
+                "planned record {position} pair {id} flags {found:#06x} sets a reserved bit"
             ),
             Self::PairWithoutTenant { position, id } => write!(
                 f,
-                "planned record {position} pair {} is present but its dictionary record is not live",
-                id.0
+                "planned record {position} pair {id} is present but its dictionary record is not live"
+            ),
+            Self::PairSegment {
+                position,
+                id,
+                found,
+            } => write!(
+                f,
+                "planned record {position} pair {id} names offset segment {found}"
             ),
             Self::TenantCount {
                 position,
@@ -886,16 +1036,7 @@ impl fmt::Display for FormatError {
                 f,
                 "planned record {position} tenant_count {stored} stored, {found} present pairs found"
             ),
-            Self::ZeroGeneration => f.write_str("generation 0: the slot was never written"),
-            Self::NoValidSlot { first, second } => {
-                write!(
-                    f,
-                    "neither slot is valid (first: {first}; second: {second})"
-                )
-            }
-            Self::EqualGenerations { generation } => {
-                write!(f, "both slots carry generation {generation}")
-            }
+            other => write!(f, "{other:?}"),
         }
     }
 }
@@ -961,7 +1102,7 @@ pub fn decode_file_header(bytes: &[u8]) -> Result<Geometry, FormatError> {
 }
 
 // ---------------------------------------------------------------
-// Slot
+// Slot: encode
 // ---------------------------------------------------------------
 
 /// Lay `record` out as one `slot_len`-byte slot at `generation`.
@@ -975,10 +1116,36 @@ pub fn encode_slot(
     generation: u64,
     geometry: Geometry,
 ) -> Result<Vec<u8>, EncodeError> {
+    let mut out = vec![0u8; to_usize(geometry.slot_len())];
+    encode_slot_into(record, generation, geometry, &mut out)?;
+    Ok(out)
+}
+
+/// Lay `record` out into `out`, a caller-owned buffer of exactly
+/// `slot_len` bytes that is zeroed first. The steady-state writer keeps
+/// one such buffer for the life of the file, so a pass allocates
+/// nothing (§3.2); [`encode_slot`] is the allocating convenience.
+///
+/// # Errors
+///
+/// [`EncodeError`] when the record does not fit the geometry, names an
+/// id the dictionary does not hold live, or `out` is the wrong length.
+pub fn encode_slot_into(
+    record: &ReclaimRecord,
+    generation: u64,
+    geometry: Geometry,
+    out: &mut [u8],
+) -> Result<(), EncodeError> {
+    if out.len() != to_usize(geometry.slot_len()) {
+        return Err(EncodeError::BufferLength {
+            found: out.len(),
+            slot_len: geometry.slot_len(),
+        });
+    }
     if generation == 0 {
         return Err(EncodeError::ZeroGeneration);
     }
-    let tenants = record.dictionary.records.len();
+    let tenants = record.dictionary.len();
     if tenants > to_usize(geometry.tenants()) {
         return Err(EncodeError::TooManyTenants {
             found: tenants,
@@ -991,75 +1158,14 @@ pub fn encode_slot(
             max_unlinks_per_pass: geometry.max_unlinks_per_pass,
         });
     }
-    let mut out = vec![0u8; to_usize(geometry.slot_len())];
-
-    let mut entry_count = 0u32;
-    let entries_offset = to_usize(geometry.entries_offset());
-    for (id, dict) in record.dictionary.iter() {
-        let key = dict.key.as_str().as_bytes();
-        if key.is_empty() || key.len() > KEY_LEN {
-            return Err(EncodeError::KeyLength {
-                id,
-                found: key.len(),
-            });
-        }
-        let at = to_usize(SLOT_HEADER_LEN + DICT_RECORD_LEN * u64::from(id.0));
-        // `key.len() <= KEY_LEN == 128` fits a u16.
-        let len = u16::try_from(key.len()).unwrap_or(u16::MAX);
-        out[at..at + 2].copy_from_slice(&len.to_le_bytes());
-        out[at + 2..at + 2 + key.len()].copy_from_slice(key);
-        let flags = match dict.state {
-            SlotState::Tombstoned => DICT_TOMBSTONED,
-            SlotState::Live { .. } => 0,
-        };
-        out[at + 130..at + 132].copy_from_slice(&flags.to_le_bytes());
-
-        if let SlotState::Live {
-            reclaimed_through: Some(entry),
-        } = dict.state
-        {
-            let at = entries_offset + to_usize(ENTRY_LEN * u64::from(id.0));
-            out[at..at + 2].copy_from_slice(&ENTRY_OCCUPIED.to_le_bytes());
-            out[at + 2..at + 4].copy_from_slice(&entry.mode.code().to_le_bytes());
-            write_offset(&mut out[at + 8..at + 8 + OFFSET_LEN], entry.offset);
-            entry_count += 1;
-        }
+    if record.consumer_mode == RecordedMode::Unrecorded && !record.planned.is_empty() {
+        return Err(EncodeError::PlannedWithoutMode);
     }
-
-    let planned_offset = to_usize(geometry.planned_offset());
-    let stride = to_usize(geometry.planned_stride());
+    out.fill(0);
+    let entry_count = encode_dictionary(out, record, geometry)?;
     for (position, planned) in record.planned.iter().enumerate() {
-        let at = planned_offset + position * stride;
-        out[at..at + 16].copy_from_slice(planned.segment.as_bytes());
-        // `last_offsets` holds at most `max_tenants <= 65_536` pairs, but a
-        // `u16` reports 65_535; the count is reported, never walked, so
-        // saturating is the documented reading.
-        let tenant_count = u16::try_from(planned.last_offsets.len()).unwrap_or(u16::MAX);
-        out[at + 16..at + 18].copy_from_slice(&tenant_count.to_le_bytes());
-        let mut flags = PLANNED_OCCUPIED;
-        if planned.uncertain {
-            flags |= PLANNED_UNCERTAIN;
-        }
-        out[at + 22] = flags;
-        for (&id, &offset) in &planned.last_offsets {
-            match record.dictionary.get(id) {
-                Some(DictRecord {
-                    state: SlotState::Live { .. },
-                    ..
-                }) => {}
-                Some(_) | None => {
-                    return Err(EncodeError::PairWithoutTenant {
-                        segment: planned.segment,
-                        id,
-                    });
-                }
-            }
-            let at = at + to_usize(PLANNED_HEADER_LEN + PAIR_LEN * u64::from(id.0));
-            out[at..at + 2].copy_from_slice(&PAIR_PRESENT.to_le_bytes());
-            write_offset(&mut out[at + 8..at + 8 + OFFSET_LEN], offset);
-        }
+        encode_planned(out, planned, position, &record.dictionary, geometry)?;
     }
-
     out[0..8].copy_from_slice(&generation.to_le_bytes());
     out[8..12].copy_from_slice(&entry_count.to_le_bytes());
     // `planned.len() <= max_unlinks_per_pass <= 65_536` fits a u32.
@@ -1068,12 +1174,109 @@ pub fn encode_slot(
     out[16..18].copy_from_slice(&record.witness.bits().to_le_bytes());
     out[18..20].copy_from_slice(&record.consumer_mode.code().to_le_bytes());
     out[20..24].copy_from_slice(&record.dictionary.next_slot_id().to_le_bytes());
-
-    let trailer = to_usize(geometry.trailer_offset());
+    let trailer = geometry.trailer_offset();
     let crc = crc32c::crc32c(&out[..trailer]);
     out[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
+
+/// The dictionary and entry arrays; returns the occupied-entry count.
+/// An entry is written only under the mode the root recorded, since
+/// recovery reads it by that mode (§3.2).
+fn encode_dictionary(
+    out: &mut [u8],
+    record: &ReclaimRecord,
+    geometry: Geometry,
+) -> Result<u32, EncodeError> {
+    let mut entry_count = 0u32;
+    for (id, dict) in record.dictionary.iter() {
+        encode_dict_record(&mut out[Geometry::dictionary_at(id)..], id, dict)?;
+        if let SlotState::Live {
+            reclaimed_through: Some(entry),
+        } = dict.state
+        {
+            if !record.consumer_mode.admits(entry.mode) {
+                return Err(EncodeError::EntryModeDisagrees {
+                    id,
+                    entry: entry.mode,
+                    recorded: record.consumer_mode,
+                });
+            }
+            encode_entry(&mut out[geometry.entry_at(id)..], entry);
+            entry_count += 1;
+        }
+    }
+    Ok(entry_count)
+}
+
+fn encode_dict_record(out: &mut [u8], id: SlotId, dict: &DictRecord) -> Result<(), EncodeError> {
+    let key = dict.key.as_str().as_bytes();
+    if key.is_empty() || key.len() > KEY_LEN {
+        return Err(EncodeError::KeyLength {
+            id,
+            found: key.len(),
+        });
+    }
+    // `key.len() <= KEY_LEN == 128` fits a u16.
+    let len = u16::try_from(key.len()).unwrap_or(u16::MAX);
+    out[0..2].copy_from_slice(&len.to_le_bytes());
+    out[2..2 + key.len()].copy_from_slice(key);
+    let flags = if dict.is_live() { 0 } else { DICT_TOMBSTONED };
+    out[130..132].copy_from_slice(&flags.to_le_bytes());
+    Ok(())
+}
+
+fn encode_entry(out: &mut [u8], entry: Entry) {
+    out[0..2].copy_from_slice(&ENTRY_OCCUPIED.to_le_bytes());
+    out[2..4].copy_from_slice(&entry.mode.code().to_le_bytes());
+    write_offset(&mut out[8..8 + OFFSET_LEN], entry.offset);
+}
+
+fn encode_planned(
+    out: &mut [u8],
+    planned: &PlannedUnlink,
+    position: usize,
+    dictionary: &Dictionary,
+    geometry: Geometry,
+) -> Result<(), EncodeError> {
+    let at = geometry.planned_at(position);
+    out[at..at + 16].copy_from_slice(planned.segment.as_bytes());
+    let tenant_count =
+        u16::try_from(planned.last_offsets.len()).map_err(|_| EncodeError::TooManyPairs {
+            segment: planned.segment,
+            found: planned.last_offsets.len(),
+        })?;
+    out[at + 16..at + 18].copy_from_slice(&tenant_count.to_le_bytes());
+    let uncertain = if planned.uncertain {
+        PLANNED_UNCERTAIN
+    } else {
+        0
+    };
+    out[at + 22] = PLANNED_OCCUPIED | uncertain;
+    for (&id, &offset) in &planned.last_offsets {
+        if !dictionary.is_live(id) {
+            return Err(EncodeError::PairWithoutTenant {
+                segment: planned.segment,
+                id,
+            });
+        }
+        if offset.segment != planned.segment {
+            return Err(EncodeError::PairSegment {
+                segment: planned.segment,
+                id,
+                found: offset.segment,
+            });
+        }
+        let at = geometry.pair_at(position, id);
+        out[at..at + 2].copy_from_slice(&PAIR_PRESENT.to_le_bytes());
+        write_offset(&mut out[at + 8..at + 8 + OFFSET_LEN], offset);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------
+// Slot: decode
+// ---------------------------------------------------------------
 
 /// Read one slot back. The CRC is checked before any field is read, so
 /// a torn slot is refused whole rather than partly believed.
@@ -1089,20 +1292,17 @@ pub fn decode_slot(bytes: &[u8], geometry: Geometry) -> Result<DecodedSlot, Form
             expected: slot_len,
         });
     }
-    let trailer = to_usize(geometry.trailer_offset());
+    let trailer = geometry.trailer_offset();
     let computed = crc32c::crc32c(&bytes[..trailer]);
     let found = read_u32(bytes, trailer);
     if found != computed {
         return Err(FormatError::CrcMismatch { found, computed });
     }
     reserved_zero(bytes, trailer + 4..trailer + 8, "slot trailer")?;
-
     let generation = read_u64(bytes, 0);
     if generation == 0 {
         return Err(FormatError::ZeroGeneration);
     }
-    let entry_count = read_u32(bytes, 8);
-    let planned_count = read_u32(bytes, 12);
     let witness = WitnessFlags::from_bits(read_u16(bytes, 16))?;
     let consumer_mode = RecordedMode::from_code(read_u16(bytes, 18))?;
     let next_slot_id = read_u32(bytes, 20);
@@ -1112,7 +1312,14 @@ pub fn decode_slot(bytes: &[u8], geometry: Geometry) -> Result<DecodedSlot, Form
             max_tenants: geometry.max_tenants,
         });
     }
-    let dictionary = decode_dictionary(bytes, geometry, next_slot_id, entry_count)?;
+    let dictionary = decode_dictionary(bytes, geometry, next_slot_id, read_u32(bytes, 8))?;
+    entries_agree_with(&dictionary, consumer_mode)?;
+    let planned_count = read_u32(bytes, 12);
+    if consumer_mode == RecordedMode::Unrecorded && planned_count != 0 {
+        return Err(FormatError::PlannedWithoutMode {
+            found: planned_count,
+        });
+    }
     let planned = decode_planned(bytes, geometry, &dictionary, planned_count)?;
     Ok(DecodedSlot {
         generation,
@@ -1134,79 +1341,15 @@ fn decode_dictionary(
     entry_count: u32,
 ) -> Result<Dictionary, FormatError> {
     let mut records = Vec::with_capacity(to_usize(u64::from(next_slot_id)));
-    let entries_offset = to_usize(geometry.entries_offset());
     let mut entries_found = 0u32;
-    for index in 0..to_usize(geometry.tenants()) {
-        let id = SlotId(u16::try_from(index).unwrap_or(u16::MAX));
-        let at = to_usize(SLOT_HEADER_LEN) + index * to_usize(DICT_RECORD_LEN);
-        let len = usize::from(read_u16(bytes, at));
-        let below_next = u64::from(id.0) < u64::from(next_slot_id);
-        let entry_at = entries_offset + index * to_usize(ENTRY_LEN);
-        let entry_flags = read_u16(bytes, entry_at);
-        if entry_flags & !ENTRY_OCCUPIED != 0 {
-            return Err(FormatError::EntryFlags {
-                id,
-                found: entry_flags,
-            });
-        }
-        let occupied = entry_flags & ENTRY_OCCUPIED != 0;
-        if len == 0 {
-            if below_next {
-                return Err(FormatError::DictionaryHole { id });
-            }
-            reserved_zero(
-                bytes,
-                at + 2..at + to_usize(DICT_RECORD_LEN),
-                "dictionary record",
-            )?;
-            if occupied {
-                return Err(FormatError::EntryWithoutTenant { id });
-            }
-            reserved_zero(bytes, entry_at + 2..entry_at + to_usize(ENTRY_LEN), "entry")?;
+    for id in geometry.ids() {
+        let key = decode_dict_record(&bytes[Geometry::dictionary_at(id)..], id, next_slot_id)?;
+        let entry = decode_entry(&bytes[geometry.entry_at(id)..], id)?;
+        let Some(record) = slot_record(id, key, entry)? else {
             continue;
-        }
-        if !below_next {
-            return Err(FormatError::DictionaryPastNext { id, next_slot_id });
-        }
-        if len > KEY_LEN {
-            return Err(FormatError::KeyLength { id, found: len });
-        }
-        let key = std::str::from_utf8(&bytes[at + 2..at + 2 + len])
-            .map_err(|_| FormatError::KeyNotUtf8 { id })?;
-        reserved_zero(bytes, at + 2 + len..at + 130, "dictionary key padding")?;
-        let dict_flags = read_u16(bytes, at + 130);
-        if dict_flags & !DICT_TOMBSTONED != 0 {
-            return Err(FormatError::DictionaryFlags {
-                id,
-                found: dict_flags,
-            });
-        }
-        let tombstoned = dict_flags & DICT_TOMBSTONED != 0;
-        let state = if occupied {
-            if tombstoned {
-                return Err(FormatError::EntryWithoutTenant { id });
-            }
-            let mode = EntryMode::from_code(read_u16(bytes, entry_at + 2))?;
-            reserved_zero(bytes, entry_at + 4..entry_at + 8, "entry")?;
-            let offset = read_offset(bytes, entry_at + 8);
-            entries_found += 1;
-            SlotState::Live {
-                reclaimed_through: Some(Entry { mode, offset }),
-            }
-        } else {
-            reserved_zero(bytes, entry_at + 2..entry_at + to_usize(ENTRY_LEN), "entry")?;
-            if tombstoned {
-                SlotState::Tombstoned
-            } else {
-                SlotState::Live {
-                    reclaimed_through: None,
-                }
-            }
         };
-        records.push(DictRecord {
-            key: TenantId::new(key),
-            state,
-        });
+        entries_found += u32::from(entry.is_some());
+        records.push(record);
     }
     if entries_found != entry_count {
         return Err(FormatError::EntryCount {
@@ -1217,6 +1360,99 @@ fn decode_dictionary(
     Ok(Dictionary { records })
 }
 
+/// Every entry was written under the mode the slot recorded (§3.2):
+/// recovery reads an entry by its mode, and a mode the header does not
+/// vouch for would let a `NoConsumer` entry be read as checkpoint-
+/// covered on a root that had a miner.
+fn entries_agree_with(dictionary: &Dictionary, recorded: RecordedMode) -> Result<(), FormatError> {
+    for (id, record) in dictionary.live() {
+        if let SlotState::Live {
+            reclaimed_through: Some(entry),
+        } = record.state
+            && !recorded.admits(entry.mode)
+        {
+            return Err(FormatError::EntryModeDisagrees {
+                id,
+                entry: entry.mode,
+                recorded,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A dictionary record's key and tombstone bit; `None` for an unused
+/// position, which must lie at or above `next_slot_id`.
+fn decode_dict_record(
+    bytes: &[u8],
+    id: SlotId,
+    next_slot_id: u32,
+) -> Result<Option<(TenantId, bool)>, FormatError> {
+    let len = usize::from(read_u16(bytes, 0));
+    let below_next = u32::from(id.0) < next_slot_id;
+    if len == 0 {
+        if below_next {
+            return Err(FormatError::DictionaryHole { id });
+        }
+        reserved_zero(bytes, 2..to_usize(DICT_RECORD_LEN), "dictionary record")?;
+        return Ok(None);
+    }
+    if !below_next {
+        return Err(FormatError::DictionaryPastNext { id, next_slot_id });
+    }
+    if len > KEY_LEN {
+        return Err(FormatError::KeyLength { id, found: len });
+    }
+    let key =
+        std::str::from_utf8(&bytes[2..2 + len]).map_err(|_| FormatError::KeyNotUtf8 { id })?;
+    reserved_zero(bytes, 2 + len..130, "dictionary key padding")?;
+    let flags = read_u16(bytes, 130);
+    if flags & !DICT_TOMBSTONED != 0 {
+        return Err(FormatError::DictionaryFlags { id, found: flags });
+    }
+    Ok(Some((TenantId::new(key), flags & DICT_TOMBSTONED != 0)))
+}
+
+/// An entry's content; `None` for an unoccupied one, which must be
+/// all zero past its flags.
+fn decode_entry(bytes: &[u8], id: SlotId) -> Result<Option<Entry>, FormatError> {
+    let flags = read_u16(bytes, 0);
+    if flags & !ENTRY_OCCUPIED != 0 {
+        return Err(FormatError::EntryFlags { id, found: flags });
+    }
+    if flags & ENTRY_OCCUPIED == 0 {
+        reserved_zero(bytes, 2..to_usize(ENTRY_LEN), "entry")?;
+        return Ok(None);
+    }
+    let mode = EntryMode::from_code(read_u16(bytes, 2))?;
+    reserved_zero(bytes, 4..8, "entry")?;
+    Ok(Some(Entry {
+        mode,
+        offset: read_offset(bytes, 8),
+    }))
+}
+
+/// Combine a position's dictionary record and entry: an entry may sit
+/// only beside a live record.
+fn slot_record(
+    id: SlotId,
+    key: Option<(TenantId, bool)>,
+    entry: Option<Entry>,
+) -> Result<Option<DictRecord>, FormatError> {
+    match (key, entry) {
+        (None, None) => Ok(None),
+        (Some((key, false)), reclaimed_through) => Ok(Some(DictRecord {
+            key,
+            state: SlotState::Live { reclaimed_through },
+        })),
+        (Some((key, true)), None) => Ok(Some(DictRecord {
+            key,
+            state: SlotState::Tombstoned,
+        })),
+        (None | Some((_, true)), Some(_)) => Err(FormatError::EntryWithoutTenant { id }),
+    }
+}
+
 /// The planned array; a present pair must name a live dictionary id.
 fn decode_planned(
     bytes: &[u8],
@@ -1224,76 +1460,11 @@ fn decode_planned(
     dictionary: &Dictionary,
     planned_count: u32,
 ) -> Result<Vec<PlannedUnlink>, FormatError> {
-    let planned_offset = to_usize(geometry.planned_offset());
-    let stride = to_usize(geometry.planned_stride());
     let mut planned = Vec::new();
     for position in 0..to_usize(geometry.unlinks()) {
-        let at = planned_offset + position * stride;
-        let flags = bytes[at + 22];
-        if flags & !(PLANNED_OCCUPIED | PLANNED_UNCERTAIN) != 0 {
-            return Err(FormatError::PlannedFlags {
-                position,
-                found: flags,
-            });
+        if let Some(record) = decode_planned_record(bytes, geometry, dictionary, position)? {
+            planned.push(record);
         }
-        reserved_zero(bytes, at + 18..at + 22, "planned record")?;
-        reserved_zero(bytes, at + 23..at + 24, "planned record")?;
-        if flags & PLANNED_OCCUPIED == 0 {
-            if flags != 0 {
-                return Err(FormatError::PlannedFlags {
-                    position,
-                    found: flags,
-                });
-            }
-            reserved_zero(bytes, at..at + 18, "planned record")?;
-            reserved_zero(bytes, at + 24..at + stride, "planned pairs")?;
-            continue;
-        }
-        let mut segment = [0u8; 16];
-        segment.copy_from_slice(&bytes[at..at + 16]);
-        let tenant_count = read_u16(bytes, at + 16);
-        let mut last_offsets = BTreeMap::new();
-        for index in 0..to_usize(geometry.tenants()) {
-            let id = SlotId(u16::try_from(index).unwrap_or(u16::MAX));
-            let pair_at = at + to_usize(PLANNED_HEADER_LEN) + index * to_usize(PAIR_LEN);
-            let pair_flags = read_u16(bytes, pair_at);
-            if pair_flags & !PAIR_PRESENT != 0 {
-                return Err(FormatError::PairFlags {
-                    position,
-                    id,
-                    found: pair_flags,
-                });
-            }
-            reserved_zero(bytes, pair_at + 2..pair_at + 8, "planned pair")?;
-            if pair_flags & PAIR_PRESENT == 0 {
-                reserved_zero(
-                    bytes,
-                    pair_at + 8..pair_at + to_usize(PAIR_LEN),
-                    "planned pair",
-                )?;
-                continue;
-            }
-            match dictionary.get(id) {
-                Some(DictRecord {
-                    state: SlotState::Live { .. },
-                    ..
-                }) => {}
-                Some(_) | None => return Err(FormatError::PairWithoutTenant { position, id }),
-            }
-            last_offsets.insert(id, read_offset(bytes, pair_at + 8));
-        }
-        if usize::from(tenant_count) != last_offsets.len() {
-            return Err(FormatError::TenantCount {
-                position,
-                stored: tenant_count,
-                found: last_offsets.len(),
-            });
-        }
-        planned.push(PlannedUnlink {
-            segment: Uuid::from_bytes(segment),
-            uncertain: flags & PLANNED_UNCERTAIN != 0,
-            last_offsets,
-        });
     }
     let planned_found = u32::try_from(planned.len()).unwrap_or(u32::MAX);
     if planned_found != planned_count {
@@ -1303,6 +1474,95 @@ fn decode_planned(
         });
     }
     Ok(planned)
+}
+
+/// One planned position; `None` when no segment occupies it, in which
+/// case the whole stride must be zero.
+fn decode_planned_record(
+    bytes: &[u8],
+    geometry: Geometry,
+    dictionary: &Dictionary,
+    position: usize,
+) -> Result<Option<PlannedUnlink>, FormatError> {
+    let at = geometry.planned_at(position);
+    let flags = bytes[at + 22];
+    if flags & !(PLANNED_OCCUPIED | PLANNED_UNCERTAIN) != 0 {
+        return Err(FormatError::PlannedFlags {
+            position,
+            found: flags,
+        });
+    }
+    reserved_zero(bytes, at + 18..at + 22, "planned record")?;
+    reserved_zero(bytes, at + 23..at + 24, "planned record")?;
+    if flags & PLANNED_OCCUPIED == 0 {
+        if flags != 0 {
+            return Err(FormatError::PlannedFlags {
+                position,
+                found: flags,
+            });
+        }
+        reserved_zero(bytes, at..at + 18, "planned record")?;
+        let end = at + to_usize(geometry.planned_stride());
+        reserved_zero(bytes, at + 24..end, "planned pairs")?;
+        return Ok(None);
+    }
+    let mut segment = [0u8; 16];
+    segment.copy_from_slice(&bytes[at..at + 16]);
+    let segment = Uuid::from_bytes(segment);
+    let mut last_offsets = BTreeMap::new();
+    for id in geometry.ids() {
+        let pair_at = geometry.pair_at(position, id);
+        let Some(offset) = decode_pair(&bytes[pair_at..], dictionary, position, id)? else {
+            continue;
+        };
+        if offset.segment != segment {
+            return Err(FormatError::PairSegment {
+                position,
+                id,
+                found: offset.segment,
+            });
+        }
+        last_offsets.insert(id, offset);
+    }
+    let tenant_count = read_u16(bytes, at + 16);
+    if usize::from(tenant_count) != last_offsets.len() {
+        return Err(FormatError::TenantCount {
+            position,
+            stored: tenant_count,
+            found: last_offsets.len(),
+        });
+    }
+    Ok(Some(PlannedUnlink {
+        segment,
+        uncertain: flags & PLANNED_UNCERTAIN != 0,
+        last_offsets,
+    }))
+}
+
+/// One planned pair; `None` when absent, which must be all zero.
+fn decode_pair(
+    bytes: &[u8],
+    dictionary: &Dictionary,
+    position: usize,
+    id: SlotId,
+) -> Result<Option<WalOffset>, FormatError> {
+    let flags = read_u16(bytes, 0);
+    if flags & !PAIR_PRESENT != 0 {
+        return Err(FormatError::PairFlags {
+            position,
+            id,
+            found: flags,
+        });
+    }
+    reserved_zero(bytes, 2..8, "planned pair")?;
+    if flags & PAIR_PRESENT == 0 {
+        reserved_zero(bytes, 8..to_usize(PAIR_LEN), "planned pair")?;
+        return Ok(None);
+    }
+    if !dictionary.is_live(id) {
+        return Err(FormatError::PairWithoutTenant { position, id });
+    }
+    Ok(Some(read_offset(bytes, 8)))
 }
 
 /// The slot a reader believes: the valid one with the greater
@@ -1409,6 +1669,8 @@ mod tests {
         }
     }
 
+    /// The fixture every slot test reads: three tenants (one tombstoned,
+    /// one with an entry) and two planned records at geometry (8, 4).
     fn populated() -> ReclaimRecord {
         let g = geometry(8, 4);
         let mut dictionary = Dictionary::default();
@@ -1434,7 +1696,7 @@ mod tests {
             dictionary,
             planned: vec![
                 PlannedUnlink {
-                    segment: Uuid::from_u128(7),
+                    segment: offset(0).segment,
                     uncertain: false,
                     last_offsets: planned,
                 },
@@ -1447,91 +1709,89 @@ mod tests {
         }
     }
 
+    /// Offsets inside a (8, 4) slot, written out so a test reads like
+    /// the §3.2 table.
+    const DICT: usize = 24;
+    const ENTRIES: usize = DICT + 8 * 132;
+    const PLANNED: usize = ENTRIES + 8 * 32;
+    const STRIDE: usize = 24 + 32 * 8;
+
     /// The §3.2 figures at the defaults: 1024 tenants and a cap of 128.
     #[test]
     fn default_geometry_matches_the_rfc_figures() {
         let g = geometry(1024, 128);
-        assert_eq!(g.slot_len(), 4_365_344);
-        assert_eq!(g.file_len(), 8_730_720);
-        assert_eq!(g.slot_offset(SlotIndex::First), 32);
-        assert_eq!(g.slot_offset(SlotIndex::Second), 32 + 4_365_344);
+        let slots = (
+            g.slot_offset(SlotIndex::First),
+            g.slot_offset(SlotIndex::Second),
+        );
+        assert_eq!((g.slot_len(), g.file_len()), (4_365_344, 8_730_720));
+        assert_eq!(slots, (32, 32 + 4_365_344));
     }
 
     #[test]
     fn geometry_refuses_the_format_ceilings() {
-        assert_eq!(
-            Geometry::new(0, 1),
-            Err(GeometryError::MaxTenants { found: 0 })
-        );
-        assert_eq!(
-            Geometry::new(65_537, 1),
-            Err(GeometryError::MaxTenants { found: 65_537 })
-        );
-        assert_eq!(
-            Geometry::new(1, 0),
-            Err(GeometryError::MaxUnlinksPerPass { found: 0 })
-        );
+        let refused = [
+            (Geometry::new(0, 1), GeometryError::MaxTenants { found: 0 }),
+            (
+                Geometry::new(65_537, 1),
+                GeometryError::MaxTenants { found: 65_537 },
+            ),
+            (
+                Geometry::new(1, 0),
+                GeometryError::MaxUnlinksPerPass { found: 0 },
+            ),
+        ];
+        for (found, expected) in refused {
+            assert_eq!(found, Err(expected));
+        }
         assert!(Geometry::new(65_536, 65_536).is_ok());
+    }
+
+    #[test]
+    fn a_geometry_covers_one_no_wider_on_either_axis() {
         assert!(geometry(2, 2).covers(geometry(1, 2)));
         assert!(!geometry(2, 2).covers(geometry(3, 1)));
+        assert!(!geometry(2, 2).covers(geometry(1, 3)));
     }
 
     #[test]
     fn file_header_layout_is_the_pinned_32_bytes() {
         let g = geometry(1024, 128);
         let bytes = encode_file_header(g);
-        assert_eq!(&bytes[0..4], b"OWRC");
-        assert_eq!(&bytes[4..6], &[1, 0]);
-        assert_eq!(&bytes[6..8], &[0, 0]);
-        assert_eq!(read_u64(&bytes, 8), 4_365_344);
-        assert_eq!(read_u32(&bytes, 16), 1024);
-        assert_eq!(read_u32(&bytes, 20), 128);
+        let fixed = (&bytes[0..4], &bytes[4..8], &bytes[28..32]);
+        assert_eq!(fixed, (&b"OWRC"[..], &[1, 0, 0, 0][..], &[0, 0, 0, 0][..]));
+        let fields = (
+            read_u64(&bytes, 8),
+            read_u32(&bytes, 16),
+            read_u32(&bytes, 20),
+        );
+        assert_eq!(fields, (4_365_344, 1024, 128));
         assert_eq!(read_u32(&bytes, 24), crc32c::crc32c(&bytes[..24]));
-        assert_eq!(&bytes[28..32], &[0, 0, 0, 0]);
         assert_eq!(decode_file_header(&bytes), Ok(g));
     }
 
     #[test]
     fn file_header_rejects_each_invalid_field() {
         let valid = encode_file_header(geometry(4, 2));
-        let mut bad = valid;
-        bad[0] = b'X';
+        let corrupt = |at: usize, value: u8| {
+            let mut bad = valid;
+            bad[at] = value;
+            decode_file_header(&bad)
+        };
         assert!(matches!(
-            decode_file_header(&bad),
+            corrupt(0, b'X'),
             Err(FormatError::BadMagic { .. })
         ));
-        let mut bad = valid;
-        bad[4] = 2;
         assert!(matches!(
-            decode_file_header(&bad),
+            corrupt(4, 2),
             Err(FormatError::UnknownVersion { found: 2 })
         ));
-        let mut bad = valid;
-        bad[7] = 1;
+        assert!(matches!(corrupt(7, 1), Err(FormatError::Reserved { .. })));
+        let after_crc = corrupt(30, 1);
+        assert!(matches!(after_crc, Err(FormatError::Reserved { .. })));
         assert!(matches!(
-            decode_file_header(&bad),
-            Err(FormatError::Reserved { .. })
-        ));
-        let mut bad = valid;
-        bad[30] = 1;
-        assert!(matches!(
-            decode_file_header(&bad),
-            Err(FormatError::Reserved { .. })
-        ));
-        let mut bad = valid;
-        bad[9] ^= 1;
-        assert!(matches!(
-            decode_file_header(&bad),
+            corrupt(9, valid[9] ^ 1),
             Err(FormatError::CrcMismatch { .. })
-        ));
-        // A slot_len that passes the CRC but disagrees with the capacities.
-        let mut bad = valid;
-        bad[8..16].copy_from_slice(&1u64.to_le_bytes());
-        let crc = crc32c::crc32c(&bad[..24]);
-        bad[24..28].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(
-            decode_file_header(&bad),
-            Err(FormatError::SlotLen { stored: 1, .. })
         ));
         assert!(matches!(
             decode_file_header(&valid[..31]),
@@ -1540,96 +1800,213 @@ mod tests {
     }
 
     #[test]
-    fn slot_round_trips_and_pins_the_header_fields() {
-        let g = geometry(8, 4);
-        let record = populated();
-        let bytes = encode_slot(&record, 3, g).expect("encode");
-        assert_eq!(bytes.len() as u64, g.slot_len());
-        assert_eq!(read_u64(&bytes, 0), 3, "generation");
-        assert_eq!(
-            read_u32(&bytes, 8),
-            1,
-            "entry_count is the live-entry count"
-        );
-        assert_eq!(read_u32(&bytes, 12), 2, "planned_count");
-        assert_eq!(
-            read_u16(&bytes, 16),
-            0b11,
-            "checkpoint_armed | checkpoint_seen"
-        );
-        assert_eq!(read_u16(&bytes, 18), 1, "consumer_mode Known");
-        assert_eq!(read_u32(&bytes, 20), 3, "next_slot_id");
-        // Dictionary record 2 is the tombstone: len 4, key "gone", flags bit 0.
-        let at = 24 + 2 * 132;
-        assert_eq!(read_u16(&bytes, at), 4);
-        assert_eq!(&bytes[at + 2..at + 6], b"gone");
-        assert_eq!(read_u16(&bytes, at + 130), 1);
-        // Entry 0 is occupied under Known at byte 4096; entry 1 is zero.
-        let entries = 24 + 8 * 132;
-        assert_eq!(read_u16(&bytes, entries), 1);
-        assert_eq!(read_u16(&bytes, entries + 2), 1);
-        assert_eq!(read_u64(&bytes, entries + 8 + 16), 4096);
-        assert!(bytes[entries + 32..entries + 64].iter().all(|&b| b == 0));
-        // Planned record 1 is occupied and uncertain with no pairs.
-        let planned = entries + 8 * 32;
-        let stride = 24 + 32 * 8;
-        assert_eq!(bytes[planned + stride + 22], 0b11);
-        assert_eq!(read_u16(&bytes, planned + stride + 16), 0);
-        let decoded = decode_slot(&bytes, g).expect("decode");
-        assert_eq!(decoded.generation, 3);
-        assert_eq!(decoded.record, record);
+    fn file_header_slot_len_must_agree_with_the_capacities() {
+        let mut bad = encode_file_header(geometry(4, 2));
+        bad[8..16].copy_from_slice(&1u64.to_le_bytes());
+        let crc = crc32c::crc32c(&bad[..24]);
+        bad[24..28].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode_file_header(&bad),
+            Err(FormatError::SlotLen { stored: 1, .. })
+        ));
     }
 
     #[test]
-    fn empty_record_round_trips_at_generation_one() {
-        let g = geometry(2, 1);
-        let bytes = encode_slot(&ReclaimRecord::default(), 1, g).expect("encode");
-        let decoded = decode_slot(&bytes, g).expect("decode");
-        assert_eq!(decoded.generation, 1);
-        assert_eq!(decoded.record, ReclaimRecord::default());
+    fn slot_header_fields_sit_at_their_pinned_offsets() {
+        let g = geometry(8, 4);
+        let bytes = encode_slot(&populated(), 3, g).expect("encode");
+        assert_eq!(bytes.len() as u64, g.slot_len());
+        let header = (
+            read_u64(&bytes, 0),
+            read_u32(&bytes, 8),
+            read_u32(&bytes, 12),
+            read_u16(&bytes, 16),
+            read_u16(&bytes, 18),
+            read_u32(&bytes, 20),
+        );
+        // generation, live-entry count, planned count, armed | seen,
+        // Known, next_slot_id.
+        assert_eq!(header, (3, 1, 2, 0b11, 1, 3));
+    }
+
+    #[test]
+    fn dictionary_entries_and_planned_records_sit_at_their_pinned_offsets() {
+        let g = geometry(8, 4);
+        let bytes = encode_slot(&populated(), 3, g).expect("encode");
+        // Record 2 is the tombstone: len 4, key "gone", flags bit 0.
+        let at = DICT + 2 * 132;
+        let tombstone = (
+            read_u16(&bytes, at),
+            &bytes[at + 2..at + 6],
+            read_u16(&bytes, at + 130),
+        );
+        assert_eq!(tombstone, (4, &b"gone"[..], 1));
+        // Entry 0 is occupied under Known at byte 4096; entry 1 is zero.
+        let entry = (
+            read_u16(&bytes, ENTRIES),
+            read_u16(&bytes, ENTRIES + 2),
+            read_u64(&bytes, ENTRIES + 8 + 16),
+        );
+        assert_eq!(entry, (1, 1, 4096));
+        assert!(bytes[ENTRIES + 32..ENTRIES + 64].iter().all(|&b| b == 0));
+        // Planned record 1 is occupied and uncertain with no pairs.
+        let second = PLANNED + STRIDE;
         assert_eq!(
-            encode_slot(&ReclaimRecord::default(), 0, g),
-            Err(EncodeError::ZeroGeneration)
+            (bytes[second + 22], read_u16(&bytes, second + 16)),
+            (0b11, 0)
+        );
+    }
+
+    #[test]
+    fn populated_and_empty_records_round_trip() {
+        let g = geometry(8, 4);
+        let record = populated();
+        let bytes = encode_slot(&record, 3, g).expect("encode");
+        let decoded = decode_slot(&bytes, g).expect("decode");
+        assert_eq!((decoded.generation, decoded.record), (3, record));
+        let small = geometry(2, 1);
+        let bytes = encode_slot(&ReclaimRecord::default(), 1, small).expect("encode empty");
+        let decoded = decode_slot(&bytes, small).expect("decode empty");
+        assert_eq!(
+            (decoded.generation, decoded.record),
+            (1, ReclaimRecord::default())
         );
     }
 
     #[test]
     fn encode_refuses_what_the_geometry_cannot_hold() {
         let g = geometry(2, 1);
+        assert_eq!(
+            encode_slot(&ReclaimRecord::default(), 0, g),
+            Err(EncodeError::ZeroGeneration)
+        );
         let mut record = ReclaimRecord::default();
-        let wide = geometry(8, 8);
         for key in ["a", "b", "c"] {
             record
                 .dictionary
-                .assign(&tenant(key), wide)
+                .assign(&tenant(key), geometry(8, 8))
                 .expect("assign");
         }
         assert!(matches!(
             encode_slot(&record, 1, g),
             Err(EncodeError::TooManyTenants { found: 3, .. })
         ));
+        let planned = PlannedUnlink {
+            segment: Uuid::from_u128(1),
+            uncertain: false,
+            last_offsets: BTreeMap::new(),
+        };
         let record = ReclaimRecord {
-            planned: vec![
-                PlannedUnlink {
-                    segment: Uuid::from_u128(1),
-                    uncertain: false,
-                    last_offsets: BTreeMap::new(),
-                };
-                2
-            ],
+            consumer_mode: RecordedMode::Known,
+            planned: vec![planned; 2],
             ..ReclaimRecord::default()
         };
         assert!(matches!(
             encode_slot(&record, 1, g),
             Err(EncodeError::TooManyPlanned { found: 2, .. })
         ));
+    }
+
+    #[test]
+    fn a_record_without_a_mode_carries_no_entry_and_no_plan() {
+        let g = geometry(2, 1);
         let mut record = ReclaimRecord::default();
+        let id = record.dictionary.assign(&tenant("a"), g).expect("assign");
+        record.dictionary.get_mut(id).expect("a").state = SlotState::Live {
+            reclaimed_through: Some(Entry {
+                mode: EntryMode::Known,
+                offset: offset(1),
+            }),
+        };
+        assert!(matches!(
+            encode_slot(&record, 1, g),
+            Err(EncodeError::EntryModeDisagrees {
+                recorded: RecordedMode::Unrecorded,
+                ..
+            })
+        ));
+        record.consumer_mode = RecordedMode::NoConsumer;
+        assert!(matches!(
+            encode_slot(&record, 1, g),
+            Err(EncodeError::EntryModeDisagrees {
+                entry: EntryMode::Known,
+                recorded: RecordedMode::NoConsumer,
+                ..
+            })
+        ));
+        let planned_only = ReclaimRecord {
+            planned: vec![PlannedUnlink {
+                segment: offset(0).segment,
+                uncertain: false,
+                last_offsets: BTreeMap::new(),
+            }],
+            ..ReclaimRecord::default()
+        };
+        assert_eq!(
+            encode_slot(&planned_only, 1, g),
+            Err(EncodeError::PlannedWithoutMode)
+        );
+        // The same shape on disk: a Known slot whose header mode is zeroed.
+        let unrecorded = resealed(geometry(8, 4), |b| b[18] = 0);
+        assert!(matches!(
+            unrecorded,
+            Err(FormatError::EntryModeDisagrees {
+                recorded: RecordedMode::Unrecorded,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn encode_slot_into_needs_exactly_one_slot_and_zeroes_it_first() {
+        let g = geometry(2, 1);
+        let mut short = vec![0u8; to_usize(g.slot_len()) - 1];
+        assert!(matches!(
+            encode_slot_into(&ReclaimRecord::default(), 1, g, &mut short),
+            Err(EncodeError::BufferLength { .. })
+        ));
+        let mut dirty = vec![0xffu8; to_usize(g.slot_len())];
+        encode_slot_into(&ReclaimRecord::default(), 1, g, &mut dirty).expect("encode");
+        assert_eq!(
+            dirty,
+            encode_slot(&ReclaimRecord::default(), 1, g).expect("encode")
+        );
+    }
+
+    #[test]
+    fn encode_refuses_a_pair_in_another_segment() {
+        let g = geometry(2, 1);
+        let mut record = ReclaimRecord {
+            consumer_mode: RecordedMode::Known,
+            ..ReclaimRecord::default()
+        };
+        let id = record.dictionary.assign(&tenant("a"), g).expect("assign");
+        let mut last_offsets = BTreeMap::new();
+        last_offsets.insert(id, offset(1));
+        record.planned = vec![PlannedUnlink {
+            segment: Uuid::from_u128(7),
+            uncertain: false,
+            last_offsets,
+        }];
+        assert!(matches!(
+            encode_slot(&record, 1, g),
+            Err(EncodeError::PairSegment { id: SlotId(0), .. })
+        ));
+    }
+
+    #[test]
+    fn encode_refuses_a_pair_on_a_tombstoned_id() {
+        let g = geometry(2, 1);
+        let mut record = ReclaimRecord {
+            consumer_mode: RecordedMode::Known,
+            ..ReclaimRecord::default()
+        };
         let id = record.dictionary.assign(&tenant("a"), g).expect("assign");
         record.dictionary.tombstone(id).expect("tombstone");
         let mut last_offsets = BTreeMap::new();
         last_offsets.insert(id, offset(1));
         record.planned = vec![PlannedUnlink {
-            segment: Uuid::from_u128(1),
+            segment: offset(0).segment,
             uncertain: false,
             last_offsets,
         }];
@@ -1641,163 +2018,56 @@ mod tests {
 
     /// Re-seal a deliberately inconsistent slot so the CRC passes and
     /// the field check under test is the one that fires.
-    fn reseal(g: Geometry, mut bytes: Vec<u8>) -> Vec<u8> {
-        let trailer = to_usize(g.trailer_offset());
+    fn resealed(g: Geometry, edit: impl FnOnce(&mut [u8])) -> Result<DecodedSlot, FormatError> {
+        let mut bytes = encode_slot(&populated(), 5, g).expect("encode");
+        edit(&mut bytes);
+        let trailer = g.trailer_offset();
         let crc = crc32c::crc32c(&bytes[..trailer]);
         bytes[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
-        bytes
+        decode_slot(&bytes, g)
     }
 
     #[test]
-    fn decode_refuses_each_header_and_dictionary_inconsistency() {
+    fn a_torn_byte_fails_the_crc_before_any_field_is_read() {
         let g = geometry(8, 4);
-        let valid = encode_slot(&populated(), 5, g).expect("encode");
-        let reseal = |bytes| reseal(g, bytes);
-        // A torn byte fails the CRC before anything else is read.
-        let mut torn = valid.clone();
+        let mut torn = encode_slot(&populated(), 5, g).expect("encode");
         torn[24] ^= 0xff;
         assert!(matches!(
             decode_slot(&torn, g),
             Err(FormatError::CrcMismatch { .. })
         ));
-        // Reserved bits in header_flags.
-        let mut bad = valid.clone();
-        bad[17] = 0x80;
+        let zeroed = vec![0u8; to_usize(g.slot_len())];
         assert!(matches!(
-            decode_slot(&reseal(bad), g),
+            decode_slot(&zeroed, g),
+            Err(FormatError::CrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_refuses_each_slot_header_inconsistency() {
+        let g = geometry(8, 4);
+        let reserved_flag = resealed(g, |b| b[17] = 0x80);
+        assert!(matches!(
+            reserved_flag,
             Err(FormatError::ReservedHeaderFlags { .. })
         ));
-        // checkpoint_seen without checkpoint_armed.
-        let mut bad = valid.clone();
-        bad[16] = 0b10;
+        let seen_unarmed = resealed(g, |b| b[16] = 0b10);
         assert!(matches!(
-            decode_slot(&reseal(bad), g),
+            seen_unarmed,
             Err(FormatError::WitnessOrder { found: 0b10 })
         ));
-        // An unknown consumer mode.
-        let mut bad = valid.clone();
-        bad[18] = 7;
+        let mode = resealed(g, |b| b[18] = 7);
         assert!(matches!(
-            decode_slot(&reseal(bad), g),
+            mode,
             Err(FormatError::UnknownMode {
                 field: "consumer_mode",
                 found: 7
             })
         ));
-        // A hole below next_slot_id: blank record 1 out.
-        let mut bad = valid.clone();
-        let at = 24 + 132;
-        bad[at..at + 132].fill(0);
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::DictionaryHole { id: SlotId(1) })
-        ));
-        // A used record at or above next_slot_id.
-        let mut bad = valid.clone();
-        bad[20..24].copy_from_slice(&2u32.to_le_bytes());
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::DictionaryPastNext { id: SlotId(2), .. })
-        ));
-        // Key padding must be zero.
-        let mut bad = valid.clone();
-        bad[24 + 2 + 4] = b'!';
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::Reserved {
-                field: "dictionary key padding",
-                ..
-            })
-        ));
-        // An occupied entry beside the tombstone.
-        let mut bad = valid.clone();
-        let entries = 24 + 8 * 132;
-        bad[entries + 2 * 32] = 1;
-        bad[entries + 2 * 32 + 2] = 1;
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::EntryWithoutTenant { id: SlotId(2) })
-        ));
-        // An entry mode of zero on an occupied entry.
-        let mut bad = valid.clone();
-        bad[entries + 2] = 0;
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::UnknownMode {
-                field: "entry mode",
-                found: 0
-            })
-        ));
-        // A stored entry_count that disagrees with the array.
-        let mut bad = valid;
-        bad[8..12].copy_from_slice(&9u32.to_le_bytes());
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::EntryCount {
-                stored: 9,
-                found: 1
-            })
-        ));
-    }
-
-    #[test]
-    fn decode_refuses_each_planned_and_trailer_inconsistency() {
-        let g = geometry(8, 4);
-        let valid = encode_slot(&populated(), 5, g).expect("encode");
-        let reseal = |bytes| reseal(g, bytes);
-        let entries = 24 + 8 * 132;
-        // A present pair for the tombstoned id.
-        let mut bad = valid.clone();
-        let planned = entries + 8 * 32;
-        let pair = planned + 24 + 2 * 32;
-        bad[pair] = 1;
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::PairWithoutTenant {
-                position: 0,
-                id: SlotId(2)
-            })
-        ));
-        // A tenant_count that disagrees with the present pairs.
-        let mut bad = valid.clone();
-        bad[planned + 16] = 5;
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::TenantCount {
-                position: 0,
-                stored: 5,
-                found: 2
-            })
-        ));
-        // A reserved planned flag bit.
-        let mut bad = valid.clone();
-        bad[planned + 22] = 0b110;
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::PlannedFlags { position: 0, .. })
-        ));
-        // Bytes in an unoccupied planned position.
-        let mut bad = valid.clone();
-        let stride = 24 + 32 * 8;
-        bad[planned + 2 * stride + 5] = 1;
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::Reserved {
-                field: "planned record",
-                ..
-            })
-        ));
-        // Generation zero is never a written slot.
-        let mut bad = valid.clone();
-        bad[0..8].fill(0);
-        assert!(matches!(
-            decode_slot(&reseal(bad), g),
-            Err(FormatError::ZeroGeneration)
-        ));
-        // Non-zero trailer reserved bytes.
-        let mut bad = valid;
-        let trailer = to_usize(g.trailer_offset());
-        bad[trailer + 5] = 1;
+        let generation = resealed(g, |b| b[0..8].fill(0));
+        assert!(matches!(generation, Err(FormatError::ZeroGeneration)));
+        let mut bad = encode_slot(&populated(), 5, g).expect("encode");
+        bad[g.trailer_offset() + 5] = 1;
         assert!(matches!(
             decode_slot(&bad, g),
             Err(FormatError::Reserved {
@@ -1808,52 +2078,159 @@ mod tests {
     }
 
     #[test]
-    fn a_zeroed_slot_is_not_a_record() {
-        let g = geometry(4, 2);
-        let zeroed = vec![0u8; to_usize(g.slot_len())];
+    fn decode_refuses_each_dictionary_inconsistency() {
+        let g = geometry(8, 4);
+        // A hole below next_slot_id: blank record 1 out.
+        let hole = resealed(g, |b| b[DICT + 132..DICT + 2 * 132].fill(0));
         assert!(matches!(
-            decode_slot(&zeroed, g),
-            Err(FormatError::CrcMismatch { .. })
+            hole,
+            Err(FormatError::DictionaryHole { id: SlotId(1) })
+        ));
+        // A used record at or above next_slot_id.
+        let past = resealed(g, |b| b[20..24].copy_from_slice(&2u32.to_le_bytes()));
+        assert!(matches!(
+            past,
+            Err(FormatError::DictionaryPastNext { id: SlotId(2), .. })
+        ));
+        let padding = resealed(g, |b| b[DICT + 2 + 4] = b'!');
+        assert!(matches!(
+            padding,
+            Err(FormatError::Reserved {
+                field: "dictionary key padding",
+                ..
+            })
+        ));
+        let flags = resealed(g, |b| b[DICT + 131] = 0x80);
+        assert!(matches!(
+            flags,
+            Err(FormatError::DictionaryFlags { id: SlotId(0), .. })
         ));
     }
 
     #[test]
-    fn the_greater_generation_wins_and_a_lone_valid_slot_is_taken() {
+    fn decode_refuses_each_entry_inconsistency() {
+        let g = geometry(8, 4);
+        // An occupied entry beside the tombstone at id 2.
+        let beside_tombstone = resealed(g, |b| {
+            b[ENTRIES + 2 * 32] = 1;
+            b[ENTRIES + 2 * 32 + 2] = 1;
+        });
+        assert!(matches!(
+            beside_tombstone,
+            Err(FormatError::EntryWithoutTenant { id: SlotId(2) })
+        ));
+        let mode_zero = resealed(g, |b| b[ENTRIES + 2] = 0);
+        assert!(matches!(
+            mode_zero,
+            Err(FormatError::UnknownMode {
+                field: "entry mode",
+                found: 0
+            })
+        ));
+        // A NoConsumer entry under a Known header.
+        let disagrees = resealed(g, |b| b[ENTRIES + 2] = 2);
+        assert!(matches!(
+            disagrees,
+            Err(FormatError::EntryModeDisagrees {
+                id: SlotId(0),
+                entry: EntryMode::NoConsumer,
+                recorded: RecordedMode::Known
+            })
+        ));
+        let count = resealed(g, |b| b[8..12].copy_from_slice(&9u32.to_le_bytes()));
+        assert!(matches!(
+            count,
+            Err(FormatError::EntryCount {
+                stored: 9,
+                found: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_refuses_each_planned_inconsistency() {
+        let g = geometry(8, 4);
+        // A present pair for the tombstoned id 2.
+        let pair = resealed(g, |b| b[PLANNED + 24 + 2 * 32] = 1);
+        assert!(matches!(
+            pair,
+            Err(FormatError::PairWithoutTenant {
+                position: 0,
+                id: SlotId(2)
+            })
+        ));
+        let tenant_count = resealed(g, |b| b[PLANNED + 16] = 5);
+        assert!(matches!(
+            tenant_count,
+            Err(FormatError::TenantCount {
+                position: 0,
+                stored: 5,
+                found: 2
+            })
+        ));
+        let flags = resealed(g, |b| b[PLANNED + 22] = 0b110);
+        assert!(matches!(
+            flags,
+            Err(FormatError::PlannedFlags { position: 0, .. })
+        ));
+        // A pair whose offset names another segment than its record.
+        let elsewhere = resealed(g, |b| b[PLANNED + 24 + 8] ^= 1);
+        assert!(matches!(
+            elsewhere,
+            Err(FormatError::PairSegment {
+                position: 0,
+                id: SlotId(0),
+                ..
+            })
+        ));
+        // Bytes in an unoccupied planned position.
+        let unoccupied = resealed(g, |b| b[PLANNED + 2 * STRIDE + 5] = 1);
+        assert!(matches!(
+            unoccupied,
+            Err(FormatError::Reserved {
+                field: "planned record",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_greater_generation_wins() {
         let g = geometry(4, 2);
         let older = decode_slot(&encode_slot(&ReclaimRecord::default(), 1, g).expect("e"), g);
-        let newer = decode_slot(&encode_slot(&populated_small(g), 2, g).expect("e"), g);
-        let torn = Err(FormatError::CrcMismatch {
-            found: 0,
-            computed: 1,
-        });
+        let mut record = ReclaimRecord::default();
+        record.dictionary.assign(&tenant("x"), g).expect("assign");
+        let newer = decode_slot(&encode_slot(&record, 2, g).expect("e"), g);
         let (index, live) = choose_live(older.clone(), newer.clone()).expect("both valid");
-        assert_eq!(index, SlotIndex::Second);
-        assert_eq!(live.generation, 2);
-        let (index, live) = choose_live(newer.clone(), older.clone()).expect("both valid");
-        assert_eq!(index, SlotIndex::First);
-        assert_eq!(live.generation, 2);
-        let (index, live) = choose_live(torn.clone(), older.clone()).expect("second valid");
-        assert_eq!((index, live.generation), (SlotIndex::Second, 1));
-        let (index, _) = choose_live(older.clone(), torn.clone()).expect("first valid");
-        assert_eq!(index, SlotIndex::First);
-        assert!(matches!(
-            choose_live(torn.clone(), torn),
-            Err(FormatError::NoValidSlot { .. })
-        ));
+        assert_eq!((index, live.generation), (SlotIndex::Second, 2));
+        let (index, live) = choose_live(newer, older.clone()).expect("both valid");
+        assert_eq!((index, live.generation), (SlotIndex::First, 2));
         assert!(matches!(
             choose_live(older.clone(), older),
             Err(FormatError::EqualGenerations { generation: 1 })
         ));
     }
 
-    fn populated_small(g: Geometry) -> ReclaimRecord {
-        let mut record = ReclaimRecord::default();
-        record.dictionary.assign(&tenant("x"), g).expect("assign");
-        record
+    #[test]
+    fn a_lone_valid_slot_is_taken_and_none_is_corruption() {
+        let g = geometry(4, 2);
+        let valid = decode_slot(&encode_slot(&ReclaimRecord::default(), 1, g).expect("e"), g);
+        let torn = Err(FormatError::CrcMismatch {
+            found: 0,
+            computed: 1,
+        });
+        let (index, live) = choose_live(torn.clone(), valid.clone()).expect("second valid");
+        assert_eq!((index, live.generation), (SlotIndex::Second, 1));
+        let (index, _) = choose_live(valid, torn.clone()).expect("first valid");
+        assert_eq!(index, SlotIndex::First);
+        assert!(matches!(
+            choose_live(torn.clone(), torn),
+            Err(FormatError::NoValidSlot { .. })
+        ));
     }
 
     #[test]
-    fn dictionary_assigns_upward_never_reuses_and_unions_by_position() {
+    fn dictionary_assigns_upward_and_never_reuses_a_retired_id() {
         let g = geometry(4, 1);
         let mut dictionary = Dictionary::default();
         let a = dictionary.assign(&tenant("a"), g).expect("a");
@@ -1861,40 +2238,46 @@ mod tests {
         assert_eq!((a, b), (SlotId(0), SlotId(1)));
         assert_eq!(dictionary.assign(&tenant("a"), g), Ok(a), "idempotent");
         dictionary.tombstone(a).expect("tombstone");
-        assert_eq!(dictionary.id_of(&tenant("a")), None, "retired");
+        let retired = dictionary.id_of(&tenant("a"));
         let a2 = dictionary.assign(&tenant("a"), g).expect("a again");
-        assert_eq!(a2, SlotId(2), "a returning tenant takes a fresh id");
-        assert_eq!(dictionary.next_slot_id(), 3);
+        assert_eq!(
+            (retired, a2),
+            (None, SlotId(2)),
+            "a returning tenant takes a fresh id"
+        );
         dictionary.assign(&tenant("d"), g).expect("d");
-        assert_eq!(
-            dictionary.assign(&tenant("e"), g),
-            Err(DictionaryFull { max_tenants: 4 })
-        );
-        assert_eq!(
-            dictionary.tombstone(SlotId(9)),
-            Err(UnknownSlotId { id: SlotId(9) })
-        );
+        let full = dictionary.assign(&tenant("e"), g);
+        assert_eq!(full, Err(DictionaryFull { max_tenants: 4 }));
+        let unknown = dictionary.tombstone(SlotId(9));
+        assert_eq!(unknown, Err(UnknownSlotId { id: SlotId(9) }));
+    }
 
-        // The other sidecar knows one more tenant and has tombstoned "b".
-        let wide = geometry(8, 1);
+    #[test]
+    fn dictionaries_union_by_position_and_refuse_a_conflict() {
+        let g = geometry(4, 1);
+        let mut dictionary = Dictionary::default();
+        for key in ["a", "b", "c"] {
+            dictionary.assign(&tenant(key), g).expect("assign");
+        }
+        // The other sidecar knows two more tenants and has tombstoned "b".
         let mut other = Dictionary::default();
-        // The same history as `dictionary` — "a" retired at 0 and
-        // reassigned at 2 — with "b" tombstoned and one more tenant.
-        for key in ["a", "b", "a", "d", "f"] {
-            let id = other.assign(&tenant(key), wide).expect("other");
-            if matches!((key, id), ("a", SlotId(0)) | ("b", _)) {
-                other.tombstone(id).expect("tombstone");
+        for key in ["a", "b", "c", "d", "e"] {
+            let id = other.assign(&tenant(key), geometry(8, 1)).expect("other");
+            if key == "b" {
+                other.tombstone(id).expect("tombstone b");
             }
         }
         let seeded = dictionary.union(&other.seed_keys()).expect("union");
-        assert_eq!(seeded.next_slot_id(), 5, "max of the two");
-        assert_eq!(seeded.id_of(&tenant("f")), Some(SlotId(4)));
-        assert_eq!(
-            seeded.get(SlotId(1)).map(|r| &r.state),
-            Some(&SlotState::Tombstoned)
+        let ids = (
+            seeded.next_slot_id(),
+            seeded.id_of(&tenant("e")),
+            seeded.id_of(&tenant("b")),
         );
-        assert_eq!(seeded.id_of(&tenant("a")), Some(SlotId(2)));
-
+        assert_eq!(
+            ids,
+            (5, Some(SlotId(4)), None),
+            "max of the two; a tombstone in either retires"
+        );
         let mut conflicting = Dictionary::default();
         conflicting.assign(&tenant("zzz"), g).expect("zzz");
         assert_eq!(
@@ -1922,78 +2305,106 @@ mod tests {
         })
     }
 
-    fn arb_record(g: Geometry) -> impl Strategy<Value = ReclaimRecord> {
-        let tenants = to_usize(g.tenants());
-        let unlinks = to_usize(g.unlinks());
+    /// A record's state under `mode`: entries only exist under a
+    /// recorded mode and carry that mode.
+    fn arb_state(mode: RecordedMode) -> BoxedStrategy<SlotState> {
+        let bare = prop_oneof![
+            Just(SlotState::Tombstoned),
+            Just(SlotState::Live {
+                reclaimed_through: None
+            }),
+        ];
+        let entry_mode = match mode {
+            RecordedMode::Unrecorded => return bare.boxed(),
+            RecordedMode::Known => EntryMode::Known,
+            RecordedMode::NoConsumer => EntryMode::NoConsumer,
+        };
+        let entry = arb_offset().prop_map(move |offset| SlotState::Live {
+            reclaimed_through: Some(Entry {
+                mode: entry_mode,
+                offset,
+            }),
+        });
+        prop_oneof![bare, entry].boxed()
+    }
+
+    fn arb_dictionary(max_tenants: usize, mode: RecordedMode) -> impl Strategy<Value = Dictionary> {
         let key = prop_oneof![
             "[A-Za-z0-9._-]{1,16}",
             Just("k".repeat(KEY_LEN)),
             "[\\x21-\\x7e]{1,128}",
         ];
-        let dict = prop::collection::vec(
-            (
-                key,
-                prop_oneof![
-                    Just(SlotState::Tombstoned),
-                    Just(SlotState::Live {
-                        reclaimed_through: None
-                    }),
-                    (
-                        prop_oneof![Just(EntryMode::Known), Just(EntryMode::NoConsumer)],
-                        arb_offset()
-                    )
-                        .prop_map(|(mode, offset)| SlotState::Live {
-                            reclaimed_through: Some(Entry { mode, offset })
-                        }),
-                ],
-            ),
-            0..=tenants,
+        prop::collection::vec((key, arb_state(mode)), 0..=max_tenants).prop_map(|records| {
+            Dictionary {
+                records: records
+                    .into_iter()
+                    .map(|(key, state)| DictRecord {
+                        key: TenantId::new(key),
+                        state,
+                    })
+                    .collect(),
+            }
+        })
+    }
+
+    fn arb_planned(
+        live: Vec<SlotId>,
+        max_unlinks: usize,
+    ) -> impl Strategy<Value = Vec<PlannedUnlink>> {
+        let count = live.len();
+        let pairs = prop::collection::btree_map(
+            prop::sample::select(if live.is_empty() {
+                vec![SlotId(0)]
+            } else {
+                live
+            }),
+            any::<u64>(),
+            0..=count,
         );
-        (
-            any::<u8>(),
-            prop_oneof![
-                Just(RecordedMode::Unrecorded),
-                Just(RecordedMode::Known),
-                Just(RecordedMode::NoConsumer)
-            ],
-            dict,
-        )
-            .prop_flat_map(move |(flag_bits, mode, dict)| {
-                let dictionary = Dictionary {
-                    records: dict
+        let planned =
+            (any::<u128>(), any::<bool>(), pairs).prop_map(|(segment, uncertain, bytes)| {
+                let segment = Uuid::from_u128(segment);
+                PlannedUnlink {
+                    segment,
+                    uncertain,
+                    last_offsets: bytes
                         .into_iter()
-                        .map(|(key, state)| DictRecord {
-                            key: TenantId::new(key),
-                            state,
-                        })
+                        .map(|(id, byte)| (id, WalOffset { segment, byte }))
                         .collect(),
-                };
+                }
+            });
+        prop::collection::vec(planned, 0..=max_unlinks)
+    }
+
+    fn arb_record(g: Geometry) -> impl Strategy<Value = ReclaimRecord> {
+        let mode = prop_oneof![
+            Just(RecordedMode::Unrecorded),
+            Just(RecordedMode::Known),
+            Just(RecordedMode::NoConsumer)
+        ];
+        let tenants = to_usize(g.tenants());
+        let unlinks = to_usize(g.unlinks());
+        (any::<u8>(), mode)
+            .prop_flat_map(move |(flag_bits, consumer_mode)| {
+                (
+                    Just(flag_bits),
+                    Just(consumer_mode),
+                    arb_dictionary(tenants, consumer_mode),
+                )
+            })
+            .prop_flat_map(move |(flag_bits, consumer_mode, dictionary)| {
                 let live: Vec<SlotId> = dictionary.live().map(|(id, _)| id).collect();
-                let pairs = prop::collection::btree_map(
-                    prop::sample::select(if live.is_empty() {
-                        vec![SlotId(0)]
-                    } else {
-                        live.clone()
-                    }),
-                    arb_offset(),
-                    0..=live.len(),
-                );
-                let planned = prop::collection::vec(
-                    (any::<u128>(), any::<bool>(), pairs).prop_map(
-                        |(segment, uncertain, last_offsets)| PlannedUnlink {
-                            segment: Uuid::from_u128(segment),
-                            uncertain,
-                            last_offsets,
-                        },
-                    ),
-                    0..=unlinks,
-                );
-                planned.prop_map(move |planned| ReclaimRecord {
+                let unlinks = if consumer_mode == RecordedMode::Unrecorded {
+                    0
+                } else {
+                    unlinks
+                };
+                arb_planned(live, unlinks).prop_map(move |planned| ReclaimRecord {
                     witness: WitnessFlags {
                         checkpoint: witness_of(flag_bits & 0b11),
                         published_seeding: witness_of((flag_bits >> 2) & 0b11),
                     },
-                    consumer_mode: mode,
+                    consumer_mode,
                     dictionary: dictionary.clone(),
                     planned,
                 })
@@ -2017,8 +2428,7 @@ mod tests {
             let g = geometry(6, 3);
             let bytes = encode_slot(&record, generation, g).expect("encode");
             let decoded = decode_slot(&bytes, g).expect("decode");
-            prop_assert_eq!(decoded.generation, generation);
-            prop_assert_eq!(&decoded.record, &record);
+            prop_assert_eq!((decoded.generation, &decoded.record), (generation, &record));
             let mut flipped = bytes.clone();
             let at = flip.index(flipped.len());
             flipped[at] ^= mask;

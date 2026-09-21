@@ -20,8 +20,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::reclaim::{
-    self, FILE_HEADER_LEN, Geometry, REBUILD_NAME, ReclaimRecord, SIDECAR_NAME, SLOT_COUNT,
-    SlotIndex,
+    self, FILE_HEADER_BYTES, FILE_HEADER_LEN, Geometry, REBUILD_NAME, ReclaimRecord, SIDECAR_NAME,
+    SLOT_COUNT, SlotIndex,
 };
 use crate::{OpenError, sync_file_data, sync_parent_dir};
 
@@ -86,6 +86,16 @@ impl ReclaimStore {
     /// written rather than the length merely set, so a volume with no
     /// room fails here — at open, where the operator can act — rather
     /// than on the first pass that needs the record.
+    ///
+    /// **Creation goes through `RECLAIM.new`, like the rebuild.**
+    /// Writing the final name first would leave a half-written sidecar
+    /// behind when the allocation fails part-way, and the next open
+    /// reads *present* bytes as corruption rather than as absence — so
+    /// a transient ENOSPC would brick a root on which nothing had been
+    /// reclaimed. The rename is atomic and the temp is never read, so
+    /// every surviving state is either "no record" or "a complete
+    /// record". This is not the §3.2 commit path, which must never
+    /// allocate; a creation allocates by definition.
     pub(crate) fn create(
         root: &Path,
         geometry: Geometry,
@@ -93,34 +103,19 @@ impl ReclaimStore {
         full_fsync: bool,
     ) -> Result<Self, StoreError> {
         let path = root.join(SIDECAR_NAME);
-        let mut store = Self {
-            path: path.clone(),
+        let bytes = whole_file(geometry, record, FIRST_GENERATION, &path)?;
+        let file = install(root, &path, &bytes, full_fsync)?;
+        Ok(Self {
+            path,
             root: root.to_path_buf(),
-            file: OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .map_err(|source| StoreError::Io {
-                    op: "create(RECLAIM)",
-                    source,
-                })?,
+            file,
             geometry,
             live: SlotIndex::First,
             generation: FIRST_GENERATION,
             record: record.clone(),
             buffer: vec![0u8; slot_bytes(geometry)],
             full_fsync,
-        };
-        let bytes = store.whole_file(record, FIRST_GENERATION)?;
-        store.write_at(0, &bytes, "write(RECLAIM)")?;
-        store.sync("fsync(RECLAIM)")?;
-        sync_parent_dir(root).map_err(|source| StoreError::Io {
-            op: "fsync(wal_root after create(RECLAIM))",
-            source,
-        })?;
-        Ok(store)
+        })
     }
 
     /// Open the existing file, rebuilding it at the larger geometry
@@ -141,13 +136,7 @@ impl ReclaimStore {
                 op: "open(RECLAIM)",
                 source,
             })?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|source| StoreError::Io {
-                op: "read(RECLAIM)",
-                source,
-            })?;
-        let (geometry, live, generation, record) = decode_file(&path, &bytes)?;
+        let (geometry, live, generation, record) = decode_file(&path, &mut file)?;
         let mut store = Self {
             path,
             root: root.to_path_buf(),
@@ -207,55 +196,11 @@ impl ReclaimStore {
         )
         .map_err(|e| self.corrupt("sizing the rebuilt file", &e))?;
         self.geometry = wider;
-        let record = self.record.clone();
-        let bytes = self.whole_file(&record, self.generation)?;
-        let temp = self.root.join(REBUILD_NAME);
-        let mut new = File::create(&temp).map_err(|source| StoreError::Io {
-            op: "create(RECLAIM.new)",
-            source,
-        })?;
-        new.write_all(&bytes).map_err(|source| StoreError::Io {
-            op: "write(RECLAIM.new)",
-            source,
-        })?;
-        sync_file_data(&new, self.full_fsync).map_err(|source| StoreError::Io {
-            op: "fsync(RECLAIM.new)",
-            source,
-        })?;
-        std::fs::rename(&temp, &self.path).map_err(|source| StoreError::Io {
-            op: "rename(RECLAIM.new -> RECLAIM)",
-            source,
-        })?;
-        sync_parent_dir(&self.root).map_err(|source| StoreError::Io {
-            op: "fsync(wal_root after rebuild(RECLAIM))",
-            source,
-        })?;
-        self.file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .map_err(|source| StoreError::Io {
-                op: "reopen(RECLAIM after rebuild)",
-                source,
-            })?;
+        let bytes = whole_file(wider, &self.record.clone(), self.generation, &self.path)?;
+        self.file = install(&self.root, &self.path, &bytes, self.full_fsync)?;
         self.live = SlotIndex::First;
         self.buffer = vec![0u8; slot_bytes(wider)];
         Ok(())
-    }
-
-    /// The complete file: header, `record` in the first slot at
-    /// `generation`, the second slot zeroed. A zeroed slot carries
-    /// generation 0, which no writer produces, so the reader takes the
-    /// written one.
-    fn whole_file(&self, record: &ReclaimRecord, generation: u64) -> Result<Vec<u8>, StoreError> {
-        let geometry = self.geometry;
-        let mut bytes = vec![0u8; slot_bytes(geometry) * to_usize(SLOT_COUNT) + header_bytes()];
-        bytes[..header_bytes()].copy_from_slice(&reclaim::encode_file_header(geometry));
-        let first = to_usize(geometry.slot_offset(SlotIndex::First));
-        let end = first + slot_bytes(geometry);
-        reclaim::encode_slot_into(record, generation, geometry, &mut bytes[first..end])
-            .map_err(|e| self.corrupt("encoding a slot", &e))?;
-        Ok(bytes)
     }
 
     fn write_at(&mut self, at: u64, bytes: &[u8], op: &'static str) -> Result<(), StoreError> {
@@ -281,33 +226,91 @@ impl ReclaimStore {
     }
 }
 
+/// The complete file: header, `record` in the first slot at
+/// `generation`, the second slot zeroed. A zeroed slot carries
+/// generation 0, which no writer produces, so the reader takes the
+/// written one.
+fn whole_file(
+    geometry: Geometry,
+    record: &ReclaimRecord,
+    generation: u64,
+    path: &Path,
+) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = vec![0u8; slot_bytes(geometry) * to_usize(SLOT_COUNT) + header_bytes()];
+    bytes[..header_bytes()].copy_from_slice(&reclaim::encode_file_header(geometry));
+    let first = to_usize(geometry.slot_offset(SlotIndex::First));
+    let end = first + slot_bytes(geometry);
+    reclaim::encode_slot_into(record, generation, geometry, &mut bytes[first..end]).map_err(
+        |e| StoreError::Corrupt {
+            detail: format!(
+                "RECLAIM sidecar at {}: encoding a slot: {e}",
+                path.display()
+            ),
+        },
+    )?;
+    Ok(bytes)
+}
+
+/// Put `bytes` at `path` atomically: write them whole to
+/// `RECLAIM.new`, fsync it, rename it over `path`, fsync the parent,
+/// and hand back a handle on the result. The temp is never read, so a
+/// crash or a failed allocation at any point leaves either the old
+/// file or the new one and never a half-written sidecar — which the
+/// next open would have to read as corruption rather than absence.
+fn install(root: &Path, path: &Path, bytes: &[u8], full_fsync: bool) -> Result<File, StoreError> {
+    let io = |op: &'static str| move |source| StoreError::Io { op, source };
+    let temp = root.join(REBUILD_NAME);
+    let mut new = File::create(&temp).map_err(io("create(RECLAIM.new)"))?;
+    new.write_all(bytes).map_err(io("write(RECLAIM.new)"))?;
+    sync_file_data(&new, full_fsync).map_err(io("fsync(RECLAIM.new)"))?;
+    std::fs::rename(&temp, path).map_err(io("rename(RECLAIM.new -> RECLAIM)"))?;
+    sync_parent_dir(root).map_err(io("fsync(wal_root after installing RECLAIM)"))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io("reopen(RECLAIM after install)"))
+}
+
 /// The file header and both slots, or the first field that does not
 /// check out. The version byte and every checksum are validated before
 /// any record is believed.
+///
+/// The fixed header is read and validated **before** anything sized by
+/// it is allocated, and the geometry it declares is checked against the
+/// file's real length: a header claiming the format ceiling describes a
+/// file of hundreds of GiB, and trusting it enough to read the file
+/// whole would let a malformed sidecar stall or exhaust startup.
 fn decode_file(
     path: &Path,
-    bytes: &[u8],
+    file: &mut File,
 ) -> Result<(Geometry, SlotIndex, u64, ReclaimRecord), StoreError> {
     let corrupt = |source: &dyn std::fmt::Display| StoreError::Corrupt {
         detail: format!("RECLAIM sidecar at {}: {source}", path.display()),
     };
-    let header = bytes
-        .get(..header_bytes())
-        .ok_or_else(|| corrupt(&format!("size {} B, shorter than its header", bytes.len())))?;
-    let geometry = reclaim::decode_file_header(header).map_err(|e| corrupt(&e))?;
-    let expected = to_usize(geometry.file_len());
-    if bytes.len() != expected {
+    let io = |op: &'static str| move |source| StoreError::Io { op, source };
+    let mut header = [0u8; FILE_HEADER_BYTES];
+    file.read_exact(&mut header)
+        .map_err(io("read(RECLAIM file header)"))?;
+    let geometry = reclaim::decode_file_header(&header).map_err(|e| corrupt(&e))?;
+    let expected = geometry.file_len();
+    let found = file.metadata().map_err(io("stat(RECLAIM)"))?.len();
+    if found != expected {
         return Err(corrupt(&format!(
-            "size {} B, expected {expected} B at the stored capacities",
-            bytes.len()
+            "size {found} B, expected {expected} B at the stored capacities"
         )));
     }
-    let slot = |index: SlotIndex| {
-        let at = to_usize(geometry.slot_offset(index));
-        reclaim::decode_slot(&bytes[at..at + slot_bytes(geometry)], geometry)
+    let mut slot = vec![0u8; slot_bytes(geometry)];
+    let mut read = |index: SlotIndex| -> Result<_, StoreError> {
+        file.seek(SeekFrom::Start(geometry.slot_offset(index)))
+            .map_err(io("seek(RECLAIM slot)"))?;
+        file.read_exact(&mut slot)
+            .map_err(io("read(RECLAIM slot)"))?;
+        Ok(reclaim::decode_slot(&slot, geometry))
     };
-    let (live, decoded) = reclaim::choose_live(slot(SlotIndex::First), slot(SlotIndex::Second))
-        .map_err(|e| corrupt(&e))?;
+    let first = read(SlotIndex::First)?;
+    let second = read(SlotIndex::Second)?;
+    let (live, decoded) = reclaim::choose_live(first, second).map_err(|e| corrupt(&e))?;
     Ok((geometry, live, decoded.generation, decoded.record))
 }
 
@@ -358,6 +361,52 @@ mod tests {
         assert_eq!(len, g.file_len(), "the file is preallocated whole");
         let store = ReclaimStore::open(tmp.path(), g, false).expect("reopen");
         assert_eq!(store.record(), &record);
+    }
+
+    /// A creation that cannot complete leaves **no** `RECLAIM` behind.
+    /// Writing the final name first would leave a half-written sidecar
+    /// that the next open reads as corruption rather than absence, so a
+    /// transient allocation failure would brick a root on which nothing
+    /// had been reclaimed — exactly the case §3.2 says must start
+    /// normally once space is freed.
+    #[test]
+    fn a_failed_create_leaves_no_partial_sidecar_behind() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let g = geometry(4, 2);
+        // A directory in the temp's place: `File::create` cannot open
+        // it, which stands in for the allocation failing part-way.
+        std::fs::create_dir_all(tmp.path().join(REBUILD_NAME)).expect("block the temp");
+        ReclaimStore::create(tmp.path(), g, &armed(), false).expect_err("create must fail");
+        assert!(
+            !tmp.path().join(SIDECAR_NAME).exists(),
+            "the final name is never touched until the temp is complete",
+        );
+
+        // And once the obstruction is gone the root starts normally.
+        std::fs::remove_dir(tmp.path().join(REBUILD_NAME)).expect("free the temp");
+        let store = ReclaimStore::create(tmp.path(), g, &armed(), false).expect("create");
+        assert_eq!(store.record(), &armed());
+    }
+
+    /// A header declaring a geometry the file does not have is refused
+    /// before anything sized by it is allocated: the stored capacities
+    /// can describe hundreds of GiB, and trusting them enough to read
+    /// the file whole would let a malformed sidecar stall startup.
+    #[test]
+    fn a_header_disagreeing_with_the_file_length_is_refused() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let g = geometry(2, 1);
+        ReclaimStore::create(tmp.path(), g, &armed(), false).expect("create");
+        let path = tmp.path().join(SIDECAR_NAME);
+        let bytes = std::fs::read(&path).expect("read");
+        // The header is intact; the file is not as long as it claims.
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).expect("truncate");
+        match ReclaimStore::open(tmp.path(), g, false) {
+            Err(StoreError::Corrupt { detail }) => {
+                assert!(detail.contains("expected"), "detail: {detail}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 
     /// A commit alternates slots, never extends the file, and is what a

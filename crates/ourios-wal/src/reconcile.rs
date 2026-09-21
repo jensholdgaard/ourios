@@ -151,13 +151,21 @@ fn promote_checkpoint_witness(
 /// segments** is a genuinely fresh root whose arming preceded a
 /// checkpoint that never landed: it is opened empty and re-armed by
 /// the next attempt.
+/// "Empty" is the *checkpoint* arming being cleared; the
+/// `published_seeding` pair shares this header and is monotone by
+/// §3.2, so it survives a reset that has nothing to do with it.
 fn reset_record(store: &mut reclaim_store::ReclaimStore) -> Result<(), OpenError> {
-    if *store.record() == reclaim::ReclaimRecord::default() {
+    let empty = reclaim::ReclaimRecord {
+        witness: reclaim::WitnessFlags {
+            checkpoint: reclaim::Witness::Unarmed,
+            ..store.record().witness
+        },
+        ..reclaim::ReclaimRecord::default()
+    };
+    if *store.record() == empty {
         return Ok(());
     }
-    store
-        .commit(&reclaim::ReclaimRecord::default())
-        .map_err(OpenError::from)
+    store.commit(&empty).map_err(OpenError::from)
 }
 
 /// §3.2's open-time reconciliation of the `planned` list. A planned
@@ -306,14 +314,18 @@ pub(crate) fn arm(
     store: &mut Option<reclaim_store::ReclaimStore>,
     config: &WalConfig,
 ) -> Result<(), CheckpointError> {
-    let armed = reclaim::WitnessFlags {
-        checkpoint: reclaim::Witness::Armed,
-        ..reclaim::WitnessFlags::default()
-    };
     match store.as_mut() {
         Some(held) if held.record().witness.checkpoint == reclaim::Witness::Unarmed => {
+            // Only the checkpoint witness moves. The
+            // `published_seeding` pair shares this header, is monotone
+            // by §3.2 ("once confirmed it never clears"), and belongs
+            // to a writer this slice does not have — replacing the
+            // whole `WitnessFlags` would silently clear it.
             let record = reclaim::ReclaimRecord {
-                witness: armed,
+                witness: reclaim::WitnessFlags {
+                    checkpoint: reclaim::Witness::Armed,
+                    ..held.record().witness
+                },
                 ..held.record().clone()
             };
             held.commit(&record).map_err(record_failed)

@@ -6,7 +6,58 @@
 //! point is the *selector*, and the dangerous neighbours
 //! (`CHECKPOINT.tmp`, `*.snap.tmp`) are produced by other subsystems.
 
-use crate::rfc0052_support::{CHECKPOINT, RECLAIM, open, segment_files};
+use ourios_wal::FrameKind;
+
+use crate::rfc0052_support::{CHECKPOINT, RECLAIM, build_closed_segment, open, segment_files};
+
+/// RFC 0052 §3.7's unreclaimed-byte figure is kept *incrementally*,
+/// the way `unflushed_bytes` already is: seeded from the post-recovery
+/// walk, raised by every frame that lands, lowered by every verified
+/// unlink. Seeding alone would omit everything written since the last
+/// restart and count reclaimed bytes forever, so the export would not
+/// be the exact figure RFC 0053's bound is meant to be taken on.
+#[test]
+fn rfc0052_7_unreclaimed_bytes_rise_on_append_and_fall_on_reclaim() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let first = build_closed_segment(root, &[b"a1", b"a2"]);
+    let second = build_closed_segment(root, &[b"b1"]);
+    build_closed_segment(root, &[b"c1"]);
+
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("seed the ledger");
+    let seeded = wal.reclaim_state().unreclaimed_bytes;
+    assert!(seeded > 0, "the walk seeds the surviving frames' bytes");
+
+    // Appending raises it by exactly the frame it wrote.
+    let payload = b"a frame that lands after the seed";
+    wal.append(FrameKind::OtlpBatch, payload).expect("append");
+    wal.sync().expect("sync");
+    let grown = wal.reclaim_state().unreclaimed_bytes;
+    assert_eq!(
+        grown - seeded,
+        (payload.len() + 12) as u64,
+        "the 12 B frame header plus the payload, and nothing else",
+    );
+
+    // Reclaiming lowers it by the bytes the unlinked segments held.
+    assert!(!first.is_empty() && !second.is_empty());
+    wal.checkpoint(*second.last().expect("segment two"))
+        .expect("checkpoint");
+    wal.housekeeping(None).expect("housekeeping");
+    let survivors = segment_files(root);
+    assert_eq!(survivors.len(), 1, "two segments are reclaimed");
+    let reclaimed = wal.reclaim_state().unreclaimed_bytes;
+    assert!(
+        reclaimed < grown,
+        "the figure falls with the segments rather than counting them forever",
+    );
+    let live_frame_bytes = std::fs::metadata(&survivors[0]).expect("stat").len() - 24;
+    assert_eq!(
+        reclaimed, live_frame_bytes,
+        "leaving exactly the surviving segment's frame bytes — its length less its 24 B header",
+    );
+}
 
 /// Scenario RFC0052.16 — exactly one of four file kinds is removed.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.

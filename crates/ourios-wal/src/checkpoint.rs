@@ -131,12 +131,20 @@ pub(crate) fn read(root: &Path) -> Result<Option<Sidecar>, OpenError> {
     }
 }
 
-/// Atomically persist `offset` to `<root>/CHECKPOINT` per §6.7:
-/// write to `CHECKPOINT.tmp`, `fsync`, `rename`, `fsync` the
-/// parent directory. Durability is required, not advisory — a
-/// crash after `checkpoint(X)` but before housekeeping must
-/// still find `X` on restart, or the driver's Parquet-side
-/// suppression loses its horizon.
+/// Persist `offset` to `<root>/CHECKPOINT` per §6.7 up to and
+/// including the rename: write to `CHECKPOINT.tmp`, `fsync`, `rename`.
+/// Durability is required, not advisory — a crash after
+/// `checkpoint(X)` but before housekeeping must still find `X` on
+/// restart, or the driver's Parquet-side suppression loses its
+/// horizon.
+///
+/// The parent-directory fsync is [`sync_root`] and **not** part of
+/// this call, because the two failure modes are not the same one. A
+/// failure here leaves nothing visible under the final name, so the
+/// caller's mark must not advance; a failure of the fsync leaves the
+/// new mark already visible, so the caller's mark must. Folding them
+/// together forced one answer on both, and the wrong one let a later,
+/// lower mark rewrite the sidecar backwards.
 pub(crate) fn write(root: &Path, offset: WalOffset) -> Result<(), CheckpointError> {
     let io = |op: &'static str, source| CheckpointError::Io { op, source };
     let tmp = root.join(TMP_NAME);
@@ -146,9 +154,16 @@ pub(crate) fn write(root: &Path, offset: WalOffset) -> Result<(), CheckpointErro
     file.sync_all()
         .map_err(|e| io("fsync(CHECKPOINT.tmp)", e))?;
     std::fs::rename(&tmp, root.join(SIDECAR_NAME))
-        .map_err(|e| io("rename(CHECKPOINT.tmp -> CHECKPOINT)", e))?;
-    sync_parent_dir(root).map_err(|e| io("fsync(wal_root after checkpoint)", e))?;
-    Ok(())
+        .map_err(|e| io("rename(CHECKPOINT.tmp -> CHECKPOINT)", e))
+}
+
+/// Make the renamed `CHECKPOINT`'s directory entry durable. Called
+/// straight after [`write`], once the caller has taken the new mark.
+pub(crate) fn sync_root(root: &Path) -> Result<(), CheckpointError> {
+    sync_parent_dir(root).map_err(|source| CheckpointError::Io {
+        op: "fsync(wal_root after checkpoint)",
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -234,6 +249,7 @@ mod tests {
         assert!(read(tmp.path()).expect("absent").is_none());
         let original = offset();
         write(tmp.path(), original).expect("write");
+        sync_root(tmp.path()).expect("fsync the root");
         assert_eq!(
             read(tmp.path()).expect("present"),
             Some(Sidecar {

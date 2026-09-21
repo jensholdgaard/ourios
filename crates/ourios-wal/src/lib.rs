@@ -591,6 +591,12 @@ impl Wal {
         let post_write_byte = pre_write_byte + frame_len;
         self.appends_total += 1;
         self.unflushed_bytes += frame_len;
+        // RFC 0052 §3.7 keeps this figure incrementally, as
+        // `unflushed_bytes` already is: seeded from the post-recovery
+        // walk, raised by every frame that lands, lowered by every
+        // verified unlink. A figure only ever seeded would omit
+        // everything written since the last restart.
+        self.unreclaimed_bytes += frame_len;
         Ok(WalOffset {
             segment: self.current_segment_uuid,
             byte: post_write_byte,
@@ -792,31 +798,48 @@ impl Wal {
             // housekeeping would stay gated forever. Only an equal
             // mark on an already-version-2 sidecar takes the no-write
             // fast path.
+            // The fast path also requires the witness to be on disk.
+            // A previous call whose `checkpoint_seen` write failed
+            // left the mark durable and the witness unarmed-or-armed,
+            // and taking the fast path there would skip that write for
+            // the life of the process — so a retry at the same mark
+            // really does retry both halves.
             if durable_to == current
                 && self.checkpoint_version == Some(checkpoint::SidecarVersion::Current)
+                && self.checkpoint_is_witnessed()
             {
                 return Ok(());
             }
         }
         reconcile::arm(&mut self.reclaim, &self.config)?;
+        // Split at the rename, because the two halves need opposite
+        // answers. A failure inside `write` leaves nothing visible
+        // under the final name, so nothing advances. A failure of the
+        // parent fsync leaves the new mark already visible, so the
+        // in-memory mark must follow it: a later call that found a
+        // stale mark here would pass the monotonicity check against it
+        // and rewrite the sidecar *backwards*, which recovery reads as
+        // a lower Parquet suppression horizon and republishes every
+        // row above it.
         checkpoint::write(&self.config.root, durable_to)?;
-        // The sidecar is durable as of the line above, so the
-        // in-memory mark follows it **immediately** and with nothing
-        // fallible in between. A later call that found a stale mark
-        // here would pass the monotonicity check against it and
-        // rewrite the sidecar *backwards*, which recovery reads as a
-        // lower Parquet suppression horizon and republishes every row
-        // above it. Keeping the two in step leaves no window for that
-        // rather than detecting it.
         self.checkpoint = Some(durable_to);
         self.checkpoint_version = Some(checkpoint::SidecarVersion::Current);
         self.reclaimable = true;
-        // The witness is a second durable write and its own failure:
+        checkpoint::sync_root(&self.config.root)?;
+        // The witness is a third durable write and its own failure:
         // reported, never rolled back. `checkpoint_seen` governs only
         // the open-time matrix, and an armed record beside a version-2
         // sidecar is promoted at the next open, so a failure here
         // loses nothing.
         reconcile::witness(&mut self.reclaim)
+    }
+
+    /// Whether `checkpoint_seen` is on disk. A legacy root with no
+    /// record has no witness, so it never takes the no-write path.
+    fn checkpoint_is_witnessed(&self) -> bool {
+        self.reclaim
+            .as_ref()
+            .is_some_and(|store| store.record().witness.checkpoint == reclaim::Witness::Terminal)
     }
 
     /// The `CHECKPOINT` sidecar's offset (`None` =
@@ -912,6 +935,14 @@ impl Wal {
             };
             if highest <= bound {
                 std::fs::remove_file(&path).map_err(|e| io("unlink(segment)", e))?;
+                // The frame bytes this segment held leave the
+                // unreclaimed figure with it. `len - header` is exact
+                // for a *closed* segment: a torn tail on one is
+                // RFC0008.5 corruption that halts replay, so a segment
+                // that reached this point has none.
+                self.unreclaimed_bytes = self
+                    .unreclaimed_bytes
+                    .saturating_sub(len.saturating_sub(SEGMENT_HEADER_LEN as u64));
                 unlinked_any = true;
             }
         }

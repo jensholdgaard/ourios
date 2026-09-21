@@ -28,7 +28,7 @@ const VERSION: u16 = 1;
 
 /// The file header's length as an array size; [`FILE_HEADER_LEN`] is
 /// the same number where offsets are computed.
-const FILE_HEADER_BYTES: usize = 32;
+pub(crate) const FILE_HEADER_BYTES: usize = 32;
 pub(crate) const FILE_HEADER_LEN: u64 = 32;
 const FILE_HEADER_CRC_COVERS: usize = 24;
 const SLOT_HEADER_LEN: u64 = 24;

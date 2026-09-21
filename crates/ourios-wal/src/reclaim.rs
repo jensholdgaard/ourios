@@ -490,8 +490,24 @@ impl Dictionary {
         self.records.get(id.index())
     }
 
-    pub fn get_mut(&mut self, id: SlotId) -> Option<&mut DictRecord> {
-        self.records.get_mut(id.index())
+    /// Record `entry` as `id`'s `reclaimed_through`. This is the only
+    /// change a recorded tenant takes besides its tombstone: a key
+    /// never changes and a retired id never comes back (§3.2).
+    ///
+    /// # Errors
+    ///
+    /// [`NotLive`] when no record holds `id`, or when it is tombstoned.
+    pub fn record_reclaimed(&mut self, id: SlotId, entry: Entry) -> Result<(), NotLive> {
+        match self.records.get_mut(id.index()) {
+            Some(record) if record.is_live() => {
+                record.state = SlotState::Live {
+                    reclaimed_through: Some(entry),
+                };
+                Ok(())
+            }
+            Some(_) => Err(NotLive::Tombstoned { id }),
+            None => Err(NotLive::Unknown { id }),
+        }
     }
 
     /// Whether `id` names a recorded, non-tombstoned tenant.
@@ -639,6 +655,28 @@ impl fmt::Display for UnknownSlotId {
 }
 
 impl std::error::Error for UnknownSlotId {}
+
+/// Why a position cannot take a `reclaimed_through`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotLive {
+    /// No record holds this id.
+    Unknown { id: SlotId },
+    /// The id is retired, and a tombstoned record carries no entry.
+    Tombstoned { id: SlotId },
+}
+
+impl fmt::Display for NotLive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown { id } => write!(f, "slot id {id} is not in the dictionary"),
+            Self::Tombstoned { id } => {
+                write!(f, "slot id {id} is tombstoned and carries no entry")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotLive {}
 
 /// One popped segment the record promises to unlink: its uuid and each
 /// tenant's last offset in it, written before the unlinks so open can
@@ -1759,12 +1797,15 @@ mod tests {
         let b = dictionary.assign(&tenant("beta-eu"), g).expect("assign b");
         let c = dictionary.assign(&tenant("gone"), g).expect("assign c");
         dictionary.tombstone(c).expect("tombstone");
-        dictionary.get_mut(a).expect("a").state = SlotState::Live {
-            reclaimed_through: Some(Entry {
-                mode: EntryMode::Known,
-                offset: offset(4096),
-            }),
-        };
+        dictionary
+            .record_reclaimed(
+                a,
+                Entry {
+                    mode: EntryMode::Known,
+                    offset: offset(4096),
+                },
+            )
+            .expect("a");
         let mut planned = BTreeMap::new();
         planned.insert(a, offset(8192));
         planned.insert(b, offset(100));
@@ -1993,12 +2034,16 @@ mod tests {
         let g = geometry(2, 1);
         let mut record = ReclaimRecord::default();
         let id = record.dictionary.assign(&tenant("a"), g).expect("assign");
-        record.dictionary.get_mut(id).expect("a").state = SlotState::Live {
-            reclaimed_through: Some(Entry {
-                mode: EntryMode::Known,
-                offset: offset(1),
-            }),
-        };
+        record
+            .dictionary
+            .record_reclaimed(
+                id,
+                Entry {
+                    mode: EntryMode::Known,
+                    offset: offset(1),
+                },
+            )
+            .expect("a");
         assert!(matches!(
             encode_slot(&record, 1, g),
             Err(EncodeError::EntryModeDisagrees {
@@ -2362,6 +2407,38 @@ mod tests {
         assert_eq!(full, Err(DictionaryFull { max_tenants: 4 }));
         let unknown = dictionary.tombstone(SlotId(9));
         assert_eq!(unknown, Err(UnknownSlotId { id: SlotId(9) }));
+    }
+
+    #[test]
+    fn only_a_live_record_takes_an_entry() {
+        let g = geometry(4, 1);
+        let mut dictionary = Dictionary::default();
+        let a = dictionary.assign(&tenant("a"), g).expect("a");
+        let entry = Entry {
+            mode: EntryMode::Known,
+            offset: offset(64),
+        };
+        dictionary.record_reclaimed(a, entry).expect("record");
+        assert_eq!(
+            dictionary.get(a).map(|record| record.state.clone()),
+            Some(SlotState::Live {
+                reclaimed_through: Some(entry)
+            })
+        );
+        dictionary.tombstone(a).expect("tombstone");
+        assert_eq!(
+            dictionary.record_reclaimed(a, entry),
+            Err(NotLive::Tombstoned { id: a }),
+            "a retired id never comes back"
+        );
+        assert_eq!(
+            dictionary.record_reclaimed(SlotId(9), entry),
+            Err(NotLive::Unknown { id: SlotId(9) })
+        );
+        assert_eq!(
+            dictionary.get(a).map(|record| record.state.clone()),
+            Some(SlotState::Tombstoned)
+        );
     }
 
     #[test]

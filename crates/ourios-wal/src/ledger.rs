@@ -235,14 +235,24 @@ enum Swept {
 
 fn remove_partial(path: &Path, root: &Path) -> Swept {
     match std::fs::remove_file(path) {
-        Ok(()) => match sync_parent_dir(root) {
-            Ok(()) => Swept::Removed,
-            Err(source) => Swept::Uncertain(source),
-        },
-        // Already gone: a previous pass's uncertain unlink really did
-        // land, which completes the reclamation.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Swept::Removed,
+        Ok(()) => durable_removal(root),
+        // Already gone — which is *not* the same as durably gone.
+        // This is the re-verification of a previous pass's uncertain
+        // deletion, and what was uncertain about it was exactly the
+        // fsync. Letting the path leave the list on the strength of a
+        // directory change a crash can still undo would forget the
+        // file entirely, so the fsync is repeated rather than assumed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => durable_removal(root),
         Err(_) => Swept::Retry,
+    }
+}
+
+/// An unlink counts only once the directory entry that carried it is
+/// durable.
+fn durable_removal(root: &Path) -> Swept {
+    match sync_parent_dir(root) {
+        Ok(()) => Swept::Removed,
+        Err(source) => Swept::Uncertain(source),
     }
 }
 
@@ -299,6 +309,18 @@ mod tests {
             "and the list drains once the fsync works"
         );
         assert!(debris.iter().all(|p| !p.exists()));
+
+        // Re-verifying an already-gone path is not complete until its
+        // own fsync lands: what was uncertain about the previous
+        // pass's unlink was exactly the fsync, so dropping the path
+        // here would forget a directory entry a crash can bring back.
+        let mut requeued = vec![debris[0].clone()];
+        sweep_partials(&mut requeued, &unopenable).expect_err("the parent fsync must fail");
+        assert_eq!(
+            requeued,
+            vec![debris[0].clone()],
+            "an unverified removal stays queued even when the file is already gone",
+        );
     }
 
     /// The selector is the whole safety of the sweep: `*.tmp` is the

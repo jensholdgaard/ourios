@@ -501,7 +501,7 @@ impl Wal {
             unreclaimed_bytes: self.unreclaimed_bytes,
             checkpoint: self.checkpoint,
             stale_partials: self.stale_partials.len(),
-            reclaimable: self.may_reclaim(),
+            reclaimable: self.checkpoint_is_settled(),
         }
     }
 
@@ -847,13 +847,23 @@ impl Wal {
         reconcile::witness(&mut self.reclaim)
     }
 
-    /// Both halves of the last checkpoint are on disk: the sidecar at
-    /// version 2, and `checkpoint_seen` in the record beside it.
-    /// Either one missing is real work — RFC 0052 §3.2's
-    /// version-aware upgrade, or a witness write a previous call
-    /// failed — so an equal mark must not take the no-write path and
-    /// skip it for the life of the process. A legacy root with no
-    /// record has no witness and is never settled.
+    /// Every part of the last checkpoint is on disk: the sidecar at
+    /// version 2, its directory entry fsynced, and `checkpoint_seen`
+    /// in the record beside it. Two callers want exactly this, and for
+    /// the same reason — the checkpoint is only as good as the weakest
+    /// of the three:
+    ///
+    /// - the equal-mark no-write path, which must not skip a write a
+    ///   previous call owed and failed, or it would skip it for the
+    ///   life of the process;
+    /// - a housekeeping pass, which must not unlink under a checkpoint
+    ///   whose entry a crash could lose, nor under one whose startup
+    ///   loss witness is still only `Armed` — RFC 0052 §3.2's matrix
+    ///   reads a later missing `CHECKPOINT` as a fresh root without
+    ///   `checkpoint_seen`, and by then the frames are gone.
+    ///
+    /// A legacy root has no witness and is never settled, so a pass
+    /// plans nothing until the version-aware upgrade lands.
     fn checkpoint_is_settled(&self) -> bool {
         if self.reclaim_gate != ReclaimGate::Open {
             return false;
@@ -906,23 +916,13 @@ impl Wal {
         let Some(cp) = self.checkpoint else {
             return Ok(());
         };
-        if !self.may_reclaim() {
+        if !self.checkpoint_is_settled() {
             return Ok(());
         }
         self.unlink_at_or_below(match retain_floor {
             Some(floor) => cp.min(floor),
             None => cp,
         })
-    }
-
-    /// Whether a pass may plan segments at all: §3.2's witness exists
-    /// — a version-2 `CHECKPOINT` beside a record, since unlinking
-    /// under a version-1 one would leave exactly the shape the
-    /// open-time matrix reads as "nothing was ever reclaimed" — **and**
-    /// that checkpoint's own directory entry is durable rather than
-    /// merely renamed.
-    fn may_reclaim(&self) -> bool {
-        self.reclaim_gate == ReclaimGate::Open
     }
 
     /// Unlink every closed segment whose highest frame offset is at or
@@ -1833,7 +1833,10 @@ mod tests {
         let mut wal = Wal::open(default_config(dest.path())).expect("open");
         wal.checkpoint(*offsets.last().expect("offsets"))
             .expect("checkpoint");
-        assert!(wal.may_reclaim(), "a completed checkpoint is reclaimable");
+        assert!(
+            wal.checkpoint_is_settled(),
+            "a completed checkpoint is reclaimable",
+        );
 
         wal.reclaim_gate = ReclaimGate::FsyncPending;
         wal.housekeeping(None).expect("housekeeping");
@@ -1849,6 +1852,41 @@ mod tests {
             list_segments(dest.path()).expect("list").len(),
             1,
             "and the next pass reclaims once it is",
+        );
+    }
+
+    /// A checkpoint whose `checkpoint_seen` write failed leaves the
+    /// record only `Armed`, and no segment is reclaimed under that
+    /// either: §3.2's matrix reads a later missing `CHECKPOINT` beside
+    /// an armed record as a root mid migration rather than as a loss,
+    /// and by then the frames the pass unlinked would be gone.
+    #[test]
+    fn housekeeping_waits_for_the_startup_loss_witness() {
+        let dest = tempfile::TempDir::new().expect("temp");
+        let offsets = mint_closed_segment(dest.path(), &[b"a1", b"a2"]);
+        mint_closed_segment(dest.path(), &[b"b1"]);
+        let mut wal = Wal::open(default_config(dest.path())).expect("open");
+        wal.checkpoint(*offsets.last().expect("offsets"))
+            .expect("checkpoint");
+
+        // Wind the witness back to where a failed `checkpoint_seen`
+        // write would have left it.
+        let store = wal.reclaim.as_mut().expect("a post-RFC root has a record");
+        let armed = reclaim::ReclaimRecord {
+            witness: reclaim::WitnessFlags {
+                checkpoint: reclaim::Witness::Armed,
+                ..store.record().witness
+            },
+            ..store.record().clone()
+        };
+        store.commit(&armed).expect("commit");
+
+        assert!(!wal.checkpoint_is_settled());
+        wal.housekeeping(None).expect("housekeeping");
+        assert_eq!(
+            list_segments(dest.path()).expect("list").len(),
+            2,
+            "nothing is reclaimed while the loss witness is only armed",
         );
     }
 

@@ -1,7 +1,7 @@
 ---
 rfc: 0052
 title: WAL reclamation and quiesce recovery
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-12
@@ -11,9 +11,27 @@ superseded-by: —
 
 # RFC 0052 — WAL reclamation and quiesce recovery
 
-> **Status note.** `specified` — §5 and §6 are complete, every invariant
-> and hazard this RFC touches has a scenario, and review has confirmed the
-> criteria testable (`docs/rfcs/README.md` §Lifecycle). **Stage 1 of two.** Motivated by a production
+> **Status note.** `red` — test stubs exist and fail
+> (`docs/rfcs/README.md` §Lifecycle): every live §5 scenario has one or
+> more `#[ignore]`d `todo!` stubs, per leg where §6 separates the legs,
+> in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12, .13, .16,
+> .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's startup leg,
+> .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry.rs` (.7, its own
+> binary per RFC0028.2) and `ourios-bench/tests/rfc0052_3_bounded_growth.rs`
+> (.3). Implementation proceeds in six green slices, each un-ignoring the
+> stubs it discharges:
+> **A** reclaim record and sidecars (§3.2 `RECLAIM`, `CHECKPOINT` v2,
+> `SEGMENT_VERSION` 2, open-time reconciliation → .11, .16, .17);
+> **B** housekeeping (ledger, `RetainFloor`, capped passes,
+> prepare/commit split → .2, .12, .13);
+> **C** rotation (temporary name, bounded retry, terminal state, the
+> `hold/794-wedged-classification` reintroduction → .4, .5, .15);
+> **D** barrier (guard-at-submit, publisher thread, epoch latch,
+> ingest exclusion → .1, .14, .13's startup leg);
+> **E** timer and telemetry (§3.5 instruments and events → .7);
+> **F** crash and soak (.10 on the rfc0014_5 fixture, .3 on the extended
+> soak harness). A before B; B before D and E; F last.
+> **Stage 1 of two.** Motivated by a production
 > incident (issue #791) and the defects found tracing it (#791, #793). Amends
 > RFC 0008 §6.5 and §6.7 with the *policy* those sections left to a caller
 > that was never written, **amends RFC 0001 §6.9** (per-tenant own-frame

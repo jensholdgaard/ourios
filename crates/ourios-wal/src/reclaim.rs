@@ -490,22 +490,30 @@ impl Dictionary {
         self.records.get(id.index())
     }
 
-    /// Record `entry` as `id`'s `reclaimed_through`. This is the only
-    /// change a recorded tenant takes besides its tombstone: a key
-    /// never changes and a retired id never comes back (§3.2).
+    /// Raise `id`'s `reclaimed_through` to `entry`, keeping the greater
+    /// offset: the proof of loss only rises (§3.2), so a stale or
+    /// reordered commit leaves it where it is. This is the only change
+    /// a recorded tenant takes besides its tombstone — a key never
+    /// changes and a retired id never comes back.
     ///
     /// # Errors
     ///
     /// [`NotLive`] when no record holds `id`, or when it is tombstoned.
-    pub fn record_reclaimed(&mut self, id: SlotId, entry: Entry) -> Result<(), NotLive> {
+    pub fn raise_reclaimed(&mut self, id: SlotId, entry: Entry) -> Result<(), NotLive> {
         match self.records.get_mut(id.index()) {
-            Some(record) if record.is_live() => {
-                record.state = SlotState::Live {
-                    reclaimed_through: Some(entry),
-                };
-                Ok(())
-            }
-            Some(_) => Err(NotLive::Tombstoned { id }),
+            Some(record) => match record.state {
+                SlotState::Live { reclaimed_through } => {
+                    let raised = match reclaimed_through {
+                        Some(held) if held.offset >= entry.offset => held,
+                        Some(_) | None => entry,
+                    };
+                    record.state = SlotState::Live {
+                        reclaimed_through: Some(raised),
+                    };
+                    Ok(())
+                }
+                SlotState::Tombstoned => Err(NotLive::Tombstoned { id }),
+            },
             None => Err(NotLive::Unknown { id }),
         }
     }
@@ -1798,7 +1806,7 @@ mod tests {
         let c = dictionary.assign(&tenant("gone"), g).expect("assign c");
         dictionary.tombstone(c).expect("tombstone");
         dictionary
-            .record_reclaimed(
+            .raise_reclaimed(
                 a,
                 Entry {
                     mode: EntryMode::Known,
@@ -2036,7 +2044,7 @@ mod tests {
         let id = record.dictionary.assign(&tenant("a"), g).expect("assign");
         record
             .dictionary
-            .record_reclaimed(
+            .raise_reclaimed(
                 id,
                 Entry {
                     mode: EntryMode::Known,
@@ -2418,7 +2426,7 @@ mod tests {
             mode: EntryMode::Known,
             offset: offset(64),
         };
-        dictionary.record_reclaimed(a, entry).expect("record");
+        dictionary.raise_reclaimed(a, entry).expect("record");
         assert_eq!(
             dictionary.get(a).map(|record| record.state.clone()),
             Some(SlotState::Live {
@@ -2427,17 +2435,60 @@ mod tests {
         );
         dictionary.tombstone(a).expect("tombstone");
         assert_eq!(
-            dictionary.record_reclaimed(a, entry),
+            dictionary.raise_reclaimed(a, entry),
             Err(NotLive::Tombstoned { id: a }),
             "a retired id never comes back"
         );
         assert_eq!(
-            dictionary.record_reclaimed(SlotId(9), entry),
+            dictionary.raise_reclaimed(SlotId(9), entry),
             Err(NotLive::Unknown { id: SlotId(9) })
         );
         assert_eq!(
             dictionary.get(a).map(|record| record.state.clone()),
             Some(SlotState::Tombstoned)
+        );
+    }
+
+    /// The proof of loss only rises (§3.2): a commit that arrives stale,
+    /// or out of order behind a later one, leaves the entry alone.
+    #[test]
+    fn reclaimed_through_only_rises() {
+        let g = geometry(4, 1);
+        let mut dictionary = Dictionary::default();
+        let a = dictionary.assign(&tenant("a"), g).expect("a");
+        let entry = |byte| Entry {
+            mode: EntryMode::Known,
+            offset: offset(byte),
+        };
+        let held = |dictionary: &Dictionary| match dictionary.get(a).map(|record| &record.state) {
+            Some(SlotState::Live {
+                reclaimed_through: Some(entry),
+            }) => Some(*entry),
+            _ => None,
+        };
+        dictionary.raise_reclaimed(a, entry(4096)).expect("first");
+        dictionary.raise_reclaimed(a, entry(8192)).expect("higher");
+        assert_eq!(held(&dictionary), Some(entry(8192)));
+        dictionary.raise_reclaimed(a, entry(64)).expect("stale");
+        assert_eq!(held(&dictionary), Some(entry(8192)), "a stale commit");
+        dictionary.raise_reclaimed(a, entry(8192)).expect("equal");
+        assert_eq!(held(&dictionary), Some(entry(8192)));
+
+        let older = Uuid::from_u128(0x0190_0000_0000_7000_8000_0000_0000_0000);
+        let earlier_segment = Entry {
+            mode: EntryMode::Known,
+            offset: WalOffset {
+                segment: older,
+                byte: u64::MAX,
+            },
+        };
+        dictionary
+            .raise_reclaimed(a, earlier_segment)
+            .expect("older segment");
+        assert_eq!(
+            held(&dictionary),
+            Some(entry(8192)),
+            "segments order before bytes"
         );
     }
 

@@ -1596,6 +1596,12 @@ fn list_segments(root: &std::path::Path) -> Result<Vec<PathBuf>, OpenError> {
 /// hard errors that surface as [`OpenError::Corrupt`]); the
 /// segment's `UUIDv7` comes from the in-file header so a
 /// renamed file still decodes correctly.
+///
+/// RFC 0052 §3.3 withdrew the idea of unlinking an unreadable newest
+/// segment: the shape carries no evidence of which cause produced it,
+/// and a heuristic that removes it can silently discard real data. So
+/// this still halts; what the RFC adds is that the halt is actionable,
+/// naming the file and the shape without claiming a cause.
 fn open_existing_segment(path: &std::path::Path) -> Result<(File, PathBuf, uuid::Uuid), OpenError> {
     let mut handle = OpenOptions::new()
         .read(true)
@@ -1606,7 +1612,10 @@ fn open_existing_segment(path: &std::path::Path) -> Result<(File, PathBuf, uuid:
             source,
         })?;
     let header = segment::read_header(&mut handle).map_err(|e| OpenError::Corrupt {
-        detail: format!("segment header at {}: {e}", path.display()),
+        detail: format!(
+            "segment header at {}: {e}. This is the newest segment in the WAL root and its header does not read. A rotation that failed before RFC 0052 §3.3's temporary-name sequence is one way to produce this shape — a header-only file left under its final name — but an unreadable header is indistinguishable from real corruption, so nothing is unlinked and whether to remove this file is an operator's decision.",
+            path.display()
+        ),
     })?;
     Ok((handle, path.to_path_buf(), header.segment_uuid))
 }
@@ -2207,6 +2216,66 @@ mod tests {
     }
 
     use super::*;
+
+    /// RFC 0052 §3.2's open-time reconciliation of the `planned` list.
+    /// A planned segment still present is retained and its entry
+    /// dropped — the next pass re-plans it — while an absent one is a
+    /// reclamation that finished, raising each tenant's
+    /// `reclaimed_through` as the commit would have. Both outcomes
+    /// leave the list empty and the record durable.
+    #[test]
+    fn reconcile_planned_drops_present_segments_and_raises_absent_ones() {
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let geometry = reclaim::Geometry::new(2, 2).expect("geometry");
+        let mut dictionary = reclaim::Dictionary::default();
+        let tenant = ourios_core::tenant::TenantId::try_new("checkout").expect("tenant");
+        let id = dictionary.assign(&tenant, geometry).expect("slot id");
+
+        let present = uuid::Uuid::now_v7();
+        let absent = uuid::Uuid::now_v7();
+        std::fs::write(tmp.path().join(format!("{present}.wal")), b"").expect("present segment");
+        let plan = |segment, byte| reclaim::PlannedUnlink {
+            segment,
+            uncertain: false,
+            last_offsets: BTreeMap::from([(id, WalOffset { segment, byte })]),
+        };
+        let record = reclaim::ReclaimRecord {
+            witness: reclaim::WitnessFlags::default(),
+            consumer_mode: reclaim::RecordedMode::Known,
+            dictionary,
+            planned: vec![plan(present, 100), plan(absent, 200)],
+        };
+        let mut store = reclaim_store::ReclaimStore::create(tmp.path(), geometry, &record, false)
+            .expect("create");
+
+        reconcile_planned(&mut store, tmp.path()).expect("reconcile");
+
+        let reconciled = store.record();
+        assert!(
+            reconciled.planned.is_empty(),
+            "every planned entry is resolved, not carried forward",
+        );
+        let state = reconciled.dictionary.get(id).map(|r| r.state.clone());
+        assert_eq!(
+            state,
+            Some(reclaim::SlotState::Live {
+                reclaimed_through: Some(reclaim::Entry {
+                    mode: reclaim::EntryMode::Known,
+                    offset: WalOffset {
+                        segment: absent,
+                        byte: 200
+                    },
+                }),
+            }),
+            "only the absent segment's offsets become proof of loss",
+        );
+        assert!(
+            tmp.path().join(format!("{present}.wal")).exists(),
+            "reconciliation never unlinks; the retained segment stays for the next pass",
+        );
+    }
 
     /// §6.3 macOS strong durability (#125): with the knob set, the
     /// segment sync goes through `fcntl(F_FULLFSYNC)` and the

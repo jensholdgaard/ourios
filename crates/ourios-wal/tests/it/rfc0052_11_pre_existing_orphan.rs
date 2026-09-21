@@ -11,17 +11,59 @@
 //! indistinguishable from real corruption — so open still halts; what
 //! this RFC adds is the error's guidance.
 
+use ourios_wal::{OpenError, Wal};
+
+use crate::rfc0052_support::{
+    CHECKPOINT, RECLAIM, build_closed_segment, default_config, downgrade_segments, segment_files,
+    truncate_segment_header,
+};
+
 /// Scenario RFC0052.11 — a partial-header newest `*.wal` still halts as `Corrupt`.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.11 stub — implemented in the reclaim-record green slice A (OpenError::Corrupt names the file and the rotation-remnant shape)"]
 fn rfc0052_11_legacy_orphan_halts_open_naming_the_file_and_shape() {
-    todo!(
-        "RFC0052.11 — a WAL directory whose newest *.wal has partial \
-         header bytes, written before this RFC; Wal::open reports \
-         OpenError::Corrupt rather than unlinking anything, and the \
-         error names the file, describes the observable shape and names \
-         a failed rotation as one possible cause without asserting it"
+    // Given: a WAL directory written before this RFC — version-1
+    // segments and neither sidecar — whose newest `*.wal` has partial
+    // header bytes.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    build_closed_segment(root, &[b"kept"]);
+    build_closed_segment(root, &[b"orphan"]);
+    std::fs::remove_file(root.join(RECLAIM)).expect("a pre-RFC root has no record");
+    assert!(!root.join(CHECKPOINT).exists(), "and no checkpoint");
+    downgrade_segments(root);
+    let newest = segment_files(root).pop().expect("two segments");
+    truncate_segment_header(&newest);
+
+    // When: the node starts.
+    let failure = Wal::open(default_config(root)).expect_err("open must halt");
+
+    // Then: `OpenError::Corrupt`, naming the file and the shape, and
+    // naming a failed rotation as one possible cause without asserting
+    // it — §3.3 withdrew the heuristic that would have unlinked it.
+    let OpenError::Corrupt { detail } = failure else {
+        panic!("expected Corrupt, got {failure:?}");
+    };
+    assert!(
+        detail.contains(&newest.display().to_string()),
+        "the error names the file: {detail}",
+    );
+    assert!(
+        detail.contains("newest segment") && detail.contains("header"),
+        "the error describes the observable shape: {detail}",
+    );
+    assert!(
+        detail.contains("rotation") && detail.contains("operator"),
+        "a failed rotation is named as one way to produce it, and the decision is an operator's: {detail}",
+    );
+    assert!(
+        newest.exists(),
+        "nothing is unlinked: an unreadable header is indistinguishable from real corruption",
+    );
+    assert_eq!(
+        segment_files(root).len(),
+        2,
+        "and no other segment is touched either",
     );
 }
 

@@ -768,10 +768,15 @@ impl Wal {
     ///
     /// # Errors
     ///
-    /// See [`CheckpointError`]. On error the in-memory
-    /// checkpoint is **not** advanced — the WAL conservatively
-    /// keeps all segments rather than risk a post-crash
-    /// data-side dup.
+    /// See [`CheckpointError`]. When the **sidecar write** fails the
+    /// in-memory checkpoint is not advanced — the WAL conservatively
+    /// keeps all segments rather than risk a post-crash data-side
+    /// dup. When the sidecar write succeeded and RFC 0052 §3.2's
+    /// `checkpoint_seen` write then failed, the mark *is* durable and
+    /// the in-memory checkpoint tracks it: leaving it behind would let
+    /// a later, lower mark pass the monotonicity check and rewrite the
+    /// sidecar backwards. The error still surfaces, and the next
+    /// [`Self::open`] promotes the witness.
     pub fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), CheckpointError> {
         if let Some(current) = self.checkpoint {
             if durable_to < current {
@@ -795,17 +800,23 @@ impl Wal {
         }
         reconcile::arm(&mut self.reclaim, &self.config)?;
         checkpoint::write(&self.config.root, durable_to)?;
-        // Nothing in memory advances until the witness is on disk too,
-        // so the documented "on error the checkpoint is not advanced"
-        // holds for every step rather than only the sidecar write. A
-        // retry at the same mark then re-runs both: the sidecar write
-        // is idempotent and the witness never clears, so the pair is
-        // self-healing rather than stuck behind a fast path.
-        reconcile::witness(&mut self.reclaim)?;
+        // The sidecar is durable as of the line above, so the
+        // in-memory mark follows it **immediately** and with nothing
+        // fallible in between. A later call that found a stale mark
+        // here would pass the monotonicity check against it and
+        // rewrite the sidecar *backwards*, which recovery reads as a
+        // lower Parquet suppression horizon and republishes every row
+        // above it. Keeping the two in step leaves no window for that
+        // rather than detecting it.
         self.checkpoint = Some(durable_to);
         self.checkpoint_version = Some(checkpoint::SidecarVersion::Current);
         self.reclaimable = true;
-        Ok(())
+        // The witness is a second durable write and its own failure:
+        // reported, never rolled back. `checkpoint_seen` governs only
+        // the open-time matrix, and an armed record beside a version-2
+        // sidecar is promoted at the next open, so a failure here
+        // loses nothing.
+        reconcile::witness(&mut self.reclaim)
     }
 
     /// The `CHECKPOINT` sidecar's offset (`None` =

@@ -181,11 +181,17 @@ fn is_partial(path: &Path) -> bool {
 /// already removed — including when a later unlink in the same pass
 /// fails.
 ///
-/// A failed unlink keeps its path in `partials`, which both retries it
-/// on the next pass and keeps it visible through
-/// `Wal::reclaim_state`. Housekeeping holds the single-writer
-/// position, so no rotation attempt is in progress and every partial
-/// it sees is debris.
+/// **A path leaves the list only when its removal is verified.** The
+/// list is the sweep's only record — §3.3 forbids a listing on the
+/// pass — so a failed unlink stays queued, an unlink whose parent
+/// fsync failed stays queued as §3.2's *uncertain* deletion for the
+/// next pass to re-verify (an unlink that then finds the file gone
+/// completes the reclamation), and the candidates a failed pass never
+/// reached stay queued untouched. Anything else would make debris
+/// invisible to every later pass.
+///
+/// Housekeeping holds the single-writer position, so no rotation
+/// attempt is in progress and every partial it sees is debris.
 pub(crate) fn sweep_partials(
     partials: &mut Vec<PathBuf>,
     root: &Path,
@@ -193,26 +199,101 @@ pub(crate) fn sweep_partials(
     let cap = usize::try_from(reclaim::DEFAULT_MAX_UNLINKS_PER_PASS).unwrap_or(usize::MAX);
     let take = partials.len().min(cap);
     let batch: Vec<PathBuf> = partials.drain(..take).collect();
-    let mut retry = Vec::new();
-    for path in batch {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                sync_parent_dir(root).map_err(|source| HousekeepingError::Io {
+    let mut queued = Vec::new();
+    for (index, path) in batch.iter().enumerate() {
+        match remove_partial(path, root) {
+            Swept::Removed => {}
+            Swept::Retry => queued.push(path.clone()),
+            // One fsync covers every unlink the pass has done, so a
+            // failure ends it: this path and every candidate after it
+            // go back on the list before the error surfaces.
+            Swept::Uncertain(source) => {
+                queued.extend_from_slice(&batch[index..]);
+                partials.extend(queued);
+                return Err(HousekeepingError::Io {
                     op: "fsync(wal_root after unlink(partial))",
                     source,
-                })?;
+                });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => retry.push(path),
         }
     }
-    partials.extend(retry);
+    partials.extend(queued);
     Ok(())
+}
+
+/// What one partial's removal did. Only [`Swept::Removed`] lets the
+/// path leave the list.
+enum Swept {
+    Removed,
+    /// The unlink failed. Retried next pass, and visible through
+    /// `Wal::reclaim_state` until it succeeds.
+    Retry,
+    /// The unlink succeeded but the parent fsync did not, so whether
+    /// the entry survives a restart is unknown until re-verified.
+    Uncertain(std::io::Error),
+}
+
+fn remove_partial(path: &Path, root: &Path) -> Swept {
+    match std::fs::remove_file(path) {
+        Ok(()) => match sync_parent_dir(root) {
+            Ok(()) => Swept::Removed,
+            Err(source) => Swept::Uncertain(source),
+        },
+        // Already gone: a previous pass's uncertain unlink really did
+        // land, which completes the reclamation.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Swept::Removed,
+        Err(_) => Swept::Retry,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_partial;
+    use std::path::PathBuf;
+
+    use super::{is_partial, sweep_partials};
+
+    /// The list is the sweep's only record, so a pass that fails
+    /// part-way must not consume it. With the parent fsync failing,
+    /// the path it just unlinked is an uncertain deletion and the
+    /// candidates it never reached were never even attempted: all of
+    /// them stay queued, or they become invisible to every later pass.
+    #[test]
+    fn a_failed_parent_fsync_leaves_the_whole_batch_queued() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let debris: Vec<PathBuf> = (0..3)
+            .map(|_| {
+                let path = tmp
+                    .path()
+                    .join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
+                std::fs::write(&path, b"rotation debris").expect("write");
+                path
+            })
+            .collect();
+        let mut partials = debris.clone();
+
+        // A root the fsync cannot open: each unlink succeeds, the
+        // fsync that would make it durable does not.
+        let unopenable = tmp.path().join("gone");
+        sweep_partials(&mut partials, &unopenable).expect_err("the parent fsync must fail");
+
+        assert_eq!(
+            partials, debris,
+            "every path stays queued, in order: the uncertain one and the untried ones alike",
+        );
+        assert!(
+            !debris[0].exists() && debris[1].exists(),
+            "the pass stops at the first failure rather than unlinking the rest",
+        );
+
+        // The next pass reconciles it: an unlink that finds the file
+        // gone completes the reclamation.
+        sweep_partials(&mut partials, tmp.path()).expect("a pass against a real root");
+        assert!(
+            partials.is_empty(),
+            "and the list drains once the fsync works"
+        );
+        assert!(debris.iter().all(|p| !p.exists()));
+    }
 
     /// The selector is the whole safety of the sweep: `*.tmp` is the
     /// checkpoint and snapshot namespace, and a stem that is not a

@@ -68,6 +68,16 @@ pub(crate) struct ReclaimStore {
     full_fsync: bool,
 }
 
+/// The parts a store is assembled from once its file exists — the
+/// same set whether the file was just created or reopened.
+struct Opened {
+    file: File,
+    geometry: Geometry,
+    live: SlotIndex,
+    generation: u64,
+    record: ReclaimRecord,
+}
+
 /// Whether `<root>/RECLAIM` is there at all — the input to §3.2's
 /// open-time matrix, which reads absence and damage as different
 /// things.
@@ -104,18 +114,14 @@ impl ReclaimStore {
     ) -> Result<Self, StoreError> {
         let path = root.join(SIDECAR_NAME);
         let bytes = whole_file(geometry, record, FIRST_GENERATION, &path)?;
-        let file = install(root, &path, &bytes, full_fsync)?;
-        Ok(Self {
-            path,
-            root: root.to_path_buf(),
-            file,
+        let opened = Opened {
+            file: install(root, &path, &bytes, full_fsync)?,
             geometry,
             live: SlotIndex::First,
             generation: FIRST_GENERATION,
             record: record.clone(),
-            buffer: vec![0u8; slot_bytes(geometry)],
-            full_fsync,
-        })
+        };
+        Ok(Self::assemble(root, opened, full_fsync))
     }
 
     /// Open the existing file, rebuilding it at the larger geometry
@@ -137,21 +143,35 @@ impl ReclaimStore {
                 source,
             })?;
         let (geometry, live, generation, record) = decode_file(&path, &mut file)?;
-        let mut store = Self {
-            path,
-            root: root.to_path_buf(),
+        let opened = Opened {
             file,
             geometry,
             live,
             generation,
             record,
-            buffer: vec![0u8; slot_bytes(geometry)],
-            full_fsync,
         };
+        let mut store = Self::assemble(root, opened, full_fsync);
         if !geometry.covers(needed) {
             store.rebuild(needed)?;
         }
         Ok(store)
+    }
+
+    /// Build the store around a file that already exists, wherever it
+    /// came from. The reusable slot buffer is sized here so both
+    /// entry points get it right.
+    fn assemble(root: &Path, opened: Opened, full_fsync: bool) -> Self {
+        Self {
+            path: root.join(SIDECAR_NAME),
+            root: root.to_path_buf(),
+            buffer: vec![0u8; slot_bytes(opened.geometry)],
+            file: opened.file,
+            geometry: opened.geometry,
+            live: opened.live,
+            generation: opened.generation,
+            record: opened.record,
+            full_fsync,
+        }
     }
 
     pub(crate) fn record(&self) -> &ReclaimRecord {
@@ -388,27 +408,6 @@ mod tests {
         assert_eq!(store.record(), &armed());
     }
 
-    /// A header declaring a geometry the file does not have is refused
-    /// before anything sized by it is allocated: the stored capacities
-    /// can describe hundreds of GiB, and trusting them enough to read
-    /// the file whole would let a malformed sidecar stall startup.
-    #[test]
-    fn a_header_disagreeing_with_the_file_length_is_refused() {
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let g = geometry(2, 1);
-        ReclaimStore::create(tmp.path(), g, &armed(), false).expect("create");
-        let path = tmp.path().join(SIDECAR_NAME);
-        let bytes = std::fs::read(&path).expect("read");
-        // The header is intact; the file is not as long as it claims.
-        std::fs::write(&path, &bytes[..bytes.len() - 1]).expect("truncate");
-        match ReclaimStore::open(tmp.path(), g, false) {
-            Err(StoreError::Corrupt { detail }) => {
-                assert!(detail.contains("expected"), "detail: {detail}");
-            }
-            other => panic!("expected Corrupt, got {other:?}"),
-        }
-    }
-
     /// A commit alternates slots, never extends the file, and is what a
     /// later reader sees — the property that makes a pass on a full
     /// volume safe.
@@ -459,22 +458,39 @@ mod tests {
         );
     }
 
-    /// Damage anywhere in the header or in both slots is `Corrupt`
-    /// naming the file — never silently read as a missing record.
+    /// Damage is `Corrupt` naming the file, never silently read as a
+    /// missing record — and a header declaring a geometry the file
+    /// does not have is refused *before* anything sized by it is
+    /// allocated, since the stored capacities can describe hundreds of
+    /// GiB.
     #[test]
     fn a_damaged_file_is_corrupt_naming_the_file() {
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let g = geometry(2, 1);
-        ReclaimStore::create(tmp.path(), g, &armed(), false).expect("create");
-        let path = tmp.path().join(SIDECAR_NAME);
-        let mut bytes = std::fs::read(&path).expect("read");
-        bytes[4] = 0xFF;
-        std::fs::write(&path, &bytes).expect("poison the version byte");
-        match ReclaimStore::open(tmp.path(), g, false) {
-            Err(StoreError::Corrupt { detail }) => {
-                assert!(detail.contains("RECLAIM sidecar at"), "detail: {detail}");
+        /// How one case damages a valid file.
+        type Damage = fn(Vec<u8>) -> Vec<u8>;
+
+        let cases: [(&str, Damage); 2] = [
+            ("the version byte", |mut bytes| {
+                bytes[4] = 0xFF;
+                bytes
+            }),
+            // The header stays intact; the file is not as long as it
+            // claims to be.
+            ("the file length", |bytes| bytes[..bytes.len() - 1].to_vec()),
+        ];
+        for (what, damage) in cases {
+            let tmp = tempfile::TempDir::new().expect("temp");
+            let g = geometry(2, 1);
+            ReclaimStore::create(tmp.path(), g, &armed(), false).expect("create");
+            let path = tmp.path().join(SIDECAR_NAME);
+            let bytes = std::fs::read(&path).expect("read");
+            std::fs::write(&path, damage(bytes)).expect("damage the file");
+            match ReclaimStore::open(tmp.path(), g, false) {
+                Err(StoreError::Corrupt { detail }) => assert!(
+                    detail.contains("RECLAIM sidecar at"),
+                    "{what}: detail names the file, got {detail}",
+                ),
+                other => panic!("{what}: expected Corrupt, got {other:?}"),
             }
-            other => panic!("expected Corrupt, got {other:?}"),
         }
     }
 

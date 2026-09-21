@@ -798,16 +798,7 @@ impl Wal {
             // housekeeping would stay gated forever. Only an equal
             // mark on an already-version-2 sidecar takes the no-write
             // fast path.
-            // The fast path also requires the witness to be on disk.
-            // A previous call whose `checkpoint_seen` write failed
-            // left the mark durable and the witness unarmed-or-armed,
-            // and taking the fast path there would skip that write for
-            // the life of the process — so a retry at the same mark
-            // really does retry both halves.
-            if durable_to == current
-                && self.checkpoint_version == Some(checkpoint::SidecarVersion::Current)
-                && self.checkpoint_is_witnessed()
-            {
+            if durable_to == current && self.checkpoint_is_settled() {
                 return Ok(());
             }
         }
@@ -834,9 +825,17 @@ impl Wal {
         reconcile::witness(&mut self.reclaim)
     }
 
-    /// Whether `checkpoint_seen` is on disk. A legacy root with no
-    /// record has no witness, so it never takes the no-write path.
-    fn checkpoint_is_witnessed(&self) -> bool {
+    /// Both halves of the last checkpoint are on disk: the sidecar at
+    /// version 2, and `checkpoint_seen` in the record beside it.
+    /// Either one missing is real work — RFC 0052 §3.2's
+    /// version-aware upgrade, or a witness write a previous call
+    /// failed — so an equal mark must not take the no-write path and
+    /// skip it for the life of the process. A legacy root with no
+    /// record has no witness and is never settled.
+    fn checkpoint_is_settled(&self) -> bool {
+        if self.checkpoint_version != Some(checkpoint::SidecarVersion::Current) {
+            return false;
+        }
         self.reclaim
             .as_ref()
             .is_some_and(|store| store.record().witness.checkpoint == reclaim::Witness::Terminal)

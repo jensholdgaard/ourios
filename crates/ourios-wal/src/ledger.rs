@@ -248,7 +248,7 @@ fn remove_partial(path: &Path, root: &Path) -> Swept {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{is_partial, sweep_partials};
 
@@ -260,15 +260,21 @@ mod tests {
     #[test]
     fn a_failed_parent_fsync_leaves_the_whole_batch_queued() {
         let tmp = tempfile::TempDir::new().expect("temp");
-        let debris: Vec<PathBuf> = (0..3)
-            .map(|_| {
-                let path = tmp
-                    .path()
-                    .join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
-                std::fs::write(&path, b"rotation debris").expect("write");
-                path
-            })
-            .collect();
+        // Fixed names, ordered as the seeded list is: the assertion is
+        // about *which* paths survive a failed pass and in what order,
+        // so minting them would make the expectation unreadable.
+        let debris: Vec<PathBuf> = [
+            "01890c43-7b3d-7c01-9e00-00000000000a.wal.partial",
+            "01890c43-7b3d-7c01-9e00-00000000000b.wal.partial",
+            "01890c43-7b3d-7c01-9e00-00000000000c.wal.partial",
+        ]
+        .iter()
+        .map(|name| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, b"rotation debris").expect("write");
+            path
+        })
+        .collect();
         let mut partials = debris.clone();
 
         // A root the fsync cannot open: each unlink succeeds, the
@@ -300,12 +306,13 @@ mod tests {
     /// UUID is an operator's file, not rotation debris.
     #[test]
     fn only_a_uuid_named_wal_partial_matches() {
-        let uuid = uuid::Uuid::now_v7();
+        // Fixed names rather than minted ones: the selector is a
+        // textual shape, so the cases belong in the test as text.
         for name in [
-            format!("{uuid}.wal.partial"),
-            format!("{}.wal.partial", uuid::Uuid::nil()),
+            "01890c43-7b3d-7c01-9e00-0123456789ab.wal.partial",
+            "00000000-0000-0000-0000-000000000000.wal.partial",
         ] {
-            assert!(is_partial(std::path::Path::new(&name)), "{name}");
+            assert!(is_partial(Path::new(name)), "{name}");
         }
         for name in [
             "foo.wal.partial",
@@ -313,10 +320,11 @@ mod tests {
             "RECLAIM",
             "RECLAIM.new",
             "checkout.42.snap.tmp",
-            &format!("{uuid}.wal"),
-            &format!("{uuid}.wal.partial.bak"),
+            "01890c43-7b3d-7c01-9e00-0123456789ab.wal",
+            "01890c43-7b3d-7c01-9e00-0123456789ab.wal.partial.bak",
+            "01890c43-7b3d-7c01-9e00-0123456789ab",
         ] {
-            assert!(!is_partial(std::path::Path::new(name)), "{name}");
+            assert!(!is_partial(Path::new(name)), "{name}");
         }
     }
 }

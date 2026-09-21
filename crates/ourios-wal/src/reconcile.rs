@@ -7,8 +7,11 @@
 //! safe to proceed from. Every row that cannot be told apart from a
 //! loss fails closed, naming the files it read.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+use uuid::Uuid;
 
 use crate::{CheckpointError, OpenError, WalConfig, checkpoint, reclaim, reclaim_store, segment};
 
@@ -207,21 +210,46 @@ pub(crate) fn planned(
         // so a decoded record with entries always has one.
         reclaim::RecordedMode::Unrecorded => return Ok(()),
     };
+    let surviving = surviving_segments(root)?;
     let mut record = store.record().clone();
     let planned = std::mem::take(&mut record.planned);
     for entry in &planned {
-        let present = root
-            .join(format!("{}.wal", entry.segment))
-            .try_exists()
-            .map_err(|source| OpenError::Io {
-                op: "stat(planned segment)",
-                source,
-            })?;
-        if !present {
+        if !surviving.contains(&entry.segment) {
             raise_reclaimed(&mut record, entry, mode)?;
         }
     }
     store.commit(&record).map_err(OpenError::from)
+}
+
+/// The uuids of the segments that survive, read from their **headers**
+/// rather than their names. A segment's identity is its in-file uuid —
+/// `Wal::housekeeping` already judges a renamed file by it rather than
+/// by its path — so matching on `<uuid>.wal` would read a renamed
+/// survivor as reclaimed and raise `reclaimed_through` over frames
+/// that are still on disk.
+///
+/// A header that will not read fails the whole reconciliation closed.
+/// It is not evidence that some *other* planned segment is gone, and
+/// the one thing this function must never do is under-report a
+/// survivor: `reclaimed_through` is read as proof of loss. Such a root
+/// halts anyway — `Wal::open` on the newest unreadable segment, replay
+/// on any other — so refusing here costs nothing and guesses nothing.
+fn surviving_segments(root: &Path) -> Result<HashSet<Uuid>, OpenError> {
+    let mut out = HashSet::new();
+    for path in crate::list_segments(root)? {
+        let mut handle = File::open(&path).map_err(|source| OpenError::Io {
+            op: "open(segment for reconciliation)",
+            source,
+        })?;
+        let header = segment::read_header(&mut handle).map_err(|e| OpenError::Corrupt {
+            detail: format!(
+                "segment header at {}: {e}. RECLAIM holds planned unlinks, and a segment whose identity cannot be read cannot be reconciled against them without guessing at what is already gone.",
+                path.display()
+            ),
+        })?;
+        out.insert(header.segment_uuid);
+    }
+    Ok(out)
 }
 
 /// An absent planned segment is a reclamation that finished: each
@@ -525,14 +553,20 @@ mod tests {
     #[test]
     fn reconcile_planned_drops_present_segments_and_raises_absent_ones() {
         let tmp = tempfile::TempDir::new().expect("temp");
-        let geometry = Geometry::new(2, 2).expect("geometry");
+        let geometry = Geometry::new(2, 3).expect("geometry");
         let mut dictionary = Dictionary::default();
         let tenant = TenantId::try_new("checkout").expect("tenant");
         let id = dictionary.assign(&tenant, geometry).expect("slot id");
 
         let present = uuid::Uuid::now_v7();
+        let renamed = uuid::Uuid::now_v7();
         let absent = uuid::Uuid::now_v7();
-        std::fs::write(tmp.path().join(format!("{present}.wal")), b"").expect("present segment");
+        lay_down_segment(tmp.path(), present, &format!("{present}.wal"));
+        // A survivor under a non-canonical name. Identity is the
+        // in-file uuid, so this must read as present too — matching on
+        // `<uuid>.wal` would raise `reclaimed_through` over frames
+        // that are still there.
+        lay_down_segment(tmp.path(), renamed, "moved-by-an-operator.wal");
         let plan = |segment, byte| PlannedUnlink {
             segment,
             uncertain: false,
@@ -542,7 +576,7 @@ mod tests {
             witness: WitnessFlags::default(),
             consumer_mode: RecordedMode::Known,
             dictionary,
-            planned: vec![plan(present, 100), plan(absent, 200)],
+            planned: vec![plan(present, 100), plan(renamed, 150), plan(absent, 200)],
         };
         let mut store = ReclaimStore::create(tmp.path(), geometry, &record, false).expect("create");
 
@@ -568,8 +602,18 @@ mod tests {
             "only the absent segment's offsets become proof of loss",
         );
         assert!(
-            tmp.path().join(format!("{present}.wal")).exists(),
-            "reconciliation never unlinks; the retained segment stays for the next pass",
+            tmp.path().join(format!("{present}.wal")).exists()
+                && tmp.path().join("moved-by-an-operator.wal").exists(),
+            "reconciliation never unlinks; the retained segments stay for the next pass",
         );
+    }
+
+    /// Write a real 24 B segment header, since reconciliation reads
+    /// identity out of the file rather than off the name.
+    fn lay_down_segment(root: &std::path::Path, uuid: uuid::Uuid, name: &str) {
+        let mut bytes = Vec::new();
+        crate::segment::write_header(&mut bytes, &crate::segment::SegmentHeader::new(uuid))
+            .expect("header");
+        std::fs::write(root.join(name), &bytes).expect("segment");
     }
 }

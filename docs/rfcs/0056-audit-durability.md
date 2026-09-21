@@ -12,9 +12,9 @@ superseded-by: —
 # RFC 0056 — Audit-sink durability on permanent write failure
 
 > **Status note.** `drafted`. Split out of RFC 0053's status note so an
-> amendment to an *accepted* RFC is not hidden. Source wording: #802 @
+> amendment to an *accepted* RFC is not hidden. Source wording: [#802](https://github.com/jensholdgaard/ourios/pull/802) @
 > `30a21f80`, status note + the three-way `write_owned` result in §3.2.
-> **Blocked from `validated` by #809** — RFC 0026's denial-audit
+> **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)** — RFC 0026's denial-audit
 > durability, which §7 explains this RFC cannot close.
 
 ## 1. Summary
@@ -30,8 +30,10 @@ requeued. The tenant becomes server-terminal until repaired.
 ## 2. Motivation
 
 A record in Parquet without the template event that describes it
-breaks `CLAUDE.md` §3.1 (no silent template merges / audit
-durability). The 0053 draft changed that behaviour in a status note.
+breaks two contracts at once: `CLAUDE.md` §3.1, which forbids a silent
+template merge and requires an audit event on every template change, and
+RFC 0005 §7, the durability contract under which those events survive a
+crash. The 0053 draft changed that behaviour in a status note.
 An accepted RFC needs its own amendment and criterion.
 
 ## 3. Proposed design

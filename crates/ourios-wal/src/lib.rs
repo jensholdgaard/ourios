@@ -33,10 +33,13 @@ pub(crate) mod checkpoint;
 pub(crate) mod frame;
 #[cfg(feature = "fuzzing")]
 pub mod frame;
-// The codec lands ahead of its callers: `Wal::open` wires the sidecar
-// in the next RFC 0052 slice, which removes this allow.
+// The codec's dictionary-mutation surface (assign, tombstone, union,
+// raise_reclaimed) lands ahead of its callers: the housekeeping pass
+// that merges horizons into the record is RFC 0052's next slice, which
+// removes this allow.
 #[allow(dead_code)]
 pub(crate) mod reclaim;
+pub(crate) mod reclaim_store;
 pub(crate) mod segment;
 
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
@@ -333,6 +336,33 @@ pub struct Wal {
     /// Parquet-side suppression horizon ([`Self::last_checkpoint`])
     /// and one of housekeeping's two truncation bounds.
     checkpoint: Option<WalOffset>,
+    /// The format version of the `CHECKPOINT` on disk (RFC 0052
+    /// §3.2). A version-1 sidecar is a pre-RFC root whose next
+    /// checkpoint rewrites it at version 2; the version, not the
+    /// mark, decides whether that rewrite happens, so an idle node
+    /// offering an unchanged mark still reaches version 2.
+    checkpoint_version: Option<checkpoint::SidecarVersion>,
+    /// The `RECLAIM` sidecar (RFC 0052 §3.2), when this root has one.
+    /// A legacy root opens without a record and the first checkpoint
+    /// creates it on the upgrade path.
+    reclaim: Option<reclaim_store::ReclaimStore>,
+    /// Whether a housekeeping pass may plan segments: RFC 0052 §3.2's
+    /// witness, a version-2 `CHECKPOINT` beside a record. Until it
+    /// exists a pass sweeps partials and plans nothing, since
+    /// unlinking under a version-1 checkpoint would leave exactly the
+    /// shape the open-time matrix reads as "nothing was ever
+    /// reclaimed".
+    reclaimable: bool,
+    /// Stale `<uuid>.wal.partial` files, seeded by
+    /// [`Self::rebuild_ledger`] and popped by the housekeeping sweep.
+    /// §3.3: the sweep lists nothing on the pass, so restart debris is
+    /// found without a directory scan under the writer position.
+    stale_partials: Vec<PathBuf>,
+    /// Bytes of validated frames in surviving segments, seeded after
+    /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
+    /// less header, which would count a torn tail, and never the
+    /// best-effort directory walk `metrics` uses.
+    unreclaimed_bytes: u64,
     /// A rotation step failed (§6.5): the closing segment's
     /// data sync, the fresh segment's creation, or the
     /// parent-dir `fsync`. Once set, every `append` is refused
@@ -366,6 +396,13 @@ impl Wal {
     /// **before** any [`Self::append`] to walk surviving
     /// frames into the recovery sink.
     ///
+    /// The `RECLAIM` sidecar is read, reconciled and — on a fresh root
+    /// — created and fsynced **before** the initial segment exists
+    /// (RFC 0052 §3.2). That ordering is part of the contract: a
+    /// record written afterwards would leave a first-ever node one
+    /// crash away from a root holding a segment and neither sidecar,
+    /// which is the state the open-time matrix fails closed on.
+    ///
     /// # Errors
     ///
     /// See [`OpenError`].
@@ -375,13 +412,24 @@ impl Wal {
             op: "create_dir_all(wal_root)",
             source,
         })?;
+        // RFC 0052 §3.2: a rename's parent fsync can fail after the
+        // entry is already visible to this process, so a listing alone
+        // does not prove a sidecar survives the next crash. One
+        // directory fsync before the sidecars are read makes every
+        // entry the listing saw durable, and failing it is a fault to
+        // surface rather than to continue past.
+        sync_parent_dir(&config.root).map_err(|source| OpenError::Io {
+            op: "fsync(wal_root before reading the sidecars)",
+            source,
+        })?;
         // §6.6 step 1: a present-but-invalid sidecar aborts here
         // (before any recovery) rather than being silently
         // treated as None — that would drop the Parquet
         // suppression horizon and duplicate every
         // already-published record on the data side.
-        let checkpoint = checkpoint::read(&config.root)?.map(|sidecar| sidecar.offset);
+        let sidecar = checkpoint::read(&config.root)?;
         let existing_segments = list_segments(&config.root)?;
+        let witness = reconcile_root(&config, sidecar, &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             if let Some(newest) = existing_segments.into_iter().next_back() {
                 open_existing_segment(&newest)?
@@ -399,12 +447,71 @@ impl Wal {
             // directory entry (see the field doc — §3.4).
             dir_fsync_pending: true,
             quiesced: false,
-            checkpoint,
+            checkpoint: sidecar.map(|s| s.offset),
+            checkpoint_version: sidecar.map(|s| s.version),
+            reclaim: witness.store,
+            reclaimable: witness.reclaimable,
+            stale_partials: Vec::new(),
+            unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,
             unflushed_bytes: 0,
             corrupt_frames_total: 0,
         })
+    }
+
+    /// Rebuild the in-memory ledger RFC 0052 §3.7 requires from the
+    /// surviving segments: the unreclaimed-byte figure and the stale
+    /// `*.wal.partial` list the housekeeping sweep pops from. Called
+    /// by the recovery driver **after** replay has healed any torn
+    /// tail, since a figure taken at `open` would count torn bytes.
+    ///
+    /// The walk validates every frame prefix exactly as replay does
+    /// and decodes each `TenantOtlpBatch`'s tenant, so a frame written
+    /// before RFC 0052 §3.2 amended the bound — carrying a tenant
+    /// longer than [`TenantBatch::MAX_TENANT_BYTES`] — fails closed
+    /// here, naming the frame and the length, rather than having its
+    /// key truncated or its frame dropped.
+    ///
+    /// # Errors
+    ///
+    /// See [`LedgerError`].
+    pub fn rebuild_ledger(&mut self) -> Result<(), LedgerError> {
+        let segments = list_segments(&self.config.root).map_err(|e| match e {
+            OpenError::Io { op, source } => LedgerError::Io { op, source },
+            OpenError::InvalidConfig { .. } | OpenError::Corrupt { .. } => {
+                unreachable!("list_segments only surfaces OpenError::Io")
+            }
+        })?;
+        let mut scan = LedgerScan::default();
+        let newest_idx = segments.len().checked_sub(1);
+        for (idx, path) in segments.iter().enumerate() {
+            match replay_segment(path, Some(idx) == newest_idx, &mut scan) {
+                Ok(SegmentScan::CleanTail | SegmentScan::TornTail { .. }) => {}
+                Err(e) => return Err(scan.into_error(&e)),
+            }
+        }
+        self.unreclaimed_bytes = scan.bytes;
+        self.stale_partials = list_partials(&self.config.root)?;
+        Ok(())
+    }
+
+    /// The WAL state RFC 0052 §3.5 exports. The retain floor with its
+    /// lag, the rotation-failure state and the age of the oldest
+    /// unreclaimed frame arrive with the slices that own them; this is
+    /// what the WAL knows once the sidecar is wired.
+    #[must_use]
+    pub fn reclaim_state(&self) -> ReclaimState {
+        let metrics = self.metrics();
+        ReclaimState {
+            unflushed_bytes: metrics.unflushed_bytes,
+            disk_bytes: metrics.disk_bytes,
+            segment_count: metrics.segment_count,
+            unreclaimed_bytes: self.unreclaimed_bytes,
+            checkpoint: self.checkpoint,
+            stale_partials: self.stale_partials.len(),
+            reclaimable: self.reclaimable,
+        }
     }
 
     /// Append a frame of `kind` carrying `payload` (≤
@@ -690,13 +797,87 @@ impl Wal {
                     attempted: durable_to,
                 });
             }
-            if durable_to == current {
+            // RFC 0052 §3.2's upgrade is version-aware, not
+            // mark-aware: an idle node offers an unchanged mark on
+            // every barrier after the first, so a root whose sidecar
+            // is still version 1 would never reach version 2 and
+            // housekeeping would stay gated forever. Only an equal
+            // mark on an already-version-2 sidecar takes the no-write
+            // fast path.
+            if durable_to == current
+                && self.checkpoint_version == Some(checkpoint::SidecarVersion::Current)
+            {
                 return Ok(());
             }
         }
+        self.arm_reclaim_record()?;
         checkpoint::write(&self.config.root, durable_to)?;
         self.checkpoint = Some(durable_to);
-        Ok(())
+        self.checkpoint_version = Some(checkpoint::SidecarVersion::Current);
+        self.reclaimable = true;
+        self.witness_checkpoint()
+    }
+
+    /// Write `checkpoint_armed` durably before the first version-2
+    /// `CHECKPOINT` attempt, creating the record when a legacy root
+    /// has none (RFC 0052 §3.2). Arming before the attempt is what
+    /// keeps a crash in the window between the two an ordinary state
+    /// rather than a lost checkpoint.
+    fn arm_reclaim_record(&mut self) -> Result<(), CheckpointError> {
+        let armed = reclaim::WitnessFlags {
+            checkpoint: reclaim::Witness::Armed,
+            ..reclaim::WitnessFlags::default()
+        };
+        match self.reclaim.as_mut() {
+            Some(store) if store.record().witness.checkpoint == reclaim::Witness::Unarmed => {
+                let record = reclaim::ReclaimRecord {
+                    witness: armed,
+                    ..store.record().clone()
+                };
+                store.commit(&record).map_err(record_failed)
+            }
+            Some(_) => Ok(()),
+            None => {
+                let record = reclaim::ReclaimRecord {
+                    witness: armed,
+                    ..reclaim::ReclaimRecord::default()
+                };
+                let geometry = configured_geometry().map_err(|e| CheckpointError::Io {
+                    op: "size(RECLAIM)",
+                    source: std::io::Error::new(ErrorKind::InvalidData, e.to_string()),
+                })?;
+                let store = reclaim_store::ReclaimStore::create(
+                    &self.config.root,
+                    geometry,
+                    &record,
+                    self.config.macos_full_fsync,
+                )
+                .map_err(record_failed)?;
+                self.reclaim = Some(store);
+                Ok(())
+            }
+        }
+    }
+
+    /// Write `checkpoint_seen` at the next record write after the
+    /// checkpoint succeeded — immediately, since no pass is pending
+    /// (§3.2). Once seen the flag never clears, which is what lets the
+    /// open-time matrix read a later missing `CHECKPOINT` as a loss
+    /// rather than as a fresh root.
+    fn witness_checkpoint(&mut self) -> Result<(), CheckpointError> {
+        match self.reclaim.as_mut() {
+            Some(store) if store.record().witness.checkpoint != reclaim::Witness::Terminal => {
+                let record = reclaim::ReclaimRecord {
+                    witness: reclaim::WitnessFlags {
+                        checkpoint: reclaim::Witness::Terminal,
+                        ..store.record().witness
+                    },
+                    ..store.record().clone()
+                };
+                store.commit(&record).map_err(record_failed)
+            }
+            Some(_) | None => Ok(()),
+        }
     }
 
     /// The `CHECKPOINT` sidecar's offset (`None` =
@@ -730,9 +911,22 @@ impl Wal {
         &mut self,
         retain_floor: Option<WalOffset>,
     ) -> Result<(), HousekeepingError> {
+        // RFC 0052 §3.3: the sweep runs on **every** pass, witness or
+        // not. A `.wal.partial` is debris from a rotation that never
+        // installed a segment — no reader can depend on it and no
+        // `reclaimed_through` accounts for it — so gating it would let
+        // debris created before the first checkpoint survive forever.
+        self.sweep_partials()?;
         let Some(cp) = self.checkpoint else {
             return Ok(());
         };
+        // §3.2: a pass whose root still has a version-1 `CHECKPOINT`,
+        // or no record, plans no segment. Unlinking there would leave
+        // exactly the shape the open-time matrix reads as "nothing was
+        // ever reclaimed".
+        if !self.reclaimable {
+            return Ok(());
+        }
         let bound = match retain_floor {
             Some(floor) => cp.min(floor),
             None => cp,
@@ -780,6 +974,38 @@ impl Wal {
             sync_parent_dir(&self.config.root)
                 .map_err(|e| io("fsync(wal_root after housekeeping)", e))?;
         }
+        Ok(())
+    }
+
+    /// Unlink stale `<uuid>.wal.partial` files, oldest first, within
+    /// the per-pass cap (RFC 0052 §3.3). Each unlink is followed by a
+    /// parent-directory fsync, so a crash cannot resurrect debris the
+    /// pass already removed — including when a later unlink in the
+    /// same pass fails.
+    ///
+    /// A failed unlink keeps its path in the list, which both retries
+    /// it on the next pass and keeps it visible through
+    /// [`Self::reclaim_state`]. Housekeeping holds the single-writer
+    /// position, so no rotation attempt is in progress and every
+    /// partial it sees is debris.
+    fn sweep_partials(&mut self) -> Result<(), HousekeepingError> {
+        let cap = usize::try_from(reclaim::DEFAULT_MAX_UNLINKS_PER_PASS).unwrap_or(usize::MAX);
+        let take = self.stale_partials.len().min(cap);
+        let batch: Vec<PathBuf> = self.stale_partials.drain(..take).collect();
+        let mut retry = Vec::new();
+        for path in batch {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    sync_parent_dir(&self.config.root).map_err(|source| HousekeepingError::Io {
+                        op: "fsync(wal_root after unlink(partial))",
+                        source,
+                    })?;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(_) => retry.push(path),
+            }
+        }
+        self.stale_partials.extend(retry);
         Ok(())
     }
 
@@ -967,6 +1193,368 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
     }
     // `macos_full_fsync` is a `bool`; nothing to validate.
     Ok(())
+}
+
+/// The geometry every `RECLAIM` file this build creates is sized for.
+/// `max_tenants` and `max_unlinks_per_pass` become [`WalConfig`] knobs
+/// with the housekeeping pass that reads the cap (RFC 0052 §3.8);
+/// until then the RFC's own defaults are the only values, and
+/// `Wal::open` still rebuilds a file built at a smaller geometry.
+fn configured_geometry() -> Result<reclaim::Geometry, reclaim::GeometryError> {
+    reclaim::Geometry::new(
+        reclaim::DEFAULT_MAX_TENANTS,
+        reclaim::DEFAULT_MAX_UNLINKS_PER_PASS,
+    )
+}
+
+/// What RFC 0052 §3.2's open-time matrix decided about this root.
+struct RootWitness {
+    store: Option<reclaim_store::ReclaimStore>,
+    /// A version-2 `CHECKPOINT` beside a record — the only shape a
+    /// pass may plan segments under.
+    reclaimable: bool,
+}
+
+impl RootWitness {
+    /// A pre-RFC root: no record is created, and the first checkpoint
+    /// makes one on the upgrade path.
+    fn legacy() -> Self {
+        Self {
+            store: None,
+            reclaimable: false,
+        }
+    }
+
+    /// A record whose root still owes the version-2 upgrade.
+    fn with_record(store: reclaim_store::ReclaimStore) -> Self {
+        Self {
+            store: Some(store),
+            reclaimable: false,
+        }
+    }
+
+    fn witnessed(store: reclaim_store::ReclaimStore) -> Self {
+        Self {
+            store: Some(store),
+            reclaimable: true,
+        }
+    }
+}
+
+/// RFC 0052 §3.2's open-time matrix over the `CHECKPOINT` version, the
+/// `RECLAIM` record and the segment headers. Missing means "never
+/// reclaimed" and damaged means "reclaimed, extent unknown", so the
+/// two are never collapsed: only the first is safe to proceed from.
+fn reconcile_root(
+    config: &WalConfig,
+    sidecar: Option<checkpoint::Sidecar>,
+    segments: &[PathBuf],
+) -> Result<RootWitness, OpenError> {
+    let version = sidecar.map(|s| s.version);
+    if reclaim_store::present(&config.root)? {
+        return reconcile_record(config, version, segments);
+    }
+    match version {
+        // Every unlink is gated on a checkpoint, and on a post-RFC
+        // root the record is created at open, before the first
+        // checkpoint can exist — so a version-2 sidecar beside no
+        // record is a loss, not a pre-RFC layout.
+        Some(checkpoint::SidecarVersion::Current) => Err(lost_record(&config.root)),
+        Some(checkpoint::SidecarVersion::Legacy) => Ok(RootWitness::legacy()),
+        None => open_without_sidecars(config, segments),
+    }
+}
+
+/// The record is there: promote or retain its checkpoint witness by
+/// the `CHECKPOINT` beside it, and reconcile its `planned` entries
+/// against the directory before anything reads it as proof of loss.
+fn reconcile_record(
+    config: &WalConfig,
+    version: Option<checkpoint::SidecarVersion>,
+    segments: &[PathBuf],
+) -> Result<RootWitness, OpenError> {
+    let geometry = configured_geometry().map_err(|e| OpenError::InvalidConfig {
+        field: "max_tenants",
+        detail: e.to_string(),
+    })?;
+    let mut store =
+        reclaim_store::ReclaimStore::open(&config.root, geometry, config.macos_full_fsync)?;
+    match (version, store.record().witness.checkpoint) {
+        (Some(checkpoint::SidecarVersion::Current), witness) => {
+            promote_checkpoint_witness(&mut store, witness)?;
+            reconcile_planned(&mut store, &config.root)?;
+            Ok(RootWitness::witnessed(store))
+        }
+        // The migration's own retry state: armed, no version-2
+        // checkpoint, and nothing reclaimed — housekeeping is gated
+        // until the witness exists — so the next checkpoint retries
+        // the upgrade against the arming already on disk.
+        (Some(checkpoint::SidecarVersion::Legacy), _) => {
+            reconcile_planned(&mut store, &config.root)?;
+            Ok(RootWitness::with_record(store))
+        }
+        (None, reclaim::Witness::Terminal) => Err(lost_checkpoint(&config.root)),
+        // Not fresh at all: the first rotation on a legacy root writes
+        // the record before it creates its version-2 segment, so this
+        // is that root mid migration. Emptying the record here would
+        // discard a mode the first pass may already have adopted.
+        (None, _) if !segments.is_empty() => {
+            reconcile_planned(&mut store, &config.root)?;
+            Ok(RootWitness::with_record(store))
+        }
+        (None, _) => {
+            reset_record(&mut store)?;
+            Ok(RootWitness::with_record(store))
+        }
+    }
+}
+
+/// An armed record beside a present version-2 `CHECKPOINT` is the
+/// ordinary post-upgrade state — the crash simply landed before the
+/// record's next write — so open promotes it durably before anything
+/// reads the matrix, and it is never a fault.
+fn promote_checkpoint_witness(
+    store: &mut reclaim_store::ReclaimStore,
+    witness: reclaim::Witness,
+) -> Result<(), OpenError> {
+    if witness == reclaim::Witness::Terminal {
+        return Ok(());
+    }
+    let record = reclaim::ReclaimRecord {
+        witness: reclaim::WitnessFlags {
+            checkpoint: reclaim::Witness::Terminal,
+            ..store.record().witness
+        },
+        ..store.record().clone()
+    };
+    store.commit(&record).map_err(OpenError::from)
+}
+
+/// A record beside a missing `CHECKPOINT` on a root with **no
+/// segments** is a genuinely fresh root whose arming preceded a
+/// checkpoint that never landed: it is opened empty and re-armed by
+/// the next attempt.
+fn reset_record(store: &mut reclaim_store::ReclaimStore) -> Result<(), OpenError> {
+    if *store.record() == reclaim::ReclaimRecord::default() {
+        return Ok(());
+    }
+    store
+        .commit(&reclaim::ReclaimRecord::default())
+        .map_err(OpenError::from)
+}
+
+/// §3.2's open-time reconciliation of the `planned` list. A planned
+/// segment still present is retained — the ledger rebuilds it and a
+/// later pass re-plans it — and its entry is dropped; an absent one is
+/// treated exactly like a completed reclamation, since a planned
+/// segment held only covered frames by construction. The reconciled
+/// record is made durable before the first pass.
+fn reconcile_planned(
+    store: &mut reclaim_store::ReclaimStore,
+    root: &std::path::Path,
+) -> Result<(), OpenError> {
+    let mode = match store.record().consumer_mode {
+        reclaim::RecordedMode::Known => reclaim::EntryMode::Known,
+        reclaim::RecordedMode::NoConsumer => reclaim::EntryMode::NoConsumer,
+        // The codec refuses planned records beside an unrecorded mode,
+        // so a decoded record with entries always has one.
+        reclaim::RecordedMode::Unrecorded => return Ok(()),
+    };
+    let mut record = store.record().clone();
+    let planned = std::mem::take(&mut record.planned);
+    if planned.is_empty() {
+        return Ok(());
+    }
+    for entry in &planned {
+        let present = root
+            .join(format!("{}.wal", entry.segment))
+            .try_exists()
+            .map_err(|source| OpenError::Io {
+                op: "stat(planned segment)",
+                source,
+            })?;
+        if !present {
+            raise_reclaimed(&mut record, entry, mode)?;
+        }
+    }
+    store.commit(&record).map_err(OpenError::from)
+}
+
+/// An absent planned segment is a reclamation that finished: each
+/// tenant's last offset in it raises that tenant's `reclaimed_through`
+/// exactly as the commit would have.
+fn raise_reclaimed(
+    record: &mut reclaim::ReclaimRecord,
+    planned: &reclaim::PlannedUnlink,
+    mode: reclaim::EntryMode,
+) -> Result<(), OpenError> {
+    for (&id, &offset) in &planned.last_offsets {
+        record
+            .dictionary
+            .raise_reclaimed(id, reclaim::Entry { mode, offset })
+            .map_err(|e| OpenError::Corrupt {
+                detail: format!(
+                    "RECLAIM sidecar: planned segment {} names {e}",
+                    planned.segment
+                ),
+            })?;
+    }
+    Ok(())
+}
+
+/// Neither sidecar. RFC 0052 §3.2's witness is then the segment
+/// header's format version, which every root with any segment
+/// necessarily carries: a version-2 segment means the root has run
+/// under this RFC and its missing sidecars are a loss, while
+/// all-version-1 segments are the shape every live pre-RFC root has.
+fn open_without_sidecars(
+    config: &WalConfig,
+    segments: &[PathBuf],
+) -> Result<RootWitness, OpenError> {
+    match post_rfc_segment(segments) {
+        Some(path) => Err(lost_sidecars(&config.root, path)),
+        None if segments.is_empty() => seed_fresh_record(config),
+        None => Ok(RootWitness::legacy()),
+    }
+}
+
+/// The first segment whose header names RFC 0052's version. A header
+/// that cannot be read is not a witness either way — `replay` halts on
+/// it as it always has, and deciding here would turn that halt into a
+/// different one at `open`.
+fn post_rfc_segment(segments: &[PathBuf]) -> Option<&PathBuf> {
+    segments.iter().find(|path| {
+        File::open(path)
+            .ok()
+            .and_then(|mut handle| segment::read_header(&mut handle).ok())
+            .is_some_and(|header| header.version == segment::SEGMENT_VERSION)
+    })
+}
+
+/// A fresh root: the empty record is written and its parent fsynced
+/// **before** `create_fresh_segment`, so every directory that has ever
+/// held a segment has held a record too and the fail-closed row can
+/// never fire on a node's own first start.
+fn seed_fresh_record(config: &WalConfig) -> Result<RootWitness, OpenError> {
+    let geometry = configured_geometry().map_err(|e| OpenError::InvalidConfig {
+        field: "max_tenants",
+        detail: e.to_string(),
+    })?;
+    let store = reclaim_store::ReclaimStore::create(
+        &config.root,
+        geometry,
+        &reclaim::ReclaimRecord::default(),
+        config.macos_full_fsync,
+    )?;
+    Ok(RootWitness::with_record(store))
+}
+
+fn lost_record(root: &std::path::Path) -> OpenError {
+    OpenError::Corrupt {
+        detail: format!(
+            "{} is missing beside a version-2 {} (RFC 0052 §3.2): every unlink is gated on a checkpoint and the record is created at open, so this root has run under RFC 0052 and its reclaim record is a loss, not an absence",
+            root.join(reclaim::SIDECAR_NAME).display(),
+            root.join(checkpoint::SIDECAR_NAME).display(),
+        ),
+    }
+}
+
+fn lost_checkpoint(root: &std::path::Path) -> OpenError {
+    OpenError::Corrupt {
+        detail: format!(
+            "{} carries checkpoint_seen but {} is missing (RFC 0052 §3.2): a version-2 checkpoint succeeded on this root, so the sidecar is a loss — without it the Parquet-side suppression horizon cannot be rebuilt and replay would republish",
+            root.join(reclaim::SIDECAR_NAME).display(),
+            root.join(checkpoint::SIDECAR_NAME).display(),
+        ),
+    }
+}
+
+fn lost_sidecars(root: &std::path::Path, segment: &std::path::Path) -> OpenError {
+    OpenError::Corrupt {
+        detail: format!(
+            "{} and {} are both missing beside the version-2 segment {} (RFC 0052 §3.2): the segment header is the witness that this root has run under RFC 0052, so reading it as a fresh root would replay frames whose Parquet rows may already exist",
+            root.join(reclaim::SIDECAR_NAME).display(),
+            root.join(checkpoint::SIDECAR_NAME).display(),
+            segment.display(),
+        ),
+    }
+}
+
+/// Stale `<uuid>.wal.partial` files in the WAL root, sorted. The name
+/// is **reserved and exact** (RFC 0052 §3.3): `*.tmp` is never
+/// matched — it stays the checkpoint and snapshot namespace — and a
+/// name whose stem does not parse as a UUID is ignored like any other
+/// non-segment file.
+fn list_partials(root: &std::path::Path) -> Result<Vec<PathBuf>, LedgerError> {
+    let io = |op: &'static str| move |source| LedgerError::Io { op, source };
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(io("read_dir(wal_root)"))? {
+        let path = entry.map_err(io("read_dir_entry(wal_root)"))?.path();
+        if is_partial(&path) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn is_partial(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".wal.partial"))
+        .is_some_and(|stem| stem.parse::<uuid::Uuid>().is_ok())
+}
+
+/// The [`FrameSink`] [`Wal::rebuild_ledger`] walks surviving segments
+/// with: it sums validated frame bytes and stops the walk on the one
+/// prefix RFC 0052 §3.2 makes fatal.
+#[derive(Default)]
+struct LedgerScan {
+    bytes: u64,
+    overlong_tenant: Option<(WalOffset, usize)>,
+}
+
+impl LedgerScan {
+    fn into_error(self, scan: &RecoveryError) -> LedgerError {
+        match self.overlong_tenant {
+            Some((offset, found)) => LedgerError::TenantTooLong {
+                offset,
+                found,
+                limit: TenantBatch::MAX_TENANT_BYTES,
+            },
+            None => LedgerError::Scan {
+                detail: format!("{scan:?}"),
+            },
+        }
+    }
+}
+
+impl FrameSink for LedgerScan {
+    fn consume(
+        &mut self,
+        offset: WalOffset,
+        kind: FrameKind,
+        payload: &[u8],
+    ) -> Result<(), RecoveryError> {
+        let len = u64::try_from(payload.len())
+            .expect("payload.len() fits u64 (read_frame capped it at MAX_FRAME_BYTES)");
+        self.bytes += frame::FRAME_HEADER_LEN as u64 + len;
+        if kind != FrameKind::TenantOtlpBatch {
+            return Ok(());
+        }
+        match TenantBatch::decode(payload) {
+            Err(TenantBatchError::TenantTooLong { found }) => {
+                self.overlong_tenant = Some((offset, found));
+                Err(RecoveryError::SinkRejected {
+                    detail: format!("tenant length {found} exceeds the RFC 0048 §3.1 bound"),
+                })
+            }
+            // Every other malformed prefix stays what it is today: an
+            // invalid payload the recovery driver classifies, never a
+            // reason to refuse to open.
+            Ok(_) | Err(_) => Ok(()),
+        }
+    }
 }
 
 /// Sorted (= chronological per `UUIDv7`) list of `*.wal`
@@ -1431,6 +2019,90 @@ impl std::error::Error for HousekeepingError {
             Self::Io { source, .. } => Some(source),
         }
     }
+}
+
+/// Map a sidecar failure onto the checkpoint's own error surface.
+/// Damaged bytes travel as an `InvalidData` source rather than a new
+/// public variant, the way the segment-header read already does.
+fn record_failed(e: reclaim_store::StoreError) -> CheckpointError {
+    match e {
+        reclaim_store::StoreError::Io { op, source } => CheckpointError::Io { op, source },
+        reclaim_store::StoreError::Corrupt { detail } => CheckpointError::Io {
+            op: "write(RECLAIM)",
+            source: std::io::Error::new(ErrorKind::InvalidData, detail),
+        },
+    }
+}
+
+/// Errors from [`Wal::rebuild_ledger`].
+#[derive(Debug)]
+pub enum LedgerError {
+    /// Filesystem I/O failure (segment listing, segment open, segment
+    /// read, or the root listing the partial list is seeded from).
+    Io {
+        op: &'static str,
+        source: std::io::Error,
+    },
+    /// A frame carries a tenant longer than
+    /// [`TenantBatch::MAX_TENANT_BYTES`] — a frame written before
+    /// RFC 0052 §3.2 amended the codec to RFC 0048 §3.1's bound.
+    /// Startup fails closed on it: truncating the key would cross two
+    /// tenants in a record read as proof of loss, and dropping the
+    /// frame would lose acknowledged data.
+    TenantTooLong {
+        offset: WalOffset,
+        found: usize,
+        limit: usize,
+    },
+    /// A segment header or frame failed the walk's validation. Replay
+    /// surfaces the same state with its own typed reason; the ledger
+    /// scan runs after it and carries the detail through.
+    Scan { detail: String },
+}
+
+impl std::fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { op, source } => write!(f, "WAL ledger rebuild failed at {op}: {source}"),
+            Self::TenantTooLong {
+                offset,
+                found,
+                limit,
+            } => write!(
+                f,
+                "frame at segment {} byte {} carries a {found} B tenant, above the {limit} B bound (RFC 0048 §3.1)",
+                offset.segment, offset.byte,
+            ),
+            Self::Scan { detail } => write!(f, "WAL ledger rebuild failed scanning: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for LedgerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::TenantTooLong { .. } | Self::Scan { .. } => None,
+        }
+    }
+}
+
+/// The WAL state RFC 0052 §3.5 exports, as [`Wal::reclaim_state`]
+/// returns it. `disk_bytes` stays the best-effort diagnostic
+/// [`WalMetrics`] documents; `unreclaimed_bytes` is the exact figure,
+/// seeded from the post-recovery ledger walk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReclaimState {
+    pub unflushed_bytes: u64,
+    pub disk_bytes: u64,
+    pub segment_count: u32,
+    pub unreclaimed_bytes: u64,
+    pub checkpoint: Option<WalOffset>,
+    /// `<uuid>.wal.partial` files awaiting the housekeeping sweep.
+    pub stale_partials: usize,
+    /// Whether a pass may plan segments: RFC 0052 §3.2's witness, a
+    /// version-2 `CHECKPOINT` beside a `RECLAIM` record.
+    pub reclaimable: bool,
 }
 
 /// Errors from [`Wal::replay`].

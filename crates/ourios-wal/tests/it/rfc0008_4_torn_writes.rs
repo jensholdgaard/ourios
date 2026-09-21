@@ -67,6 +67,14 @@ fn build_closed_segment(dest_root: &Path, payloads: &[&[u8]]) {
         .expect("scratch holds one segment");
     let dest = dest_root.join(seg.file_name().expect("segment file name"));
     std::fs::rename(&seg, &dest).expect("move segment into dest root");
+    // RFC 0052 §3.2: a root holding a version-2 segment beside no
+    // sidecars is fail-closed, so the scratch root's `RECLAIM` moves
+    // with the segment it belongs to. Without it this hand-built root
+    // is a shape no node can produce.
+    let record = dest_root.join("RECLAIM");
+    if !record.exists() {
+        std::fs::copy(scratch.path().join("RECLAIM"), &record).expect("bring the record along");
+    }
 }
 
 #[derive(Default)]

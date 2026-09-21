@@ -25,7 +25,7 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 futures-core = { version = "0.3", default-features = false }
 # The handshake-failure counter and the propagation Context — API only;
 # the SDK lives in the binary (RFC 0039 §3.5).
-opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 # RFC 0030 TLS seam: rustls builds each listener's ServerConfig,
 # tokio-rustls wraps each accepted TcpStream in the handshake.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -63,7 +63,7 @@ rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"]
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # propagation's unit tests drive a concrete TraceContextPropagator —
 # same pin as the rest of the workspace.
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "metrics"] }
 # The resolver tests stand up a fake OpenFGA endpoint and speak its
 # JSON wire shape.
 serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }

@@ -66,7 +66,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # are no-ops until a provider is installed. RFC 0040 §3.4 adds the `trace`
 # feature: `record_operator_spans` reads the current span's `Context` and
 # resolves the process-global tracer to hand `ourios-df-otel`.
-opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 # RFC 0040 §3.4 — `tracing::Span::current().context()` (`OpenTelemetrySpanExt`)
 # is how the querier reaches the `POST /v1/query` span's OTel `Context`
 # without threading one through every call site by hand (mirrors RFC 0039's
@@ -104,7 +104,7 @@ ourios-config = { path = "../ourios-config" }
 # pipeline (`init_in_memory` installs the global provider) plus the SDK's
 # exported-data types the assertions read.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["metrics", "trace", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
 # RFC 0040 — the scoped `InMemorySpanExporter` test harness (mirrors
 # `ourios-server`'s `rfc0039_1_query_propagation.rs`).
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }

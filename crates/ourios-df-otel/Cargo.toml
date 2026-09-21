@@ -17,10 +17,10 @@ path = "src/lib.rs"
 # No `ourios-*` dep — deliberate, so this lifts cleanly to a standalone
 # `datafusion-contrib` crate (RFC 0040 §3.5).
 datafusion = { version = "55", default-features = false, features = ["parquet"] }
-opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 
 [dev-dependencies]
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "testing"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 # RFC0040.6 — the unsampled-path cost guard.
 criterion = "=0.8.2"

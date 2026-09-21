@@ -5,7 +5,7 @@ name: Capture Software Bill of Behaviour (one-off)
 # (eBPF-based; needs a real Linux kernel, which is why this runs on the
 # GitHub-hosted runner rather than a local VM), the real Ourios Helm chart,
 # and a mix of OTLP ingest + query traffic during the node-agent's learning
-# window. The output is the raw ApplicationProfile CR(s) as a downloadable
+# window. The output is the raw ContainerProfile CR(s) as a downloadable
 # artifact for manual review — this workflow does not commit anything back
 # to the repo, and it never fires automatically (no push/PR/schedule
 # trigger), matching the dispatch-only precedent in pages.yml. This is an
@@ -232,28 +232,34 @@ jobs:
 
       # maxLearningPeriod (6m) plus slack for Kubescape to flip the status
       # annotation. Poll rather than a fixed sleep — completion timing isn't
-      # exact.
-      - name: Wait for ApplicationProfiles to complete
+      # exact. Targets containerprofile, not the legacy applicationprofile:
+      # node-agent v0.2.357 only writes ContainerProfile objects (its
+      # ApplicationProfiles.List call in pkg/storage/v1/storage.go is just a
+      # startup readiness probe against the aggregated API, which still
+      # registers the applicationprofiles REST resource for back-compat even
+      # though nothing populates it) — kubectl get applicationprofile would
+      # sit at 0 items and time out.
+      - name: Wait for ContainerProfiles to complete
         run: |
           deadline=$((SECONDS + 600))
           while [ "$SECONDS" -lt "$deadline" ]; do
-            total="$(kubectl get applicationprofile -o json | jq '.items | length')"
-            done_count="$(kubectl get applicationprofile -o json | jq '[.items[] | select(.metadata.annotations["kubescape.io/status"] == "completed")] | length')"
-            echo "applicationprofiles: ${done_count}/${total} completed"
+            total="$(kubectl get containerprofile -o json | jq '.items | length')"
+            done_count="$(kubectl get containerprofile -o json | jq '[.items[] | select(.metadata.annotations["kubescape.io/status"] == "completed")] | length')"
+            echo "containerprofiles: ${done_count}/${total} completed"
             if [ "${total}" -gt 0 ] && [ "${done_count}" = "${total}" ]; then break; fi
             sleep 20
           done
-          kubectl get applicationprofile -o wide || true
+          kubectl get containerprofile -o wide || true
           if [ "${total}" -eq 0 ] || [ "${done_count}" != "${total}" ]; then
-            echo "ApplicationProfiles did not all complete within the deadline (${done_count}/${total})"
+            echo "ContainerProfiles did not all complete within the deadline (${done_count}/${total})"
             exit 1
           fi
 
-      - name: Export ApplicationProfiles
+      - name: Export ContainerProfiles
         run: |
           mkdir -p bob-out
-          kubectl get applicationprofile -o yaml > bob-out/applicationprofiles.yaml
-          kubectl get applicationprofile -o json \
+          kubectl get containerprofile -o yaml > bob-out/containerprofiles.yaml
+          kubectl get containerprofile -o json \
             | jq -r '.items[] | .metadata.name' > bob-out/profile-names.txt
           cat bob-out/profile-names.txt
 
@@ -267,7 +273,7 @@ jobs:
         if: failure()
         run: |
           kubectl get pods -A -o wide || true
-          kubectl get applicationprofile -A -o yaml || true
+          kubectl get containerprofile -A -o yaml || true
           echo "=== receiver logs ==="; kubectl logs -l app.kubernetes.io/component=receiver --tail=200 || true
           echo "=== querier logs ===";  kubectl logs -l app.kubernetes.io/component=querier --tail=200 || true
           echo "=== node-agent logs ==="; kubectl logs -n "${KS_NAMESPACE}" -l app=node-agent --tail=200 || true

@@ -19,3 +19,7 @@ mod rfc0008_6_rotation;
 mod rfc0008_7_checkpoint;
 mod rfc0008_9_unflushed_bytes;
 mod rfc0046_6_frame_kind_dimension;
+mod rfc0052_12_capped_passes;
+mod rfc0052_13_floor_pinning;
+mod rfc0052_16_temp_sweep;
+mod rfc0052_2_truncation_bounds;

@@ -108,6 +108,12 @@ fn rfc0052_12_the_pop_half_reports_capped_without_the_horizon_half() {
         .expect("housekeeping");
     assert_eq!(first.removed_segments, CAP);
     assert!(first.capped, "the pop half hit its budget: {first:?}");
+    assert_eq!(
+        first.horizon_remaining, 0,
+        "and a no-consumer pass reports no horizon backlog: it applies \
+         none and can apply none, so the membership the ledger still \
+         tracks is work no pass will ever reduce: {first:?}",
+    );
 
     // And the pass that drains the backlog says the opposite, so the
     // flag is the pop half's own and not a constant.
@@ -328,6 +334,11 @@ fn rfc0052_12_partials_are_swept_first_under_the_same_cap() {
         debris.iter().filter(|p| p.exists()).count(),
         BACKLOG - CAP,
         "the rest wait for the next pass",
+    );
+    assert!(
+        progress.capped,
+        "and the partial half says so on its own — it is the only half \
+         that spent any budget here: {progress:?}",
     );
     assert_eq!(
         progress.outcome,

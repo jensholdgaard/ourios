@@ -67,6 +67,11 @@ impl Wal {
         let horizons_capped = self.ledger.apply(horizons, cap);
         let take = self.stale_partials.len().min(cap);
         let partials: Vec<PathBuf> = self.stale_partials.drain(..take).collect();
+        // The cap is shared, so the partial half can exhaust it on its
+        // own. Anything still on the list after the drain is work this
+        // pass left for the next tick, and `capped` is the caller's
+        // only signal that the budget bound it.
+        let partials_capped = !self.stale_partials.is_empty();
         let budget = cap - partials.len();
         let (segments, pops_capped, outcome) = self.pop_segments(horizons, budget);
         let mut plan = ReclaimPlan {
@@ -77,7 +82,7 @@ impl Wal {
             progress: HousekeepingProgress {
                 removed_segments: 0,
                 removed_partials: 0,
-                capped: horizons_capped || pops_capped,
+                capped: horizons_capped || pops_capped || partials_capped,
                 horizon_remaining: self.ledger.horizon_remaining(),
                 unlink_remaining: self.ledger.unlink_remaining(self.current_segment_uuid),
                 floor: self.ledger.floor(),

@@ -225,6 +225,10 @@ pub(crate) struct SegmentLedger {
     /// re-plan walks them oldest-first and costs O(cap) — a pass pops
     /// at most the cap, so this set never grows past it.
     reclaiming: BTreeSet<Uuid>,
+    /// Whether the last pass received horizons at all. `NoConsumer`
+    /// applies none and can apply none, so the membership the ledger
+    /// still tracks is not a backlog any pass will work off.
+    consumer: bool,
     floor: RetainFloor,
 }
 
@@ -342,8 +346,12 @@ impl SegmentLedger {
     /// range count proportional to the span a rising horizon newly
     /// covers, which is exactly the unbounded work under the journal
     /// guard that RFC0052.12 forbids.
+    /// Zero until a pass receives horizons, and zero again under
+    /// `NoConsumer`: the ledger keeps its tenant membership either way
+    /// — a later `Known` pass resumes from it — but reporting it as
+    /// remaining work would export a backlog no pass will ever reduce.
     pub(crate) fn horizon_remaining(&self) -> usize {
-        self.behind_total
+        if self.consumer { self.behind_total } else { 0 }
     }
 
     /// Empty-set segments not yet popped, plus entries reclaiming or
@@ -385,10 +393,12 @@ impl SegmentLedger {
     pub(crate) fn apply(&mut self, horizons: &SnapshotHorizons, budget: usize) -> bool {
         match horizons {
             SnapshotHorizons::NoConsumer => {
+                self.consumer = false;
                 self.floor = RetainFloor::None;
                 false
             }
             SnapshotHorizons::Known(marks) => {
+                self.consumer = true;
                 self.receive(marks);
                 let capped = self.walk(budget);
                 self.floor = self.derive_floor();
@@ -906,7 +916,7 @@ mod tests {
     /// The two O(1) figures against the sums they summarise.
     fn check(ledger: &SegmentLedger, current: uuid::Uuid, what: &str) {
         assert_eq!(
-            ledger.horizon_remaining(),
+            ledger.behind_total,
             ledger.tenants.values().map(|t| t.behind).sum::<usize>(),
             "behind_total after {what}",
         );

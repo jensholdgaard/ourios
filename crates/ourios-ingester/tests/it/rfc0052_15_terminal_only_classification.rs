@@ -313,8 +313,6 @@ async fn rfc0052_15_ordinary_append_and_fsync_failures_stay_transient() {
         Code::InvalidArgument,
         "an oversize batch is still its own outcome, not a durability class",
     );
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let _ = tmp;
     let (status, _, _) = over_http(oversize_append_pipeline()).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }

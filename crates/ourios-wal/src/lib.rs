@@ -2202,6 +2202,14 @@ mod tests {
                 housekeeping_secs: MAX_HOUSEKEEPING_SECS,
                 ..default_config(tmp.path())
             },
+            WalConfig {
+                max_unlinks_per_pass: 1,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                max_unlinks_per_pass: reclaim::MAX_UNLINKS_PER_PASS_CEILING,
+                ..default_config(tmp.path())
+            },
         ];
         for cfg in boundaries {
             validate_config(&cfg).expect("boundary value");

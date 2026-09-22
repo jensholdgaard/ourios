@@ -16,12 +16,12 @@
 //! nothing acted on. Packed, a cut captures the whole state with one
 //! acquire load and RFC 0053's clear is a CAS on that exact word.
 //!
-//! The clear encoding is [`Epoch::RESERVED`] in the high half with the
-//! generation zero, and that is load-bearing: a default-zero word would
-//! read as "epoch 0 failed", which is at or below every cut's epoch and
-//! would refuse every cut on a node that had never panicked.
-//! `Epoch::RESERVED` is never assigned to a cut, so the sentinel cannot
-//! collide with a real failure.
+//! The clear encoding is the reserved epoch `u32::MAX` in the high half
+//! with the generation zero, and that is load-bearing: a default-zero
+//! word would read as "epoch 0 failed", which is at or below every cut's
+//! epoch and would refuse every cut on a node that had never panicked.
+//! `u32::MAX` is never assigned to a cut, so the sentinel cannot collide
+//! with a real failure.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -119,7 +119,7 @@ impl BarrierEpochs {
     /// Take the next cut's epoch and advance the counter — the capture
     /// step, under the exclusion.
     ///
-    /// The counter stops one below [`Epoch::RESERVED`] rather than
+    /// The counter stops one below the reserved `u32::MAX` rather than
     /// wrapping: a node that somehow reached 2^32 cuts (about 40,000
     /// years at the 300-second default) stops stamping rather than
     /// wrapping into a stale comparison.
@@ -165,8 +165,8 @@ impl BarrierEpochs {
         LatchState(self.failed.load(Ordering::Acquire))
     }
 
-    /// The counter is held below [`Epoch::RESERVED`], so every value it
-    /// yields is a `u32`.
+    /// The counter is held below the reserved `u32::MAX`, so every value
+    /// it yields is a `u32`.
     fn narrow(raw: u64) -> Epoch {
         Epoch(u32::try_from(raw).unwrap_or(u32::MAX))
     }

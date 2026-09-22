@@ -90,7 +90,8 @@ impl Wal {
         let partials_capped = !self.stale_partials.is_empty();
         let budget = cap - partials.len();
         let (segments, pops_capped, outcome) = self.pop_segments(horizons, budget);
-        let mut plan = ReclaimPlan {
+        let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
+        let plan = ReclaimPlan {
             segments: segments
                 .iter()
                 .map(|popped| PlannedSegment {
@@ -113,14 +114,11 @@ impl Wal {
                 horizon_remaining: self.ledger.horizon_remaining(),
                 unlink_remaining: self.ledger.unlink_remaining(self.current_segment_uuid),
                 floor: self.ledger.floor(),
-                lag_bytes: 0,
-                lag_segments: 0,
+                lag_bytes,
+                lag_segments,
                 outcome,
             },
         };
-        let (lag_bytes, lag_segments) = self.ledger.lag(self.lag_floor(), self.checkpoint);
-        plan.progress.lag_bytes = lag_bytes;
-        plan.progress.lag_segments = lag_segments;
         self.outstanding = Some(Outstanding {
             segments,
             partials: plan.partials.clone(),
@@ -548,21 +546,13 @@ impl Wal {
         }
     }
 
-    /// The floor the lag is measured from — `None` when nothing holds
-    /// anything back, which is every pass with no floor of its own.
-    /// `RetainFloor::None` says the checkpoint alone governs, so a
-    /// no-consumer pass lags by nothing however far the checkpoint
-    /// reaches.
-    fn lag_floor(&self) -> Option<WalOffset> {
-        self.ledger.floor().offset()
-    }
-
     fn progress(
         &self,
         removed_segments: usize,
         removed_partials: usize,
         outcome: PassOutcome,
     ) -> HousekeepingProgress {
+        let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
         HousekeepingProgress {
             removed_segments,
             removed_partials,
@@ -570,8 +560,8 @@ impl Wal {
             horizon_remaining: self.ledger.horizon_remaining(),
             unlink_remaining: self.ledger.unlink_remaining(self.current_segment_uuid),
             floor: self.ledger.floor(),
-            lag_bytes: 0,
-            lag_segments: 0,
+            lag_bytes,
+            lag_segments,
             outcome,
         }
     }

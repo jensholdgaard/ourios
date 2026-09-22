@@ -2,16 +2,16 @@
 //! at open.
 //! See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 //!
-//! Stubs are `#[ignore]`d so the default run stays green while the
-//! RFC is red; each names the green slice that discharges it.
-//!
 //! A hand-built directory fixture rather than fault injection (RFC 0052
 //! §6): the state predates the code under test. §3.3 withdrew the
 //! shape-based heuristic — an unreadable newest segment is
 //! indistinguishable from real corruption — so open still halts; what
 //! this RFC adds is the error's guidance.
 
-use ourios_wal::{OpenError, Wal};
+use ourios_wal::{
+    FrameKind, FrameSink, OpenError, RecoveryError, RotationFaults, RotationKind, RotationSite,
+    Wal, WalConfig, WalOffset,
+};
 
 use crate::rfc0052_support::{
     CHECKPOINT, RECLAIM, build_closed_segment, default_config, downgrade_segments, segment_files,
@@ -67,16 +67,64 @@ fn rfc0052_11_legacy_orphan_halts_open_naming_the_file_and_shape() {
     );
 }
 
+/// Every surviving frame, so `replay` proves each segment readable
+/// rather than only the newest one `Wal::open` validates.
+#[derive(Default)]
+struct CountingSink(usize);
+
+impl FrameSink for CountingSink {
+    fn consume(
+        &mut self,
+        _offset: WalOffset,
+        _kind: FrameKind,
+        _payload: &[u8],
+    ) -> Result<(), RecoveryError> {
+        self.0 += 1;
+        Ok(())
+    }
+}
+
 /// Scenario RFC0052.11 — a node rotating under this RFC cannot reach that state.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+///
+/// The population above is finite and shrinking because the shape is
+/// now unreachable: §3.3 fsyncs the header under the `.wal.partial`
+/// name *before* the rename, and `list_segments` returns only `*.wal`,
+/// so a rotation that dies at any step leaves no `*.wal` whose header
+/// bytes might be missing. Asserted by killing a rotation at each of
+/// the five sites in turn and reopening.
 #[test]
-#[ignore = "RFC0052.11 stub — implemented in the rotation green slice C (header fsynced under the temporary name before the rename)"]
 fn rfc0052_11_post_rfc_rotations_never_leave_a_selectable_orphan() {
-    todo!(
-        "RFC0052.11 — with a crash injected at every step of a §3.3 \
-         rotation, no surviving *.wal has unreadable header bytes: the \
-         header is durable under the .wal.partial name before the \
-         rename, so Wal::open never meets the legacy shape on a root \
-         whose rotations all happened under this RFC"
-    );
+    for site in RotationSite::ALL {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path();
+        let config = WalConfig {
+            segment_age_secs: 1,
+            ..default_config(root)
+        };
+
+        let mut wal = Wal::open(config.clone()).expect("open");
+        wal.append(FrameKind::OtlpBatch, b"a frame worth keeping")
+            .expect("append");
+        wal.sync().expect("sync");
+        wal.arm_rotation_faults(RotationFaults::always(site));
+
+        // The rotation dies at `site`; dropping the handle without a
+        // further call is this process ending there.
+        let _ = wal.rotate(RotationKind::Owed);
+        drop(wal);
+
+        for path in segment_files(root) {
+            let bytes = std::fs::read(&path).expect("read segment");
+            assert!(
+                bytes.len() >= 24 && &bytes[0..4] == b"OWAL",
+                "{site:?}: every surviving *.wal has a complete header: {}",
+                path.display(),
+            );
+        }
+        let mut reopened = Wal::open(config).expect("reopen");
+        reopened
+            .replay(&mut CountingSink::default())
+            .expect("replay reads every surviving segment");
+    }
 }

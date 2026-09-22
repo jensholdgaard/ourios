@@ -3,12 +3,15 @@
 //! See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 //!
 //! All of these need `SnapshotHorizons`, which §3.7 puts on
-//! `housekeeping_prepare`. The one stub left is the legacy-root
-//! rotation row, whose crash injection belongs to the rotation slice.
+//! `housekeeping_prepare`, except the legacy-root rotation row, whose
+//! crash injection came with the rotation slice.
 
 use std::path::PathBuf;
 
-use ourios_wal::{PassOutcome, ReclaimOutcome, SkipReason, SnapshotHorizons, unlink_planned};
+use ourios_wal::{
+    PassOutcome, ReclaimOutcome, RotationFaults, RotationKind, RotationSite, SkipReason,
+    SnapshotHorizons, unlink_planned,
+};
 
 use crate::rfc0052_record::{PlannedRow, planned_unlinks, reclaimed_through};
 use crate::rfc0052_support::{
@@ -415,14 +418,48 @@ fn the_first_pass_adopts_its_mode_before_it_unlinks_anything() {
 
 /// Scenario RFC0052.17 — a legacy root rotating before its first checkpoint stays openable.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+///
+/// The ordering `rfc0052_17_legacy_root_rotation_stays_openable_without_a_checkpoint`
+/// asserts on the happy path, driven at the crash point that could
+/// break it: the record write is the step *before* the fresh segment's
+/// creation, so a kill in between must leave the record and no
+/// version-2 segment — never the reverse, which the open-time matrix
+/// fails closed on.
 #[test]
-#[ignore = "RFC0052.17 stub — implemented in the rotation green slice C (record written and fsynced before the version-2 segment is created)"]
 fn rfc0052_17_legacy_root_rotation_writes_the_record_before_the_v2_segment() {
-    todo!(
-        "RFC0052.17 — a legacy root rotates before its first checkpoint \
-         with a crash injected between the record write and the \
-         version-2 segment's creation: no restart finds a version-2 \
-         segment beside no record, and open succeeds"
+    // Given: a pre-RFC root — version-1 segments, neither sidecar —
+    // that has never checkpointed.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    build_closed_segment(root, &[b"written before this RFC"]);
+    std::fs::remove_file(root.join(RECLAIM)).expect("a pre-RFC root has no record");
+    downgrade_segments(root);
+    let mut wal = open(root);
+    assert!(!root.join(RECLAIM).exists(), "no record at open");
+    let before = segment_files(root);
+
+    // When: it rotates, and the process dies between the record write
+    // and the fresh segment's creation.
+    wal.arm_rotation_faults(RotationFaults::always(RotationSite::Create));
+    wal.rotate(RotationKind::Owed)
+        .expect_err("the rotation dies at the create");
+    drop(wal);
+
+    // Then: the record is on disk, no version-2 segment is beside it,
+    // and the restart opens rather than halting.
+    assert!(
+        root.join(RECLAIM).exists(),
+        "the record was written and fsynced before the segment was created",
+    );
+    assert_eq!(
+        segment_files(root),
+        before,
+        "no version-2 segment was created, so none can be found beside no record",
+    );
+    let wal = open(root);
+    assert!(
+        !wal.reclaim_state().reclaimable,
+        "and the root stays on the legacy branch until its first checkpoint",
     );
 }
 

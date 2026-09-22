@@ -775,6 +775,103 @@ mod tests {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ourios_config::MinerConfig;
 
+    /// The classifier exists to force "one retryable-vs-not decision"
+    /// (see its doc comment). It used to fold a permanently quiesced
+    /// WAL into the transient bucket, so a node only a restart could
+    /// fix kept answering "retry later" forever (#791). RFC 0052 §3.3
+    /// made the refusal *bounded*, so the rule is now terminal-only:
+    /// the state that leaves the transient class is the exhausted
+    /// budget, and nothing else.
+    mod terminal_vs_transient {
+        use super::super::{IngestFailure, ReceiveError};
+        use ourios_wal::{AppendError, RotationFault, RotationSite, SyncError};
+
+        fn fault(attempts: u32) -> RotationFault {
+            RotationFault::new(
+                RotationSite::CloseSync,
+                &std::io::Error::other("io"),
+                attempts,
+                3,
+            )
+        }
+
+        /// The state #794 called wedged. It is reached by exhausting the
+        /// budget now, and every append after it carries this variant.
+        #[test]
+        fn a_terminal_rotation_state_classifies_server_terminal_not_transient() {
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::RotationTerminal(
+                    fault(3),
+                ))),
+                IngestFailure::ServerTerminal,
+            );
+        }
+
+        /// The append whose own rotation spent the last unit of the
+        /// budget is already terminal: every later append is refused.
+        /// #794 classified it transient, which advised a retry on the
+        /// one request that had just made retrying useless — and the
+        /// *sync* surface reaches the same state, so it must classify
+        /// the same way.
+        #[test]
+        fn the_append_and_the_sync_that_exhaust_the_budget_are_both_terminal() {
+            for error in [
+                ReceiveError::WalAppend(AppendError::RotationTerminal(fault(3))),
+                ReceiveError::WalSync(SyncError::RotationTerminal(fault(3))),
+            ] {
+                assert_eq!(
+                    IngestFailure::classify(&error),
+                    IngestFailure::ServerTerminal
+                );
+            }
+        }
+
+        /// The half #794 got wrong once §3.3 lands: a rotation failure
+        /// still inside its budget genuinely is transient, because a
+        /// later append can succeed. Classifying it terminal would tell
+        /// an operator to intervene on a blip.
+        #[test]
+        fn a_rotation_still_inside_its_budget_stays_transient() {
+            for error in [
+                ReceiveError::WalAppend(AppendError::RotationRetrying(fault(1))),
+                ReceiveError::WalSync(SyncError::RotationRetrying(fault(1))),
+            ] {
+                assert_eq!(IngestFailure::classify(&error), IngestFailure::Unavailable);
+            }
+        }
+
+        #[test]
+        fn other_append_and_sync_failures_stay_transient() {
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::Io {
+                    op: "write",
+                    source: std::io::Error::other("io"),
+                })),
+                IngestFailure::Unavailable,
+            );
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalSync(SyncError::Io {
+                    op: "fdatasync",
+                    source: std::io::Error::other("io"),
+                })),
+                IngestFailure::Unavailable,
+            );
+        }
+
+        /// The split must not have moved the oversize case, which is the
+        /// one append failure a client can fix itself.
+        #[test]
+        fn an_oversize_batch_is_still_its_own_outcome() {
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::TooLarge {
+                    len: 32 * 1024 * 1024,
+                    limit: 16 * 1024 * 1024,
+                })),
+                IngestFailure::TooLarge,
+            );
+        }
+    }
+
     /// Persists nothing; `sync` reports the configured offset and counts
     /// its calls, so a test can assert WAL-before-ack ordering and
     /// per-batch (not per-record) fsync.

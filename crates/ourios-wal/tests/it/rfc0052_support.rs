@@ -313,6 +313,42 @@ pub fn tenant_id(name: &str) -> ourios_core::tenant::TenantId {
     ourios_core::tenant::TenantId::new(name)
 }
 
+/// Age the root's one segment by `age_ms`, so the next `append`
+/// crosses `segment_age_secs` and rotates — without the test sleeping
+/// for it.
+///
+/// A segment's age is its `UUIDv7` mint time (RFC 0008 §6.5), which
+/// lives in the first 48 bits as a big-endian millisecond count, so
+/// backdating it is a rewrite of the name and the six header bytes that
+/// carry the same value. Nothing else in the file depends on the id.
+pub fn backdate_segment(root: &Path, age_ms: u64) -> uuid::Uuid {
+    let path = segment_files(root)
+        .into_iter()
+        .next_back()
+        .expect("the root holds a segment");
+    let current = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<uuid::Uuid>().ok())
+        .expect("the newest segment is UUIDv7-named");
+
+    let mut bytes = *current.as_bytes();
+    let minted = u64::from_be_bytes([
+        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+    ]);
+    let backdated = minted
+        .checked_sub(age_ms)
+        .expect("the mint time is further from the epoch than the age asked for");
+    bytes[..6].copy_from_slice(&backdated.to_be_bytes()[2..]);
+    let aged = uuid::Uuid::from_bytes(bytes);
+
+    let mut file = std::fs::read(&path).expect("read segment");
+    file[8..24].copy_from_slice(aged.as_bytes());
+    std::fs::remove_file(&path).expect("remove the segment under its old name");
+    std::fs::write(root.join(format!("{aged}.wal")), &file).expect("write the backdated segment");
+    aged
+}
+
 /// Rotation debris a previous process left: `<uuid>.wal.partial` is
 /// the reserved shape §3.3's sweep pops.
 pub fn write_partial(root: &Path) -> std::path::PathBuf {

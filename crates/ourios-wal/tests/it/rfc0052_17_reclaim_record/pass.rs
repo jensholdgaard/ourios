@@ -337,6 +337,15 @@ fn a_pass_that_disagrees_with_the_recorded_mode_is_refused() {
     let failure = wal
         .housekeeping_prepare(&known(&[("alpha", first[0])]), CAP)
         .expect_err("a Known pass on a NoConsumer root must be refused");
+    let ourios_wal::ReclaimError::Housekeeping { progress, .. } = &failure else {
+        panic!("a refused pass is a housekeeping failure: {failure:?}");
+    };
+    assert_eq!(
+        progress.outcome,
+        PassOutcome::Skipped(SkipReason::Refused),
+        "the progress beside a refusal must not claim the pass planned",
+    );
+    assert_eq!(SkipReason::Refused.as_str(), "refused");
     let text = format!("{failure}");
     assert!(
         text.contains("NoConsumer") && text.contains("Known"),

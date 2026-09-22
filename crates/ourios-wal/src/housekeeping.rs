@@ -708,9 +708,12 @@ impl Wal {
         })
     }
 
+    /// A refusal, with the state as it stands. Every caller of this is
+    /// a check that runs **before** `pop_segments`, so the pass planned
+    /// nothing and the progress beside the error must not say it did.
     fn housekeeping_failure(&self, source: HousekeepingError) -> ReclaimError {
         ReclaimError::Housekeeping {
-            progress: Box::new(self.progress(0, 0, PassOutcome::Planned)),
+            progress: Box::new(self.progress(0, 0, PassOutcome::Skipped(SkipReason::Refused))),
             source,
         }
     }

@@ -77,6 +77,12 @@ pub enum SkipReason {
     /// would leave exactly the shape the open-time matrix reads as
     /// "nothing was ever reclaimed".
     MigrationWindow,
+    /// The pass was refused before it could plan anything — a mode
+    /// disagreement, or a tenant whose state cannot be told apart
+    /// from a loss. The refusal's own `HousekeepingError` says which;
+    /// this is here so the progress carried beside it does not claim
+    /// the pass planned work it never reached.
+    Refused,
 }
 
 impl SkipReason {
@@ -86,6 +92,7 @@ impl SkipReason {
         match self {
             Self::NoCheckpoint => "no_checkpoint",
             Self::MigrationWindow => "migration_window",
+            Self::Refused => "refused",
         }
     }
 }

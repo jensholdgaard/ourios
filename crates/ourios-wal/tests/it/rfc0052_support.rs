@@ -356,3 +356,15 @@ pub fn write_partial(root: &Path) -> std::path::PathBuf {
     std::fs::write(&path, b"rotation debris").expect("write a partial");
     path
 }
+
+/// One capped RFC 0052 §3.2 pass with no snapshot consumer — the
+/// surface the rotation legs use to reach the partial sweep now that
+/// RFC 0008 §6.7's global-bound `Wal::housekeeping` is feature-gated
+/// out of production (issue #827).
+pub fn sweep(wal: &mut Wal) -> ourios_wal::HousekeepingProgress {
+    wal.housekeeping_pass(
+        &ourios_wal::SnapshotHorizons::NoConsumer,
+        usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("the cap fits usize"),
+    )
+    .expect("a capped pass")
+}

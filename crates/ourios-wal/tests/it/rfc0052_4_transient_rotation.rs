@@ -24,7 +24,7 @@ use ourios_wal::{
     Wal, WalConfig,
 };
 
-use crate::rfc0052_support::{backdate_segment, segment_files};
+use crate::rfc0052_support::{backdate_segment, segment_files, sweep};
 
 fn config(root: &Path, rotation_retry_attempts: u32) -> WalConfig {
     WalConfig {
@@ -149,7 +149,7 @@ fn a_failed_attempts_partial_is_swept(site: RotationSite) {
     wal.append(FrameKind::OtlpBatch, b"the append after the fault clears")
         .expect("the retry rotates");
     wal.sync().expect("sync");
-    wal.housekeeping(None).expect("a capped pass");
+    sweep(&mut wal);
     assert!(
         partials(root).is_empty(),
         "{site:?}: one pass clears one rotation's debris",
@@ -299,7 +299,7 @@ fn rfc0052_4_idle_rotation_failure_recovers_on_the_next_append() {
         "the append landed in the segment the retry installed",
     );
 
-    wal.housekeeping(None).expect("a capped pass");
+    sweep(&mut wal);
     assert!(
         partials(root).is_empty(),
         "the idle rotation's debris is swept under the same cap",
@@ -340,8 +340,7 @@ fn rfc0052_4_a_failed_create_still_registers_its_reserved_path() {
         "and this particular failure left no file, which the sweep must tolerate",
     );
 
-    wal.housekeeping(None)
-        .expect("a pass over a path the create never reached");
+    sweep(&mut wal);
     assert_eq!(
         wal.reclaim_state().stale_partials,
         0,
@@ -449,7 +448,7 @@ fn rfc0052_4_open_refuses_a_cap_below_the_retry_budget() {
         "one partial per attempt, bounded by the budget",
     );
 
-    wal.housekeeping(None).expect("a capped pass");
+    sweep(&mut wal);
     assert!(
         partials(root).is_empty(),
         "one rotation's whole budget of debris clears in one capped pass",
@@ -497,7 +496,7 @@ proptest! {
             "{site:?}: the obligation was discharged, so the budget reset",
         );
 
-        wal.housekeeping(None).expect("a capped pass");
+        sweep(&mut wal);
         prop_assert!(partials(root).is_empty(), "{site:?}: no partial survives the sweep");
 
         drop(wal);

@@ -1247,9 +1247,25 @@ impl Wal {
     /// The timer lives in the caller (`wal_housekeeping_secs`);
     /// this is one pass.
     ///
+    /// **Superseded, and unreachable from production (issue #827).**
+    /// RFC 0052 §3.2's per-segment rule replaces this global bound
+    /// rather than standing beside it: this entry point writes no
+    /// `planned` witness, drops the segment from the tenant-aware
+    /// ledger and honours no per-pass cap, so a pass run through it
+    /// after the ledger has recorded a consumer mode can remove frames
+    /// a pinned tenant still holds. It survives only because it is
+    /// RFC 0008 §6.7's asserted contract, and the `legacy-housekeeping`
+    /// feature is what keeps the two surfaces from ever meeting on a
+    /// live root: the feature is enabled by this crate's own
+    /// dev-dependency and nothing else, so no product binary can reach
+    /// it. Every other caller uses [`Self::housekeeping_pass`] or the
+    /// [`Self::housekeeping_prepare`] / [`Self::housekeeping_commit`]
+    /// pair.
+    ///
     /// # Errors
     ///
     /// See [`HousekeepingError`].
+    #[cfg(feature = "legacy-housekeeping")]
     pub fn housekeeping(
         &mut self,
         retain_floor: Option<WalOffset>,
@@ -1276,6 +1292,7 @@ impl Wal {
     /// Unlink every closed segment whose highest frame offset is at or
     /// below `bound`. Whole segments only; the current append segment
     /// is never unlinked.
+    #[cfg(feature = "legacy-housekeeping")]
     fn unlink_at_or_below(&mut self, bound: WalOffset) -> Result<(), HousekeepingError> {
         let io = |op: &'static str, source| HousekeepingError::Io { op, source };
         let segments = list_segments(&self.config.root).map_err(|e| match e {

@@ -155,12 +155,6 @@ enum State {
     /// the entry survives a restart is unknown until re-verified.
     Reclaiming {
         uncertain: bool,
-        /// A commit told us what the file half did with this entry.
-        /// An entry popped by a pass that never committed has not been
-        /// reported on, so whether its unlink happened is unknown —
-        /// which is the same thing `uncertain` means, and is why a
-        /// re-plan of one inherits it.
-        reported: bool,
     },
 }
 
@@ -195,6 +189,18 @@ struct Segment {
     /// here. Empty means no tenant holds this segment back.
     pending: HashSet<TenantId>,
     state: State,
+    /// A pass has handed this segment to a file half that no commit
+    /// has reported back on, so its unlink may already have happened.
+    ///
+    /// It lives on the segment rather than on [`State::Reclaiming`]
+    /// because it has to **survive a withdrawal**: a horizon that
+    /// regresses puts a popped entry back to `Eligible` (§3.7), and if
+    /// the file was already gone, re-planning it later as a first
+    /// attempt would fail on the missing path for the life of the
+    /// process. Cleared by the commit that says what the file half
+    /// did — which is either that nothing was unlinked at all, or
+    /// [`State::Reclaiming`]'s own `uncertain`.
+    attempted: bool,
 }
 
 /// A tenant's horizon application state (§3.7). The cursor is the
@@ -318,6 +324,7 @@ impl SegmentLedger {
             members: HashMap::new(),
             pending: HashSet::new(),
             state: State::Eligible,
+            attempted: false,
         });
         // A segment with no tenant frame holds nothing back, so it
         // joins the unpinned head immediately.
@@ -802,25 +809,18 @@ impl SegmentLedger {
             return None;
         }
         let segment = self.segments.get_mut(&id)?;
-        // §3.2's uncertain deletion, plus the case §3.7's
-        // abandoned plan creates: a pass popped this, the file half
-        // may or may not have unlinked it, and no commit ever said.
+        // §3.2's uncertain deletion, plus the case §3.7's abandoned
+        // plan creates: a pass handed this to a file half that may or
+        // may not have unlinked it, and no commit ever said.
         // Re-planning it as certain would make an `unlink` that finds
         // it gone a failure to retry forever.
-        let uncertain = match segment.state {
-            State::Eligible => {
-                self.reclaiming.insert(id);
-                false
-            }
-            State::Reclaiming {
-                uncertain,
-                reported,
-            } => uncertain || !reported,
-        };
-        segment.state = State::Reclaiming {
-            uncertain,
-            reported: false,
-        };
+        let uncertain =
+            segment.attempted || matches!(segment.state, State::Reclaiming { uncertain: true });
+        if segment.state == State::Eligible {
+            self.reclaiming.insert(id);
+        }
+        segment.state = State::Reclaiming { uncertain };
+        segment.attempted = true;
         self.unpinned.remove(&id);
         let mut last_offsets: Vec<(TenantId, WalOffset)> = segment
             .members
@@ -838,6 +838,10 @@ impl SegmentLedger {
 
     /// A popped segment the file half never unlinked: it goes back to
     /// eligible and the next pass pops it again.
+    ///
+    /// This is the record-failed arm alone, where **nothing** was
+    /// unlinked, so the attempt is withdrawn with the entry and the
+    /// next plan is a genuine first one.
     pub(crate) fn restore(&mut self, id: Uuid) {
         let Some(segment) = self.segments.get_mut(&id) else {
             return;
@@ -846,6 +850,7 @@ impl SegmentLedger {
             self.reclaiming.remove(&id);
         }
         segment.state = State::Eligible;
+        segment.attempted = false;
         if segment.pending.is_empty() {
             self.unpinned.insert(id);
         }
@@ -853,13 +858,12 @@ impl SegmentLedger {
 
     /// A popped segment whose unlink failed, or whose deletion is
     /// uncertain: it stays reclaiming and counted, re-verified by the
-    /// next pass.
+    /// next pass. The commit has spoken, so the attempt is no longer
+    /// unresolved — `uncertain` is what survives of it.
     pub(crate) fn hold(&mut self, id: Uuid, uncertain: bool) {
         if let Some(segment) = self.segments.get_mut(&id) {
-            segment.state = State::Reclaiming {
-                uncertain,
-                reported: true,
-            };
+            segment.state = State::Reclaiming { uncertain };
+            segment.attempted = false;
         }
     }
 

@@ -453,6 +453,60 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
     );
 }
 
+/// An abandoned plan's unlinks survive a horizon that regresses over
+/// them. §3.7's rewind withdraws a popped entry back to eligible so a
+/// regressed horizon cannot have its frames unlinked — but the file
+/// half may already have removed the file, and a withdrawal that
+/// forgets that leaves the segment to be re-planned later as a first
+/// attempt, failing on the missing path for the life of the process.
+#[test]
+fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    wal.write_plan_record(&abandoned).expect("record");
+    let planned: Vec<PathBuf> = abandoned.segments.iter().map(|s| s.path.clone()).collect();
+    let _ = unlink_planned(&abandoned);
+    assert!(planned.iter().all(|path| !path.exists()));
+
+    // The task dies, and the tenant's snapshot stops restoring before
+    // the next pass: every segment it holds is withdrawn and pinned,
+    // the ones already unlinked among them.
+    let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
+    assert!(pinned.segments.is_empty(), "the regression withdrew them");
+    wal.housekeeping_commit(unlink_planned(&pinned))
+        .expect("commit");
+
+    // When the snapshot restores again the withdrawn entries come
+    // back, and the pass must still treat them as deletions that may
+    // already have happened.
+    let resumed = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    assert_eq!(
+        resumed
+            .segments
+            .iter()
+            .filter(|s| planned.contains(&s.path))
+            .map(|s| s.uncertain)
+            .collect::<Vec<_>>(),
+        vec![true; planned.len()],
+        "the withdrawal did not forget that a file half had them",
+    );
+    wal.write_plan_record(&resumed).expect("record");
+    assert_eq!(
+        wal.housekeeping_commit(unlink_planned(&resumed))
+            .expect("commit")
+            .removed_segments,
+        resumed.segments.len(),
+        "so the pass completes instead of failing on the missing paths",
+    );
+}
+
 /// A plan a later `housekeeping_prepare` superseded is refused at the
 /// record write. §3.7 makes the second prepare legal — it is the
 /// abandoned-plan recovery — and a horizon that regressed in between

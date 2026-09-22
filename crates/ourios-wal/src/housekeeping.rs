@@ -19,6 +19,18 @@ use crate::{
     reclaim_store, reconcile, retain, unlink_planned,
 };
 
+/// A plan whose pass is no longer the outstanding one (RFC 0052 §3.7).
+fn superseded(plan: &ReclaimPlan, outstanding: pass::PassId) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "WAL housekeeping refused: plan from pass {} was superseded by pass {outstanding} \
+             (RFC 0052 §3.7)",
+            plan.pass,
+        ),
+    )
+}
+
 impl Wal {
     /// `max_unlinks_per_pass` as a `usize` (RFC 0052 §3.8). The
     /// configured value is validated against
@@ -91,7 +103,10 @@ impl Wal {
         let budget = cap - partials.len();
         let (segments, pops_capped, outcome) = self.pop_segments(horizons, budget);
         let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
+        self.passes += 1;
+        let pass = pass::PassId::new(self.passes);
         let plan = ReclaimPlan {
+            pass,
             segments: segments
                 .iter()
                 .map(|popped| PlannedSegment {
@@ -120,6 +135,7 @@ impl Wal {
             },
         };
         self.outstanding = Some(Outstanding {
+            pass,
             segments,
             partials: plan.partials.clone(),
             mode: pass::entry_mode(horizons),
@@ -146,20 +162,31 @@ impl Wal {
     /// concurrent checkpoint, or a `reclaimed_through` an earlier
     /// commit raised.
     ///
+    /// **A plan a later `housekeeping_prepare` superseded is refused
+    /// here**, and this is the only place it can be: §3.2 orders the
+    /// record write before any unlink, so a caller following that
+    /// order cannot reach the file half with a stale plan. It matters
+    /// because §3.7's abandoned-plan recovery makes a second prepare
+    /// legal, and a horizon that regressed in between withdraws the
+    /// segments the first plan named — writing its record would
+    /// witness them under the live pass's mode, and the unlinks after
+    /// it would remove frames the ledger has since re-pinned.
+    ///
     /// # Errors
     ///
-    /// The merge could not assign a slot id, or the slot write or its
-    /// fsync failed. Nothing has been unlinked either way, and
-    /// [`ReclaimOutcome::RecordFailed`] is what
-    /// [`Self::housekeeping_commit`] expects in response.
+    /// The plan was superseded, the merge could not assign a slot id,
+    /// or the slot write or its fsync failed. Nothing has been
+    /// unlinked either way, and [`ReclaimOutcome::RecordFailed`] is
+    /// what [`Self::housekeeping_commit`] expects in response.
     pub fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<(), std::io::Error> {
+        let mode = match self.outstanding.as_ref() {
+            Some(outstanding) if outstanding.pass == plan.pass => outstanding.mode,
+            Some(outstanding) => return Err(superseded(plan, outstanding.pass)),
+            None => return Ok(()),
+        };
         if !plan.records {
             return Ok(());
         }
-        let mode = match self.outstanding.as_ref() {
-            Some(outstanding) => outstanding.mode,
-            None => return Ok(()),
-        };
         let Some(record) = self.merge_plan(plan, mode)? else {
             return Ok(());
         };

@@ -453,6 +453,50 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
     );
 }
 
+/// A plan a later `housekeeping_prepare` superseded is refused at the
+/// record write. §3.7 makes the second prepare legal — it is the
+/// abandoned-plan recovery — and a horizon that regressed in between
+/// withdraws exactly the segments the first plan named, so submitting
+/// the old plan would unlink frames the ledger has re-pinned. §3.2
+/// orders the record before the unlinks, which is what makes this the
+/// place the stale plan stops.
+#[test]
+fn rfc0052_12_a_superseded_plan_is_refused_at_the_record_write() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let superseded = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    // The tenant's snapshot stops restoring: every segment it holds
+    // goes back to pinned, the plan above included.
+    let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
+    assert!(
+        pinned.segments.is_empty(),
+        "the regression withdrew what the first plan named",
+    );
+
+    let refused = wal
+        .write_plan_record(&superseded)
+        .expect_err("a superseded plan must not reach the file half");
+    let text = refused.to_string();
+    assert!(
+        text.contains("superseded") && text.contains("§3.7"),
+        "and the refusal says why: {text}",
+    );
+    assert_eq!(
+        segment_files(root).len(),
+        BACKLOG + 1,
+        "nothing was unlinked",
+    );
+
+    wal.write_plan_record(&pinned)
+        .expect("the live plan still writes");
+}
+
 /// An unlink that fails is kept for retry **and** reported. §3.1's
 /// rule is that the failure is logged and the next pass retries it,
 /// and a pass that returned `Ok` gave its caller neither.

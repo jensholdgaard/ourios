@@ -48,8 +48,8 @@ pub(crate) mod segment;
 
 pub use ledger::LedgerError;
 pub use pass::{
-    HousekeepingProgress, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome, ReclaimPlan,
-    SkipReason, unlink_planned,
+    HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
+    ReclaimPlan, SkipReason, unlink_planned,
 };
 pub use reclaim::{
     DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
@@ -416,6 +416,10 @@ pub struct Wal {
     /// that is never committed strands nothing, since the entries stay
     /// marked reclaiming and the next prepare re-plans them.
     outstanding: Option<Outstanding>,
+    /// Passes [`Self::housekeeping_prepare`] has run, which is where
+    /// the [`PassId`] on each plan comes from. Monotone, so a plan a
+    /// later prepare superseded never matches the outstanding one.
+    passes: u64,
     /// Bytes of validated frames in surviving segments, seeded after
     /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
     /// less header, which would count a torn tail, and never the
@@ -497,6 +501,7 @@ impl Wal {
             stale_partials: Vec::new(),
             ledger: retain::SegmentLedger::default(),
             outstanding: None,
+            passes: 0,
             unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,
@@ -1847,6 +1852,9 @@ impl std::error::Error for HousekeepingError {
 /// ledger, while a partial goes back on the sweep's list.
 #[derive(Debug)]
 struct Outstanding {
+    /// The pass this state belongs to, so a plan a later prepare
+    /// superseded is refused before its record is written (§3.7).
+    pass: pass::PassId,
     segments: Vec<retain::Popped>,
     partials: Vec<PathBuf>,
     /// The mode this pass runs under, so the record merge in the file

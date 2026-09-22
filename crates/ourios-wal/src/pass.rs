@@ -97,10 +97,37 @@ pub struct PlannedSegment {
     pub path: PathBuf,
 }
 
+/// Which `housekeeping_prepare` produced a plan. The WAL mints one per
+/// pass and keeps it beside the outstanding state, so a plan a later
+/// prepare superseded can be told from the live one — §3.7's
+/// abandoned-plan recovery re-plans under a new id, and a horizon that
+/// regressed in between can have withdrawn exactly the segments the
+/// old plan names.
+///
+/// The value is the WAL's own, with no constructor outside this crate:
+/// a plan is something a pass hands out, never something a caller
+/// builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassId(u64);
+
+impl PassId {
+    pub(crate) fn new(pass: u64) -> Self {
+        Self(pass)
+    }
+}
+
+impl std::fmt::Display for PassId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Everything the file half needs, owned, so it holds no guard and no
 /// WAL handle (RFC 0052 §3.7).
 #[derive(Debug, Clone)]
 pub struct ReclaimPlan {
+    /// The pass that produced this plan (§3.7).
+    pub pass: PassId,
     pub segments: Vec<PlannedSegment>,
     pub partials: Vec<PathBuf>,
     /// Whether this pass owes a record write at all. §3.2 gates the

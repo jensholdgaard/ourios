@@ -136,6 +136,12 @@ oidc = ["ourios-serving/oidc"]
 openfga = ["ourios-serving/openfga"]
 
 [dev-dependencies]
+# RFC 0052 §6's rotation fault-injection seam, for the RFC0052.15 arms
+# that drive a *real* WAL's rotation failure out to both transports —
+# §3.3's five steps are `fsync`, `create` and `rename` calls a directory
+# permission cannot single out. Test targets only: `cargo build` does not
+# resolve dev-dependencies, so no product binary carries the seam.
+ourios-wal = { path = "../ourios-wal", features = ["fault-injection"] }
 # RFC0030.2 HTTPS client: a real TLS handshake to the http listener
 # (the other http tests use in-process oneshot, which skips TLS).
 # rustls-tls-manual-roots so the test trusts only its rcgen CA.

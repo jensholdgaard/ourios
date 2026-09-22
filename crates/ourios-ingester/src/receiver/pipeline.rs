@@ -666,6 +666,22 @@ pub(super) enum IngestFailure {
     /// Durability is temporarily unavailable; retryable. HTTP 503 /
     /// gRPC `UNAVAILABLE`.
     Unavailable,
+    /// **Server-terminal, client-retryable** — RFC 0018 §3.2's third
+    /// class, which RFC 0052 §3.3 adds. The WAL's rotation retry budget
+    /// is exhausted: no delay fixes the node, it needs an operator, and
+    /// the only exit today is a restart (#791).
+    ///
+    /// Still HTTP 503 / gRPC `UNAVAILABLE`, deliberately and for the
+    /// reason §3.2 gives: the batch was never acked, and every
+    /// non-retryable OTLP status also instructs the client to *drop*
+    /// it, which would turn a terminal node into silent data loss.
+    /// OTLP's retryable axis is about the data, and this batch is
+    /// valid — it will be accepted once the node is cleared. What
+    /// changes is the message, which names the state instead of
+    /// implying a blip, and that no retry hint is carried: the server
+    /// schedules no retry of its own, so a conforming client backs off
+    /// exponentially.
+    ServerTerminal,
     /// Unreachable for a transport-validated selector; our bug.
     /// HTTP 500 / gRPC `INTERNAL`.
     Internal,
@@ -678,6 +694,15 @@ impl IngestFailure {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
             ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
+            // RFC 0052 §3.3's narrow reclassification: only the
+            // *terminal* rotation state leaves the transient class. A
+            // rotation still inside its retry budget genuinely is
+            // transient — a later append can succeed — and an ordinary
+            // append or fsync I/O failure never reaches this arm at all.
+            ReceiveError::WalAppend(ourios_wal::AppendError::RotationTerminal(_))
+            | ReceiveError::WalSync(ourios_wal::SyncError::RotationTerminal(_)) => {
+                Self::ServerTerminal
+            }
             ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
         }
@@ -749,6 +774,103 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ourios_config::MinerConfig;
+
+    /// The classifier exists to force "one retryable-vs-not decision"
+    /// (see its doc comment). It used to fold a permanently quiesced
+    /// WAL into the transient bucket, so a node only a restart could
+    /// fix kept answering "retry later" forever (#791). RFC 0052 §3.3
+    /// made the refusal *bounded*, so the rule is now terminal-only:
+    /// the state that leaves the transient class is the exhausted
+    /// budget, and nothing else.
+    mod terminal_vs_transient {
+        use super::super::{IngestFailure, ReceiveError};
+        use ourios_wal::{AppendError, RotationFault, RotationSite, SyncError};
+
+        fn fault(attempts: u32) -> RotationFault {
+            RotationFault::new(
+                RotationSite::CloseSync,
+                &std::io::Error::other("io"),
+                attempts,
+                3,
+            )
+        }
+
+        /// The state #794 called wedged. It is reached by exhausting the
+        /// budget now, and every append after it carries this variant.
+        #[test]
+        fn a_terminal_rotation_state_classifies_server_terminal_not_transient() {
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::RotationTerminal(
+                    fault(3),
+                ))),
+                IngestFailure::ServerTerminal,
+            );
+        }
+
+        /// The append whose own rotation spent the last unit of the
+        /// budget is already terminal: every later append is refused.
+        /// #794 classified it transient, which advised a retry on the
+        /// one request that had just made retrying useless — and the
+        /// *sync* surface reaches the same state, so it must classify
+        /// the same way.
+        #[test]
+        fn the_append_and_the_sync_that_exhaust_the_budget_are_both_terminal() {
+            for error in [
+                ReceiveError::WalAppend(AppendError::RotationTerminal(fault(3))),
+                ReceiveError::WalSync(SyncError::RotationTerminal(fault(3))),
+            ] {
+                assert_eq!(
+                    IngestFailure::classify(&error),
+                    IngestFailure::ServerTerminal
+                );
+            }
+        }
+
+        /// The half #794 got wrong once §3.3 lands: a rotation failure
+        /// still inside its budget genuinely is transient, because a
+        /// later append can succeed. Classifying it terminal would tell
+        /// an operator to intervene on a blip.
+        #[test]
+        fn a_rotation_still_inside_its_budget_stays_transient() {
+            for error in [
+                ReceiveError::WalAppend(AppendError::RotationRetrying(fault(1))),
+                ReceiveError::WalSync(SyncError::RotationRetrying(fault(1))),
+            ] {
+                assert_eq!(IngestFailure::classify(&error), IngestFailure::Unavailable);
+            }
+        }
+
+        #[test]
+        fn other_append_and_sync_failures_stay_transient() {
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::Io {
+                    op: "write",
+                    source: std::io::Error::other("io"),
+                })),
+                IngestFailure::Unavailable,
+            );
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalSync(SyncError::Io {
+                    op: "fdatasync",
+                    source: std::io::Error::other("io"),
+                })),
+                IngestFailure::Unavailable,
+            );
+        }
+
+        /// The split must not have moved the oversize case, which is the
+        /// one append failure a client can fix itself.
+        #[test]
+        fn an_oversize_batch_is_still_its_own_outcome() {
+            assert_eq!(
+                IngestFailure::classify(&ReceiveError::WalAppend(AppendError::TooLarge {
+                    len: 32 * 1024 * 1024,
+                    limit: 16 * 1024 * 1024,
+                })),
+                IngestFailure::TooLarge,
+            );
+        }
+    }
 
     /// Persists nothing; `sync` reports the configured offset and counts
     /// its calls, so a test can assert WAL-before-ack ordering and

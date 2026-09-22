@@ -220,10 +220,11 @@ impl LogsService for LogsReceiver {
 /// Every other WAL append/sync failure is `UNAVAILABLE`, which OTLP defines
 /// as retryable — the batch was not acked (§3.4), so compliant clients
 /// re-send rather than drop data (a non-retryable `INTERNAL` would tell them
-/// to drop it). That includes `QuiescedAfterRotationFailure`, per RFC 0018
-/// §3.2's transient class; whether a quiesced WAL should be reported
-/// differently is RFC 0052's question, not this arm's. The message rides
-/// along, so a client at least sees which failure it was.
+/// to drop it). That includes RFC 0052 §3.3's **terminal** rotation state,
+/// which RFC 0018 §3.2's third class reports server-terminal but still
+/// client-retryable for exactly that reason; the message is what separates
+/// it from a transient blip, and no retry hint rides on either, since the
+/// server schedules no retry of its own.
 ///
 /// Adapt the shared [`IngestFailure`] classification to gRPC status
 /// vocabulary (the classification itself lives beside `ReceiveError`
@@ -234,7 +235,11 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
         IngestFailure::Denied => Status::permission_denied(msg),
         // gRPC has no payload-too-large code (RFC 0026 §3.5 mapping).
         IngestFailure::TooLarge => Status::invalid_argument(msg),
-        IngestFailure::Unavailable => Status::unavailable(msg),
+        // Both durability classes are `UNAVAILABLE`: a non-retryable code
+        // would tell the client to drop a batch that was never acked
+        // (RFC 0018 §3.2, as RFC 0052 §3.3 amends it). The message, not
+        // the code, carries the distinction.
+        IngestFailure::Unavailable | IngestFailure::ServerTerminal => Status::unavailable(msg),
         IngestFailure::Internal => Status::internal(msg),
     }
 }
@@ -242,8 +247,17 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::{ReceiveError, ingest_error_status};
-    use ourios_wal::{AppendError, SyncError};
+    use ourios_wal::{AppendError, RotationFault, RotationSite, SyncError};
     use tonic::Code;
+
+    fn fault(attempts: u32) -> RotationFault {
+        RotationFault::new(
+            RotationSite::ParentFsync,
+            &std::io::Error::other("io"),
+            attempts,
+            3,
+        )
+    }
 
     #[test]
     fn tenant_denied_is_permission_denied() {
@@ -272,10 +286,18 @@ mod tests {
         assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
     }
 
+    /// RFC 0052 §3.3 replaced the permanent quiesce with a bounded
+    /// retry, so this arm now covers both of its states. Neither may
+    /// become a non-retryable code: the batch was never acked.
     #[test]
-    fn quiesced_wal_append_is_unavailable() {
-        let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
-        assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
+    fn both_rotation_states_are_unavailable() {
+        for error in [
+            AppendError::RotationRetrying(fault(1)),
+            AppendError::RotationTerminal(fault(3)),
+        ] {
+            let e = ReceiveError::WalAppend(error);
+            assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
+        }
     }
 
     #[test]

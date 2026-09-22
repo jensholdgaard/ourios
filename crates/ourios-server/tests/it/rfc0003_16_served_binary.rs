@@ -101,6 +101,7 @@ fn replay_frames(wal_root: &Path) -> Vec<(FrameKind, Vec<u8>)> {
         segment_age_secs: 600,
         housekeeping_secs: 60,
         max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+        rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
         macos_full_fsync: false,
     })
     .expect("reopen WAL")

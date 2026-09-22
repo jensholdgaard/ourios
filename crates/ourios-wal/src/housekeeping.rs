@@ -89,7 +89,18 @@ impl Wal {
         let (lag_bytes, lag_segments) = self.ledger.lag(self.floor_bound(horizons));
         plan.progress.lag_bytes = lag_bytes;
         plan.progress.lag_segments = lag_segments;
-        self.merge_plan(&mut plan, &segments, pass::entry_mode(horizons))?;
+        // The merge is fallible — a segment can introduce a tenant the
+        // fixed dictionary has no room for — and the partials are
+        // already out of the sweep's list, which is their only record.
+        // Put everything back before the error leaves, or they become
+        // invisible to every later pass.
+        if let Err(e) = self.merge_plan(&mut plan, &segments, pass::entry_mode(horizons)) {
+            for popped in &segments {
+                self.ledger.restore(popped.segment);
+            }
+            self.requeue_partials(plan.partials);
+            return Err(e);
+        }
         self.outstanding = Some(Outstanding {
             segments,
             partials: plan.partials.clone(),

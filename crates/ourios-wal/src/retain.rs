@@ -218,7 +218,13 @@ pub(crate) struct SegmentLedger {
     /// Segments whose `pending` set is empty — the eligible head the
     /// pass pops from under the checkpoint rule.
     unpinned: BTreeSet<Uuid>,
-    reclaiming: usize,
+    /// The sum of every tenant's `behind`, maintained beside it so
+    /// reading it is O(1) rather than a per-tenant sum on the pass.
+    behind_total: usize,
+    /// Entries a pass popped and no commit has settled, ordered so a
+    /// re-plan walks them oldest-first and costs O(cap) — a pass pops
+    /// at most the cap, so this set never grows past it.
+    reclaiming: BTreeSet<Uuid>,
     floor: RetainFloor,
 }
 
@@ -312,6 +318,7 @@ impl SegmentLedger {
         let state = self.tenants.entry(tenant.clone()).or_default();
         if state.segments.insert(id) && is_above(state.cursor, id) {
             state.behind += 1;
+            self.behind_total += 1;
         }
     }
 
@@ -336,7 +343,7 @@ impl SegmentLedger {
     /// covers, which is exactly the unbounded work under the journal
     /// guard that RFC0052.12 forbids.
     pub(crate) fn horizon_remaining(&self) -> usize {
-        self.tenants.values().map(|t| t.behind).sum()
+        self.behind_total
     }
 
     /// Empty-set segments not yet popped, plus entries reclaiming or
@@ -346,7 +353,7 @@ impl SegmentLedger {
     /// it, so counting it would make the backlog figure an operator
     /// watches never reach zero on a healthy node.
     pub(crate) fn unlink_remaining(&self, current: Uuid) -> usize {
-        self.unpinned.len() - usize::from(self.unpinned.contains(&current)) + self.reclaiming
+        self.unpinned.len() - usize::from(self.unpinned.contains(&current)) + self.reclaiming.len()
     }
 
     /// The oldest surviving frame of `tenant`: its first offset in its
@@ -437,6 +444,7 @@ impl SegmentLedger {
             return;
         };
         state.cursor = None;
+        self.behind_total = self.behind_total - state.behind + state.segments.len();
         state.behind = state.segments.len();
         let segments: Vec<Uuid> = state.segments.iter().copied().collect();
         for id in segments {
@@ -444,7 +452,7 @@ impl SegmentLedger {
                 entry.pending.insert(tenant.clone());
                 if matches!(entry.state, State::Reclaiming { .. }) {
                     entry.state = State::Eligible;
-                    self.reclaiming -= 1;
+                    self.reclaiming.remove(&id);
                 }
             }
             self.unpinned.remove(&id);
@@ -532,6 +540,7 @@ impl SegmentLedger {
         {
             state.cursor = state.segments.range(..segment).next_back().copied();
             state.behind += 1;
+            self.behind_total += 1;
         }
     }
 
@@ -547,11 +556,12 @@ impl SegmentLedger {
         if let Some(state) = self.tenants.get_mut(tenant) {
             state.cursor = Some(segment);
             state.behind = state.behind.saturating_sub(1);
+            self.behind_total = self.behind_total.saturating_sub(1);
         }
     }
 
     fn any_behind(&self) -> bool {
-        self.tenants.values().any(|t| t.behind > 0)
+        self.behind_total > 0
     }
 
     /// §3.2's reported summary: the minimum over every tenant's
@@ -629,22 +639,43 @@ impl SegmentLedger {
         false
     }
 
-    /// The ids one drain walks. `Reclaiming` is §3.7's re-plan of a
-    /// pass that never committed, taken ahead of anything newly
-    /// eligible. `Eligible` under `NoConsumer` walks the whole ledger,
-    /// since no tenant constrains anything; otherwise it walks the
-    /// empty-set head, which is what keeps a pinned oldest segment
-    /// from shadowing a later eligible one.
+    /// The ids one drain walks, **bounded by the budget**. `Reclaiming`
+    /// is §3.7's re-plan of a pass that never committed, taken ahead of
+    /// anything newly eligible. `Eligible` under `NoConsumer` walks the
+    /// whole ledger, since no tenant constrains anything; otherwise it
+    /// walks the empty-set head, which is what keeps a pinned oldest
+    /// segment from shadowing a later eligible one.
+    ///
+    /// Every branch takes at most `budget` ids and stops at the first
+    /// segment above the checkpoint. That is what makes the walk O(cap)
+    /// and not O(backlog): both structures are ordered by `UUIDv7`,
+    /// which is the order of the segments' highest offsets, so nothing
+    /// after the first uncovered one is covered either. The
+    /// `NoConsumer` branch may additionally skip entries already
+    /// reclaiming, of which a pass leaves at most the cap.
     fn candidates(&self, drain: Drain) -> Vec<Uuid> {
+        let covered = |id: &Uuid| {
+            self.segments
+                .get(id)
+                .is_some_and(|s| s.highest <= drain.bound.checkpoint)
+        };
         match (drain.admit, drain.bound.tenant_aware) {
-            (Admit::Reclaiming, _) => self
-                .segments
+            (Admit::Reclaiming, _) => self.reclaiming.iter().take(drain.budget).copied().collect(),
+            (Admit::Eligible, true) => self
+                .unpinned
                 .iter()
-                .filter(|(_, s)| matches!(s.state, State::Reclaiming { .. }))
-                .map(|(id, _)| *id)
+                .take_while(|id| covered(id))
+                .take(drain.budget)
+                .copied()
                 .collect(),
-            (Admit::Eligible, true) => self.unpinned.iter().copied().collect(),
-            (Admit::Eligible, false) => self.segments.keys().copied().collect(),
+            (Admit::Eligible, false) => self
+                .segments
+                .keys()
+                .take_while(|id| covered(id))
+                .filter(|id| !self.reclaiming.contains(id))
+                .take(drain.budget)
+                .copied()
+                .collect(),
         }
     }
 
@@ -667,7 +698,7 @@ impl SegmentLedger {
         let segment = self.segments.get_mut(&id)?;
         let uncertain = matches!(segment.state, State::Reclaiming { uncertain: true });
         if segment.state == State::Eligible {
-            self.reclaiming += 1;
+            self.reclaiming.insert(id);
         }
         segment.state = State::Reclaiming { uncertain };
         self.unpinned.remove(&id);
@@ -692,7 +723,7 @@ impl SegmentLedger {
             return;
         };
         if matches!(segment.state, State::Reclaiming { .. }) {
-            self.reclaiming -= 1;
+            self.reclaiming.remove(&id);
         }
         segment.state = State::Eligible;
         if segment.pending.is_empty() {
@@ -717,7 +748,7 @@ impl SegmentLedger {
             return 0;
         };
         if matches!(segment.state, State::Reclaiming { .. }) {
-            self.reclaiming -= 1;
+            self.reclaiming.remove(&id);
         }
         self.unpinned.remove(&id);
         for tenant in segment.members.keys() {
@@ -727,12 +758,14 @@ impl SegmentLedger {
             state.segments.remove(&id);
             if is_above(state.cursor, id) {
                 state.behind = state.behind.saturating_sub(1);
+                self.behind_total = self.behind_total.saturating_sub(1);
             }
             // The cursor is an ordering bound, not a reference: it
             // keeps the uuid of the segment it reached even once that
             // segment is gone, so the next pass resumes above it
             // rather than re-walking a prefix it has already applied.
             if state.segments.is_empty() {
+                self.behind_total = self.behind_total.saturating_sub(state.behind);
                 self.tenants.remove(tenant);
             }
         }
@@ -764,4 +797,110 @@ fn next_after(cursor: Uuid) -> (std::ops::Bound<Uuid>, std::ops::Bound<Uuid>) {
 /// Whether `id` sits above a cursor that may not exist yet.
 fn is_above(cursor: Option<Uuid>, id: Uuid) -> bool {
     cursor.is_none_or(|at| id > at)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{FrameAt, PopBound, SegmentLedger, SnapshotHorizons};
+    use crate::WalOffset;
+    use ourios_core::tenant::TenantId;
+
+    /// `horizon_remaining` and `unlink_remaining` are O(1) reads, which
+    /// is only honest if the aggregates behind them track the per-tenant
+    /// and per-segment state they summarise. Every mutation moves both,
+    /// so a drift is a bug the pass would report and never notice —
+    /// this walks a sequence that touches all of them and re-derives
+    /// the sums the long way.
+    #[test]
+    fn the_o1_aggregates_equal_the_sums_they_stand_for() {
+        let mut ledger = SegmentLedger::default();
+        let alpha = TenantId::new("alpha");
+        let beta = TenantId::new("beta");
+        let segments: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::now_v7()).collect();
+        let mut offsets = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            for (byte, tenant) in [(64, &alpha), (128, &beta)] {
+                let offset = WalOffset {
+                    segment: *segment,
+                    byte: byte + index as u64,
+                };
+                ledger.observe(FrameAt {
+                    offset,
+                    bytes: 32,
+                    tenant: Some(tenant),
+                    path: Path::new("/wal/x.wal"),
+                });
+                offsets.push(offset);
+            }
+        }
+        let current = *segments.last().expect("four segments");
+        let check = |ledger: &SegmentLedger, what: &str| {
+            assert_eq!(
+                ledger.horizon_remaining(),
+                ledger.tenants.values().map(|t| t.behind).sum::<usize>(),
+                "behind_total after {what}",
+            );
+            assert_eq!(
+                ledger.unlink_remaining(current),
+                ledger.unpinned.len() - usize::from(ledger.unpinned.contains(&current))
+                    + ledger
+                        .segments
+                        .values()
+                        .filter(|s| matches!(s.state, super::State::Reclaiming { .. }))
+                        .count(),
+                "reclaiming index after {what}",
+            );
+        };
+        check(&ledger, "the rebuild");
+
+        let horizons = |marks: &[(&TenantId, WalOffset)]| {
+            SnapshotHorizons::restorable(
+                marks
+                    .iter()
+                    .map(|(tenant, offset)| ((*tenant).clone(), *offset)),
+            )
+        };
+        let bound = PopBound {
+            checkpoint: offsets[5],
+            current,
+            tenant_aware: true,
+        };
+
+        ledger.apply(&horizons(&[(&alpha, offsets[6]), (&beta, offsets[7])]), 2);
+        check(&ledger, "a capped application");
+        ledger.apply(&horizons(&[(&alpha, offsets[6]), (&beta, offsets[7])]), 8);
+        check(&ledger, "the rest of the application");
+
+        let (popped, _) = ledger.pop(bound, 8);
+        check(&ledger, "a pop");
+        for entry in &popped {
+            ledger.restore(entry.segment);
+        }
+        check(&ledger, "a restore");
+
+        let (popped, _) = ledger.pop(bound, 8);
+        for entry in &popped {
+            ledger.remove(entry.segment);
+        }
+        check(&ledger, "a removal");
+
+        // A horizon that disappears rewinds both tenants.
+        ledger.apply(&horizons(&[]), 8);
+        check(&ledger, "a rewind");
+
+        // And an append above the applied horizon re-pins.
+        ledger.apply(&horizons(&[(&alpha, offsets[6]), (&beta, offsets[7])]), 8);
+        ledger.observe(FrameAt {
+            offset: WalOffset {
+                segment: current,
+                byte: 4096,
+            },
+            bytes: 32,
+            tenant: Some(&alpha),
+            path: Path::new("/wal/x.wal"),
+        });
+        check(&ledger, "a re-pinning append");
+    }
 }

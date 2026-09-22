@@ -570,12 +570,7 @@ impl SegmentLedger {
         let segments: Vec<Uuid> = state.segments.iter().copied().collect();
         for id in segments {
             self.pin(tenant, id);
-            if let Some(entry) = self.segments.get_mut(&id)
-                && matches!(entry.state, State::Reclaiming { .. })
-            {
-                entry.state = State::Eligible;
-                self.reclaiming.remove(&id);
-            }
+            self.withdraw(id);
             self.unpinned.remove(&id);
         }
     }
@@ -859,6 +854,26 @@ impl SegmentLedger {
             uncertain,
             last_offsets,
         })
+    }
+
+    /// Take a popped entry back out of the pass without forgetting
+    /// that a file half may have had it.
+    ///
+    /// This is [`Self::restore`] minus its one certainty: the caller
+    /// here does not know whether the unlink ran, so `attempted`
+    /// stays and a later re-plan is still an uncertain deletion.
+    pub(crate) fn withdraw(&mut self, id: Uuid) {
+        let Some(segment) = self.segments.get_mut(&id) else {
+            return;
+        };
+        if !matches!(segment.state, State::Reclaiming { .. }) {
+            return;
+        }
+        segment.state = State::Eligible;
+        self.reclaiming.remove(&id);
+        if segment.pending.is_empty() {
+            self.unpinned.insert(id);
+        }
     }
 
     /// A popped segment the file half never unlinked: it goes back to

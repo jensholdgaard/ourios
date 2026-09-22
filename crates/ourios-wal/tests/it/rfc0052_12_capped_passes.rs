@@ -516,6 +516,47 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     );
 }
 
+/// A plan abandoned before its record write leaves the recorded mode
+/// `Unrecorded`, so §3.2's mode guard admits any mode on the next
+/// pass — and §3.7 re-plans a reclaiming entry unconditionally. A
+/// `NoConsumer` pass pops by the checkpoint alone, with no tenant
+/// constraint at all, so without withdrawing its entries first that
+/// pair unlinks the frames of a tenant that has no snapshot: exactly
+/// the loss the mode guard exists to prevent, through the one window
+/// the guard cannot see.
+#[test]
+fn rfc0052_12_an_abandoned_no_consumer_plan_does_not_survive_into_a_known_pass() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let first = build_tenant_segment(root, &[("alpha", b"a1")]);
+    build_tenant_segment(root, &[("alpha", b"a2")]);
+    let before = segment_files(root);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(first[0]).expect("checkpoint");
+
+    let abandoned = wal
+        .housekeeping_prepare(&SnapshotHorizons::NoConsumer, CAP)
+        .expect("prepare");
+    assert_eq!(
+        abandoned.segments().len(),
+        1,
+        "the no-consumer pass popped it by the checkpoint alone",
+    );
+    // The task dies before the record write, so the root's mode is
+    // still unrecorded and the next pass may pick any.
+
+    let known_pass = wal.housekeeping_prepare(&known(&[]), CAP).expect("prepare");
+    assert!(
+        known_pass.segments().is_empty(),
+        "a tenant with no snapshot pins its own segment, re-plan or not",
+    );
+    wal.write_plan_record(&known_pass).expect("record");
+    wal.housekeeping_commit(unlink_planned(&known_pass))
+        .expect("commit");
+    assert_eq!(segment_files(root), before, "so its frames are still there");
+}
+
 /// A plan a later `housekeeping_prepare` superseded is refused at the
 /// record write. §3.7 makes the second prepare legal — it is the
 /// abandoned-plan recovery — and a horizon that regressed in between

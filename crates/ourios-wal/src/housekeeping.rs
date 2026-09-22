@@ -82,6 +82,7 @@ impl Wal {
         // here can return early: a pass refused for a mode or horizon
         // mismatch would otherwise take them with it.
         if let Some(abandoned) = self.outstanding.take() {
+            self.withdraw_across_modes(&abandoned, horizons);
             self.requeue_partials(abandoned.partials);
         }
         self.refuse_mode_disagreement(horizons)?;
@@ -142,6 +143,29 @@ impl Wal {
             progress: plan.progress,
         });
         Ok(plan)
+    }
+
+    /// An abandoned plan's entries stay marked reclaiming and §3.7
+    /// re-plans them **unconditionally**, ahead of anything newly
+    /// eligible. That is right under the same mode. It is not right
+    /// across a change of mode: a `NoConsumer` pass pops by the
+    /// checkpoint alone, with no tenant constraint at all, so carrying
+    /// its choices into a `Known` pass would unlink frames of a tenant
+    /// that has no snapshot — the loss §3.2's mode guard exists to
+    /// prevent, reached through the one window where that guard cannot
+    /// see it, since a plan abandoned before its record write leaves
+    /// the recorded mode `Unrecorded` and every mode is then admitted.
+    ///
+    /// The entries are withdrawn rather than restored: the file half
+    /// may have had them, and §3.2's ordering puts the record write
+    /// first, so the next plan must still treat them as uncertain.
+    fn withdraw_across_modes(&mut self, abandoned: &Outstanding, horizons: &SnapshotHorizons) {
+        if abandoned.mode == pass::entry_mode(horizons) {
+            return;
+        }
+        for popped in &abandoned.segments {
+            self.ledger.withdraw(popped.segment);
+        }
     }
 
     /// The record half of RFC 0052 §3.2's file half: rewrite the

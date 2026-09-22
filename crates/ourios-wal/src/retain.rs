@@ -289,6 +289,27 @@ impl SegmentLedger {
     /// Record a frame, whether from the recovery walk or a live
     /// append.
     pub(crate) fn observe(&mut self, at: FrameAt<'_>) {
+        self.record_frame(at);
+        let Some(tenant) = at.tenant else {
+            return;
+        };
+        if self.extend_span(tenant, at.offset) {
+            // A frame appended into a segment whose horizon was
+            // already applied here puts that tenant behind again. The
+            // append path is the only place that can happen — the
+            // current segment's last offset rises after the pass that
+            // cleared it — and leaving it cleared would let the
+            // segment be reclaimed after rotation over frames the
+            // tenant has not snapshotted.
+            self.repin(tenant, at.offset.segment);
+            return;
+        }
+        self.join(tenant, at.offset);
+    }
+
+    /// The segment half of an observation: create the entry if this is
+    /// its first frame, then take the frame's bytes and its offset.
+    fn record_frame(&mut self, at: FrameAt<'_>) {
         let id = at.offset.segment;
         let entry = self.segments.entry(id).or_insert_with(|| Segment {
             path: at.path.to_path_buf(),
@@ -305,33 +326,39 @@ impl SegmentLedger {
         }
         entry.bytes += at.bytes;
         entry.highest = entry.highest.max(at.offset);
+        // A held segment's bytes are part of §3.5's lag figures.
         if !entry.pending.is_empty() {
             self.held_bytes += at.bytes;
         }
-        let Some(tenant) = at.tenant else {
-            return;
+    }
+
+    /// Raise `tenant`'s last offset in this segment, if it holds one
+    /// there already. Returns whether it did.
+    fn extend_span(&mut self, tenant: &TenantId, offset: WalOffset) -> bool {
+        let Some(entry) = self.segments.get_mut(&offset.segment) else {
+            return false;
         };
-        if let Some(span) = entry.members.get_mut(tenant) {
-            span.last = span.last.max(at.offset);
-            // A frame appended into a segment whose horizon was
-            // already applied here puts that tenant behind again. The
-            // append path is the only place that can happen — the
-            // current segment's last offset rises after the pass that
-            // cleared it — and leaving it cleared would let the
-            // segment be reclaimed after rotation over frames the
-            // tenant has not snapshotted.
-            self.repin(tenant, id);
-            return;
+        let Some(span) = entry.members.get_mut(tenant) else {
+            return false;
+        };
+        span.last = span.last.max(offset);
+        true
+    }
+
+    /// `tenant`'s first frame in this segment: it joins the membership,
+    /// holds the segment back until its horizon is applied here, and
+    /// the segment counts against its own backlog.
+    fn join(&mut self, tenant: &TenantId, offset: WalOffset) {
+        let id = offset.segment;
+        if let Some(entry) = self.segments.get_mut(&id) {
+            entry.members.insert(
+                tenant.clone(),
+                Span {
+                    first: offset,
+                    last: offset,
+                },
+            );
         }
-        entry.members.insert(
-            tenant.clone(),
-            Span {
-                first: at.offset,
-                last: at.offset,
-            },
-        );
-        // A tenant new to this segment holds it back until its horizon
-        // is applied here.
         self.pin(tenant, id);
         let state = self.tenants.entry(tenant.clone()).or_default();
         if state.segments.insert(id) && is_above(state.cursor, id) {
@@ -1109,6 +1136,14 @@ mod tests {
     /// Every O(1) figure against a fresh walk of the state it stands
     /// for, plus the two indexes the figures are read off.
     fn check(ledger: &SegmentLedger, current: uuid::Uuid, what: &str) {
+        check_backlog(ledger, what);
+        check_indexes(ledger, current, what);
+        check_lag(ledger, current, what);
+    }
+
+    /// Each tenant's own `behind`, recounted from its cursor, and the
+    /// sum the pass reports as `horizon_remaining`.
+    fn check_backlog(ledger: &SegmentLedger, what: &str) {
         let mut behind = 0;
         for (tenant, state) in &ledger.tenants {
             let walked = state
@@ -1120,7 +1155,11 @@ mod tests {
             behind += walked;
         }
         assert_eq!(ledger.behind_total, behind, "behind_total after {what}");
+    }
 
+    /// The eligible head and the pop index against the segment states
+    /// they mirror, and `unlink_remaining` against both.
+    fn check_indexes(ledger: &SegmentLedger, current: uuid::Uuid, what: &str) {
         let reclaiming: BTreeSet<uuid::Uuid> = ledger
             .segments
             .iter()
@@ -1140,7 +1179,10 @@ mod tests {
             unpinned.len() - usize::from(unpinned.contains(&current)) + reclaiming.len(),
             "unlink_remaining after {what}",
         );
+    }
 
+    /// The held aggregates, and the lag they are reported as.
+    fn check_lag(ledger: &SegmentLedger, current: uuid::Uuid, what: &str) {
         let held = || ledger.segments.values().filter(|s| !s.pending.is_empty());
         assert_eq!(ledger.held_segments, held().count(), "held_segments {what}");
         assert_eq!(

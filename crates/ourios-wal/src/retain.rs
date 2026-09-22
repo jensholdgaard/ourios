@@ -222,6 +222,24 @@ pub(crate) struct SegmentLedger {
     floor: RetainFloor,
 }
 
+/// One walk of the ledger inside a pass.
+#[derive(Debug, Clone, Copy)]
+struct Drain {
+    bound: PopBound,
+    budget: usize,
+    admit: Admit,
+}
+
+/// Which candidates a walk admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admit {
+    /// Entries a pass left marked reclaiming, re-planned ahead of
+    /// anything newly eligible (§3.7).
+    Reclaiming,
+    /// Empty-set segments at or below the checkpoint.
+    Eligible,
+}
+
 /// What bounds one pass's pops (RFC 0052 §3.2).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PopBound {
@@ -391,38 +409,41 @@ impl SegmentLedger {
     /// Advance one tenant's cursor by one segment, if its horizon
     /// covers that segment's last offset for it.
     fn step(&mut self, tenant: &TenantId) -> bool {
-        let Some(state) = self.tenants.get(tenant) else {
+        let Some(next) = self.next_covered(tenant) else {
             return false;
         };
-        let Some(horizon) = state.horizon else {
-            return false;
-        };
+        self.apply_to(tenant, next);
+        true
+    }
+
+    /// The oldest segment above this tenant's cursor whose last offset
+    /// for it the tenant's horizon covers. `None` ends the prefix
+    /// walk: last offsets rise with the segments, so nothing above an
+    /// uncovered one is covered either.
+    fn next_covered(&self, tenant: &TenantId) -> Option<Uuid> {
+        let state = self.tenants.get(tenant)?;
+        let horizon = state.horizon?;
         let next = match state.cursor {
             Some(cursor) => state.segments.range(next_after(cursor)).next().copied(),
             None => state.segments.iter().next().copied(),
-        };
-        let Some(next) = next else {
-            return false;
-        };
-        let covered = self
-            .segments
-            .get(&next)
-            .and_then(|s| s.members.get(tenant))
-            .is_some_and(|span| span.last <= horizon);
-        if !covered {
-            return false;
-        }
-        if let Some(segment) = self.segments.get_mut(&next) {
-            segment.pending.remove(tenant);
-            if segment.pending.is_empty() && segment.state == State::Eligible {
-                self.unpinned.insert(next);
+        }?;
+        let span = self.segments.get(&next)?.members.get(tenant)?;
+        (span.last <= horizon).then_some(next)
+    }
+
+    /// Record that `tenant`'s horizon now covers `segment`: it stops
+    /// holding the segment back, and the cursor moves past it.
+    fn apply_to(&mut self, tenant: &TenantId, segment: Uuid) {
+        if let Some(entry) = self.segments.get_mut(&segment) {
+            entry.pending.remove(tenant);
+            if entry.pending.is_empty() && entry.state == State::Eligible {
+                self.unpinned.insert(segment);
             }
         }
         if let Some(state) = self.tenants.get_mut(tenant) {
-            state.cursor = Some(next);
+            state.cursor = Some(segment);
             state.behind = state.behind.saturating_sub(1);
         }
-        true
     }
 
     fn any_behind(&self) -> bool {
@@ -469,62 +490,69 @@ impl SegmentLedger {
     /// tenants constrain the candidates at all.
     pub(crate) fn pop(&mut self, bound: PopBound, budget: usize) -> (Vec<Popped>, bool) {
         let mut out = Vec::new();
-        let replans = self.reclaiming_ids();
-        if self.drain_into(&mut out, replans, bound, budget, |_| true) {
+        let replan = Drain {
+            bound,
+            budget,
+            admit: Admit::Reclaiming,
+        };
+        if self.drain(&mut out, replan) {
             return (out, true);
         }
-        let candidates = self.eligible_ids(bound.tenant_aware);
-        let capped = self.drain_into(&mut out, candidates, bound, budget, |segment| {
-            segment.state == State::Eligible && segment.highest <= bound.checkpoint
-        });
+        let capped = self.drain(
+            &mut out,
+            Drain {
+                admit: Admit::Eligible,
+                ..replan
+            },
+        );
         (out, capped)
     }
 
-    /// Pop from `ids`, oldest first, while `admit` accepts the segment
-    /// and the budget holds. Returns whether the budget bound.
-    fn drain_into(
-        &mut self,
-        out: &mut Vec<Popped>,
-        ids: Vec<Uuid>,
-        bound: PopBound,
-        budget: usize,
-        admit: impl Fn(&Segment) -> bool,
-    ) -> bool {
-        for id in ids {
-            if out.len() >= budget {
+    /// Pop the candidates `drain` admits, oldest first, while the
+    /// budget holds. Returns whether the budget bound.
+    fn drain(&mut self, out: &mut Vec<Popped>, drain: Drain) -> bool {
+        for id in self.candidates(drain) {
+            if out.len() >= drain.budget {
                 return true;
             }
-            if !self.segments.get(&id).is_some_and(&admit) {
+            if !self.admits(id, drain) {
                 continue;
             }
-            if let Some(popped) = self.take(id, bound.current) {
+            if let Some(popped) = self.take(id, drain.bound.current) {
                 out.push(popped);
             }
         }
         false
     }
 
-    /// §3.7's re-plan: a pass that never committed left these marked
-    /// reclaiming, and the next prepare takes them ahead of anything
-    /// newly eligible.
-    fn reclaiming_ids(&self) -> Vec<Uuid> {
-        self.segments
-            .iter()
-            .filter(|(_, s)| matches!(s.state, State::Reclaiming { .. }))
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Under `NoConsumer` no tenant constrains anything, so the
-    /// candidate order is the whole ledger's; otherwise it is the
+    /// The ids one drain walks. `Reclaiming` is §3.7's re-plan of a
+    /// pass that never committed, taken ahead of anything newly
+    /// eligible. `Eligible` under `NoConsumer` walks the whole ledger,
+    /// since no tenant constrains anything; otherwise it walks the
     /// empty-set head, which is what keeps a pinned oldest segment
     /// from shadowing a later eligible one.
-    fn eligible_ids(&self, tenant_aware: bool) -> Vec<Uuid> {
-        if tenant_aware {
-            self.unpinned.iter().copied().collect()
-        } else {
-            self.segments.keys().copied().collect()
+    fn candidates(&self, drain: Drain) -> Vec<Uuid> {
+        match (drain.admit, drain.bound.tenant_aware) {
+            (Admit::Reclaiming, _) => self
+                .segments
+                .iter()
+                .filter(|(_, s)| matches!(s.state, State::Reclaiming { .. }))
+                .map(|(id, _)| *id)
+                .collect(),
+            (Admit::Eligible, true) => self.unpinned.iter().copied().collect(),
+            (Admit::Eligible, false) => self.segments.keys().copied().collect(),
         }
+    }
+
+    fn admits(&self, id: Uuid, drain: Drain) -> bool {
+        self.segments
+            .get(&id)
+            .is_some_and(|segment| match drain.admit {
+                Admit::Reclaiming => true,
+                Admit::Eligible => {
+                    segment.state == State::Eligible && segment.highest <= drain.bound.checkpoint
+                }
+            })
     }
 
     /// Mark one segment reclaiming and describe it for the record.

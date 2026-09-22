@@ -27,4 +27,5 @@ mod rfc0052_17_reclaim_record;
 mod rfc0052_2_truncation_bounds;
 mod rfc0052_4_transient_rotation;
 mod rfc0052_5_persistent_rotation;
+mod rfc0052_record;
 mod rfc0052_support;

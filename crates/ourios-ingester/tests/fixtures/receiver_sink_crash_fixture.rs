@@ -45,6 +45,19 @@ fn string_value(s: &str) -> AnyValue {
     }
 }
 
+/// The workspace-standard WAL knobs (RFC 0008 §6.9, RFC 0052 §3.8).
+fn wal_config(root: String) -> WalConfig {
+    WalConfig {
+        root: root.into(),
+        batch_window_ms: 100,
+        segment_size_bytes: 128 * 1024 * 1024,
+        segment_age_secs: 600,
+        housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+        macos_full_fsync: false,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -52,15 +65,7 @@ async fn main() {
     let bucket_root = args.next().expect("fixture: missing <bucket_root> arg");
     let crash_window = args.next().unwrap_or_else(|| "buffer".to_owned());
 
-    let config = WalConfig {
-        root: wal_root.into(),
-        batch_window_ms: 100,
-        segment_size_bytes: 128 * 1024 * 1024,
-        segment_age_secs: 600,
-        housekeeping_secs: 60,
-        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
-        macos_full_fsync: false,
-    };
+    let config = wal_config(wal_root);
     let window = Duration::from_millis(config.batch_window_ms);
     let segment_size_bytes = config.segment_size_bytes;
     let wal = Wal::open(config).expect("fixture: Wal::open");

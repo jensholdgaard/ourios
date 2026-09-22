@@ -10,10 +10,11 @@ use std::path::PathBuf;
 
 use ourios_wal::{PassOutcome, ReclaimOutcome, SkipReason, SnapshotHorizons, unlink_planned};
 
+use crate::rfc0052_record::{PlannedRow, planned_unlinks, reclaimed_through};
 use crate::rfc0052_support::{
-    CHECKPOINT, MODE_KNOWN, MODE_NO_CONSUMER, PlannedRow, RECLAIM, build_closed_segment,
-    build_tenant_segment, checkpoint_version, downgrade_segments, known, live_slot, open,
-    planned_unlinks, reclaimed_through, segment_files, write_legacy_checkpoint, write_partial,
+    CHECKPOINT, MODE_KNOWN, MODE_NO_CONSUMER, RECLAIM, build_closed_segment, build_tenant_segment,
+    checkpoint_version, downgrade_segments, known, live_slot, open, segment_files,
+    write_legacy_checkpoint, write_partial,
 };
 
 const CAP: usize = 64;

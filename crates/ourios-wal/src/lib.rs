@@ -797,6 +797,17 @@ impl Wal {
             .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
     }
 
+    /// Whether the current segment has outlived `segment_age_secs` —
+    /// the barrier task's idle-rotation predicate (RFC 0052 §3.1). The
+    /// age is the `UUIDv7`'s embedded mint time, so this costs no
+    /// syscall; whether the segment holds a frame is
+    /// [`Self::rotate`]'s own [`RotationKind::Discretionary`] check.
+    #[must_use]
+    pub fn segment_age_exceeded(&self) -> bool {
+        segment_age(self.current_segment_uuid)
+            .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
+    }
+
     /// RFC 0052 §3.3's callable rotation: close the current segment and
     /// install a fresh one, without an append driving it.
     ///

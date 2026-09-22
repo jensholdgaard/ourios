@@ -26,7 +26,10 @@ use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, TenantBatch, Wal, WalOffset};
+use ourios_wal::{
+    FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
+    ReclaimState, RotationKind, SnapshotHorizons, TenantBatch, UnlinkPermit, Wal, WalOffset,
+};
 use prost::Message;
 use tracing::Instrument as _;
 
@@ -58,12 +61,19 @@ pub type SharedPipeline = Arc<IngestPipeline>;
 /// `Send` so it can live behind the coordinator's `Mutex<Box<dyn Journal>>`
 /// as shared state in the async HTTP/gRPC listeners.
 pub trait Journal: Send {
-    /// Append one `OtlpBatch` frame carrying `payload` (not yet durable).
+    /// Append one `OtlpBatch` frame carrying `payload` (not yet durable),
+    /// yielding **this frame's own offset**.
+    ///
+    /// RFC 0052 §3.1: that offset, not the group sync's reported EOF, is
+    /// what the turn stores as `last_durable` and what the barrier reads
+    /// as its mark. A sync's EOF can cover a later turn's frame that has
+    /// not run yet, and a checkpoint at that EOF would stamp across a
+    /// frame nothing had mined.
     ///
     /// # Errors
     ///
     /// [`ReceiveError::WalAppend`] on a persistence failure.
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError>;
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError>;
 
     /// Fsync — appended frames are durable when this returns `Ok`,
     /// yielding the durable high-water offset. The real WAL always has
@@ -80,13 +90,99 @@ pub trait Journal: Send {
     /// by the coordinator's segment-fill early cut ("until the segment
     /// fills", §3.4). Cheap — an in-memory counter, no syscall.
     fn unflushed_bytes(&self) -> u64;
+
+    /// RFC 0052 §3.7's reclamation surface, reached through the trait
+    /// object rather than a downcast so the barrier's tests can drive a
+    /// double that observes reclamation.
+    ///
+    /// The defaults answer [`ReclaimError::NoReclamationSurface`]: the
+    /// spy journals the ingest-path tests use persist nothing, and a
+    /// silent no-op default would let a missing checkpoint read as a
+    /// clean pass. Only [`Wal`] overrides them.
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimError::Checkpoint`] on a sidecar write failure — the
+    /// in-memory mark is left where it was either way (§3.1's
+    /// fail-closed rule).
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
+        let _ = durable_to;
+        Err(ReclaimError::NoReclamationSurface)
+    }
+
+    /// The journal's persisted checkpoint mark, if any.
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        None
+    }
+
+    /// The ledger half of one capped housekeeping pass (§3.2), under the
+    /// journal's single-writer position.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::housekeeping_prepare`].
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        let _ = (horizons, max_unlinks);
+        Err(ReclaimError::NoReclamationSurface)
+    }
+
+    /// Write the plan's `planned` witness and take the unlink permit.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::write_plan_record`].
+    fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
+        let _ = plan;
+        Err(std::io::Error::other(
+            "this journal exposes no RFC 0052 reclamation surface",
+        ))
+    }
+
+    /// Fold the file half's outcome back under the writer position.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::housekeeping_commit`].
+    fn housekeeping_commit(
+        &mut self,
+        pass: PassId,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        let _ = (pass, outcome);
+        Err(ReclaimError::NoReclamationSurface)
+    }
+
+    /// §3.3's append-independent rotation — the barrier task's idle
+    /// rotation, and the discharge of a pending rotation-origin
+    /// directory fsync.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::rotate`].
+    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
+        let _ = kind;
+        Ok(())
+    }
+
+    /// Whether the current segment has outlived `segment_age_secs` —
+    /// the barrier task's idle-rotation predicate (§3.1).
+    fn segment_age_exceeded(&self) -> bool {
+        false
+    }
+
+    /// §3.5's export surface.
+    fn reclaim_state(&self) -> ReclaimState {
+        ReclaimState::default()
+    }
 }
 
 impl Journal for Wal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
-        Wal::append(self, FrameKind::TenantOtlpBatch, payload)
-            .map(|_| ())
-            .map_err(ReceiveError::WalAppend)
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+        Wal::append(self, FrameKind::TenantOtlpBatch, payload).map_err(ReceiveError::WalAppend)
     }
 
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
@@ -95,6 +191,46 @@ impl Journal for Wal {
 
     fn unflushed_bytes(&self) -> u64 {
         self.metrics().unflushed_bytes
+    }
+
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
+        Wal::checkpoint(self, durable_to).map_err(ReclaimError::Checkpoint)
+    }
+
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        Wal::last_checkpoint(self)
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        Wal::housekeeping_prepare(self, horizons, max_unlinks)
+    }
+
+    fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
+        Wal::write_plan_record(self, plan)
+    }
+
+    fn housekeeping_commit(
+        &mut self,
+        pass: PassId,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        Wal::housekeeping_commit(self, pass, outcome)
+    }
+
+    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
+        Wal::rotate(self, kind).map_err(ReceiveError::WalAppend)
+    }
+
+    fn segment_age_exceeded(&self) -> bool {
+        Wal::segment_age_exceeded(self)
+    }
+
+    fn reclaim_state(&self) -> ReclaimState {
+        Wal::reclaim_state(self)
     }
 }
 
@@ -401,8 +537,19 @@ impl IngestPipeline {
             coordinator: &self.coordinator,
             seq,
         };
-        let ack = match outcome.result {
-            Ok(now) => {
+        // RFC 0052 §3.1: the mark is this turn's **own** frame offset,
+        // never the sync's reported EOF — a flush spanning two turns
+        // reports an EOF that already covers the later frame, whose own
+        // turn has not run, and a checkpoint at that EOF would stamp
+        // across a frame nothing had mined. `own` is `Some` whenever
+        // `seq` is, so the `else` arm is unreachable; treating it as a
+        // sync failure keeps the invariant rather than inventing a mark.
+        let ack = match (outcome.result, outcome.own) {
+            (Ok(_), None) => Err(ReceiveError::WalSync(ourios_wal::SyncError::Io {
+                op: "group-commit sync",
+                source: std::io::Error::other("commit reported no frame offset"),
+            })),
+            (Ok(_), Some(now)) => {
                 // §6.9 rotation cadence: a segment change since the prior
                 // (now strictly-previous) durable mark means the WAL
                 // rotated under this batch; fire the hook with the
@@ -454,7 +601,7 @@ impl IngestPipeline {
             }
             // Sync failed: the frame is not durable and not acked; it
             // reaches neither the miner nor the durable mark.
-            Err(e) => Err(e),
+            (Err(e), _) => Err(e),
         };
         // `_gate` releases the hand-off to `seq + 1` as it drops here.
         ack
@@ -882,9 +1029,9 @@ mod tests {
     }
 
     impl Journal for FixedSyncJournal {
-        fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
             self.appends.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(self.offset)
         }
 
         fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
@@ -1002,19 +1149,29 @@ mod tests {
         assert_eq!(pipeline.last_durable(), Some(synced));
     }
 
-    /// `sync` reports offsets from a queue, so a segment change can be
-    /// staged mid-sequence.
+    /// `append_batch` reports each frame's own offset from a queue, so a
+    /// segment change can be staged mid-sequence. RFC 0052 §3.1 makes
+    /// that offset — not the sync's EOF — the rotation-detection input,
+    /// so the queue is drained per append and `sync` echoes the last one.
     struct SequenceJournal {
         offsets: Mutex<Vec<WalOffset>>,
+        last: Mutex<Option<WalOffset>>,
     }
 
     impl Journal for SequenceJournal {
-        fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
-            Ok(())
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+            let next = self.offsets.lock().expect("offsets").remove(0);
+            *self.last.lock().expect("last") = Some(next);
+            Ok(next)
         }
 
         fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
-            Ok(self.offsets.lock().expect("offsets").remove(0))
+            self.last.lock().expect("last").ok_or_else(|| {
+                ReceiveError::WalSync(ourios_wal::SyncError::Io {
+                    op: "fdatasync",
+                    source: std::io::Error::other("nothing appended"),
+                })
+            })
         }
 
         fn unflushed_bytes(&self) -> u64 {
@@ -1026,6 +1183,7 @@ mod tests {
         let coordinator = CommitCoordinator::new(
             Box::new(SequenceJournal {
                 offsets: Mutex::new(offsets),
+                last: Mutex::new(None),
             }),
             Duration::from_millis(5),
             u64::MAX,

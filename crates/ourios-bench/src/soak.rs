@@ -1340,7 +1340,7 @@ fn lock_wal(wal: &Arc<Mutex<Wal>>) -> MutexGuard<'_, Wal> {
 }
 
 impl Journal for SharedWal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         Journal::append_batch(&mut *lock_wal(&self.0), payload)
     }
 
@@ -1350,6 +1350,49 @@ impl Journal for SharedWal {
 
     fn unflushed_bytes(&self) -> u64 {
         Journal::unflushed_bytes(&*lock_wal(&self.0))
+    }
+
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ourios_wal::ReclaimError> {
+        Journal::checkpoint(&mut *lock_wal(&self.0), durable_to)
+    }
+
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        Journal::last_checkpoint(&*lock_wal(&self.0))
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &ourios_wal::SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ourios_wal::ReclaimPlan, ourios_wal::ReclaimError> {
+        Journal::housekeeping_prepare(&mut *lock_wal(&self.0), horizons, max_unlinks)
+    }
+
+    fn write_plan_record(
+        &mut self,
+        plan: &ourios_wal::ReclaimPlan,
+    ) -> Result<ourios_wal::UnlinkPermit, std::io::Error> {
+        Journal::write_plan_record(&mut *lock_wal(&self.0), plan)
+    }
+
+    fn housekeeping_commit(
+        &mut self,
+        pass: ourios_wal::PassId,
+        outcome: ourios_wal::ReclaimOutcome,
+    ) -> Result<ourios_wal::HousekeepingProgress, ourios_wal::ReclaimError> {
+        Journal::housekeeping_commit(&mut *lock_wal(&self.0), pass, outcome)
+    }
+
+    fn rotate(&mut self, kind: ourios_wal::RotationKind) -> Result<(), ReceiveError> {
+        Journal::rotate(&mut *lock_wal(&self.0), kind)
+    }
+
+    fn segment_age_exceeded(&self) -> bool {
+        Journal::segment_age_exceeded(&*lock_wal(&self.0))
+    }
+
+    fn reclaim_state(&self) -> ourios_wal::ReclaimState {
+        Journal::reclaim_state(&*lock_wal(&self.0))
     }
 }
 

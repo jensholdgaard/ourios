@@ -37,7 +37,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ourios_wal::WalOffset;
+use ourios_wal::{HousekeepingProgress, ReclaimError, ReclaimOutcome, SnapshotHorizons, WalOffset};
 use tokio::sync::watch;
 
 use crate::receiver::pipeline::{Journal, ReceiveError};
@@ -55,6 +55,12 @@ use crate::receiver::pipeline::{Journal, ReceiveError};
 /// snapshot-restore §3.5.3) even though the fsyncs batched concurrently.
 pub struct CommitOutcome {
     pub seq: Option<u64>,
+    /// **This frame's own offset**, as its `append_batch` returned it —
+    /// `Some` exactly when `seq` is. RFC 0052 §3.1: the group sync
+    /// reports the WAL's EOF, which can already include a later turn's
+    /// frame, so the mark a turn stores (and the barrier then
+    /// checkpoints at) is this offset and never the EOF in `result`.
+    pub own: Option<WalOffset>,
     pub result: Result<WalOffset, ReceiveError>,
 }
 
@@ -210,20 +216,24 @@ impl CommitCoordinator {
         // Append under the lock, take this frame's seq, and read the
         // WAL's unflushed bytes to decide on an early cut — all while the
         // lock is held so the seq ↔ append ordering is atomic.
-        let (seq, unflushed) = {
+        let (seq, own, unflushed) = {
             let mut journal = self.lock_journal();
-            if let Err(e) = journal.append_batch(payload) {
+            let own = match journal.append_batch(payload) {
+                Ok(own) => own,
                 // No sequence consumed: append never happened.
-                return CommitOutcome {
-                    seq: None,
-                    result: Err(e),
-                };
-            }
+                Err(e) => {
+                    return CommitOutcome {
+                        seq: None,
+                        own: None,
+                        result: Err(e),
+                    };
+                }
+            };
             let mut state = self.lock_flush_state();
             let seq = state.next_seq;
             state.next_seq += 1;
             state.appended_seq = seq;
-            (seq, journal.unflushed_bytes())
+            (seq, own, journal.unflushed_bytes())
         };
 
         // Arm (or piggy-back on) the windowed flush. An unflushed volume
@@ -248,6 +258,7 @@ impl CommitCoordinator {
         };
         CommitOutcome {
             seq: Some(seq),
+            own: Some(own),
             result,
         }
     }
@@ -276,6 +287,106 @@ impl CommitCoordinator {
     /// step, for a sync-failed `seq`) so `seq + 1` may proceed.
     pub fn complete_ingest(&self, seq: u64) {
         self.ingest_gate.send_modify(|next| *next = seq + 1);
+    }
+
+    /// RFC 0052 §3.7: advance the journal's checkpoint to `mark`, from
+    /// the one owner of the single-writer position (RFC 0008 §3.1). The
+    /// barrier reaches reclamation through here rather than taking a
+    /// second handle to the same WAL.
+    ///
+    /// Fail-closed by construction: `Wal::checkpoint` leaves the
+    /// in-memory mark unadvanced on a sidecar write error, so nothing
+    /// past the *previous* mark becomes reclaimable — segments already
+    /// eligible under it still are.
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimError::Checkpoint`] on a sidecar write or fsync failure.
+    pub fn checkpoint(&self, mark: WalOffset) -> Result<(), ReclaimError> {
+        self.lock_journal().checkpoint(mark)
+    }
+
+    /// The journal's persisted checkpoint mark.
+    #[must_use]
+    pub fn last_checkpoint(&self) -> Option<WalOffset> {
+        self.lock_journal().last_checkpoint()
+    }
+
+    /// RFC 0052 §3.5's export surface, read through the one journal
+    /// owner.
+    #[must_use]
+    pub fn reclaim_state(&self) -> ourios_wal::ReclaimState {
+        self.lock_journal().reclaim_state()
+    }
+
+    /// §3.3's append-independent rotation. `Discretionary` is the
+    /// barrier task's idle rotation — a no-op when the current segment
+    /// holds no frame — and is skipped entirely unless the segment has
+    /// outlived `segment_age_secs`, which is read under the same guard
+    /// so the decision and the rotation cannot straddle an append.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::receiver::pipeline::Journal::rotate`].
+    pub fn rotate_if_aged(&self) -> Result<(), ReceiveError> {
+        let mut journal = self.lock_journal();
+        if !journal.segment_age_exceeded() {
+            return Ok(());
+        }
+        journal.rotate(ourios_wal::RotationKind::Discretionary)
+    }
+
+    /// One capped housekeeping pass (§3.2 / §3.7), as a protocol rather
+    /// than a single journal call: the guard is held for the ledger
+    /// half, released for the unlinks and the parent fsync, and taken
+    /// again to fold the outcome back. Between the two the WAL keeps
+    /// serving appends and rotations, which never touch an entry marked
+    /// reclaiming.
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimError::Housekeeping`], carrying the progress so partial
+    /// work, floor and lag stay observable on the failure path.
+    pub fn maintain(
+        &self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        let (plan, permit) = {
+            let mut journal = self.lock_journal();
+            let plan = journal.housekeeping_prepare(horizons, max_unlinks)?;
+            match journal.write_plan_record(&plan) {
+                Ok(permit) => (plan, permit),
+                // §3.1: the commit still runs — it is what returns the
+                // popped entries to eligible and requeues the partials
+                // — and the failure is still the caller's to see.
+                Err(source) => {
+                    let pass = plan.pass();
+                    let (kind, detail) = (source.kind(), source.to_string());
+                    let progress =
+                        journal.housekeeping_commit(pass, ReclaimOutcome::RecordFailed(source))?;
+                    return Err(ReclaimError::Housekeeping {
+                        progress: Box::new(progress),
+                        source: ourios_wal::HousekeepingError::Io {
+                            op: "write(RECLAIM slot)",
+                            source: std::io::Error::new(kind, detail),
+                        },
+                    });
+                }
+            }
+        };
+        let outcome = ourios_wal::unlink_planned(&plan, permit);
+        let failure = ourios_wal::unlink_failure(&outcome);
+        let progress = self
+            .lock_journal()
+            .housekeeping_commit(plan.pass(), outcome)?;
+        match failure {
+            Some(source) => Err(ReclaimError::Housekeeping {
+                progress: Box::new(progress),
+                source,
+            }),
+            None => Ok(progress),
+        }
     }
 
     /// Arm a windowed flush if one is not already pending. The first
@@ -453,10 +564,13 @@ mod tests {
     }
 
     impl Journal for SpyJournal {
-        fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+        fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
             self.appends.fetch_add(1, Ordering::SeqCst);
             self.unflushed += payload.len() as u64;
-            Ok(())
+            Ok(WalOffset {
+                segment: uuid::Uuid::from_u128(1),
+                byte: self.byte + self.unflushed,
+            })
         }
 
         fn sync(&mut self) -> Result<WalOffset, ReceiveError> {

@@ -646,6 +646,63 @@ fn rfc0052_12_a_superseded_commit_leaves_the_live_plan_alone() {
     );
 }
 
+/// A plan does not survive the `Wal` that made it. The per-pass
+/// sequence alone repeats — a reopen of the same root starts again at
+/// one — so a plan left over from the instance before would be taken
+/// as the live one: its segments written into that root's record and
+/// its outstanding state settled under a pass the new instance never
+/// ran.
+#[test]
+fn rfc0052_12_a_plan_does_not_cross_from_one_wal_to_the_next() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let horizons = known(&[("alpha", covered)]);
+
+    let mut first = open(root);
+    first.rebuild_ledger().expect("ledger");
+    first.checkpoint(covered).expect("checkpoint");
+    let stale = first.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    drop(first);
+
+    // The same root, reopened: its own first pass, its own plan.
+    let mut reopened = open(root);
+    reopened.rebuild_ledger().expect("ledger");
+    let live = reopened
+        .housekeeping_prepare(&horizons, CAP)
+        .expect("prepare");
+    assert_ne!(
+        format!("{}", stale.pass()),
+        format!("{}", live.pass()),
+        "the sequence repeats across instances; the identity must not",
+    );
+
+    let refused = reopened
+        .write_plan_record(&stale)
+        .expect_err("the previous instance's plan is not this one's");
+    assert!(format!("{refused}").contains("superseded"));
+    assert!(
+        reopened
+            .housekeeping_commit(
+                stale.pass(),
+                ourios_wal::ReclaimOutcome::RecordFailed(refused),
+            )
+            .is_err(),
+        "and neither is its outcome",
+    );
+
+    reopened
+        .write_plan_record(&live)
+        .expect("the live plan writes");
+    assert_eq!(
+        reopened
+            .housekeeping_commit(live.pass(), unlink_planned(&live))
+            .expect("commit")
+            .removed_segments,
+        live.segments().len(),
+    );
+}
+
 /// An unlink that fails is kept for retry **and** reported. §3.1's
 /// rule is that the failure is logged and the next pass retries it,
 /// and a pass that returned `Ok` gave its caller neither.

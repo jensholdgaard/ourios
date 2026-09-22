@@ -114,21 +114,30 @@ pub struct PlannedSegment {
 /// regressed in between can have withdrawn exactly the segments the
 /// old plan names.
 ///
+/// It names the **`Wal` as well as the pass**. A per-WAL sequence
+/// alone repeats: a reopen of the same root starts again at one, so a
+/// plan left over from the instance before would be accepted by the
+/// new one — its segments written into that root's record and its
+/// outstanding state settled under a pass it never ran.
+///
 /// The value is the WAL's own, with no constructor outside this crate:
 /// a plan is something a pass hands out, never something a caller
 /// builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PassId(u64);
+pub struct PassId {
+    wal: u64,
+    pass: u64,
+}
 
 impl PassId {
-    pub(crate) fn new(pass: u64) -> Self {
-        Self(pass)
+    pub(crate) fn new(wal: u64, pass: u64) -> Self {
+        Self { wal, pass }
     }
 }
 
 impl std::fmt::Display for PassId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}.{}", self.wal, self.pass)
     }
 }
 
@@ -511,7 +520,7 @@ mod tests {
 
     fn plan(root: &std::path::Path, partials: Vec<PathBuf>) -> ReclaimPlan {
         ReclaimPlan {
-            pass: PassId::new(1),
+            pass: PassId::new(1, 1),
             segments: Vec::new(),
             partials,
             records: false,

@@ -119,7 +119,7 @@ impl Wal {
         let (segments, pops_capped, outcome) = self.pop_segments(horizons, budget);
         let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
         self.passes += 1;
-        let pass = pass::PassId::new(self.passes);
+        let pass = pass::PassId::new(self.instance, self.passes);
         let plan = ReclaimPlan {
             pass,
             segments: segments

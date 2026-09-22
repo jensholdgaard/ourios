@@ -420,6 +420,10 @@ pub struct Wal {
     /// the [`PassId`] on each plan comes from. Monotone, so a plan a
     /// later prepare superseded never matches the outstanding one.
     passes: u64,
+    /// This `Wal`'s own number, minted at open and never reused in the
+    /// process, so a [`PassId`] cannot be mistaken for one another
+    /// instance on the same root — a reopen — handed out.
+    instance: u64,
     /// Bytes of validated frames in surviving segments, seeded after
     /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
     /// less header, which would count a torn tail, and never the
@@ -509,6 +513,7 @@ impl Wal {
             ledger,
             outstanding: None,
             passes: 0,
+            instance: NEXT_WAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,
@@ -1873,6 +1878,10 @@ struct Outstanding {
     /// since changed would describe a different one.
     progress: HousekeepingProgress,
 }
+
+/// Numbers each `Wal` this process opens, so [`PassId`] names the
+/// instance as well as the pass (RFC 0052 §3.7).
+static NEXT_WAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Mark one segment's `planned` entry as RFC 0052 §3.2's uncertain
 /// deletion, so the next pass re-verifies its presence.

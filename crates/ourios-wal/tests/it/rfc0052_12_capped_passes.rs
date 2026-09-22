@@ -212,11 +212,10 @@ fn rfc0052_12_horizon_application_is_capped_and_resumes() {
     let horizons = known(&[("alpha", covered)]);
     let first = wal.housekeeping_pass(&horizons, CAP).expect("housekeeping");
     assert!(first.capped, "one pass does not apply the whole backlog");
+    let moved_to = first.horizon_remaining;
     assert!(
-        first.horizon_remaining < backlog_before,
-        "the cursor moved: {} -> {}",
-        backlog_before,
-        first.horizon_remaining,
+        moved_to < backlog_before,
+        "the cursor moved: {backlog_before} -> {moved_to}",
     );
     let mut previous = first.horizon_remaining;
     let mut progress = first;

@@ -127,10 +127,10 @@ fn rfc0052_13_pinned_is_not_expressible_as_no_consumer() {
     let (pinned, survivors) = fixture(&known(&[]));
     assert_eq!(pinned.removed_segments, 0);
     assert_eq!(survivors, 2);
+    let floor = pinned.floor;
     assert!(
-        matches!(pinned.floor, RetainFloor::Pinned { tenants: 1, .. }),
-        "the pinned case is its own variant, not None: {:?}",
-        pinned.floor,
+        matches!(floor, RetainFloor::Pinned { tenants: 1, .. }),
+        "the pinned case is its own variant, not None: {floor:?}",
     );
     assert_ne!(pinned.floor, RetainFloor::None);
 }

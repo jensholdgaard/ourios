@@ -84,10 +84,10 @@ fn rfc0052_2_only_segments_under_every_horizon_are_unlinked() {
     drop(wal);
     let mut sink = TenantSink::default();
     open(root).replay(&mut sink).expect("replay");
+    let frames = sink.frames;
     assert!(
-        sink.frames.contains(&("beta".to_owned(), b"b2".to_vec())),
-        "b2 survives for the lagging tenant to re-mine: {:?}",
-        sink.frames,
+        frames.contains(&("beta".to_owned(), b"b2".to_vec())),
+        "b2 survives for the lagging tenant to re-mine: {frames:?}",
     );
 }
 
@@ -282,10 +282,10 @@ fn rfc0052_2_pinned_tenant_retains_only_its_segments() {
         vec![before[0].clone(), before[2].clone()],
         "the pinning tenant's segment survives; the covered one does not",
     );
+    let floor = progress.floor;
     assert_eq!(
-        progress.floor.pinned_tenants(),
+        floor.pinned_tenants(),
         1,
-        "and the floor says a tenant is holding it down: {:?}",
-        progress.floor,
+        "and the floor says a tenant is holding it down: {floor:?}",
     );
 }

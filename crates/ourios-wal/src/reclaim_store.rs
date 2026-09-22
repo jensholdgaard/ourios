@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::reclaim::{
     self, FILE_HEADER_BYTES, FILE_HEADER_LEN, Geometry, REBUILD_NAME, ReclaimRecord, SIDECAR_NAME,
-    SLOT_COUNT, SlotIndex,
+    SlotIndex,
 };
 use crate::{OpenError, sync_file_data, sync_parent_dir};
 
@@ -69,13 +69,17 @@ pub(crate) struct ReclaimStore {
 }
 
 /// The parts a store is assembled from once its file exists — the
-/// same set whether the file was just created or reopened.
+/// same set whether the file was just created or reopened. The
+/// reusable slot buffer is one of them so it is reserved fallibly, by
+/// whichever path already knows the geometry, and then moved into the
+/// store rather than allocated a second time.
 struct Opened {
     file: File,
     geometry: Geometry,
     live: SlotIndex,
     generation: u64,
     record: ReclaimRecord,
+    buffer: Vec<u8>,
 }
 
 /// Whether `<root>/RECLAIM` is there at all — the input to §3.2's
@@ -113,6 +117,7 @@ impl ReclaimStore {
         full_fsync: bool,
     ) -> Result<Self, StoreError> {
         let path = root.join(SIDECAR_NAME);
+        let buffer = zeroed(slot_bytes(geometry), &path, "a slot")?;
         let bytes = whole_file(geometry, record, FIRST_GENERATION, &path)?;
         let opened = Opened {
             file: install(root, &path, &bytes, full_fsync)?,
@@ -120,6 +125,7 @@ impl ReclaimStore {
             live: SlotIndex::First,
             generation: FIRST_GENERATION,
             record: record.clone(),
+            buffer,
         };
         Ok(Self::assemble(root, opened, full_fsync))
     }
@@ -134,7 +140,7 @@ impl ReclaimStore {
         full_fsync: bool,
     ) -> Result<Self, StoreError> {
         let path = root.join(SIDECAR_NAME);
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
@@ -142,14 +148,8 @@ impl ReclaimStore {
                 op: "open(RECLAIM)",
                 source,
             })?;
-        let (geometry, live, generation, record) = decode_file(&path, &mut file)?;
-        let opened = Opened {
-            file,
-            geometry,
-            live,
-            generation,
-            record,
-        };
+        let opened = decode_file(&path, file)?;
+        let geometry = opened.geometry;
         let mut store = Self::assemble(root, opened, full_fsync);
         if !geometry.covers(needed) {
             store.rebuild(needed)?;
@@ -158,13 +158,12 @@ impl ReclaimStore {
     }
 
     /// Build the store around a file that already exists, wherever it
-    /// came from. The reusable slot buffer is sized here so both
-    /// entry points get it right.
+    /// came from.
     fn assemble(root: &Path, opened: Opened, full_fsync: bool) -> Self {
         Self {
             path: root.join(SIDECAR_NAME),
             root: root.to_path_buf(),
-            buffer: vec![0u8; slot_bytes(opened.geometry)],
+            buffer: opened.buffer,
             file: opened.file,
             geometry: opened.geometry,
             live: opened.live,
@@ -215,11 +214,12 @@ impl ReclaimStore {
                 .max(needed.max_unlinks_per_pass()),
         )
         .map_err(|e| self.corrupt("sizing the rebuilt file", &e))?;
-        self.geometry = wider;
+        let buffer = zeroed(slot_bytes(wider), &self.path, "a slot")?;
         let bytes = whole_file(wider, &self.record.clone(), self.generation, &self.path)?;
         self.file = install(&self.root, &self.path, &bytes, self.full_fsync)?;
+        self.geometry = wider;
         self.live = SlotIndex::First;
-        self.buffer = vec![0u8; slot_bytes(wider)];
+        self.buffer = buffer;
         Ok(())
     }
 
@@ -256,7 +256,7 @@ fn whole_file(
     generation: u64,
     path: &Path,
 ) -> Result<Vec<u8>, StoreError> {
-    let mut bytes = vec![0u8; slot_bytes(geometry) * to_usize(SLOT_COUNT) + header_bytes()];
+    let mut bytes = zeroed(to_usize(geometry.file_len()), path, "a whole file")?;
     bytes[..header_bytes()].copy_from_slice(&reclaim::encode_file_header(geometry));
     let first = to_usize(geometry.slot_offset(SlotIndex::First));
     let end = first + slot_bytes(geometry);
@@ -294,17 +294,15 @@ fn install(root: &Path, path: &Path, bytes: &[u8], full_fsync: bool) -> Result<F
 
 /// The file header and both slots, or the first field that does not
 /// check out. The version byte and every checksum are validated before
-/// any record is believed.
+/// any record is believed. The slot buffer the decode reserves is
+/// handed back in the [`Opened`] so the store reuses it.
 ///
 /// The fixed header is read and validated **before** anything sized by
 /// it is allocated, and the geometry it declares is checked against the
 /// file's real length: a header claiming the format ceiling describes a
 /// file of hundreds of GiB, and trusting it enough to read the file
 /// whole would let a malformed sidecar stall or exhaust startup.
-fn decode_file(
-    path: &Path,
-    file: &mut File,
-) -> Result<(Geometry, SlotIndex, u64, ReclaimRecord), StoreError> {
+fn decode_file(path: &Path, mut file: File) -> Result<Opened, StoreError> {
     let corrupt = |source: &dyn std::fmt::Display| StoreError::Corrupt {
         detail: format!("RECLAIM sidecar at {}: {source}", path.display()),
     };
@@ -320,15 +318,7 @@ fn decode_file(
             "size {found} B, expected {expected} B at the stored capacities"
         )));
     }
-    // The length check above bounds this by the file that really
-    // exists, but a sparse file at §3.2's 65,536 × 65,536 format
-    // ceilings is a legal shape describing a ~128 GiB slot. Reserve
-    // fallibly so that is a refusal naming the file rather than an
-    // allocation abort during startup.
-    let mut slot = Vec::new();
-    slot.try_reserve_exact(slot_bytes(geometry))
-        .map_err(|_| corrupt(&format!("cannot hold a {} B slot", slot_bytes(geometry))))?;
-    slot.resize(slot_bytes(geometry), 0);
+    let mut slot = zeroed(slot_bytes(geometry), path, "a slot")?;
     let mut read = |index: SlotIndex| -> Result<_, StoreError> {
         file.seek(SeekFrom::Start(geometry.slot_offset(index)))
             .map_err(io("seek(RECLAIM slot)"))?;
@@ -339,7 +329,35 @@ fn decode_file(
     let first = read(SlotIndex::First)?;
     let second = read(SlotIndex::Second)?;
     let (live, decoded) = reclaim::choose_live(first, second).map_err(|e| corrupt(&e))?;
-    Ok((geometry, live, decoded.generation, decoded.record))
+    Ok(Opened {
+        file,
+        geometry,
+        live,
+        generation: decoded.generation,
+        record: decoded.record,
+        buffer: slot,
+    })
+}
+
+/// `len` zeroed bytes, or `Corrupt` naming the file.
+///
+/// Every buffer on the open path is sized from what the file declares,
+/// and §3.2's 65,536 × 65,536 format ceilings are a legal shape
+/// describing a ~128 GiB slot, so each one is reserved fallibly: a
+/// stored geometry this machine cannot hold is a refusal the operator
+/// can act on, never an allocation abort during startup.
+fn zeroed(len: usize, path: &Path, what: &str) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| StoreError::Corrupt {
+            detail: format!(
+                "RECLAIM sidecar at {}: cannot hold {what} of {len} B",
+                path.display()
+            ),
+        })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 fn header_bytes() -> usize {
@@ -500,6 +518,42 @@ mod tests {
                 other => panic!("{what}: expected Corrupt, got {other:?}"),
             }
         }
+    }
+
+    /// A stored geometry this machine cannot hold is `Corrupt` naming
+    /// the file, not an allocation abort — and the buffer the decode
+    /// reserved is the one the store keeps, so opening never allocates
+    /// a second slot past the guard.
+    ///
+    /// The refusal is asserted at the guard rather than through
+    /// `open`, because driving the real path to it means a sidecar
+    /// declaring §3.2's ceiling geometry, and a host that lets a
+    /// ~128 GiB reservation through would then zero it for real.
+    /// `usize::MAX` overflows the reserve without touching the
+    /// allocator, which is the same branch every call site takes.
+    #[test]
+    fn a_geometry_too_large_to_hold_is_corrupt_rather_than_an_abort() {
+        match zeroed(usize::MAX, Path::new("/wal/RECLAIM"), "a slot") {
+            Err(StoreError::Corrupt { detail }) => {
+                assert!(detail.contains("/wal/RECLAIM"), "names the file: {detail}");
+                assert!(
+                    detail.contains("cannot hold a slot"),
+                    "names what did not fit: {detail}",
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other:?}"),
+            Ok(bytes) => panic!("expected a refusal, got {} B", bytes.len()),
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let g = geometry(4, 2);
+        ReclaimStore::create(tmp.path(), g, &armed(), false).expect("create");
+        let store = ReclaimStore::open(tmp.path(), g, false).expect("reopen");
+        assert_eq!(
+            store.buffer.len(),
+            slot_bytes(g),
+            "the decode's checked buffer is the store's commit buffer",
+        );
     }
 
     /// A torn write into the inactive slot leaves the previous slot

@@ -135,6 +135,63 @@ fn rfc0052_13_pinned_is_not_expressible_as_no_consumer() {
     assert_ne!(pinned.floor, RetainFloor::None);
 }
 
+/// A horizon that **regresses or disappears** — a snapshot that stopped
+/// restoring — puts the tenant back behind every one of its segments.
+/// Reporting `Pinned` while the segments a higher horizon had already
+/// cleared sat in the eligible head would reclaim exactly the frames
+/// the pin exists to keep.
+#[test]
+fn rfc0052_13_a_horizon_that_regresses_re_pins_what_it_had_cleared() {
+    // Given: one closed segment holding two frames for a tenant, and a
+    // checkpoint that stops between them — so a horizon can clear the
+    // segment without the pass being able to reclaim it, and nothing
+    // of the tenant's is ever reclaimed. The record therefore holds no
+    // entry for it, which is what keeps this leg about the pin rather
+    // than about RFC0052.17's halt.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let frames = build_tenant_segment(root, &[("alpha", b"a1"), ("alpha", b"a2")]);
+    build_tenant_segment(root, &[("alpha", b"a3")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(frames[0]).expect("checkpoint mid-segment");
+
+    // A horizon covering the whole segment arrives and clears it into
+    // the eligible head, where the checkpoint still holds it back.
+    let cleared = wal
+        .housekeeping_pass(&known(&[("alpha", frames[1])]), CAP)
+        .expect("housekeeping");
+    assert_eq!(cleared.removed_segments, 0, "the mark has not reached it");
+    assert_eq!(cleared.floor, RetainFloor::Min(frames[1]));
+
+    // When: the snapshot stops restoring and the mark then passes the
+    // segment.
+    wal.checkpoint(frames[1]).expect("advance past the segment");
+    let pinned = wal
+        .housekeeping_pass(&known(&[]), CAP)
+        .expect("housekeeping");
+
+    // Then: the cleared segment is held again rather than reclaimed —
+    // without the rewind it would still be sitting in the eligible
+    // head, at or below the mark, and the pass would take it.
+    assert_eq!(pinned.removed_segments, 0);
+    assert_eq!(segment_files(root).len(), 2);
+    assert_eq!(
+        pinned.floor,
+        RetainFloor::Pinned {
+            offset: frames[0],
+            tenants: 1,
+        },
+        "and the floor is the pin at the tenant's oldest surviving frame",
+    );
+
+    // And: the pin lifts again when the snapshot comes back.
+    let lifted = wal
+        .housekeeping_pass(&known(&[("alpha", frames[1])]), CAP)
+        .expect("housekeeping");
+    assert_eq!(lifted.removed_segments, 1);
+}
+
 /// Scenario RFC0052.13 — `RetainFloor::Unknown` before the first pass, then the churn leg.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]

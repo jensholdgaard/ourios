@@ -665,10 +665,18 @@ impl Wal {
         // §3.2's ledger is rebuilt at recovery and updated on every
         // live append, so a pass never has to read a header to learn
         // which tenants a segment holds.
+        // `TenantId::new`, not `try_new`: the ledger must key on the
+        // identity **replay** will assign, and `recovery`'s driver
+        // wraps the same prefix unvalidated. A stored tenant that the
+        // RFC 0048 §3.1 grammar would reject at a request boundary is
+        // still a tenant the miner rebuilds state for, and dropping its
+        // membership here would leave its segments governed by the
+        // checkpoint alone. `TenantBatch::decode` has already bounded
+        // the length and checked UTF-8.
         let tenant = match kind {
             FrameKind::TenantOtlpBatch => TenantBatch::decode(payload)
                 .ok()
-                .and_then(|batch| ourios_core::tenant::TenantId::try_new(batch.tenant).ok()),
+                .map(|batch| ourios_core::tenant::TenantId::new(batch.tenant)),
             FrameKind::OtlpBatch | FrameKind::AuditEvent => None,
         };
         self.ledger.observe(retain::FrameAt {

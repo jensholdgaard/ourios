@@ -288,6 +288,14 @@ impl SegmentLedger {
         };
         if let Some(span) = entry.members.get_mut(tenant) {
             span.last = span.last.max(at.offset);
+            // A frame appended into a segment whose horizon was
+            // already applied here puts that tenant behind again. The
+            // append path is the only place that can happen — the
+            // current segment's last offset rises after the pass that
+            // cleared it — and leaving it cleared would let the
+            // segment be reclaimed after rotation over frames the
+            // tenant has not snapshotted.
+            self.repin(tenant, id);
             return;
         }
         entry.members.insert(
@@ -374,13 +382,59 @@ impl SegmentLedger {
                 false
             }
             SnapshotHorizons::Known(marks) => {
-                for (tenant, state) in &mut self.tenants {
-                    state.horizon = marks.get(tenant).and_then(|h| h.restorable());
-                }
+                self.receive(marks);
                 let capped = self.walk(budget);
                 self.floor = self.derive_floor();
                 capped
             }
+        }
+    }
+
+    /// Take this pass's horizons.
+    ///
+    /// A horizon that **regresses or disappears** — a snapshot that
+    /// stopped restoring, a tenant that fell out of the ledger the
+    /// receiver keeps — must put the tenant back where it was before
+    /// anything was applied: `derive_floor` would otherwise report the
+    /// pin while the segments a higher horizon had already cleared sat
+    /// in the eligible head, and the pass would reclaim exactly the
+    /// frames the pin exists to keep. Rewinding is O(that tenant's
+    /// segments) and happens only when its horizon goes backwards,
+    /// which the steady state never does.
+    fn receive(&mut self, marks: &HashMap<TenantId, TenantHorizon>) {
+        let rewound: Vec<TenantId> = self
+            .tenants
+            .iter()
+            .filter(|(tenant, state)| {
+                let next = marks.get(*tenant).and_then(|h| h.restorable());
+                state
+                    .horizon
+                    .is_some_and(|held| next.is_none_or(|n| n < held))
+            })
+            .map(|(tenant, _)| tenant.clone())
+            .collect();
+        for tenant in rewound {
+            self.rewind(&tenant);
+        }
+        for (tenant, state) in &mut self.tenants {
+            state.horizon = marks.get(tenant).and_then(|h| h.restorable());
+        }
+    }
+
+    /// Put one tenant back to its unapplied state: it holds every one
+    /// of its segments again and its cursor starts from the oldest.
+    fn rewind(&mut self, tenant: &TenantId) {
+        let Some(state) = self.tenants.get_mut(tenant) else {
+            return;
+        };
+        state.cursor = None;
+        state.behind = state.segments.len();
+        let segments: Vec<Uuid> = state.segments.iter().copied().collect();
+        for id in segments {
+            if let Some(entry) = self.segments.get_mut(&id) {
+                entry.pending.insert(tenant.clone());
+            }
+            self.unpinned.remove(&id);
         }
     }
 
@@ -429,6 +483,43 @@ impl SegmentLedger {
         }?;
         let span = self.segments.get(&next)?.members.get(tenant)?;
         (span.last <= horizon).then_some(next)
+    }
+
+    /// Put `tenant` back behind `segment`: it holds the segment again
+    /// and its cursor drops below it, so the next pass re-applies.
+    ///
+    /// The cursor is only ever moved backwards here, and only because
+    /// the premise that makes it monotone — a tenant's last offsets
+    /// rise *with* the segments — is what an append into an already
+    /// applied segment breaks. The re-walk is bounded by one segment:
+    /// the cursor lands on this segment's predecessor in the tenant's
+    /// own set.
+    fn repin(&mut self, tenant: &TenantId, segment: Uuid) {
+        let covered = self
+            .tenants
+            .get(tenant)
+            .and_then(|state| state.horizon)
+            .zip(
+                self.segments
+                    .get(&segment)
+                    .and_then(|entry| entry.members.get(tenant)),
+            )
+            .is_some_and(|(horizon, span)| span.last <= horizon);
+        if covered {
+            return;
+        }
+        if let Some(entry) = self.segments.get_mut(&segment) {
+            if !entry.pending.insert(tenant.clone()) {
+                return;
+            }
+            self.unpinned.remove(&segment);
+        }
+        if let Some(state) = self.tenants.get_mut(tenant)
+            && !is_above(state.cursor, segment)
+        {
+            state.cursor = state.segments.range(..segment).next_back().copied();
+            state.behind += 1;
+        }
     }
 
     /// Record that `tenant`'s horizon now covers `segment`: it stops

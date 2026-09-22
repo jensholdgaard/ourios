@@ -150,6 +150,102 @@ fn rfc0052_2_horizon_frame_segment_is_unlinked_and_restart_is_clean() {
     );
 }
 
+/// The ledger keys on the identity **replay** assigns, not on the one
+/// a request boundary would admit. `recovery`'s driver wraps a stored
+/// tenant with `TenantId::new`, so a frame whose tenant the RFC 0048
+/// §3.1 grammar rejects — `acme/eu`, which the WAL codec has always
+/// accepted — is still a tenant the miner rebuilds state for. Reading
+/// it as "no tenant" would leave its segments governed by the
+/// checkpoint alone and reclaim frames the miner needs.
+#[test]
+fn rfc0052_2_a_tenant_the_grammar_rejects_still_pins_its_segments() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let stored = build_tenant_segment(root, &[("acme/eu", b"a1")]);
+    build_tenant_segment(root, &[("acme/eu", b"a2")]);
+    assert!(
+        ourios_core::tenant::TenantId::try_new("acme/eu").is_err(),
+        "fixture: the grammar rejects this id at a request boundary",
+    );
+
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(stored[0])
+        .expect("checkpoint past the first");
+
+    // No horizon for it, so it pins — the whole point.
+    let pinned = wal
+        .housekeeping_pass(&known(&[]), CAP)
+        .expect("housekeeping");
+    assert_eq!(pinned.removed_segments, 0);
+    assert_eq!(
+        pinned.floor,
+        RetainFloor::Pinned {
+            offset: stored[0],
+            tenants: 1,
+        },
+    );
+    assert_eq!(segment_files(root).len(), 2);
+
+    // And its horizon lifts the pin like any other tenant's.
+    let lifted = wal
+        .housekeeping_pass(&known(&[("acme/eu", stored[0])]), CAP)
+        .expect("housekeeping");
+    assert_eq!(lifted.removed_segments, 1);
+}
+
+/// A frame appended into the current segment **after** a pass applied
+/// that tenant's horizon to it puts the tenant behind again. The
+/// current segment is never popped, so the loss would only show after
+/// a rotation — by which time the frame above the horizon is gone.
+#[test]
+fn rfc0052_2_an_append_above_an_applied_horizon_re_pins_its_segment() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    build_tenant_segment(root, &[("alpha", b"a1")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    let early = wal
+        .append(
+            FrameKind::TenantOtlpBatch,
+            &ourios_wal::TenantBatch::encode("alpha", b"c1").expect("encode"),
+        )
+        .expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(early).expect("checkpoint");
+
+    // A pass applies the horizon to the current segment, clearing it.
+    wal.housekeeping_pass(&known(&[("alpha", early)]), CAP)
+        .expect("housekeeping");
+
+    // A later append lands above that horizon.
+    let late = wal
+        .append(
+            FrameKind::TenantOtlpBatch,
+            &ourios_wal::TenantBatch::encode("alpha", b"c2").expect("encode"),
+        )
+        .expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(late).expect("checkpoint past it");
+
+    // The segment now holds a frame the tenant has not snapshotted, so
+    // the floor is back at that frame and the segment is held — which
+    // is what keeps it from being reclaimed once it rotates.
+    let after = wal
+        .housekeeping_pass(&known(&[("alpha", early)]), CAP)
+        .expect("housekeeping");
+    assert_eq!(
+        after.floor,
+        RetainFloor::Min(early),
+        "the tenant is behind on its own current segment again",
+    );
+    assert!(
+        after.unlink_remaining == 0,
+        "and that segment is not sitting in the eligible head: {after:?}",
+    );
+    assert!(late > early);
+}
+
 /// Scenario RFC0052.2 — a snapshot-less tenant pins only its own segments.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]

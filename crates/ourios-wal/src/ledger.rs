@@ -167,8 +167,15 @@ impl FrameSink for Scan {
                     detail: format!("tenant length {found} exceeds the RFC 0048 §3.1 bound"),
                 })
             }
+            // `TenantId::new`, not `try_new`: the ledger keys on the
+            // identity **replay** assigns, and `recovery`'s driver
+            // wraps the same prefix unvalidated. A stored tenant the
+            // RFC 0048 §3.1 grammar would reject at a request boundary
+            // is still one the miner rebuilds state for, so dropping
+            // its membership here would leave its segments governed by
+            // the checkpoint alone.
             Ok(batch) => {
-                self.record(offset, bytes, TenantId::try_new(batch.tenant).ok().as_ref());
+                self.record(offset, bytes, Some(&TenantId::new(batch.tenant)));
                 Ok(())
             }
             // Every other malformed prefix stays what it is today: an

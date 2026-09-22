@@ -304,8 +304,12 @@ pub fn known(marks: &[(&str, WalOffset)]) -> ourios_wal::SnapshotHorizons {
     )
 }
 
+/// `TenantId::new`, not `try_new`: the ledger keys on the identity
+/// replay assigns, and the WAL codec has always accepted stored
+/// tenants the RFC 0048 §3.1 request-boundary grammar would reject.
+/// A helper that validated would be unable to name one of them.
 pub fn tenant_id(name: &str) -> ourios_core::tenant::TenantId {
-    ourios_core::tenant::TenantId::try_new(name).expect("tenant id")
+    ourios_core::tenant::TenantId::new(name)
 }
 
 /// Rotation debris a previous process left: `<uuid>.wal.partial` is

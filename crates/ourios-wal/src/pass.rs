@@ -27,7 +27,9 @@ use ourios_core::tenant::TenantId;
 use uuid::Uuid;
 
 use crate::retain::{RetainFloor, SnapshotHorizons};
-use crate::{CheckpointError, HousekeepingError, WalOffset, reclaim, segment, sync_parent_dir};
+use crate::{
+    CheckpointError, HousekeepingError, WalOffset, ledger, reclaim, segment, sync_parent_dir,
+};
 
 /// What one pass did, and what it still owes (RFC 0052 §3.7).
 /// Carried on `Err` too, so partial work, floor and lag stay
@@ -220,7 +222,7 @@ pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
     let partials = plan
         .partials
         .iter()
-        .map(|path| (path, unlink_partial(path)));
+        .map(|path| (path, unlink_partial(&plan.root, path)));
     let segments = plan
         .segments
         .iter()
@@ -244,7 +246,24 @@ pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
 /// Remove one stale `<uuid>.wal.partial`. An unlink that finds it gone
 /// completes a previous pass's removal, which is what makes §3.2's
 /// uncertain deletion verifiable.
-fn unlink_partial(path: &std::path::Path) -> Result<(), std::io::Error> {
+///
+/// The name is re-checked against §3.3's reserved shape under this
+/// plan's root first. A segment is protected by its header uuid, which
+/// a partial has nowhere to carry, and this function is public, takes
+/// no guard and is handed a plan whose `partials` a caller can reach —
+/// so without the check an `unlink` here could name any path at all. A
+/// path that fails it is a failure the pass reports, not a silent skip.
+fn unlink_partial(root: &std::path::Path, path: &std::path::Path) -> Result<(), std::io::Error> {
+    if !ledger::is_reserved_partial(root, path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a stale partial of the WAL root at {}",
+                path.display(),
+                root.display(),
+            ),
+        ));
+    }
     match std::fs::remove_file(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,

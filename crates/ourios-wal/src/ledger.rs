@@ -208,6 +208,15 @@ fn list_partials(root: &Path) -> Result<Vec<PathBuf>, LedgerError> {
     Ok(out)
 }
 
+/// Whether `path` is §3.3's reserved partial **directly in `root`**.
+///
+/// The sweep's own seeding walks `root`, so its paths satisfy this by
+/// construction; the check exists for the unlocked file half, which is
+/// handed a plan whose fields a caller can reach.
+pub(crate) fn is_reserved_partial(root: &Path, path: &Path) -> bool {
+    path.parent() == Some(root) && is_partial(path)
+}
+
 fn is_partial(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())

@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use ourios_wal::{
-    FrameKind, PassOutcome, ReclaimError, SkipReason, SnapshotHorizons, TenantBatch, WalOffset,
-    unlink_planned,
+    FrameKind, PassOutcome, ReclaimError, ReclaimOutcome, SkipReason, SnapshotHorizons,
+    TenantBatch, WalOffset, unlink_planned,
 };
 
 use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files, write_partial};
@@ -590,6 +590,58 @@ fn rfc0052_12_a_failed_unlink_is_reported_and_stays_queued() {
         next.partials,
         vec![wedged],
         "the failed path is back at the head of the sweep's list",
+    );
+}
+
+/// `unlink_planned` is public, takes no guard, and is handed a plan
+/// whose `partials` are public paths. A planned segment is protected
+/// by the header uuid the unlink verifies; a partial has nowhere to
+/// carry one, so §3.3's reserved shape under the plan's own root is
+/// the only check there is — and it has to be made here rather than
+/// trusted from the sweep's seeding.
+#[test]
+fn rfc0052_12_unlink_planned_refuses_a_partial_outside_the_reserved_shape() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, 1);
+    write_partial(root);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+    let plan = wal
+        .housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
+        .expect("prepare");
+    assert_eq!(plan.partials.len(), 1, "the sweep's own path is reserved");
+
+    // The wrong name in the right directory, and the right name in the
+    // wrong one.
+    let misnamed = root.join("keep-me");
+    std::fs::write(&misnamed, b"not the WAL's to remove").expect("bystander");
+    let elsewhere = tempfile::TempDir::new().expect("temp");
+    let outside = elsewhere
+        .path()
+        .join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
+    std::fs::write(&outside, b"another root's debris").expect("bystander");
+
+    let mut tampered = plan.clone();
+    tampered.segments = Vec::new();
+    tampered.partials = vec![misnamed.clone(), outside.clone()];
+    let ReclaimOutcome::Unlinked {
+        removed, failed, ..
+    } = unlink_planned(&tampered)
+    else {
+        panic!("the unlink half ran");
+    };
+
+    assert!(removed.is_empty(), "neither path is the pass's to remove");
+    assert!(misnamed.exists() && outside.exists());
+    assert_eq!(
+        failed
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>(),
+        vec![misnamed, outside],
+        "and each is reported rather than silently skipped",
     );
 }
 

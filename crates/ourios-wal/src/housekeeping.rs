@@ -43,7 +43,7 @@ impl Wal {
     /// the tenants that are behind are each one sweep of the tenant
     /// set, which `max_tenants` bounds. RFC0052.12's guarantee is
     /// about the backlog — the incident's 1,113 segments — and that is
-    /// what the cap holds. The one exception is [`Self::lag_floor`]'s
+    /// what the cap holds. The one exception is the lag figures'
     /// range, which costs the segments it reports and is empty
     /// whenever the floor is keeping up.
     ///

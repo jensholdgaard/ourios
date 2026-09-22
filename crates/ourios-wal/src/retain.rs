@@ -156,6 +156,12 @@ enum State {
     /// the entry survives a restart is unknown until re-verified.
     Reclaiming {
         uncertain: bool,
+        /// A commit told us what the file half did with this entry.
+        /// An entry popped by a pass that never committed has not been
+        /// reported on, so whether its unlink happened is unknown —
+        /// which is the same thing `uncertain` means, and is why a
+        /// re-plan of one inherits it.
+        reported: bool,
     },
 }
 
@@ -725,11 +731,25 @@ impl SegmentLedger {
             return None;
         }
         let segment = self.segments.get_mut(&id)?;
-        let uncertain = matches!(segment.state, State::Reclaiming { uncertain: true });
-        if segment.state == State::Eligible {
-            self.reclaiming.insert(id);
-        }
-        segment.state = State::Reclaiming { uncertain };
+        // §3.2's uncertain deletion, plus the case §3.7's
+        // abandoned plan creates: a pass popped this, the file half
+        // may or may not have unlinked it, and no commit ever said.
+        // Re-planning it as certain would make an `unlink` that finds
+        // it gone a failure to retry forever.
+        let uncertain = match segment.state {
+            State::Eligible => {
+                self.reclaiming.insert(id);
+                false
+            }
+            State::Reclaiming {
+                uncertain,
+                reported,
+            } => uncertain || !reported,
+        };
+        segment.state = State::Reclaiming {
+            uncertain,
+            reported: false,
+        };
         self.unpinned.remove(&id);
         let mut last_offsets: Vec<(TenantId, WalOffset)> = segment
             .members
@@ -765,7 +785,10 @@ impl SegmentLedger {
     /// next pass.
     pub(crate) fn hold(&mut self, id: Uuid, uncertain: bool) {
         if let Some(segment) = self.segments.get_mut(&id) {
-            segment.state = State::Reclaiming { uncertain };
+            segment.state = State::Reclaiming {
+                uncertain,
+                reported: true,
+            };
         }
     }
 

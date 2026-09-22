@@ -401,6 +401,57 @@ fn rfc0052_12_a_plan_that_is_never_committed_strands_nothing() {
     assert!(!debris.exists());
 }
 
+/// The same abandonment, but **after** the unlinks ran: §3.7's panic
+/// lands between `unlink_planned` and the commit, so the files are
+/// gone and no commit ever said so. The re-plan must carry §3.2's
+/// `uncertain` mark, or the next unlink reads the absent file as the
+/// renamed-survivor shape and retries it for the life of the process.
+#[test]
+fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    wal.write_plan_record(&abandoned).expect("record");
+    let planned: Vec<PathBuf> = abandoned.segments.iter().map(|s| s.path.clone()).collect();
+    assert_eq!(planned.len(), CAP);
+    let _ = unlink_planned(&abandoned);
+    assert!(
+        planned.iter().all(|path| !path.exists()),
+        "the file half finished; only the commit did not",
+    );
+
+    // The task dies here. The next pass re-plans what it held.
+    let replanned = wal.housekeeping_prepare(&horizons, CAP).expect("re-plan");
+    assert_eq!(
+        replanned
+            .segments
+            .iter()
+            .map(|s| (s.segment, s.uncertain))
+            .collect::<Vec<_>>(),
+        abandoned
+            .segments
+            .iter()
+            .map(|s| (s.segment, true))
+            .collect::<Vec<_>>(),
+        "an entry no commit reported on is re-planned as an uncertain deletion",
+    );
+
+    wal.write_plan_record(&replanned).expect("record");
+    let progress = wal
+        .housekeeping_commit(unlink_planned(&replanned))
+        .expect("commit");
+    assert_eq!(
+        progress.removed_segments, CAP,
+        "so the absent files complete the reclamation rather than failing forever",
+    );
+}
+
 /// `count` closed segments for one tenant plus a current one. The
 /// returned mark is the newest frame of all, so it covers every
 /// segment: the current one is held back by its identity, not by the

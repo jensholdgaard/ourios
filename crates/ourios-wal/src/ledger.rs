@@ -198,7 +198,7 @@ impl FrameSink for Scan {
 /// matched — it stays the checkpoint and snapshot namespace — and a
 /// name whose stem does not parse as a UUID is ignored like any other
 /// non-segment file.
-fn list_partials(root: &Path) -> Result<Vec<PathBuf>, LedgerError> {
+pub(crate) fn list_partials(root: &Path) -> Result<Vec<PathBuf>, LedgerError> {
     let io = |op: &'static str| move |source| LedgerError::Io { op, source };
     let mut out = Vec::new();
     for entry in std::fs::read_dir(root).map_err(io("read_dir(wal_root)"))? {

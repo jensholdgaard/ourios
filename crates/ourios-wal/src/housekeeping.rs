@@ -33,6 +33,17 @@ fn superseded_commit(pass: pass::PassId, outstanding: pass::PassId) -> Housekeep
     }
 }
 
+/// A plan whose pass a commit has already settled (RFC 0052 §3.7).
+fn settled(plan: &ReclaimPlan) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "WAL housekeeping refused: plan from pass {} is already settled (RFC 0052 §3.7)",
+            plan.pass,
+        ),
+    )
+}
+
 /// A plan whose pass is no longer the outstanding one (RFC 0052 §3.7).
 fn superseded(plan: &ReclaimPlan, outstanding: pass::PassId) -> std::io::Error {
     std::io::Error::new(
@@ -220,7 +231,13 @@ impl Wal {
         let mode = match self.outstanding.as_ref() {
             Some(outstanding) if outstanding.pass == plan.pass => outstanding.mode,
             Some(outstanding) => return Err(superseded(plan, outstanding.pass)),
-            None => return Ok(()),
+            // Not superseded but **settled**: a commit has already
+            // taken this pass's outstanding state. Answering `Ok` here
+            // would say the witness was written when none was, and the
+            // caller's next `unlink_planned` would remove segments the
+            // commit had returned to eligible with nothing on disk
+            // accounting for them.
+            None => return Err(settled(plan)),
         };
         if !plan.records {
             return Ok(());

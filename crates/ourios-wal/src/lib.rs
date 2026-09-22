@@ -489,6 +489,18 @@ impl Wal {
         if existing_segments.is_empty() {
             ledger.describe_root();
         }
+        // §3.3 runs the sweep on every pass and the pass itself lists
+        // nothing, so the list is seeded from a listing open does.
+        // Unlike the segment ledger this is safe here: a
+        // `.wal.partial` is debris no reader depends on and has no
+        // torn tail for recovery to heal, so nothing it holds can be
+        // counted wrongly.
+        let stale_partials = ledger::list_partials(&config.root).map_err(|e| match e {
+            LedgerError::Io { op, source } => OpenError::Io { op, source },
+            other => OpenError::Corrupt {
+                detail: other.to_string(),
+            },
+        })?;
         let witness = reconcile::root(&config, sidecar, &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             append_target(&config.root, existing_segments)?;
@@ -509,7 +521,7 @@ impl Wal {
             // `prepare_root` fsynced the root before the sidecars
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
-            stale_partials: Vec::new(),
+            stale_partials,
             ledger,
             outstanding: None,
             passes: 0,

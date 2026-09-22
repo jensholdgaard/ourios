@@ -703,6 +703,69 @@ fn rfc0052_12_a_plan_does_not_cross_from_one_wal_to_the_next() {
     );
 }
 
+/// A plan a commit has already settled is refused at the record
+/// write. Answering `Ok` there said the witness was written when none
+/// was, and the caller's next `unlink_planned` would then remove
+/// segments the commit had returned to eligible, with nothing on disk
+/// accounting for them.
+#[test]
+fn rfc0052_12_a_settled_plan_cannot_be_written_again() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let plan = wal
+        .housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
+        .expect("prepare");
+    let planned: Vec<PathBuf> = plan.segments().iter().map(|s| s.path.clone()).collect();
+    // The record write failed, so the commit returned every popped
+    // entry to eligible and unlinked nothing.
+    wal.housekeeping_commit(
+        plan.pass(),
+        ourios_wal::ReclaimOutcome::RecordFailed(std::io::Error::other("injected")),
+    )
+    .expect("commit");
+
+    let refused = wal
+        .write_plan_record(&plan)
+        .expect_err("a settled plan is not writable again");
+    assert!(
+        format!("{refused}").contains("already settled"),
+        "naming why: {refused}",
+    );
+    assert!(planned.iter().all(|path| path.exists()));
+}
+
+/// Debris is found on a root opened without `rebuild_ledger`. §3.3
+/// runs the sweep on every pass and the pass lists nothing itself, so
+/// the list has to be seeded from a listing `open` does — a partial is
+/// debris no reader depends on, with no torn tail for recovery to
+/// heal, so it carries none of the segment ledger's hazard.
+#[test]
+fn rfc0052_12_partials_are_discovered_without_a_rebuild() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, 1);
+    let mut seeded = open(root);
+    seeded.rebuild_ledger().expect("ledger");
+    seeded.checkpoint(covered).expect("checkpoint");
+    drop(seeded);
+    let debris = write_partial(root);
+
+    let mut wal = open(root);
+    let progress = wal
+        .housekeeping_pass(&known(&[("alpha", covered)]), CAP)
+        .expect("housekeeping");
+    assert_eq!(
+        progress.removed_partials, 1,
+        "the sweep runs on a pass that can plan no segment at all",
+    );
+    assert!(!debris.exists());
+}
+
 /// An unlink that fails is kept for retry **and** reported. §3.1's
 /// rule is that the failure is logged and the next pass retries it,
 /// and a pass that returned `Ok` gave its caller neither.

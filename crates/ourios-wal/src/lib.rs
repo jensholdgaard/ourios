@@ -33,18 +33,29 @@ pub(crate) mod checkpoint;
 pub(crate) mod frame;
 #[cfg(feature = "fuzzing")]
 pub mod frame;
+pub(crate) mod housekeeping;
 pub(crate) mod ledger;
-// The codec's dictionary-mutation surface (assign, tombstone, union)
-// lands ahead of its callers: the housekeeping pass that merges
-// horizons into the record is RFC 0052's next slice, which removes
-// this allow.
+pub(crate) mod pass;
+// The codec's tombstone and union entry points land ahead of their
+// callers: tenant removal and RFC 0053's `PUBLISHED` dictionary are
+// the slices that reach them.
 #[allow(dead_code)]
 pub(crate) mod reclaim;
 pub(crate) mod reclaim_store;
 pub(crate) mod reconcile;
+pub(crate) mod retain;
 pub(crate) mod segment;
 
 pub use ledger::LedgerError;
+pub use pass::{
+    HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
+    ReclaimPlan, SkipReason, UnlinkPermit, unlink_failure, unlink_planned,
+};
+pub use reclaim::{
+    DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
+    MAX_UNLINKS_PER_PASS_CEILING,
+};
+pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
 
 // -----------------------------------------------------------
@@ -252,6 +263,22 @@ pub struct WalConfig {
     /// `wal_housekeeping_secs` — checkpoint housekeeping
     /// cadence (§6.7). Default `60`.
     pub housekeeping_secs: u64,
+    /// `wal_max_unlinks_per_pass` — how much per-file work one
+    /// reclamation pass may do (RFC 0052 §3.7, §3.8). Default
+    /// [`DEFAULT_MAX_UNLINKS_PER_PASS`]; range
+    /// `1..=`[`MAX_UNLINKS_PER_PASS_CEILING`].
+    ///
+    /// It bounds how long a pass holds the journal mutex, and so the
+    /// stall an append can see, and it sizes the `RECLAIM` sidecar's
+    /// `planned` array — which is why `Wal::open` both validates it
+    /// and rebuilds the file when it rises above the stored capacity.
+    ///
+    /// §3.8 also validates the lower bound against
+    /// `rotation_retry_attempts`, so RFC0052.4's one-pass debris
+    /// clearance holds. That knob arrives with the rotation slice; the
+    /// cross-check lands with it, and the range below is the format's
+    /// own until then.
+    pub max_unlinks_per_pass: u32,
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
     /// §6.3 / §9: on macOS `fsync`/`fdatasync` do not flush the
@@ -331,8 +358,8 @@ pub struct Wal {
     /// at, swapped on rotation. Kept for diagnostic messages;
     /// housekeeping deliberately does NOT key on it — the
     /// append target is identified by its header UUID so a
-    /// rename can't slip it past the guard.
-    #[allow(dead_code)]
+    /// rename can't slip it past the guard, and the RFC 0052 §3.2
+    /// ledger records it so an unlink targets the real file.
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
     /// filename's stem and the segment's in-file header per
@@ -377,6 +404,31 @@ pub struct Wal {
     /// §3.3: the sweep lists nothing on the pass, so restart debris is
     /// found without a directory scan under the writer position.
     stale_partials: Vec<PathBuf>,
+    /// RFC 0052 §3.2's per-segment ledger: tenant membership, each
+    /// tenant's first and last offset per segment, the horizon
+    /// cursors and the eligible head. Rebuilt once after recovery and
+    /// maintained incrementally, so a pass reads no header and lists
+    /// no directory.
+    ledger: retain::SegmentLedger,
+    /// The segments [`Self::housekeeping_prepare`] popped and
+    /// [`Self::housekeeping_commit`] has not yet accounted for. One
+    /// plan is outstanding at a time by construction (§3.7): a plan
+    /// that is never committed strands nothing, since the entries stay
+    /// marked reclaiming and the next prepare re-plans them.
+    outstanding: Option<Outstanding>,
+    /// Passes [`Self::housekeeping_prepare`] has run, which is where
+    /// the [`PassId`] on each plan comes from. Monotone, so a plan a
+    /// later prepare superseded never matches the outstanding one.
+    passes: u64,
+    /// This `Wal`'s own number, minted at open and never reused in the
+    /// process, so a [`PassId`] cannot be mistaken for one another
+    /// instance on the same root — a reopen — handed out.
+    instance: u64,
+    /// The pass an outstanding [`UnlinkPermit`] would still authorise,
+    /// zero when none is. Shared with the permits themselves, because
+    /// the unlink half holds no guard and no WAL handle and still has
+    /// to know that a later prepare has moved past its plan.
+    live_pass: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Bytes of validated frames in surviving segments, seeded after
     /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
     /// less header, which would count a torn tail, and never the
@@ -435,6 +487,25 @@ impl Wal {
         // already-published record on the data side.
         let sidecar = checkpoint::read(&config.root)?;
         let existing_segments = list_segments(&config.root)?;
+        // A root with nothing on it has nothing the ledger fails to
+        // describe, so its ledger is authoritative from here; one with
+        // segments stays unpoppable until `rebuild_ledger` walks them.
+        let mut ledger = retain::SegmentLedger::default();
+        if existing_segments.is_empty() {
+            ledger.describe_root();
+        }
+        // §3.3 runs the sweep on every pass and the pass itself lists
+        // nothing, so the list is seeded from a listing open does.
+        // Unlike the segment ledger this is safe here: a
+        // `.wal.partial` is debris no reader depends on and has no
+        // torn tail for recovery to heal, so nothing it holds can be
+        // counted wrongly.
+        let stale_partials = ledger::list_partials(&config.root).map_err(|e| match e {
+            LedgerError::Io { op, source } => OpenError::Io { op, source },
+            other => OpenError::Corrupt {
+                detail: other.to_string(),
+            },
+        })?;
         let witness = reconcile::root(&config, sidecar, &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             append_target(&config.root, existing_segments)?;
@@ -455,7 +526,12 @@ impl Wal {
             // `prepare_root` fsynced the root before the sidecars
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
-            stale_partials: Vec::new(),
+            stale_partials,
+            ledger,
+            outstanding: None,
+            passes: 0,
+            instance: NEXT_WAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            live_pass: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,
@@ -482,7 +558,8 @@ impl Wal {
     /// See [`LedgerError`].
     pub fn rebuild_ledger(&mut self) -> Result<(), LedgerError> {
         let rebuilt = ledger::rebuild(&self.config.root)?;
-        self.unreclaimed_bytes = rebuilt.bytes;
+        self.unreclaimed_bytes = rebuilt.segments.bytes();
+        self.ledger = rebuilt.segments;
         self.stale_partials = rebuilt.partials;
         Ok(())
     }
@@ -502,6 +579,7 @@ impl Wal {
             checkpoint: self.checkpoint,
             stale_partials: self.stale_partials.len(),
             reclaimable: self.checkpoint_is_settled(),
+            floor: self.ledger.floor(),
         }
     }
 
@@ -615,10 +693,34 @@ impl Wal {
         // verified unlink. A figure only ever seeded would omit
         // everything written since the last restart.
         self.unreclaimed_bytes += frame_len;
-        Ok(WalOffset {
+        let offset = WalOffset {
             segment: self.current_segment_uuid,
             byte: post_write_byte,
-        })
+        };
+        // §3.2's ledger is rebuilt at recovery and updated on every
+        // live append, so a pass never has to read a header to learn
+        // which tenants a segment holds.
+        // `TenantId::new`, not `try_new`: the ledger must key on the
+        // identity **replay** will assign, and `recovery`'s driver
+        // wraps the same prefix unvalidated. A stored tenant that the
+        // RFC 0048 §3.1 grammar would reject at a request boundary is
+        // still a tenant the miner rebuilds state for, and dropping its
+        // membership here would leave its segments governed by the
+        // checkpoint alone. `TenantBatch::decode` has already bounded
+        // the length and checked UTF-8.
+        let tenant = match kind {
+            FrameKind::TenantOtlpBatch => TenantBatch::decode(payload)
+                .ok()
+                .map(|batch| ourios_core::tenant::TenantId::new(batch.tenant)),
+            FrameKind::OtlpBatch | FrameKind::AuditEvent => None,
+        };
+        self.ledger.observe(retain::FrameAt {
+            offset,
+            bytes: frame_len,
+            tenant: tenant.as_ref(),
+            path: &self.current_segment_path,
+        });
+        Ok(offset)
     }
 
     /// §6.5's two triggers, checked before the write lands.
@@ -919,7 +1021,8 @@ impl Wal {
         // installed a segment — no reader can depend on it and no
         // `reclaimed_through` accounts for it — so gating it would let
         // debris created before the first checkpoint survive forever.
-        ledger::sweep_partials(&mut self.stale_partials, &self.config.root)?;
+        let cap = self.pass_cap();
+        ledger::sweep_partials(&mut self.stale_partials, &self.config.root, cap)?;
         let Some(cp) = self.checkpoint else {
             return Ok(());
         };
@@ -980,6 +1083,10 @@ impl Wal {
                 self.unreclaimed_bytes = self
                     .unreclaimed_bytes
                     .saturating_sub(len.saturating_sub(SEGMENT_HEADER_LEN as u64));
+                // The RFC 0052 §3.2 ledger is the other view of this
+                // directory; leaving a reclaimed segment in it would
+                // let a later pass plan a file that is already gone.
+                self.ledger.remove(header.segment_uuid);
                 unlinked_any = true;
             }
         }
@@ -989,7 +1096,9 @@ impl Wal {
         }
         Ok(())
     }
+}
 
+impl Wal {
     /// Walk every surviving segment in chronological order,
     /// handing each well-formed frame to `sink` (§6.6). Used by
     /// the ingester at startup before opening network
@@ -1169,6 +1278,15 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
             format!(
                 "{} outside §6.9 range {MIN_HOUSEKEEPING_SECS}..={MAX_HOUSEKEEPING_SECS}",
                 c.housekeeping_secs
+            ),
+        ));
+    }
+    if !(1..=MAX_UNLINKS_PER_PASS_CEILING).contains(&c.max_unlinks_per_pass) {
+        return Err(outside(
+            "max_unlinks_per_pass",
+            format!(
+                "{} outside RFC 0052 §3.8 range 1..={MAX_UNLINKS_PER_PASS_CEILING}",
+                c.max_unlinks_per_pass
             ),
         ));
     }
@@ -1676,6 +1794,28 @@ pub enum CheckpointError {
     },
 }
 
+impl std::fmt::Display for CheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { op, source } => write!(f, "WAL checkpoint failed at {op}: {source}"),
+            Self::NonMonotonic { current, attempted } => write!(
+                f,
+                "WAL checkpoint is monotonic: segment {} byte {} is below the current segment {} byte {}",
+                attempted.segment, attempted.byte, current.segment, current.byte,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::NonMonotonic { .. } => None,
+        }
+    }
+}
+
 /// Errors from [`Wal::housekeeping`].
 #[derive(Debug)]
 pub enum HousekeepingError {
@@ -1687,12 +1827,41 @@ pub enum HousekeepingError {
         op: &'static str,
         source: std::io::Error,
     },
+    /// The pass's consumer mode disagrees with the mode recorded in
+    /// the `RECLAIM` header (RFC 0052 §3.2). Every pass on a root runs
+    /// under the recorded mode: a `NoConsumer` pass on a root a miner
+    /// reclaimed from would delete frames nothing can re-mine, so the
+    /// pass is refused before anything is planned or unlinked.
+    ModeDisagreement {
+        recorded: &'static str,
+        attempted: &'static str,
+    },
+    /// A tenant's state cannot be told apart from a loss (RFC 0052
+    /// §3.2): either the `RECLAIM` record holds a `Known` entry above
+    /// the tenant's restorable horizon — the frames it names are gone
+    /// and no pin can rebuild what they held — or the root is still on
+    /// the legacy branch and the tenant's oldest surviving frame sits
+    /// above its last recorded horizon, which is what reclamation
+    /// under a version-1 checkpoint leaves behind.
+    Unrecoverable { tenant: String, horizon: WalOffset },
 }
 
 impl std::fmt::Display for HousekeepingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { op, source } => write!(f, "WAL housekeeping failed at {op}: {source}"),
+            Self::ModeDisagreement {
+                recorded,
+                attempted,
+            } => write!(
+                f,
+                "WAL housekeeping refused: this root recorded consumer mode {recorded} and the pass offered {attempted} (RFC 0052 §3.2)"
+            ),
+            Self::Unrecoverable { tenant, horizon } => write!(
+                f,
+                "WAL housekeeping refused: tenant {tenant} has no restorable snapshot at or above segment {} byte {} (RFC 0052 §3.2)",
+                horizon.segment, horizon.byte,
+            ),
         }
     }
 }
@@ -1701,6 +1870,56 @@ impl std::error::Error for HousekeepingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::ModeDisagreement { .. } | Self::Unrecoverable { .. } => None,
+        }
+    }
+}
+
+/// What one [`Wal::housekeeping_prepare`] handed to the file half and
+/// [`Wal::housekeeping_commit`] has still to account for. Segments and
+/// partials are kept apart because their failure paths differ: a
+/// segment the file half never verified stays reclaiming in the
+/// ledger, while a partial goes back on the sweep's list.
+#[derive(Debug)]
+struct Outstanding {
+    /// The pass this state belongs to, so a plan a later prepare
+    /// superseded is refused before its record is written (§3.7).
+    pass: pass::PassId,
+    segments: Vec<retain::Popped>,
+    partials: Vec<PathBuf>,
+    /// The mode this pass runs under, so the record merge in the file
+    /// half adopts the same one the ledger half was checked against.
+    mode: reclaim::EntryMode,
+    /// What the ledger half decided. The commit reports the same
+    /// floor, lag, cap state and skip reason: they are facts about
+    /// this pass, and re-deriving them from a ledger the unlinks have
+    /// since changed would describe a different one.
+    progress: HousekeepingProgress,
+}
+
+impl Drop for Wal {
+    /// A permit outlives the `Wal` that issued it — the plan and the
+    /// permit are owned values the file half holds with no handle —
+    /// so dropping the WAL has to revoke it. Otherwise a caller could
+    /// drop this instance, reopen the same root, and unlink against a
+    /// cell the gone instance still owns, past a new `Wal` that
+    /// refuses the stale plan at both of its own checks.
+    fn drop(&mut self) {
+        self.live_pass
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Numbers each `Wal` this process opens, so [`PassId`] names the
+/// instance as well as the pass (RFC 0052 §3.7).
+static NEXT_WAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Mark one segment's `planned` entry as RFC 0052 §3.2's uncertain
+/// deletion, so the next pass re-verifies its presence.
+fn mark_uncertain(record: &mut reclaim::ReclaimRecord, segment: uuid::Uuid) {
+    for entry in &mut record.planned {
+        if entry.segment == segment {
+            entry.uncertain = true;
         }
     }
 }
@@ -1721,6 +1940,12 @@ pub struct ReclaimState {
     /// Whether a pass may plan segments: RFC 0052 §3.2's witness, a
     /// version-2 `CHECKPOINT` beside a `RECLAIM` record.
     pub reclaimable: bool,
+    /// The floor the WAL derived on its last pass (RFC 0052 §3.7).
+    /// Between passes that is by definition the floor governing
+    /// retention, so the export is never stale; before the first it is
+    /// [`RetainFloor::Unknown`], which is not the same claim as "no
+    /// consumer exists".
+    pub floor: RetainFloor,
 }
 
 /// Errors from [`Wal::replay`].
@@ -1949,6 +2174,7 @@ mod tests {
             segment_size_bytes: 128 * 1024 * 1024,
             segment_age_secs: 600,
             housekeeping_secs: 60,
+            max_unlinks_per_pass: DEFAULT_MAX_UNLINKS_PER_PASS,
             macos_full_fsync: false,
         }
     }
@@ -1993,6 +2219,14 @@ mod tests {
             },
             WalConfig {
                 housekeeping_secs: MAX_HOUSEKEEPING_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                max_unlinks_per_pass: 1,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                max_unlinks_per_pass: reclaim::MAX_UNLINKS_PER_PASS_CEILING,
                 ..default_config(tmp.path())
             },
         ];

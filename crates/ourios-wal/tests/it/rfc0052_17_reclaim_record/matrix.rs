@@ -7,15 +7,21 @@
 //! the crash left a witness half-written, promoted durably before
 //! anything else reads it.
 //!
-//! The three rows whose decision also needs a *snapshot* stay
-//! `#[ignore]`d stubs, each naming the green slice that discharges it.
+//! The one row that needs the `PUBLISHED` sidecar stays an
+//! `#[ignore]`d stub: its writer and format are RFC 0055's.
 
-use ourios_wal::{FrameKind, MIN_SEGMENT_SIZE_BYTES, OpenError, Wal};
+use std::collections::HashMap;
+
+use ourios_wal::{
+    FrameKind, MIN_SEGMENT_SIZE_BYTES, OpenError, RetainFloor, SnapshotHorizons, TenantBatch,
+    TenantHorizon, Wal, WalOffset,
+};
 
 use crate::rfc0052_support::{
     CHECKPOINT, CHECKPOINT_ARMED, CHECKPOINT_SEEN, MODE_KNOWN, MODE_UNRECORDED, RECLAIM,
-    build_closed_segment, checkpoint_version, default_config, downgrade_segments, live_slot, open,
-    segment_files, set_live_witness, write_legacy_checkpoint,
+    build_closed_segment, build_tenant_segment, checkpoint_version, default_config,
+    downgrade_segments, live_slot, open, segment_files, set_live_witness, tenant_id,
+    write_legacy_checkpoint,
 };
 
 /// Scenario RFC0052.17 — a legacy root that rotates before its first
@@ -379,36 +385,177 @@ fn armed_beside_a_version_1_checkpoint_retries_the_upgrade() {
 /// Scenario RFC0052.17 — no record and no checkpoint: a pre-RFC root gains an empty record.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.17 stub — implemented in the housekeeping green slice B (its pin leg is a RetainFloor case, which the pass derives)"]
 fn rfc0052_17_absent_record_and_absent_checkpoint_opens_and_seeds_an_empty_record() {
-    todo!(
-        "RFC0052.17 — a root with no RECLAIM and no CHECKPOINT at all: \
-         Wal::open succeeds, an empty record is durable before the first \
-         housekeeping pass, and a tenant without a snapshot pins rather \
-         than halts"
+    // Given: a root with no `RECLAIM` and no `CHECKPOINT` at all.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    assert!(!root.join(RECLAIM).exists() && !root.join(CHECKPOINT).exists());
+
+    // When: `Wal::open` runs. Then: it succeeds and the empty record
+    // is durable before anything else — the ordering that keeps the
+    // fail-closed row from firing on a node's own first start.
+    let mut wal = open(root);
+    assert_eq!(
+        live_slot(&std::fs::read(root.join(RECLAIM)).expect("read RECLAIM")).1,
+        0,
+        "the record is seeded empty",
+    );
+    assert!(!root.join(CHECKPOINT).exists(), "and nothing checkpointed");
+
+    // And: a tenant without a snapshot pins rather than halts — the
+    // record holds no entry for it, so it has lost nothing.
+    let mark = wal
+        .append(
+            FrameKind::TenantOtlpBatch,
+            &TenantBatch::encode("alpha", b"a1").expect("encode"),
+        )
+        .expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(mark).expect("checkpoint");
+    let plan = wal
+        .housekeeping_prepare(&SnapshotHorizons::Known(HashMap::new()), 64)
+        .expect("a tenant with no entry pins rather than halting");
+    assert_eq!(
+        plan.progress().floor,
+        RetainFloor::Pinned {
+            offset: mark,
+            tenants: 1,
+        },
     );
 }
 /// Scenario RFC0052.17 — the legacy-root migration window.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.17 stub — implemented in the housekeeping green slice B (its final leg, the legacy stale-gap check, compares a tenant's oldest surviving frame with its last recorded horizon)"]
 fn rfc0052_17_version_1_checkpoint_opens_legacy_and_upgrades_on_first_checkpoint() {
-    todo!(
-        "RFC0052.17 — a root holding a version-1 CHECKPOINT (an \
-         RFC0008.7 fixture) and no RECLAIM opens as pre-RFC without \
-         creating a record; its first checkpoint rewrites the sidecar at \
-         version 2 and creates the record armed on the same path, even \
-         when the mark equals the one on disk, while an equal mark on an \
-         already-version-2 sidecar takes the no-write path; a restart \
-         in the window takes the legacy branch again; a tenant whose \
-         snapshot is missing and whose oldest surviving frame is above \
-         its last recorded horizon fails closed naming the tenant"
+    // Given: a root holding a version-1 `CHECKPOINT` — an RFC0008.7
+    // fixture — and no `RECLAIM`.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    build_closed_segment(root, &[b"a1"]);
+    let second = build_closed_segment(root, &[b"b1"]);
+    build_closed_segment(root, &[b"c1"]);
+    std::fs::remove_file(root.join(RECLAIM)).expect("a pre-RFC root has no record");
+    downgrade_segments(root);
+    let mark = *second.last().expect("segment two's offsets");
+    write_legacy_checkpoint(root, mark);
+
+    // When: it opens. Then: it is read as pre-RFC and gains no record.
+    let wal = open(root);
+    assert!(
+        !root.join(RECLAIM).exists(),
+        "the legacy branch creates no record",
     );
+    assert!(!wal.reclaim_state().reclaimable);
+
+    // And: a restart in that window takes the legacy branch again
+    // rather than any fail-closed row.
+    drop(wal);
+    let mut wal = open(root);
+    assert!(!root.join(RECLAIM).exists() && !wal.reclaim_state().reclaimable);
+
+    // And: its first checkpoint rewrites the sidecar at version 2 and
+    // creates the record armed on the same path, **even when the mark
+    // equals the one on disk** — the idle-node case.
+    wal.checkpoint(mark).expect("the upgrade");
+    assert_eq!(checkpoint_version(root), 2);
+    assert_eq!(
+        live_slot(&std::fs::read(root.join(RECLAIM)).expect("read RECLAIM")).1,
+        CHECKPOINT_ARMED | CHECKPOINT_SEEN,
+        "the record is created armed and then witnessed on that path",
+    );
+
+    // While an equal mark on an already-version-2 sidecar takes the
+    // no-write path.
+    let untouched = std::fs::metadata(root.join(CHECKPOINT))
+        .expect("stat")
+        .modified()
+        .expect("mtime");
+    wal.checkpoint(mark).expect("the no-write path");
+    assert_eq!(
+        std::fs::metadata(root.join(CHECKPOINT))
+            .expect("stat")
+            .modified()
+            .expect("mtime"),
+        untouched,
+        "a settled checkpoint re-asserted at the same mark writes nothing",
+    );
+
+    legacy_stale_gap_fails_closed_naming_the_tenant();
+}
+
+/// On a legacy root the deployment invariant behind the branch — #793
+/// means no served root ever reclaimed — is belted rather than
+/// trusted: a tenant whose snapshot does not restore and whose oldest
+/// surviving frame sits above its last recorded horizon is the shape
+/// reclamation under a version-1 checkpoint leaves behind.
+fn legacy_stale_gap_fails_closed_naming_the_tenant() {
+    let build = || {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path().to_path_buf();
+        let frames = build_tenant_segment(&root, &[("alpha", b"a1")]);
+        build_tenant_segment(&root, &[("alpha", b"a2")]);
+        std::fs::remove_file(root.join(RECLAIM)).expect("a pre-RFC root has no record");
+        downgrade_segments(&root);
+        write_legacy_checkpoint(&root, frames[0]);
+        (tmp, root, frames[0])
+    };
+
+    // A recorded horizon at or above the oldest surviving frame is the
+    // ordinary pre-RFC root: it pins and carries on.
+    let (_tmp, root, oldest) = build();
+    let mut wal = open(&root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.housekeeping_prepare(
+        &SnapshotHorizons::Known(HashMap::from([(
+            tenant_id("alpha"),
+            TenantHorizon::RecordedOnly(oldest),
+        )])),
+        64,
+    )
+    .expect("a horizon that explains the oldest surviving frame");
+
+    // One *below* it is the stale gap, and so is no horizon at all: a
+    // snapshot that cannot be decoded even for that field has nothing
+    // to compare.
+    let below = WalOffset {
+        segment: uuid::Uuid::nil(),
+        byte: 0,
+    };
+    for (what, horizons) in [
+        (
+            "a recorded horizon below the oldest surviving frame",
+            SnapshotHorizons::Known(HashMap::from([(
+                tenant_id("alpha"),
+                TenantHorizon::RecordedOnly(below),
+            )])),
+        ),
+        ("no horizon at all", SnapshotHorizons::Known(HashMap::new())),
+    ] {
+        let (_tmp, root, _) = build();
+        let mut wal = open(&root);
+        wal.rebuild_ledger().expect("ledger");
+        let failure = wal
+            .housekeeping_prepare(&horizons, 64)
+            .expect_err("must fail closed");
+        assert!(
+            format!("{failure}").contains("alpha"),
+            "{what}: the refusal names the tenant: {failure}",
+        );
+    }
 }
 /// Scenario RFC0052.17 — slot ids and the `published_seeded_*` flag rows.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+///
+/// Both legs read the `PUBLISHED` sidecar. §3.2 defines the two
+/// `published_seeded_*` header bits and says they are RFC 0053's,
+/// amending this header — but the **writer and the file's format**
+/// belong to **RFC 0055** (publication frontiers), which is still
+/// `drafted`. The earlier reason here misattributed them to RFC 0053;
+/// nothing in slice B can seed a tenant through a file that has no
+/// writer, and inventing one would put the id space's owner in the
+/// wrong RFC.
 #[test]
-#[ignore = "RFC0052.17 stub — implemented in the housekeeping green slice B (both legs read PUBLISHED, whose writer and format are RFC 0053's)"]
+#[ignore = "RFC0052.17 stub — blocked on RFC 0055 (publication frontiers), which owns the PUBLISHED writer and format; the slice that lands it discharges this"]
 fn rfc0052_17_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve() {
     todo!(
         "RFC0052.17 — a tenant introduced by a PUBLISHED-only write keeps \

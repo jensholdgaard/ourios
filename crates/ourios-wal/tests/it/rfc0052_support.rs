@@ -28,6 +28,7 @@ pub const CHECKPOINT_ARMED: u16 = 1 << 0;
 pub const CHECKPOINT_SEEN: u16 = 1 << 1;
 pub const MODE_UNRECORDED: u16 = 0;
 pub const MODE_KNOWN: u16 = 1;
+pub const MODE_NO_CONSUMER: u16 = 2;
 
 /// The RFC 0052 §3.2 defaults the WAL sizes every record it creates
 /// for, until `max_tenants` and `max_unlinks_per_pass` become
@@ -42,6 +43,7 @@ pub fn default_config(root: &Path) -> WalConfig {
         segment_size_bytes: 128 * 1024 * 1024,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     }
 }
@@ -259,4 +261,61 @@ pub fn build_closed_segment(dest_root: &Path, payloads: &[&[u8]]) -> Vec<WalOffs
 pub fn truncate_segment_header(path: &Path) {
     let bytes = std::fs::read(path).expect("read segment");
     std::fs::write(path, &bytes[..SEGMENT_HEADER_LEN / 2]).expect("truncate the header");
+}
+
+/// The same as [`build_closed_segment`], with `TenantOtlpBatch`
+/// frames: RFC 0052 §3.2's tenant-aware retain rule is driven by the
+/// membership only that kind carries. Returns each frame's offset in
+/// the order given.
+pub fn build_tenant_segment(dest_root: &Path, frames: &[(&str, &[u8])]) -> Vec<WalOffset> {
+    let scratch = tempfile::TempDir::new().expect("scratch root");
+    let mut wal = open(scratch.path());
+    let offsets = frames
+        .iter()
+        .map(|(tenant, body)| {
+            let payload = ourios_wal::TenantBatch::encode(tenant, body).expect("encode");
+            wal.append(FrameKind::TenantOtlpBatch, &payload)
+                .expect("append")
+        })
+        .collect();
+    wal.sync().expect("sync");
+    drop(wal);
+    let seg = segment_files(scratch.path())
+        .into_iter()
+        .next()
+        .expect("scratch holds one segment");
+    std::fs::create_dir_all(dest_root).expect("dest root");
+    let dest = dest_root.join(seg.file_name().expect("segment file name"));
+    std::fs::rename(&seg, &dest).expect("move segment into dest root");
+    let record = dest_root.join(RECLAIM);
+    if !record.exists() {
+        std::fs::copy(scratch.path().join(RECLAIM), &record).expect("bring the record along");
+    }
+    offsets
+}
+
+/// The horizons of a caller that holds miner state: every named
+/// tenant restorable at its mark, every unnamed one pinned.
+pub fn known(marks: &[(&str, WalOffset)]) -> ourios_wal::SnapshotHorizons {
+    ourios_wal::SnapshotHorizons::restorable(
+        marks
+            .iter()
+            .map(|(tenant, offset)| (tenant_id(tenant), *offset)),
+    )
+}
+
+/// `TenantId::new`, not `try_new`: the ledger keys on the identity
+/// replay assigns, and the WAL codec has always accepted stored
+/// tenants the RFC 0048 §3.1 request-boundary grammar would reject.
+/// A helper that validated would be unable to name one of them.
+pub fn tenant_id(name: &str) -> ourios_core::tenant::TenantId {
+    ourios_core::tenant::TenantId::new(name)
+}
+
+/// Rotation debris a previous process left: `<uuid>.wal.partial` is
+/// the reserved shape §3.3's sweep pops.
+pub fn write_partial(root: &Path) -> std::path::PathBuf {
+    let path = root.join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
+    std::fs::write(&path, b"rotation debris").expect("write a partial");
+    path
 }

@@ -10,14 +10,17 @@
 
 use std::path::{Path, PathBuf};
 
+use ourios_core::tenant::TenantId;
+
 use crate::{
     FrameKind, FrameSink, HousekeepingError, OpenError, RecoveryError, SegmentScan, TenantBatch,
-    TenantBatchError, WalOffset, frame, list_segments, reclaim, replay_segment, sync_parent_dir,
+    TenantBatchError, WalOffset, frame, list_segments, replay_segment, retain,
+    retain::SegmentLedger, sync_parent_dir,
 };
 
 /// What one walk of the surviving segments found.
 pub(crate) struct Ledger {
-    pub(crate) bytes: u64,
+    pub(crate) segments: SegmentLedger,
     pub(crate) partials: Vec<PathBuf>,
 }
 
@@ -88,23 +91,43 @@ pub(crate) fn rebuild(root: &Path) -> Result<Ledger, LedgerError> {
     let mut scan = Scan::default();
     let newest_idx = segments.len().checked_sub(1);
     for (idx, path) in segments.iter().enumerate() {
+        // The ledger records the file the frames are in, not the name
+        // their uuid would give: a segment an operator renamed must
+        // still be unlinkable by a later pass.
+        scan.path.clone_from(path);
         match replay_segment(path, Some(idx) == newest_idx, &mut scan) {
             Ok(SegmentScan::CleanTail | SegmentScan::TornTail { .. }) => {}
             Err(e) => return Err(scan.into_error(&e)),
         }
     }
+    // The walk has now seen every segment on the root, which is what
+    // lets a pass pop from this ledger at all.
+    scan.segments.describe_root();
     Ok(Ledger {
-        bytes: scan.bytes,
+        segments: scan.segments,
         partials: list_partials(root)?,
     })
 }
 
-/// The [`FrameSink`] the walk runs with: it sums validated frame bytes
-/// and stops on the one prefix RFC 0052 §3.2 makes fatal.
+/// The [`FrameSink`] the walk runs with: it records every validated
+/// frame into the segment ledger and stops on the one prefix
+/// RFC 0052 §3.2 makes fatal.
 #[derive(Default)]
 struct Scan {
-    bytes: u64,
+    segments: SegmentLedger,
+    path: PathBuf,
     overlong_tenant: Option<(WalOffset, usize)>,
+}
+
+impl Scan {
+    fn record(&mut self, offset: WalOffset, bytes: u64, tenant: Option<&TenantId>) {
+        self.segments.observe(retain::FrameAt {
+            offset,
+            bytes,
+            tenant,
+            path: &self.path,
+        });
+    }
 }
 
 impl Scan {
@@ -131,8 +154,13 @@ impl FrameSink for Scan {
     ) -> Result<(), RecoveryError> {
         let len = u64::try_from(payload.len())
             .expect("payload.len() fits u64 (read_frame capped it at MAX_FRAME_BYTES)");
-        self.bytes += frame::FRAME_HEADER_LEN as u64 + len;
+        let bytes = frame::FRAME_HEADER_LEN as u64 + len;
         if kind != FrameKind::TenantOtlpBatch {
+            // §3.2: only `TenantOtlpBatch` frames carry tenant
+            // membership. Every other kind is governed by the
+            // checkpoint alone, so it contributes bytes and a highest
+            // offset and pins nothing.
+            self.record(offset, bytes, None);
             return Ok(());
         }
         match TenantBatch::decode(payload) {
@@ -142,10 +170,25 @@ impl FrameSink for Scan {
                     detail: format!("tenant length {found} exceeds the RFC 0048 §3.1 bound"),
                 })
             }
+            // `TenantId::new`, not `try_new`: the ledger keys on the
+            // identity **replay** assigns, and `recovery`'s driver
+            // wraps the same prefix unvalidated. A stored tenant the
+            // RFC 0048 §3.1 grammar would reject at a request boundary
+            // is still one the miner rebuilds state for, so dropping
+            // its membership here would leave its segments governed by
+            // the checkpoint alone.
+            Ok(batch) => {
+                self.record(offset, bytes, Some(&TenantId::new(batch.tenant)));
+                Ok(())
+            }
             // Every other malformed prefix stays what it is today: an
             // invalid payload the recovery driver classifies, never a
-            // reason to refuse to open.
-            Ok(_) | Err(_) => Ok(()),
+            // reason to refuse to open. It still holds bytes, so it
+            // joins the ledger under the checkpoint rule alone.
+            Err(_) => {
+                self.record(offset, bytes, None);
+                Ok(())
+            }
         }
     }
 }
@@ -155,7 +198,7 @@ impl FrameSink for Scan {
 /// matched — it stays the checkpoint and snapshot namespace — and a
 /// name whose stem does not parse as a UUID is ignored like any other
 /// non-segment file.
-fn list_partials(root: &Path) -> Result<Vec<PathBuf>, LedgerError> {
+pub(crate) fn list_partials(root: &Path) -> Result<Vec<PathBuf>, LedgerError> {
     let io = |op: &'static str| move |source| LedgerError::Io { op, source };
     let mut out = Vec::new();
     for entry in std::fs::read_dir(root).map_err(io("read_dir(wal_root)"))? {
@@ -166,6 +209,15 @@ fn list_partials(root: &Path) -> Result<Vec<PathBuf>, LedgerError> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Whether `path` is §3.3's reserved partial **directly in `root`**.
+///
+/// The sweep's own seeding walks `root`, so its paths satisfy this by
+/// construction; the check exists for the unlocked file half, which is
+/// handed a plan whose fields a caller can reach.
+pub(crate) fn is_reserved_partial(root: &Path, path: &Path) -> bool {
+    path.parent() == Some(root) && is_partial(path)
 }
 
 fn is_partial(path: &Path) -> bool {
@@ -195,8 +247,8 @@ fn is_partial(path: &Path) -> bool {
 pub(crate) fn sweep_partials(
     partials: &mut Vec<PathBuf>,
     root: &Path,
+    cap: usize,
 ) -> Result<(), HousekeepingError> {
-    let cap = usize::try_from(reclaim::DEFAULT_MAX_UNLINKS_PER_PASS).unwrap_or(usize::MAX);
     let take = partials.len().min(cap);
     let batch: Vec<PathBuf> = partials.drain(..take).collect();
     let mut queued = Vec::new();
@@ -262,6 +314,9 @@ mod tests {
 
     use super::{is_partial, sweep_partials};
 
+    /// RFC 0052 §3.8's proposed default cap.
+    const CAP: usize = 128;
+
     /// The list is the sweep's only record, so a pass that fails
     /// part-way must not consume it. With the parent fsync failing,
     /// the path it just unlinked is an uncertain deletion and the
@@ -290,7 +345,7 @@ mod tests {
         // A root the fsync cannot open: each unlink succeeds, the
         // fsync that would make it durable does not.
         let unopenable = tmp.path().join("gone");
-        sweep_partials(&mut partials, &unopenable).expect_err("the parent fsync must fail");
+        sweep_partials(&mut partials, &unopenable, CAP).expect_err("the parent fsync must fail");
 
         assert_eq!(
             partials, debris,
@@ -303,7 +358,7 @@ mod tests {
 
         // The next pass reconciles it: an unlink that finds the file
         // gone completes the reclamation.
-        sweep_partials(&mut partials, tmp.path()).expect("a pass against a real root");
+        sweep_partials(&mut partials, tmp.path(), CAP).expect("a pass against a real root");
         assert!(
             partials.is_empty(),
             "and the list drains once the fsync works"
@@ -315,7 +370,7 @@ mod tests {
         // pass's unlink was exactly the fsync, so dropping the path
         // here would forget a directory entry a crash can bring back.
         let mut requeued = vec![debris[0].clone()];
-        sweep_partials(&mut requeued, &unopenable).expect_err("the parent fsync must fail");
+        sweep_partials(&mut requeued, &unopenable, CAP).expect_err("the parent fsync must fail");
         assert_eq!(
             requeued,
             vec![debris[0].clone()],

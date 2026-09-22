@@ -25,6 +25,7 @@ fn config(root: &Path, segment_size_bytes: u64, segment_age_secs: u64) -> WalCon
         segment_size_bytes,
         segment_age_secs,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     }
 }

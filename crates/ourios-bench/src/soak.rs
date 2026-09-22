@@ -334,6 +334,23 @@ fn validate(config: &SoakConfig) -> Result<(), SoakError> {
     Ok(())
 }
 
+/// The soak's WAL knobs. `macos_full_fsync: false` matches the
+/// write-path bench, and `max_unlinks_per_pass` is RFC 0052 §3.8's
+/// default rather than a tuned value: nothing here drives a
+/// housekeeping pass yet, so the knob is set for the day the soak
+/// does and the run must not be read as exercising the cadence.
+fn wal_config(root: std::path::PathBuf) -> WalConfig {
+    WalConfig {
+        root,
+        batch_window_ms: WAL_BATCH_WINDOW_MS,
+        segment_size_bytes: WAL_SEGMENT_BYTES,
+        segment_age_secs: 600,
+        housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+        macos_full_fsync: false,
+    }
+}
+
 async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError> {
     let Some(pace) = batch_interval(config.target_lines_per_sec, config.batch_size) else {
         return Err(SoakError::Config("target rate and batch size must be > 0"));
@@ -350,15 +367,8 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // pipeline. `macos_full_fsync: false` matches the write-path bench.
     // The WAL is shared behind a mutex so the sampler can read
     // `Wal::metrics` while the coordinator owns the append/sync path.
-    let wal = Wal::open(WalConfig {
-        root: wal_root,
-        batch_window_ms: WAL_BATCH_WINDOW_MS,
-        segment_size_bytes: WAL_SEGMENT_BYTES,
-        segment_age_secs: 600,
-        housekeeping_secs: 60,
-        macos_full_fsync: false,
-    })
-    .map_err(|e| SoakError::Setup(format!("open WAL: {e:?}")))?;
+    let wal = Wal::open(wal_config(wal_root))
+        .map_err(|e| SoakError::Setup(format!("open WAL: {e:?}")))?;
     let wal = Arc::new(Mutex::new(wal));
     let coordinator = CommitCoordinator::new(
         Box::new(SharedWal(Arc::clone(&wal))),

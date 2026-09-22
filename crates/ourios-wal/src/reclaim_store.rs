@@ -177,6 +177,19 @@ impl ReclaimStore {
         &self.record
     }
 
+    /// Take `record` as the in-memory state **without** writing it.
+    ///
+    /// RFC 0052 §3.2 advances `reclaimed_through` in
+    /// `housekeeping_commit`, which runs under the writer position —
+    /// exactly where a slot write and its fsync must not — and makes
+    /// it durable at the next record write. The gap is safe because
+    /// the `planned` list was durable before the unlinks: a crash in
+    /// it reconciles at open, where an absent planned segment is
+    /// treated as a completed reclamation and raises the same entry.
+    pub(crate) fn adopt(&mut self, record: ReclaimRecord) {
+        self.record = record;
+    }
+
     /// Make `record` the live one: lay it into the reusable buffer at
     /// the next generation, rewrite the *inactive* slot in place, and
     /// fsync. Nothing is allocated and the file never grows, so a pass

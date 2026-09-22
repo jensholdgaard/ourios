@@ -416,7 +416,7 @@ fn rfc0052_17_absent_record_and_absent_checkpoint_opens_and_seeds_an_empty_recor
         .housekeeping_prepare(&SnapshotHorizons::Known(HashMap::new()), 64)
         .expect("a tenant with no entry pins rather than halting");
     assert_eq!(
-        plan.progress.floor,
+        plan.progress().floor,
         RetainFloor::Pinned {
             offset: mark,
             tenants: 1,

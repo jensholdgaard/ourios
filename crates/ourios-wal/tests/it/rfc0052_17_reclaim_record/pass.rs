@@ -101,7 +101,7 @@ fn rfc0052_17_no_entry_with_undecodable_snapshot_pins_the_tenant() {
     // minimum over horizons *and* pins, so here it is `alpha`'s
     // horizon; what `Pinned` adds is that a tenant is holding it.
     assert_eq!(
-        plan.progress.floor,
+        plan.progress().floor,
         ourios_wal::RetainFloor::Pinned {
             offset: first[0],
             tenants: 1,
@@ -248,11 +248,11 @@ fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
     // Then: it plans no segment, writes no record, and is counted as a
     // skipped pass with its reason.
     assert_eq!(
-        plan.progress.outcome,
+        plan.progress().outcome,
         PassOutcome::Skipped(SkipReason::MigrationWindow),
     );
     assert_eq!(SkipReason::MigrationWindow.as_str(), "migration_window");
-    assert!(plan.segments().is_empty() && !plan.records);
+    assert!(plan.segments().is_empty() && !plan.records());
     assert!(
         !root.join(RECLAIM).exists(),
         "no record is created under a version-1 checkpoint",

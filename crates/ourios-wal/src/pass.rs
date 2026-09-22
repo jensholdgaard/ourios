@@ -135,30 +135,33 @@ impl std::fmt::Display for PassId {
 /// Everything the file half needs, owned, so it holds no guard and no
 /// WAL handle (RFC 0052 §3.7).
 #[derive(Debug, Clone)]
+///
+/// **Every field is the pass's own**, readable through the accessors
+/// below and writable only inside this crate. [`unlink_planned`] is
+/// public, holds no guard and removes files, and
+/// [`crate::Wal::write_plan_record`] decides from this value whether
+/// §3.2's durable witness is owed — so every invariant the ledger half
+/// establishes here would otherwise be one field assignment away from
+/// being none: the cap RFC0052.12 bounds a pass by, the reserved
+/// partial shape, the segment identities the record witnesses, the
+/// root the shape is resolved against, and the record-before-unlink
+/// ordering itself.
 pub struct ReclaimPlan {
-    /// The pass that produced this plan (§3.7).
-    pub pass: PassId,
-    /// Readable through [`Self::segments`] and [`Self::partials`] but
-    /// not writable from outside the crate.
-    ///
-    /// [`unlink_planned`] is public, holds no guard and removes files;
-    /// what it removes has to be what the ledger half chose, and every
-    /// invariant the pass establishes here — the cap RFC0052.12 bounds
-    /// a pass by, the reserved partial shape, the segment identities
-    /// the record witnesses — would otherwise be one field assignment
-    /// away from being none.
+    pub(crate) pass: PassId,
     pub(crate) segments: Vec<PlannedSegment>,
     pub(crate) partials: Vec<PathBuf>,
-    /// Whether this pass owes a record write at all. §3.2 gates the
-    /// record write with the segment planning: a record written under
-    /// a version-1 checkpoint witnesses a reclamation that never
-    /// happened.
-    pub records: bool,
-    pub root: PathBuf,
-    pub progress: HousekeepingProgress,
+    pub(crate) records: bool,
+    pub(crate) root: PathBuf,
+    pub(crate) progress: HousekeepingProgress,
 }
 
 impl ReclaimPlan {
+    /// The pass that produced this plan (§3.7).
+    #[must_use]
+    pub fn pass(&self) -> PassId {
+        self.pass
+    }
+
     /// The segments this pass planned, oldest first.
     #[must_use]
     pub fn segments(&self) -> &[PlannedSegment] {
@@ -169,6 +172,27 @@ impl ReclaimPlan {
     #[must_use]
     pub fn partials(&self) -> &[PathBuf] {
         &self.partials
+    }
+
+    /// Whether this pass owes a record write at all. §3.2 gates the
+    /// record write with the segment planning: a record written under
+    /// a version-1 checkpoint witnesses a reclamation that never
+    /// happened.
+    #[must_use]
+    pub fn records(&self) -> bool {
+        self.records
+    }
+
+    /// The WAL root the unlinks and the parent fsync run against.
+    #[must_use]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// What the ledger half decided, as of this plan.
+    #[must_use]
+    pub fn progress(&self) -> &HousekeepingProgress {
+        &self.progress
     }
 }
 

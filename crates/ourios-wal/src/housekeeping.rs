@@ -19,6 +19,20 @@ use crate::{
     reclaim_store, reconcile, retain, unlink_planned,
 };
 
+/// An outcome whose pass is no longer the outstanding one (§3.7).
+fn superseded_commit(pass: pass::PassId, outstanding: pass::PassId) -> HousekeepingError {
+    HousekeepingError::Io {
+        op: "housekeeping_commit(plan)",
+        source: std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "WAL housekeeping refused: outcome from pass {pass} was superseded by pass \
+                 {outstanding} (RFC 0052 §3.7)"
+            ),
+        ),
+    }
+}
+
 /// A plan whose pass is no longer the outstanding one (RFC 0052 §3.7).
 fn superseded(plan: &ReclaimPlan, outstanding: pass::PassId) -> std::io::Error {
     std::io::Error::new(
@@ -239,18 +253,34 @@ impl Wal {
     /// where an absent planned segment is treated exactly like a
     /// completed reclamation.
     ///
+    /// `pass` is the plan's own [`ReclaimPlan::pass`], and an outcome
+    /// that names a **superseded** one is refused with the outstanding
+    /// state untouched. Without it, a caller holding a plan a later
+    /// prepare replaced could take the refusal from
+    /// [`Self::write_plan_record`], report it here as
+    /// [`ReclaimOutcome::RecordFailed`] as the protocol says, and tear
+    /// down the *live* plan: its entries restored, its partials
+    /// requeued, and its own file half then unaccounted for.
+    ///
     /// # Errors
     ///
-    /// [`ReclaimError::Housekeeping`] when a planned segment names a
-    /// slot id the dictionary cannot raise — a record that cannot be
-    /// told apart from a loss.
+    /// [`ReclaimError::Housekeeping`] when the outcome belongs to a
+    /// superseded pass, or when a planned segment names a slot id the
+    /// dictionary cannot raise — a record that cannot be told apart
+    /// from a loss.
     pub fn housekeeping_commit(
         &mut self,
+        pass: pass::PassId,
         outcome: ReclaimOutcome,
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let Some(outstanding) = self.outstanding.take() else {
             return Ok(self.progress(0, 0, PassOutcome::Skipped(SkipReason::NoCheckpoint)));
         };
+        if outstanding.pass != pass {
+            let refused = superseded_commit(pass, outstanding.pass);
+            self.outstanding = Some(outstanding);
+            return Err(self.housekeeping_failure(refused));
+        }
         let ReclaimOutcome::Unlinked {
             removed,
             failed: _,
@@ -328,7 +358,7 @@ impl Wal {
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let plan = self.housekeeping_prepare(horizons, max_unlinks)?;
         let Err(source) = self.write_plan_record(&plan) else {
-            return self.settle_unlinks(unlink_planned(&plan));
+            return self.settle_unlinks(plan.pass, unlink_planned(&plan));
         };
         // The commit is what puts the popped entries back and requeues
         // the partials, so it runs either way — but the failure is the
@@ -337,7 +367,7 @@ impl Wal {
         // fail-closed rule is that such a failure is logged and the
         // next pass retries.
         let (kind, detail) = (source.kind(), source.to_string());
-        let progress = self.housekeeping_commit(ReclaimOutcome::RecordFailed(source))?;
+        let progress = self.housekeeping_commit(plan.pass, ReclaimOutcome::RecordFailed(source))?;
         Err(ReclaimError::Housekeeping {
             progress: Box::new(progress),
             source: HousekeepingError::Io {
@@ -352,10 +382,11 @@ impl Wal {
     /// entries discoverable.
     fn settle_unlinks(
         &mut self,
+        pass: pass::PassId,
         outcome: ReclaimOutcome,
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let failure = pass::unlink_failure(&outcome);
-        let progress = self.housekeeping_commit(outcome)?;
+        let progress = self.housekeeping_commit(pass, outcome)?;
         match failure {
             Some(source) => Err(ReclaimError::Housekeeping {
                 progress: Box::new(progress),

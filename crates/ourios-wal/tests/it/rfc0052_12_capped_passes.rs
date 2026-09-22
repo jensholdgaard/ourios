@@ -169,7 +169,7 @@ fn rfc0052_12_append_completes_while_file_half_is_held() {
     // it.
     wal.write_plan_record(&plan).expect("record");
     let progress = wal
-        .housekeeping_commit(unlink_planned(&plan))
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan))
         .expect("commit");
     assert_eq!(progress.removed_segments, CAP);
     assert!(
@@ -394,7 +394,7 @@ fn rfc0052_12_a_plan_that_is_never_committed_strands_nothing() {
 
     wal.write_plan_record(&replanned).expect("record");
     let progress = wal
-        .housekeeping_commit(unlink_planned(&replanned))
+        .housekeeping_commit(replanned.pass(), unlink_planned(&replanned))
         .expect("commit");
     assert_eq!(
         (progress.removed_segments, progress.removed_partials),
@@ -450,7 +450,7 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
 
     wal.write_plan_record(&replanned).expect("record");
     let progress = wal
-        .housekeeping_commit(unlink_planned(&replanned))
+        .housekeeping_commit(replanned.pass(), unlink_planned(&replanned))
         .expect("commit");
     assert_eq!(
         progress.removed_segments, CAP,
@@ -489,7 +489,7 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     // the ones already unlinked among them.
     let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
     assert!(pinned.segments().is_empty(), "the regression withdrew them");
-    wal.housekeeping_commit(unlink_planned(&pinned))
+    wal.housekeeping_commit(pinned.pass(), unlink_planned(&pinned))
         .expect("commit");
 
     // When the snapshot restores again the withdrawn entries come
@@ -508,7 +508,7 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     );
     wal.write_plan_record(&resumed).expect("record");
     assert_eq!(
-        wal.housekeeping_commit(unlink_planned(&resumed))
+        wal.housekeeping_commit(resumed.pass(), unlink_planned(&resumed))
             .expect("commit")
             .removed_segments,
         resumed.segments().len(),
@@ -552,7 +552,7 @@ fn rfc0052_12_an_abandoned_no_consumer_plan_does_not_survive_into_a_known_pass()
         "a tenant with no snapshot pins its own segment, re-plan or not",
     );
     wal.write_plan_record(&known_pass).expect("record");
-    wal.housekeeping_commit(unlink_planned(&known_pass))
+    wal.housekeeping_commit(known_pass.pass(), unlink_planned(&known_pass))
         .expect("commit");
     assert_eq!(segment_files(root), before, "so its frames are still there");
 }
@@ -599,6 +599,51 @@ fn rfc0052_12_a_superseded_plan_is_refused_at_the_record_write() {
 
     wal.write_plan_record(&pinned)
         .expect("the live plan still writes");
+}
+
+/// ...and a superseded plan's *commit* is refused too, with the live
+/// plan untouched. The record write's refusal is not enough on its
+/// own: §3.7's protocol says a record-write failure is reported as
+/// `RecordFailed`, so a caller doing exactly that with the stale plan
+/// would otherwise restore the **newer** plan's entries and requeue
+/// its partials, leaving that plan's own file half unaccounted for.
+#[test]
+fn rfc0052_12_a_superseded_commit_leaves_the_live_plan_alone() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let superseded = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    let live = wal.housekeeping_prepare(&horizons, CAP).expect("re-plan");
+    let refused = wal
+        .write_plan_record(&superseded)
+        .expect_err("the stale plan is refused at the record write");
+
+    // The caller reports that failure the way §3.7 says to — with the
+    // stale plan's own pass.
+    let failure = wal
+        .housekeeping_commit(
+            superseded.pass(),
+            ourios_wal::ReclaimOutcome::RecordFailed(refused),
+        )
+        .expect_err("and the commit refuses it as well");
+    assert!(
+        format!("{failure}").contains("superseded"),
+        "naming why: {failure}",
+    );
+
+    // The live plan is still outstanding and still completes.
+    wal.write_plan_record(&live).expect("the live plan writes");
+    assert_eq!(
+        wal.housekeeping_commit(live.pass(), unlink_planned(&live))
+            .expect("commit")
+            .removed_segments,
+        live.segments().len(),
+    );
 }
 
 /// An unlink that fails is kept for retry **and** reported. §3.1's

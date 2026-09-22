@@ -261,7 +261,7 @@ fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
     // And: it still sweeps stale `.wal.partial` files, so debris from
     // before the first checkpoint does not survive the window.
     let progress = wal
-        .housekeeping_commit(unlink_planned(&plan))
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan))
         .expect("commit");
     assert_eq!(progress.removed_partials, 1);
     assert!(!debris.exists());
@@ -398,7 +398,7 @@ fn the_first_pass_adopts_its_mode_before_it_unlinks_anything() {
         "the mode is durable while every segment is still on disk",
     );
     assert_eq!(segment_files(root).len(), 2, "nothing unlinked yet");
-    wal.housekeeping_commit(unlink_planned(&plan))
+    wal.housekeeping_commit(plan.pass(), unlink_planned(&plan))
         .expect("commit");
     assert_eq!(segment_files(root).len(), 1);
 }
@@ -445,11 +445,14 @@ fn a_failed_unlink_keeps_the_entry_behind_and_pins_on_restart() {
 
     let path = plan.segments()[0].path.clone();
     let progress = wal
-        .housekeeping_commit(ReclaimOutcome::Unlinked {
-            removed: Vec::new(),
-            failed: vec![(path.clone(), std::io::Error::other("injected"))],
-            fsync_failed: false,
-        })
+        .housekeeping_commit(
+            plan.pass(),
+            ReclaimOutcome::Unlinked {
+                removed: Vec::new(),
+                failed: vec![(path.clone(), std::io::Error::other("injected"))],
+                fsync_failed: false,
+            },
+        )
         .expect("commit");
     assert_eq!(progress.removed_segments, 0);
     assert!(path.exists(), "the segment stays on disk");
@@ -492,11 +495,14 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
         std::fs::remove_file(&plan.segments()[0].path).expect("the unlink itself succeeded");
     }
     let progress = wal
-        .housekeeping_commit(ReclaimOutcome::Unlinked {
-            removed: vec![plan.segments()[0].path.clone()],
-            failed: Vec::new(),
-            fsync_failed: true,
-        })
+        .housekeeping_commit(
+            plan.pass(),
+            ReclaimOutcome::Unlinked {
+                removed: vec![plan.segments()[0].path.clone()],
+                failed: Vec::new(),
+                fsync_failed: true,
+            },
+        )
         .expect("commit");
 
     assert_eq!(
@@ -603,7 +609,7 @@ fn a_renamed_planned_segment_is_not_counted_as_reclaimed() {
     std::fs::rename(&plan.segments()[0].path, &moved).expect("rename the planned segment");
 
     let progress = wal
-        .housekeeping_commit(unlink_planned(&plan))
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan))
         .expect("commit");
     assert_eq!(
         progress.removed_segments, 0,
@@ -684,9 +690,12 @@ fn rfc0052_17_failed_record_write_unlinks_nothing_and_segments_are_reclaimed_lat
 
     // When: the file half reports it.
     let progress = wal
-        .housekeeping_commit(ReclaimOutcome::RecordFailed(std::io::Error::other(
-            "injected: no room for the slot write",
-        )))
+        .housekeeping_commit(
+            plan.pass(),
+            ReclaimOutcome::RecordFailed(std::io::Error::other(
+                "injected: no room for the slot write",
+            )),
+        )
         .expect("commit");
 
     // Then: nothing was unlinked and the WAL's accounting is unchanged.

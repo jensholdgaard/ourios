@@ -10,7 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ourios_wal::{FrameKind, PassOutcome, SkipReason, TenantBatch, WalOffset, unlink_planned};
+use ourios_wal::{
+    FrameKind, PassOutcome, SkipReason, SnapshotHorizons, TenantBatch, WalOffset, unlink_planned,
+};
 
 use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files, write_partial};
 
@@ -49,6 +51,12 @@ fn rfc0052_12_pass_unlinks_at_most_the_cap() {
     assert_eq!(first.removed_segments, CAP);
     assert!(first.capped, "the pass reports the backlog is not drained");
     assert!(
+        first.horizon_remaining > 0,
+        "and the backlog figure agrees — the segments still waiting are \
+         waiting on horizon application, which is what §3.7 counts there \
+         rather than in unlink_remaining: {first:?}",
+    );
+    assert!(
         decoy.exists(),
         "the pass listed no directory and read no header",
     );
@@ -78,6 +86,39 @@ fn rfc0052_12_pass_unlinks_at_most_the_cap() {
         0,
         "and the pass reports nothing left to unlink",
     );
+}
+
+/// `capped` reports **either** half hitting its budget, and the pop
+/// half has to say so on its own. A `NoConsumer` pass applies no
+/// horizon, so its horizon half never raises the flag: whatever
+/// `capped` says there is the pop half's answer, and a caller that
+/// read "drained" off a pass that stopped at the cap would stop
+/// scheduling the next one.
+#[test]
+fn rfc0052_12_the_pop_half_reports_capped_without_the_horizon_half() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let first = wal
+        .housekeeping_pass(&SnapshotHorizons::NoConsumer, CAP)
+        .expect("housekeeping");
+    assert_eq!(first.removed_segments, CAP);
+    assert!(first.capped, "the pop half hit its budget: {first:?}");
+
+    // And the pass that drains the backlog says the opposite, so the
+    // flag is the pop half's own and not a constant.
+    let mut last = first;
+    while last.removed_segments > 0 {
+        last = wal
+            .housekeeping_pass(&SnapshotHorizons::NoConsumer, CAP)
+            .expect("housekeeping");
+    }
+    assert!(!last.capped, "a pass with nothing left is not capped");
+    assert_eq!(last.unlink_remaining, 0);
 }
 
 /// Scenario RFC0052.12 — an append is never held across the file half.

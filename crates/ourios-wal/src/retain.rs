@@ -646,26 +646,34 @@ impl SegmentLedger {
     /// walks the empty-set head, which is what keeps a pinned oldest
     /// segment from shadowing a later eligible one.
     ///
-    /// Every branch takes at most `budget` ids and stops at the first
-    /// segment above the checkpoint. That is what makes the walk O(cap)
-    /// and not O(backlog): both structures are ordered by `UUIDv7`,
-    /// which is the order of the segments' highest offsets, so nothing
-    /// after the first uncovered one is covered either. The
-    /// `NoConsumer` branch may additionally skip entries already
+    /// Every branch takes at most **one more than** the budget and
+    /// stops at the first segment above the checkpoint. That is what
+    /// makes the walk O(cap) and not O(backlog): both structures are
+    /// ordered by `UUIDv7`, which is the order of the segments' highest
+    /// offsets, so nothing after the first uncovered one is covered
+    /// either, and `take` is lazy so nothing past it is even visited.
+    /// The `NoConsumer` branch may additionally skip entries already
     /// reclaiming, of which a pass leaves at most the cap.
+    ///
+    /// The one extra id is what lets [`Self::drain`] tell "the budget
+    /// bound this pass" from "the backlog drained": truncating at
+    /// exactly the budget would make every full pass report `capped`
+    /// as false and the caller read a backlog that is still there as
+    /// finished.
     fn candidates(&self, drain: Drain) -> Vec<Uuid> {
+        let take = drain.budget.saturating_add(1);
         let covered = |id: &Uuid| {
             self.segments
                 .get(id)
                 .is_some_and(|s| s.highest <= drain.bound.checkpoint)
         };
         match (drain.admit, drain.bound.tenant_aware) {
-            (Admit::Reclaiming, _) => self.reclaiming.iter().take(drain.budget).copied().collect(),
+            (Admit::Reclaiming, _) => self.reclaiming.iter().take(take).copied().collect(),
             (Admit::Eligible, true) => self
                 .unpinned
                 .iter()
                 .take_while(|id| covered(id))
-                .take(drain.budget)
+                .take(take)
                 .copied()
                 .collect(),
             (Admit::Eligible, false) => self
@@ -673,7 +681,7 @@ impl SegmentLedger {
                 .keys()
                 .take_while(|id| covered(id))
                 .filter(|id| !self.reclaiming.contains(id))
-                .take(drain.budget)
+                .take(take)
                 .copied()
                 .collect(),
         }

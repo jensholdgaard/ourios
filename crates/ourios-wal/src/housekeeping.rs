@@ -35,8 +35,17 @@ impl Wal {
     /// It does no I/O at all. Everything the old header walk supplied
     /// — a segment's highest offset, each tenant's last offset in it,
     /// its frame bytes — comes from the ledger, so the pass reads no
-    /// segment header and lists no directory, and an append taken
-    /// concurrently waits for O(cap) work whatever the backlog.
+    /// segment header and lists no directory.
+    ///
+    /// The cost an append can wait on is **O(cap + tenants)**, not
+    /// O(backlog): the horizon walk and the pops are bounded by the
+    /// cap, while taking the horizons, deriving the floor and listing
+    /// the tenants that are behind are each one sweep of the tenant
+    /// set, which `max_tenants` bounds. RFC0052.12's guarantee is
+    /// about the backlog — the incident's 1,113 segments — and that is
+    /// what the cap holds. The one exception is [`Self::lag_floor`]'s
+    /// range, which costs the segments it reports and is empty
+    /// whenever the floor is keeping up.
     ///
     /// The returned [`ReclaimPlan`] is owned, so the file half needs
     /// neither the guard nor a WAL handle; feed its outcome back
@@ -109,7 +118,7 @@ impl Wal {
                 outcome,
             },
         };
-        let (lag_bytes, lag_segments) = self.ledger.lag(self.floor_bound(horizons));
+        let (lag_bytes, lag_segments) = self.ledger.lag(self.lag_floor(), self.checkpoint);
         plan.progress.lag_bytes = lag_bytes;
         plan.progress.lag_segments = lag_segments;
         self.outstanding = Some(Outstanding {
@@ -264,10 +273,24 @@ impl Wal {
         max_unlinks: usize,
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let plan = self.housekeeping_prepare(horizons, max_unlinks)?;
-        match self.write_plan_record(&plan) {
-            Ok(()) => self.housekeeping_commit(unlink_planned(&plan)),
-            Err(source) => self.housekeeping_commit(ReclaimOutcome::RecordFailed(source)),
-        }
+        let Err(source) = self.write_plan_record(&plan) else {
+            return self.housekeeping_commit(unlink_planned(&plan));
+        };
+        // The commit is what puts the popped entries back and requeues
+        // the partials, so it runs either way — but the failure is the
+        // caller's to see. Swallowing it would report a pass that could
+        // not make its witness durable as a clean one, and §3.1's
+        // fail-closed rule is that such a failure is logged and the
+        // next pass retries.
+        let (kind, detail) = (source.kind(), source.to_string());
+        let progress = self.housekeeping_commit(ReclaimOutcome::RecordFailed(source))?;
+        Err(ReclaimError::Housekeeping {
+            progress: Box::new(progress),
+            source: HousekeepingError::Io {
+                op: "write(RECLAIM slot)",
+                source: std::io::Error::new(kind, detail),
+            },
+        })
     }
 
     /// Pop this pass's segments, or say why it planned none. §3.2's
@@ -525,16 +548,13 @@ impl Wal {
         }
     }
 
-    /// The bound the lag figures are taken against: the floor when one
-    /// governs, the checkpoint when it alone does.
-    fn floor_bound(&self, horizons: &SnapshotHorizons) -> Option<WalOffset> {
-        match horizons {
-            SnapshotHorizons::NoConsumer => self.checkpoint,
-            SnapshotHorizons::Known(_) => match (self.ledger.floor().offset(), self.checkpoint) {
-                (Some(floor), Some(checkpoint)) => Some(floor.min(checkpoint)),
-                (floor, checkpoint) => floor.or(checkpoint),
-            },
-        }
+    /// The floor the lag is measured from — `None` when nothing holds
+    /// anything back, which is every pass with no floor of its own.
+    /// `RetainFloor::None` says the checkpoint alone governs, so a
+    /// no-consumer pass lags by nothing however far the checkpoint
+    /// reaches.
+    fn lag_floor(&self) -> Option<WalOffset> {
+        self.ledger.floor().offset()
     }
 
     fn progress(

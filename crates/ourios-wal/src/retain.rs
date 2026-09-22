@@ -19,6 +19,7 @@
 //! every append and every verified unlink.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use ourios_core::tenant::TenantId;
@@ -471,16 +472,26 @@ impl SegmentLedger {
 
     /// The prefix walk, round-robin so one tenant cannot starve
     /// another's.
+    /// The candidate list is built **once**, from the tenants that are
+    /// actually behind: a pinned backlog has none, and rebuilding it
+    /// per round would make the walk O(budget × tenants) rather than
+    /// O(tenants + budget). A tenant that stops making progress is
+    /// simply skipped on later rounds.
     fn walk(&mut self, budget: usize) -> bool {
+        let behind: Vec<TenantId> = self
+            .tenants
+            .iter()
+            .filter(|(_, state)| state.behind > 0)
+            .map(|(tenant, _)| tenant.clone())
+            .collect();
         let mut spent = 0;
         loop {
             let mut progressed = false;
-            let names: Vec<TenantId> = self.tenants.keys().cloned().collect();
-            for tenant in names {
+            for tenant in &behind {
                 if spent >= budget {
                     return self.any_behind();
                 }
-                if self.step(&tenant) {
+                if self.step(tenant) {
                     spent += 1;
                     progressed = true;
                 }
@@ -793,14 +804,43 @@ impl SegmentLedger {
     /// Bytes and segments below the floor — §3.5's lag figures, taken
     /// from the per-segment accounting rather than an inspection the
     /// cap would bound.
-    pub(crate) fn lag(&self, floor: Option<WalOffset>) -> (u64, usize) {
-        let Some(floor) = floor else {
+    ///
+    /// The floor's lag is what the **checkpoint would release and the
+    /// floor holds back**: segments with `floor < highest <=
+    /// checkpoint`. Segments at or below the floor are eligible, not
+    /// lagging, and a pass with no floor at all — `None` or `Unknown`
+    /// — holds nothing back, so its lag is zero however far the
+    /// checkpoint reaches.
+    ///
+    /// This is the one figure that costs the range it reports. Both
+    /// bounds are `WalOffset`s and the map is keyed in their order, so
+    /// the walk visits exactly the segments it counts: empty in steady
+    /// state, where the floor tracks the checkpoint, and proportional
+    /// to the backlog only while the floor is genuinely lagging —
+    /// which is when an operator wants the number.
+    pub(crate) fn lag(
+        &self,
+        floor: Option<WalOffset>,
+        checkpoint: Option<WalOffset>,
+    ) -> (u64, usize) {
+        let (Some(floor), Some(checkpoint)) = (floor, checkpoint) else {
             return (0, 0);
         };
+        // A floor at or above the mark holds nothing back — the
+        // ordinary healthy state — and the range below would be
+        // inverted rather than merely empty.
+        if floor >= checkpoint {
+            return (0, 0);
+        }
         self.segments
-            .values()
-            .filter(|s| s.highest <= floor)
-            .fold((0, 0), |(bytes, count), s| (bytes + s.bytes, count + 1))
+            .range((
+                Bound::Included(floor.segment),
+                Bound::Included(checkpoint.segment),
+            ))
+            .filter(|(_, s)| s.highest > floor && s.highest <= checkpoint)
+            .fold((0, 0), |(bytes, count), (_, s)| {
+                (bytes + s.bytes, count + 1)
+            })
     }
 }
 

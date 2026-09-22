@@ -9,9 +9,13 @@
 //! matters (§6): "segments disappear" passes on a bound that ignores
 //! the floor.
 
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, RetainFloor, WalOffset};
+use ourios_wal::{
+    FrameKind, FrameSink, MIN_SEGMENT_SIZE_BYTES, RecoveryError, RetainFloor, Wal, WalOffset,
+};
 
-use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files, write_partial};
+use crate::rfc0052_support::{
+    build_tenant_segment, default_config, known, open, segment_files, write_partial,
+};
 
 /// Every tenant frame replay delivered, so the leg that asserts a
 /// retained frame asserts it is still *readable*, not merely that a
@@ -195,21 +199,25 @@ fn rfc0052_2_a_tenant_the_grammar_rejects_still_pins_its_segments() {
 }
 
 /// A frame appended into the current segment **after** a pass applied
-/// that tenant's horizon to it puts the tenant behind again. The
-/// current segment is never popped, so the loss would only show after
-/// a rotation — by which time the frame above the horizon is gone.
+/// that tenant's horizon to it puts the tenant behind again.
+///
+/// The loss this guards is invisible until the segment rotates — the
+/// append target is never popped, whatever the ledger thinks of it —
+/// so the leg rotates it and then asks the pass to reclaim. Without
+/// the re-pin the segment sits in the eligible head and goes, taking
+/// the frame above the horizon with it.
 #[test]
 fn rfc0052_2_an_append_above_an_applied_horizon_re_pins_its_segment() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
-    build_tenant_segment(root, &[("alpha", b"a1")]);
-    let mut wal = open(root);
-    wal.rebuild_ledger().expect("ledger");
+    let mut config = default_config(root);
+    // The smallest legal segment, so two big frames force a rotation.
+    config.segment_size_bytes = MIN_SEGMENT_SIZE_BYTES;
+    let mut wal = Wal::open(config).expect("open");
+    let frame = |body: &[u8]| ourios_wal::TenantBatch::encode("alpha", body).expect("encode");
+
     let early = wal
-        .append(
-            FrameKind::TenantOtlpBatch,
-            &ourios_wal::TenantBatch::encode("alpha", b"c1").expect("encode"),
-        )
+        .append(FrameKind::TenantOtlpBatch, &frame(b"c1"))
         .expect("append");
     wal.sync().expect("sync");
     wal.checkpoint(early).expect("checkpoint");
@@ -218,31 +226,41 @@ fn rfc0052_2_an_append_above_an_applied_horizon_re_pins_its_segment() {
     wal.housekeeping_pass(&known(&[("alpha", early)]), CAP)
         .expect("housekeeping");
 
-    // A later append lands above that horizon.
+    // A later append lands in the same segment, above that horizon...
     let late = wal
         .append(
             FrameKind::TenantOtlpBatch,
-            &ourios_wal::TenantBatch::encode("alpha", b"c2").expect("encode"),
+            &frame(&vec![0xAA; 15 * 1024 * 1024]),
         )
         .expect("append");
+    // ...and the next one no longer fits, so the segment closes.
+    wal.append(
+        FrameKind::TenantOtlpBatch,
+        &frame(&vec![0xBB; 15 * 1024 * 1024]),
+    )
+    .expect("the append that rotates");
     wal.sync().expect("sync");
-    wal.checkpoint(late).expect("checkpoint past it");
+    let closed = segment_files(root);
+    assert_eq!(closed.len(), 2, "fixture: the segment rotated");
+    wal.checkpoint(late)
+        .expect("checkpoint past the closed one");
 
-    // The segment now holds a frame the tenant has not snapshotted, so
-    // the floor is back at that frame and the segment is held — which
-    // is what keeps it from being reclaimed once it rotates.
+    // When: a pass runs with the tenant's horizon still at `early`.
     let after = wal
         .housekeeping_pass(&known(&[("alpha", early)]), CAP)
         .expect("housekeeping");
-    assert_eq!(
-        after.floor,
-        RetainFloor::Min(early),
-        "the tenant is behind on its own current segment again",
-    );
-    assert!(
-        after.unlink_remaining == 0,
-        "and that segment is not sitting in the eligible head: {after:?}",
-    );
+
+    // Then: the closed segment is retained — it holds `late`, which
+    // the tenant has not snapshotted.
+    assert_eq!(after.removed_segments, 0);
+    assert_eq!(segment_files(root), closed, "the closed segment survives");
+    assert_eq!(after.floor, RetainFloor::Min(early));
+
+    // And: it goes once the horizon reaches that frame.
+    let lifted = wal
+        .housekeeping_pass(&known(&[("alpha", late)]), CAP)
+        .expect("housekeeping");
+    assert_eq!(lifted.removed_segments, 1);
     assert!(late > early);
 }
 

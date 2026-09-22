@@ -1897,6 +1897,19 @@ struct Outstanding {
     progress: HousekeepingProgress,
 }
 
+impl Drop for Wal {
+    /// A permit outlives the `Wal` that issued it — the plan and the
+    /// permit are owned values the file half holds with no handle —
+    /// so dropping the WAL has to revoke it. Otherwise a caller could
+    /// drop this instance, reopen the same root, and unlink against a
+    /// cell the gone instance still owns, past a new `Wal` that
+    /// refuses the stale plan at both of its own checks.
+    fn drop(&mut self) {
+        self.live_pass
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Numbers each `Wal` this process opens, so [`PassId`] names the
 /// instance as well as the pass (RFC 0052 §3.7).
 static NEXT_WAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

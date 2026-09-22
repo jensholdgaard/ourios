@@ -996,6 +996,41 @@ fn rfc0052_12_a_refused_prepare_revokes_the_permit_before_it() {
     );
 }
 
+/// Dropping the `Wal` revokes its permits. A plan and its permit are
+/// owned values the file half holds with no handle, so they outlive
+/// the instance that issued them — and a reopen of the same root
+/// refuses the stale plan at both of its own checks, which is no help
+/// if the unlink never reaches them.
+#[test]
+fn rfc0052_12_dropping_the_wal_revokes_its_permits() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let stale = wal
+        .housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
+        .expect("prepare");
+    let planned: Vec<PathBuf> = stale.segments().iter().map(|s| s.path.clone()).collect();
+    assert!(!planned.is_empty());
+    let permit = wal.write_plan_record(&stale).expect("record");
+    drop(wal);
+
+    let reopened = open(root);
+    let outcome = unlink_planned(&stale, permit);
+    assert!(
+        matches!(outcome, ourios_wal::ReclaimOutcome::RecordFailed(_)),
+        "the instance that issued the permit took it with it",
+    );
+    assert!(
+        planned.iter().all(|path| path.exists()),
+        "so a reopened root is not unlinked against by the one before it",
+    );
+    drop(reopened);
+}
+
 /// An unlink that fails is kept for retry **and** reported. §3.1's
 /// rule is that the failure is logged and the next pass retries it,
 /// and a pass that returned `Ok` gave its caller neither.

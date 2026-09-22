@@ -3,10 +3,18 @@
 //!
 //! The ledger half runs under the WAL's single-writer position and
 //! does no I/O at all: it applies horizons, derives the floor and pops
-//! at most the cap's worth of work. The file half — the `RECLAIM` slot
-//! write, the unlinks and the parent fsync — runs on the plan's owned
-//! paths with no guard and no WAL handle, which is what keeps an
-//! append from waiting on an fsync.
+//! at most the cap's worth of work. The unlinks and the parent fsync —
+//! [`unlink_planned`] — run on the plan's owned paths with no guard
+//! and no WAL handle, which is what keeps an append from waiting on an
+//! fsync.
+//!
+//! The `RECLAIM` slot write does **not** yet: `Wal::write_plan_record`
+//! takes `&mut Wal` because §3.2 puts the *merge* off the writer
+//! position while the record it merges into is the store's live one,
+//! which a concurrent checkpoint also writes. A coordinator holding
+//! the journal behind a mutex therefore holds it across that write.
+//! Closing it means giving the store an ownership of its own, which is
+//! §3.7's question, not this module's — see the PR's open question 11.
 //!
 //! Nothing a pass has touched can become undiscoverable: a popped
 //! entry stays in the ledger and in the byte accounting, marked

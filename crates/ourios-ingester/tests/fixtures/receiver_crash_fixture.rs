@@ -42,6 +42,7 @@ async fn main() {
         segment_size_bytes: 128 * 1024 * 1024,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     };
     let window = Duration::from_millis(config.batch_window_ms);

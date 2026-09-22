@@ -16,15 +16,14 @@ use uuid::Uuid;
 use crate::{CheckpointError, OpenError, WalConfig, checkpoint, reclaim, reclaim_store, segment};
 
 /// The geometry every `RECLAIM` file this build creates is sized for.
-/// `max_tenants` and `max_unlinks_per_pass` become [`WalConfig`] knobs
-/// with the housekeeping pass that reads the cap (RFC 0052 §3.8);
-/// until then the RFC's own defaults are the only values, and
-/// `Wal::open` still rebuilds a file built at a smaller geometry.
-pub(crate) fn configured_geometry() -> Result<reclaim::Geometry, reclaim::GeometryError> {
-    reclaim::Geometry::new(
-        reclaim::DEFAULT_MAX_TENANTS,
-        reclaim::DEFAULT_MAX_UNLINKS_PER_PASS,
-    )
+/// `max_unlinks_per_pass` is a [`WalConfig`] knob (RFC 0052 §3.8) and
+/// `max_tenants` is RFC 0053's, so the RFC's own default is the only
+/// value for it here. A configured cap above the stored one rebuilds
+/// the file wider at `Wal::open`; one at or below opens in place.
+pub(crate) fn configured_geometry(
+    config: &WalConfig,
+) -> Result<reclaim::Geometry, reclaim::GeometryError> {
+    reclaim::Geometry::new(reclaim::DEFAULT_MAX_TENANTS, config.max_unlinks_per_pass)
 }
 
 /// What RFC 0052 §3.2's open-time matrix decided about this root.
@@ -93,7 +92,7 @@ fn recorded_root(
     version: Option<checkpoint::SidecarVersion>,
     segments: &[PathBuf],
 ) -> Result<RootWitness, OpenError> {
-    let geometry = configured_geometry().map_err(|e| OpenError::InvalidConfig {
+    let geometry = configured_geometry(config).map_err(|e| OpenError::InvalidConfig {
         field: "max_tenants",
         detail: e.to_string(),
     })?;
@@ -308,7 +307,7 @@ fn post_rfc_segment(segments: &[PathBuf]) -> Option<&PathBuf> {
 /// held a segment has held a record too and the fail-closed row can
 /// never fire on a node's own first start.
 fn seed_fresh_record(config: &WalConfig) -> Result<RootWitness, OpenError> {
-    let geometry = configured_geometry().map_err(|e| OpenError::InvalidConfig {
+    let geometry = configured_geometry(config).map_err(|e| OpenError::InvalidConfig {
         field: "max_tenants",
         detail: e.to_string(),
     })?;
@@ -409,7 +408,7 @@ pub(crate) fn ensure_record(
         },
         ..reclaim::ReclaimRecord::default()
     };
-    let geometry = configured_geometry().map_err(|e| reclaim_store::StoreError::Corrupt {
+    let geometry = configured_geometry(config).map_err(|e| reclaim_store::StoreError::Corrupt {
         detail: format!("RECLAIM sidecar: sizing the file: {e}"),
     })?;
     *store = Some(reclaim_store::ReclaimStore::create(

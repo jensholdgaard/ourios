@@ -24,6 +24,7 @@ fn config(root: &std::path::Path) -> WalConfig {
         segment_size_bytes: MIN_SEGMENT_SIZE_BYTES,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     }
 }
@@ -112,6 +113,7 @@ fn rfc0008_9_undersized_segment_config_is_rejected_at_open() {
         segment_size_bytes: 1024 * 1024,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     };
     let err = ourios_wal::Wal::open(bad).expect_err("undersized segment must be rejected");

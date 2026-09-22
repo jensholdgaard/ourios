@@ -20,6 +20,7 @@ fn default_config(root: &Path) -> WalConfig {
         segment_size_bytes: 128 * 1024 * 1024,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     }
 }
@@ -141,6 +142,17 @@ fn every_tunable_out_of_range_value_is_rejected() {
         }),
         ("housekeeping_secs", &|root| WalConfig {
             housekeeping_secs: MIN_HOUSEKEEPING_SECS - 1,
+            ..default_config(root)
+        }),
+        // RFC 0052 §3.8: a cap of zero would make every pass a no-op,
+        // and one above the format ceiling cannot be addressed by the
+        // record's `planned` array.
+        ("max_unlinks_per_pass", &|root| WalConfig {
+            max_unlinks_per_pass: 0,
+            ..default_config(root)
+        }),
+        ("max_unlinks_per_pass", &|root| WalConfig {
+            max_unlinks_per_pass: ourios_wal::MAX_UNLINKS_PER_PASS_CEILING + 1,
             ..default_config(root)
         }),
     ];

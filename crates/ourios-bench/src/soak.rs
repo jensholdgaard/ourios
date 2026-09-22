@@ -356,6 +356,7 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
         segment_size_bytes: WAL_SEGMENT_BYTES,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
         macos_full_fsync: false,
     })
     .map_err(|e| SoakError::Setup(format!("open WAL: {e:?}")))?;

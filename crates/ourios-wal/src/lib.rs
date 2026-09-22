@@ -34,17 +34,27 @@ pub(crate) mod frame;
 #[cfg(feature = "fuzzing")]
 pub mod frame;
 pub(crate) mod ledger;
-// The codec's dictionary-mutation surface (assign, tombstone, union)
-// lands ahead of its callers: the housekeeping pass that merges
-// horizons into the record is RFC 0052's next slice, which removes
-// this allow.
+pub(crate) mod pass;
+// The codec's tombstone and union entry points land ahead of their
+// callers: tenant removal and RFC 0053's `PUBLISHED` dictionary are
+// the slices that reach them.
 #[allow(dead_code)]
 pub(crate) mod reclaim;
 pub(crate) mod reclaim_store;
 pub(crate) mod reconcile;
+pub(crate) mod retain;
 pub(crate) mod segment;
 
 pub use ledger::LedgerError;
+pub use pass::{
+    HousekeepingProgress, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome, ReclaimPlan,
+    SkipReason, unlink_planned,
+};
+pub use reclaim::{
+    DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
+    MAX_UNLINKS_PER_PASS_CEILING,
+};
+pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
 
 // -----------------------------------------------------------
@@ -252,6 +262,22 @@ pub struct WalConfig {
     /// `wal_housekeeping_secs` — checkpoint housekeeping
     /// cadence (§6.7). Default `60`.
     pub housekeeping_secs: u64,
+    /// `wal_max_unlinks_per_pass` — how much per-file work one
+    /// reclamation pass may do (RFC 0052 §3.7, §3.8). Default
+    /// [`DEFAULT_MAX_UNLINKS_PER_PASS`]; range
+    /// `1..=`[`MAX_UNLINKS_PER_PASS_CEILING`].
+    ///
+    /// It bounds how long a pass holds the journal mutex, and so the
+    /// stall an append can see, and it sizes the `RECLAIM` sidecar's
+    /// `planned` array — which is why `Wal::open` both validates it
+    /// and rebuilds the file when it rises above the stored capacity.
+    ///
+    /// §3.8 also validates the lower bound against
+    /// `rotation_retry_attempts`, so RFC0052.4's one-pass debris
+    /// clearance holds. That knob arrives with the rotation slice; the
+    /// cross-check lands with it, and the range below is the format's
+    /// own until then.
+    pub max_unlinks_per_pass: u32,
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
     /// §6.3 / §9: on macOS `fsync`/`fdatasync` do not flush the
@@ -331,8 +357,8 @@ pub struct Wal {
     /// at, swapped on rotation. Kept for diagnostic messages;
     /// housekeeping deliberately does NOT key on it — the
     /// append target is identified by its header UUID so a
-    /// rename can't slip it past the guard.
-    #[allow(dead_code)]
+    /// rename can't slip it past the guard, and the RFC 0052 §3.2
+    /// ledger records it so an unlink targets the real file.
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
     /// filename's stem and the segment's in-file header per
@@ -377,6 +403,18 @@ pub struct Wal {
     /// §3.3: the sweep lists nothing on the pass, so restart debris is
     /// found without a directory scan under the writer position.
     stale_partials: Vec<PathBuf>,
+    /// RFC 0052 §3.2's per-segment ledger: tenant membership, each
+    /// tenant's first and last offset per segment, the horizon
+    /// cursors and the eligible head. Rebuilt once after recovery and
+    /// maintained incrementally, so a pass reads no header and lists
+    /// no directory.
+    ledger: retain::SegmentLedger,
+    /// The segments [`Self::housekeeping_prepare`] popped and
+    /// [`Self::housekeeping_commit`] has not yet accounted for. One
+    /// plan is outstanding at a time by construction (§3.7): a plan
+    /// that is never committed strands nothing, since the entries stay
+    /// marked reclaiming and the next prepare re-plans them.
+    outstanding: Option<Outstanding>,
     /// Bytes of validated frames in surviving segments, seeded after
     /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
     /// less header, which would count a torn tail, and never the
@@ -456,6 +494,8 @@ impl Wal {
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
             stale_partials: Vec::new(),
+            ledger: retain::SegmentLedger::default(),
+            outstanding: None,
             unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,
@@ -482,7 +522,8 @@ impl Wal {
     /// See [`LedgerError`].
     pub fn rebuild_ledger(&mut self) -> Result<(), LedgerError> {
         let rebuilt = ledger::rebuild(&self.config.root)?;
-        self.unreclaimed_bytes = rebuilt.bytes;
+        self.unreclaimed_bytes = rebuilt.segments.bytes();
+        self.ledger = rebuilt.segments;
         self.stale_partials = rebuilt.partials;
         Ok(())
     }
@@ -502,6 +543,7 @@ impl Wal {
             checkpoint: self.checkpoint,
             stale_partials: self.stale_partials.len(),
             reclaimable: self.checkpoint_is_settled(),
+            floor: self.ledger.floor(),
         }
     }
 
@@ -615,10 +657,26 @@ impl Wal {
         // verified unlink. A figure only ever seeded would omit
         // everything written since the last restart.
         self.unreclaimed_bytes += frame_len;
-        Ok(WalOffset {
+        let offset = WalOffset {
             segment: self.current_segment_uuid,
             byte: post_write_byte,
-        })
+        };
+        // §3.2's ledger is rebuilt at recovery and updated on every
+        // live append, so a pass never has to read a header to learn
+        // which tenants a segment holds.
+        let tenant = match kind {
+            FrameKind::TenantOtlpBatch => TenantBatch::decode(payload)
+                .ok()
+                .and_then(|batch| ourios_core::tenant::TenantId::try_new(batch.tenant).ok()),
+            FrameKind::OtlpBatch | FrameKind::AuditEvent => None,
+        };
+        self.ledger.observe(retain::FrameAt {
+            offset,
+            bytes: frame_len,
+            tenant: tenant.as_ref(),
+            path: &self.current_segment_path,
+        });
+        Ok(offset)
     }
 
     /// §6.5's two triggers, checked before the write lands.
@@ -919,7 +977,8 @@ impl Wal {
         // installed a segment — no reader can depend on it and no
         // `reclaimed_through` accounts for it — so gating it would let
         // debris created before the first checkpoint survive forever.
-        ledger::sweep_partials(&mut self.stale_partials, &self.config.root)?;
+        let cap = self.pass_cap();
+        ledger::sweep_partials(&mut self.stale_partials, &self.config.root, cap)?;
         let Some(cp) = self.checkpoint else {
             return Ok(());
         };
@@ -980,6 +1039,10 @@ impl Wal {
                 self.unreclaimed_bytes = self
                     .unreclaimed_bytes
                     .saturating_sub(len.saturating_sub(SEGMENT_HEADER_LEN as u64));
+                // The RFC 0052 §3.2 ledger is the other view of this
+                // directory; leaving a reclaimed segment in it would
+                // let a later pass plan a file that is already gone.
+                self.ledger.remove(header.segment_uuid);
                 unlinked_any = true;
             }
         }
@@ -988,6 +1051,482 @@ impl Wal {
                 .map_err(|e| io("fsync(wal_root after housekeeping)", e))?;
         }
         Ok(())
+    }
+
+    /// `max_unlinks_per_pass` as a `usize` (RFC 0052 §3.8). The
+    /// configured value is validated against
+    /// [`MAX_UNLINKS_PER_PASS_CEILING`] at open, so it always fits.
+    fn pass_cap(&self) -> usize {
+        usize::try_from(self.config.max_unlinks_per_pass).unwrap_or(usize::MAX)
+    }
+
+    /// RFC 0052 §3.2's **ledger half**, under the WAL's single-writer
+    /// position: apply `horizons` (capped), derive the retain floor,
+    /// pop stale partials and then eligible segments up to
+    /// `max_unlinks`, and mark each popped entry reclaiming.
+    ///
+    /// It does no I/O at all. Everything the old header walk supplied
+    /// — a segment's highest offset, each tenant's last offset in it,
+    /// its frame bytes — comes from the ledger, so the pass reads no
+    /// segment header and lists no directory, and an append taken
+    /// concurrently waits for O(cap) work whatever the backlog.
+    ///
+    /// The returned [`ReclaimPlan`] is owned, so the file half needs
+    /// neither the guard nor a WAL handle; feed its outcome back
+    /// through [`Self::housekeeping_commit`].
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimError::Housekeeping`] when the pass's mode disagrees
+    /// with the mode recorded in the `RECLAIM` header, or when a
+    /// tenant's state cannot be told apart from a loss — both refused
+    /// before anything is planned or unlinked.
+    pub fn housekeeping_prepare(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        let cap = max_unlinks.max(1);
+        self.refuse_mode_disagreement(horizons)?;
+        self.refuse_unexplained_tenants(horizons)?;
+        let horizons_capped = self.ledger.apply(horizons, cap);
+        let take = self.stale_partials.len().min(cap);
+        let partials: Vec<PathBuf> = self.stale_partials.drain(..take).collect();
+        let budget = cap - partials.len();
+        let (segments, pops_capped, outcome) = self.pop_segments(horizons, budget);
+        let mut plan = ReclaimPlan {
+            segments: Vec::new(),
+            partials,
+            record: None,
+            root: self.config.root.clone(),
+            progress: HousekeepingProgress {
+                removed_segments: 0,
+                removed_partials: 0,
+                capped: horizons_capped || pops_capped,
+                horizon_remaining: self.ledger.horizon_remaining(),
+                unlink_remaining: self.ledger.unlink_remaining(),
+                floor: self.ledger.floor(),
+                lag_bytes: 0,
+                lag_segments: 0,
+                outcome,
+            },
+        };
+        let (lag_bytes, lag_segments) = self.ledger.lag(self.floor_bound(horizons));
+        plan.progress.lag_bytes = lag_bytes;
+        plan.progress.lag_segments = lag_segments;
+        self.merge_plan(&mut plan, &segments, pass::entry_mode(horizons))?;
+        self.outstanding = Some(Outstanding {
+            segments,
+            partials: plan.partials.clone(),
+        });
+        Ok(plan)
+    }
+
+    /// The record half of RFC 0052 §3.2's file half: rewrite the
+    /// inactive `RECLAIM` slot in place and fsync it. It allocates
+    /// nothing and never extends the file, so a pass on a full volume
+    /// still commits — which is the case this record exists for.
+    ///
+    /// Separate from [`unlink_planned`] because §3.2's ordering rule
+    /// is exactly that the record is durable **before** the segments
+    /// it accounts for are gone.
+    ///
+    /// # Errors
+    ///
+    /// The slot write or its fsync failed; nothing has been unlinked,
+    /// and [`ReclaimOutcome::RecordFailed`] is what
+    /// [`Self::housekeeping_commit`] expects in response.
+    pub fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<(), std::io::Error> {
+        match (plan.record.as_ref(), self.reclaim.as_mut()) {
+            (Some(record), Some(store)) => store.commit(record).map_err(|e| match e {
+                reclaim_store::StoreError::Io { source, .. } => source,
+                reclaim_store::StoreError::Corrupt { detail } => {
+                    std::io::Error::new(ErrorKind::InvalidData, detail)
+                }
+            }),
+            // A plan carrying a record is only ever produced from a
+            // root that has one; a plan without one has nothing to
+            // write.
+            (Some(_), None) | (None, _) => Ok(()),
+        }
+    }
+
+    /// RFC 0052 §3.2's **ledger half again**, with what the file half
+    /// did: removed entries leave the ledger and its byte accounting,
+    /// an uncertain deletion keeps the whole removed set reclaiming
+    /// for the next pass to re-verify, a failed unlink stays
+    /// reclaiming, and a failed record write returns every popped
+    /// entry to eligible — nothing a pass touched becomes
+    /// undiscoverable.
+    ///
+    /// `reclaimed_through` is raised here and made durable by the next
+    /// record write. The gap is safe because the `planned` list was
+    /// durable *before* the unlinks: a crash in it reconciles at open,
+    /// where an absent planned segment is treated exactly like a
+    /// completed reclamation.
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimError::Housekeeping`] when a planned segment names a
+    /// slot id the dictionary cannot raise — a record that cannot be
+    /// told apart from a loss.
+    pub fn housekeeping_commit(
+        &mut self,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        let Some(outstanding) = self.outstanding.take() else {
+            return Ok(self.progress(0, 0, PassOutcome::Skipped(SkipReason::NoCheckpoint)));
+        };
+        match outcome {
+            ReclaimOutcome::RecordFailed(_) => {
+                for popped in &outstanding.segments {
+                    self.ledger.restore(popped.segment);
+                }
+                self.requeue_partials(outstanding.partials);
+                Ok(self.progress(0, 0, PassOutcome::Planned))
+            }
+            ReclaimOutcome::Unlinked {
+                removed,
+                failed: _,
+                fsync_failed,
+            } => {
+                let removed: std::collections::HashSet<PathBuf> = removed.into_iter().collect();
+                let segments =
+                    self.settle_segments(&outstanding.segments, &removed, fsync_failed)?;
+                let mut partials = 0;
+                let mut requeued = Vec::new();
+                for path in outstanding.partials {
+                    if removed.contains(&path) && !fsync_failed {
+                        partials += 1;
+                    } else {
+                        requeued.push(path);
+                    }
+                }
+                self.requeue_partials(requeued);
+                Ok(self.progress(segments, partials, PassOutcome::Planned))
+            }
+        }
+    }
+
+    /// One whole pass for a caller that owns the WAL outright: the
+    /// ledger half, the record write, the unlinks and the commit.
+    ///
+    /// The coordinator uses the three-part form instead, because its
+    /// journal is behind a mutex and the whole file half has to run
+    /// with that guard released (§3.7).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::housekeeping_prepare`] and
+    /// [`Self::housekeeping_commit`].
+    pub fn housekeeping_pass(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        let plan = self.housekeeping_prepare(horizons, max_unlinks)?;
+        match self.write_plan_record(&plan) {
+            Ok(()) => self.housekeeping_commit(unlink_planned(&plan)),
+            Err(source) => self.housekeeping_commit(ReclaimOutcome::RecordFailed(source)),
+        }
+    }
+
+    /// Pop this pass's segments, or say why it planned none. §3.2's
+    /// gate is on segment planning and the record write alone — the
+    /// partial sweep runs on every pass, witness or not.
+    fn pop_segments(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        budget: usize,
+    ) -> (Vec<retain::Popped>, bool, PassOutcome) {
+        let Some(checkpoint) = self.checkpoint else {
+            return (
+                Vec::new(),
+                false,
+                PassOutcome::Skipped(SkipReason::NoCheckpoint),
+            );
+        };
+        if !self.checkpoint_is_settled() {
+            return (
+                Vec::new(),
+                false,
+                PassOutcome::Skipped(SkipReason::MigrationWindow),
+            );
+        }
+        let tenant_aware = matches!(horizons, SnapshotHorizons::Known(_));
+        let (popped, capped) =
+            self.ledger
+                .pop(checkpoint, self.current_segment_uuid, tenant_aware, budget);
+        (popped, capped, PassOutcome::Planned)
+    }
+
+    /// Merge this pass's popped segments and its mode into the record
+    /// the file half will write. A pass that plans nothing and owes no
+    /// mode writes no record at all.
+    fn merge_plan(
+        &mut self,
+        plan: &mut ReclaimPlan,
+        popped: &[retain::Popped],
+        mode: reclaim::EntryMode,
+    ) -> Result<(), ReclaimError> {
+        let Some(store) = self.reclaim.as_ref() else {
+            return Ok(());
+        };
+        let geometry = reconcile::configured_geometry(&self.config).map_err(|e| {
+            self.housekeeping_failure(HousekeepingError::Io {
+                op: "sizing(RECLAIM)",
+                source: std::io::Error::new(ErrorKind::InvalidData, e.to_string()),
+            })
+        })?;
+        let mut record = store.record().clone();
+        // §3.2: the first pass adopts its own mode durably before it
+        // unlinks anything. A root whose mode is already recorded was
+        // checked for disagreement before anything was planned.
+        let adopting = record.consumer_mode == reclaim::RecordedMode::Unrecorded;
+        if adopting {
+            record.consumer_mode = pass::recorded_mode(mode);
+        }
+        for entry in popped {
+            record.planned.retain(|p| p.segment != entry.segment);
+            let planned = pass::plan_entry(
+                &mut record.dictionary,
+                geometry,
+                entry.segment,
+                entry.uncertain,
+                &entry.last_offsets,
+            )
+            .map_err(|e| {
+                self.housekeeping_failure(HousekeepingError::Io {
+                    op: "assign(RECLAIM slot id)",
+                    source: std::io::Error::new(ErrorKind::InvalidData, e.to_string()),
+                })
+            })?;
+            plan.segments.push(PlannedSegment {
+                unlink: planned.clone(),
+                path: entry.path.clone(),
+            });
+            record.planned.push(planned);
+        }
+        if adopting || !popped.is_empty() {
+            plan.record = Some(record);
+        }
+        Ok(())
+    }
+
+    /// Fold the unlink results back into the ledger and the record.
+    fn settle_segments(
+        &mut self,
+        popped: &[retain::Popped],
+        removed: &std::collections::HashSet<PathBuf>,
+        fsync_failed: bool,
+    ) -> Result<usize, ReclaimError> {
+        let Some(store) = self.reclaim.as_ref() else {
+            return Ok(0);
+        };
+        let mut record = store.record().clone();
+        let mut done = 0;
+        for entry in popped {
+            match (removed.contains(&entry.path), fsync_failed) {
+                (true, false) => {
+                    self.raise_entry(&mut record, entry.segment)?;
+                    record.planned.retain(|p| p.segment != entry.segment);
+                    self.unreclaimed_bytes = self
+                        .unreclaimed_bytes
+                        .saturating_sub(self.ledger.remove(entry.segment));
+                    done += 1;
+                }
+                // One parent fsync covers every unlink of the pass, so
+                // its failure marks the whole removed set uncertain.
+                (true, true) => {
+                    self.ledger.hold(entry.segment, true);
+                    mark_uncertain(&mut record, entry.segment);
+                }
+                (false, _) => self.ledger.hold(entry.segment, entry.uncertain),
+            }
+        }
+        if let Some(store) = self.reclaim.as_mut() {
+            store.adopt(record);
+        }
+        Ok(done)
+    }
+
+    /// Raise every tenant named by a completed segment's `planned`
+    /// entry, exactly as the reconciliation at open would.
+    fn raise_entry(
+        &self,
+        record: &mut reclaim::ReclaimRecord,
+        segment: uuid::Uuid,
+    ) -> Result<(), ReclaimError> {
+        let mode = match record.consumer_mode {
+            reclaim::RecordedMode::Known => reclaim::EntryMode::Known,
+            reclaim::RecordedMode::NoConsumer => reclaim::EntryMode::NoConsumer,
+            reclaim::RecordedMode::Unrecorded => return Ok(()),
+        };
+        let Some(planned) = record
+            .planned
+            .iter()
+            .find(|p| p.segment == segment)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        for (&id, &offset) in &planned.last_offsets {
+            record
+                .dictionary
+                .raise_reclaimed(id, reclaim::Entry { mode, offset })
+                .map_err(|e| {
+                    self.housekeeping_failure(HousekeepingError::Io {
+                        op: "raise(RECLAIM reclaimed_through)",
+                        source: std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!("planned segment {segment} names {e}"),
+                        ),
+                    })
+                })?;
+        }
+        Ok(())
+    }
+
+    /// §3.2's precondition, checked from durable state: every pass on
+    /// a root runs under the mode the record carries, and a
+    /// disagreement is refused before anything is planned. A root that
+    /// has checkpointed but never reclaimed has no entry to infer
+    /// from, which is why the header and not an entry is the witness.
+    fn refuse_mode_disagreement(&self, horizons: &SnapshotHorizons) -> Result<(), ReclaimError> {
+        let Some(store) = self.reclaim.as_ref() else {
+            return Ok(());
+        };
+        let recorded = store.record().consumer_mode;
+        let attempted = pass::entry_mode(horizons);
+        match recorded {
+            reclaim::RecordedMode::Unrecorded => Ok(()),
+            _ if recorded.admits(attempted) => Ok(()),
+            _ => Err(
+                self.housekeeping_failure(HousekeepingError::ModeDisagreement {
+                    recorded: pass::mode_name(recorded),
+                    attempted: pass::mode_name(pass::recorded_mode(attempted)),
+                }),
+            ),
+        }
+    }
+
+    /// §3.2's halt-or-pin, and the legacy root's stale-gap belt.
+    ///
+    /// A `Known` entry whose tenant's restorable horizon is below it —
+    /// including a tenant with an entry and no restorable snapshot at
+    /// all — is unrecoverable state: the frames below that horizon are
+    /// gone and a pin cannot rebuild what they held. A tenant with no
+    /// entry has lost nothing and pins at its oldest surviving frame.
+    fn refuse_unexplained_tenants(&self, horizons: &SnapshotHorizons) -> Result<(), ReclaimError> {
+        let SnapshotHorizons::Known(marks) = horizons else {
+            return Ok(());
+        };
+        if let Some(store) = self.reclaim.as_ref() {
+            for (_, held) in store.record().dictionary.live() {
+                let reclaim::SlotState::Live {
+                    reclaimed_through: Some(entry),
+                } = &held.state
+                else {
+                    continue;
+                };
+                if entry.mode != reclaim::EntryMode::Known {
+                    continue;
+                }
+                let restorable = marks.get(&held.key).and_then(|h| h.restorable());
+                if restorable.is_none_or(|horizon| horizon < entry.offset) {
+                    return Err(self.unrecoverable(&held.key, entry.offset));
+                }
+            }
+        }
+        match self.reclaim_gate {
+            ReclaimGate::Unwitnessed => self.refuse_legacy_stale_gaps(marks),
+            ReclaimGate::FsyncPending | ReclaimGate::Open => Ok(()),
+        }
+    }
+
+    /// The legacy branch rests on "#793 means no served root ever
+    /// reclaimed", and §3.2 belts rather than trusts it: a tenant
+    /// whose snapshot does not restore and whose oldest surviving
+    /// frame sits above its last recorded horizon is the shape
+    /// reclamation under a version-1 checkpoint leaves behind. A
+    /// tenant with no recorded horizon at all has nothing to compare,
+    /// which is the one direction that could replay past reclaimed
+    /// data, so it fails closed too.
+    fn refuse_legacy_stale_gaps(
+        &self,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Result<(), ReclaimError> {
+        for tenant in self.ledger.tenants() {
+            let Some(oldest) = self.ledger.oldest_frame(&tenant) else {
+                continue;
+            };
+            match marks.get(&tenant) {
+                Some(TenantHorizon::Restorable(_)) => {}
+                Some(TenantHorizon::RecordedOnly(recorded)) if oldest <= *recorded => {}
+                Some(TenantHorizon::RecordedOnly(recorded)) => {
+                    return Err(self.unrecoverable(&tenant, *recorded));
+                }
+                None => return Err(self.unrecoverable(&tenant, oldest)),
+            }
+        }
+        Ok(())
+    }
+
+    fn unrecoverable(
+        &self,
+        tenant: &ourios_core::tenant::TenantId,
+        horizon: WalOffset,
+    ) -> ReclaimError {
+        self.housekeeping_failure(HousekeepingError::Unrecoverable {
+            tenant: tenant.as_str().to_owned(),
+            horizon,
+        })
+    }
+
+    fn housekeeping_failure(&self, source: HousekeepingError) -> ReclaimError {
+        ReclaimError::Housekeeping {
+            progress: Box::new(self.progress(0, 0, PassOutcome::Planned)),
+            source,
+        }
+    }
+
+    /// The bound the lag figures are taken against: the floor when one
+    /// governs, the checkpoint when it alone does.
+    fn floor_bound(&self, horizons: &SnapshotHorizons) -> Option<WalOffset> {
+        match horizons {
+            SnapshotHorizons::NoConsumer => self.checkpoint,
+            SnapshotHorizons::Known(_) => match (self.ledger.floor().offset(), self.checkpoint) {
+                (Some(floor), Some(checkpoint)) => Some(floor.min(checkpoint)),
+                (floor, checkpoint) => floor.or(checkpoint),
+            },
+        }
+    }
+
+    fn progress(
+        &self,
+        removed_segments: usize,
+        removed_partials: usize,
+        outcome: PassOutcome,
+    ) -> HousekeepingProgress {
+        HousekeepingProgress {
+            removed_segments,
+            removed_partials,
+            capped: false,
+            horizon_remaining: self.ledger.horizon_remaining(),
+            unlink_remaining: self.ledger.unlink_remaining(),
+            floor: self.ledger.floor(),
+            lag_bytes: 0,
+            lag_segments: 0,
+            outcome,
+        }
+    }
+
+    /// Paths a pass did not verify go back on the list in order: it is
+    /// the sweep's only record, so anything dropped here becomes
+    /// invisible to every later pass.
+    fn requeue_partials(&mut self, paths: Vec<PathBuf>) {
+        self.stale_partials.extend(paths);
+        self.stale_partials.sort();
     }
 
     /// Walk every surviving segment in chronological order,
@@ -1169,6 +1708,15 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
             format!(
                 "{} outside §6.9 range {MIN_HOUSEKEEPING_SECS}..={MAX_HOUSEKEEPING_SECS}",
                 c.housekeeping_secs
+            ),
+        ));
+    }
+    if !(1..=MAX_UNLINKS_PER_PASS_CEILING).contains(&c.max_unlinks_per_pass) {
+        return Err(outside(
+            "max_unlinks_per_pass",
+            format!(
+                "{} outside RFC 0052 §3.8 range 1..={MAX_UNLINKS_PER_PASS_CEILING}",
+                c.max_unlinks_per_pass
             ),
         ));
     }
@@ -1676,6 +2224,28 @@ pub enum CheckpointError {
     },
 }
 
+impl std::fmt::Display for CheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { op, source } => write!(f, "WAL checkpoint failed at {op}: {source}"),
+            Self::NonMonotonic { current, attempted } => write!(
+                f,
+                "WAL checkpoint is monotonic: segment {} byte {} is below the current segment {} byte {}",
+                attempted.segment, attempted.byte, current.segment, current.byte,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::NonMonotonic { .. } => None,
+        }
+    }
+}
+
 /// Errors from [`Wal::housekeeping`].
 #[derive(Debug)]
 pub enum HousekeepingError {
@@ -1687,12 +2257,41 @@ pub enum HousekeepingError {
         op: &'static str,
         source: std::io::Error,
     },
+    /// The pass's consumer mode disagrees with the mode recorded in
+    /// the `RECLAIM` header (RFC 0052 §3.2). Every pass on a root runs
+    /// under the recorded mode: a `NoConsumer` pass on a root a miner
+    /// reclaimed from would delete frames nothing can re-mine, so the
+    /// pass is refused before anything is planned or unlinked.
+    ModeDisagreement {
+        recorded: &'static str,
+        attempted: &'static str,
+    },
+    /// A tenant's state cannot be told apart from a loss (RFC 0052
+    /// §3.2): either the `RECLAIM` record holds a `Known` entry above
+    /// the tenant's restorable horizon — the frames it names are gone
+    /// and no pin can rebuild what they held — or the root is still on
+    /// the legacy branch and the tenant's oldest surviving frame sits
+    /// above its last recorded horizon, which is what reclamation
+    /// under a version-1 checkpoint leaves behind.
+    Unrecoverable { tenant: String, horizon: WalOffset },
 }
 
 impl std::fmt::Display for HousekeepingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { op, source } => write!(f, "WAL housekeeping failed at {op}: {source}"),
+            Self::ModeDisagreement {
+                recorded,
+                attempted,
+            } => write!(
+                f,
+                "WAL housekeeping refused: this root recorded consumer mode {recorded} and the pass offered {attempted} (RFC 0052 §3.2)"
+            ),
+            Self::Unrecoverable { tenant, horizon } => write!(
+                f,
+                "WAL housekeeping refused: tenant {tenant} has no restorable snapshot at or above segment {} byte {} (RFC 0052 §3.2)",
+                horizon.segment, horizon.byte,
+            ),
         }
     }
 }
@@ -1701,6 +2300,28 @@ impl std::error::Error for HousekeepingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::ModeDisagreement { .. } | Self::Unrecoverable { .. } => None,
+        }
+    }
+}
+
+/// What one [`Wal::housekeeping_prepare`] handed to the file half and
+/// [`Wal::housekeeping_commit`] has still to account for. Segments and
+/// partials are kept apart because their failure paths differ: a
+/// segment the file half never verified stays reclaiming in the
+/// ledger, while a partial goes back on the sweep's list.
+#[derive(Debug)]
+struct Outstanding {
+    segments: Vec<retain::Popped>,
+    partials: Vec<PathBuf>,
+}
+
+/// Mark one segment's `planned` entry as RFC 0052 §3.2's uncertain
+/// deletion, so the next pass re-verifies its presence.
+fn mark_uncertain(record: &mut reclaim::ReclaimRecord, segment: uuid::Uuid) {
+    for entry in &mut record.planned {
+        if entry.segment == segment {
+            entry.uncertain = true;
         }
     }
 }
@@ -1721,6 +2342,12 @@ pub struct ReclaimState {
     /// Whether a pass may plan segments: RFC 0052 §3.2's witness, a
     /// version-2 `CHECKPOINT` beside a `RECLAIM` record.
     pub reclaimable: bool,
+    /// The floor the WAL derived on its last pass (RFC 0052 §3.7).
+    /// Between passes that is by definition the floor governing
+    /// retention, so the export is never stale; before the first it is
+    /// [`RetainFloor::Unknown`], which is not the same claim as "no
+    /// consumer exists".
+    pub floor: RetainFloor,
 }
 
 /// Errors from [`Wal::replay`].
@@ -1949,6 +2576,7 @@ mod tests {
             segment_size_bytes: 128 * 1024 * 1024,
             segment_age_secs: 600,
             housekeeping_secs: 60,
+            max_unlinks_per_pass: DEFAULT_MAX_UNLINKS_PER_PASS,
             macos_full_fsync: false,
         }
     }

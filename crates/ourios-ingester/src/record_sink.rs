@@ -782,23 +782,54 @@ struct InFlightPublishes {
     /// frames above `E`'s mark, so its failure fails no cut at or below
     /// `E`; and a cut captured after the return drained them itself. The
     /// `at` alone — one monotone maximum — would refuse both of those.
-    resettlements: Mutex<Vec<Resettlement>>,
+    settlements: Mutex<Vec<Settlement>>,
     /// The cadence state every guard reports into.
     epochs: Arc<BarrierEpochs>,
 }
 
-/// One publish whose records went back into the buffers rather than to
-/// the store (RFC 0052 §3.1).
-#[derive(Clone, Copy, Debug)]
-struct Resettlement {
-    registered: Epoch,
-    at: Epoch,
+impl InFlightPublishes {
+    fn record(&self, settlement: Settlement) {
+        self.settlements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(settlement);
+    }
 }
 
-impl Resettlement {
+/// How one registered publish ended up somewhere other than the store
+/// (RFC 0052 §3.1). Two states, not one with a flag: they refuse
+/// different sets of cuts, and a single variant could not say which.
+#[derive(Clone, Copy, Debug)]
+enum Settlement {
+    /// The records went back into the buffers — a transient failure's
+    /// requeue, or one of the three park sites. Only a cut captured
+    /// before the return, by a publish registered before that cut, is
+    /// refused: a cut captured after it drained them itself.
+    Returned { registered: Epoch, at: Epoch },
+    /// The publish unwound: its records are in neither the buffers nor
+    /// the store, so every cut whose mark could cover them is refused
+    /// until a restart re-mines them from the WAL.
+    Unwound { registered: Epoch },
+}
+
+impl Settlement {
     /// Whether this settlement refuses a cut of `epoch`.
     fn refuses(self, epoch: Epoch) -> bool {
-        self.registered <= epoch && epoch < self.at
+        match self {
+            Self::Returned { registered, at } => registered <= epoch && epoch < at,
+            Self::Unwound { registered } => registered <= epoch,
+        }
+    }
+
+    /// Whether a cut of `epoch` has put this settlement permanently
+    /// behind it.
+    fn spent(self, epoch: Epoch) -> bool {
+        match self {
+            Self::Returned { at, .. } => at <= epoch,
+            // Stage 1 never clears an unwind: the records exist only in
+            // the WAL until a restart re-mines them.
+            Self::Unwound { .. } => false,
+        }
     }
 }
 
@@ -811,7 +842,7 @@ impl Resettlement {
 /// either alone refuses the stamp.
 #[derive(Clone, Debug, Default)]
 pub struct PublishOutcomes {
-    resettlements: Vec<Resettlement>,
+    settlements: Vec<Settlement>,
 }
 
 impl PublishOutcomes {
@@ -821,7 +852,7 @@ impl PublishOutcomes {
     #[must_use]
     pub fn all_ok(&self, epoch: Epoch) -> bool {
         !self
-            .resettlements
+            .settlements
             .iter()
             .any(|settlement| settlement.refuses(epoch))
     }
@@ -855,7 +886,14 @@ impl PublishGuard {
 impl Drop for PublishGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            // Two records of the same unwind, because §3.1 needs both:
+            // the latch defends the *ordering* (a cut's recheck sees it),
+            // and the settlement defends the *data* (`all_ok` is false
+            // for it independently). Either alone refuses the stamp.
             self.in_flight.epochs.report(self.epoch);
+            self.in_flight.record(Settlement::Unwound {
+                registered: self.epoch,
+            });
         }
         let mut count = self
             .in_flight
@@ -920,7 +958,7 @@ impl SharedParquetSink {
             in_flight: Arc::new(InFlightPublishes {
                 count: Mutex::new(0),
                 settled: Condvar::new(),
-                resettlements: Mutex::new(Vec::new()),
+                settlements: Mutex::new(Vec::new()),
                 epochs,
             }),
         }
@@ -964,20 +1002,7 @@ impl SharedParquetSink {
             return;
         }
         self.in_flight
-            .resettlements
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Resettlement { registered, at });
-    }
-
-    /// Drop settlements no future cut can be refused by: cuts are
-    /// strictly increasing, so once a cut reaches `at` the pair is spent.
-    fn prune_resettlements(&self, epoch: Epoch) {
-        self.in_flight
-            .resettlements
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|settlement| epoch < settlement.at);
+            .record(Settlement::Returned { registered, at });
     }
 
     /// Block until no drained-but-unsettled off-lock publish is in flight —
@@ -1019,20 +1044,25 @@ impl SharedParquetSink {
         }
         drop(count);
         PublishOutcomes {
-            resettlements: self
+            settlements: self
                 .in_flight
-                .resettlements
+                .settlements
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
         }
     }
 
-    /// Discard the settlements a cut of `epoch` has now covered — called
-    /// once that cut's outcome is known, so the list cannot grow with
-    /// the process.
+    /// Discard the settlements a cut of `epoch` has now put permanently
+    /// behind it — called once that cut's outcome is known, so the list
+    /// cannot grow with the process. An unwind is never discarded: stage
+    /// 1 has no way to clear it short of a restart.
     pub fn settle_cut(&self, epoch: Epoch) {
-        self.prune_resettlements(epoch);
+        self.in_flight
+            .settlements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|settlement| !settlement.spent(epoch));
     }
 
     /// Lock the sink, recovering a poisoned mutex. A poison means a past panic

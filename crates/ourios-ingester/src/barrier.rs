@@ -348,16 +348,20 @@ impl Barrier {
         if !published {
             return CutOutcome::Retained;
         }
-        // Publishes registered *before* this cut settle here. The
-        // outcome defends the data — a failure in any of them means no
-        // stamp even though the cut's own flush succeeded.
-        if !self.publish.record().quiesce_publishes().all_ok(epoch) {
-            return CutOutcome::Retained;
-        }
-        // The recheck defends the ordering: a publish registered before
-        // the barrier began can panic while it waits above.
+        // Publishes registered *before* this cut settle here — the wait
+        // §3.1 has always made, now also reporting.
+        let outcomes = self.publish.record().quiesce_publishes();
+        // Two independent refusals, and the order is only about which
+        // one is *named*. The recheck defends the ordering: a publish
+        // registered before the barrier began can panic while it waits
+        // above, and the latch it sets lands after the first check. The
+        // outcome defends the data: a failure in any of those publishes
+        // means no stamp even though the cut's own flush succeeded.
         if self.epochs.capture().refuses(epoch) {
             return CutOutcome::Latched;
+        }
+        if !outcomes.all_ok(epoch) {
+            return CutOutcome::Retained;
         }
         self.install(&snapshots, mark);
         self.stamp(mark);

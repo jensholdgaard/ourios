@@ -55,3 +55,4 @@ mod rfc0052_13_startup_fsync;
 mod rfc0052_14_timer_exclusion;
 mod rfc0052_15_terminal_only_classification;
 mod rfc0052_1_checkpoint_policy;
+mod rfc0052_barrier_support;

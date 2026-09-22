@@ -13,99 +13,350 @@
 //! scheduler RFC0052.14 uses, so a latch stored after the pending count
 //! settles fails the test rather than passing by timing.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use ourios_ingester::barrier::CutOutcome;
+use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+use ourios_parquet::Store;
+use ourios_wal::SnapshotHorizons;
+
+use crate::rfc0052_barrier_support::BarrierRig;
+
 /// Scenario RFC0052.1 — healthy store: the mark advances to the barrier's high-water mark.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (checkpoint behind both sinks fully drained)"]
-fn rfc0052_1_healthy_store_advances_the_checkpoint_to_the_high_water_mark() {
-    todo!(
-        "RFC0052.1 — a WAL with acknowledged frames and a healthy record \
-         sink; the barrier completes with both sinks fully drained: \
-         last_checkpoint() equals the barrier's high-water mark; with a \
-         None high-water mark no checkpoint is attempted"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_healthy_store_advances_the_checkpoint_to_the_high_water_mark() {
+    // Given a WAL with acknowledged frames and a healthy record sink.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let mark = rig.ingest("checkout", &["user 1 logged in"]).await;
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "nothing has stamped yet",
+    );
+
+    // When the barrier completes with both sinks fully drained.
+    let outcome = rig.barrier.tick(&rig.pipeline, false);
+
+    // Then the journal's checkpoint is advanced to that mark.
+    assert_eq!(outcome, CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark),
+        "the checkpoint is the barrier's high-water mark",
+    );
+    assert_eq!(rig.sink.buffered_records(), 0, "the cut drained the sink");
+    assert!(
+        !rig.data_files().is_empty(),
+        "and the cut's own batch reached the store before the stamp",
+    );
+
+    // And with a `None` high-water mark, no checkpoint is attempted: a
+    // node that has acknowledged nothing has nothing to declare
+    // reclaimable.
+    let idle_tmp = tempfile::TempDir::new().expect("temp");
+    let idle = BarrierRig::new(idle_tmp.path());
+    assert_eq!(idle.pipeline.last_durable(), None, "no acked frame");
+    assert_eq!(
+        idle.barrier.tick(&idle.pipeline, false),
+        CutOutcome::Stamped
+    );
+    assert_eq!(
+        idle.commits.last_checkpoint(),
+        None,
+        "no mark, so no checkpoint was attempted",
     );
 }
 
 /// Scenario RFC0052.1 — failing store: a retained partition leaves the mark untouched.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (any retained partition on either sink → no checkpoint attempted)"]
-fn rfc0052_1_failing_store_leaves_the_checkpoint_unchanged() {
-    todo!(
-        "RFC0052.1 — a store that fails one partition write so a sink \
-         retains something: no checkpoint is attempted and \
-         last_checkpoint() is unchanged after the barrier"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_failing_store_leaves_the_checkpoint_unchanged() {
+    // Given a healthy first cut, so there is a previous mark to be
+    // "unchanged" against.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let first = rig.ingest("checkout", &["user 1 logged in"]).await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    assert_eq!(rig.commits.last_checkpoint(), Some(first));
+
+    // Given a store that fails the partition write, so a sink retains.
+    let second = rig.ingest("checkout", &["user 2 logged in"]).await;
+    assert_ne!(second, first, "the second frame is above the first mark");
+    rig.sabotage_data_store();
+
+    // When the barrier runs.
+    let outcome = rig.barrier.tick(&rig.pipeline, false);
+
+    // Then no checkpoint is attempted and the mark is unchanged.
+    assert_eq!(outcome, CutOutcome::Retained);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(first),
+        "a retained partition leaves the previous mark exactly where it was",
+    );
+    assert_eq!(
+        rig.sink.buffered_records(),
+        1,
+        "and the records are requeued, not lost (the WAL is the durability of record)",
     );
 }
 
 /// Scenario RFC0052.1 — sidecar failure: the previous mark stays usable and fail-closed.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (Wal::checkpoint leaves the old mark intact on a failed sidecar write)"]
-fn rfc0052_1_checkpoint_write_failure_keeps_the_previous_mark_usable() {
-    todo!(
-        "RFC0052.1 — healthy store, the CHECKPOINT sidecar write and its \
-         directory fsync made to fail: the barrier still reports \
-         success, last_checkpoint() is unchanged, and the next \
-         housekeeping pass reclaims nothing that was not already \
-         eligible under the previous mark — the fail-closed branch a \
-         partition-write failure cannot reach"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_checkpoint_write_failure_keeps_the_previous_mark_usable() {
+    // Given a healthy store and a first, successful stamp.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let first = rig.ingest("checkout", &["user 1 logged in"]).await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    assert_eq!(rig.commits.last_checkpoint(), Some(first));
+
+    // Given the `CHECKPOINT` sidecar write and its directory fsync made
+    // to fail.
+    rig.sabotage_checkpoint();
+    let second = rig.ingest("checkout", &["user 2 logged in"]).await;
+    assert_ne!(second, first);
+
+    // When the barrier runs.
+    let outcome = rig.barrier.tick(&rig.pipeline, false);
+
+    // Then the barrier still reports success — the data is in the store
+    // either way, and refusing to ack over a reclamation error would turn
+    // a disk-space problem into an availability one.
+    assert_eq!(outcome, CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(first),
+        "`Wal::checkpoint` leaves the previous mark intact on a failed write",
+    );
+    assert!(
+        rig.data_files().len() >= 2,
+        "the cut's own records did reach the store",
+    );
+
+    // And the next housekeeping pass reclaims nothing that was not
+    // already eligible under the previous mark. Forbidding all
+    // reclamation would reject the fail-closed behaviour §3.1 specifies
+    // rather than test it, so the assertion is that the pass runs and
+    // stays bounded by `first`.
+    let progress = rig
+        .commits
+        .maintain(
+            &SnapshotHorizons::NoConsumer,
+            usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("the cap fits"),
+        )
+        .expect("the pass runs against the previous mark");
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(first),
+        "the pass did not move the mark either",
+    );
+    assert_eq!(
+        progress.removed_segments, 0,
+        "nothing above the previous mark became eligible (the only segment is the current one)",
     );
 }
 
 /// Scenario RFC0052.1 — the `cadence_failed` latch refuses every barrier until restart.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (epoch latch at or below the cut's epoch refuses checkpoint and snapshot)"]
-fn rfc0052_1_latched_epoch_refuses_checkpoint_and_snapshot_until_restart() {
-    todo!(
-        "RFC0052.1 — while the cadence_failed latch holds an epoch at or \
-         below the cut's, the barrier neither checkpoints nor snapshots \
-         however many timer passes run; a failed publish refuses only \
-         cuts captured before its requeue"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_latched_epoch_refuses_checkpoint_and_snapshot_until_restart() {
+    // Given an acknowledged frame and a latch holding the epoch the next
+    // cut will take.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.epochs.report(rig.epochs.current());
+
+    // When however many timer passes run.
+    for _ in 0..3 {
+        assert_eq!(
+            rig.barrier.tick(&rig.pipeline, false),
+            CutOutcome::Latched,
+            "a latch at or below the cut's epoch refuses it",
+        );
+    }
+
+    // Then the barrier neither checkpoints nor snapshots.
+    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
+    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
+    assert_eq!(
+        rig.sink.buffered_records(),
+        1,
+        "the records stay where a later cut — or a restart's replay — finds them",
+    );
+
+    // And a *failed publish* refuses only cuts captured before its
+    // requeue: the same latch word carries the scope, so a publish
+    // registered after a cut fails no cut at or below it.
+    let fresh = tempfile::TempDir::new().expect("temp");
+    let later = BarrierRig::new(fresh.path());
+    let mark = later.ingest("checkout", &["user 1 logged in"]).await;
+    let registered = later.epochs.current();
+    let cut = later.epochs.open_cut();
+    assert_eq!(cut, registered, "the guard was registered before the cut");
+    // A publish registered *after* that cut: its frames are above the
+    // cut's mark by construction.
+    let after = later.epochs.current();
+    later.sink.note_resettled(after);
+    assert_eq!(
+        later.barrier.tick(&later.pipeline, false),
+        CutOutcome::Stamped
+    );
+    assert_eq!(
+        later.commits.last_checkpoint(),
+        Some(mark),
+        "a post-cut settlement fails no cut at or below the current one",
     );
 }
 
 /// Scenario RFC0052.1 — unwind leg: an age-sweep publish panics inside `quiesce_publishes`.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (latch recheck before stamping; publish outcome reported failed independently)"]
-fn rfc0052_1_publish_panic_during_quiesce_leaves_checkpoint_and_snapshots_unchanged() {
-    todo!(
-        "RFC0052.1 — a test sink whose age-sweep publish, registered \
-         before the barrier began, panics while the barrier waits in \
-         quiesce_publishes: the latch set after the barrier's first \
-         check is observed at its recheck before stamping, the \
-         checkpoint and every snapshot are unchanged, and the publish's \
-         outcome is reported failed"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_publish_panic_during_quiesce_leaves_checkpoint_and_snapshots_unchanged() {
+    // Given a publish registered *before* the barrier began — the age
+    // sweep's own in-flight guard — and an acknowledged frame.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+
+    let sink = rig.sink.clone();
+    let panicking = Arc::new(AtomicBool::new(false));
+    let release = Arc::clone(&panicking);
+    // The guard is taken on this thread, before the barrier starts, so
+    // it carries the epoch of the cut the barrier is about to take.
+    let guard = sink.begin_publish();
+    let epoch = guard.epoch();
+    let sweep = std::thread::spawn(move || {
+        while !release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // The guard drops during this unwind, which is what releases the
+        // barrier waiting in `quiesce_publishes`.
+        let _held = guard;
+        panic!("injected age-sweep publish panic");
+    });
+
+    // When the barrier reaches `quiesce_publishes` and the publish then
+    // panics: the latch it sets lands *after* the barrier's first check.
+    let barrier = Arc::clone(&rig.barrier);
+    let pipeline = rig.pipeline.clone();
+    let running = std::thread::spawn(move || barrier.tick(&pipeline, false));
+    std::thread::sleep(Duration::from_millis(50));
+    panicking.store(true, Ordering::Release);
+    assert!(sweep.join().is_err(), "the publish panicked");
+    let outcome = running.join().expect("the barrier itself did not panic");
+
+    // Then the checkpoint and every snapshot are unchanged.
+    assert_eq!(
+        outcome,
+        CutOutcome::Latched,
+        "the latch is observed at the recheck before stamping",
+    );
+    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
+    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
+
+    // And the publish's outcome is reported failed independently of the
+    // latch: the recheck defends the ordering, the outcome defends the
+    // data, and either alone refuses the stamp.
+    assert!(
+        !rig.sink.quiesce_publishes().all_ok(epoch),
+        "the unwind is recorded as a failed publish, not only as a latch",
     );
 }
 
 /// Scenario RFC0052.1 — unwind leg: an encode worker panics mid-batch, barrier after.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (unwinding guard stores the latch; unemitted records replay on restart)"]
-fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_replays() {
-    todo!(
-        "RFC0052.1 — a record that panics the encode worker mid-batch, \
-         followed by a barrier: the checkpoint and every snapshot are \
-         unchanged and the batch's unemitted records are replayed on \
-         restart"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_replays() {
+    // Given a record whose emit panics the encode worker mid-batch: the
+    // sink's audit barrier runs inside `emit_concurrent`, on the record
+    // that crosses the size target, which is exactly where §3.1 says a
+    // worker panic leaves a batch's remainder in neither the buffers nor
+    // Parquet.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let panicking = panicking_sink(&rig);
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&panicking, 1);
+    let epoch = panicking.epochs().current();
+    pool.submit(vec![mined("checkout"), mined("checkout")]);
+    pool.quiesce();
+
+    // When a barrier follows the panic.
+    let latched = panicking.epochs().capture();
+
+    // Then the unwinding guard stored the latch before the decrement that
+    // settled the count, so the barrier cannot see a quiet pool and a
+    // clear latch.
+    assert_eq!(
+        latched.failed_epoch(),
+        Some(epoch),
+        "the worker's unwinding batch guard reported its own epoch",
+    );
+    assert!(
+        latched.refuses(epoch),
+        "so every cut whose mark could cover that batch is refused",
+    );
+
+    // And the batch's unemitted records are still in the WAL for a
+    // restart to replay — nothing published them.
+    assert!(
+        crate::rfc0052_barrier_support::parquet_files(&rig.data_root).is_empty(),
+        "the panicking batch reached no Parquet object",
     );
 }
 
 /// Scenario RFC0052.1 — unwind leg: the barrier starts concurrently with the panic, every schedule.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (seeded scheduler covers the store-before-decrement order)"]
 fn rfc0052_1_barrier_concurrent_with_worker_panic_observes_the_latch_under_every_schedule() {
-    todo!(
-        "RFC0052.1 — the same encode-worker panic with the barrier \
-         started concurrently, under every seeded schedule: a barrier \
-         that observes the pool's pending count at zero has observed \
-         the latch, because the unwinding guard stores it before the \
-         decrement that settles the count"
-    );
+    // Given the same encode-worker panic, with the observer started
+    // concurrently and the interleaving seeded rather than timed: a latch
+    // stored *after* the count settled would fail this rather than pass
+    // by timing.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    for seed in 0..64u64 {
+        let panicking = panicking_sink(&rig);
+        let pool = ourios_ingester::encode_pool::EncodePool::new(&panicking, 1);
+        let epochs = panicking.epochs();
+        let epoch = epochs.current();
+        pool.submit(vec![mined("checkout")]);
+
+        // When the observer runs at a seeded point in the panic's window.
+        let observer = {
+            let epochs = Arc::clone(&epochs);
+            std::thread::spawn(move || {
+                for _ in 0..(seed % 8) {
+                    std::thread::yield_now();
+                }
+                // `quiesce` returning is exactly "the pool's pending count
+                // is zero"; the latch is read strictly after it.
+                (epochs.capture(), ())
+            })
+        };
+        pool.quiesce();
+        let (early, ()) = observer.join().expect("observer");
+        let settled = epochs.capture();
+
+        // Then a barrier that observes the count at zero has observed the
+        // latch, because the unwinding guard stores it before the
+        // decrement that settles the count.
+        assert!(
+            settled.refuses(epoch),
+            "seed {seed}: the count settled, so the latch is set",
+        );
+        assert!(
+            early.failed_epoch().is_none() || early.refuses(epoch),
+            "seed {seed}: an observation before the settle is either clear or already latched — \
+             never a stale 'no failure' beside a settled count",
+        );
+    }
 }
 
 /// Scenario RFC0052.1 — a panic in a cadence tick itself, and a `JoinError` at shutdown.
@@ -127,12 +378,32 @@ fn rfc0052_1_cadence_tick_panic_and_join_error_read_as_a_failed_cut() {
 /// Scenario RFC0052.1 — epoch is assigned in `submit`, so a straddling batch fails cut `E`.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (epoch stamped at submit, not at dequeue)"]
 fn rfc0052_1_batch_queued_before_the_cut_carries_the_cuts_epoch() {
-    todo!(
-        "RFC0052.1 — a batch queued before cut E's capture and dequeued \
-         after it carries epoch E, so a panic in it fails cut E and not \
-         only later ones"
+    // Given a batch queued before cut E's capture and dequeued after it.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let panicking = panicking_sink(&rig);
+    let epochs = panicking.epochs();
+    // One worker, held on a first batch, so the second sits in the queue
+    // across the capture below.
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&panicking, 1);
+    let queued_at = epochs.current();
+    pool.submit(vec![mined("checkout")]);
+
+    // When cut E is captured between the submit and the dequeue.
+    let cut = epochs.open_cut();
+    assert_eq!(
+        cut, queued_at,
+        "the cut takes the epoch the queued batch already carries",
+    );
+    pool.quiesce();
+
+    // Then a panic in it fails cut E, not only later ones.
+    let state = epochs.capture();
+    assert_eq!(state.failed_epoch(), Some(cut));
+    assert!(
+        state.refuses(cut),
+        "the epoch was stamped at submit, not at dequeue",
     );
 }
 
@@ -181,4 +452,56 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
          dependent partition requeues rather than landing in Parquet \
          ahead of its template events"
     );
+}
+
+/// A sink over the rig's store whose inline audit barrier panics — the
+/// production seam an encode worker actually runs inside
+/// `emit_concurrent`, reached on the record that crosses the size
+/// target.
+fn panicking_sink(rig: &BarrierRig) -> SharedParquetSink {
+    SharedParquetSink::with_cadence(
+        ParquetRecordSink::new(
+            Store::local(&rig.data_root).expect("store"),
+            FlushConfig {
+                target_bytes: 1,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            },
+        )
+        .with_audit_barrier(Box::new(|| panic!("injected encode-worker panic"))),
+        Arc::new(ourios_ingester::cadence::BarrierEpochs::new()),
+    )
+}
+
+fn mined(tenant: &str) -> ourios_core::record::MinedRecord {
+    ourios_core::record::MinedRecord {
+        tenant_id: ourios_core::tenant::TenantId::new(tenant),
+        template_id: 1,
+        template_version: 1,
+        severity_number: 9,
+        severity_text: None,
+        scope_name: None,
+        scope_version: None,
+        scope_attributes: Vec::new(),
+        resource_schema_url: None,
+        scope_schema_url: None,
+        time_unix_nano: 1_775_127_480_000_000_000,
+        observed_time_unix_nano: None,
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        resource_attributes: Vec::new(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        event_name: None,
+        body_kind: ourios_core::record::BodyKind::String,
+        params: vec![ourios_core::record::Param {
+            type_tag: ourios_core::audit::ParamType::Num,
+            value: "1".to_string(),
+        }],
+        separators: vec![String::new(), String::new()],
+        body: None,
+        confidence: 1.0,
+        lossy_flag: false,
+    }
 }

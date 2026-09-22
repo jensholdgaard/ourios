@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 use ourios_core::tenant::TenantId;
 
 use crate::{
-    FrameKind, FrameSink, HousekeepingError, OpenError, RecoveryError, SegmentScan, TenantBatch,
-    TenantBatchError, WalOffset, frame, list_segments, replay_segment, retain,
-    retain::SegmentLedger, sync_parent_dir,
+    FrameKind, FrameSink, OpenError, RecoveryError, SegmentScan, TenantBatch, TenantBatchError,
+    WalOffset, frame, list_segments, replay_segment, retain, retain::SegmentLedger,
 };
+#[cfg(feature = "legacy-housekeeping")]
+use crate::{HousekeepingError, sync_parent_dir};
 
 /// What one walk of the surviving segments found.
 pub(crate) struct Ledger {

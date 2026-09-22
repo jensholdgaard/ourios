@@ -129,6 +129,19 @@ fn write_and_install(
 pub fn fsync_root(root: &Path) -> Result<(), SnapshotStoreError> {
     let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
     match File::open(root) {
+        // Fsyncing a *file* proves nothing about a directory entry, so
+        // a root that is not a directory is a failed step rather than a
+        // silently successful one — and it is the shape the
+        // file-in-place-of-directory fixture produces (§6).
+        Ok(handle) if !handle.metadata().is_ok_and(|meta| meta.is_dir()) => {
+            return Err(SnapshotStoreError::Io {
+                op: "fsync(snapshots root)",
+                source: std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("{} is not a directory", root.display()),
+                ),
+            });
+        }
         Ok(dir) => dir.sync_all().map_err(io("fsync(snapshots root)"))?,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(source) => {

@@ -167,9 +167,9 @@ fn rfc0052_12_append_completes_while_file_half_is_held() {
 
     // Then: it completed, and the pass still settles correctly around
     // it.
-    wal.write_plan_record(&plan).expect("record");
+    let permit_plan = wal.write_plan_record(&plan).expect("record");
     let progress = wal
-        .housekeeping_commit(plan.pass(), unlink_planned(&plan))
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan, permit_plan))
         .expect("commit");
     assert_eq!(progress.removed_segments, CAP);
     assert!(
@@ -392,9 +392,12 @@ fn rfc0052_12_a_plan_that_is_never_committed_strands_nothing() {
         "and the entries still marked reclaiming are re-planned first",
     );
 
-    wal.write_plan_record(&replanned).expect("record");
+    let permit_replanned = wal.write_plan_record(&replanned).expect("record");
     let progress = wal
-        .housekeeping_commit(replanned.pass(), unlink_planned(&replanned))
+        .housekeeping_commit(
+            replanned.pass(),
+            unlink_planned(&replanned, permit_replanned),
+        )
         .expect("commit");
     assert_eq!(
         (progress.removed_segments, progress.removed_partials),
@@ -419,14 +422,14 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
 
     let horizons = known(&[("alpha", covered)]);
     let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
-    wal.write_plan_record(&abandoned).expect("record");
+    let permit_abandoned = wal.write_plan_record(&abandoned).expect("record");
     let planned: Vec<PathBuf> = abandoned
         .segments()
         .iter()
         .map(|s| s.path.clone())
         .collect();
     assert_eq!(planned.len(), CAP);
-    let _ = unlink_planned(&abandoned);
+    let _ = unlink_planned(&abandoned, permit_abandoned);
     assert!(
         planned.iter().all(|path| !path.exists()),
         "the file half finished; only the commit did not",
@@ -448,9 +451,12 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
         "an entry no commit reported on is re-planned as an uncertain deletion",
     );
 
-    wal.write_plan_record(&replanned).expect("record");
+    let permit_replanned = wal.write_plan_record(&replanned).expect("record");
     let progress = wal
-        .housekeeping_commit(replanned.pass(), unlink_planned(&replanned))
+        .housekeeping_commit(
+            replanned.pass(),
+            unlink_planned(&replanned, permit_replanned),
+        )
         .expect("commit");
     assert_eq!(
         progress.removed_segments, CAP,
@@ -475,13 +481,13 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
 
     let horizons = known(&[("alpha", covered)]);
     let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
-    wal.write_plan_record(&abandoned).expect("record");
+    let permit_abandoned = wal.write_plan_record(&abandoned).expect("record");
     let planned: Vec<PathBuf> = abandoned
         .segments()
         .iter()
         .map(|s| s.path.clone())
         .collect();
-    let _ = unlink_planned(&abandoned);
+    let _ = unlink_planned(&abandoned, permit_abandoned);
     assert!(planned.iter().all(|path| !path.exists()));
 
     // The task dies, and the tenant's snapshot stops restoring before
@@ -489,7 +495,8 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     // the ones already unlinked among them.
     let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
     assert!(pinned.segments().is_empty(), "the regression withdrew them");
-    wal.housekeeping_commit(pinned.pass(), unlink_planned(&pinned))
+    let permit_pinned = wal.write_plan_record(&pinned).expect("record");
+    wal.housekeeping_commit(pinned.pass(), unlink_planned(&pinned, permit_pinned))
         .expect("commit");
 
     // When the snapshot restores again the withdrawn entries come
@@ -506,9 +513,9 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
         vec![true; planned.len()],
         "the withdrawal did not forget that a file half had them",
     );
-    wal.write_plan_record(&resumed).expect("record");
+    let permit_resumed = wal.write_plan_record(&resumed).expect("record");
     assert_eq!(
-        wal.housekeeping_commit(resumed.pass(), unlink_planned(&resumed))
+        wal.housekeeping_commit(resumed.pass(), unlink_planned(&resumed, permit_resumed))
             .expect("commit")
             .removed_segments,
         resumed.segments().len(),
@@ -551,9 +558,12 @@ fn rfc0052_12_an_abandoned_no_consumer_plan_does_not_survive_into_a_known_pass()
         known_pass.segments().is_empty(),
         "a tenant with no snapshot pins its own segment, re-plan or not",
     );
-    wal.write_plan_record(&known_pass).expect("record");
-    wal.housekeeping_commit(known_pass.pass(), unlink_planned(&known_pass))
-        .expect("commit");
+    let permit_known_pass = wal.write_plan_record(&known_pass).expect("record");
+    wal.housekeeping_commit(
+        known_pass.pass(),
+        unlink_planned(&known_pass, permit_known_pass),
+    )
+    .expect("commit");
     assert_eq!(segment_files(root), before, "so its frames are still there");
 }
 
@@ -597,7 +607,8 @@ fn rfc0052_12_a_superseded_plan_is_refused_at_the_record_write() {
         "nothing was unlinked",
     );
 
-    wal.write_plan_record(&pinned)
+    let _permit_pinned = wal
+        .write_plan_record(&pinned)
         .expect("the live plan still writes");
 }
 
@@ -637,9 +648,9 @@ fn rfc0052_12_a_superseded_commit_leaves_the_live_plan_alone() {
     );
 
     // The live plan is still outstanding and still completes.
-    wal.write_plan_record(&live).expect("the live plan writes");
+    let permit_live = wal.write_plan_record(&live).expect("the live plan writes");
     assert_eq!(
-        wal.housekeeping_commit(live.pass(), unlink_planned(&live))
+        wal.housekeeping_commit(live.pass(), unlink_planned(&live, permit_live))
             .expect("commit")
             .removed_segments,
         live.segments().len(),
@@ -691,12 +702,12 @@ fn rfc0052_12_a_plan_does_not_cross_from_one_wal_to_the_next() {
         "and neither is its outcome",
     );
 
-    reopened
+    let permit_live = reopened
         .write_plan_record(&live)
         .expect("the live plan writes");
     assert_eq!(
         reopened
-            .housekeeping_commit(live.pass(), unlink_planned(&live))
+            .housekeeping_commit(live.pass(), unlink_planned(&live, permit_live))
             .expect("commit")
             .removed_segments,
         live.segments().len(),
@@ -764,6 +775,150 @@ fn rfc0052_12_partials_are_discovered_without_a_rebuild() {
         "the sweep runs on a pass that can plan no segment at all",
     );
     assert!(!debris.exists());
+}
+
+/// A commit for a pass nothing is outstanding for is refused. It used
+/// to report a clean `NoCheckpoint` skip, which swallowed the
+/// outcome's unlink failures and left the identity unchecked in the
+/// one branch that never looked at it.
+#[test]
+fn rfc0052_12_a_commit_with_nothing_outstanding_is_refused() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, 1);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let plan = wal
+        .housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
+        .expect("prepare");
+    let permit = wal.write_plan_record(&plan).expect("record");
+    wal.housekeeping_commit(plan.pass(), unlink_planned(&plan, permit))
+        .expect("the first commit settles it");
+
+    let again = wal
+        .housekeeping_commit(
+            plan.pass(),
+            ourios_wal::ReclaimOutcome::Unlinked {
+                removed: Vec::new(),
+                failed: Vec::new(),
+                fsync_failed: false,
+            },
+        )
+        .expect_err("a second commit for the same pass has nothing to settle");
+    assert!(
+        format!("{again}").contains("already settled"),
+        "naming why: {again}",
+    );
+}
+
+/// An uncertainty a commit **settled** survives a withdrawal. `hold`
+/// records it in the entry's state and clears the attempt, so a
+/// withdrawal that dropped the state with it left a later pass
+/// planning the entry as certain — and its `unlink` failing on the
+/// missing path until a restart.
+#[test]
+fn rfc0052_12_a_withdrawal_does_not_forget_a_settled_uncertainty() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let plan = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    let planned: Vec<PathBuf> = plan.segments().iter().map(|s| s.path.clone()).collect();
+    let permit = wal.write_plan_record(&plan).expect("record");
+    let _ = unlink_planned(&plan, permit);
+    assert!(planned.iter().all(|path| !path.exists()));
+    // The unlinks ran but the parent fsync did not: §3.2's uncertain
+    // deletion, settled by the commit into the entries themselves.
+    wal.housekeeping_commit(
+        plan.pass(),
+        ourios_wal::ReclaimOutcome::Unlinked {
+            removed: planned.clone(),
+            failed: Vec::new(),
+            fsync_failed: true,
+        },
+    )
+    .expect("commit");
+
+    // The tenant's snapshot then stops restoring, which withdraws
+    // every entry it holds — these among them.
+    let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("prepare");
+    assert!(pinned.segments().is_empty());
+    let permit = wal.write_plan_record(&pinned).expect("record");
+    wal.housekeeping_commit(pinned.pass(), unlink_planned(&pinned, permit))
+        .expect("commit");
+
+    // And when it restores, the re-plan must still know a file half
+    // has had them.
+    let resumed = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    assert_eq!(
+        resumed
+            .segments()
+            .iter()
+            .filter(|s| planned.contains(&s.path))
+            .map(|s| s.uncertain)
+            .collect::<Vec<_>>(),
+        vec![true; planned.len()],
+    );
+    let permit = wal.write_plan_record(&resumed).expect("record");
+    assert_eq!(
+        wal.housekeeping_commit(resumed.pass(), unlink_planned(&resumed, permit))
+            .expect("commit")
+            .removed_segments,
+        planned.len(),
+        "so the absent files complete the reclamation",
+    );
+}
+
+/// The same for a record failure. `restore` withdraws **this pass's**
+/// attempt, which is right — it unlinked nothing — but the
+/// uncertainty a previous pass left behind is not this pass's to
+/// forget.
+#[test]
+fn rfc0052_12_a_record_failure_keeps_an_inherited_uncertainty() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    let planned: Vec<PathBuf> = abandoned
+        .segments()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    let permit = wal.write_plan_record(&abandoned).expect("record");
+    let _ = unlink_planned(&abandoned, permit);
+
+    // Re-planned as uncertain, then that pass's record write fails.
+    let retried = wal.housekeeping_prepare(&horizons, CAP).expect("re-plan");
+    assert!(retried.segments().iter().all(|s| s.uncertain));
+    wal.housekeeping_commit(
+        retried.pass(),
+        ourios_wal::ReclaimOutcome::RecordFailed(std::io::Error::other("injected")),
+    )
+    .expect("commit");
+
+    let resumed = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    assert!(
+        resumed.segments().iter().all(|s| s.uncertain),
+        "the record failure unlinked nothing, but it did not undo what had",
+    );
+    let permit = wal.write_plan_record(&resumed).expect("record");
+    assert_eq!(
+        wal.housekeeping_commit(resumed.pass(), unlink_planned(&resumed, permit))
+            .expect("commit")
+            .removed_segments,
+        planned.len(),
+    );
 }
 
 /// An unlink that fails is kept for retry **and** reported. §3.1's

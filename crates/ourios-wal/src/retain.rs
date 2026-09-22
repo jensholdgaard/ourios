@@ -861,14 +861,18 @@ impl SegmentLedger {
     ///
     /// This is [`Self::restore`] minus its one certainty: the caller
     /// here does not know whether the unlink ran, so `attempted`
-    /// stays and a later re-plan is still an uncertain deletion.
+    /// stays and a later re-plan is still an uncertain deletion. An
+    /// `uncertain` a commit had already settled folds into it rather
+    /// than going with the state — the two say the same thing, that a
+    /// file half may have had this entry.
     pub(crate) fn withdraw(&mut self, id: Uuid) {
         let Some(segment) = self.segments.get_mut(&id) else {
             return;
         };
-        if !matches!(segment.state, State::Reclaiming { .. }) {
+        let State::Reclaiming { uncertain } = segment.state else {
             return;
-        }
+        };
+        segment.attempted |= uncertain;
         segment.state = State::Eligible;
         self.reclaiming.remove(&id);
         if segment.pending.is_empty() {
@@ -879,18 +883,23 @@ impl SegmentLedger {
     /// A popped segment the file half never unlinked: it goes back to
     /// eligible and the next pass pops it again.
     ///
-    /// This is the record-failed arm alone, where **nothing** was
-    /// unlinked, so the attempt is withdrawn with the entry and the
-    /// next plan is a genuine first one.
+    /// This is the record-failed arm alone, where **this pass**
+    /// unlinked nothing — so its own attempt is withdrawn, and the
+    /// only uncertainty that survives is the one it inherited: an
+    /// entry re-planned as an uncertain deletion is still one.
     pub(crate) fn restore(&mut self, id: Uuid) {
         let Some(segment) = self.segments.get_mut(&id) else {
             return;
         };
-        if matches!(segment.state, State::Reclaiming { .. }) {
-            self.reclaiming.remove(&id);
-        }
+        let inherited = match segment.state {
+            State::Reclaiming { uncertain } => {
+                self.reclaiming.remove(&id);
+                uncertain
+            }
+            State::Eligible => false,
+        };
         segment.state = State::Eligible;
-        segment.attempted = false;
+        segment.attempted = inherited;
         if segment.pending.is_empty() {
             self.unpinned.insert(id);
         }

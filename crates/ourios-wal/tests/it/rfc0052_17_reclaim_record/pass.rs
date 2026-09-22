@@ -191,7 +191,7 @@ fn rfc0052_17_crash_after_record_write_before_first_unlink_restarts_cleanly() {
     wal.checkpoint(first[0]).expect("checkpoint");
     let horizons = known(&[("alpha", first[0])]);
     let plan = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
-    wal.write_plan_record(&plan).expect("record");
+    let _permit_plan = wal.write_plan_record(&plan).expect("record");
     assert_eq!(
         planned_unlinks(root).len(),
         1,
@@ -260,8 +260,9 @@ fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
 
     // And: it still sweeps stale `.wal.partial` files, so debris from
     // before the first checkpoint does not survive the window.
+    let permit = wal.write_plan_record(&plan).expect("no record is owed");
     let progress = wal
-        .housekeeping_commit(plan.pass(), unlink_planned(&plan))
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan, permit))
         .expect("commit");
     assert_eq!(progress.removed_partials, 1);
     assert!(!debris.exists());
@@ -390,7 +391,7 @@ fn the_first_pass_adopts_its_mode_before_it_unlinks_anything() {
     let plan = wal
         .housekeeping_prepare(&known(&[("alpha", first[0])]), CAP)
         .expect("prepare");
-    wal.write_plan_record(&plan).expect("record");
+    let permit_plan = wal.write_plan_record(&plan).expect("record");
 
     assert_eq!(
         live_slot(&std::fs::read(root.join(RECLAIM)).expect("read RECLAIM")).2,
@@ -398,7 +399,7 @@ fn the_first_pass_adopts_its_mode_before_it_unlinks_anything() {
         "the mode is durable while every segment is still on disk",
     );
     assert_eq!(segment_files(root).len(), 2, "nothing unlinked yet");
-    wal.housekeeping_commit(plan.pass(), unlink_planned(&plan))
+    wal.housekeeping_commit(plan.pass(), unlink_planned(&plan, permit_plan))
         .expect("commit");
     assert_eq!(segment_files(root).len(), 1);
 }
@@ -441,7 +442,7 @@ fn a_failed_unlink_keeps_the_entry_behind_and_pins_on_restart() {
     let plan = wal
         .housekeeping_prepare(&known(&[("alpha", first[0])]), CAP)
         .expect("prepare");
-    wal.write_plan_record(&plan).expect("record");
+    let _permit_plan = wal.write_plan_record(&plan).expect("record");
 
     let path = plan.segments()[0].path.clone();
     let progress = wal
@@ -488,7 +489,7 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
     let plan = wal
         .housekeeping_prepare(&known(&[("alpha", first[0])]), CAP)
         .expect("prepare");
-    wal.write_plan_record(&plan).expect("record");
+    let _permit_plan = wal.write_plan_record(&plan).expect("record");
 
     let segment = plan.segments()[0].segment;
     if really_removed {
@@ -599,7 +600,7 @@ fn a_renamed_planned_segment_is_not_counted_as_reclaimed() {
     wal.checkpoint(first[0]).expect("checkpoint");
     let horizons = known(&[("alpha", first[0])]);
     let plan = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
-    wal.write_plan_record(&plan).expect("record");
+    let permit_plan = wal.write_plan_record(&plan).expect("record");
 
     // The operator moves it while the file half is outstanding. The
     // name sorts *below* every `UUIDv7`, so the restart still opens
@@ -609,7 +610,7 @@ fn a_renamed_planned_segment_is_not_counted_as_reclaimed() {
     std::fs::rename(&plan.segments()[0].path, &moved).expect("rename the planned segment");
 
     let progress = wal
-        .housekeeping_commit(plan.pass(), unlink_planned(&plan))
+        .housekeeping_commit(plan.pass(), unlink_planned(&plan, permit_plan))
         .expect("commit");
     assert_eq!(
         progress.removed_segments, 0,
@@ -652,8 +653,8 @@ fn a_crash_between_the_record_write_and_the_commit_reconciles_the_same_way() {
     let plan = wal
         .housekeeping_prepare(&known(&[("alpha", first[0])]), CAP)
         .expect("prepare");
-    wal.write_plan_record(&plan).expect("record");
-    let outcome = unlink_planned(&plan);
+    let permit_plan = wal.write_plan_record(&plan).expect("record");
+    let outcome = unlink_planned(&plan, permit_plan);
     assert!(matches!(outcome, ReclaimOutcome::Unlinked { .. }));
     // No `housekeeping_commit`: the process dies between the halves.
     drop(wal);

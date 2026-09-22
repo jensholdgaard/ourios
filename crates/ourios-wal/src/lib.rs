@@ -49,7 +49,7 @@ pub(crate) mod segment;
 pub use ledger::LedgerError;
 pub use pass::{
     HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
-    ReclaimPlan, SkipReason, unlink_failure, unlink_planned,
+    ReclaimPlan, SkipReason, UnlinkPermit, unlink_failure, unlink_planned,
 };
 pub use reclaim::{
     DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,

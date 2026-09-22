@@ -19,6 +19,17 @@ use crate::{
     reclaim_store, reconcile, retain, unlink_planned,
 };
 
+/// An outcome for a pass nothing is outstanding for (RFC 0052 §3.7).
+fn settled_commit(pass: pass::PassId) -> HousekeepingError {
+    HousekeepingError::Io {
+        op: "housekeeping_commit(plan)",
+        source: std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("WAL housekeeping refused: pass {pass} is already settled (RFC 0052 §3.7)"),
+        ),
+    }
+}
+
 /// An outcome whose pass is no longer the outstanding one (§3.7).
 fn superseded_commit(pass: pass::PassId, outstanding: pass::PassId) -> HousekeepingError {
     HousekeepingError::Io {
@@ -227,7 +238,10 @@ impl Wal {
     /// or the slot write or its fsync failed. Nothing has been
     /// unlinked either way, and [`ReclaimOutcome::RecordFailed`] is
     /// what [`Self::housekeeping_commit`] expects in response.
-    pub fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<(), std::io::Error> {
+    pub fn write_plan_record(
+        &mut self,
+        plan: &ReclaimPlan,
+    ) -> Result<pass::UnlinkPermit, std::io::Error> {
         let mode = match self.outstanding.as_ref() {
             Some(outstanding) if outstanding.pass == plan.pass => outstanding.mode,
             Some(outstanding) => return Err(superseded(plan, outstanding.pass)),
@@ -239,16 +253,17 @@ impl Wal {
             // accounting for them.
             None => return Err(settled(plan)),
         };
+        let permit = pass::UnlinkPermit::new(plan.pass);
         if !plan.records {
-            return Ok(());
+            return Ok(permit);
         }
         let Some(record) = self.merge_plan(plan, mode)? else {
-            return Ok(());
+            return Ok(permit);
         };
         let Some(store) = self.reclaim.as_mut() else {
-            return Ok(());
+            return Ok(permit);
         };
-        store.commit(&record).map_err(|e| match e {
+        store.commit(&record).map(|()| permit).map_err(|e| match e {
             reclaim_store::StoreError::Io { source, .. } => source,
             reclaim_store::StoreError::Corrupt { detail } => {
                 std::io::Error::new(ErrorKind::InvalidData, detail)
@@ -291,7 +306,12 @@ impl Wal {
         outcome: ReclaimOutcome,
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let Some(outstanding) = self.outstanding.take() else {
-            return Ok(self.progress(0, 0, PassOutcome::Skipped(SkipReason::NoCheckpoint)));
+            // Not "nothing to do": a commit has already taken this
+            // pass's state, or none was ever prepared. Reporting a
+            // clean skip would swallow the outcome's unlink failures
+            // and leave the identity unchecked in the one branch that
+            // never looks at it.
+            return Err(self.housekeeping_failure(settled_commit(pass)));
         };
         if outstanding.pass != pass {
             let refused = superseded_commit(pass, outstanding.pass);
@@ -374,15 +394,23 @@ impl Wal {
         max_unlinks: usize,
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let plan = self.housekeeping_prepare(horizons, max_unlinks)?;
-        let Err(source) = self.write_plan_record(&plan) else {
-            return self.settle_unlinks(plan.pass, unlink_planned(&plan));
+        let permit = match self.write_plan_record(&plan) {
+            Ok(permit) => permit,
+            Err(source) => return self.record_failed(&plan, source),
         };
-        // The commit is what puts the popped entries back and requeues
-        // the partials, so it runs either way — but the failure is the
-        // caller's to see. Swallowing it would report a pass that could
-        // not make its witness durable as a clean one, and §3.1's
-        // fail-closed rule is that such a failure is logged and the
-        // next pass retries.
+        self.settle_unlinks(plan.pass, unlink_planned(&plan, permit))
+    }
+
+    /// §3.1's rule for a witness that could not be made durable: the
+    /// commit still runs — it is what puts the popped entries back and
+    /// requeues the partials — and the failure is the caller's to see.
+    /// Swallowing it would report a pass that unlinked nothing as a
+    /// clean one, and the next pass would have nothing to retry from.
+    fn record_failed(
+        &mut self,
+        plan: &ReclaimPlan,
+        source: std::io::Error,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
         let (kind, detail) = (source.kind(), source.to_string());
         let progress = self.housekeeping_commit(plan.pass, ReclaimOutcome::RecordFailed(source))?;
         Err(ReclaimError::Housekeeping {

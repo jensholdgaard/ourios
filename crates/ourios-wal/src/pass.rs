@@ -135,10 +135,32 @@ impl PassId {
     }
 }
 
+impl UnlinkPermit {
+    pub(crate) fn new(pass: PassId) -> Self {
+        Self { pass }
+    }
+}
+
 impl std::fmt::Display for PassId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.wal, self.pass)
     }
+}
+
+/// Proof that this pass's `RECLAIM` write ran, which is what
+/// [`unlink_planned`] needs before it removes anything.
+///
+/// §3.2's ordering rule is that the record is durable **before** the
+/// segments it accounts for are gone: a segment unlinked with no
+/// `planned` entry naming it is an absence nothing at open can
+/// explain. Call order alone cannot hold that — the unlink half is
+/// public, unlocked and reachable from anywhere — so
+/// [`crate::Wal::write_plan_record`] hands this out and the unlink
+/// consumes it. It names the pass, so a permit from one plan cannot
+/// unlink another's.
+#[derive(Debug)]
+pub struct UnlinkPermit {
+    pass: PassId,
 }
 
 /// Everything the file half needs, owned, so it holds no guard and no
@@ -270,8 +292,27 @@ impl From<CheckpointError> for ReclaimError {
 /// between them spends it in §3.2's order. One parent fsync covers
 /// every unlink of the pass, which is why its failure marks **every**
 /// removed path uncertain rather than the last one.
+///
+/// `permit` is [`crate::Wal::write_plan_record`]'s receipt, consumed
+/// here: §3.2's record-before-unlink ordering is the one invariant a
+/// caller could otherwise break by call order alone, and a plan whose
+/// permit belongs to a different pass unlinks nothing.
 #[must_use]
-pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
+// By value because that is what spends it: a reference would let one
+// record write authorise any number of unlinks, which is the ordering
+// this permit exists to enforce.
+#[allow(clippy::needless_pass_by_value)]
+pub fn unlink_planned(plan: &ReclaimPlan, permit: UnlinkPermit) -> ReclaimOutcome {
+    let UnlinkPermit { pass } = permit;
+    if pass != plan.pass {
+        return ReclaimOutcome::RecordFailed(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "WAL housekeeping refused: pass {}'s permit does not cover pass {} (RFC 0052 §3.2)",
+                pass, plan.pass,
+            ),
+        ));
+    }
     // Debris first, then segments — §3.2's order for a shared cap.
     // Debris has no identity to check: a `.wal.partial` is a file no
     // reader ever depended on, so "already gone" simply completes one.
@@ -465,8 +506,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        HousekeepingProgress, PassId, PassOutcome, ReclaimOutcome, ReclaimPlan, RetainFloor, Uuid,
-        unlink_planned,
+        HousekeepingProgress, PassId, PassOutcome, ReclaimOutcome, ReclaimPlan, RetainFloor,
+        UnlinkPermit, Uuid, unlink_planned,
     };
 
     /// The plan's paths are the crate's own, but [`unlink_planned`] is
@@ -491,10 +532,11 @@ mod tests {
             std::fs::write(path, b"debris").expect("write");
         }
 
-        let outcome = unlink_planned(&plan(
+        let built = plan(
             root,
             vec![misnamed.clone(), outside.clone(), reserved.clone()],
-        ));
+        );
+        let outcome = unlink_planned(&built, UnlinkPermit::new(built.pass));
         let ReclaimOutcome::Unlinked {
             removed, failed, ..
         } = outcome

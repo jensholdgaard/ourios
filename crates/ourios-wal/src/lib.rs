@@ -645,12 +645,21 @@ impl Wal {
     /// segment would exceed `wal_segment_size_bytes` with this
     /// frame, or its age (from the `UUIDv7` mint time) exceeds
     /// `wal_segment_age_secs`, the segment is closed (its final
-    /// data sync), a fresh one is created, and the parent dir
-    /// is fsync'd before the frame lands — so a frame never
-    /// straddles segments. A failed rotation is retried under RFC 0052
-    /// §3.3's bounded budget: [`AppendError::RotationRetrying`] while
-    /// it holds, [`AppendError::RotationTerminal`] once it is spent.
-    /// No batch is acked in either state.
+    /// data sync), a fresh one is created under a temporary name,
+    /// fsynced and renamed into place — so a frame never straddles
+    /// segments.
+    ///
+    /// RFC 0052 §3.3 changed what the parent-directory fsync
+    /// guarantees, and the old wording here — "the parent dir is
+    /// fsync'd before the frame lands" — no longer holds: the fresh
+    /// segment is installed *before* that fsync, so frames may land in
+    /// a segment whose directory entry is not yet durable. Nothing in
+    /// it is acked, because [`Self::sync`] discharges the pending fsync
+    /// before it reports a durable offset, which is what §3.4 gates the
+    /// ack on. A failed rotation is retried under §3.3's bounded
+    /// budget: [`AppendError::RotationRetrying`] while it holds,
+    /// [`AppendError::RotationTerminal`] once it is spent. No batch is
+    /// acked in either state.
     ///
     /// If `write_frame` fails after partial bytes have hit the
     /// segment, the file is best-effort truncated back to its
@@ -970,7 +979,9 @@ impl Wal {
         let mut handle = None;
         self.stale_partials.push(partial.clone());
         self.rotation_step(RotationSite::Create, |_| {
-            handle = Some(create_segment_at(&target, uuid)?);
+            // The two halves collapse here on purpose: §3.3 charges the
+            // budget per *site*, and both are the `Create` site.
+            handle = Some(create_segment_at(&target, uuid).map_err(|e| e.source)?);
             Ok(())
         })?;
         match handle {
@@ -1590,6 +1601,18 @@ where
 /// Map a sidecar failure onto the rotation's error surface. A
 /// rotation that cannot make the record durable has created nothing,
 /// so it is reported exactly as a failed `create_fresh_segment` is.
+///
+/// Deliberately **outside** RFC 0052 §3.3's retry budget, and so never
+/// terminal. The budget is charged per §3.3 *site*, and the five sites
+/// are the segment's own steps; the `RECLAIM` write is §3.2's, and
+/// widening the budget to cover it would widen the terminal state past
+/// what RFC0052.15 pins as narrow. Nothing is left behind either way —
+/// `ensure_record` is a no-op once the store exists — so the next
+/// append simply re-enters the rotation.
+///
+/// This is also where the old permanent quiesce used to be set, which
+/// §3.3 removes: a record write that fails is now retried like any
+/// other transient I/O failure rather than wedging the node.
 fn rotation_record_failed(e: reclaim_store::StoreError) -> AppendError {
     match e {
         reclaim_store::StoreError::Io { op, source } => AppendError::Io { op, source },
@@ -1702,11 +1725,23 @@ fn open_existing_segment(path: &std::path::Path) -> Result<(File, PathBuf, uuid:
 fn create_fresh_segment(root: &std::path::Path) -> Result<(File, PathBuf, uuid::Uuid), OpenError> {
     let uuid = uuid::Uuid::now_v7();
     let path = root.join(format!("{uuid}.wal"));
-    let handle = create_segment_at(&path, uuid).map_err(|source| OpenError::Io {
-        op: "create(fresh segment)",
-        source,
+    let handle = create_segment_at(&path, uuid).map_err(|e| OpenError::Io {
+        op: e.op,
+        source: e.source,
     })?;
     Ok((handle, path, uuid))
+}
+
+/// Which half of the two-step segment creation failed.
+///
+/// `Wal::open` reports the halves separately, as it always has: an
+/// operator reading `create(fresh segment)` is looking at a different
+/// fault from one reading `write(segment header)`. A rotation reports
+/// its own §3.3 site instead, since the retry budget is charged per
+/// site and the two halves share one.
+struct SegmentCreateError {
+    op: &'static str,
+    source: std::io::Error,
 }
 
 /// Create one segment file at `path` and write its §6.2.1 header.
@@ -1715,13 +1750,20 @@ fn create_fresh_segment(root: &std::path::Path) -> Result<(File, PathBuf, uuid::
 /// and the `<uuid>.wal.partial` temporary name on RFC 0052 §3.3's
 /// rotation path; the bytes written are identical either way, which is
 /// what lets the rename install the file unchanged.
-fn create_segment_at(path: &std::path::Path, uuid: uuid::Uuid) -> std::io::Result<File> {
+fn create_segment_at(path: &std::path::Path, uuid: uuid::Uuid) -> Result<File, SegmentCreateError> {
     let mut handle = OpenOptions::new()
         .read(true)
         .append(true)
         .create_new(true)
-        .open(path)?;
-    write_header(&mut handle, &SegmentHeader::new(uuid))?;
+        .open(path)
+        .map_err(|source| SegmentCreateError {
+            op: "create(fresh segment)",
+            source,
+        })?;
+    write_header(&mut handle, &SegmentHeader::new(uuid)).map_err(|source| SegmentCreateError {
+        op: "write(segment header)",
+        source,
+    })?;
     // SEGMENT_HEADER_LEN sanity — if `write_header` ever
     // diverges from the on-disk format constant, the metadata
     // size below disagrees with `SEGMENT_HEADER_LEN` and the

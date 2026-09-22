@@ -159,6 +159,10 @@ fn rfc0052_12_append_completes_while_file_half_is_held() {
         .append(FrameKind::TenantOtlpBatch, &frame("alpha", b"live"))
         .expect("an append never waits for the RECLAIM write or an unlink");
     wal.sync().expect("sync");
+    // Captured here, not re-derived after the commit: `newest_segment`
+    // picks from whatever survives, so asking it afterwards would be
+    // true however the pass behaved.
+    let landed = newest_segment(root);
 
     // Then: it completed, and the pass still settles correctly around
     // it.
@@ -172,8 +176,9 @@ fn rfc0052_12_append_completes_while_file_half_is_held() {
         "the frame landed above the checkpoint the pass reclaimed under",
     );
     assert!(
-        segment_files(root).contains(&newest_segment(root)),
-        "and its segment is still there",
+        landed.exists(),
+        "and the file the append landed in survives the commit: {}",
+        landed.display(),
     );
 }
 
@@ -375,12 +380,12 @@ fn rfc0052_12_a_plan_that_is_never_committed_strands_nothing() {
         replanned
             .segments
             .iter()
-            .map(|s| s.unlink.segment)
+            .map(|s| s.segment)
             .collect::<Vec<_>>(),
         abandoned
             .segments
             .iter()
-            .map(|s| s.unlink.segment)
+            .map(|s| s.segment)
             .collect::<Vec<_>>(),
         "and the entries still marked reclaiming are re-planned first",
     );

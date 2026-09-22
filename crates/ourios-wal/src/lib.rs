@@ -1849,6 +1849,9 @@ impl std::error::Error for HousekeepingError {
 struct Outstanding {
     segments: Vec<retain::Popped>,
     partials: Vec<PathBuf>,
+    /// The mode this pass runs under, so the record merge in the file
+    /// half adopts the same one the ledger half was checked against.
+    mode: reclaim::EntryMode,
     /// What the ledger half decided. The commit reports the same
     /// floor, lag, cap state and skip reason: they are facts about
     /// this pass, and re-deriving them from a ledger the unlinks have

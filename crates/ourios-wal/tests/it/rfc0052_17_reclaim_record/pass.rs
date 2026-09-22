@@ -252,7 +252,7 @@ fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
         PassOutcome::Skipped(SkipReason::MigrationWindow),
     );
     assert_eq!(SkipReason::MigrationWindow.as_str(), "migration_window");
-    assert!(plan.segments.is_empty() && plan.record.is_none());
+    assert!(plan.segments.is_empty() && !plan.records);
     assert!(
         !root.join(RECLAIM).exists(),
         "no record is created under a version-1 checkpoint",
@@ -423,6 +423,7 @@ fn rfc0052_17_failed_unlink_and_uncertain_deletion_are_reconciled() {
     a_failed_unlink_keeps_the_entry_behind_and_pins_on_restart();
     an_uncertain_deletion_is_reverified_and_reconciled(true);
     an_uncertain_deletion_is_reverified_and_reconciled(false);
+    a_renamed_planned_segment_is_not_counted_as_reclaimed();
     a_crash_between_the_record_write_and_the_commit_reconciles_the_same_way();
 }
 
@@ -486,7 +487,7 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
         .expect("prepare");
     wal.write_plan_record(&plan).expect("record");
 
-    let segment = plan.segments[0].unlink.segment;
+    let segment = plan.segments[0].segment;
     if really_removed {
         std::fs::remove_file(&plan.segments[0].path).expect("the unlink itself succeeded");
     }
@@ -531,7 +532,7 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
         replan
             .segments
             .iter()
-            .map(|s| (s.unlink.segment, s.unlink.uncertain))
+            .map(|s| (s.segment, s.uncertain))
             .collect::<Vec<_>>(),
         vec![(segment, true)],
     );
@@ -574,6 +575,62 @@ fn the_restart_reconciles_an_uncertain_deletion(
         1,
         "and the next pass re-plans it",
     );
+}
+
+/// A planned segment an operator renames between prepare and the
+/// unlink is **not** reclaimed: the file half checks the header uuid
+/// before removing anything. Unlinking by path alone would either
+/// destroy whatever now sits at that path, or — when the path is empty
+/// because the segment moved — count a survivor as removed and raise
+/// `reclaimed_through` over frames still on disk.
+fn a_renamed_planned_segment_is_not_counted_as_reclaimed() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let first = build_tenant_segment(root, &[("alpha", b"a1")]);
+    build_tenant_segment(root, &[("alpha", b"a2")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(first[0]).expect("checkpoint");
+    let horizons = known(&[("alpha", first[0])]);
+    let plan = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    wal.write_plan_record(&plan).expect("record");
+
+    // The operator moves it while the file half is outstanding. The
+    // name sorts *below* every `UUIDv7`, so the restart still opens
+    // the newest segment as its append target and this one stays an
+    // ordinary closed candidate.
+    let moved = root.join("0-kept-by-an-operator.wal");
+    std::fs::rename(&plan.segments[0].path, &moved).expect("rename the planned segment");
+
+    let progress = wal
+        .housekeeping_commit(unlink_planned(&plan))
+        .expect("commit");
+    assert_eq!(
+        progress.removed_segments, 0,
+        "a path that no longer holds the planned segment is not a reclamation",
+    );
+    assert!(moved.exists(), "and the segment itself is untouched");
+    drop(wal);
+    assert!(
+        reclaimed_through(root).is_empty(),
+        "nothing is claimed lost while its frames are still on disk",
+    );
+
+    // The restart reconciles by uuid: the segment is present, so its
+    // planned entry is dropped and the rebuilt ledger finds it under
+    // the name it now has.
+    let mut restarted = open(root);
+    assert!(planned_unlinks(root).is_empty());
+    restarted.rebuild_ledger().expect("ledger");
+    assert_eq!(
+        restarted
+            .housekeeping_pass(&horizons, CAP)
+            .expect("housekeeping")
+            .removed_segments,
+        1,
+        "and the next pass reclaims it at its real path",
+    );
+    assert!(!moved.exists());
 }
 
 /// A crash between the record write and the commit is reconciled the

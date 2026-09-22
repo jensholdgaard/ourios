@@ -19,7 +19,7 @@ use ourios_core::tenant::TenantId;
 use uuid::Uuid;
 
 use crate::retain::{RetainFloor, SnapshotHorizons};
-use crate::{CheckpointError, HousekeepingError, WalOffset, reclaim, sync_parent_dir};
+use crate::{CheckpointError, HousekeepingError, WalOffset, reclaim, segment, sync_parent_dir};
 
 /// What one pass did, and what it still owes (RFC 0052 §3.7).
 /// Carried on `Err` too, so partial work, floor and lag stay
@@ -78,11 +78,22 @@ impl SkipReason {
     }
 }
 
-/// One segment the ledger half popped: the record's view of it and the
-/// file the unlink targets.
+/// One segment the ledger half popped: its identity, the horizon each
+/// tenant is to be reclaimed under, and the file the unlink targets.
+///
+/// Identity and path are both here because they answer different
+/// questions. The uuid is what the record names and what the unlink
+/// **verifies** before removing anything; the path is where the file
+/// was when the ledger last listed it, which an operator can change
+/// underneath a pass.
 #[derive(Debug, Clone)]
 pub struct PlannedSegment {
-    pub unlink: reclaim::PlannedUnlink,
+    pub segment: Uuid,
+    /// §3.2's uncertain deletion, carried from a previous pass whose
+    /// parent fsync failed: for these, and only these, an `unlink`
+    /// that finds the file gone completes the reclamation.
+    pub uncertain: bool,
+    pub last_offsets: Vec<(TenantId, WalOffset)>,
     pub path: PathBuf,
 }
 
@@ -92,10 +103,11 @@ pub struct PlannedSegment {
 pub struct ReclaimPlan {
     pub segments: Vec<PlannedSegment>,
     pub partials: Vec<PathBuf>,
-    /// The merged record: this pass's `planned` list, the horizons it
-    /// reclaims under and the mode it adopted. `None` when the pass
-    /// has nothing to record — a skipped pass writes no record.
-    pub record: Option<reclaim::ReclaimRecord>,
+    /// Whether this pass owes a record write at all. §3.2 gates the
+    /// record write with the segment planning: a record written under
+    /// a version-1 checkpoint witnesses a reclamation that never
+    /// happened.
+    pub records: bool,
     pub root: PathBuf,
     pub progress: HousekeepingProgress,
 }
@@ -169,18 +181,21 @@ impl From<CheckpointError> for ReclaimError {
 pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
     let mut removed = Vec::new();
     let mut failed = Vec::new();
-    for path in plan
-        .partials
-        .iter()
-        .chain(plan.segments.iter().map(|s| &s.path))
-    {
+    // Debris has no identity to check — a `.wal.partial` is a file no
+    // reader ever depended on — so the sweep's paths go straight
+    // through. "Already gone" completes one here, which is what makes
+    // a previous pass's uncertain removal verifiable.
+    for path in &plan.partials {
         match std::fs::remove_file(path) {
-            // Already gone is not the same as durably gone, but it is
-            // the re-verification of a previous pass's uncertain
-            // deletion: the fsync below is what completes it.
             Ok(()) => removed.push(path.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed.push(path.clone()),
             Err(source) => failed.push((path.clone(), source)),
+        }
+    }
+    for segment in &plan.segments {
+        match unlink_segment(segment) {
+            Ok(()) => removed.push(segment.path.clone()),
+            Err(source) => failed.push((segment.path.clone(), source)),
         }
     }
     let fsync_failed = !removed.is_empty() && sync_parent_dir(&plan.root).is_err();
@@ -189,6 +204,60 @@ pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
         failed,
         fsync_failed,
     }
+}
+
+/// Remove one planned segment, **by identity rather than by path**.
+///
+/// The ledger records where a segment was when it was last listed, and
+/// an operator can move it between then and here. Two shapes follow:
+///
+/// - the path now holds a *different* segment — unlinking it would
+///   destroy frames nothing planned;
+/// - the path holds nothing at all, while the segment survives under
+///   its new name — counting that as removed would raise
+///   `reclaimed_through` over frames still on disk, which is the one
+///   thing the record must never do.
+///
+/// So the header is read first and a mismatch is a failure to retry.
+/// `NotFound` completes only a deletion a previous pass already made
+/// and could not verify (§3.2's uncertain case); on a first attempt it
+/// is the renamed-survivor shape and is retried, which the next open
+/// resolves by uuid when it rebuilds the ledger from the directory.
+fn unlink_segment(segment: &PlannedSegment) -> Result<(), std::io::Error> {
+    match segment_identity(&segment.path) {
+        Ok(Some(found)) if found == segment.segment => std::fs::remove_file(&segment.path),
+        Ok(Some(found)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} now holds segment {found}, not the planned {}",
+                segment.path.display(),
+                segment.segment,
+            ),
+        )),
+        Ok(None) if segment.uncertain => Ok(()),
+        Ok(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "{} is gone but this pass never unlinked it; segment {} may survive elsewhere",
+                segment.path.display(),
+                segment.segment,
+            ),
+        )),
+        Err(source) => Err(source),
+    }
+}
+
+/// The uuid in a segment file's header, or `None` when the file is not
+/// there at all.
+fn segment_identity(path: &std::path::Path) -> Result<Option<Uuid>, std::io::Error> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    segment::read_header(&mut file)
+        .map(|header| Some(header.segment_uuid))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// The mode a pass runs under, from what the caller knows.

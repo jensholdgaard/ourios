@@ -21,7 +21,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::{RecoveryOutcome, WalHighWater};
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, TenantBatch, Wal, WalOffset};
+use ourios_wal::{FrameKind, FrameSink, LedgerError, RecoveryError, TenantBatch, Wal, WalOffset};
 use prost::Message;
 
 use crate::receiver::tenant::assign;
@@ -73,6 +73,10 @@ pub enum RecoveryDriverError {
     /// `Wal::replay` failed (I/O, frame corruption, or this driver's
     /// sink rejecting a frame that would not decode).
     Replay(RecoveryError),
+    /// The post-replay ledger rebuild failed (RFC 0052 §3.7) — I/O, or
+    /// a frame carrying a tenant above RFC 0048 §3.1's bound, which
+    /// fails startup closed rather than truncating the key.
+    Ledger(LedgerError),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -80,6 +84,7 @@ impl std::fmt::Display for RecoveryDriverError {
         match self {
             Self::Store(e) => write!(f, "recovery snapshot store: {e}"),
             Self::Replay(e) => write!(f, "recovery WAL replay: {e:?}"),
+            Self::Ledger(e) => write!(f, "recovery WAL ledger rebuild: {e}"),
         }
     }
 }
@@ -88,6 +93,7 @@ impl std::error::Error for RecoveryDriverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Store(e) => Some(e),
+            Self::Ledger(e) => Some(e),
             Self::Replay(_) => None,
         }
     }
@@ -159,6 +165,14 @@ pub fn recover(
         max_delivered: None,
     };
     wal.replay(&mut sink).map_err(RecoveryDriverError::Replay)?;
+    // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
+    // ends there rather than at `Wal::open` because open runs before
+    // replay has healed a torn tail — a figure taken there would count
+    // torn bytes. Without this call the WAL would export zero
+    // unreclaimed bytes, and the housekeeping sweep would have no
+    // restart debris to pop, which is #793's shape all over again: a
+    // method whose only callers are tests.
+    wal.rebuild_ledger().map_err(RecoveryDriverError::Ledger)?;
 
     for tenant in &mut tenants {
         if let Some(horizon) = horizons.get(&tenant.tenant_id) {
@@ -462,5 +476,64 @@ mod tests {
         assert!(detail.contains("legacy"), "{detail}");
         assert!(detail.contains("drain the WAL"), "{detail}");
         assert!(detail.contains(&format!("{SEGMENT}+32")));
+    }
+
+    /// RFC 0052 §3.7: the ledger is rebuilt by *this* driver, after
+    /// replay, and not by a test. Without the call the WAL would
+    /// export zero unreclaimed bytes and the housekeeping sweep would
+    /// never see a previous process's rotation debris — #793's shape,
+    /// a method whose only callers are tests.
+    #[test]
+    fn recover_seeds_the_reclaim_ledger_from_the_surviving_root() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path();
+        let mut wal = Wal::open(wal_config(root)).expect("open");
+        let payload = TenantBatch::encode(
+            "checkout",
+            &ExportLogsServiceRequest::default().encode_to_vec(),
+        )
+        .expect("frame");
+        wal.append(FrameKind::TenantOtlpBatch, &payload)
+            .expect("append");
+        wal.sync().expect("sync");
+        drop(wal);
+        let partial = root.join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
+        std::fs::write(&partial, b"a previous process's rotation debris").expect("partial");
+
+        let mut wal = Wal::open(wal_config(root)).expect("reopen");
+        assert_eq!(
+            wal.reclaim_state().unreclaimed_bytes,
+            0,
+            "open alone seeds nothing: it runs before replay has healed a torn tail",
+        );
+
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        recover(&mut wal, &root.join("snapshots"), &mut miner).expect("recover");
+
+        let state = wal.reclaim_state();
+        assert!(
+            state.unreclaimed_bytes > 0,
+            "recovery seeds the byte figure from the validated frames",
+        );
+        assert_eq!(
+            state.stale_partials, 1,
+            "and the partial list the sweep pops from, without a listing on the pass",
+        );
+        wal.housekeeping(None).expect("housekeeping");
+        assert!(
+            !partial.exists(),
+            "so the very first pass sweeps the debris"
+        );
+    }
+
+    fn wal_config(root: &Path) -> ourios_wal::WalConfig {
+        ourios_wal::WalConfig {
+            root: root.to_path_buf(),
+            batch_window_ms: 100,
+            segment_size_bytes: 128 * 1024 * 1024,
+            segment_age_secs: 600,
+            housekeeping_secs: 60,
+            macos_full_fsync: false,
+        }
     }
 }

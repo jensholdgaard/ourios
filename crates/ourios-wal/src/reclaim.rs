@@ -28,7 +28,7 @@ const VERSION: u16 = 1;
 
 /// The file header's length as an array size; [`FILE_HEADER_LEN`] is
 /// the same number where offsets are computed.
-const FILE_HEADER_BYTES: usize = 32;
+pub(crate) const FILE_HEADER_BYTES: usize = 32;
 pub(crate) const FILE_HEADER_LEN: u64 = 32;
 const FILE_HEADER_CRC_COVERS: usize = 24;
 const SLOT_HEADER_LEN: u64 = 24;
@@ -45,6 +45,17 @@ const PLANNED_HEADER_LEN: u64 = 24;
 const PAIR_LEN: u64 = 32;
 const OFFSET_LEN: usize = 24;
 pub(crate) const SLOT_COUNT: u64 = 2;
+
+/// RFC 0053 §3.1's `max_tenants` default. RFC 0052 §3.2 sizes this
+/// record from it and says so explicitly: the two RFCs land as one
+/// pair, and until 0053's knob exists the implementation uses the same
+/// constant.
+pub const DEFAULT_MAX_TENANTS: u32 = 1_024;
+
+/// RFC 0052 §3.8's proposed `max_unlinks_per_pass` default. The knob
+/// itself arrives with the housekeeping slice, whose capped pass is its
+/// only reader; the sidecar needs the number now, to size its slots.
+pub const DEFAULT_MAX_UNLINKS_PER_PASS: u32 = 128;
 
 /// The format ceiling on `max_tenants`: slot ids are `u16` and id 0 is
 /// usable, so 65,536 records address the whole space.

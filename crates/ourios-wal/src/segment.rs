@@ -22,12 +22,17 @@ use uuid::Uuid;
 /// `*.lock`) without consulting the filename. ASCII `"OWAL"`.
 pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"OWAL";
 
-/// Format version of [`SegmentHeader`]. A future migration
-/// bumps this and the reader either decodes or rejects per the
-/// RFC 0005 §3.5 schema-evolution rules (this file format is
-/// independent of the Parquet schema but follows the same
-/// "forward-compat readers, explicit migration" discipline).
-pub(crate) const SEGMENT_VERSION: u16 = 1;
+/// Format version [`write_header`] stamps. RFC 0052 §3.2 bumps it to
+/// 2: a segment header is the one witness every root with any segment
+/// carries, so "holds a version-2 segment" is what separates a root
+/// that has run under RFC 0052 — and whose missing sidecars are a loss
+/// — from a pre-RFC root. Pre-production, accepting both versions on
+/// read is the whole migration (RFC 0052 §3.8).
+pub(crate) const SEGMENT_VERSION: u16 = 2;
+
+/// The version a segment written before RFC 0052 carries.
+/// [`read_header`] accepts it; nothing writes it.
+pub(crate) const SEGMENT_VERSION_LEGACY: u16 = 1;
 
 /// Reserved flags field; MUST be zero today. A future read MAY
 /// reject non-zero flags as RFC0008.5 corruption rather than
@@ -85,7 +90,7 @@ impl std::fmt::Display for HeaderError {
             ),
             Self::UnknownVersion { found } => write!(
                 f,
-                "unknown segment version {found} (this build supports v{SEGMENT_VERSION})",
+                "unknown segment version {found} (this build supports v{SEGMENT_VERSION_LEGACY} and v{SEGMENT_VERSION})",
             ),
             Self::Io(e) => write!(f, "segment header read: {e}"),
         }
@@ -141,10 +146,10 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<SegmentHeader, HeaderErr
     if magic != SEGMENT_MAGIC {
         return Err(HeaderError::BadMagic { found: magic });
     }
-    let version = u16::from_le_bytes([buf[4], buf[5]]);
-    if version != SEGMENT_VERSION {
-        return Err(HeaderError::UnknownVersion { found: version });
-    }
+    let version = match u16::from_le_bytes([buf[4], buf[5]]) {
+        known @ (SEGMENT_VERSION_LEGACY | SEGMENT_VERSION) => known,
+        found => return Err(HeaderError::UnknownVersion { found }),
+    };
     let flags = u16::from_le_bytes([buf[6], buf[7]]);
     let mut uuid_bytes = [0u8; 16];
     uuid_bytes.copy_from_slice(&buf[8..24]);
@@ -176,7 +181,11 @@ mod tests {
         write_header(&mut buf, &header).expect("write");
         assert_eq!(buf.len(), 24, "header is exactly 24 bytes per §6.2.1");
         assert_eq!(&buf[0..4], b"OWAL", "magic prefix");
-        assert_eq!(&buf[4..6], &[0x01, 0x00], "version = 1 (LE u16)");
+        assert_eq!(
+            &buf[4..6],
+            &[0x02, 0x00],
+            "version = 2 (LE u16) — RFC 0052 §3.8's segment-header Invariant row",
+        );
         assert_eq!(&buf[6..8], &[0x00, 0x00], "flags = 0 (LE u16, reserved)");
         assert_eq!(&buf[8..24], uuid.as_bytes(), "UUID bytes in RFC 4122 order");
     }
@@ -211,6 +220,22 @@ mod tests {
             HeaderError::BadMagic { found } => assert_eq!(&found, b"NOPE"),
             other => panic!("expected BadMagic, got {other:?}"),
         }
+    }
+
+    /// A version-1 header — a segment written before RFC 0052 — still
+    /// reads. Accepting both versions is the whole migration (§3.8);
+    /// the reader must not refuse a live pre-RFC root's segments.
+    #[test]
+    fn read_header_accepts_the_legacy_version() {
+        let uuid = Uuid::now_v7();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&SEGMENT_MAGIC);
+        buf.extend_from_slice(&SEGMENT_VERSION_LEGACY.to_le_bytes());
+        buf.extend_from_slice(&SEGMENT_FLAGS_RESERVED.to_le_bytes());
+        buf.extend_from_slice(uuid.as_bytes());
+        let parsed = read_header(&mut Cursor::new(&buf[..])).expect("legacy header");
+        assert_eq!(parsed.version, SEGMENT_VERSION_LEGACY);
+        assert_eq!(parsed.segment_uuid, uuid);
     }
 
     /// `UnknownVersion` on a future-format file: the magic

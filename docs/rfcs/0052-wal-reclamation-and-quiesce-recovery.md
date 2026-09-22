@@ -23,10 +23,20 @@ superseded-by: —
 > below is by leg and each stub's `#[ignore]` reason names its slice:
 > **A** reclaim record and sidecars (§3.2 `RECLAIM`, `CHECKPOINT` v2,
 > `SEGMENT_VERSION` 2, open-time reconciliation → .16, .11's open-time
-> leg, .17's format and open-time legs);
+> leg, .17's format, sidecar-matrix and geometry legs: the corrupt
+> record, the deleted record on a post-RFC root, the overlong replayed
+> tenant, the both-sidecars-missing rows, the geometry rebuild, the
+> at-open allocation failure, the fresh-open ordering, the torn-slot
+> fallback and the `checkpoint_armed` / `checkpoint_seen` rows);
 > **B** housekeeping (ledger, `RetainFloor`, capped passes,
-> prepare/commit split → .2, .12, .13's floor legs, .17's pass legs:
-> migration-window skip, failed or uncertain unlink, failed record write);
+> prepare/commit split → .2, .12, .13's floor legs, .17's pass legs and
+> every leg that reads a snapshot, since `SnapshotHorizons` arrives at
+> `housekeeping_prepare`: the halt-or-pin rows, the empty-record pin,
+> entry monotonicity, the record-then-unlink crash, the legacy-root
+> migration window (whose stale-gap leg compares a tenant's oldest
+> surviving frame with its last recorded horizon), the consumer-mode
+> rows, the `PUBLISHED` seeding and slot-id rows, the migration-window
+> skip, failed or uncertain unlink, failed record write);
 > **C** rotation (temporary name, bounded retry, terminal state, the
 > `hold/794-wedged-classification` reintroduction → .4, .5, .15, .11's
 > post-RFC rotation leg, .17's legacy-root rotation leg);

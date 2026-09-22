@@ -424,6 +424,11 @@ pub struct Wal {
     /// process, so a [`PassId`] cannot be mistaken for one another
     /// instance on the same root — a reopen — handed out.
     instance: u64,
+    /// The pass an outstanding [`UnlinkPermit`] would still authorise,
+    /// zero when none is. Shared with the permits themselves, because
+    /// the unlink half holds no guard and no WAL handle and still has
+    /// to know that a later prepare has moved past its plan.
+    live_pass: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Bytes of validated frames in surviving segments, seeded after
     /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
     /// less header, which would count a torn tail, and never the
@@ -526,6 +531,7 @@ impl Wal {
             outstanding: None,
             passes: 0,
             instance: NEXT_WAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            live_pass: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,

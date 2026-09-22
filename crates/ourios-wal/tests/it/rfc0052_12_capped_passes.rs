@@ -921,6 +921,44 @@ fn rfc0052_12_a_record_failure_keeps_an_inherited_uncertainty() {
     );
 }
 
+/// A permit a later prepare has moved past unlinks nothing. Naming
+/// the pass is not enough on its own: §3.7's abandoned-plan recovery
+/// lets a prepare supersede a plan whose record was already written,
+/// and a horizon that regressed in between re-pins exactly the
+/// segments that plan names. The commit refuses the stale outcome —
+/// but only after the files would be gone.
+#[test]
+fn rfc0052_12_a_permit_the_wal_has_moved_past_unlinks_nothing() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let stale = wal
+        .housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
+        .expect("prepare");
+    let planned: Vec<PathBuf> = stale.segments().iter().map(|s| s.path.clone()).collect();
+    assert!(!planned.is_empty());
+    let permit = wal.write_plan_record(&stale).expect("record");
+
+    // The tenant's snapshot stops restoring before the file half
+    // runs: the next prepare withdraws and re-pins what it named.
+    let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
+    assert!(pinned.segments().is_empty(), "the regression withdrew them");
+
+    let outcome = unlink_planned(&stale, permit);
+    assert!(
+        matches!(outcome, ourios_wal::ReclaimOutcome::RecordFailed(_)),
+        "the permit no longer authorises its own plan",
+    );
+    assert!(
+        planned.iter().all(|path| path.exists()),
+        "so the frames the pin exists to keep are still there",
+    );
+}
+
 /// An unlink that fails is kept for retry **and** reported. §3.1's
 /// rule is that the failure is logged and the next pass retries it,
 /// and a pass that returned `Ok` gave its caller neither.

@@ -22,6 +22,8 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_core::tenant::TenantId;
 use uuid::Uuid;
@@ -133,11 +135,15 @@ impl PassId {
     pub(crate) fn new(wal: u64, pass: u64) -> Self {
         Self { wal, pass }
     }
+
+    pub(crate) fn seq(self) -> u64 {
+        self.pass
+    }
 }
 
 impl UnlinkPermit {
-    pub(crate) fn new(pass: PassId) -> Self {
-        Self { pass }
+    pub(crate) fn new(pass: PassId, live: Arc<AtomicU64>) -> Self {
+        Self { pass, live }
     }
 }
 
@@ -158,9 +164,19 @@ impl std::fmt::Display for PassId {
 /// [`crate::Wal::write_plan_record`] hands this out and the unlink
 /// consumes it. It names the pass, so a permit from one plan cannot
 /// unlink another's.
+///
+/// It is also **revocable**, which naming the pass alone is not enough
+/// for: §3.7's abandoned-plan recovery lets a later
+/// `housekeeping_prepare` supersede a plan whose record was already
+/// written, and a horizon that regressed in between re-pins exactly
+/// the segments that plan names. The commit would refuse the stale
+/// outcome — but only after the files were gone. So the permit holds
+/// the WAL's live-pass cell and reads it at the unlink: a pass the WAL
+/// has moved past authorises nothing.
 #[derive(Debug)]
 pub struct UnlinkPermit {
     pass: PassId,
+    live: Arc<AtomicU64>,
 }
 
 /// Everything the file half needs, owned, so it holds no guard and no
@@ -303,12 +319,13 @@ impl From<CheckpointError> for ReclaimError {
 // this permit exists to enforce.
 #[allow(clippy::needless_pass_by_value)]
 pub fn unlink_planned(plan: &ReclaimPlan, permit: UnlinkPermit) -> ReclaimOutcome {
-    let UnlinkPermit { pass } = permit;
-    if pass != plan.pass {
+    let UnlinkPermit { pass, live } = permit;
+    if pass != plan.pass || live.load(Ordering::Acquire) != pass.seq() {
         return ReclaimOutcome::RecordFailed(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "WAL housekeeping refused: pass {}'s permit does not cover pass {} (RFC 0052 §3.2)",
+                "WAL housekeeping refused: pass {}'s permit does not authorise pass {} \
+                 (RFC 0052 §3.2)",
                 pass, plan.pass,
             ),
         ));
@@ -506,8 +523,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        HousekeepingProgress, PassId, PassOutcome, ReclaimOutcome, ReclaimPlan, RetainFloor,
-        UnlinkPermit, Uuid, unlink_planned,
+        Arc, AtomicU64, HousekeepingProgress, PassId, PassOutcome, ReclaimOutcome, ReclaimPlan,
+        RetainFloor, UnlinkPermit, Uuid, unlink_planned,
     };
 
     /// The plan's paths are the crate's own, but [`unlink_planned`] is
@@ -536,7 +553,8 @@ mod tests {
             root,
             vec![misnamed.clone(), outside.clone(), reserved.clone()],
         );
-        let outcome = unlink_planned(&built, UnlinkPermit::new(built.pass));
+        let live = Arc::new(AtomicU64::new(built.pass.seq()));
+        let outcome = unlink_planned(&built, UnlinkPermit::new(built.pass, live));
         let ReclaimOutcome::Unlinked {
             removed, failed, ..
         } = outcome

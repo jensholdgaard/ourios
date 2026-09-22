@@ -142,6 +142,12 @@ impl Wal {
         let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
         self.passes += 1;
         let pass = pass::PassId::new(self.instance, self.passes);
+        // Any permit an earlier pass still holds stops authorising
+        // anything here: §3.7 lets this prepare supersede that plan,
+        // and a horizon that regressed in between has re-pinned the
+        // segments it names.
+        self.live_pass
+            .store(self.passes, std::sync::atomic::Ordering::Release);
         let plan = ReclaimPlan {
             pass,
             segments: segments
@@ -253,7 +259,7 @@ impl Wal {
             // accounting for them.
             None => return Err(settled(plan)),
         };
-        let permit = pass::UnlinkPermit::new(plan.pass);
+        let permit = pass::UnlinkPermit::new(plan.pass, std::sync::Arc::clone(&self.live_pass));
         if !plan.records {
             return Ok(permit);
         }
@@ -305,6 +311,12 @@ impl Wal {
         pass: pass::PassId,
         outcome: ReclaimOutcome,
     ) -> Result<HousekeepingProgress, ReclaimError> {
+        let settle = self.outstanding.as_ref().is_some_and(|o| o.pass == pass);
+        if settle {
+            // The plan is being accounted for, so its permit is spent.
+            self.live_pass
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
         let Some(outstanding) = self.outstanding.take() else {
             // Not "nothing to do": a commit has already taken this
             // pass's state, or none was ever prepared. Reporting a

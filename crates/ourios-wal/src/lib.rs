@@ -44,6 +44,7 @@ pub(crate) mod reclaim;
 pub(crate) mod reclaim_store;
 pub(crate) mod reconcile;
 pub(crate) mod retain;
+pub(crate) mod rotation;
 pub(crate) mod segment;
 
 pub use ledger::LedgerError;
@@ -56,6 +57,8 @@ pub use reclaim::{
     MAX_UNLINKS_PER_PASS_CEILING,
 };
 pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
+use rotation::DirFsync;
+pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
 
 // -----------------------------------------------------------
@@ -279,6 +282,17 @@ pub struct WalConfig {
     /// cross-check lands with it, and the range below is the format's
     /// own until then.
     pub max_unlinks_per_pass: u32,
+    /// `wal_rotation_retry_attempts` — how many consecutive failed
+    /// rotation attempts are retried before the WAL gives up (RFC 0052
+    /// §3.3, §3.8). Default [`DEFAULT_ROTATION_RETRY_ATTEMPTS`]; range
+    /// `MIN_ROTATION_RETRY_ATTEMPTS..=MAX_ROTATION_RETRY_ATTEMPTS`.
+    ///
+    /// A failed `rotate` and a failed rotation-origin parent-directory
+    /// fsync discharge each charge one unit; the count resets only when
+    /// that obligation itself succeeds. Exhausting it enters the
+    /// terminal state, which refuses appends until an operator
+    /// intervenes. No batch is acknowledged in either state.
+    pub rotation_retry_attempts: u32,
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
     /// §6.3 / §9: on macOS `fsync`/`fdatasync` do not flush the
@@ -318,6 +332,16 @@ pub const MAX_SEGMENT_AGE_SECS: u64 = 86_400;
 /// `wal_housekeeping_secs` validated range per §6.9.
 pub const MIN_HOUSEKEEPING_SECS: u64 = 1;
 pub const MAX_HOUSEKEEPING_SECS: u64 = 3_600;
+
+/// `wal_rotation_retry_attempts` default per RFC 0052 §3.8 — three
+/// consecutive failed attempts.
+pub const DEFAULT_ROTATION_RETRY_ATTEMPTS: u32 = 3;
+
+/// `wal_rotation_retry_attempts` validated range per RFC 0052 §3.8. A
+/// budget of zero would make the first transient failure terminal; a
+/// large one delays the terminal state an operator must act on.
+pub const MIN_ROTATION_RETRY_ATTEMPTS: u32 = 1;
+pub const MAX_ROTATION_RETRY_ATTEMPTS: u32 = 16;
 
 /// Whether a housekeeping pass may plan segments (RFC 0052 §3.2), as
 /// one value rather than two flags — "the sidecar's entry is not yet
@@ -367,7 +391,8 @@ pub struct Wal {
     current_segment_uuid: uuid::Uuid,
     /// Whether the parent directory still needs an `fsync` to
     /// make the current segment's directory entry durable
-    /// (§6.3). `open` always sets it `true` and the first
+    /// (§6.3), and — RFC 0052 §3.3 — which obligation owes it.
+    /// `open` always sets it pending and the first
     /// `sync` of the process clears it — the directory fsync
     /// runs once per open regardless of whether `open` minted a
     /// *fresh* segment or reattached to an *existing* one. The
@@ -380,7 +405,11 @@ pub struct Wal {
     /// risk losing that acked frame to an orphaned inode on
     /// power loss — a §3.4 violation. One extra fsync per
     /// process start is the cheap, conservative guard.
-    dir_fsync_pending: bool,
+    ///
+    /// The origin decides the failure path: an `open`-owed discharge
+    /// that fails is an ordinary retryable sync failure, while a
+    /// rotation-owed one charges the §3.3 retry budget.
+    dir_fsync: DirFsync,
     /// The `CHECKPOINT` sidecar's offset, read at `open` and
     /// advanced by `checkpoint` (§6.7). `None` = first-run /
     /// pre-checkpoint. This is the recovery driver's
@@ -434,14 +463,18 @@ pub struct Wal {
     /// less header, which would count a torn tail, and never the
     /// best-effort directory walk `metrics` uses.
     unreclaimed_bytes: u64,
-    /// A rotation step failed (§6.5): the closing segment's
-    /// data sync, the fresh segment's creation, or the
-    /// parent-dir `fsync`. Once set, every `append` is refused
-    /// until an operator intervenes — continuing would risk
-    /// either a torn tail on a *closed* segment (which recovery
-    /// treats as RFC0008.5 corruption) or a frame landing in a
-    /// segment whose directory entry is not durable.
-    quiesced: bool,
+    /// RFC 0052 §3.3's rotation state: healthy, retrying within the
+    /// `rotation_retry_attempts` budget, or terminal once it is
+    /// exhausted. Only the terminal state refuses appends; a retrying
+    /// one lets the next append re-enter `rotate` (or, for the
+    /// post-rename site, the next `sync` discharge the directory
+    /// fsync), which is what makes the quiesce recoverable without a
+    /// restart.
+    rotation: RotationState,
+    /// The RFC 0052 §6 fault-injection seam. Default-constructed and
+    /// inert; only [`Self::arm_rotation_faults`] (behind the
+    /// `fault-injection` feature) ever arms it.
+    faults: RotationFaults,
     /// §6.8 counters. `unflushed_bytes` is the H3 detection
     /// metric: grows on `append`, resets on a successful
     /// `sync` (or on a rotation's closing segment sync).
@@ -518,8 +551,9 @@ impl Wal {
             // directory regardless of fresh-vs-existing open, so
             // an acked frame's segment is guaranteed a durable
             // directory entry (see the field doc — §3.4).
-            dir_fsync_pending: true,
-            quiesced: false,
+            dir_fsync: DirFsync::PendingOpen,
+            rotation: RotationState::Healthy,
+            faults: RotationFaults::default(),
             checkpoint: sidecar.map(|s| s.offset),
             checkpoint_version: sidecar.map(|s| s.version),
             reclaim: witness.store,
@@ -580,7 +614,19 @@ impl Wal {
             stale_partials: self.stale_partials.len(),
             reclaimable: self.checkpoint_is_settled(),
             floor: self.ledger.floor(),
+            rotation: self.rotation.clone(),
         }
+    }
+
+    /// Arm RFC 0052 §6's rotation fault-injection seam.
+    ///
+    /// Behind the `fault-injection` feature, which only this crate's own
+    /// test targets enable: §3.3's five sites are `fsync`, `create` and
+    /// `rename` calls that no directory permission can single out, so
+    /// the matrix RFC0052.4/.5 require has no other way in.
+    #[cfg(feature = "fault-injection")]
+    pub fn arm_rotation_faults(&mut self, faults: RotationFaults) {
+        self.faults = faults;
     }
 
     /// Append a frame of `kind` carrying `payload` (≤
@@ -601,9 +647,10 @@ impl Wal {
     /// `wal_segment_age_secs`, the segment is closed (its final
     /// data sync), a fresh one is created, and the parent dir
     /// is fsync'd before the frame lands — so a frame never
-    /// straddles segments and never lands in a segment without a
-    /// durable directory entry. A failed rotation quiesces the
-    /// WAL (see [`AppendError::QuiescedAfterRotationFailure`]).
+    /// straddles segments. A failed rotation is retried under RFC 0052
+    /// §3.3's bounded budget: [`AppendError::RotationRetrying`] while
+    /// it holds, [`AppendError::RotationTerminal`] once it is spent.
+    /// No batch is acked in either state.
     ///
     /// If `write_frame` fails after partial bytes have hit the
     /// segment, the file is best-effort truncated back to its
@@ -626,8 +673,8 @@ impl Wal {
     /// always succeeds; the `expect` documents the invariant
     /// rather than guarding a real failure mode.
     pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
-        if self.quiesced {
-            return Err(AppendError::QuiescedAfterRotationFailure);
+        if let Some(fault) = self.rotation.terminal() {
+            return Err(AppendError::RotationTerminal(fault.clone()));
         }
         if payload.len() > MAX_FRAME_BYTES {
             return Err(AppendError::TooLarge {
@@ -661,7 +708,7 @@ impl Wal {
         // about to land. The §6.9 segment-size lower bound
         // guarantees any legal frame fits a fresh segment.
         if self.rotation_due(pre_write_byte, frame_len) {
-            self.rotate()?;
+            self.rotate_now()?;
             pre_write_byte = SEGMENT_HEADER_LEN as u64;
         }
         if let Err(source) = frame::write_frame(&mut self.current_segment, kind, payload) {
@@ -741,27 +788,69 @@ impl Wal {
             .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
     }
 
-    /// Close the current segment and open a fresh one (§6.5):
-    /// sync the old segment's data (the last sync it ever
-    /// receives — a torn tail on a *closed* segment is RFC0008.5
-    /// corruption, so closing without it would convert a benign
-    /// crash into a recovery halt), create the new `UUIDv7`
-    /// segment with its 24 B header, then `fsync` the parent
-    /// directory so the new entry is durable before any frame
-    /// lands in it. Any step failing quiesces the WAL: every
-    /// subsequent `append` returns
-    /// [`AppendError::QuiescedAfterRotationFailure`] until an
-    /// operator intervenes. (`sync` stays available — the old
-    /// segment is still the append target, and acking frames
-    /// already written to it is safe.)
-    fn rotate(&mut self) -> Result<(), AppendError> {
-        if let Err(source) = sync_file_data(&self.current_segment, self.config.macos_full_fsync) {
-            self.quiesced = true;
-            return Err(AppendError::Io {
-                op: "sync(rotation: close segment)",
-                source,
-            });
+    /// RFC 0052 §3.3's callable rotation: close the current segment and
+    /// install a fresh one, without an append driving it.
+    ///
+    /// A pending rotation-origin directory fsync is discharged first —
+    /// §3.3's one-obligation-at-a-time rule — and the rotation is
+    /// refused if that discharge fails. A [`RotationKind::Discretionary`]
+    /// rotation of a segment holding no frame is a no-op: there is no
+    /// recovery window to bound and nothing to seal. A
+    /// [`RotationKind::Owed`] one proceeds regardless.
+    ///
+    /// # Errors
+    ///
+    /// See [`AppendError`]. A failure charges the §3.3 retry budget
+    /// exactly as an append-driven rotation's does.
+    pub fn rotate(&mut self, kind: RotationKind) -> Result<(), AppendError> {
+        if let Some(fault) = self.rotation.terminal() {
+            return Err(AppendError::RotationTerminal(fault.clone()));
         }
+        if kind == RotationKind::Discretionary && !self.current_segment_holds_a_frame()? {
+            return Ok(());
+        }
+        self.rotate_now()
+    }
+
+    /// Whether the current segment holds anything past its header.
+    fn current_segment_holds_a_frame(&self) -> Result<bool, AppendError> {
+        let len = self
+            .current_segment
+            .metadata()
+            .map_err(|source| AppendError::Io {
+                op: "stat(current_segment)",
+                source,
+            })?
+            .len();
+        Ok(len > SEGMENT_HEADER_LEN as u64)
+    }
+
+    /// Close the current segment and open a fresh one (§6.5, as RFC 0052
+    /// §3.3 amends it): sync the old segment's data (the last sync it
+    /// ever receives — a torn tail on a *closed* segment is RFC0008.5
+    /// corruption, so closing without it would convert a benign crash
+    /// into a recovery halt), create the new segment under its
+    /// `<uuid>.wal.partial` name, fsync its header, rename it into
+    /// place, install it, and only then `fsync` the parent directory.
+    ///
+    /// The ordering is load-bearing in both directions: the header must
+    /// be durable *before* the rename, or a surviving `.wal` entry can
+    /// have unreadable header bytes; and the parent fsync must come
+    /// *after* it, because the rename is what creates the entry. A
+    /// failure before the rename therefore leaves nothing
+    /// [`Self::open`] would select — `list_segments` returns only
+    /// `*.wal` — and the partial is swept by housekeeping.
+    ///
+    /// The fresh segment is installed *before* the parent fsync, so a
+    /// failure there leaves the WAL writing into a complete, valid
+    /// segment whose directory entry is not yet durable. That file is
+    /// never unlinked; the obligation is recorded and the next
+    /// [`Self::sync`] discharges it before acking anything.
+    fn rotate_now(&mut self) -> Result<(), AppendError> {
+        self.discharge_owed_rotation_fsync()?;
+        self.step(RotationSite::CloseSync, |wal| {
+            sync_file_data(&wal.current_segment, wal.config.macos_full_fsync)
+        })?;
         // The closing data sync flushed everything appended so far.
         self.unflushed_bytes = 0;
         // RFC 0052 §3.2: no version-2 segment is ever created before
@@ -771,48 +860,108 @@ impl Wal {
         // open-time matrix fails closed on — a live pre-RFC root
         // bricked by rotating.
         if let Err(e) = reconcile::ensure_record(&mut self.reclaim, &self.config) {
-            self.quiesced = true;
             return Err(rotation_record_failed(e));
         }
-        let (file, path, uuid) = match create_fresh_segment(&self.config.root) {
-            Ok(fresh) => fresh,
-            Err(OpenError::Io { op, source }) => {
-                self.quiesced = true;
-                return Err(AppendError::Io { op, source });
-            }
-            Err(OpenError::InvalidConfig { .. } | OpenError::Corrupt { .. }) => {
-                unreachable!("create_fresh_segment only surfaces OpenError::Io")
-            }
-        };
-        // The header must be durable BEFORE the directory entry: the
-        // parent fsync below makes the new file name survive a power
-        // cut, and a surviving entry whose 24 B header bytes were
-        // lost would fail the next `Wal::open`'s header read — a
-        // benign crash turned into OpenError::Corrupt. (`open`'s own
-        // fresh segment doesn't carry this ordering: nothing fsyncs
-        // its directory entry until the first `sync`, which
-        // syncs the segment data first.)
-        if let Err(source) = sync_file_data(&file, self.config.macos_full_fsync) {
-            self.quiesced = true;
-            return Err(AppendError::Io {
-                op: "sync(rotation: fresh segment header)",
-                source,
-            });
-        }
-        if let Err(source) = sync_parent_dir(&self.config.root) {
-            // The fresh header-only segment is left in place: replay
-            // reads it as zero frames, and unlinking it here could
-            // itself fail. The quiesce is what protects correctness.
-            self.quiesced = true;
-            return Err(AppendError::Io {
-                op: "fsync(wal_root after rotation)",
-                source,
-            });
-        }
+        let (file, partial, uuid) = self.create_partial()?;
+        self.step(RotationSite::HeaderSync, |wal| {
+            sync_file_data(&file, wal.config.macos_full_fsync)
+        })?;
+        let path = self.config.root.join(format!("{uuid}.wal"));
+        self.step(RotationSite::Rename, |_| std::fs::rename(&partial, &path))?;
+        self.forget_partial(&partial);
         self.current_segment = file;
         self.current_segment_path = path;
         self.current_segment_uuid = uuid;
-        self.dir_fsync_pending = false;
+        self.dir_fsync = DirFsync::PendingRotation;
+        self.step(RotationSite::ParentFsync, |wal| {
+            sync_parent_dir(&wal.config.root)
+        })?;
+        self.dir_fsync = DirFsync::Clean;
+        self.rotation.discharged();
+        Ok(())
+    }
+
+    /// Run one §3.3 rotation step, charging the retry budget when it
+    /// fails. The fault seam is consulted first so every site can be
+    /// driven from a test; it is inert unless armed.
+    fn step<F>(&mut self, site: RotationSite, run: F) -> Result<(), AppendError>
+    where
+        F: FnOnce(&Self) -> std::io::Result<()>,
+    {
+        let outcome = match self.faults.take(site) {
+            Some(injected) => Err(injected),
+            None => run(self),
+        };
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(source) => Err(self.charge_rotation(site, &source)),
+        }
+    }
+
+    /// Charge one unit of the §3.3 budget and render the failure as the
+    /// append-surface error the caller returns.
+    fn charge_rotation(&mut self, site: RotationSite, source: &std::io::Error) -> AppendError {
+        let fault = self
+            .rotation
+            .charge(site.op(), source, self.config.rotation_retry_attempts);
+        match self.rotation {
+            RotationState::Terminal(_) => AppendError::RotationTerminal(fault),
+            RotationState::Healthy | RotationState::Retrying(_) => {
+                AppendError::RotationRetrying(fault)
+            }
+        }
+    }
+
+    /// Create `<uuid>.wal.partial` and write its header. Nothing a
+    /// [`Self::open`] can select exists until the rename, since
+    /// `list_segments` returns only `*.wal`.
+    ///
+    /// The path is registered on the housekeeping sweep's list as soon
+    /// as the file exists, so a rotation that dies at any later step
+    /// leaves its debris where the sweep already looks — §3.3 requires
+    /// the pass itself to list nothing.
+    fn create_partial(&mut self) -> Result<(File, PathBuf, uuid::Uuid), AppendError> {
+        let uuid = uuid::Uuid::now_v7();
+        let partial = self.config.root.join(format!("{uuid}.wal.partial"));
+        let target = partial.clone();
+        let mut handle = None;
+        self.step(RotationSite::Create, |_| {
+            handle = Some(create_segment_at(&target, uuid)?);
+            Ok(())
+        })?;
+        match handle {
+            Some(file) => {
+                self.stale_partials.push(partial.clone());
+                Ok((file, partial, uuid))
+            }
+            None => unreachable!("a successful Create step always yields the handle"),
+        }
+    }
+
+    /// Drop one partial from the sweep's list — the rename installed it
+    /// under its final name, so there is no debris left to collect.
+    fn forget_partial(&mut self, partial: &std::path::Path) {
+        self.stale_partials.retain(|queued| queued != partial);
+    }
+
+    /// §3.3's one-rotation-obligation-at-a-time rule: a rotation-origin
+    /// directory fsync still owed is discharged before a second rotation
+    /// begins, and the rotation is refused if that fails. Starting the
+    /// second rotation would install a segment whose predecessor's
+    /// directory entry is still not durable, losing the ordering the
+    /// first obligation exists to restore.
+    ///
+    /// An `open`-origin obligation does not gate a rotation: the
+    /// rotation's own parent fsync discharges it.
+    fn discharge_owed_rotation_fsync(&mut self) -> Result<(), AppendError> {
+        if self.dir_fsync != DirFsync::PendingRotation {
+            return Ok(());
+        }
+        self.step(RotationSite::ParentFsync, |wal| {
+            sync_parent_dir(&wal.config.root)
+        })?;
+        self.dir_fsync = DirFsync::Clean;
+        self.rotation.discharged();
         Ok(())
     }
 
@@ -840,13 +989,7 @@ impl Wal {
     /// See [`SyncError`].
     pub fn sync(&mut self) -> Result<WalOffset, SyncError> {
         self.sync_segment_data()?;
-        if self.dir_fsync_pending {
-            sync_parent_dir(&self.config.root).map_err(|source| SyncError::Io {
-                op: "fsync(wal_root)",
-                source,
-            })?;
-            self.dir_fsync_pending = false;
-        }
+        self.discharge_dir_fsync()?;
         // Everything written so far is now durable; the highest
         // durable byte is the segment's current length. Re-stat
         // rather than thread a counter so a crash between the
@@ -865,6 +1008,49 @@ impl Wal {
             segment: self.current_segment_uuid,
             byte,
         })
+    }
+
+    /// Make the current segment's directory entry durable when one of
+    /// the two obligations (§6.3's per-open one, or RFC 0052 §3.3's
+    /// post-rename one) is outstanding.
+    ///
+    /// A rotation-origin discharge is the second operation §3.3's retry
+    /// budget counts, and a terminal state short-circuits it rather than
+    /// hammering a disk that has already failed the same fsync its whole
+    /// budget's worth of times. An `open`-origin failure stays an
+    /// ordinary retryable sync error, outside the budget — which is what
+    /// keeps RFC0052.15's reclassification narrow.
+    fn discharge_dir_fsync(&mut self) -> Result<(), SyncError> {
+        match self.dir_fsync {
+            DirFsync::Clean => Ok(()),
+            DirFsync::PendingOpen => self.discharge_open_fsync(),
+            DirFsync::PendingRotation => self.discharge_rotation_fsync(),
+        }
+    }
+
+    fn discharge_open_fsync(&mut self) -> Result<(), SyncError> {
+        sync_parent_dir(&self.config.root).map_err(|source| SyncError::Io {
+            op: "fsync(wal_root)",
+            source,
+        })?;
+        self.dir_fsync = DirFsync::Clean;
+        Ok(())
+    }
+
+    fn discharge_rotation_fsync(&mut self) -> Result<(), SyncError> {
+        if let Some(fault) = self.rotation.terminal() {
+            return Err(SyncError::RotationTerminal(fault.clone()));
+        }
+        match self.step(RotationSite::ParentFsync, |wal| {
+            sync_parent_dir(&wal.config.root)
+        }) {
+            Ok(()) => {
+                self.dir_fsync = DirFsync::Clean;
+                self.rotation.discharged();
+                Ok(())
+            }
+            Err(e) => Err(rotation_sync_failed(e)),
+        }
     }
 
     /// The live segment's §6.3 data sync — [`sync_file_data`] with
@@ -1187,7 +1373,7 @@ impl Wal {
             op: "fsync(wal_root after heal)",
             source,
         })?;
-        self.dir_fsync_pending = false;
+        self.dir_fsync = DirFsync::Clean;
         Ok(())
     }
 
@@ -1290,8 +1476,52 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
             ),
         ));
     }
+    if !(MIN_ROTATION_RETRY_ATTEMPTS..=MAX_ROTATION_RETRY_ATTEMPTS)
+        .contains(&c.rotation_retry_attempts)
+    {
+        return Err(outside(
+            "rotation_retry_attempts",
+            format!(
+                "{} outside RFC 0052 §3.8 range {MIN_ROTATION_RETRY_ATTEMPTS}..={MAX_ROTATION_RETRY_ATTEMPTS}",
+                c.rotation_retry_attempts
+            ),
+        ));
+    }
+    // RFC 0052 §3.8's one cross-knob rule, and the reason it lives in the
+    // WAL: only `Wal::open` sees both numbers. RFC0052.4's one-pass debris
+    // clearance is what it protects — a rotation retrying its full budget
+    // leaves one `.wal.partial` per attempt, and a pass that cannot pop
+    // them all would leave rotation debris on disk indefinitely.
+    if c.max_unlinks_per_pass < c.rotation_retry_attempts {
+        return Err(outside(
+            "max_unlinks_per_pass",
+            format!(
+                "{} below rotation_retry_attempts {} — one rotation's debris must clear in one pass (RFC 0052 §3.8)",
+                c.max_unlinks_per_pass, c.rotation_retry_attempts
+            ),
+        ));
+    }
     // `macos_full_fsync` is a `bool`; nothing to validate.
     Ok(())
+}
+
+/// Re-surface a rotation-origin directory-fsync failure on `sync`'s
+/// error type. The two surfaces carry the same two rotation variants,
+/// so the class survives the crossing; anything else would be a bug in
+/// [`Wal::step`]'s only caller here, which can raise nothing else.
+fn rotation_sync_failed(e: AppendError) -> SyncError {
+    match e {
+        AppendError::RotationRetrying(fault) => SyncError::RotationRetrying(fault),
+        AppendError::RotationTerminal(fault) => SyncError::RotationTerminal(fault),
+        AppendError::Io { op, source } => SyncError::Io { op, source },
+        AppendError::TooLarge { len, limit } => SyncError::Io {
+            op: "fsync(wal_root after rotation)",
+            source: std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unreachable: a directory fsync cannot be oversize ({len} > {limit})"),
+            ),
+        },
+    }
 }
 
 /// Map a sidecar failure onto the rotation's error surface. A
@@ -1409,19 +1639,26 @@ fn open_existing_segment(path: &std::path::Path) -> Result<(File, PathBuf, uuid:
 fn create_fresh_segment(root: &std::path::Path) -> Result<(File, PathBuf, uuid::Uuid), OpenError> {
     let uuid = uuid::Uuid::now_v7();
     let path = root.join(format!("{uuid}.wal"));
+    let handle = create_segment_at(&path, uuid).map_err(|source| OpenError::Io {
+        op: "create(fresh segment)",
+        source,
+    })?;
+    Ok((handle, path, uuid))
+}
+
+/// Create one segment file at `path` and write its §6.2.1 header.
+///
+/// `path` is the final `*.wal` name on [`Wal::open`]'s fresh-root path
+/// and the `<uuid>.wal.partial` temporary name on RFC 0052 §3.3's
+/// rotation path; the bytes written are identical either way, which is
+/// what lets the rename install the file unchanged.
+fn create_segment_at(path: &std::path::Path, uuid: uuid::Uuid) -> std::io::Result<File> {
     let mut handle = OpenOptions::new()
         .read(true)
         .append(true)
         .create_new(true)
-        .open(&path)
-        .map_err(|source| OpenError::Io {
-            op: "create(fresh segment)",
-            source,
-        })?;
-    write_header(&mut handle, &SegmentHeader::new(uuid)).map_err(|source| OpenError::Io {
-        op: "write(segment header)",
-        source,
-    })?;
+        .open(path)?;
+    write_header(&mut handle, &SegmentHeader::new(uuid))?;
     // SEGMENT_HEADER_LEN sanity — if `write_header` ever
     // diverges from the on-disk format constant, the metadata
     // size below disagrees with `SEGMENT_HEADER_LEN` and the
@@ -1438,7 +1675,7 @@ fn create_fresh_segment(root: &std::path::Path) -> Result<(File, PathBuf, uuid::
         SEGMENT_HEADER_LEN as u64,
         "segment header write must produce exactly SEGMENT_HEADER_LEN bytes",
     );
-    Ok((handle, path, uuid))
+    Ok(handle)
 }
 
 /// How one segment's frame scan terminated (the §6.6 step-3
@@ -1701,14 +1938,22 @@ pub enum AppendError {
         op: &'static str,
         source: std::io::Error,
     },
-    /// A prior rotation failed (the closing segment's
-    /// data sync, the fresh segment's creation, or the
-    /// parent-dir `fsync`) and the WAL is quiesced per §6.5 —
-    /// operator intervention is required before further appends
-    /// are accepted. The append that triggered the failed
-    /// rotation surfaced the underlying [`AppendError::Io`];
-    /// every append after it gets this variant.
-    QuiescedAfterRotationFailure,
+    /// A rotation step failed and RFC 0052 §3.3's retry budget still
+    /// holds: a later `append` re-enters `rotate` and can succeed, so
+    /// the failure is genuinely transient (RFC0052.15). No batch is
+    /// acked either way — the frame did not land.
+    RotationRetrying(RotationFault),
+    /// The rotation retry budget is exhausted (RFC 0052 §3.3): every
+    /// append is refused until an operator intervenes, and the only
+    /// exit today is a restart. The fault carries the *first*
+    /// underlying I/O error, not a generic quiesce message, so the
+    /// diagnosis survives to the operator.
+    ///
+    /// Reported **server-terminal, client-retryable** — RFC 0018 §3.2's
+    /// third class, which this RFC adds: the status stays
+    /// `UNAVAILABLE` / `503` because the batch was never acked and the
+    /// client must keep it, but no delay fixes the node.
+    RotationTerminal(RotationFault),
 }
 
 /// Errors from [`Wal::sync`].
@@ -1721,6 +1966,16 @@ pub enum SyncError {
         op: &'static str,
         source: std::io::Error,
     },
+    /// The rotation-origin parent-directory fsync RFC 0052 §3.3 leaves
+    /// owed failed, and the retry budget still holds. Transient: a
+    /// later `sync` discharges it. Nothing behind it is acked, because
+    /// the installed segment's directory entry is not yet durable.
+    RotationRetrying(RotationFault),
+    /// That discharge exhausted the budget (RFC 0052 §3.3). Reported
+    /// server-terminal, client-retryable, exactly as the append surface
+    /// does — an ordinary fsync failure never reaches this variant,
+    /// which is what keeps RFC0052.15's reclassification narrow.
+    RotationTerminal(RotationFault),
 }
 
 impl std::fmt::Display for AppendError {
@@ -1730,18 +1985,44 @@ impl std::fmt::Display for AppendError {
                 write!(f, "frame payload {len} B exceeds the {limit} B limit")
             }
             Self::Io { op, source } => write!(f, "WAL append failed at {op}: {source}"),
-            Self::QuiescedAfterRotationFailure => {
-                write!(f, "WAL is quiesced after a rotation failure (§6.5)")
-            }
+            Self::RotationRetrying(fault) => write!(f, "{}", retrying_message(fault)),
+            Self::RotationTerminal(fault) => write!(f, "{}", terminal_message(fault)),
         }
     }
+}
+
+/// The wire message for a rotation failure still inside its budget. It
+/// says the WAL is retrying, because RFC0052.15 requires a client to be
+/// told the difference between a state a later request clears and one
+/// that needs an operator.
+fn retrying_message(fault: &RotationFault) -> String {
+    format!(
+        "WAL rotation failed at {} and is retrying (attempt {} of {}, RFC 0052 §3.3): {}",
+        fault.op(),
+        fault.attempts(),
+        fault.budget(),
+        fault.detail(),
+    )
+}
+
+/// The wire message for the terminal state. It names the state and
+/// carries the first underlying error, so an operator reading one
+/// response learns both.
+fn terminal_message(fault: &RotationFault) -> String {
+    format!(
+        "WAL rotation is terminal after {} failed attempts and needs an operator \
+         (RFC 0052 §3.3); first failure at {}: {}",
+        fault.attempts(),
+        fault.op(),
+        fault.detail(),
+    )
 }
 
 impl std::error::Error for AppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::TooLarge { .. } | Self::QuiescedAfterRotationFailure => None,
+            Self::TooLarge { .. } | Self::RotationRetrying(_) | Self::RotationTerminal(_) => None,
         }
     }
 }
@@ -1750,6 +2031,8 @@ impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { op, source } => write!(f, "WAL sync failed at {op}: {source}"),
+            Self::RotationRetrying(fault) => write!(f, "{}", retrying_message(fault)),
+            Self::RotationTerminal(fault) => write!(f, "{}", terminal_message(fault)),
         }
     }
 }
@@ -1758,6 +2041,7 @@ impl std::error::Error for SyncError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::RotationRetrying(_) | Self::RotationTerminal(_) => None,
         }
     }
 }
@@ -1946,6 +2230,10 @@ pub struct ReclaimState {
     /// [`RetainFloor::Unknown`], which is not the same claim as "no
     /// consumer exists".
     pub floor: RetainFloor,
+    /// RFC 0052 §3.3's rotation state — healthy, retrying with its
+    /// attempt count, or terminal. §3.5 exports the distinction because
+    /// "retrying" and "given up" need different operator responses.
+    pub rotation: RotationState,
 }
 
 /// Errors from [`Wal::replay`].
@@ -2175,6 +2463,7 @@ mod tests {
             segment_age_secs: 600,
             housekeeping_secs: 60,
             max_unlinks_per_pass: DEFAULT_MAX_UNLINKS_PER_PASS,
+            rotation_retry_attempts: DEFAULT_ROTATION_RETRY_ATTEMPTS,
             macos_full_fsync: false,
         }
     }
@@ -2221,12 +2510,26 @@ mod tests {
                 housekeeping_secs: MAX_HOUSEKEEPING_SECS,
                 ..default_config(tmp.path())
             },
+            // RFC 0052 §3.8 writes this knob's range as
+            // `rotation_retry_attempts..=65_536`, so its lower boundary
+            // is a *pair*: the format's own 1 is reachable only with a
+            // budget of 1 beside it.
             WalConfig {
                 max_unlinks_per_pass: 1,
+                rotation_retry_attempts: MIN_ROTATION_RETRY_ATTEMPTS,
                 ..default_config(tmp.path())
             },
             WalConfig {
                 max_unlinks_per_pass: reclaim::MAX_UNLINKS_PER_PASS_CEILING,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                rotation_retry_attempts: MIN_ROTATION_RETRY_ATTEMPTS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                rotation_retry_attempts: MAX_ROTATION_RETRY_ATTEMPTS,
+                max_unlinks_per_pass: MAX_ROTATION_RETRY_ATTEMPTS,
                 ..default_config(tmp.path())
             },
         ];
@@ -2289,6 +2592,30 @@ mod tests {
                 "housekeeping_secs",
                 WalConfig {
                     housekeeping_secs: MAX_HOUSEKEEPING_SECS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "rotation_retry_attempts",
+                WalConfig {
+                    rotation_retry_attempts: MIN_ROTATION_RETRY_ATTEMPTS - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "rotation_retry_attempts",
+                WalConfig {
+                    rotation_retry_attempts: MAX_ROTATION_RETRY_ATTEMPTS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            // RFC 0052 §3.8's one cross-knob rule: both values are
+            // individually legal, and the pair is not.
+            (
+                "max_unlinks_per_pass",
+                WalConfig {
+                    max_unlinks_per_pass: 2,
+                    rotation_retry_attempts: 3,
                     ..default_config(tmp.path())
                 },
             ),

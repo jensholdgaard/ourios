@@ -666,6 +666,22 @@ pub(super) enum IngestFailure {
     /// Durability is temporarily unavailable; retryable. HTTP 503 /
     /// gRPC `UNAVAILABLE`.
     Unavailable,
+    /// **Server-terminal, client-retryable** — RFC 0018 §3.2's third
+    /// class, which RFC 0052 §3.3 adds. The WAL's rotation retry budget
+    /// is exhausted: no delay fixes the node, it needs an operator, and
+    /// the only exit today is a restart (#791).
+    ///
+    /// Still HTTP 503 / gRPC `UNAVAILABLE`, deliberately and for the
+    /// reason §3.2 gives: the batch was never acked, and every
+    /// non-retryable OTLP status also instructs the client to *drop*
+    /// it, which would turn a terminal node into silent data loss.
+    /// OTLP's retryable axis is about the data, and this batch is
+    /// valid — it will be accepted once the node is cleared. What
+    /// changes is the message, which names the state instead of
+    /// implying a blip, and that no retry hint is carried: the server
+    /// schedules no retry of its own, so a conforming client backs off
+    /// exponentially.
+    ServerTerminal,
     /// Unreachable for a transport-validated selector; our bug.
     /// HTTP 500 / gRPC `INTERNAL`.
     Internal,
@@ -678,6 +694,15 @@ impl IngestFailure {
         match error {
             ReceiveError::TenantDenied { .. } => Self::Denied,
             ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => Self::TooLarge,
+            // RFC 0052 §3.3's narrow reclassification: only the
+            // *terminal* rotation state leaves the transient class. A
+            // rotation still inside its retry budget genuinely is
+            // transient — a later append can succeed — and an ordinary
+            // append or fsync I/O failure never reaches this arm at all.
+            ReceiveError::WalAppend(ourios_wal::AppendError::RotationTerminal(_))
+            | ReceiveError::WalSync(ourios_wal::SyncError::RotationTerminal(_)) => {
+                Self::ServerTerminal
+            }
             ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => Self::Unavailable,
             ReceiveError::TenantFrame(_) => Self::Internal,
         }

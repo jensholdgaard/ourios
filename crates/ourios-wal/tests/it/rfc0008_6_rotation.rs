@@ -3,7 +3,10 @@
 //!
 //! Size-cap and time-cap arms; close-fsync + new-header +
 //! parent-dir fsync sequence; no drop/duplicate across the
-//! rotation boundary; rotation-failure quiesce per §6.5. The
+//! rotation boundary; rotation-failure refusal per §6.5 as RFC 0052
+//! §3.3 amends it — the refusal is now bounded by
+//! `rotation_retry_attempts` rather than permanent, and the recovering
+//! half lives in RFC0052.4. The
 //! size-cap arm works at the §6.9 minimum segment size
 //! (17 MiB), so it really writes ~16 MiB — still fast on
 //! local disk; the time-cap arm uses the §6.9 minimum age
@@ -19,6 +22,20 @@ use ourios_wal::{
 };
 
 fn config(root: &Path, segment_size_bytes: u64, segment_age_secs: u64) -> WalConfig {
+    budgeted_config(
+        root,
+        segment_size_bytes,
+        segment_age_secs,
+        ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
+    )
+}
+
+fn budgeted_config(
+    root: &Path,
+    segment_size_bytes: u64,
+    segment_age_secs: u64,
+    rotation_retry_attempts: u32,
+) -> WalConfig {
     WalConfig {
         root: root.to_path_buf(),
         batch_window_ms: 100,
@@ -26,6 +43,7 @@ fn config(root: &Path, segment_size_bytes: u64, segment_age_secs: u64) -> WalCon
         segment_age_secs,
         housekeeping_secs: 60,
         max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+        rotation_retry_attempts,
         macos_full_fsync: false,
     }
 }
@@ -150,19 +168,28 @@ fn rfc0008_6_time_cap_rotates_without_drop_or_duplicate() {
     );
 }
 
-/// Quiesce arm: a rotation step failing surfaces as a hard
-/// `AppendError`, and every subsequent append is refused with
-/// `QuiescedAfterRotationFailure` until an operator
-/// intervenes — even after the underlying condition clears.
-/// `sync` stays available: the old segment is still the append
-/// target and acking frames already written to it is safe.
+/// Persistent-fault arm, as RFC 0052 §3.3 amends §6.5. The two halves
+/// this test has always protected are kept: **no batch is acked on an
+/// incomplete rotation**, and **the refusal is permanent when the fault
+/// is persistent** — the second now reached through the
+/// `rotation_retry_attempts` budget rather than a latch set on the first
+/// failure. The budget is 1 here, so one persistent fault exhausts it
+/// and the WAL refuses every later append even after the underlying
+/// condition clears, exactly as before.
+///
+/// The recovering half — a *transient* fault, which §3.3 makes
+/// retryable and this test's original "even after the underlying
+/// condition clears" wording forbade — is RFC0052.4's, not this one's.
+/// `sync` stays available: the old segment is still the append target
+/// and acking frames already written to it is safe.
 #[cfg(unix)]
 #[test]
-fn rfc0008_6_rotation_failure_quiesces_the_wal() {
+fn rfc0008_6_persistent_rotation_failure_refuses_appends_for_good() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::TempDir::new().expect("temp");
-    let mut wal = Wal::open(config(tmp.path(), MIN_SEGMENT_SIZE_BYTES, 600)).expect("open");
+    let mut wal =
+        Wal::open(budgeted_config(tmp.path(), MIN_SEGMENT_SIZE_BYTES, 600, 1)).expect("open");
     wal.append(FrameKind::OtlpBatch, &vec![0xAA; 16 * 1024 * 1024])
         .expect("first append");
 
@@ -178,20 +205,33 @@ fn rfc0008_6_rotation_failure_quiesces_the_wal() {
     let err = wal
         .append(FrameKind::OtlpBatch, &vec![0xBB; 2 * 1024 * 1024])
         .expect_err("rotation must fail on a read-only root");
-    assert!(
-        matches!(err, AppendError::Io { .. }),
-        "the triggering append surfaces the underlying IO error, got {err:?}",
-    );
+    // The triggering append is typed as a rotation failure, not as a
+    // generic append `Io`: it has just consumed the last of the budget,
+    // so a transport reading it as an ordinary transient error would
+    // tell the client to retry shortly (#791). `op` must still name the
+    // step, since the fault is the only place the real cause is
+    // reported — later appends carry no source at all.
+    match &err {
+        AppendError::RotationTerminal(fault) => {
+            assert!(
+                fault.op().contains("rotation"),
+                "the rotation step must be named, got {:?}",
+                fault.op(),
+            );
+            assert_eq!(fault.attempts(), 1, "one attempt exhausted a budget of 1");
+        }
+        other => panic!("the triggering append must be terminal, got {other:?}"),
+    }
 
     // Restore the root: the condition is gone, but the WAL stays
-    // quiesced — only operator intervention (a fresh open) clears it.
+    // terminal — only operator intervention (a fresh open) clears it.
     std::fs::set_permissions(tmp.path(), writable).expect("chmod rw");
     let err = wal
         .append(FrameKind::OtlpBatch, &[0xCC])
-        .expect_err("quiesced WAL refuses appends");
+        .expect_err("a terminal WAL refuses appends");
     assert!(
-        matches!(err, AppendError::QuiescedAfterRotationFailure),
-        "subsequent appends get the quiesce variant, got {err:?}",
+        matches!(err, AppendError::RotationTerminal(_)),
+        "subsequent appends get the terminal variant, got {err:?}",
     );
     assert!(
         wal.sync().is_ok(),

@@ -255,7 +255,7 @@ fn rfc0052_2_pinned_tenant_retains_only_its_segments() {
     // debris beside them.
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
-    build_tenant_segment(root, &[("pinned", b"p1")]);
+    let pin = build_tenant_segment(root, &[("pinned", b"p1")]);
     let covered = build_tenant_segment(root, &[("alpha", b"a1")]);
     build_tenant_segment(root, &[("alpha", b"a2")]);
     let before = segment_files(root);
@@ -282,10 +282,13 @@ fn rfc0052_2_pinned_tenant_retains_only_its_segments() {
         vec![before[0].clone(), before[2].clone()],
         "the pinning tenant's segment survives; the covered one does not",
     );
-    let floor = progress.floor;
+    // And the floor names the tenant holding it down, at that
+    // tenant's oldest surviving frame.
     assert_eq!(
-        floor.pinned_tenants(),
-        1,
-        "and the floor says a tenant is holding it down: {floor:?}",
+        progress.floor,
+        RetainFloor::Pinned {
+            offset: pin[0],
+            tenants: 1,
+        },
     );
 }

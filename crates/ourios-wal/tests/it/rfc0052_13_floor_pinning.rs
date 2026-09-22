@@ -127,12 +127,10 @@ fn rfc0052_13_pinned_is_not_expressible_as_no_consumer() {
     let (pinned, survivors) = fixture(&known(&[]));
     assert_eq!(pinned.removed_segments, 0);
     assert_eq!(survivors, 2);
-    let floor = pinned.floor;
-    assert!(
-        matches!(floor, RetainFloor::Pinned { tenants: 1, .. }),
-        "the pinned case is its own variant, not None: {floor:?}",
-    );
+    // The pinned case is its own variant, not `None`.
+    assert_eq!(pinned.floor.pinned_tenants(), 1);
     assert_ne!(pinned.floor, RetainFloor::None);
+    assert_ne!(pinned.floor, no_consumer.floor);
 }
 
 /// A horizon that **regresses or disappears** — a snapshot that stopped

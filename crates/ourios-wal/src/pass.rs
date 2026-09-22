@@ -270,6 +270,32 @@ fn segment_identity(path: &std::path::Path) -> Result<Option<Uuid>, std::io::Err
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
+/// The unlink failures of one pass, as the error its caller sees.
+///
+/// One error stands for the set: every failed path stays queued and is
+/// retried together on the next tick, so the count beside the first is
+/// what tells a single stuck file from a failing volume. A pass whose
+/// only trouble was the parent fsync is **not** one of these: §3.2
+/// reads that as the uncertain deletion it defines, re-verified by the
+/// next pass rather than retried as a failure.
+pub(crate) fn unlink_failure(outcome: &ReclaimOutcome) -> Option<HousekeepingError> {
+    let ReclaimOutcome::Unlinked { failed, .. } = outcome else {
+        return None;
+    };
+    let (path, source) = failed.first()?;
+    Some(HousekeepingError::Io {
+        op: "unlink(planned path)",
+        source: std::io::Error::new(
+            source.kind(),
+            format!(
+                "{} of this pass's unlinks failed, the first at {}: {source}",
+                failed.len(),
+                path.display(),
+            ),
+        ),
+    })
+}
+
 /// The mode a pass runs under, from what the caller knows.
 pub(crate) fn entry_mode(horizons: &SnapshotHorizons) -> reclaim::EntryMode {
     match horizons {

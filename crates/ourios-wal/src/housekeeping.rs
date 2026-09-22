@@ -264,7 +264,12 @@ impl Wal {
     /// # Errors
     ///
     /// See [`Self::housekeeping_prepare`] and
-    /// [`Self::housekeeping_commit`].
+    /// [`Self::housekeeping_commit`], plus
+    /// [`HousekeepingError::Io`] when an unlink failed: the entries
+    /// stay reclaiming and the partials stay on the sweep's list, so
+    /// the retry is intact, but §3.1's rule is that such a failure is
+    /// logged and the next pass retries it — neither of which a caller
+    /// that cannot see it can do.
     pub fn housekeeping_pass(
         &mut self,
         horizons: &SnapshotHorizons,
@@ -272,7 +277,7 @@ impl Wal {
     ) -> Result<HousekeepingProgress, ReclaimError> {
         let plan = self.housekeeping_prepare(horizons, max_unlinks)?;
         let Err(source) = self.write_plan_record(&plan) else {
-            return self.housekeeping_commit(unlink_planned(&plan));
+            return self.settle_unlinks(unlink_planned(&plan));
         };
         // The commit is what puts the popped entries back and requeues
         // the partials, so it runs either way — but the failure is the
@@ -289,6 +294,24 @@ impl Wal {
                 source: std::io::Error::new(kind, detail),
             },
         })
+    }
+
+    /// Commit what the file half did, then report its unlink failures.
+    /// The commit runs first either way: it is what keeps the failed
+    /// entries discoverable.
+    fn settle_unlinks(
+        &mut self,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        let failure = pass::unlink_failure(&outcome);
+        let progress = self.housekeeping_commit(outcome)?;
+        match failure {
+            Some(source) => Err(ReclaimError::Housekeeping {
+                progress: Box::new(progress),
+                source,
+            }),
+            None => Ok(progress),
+        }
     }
 
     /// Pop this pass's segments, or say why it planned none. §3.2's

@@ -11,7 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use ourios_wal::{
-    FrameKind, PassOutcome, SkipReason, SnapshotHorizons, TenantBatch, WalOffset, unlink_planned,
+    FrameKind, PassOutcome, ReclaimError, SkipReason, SnapshotHorizons, TenantBatch, WalOffset,
+    unlink_planned,
 };
 
 use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files, write_partial};
@@ -449,6 +450,48 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
     assert_eq!(
         progress.removed_segments, CAP,
         "so the absent files complete the reclamation rather than failing forever",
+    );
+}
+
+/// An unlink that fails is kept for retry **and** reported. §3.1's
+/// rule is that the failure is logged and the next pass retries it,
+/// and a pass that returned `Ok` gave its caller neither.
+#[test]
+fn rfc0052_12_a_failed_unlink_is_reported_and_stays_queued() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, 1);
+    // A directory under the reserved partial name: the sweep's list is
+    // seeded from the name alone, and `remove_file` cannot take it.
+    let wedged = root.join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&wedged).expect("a partial no unlink can remove");
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let failure = wal
+        .housekeeping_pass(&horizons, CAP)
+        .expect_err("a pass whose unlink failed is not a clean pass");
+    let ReclaimError::Housekeeping { progress, .. } = &failure else {
+        panic!("an unlink failure is a housekeeping failure: {failure:?}");
+    };
+    assert_eq!(
+        (progress.removed_segments, progress.removed_partials),
+        (1, 0),
+        "the half that could finish still did, and the commit still ran",
+    );
+    assert!(
+        format!("{failure}").contains(&wedged.display().to_string()),
+        "and the error names the path that failed: {failure}",
+    );
+    assert!(wedged.exists());
+
+    let next = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    assert_eq!(
+        next.partials,
+        vec![wedged],
+        "the failed path is back at the head of the sweep's list",
     );
 }
 

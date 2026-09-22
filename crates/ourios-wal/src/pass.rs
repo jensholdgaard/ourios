@@ -179,23 +179,23 @@ impl From<CheckpointError> for ReclaimError {
 /// removed path uncertain rather than the last one.
 #[must_use]
 pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
+    // Debris first, then segments — §3.2's order for a shared cap.
+    // Debris has no identity to check: a `.wal.partial` is a file no
+    // reader ever depended on, so "already gone" simply completes one.
+    let partials = plan
+        .partials
+        .iter()
+        .map(|path| (path, unlink_partial(path)));
+    let segments = plan
+        .segments
+        .iter()
+        .map(|segment| (&segment.path, unlink_segment(segment)));
     let mut removed = Vec::new();
     let mut failed = Vec::new();
-    // Debris has no identity to check — a `.wal.partial` is a file no
-    // reader ever depended on — so the sweep's paths go straight
-    // through. "Already gone" completes one here, which is what makes
-    // a previous pass's uncertain removal verifiable.
-    for path in &plan.partials {
-        match std::fs::remove_file(path) {
+    for (path, outcome) in partials.chain(segments) {
+        match outcome {
             Ok(()) => removed.push(path.clone()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed.push(path.clone()),
             Err(source) => failed.push((path.clone(), source)),
-        }
-    }
-    for segment in &plan.segments {
-        match unlink_segment(segment) {
-            Ok(()) => removed.push(segment.path.clone()),
-            Err(source) => failed.push((segment.path.clone(), source)),
         }
     }
     let fsync_failed = !removed.is_empty() && sync_parent_dir(&plan.root).is_err();
@@ -203,6 +203,16 @@ pub fn unlink_planned(plan: &ReclaimPlan) -> ReclaimOutcome {
         removed,
         failed,
         fsync_failed,
+    }
+}
+
+/// Remove one stale `<uuid>.wal.partial`. An unlink that finds it gone
+/// completes a previous pass's removal, which is what makes §3.2's
+/// uncertain deletion verifiable.
+fn unlink_partial(path: &std::path::Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 

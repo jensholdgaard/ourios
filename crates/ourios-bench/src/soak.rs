@@ -336,7 +336,9 @@ fn validate(config: &SoakConfig) -> Result<(), SoakError> {
 
 /// The soak's WAL knobs. `macos_full_fsync: false` matches the
 /// write-path bench, and `max_unlinks_per_pass` is RFC 0052 §3.8's
-/// default — the soak measures the cadence, not a tuned cap.
+/// default rather than a tuned value: nothing here drives a
+/// housekeeping pass yet, so the knob is set for the day the soak
+/// does and the run must not be read as exercising the cadence.
 fn wal_config(root: std::path::PathBuf) -> WalConfig {
     WalConfig {
         root,

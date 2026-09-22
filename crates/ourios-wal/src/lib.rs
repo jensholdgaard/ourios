@@ -478,6 +478,13 @@ impl Wal {
         // already-published record on the data side.
         let sidecar = checkpoint::read(&config.root)?;
         let existing_segments = list_segments(&config.root)?;
+        // A root with nothing on it has nothing the ledger fails to
+        // describe, so its ledger is authoritative from here; one with
+        // segments stays unpoppable until `rebuild_ledger` walks them.
+        let mut ledger = retain::SegmentLedger::default();
+        if existing_segments.is_empty() {
+            ledger.describe_root();
+        }
         let witness = reconcile::root(&config, sidecar, &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             append_target(&config.root, existing_segments)?;
@@ -499,7 +506,7 @@ impl Wal {
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
             stale_partials: Vec::new(),
-            ledger: retain::SegmentLedger::default(),
+            ledger,
             outstanding: None,
             passes: 0,
             unreclaimed_bytes: 0,

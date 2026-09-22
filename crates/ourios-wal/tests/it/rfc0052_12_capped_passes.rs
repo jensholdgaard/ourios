@@ -602,11 +602,14 @@ fn rfc0052_12_a_failed_unlink_is_reported_and_stays_queued() {
     );
 }
 
-/// A pass before `rebuild_ledger` reclaims **nothing**. Eligibility
-/// comes from the ledger and nowhere else (§3.7 withdrew the directory
-/// listing and the header read), so an empty one has no candidate to
-/// pop — the pass cannot mistake "no tenant spans yet" for "no tenant
-/// holds these", because it never sees the segments either.
+/// A pass before `rebuild_ledger` reclaims **nothing**, and appending
+/// first does not change that. `Wal::open` adopts an existing segment
+/// as its append target without reading it, so until the rebuild walks
+/// the root the ledger describes only what was appended since — a
+/// segment whose earlier tenants are missing from it looks unheld, and
+/// a pass would take it over their frames. §3.7 forbids seeding at
+/// open (a byte count there would include a torn tail recovery has not
+/// healed), so the ledger carries whether it has been walked instead.
 #[test]
 fn rfc0052_12_a_pass_before_the_ledger_is_rebuilt_reclaims_nothing() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -621,16 +624,36 @@ fn rfc0052_12_a_pass_before_the_ledger_is_rebuilt_reclaims_nothing() {
     // every closed segment, and the tenant's horizon covers them too.
     let before = segment_files(root);
     let mut wal = open(root);
+    // Appended to, so the ledger is not merely empty — it holds the
+    // adopted segment, described by this frame alone.
+    let appended = wal
+        .append(FrameKind::TenantOtlpBatch, &frame("beta", b"b1"))
+        .expect("append");
+    wal.sync().expect("sync");
+    wal.checkpoint(appended)
+        .expect("checkpoint past everything");
     let progress = wal
-        .housekeeping_pass(&known(&[("alpha", covered)]), CAP)
+        .housekeeping_pass(&known(&[("alpha", covered), ("beta", appended)]), CAP)
         .expect("housekeeping");
 
     assert_eq!(
         (progress.removed_segments, progress.unlink_remaining),
         (0, 0),
-        "an empty ledger offers the pass no candidate at all",
+        "a ledger that has not walked the root offers no candidate",
     );
     assert_eq!(segment_files(root), before, "so every segment survives");
+
+    // And it resumes the moment the root has been walked. How much it
+    // takes on this tick is the shared cap's business, which the legs
+    // above own; what this one holds is that it takes anything at all.
+    wal.rebuild_ledger().expect("ledger");
+    let resumed = wal
+        .housekeeping_pass(&known(&[("alpha", covered), ("beta", appended)]), CAP)
+        .expect("housekeeping");
+    assert!(
+        resumed.removed_segments > 0 && resumed.capped,
+        "the gate is the walk, not the pass: {resumed:?}",
+    );
 }
 
 /// `count` closed segments for one tenant plus a current one. The

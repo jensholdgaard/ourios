@@ -55,9 +55,9 @@ impl Wal {
     /// the tenants that are behind are each one sweep of the tenant
     /// set, which `max_tenants` bounds. RFC0052.12's guarantee is
     /// about the backlog — the incident's 1,113 segments — and that is
-    /// what the cap holds. The one exception is the lag figures'
-    /// range, which costs the segments it reports and is empty
-    /// whenever the floor is keeping up.
+    /// what the cap holds. There is **no exception**: the backlog
+    /// figures and the lag figures are all aggregates the ledger moves
+    /// on mutation, so reading them costs nothing here.
     ///
     /// The returned [`ReclaimPlan`] is owned, so the file half needs
     /// neither the guard nor a WAL handle; feed its outcome back

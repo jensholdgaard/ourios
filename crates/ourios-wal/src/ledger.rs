@@ -100,6 +100,9 @@ pub(crate) fn rebuild(root: &Path) -> Result<Ledger, LedgerError> {
             Err(e) => return Err(scan.into_error(&e)),
         }
     }
+    // The walk has now seen every segment on the root, which is what
+    // lets a pass pop from this ledger at all.
+    scan.segments.describe_root();
     Ok(Ledger {
         segments: scan.segments,
         partials: list_partials(root)?,

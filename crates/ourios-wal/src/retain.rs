@@ -243,6 +243,19 @@ pub(crate) struct SegmentLedger {
     /// costs nothing under the writer position.
     held_bytes: u64,
     held_segments: usize,
+    /// Whether this ledger describes **everything on the root**, and
+    /// so may be popped from at all.
+    ///
+    /// `Wal::open` adopts an existing segment as its append target
+    /// without reading it, and §3.7 forbids seeding here — a byte
+    /// count taken at open would include a torn tail recovery has not
+    /// healed yet. So until [`crate::Wal::rebuild_ledger`] has walked
+    /// the root, a segment that was already on disk is in the ledger
+    /// only through the frames appended *since* open: its earlier
+    /// tenants are missing from `members`, nothing holds it back, and
+    /// a pass would reclaim it over their frames. A root that had no
+    /// segments at open has nothing undescribed and starts true.
+    describes_root: bool,
     /// Whether the last pass received horizons at all. `NoConsumer`
     /// applies none and can apply none, so the membership the ledger
     /// still tracks is not a backlog any pass will work off.
@@ -292,6 +305,12 @@ pub(crate) struct Popped {
 }
 
 impl SegmentLedger {
+    /// This ledger describes the whole root: either the rebuild walked
+    /// it, or `Wal::open` found no segment on it to describe.
+    pub(crate) fn describe_root(&mut self) {
+        self.describes_root = true;
+    }
+
     /// Record a frame, whether from the recovery walk or a live
     /// append.
     pub(crate) fn observe(&mut self, at: FrameAt<'_>) {
@@ -708,6 +727,9 @@ impl SegmentLedger {
     /// (inclusive), the segment that may never be popped, and whether
     /// tenants constrain the candidates at all.
     pub(crate) fn pop(&mut self, bound: PopBound, budget: usize) -> (Vec<Popped>, bool) {
+        if !self.describes_root {
+            return (Vec::new(), false);
+        }
         let mut out = Vec::new();
         let replan = Drain {
             bound,
@@ -764,7 +786,9 @@ impl SegmentLedger {
     /// bound this pass" from "the backlog drained": truncating at
     /// exactly the budget would make every full pass report `capped`
     /// as false and the caller read a backlog that is still there as
-    /// finished.
+    /// finished. The append target is dropped **before** that extra is
+    /// taken, since [`Self::take`] would refuse it anyway and letting
+    /// it be the lookahead reports work no pass can ever do.
     fn candidates(&self, drain: Drain) -> Vec<Uuid> {
         let take = drain.budget.saturating_add(1);
         let covered = |id: &Uuid| {
@@ -778,6 +802,7 @@ impl SegmentLedger {
                 .unpinned
                 .iter()
                 .take_while(|id| covered(id))
+                .filter(|id| **id != drain.bound.current)
                 .take(take)
                 .copied()
                 .collect(),
@@ -785,7 +810,7 @@ impl SegmentLedger {
                 .segments
                 .keys()
                 .take_while(|id| covered(id))
-                .filter(|id| !self.reclaiming.contains(id))
+                .filter(|id| **id != drain.bound.current && !self.reclaiming.contains(id))
                 .take(take)
                 .copied()
                 .collect(),
@@ -1097,10 +1122,61 @@ mod tests {
         ledger.tenants[&TenantId::new(tenant)].behind
     }
 
+    /// A ledger nothing has walked the root for pops **nothing**,
+    /// however eligible its own contents look. `Wal::open` adopts an
+    /// existing segment as its append target without reading it, so
+    /// until `rebuild_ledger` runs, a segment already on disk is in
+    /// the ledger only through the frames appended since — its earlier
+    /// tenants missing from `members`, nothing holding it back, and a
+    /// pass would reclaim it over their frames.
+    #[test]
+    fn a_ledger_that_has_not_walked_the_root_pops_nothing() {
+        let caught_up = |ledger: &mut SegmentLedger, offsets: &[WalOffset]| {
+            ledger.apply(&horizons(&[(ALPHA, offsets[6]), (BETA, offsets[7])]), 8);
+        };
+        let (mut walked, offsets, current) = seeded();
+        let bound = PopBound {
+            checkpoint: offsets[5],
+            current,
+            tenant_aware: true,
+        };
+        caught_up(&mut walked, &offsets);
+        assert!(
+            !walked.pop(bound, 8).0.is_empty(),
+            "the fixture is poppable once the root has been walked",
+        );
+
+        let (mut unwalked, offsets, current) = seeded_raw();
+        caught_up(&mut unwalked, &offsets);
+        assert!(
+            unwalked
+                .pop(
+                    PopBound {
+                        checkpoint: offsets[5],
+                        current,
+                        tenant_aware: true,
+                    },
+                    8,
+                )
+                .0
+                .is_empty(),
+            "and the identical ledger pops nothing until it has been",
+        );
+    }
+
     /// Four segments, two tenants in each, and the offsets in the
     /// order they were appended. The newest segment is the current
     /// one, as it is after any open.
     fn seeded() -> (SegmentLedger, Vec<WalOffset>, uuid::Uuid) {
+        // As the rebuild leaves it: it has walked the whole root.
+        let (mut ledger, offsets, current) = seeded_raw();
+        ledger.describe_root();
+        (ledger, offsets, current)
+    }
+
+    /// The same fixture as `Wal::open` leaves it on a root that has
+    /// segments: populated by appends, but never walked.
+    fn seeded_raw() -> (SegmentLedger, Vec<WalOffset>, uuid::Uuid) {
         let mut ledger = SegmentLedger::default();
         let segments: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::now_v7()).collect();
         let mut offsets = Vec::new();

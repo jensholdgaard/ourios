@@ -32,6 +32,7 @@ use ourios_parquet::{
 };
 use uuid::Uuid;
 
+use crate::cadence::{BarrierEpochs, Epoch};
 use crate::metrics::SinkMetrics;
 
 /// Flush-policy knobs (RFC 0014 §3; RFC 0004 config at the call site).
@@ -86,6 +87,89 @@ struct PartitionBuffer {
     records: Vec<MinedRecord>,
     est_bytes: usize,
     oldest: Instant,
+    /// RFC 0052 §3.1's `ready` mark: set when a partition that had
+    /// already left the buffers is **parked** back into them — a full
+    /// publisher queue, the publisher's unwind drain, or a send that
+    /// found the channel closed.
+    ///
+    /// It keeps the partition's `audit_watermark`, because parking must
+    /// not strip the dependency that makes the records publishable, and
+    /// it excludes the partition from the size trigger: it is already
+    /// past it, so re-firing would publish it inline instead of letting
+    /// the publisher or the next drain take it oldest-first.
+    ready: Option<u64>,
+}
+
+impl PartitionBuffer {
+    fn empty() -> Self {
+        Self {
+            records: Vec::new(),
+            est_bytes: 0,
+            oldest: Instant::now(),
+            ready: None,
+        }
+    }
+}
+
+/// Partitions taken out of the buffers by one drain, with the audit
+/// position their publish depends on (RFC 0052 §3.1).
+///
+/// The watermark is the **maximum** over the partitions taken: a
+/// `ready` partition carries its own from the park, and an ordinary one
+/// contributes the sink's position at drain time, which is at or above
+/// every event its records produced. Accessors rather than public
+/// fields — a caller that could rebuild this value could publish
+/// records ahead of their template events.
+#[derive(Debug, Default)]
+pub struct TakenPartitions {
+    partitions: Vec<(PartitionKey, Vec<MinedRecord>)>,
+    audit_watermark: u64,
+}
+
+impl TakenPartitions {
+    /// Whether the drain took nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.partitions.is_empty()
+    }
+
+    /// The audit position that must be durable before these records are
+    /// written.
+    #[must_use]
+    pub fn audit_watermark(&self) -> u64 {
+        self.audit_watermark
+    }
+
+    /// The partitions, borrowed.
+    #[must_use]
+    pub fn partitions(&self) -> &[(PartitionKey, Vec<MinedRecord>)] {
+        &self.partitions
+    }
+
+    /// The partitions, owned — the publish path's consuming form.
+    #[must_use]
+    pub fn into_partitions(self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        self.partitions
+    }
+
+    /// Total estimated bytes, for the barrier's coalescing bound
+    /// (§3.1's `ceiling_bytes`).
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.partitions
+            .iter()
+            .flat_map(|(_, records)| records.iter())
+            .map(estimate_bytes)
+            .sum()
+    }
+
+    /// Fold `other`'s partitions into this drain, keeping the higher
+    /// watermark — the barrier's coalescing step (§3.1). The two drains
+    /// are disjoint by construction, each having emptied the buffers.
+    pub fn absorb(&mut self, other: Self) {
+        self.partitions.extend(other.partitions);
+        self.audit_watermark = self.audit_watermark.max(other.audit_watermark);
+    }
 }
 
 /// The buffering Parquet record sink — the production replacement for
@@ -479,7 +563,7 @@ impl ParquetRecordSink {
     /// The [`crate::publish::PublishCoordinator`] calls this under the pipeline's
     /// miner lock so the drain is atomic w.r.t. `miner.ingest` (issue #302 #1),
     /// then publishes the batches off-lock via `publish_partition`.
-    pub fn drain_aged(&mut self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+    pub fn drain_aged(&mut self) -> TakenPartitions {
         let max = self.config.max_buffer_age;
         let keys: Vec<PartitionKey> = self
             .buffers
@@ -492,29 +576,53 @@ impl ParquetRecordSink {
 
     /// Take **every** buffered partition as owned batches (the rotation /
     /// shutdown drain) — a cheap memory move, no I/O.
-    pub fn drain_all(&mut self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+    pub fn drain_all(&mut self) -> TakenPartitions {
         let keys: Vec<PartitionKey> = self.buffers.keys().cloned().collect();
         self.take_partitions(keys)
     }
 
     /// Remove `keys` from the buffer map, returning their non-empty record
     /// batches and decrementing the byte accounting + occupancy gauge.
-    fn take_partitions(
-        &mut self,
-        keys: Vec<PartitionKey>,
-    ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
-        let mut out = Vec::new();
+    ///
+    /// A `ready` partition (RFC 0052 §3.1, parked back into the buffers)
+    /// contributes its stored `audit_watermark` to the drain's, so the
+    /// dependency parking preserved travels with the records.
+    fn take_partitions(&mut self, keys: Vec<PartitionKey>) -> TakenPartitions {
+        let mut out = TakenPartitions::default();
         for key in keys {
             if let Some(buf) = self.buffers.remove(&key) {
                 self.total_bytes = self.total_bytes.saturating_sub(buf.est_bytes);
                 self.metrics
                     .add_buffered(-i64::try_from(buf.est_bytes).unwrap_or(i64::MAX));
+                out.audit_watermark = out.audit_watermark.max(buf.ready.unwrap_or(0));
                 if !buf.records.is_empty() {
-                    out.push((key, buf.records));
+                    out.partitions.push((key, buf.records));
                 }
             }
         }
         out
+    }
+
+    /// RFC 0052 §3.1's **park**: put partitions that had already left
+    /// the buffers back into them as `ready`, keeping the
+    /// `audit_watermark` their publish depends on.
+    ///
+    /// Three sites take it — a full publisher queue, the publisher's
+    /// unwind drain, and a send that found the channel closed — and all
+    /// three must be a settlement with a date on it, which the caller
+    /// records on the in-flight accounting.
+    pub fn park_ready(
+        &mut self,
+        batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        audit_watermark: u64,
+    ) {
+        let keys: Vec<PartitionKey> = batches.iter().map(|(key, _)| key.clone()).collect();
+        self.requeue(batches);
+        for key in keys {
+            if let Some(buf) = self.buffers.get_mut(&key) {
+                buf.ready = Some(buf.ready.unwrap_or(0).max(audit_watermark));
+            }
+        }
     }
 
     /// Re-buffer `batches` whose off-lock publish failed (transient): the WAL is
@@ -531,11 +639,10 @@ impl ParquetRecordSink {
             .unwrap_or_else(Instant::now);
         for (key, records) in batches {
             let est: usize = records.iter().map(estimate_bytes).sum();
-            let buf = self.buffers.entry(key).or_insert_with(|| PartitionBuffer {
-                records: Vec::new(),
-                est_bytes: 0,
-                oldest: Instant::now(),
-            });
+            let buf = self
+                .buffers
+                .entry(key)
+                .or_insert_with(PartitionBuffer::empty);
             let mut combined = records;
             combined.append(&mut buf.records);
             buf.records = combined;
@@ -583,17 +690,14 @@ impl ParquetRecordSink {
         key: PartitionKey,
         est: usize,
         record: MinedRecord,
-    ) -> (
-        Vec<(PartitionKey, Vec<MinedRecord>)>,
-        Vec<(PartitionKey, Vec<MinedRecord>)>,
-    ) {
+    ) -> (TakenPartitions, TakenPartitions) {
         // Ceiling (RFC0014.4), off-lock form: take the largest partition
         // out for the caller to publish instead of flushing inline. The
         // byte accounting drops at take time, so the loop terminates once
         // the buffers are drained even if the off-lock publish later
         // fails (a failure requeues and the ceiling is transiently
         // exceeded — same posture as `emit`).
-        let mut ceiling_taken = Vec::new();
+        let mut ceiling_taken = TakenPartitions::default();
         while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes {
             if !self.inline_publish_allowed() {
                 break;
@@ -607,20 +711,19 @@ impl ParquetRecordSink {
             else {
                 break;
             };
-            ceiling_taken.extend(self.take_partitions(vec![largest]));
+            ceiling_taken.absorb(self.take_partitions(vec![largest]));
         }
 
         let buf = self
             .buffers
             .entry(key.clone())
-            .or_insert_with(|| PartitionBuffer {
-                records: Vec::new(),
-                est_bytes: 0,
-                oldest: Instant::now(),
-            });
+            .or_insert_with(PartitionBuffer::empty);
         buf.records.push(record);
         buf.est_bytes = buf.est_bytes.saturating_add(est);
-        let over_target = buf.est_bytes >= self.config.target_bytes;
+        // RFC 0052 §3.1: a parked `ready` partition is already past the
+        // size trigger, so re-firing it would publish inline instead of
+        // letting the publisher or the next drain take it oldest-first.
+        let over_target = buf.ready.is_none() && buf.est_bytes >= self.config.target_bytes;
         self.total_bytes = self.total_bytes.saturating_add(est);
         self.metrics
             .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
@@ -628,7 +731,7 @@ impl ParquetRecordSink {
         // Size trigger (RFC0014.1), audit-ordered exactly like `emit`
         // (issue #302 fix #2): the partition is taken only after the
         // barrier confirms the audit sink is durable.
-        let mut size_taken = Vec::new();
+        let mut size_taken = TakenPartitions::default();
         if over_target && self.inline_publish_allowed() {
             size_taken = self.take_partitions(vec![key]);
         }
@@ -667,21 +770,71 @@ fn publish_partition(
 struct InFlightPublishes {
     count: Mutex<usize>,
     settled: Condvar,
+    /// RFC 0052 §3.1's dated settlements: the highest `barrier_epoch`
+    /// observed when records re-entered the buffers — a requeue after a
+    /// transient failure, or one of the three park sites.
+    ///
+    /// A cut captured *before* that epoch could not have drained those
+    /// records, so it is refused; one captured after drained them itself
+    /// and stamps normally. Monotone, so one transient failure cannot
+    /// refuse every later cut.
+    resettled_at: Mutex<Option<Epoch>>,
+    /// The cadence state every guard reports into.
+    epochs: Arc<BarrierEpochs>,
+}
+
+/// The outcome of [`SharedParquetSink::quiesce_publishes`]: every
+/// registered publish has settled, and this says whether any of them
+/// settled in a way that refuses a given cut.
+///
+/// A value rather than a bare wait, because §3.1 needs both halves —
+/// the recheck defends the ordering, the outcome defends the data, and
+/// either alone refuses the stamp.
+#[derive(Clone, Copy, Debug)]
+pub struct PublishOutcomes {
+    resettled_at: Option<Epoch>,
+}
+
+impl PublishOutcomes {
+    /// Whether a cut of `epoch` may stamp: false when a publish
+    /// registered before its capture put records back into the buffers
+    /// at a later epoch.
+    #[must_use]
+    pub fn all_ok(self, epoch: Epoch) -> bool {
+        self.resettled_at.is_none_or(|at| at <= epoch)
+    }
 }
 
 /// Settles one in-flight publish on drop — including during unwinding, so a
 /// panic mid-publish cannot strand [`SharedParquetSink::quiesce_publishes`],
 /// which waits under the pipeline's miner lock at rotation, where a wedge
 /// would halt all ingest (the same posture as the encode pool's
-/// `BatchGuard`). No publish path panics today (store and encode failures
-/// are `Result`s that requeue); the guard is the defence if one ever does.
+/// `BatchGuard`).
+///
+/// RFC 0052 §3.1: the guard carries the epoch it was **registered**
+/// under, and an unwinding drop *reports* that epoch to the cadence
+/// latch **before** the decrement that wakes a waiting barrier — so
+/// there is no schedule in which the count settles and the latch is
+/// still clear.
 #[derive(Debug)]
-pub(crate) struct PublishGuard {
+pub struct PublishGuard {
     in_flight: Arc<InFlightPublishes>,
+    epoch: Epoch,
+}
+
+impl PublishGuard {
+    /// The epoch this publish was registered under.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
 }
 
 impl Drop for PublishGuard {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.in_flight.epochs.report(self.epoch);
+        }
         let mut count = self
             .in_flight
             .count
@@ -726,33 +879,69 @@ pub struct SharedParquetSink {
 
 impl SharedParquetSink {
     /// Wrap `sink` in a shared, cloneable handle.
+    ///
+    /// The handle owns the process's [`BarrierEpochs`]: it is the one
+    /// object every party to a cut already holds — the encode pool, the
+    /// publish coordinator, the barrier task — so making it the root
+    /// removes any way for two of them to end up on different latches.
     #[must_use]
     pub fn new(sink: ParquetRecordSink) -> Self {
+        Self::with_cadence(sink, Arc::new(BarrierEpochs::new()))
+    }
+
+    /// [`Self::new`] over an existing cadence state — for a test that
+    /// drives the latch directly.
+    #[must_use]
+    pub fn with_cadence(sink: ParquetRecordSink, epochs: Arc<BarrierEpochs>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(sink)),
             in_flight: Arc::new(InFlightPublishes {
                 count: Mutex::new(0),
                 settled: Condvar::new(),
+                resettled_at: Mutex::new(None),
+                epochs,
             }),
         }
+    }
+
+    /// The cadence state this sink's guards report into.
+    #[must_use]
+    pub fn epochs(&self) -> Arc<BarrierEpochs> {
+        Arc::clone(&self.in_flight.epochs)
     }
 
     /// Register one off-lock publish of records about to be drained out of
     /// this sink's buffers (issue #578): the returned guard marks them in
     /// flight until it drops. **Acquire before the drain, under the
-    /// pipeline's miner lock** — the same lock every `wal_high_water`
-    /// stamping path holds — so there is no instant at which drained records
-    /// exist outside both the buffers and the in-flight count.
+    /// barrier exclusion** — the same exclusion every cut capture takes —
+    /// so there is no instant at which drained records exist outside both
+    /// the buffers and the in-flight count, and the epoch the guard reads
+    /// is ordered against the capture (RFC 0052 §3.1).
     #[must_use]
-    pub(crate) fn begin_publish(&self) -> PublishGuard {
+    pub fn begin_publish(&self) -> PublishGuard {
         *self
             .in_flight
             .count
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += 1;
         PublishGuard {
+            epoch: self.in_flight.epochs.current(),
             in_flight: Arc::clone(&self.in_flight),
         }
+    }
+
+    /// Record that records re-entered the buffers now — a requeue or one
+    /// of §3.1's three park sites. Dated with the current
+    /// `barrier_epoch`, so a cut captured before it is refused and one
+    /// captured after it (which drained them) is not.
+    pub fn note_resettled(&self) {
+        let at = self.in_flight.epochs.current();
+        let mut resettled = self
+            .in_flight
+            .resettled_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *resettled = Some(resettled.map_or(at, |previous| previous.max(at)));
     }
 
     /// Block until no drained-but-unsettled off-lock publish is in flight —
@@ -771,8 +960,15 @@ impl SharedParquetSink {
     /// returns, every such snapshot is either durable in the store or
     /// requeued into the buffers (where the caller's flush covers it), and
     /// the caller's miner exclusivity keeps the count at zero until the
-    /// stamp: every drain acquires its guard under the miner lock.
-    pub fn quiesce_publishes(&self) {
+    /// stamp: every drain acquires its guard under the barrier exclusion.
+    ///
+    /// RFC 0052 §3.1 makes it **report** rather than merely wait: the
+    /// returned [`PublishOutcomes`] says whether any settled publish put
+    /// records back into the buffers at an epoch above a given cut's, in
+    /// which case that cut must not stamp even though its own flush
+    /// succeeded.
+    #[must_use]
+    pub fn quiesce_publishes(&self) -> PublishOutcomes {
         let mut count = self
             .in_flight
             .count
@@ -784,6 +980,14 @@ impl SharedParquetSink {
                 .settled
                 .wait(count)
                 .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(count);
+        PublishOutcomes {
+            resettled_at: *self
+                .in_flight
+                .resettled_at
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
         }
     }
 
@@ -837,21 +1041,40 @@ impl SharedParquetSink {
     /// miner lock so the drain is atomic w.r.t. `miner.ingest`, then publishes
     /// off-lock via [`Self::publish_owned`].
     #[must_use]
-    pub fn drain_aged(&self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+    pub fn drain_aged(&self) -> TakenPartitions {
         self.lock().drain_aged()
     }
 
     /// Atomically take **every** buffered partition as owned batches.
     #[must_use]
-    pub fn drain_all(&self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+    pub fn drain_all(&self) -> TakenPartitions {
         self.lock().drain_all()
     }
 
     /// Re-buffer owned `batches` (a transient publish failure, or the
     /// coordinator holding records because the audit write failed). The WAL is
     /// the durability of record, so retain + retry on the next cadence.
+    ///
+    /// The re-entry is dated with the current `barrier_epoch` (RFC 0052
+    /// §3.1), so a cut captured before it — one whose drain could not
+    /// have seen these records — is refused.
     pub fn requeue(&self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>) {
+        if batches.is_empty() {
+            return;
+        }
         self.lock().requeue(batches);
+        self.note_resettled();
+    }
+
+    /// RFC 0052 §3.1's **park**: re-buffer `batches` as `ready`, keeping
+    /// the `audit_watermark` their publish depends on, and date the
+    /// re-entry like any other settlement.
+    pub fn park_ready(&self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>, audit_watermark: u64) {
+        if batches.is_empty() {
+            return;
+        }
+        self.lock().park_ready(batches, audit_watermark);
+        self.note_resettled();
     }
 
     /// Publish owned `batches` to the data store **off the lock** (the encode +
@@ -920,20 +1143,36 @@ impl SharedParquetSink {
     /// quarantines poison records, and requeues on transient failure) —
     /// so one worker's Parquet encode never blocks the others' appends.
     pub fn emit_concurrent(&self, record: MinedRecord) {
+        for (trigger, taken) in self.detach_concurrent(record) {
+            if !taken.is_empty() {
+                let _ = self.publish_owned(taken.into_partitions(), trigger);
+            }
+        }
+    }
+
+    /// [`Self::emit_concurrent`]'s under-lock half alone: append the
+    /// record and return whatever the ceiling and size triggers took,
+    /// **unpublished**.
+    ///
+    /// RFC 0052 §3.1 moves the store I/O off the encode worker, so the
+    /// worker hands these to the publisher instead of writing them
+    /// itself. The returned partitions are out of the buffers and out of
+    /// the byte accounting, so the caller owes them a settlement — a
+    /// durable write, a requeue, or a park.
+    #[must_use]
+    pub fn detach_concurrent(&self, record: MinedRecord) -> [(&'static str, TakenPartitions); 2] {
         let Ok(key) = PartitionKey::derive(&record) else {
             let mut sink = self.lock();
             sink.derive_errors += 1;
             sink.metrics.record_derive_error();
-            return;
+            return [
+                ("ceiling", TakenPartitions::default()),
+                ("size", TakenPartitions::default()),
+            ];
         };
         let est = estimate_bytes(&record);
         let (ceiling_taken, size_taken) = self.lock().append_off_lock(key, est, record);
-        if !ceiling_taken.is_empty() {
-            let _ = self.publish_owned(ceiling_taken, "ceiling");
-        }
-        if !size_taken.is_empty() {
-            let _ = self.publish_owned(size_taken, "size");
-        }
+        [("ceiling", ceiling_taken), ("size", size_taken)]
     }
 }
 
@@ -975,17 +1214,16 @@ impl RecordSink for ParquetRecordSink {
         let buf = self
             .buffers
             .entry(key.clone())
-            .or_insert_with(|| PartitionBuffer {
-                records: Vec::new(),
-                est_bytes: 0,
-                oldest: Instant::now(),
-            });
+            .or_insert_with(PartitionBuffer::empty);
         buf.records.push(record);
         // Saturating (matching `saturating_sub` on flush) so the byte counters
         // stay monotonic and the triggers can't be corrupted by wraparound
         // under prolonged retention (e.g. a store outage).
         buf.est_bytes = buf.est_bytes.saturating_add(est);
-        let over_target = buf.est_bytes >= self.config.target_bytes;
+        // RFC 0052 §3.1: a parked `ready` partition is already past the
+        // size trigger, so re-firing it would publish inline instead of
+        // letting the publisher or the next drain take it oldest-first.
+        let over_target = buf.ready.is_none() && buf.est_bytes >= self.config.target_bytes;
         self.total_bytes = self.total_bytes.saturating_add(est);
         self.metrics
             .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
@@ -1085,7 +1323,7 @@ mod tests {
         // Drain a batch to stand in for an aged drain whose publish then fails.
         sink.emit(rec("checkout"));
         let batch = sink.drain_all();
-        assert_eq!(batch.len(), 1, "one partition drained");
+        assert_eq!(batch.partitions().len(), 1, "one partition drained");
 
         // A newer record arrives for the same partition during the off-lock
         // publish; on its own it is not aged.
@@ -1095,16 +1333,16 @@ mod tests {
             "the fresh record alone is not aged",
         );
 
-        sink.requeue(batch);
+        sink.requeue(batch.into_partitions());
 
         let retry = sink.drain_aged();
         assert_eq!(
-            retry.len(),
+            retry.partitions().len(),
             1,
             "the requeued partition is aged again and re-drains on the next sweep",
         );
         assert_eq!(
-            retry[0].1.len(),
+            retry.partitions()[0].1.len(),
             2,
             "both the requeued record and the newer one drain together",
         );

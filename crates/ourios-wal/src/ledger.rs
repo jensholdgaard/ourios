@@ -244,6 +244,7 @@ fn is_partial(path: &Path) -> bool {
 ///
 /// Housekeeping holds the single-writer position, so no rotation
 /// attempt is in progress and every partial it sees is debris.
+#[cfg(feature = "legacy-housekeeping")]
 pub(crate) fn sweep_partials(
     partials: &mut Vec<PathBuf>,
     root: &Path,
@@ -275,6 +276,7 @@ pub(crate) fn sweep_partials(
 
 /// What one partial's removal did. Only [`Swept::Removed`] lets the
 /// path leave the list.
+#[cfg(feature = "legacy-housekeeping")]
 enum Swept {
     Removed,
     /// The unlink failed. Retried next pass, and visible through
@@ -285,6 +287,7 @@ enum Swept {
     Uncertain(std::io::Error),
 }
 
+#[cfg(feature = "legacy-housekeeping")]
 fn remove_partial(path: &Path, root: &Path) -> Swept {
     match std::fs::remove_file(path) {
         Ok(()) => durable_removal(root),
@@ -301,6 +304,7 @@ fn remove_partial(path: &Path, root: &Path) -> Swept {
 
 /// An unlink counts only once the directory entry that carried it is
 /// durable.
+#[cfg(feature = "legacy-housekeeping")]
 fn durable_removal(root: &Path) -> Swept {
     match sync_parent_dir(root) {
         Ok(()) => Swept::Removed,
@@ -312,7 +316,9 @@ fn durable_removal(root: &Path) -> Swept {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{is_partial, sweep_partials};
+    use super::is_partial;
+    #[cfg(feature = "legacy-housekeeping")]
+    use super::sweep_partials;
 
     /// RFC 0052 §3.8's proposed default cap.
     const CAP: usize = 128;
@@ -323,6 +329,7 @@ mod tests {
     /// candidates it never reached were never even attempted: all of
     /// them stay queued, or they become invisible to every later pass.
     #[test]
+    #[cfg(feature = "legacy-housekeeping")]
     fn a_failed_parent_fsync_leaves_the_whole_batch_queued() {
         let tmp = tempfile::TempDir::new().expect("temp");
         // Fixed names, ordered as the seeded list is: the assertion is

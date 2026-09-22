@@ -261,6 +261,30 @@ impl Drop for IngestGateGuard<'_> {
 pub struct IngestPipeline {
     coordinator: Arc<CommitCoordinator>,
     miner: Mutex<MinerCluster>,
+    /// RFC 0052 §3.1's **barrier exclusion**. Held shared across the
+    /// span that matters — the miner work, `pool.submit`, and the
+    /// `last_durable` update — by every ingest turn and by the age
+    /// sweep's drain; taken exclusively by a cut capture, and for
+    /// nothing else.
+    ///
+    /// Strictly wider than the miner lock and strictly narrower than the
+    /// ingest gate, so it does not change ingest ordering. The miner
+    /// lock alone is not enough: `ingest_bound` releases it *before*
+    /// `pool.submit` and before advancing `last_durable`, so a timer
+    /// holding only that lock could quiesce the pool and then have an
+    /// already-past-the-lock ingest submit an encode and advance the
+    /// mark underneath it.
+    ///
+    /// **Acquisition order is fixed**: exclusion, then miner lock, then
+    /// the `last_durable` mutex. Taking the miner lock first and then
+    /// waiting for the exclusion would deadlock against a capture
+    /// holding the exclusion and waiting for the miner.
+    ingest_bound: std::sync::RwLock<()>,
+    /// The cadence state (§3.1). Adopted from the encode pool's sink
+    /// when one is installed, so every party to a cut — the pool's batch
+    /// guards, the sink's publish guards, the barrier task — reports
+    /// into one latch.
+    epochs: Arc<crate::cadence::BarrierEpochs>,
     /// The durable high-water mark after the most recent acked batch (or
     /// the startup seed). Behind a mutex: concurrent acks update it, and
     /// the rotation-detection read-then-write must see a consistent value.
@@ -303,12 +327,48 @@ impl IngestPipeline {
         Self {
             coordinator,
             miner: Mutex::new(miner),
+            ingest_bound: std::sync::RwLock::new(()),
+            epochs: Arc::new(crate::cadence::BarrierEpochs::new()),
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
             encode_pool: None,
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
         }
+    }
+
+    /// The cadence state every guard in this pipeline reports into
+    /// (RFC 0052 §3.1).
+    #[must_use]
+    pub fn epochs(&self) -> Arc<crate::cadence::BarrierEpochs> {
+        Arc::clone(&self.epochs)
+    }
+
+    /// Take the barrier exclusion in **shared** mode, then run `f`.
+    ///
+    /// The age sweep's drain uses this rather than [`Self::with_miner`]:
+    /// taken inside `with_miner` the sweep would hold the miner lock
+    /// while waiting for the shared exclusion, and a capture holding the
+    /// exclusive lock would be waiting for the miner — both stuck. Held
+    /// only across the drain and the in-flight registration, never
+    /// across the off-lock publish (§3.1).
+    pub fn with_bound_miner<R>(&self, f: impl FnOnce(&MinerCluster) -> R) -> R {
+        let _bound = self.share_bound();
+        f(&self.lock_miner())
+    }
+
+    /// Take the barrier exclusion in **exclusive** mode — a cut capture,
+    /// and nothing else.
+    pub(crate) fn exclude_ingest(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.ingest_bound
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn share_bound(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.ingest_bound
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Enable the RFC 0035 §3.1 ordered/concurrent ingest split: the
@@ -319,6 +379,10 @@ impl IngestPipeline {
     /// drains all see one buffer.
     #[must_use]
     pub fn with_encode_pool(mut self, pool: crate::encode_pool::EncodePool) -> Self {
+        // One latch across the pool's batch guards, the sink's publish
+        // guards and this pipeline's cuts (RFC 0052 §3.1): the sink owns
+        // it, the pool adopted it, and the pipeline adopts the pool's.
+        self.epochs = pool.epochs();
         self.encode_pool = Some(pool);
         self
     }
@@ -550,6 +614,12 @@ impl IngestPipeline {
                 source: std::io::Error::other("commit reported no frame offset"),
             })),
             (Ok(_), Some(now)) => {
+                // RFC 0052 §3.1: the barrier exclusion spans the miner
+                // work, the pool submission and the `last_durable`
+                // update — the whole region a cut must not straddle.
+                // Taken **before** the miner lock, and never requested
+                // while holding it.
+                let _bound = self.share_bound();
                 // §6.9 rotation cadence: a segment change since the prior
                 // (now strictly-previous) durable mark means the WAL
                 // rotated under this batch; fire the hook with the

@@ -25,6 +25,7 @@ use std::thread::JoinHandle;
 
 use ourios_core::record::MinedRecord;
 
+use crate::cadence::{BarrierEpochs, Epoch};
 use crate::metrics::EncodePoolMetrics;
 use crate::record_sink::SharedParquetSink;
 
@@ -57,16 +58,40 @@ impl Pending {
 /// `emit_concurrent` panics mid-batch. Without this, a worker panic
 /// would strand `quiesce` forever, which turns one poisoned record into
 /// a wedged rotation barrier (and a hung shutdown).
-struct BatchGuard<'a> {
-    pending: &'a Pending,
-    metrics: &'a EncodePoolMetrics,
+///
+/// RFC 0052 §3.1 makes it do two more things. It is **constructed in
+/// `submit`**, under the barrier exclusion, and travels with the queued
+/// batch: constructed after dequeue it would read `E + 1` for a batch
+/// queued before cut `E`'s capture, and a later panic in it would fail
+/// the wrong cut. And an unwinding drop **reports** its epoch to the
+/// cadence latch *before* the decrement that settles the count — so a
+/// barrier that observes the pool's pending count at zero has already
+/// observed the latch. `emit_concurrent` runs after the frame was
+/// acknowledged, so a worker panic mid-batch leaves the batch's
+/// unemitted remainder in neither the buffers nor Parquet; without the
+/// report, a barrier after it would stamp across that frame.
+struct BatchGuard {
+    pending: Arc<Pending>,
+    metrics: Arc<EncodePoolMetrics>,
+    epochs: Arc<BarrierEpochs>,
+    epoch: Epoch,
 }
 
-impl Drop for BatchGuard<'_> {
+impl Drop for BatchGuard {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.epochs.report(self.epoch);
+        }
         self.pending.decrement();
         self.metrics.batch_completed();
     }
+}
+
+/// One batch on its way to a worker, carrying the guards `submit`
+/// created for it under the exclusion.
+struct QueuedBatch {
+    records: Vec<MinedRecord>,
+    guard: BatchGuard,
 }
 
 /// A bounded pool of OS threads draining mined-record batches into
@@ -77,9 +102,10 @@ impl Drop for BatchGuard<'_> {
 /// and joins the workers.
 pub struct EncodePool {
     /// `Some` until drop; taking it closes the channel so workers exit.
-    tx: Option<SyncSender<Vec<MinedRecord>>>,
+    tx: Option<SyncSender<QueuedBatch>>,
     pending: Arc<Pending>,
     metrics: Arc<EncodePoolMetrics>,
+    epochs: Arc<BarrierEpochs>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -94,7 +120,7 @@ impl EncodePool {
         // multiplication below. 256 is far above any per-node core count
         // this targets while keeping capacity arithmetic trivially safe.
         let workers = workers.clamp(1, MAX_WORKERS);
-        let (tx, rx) = sync_channel::<Vec<MinedRecord>>(workers * QUEUE_BATCHES_PER_WORKER);
+        let (tx, rx) = sync_channel::<QueuedBatch>(workers * QUEUE_BATCHES_PER_WORKER);
         // `mpsc::Receiver` is single-consumer; the mutex turns it into a
         // shared work queue — pickup serializes, the emit work does not.
         let rx = Arc::new(Mutex::new(rx));
@@ -106,8 +132,6 @@ impl EncodePool {
         let handles = (0..workers)
             .map(|_| {
                 let rx = Arc::clone(&rx);
-                let pending = Arc::clone(&pending);
-                let metrics = Arc::clone(&metrics);
                 let sink = sink.clone();
                 std::thread::spawn(move || {
                     loop {
@@ -118,11 +142,12 @@ impl EncodePool {
                         let Ok(batch) = batch else {
                             return; // channel closed: pool dropped
                         };
-                        let _settle = BatchGuard {
-                            pending: &pending,
-                            metrics: &metrics,
-                        };
-                        for record in batch {
+                        // The guard was made in `submit`, under the
+                        // exclusion, with the epoch of the cut whose
+                        // mark could cover this batch (RFC 0052 §3.1);
+                        // the worker only drops what it received.
+                        let _settle = batch.guard;
+                        for record in batch.records {
                             sink.emit_concurrent(record);
                         }
                     }
@@ -133,8 +158,17 @@ impl EncodePool {
             tx: Some(tx),
             pending,
             metrics,
+            epochs: sink.epochs(),
             workers: handles,
         }
+    }
+
+    /// The cadence state this pool's batch guards report into — the
+    /// sink's, so one latch covers the pool, the publish guards and the
+    /// barrier (RFC 0052 §3.1).
+    #[must_use]
+    pub fn epochs(&self) -> Arc<BarrierEpochs> {
+        Arc::clone(&self.epochs)
     }
 
     /// Queue one batch's mined records for concurrent emit. Blocks when
@@ -156,13 +190,26 @@ impl EncodePool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += 1;
         self.metrics.batch_submitted();
-        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(batch).is_ok());
-        if !sent {
-            // Workers already gone (drop in progress): undo the count so
-            // a concurrent quiesce cannot wait forever on a batch nobody
-            // will run.
-            self.pending.decrement();
-            self.metrics.batch_completed();
+        // RFC 0052 §3.1: the guard and its epoch are assigned here, under
+        // the caller's barrier exclusion, and travel with the batch. A
+        // batch queued before cut `E`'s capture and dequeued after it
+        // therefore still carries `E`.
+        let guard = BatchGuard {
+            pending: Arc::clone(&self.pending),
+            metrics: Arc::clone(&self.metrics),
+            epochs: Arc::clone(&self.epochs),
+            epoch: self.epochs.current(),
+        };
+        let queued = QueuedBatch {
+            records: batch,
+            guard,
+        };
+        // Workers already gone (drop in progress): the returned batch's
+        // guard settles the count as it drops here, so a concurrent
+        // quiesce cannot wait forever on a batch nobody will run.
+        match self.tx.as_ref() {
+            Some(tx) => drop(tx.send(queued)),
+            None => drop(queued),
         }
     }
 
@@ -318,11 +365,16 @@ mod tests {
             idle: Condvar::new(),
         });
         let metrics = Arc::new(EncodePoolMetrics::new());
+        let epochs = Arc::new(BarrierEpochs::new());
         let worker_pending = Arc::clone(&pending);
+        let worker_epochs = Arc::clone(&epochs);
+        let epoch = epochs.current();
         let worker = std::thread::spawn(move || {
             let _settle = BatchGuard {
-                pending: &worker_pending,
-                metrics: &metrics,
+                pending: worker_pending,
+                metrics,
+                epochs: worker_epochs,
+                epoch,
             };
             panic!("injected emit panic");
         });
@@ -331,6 +383,11 @@ mod tests {
             *pending.count.lock().unwrap_or_else(PoisonError::into_inner),
             0,
             "the guard settled the batch during unwinding",
+        );
+        assert_eq!(
+            epochs.capture().failed_epoch(),
+            Some(epoch),
+            "and reported its epoch before the decrement (RFC 0052 §3.1)",
         );
     }
 }

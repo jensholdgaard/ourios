@@ -192,6 +192,44 @@ fn rfc0052_13_a_horizon_that_regresses_re_pins_what_it_had_cleared() {
     assert_eq!(lifted.removed_segments, 1);
 }
 
+/// A plan whose commit never ran leaves its segments marked
+/// reclaiming, and §3.7 re-plans those ahead of anything newly
+/// eligible — right while horizons are monotone, which §3.7 states as
+/// a property of the input. A horizon that regresses in that window
+/// would otherwise unlink frames the tenant needs again, so the
+/// rewind withdraws the popped entry too.
+#[test]
+fn rfc0052_13_a_regression_withdraws_a_plan_that_was_never_committed() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let frames = build_tenant_segment(root, &[("alpha", b"a1")]);
+    build_tenant_segment(root, &[("alpha", b"a2")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(frames[0]).expect("checkpoint");
+
+    // A pass pops the segment and then dies before its commit.
+    let abandoned = wal
+        .housekeeping_prepare(&known(&[("alpha", frames[0])]), CAP)
+        .expect("prepare");
+    assert_eq!(abandoned.segments.len(), 1);
+
+    // The snapshot stops restoring before the next pass.
+    let pinned = wal
+        .housekeeping_pass(&known(&[]), CAP)
+        .expect("housekeeping");
+    assert_eq!(
+        pinned.removed_segments, 0,
+        "the popped entry is withdrawn, not re-planned and unlinked",
+    );
+    assert_eq!(segment_files(root).len(), 2);
+    assert_eq!(pinned.floor.pinned_tenants(), 1);
+    assert_eq!(
+        pinned.unlink_remaining, 0,
+        "and nothing is left marked reclaiming: {pinned:?}",
+    );
+}
+
 /// Scenario RFC0052.13 — `RetainFloor::Unknown` before the first pass, then the churn leg.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]

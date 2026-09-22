@@ -423,6 +423,15 @@ impl SegmentLedger {
 
     /// Put one tenant back to its unapplied state: it holds every one
     /// of its segments again and its cursor starts from the oldest.
+    ///
+    /// A segment a pass had already **popped** is withdrawn too. §3.7
+    /// re-plans a reclaiming entry unconditionally, which is right
+    /// while horizons are monotone — §3.7 states that as a property of
+    /// the input — but a plan whose commit never ran, followed by a
+    /// horizon that regressed, would re-plan and unlink frames the
+    /// tenant now needs again. Withdrawing costs nothing either way:
+    /// if the file half had already unlinked it, the next pass's
+    /// unlink finds it gone and completes the reclamation.
     fn rewind(&mut self, tenant: &TenantId) {
         let Some(state) = self.tenants.get_mut(tenant) else {
             return;
@@ -433,6 +442,10 @@ impl SegmentLedger {
         for id in segments {
             if let Some(entry) = self.segments.get_mut(&id) {
                 entry.pending.insert(tenant.clone());
+                if matches!(entry.state, State::Reclaiming { .. }) {
+                    entry.state = State::Eligible;
+                    self.reclaiming -= 1;
+                }
             }
             self.unpinned.remove(&id);
         }

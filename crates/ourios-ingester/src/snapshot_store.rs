@@ -70,21 +70,115 @@ pub fn write(
     root: &Path,
     tenant: &TenantId,
     state: &SnapshotState,
+    mark: Option<ourios_wal::WalOffset>,
 ) -> Result<(), SnapshotStoreError> {
     let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
     let bytes = snapshot(state).map_err(SnapshotStoreError::Encode)?;
     std::fs::create_dir_all(root).map_err(io("create_dir_all(snapshots root)"))?;
     let stem = percent_encode_tenant(tenant.as_str());
-    let tmp = root.join(format!("{stem}.{EXTENSION}.tmp"));
-    let mut file = File::create(&tmp).map_err(io("create(snapshot tmp)"))?;
-    file.write_all(&bytes).map_err(io("write(snapshot tmp)"))?;
-    file.sync_all().map_err(io("fsync(snapshot tmp)"))?;
-    std::fs::rename(&tmp, root.join(format!("{stem}.{EXTENSION}")))
-        .map_err(io("rename(snapshot tmp -> snapshot)"))?;
+    // RFC 0052 §3.1: a **unique** temp name per writer. One fixed
+    // `.snap.tmp` could be truncated or interleaved by a concurrent cut
+    // before either rename, and the two would install each other's
+    // bytes.
+    let tmp = root.join(format!(
+        "{stem}.{}.{EXTENSION}.tmp",
+        mark.map_or(0, |offset| offset.byte)
+    ));
+    let written = write_and_install(&tmp, root, &stem, &bytes);
+    if written.is_err() {
+        // The writer unlinks its own temp on any write, fsync or rename
+        // failure, so a failing barrier cannot leak one file per attempt.
+        drop(std::fs::remove_file(&tmp));
+    }
+    written?;
     File::open(root)
         .and_then(|dir| dir.sync_all())
         .map_err(io("fsync(snapshots root)"))?;
     Ok(())
+}
+
+fn write_and_install(
+    tmp: &Path,
+    root: &Path,
+    stem: &str,
+    bytes: &[u8],
+) -> Result<(), SnapshotStoreError> {
+    let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
+    let mut file = File::create(tmp).map_err(io("create(snapshot tmp)"))?;
+    file.write_all(bytes).map_err(io("write(snapshot tmp)"))?;
+    file.sync_all().map_err(io("fsync(snapshot tmp)"))?;
+    std::fs::rename(tmp, root.join(format!("{stem}.{EXTENSION}")))
+        .map_err(io("rename(snapshot tmp -> snapshot)"))?;
+    Ok(())
+}
+
+/// Fsync the snapshots root **and its parent** (RFC0052.13).
+///
+/// Startup calls this before any listed artefact is read as a horizon.
+/// A failure is startup's to raise, not to swallow: reclamation may
+/// already have removed the frames the listed snapshots cover, so a
+/// horizon whose directory entry may not be durable must never govern
+/// reclamation — and discarding the snapshots instead would throw away
+/// state nothing else can rebuild.
+///
+/// An absent root is a cold start, not a failure.
+///
+/// # Errors
+///
+/// [`SnapshotStoreError::Io`] when either fsync fails.
+pub fn fsync_root(root: &Path) -> Result<(), SnapshotStoreError> {
+    let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
+    match File::open(root) {
+        Ok(dir) => dir.sync_all().map_err(io("fsync(snapshots root)"))?,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(SnapshotStoreError::Io {
+                op: "open(snapshots root)",
+                source,
+            });
+        }
+    }
+    let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io("fsync(snapshots root parent)"))?;
+    Ok(())
+}
+
+/// Remove every `*.snap.tmp` a previous process left, then list the
+/// durable artefacts ([`load_all`]).
+///
+/// A temp file is a writer's private scratch: unlinking its own is the
+/// writer's job while it lives, and this is what closes the gap left by
+/// one that died mid-write.
+///
+/// # Errors
+///
+/// [`SnapshotStoreError::Io`] on any directory or file failure.
+pub fn load_all_durable(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, SnapshotStoreError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SnapshotStoreError::Io {
+                op: "read_dir(snapshots root)",
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| SnapshotStoreError::Io {
+            op: "read_dir entry",
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "tmp") {
+            drop(std::fs::remove_file(&path));
+        }
+    }
+    load_all(root)
 }
 
 /// List every snapshot artefact under `root`, decoding the tenant id
@@ -187,8 +281,8 @@ mod tests {
         let spicy = TenantId::new("acme/EU=prod");
 
         // Act
-        write(tmp.path(), &plain, &state(1)).expect("write plain");
-        write(tmp.path(), &spicy, &state(3)).expect("write spicy");
+        write(tmp.path(), &plain, &state(1), None).expect("write plain");
+        write(tmp.path(), &spicy, &state(3), None).expect("write spicy");
         let loaded = load_all(tmp.path()).expect("load_all");
 
         // Assert — both tenants come back (sorted), each decoding to
@@ -220,10 +314,10 @@ mod tests {
         // Arrange — an existing artefact for the tenant.
         let tmp = tempfile::TempDir::new().expect("temp");
         let tenant = TenantId::new("checkout");
-        write(tmp.path(), &tenant, &state(1)).expect("first write");
+        write(tmp.path(), &tenant, &state(1), None).expect("first write");
 
         // Act — overwrite with a newer state.
-        write(tmp.path(), &tenant, &state(7)).expect("overwrite");
+        write(tmp.path(), &tenant, &state(7), None).expect("overwrite");
 
         // Assert — exactly one artefact survives, carrying the newer
         // state, and no `.tmp` residue is left behind.
@@ -246,7 +340,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp");
         std::fs::write(tmp.path().join("README.md"), b"not a snapshot").expect("write");
         std::fs::write(tmp.path().join("not ours.snap"), b"junk").expect("write");
-        write(tmp.path(), &TenantId::new("checkout"), &state(1)).expect("write");
+        write(tmp.path(), &TenantId::new("checkout"), &state(1), None).expect("write");
 
         // Act + Assert
         let loaded = load_all(tmp.path()).expect("load_all");
@@ -260,7 +354,7 @@ mod tests {
         // valid one; reading it as a file would abort recovery.
         let tmp = tempfile::TempDir::new().expect("temp");
         std::fs::create_dir(tmp.path().join("junk.snap")).expect("mkdir");
-        write(tmp.path(), &TenantId::new("checkout"), &state(1)).expect("write");
+        write(tmp.path(), &TenantId::new("checkout"), &state(1), None).expect("write");
 
         // Act + Assert
         let loaded = load_all(tmp.path()).expect("load_all");

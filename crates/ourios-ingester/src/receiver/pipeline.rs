@@ -427,8 +427,15 @@ impl IngestPipeline {
     /// worth failing the ack over.
     #[must_use]
     pub fn with_rotation_hook(self, hook: RotationHook) -> Self {
-        *self.lock_hook() = Some(hook);
+        self.set_rotation_hook(hook);
         self
+    }
+
+    /// [`Self::with_rotation_hook`] after construction — the barrier
+    /// owns the hook and is built from the same coordinator this
+    /// pipeline holds, so it cannot exist before the pipeline does.
+    pub fn set_rotation_hook(&self, hook: RotationHook) {
+        *self.lock_hook() = Some(hook);
     }
 
     /// Seed the durable high-water mark from startup recovery

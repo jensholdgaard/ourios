@@ -122,7 +122,8 @@ pub fn recover(
     miner: &mut MinerCluster,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
-    let artefacts = snapshot_store::load_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
+    let artefacts =
+        snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
     let mut tenants = Vec::with_capacity(artefacts.len());
     let mut horizons: HashMap<TenantId, WalOffset> = HashMap::new();
@@ -212,7 +213,7 @@ pub fn write_snapshots(
             segment: offset.segment.to_string(),
             byte: offset.byte,
         });
-        snapshot_store::write(root, &tenant_id, &state)?;
+        snapshot_store::write(root, &tenant_id, &state, high_water)?;
     }
     Ok(())
 }

@@ -33,7 +33,7 @@
 #![deny(unsafe_code)]
 
 pub mod audit_sink;
-
+pub mod barrier;
 pub mod cadence;
 pub mod compactor;
 pub mod encode_pool;

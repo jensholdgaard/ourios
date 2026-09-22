@@ -770,17 +770,36 @@ fn publish_partition(
 struct InFlightPublishes {
     count: Mutex<usize>,
     settled: Condvar,
-    /// RFC 0052 §3.1's dated settlements: the highest `barrier_epoch`
-    /// observed when records re-entered the buffers — a requeue after a
-    /// transient failure, or one of the three park sites.
+    /// RFC 0052 §3.1's dated settlements: for each publish whose records
+    /// re-entered the buffers — a requeue after a transient failure, or
+    /// one of the three park sites — the epoch it was **registered**
+    /// under and the `barrier_epoch` current when they came back.
     ///
-    /// A cut captured *before* that epoch could not have drained those
-    /// records, so it is refused; one captured after drained them itself
-    /// and stamps normally. Monotone, so one transient failure cannot
-    /// refuse every later cut.
-    resettled_at: Mutex<Option<Epoch>>,
+    /// Both halves are needed. A cut `E` is refused only by a publish
+    /// *registered before its capture* (`registered <= E`) that came
+    /// back *after* it (`E < at`): such a cut's drain could not have
+    /// seen those records. A publish registered after `E` holds only
+    /// frames above `E`'s mark, so its failure fails no cut at or below
+    /// `E`; and a cut captured after the return drained them itself. The
+    /// `at` alone — one monotone maximum — would refuse both of those.
+    resettlements: Mutex<Vec<Resettlement>>,
     /// The cadence state every guard reports into.
     epochs: Arc<BarrierEpochs>,
+}
+
+/// One publish whose records went back into the buffers rather than to
+/// the store (RFC 0052 §3.1).
+#[derive(Clone, Copy, Debug)]
+struct Resettlement {
+    registered: Epoch,
+    at: Epoch,
+}
+
+impl Resettlement {
+    /// Whether this settlement refuses a cut of `epoch`.
+    fn refuses(self, epoch: Epoch) -> bool {
+        self.registered <= epoch && epoch < self.at
+    }
 }
 
 /// The outcome of [`SharedParquetSink::quiesce_publishes`]: every
@@ -790,18 +809,21 @@ struct InFlightPublishes {
 /// A value rather than a bare wait, because §3.1 needs both halves —
 /// the recheck defends the ordering, the outcome defends the data, and
 /// either alone refuses the stamp.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PublishOutcomes {
-    resettled_at: Option<Epoch>,
+    resettlements: Vec<Resettlement>,
 }
 
 impl PublishOutcomes {
     /// Whether a cut of `epoch` may stamp: false when a publish
     /// registered before its capture put records back into the buffers
-    /// at a later epoch.
+    /// after it.
     #[must_use]
-    pub fn all_ok(self, epoch: Epoch) -> bool {
-        self.resettled_at.is_none_or(|at| at <= epoch)
+    pub fn all_ok(&self, epoch: Epoch) -> bool {
+        !self
+            .resettlements
+            .iter()
+            .any(|settlement| settlement.refuses(epoch))
     }
 }
 
@@ -898,7 +920,7 @@ impl SharedParquetSink {
             in_flight: Arc::new(InFlightPublishes {
                 count: Mutex::new(0),
                 settled: Condvar::new(),
-                resettled_at: Mutex::new(None),
+                resettlements: Mutex::new(Vec::new()),
                 epochs,
             }),
         }
@@ -930,18 +952,32 @@ impl SharedParquetSink {
         }
     }
 
-    /// Record that records re-entered the buffers now — a requeue or one
-    /// of §3.1's three park sites. Dated with the current
-    /// `barrier_epoch`, so a cut captured before it is refused and one
-    /// captured after it (which drained them) is not.
-    pub fn note_resettled(&self) {
+    /// Record that a publish registered at `registered` put its records
+    /// back into the buffers now — a requeue or one of §3.1's three park
+    /// sites.
+    ///
+    /// A return at the epoch the publish was registered under refuses no
+    /// cut (the records never left a cut's reach), so it is not stored.
+    pub fn note_resettled(&self, registered: Epoch) {
         let at = self.in_flight.epochs.current();
-        let mut resettled = self
-            .in_flight
-            .resettled_at
+        if at <= registered {
+            return;
+        }
+        self.in_flight
+            .resettlements
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *resettled = Some(resettled.map_or(at, |previous| previous.max(at)));
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Resettlement { registered, at });
+    }
+
+    /// Drop settlements no future cut can be refused by: cuts are
+    /// strictly increasing, so once a cut reaches `at` the pair is spent.
+    fn prune_resettlements(&self, epoch: Epoch) {
+        self.in_flight
+            .resettlements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|settlement| epoch < settlement.at);
     }
 
     /// Block until no drained-but-unsettled off-lock publish is in flight —
@@ -983,12 +1019,20 @@ impl SharedParquetSink {
         }
         drop(count);
         PublishOutcomes {
-            resettled_at: *self
+            resettlements: self
                 .in_flight
-                .resettled_at
+                .resettlements
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner),
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         }
+    }
+
+    /// Discard the settlements a cut of `epoch` has now covered — called
+    /// once that cut's outcome is known, so the list cannot grow with
+    /// the process.
+    pub fn settle_cut(&self, epoch: Epoch) {
+        self.prune_resettlements(epoch);
     }
 
     /// Lock the sink, recovering a poisoned mutex. A poison means a past panic
@@ -1055,26 +1099,32 @@ impl SharedParquetSink {
     /// coordinator holding records because the audit write failed). The WAL is
     /// the durability of record, so retain + retry on the next cadence.
     ///
-    /// The re-entry is dated with the current `barrier_epoch` (RFC 0052
-    /// §3.1), so a cut captured before it — one whose drain could not
-    /// have seen these records — is refused.
-    pub fn requeue(&self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>) {
+    /// The re-entry is dated against the epoch the publish was
+    /// `registered` under (RFC 0052 §3.1): a cut captured before it —
+    /// one whose drain could not have seen these records — is refused,
+    /// and a cut captured after it is not.
+    pub fn requeue(&self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>, registered: Epoch) {
         if batches.is_empty() {
             return;
         }
         self.lock().requeue(batches);
-        self.note_resettled();
+        self.note_resettled(registered);
     }
 
     /// RFC 0052 §3.1's **park**: re-buffer `batches` as `ready`, keeping
     /// the `audit_watermark` their publish depends on, and date the
     /// re-entry like any other settlement.
-    pub fn park_ready(&self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>, audit_watermark: u64) {
+    pub fn park_ready(
+        &self,
+        batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        audit_watermark: u64,
+        registered: Epoch,
+    ) {
         if batches.is_empty() {
             return;
         }
         self.lock().park_ready(batches, audit_watermark);
-        self.note_resettled();
+        self.note_resettled(registered);
     }
 
     /// Publish owned `batches` to the data store **off the lock** (the encode +
@@ -1082,11 +1132,16 @@ impl SharedParquetSink {
     /// to settle / requeue). A partition whose put fails is requeued (the WAL is
     /// the durability of record). Returns whether every partition was published.
     /// `trigger` labels the flush metric.
+    ///
+    /// `registered` is the cut epoch the publish holding these records
+    /// was registered under, so a requeue here is dated the way RFC 0052
+    /// §3.1 requires.
     #[must_use]
     pub fn publish_owned(
         &self,
         batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
         trigger: &'static str,
+        registered: Epoch,
     ) -> bool {
         if batches.is_empty() {
             return true;
@@ -1128,9 +1183,7 @@ impl SharedParquetSink {
                 }
             }
         }
-        if !requeue.is_empty() {
-            self.lock().requeue(requeue);
-        }
+        self.requeue(requeue, registered);
         all_published
     }
 
@@ -1142,10 +1195,10 @@ impl SharedParquetSink {
     /// the lock** via [`Self::publish_owned`] (which settles counters,
     /// quarantines poison records, and requeues on transient failure) —
     /// so one worker's Parquet encode never blocks the others' appends.
-    pub fn emit_concurrent(&self, record: MinedRecord) {
+    pub fn emit_concurrent(&self, record: MinedRecord, registered: Epoch) {
         for (trigger, taken) in self.detach_concurrent(record) {
             if !taken.is_empty() {
-                let _ = self.publish_owned(taken.into_partitions(), trigger);
+                let _ = self.publish_owned(taken.into_partitions(), trigger, registered);
             }
         }
     }
@@ -1474,7 +1527,7 @@ mod tests {
         let sink = SharedParquetSink::new(ParquetRecordSink::new(store, size_trigger_config()));
 
         for _ in 0..4 {
-            sink.emit_concurrent(rec("tenant-a"));
+            sink.emit_concurrent(rec("tenant-a"), sink.epochs().current());
         }
 
         assert_eq!(sink.buffered_records(), 0, "every emit crossed the target");
@@ -1497,7 +1550,7 @@ mod tests {
             .with_audit_barrier(Box::new(|| false)),
         );
 
-        sink.emit_concurrent(rec("tenant-a"));
+        sink.emit_concurrent(rec("tenant-a"), sink.epochs().current());
 
         assert_eq!(
             sink.flushes(),

@@ -174,6 +174,32 @@ impl PublishCoordinator {
         }
     }
 
+    /// RFC 0052 §3.1's **park**: put a drained snapshot back where the
+    /// next drain finds it — the records into the sink's buffers as
+    /// `ready`, keeping the `audit_watermark` that makes them
+    /// publishable, and the events ahead of whatever the audit sink
+    /// buffered meanwhile.
+    ///
+    /// A park is a settlement with a date on it, exactly like a requeue:
+    /// without that, parking would be the one way out of §3.1's
+    /// predicate — a pre-cut guard could park its partition after a cut
+    /// had already drained the buffers, settle successfully, and the
+    /// barrier would checkpoint over records that exist only in buffers
+    /// it no longer holds.
+    pub fn park(&self, drained: Drained) {
+        let watermark = drained.audit_watermark();
+        let Drained {
+            audit,
+            records,
+            guard,
+        } = drained;
+        let registered = guard.epoch();
+        drop(guard);
+        self.audit.requeue(audit);
+        self.record
+            .park_ready(records.into_partitions(), watermark, registered);
+    }
+
     /// Write a `drained` snapshot to durability **off the lock**, audit-first:
     /// the audit batch is written before any record partition is published, so
     /// a record never reaches the store before its template event is durable.
@@ -197,6 +223,7 @@ impl PublishCoordinator {
             records,
             guard,
         } = drained;
+        let registered = guard.epoch();
         // The guard settles when this returns, whichever arm took it.
         let _guard = guard;
         let audit_durable = self.audit.write_owned(audit);
@@ -206,7 +233,7 @@ impl PublishCoordinator {
             // error). Do NOT publish the records — their template events aren't
             // durable yet. Requeue them for the next cadence (the WAL is the
             // durability of record).
-            self.record.requeue(records);
+            self.record.requeue(records, registered);
             return false;
         }
         #[cfg(feature = "openfga")]
@@ -220,7 +247,7 @@ impl PublishCoordinator {
             }
             tuples
         });
-        let published = self.record.publish_owned(records, trigger);
+        let published = self.record.publish_owned(records, trigger, registered);
         #[cfg(feature = "openfga")]
         if published
             && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)

@@ -146,9 +146,10 @@ impl EncodePool {
                         // exclusion, with the epoch of the cut whose
                         // mark could cover this batch (RFC 0052 §3.1);
                         // the worker only drops what it received.
+                        let epoch = batch.guard.epoch;
                         let _settle = batch.guard;
                         for record in batch.records {
-                            sink.emit_concurrent(record);
+                            sink.emit_concurrent(record, epoch);
                         }
                     }
                 })

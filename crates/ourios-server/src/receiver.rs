@@ -19,6 +19,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::barrier::Barrier;
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
@@ -58,6 +59,16 @@ const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
 /// How often the age sweep runs (≤ `SINK_MAX_BUFFER_AGE`): an aged partition
 /// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.
 const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
+
+/// RFC 0052 §3.1's `barrier_secs`, defaulting to the sink's age trigger.
+///
+/// Two cadences deliberately: a cut drains *every* buffered partition,
+/// so running it on the 60-second housekeeping interval would create a
+/// sub-target Parquet object per low-volume partition per tick — RFC
+/// 0014's small-file hazard reintroduced by the reclamation path. At the
+/// age trigger, a partition holding data that old would have flushed
+/// anyway.
+const BARRIER_TICK: Duration = SINK_MAX_BUFFER_AGE;
 
 /// Soft ceiling on the audit sink's in-memory event buffer (issue #302):
 /// reaching it signals an eager off-runtime flush, which keeps the buffer
@@ -253,7 +264,7 @@ fn flush_then_snapshot(
     // it gets here (`flush_tick.await`), but the barrier must not rely on
     // that ordering — this quiesce is what makes every stamping path safe by
     // construction.
-    sink.quiesce_publishes();
+    let _outcomes = sink.quiesce_publishes();
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
         tracing::warn!(
@@ -343,6 +354,10 @@ pub struct ReceiverHandle {
     /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
     /// clean exit on shutdown via the `shutdown` watch signal.
     flush_tick: JoinHandle<()>,
+    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
+    /// joined before the shutdown flush so no cut is in flight when it
+    /// runs.
+    barrier_tick: JoinHandle<()>,
 }
 
 impl ReceiverHandle {
@@ -375,6 +390,12 @@ impl ReceiverHandle {
         // anyway. A `JoinError` (the task panicked) is ignored — the drain
         // below still runs.
         let _ = self.flush_tick.await;
+        // RFC 0052 §3.1: the receiver joins the barrier task after its
+        // running cut finishes, so the flush below cannot race a cut
+        // holding drained batches outside the buffers. A store failure
+        // in that last cut requeues into the buffers as any cut's does,
+        // and the flush covers the requeue.
+        let _ = self.barrier_tick.await;
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -457,6 +478,15 @@ fn build_write_sinks(
 /// buffers hold exactly the sealed segment's data (RFC0014.3/.5, `CLAUDE.md`
 /// §3.4). It runs on the request path (inside `ingest`) and does blocking
 /// Parquet/store I/O, so `block_in_place` lets the runtime relocate other tasks.
+///
+/// **Not yet capture-only.** RFC 0052 §3.1 turns this into a capture
+/// that hands a cut to the barrier task, so the exclusion is never held
+/// across store I/O. That is a contract change to the three RFC0035.2
+/// tests below, which assert the flush and the stamp have happened by
+/// the time the rotating `ingest` returns, so it waits on explicit
+/// approval (`CLAUDE.md` §6.2) rather than an implementer's judgement.
+/// The timer path below is the barrier §3.1 specifies; this one keeps
+/// today's behaviour meanwhile.
 fn rotation_snapshot_hook(
     sink: SharedParquetSink,
     audit_sink: SharedParquetAuditSink,
@@ -473,6 +503,46 @@ fn rotation_snapshot_hook(
                 "rotation",
             );
         });
+    })
+}
+
+/// The RFC 0052 §3.1 barrier task: one cut per `BARRIER_TICK`, plus the
+/// idle rotation that lets a node with no traffic reclaim at all.
+///
+/// Append-independent by construction — which is the whole point: the
+/// rotation hook fires only after a successful append observes a segment
+/// change, so a node that stops receiving traffic would otherwise never
+/// advance its checkpoint again, and an idle node is exactly the one
+/// whose retained segments have the least reason to exist.
+///
+/// Every tick runs on the blocking pool: the capture quiesces the encode
+/// pool and the run does store I/O.
+fn spawn_barrier(
+    pipeline: SharedPipeline,
+    barrier: Arc<Barrier>,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BARRIER_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick is immediate; skip it
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = shutdown.changed() => break,
+            }
+            let pipeline = pipeline.clone();
+            let barrier = barrier.clone();
+            // `tick` catches its own panic and lowers the latch, so a
+            // `JoinError` here is a cancellation; the loop stops either
+            // way and shutdown's own flush covers what is left.
+            if tokio::task::spawn_blocking(move || barrier.tick(&pipeline, true))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
     })
 }
 
@@ -512,6 +582,15 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
     let segment_size_bytes = config.wal.segment_size_bytes;
+    // RFC0052.13: a snapshot listed at startup governs reclamation only
+    // once the snapshots root and its parent are durable **in this
+    // process**. A failure here fails startup rather than discarding the
+    // snapshots — reclamation may already have removed the frames they
+    // cover, so a horizon whose directory entry may not be durable must
+    // never be used, and throwing the artefacts away would lose state
+    // nothing else can rebuild.
+    ourios_ingester::barrier::fsync_snapshots_root(&snapshots_root)
+        .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
@@ -559,9 +638,9 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // snapshots with a concrete horizon — an unstamped snapshot is discarded at
     // the next start (RFC 0001 §6.9), which would overwrite the post-recovery
     // artefacts with full-replay-only ones.
-    let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
+    let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     let pipeline: SharedPipeline = Arc::new(
-        IngestPipeline::new(coordinator, miner)
+        IngestPipeline::new(Arc::clone(&commits), miner)
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
@@ -573,9 +652,9 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             ))
             // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
             // global commit gate; the pool emits into the same shared
-            // sink the miner holds, so the rotation hook's flush_all
-            // covers it. The pipeline drains the pool before every
-            // rotation snapshot; shutdown drains it below.
+            // sink the miner holds, so a cut's drain covers it. The
+            // pipeline drains the pool inside every capture; shutdown
+            // drains it below.
             .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(
                 &sink,
                 config.encode_workers,
@@ -589,13 +668,23 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     // The cadence age-sweep publishes through the coordinator: atomic drain
     // under the miner lock + audit-ordered off-lock write (issue #302 #1/#2).
-    let mut coordinator = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
     if let Some(emitter) = config.graph_emitter.clone() {
-        coordinator = coordinator.with_graph_emitter(emitter);
+        publisher = publisher.with_graph_emitter(emitter);
     }
+    // RFC 0052 §3.1: the append-independent barrier. Built here rather
+    // than with the pipeline because it needs the same coordinator the
+    // pipeline holds, and so cannot exist before it.
+    let barrier = Arc::new(Barrier::new(
+        publisher.clone(),
+        commits,
+        snapshots_root.clone(),
+        SINK_CEILING_BYTES,
+    ));
+    let barrier_tick = spawn_barrier(pipeline.clone(), barrier, shutdown_rx.clone());
     let flush_tick = spawn_age_sweep(
         pipeline.clone(),
-        coordinator,
+        publisher,
         audit_sink.overflow_notify(),
         shutdown_rx.clone(),
     );
@@ -705,6 +794,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         sink,
         audit_sink,
         flush_tick,
+        barrier_tick,
     })
 }
 

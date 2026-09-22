@@ -18,7 +18,7 @@
 //! [`crate::Wal::rebuild_ledger`] and maintained incrementally by
 //! every append and every verified unlink.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use ourios_core::tenant::TenantId;
@@ -528,35 +528,36 @@ impl SegmentLedger {
     }
 
     /// The prefix walk, round-robin so one tenant cannot starve
-    /// another's.
-    /// The candidate list is built **once**, from the tenants that are
-    /// actually behind: a pinned backlog has none, and rebuilding it
-    /// per round would make the walk O(budget × tenants) rather than
-    /// O(tenants + budget). A tenant that stops making progress is
-    /// simply skipped on later rounds.
+    /// another's. Returns whether the budget bound it.
+    ///
+    /// The queue holds the tenants that can still progress, seeded
+    /// once from those actually behind — a pinned backlog seeds none.
+    /// A tenant that takes a step goes to the back; one that cannot is
+    /// **dropped**, because nothing another tenant's step does can
+    /// cover a segment for it: `next_covered` reads only that tenant's
+    /// own cursor, horizon and last offsets. So each turn either
+    /// spends budget or retires a tenant, and the walk is
+    /// O(tenants + budget) rather than the O(budget × tenants) a
+    /// rescan of every tenant per round would cost under the writer
+    /// position.
     fn walk(&mut self, budget: usize) -> bool {
-        let behind: Vec<TenantId> = self
+        let mut active: VecDeque<TenantId> = self
             .tenants
             .iter()
             .filter(|(_, state)| state.behind > 0)
             .map(|(tenant, _)| tenant.clone())
             .collect();
         let mut spent = 0;
-        loop {
-            let mut progressed = false;
-            for tenant in &behind {
-                if spent >= budget {
-                    return self.any_behind();
-                }
-                if self.step(tenant) {
-                    spent += 1;
-                    progressed = true;
-                }
-            }
-            if !progressed {
+        while spent < budget {
+            let Some(tenant) = active.pop_front() else {
                 return false;
+            };
+            if self.step(&tenant) {
+                spent += 1;
+                active.push_back(tenant);
             }
         }
+        self.any_behind()
     }
 
     /// Advance one tenant's cursor by one segment, if its horizon
@@ -934,6 +935,7 @@ mod tests {
 
     const ALPHA: &str = "alpha";
     const BETA: &str = "beta";
+    const GAMMA: &str = "gamma";
 
     /// `horizon_remaining`, `unlink_remaining` and the lag figures are
     /// all O(1) reads, which is only honest if the aggregates behind
@@ -1009,6 +1011,59 @@ mod tests {
             ledger.remove(entry.segment);
         }
         check(&ledger, rotated, "a held segment removed under no consumer");
+    }
+
+    /// The walk is round-robin, and a tenant that cannot take a step
+    /// neither holds budget from one that can nor stops the walk from
+    /// draining. Both follow from retiring a blocked tenant instead of
+    /// rescanning it, and neither is visible in the loop's shape.
+    #[test]
+    fn the_horizon_walk_is_round_robin_and_retires_a_blocked_tenant() {
+        let mut ledger = SegmentLedger::default();
+        let mut alpha = Vec::new();
+        let mut beta = Vec::new();
+        let mut blocked = None;
+        for _ in 0..3 {
+            let segment = uuid::Uuid::now_v7();
+            alpha.push(append(&mut ledger, segment, 64, ALPHA));
+            beta.push(append(&mut ledger, segment, 128, BETA));
+            let gamma = append(&mut ledger, segment, 192, GAMMA);
+            // Below gamma's own first frame, so its horizon covers no
+            // segment at all and it can never take a step.
+            blocked.get_or_insert(WalOffset {
+                segment: gamma.segment,
+                byte: 0,
+            });
+        }
+        let marks = horizons(&[
+            (ALPHA, alpha[2]),
+            (BETA, beta[2]),
+            (GAMMA, blocked.expect("three segments")),
+        ]);
+
+        assert!(ledger.apply(&marks, 2), "the budget bound this pass");
+        assert_eq!(
+            (behind(&ledger, ALPHA), behind(&ledger, BETA)),
+            (2, 2),
+            "the two rounds went one each, not both to the first tenant",
+        );
+        assert_eq!(behind(&ledger, GAMMA), 3, "and none to the blocked one");
+
+        assert!(
+            !ledger.apply(&marks, 64),
+            "a walk the budget does not bind reports drained, even with a \
+             tenant still behind that no budget could advance",
+        );
+        assert_eq!((behind(&ledger, ALPHA), behind(&ledger, BETA)), (0, 0));
+        assert_eq!(
+            ledger.horizon_remaining(),
+            3,
+            "gamma's three, and only those"
+        );
+    }
+
+    fn behind(ledger: &SegmentLedger, tenant: &str) -> usize {
+        ledger.tenants[&TenantId::new(tenant)].behind
     }
 
     /// Four segments, two tenants in each, and the offsets in the

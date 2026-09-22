@@ -28,6 +28,7 @@ pub const CHECKPOINT_ARMED: u16 = 1 << 0;
 pub const CHECKPOINT_SEEN: u16 = 1 << 1;
 pub const MODE_UNRECORDED: u16 = 0;
 pub const MODE_KNOWN: u16 = 1;
+pub const MODE_NO_CONSUMER: u16 = 2;
 
 /// The RFC 0052 §3.2 defaults the WAL sizes every record it creates
 /// for, until `max_tenants` and `max_unlinks_per_pass` become
@@ -260,4 +261,137 @@ pub fn build_closed_segment(dest_root: &Path, payloads: &[&[u8]]) -> Vec<WalOffs
 pub fn truncate_segment_header(path: &Path) {
     let bytes = std::fs::read(path).expect("read segment");
     std::fs::write(path, &bytes[..SEGMENT_HEADER_LEN / 2]).expect("truncate the header");
+}
+
+/// The same as [`build_closed_segment`], with `TenantOtlpBatch`
+/// frames: RFC 0052 §3.2's tenant-aware retain rule is driven by the
+/// membership only that kind carries. Returns each frame's offset in
+/// the order given.
+pub fn build_tenant_segment(dest_root: &Path, frames: &[(&str, &[u8])]) -> Vec<WalOffset> {
+    let scratch = tempfile::TempDir::new().expect("scratch root");
+    let mut wal = open(scratch.path());
+    let offsets = frames
+        .iter()
+        .map(|(tenant, body)| {
+            let payload = ourios_wal::TenantBatch::encode(tenant, body).expect("encode");
+            wal.append(FrameKind::TenantOtlpBatch, &payload)
+                .expect("append")
+        })
+        .collect();
+    wal.sync().expect("sync");
+    drop(wal);
+    let seg = segment_files(scratch.path())
+        .into_iter()
+        .next()
+        .expect("scratch holds one segment");
+    std::fs::create_dir_all(dest_root).expect("dest root");
+    let dest = dest_root.join(seg.file_name().expect("segment file name"));
+    std::fs::rename(&seg, &dest).expect("move segment into dest root");
+    let record = dest_root.join(RECLAIM);
+    if !record.exists() {
+        std::fs::copy(scratch.path().join(RECLAIM), &record).expect("bring the record along");
+    }
+    offsets
+}
+
+/// The horizons of a caller that holds miner state: every named
+/// tenant restorable at its mark, every unnamed one pinned.
+pub fn known(marks: &[(&str, WalOffset)]) -> ourios_wal::SnapshotHorizons {
+    ourios_wal::SnapshotHorizons::restorable(
+        marks
+            .iter()
+            .map(|(tenant, offset)| (tenant_id(tenant), *offset)),
+    )
+}
+
+pub fn tenant_id(name: &str) -> ourios_core::tenant::TenantId {
+    ourios_core::tenant::TenantId::try_new(name).expect("tenant id")
+}
+
+/// Rotation debris a previous process left: `<uuid>.wal.partial` is
+/// the reserved shape §3.3's sweep pops.
+pub fn write_partial(root: &Path) -> std::path::PathBuf {
+    let path = root.join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
+    std::fs::write(&path, b"rotation debris").expect("write a partial");
+    path
+}
+
+/// The live slot's `reclaimed_through` entries, keyed by tenant, read
+/// straight out of §3.2's offset table: entry `i` belongs to
+/// dictionary record `i`, so the position **is** the identity and
+/// nothing is walked by a count.
+pub fn reclaimed_through(root: &Path) -> std::collections::BTreeMap<String, WalOffset> {
+    let bytes = std::fs::read(root.join(RECLAIM)).expect("read RECLAIM");
+    let slot = live_slot_bytes(&bytes);
+    let max_tenants = usize::try_from(u32::from_le_bytes(
+        bytes[16..20].try_into().expect("4 bytes"),
+    ))
+    .expect("capacity fits usize");
+    let entries_at = SLOT_HEADER_LEN + DICT_RECORD_LEN * max_tenants;
+    let mut out = std::collections::BTreeMap::new();
+    for index in 0..max_tenants {
+        let dict = &slot[SLOT_HEADER_LEN + DICT_RECORD_LEN * index..][..DICT_RECORD_LEN];
+        let len = usize::from(u16::from_le_bytes(dict[0..2].try_into().expect("2 bytes")));
+        if len == 0 {
+            continue;
+        }
+        let entry = &slot[entries_at + ENTRY_LEN * index..][..ENTRY_LEN];
+        if u16::from_le_bytes(entry[0..2].try_into().expect("2 bytes")) & 1 == 0 {
+            continue;
+        }
+        let key = String::from_utf8(dict[2..2 + len].to_vec()).expect("ascii key");
+        out.insert(key, read_offset(&entry[8..32]));
+    }
+    out
+}
+
+/// The live slot's `planned` records: each popped segment's uuid and
+/// whether its deletion is §3.2's uncertain one.
+pub fn planned_unlinks(root: &Path) -> Vec<(uuid::Uuid, bool)> {
+    let bytes = std::fs::read(root.join(RECLAIM)).expect("read RECLAIM");
+    let slot = live_slot_bytes(&bytes);
+    let max_tenants = usize::try_from(u32::from_le_bytes(
+        bytes[16..20].try_into().expect("4 bytes"),
+    ))
+    .expect("capacity fits usize");
+    let max_unlinks = usize::try_from(u32::from_le_bytes(
+        bytes[20..24].try_into().expect("4 bytes"),
+    ))
+    .expect("capacity fits usize");
+    let planned_at = SLOT_HEADER_LEN + (DICT_RECORD_LEN + ENTRY_LEN) * max_tenants;
+    let stride = PLANNED_HEADER_LEN + PAIR_LEN * max_tenants;
+    let mut out = Vec::new();
+    for index in 0..max_unlinks {
+        let record = &slot[planned_at + stride * index..][..PLANNED_HEADER_LEN];
+        // Bit 1 of the flags byte at offset 22 is `occupied`; a
+        // position no segment occupies is a zeroed run.
+        if record[22] & (1 << 1) == 0 {
+            continue;
+        }
+        let uuid = uuid::Uuid::from_slice(&record[0..16]).expect("16 bytes");
+        out.push((uuid, record[22] & 1 != 0));
+    }
+    out
+}
+
+/// The valid slot with the greater generation, as a reader picks it.
+fn live_slot_bytes(bytes: &[u8]) -> &[u8] {
+    let slot = stored_slot_len(bytes);
+    let (generation, _, _) = live_slot(bytes);
+    let first = u64::from_le_bytes(
+        bytes[FILE_HEADER_LEN..FILE_HEADER_LEN + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let index = usize::from(first != generation);
+    &bytes[FILE_HEADER_LEN + index * slot..][..slot]
+}
+
+/// A `WalOffset` as §3.2 stores it: 16 B uuid in RFC 4122 order then
+/// a little-endian `u64` byte.
+fn read_offset(bytes: &[u8]) -> WalOffset {
+    WalOffset {
+        segment: uuid::Uuid::from_slice(&bytes[0..16]).expect("16 bytes"),
+        byte: u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")),
+    }
 }

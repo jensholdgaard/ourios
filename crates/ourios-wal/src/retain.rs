@@ -302,8 +302,12 @@ impl SegmentLedger {
 
     /// Empty-set segments not yet popped, plus entries reclaiming or
     /// uncertain.
-    pub(crate) fn unlink_remaining(&self) -> usize {
-        self.unpinned.len() + self.reclaiming
+    ///
+    /// The current append segment is excluded: no pass can ever pop
+    /// it, so counting it would make the backlog figure an operator
+    /// watches never reach zero on a healthy node.
+    pub(crate) fn unlink_remaining(&self, current: Uuid) -> usize {
+        self.unpinned.len() - usize::from(self.unpinned.contains(&current)) + self.reclaiming
     }
 
     /// The oldest surviving frame of `tenant`: its first offset in its
@@ -568,10 +572,10 @@ impl SegmentLedger {
             if is_above(state.cursor, id) {
                 state.behind = state.behind.saturating_sub(1);
             }
-            if state.cursor == Some(id) {
-                state.cursor = None;
-                state.behind = state.segments.len();
-            }
+            // The cursor is an ordering bound, not a reference: it
+            // keeps the uuid of the segment it reached even once that
+            // segment is gone, so the next pass resumes above it
+            // rather than re-walking a prefix it has already applied.
             if state.segments.is_empty() {
                 self.tenants.remove(tenant);
             }

@@ -1104,7 +1104,7 @@ impl Wal {
                 removed_partials: 0,
                 capped: horizons_capped || pops_capped,
                 horizon_remaining: self.ledger.horizon_remaining(),
-                unlink_remaining: self.ledger.unlink_remaining(),
+                unlink_remaining: self.ledger.unlink_remaining(self.current_segment_uuid),
                 floor: self.ledger.floor(),
                 lag_bytes: 0,
                 lag_segments: 0,
@@ -1118,6 +1118,7 @@ impl Wal {
         self.outstanding = Some(Outstanding {
             segments,
             partials: plan.partials.clone(),
+            progress: plan.progress,
         });
         Ok(plan)
     }
@@ -1183,7 +1184,7 @@ impl Wal {
                     self.ledger.restore(popped.segment);
                 }
                 self.requeue_partials(outstanding.partials);
-                Ok(self.progress(0, 0, PassOutcome::Planned))
+                Ok(self.settled(outstanding.progress, 0, 0))
             }
             ReclaimOutcome::Unlinked {
                 removed,
@@ -1203,8 +1204,25 @@ impl Wal {
                     }
                 }
                 self.requeue_partials(requeued);
-                Ok(self.progress(segments, partials, PassOutcome::Planned))
+                Ok(self.settled(outstanding.progress, segments, partials))
             }
+        }
+    }
+
+    /// The ledger half's own decisions, carrying what the file half
+    /// actually removed and the backlog as it now stands.
+    fn settled(
+        &self,
+        planned: HousekeepingProgress,
+        removed_segments: usize,
+        removed_partials: usize,
+    ) -> HousekeepingProgress {
+        HousekeepingProgress {
+            removed_segments,
+            removed_partials,
+            horizon_remaining: self.ledger.horizon_remaining(),
+            unlink_remaining: self.ledger.unlink_remaining(self.current_segment_uuid),
+            ..planned
         }
     }
 
@@ -1262,13 +1280,20 @@ impl Wal {
 
     /// Merge this pass's popped segments and its mode into the record
     /// the file half will write. A pass that plans nothing and owes no
-    /// mode writes no record at all.
+    /// mode writes no record at all — and a **skipped** pass writes
+    /// none whatever it would otherwise owe: §3.2's gate is on segment
+    /// planning *and* the record write, because a record written under
+    /// a version-1 checkpoint is a witness to a reclamation that never
+    /// happened.
     fn merge_plan(
         &mut self,
         plan: &mut ReclaimPlan,
         popped: &[retain::Popped],
         mode: reclaim::EntryMode,
     ) -> Result<(), ReclaimError> {
+        if plan.progress.outcome != PassOutcome::Planned {
+            return Ok(());
+        }
         let Some(store) = self.reclaim.as_ref() else {
             return Ok(());
         };
@@ -1513,7 +1538,7 @@ impl Wal {
             removed_partials,
             capped: false,
             horizon_remaining: self.ledger.horizon_remaining(),
-            unlink_remaining: self.ledger.unlink_remaining(),
+            unlink_remaining: self.ledger.unlink_remaining(self.current_segment_uuid),
             floor: self.ledger.floor(),
             lag_bytes: 0,
             lag_segments: 0,
@@ -2314,6 +2339,11 @@ impl std::error::Error for HousekeepingError {
 struct Outstanding {
     segments: Vec<retain::Popped>,
     partials: Vec<PathBuf>,
+    /// What the ledger half decided. The commit reports the same
+    /// floor, lag, cap state and skip reason: they are facts about
+    /// this pass, and re-deriving them from a ledger the unlinks have
+    /// since changed would describe a different one.
+    progress: HousekeepingProgress,
 }
 
 /// Mark one segment's `planned` entry as RFC 0052 §3.2's uncertain

@@ -35,8 +35,14 @@ superseded-by: —
 > entry monotonicity, the record-then-unlink crash, the legacy-root
 > migration window (whose stale-gap leg compares a tenant's oldest
 > surviving frame with its last recorded horizon), the consumer-mode
-> rows, the `PUBLISHED` seeding and slot-id rows, the migration-window
-> skip, failed or uncertain unlink, failed record write);
+> rows, the migration-window skip, failed or uncertain unlink, failed
+> record write). **.17's `PUBLISHED` seeding and slot-id row is not
+> slice B's**: both its legs read the `PUBLISHED` sidecar, and while
+> §3.2 defines the two `published_seeded_*` header bits as RFC 0053's
+> amendment to this header, the file's **writer and format** are
+> **RFC 0055**'s (publication frontiers, `drafted`). The stub's earlier
+> reason misattributed it to RFC 0053; it stays ignored, named for
+> RFC 0055, and the slice that lands that writer discharges it;
 > **C** rotation (temporary name, bounded retry, terminal state, the
 > `hold/794-wedged-classification` reintroduction → .4, .5, .15, .11's
 > post-RFC rotation leg, .17's legacy-root rotation leg);

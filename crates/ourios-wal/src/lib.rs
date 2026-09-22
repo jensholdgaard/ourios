@@ -806,6 +806,12 @@ impl Wal {
         if let Some(fault) = self.rotation.terminal() {
             return Err(AppendError::RotationTerminal(fault.clone()));
         }
+        // §3.3's one-obligation-at-a-time rule outranks the no-op below.
+        // A post-rename fsync failure leaves the *fresh* segment
+        // installed and empty, so an idle node would take the no-op and
+        // leave the obligation owed until traffic returned — the one
+        // caller that can discharge it without an append is this timer.
+        self.discharge_owed_rotation_fsync()?;
         if kind == RotationKind::Discretionary && !self.current_segment_holds_a_frame()? {
             return Ok(());
         }
@@ -944,24 +950,31 @@ impl Wal {
     /// [`Self::open`] can select exists until the rename, since
     /// `list_segments` returns only `*.wal`.
     ///
-    /// The path is registered on the housekeeping sweep's list as soon
-    /// as the file exists, so a rotation that dies at any later step
-    /// leaves its debris where the sweep already looks — §3.3 requires
-    /// the pass itself to list nothing.
+    /// The path is registered on the housekeeping sweep's list *before*
+    /// the attempt, so a rotation that dies at any step leaves its
+    /// debris where the sweep already looks — §3.3 requires the pass
+    /// itself to list nothing, so a file the sweep never learned about
+    /// survives every pass in this process.
+    ///
+    /// Before the attempt rather than after it because the creation is
+    /// two operations: a file that exists and a header written into it.
+    /// A failed header write — ENOSPC, the realistic trigger for this
+    /// whole retry path — leaves the file behind with nothing returned
+    /// to register it. A path the create never reached costs the sweep
+    /// one no-op unlink, which `remove_partial` already treats as a
+    /// removal to re-verify.
     fn create_partial(&mut self) -> Result<(File, PathBuf, uuid::Uuid), AppendError> {
         let uuid = uuid::Uuid::now_v7();
         let partial = self.config.root.join(format!("{uuid}.wal.partial"));
         let target = partial.clone();
         let mut handle = None;
+        self.stale_partials.push(partial.clone());
         self.rotation_step(RotationSite::Create, |_| {
             handle = Some(create_segment_at(&target, uuid)?);
             Ok(())
         })?;
         match handle {
-            Some(file) => {
-                self.stale_partials.push(partial.clone());
-                Ok((file, partial, uuid))
-            }
+            Some(file) => Ok((file, partial, uuid)),
             None => unreachable!("a successful Create step always yields the handle"),
         }
     }
@@ -2592,71 +2605,102 @@ mod tests {
     /// error names the violated field. Iterated rather than
     /// one test per arm — the message format is what the
     /// operator sees on a real misconfiguration.
+    ///
+    /// The cases are grouped the way `validate_config` is, so a new
+    /// tunable's rows land beside the ones they belong with rather than
+    /// extending one list that grows with every RFC.
     #[test]
     fn validate_config_rejects_each_out_of_range_field() {
         let tmp = tempfile::TempDir::new().expect("temp");
-        let cases: &[(&str, WalConfig)] = &[
+        let mut cases = timing_rejections(tmp.path());
+        cases.extend(sizing_rejections(tmp.path()));
+        cases.extend(reclamation_rejections(tmp.path()));
+        for (expected_field, cfg) in cases {
+            match validate_config(&cfg).expect_err("out-of-range must reject") {
+                OpenError::InvalidConfig { field, .. } => assert_eq!(
+                    field, expected_field,
+                    "validation should name the violating field exactly",
+                ),
+                other => panic!("expected InvalidConfig({expected_field}), got {other:?}"),
+            }
+        }
+    }
+
+    type Rejection = (&'static str, WalConfig);
+
+    fn timing_rejections(root: &std::path::Path) -> Vec<Rejection> {
+        vec![
             (
                 "batch_window_ms",
                 WalConfig {
                     batch_window_ms: MAX_BATCH_WINDOW_MS + 1,
-                    ..default_config(tmp.path())
-                },
-            ),
-            (
-                "segment_size_bytes",
-                WalConfig {
-                    segment_size_bytes: MIN_SEGMENT_SIZE_BYTES - 1,
-                    ..default_config(tmp.path())
-                },
-            ),
-            (
-                "segment_size_bytes",
-                WalConfig {
-                    segment_size_bytes: MAX_SEGMENT_SIZE_BYTES + 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
             (
                 "segment_age_secs",
                 WalConfig {
                     segment_age_secs: MIN_SEGMENT_AGE_SECS - 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
             (
                 "segment_age_secs",
                 WalConfig {
                     segment_age_secs: MAX_SEGMENT_AGE_SECS + 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
             (
                 "housekeeping_secs",
                 WalConfig {
                     housekeeping_secs: MIN_HOUSEKEEPING_SECS - 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
             (
                 "housekeeping_secs",
                 WalConfig {
                     housekeeping_secs: MAX_HOUSEKEEPING_SECS + 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
+        ]
+    }
+
+    fn sizing_rejections(root: &std::path::Path) -> Vec<Rejection> {
+        vec![
+            (
+                "segment_size_bytes",
+                WalConfig {
+                    segment_size_bytes: MIN_SEGMENT_SIZE_BYTES - 1,
+                    ..default_config(root)
+                },
+            ),
+            (
+                "segment_size_bytes",
+                WalConfig {
+                    segment_size_bytes: MAX_SEGMENT_SIZE_BYTES + 1,
+                    ..default_config(root)
+                },
+            ),
+        ]
+    }
+
+    fn reclamation_rejections(root: &std::path::Path) -> Vec<Rejection> {
+        vec![
             (
                 "rotation_retry_attempts",
                 WalConfig {
                     rotation_retry_attempts: MIN_ROTATION_RETRY_ATTEMPTS - 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
             (
                 "rotation_retry_attempts",
                 WalConfig {
                     rotation_retry_attempts: MAX_ROTATION_RETRY_ATTEMPTS + 1,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
             // RFC 0052 §3.8's one cross-knob rule: both values are
@@ -2666,19 +2710,10 @@ mod tests {
                 WalConfig {
                     max_unlinks_per_pass: 2,
                     rotation_retry_attempts: 3,
-                    ..default_config(tmp.path())
+                    ..default_config(root)
                 },
             ),
-        ];
-        for (expected_field, cfg) in cases {
-            match validate_config(cfg).expect_err("out-of-range must reject") {
-                OpenError::InvalidConfig { field, .. } => assert_eq!(
-                    &field, expected_field,
-                    "validation should name the violating field exactly",
-                ),
-                other => panic!("expected InvalidConfig({expected_field}), got {other:?}"),
-            }
-        }
+        ]
     }
 
     /// `list_segments` filters by `.wal` extension and sorts

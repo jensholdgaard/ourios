@@ -306,6 +306,88 @@ fn rfc0052_4_idle_rotation_failure_recovers_on_the_next_append() {
     );
 }
 
+/// Scenario RFC0052.4 — the reserved partial path is registered before
+/// the attempt, not after it.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.3.
+///
+/// Creating the fresh segment is two operations — a file that exists,
+/// and a header written into it — and the second can fail on its own
+/// (ENOSPC, the realistic trigger for this whole retry path). Since the
+/// sweep pops only from its list and lists nothing on the pass, a file
+/// registered only on success would survive every pass in this process
+/// and break RFC0052.4's one-pass clearance under a full budget. The
+/// registration is therefore observable on a *failed* create too, and
+/// the sweep tolerates a path the create never reached.
+#[test]
+fn rfc0052_4_a_failed_create_still_registers_its_reserved_path() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = wal_due_for_rotation(
+        root,
+        BUDGET,
+        RotationFaults::failing(RotationSite::Create, 1),
+    );
+
+    wal.append(FrameKind::OtlpBatch, b"the append that meets the fault")
+        .expect_err("the create fails");
+    assert_eq!(
+        wal.reclaim_state().stale_partials,
+        1,
+        "the reserved path is on the sweep's list even though the create failed",
+    );
+    assert!(
+        partials(root).is_empty(),
+        "and this particular failure left no file, which the sweep must tolerate",
+    );
+
+    wal.housekeeping(None)
+        .expect("a pass over a path the create never reached");
+    assert_eq!(
+        wal.reclaim_state().stale_partials,
+        0,
+        "the sweep drains it rather than retrying a file that cannot exist",
+    );
+}
+
+/// Scenario RFC0052.4 — an idle rotation discharges an owed directory
+/// fsync even when the segment it would rotate is empty.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.3.
+///
+/// A post-rename fsync failure installs the fresh segment and leaves it
+/// *empty*, so the discretionary no-op below would skip the discharge
+/// and leave an idle node owing it until traffic returned. §3.3 makes
+/// the timer the one caller that can discharge it without an append, so
+/// the obligation outranks the no-op.
+#[test]
+fn rfc0052_4_an_idle_rotation_discharges_an_owed_fsync_on_an_empty_segment() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = wal_due_for_rotation(
+        root,
+        BUDGET,
+        RotationFaults::failing(RotationSite::ParentFsync, 1),
+    );
+
+    wal.append(FrameKind::OtlpBatch, b"the append that meets the fault")
+        .expect_err("the parent fsync fails after the rename");
+    assert!(
+        matches!(wal.reclaim_state().rotation, RotationState::Retrying(_)),
+        "the obligation is outstanding and the installed segment is empty",
+    );
+
+    wal.rotate(RotationKind::Discretionary)
+        .expect("the idle rotation discharges the owed fsync");
+    assert!(
+        matches!(wal.reclaim_state().rotation, RotationState::Healthy),
+        "so an idle node does not carry it until traffic returns",
+    );
+    assert_eq!(
+        segment_files(root).len(),
+        2,
+        "and the no-op still holds: the empty segment is not rotated again",
+    );
+}
+
 /// Scenario RFC0052.4 — an idle rotation of an empty segment is a no-op.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.7.
 #[test]

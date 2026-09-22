@@ -803,104 +803,114 @@ fn is_above(cursor: Option<Uuid>, id: Uuid) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{FrameAt, PopBound, SegmentLedger, SnapshotHorizons};
+    use super::{FrameAt, PopBound, SegmentLedger, SnapshotHorizons, State};
     use crate::WalOffset;
     use ourios_core::tenant::TenantId;
 
+    const ALPHA: &str = "alpha";
+    const BETA: &str = "beta";
+
     /// `horizon_remaining` and `unlink_remaining` are O(1) reads, which
-    /// is only honest if the aggregates behind them track the per-tenant
-    /// and per-segment state they summarise. Every mutation moves both,
-    /// so a drift is a bug the pass would report and never notice —
-    /// this walks a sequence that touches all of them and re-derives
-    /// the sums the long way.
+    /// is only honest if the aggregates behind them track the
+    /// per-tenant and per-segment state they stand for. Every mutation
+    /// moves both, so a drift is a figure the pass reports and nobody
+    /// can notice — this drives a sequence touching all of them and
+    /// re-derives each sum the long way after every step.
     #[test]
     fn the_o1_aggregates_equal_the_sums_they_stand_for() {
-        let mut ledger = SegmentLedger::default();
-        let alpha = TenantId::new("alpha");
-        let beta = TenantId::new("beta");
-        let segments: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::now_v7()).collect();
-        let mut offsets = Vec::new();
-        for (index, segment) in segments.iter().enumerate() {
-            for (byte, tenant) in [(64, &alpha), (128, &beta)] {
-                let offset = WalOffset {
-                    segment: *segment,
-                    byte: byte + index as u64,
-                };
-                ledger.observe(FrameAt {
-                    offset,
-                    bytes: 32,
-                    tenant: Some(tenant),
-                    path: Path::new("/wal/x.wal"),
-                });
-                offsets.push(offset);
-            }
-        }
-        let current = *segments.last().expect("four segments");
-        let check = |ledger: &SegmentLedger, what: &str| {
-            assert_eq!(
-                ledger.horizon_remaining(),
-                ledger.tenants.values().map(|t| t.behind).sum::<usize>(),
-                "behind_total after {what}",
-            );
-            assert_eq!(
-                ledger.unlink_remaining(current),
-                ledger.unpinned.len() - usize::from(ledger.unpinned.contains(&current))
-                    + ledger
-                        .segments
-                        .values()
-                        .filter(|s| matches!(s.state, super::State::Reclaiming { .. }))
-                        .count(),
-                "reclaiming index after {what}",
-            );
-        };
-        check(&ledger, "the rebuild");
+        let (mut ledger, offsets, current) = seeded();
+        check(&ledger, current, "the rebuild");
 
-        let horizons = |marks: &[(&TenantId, WalOffset)]| {
-            SnapshotHorizons::restorable(
-                marks
-                    .iter()
-                    .map(|(tenant, offset)| ((*tenant).clone(), *offset)),
-            )
-        };
+        let caught_up = horizons(&[(ALPHA, offsets[6]), (BETA, offsets[7])]);
+        ledger.apply(&caught_up, 2);
+        check(&ledger, current, "a capped application");
+        ledger.apply(&caught_up, 8);
+        check(&ledger, current, "the rest of the application");
+
         let bound = PopBound {
             checkpoint: offsets[5],
             current,
             tenant_aware: true,
         };
-
-        ledger.apply(&horizons(&[(&alpha, offsets[6]), (&beta, offsets[7])]), 2);
-        check(&ledger, "a capped application");
-        ledger.apply(&horizons(&[(&alpha, offsets[6]), (&beta, offsets[7])]), 8);
-        check(&ledger, "the rest of the application");
-
         let (popped, _) = ledger.pop(bound, 8);
-        check(&ledger, "a pop");
+        check(&ledger, current, "a pop");
         for entry in &popped {
             ledger.restore(entry.segment);
         }
-        check(&ledger, "a restore");
+        check(&ledger, current, "a restore");
 
         let (popped, _) = ledger.pop(bound, 8);
         for entry in &popped {
             ledger.remove(entry.segment);
         }
-        check(&ledger, "a removal");
+        check(&ledger, current, "a removal");
 
-        // A horizon that disappears rewinds both tenants.
+        // A horizon that disappears rewinds both tenants...
         ledger.apply(&horizons(&[]), 8);
-        check(&ledger, "a rewind");
+        check(&ledger, current, "a rewind");
 
-        // And an append above the applied horizon re-pins.
-        ledger.apply(&horizons(&[(&alpha, offsets[6]), (&beta, offsets[7])]), 8);
+        // ...and an append above the applied horizon re-pins one.
+        ledger.apply(&caught_up, 8);
+        append(&mut ledger, current, 4096, ALPHA);
+        check(&ledger, current, "a re-pinning append");
+    }
+
+    /// Four segments, two tenants in each, and the offsets in the
+    /// order they were appended. The newest segment is the current
+    /// one, as it is after any open.
+    fn seeded() -> (SegmentLedger, Vec<WalOffset>, uuid::Uuid) {
+        let mut ledger = SegmentLedger::default();
+        let segments: Vec<uuid::Uuid> = (0..4).map(|_| uuid::Uuid::now_v7()).collect();
+        let mut offsets = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let byte = 64 + index as u64;
+            offsets.push(append(&mut ledger, *segment, byte, ALPHA));
+            offsets.push(append(&mut ledger, *segment, byte + 64, BETA));
+        }
+        let current = *segments.last().expect("four segments");
+        (ledger, offsets, current)
+    }
+
+    fn append(
+        ledger: &mut SegmentLedger,
+        segment: uuid::Uuid,
+        byte: u64,
+        tenant: &str,
+    ) -> WalOffset {
+        let offset = WalOffset { segment, byte };
         ledger.observe(FrameAt {
-            offset: WalOffset {
-                segment: current,
-                byte: 4096,
-            },
+            offset,
             bytes: 32,
-            tenant: Some(&alpha),
+            tenant: Some(&TenantId::new(tenant)),
             path: Path::new("/wal/x.wal"),
         });
-        check(&ledger, "a re-pinning append");
+        offset
+    }
+
+    fn horizons(marks: &[(&str, WalOffset)]) -> SnapshotHorizons {
+        SnapshotHorizons::restorable(
+            marks
+                .iter()
+                .map(|(tenant, offset)| (TenantId::new(*tenant), *offset)),
+        )
+    }
+
+    /// The two O(1) figures against the sums they summarise.
+    fn check(ledger: &SegmentLedger, current: uuid::Uuid, what: &str) {
+        assert_eq!(
+            ledger.horizon_remaining(),
+            ledger.tenants.values().map(|t| t.behind).sum::<usize>(),
+            "behind_total after {what}",
+        );
+        let reclaiming = ledger
+            .segments
+            .values()
+            .filter(|s| matches!(s.state, State::Reclaiming { .. }))
+            .count();
+        assert_eq!(
+            ledger.unlink_remaining(current),
+            ledger.unpinned.len() - usize::from(ledger.unpinned.contains(&current)) + reclaiming,
+            "reclaiming index after {what}",
+        );
     }
 }

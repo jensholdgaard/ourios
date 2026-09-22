@@ -552,6 +552,90 @@ fn spawn_barrier(
 /// sockets bind (RFC0008.10). Returns once both sockets are bound — so
 /// the caller can observe the addresses (e.g. when binding `:0`) — with
 /// serving running on spawned tasks until [`ReceiverHandle::shutdown`].
+/// RFC 0030 §3.2: build each listener's TLS acceptor at startup, so
+/// unusable material fails here — the config path already preflighted
+/// it, but the served role re-derives from `TlsSettings`.
+///
+/// ALPN is per-listener: gRPC is h2-only, HTTP offers http/1.1 only
+/// (axum is built with just the http1 feature).
+type Acceptors = (
+    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
+    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
+);
+
+fn build_acceptors(
+    grpc_tls: Option<&TlsSettings>,
+    http_tls: Option<&TlsSettings>,
+) -> Result<Acceptors, String> {
+    let grpc = match grpc_tls {
+        Some(tls) => Some(
+            reloading_acceptor(tls, ALPN_GRPC, LISTENER_GRPC)
+                .map_err(|e| format!("receiver.grpc_tls: {e}"))?,
+        ),
+        None => None,
+    };
+    let http = match http_tls {
+        Some(tls) => Some(
+            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
+                .map_err(|e| format!("receiver.http_tls: {e}"))?,
+        ),
+        None => None,
+    };
+    Ok((grpc, http))
+}
+
+/// The two background cadences the receiver runs: RFC0014.2's age sweep
+/// and RFC 0052 §3.1's barrier.
+struct Cadences {
+    flush_tick: JoinHandle<()>,
+    barrier_tick: JoinHandle<()>,
+}
+
+/// What the cadences are built over. A value rather than four more
+/// parameters: the barrier and the sweep share a publish coordinator by
+/// construction, and handing them separate ones would put two owners on
+/// one sink's in-flight accounting.
+struct CadenceInputs {
+    publisher: PublishCoordinator,
+    graph: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+    commits: Arc<CommitCoordinator>,
+    snapshots_root: PathBuf,
+}
+
+/// Start both cadences over one publish coordinator.
+///
+/// The barrier is built here rather than with the pipeline because it
+/// needs the same commit coordinator the pipeline holds, and so cannot
+/// exist before it.
+fn spawn_cadences(
+    pipeline: &SharedPipeline,
+    inputs: CadenceInputs,
+    shutdown: &watch::Receiver<()>,
+) -> Cadences {
+    let CadenceInputs {
+        mut publisher,
+        graph,
+        commits,
+        snapshots_root,
+    } = inputs;
+    if let Some(emitter) = graph {
+        publisher = publisher.with_graph_emitter(emitter);
+    }
+    let overflow = publisher.audit().overflow_notify();
+    let barrier = Arc::new(Barrier::new(
+        publisher.clone(),
+        commits,
+        snapshots_root,
+        SINK_CEILING_BYTES,
+    ));
+    Cadences {
+        barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
+        // The age sweep drains under the miner lock and writes
+        // audit-ordered off it (issue #302 #1/#2).
+        flush_tick: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+    }
+}
+
 /// Bind both listeners before serving, so a `:0` request resolves to the
 /// real port in the returned handle. gRPC first, then HTTP.
 async fn bind_listeners(
@@ -666,27 +750,18 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     let (shutdown, shutdown_rx) = watch::channel(());
 
-    // The cadence age-sweep publishes through the coordinator: atomic drain
-    // under the miner lock + audit-ordered off-lock write (issue #302 #1/#2).
-    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
-    if let Some(emitter) = config.graph_emitter.clone() {
-        publisher = publisher.with_graph_emitter(emitter);
-    }
-    // RFC 0052 §3.1: the append-independent barrier. Built here rather
-    // than with the pipeline because it needs the same coordinator the
-    // pipeline holds, and so cannot exist before it.
-    let barrier = Arc::new(Barrier::new(
-        publisher.clone(),
-        commits,
-        snapshots_root.clone(),
-        SINK_CEILING_BYTES,
-    ));
-    let barrier_tick = spawn_barrier(pipeline.clone(), barrier, shutdown_rx.clone());
-    let flush_tick = spawn_age_sweep(
-        pipeline.clone(),
-        publisher,
-        audit_sink.overflow_notify(),
-        shutdown_rx.clone(),
+    let Cadences {
+        flush_tick,
+        barrier_tick,
+    } = spawn_cadences(
+        &pipeline,
+        CadenceInputs {
+            publisher: PublishCoordinator::new(sink.clone(), audit_sink.clone()),
+            graph: config.graph_emitter.clone(),
+            commits,
+            snapshots_root: snapshots_root.clone(),
+        },
+        &shutdown_rx,
     );
 
     // RFC 0026 §3.2 / RFC 0029 §3.3: the auth layer resolves before the
@@ -694,25 +769,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // pipeline enforces the tenant binding it attaches. A tower layer
     // rather than a sync interceptor because OIDC resolution may await a
     // JWKS refetch.
-    // RFC 0030 §3.2: build each listener's TLS acceptor at startup so
-    // unusable material fails here (the config path already preflighted
-    // it, but the served role re-derives from `TlsSettings`). ALPN is
-    // per-listener — gRPC is h2-only, HTTP offers http/1.1 only
-    // (axum is built with just the http1 feature).
-    let grpc_acceptor = match &config.grpc_tls {
-        Some(tls) => Some(
-            reloading_acceptor(tls, ALPN_GRPC, LISTENER_GRPC)
-                .map_err(|e| format!("receiver.grpc_tls: {e}"))?,
-        ),
-        None => None,
-    };
-    let http_acceptor = match &config.http_tls {
-        Some(tls) => Some(
-            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
-                .map_err(|e| format!("receiver.http_tls: {e}"))?,
-        ),
-        None => None,
-    };
+    let (grpc_acceptor, http_acceptor) =
+        build_acceptors(config.grpc_tls.as_ref(), config.http_tls.as_ref())?;
 
     // The OTel Collector's OTLP exporter gzip-compresses by default, so the
     // receiver must accept gzip to interoperate with a stock Collector

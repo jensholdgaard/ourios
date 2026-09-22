@@ -313,15 +313,15 @@ pub fn tenant_id(name: &str) -> ourios_core::tenant::TenantId {
     ourios_core::tenant::TenantId::new(name)
 }
 
-/// Age the root's one segment by `age_ms`, so the next `append`
-/// crosses `segment_age_secs` and rotates — without the test sleeping
-/// for it.
+/// Age the root's one segment by `age`, so the next `append` crosses
+/// `segment_age_secs` and rotates — without the test sleeping for it.
 ///
 /// A segment's age is its `UUIDv7` mint time (RFC 0008 §6.5), which
 /// lives in the first 48 bits as a big-endian millisecond count, so
 /// backdating it is a rewrite of the name and the six header bytes that
 /// carry the same value. Nothing else in the file depends on the id.
-pub fn backdate_segment(root: &Path, age_ms: u64) -> uuid::Uuid {
+pub fn backdate_segment(root: &Path, age: std::time::Duration) -> uuid::Uuid {
+    let age_ms = u64::try_from(age.as_millis()).expect("a test age fits u64 milliseconds");
     let path = segment_files(root)
         .into_iter()
         .next_back()

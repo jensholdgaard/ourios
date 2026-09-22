@@ -43,7 +43,7 @@ fn wal_failing_always(root: &Path, site: RotationSite) -> Wal {
         .expect("seed frame");
     seed.sync().expect("seed sync");
     drop(seed);
-    backdate_segment(root, 5_000);
+    backdate_segment(root, std::time::Duration::from_secs(5));
 
     let mut wal = Wal::open(config(root)).expect("reopen");
     wal.rebuild_ledger().expect("ledger");
@@ -68,6 +68,34 @@ fn terminal_fault(state: &RotationState) -> &RotationFault {
     }
 }
 
+/// Append once, expecting a refusal from *inside* the budget, and
+/// report how much of it that attempt had spent.
+fn retrying_attempts(wal: &mut Wal) -> u32 {
+    match wal.append(FrameKind::OtlpBatch, b"attempt") {
+        Err(AppendError::RotationRetrying(fault)) => fault.attempts(),
+        other => panic!("expected a retrying rotation failure, got {other:?}"),
+    }
+}
+
+/// Append once, expecting the terminal refusal, and report its fault.
+fn terminal_refusal(wal: &mut Wal) -> RotationFault {
+    match wal.append(FrameKind::OtlpBatch, b"attempt") {
+        Err(AppendError::RotationTerminal(fault)) => fault,
+        other => panic!("expected the terminal state, got {other:?}"),
+    }
+}
+
+/// Append into the installed segment, then `sync` — the post-rename
+/// site's retry — expecting the discharge to fail, and report its
+/// error. The append must succeed: the segment is complete and current,
+/// and it is the *ack* that is refused.
+fn failed_discharge(wal: &mut Wal) -> SyncError {
+    wal.append(FrameKind::OtlpBatch, b"lands in the installed segment")
+        .expect("appends land: the segment is complete and current");
+    wal.sync()
+        .expect_err("the discharge fails, so nothing is acked")
+}
+
 /// Scenario RFC0052.5 — every append past the budget is refused as terminal.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
@@ -78,29 +106,16 @@ fn rfc0052_5_appends_past_the_budget_are_refused_as_terminal() {
 
     // Every attempt inside the budget is reported as transient: a later
     // append genuinely could have succeeded.
-    for attempt in 1..BUDGET {
-        let err = wal
-            .append(FrameKind::OtlpBatch, b"inside the budget")
-            .expect_err("rotation fails on every attempt");
-        match &err {
-            AppendError::RotationRetrying(fault) => assert_eq!(fault.attempts(), attempt),
-            other => panic!("attempt {attempt} is still retrying, got {other:?}"),
-        }
-    }
+    let inside: Vec<u32> = (1..BUDGET).map(|_| retrying_attempts(&mut wal)).collect();
+    assert_eq!(
+        inside,
+        (1..BUDGET).collect::<Vec<_>>(),
+        "each attempt spends exactly one unit of the budget",
+    );
 
     // The attempt that spends the last unit is the one that turns
-    // terminal, and every append after it is refused without another
-    // attempt on a disk that has already failed the same step.
-    let err = wal
-        .append(
-            FrameKind::OtlpBatch,
-            b"the attempt that exhausts the budget",
-        )
-        .expect_err("the budget is spent");
-    let fault = match &err {
-        AppendError::RotationTerminal(fault) => fault.clone(),
-        other => panic!("the exhausting attempt is terminal, got {other:?}"),
-    };
+    // terminal.
+    let fault = terminal_refusal(&mut wal);
     assert_eq!(fault.attempts(), BUDGET);
     assert_eq!(
         fault.op(),
@@ -113,19 +128,12 @@ fn rfc0052_5_appends_past_the_budget_are_refused_as_terminal() {
         fault.detail(),
     );
 
-    for _ in 0..3 {
-        let err = wal
-            .append(FrameKind::OtlpBatch, b"past the budget")
-            .expect_err("every later append is refused");
-        match &err {
-            AppendError::RotationTerminal(later) => assert_eq!(
-                later.attempts(),
-                BUDGET,
-                "a refused append makes no further attempt",
-            ),
-            other => panic!("the refusal is terminal, not transient, got {other:?}"),
-        }
-    }
+    // Every append after it is refused without another attempt on a
+    // disk that has already failed the same step its whole budget over.
+    let past: Vec<u32> = (0..3)
+        .map(|_| terminal_refusal(&mut wal).attempts())
+        .collect();
+    assert_eq!(past, vec![BUDGET; 3], "a refused append makes no attempt");
     assert_eq!(
         terminal_fault(&wal.reclaim_state().rotation).attempts(),
         BUDGET
@@ -150,24 +158,15 @@ fn rfc0052_5_persistent_dir_fsync_discharge_is_terminal_and_never_acks() {
     // Each later `sync` retries that one fsync and charges the same
     // budget. Nothing behind it is acked while the directory entry is
     // not durable.
-    for attempt in 2..BUDGET {
-        wal.append(FrameKind::OtlpBatch, b"lands in the installed segment")
-            .expect("appends land: the segment is complete and current");
-        match wal
-            .sync()
-            .expect_err("the discharge fails, so nothing is acked")
-        {
-            SyncError::RotationRetrying(fault) => assert_eq!(fault.attempts(), attempt),
-            other => panic!("attempt {attempt} is still retrying, got {other:?}"),
-        }
-    }
+    let inside: Vec<u32> = (2..BUDGET)
+        .map(|_| match failed_discharge(&mut wal) {
+            SyncError::RotationRetrying(fault) => fault.attempts(),
+            other => panic!("expected a retrying discharge, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(inside, (2..BUDGET).collect::<Vec<_>>());
 
-    wal.append(FrameKind::OtlpBatch, b"one more")
-        .expect("appends still land");
-    let fault = match wal
-        .sync()
-        .expect_err("the discharge that spends the budget")
-    {
+    let fault = match failed_discharge(&mut wal) {
         SyncError::RotationTerminal(fault) => fault,
         other => panic!("the exhausting discharge is terminal, got {other:?}"),
     };
@@ -182,12 +181,15 @@ fn rfc0052_5_persistent_dir_fsync_discharge_is_terminal_and_never_acks() {
         ),
         "appends are refused",
     );
-    for _ in 0..3 {
-        match wal.sync().expect_err("and no batch is acknowledged") {
-            SyncError::RotationTerminal(later) => assert_eq!(later.attempts(), BUDGET),
-            other => panic!("expected the terminal state, got {other:?}"),
-        }
-    }
+    let later: Vec<u32> = (0..3)
+        .map(
+            |_| match wal.sync().expect_err("and no batch is acknowledged") {
+                SyncError::RotationTerminal(fault) => fault.attempts(),
+                other => panic!("expected the terminal state, got {other:?}"),
+            },
+        )
+        .collect();
+    assert_eq!(later, vec![BUDGET; 3], "a refused sync makes no attempt");
 }
 
 /// Scenario RFC0052.5 — `Wal::open` on the resulting directory succeeds.

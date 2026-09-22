@@ -49,7 +49,7 @@ fn wal_due_for_rotation(root: &Path, budget: u32, faults: RotationFaults) -> Wal
         .expect("seed frame");
     seed.sync().expect("seed sync");
     drop(seed);
-    backdate_segment(root, 5_000);
+    backdate_segment(root, std::time::Duration::from_secs(5));
 
     let mut wal = Wal::open(config(root, budget)).expect("reopen");
     wal.rebuild_ledger().expect("ledger");

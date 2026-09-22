@@ -848,7 +848,7 @@ impl Wal {
     /// [`Self::sync`] discharges it before acking anything.
     fn rotate_now(&mut self) -> Result<(), AppendError> {
         self.discharge_owed_rotation_fsync()?;
-        self.step(RotationSite::CloseSync, |wal| {
+        self.rotation_step(RotationSite::CloseSync, |wal| {
             sync_file_data(&wal.current_segment, wal.config.macos_full_fsync)
         })?;
         // The closing data sync flushed everything appended so far.
@@ -863,17 +863,17 @@ impl Wal {
             return Err(rotation_record_failed(e));
         }
         let (file, partial, uuid) = self.create_partial()?;
-        self.step(RotationSite::HeaderSync, |wal| {
+        self.rotation_step(RotationSite::HeaderSync, |wal| {
             sync_file_data(&file, wal.config.macos_full_fsync)
         })?;
         let path = self.config.root.join(format!("{uuid}.wal"));
-        self.step(RotationSite::Rename, |_| std::fs::rename(&partial, &path))?;
+        self.rotation_step(RotationSite::Rename, |_| std::fs::rename(&partial, &path))?;
         self.forget_partial(&partial);
         self.current_segment = file;
         self.current_segment_path = path;
         self.current_segment_uuid = uuid;
         self.dir_fsync = DirFsync::PendingRotation;
-        self.step(RotationSite::ParentFsync, |wal| {
+        self.rotation_step(RotationSite::ParentFsync, |wal| {
             sync_parent_dir(&wal.config.root)
         })?;
         self.dir_fsync = DirFsync::Clean;
@@ -881,10 +881,26 @@ impl Wal {
         Ok(())
     }
 
+    /// [`Self::step`] rendered on the append surface — every rotation
+    /// step but the `sync`-side discharge reports there.
+    fn rotation_step<F>(&mut self, site: RotationSite, run: F) -> Result<(), AppendError>
+    where
+        F: FnOnce(&Self) -> std::io::Result<()>,
+    {
+        match self.step(site, run) {
+            Ok(()) => Ok(()),
+            Err(fault) => Err(self.append_error(fault)),
+        }
+    }
+
     /// Run one §3.3 rotation step, charging the retry budget when it
     /// fails. The fault seam is consulted first so every site can be
     /// driven from a test; it is inert unless armed.
-    fn step<F>(&mut self, site: RotationSite, run: F) -> Result<(), AppendError>
+    ///
+    /// The fault is returned raw rather than as one surface's error
+    /// type: the same five steps are reached from `append` and from
+    /// `sync`, and each renders it on its own enum.
+    fn step<F>(&mut self, site: RotationSite, run: F) -> Result<(), RotationFault>
     where
         F: FnOnce(&Self) -> std::io::Result<()>,
     {
@@ -894,21 +910,33 @@ impl Wal {
         };
         match outcome {
             Ok(()) => Ok(()),
-            Err(source) => Err(self.charge_rotation(site, &source)),
+            Err(source) => {
+                Err(self
+                    .rotation
+                    .charge(site.op(), &source, self.config.rotation_retry_attempts))
+            }
         }
     }
 
-    /// Charge one unit of the §3.3 budget and render the failure as the
-    /// append-surface error the caller returns.
-    fn charge_rotation(&mut self, site: RotationSite, source: &std::io::Error) -> AppendError {
-        let fault = self
-            .rotation
-            .charge(site.op(), source, self.config.rotation_retry_attempts);
-        match self.rotation {
-            RotationState::Terminal(_) => AppendError::RotationTerminal(fault),
-            RotationState::Healthy | RotationState::Retrying(_) => {
-                AppendError::RotationRetrying(fault)
-            }
+    /// Whether the budget is spent — which of the two rotation variants
+    /// a `fault` is reported under.
+    fn rotation_is_terminal(&self) -> bool {
+        self.rotation.terminal().is_some()
+    }
+
+    fn append_error(&self, fault: RotationFault) -> AppendError {
+        if self.rotation_is_terminal() {
+            AppendError::RotationTerminal(fault)
+        } else {
+            AppendError::RotationRetrying(fault)
+        }
+    }
+
+    fn sync_error(&self, fault: RotationFault) -> SyncError {
+        if self.rotation_is_terminal() {
+            SyncError::RotationTerminal(fault)
+        } else {
+            SyncError::RotationRetrying(fault)
         }
     }
 
@@ -925,7 +953,7 @@ impl Wal {
         let partial = self.config.root.join(format!("{uuid}.wal.partial"));
         let target = partial.clone();
         let mut handle = None;
-        self.step(RotationSite::Create, |_| {
+        self.rotation_step(RotationSite::Create, |_| {
             handle = Some(create_segment_at(&target, uuid)?);
             Ok(())
         })?;
@@ -957,7 +985,7 @@ impl Wal {
         if self.dir_fsync != DirFsync::PendingRotation {
             return Ok(());
         }
-        self.step(RotationSite::ParentFsync, |wal| {
+        self.rotation_step(RotationSite::ParentFsync, |wal| {
             sync_parent_dir(&wal.config.root)
         })?;
         self.dir_fsync = DirFsync::Clean;
@@ -1049,7 +1077,7 @@ impl Wal {
                 self.rotation.discharged();
                 Ok(())
             }
-            Err(e) => Err(rotation_sync_failed(e)),
+            Err(fault) => Err(self.sync_error(fault)),
         }
     }
 
@@ -1420,8 +1448,19 @@ impl Wal {
 /// operator sees one structured failure rather than a list,
 /// and so a sweep through the config doesn't depend on every
 /// later field's invariants being independently checkable.
+///
+/// Grouped by what each knob governs rather than written as one
+/// chain: the list grows with every RFC that adds a tunable, and a
+/// single function accumulating them is how it stops being readable.
 fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
-    let outside = |field, detail: String| OpenError::InvalidConfig { field, detail };
+    validate_durability_window(c)?;
+    validate_segment_bounds(c)?;
+    validate_cadences(c)?;
+    validate_reclamation(c)
+}
+
+/// `wal_batch_window_ms` — §3.4's latency/durability knob.
+fn validate_durability_window(c: &WalConfig) -> Result<(), OpenError> {
     if c.batch_window_ms > MAX_BATCH_WINDOW_MS {
         return Err(outside(
             "batch_window_ms",
@@ -1431,6 +1470,12 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
             ),
         ));
     }
+    Ok(())
+}
+
+/// `wal_segment_size_bytes` — its lower bound is the one that carries
+/// a real invariant, so the two edges report differently.
+fn validate_segment_bounds(c: &WalConfig) -> Result<(), OpenError> {
     if c.segment_size_bytes < MIN_SEGMENT_SIZE_BYTES {
         return Err(outside(
             "segment_size_bytes",
@@ -1449,49 +1494,46 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
             ),
         ));
     }
-    if !(MIN_SEGMENT_AGE_SECS..=MAX_SEGMENT_AGE_SECS).contains(&c.segment_age_secs) {
-        return Err(outside(
-            "segment_age_secs",
-            format!(
-                "{} outside §6.9 range {MIN_SEGMENT_AGE_SECS}..={MAX_SEGMENT_AGE_SECS}",
-                c.segment_age_secs
-            ),
-        ));
-    }
-    if !(MIN_HOUSEKEEPING_SECS..=MAX_HOUSEKEEPING_SECS).contains(&c.housekeeping_secs) {
-        return Err(outside(
-            "housekeeping_secs",
-            format!(
-                "{} outside §6.9 range {MIN_HOUSEKEEPING_SECS}..={MAX_HOUSEKEEPING_SECS}",
-                c.housekeeping_secs
-            ),
-        ));
-    }
-    if !(1..=MAX_UNLINKS_PER_PASS_CEILING).contains(&c.max_unlinks_per_pass) {
-        return Err(outside(
-            "max_unlinks_per_pass",
-            format!(
-                "{} outside RFC 0052 §3.8 range 1..={MAX_UNLINKS_PER_PASS_CEILING}",
-                c.max_unlinks_per_pass
-            ),
-        ));
-    }
-    if !(MIN_ROTATION_RETRY_ATTEMPTS..=MAX_ROTATION_RETRY_ATTEMPTS)
-        .contains(&c.rotation_retry_attempts)
-    {
-        return Err(outside(
-            "rotation_retry_attempts",
-            format!(
-                "{} outside RFC 0052 §3.8 range {MIN_ROTATION_RETRY_ATTEMPTS}..={MAX_ROTATION_RETRY_ATTEMPTS}",
-                c.rotation_retry_attempts
-            ),
-        ));
-    }
-    // RFC 0052 §3.8's one cross-knob rule, and the reason it lives in the
-    // WAL: only `Wal::open` sees both numbers. RFC0052.4's one-pass debris
-    // clearance is what it protects — a rotation retrying its full budget
-    // leaves one `.wal.partial` per attempt, and a pass that cannot pop
-    // them all would leave rotation debris on disk indefinitely.
+    Ok(())
+}
+
+/// The two second-granularity timers: `wal_segment_age_secs` and
+/// `wal_housekeeping_secs`.
+fn validate_cadences(c: &WalConfig) -> Result<(), OpenError> {
+    in_range(
+        "segment_age_secs",
+        c.segment_age_secs,
+        MIN_SEGMENT_AGE_SECS..=MAX_SEGMENT_AGE_SECS,
+        "§6.9",
+    )?;
+    in_range(
+        "housekeeping_secs",
+        c.housekeeping_secs,
+        MIN_HOUSEKEEPING_SECS..=MAX_HOUSEKEEPING_SECS,
+        "§6.9",
+    )
+}
+
+/// RFC 0052 §3.8's two knobs, and the one rule that reads both.
+fn validate_reclamation(c: &WalConfig) -> Result<(), OpenError> {
+    in_range(
+        "max_unlinks_per_pass",
+        c.max_unlinks_per_pass,
+        1..=MAX_UNLINKS_PER_PASS_CEILING,
+        "RFC 0052 §3.8",
+    )?;
+    in_range(
+        "rotation_retry_attempts",
+        c.rotation_retry_attempts,
+        MIN_ROTATION_RETRY_ATTEMPTS..=MAX_ROTATION_RETRY_ATTEMPTS,
+        "RFC 0052 §3.8",
+    )?;
+    // RFC 0052 §3.8's one cross-knob rule, and the reason it lives in
+    // the WAL: only `Wal::open` sees both numbers. RFC0052.4's one-pass
+    // debris clearance is what it protects — a rotation retrying its
+    // full budget leaves one `.wal.partial` per attempt, and a pass
+    // that cannot pop them all would leave rotation debris on disk
+    // indefinitely.
     if c.max_unlinks_per_pass < c.rotation_retry_attempts {
         return Err(outside(
             "max_unlinks_per_pass",
@@ -1501,27 +1543,35 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
             ),
         ));
     }
-    // `macos_full_fsync` is a `bool`; nothing to validate.
     Ok(())
 }
 
-/// Re-surface a rotation-origin directory-fsync failure on `sync`'s
-/// error type. The two surfaces carry the same two rotation variants,
-/// so the class survives the crossing; anything else would be a bug in
-/// [`Wal::step`]'s only caller here, which can raise nothing else.
-fn rotation_sync_failed(e: AppendError) -> SyncError {
-    match e {
-        AppendError::RotationRetrying(fault) => SyncError::RotationRetrying(fault),
-        AppendError::RotationTerminal(fault) => SyncError::RotationTerminal(fault),
-        AppendError::Io { op, source } => SyncError::Io { op, source },
-        AppendError::TooLarge { len, limit } => SyncError::Io {
-            op: "fsync(wal_root after rotation)",
-            source: std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("unreachable: a directory fsync cannot be oversize ({len} > {limit})"),
-            ),
-        },
+fn outside(field: &'static str, detail: String) -> OpenError {
+    OpenError::InvalidConfig { field, detail }
+}
+
+/// The common shape: a closed range whose violation names the field,
+/// the value and the section the range comes from.
+fn in_range<T>(
+    field: &'static str,
+    value: T,
+    range: std::ops::RangeInclusive<T>,
+    section: &str,
+) -> Result<(), OpenError>
+where
+    T: PartialOrd + std::fmt::Display + Copy,
+{
+    if range.contains(&value) {
+        return Ok(());
     }
+    Err(outside(
+        field,
+        format!(
+            "{value} outside {section} range {}..={}",
+            range.start(),
+            range.end()
+        ),
+    ))
 }
 
 /// Map a sidecar failure onto the rotation's error surface. A

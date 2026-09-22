@@ -959,6 +959,43 @@ fn rfc0052_12_a_permit_the_wal_has_moved_past_unlinks_nothing() {
     );
 }
 
+/// A prepare that is **refused** still revokes the permit before it.
+/// The refusals run after the abandoned plan is taken, so a permit
+/// left live across one could unlink past the very decision that
+/// failed closed — §3.2's halt on a tenant whose state cannot be told
+/// apart from a loss.
+#[test]
+fn rfc0052_12_a_refused_prepare_revokes_the_permit_before_it() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    // A first pass adopts `NoConsumer` durably, so the root's mode is
+    // recorded and a `Known` pass on it is refused.
+    let first = wal
+        .housekeeping_prepare(&SnapshotHorizons::NoConsumer, CAP)
+        .expect("prepare");
+    let planned: Vec<PathBuf> = first.segments().iter().map(|s| s.path.clone()).collect();
+    assert!(!planned.is_empty());
+    let permit = wal.write_plan_record(&first).expect("record");
+
+    wal.housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
+        .expect_err("a Known pass on a NoConsumer root is refused");
+
+    let outcome = unlink_planned(&first, permit);
+    assert!(
+        matches!(outcome, ourios_wal::ReclaimOutcome::RecordFailed(_)),
+        "the refusal took the permit with it",
+    );
+    assert!(
+        planned.iter().all(|path| path.exists()),
+        "so nothing was unlinked past a pass that failed closed",
+    );
+}
+
 /// An unlink that fails is kept for retry **and** reported. §3.1's
 /// rule is that the failure is logged and the next pass retries it,
 /// and a pass that returned `Ok` gave its caller neither.

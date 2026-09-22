@@ -117,6 +117,13 @@ impl Wal {
         // their only record, so they go back on it **before** anything
         // here can return early: a pass refused for a mode or horizon
         // mismatch would otherwise take them with it.
+        // Before anything, including the refusals below: an abandoned
+        // plan's permit stops authorising the moment this prepare
+        // decides to exist. A refusal after this point leaves no
+        // outstanding state, so a permit still live across it could
+        // unlink past the very decision that failed closed.
+        self.live_pass
+            .store(0, std::sync::atomic::Ordering::Release);
         if let Some(abandoned) = self.outstanding.take() {
             self.withdraw_across_modes(&abandoned, horizons);
             self.requeue_partials(abandoned.partials);

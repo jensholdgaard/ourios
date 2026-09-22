@@ -145,6 +145,36 @@ impl UnlinkPermit {
     pub(crate) fn new(pass: PassId, live: Arc<AtomicU64>) -> Self {
         Self { pass, live }
     }
+
+    /// Whether the WAL has moved past this pass. Read again before
+    /// **every** removal, not once: a second `housekeeping_prepare`
+    /// can take the journal guard while this unlocked half is still
+    /// running, and one preflight load would let the rest of the plan
+    /// go anyway. The window it leaves — between this load and the
+    /// `unlink` after it — is one file wide rather than one plan
+    /// wide, and cannot be closed without serialising the file half
+    /// against prepare, which is the recovery path §3.7 built the
+    /// second prepare for.
+    fn holds(&self) -> bool {
+        self.live.load(Ordering::Acquire) == self.pass.seq()
+    }
+
+    /// Run one removal, unless the WAL has moved past this pass.
+    fn guard(
+        &self,
+        remove: impl FnOnce() -> Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
+        if !self.holds() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "WAL housekeeping refused: pass {} is no longer live (RFC 0052 §3.2)",
+                    self.pass,
+                ),
+            ));
+        }
+        remove()
+    }
 }
 
 impl std::fmt::Display for PassId {
@@ -319,14 +349,13 @@ impl From<CheckpointError> for ReclaimError {
 // this permit exists to enforce.
 #[allow(clippy::needless_pass_by_value)]
 pub fn unlink_planned(plan: &ReclaimPlan, permit: UnlinkPermit) -> ReclaimOutcome {
-    let UnlinkPermit { pass, live } = permit;
-    if pass != plan.pass || live.load(Ordering::Acquire) != pass.seq() {
+    if permit.pass != plan.pass || !permit.holds() {
         return ReclaimOutcome::RecordFailed(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "WAL housekeeping refused: pass {}'s permit does not authorise pass {} \
                  (RFC 0052 §3.2)",
-                pass, plan.pass,
+                permit.pass, plan.pass,
             ),
         ));
     }
@@ -336,11 +365,11 @@ pub fn unlink_planned(plan: &ReclaimPlan, permit: UnlinkPermit) -> ReclaimOutcom
     let partials = plan
         .partials
         .iter()
-        .map(|path| (path, unlink_partial(&plan.root, path)));
+        .map(|path| (path, permit.guard(|| unlink_partial(&plan.root, path))));
     let segments = plan
         .segments
         .iter()
-        .map(|segment| (&segment.path, unlink_segment(segment)));
+        .map(|segment| (&segment.path, permit.guard(|| unlink_segment(segment))));
     let mut removed = Vec::new();
     let mut failed = Vec::new();
     for (path, outcome) in partials.chain(segments) {

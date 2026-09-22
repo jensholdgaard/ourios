@@ -138,8 +138,17 @@ impl std::fmt::Display for PassId {
 pub struct ReclaimPlan {
     /// The pass that produced this plan (§3.7).
     pub pass: PassId,
-    pub segments: Vec<PlannedSegment>,
-    pub partials: Vec<PathBuf>,
+    /// Readable through [`Self::segments`] and [`Self::partials`] but
+    /// not writable from outside the crate.
+    ///
+    /// [`unlink_planned`] is public, holds no guard and removes files;
+    /// what it removes has to be what the ledger half chose, and every
+    /// invariant the pass establishes here — the cap RFC0052.12 bounds
+    /// a pass by, the reserved partial shape, the segment identities
+    /// the record witnesses — would otherwise be one field assignment
+    /// away from being none.
+    pub(crate) segments: Vec<PlannedSegment>,
+    pub(crate) partials: Vec<PathBuf>,
     /// Whether this pass owes a record write at all. §3.2 gates the
     /// record write with the segment planning: a record written under
     /// a version-1 checkpoint witnesses a reclamation that never
@@ -147,6 +156,20 @@ pub struct ReclaimPlan {
     pub records: bool,
     pub root: PathBuf,
     pub progress: HousekeepingProgress,
+}
+
+impl ReclaimPlan {
+    /// The segments this pass planned, oldest first.
+    #[must_use]
+    pub fn segments(&self) -> &[PlannedSegment] {
+        &self.segments
+    }
+
+    /// The stale partials this pass swept, in the sweep's order.
+    #[must_use]
+    pub fn partials(&self) -> &[PathBuf] {
+        &self.partials
+    }
 }
 
 /// What the file half did (RFC 0052 §3.7).
@@ -326,13 +349,19 @@ fn segment_identity(path: &std::path::Path) -> Result<Option<Uuid>, std::io::Err
 
 /// The unlink failures of one pass, as the error its caller sees.
 ///
+/// [`crate::Wal::housekeeping_pass`] returns this after its commit. A
+/// caller driving §3.7's three-part protocol owns the
+/// [`ReclaimOutcome`] itself and can read `failed` directly; this is
+/// here so both paths report the same thing.
+///
 /// One error stands for the set: every failed path stays queued and is
 /// retried together on the next tick, so the count beside the first is
 /// what tells a single stuck file from a failing volume. A pass whose
 /// only trouble was the parent fsync is **not** one of these: §3.2
 /// reads that as the uncertain deletion it defines, re-verified by the
 /// next pass rather than retried as a failure.
-pub(crate) fn unlink_failure(outcome: &ReclaimOutcome) -> Option<HousekeepingError> {
+#[must_use]
+pub fn unlink_failure(outcome: &ReclaimOutcome) -> Option<HousekeepingError> {
     let ReclaimOutcome::Unlinked { failed, .. } = outcome else {
         return None;
     };
@@ -396,4 +425,84 @@ pub(crate) fn plan_entry(
         uncertain,
         last_offsets,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{
+        HousekeepingProgress, PassId, PassOutcome, ReclaimOutcome, ReclaimPlan, RetainFloor, Uuid,
+        unlink_planned,
+    };
+
+    /// The plan's paths are the crate's own, but [`unlink_planned`] is
+    /// public, holds no guard and removes files — so the reserved
+    /// shape is re-checked at the point of use rather than trusted
+    /// from the sweep's seeding. A planned *segment* is protected by
+    /// the header uuid the unlink verifies; a partial has nowhere to
+    /// carry one, so this is the only check it has.
+    #[test]
+    fn a_partial_outside_the_reserved_shape_is_not_unlinked() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path();
+        // The wrong name in the right directory, the right name in the
+        // wrong one, and a reserved partial that is really the pass's.
+        let misnamed = root.join("keep-me");
+        let elsewhere = tempfile::TempDir::new().expect("temp");
+        let outside = elsewhere
+            .path()
+            .join(format!("{}.wal.partial", Uuid::now_v7()));
+        let reserved = root.join(format!("{}.wal.partial", Uuid::now_v7()));
+        for path in [&misnamed, &outside, &reserved] {
+            std::fs::write(path, b"debris").expect("write");
+        }
+
+        let outcome = unlink_planned(&plan(
+            root,
+            vec![misnamed.clone(), outside.clone(), reserved.clone()],
+        ));
+        let ReclaimOutcome::Unlinked {
+            removed, failed, ..
+        } = outcome
+        else {
+            panic!("the unlink half ran");
+        };
+
+        assert_eq!(removed, vec![reserved.clone()], "only the pass's own");
+        assert!(!reserved.exists());
+        assert!(
+            misnamed.exists() && outside.exists(),
+            "neither a foreign name nor a foreign root is this pass's to remove",
+        );
+        assert_eq!(
+            failed
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![misnamed, outside],
+            "and each is reported rather than silently skipped",
+        );
+    }
+
+    fn plan(root: &std::path::Path, partials: Vec<PathBuf>) -> ReclaimPlan {
+        ReclaimPlan {
+            pass: PassId::new(1),
+            segments: Vec::new(),
+            partials,
+            records: false,
+            root: root.to_path_buf(),
+            progress: HousekeepingProgress {
+                removed_segments: 0,
+                removed_partials: 0,
+                capped: false,
+                horizon_remaining: 0,
+                unlink_remaining: 0,
+                floor: RetainFloor::Unknown,
+                lag_bytes: 0,
+                lag_segments: 0,
+                outcome: PassOutcome::Planned,
+            },
+        }
+    }
 }

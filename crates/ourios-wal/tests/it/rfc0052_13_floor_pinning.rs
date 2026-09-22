@@ -210,7 +210,7 @@ fn rfc0052_13_a_regression_withdraws_a_plan_that_was_never_committed() {
     let abandoned = wal
         .housekeeping_prepare(&known(&[("alpha", frames[0])]), CAP)
         .expect("prepare");
-    assert_eq!(abandoned.segments.len(), 1);
+    assert_eq!(abandoned.segments().len(), 1);
 
     // The snapshot stops restoring before the next pass.
     let pinned = wal

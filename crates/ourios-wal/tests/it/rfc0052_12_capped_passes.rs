@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use ourios_wal::{
-    FrameKind, PassOutcome, ReclaimError, ReclaimOutcome, SkipReason, SnapshotHorizons,
-    TenantBatch, WalOffset, unlink_planned,
+    FrameKind, PassOutcome, ReclaimError, SkipReason, SnapshotHorizons, TenantBatch, WalOffset,
+    unlink_planned,
 };
 
 use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files, write_partial};
@@ -150,7 +150,7 @@ fn rfc0052_12_append_completes_while_file_half_is_held() {
     // the regression guard, since an uncapped pass would have planned
     // the whole backlog here and held the position for all of it.
     assert_eq!(
-        plan.segments.len(),
+        plan.segments().len(),
         CAP,
         "prepare plans at most the cap, not the backlog",
     );
@@ -367,24 +367,25 @@ fn rfc0052_12_a_plan_that_is_never_committed_strands_nothing() {
 
     let horizons = known(&[("alpha", covered)]);
     let abandoned = wal.housekeeping_prepare(&horizons, 3).expect("prepare");
-    assert_eq!(abandoned.partials, vec![debris.clone()]);
-    assert_eq!(abandoned.segments.len(), 2, "3 - 1 partial = 2 segments");
+    assert_eq!(abandoned.partials(), vec![debris.clone()]);
+    assert_eq!(abandoned.segments().len(), 2, "3 - 1 partial = 2 segments");
 
     // No commit: the task died between the halves. The next pass
     // re-plans everything it held.
     let replanned = wal.housekeeping_prepare(&horizons, 3).expect("re-plan");
     assert_eq!(
-        replanned.partials, abandoned.partials,
+        replanned.partials(),
+        abandoned.partials(),
         "the partial is back on the sweep's list",
     );
     assert_eq!(
         replanned
-            .segments
+            .segments()
             .iter()
             .map(|s| s.segment)
             .collect::<Vec<_>>(),
         abandoned
-            .segments
+            .segments()
             .iter()
             .map(|s| s.segment)
             .collect::<Vec<_>>(),
@@ -419,7 +420,11 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
     let horizons = known(&[("alpha", covered)]);
     let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
     wal.write_plan_record(&abandoned).expect("record");
-    let planned: Vec<PathBuf> = abandoned.segments.iter().map(|s| s.path.clone()).collect();
+    let planned: Vec<PathBuf> = abandoned
+        .segments()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
     assert_eq!(planned.len(), CAP);
     let _ = unlink_planned(&abandoned);
     assert!(
@@ -431,12 +436,12 @@ fn rfc0052_12_a_plan_abandoned_after_its_unlinks_completes_on_the_next_pass() {
     let replanned = wal.housekeeping_prepare(&horizons, CAP).expect("re-plan");
     assert_eq!(
         replanned
-            .segments
+            .segments()
             .iter()
             .map(|s| (s.segment, s.uncertain))
             .collect::<Vec<_>>(),
         abandoned
-            .segments
+            .segments()
             .iter()
             .map(|s| (s.segment, true))
             .collect::<Vec<_>>(),
@@ -471,7 +476,11 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     let horizons = known(&[("alpha", covered)]);
     let abandoned = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
     wal.write_plan_record(&abandoned).expect("record");
-    let planned: Vec<PathBuf> = abandoned.segments.iter().map(|s| s.path.clone()).collect();
+    let planned: Vec<PathBuf> = abandoned
+        .segments()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
     let _ = unlink_planned(&abandoned);
     assert!(planned.iter().all(|path| !path.exists()));
 
@@ -479,7 +488,7 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     // the next pass: every segment it holds is withdrawn and pinned,
     // the ones already unlinked among them.
     let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
-    assert!(pinned.segments.is_empty(), "the regression withdrew them");
+    assert!(pinned.segments().is_empty(), "the regression withdrew them");
     wal.housekeeping_commit(unlink_planned(&pinned))
         .expect("commit");
 
@@ -489,7 +498,7 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
     let resumed = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
     assert_eq!(
         resumed
-            .segments
+            .segments()
             .iter()
             .filter(|s| planned.contains(&s.path))
             .map(|s| s.uncertain)
@@ -502,7 +511,7 @@ fn rfc0052_12_an_abandoned_unlink_survives_a_horizon_that_regresses_over_it() {
         wal.housekeeping_commit(unlink_planned(&resumed))
             .expect("commit")
             .removed_segments,
-        resumed.segments.len(),
+        resumed.segments().len(),
         "so the pass completes instead of failing on the missing paths",
     );
 }
@@ -529,7 +538,7 @@ fn rfc0052_12_a_superseded_plan_is_refused_at_the_record_write() {
     // goes back to pinned, the plan above included.
     let pinned = wal.housekeeping_prepare(&known(&[]), CAP).expect("re-plan");
     assert!(
-        pinned.segments.is_empty(),
+        pinned.segments().is_empty(),
         "the regression withdrew what the first plan named",
     );
 
@@ -587,62 +596,41 @@ fn rfc0052_12_a_failed_unlink_is_reported_and_stays_queued() {
 
     let next = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
     assert_eq!(
-        next.partials,
+        next.partials(),
         vec![wedged],
         "the failed path is back at the head of the sweep's list",
     );
 }
 
-/// `unlink_planned` is public, takes no guard, and is handed a plan
-/// whose `partials` are public paths. A planned segment is protected
-/// by the header uuid the unlink verifies; a partial has nowhere to
-/// carry one, so §3.3's reserved shape under the plan's own root is
-/// the only check there is — and it has to be made here rather than
-/// trusted from the sweep's seeding.
+/// A pass before `rebuild_ledger` reclaims **nothing**. Eligibility
+/// comes from the ledger and nowhere else (§3.7 withdrew the directory
+/// listing and the header read), so an empty one has no candidate to
+/// pop — the pass cannot mistake "no tenant spans yet" for "no tenant
+/// holds these", because it never sees the segments either.
 #[test]
-fn rfc0052_12_unlink_planned_refuses_a_partial_outside_the_reserved_shape() {
+fn rfc0052_12_a_pass_before_the_ledger_is_rebuilt_reclaims_nothing() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
-    let covered = backlog(root, 1);
-    write_partial(root);
+    let covered = backlog(root, BACKLOG);
+    let mut seeded = open(root);
+    seeded.rebuild_ledger().expect("ledger");
+    seeded.checkpoint(covered).expect("checkpoint");
+    drop(seeded);
+
+    // Reopened and *not* rebuilt: the checkpoint is on disk and covers
+    // every closed segment, and the tenant's horizon covers them too.
+    let before = segment_files(root);
     let mut wal = open(root);
-    wal.rebuild_ledger().expect("ledger");
-    wal.checkpoint(covered).expect("checkpoint");
-    let plan = wal
-        .housekeeping_prepare(&known(&[("alpha", covered)]), CAP)
-        .expect("prepare");
-    assert_eq!(plan.partials.len(), 1, "the sweep's own path is reserved");
+    let progress = wal
+        .housekeeping_pass(&known(&[("alpha", covered)]), CAP)
+        .expect("housekeeping");
 
-    // The wrong name in the right directory, and the right name in the
-    // wrong one.
-    let misnamed = root.join("keep-me");
-    std::fs::write(&misnamed, b"not the WAL's to remove").expect("bystander");
-    let elsewhere = tempfile::TempDir::new().expect("temp");
-    let outside = elsewhere
-        .path()
-        .join(format!("{}.wal.partial", uuid::Uuid::now_v7()));
-    std::fs::write(&outside, b"another root's debris").expect("bystander");
-
-    let mut tampered = plan.clone();
-    tampered.segments = Vec::new();
-    tampered.partials = vec![misnamed.clone(), outside.clone()];
-    let ReclaimOutcome::Unlinked {
-        removed, failed, ..
-    } = unlink_planned(&tampered)
-    else {
-        panic!("the unlink half ran");
-    };
-
-    assert!(removed.is_empty(), "neither path is the pass's to remove");
-    assert!(misnamed.exists() && outside.exists());
     assert_eq!(
-        failed
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>(),
-        vec![misnamed, outside],
-        "and each is reported rather than silently skipped",
+        (progress.removed_segments, progress.unlink_remaining),
+        (0, 0),
+        "an empty ledger offers the pass no candidate at all",
     );
+    assert_eq!(segment_files(root), before, "so every segment survives");
 }
 
 /// `count` closed segments for one tenant plus a current one. The

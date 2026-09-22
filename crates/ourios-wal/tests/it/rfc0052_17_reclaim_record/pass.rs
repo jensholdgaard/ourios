@@ -112,7 +112,7 @@ fn rfc0052_17_no_entry_with_undecodable_snapshot_pins_the_tenant() {
         "fixture: the pin itself sits above the reported minimum",
     );
     assert!(
-        plan.segments.is_empty(),
+        plan.segments().is_empty(),
         "and the pin holds its own segment",
     );
 }
@@ -252,7 +252,7 @@ fn rfc0052_17_pass_in_the_migration_window_is_skipped_but_sweeps_partials() {
         PassOutcome::Skipped(SkipReason::MigrationWindow),
     );
     assert_eq!(SkipReason::MigrationWindow.as_str(), "migration_window");
-    assert!(plan.segments.is_empty() && !plan.records);
+    assert!(plan.segments().is_empty() && !plan.records);
     assert!(
         !root.join(RECLAIM).exists(),
         "no record is created under a version-1 checkpoint",
@@ -443,7 +443,7 @@ fn a_failed_unlink_keeps_the_entry_behind_and_pins_on_restart() {
         .expect("prepare");
     wal.write_plan_record(&plan).expect("record");
 
-    let path = plan.segments[0].path.clone();
+    let path = plan.segments()[0].path.clone();
     let progress = wal
         .housekeeping_commit(ReclaimOutcome::Unlinked {
             removed: Vec::new(),
@@ -487,13 +487,13 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
         .expect("prepare");
     wal.write_plan_record(&plan).expect("record");
 
-    let segment = plan.segments[0].segment;
+    let segment = plan.segments()[0].segment;
     if really_removed {
-        std::fs::remove_file(&plan.segments[0].path).expect("the unlink itself succeeded");
+        std::fs::remove_file(&plan.segments()[0].path).expect("the unlink itself succeeded");
     }
     let progress = wal
         .housekeeping_commit(ReclaimOutcome::Unlinked {
-            removed: vec![plan.segments[0].path.clone()],
+            removed: vec![plan.segments()[0].path.clone()],
             failed: Vec::new(),
             fsync_failed: true,
         })
@@ -530,7 +530,7 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
         .expect("re-plan");
     assert_eq!(
         replan
-            .segments
+            .segments()
             .iter()
             .map(|s| (s.segment, s.uncertain))
             .collect::<Vec<_>>(),
@@ -600,7 +600,7 @@ fn a_renamed_planned_segment_is_not_counted_as_reclaimed() {
     // the newest segment as its append target and this one stays an
     // ordinary closed candidate.
     let moved = root.join("0-kept-by-an-operator.wal");
-    std::fs::rename(&plan.segments[0].path, &moved).expect("rename the planned segment");
+    std::fs::rename(&plan.segments()[0].path, &moved).expect("rename the planned segment");
 
     let progress = wal
         .housekeeping_commit(unlink_planned(&plan))
@@ -680,7 +680,7 @@ fn rfc0052_17_failed_record_write_unlinks_nothing_and_segments_are_reclaimed_lat
     let before = wal.reclaim_state();
     let horizons = known(&[("alpha", first[0])]);
     let plan = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
-    let planned: Vec<PathBuf> = plan.segments.iter().map(|s| s.path.clone()).collect();
+    let planned: Vec<PathBuf> = plan.segments().iter().map(|s| s.path.clone()).collect();
 
     // When: the file half reports it.
     let progress = wal

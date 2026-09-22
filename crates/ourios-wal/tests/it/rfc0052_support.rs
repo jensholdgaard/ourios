@@ -345,9 +345,17 @@ pub fn reclaimed_through(root: &Path) -> std::collections::BTreeMap<String, WalO
     out
 }
 
-/// The live slot's `planned` records: each popped segment's uuid and
-/// whether its deletion is §3.2's uncertain one.
-pub fn planned_unlinks(root: &Path) -> Vec<(uuid::Uuid, bool)> {
+/// One `planned` record as §3.2 stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedRow {
+    pub segment: uuid::Uuid,
+    /// §3.2's uncertain deletion: the unlink returned `Ok` but the
+    /// parent fsync did not.
+    pub uncertain: bool,
+}
+
+/// The live slot's `planned` records, oldest position first.
+pub fn planned_unlinks(root: &Path) -> Vec<PlannedRow> {
     let bytes = std::fs::read(root.join(RECLAIM)).expect("read RECLAIM");
     let slot = live_slot_bytes(&bytes);
     let max_tenants = usize::try_from(u32::from_le_bytes(
@@ -368,8 +376,10 @@ pub fn planned_unlinks(root: &Path) -> Vec<(uuid::Uuid, bool)> {
         if record[22] & (1 << 1) == 0 {
             continue;
         }
-        let uuid = uuid::Uuid::from_slice(&record[0..16]).expect("16 bytes");
-        out.push((uuid, record[22] & 1 != 0));
+        out.push(PlannedRow {
+            segment: uuid::Uuid::from_slice(&record[0..16]).expect("16 bytes"),
+            uncertain: record[22] & 1 != 0,
+        });
     }
     out
 }

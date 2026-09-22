@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use ourios_wal::{PassOutcome, ReclaimOutcome, SkipReason, SnapshotHorizons, unlink_planned};
 
 use crate::rfc0052_support::{
-    CHECKPOINT, MODE_KNOWN, MODE_NO_CONSUMER, RECLAIM, build_closed_segment, build_tenant_segment,
-    checkpoint_version, downgrade_segments, known, live_slot, open, planned_unlinks,
-    reclaimed_through, segment_files, write_legacy_checkpoint, write_partial,
+    CHECKPOINT, MODE_KNOWN, MODE_NO_CONSUMER, PlannedRow, RECLAIM, build_closed_segment,
+    build_tenant_segment, checkpoint_version, downgrade_segments, known, live_slot, open,
+    planned_unlinks, reclaimed_through, segment_files, write_legacy_checkpoint, write_partial,
 };
 
 const CAP: usize = 64;
@@ -485,13 +485,13 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
         .expect("prepare");
     wal.write_plan_record(&plan).expect("record");
 
-    let path = plan.segments[0].path.clone();
+    let segment = plan.segments[0].unlink.segment;
     if really_removed {
-        std::fs::remove_file(&path).expect("the unlink itself succeeded");
+        std::fs::remove_file(&plan.segments[0].path).expect("the unlink itself succeeded");
     }
     let progress = wal
         .housekeeping_commit(ReclaimOutcome::Unlinked {
-            removed: vec![path.clone()],
+            removed: vec![plan.segments[0].path.clone()],
             failed: Vec::new(),
             fsync_failed: true,
         })
@@ -512,7 +512,10 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
     );
     assert_eq!(
         planned_unlinks(root),
-        vec![(plan.segments[0].unlink.segment, false)],
+        vec![PlannedRow {
+            segment,
+            uncertain: false,
+        }],
         "the durable entry is still the one the record write left: the \
          uncertain mark follows reclaimed_through and lands with the \
          next record write",
@@ -529,11 +532,21 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
             .iter()
             .map(|s| (s.unlink.segment, s.unlink.uncertain))
             .collect::<Vec<_>>(),
-        vec![(plan.segments[0].unlink.segment, true)],
+        vec![(segment, true)],
     );
     drop(wal);
 
-    // The restart reconciles it either way.
+    the_restart_reconciles_an_uncertain_deletion(root, first[0], really_removed);
+}
+
+/// Present ⇒ retained and re-planned; absent ⇒ `reclaimed_through`
+/// raised, no halt. Either way the reconciled record is durable before
+/// the first pass.
+fn the_restart_reconciles_an_uncertain_deletion(
+    root: &std::path::Path,
+    horizon: ourios_wal::WalOffset,
+    really_removed: bool,
+) {
     let mut restarted = open(root);
     assert!(
         planned_unlinks(root).is_empty(),
@@ -543,23 +556,23 @@ fn an_uncertain_deletion_is_reverified_and_reconciled(really_removed: bool) {
     let entries = reclaimed_through(root);
     if really_removed {
         assert_eq!(
-            entries["alpha"], first[0],
+            entries["alpha"], horizon,
             "absent ⇒ the reclamation finished, so the entry is raised",
         );
-    } else {
-        assert!(
-            entries.is_empty(),
-            "present ⇒ retained, so nothing is claimed lost",
-        );
-        assert_eq!(
-            restarted
-                .housekeeping_pass(&known(&[("alpha", first[0])]), CAP)
-                .expect("housekeeping")
-                .removed_segments,
-            1,
-            "and the next pass re-plans it",
-        );
+        return;
     }
+    assert!(
+        entries.is_empty(),
+        "present ⇒ retained, so nothing is claimed lost",
+    );
+    assert_eq!(
+        restarted
+            .housekeeping_pass(&known(&[("alpha", horizon)]), CAP)
+            .expect("housekeeping")
+            .removed_segments,
+        1,
+        "and the next pass re-plans it",
+    );
 }
 
 /// A crash between the record write and the commit is reconciled the

@@ -295,6 +295,58 @@ fn rfc0052_12_partials_are_swept_first_under_the_same_cap() {
     );
 }
 
+/// A plan that is never committed — §3.7's "the task panicked between
+/// the halves" — strands nothing. Its segments stay marked reclaiming
+/// and are re-planned ahead of anything newly eligible; its partials
+/// left the sweep's list, which is their only record, so they go back
+/// on it.
+#[test]
+fn rfc0052_12_a_plan_that_is_never_committed_strands_nothing() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let debris = write_partial(root);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let horizons = known(&[("alpha", covered)]);
+    let abandoned = wal.housekeeping_prepare(&horizons, 3).expect("prepare");
+    assert_eq!(abandoned.partials, vec![debris.clone()]);
+    assert_eq!(abandoned.segments.len(), 2, "3 - 1 partial = 2 segments");
+
+    // No commit: the task died between the halves. The next pass
+    // re-plans everything it held.
+    let replanned = wal.housekeeping_prepare(&horizons, 3).expect("re-plan");
+    assert_eq!(
+        replanned.partials, abandoned.partials,
+        "the partial is back on the sweep's list",
+    );
+    assert_eq!(
+        replanned
+            .segments
+            .iter()
+            .map(|s| s.unlink.segment)
+            .collect::<Vec<_>>(),
+        abandoned
+            .segments
+            .iter()
+            .map(|s| s.unlink.segment)
+            .collect::<Vec<_>>(),
+        "and the entries still marked reclaiming are re-planned first",
+    );
+
+    wal.write_plan_record(&replanned).expect("record");
+    let progress = wal
+        .housekeeping_commit(unlink_planned(&replanned))
+        .expect("commit");
+    assert_eq!(
+        (progress.removed_segments, progress.removed_partials),
+        (2, 1)
+    );
+    assert!(!debris.exists());
+}
+
 /// `count` closed segments for one tenant plus a current one. The
 /// returned mark is the newest frame of all, so it covers every
 /// segment: the current one is held back by its identity, not by the

@@ -222,6 +222,19 @@ pub(crate) struct SegmentLedger {
     floor: RetainFloor,
 }
 
+/// What bounds one pass's pops (RFC 0052 §3.2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PopBound {
+    /// Every pop is at or below this, inclusively.
+    pub(crate) checkpoint: WalOffset,
+    /// The append target, which is never popped: identity is the
+    /// header uuid, so a rename cannot slip it past the guard.
+    pub(crate) current: Uuid,
+    /// Whether tenant horizons constrain the candidates — false only
+    /// under `SnapshotHorizons::NoConsumer`.
+    pub(crate) tenant_aware: bool,
+}
+
 /// One segment a pass popped, with everything the record write and the
 /// unlink need. Ordered oldest-first.
 #[derive(Debug, Clone)]
@@ -451,56 +464,67 @@ impl SegmentLedger {
     /// reclaiming first — §3.7's re-plan of a pass that never
     /// committed — then newly eligible ones, oldest first.
     ///
-    /// `checkpoint` bounds every pop inclusively and `current` is
-    /// never popped: identity is the header uuid, so a rename cannot
-    /// slip the live append target past the guard.
-    pub(crate) fn pop(
-        &mut self,
-        checkpoint: WalOffset,
-        current: Uuid,
-        tenant_aware: bool,
-        budget: usize,
-    ) -> (Vec<Popped>, bool) {
+    /// `bound` carries the checkpoint every pop is bounded by
+    /// (inclusive), the segment that may never be popped, and whether
+    /// tenants constrain the candidates at all.
+    pub(crate) fn pop(&mut self, bound: PopBound, budget: usize) -> (Vec<Popped>, bool) {
         let mut out = Vec::new();
-        let replans: Vec<Uuid> = self
-            .segments
+        let replans = self.reclaiming_ids();
+        if self.drain_into(&mut out, replans, bound, budget, |_| true) {
+            return (out, true);
+        }
+        let candidates = self.eligible_ids(bound.tenant_aware);
+        let capped = self.drain_into(&mut out, candidates, bound, budget, |segment| {
+            segment.state == State::Eligible && segment.highest <= bound.checkpoint
+        });
+        (out, capped)
+    }
+
+    /// Pop from `ids`, oldest first, while `admit` accepts the segment
+    /// and the budget holds. Returns whether the budget bound.
+    fn drain_into(
+        &mut self,
+        out: &mut Vec<Popped>,
+        ids: Vec<Uuid>,
+        bound: PopBound,
+        budget: usize,
+        admit: impl Fn(&Segment) -> bool,
+    ) -> bool {
+        for id in ids {
+            if out.len() >= budget {
+                return true;
+            }
+            if !self.segments.get(&id).is_some_and(&admit) {
+                continue;
+            }
+            if let Some(popped) = self.take(id, bound.current) {
+                out.push(popped);
+            }
+        }
+        false
+    }
+
+    /// §3.7's re-plan: a pass that never committed left these marked
+    /// reclaiming, and the next prepare takes them ahead of anything
+    /// newly eligible.
+    fn reclaiming_ids(&self) -> Vec<Uuid> {
+        self.segments
             .iter()
             .filter(|(_, s)| matches!(s.state, State::Reclaiming { .. }))
             .map(|(id, _)| *id)
-            .collect();
-        for id in replans {
-            if out.len() >= budget {
-                return (out, true);
-            }
-            if let Some(popped) = self.take(id, current) {
-                out.push(popped);
-            }
-        }
-        // Under `NoConsumer` no tenant constrains anything, so the
-        // candidate order is the whole ledger's; otherwise it is the
-        // empty-set head, which is what makes a pinned oldest segment
-        // unable to shadow a later eligible one.
-        let candidates: Vec<Uuid> = if tenant_aware {
+            .collect()
+    }
+
+    /// Under `NoConsumer` no tenant constrains anything, so the
+    /// candidate order is the whole ledger's; otherwise it is the
+    /// empty-set head, which is what keeps a pinned oldest segment
+    /// from shadowing a later eligible one.
+    fn eligible_ids(&self, tenant_aware: bool) -> Vec<Uuid> {
+        if tenant_aware {
             self.unpinned.iter().copied().collect()
         } else {
             self.segments.keys().copied().collect()
-        };
-        for id in candidates {
-            if out.len() >= budget {
-                return (out, true);
-            }
-            let eligible = self
-                .segments
-                .get(&id)
-                .is_some_and(|s| s.state == State::Eligible && s.highest <= checkpoint);
-            if !eligible {
-                continue;
-            }
-            if let Some(popped) = self.take(id, current) {
-                out.push(popped);
-            }
         }
-        (out, false)
     }
 
     /// Mark one segment reclaiming and describe it for the record.

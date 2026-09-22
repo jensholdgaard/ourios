@@ -787,8 +787,15 @@ impl Wal {
     /// frame; the driver's suppression is the only dedup).
     ///
     /// Advance is monotonic: a `durable_to` below the current
-    /// checkpoint is rejected; re-asserting the current value
-    /// is an idempotent no-op.
+    /// checkpoint is rejected. Re-asserting the current value never
+    /// moves the mark, but it is a no-op only once the checkpoint is
+    /// *settled* — sidecar at version 2, its directory entry fsynced,
+    /// and `checkpoint_seen` in the RFC 0052 §3.2 record beside it.
+    /// Until then an equal mark rewrites all three, which is how a
+    /// version-1 root reaches version 2 and how a durability step a
+    /// previous call owed and failed is retried; callers that repeat
+    /// an equal mark to finish either get that, at the cost of the
+    /// writes.
     ///
     /// # Errors
     ///

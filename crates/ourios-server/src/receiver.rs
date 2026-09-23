@@ -1656,6 +1656,52 @@ mod tests {
         (pipeline, sink, barrier)
     }
 
+    /// The barrier task must not start a cut once shutdown is signalled:
+    /// `ReceiverHandle::shutdown` awaits this task, so a cut begun here
+    /// makes a graceful stop wait out a whole capture and its store I/O.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_task_takes_no_cut_once_shutdown_is_signalled() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).expect("store root");
+        let (pipeline, sink, barrier) = rotating_pooled_pipeline(
+            &tmp.path().join("wal"),
+            Store::local(&store_root).expect("local store"),
+            &tmp.path().join("snapshots"),
+        );
+        pipeline
+            .ingest(
+                export_request("checkout", &["user 1 logged in"]),
+                ourios_core::tenant::TenantId::new("checkout"),
+            )
+            .await
+            .expect("batch acks");
+        pipeline.quiesce_encodes();
+        let epochs = barrier.epochs();
+        let before = epochs.current();
+
+        // Signalled before the task is spawned, so the very first loop
+        // iteration sees it — the arm the pre-check covers, and the one a
+        // signal arriving during a cut lands in.
+        let (shutdown, shutdown_rx) = watch::channel(());
+        shutdown.send(()).expect("signal shutdown");
+        spawn_barrier(pipeline.clone(), Arc::clone(&barrier), shutdown_rx)
+            .await
+            .expect("the barrier task exits cleanly");
+
+        assert_eq!(
+            epochs.current(),
+            before,
+            "no cut was opened after the shutdown signal",
+        );
+        assert_eq!(
+            sink.buffered_records(),
+            1,
+            "and the record was never drained out of the buffers",
+        );
+        assert_eq!(barrier.pending_mark(), None, "nothing was left pending");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rfc0035_2_rotation_flushes_buffered_records_before_stamping() {
         let tmp = tempfile::TempDir::new().expect("temp");

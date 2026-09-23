@@ -20,6 +20,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::Barrier;
+use ourios_ingester::cadence::BarrierEpochs;
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
@@ -234,12 +235,50 @@ fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::
 /// data is in the store); `false` means data was retained and the snapshot was
 /// skipped. Callers log via `cadence`; the value is for tests today and
 /// sink-flush metrics later (RFC 0014 §6.3).
+/// What a non-barrier cadence point may stamp, and the state it must
+/// clear first.
+///
+/// Two variants rather than an offset beside an `Option<&_>`: only one
+/// of the two call sites can have a cadence latch at all, and a caller
+/// holding a bare offset could not tell whether it owed the check.
+enum Stamp {
+    /// `serve`'s post-recovery point. It runs before the pipeline, its
+    /// encode pool and its publish guards exist, so nothing can have
+    /// latched and there is no state to consult.
+    PreFlight(Option<WalOffset>),
+    /// A running receiver's shutdown. Refused while the latch is set: a
+    /// latch means an encode or a publish unwound and dropped records
+    /// this process can no longer account for, and unlike a requeue
+    /// those records are in no buffer for the flush below to find.
+    /// Stamping over them would put the snapshot horizon above data that
+    /// reached neither the store nor a buffer, and recovery suppresses
+    /// frames at or below that horizon — silent loss.
+    Cadence(Option<WalOffset>, Arc<BarrierEpochs>),
+}
+
+impl Stamp {
+    fn high_water(&self) -> Option<WalOffset> {
+        match self {
+            Self::PreFlight(mark) | Self::Cadence(mark, _) => *mark,
+        }
+    }
+
+    fn refused(&self) -> bool {
+        match self {
+            Self::PreFlight(_) => false,
+            // Every epoch this process has handed out is at or below
+            // `current`, so a latch anywhere refuses the stamp.
+            Self::Cadence(_, epochs) => epochs.capture().refuses(epochs.current()),
+        }
+    }
+}
+
 fn flush_then_snapshot(
     sink: &SharedParquetSink,
     audit_sink: &SharedParquetAuditSink,
     snapshots_root: &Path,
     miner: &MinerCluster,
-    high_water: Option<WalOffset>,
+    stamp: Stamp,
     cadence: &str,
 ) -> bool {
     // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
@@ -276,7 +315,21 @@ fn flush_then_snapshot(
     // it gets here (`flush_tick.await`), but the barrier must not rely on
     // that ordering — this quiesce is what makes every stamping path safe by
     // construction.
+    // A settlement that *failed* requeues its records into the buffers,
+    // where `flush_all` below finds them and the retained-records gate
+    // skips the stamp — so the outcomes need no separate check here. A
+    // settlement that *unwound* dropped them instead, and that is what
+    // the latch records.
     let _outcomes = sink.quiesce_publishes();
+    if stamp.refused() {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SINK_RETAINED,
+            "{cadence}: the cadence latch is set (an encode or a publish unwound), so the \
+             snapshot is skipped — the next start replays from the checkpoint and re-mines \
+             those frames (no acknowledged data is lost; the WAL is durable)"
+        );
+        return false;
+    }
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
         tracing::warn!(
@@ -297,7 +350,7 @@ fn flush_then_snapshot(
         );
         return false;
     }
-    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, high_water) {
+    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, stamp.high_water()) {
         tracing::warn!(
             name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
             "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
@@ -370,6 +423,10 @@ pub struct ReceiverHandle {
     /// joined before the shutdown flush so no cut is in flight when it
     /// runs.
     barrier_tick: JoinHandle<()>,
+    /// The cadence latch every guard in this receiver reports into. The
+    /// shutdown stamp consults it: it is the one stamping path left
+    /// outside [`Barrier::run_cut`]'s own checks.
+    epochs: Arc<BarrierEpochs>,
 }
 
 impl ReceiverHandle {
@@ -407,7 +464,13 @@ impl ReceiverHandle {
         // holding drained batches outside the buffers. A store failure
         // in that last cut requeues into the buffers as any cut's does,
         // and the flush covers the requeue.
-        let _ = self.barrier_tick.await;
+        // A `JoinError` is the barrier task panicking or being aborted
+        // outside `tick`'s own `catch_unwind`; the cut it was running
+        // may have drained batches it never settled, so latch its epoch
+        // and let the stamp below refuse rather than advance past them.
+        if self.barrier_tick.await.is_err() {
+            self.epochs.report(self.epochs.current());
+        }
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -436,7 +499,7 @@ impl ReceiverHandle {
                     &self.audit_sink,
                     &self.snapshots_root,
                     miner,
-                    last_durable,
+                    Stamp::Cadence(last_durable, Arc::clone(&self.epochs)),
                     "shutdown",
                 );
             });
@@ -488,33 +551,22 @@ fn build_write_sinks(
 /// the rotation `mark` only if both sinks drained (the no-loss invariant). The
 /// hook fires before the new segment's first record reaches the miner, so the
 /// buffers hold exactly the sealed segment's data (RFC0014.3/.5, `CLAUDE.md`
-/// §3.4). It runs on the request path (inside `ingest`) and does blocking
-/// Parquet/store I/O, so `block_in_place` lets the runtime relocate other tasks.
+/// §3.4).
 ///
-/// **Not yet capture-only.** RFC 0052 §3.1 turns this into a capture
-/// that hands a cut to the barrier task, so the exclusion is never held
-/// across store I/O. That is a contract change to the three RFC0035.2
-/// tests below, which assert the flush and the stamp have happened by
-/// the time the rotating `ingest` returns, so it waits on explicit
-/// approval (`CLAUDE.md` §6.2) rather than an implementer's judgement.
-/// The timer path below is the barrier §3.1 specifies; this one keeps
-/// today's behaviour meanwhile.
-fn rotation_snapshot_hook(
-    sink: SharedParquetSink,
-    audit_sink: SharedParquetAuditSink,
-    snapshots_root: PathBuf,
-) -> RotationHook {
+/// **Capture-only** (RFC 0052 §3.1). It runs on the request path, inside
+/// `ingest`, under the ingest gate and the miner lock — so it does no
+/// store I/O at all: it drains both sinks into owned batches, serialises
+/// the miner, and hands that cut to the barrier task, which flushes,
+/// installs and stamps outside every one of those locks. The invariant
+/// is unchanged — no snapshot is stamped at `mark` until every record at
+/// or below it is durable in the store — but it is now established by
+/// the cut the barrier runs rather than by a flush inside the request.
+/// The removed `flush_then_snapshot` here was the largest
+/// store-I/O-under-the-ingest-lock site in the receiver (issue #791).
+///
+fn rotation_capture_hook(barrier: Arc<Barrier>) -> RotationHook {
     Box::new(move |miner, mark| {
-        tokio::task::block_in_place(|| {
-            flush_then_snapshot(
-                &sink,
-                &audit_sink,
-                &snapshots_root,
-                miner,
-                Some(mark),
-                "rotation",
-            );
-        });
+        barrier.capture_rotation(miner, mark);
     })
 }
 
@@ -534,24 +586,40 @@ fn spawn_barrier(
     barrier: Arc<Barrier>,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
+    let epochs = barrier.epochs();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(BARRIER_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // the first tick is immediate; skip it
         loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                _ = shutdown.changed() => break,
+            // `shutdown` wins both races: the pre-check for a signal
+            // that arrived while the last cut ran, and `biased` for one
+            // that is ready alongside the tick. `ReceiverHandle::shutdown`
+            // awaits this task, so a cut started here after the signal
+            // makes a graceful stop wait out a whole capture and its
+            // store I/O.
+            if shutdown.has_changed().unwrap_or(true) {
+                break;
             }
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = tick.tick() => {}
+            }
+            let epoch = epochs.current();
             let pipeline = pipeline.clone();
             let barrier = barrier.clone();
-            // `tick` catches its own panic and lowers the latch, so a
-            // `JoinError` here is a cancellation; the loop stops either
-            // way and shutdown's own flush covers what is left.
+            // `tick` catches its own panic and lowers the latch itself,
+            // so a `JoinError` means the tick never reached a decision —
+            // a cancellation, or an abort `catch_unwind` cannot see. The
+            // cut it was running may have drained batches it never
+            // settled, so latch its epoch: shutdown's own stamp then
+            // refuses rather than advancing the horizon past them.
             if tokio::task::spawn_blocking(move || barrier.tick(&pipeline, true))
                 .await
                 .is_err()
             {
+                epochs.report(epoch);
                 break;
             }
         }
@@ -603,22 +671,19 @@ struct Cadences {
     barrier_tick: JoinHandle<()>,
 }
 
-/// What the cadences are built over. A value rather than four more
+/// What the cadences are built over. A value rather than three more
 /// parameters: the barrier and the sweep share a publish coordinator by
 /// construction, and handing them separate ones would put two owners on
 /// one sink's in-flight accounting.
 struct CadenceInputs {
     publisher: PublishCoordinator,
     graph: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
-    commits: Arc<CommitCoordinator>,
-    snapshots_root: PathBuf,
+    /// Built before the pipeline, because the capture-only rotation hook
+    /// the pipeline installs holds it (RFC 0052 §3.1).
+    barrier: Arc<Barrier>,
 }
 
 /// Start both cadences over one publish coordinator.
-///
-/// The barrier is built here rather than with the pipeline because it
-/// needs the same commit coordinator the pipeline holds, and so cannot
-/// exist before it.
 fn spawn_cadences(
     pipeline: &SharedPipeline,
     inputs: CadenceInputs,
@@ -627,23 +692,16 @@ fn spawn_cadences(
     let CadenceInputs {
         mut publisher,
         graph,
-        commits,
-        snapshots_root,
+        barrier,
     } = inputs;
     if let Some(emitter) = graph {
         publisher = publisher.with_graph_emitter(emitter);
     }
     let overflow = publisher.audit().overflow_notify();
-    let barrier = Arc::new(Barrier::new(
-        publisher.clone(),
-        commits,
-        snapshots_root,
-        SINK_CEILING_BYTES,
-    ));
     Cadences {
         barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
-        // The age sweep drains under the miner lock and writes
-        // audit-ordered off it (issue #302 #1/#2).
+        // The age sweep drains under the barrier exclusion and the miner
+        // lock, and writes audit-ordered off both (issue #302 #1/#2).
         flush_tick: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
     }
 }
@@ -721,7 +779,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             &audit_sink,
             &snapshots_root,
             &miner,
-            report.max_delivered,
+            // The highest offset replay delivered is the right horizon
+            // for a *snapshot*: the miner state below covers exactly
+            // those frames. It is not a checkpoint mark, and the
+            // pipeline's `DurableMark::Replayed` seed keeps the barrier
+            // from mistaking it for one.
+            Stamp::PreFlight(report.max_delivered),
             "post-recovery",
         );
     });
@@ -735,17 +798,24 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // the next start (RFC 0001 §6.9), which would overwrite the post-recovery
     // artefacts with full-replay-only ones.
     let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
+    // RFC 0052 §3.1: the barrier is built before the pipeline, because
+    // the pipeline's rotation hook is now a capture into it. Both
+    // cadences share this one publish coordinator — two would put two
+    // owners on a single sink's in-flight accounting.
+    let publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    let barrier = Arc::new(Barrier::new(
+        publisher.clone(),
+        Arc::clone(&commits),
+        snapshots_root.clone(),
+        SINK_CEILING_BYTES,
+    ));
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(Arc::clone(&commits), miner)
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
             .with_last_durable(report.max_delivered)
-            .with_rotation_hook(rotation_snapshot_hook(
-                sink.clone(),
-                audit_sink.clone(),
-                snapshots_root.clone(),
-            ))
+            .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier)))
             // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
             // global commit gate; the pool emits into the same shared
             // sink the miner holds, so a cut's drain covers it. The
@@ -762,16 +832,19 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     let (shutdown, shutdown_rx) = watch::channel(());
 
+    // The pool's latch, which the pipeline adopted and the barrier shares
+    // — one word across every guard in the receiver (RFC 0052 §3.1).
+    let pipeline_epochs = pipeline.epochs();
+
     let Cadences {
         flush_tick,
         barrier_tick,
     } = spawn_cadences(
         &pipeline,
         CadenceInputs {
-            publisher: PublishCoordinator::new(sink.clone(), audit_sink.clone()),
+            publisher,
             graph: config.graph_emitter.clone(),
-            commits,
-            snapshots_root: snapshots_root.clone(),
+            barrier: Arc::clone(&barrier),
         },
         &shutdown_rx,
     );
@@ -865,6 +938,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         audit_sink,
         flush_tick,
         barrier_tick,
+        epochs: pipeline_epochs,
     })
 }
 
@@ -1096,7 +1170,7 @@ mod tests {
             &audit,
             &tmp.path().join("snapshots"),
             &miner,
-            None,
+            Stamp::PreFlight(None),
             "test",
         );
 
@@ -1122,7 +1196,7 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, None, "test");
+        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, Stamp::PreFlight(None), "test");
 
         assert!(!drained, "an unavailable store does not drain the sink");
         assert_eq!(
@@ -1163,7 +1237,7 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, None, "test");
+        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, Stamp::PreFlight(None), "test");
 
         assert!(!drained, "a retained audit buffer blocks the drain");
         assert_eq!(
@@ -1549,12 +1623,14 @@ mod tests {
     // against the production hook. ---
 
     /// A pooled pipeline over a real 1 s-age WAL whose rotation hook is
-    /// the production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    /// the production capture-only `rotation_capture_hook`, plus the
+    /// barrier it captures into — the caller runs the cut where the hook
+    /// used to flush and stamp inline.
     fn rotating_pooled_pipeline(
         wal_root: &Path,
         store: Store,
         snapshots_root: &Path,
-    ) -> (SharedPipeline, SharedParquetSink) {
+    ) -> (SharedPipeline, SharedParquetSink, Arc<Barrier>) {
         let wal = Wal::open(WalConfig {
             segment_age_secs: 1,
             ..test_wal_config(wal_root)
@@ -1566,16 +1642,18 @@ mod tests {
                 .with_record_sink(Box::new(sink.clone()));
         let coordinator =
             CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let barrier = Arc::new(Barrier::new(
+            PublishCoordinator::new(sink.clone(), audit_sink),
+            Arc::clone(&coordinator),
+            snapshots_root.to_path_buf(),
+            SINK_CEILING_BYTES,
+        ));
         let pipeline = Arc::new(
             IngestPipeline::new(coordinator, miner)
                 .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
-                .with_rotation_hook(rotation_snapshot_hook(
-                    sink.clone(),
-                    audit_sink,
-                    snapshots_root.to_path_buf(),
-                )),
+                .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier))),
         );
-        (pipeline, sink)
+        (pipeline, sink, barrier)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1584,7 +1662,7 @@ mod tests {
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).expect("store root");
         let snapshots_root = tmp.path().join("snapshots");
-        let (pipeline, sink) = rotating_pooled_pipeline(
+        let (pipeline, sink, barrier) = rotating_pooled_pipeline(
             &tmp.path().join("wal"),
             Store::local(&store_root).expect("local store"),
             &snapshots_root,
@@ -1603,8 +1681,11 @@ mod tests {
         pipeline.quiesce_encodes();
         assert_eq!(sink.buffered_records(), 2, "batch A is buffered, unflushed");
 
-        // Rotation: the hook must flush the buffered records ≤ mark
-        // before it stamps the snapshot.
+        // Rotation: the hook is now capture-only (RFC 0052 §3.1), so it
+        // takes batch A out of the buffers into a cut and returns without
+        // touching the store. Nothing is stamped yet — the invariant moves
+        // from "by the time `ingest` returns" to "by the time the cut the
+        // rotation handed over has run".
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         pipeline
             .ingest(
@@ -1614,12 +1695,31 @@ mod tests {
             .await
             .expect("batch B acks");
         pipeline.quiesce_encodes();
+        assert_eq!(
+            barrier.pending_mark(),
+            Some(rotation_point),
+            "the rotation handed the barrier a cut at the rotation point",
+        );
+        assert!(
+            !std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some()),
+            "and stamped nothing on the request path",
+        );
+
+        // Run the cut the rotation captured: batch A's records reach the
+        // store, and only then is the snapshot stamped.
+        let cut = {
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || barrier.run_pending())
+                .await
+                .expect("the cut runs")
+        };
+        assert_eq!(cut, ourios_ingester::barrier::CutOutcome::Stamped);
 
         assert_eq!(
             sink.buffered_records(),
             1,
-            "only batch B's record remains buffered — the hook's flush_all \
-             drained batch A before the stamp",
+            "only batch B's record remains buffered — the cut took batch A \
+             out of the buffers and published it before the stamp",
         );
         assert!(
             !data_parquet_files(&store_root.join("data")).is_empty(),
@@ -1637,13 +1737,14 @@ mod tests {
     /// A pooled pipeline over a real 1 s-age WAL, an **age-zero** record
     /// sink (so `drain_aged` takes every partition — the sweep's view of an
     /// aged one, without waiting out a real age), an audit sink, and the
-    /// production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    /// production capture-only `rotation_capture_hook` with the barrier it
+    /// captures into.
     fn sweep_race_pipeline(
         wal_root: &Path,
         store_root: &Path,
         audit_root: &Path,
         snapshots_root: &Path,
-    ) -> (SharedPipeline, SharedParquetSink, SharedParquetAuditSink) {
+    ) -> SweepRaceRig {
         let wal = Wal::open(WalConfig {
             segment_age_secs: 1,
             ..test_wal_config(wal_root)
@@ -1663,16 +1764,31 @@ mod tests {
             .with_record_sink(Box::new(sink.clone()));
         let coordinator =
             CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let barrier = Arc::new(Barrier::new(
+            PublishCoordinator::new(sink.clone(), audit.clone()),
+            Arc::clone(&coordinator),
+            snapshots_root.to_path_buf(),
+            SINK_CEILING_BYTES,
+        ));
         let pipeline = Arc::new(
             IngestPipeline::new(coordinator, miner)
                 .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
-                .with_rotation_hook(rotation_snapshot_hook(
-                    sink.clone(),
-                    audit.clone(),
-                    snapshots_root.to_path_buf(),
-                )),
+                .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier))),
         );
-        (pipeline, sink, audit)
+        SweepRaceRig {
+            pipeline,
+            sink,
+            audit,
+            barrier,
+        }
+    }
+
+    /// Four values, so a struct rather than a tuple nobody can read.
+    struct SweepRaceRig {
+        pipeline: SharedPipeline,
+        sink: SharedParquetSink,
+        audit: SharedParquetAuditSink,
+        barrier: Arc<Barrier>,
     }
 
     /// Issue #578 — the publish half of the RFC0035.2 barrier: a rotation
@@ -1689,7 +1805,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp");
         let store_root = tmp.path().join("store");
         let snapshots_root = tmp.path().join("snapshots");
-        let (pipeline, sink, audit) = sweep_race_pipeline(
+        let SweepRaceRig {
+            pipeline,
+            sink,
+            audit,
+            barrier,
+        } = sweep_race_pipeline(
             &tmp.path().join("wal"),
             &store_root,
             &tmp.path().join("audit"),
@@ -1732,7 +1853,10 @@ mod tests {
         );
 
         // The rotation races the in-flight publish: batch B lands in a new
-        // segment and fires the production hook on the ingest path.
+        // segment and fires the production capture-only hook on the ingest
+        // path. RFC 0052 §3.1 moves the wait off that path — the capture
+        // returns at once and the cut it handed over does the waiting — so
+        // the rotating `ingest` is expected to complete here.
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         let rotate_pipeline = pipeline.clone();
         let rotation = tokio::spawn(async move {
@@ -1744,10 +1868,24 @@ mod tests {
                 .await
                 .expect("batch B acks")
         });
+        assert_eq!(rotation.await.expect("rotation task"), 1, "batch B acked");
+        assert_eq!(
+            barrier.pending_mark(),
+            Some(rotation_point),
+            "the rotation handed over a cut at the rotation point",
+        );
 
-        // Mid-window: the hook must be waiting in `quiesce_publishes`, not
-        // stamping. Without the barrier the rotation completes within the
-        // ~100 ms commit window, far inside this 800 ms observation point.
+        // Run that cut concurrently with the held publish. It must block in
+        // `quiesce_publishes` rather than stamp.
+        let cut = tokio::task::spawn_blocking({
+            let barrier = Arc::clone(&barrier);
+            move || barrier.run_pending()
+        });
+
+        // Mid-window: the cut must still be waiting, not stamping. Without
+        // the barrier's quiesce the cut has nothing of its own to publish
+        // (the sweep already emptied the buffers) and would stamp
+        // immediately, far inside this 800 ms observation point.
         tokio::time::sleep(Duration::from_millis(800)).await;
         let snapshot_written =
             std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
@@ -1758,7 +1896,10 @@ mod tests {
 
         release_tx.send(()).expect("release the publish");
         sweep.join().expect("sweep thread");
-        assert_eq!(rotation.await.expect("rotation task"), 1, "batch B acked");
+        assert_eq!(
+            cut.await.expect("the cut runs"),
+            ourios_ingester::barrier::CutOutcome::Stamped,
+        );
 
         // The stamp landed only after the publish settled: batch A is
         // durably in the store and the snapshot carries the rotation mark.
@@ -1781,7 +1922,7 @@ mod tests {
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).expect("store root");
         let snapshots_root = tmp.path().join("snapshots");
-        let (pipeline, sink) = rotating_pooled_pipeline(
+        let (pipeline, sink, barrier) = rotating_pooled_pipeline(
             &tmp.path().join("wal"),
             Store::local(&store_root).expect("local store"),
             &snapshots_root,
@@ -1797,9 +1938,9 @@ mod tests {
         pipeline.quiesce_encodes();
         assert_eq!(sink.buffered_records(), 1, "batch A is buffered, unflushed");
 
-        // Sabotage the store: the hook's flush cannot drain, so the
+        // Sabotage the store: the cut's publish cannot land, so the
         // snapshot must be skipped — stamping would advance the horizon
-        // past a buffered-but-unflushed record ≤ the mark.
+        // past a record ≤ the mark that reached no Parquet object.
         std::fs::remove_dir_all(&store_root).expect("remove store dir");
         std::fs::write(&store_root, b"not a directory").expect("sabotage store");
 
@@ -1810,19 +1951,32 @@ mod tests {
                 ourios_core::tenant::TenantId::new("checkout"),
             )
             .await
-            .expect("batch B still acks — the hook is best-effort");
+            .expect("batch B still acks — the capture is best-effort");
         pipeline.quiesce_encodes();
+
+        let cut = {
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || barrier.run_pending())
+                .await
+                .expect("the cut runs")
+        };
+        assert_eq!(
+            cut,
+            ourios_ingester::barrier::CutOutcome::Retained,
+            "the cut retained rather than stamping",
+        );
 
         assert_eq!(
             sink.buffered_records(),
             2,
-            "the un-flushable records are retained (the WAL is the durability of record)",
+            "the un-publishable records are back in the buffers (the WAL is the \
+             durability of record)",
         );
         let snapshot_written =
             std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
         assert!(
             !snapshot_written,
-            "the stamp is skipped while a record ≤ the mark is buffered-but-unflushed",
+            "the stamp is skipped while a record ≤ the mark reached no Parquet object",
         );
     }
 }

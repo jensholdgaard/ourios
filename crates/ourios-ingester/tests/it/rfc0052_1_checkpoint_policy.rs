@@ -313,12 +313,7 @@ async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_r
 
     // ...and a barrier that follows stamps nothing.
     assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Latched);
-    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
-    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
-    assert!(
-        rig.data_files().is_empty(),
-        "the panicking batch reached no Parquet object",
-    );
+    assert_nothing_reached_durability(&rig);
 
     // And the batch's unemitted records are replayed on restart: the
     // frame is in the WAL, which is the only place they survive.
@@ -331,6 +326,17 @@ async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_r
     assert_eq!(
         report.records_fed_to_miner, 2,
         "and every record in it is re-mined, with nothing suppressed by a mark that never stamped",
+    );
+}
+
+/// Neither half of a cut landed: no checkpoint, no snapshot artefact, no
+/// Parquet object.
+fn assert_nothing_reached_durability(rig: &BarrierRig) {
+    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
+    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
+    assert!(
+        rig.data_files().is_empty(),
+        "and no batch reached a Parquet object",
     );
 }
 

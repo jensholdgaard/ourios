@@ -1843,6 +1843,37 @@ mod tests {
         }
     }
 
+    /// An age sweep stopped halfway: the drain has happened, the
+    /// off-lock `write_ordered` has not, and it stays that way until
+    /// `release` is sent. That gap is the #578 window — batch A is in
+    /// neither the buffers nor the store.
+    struct HeldSweep {
+        sweep: std::thread::JoinHandle<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl HeldSweep {
+        /// Returns once the drain has happened, so the caller can observe
+        /// the window rather than race it.
+        fn drain_and_hold(pipeline: &SharedPipeline, coordinator: PublishCoordinator) -> Self {
+            let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let pipeline = pipeline.clone();
+            let sweep = std::thread::spawn(move || {
+                let drained = pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
+                assert!(!drained.is_empty(), "the sweep drained batch A");
+                drained_tx.send(()).expect("signal drained");
+                release_rx.recv().expect("hold the write in flight");
+                assert!(
+                    coordinator.write_ordered(drained, "age"),
+                    "the held-back publish lands",
+                );
+            });
+            drained_rx.recv().expect("sweep drained");
+            Self { sweep, release }
+        }
+    }
+
     /// Four values, so a struct rather than a tuple nobody can read.
     struct SweepRaceRig {
         pipeline: SharedPipeline,
@@ -1891,21 +1922,8 @@ mod tests {
 
         // Sweep half 1: the atomic drain under the miner lock. Batch A's
         // records now exist only in `drained` and the WAL — the #578 window.
-        let coordinator = PublishCoordinator::new(sink.clone(), audit.clone());
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let sweep_pipeline = pipeline.clone();
-        let sweep = std::thread::spawn(move || {
-            let drained = sweep_pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
-            assert!(!drained.is_empty(), "the sweep drained batch A");
-            drained_tx.send(()).expect("signal drained");
-            release_rx.recv().expect("hold the write in flight");
-            assert!(
-                coordinator.write_ordered(drained, "age"),
-                "the held-back publish lands",
-            );
-        });
-        drained_rx.recv().expect("sweep drained");
+        let HeldSweep { sweep, release } =
+            HeldSweep::drain_and_hold(&pipeline, PublishCoordinator::new(sink.clone(), audit));
         assert_eq!(
             sink.buffered_records(),
             0,
@@ -1954,7 +1972,7 @@ mod tests {
             "the stamp waits while the sweep's publish is in flight (issue #578)",
         );
 
-        release_tx.send(()).expect("release the publish");
+        release.send(()).expect("release the publish");
         sweep.join().expect("sweep thread");
         assert_eq!(
             cut.await.expect("the cut runs"),

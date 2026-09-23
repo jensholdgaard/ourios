@@ -322,13 +322,7 @@ async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_r
 
     // And the batch's unemitted records are replayed on restart: the
     // frame is in the WAL, which is the only place they survive.
-    let wal_root = rig.wal_root.clone();
-    let snapshots_root = rig.snapshots_root.clone();
-    drop(rig);
-    let mut wal = ourios_wal::Wal::open(wal_config(&wal_root)).expect("reopen");
-    let mut miner = ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default());
-    let report = ourios_ingester::recovery::recover(&mut wal, &snapshots_root, &mut miner)
-        .expect("recovery completes");
+    let report = restart_and_recover(rig);
     assert_eq!(
         report.max_delivered,
         Some(mark),
@@ -338,6 +332,18 @@ async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_r
         report.records_fed_to_miner, 2,
         "and every record in it is re-mined, with nothing suppressed by a mark that never stamped",
     );
+}
+
+/// Drop the rig — releasing its `Wal` — and recover from the roots it
+/// leaves behind, the way a restarting process would.
+fn restart_and_recover(rig: BarrierRig) -> ourios_ingester::recovery::RecoveryReport {
+    let wal_root = rig.wal_root.clone();
+    let snapshots_root = rig.snapshots_root.clone();
+    drop(rig);
+    let mut wal = ourios_wal::Wal::open(wal_config(&wal_root)).expect("reopen");
+    let mut miner = ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default());
+    ourios_ingester::recovery::recover(&mut wal, &snapshots_root, &mut miner)
+        .expect("recovery completes")
 }
 
 /// Scenario RFC0052.1 — unwind leg: the barrier starts concurrently with the panic, every schedule.

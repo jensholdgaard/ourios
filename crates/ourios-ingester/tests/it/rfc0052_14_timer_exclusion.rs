@@ -166,6 +166,17 @@ async fn rfc0052_14_mark_is_the_turns_frame_offset_not_the_flush_eof() {
         None,
         "a node whose first barrier never ran seeds None and lets its first turn establish one",
     );
+    assert_a_replayed_seed_is_not_a_mark(eof);
+    assert!(
+        pipeline.acknowledged_durable().is_some(),
+        "whereas a turn's own offset is a mark",
+    );
+}
+
+/// The seed half of RFC0052.14's mark leg: recovery's `max_delivered`
+/// still stamps the shutdown snapshot's high-water (RFC 0001 §6.9) and is
+/// still not a mark a cut may checkpoint at.
+fn assert_a_replayed_seed_is_not_a_mark(eof: WalOffset) {
     let replayed = WalOffset {
         segment: uuid::Uuid::from_u128(1),
         byte: 9_999,
@@ -192,10 +203,6 @@ async fn rfc0052_14_mark_is_the_turns_frame_offset_not_the_flush_eof() {
         seeded.acknowledged_durable(),
         None,
         "but it is not a mark a cut may checkpoint at",
-    );
-    assert!(
-        pipeline.acknowledged_durable().is_some(),
-        "whereas a turn's own offset is",
     );
 }
 

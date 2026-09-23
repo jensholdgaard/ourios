@@ -114,12 +114,22 @@ impl PartitionBuffer {
 /// Partitions taken out of the buffers by one drain, with the audit
 /// position their publish depends on (RFC 0052 §3.1).
 ///
-/// The watermark is the **maximum** over the partitions taken: a
-/// `ready` partition carries its own from the park, and an ordinary one
-/// contributes the sink's position at drain time, which is at or above
-/// every event its records produced. Accessors rather than public
-/// fields — a caller that could rebuild this value could publish
-/// records ahead of their template events.
+/// The watermark is the **maximum** over the `ready` partitions taken —
+/// each carrying the position its park preserved — and nothing else
+/// contributes to it yet. An ordinary partition's own position is the
+/// audit sink's count at drain time, which only the publish coordinator
+/// can read (it owns both sinks); until §3.1's publisher lands and
+/// supplies it, an ordinary drain reports `0`.
+///
+/// **So this value is not yet a sufficient gate.** Every current
+/// consumer is audit-ordered by other means: `write_ordered` writes the
+/// audit batch first, and the inline size / ceiling publish runs behind
+/// the sink's audit barrier, which is strictly stronger (it requires the
+/// whole buffer durable). A publisher that gated on this alone would
+/// publish records ahead of their template events.
+///
+/// Accessors rather than public fields — a caller that could rebuild
+/// this value could defeat the dependency parking preserves.
 #[derive(Debug, Default)]
 pub struct TakenPartitions {
     partitions: Vec<(PartitionKey, Vec<MinedRecord>)>,

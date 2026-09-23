@@ -22,7 +22,7 @@ use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquet
 use ourios_parquet::Store;
 use ourios_wal::SnapshotHorizons;
 
-use crate::rfc0052_barrier_support::BarrierRig;
+use crate::rfc0052_barrier_support::{BarrierRig, wal_config};
 
 /// Scenario RFC0052.1 — healthy store: the mark advances to the barrier's high-water mark.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
@@ -274,40 +274,56 @@ async fn rfc0052_1_publish_panic_during_quiesce_leaves_checkpoint_and_snapshots_
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_replays() {
-    // Given a record whose emit panics the encode worker mid-batch: the
-    // sink's audit barrier runs inside `emit_concurrent`, on the record
-    // that crosses the size target, which is exactly where §3.1 says a
-    // worker panic leaves a batch's remainder in neither the buffers nor
-    // Parquet.
+    // Given a whole ingest path whose encode worker panics mid-batch:
+    // the sink's inline audit barrier runs inside `emit_concurrent`, on
+    // the record that crosses the size target, which is exactly where
+    // §3.1 says a worker panic leaves a batch's remainder in neither the
+    // buffers nor Parquet. The batch is a real acknowledged OTLP export,
+    // so "replayed on restart" is something this can actually observe.
     let tmp = tempfile::TempDir::new().expect("temp");
-    let rig = BarrierRig::new(tmp.path());
-    let panicking = panicking_sink(&rig);
-    let pool = ourios_ingester::encode_pool::EncodePool::new(&panicking, 1);
-    let epoch = panicking.epochs().current();
-    pool.submit(vec![mined("checkout"), mined("checkout")]);
-    pool.quiesce();
+    let rig = BarrierRig::with_panicking_encode(tmp.path());
+    let epoch = rig.epochs.current();
+    let mark = rig
+        .ingest("checkout", &["user 1 logged in", "user 2 logged in"])
+        .await;
+    rig.pipeline.quiesce_encodes();
 
-    // When a barrier follows the panic.
-    let latched = panicking.epochs().capture();
-
-    // Then the unwinding guard stored the latch before the decrement that
-    // settled the count, so the barrier cannot see a quiet pool and a
-    // clear latch.
+    // Then the unwinding guard stored the latch before the decrement
+    // that settled the count, so a barrier cannot see a quiet pool and a
+    // clear latch...
+    let latched = rig.epochs.capture();
     assert_eq!(
         latched.failed_epoch(),
         Some(epoch),
         "the worker's unwinding batch guard reported its own epoch",
     );
+
+    // ...and a barrier that follows stamps nothing.
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Latched);
+    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
+    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
     assert!(
-        latched.refuses(epoch),
-        "so every cut whose mark could cover that batch is refused",
+        rig.data_files().is_empty(),
+        "the panicking batch reached no Parquet object",
     );
 
-    // And the batch's unemitted records are still in the WAL for a
-    // restart to replay — nothing published them.
-    assert!(
-        crate::rfc0052_barrier_support::parquet_files(&rig.data_root).is_empty(),
-        "the panicking batch reached no Parquet object",
+    // And the batch's unemitted records are replayed on restart: the
+    // frame is in the WAL, which is the only place they survive.
+    let wal_root = rig.wal_root.clone();
+    let snapshots_root = rig.snapshots_root.clone();
+    drop(rig);
+    let mut wal = ourios_wal::Wal::open(wal_config(&wal_root)).expect("reopen");
+    let mut miner = ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default());
+    let report = ourios_ingester::recovery::recover(&mut wal, &snapshots_root, &mut miner)
+        .expect("recovery completes");
+    assert_eq!(
+        report.max_delivered,
+        Some(mark),
+        "the acknowledged frame survived the worker's unwind",
+    );
+    assert_eq!(
+        report.records_fed_to_miner, 2,
+        "and every record in it is re-mined, with nothing suppressed by a mark that never stamped",
     );
 }
 
@@ -379,26 +395,41 @@ fn rfc0052_1_cadence_tick_panic_and_join_error_read_as_a_failed_cut() {
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
 fn rfc0052_1_batch_queued_before_the_cut_carries_the_cuts_epoch() {
-    // Given a batch queued before cut E's capture and dequeued after it.
+    // Given one worker held inside batch A's emit, so batch B is
+    // genuinely sitting in the queue — not merely submitted — when the
+    // cut is captured. Without the hold the worker could dequeue B
+    // first, and the test would pass on a dequeue-assigned epoch too.
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = BarrierRig::new(tmp.path());
-    let panicking = panicking_sink(&rig);
-    let epochs = panicking.epochs();
-    // One worker, held on a first batch, so the second sits in the queue
-    // across the capture below.
-    let pool = ourios_ingester::encode_pool::EncodePool::new(&panicking, 1);
+    let held = HeldSink::new(&rig);
+    let epochs = held.sink.epochs();
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&held.sink, 1);
+
+    pool.submit(vec![mined("checkout")]);
+    held.await_worker_inside_the_first_emit();
     let queued_at = epochs.current();
     pool.submit(vec![mined("checkout")]);
 
-    // When cut E is captured between the submit and the dequeue.
+    // When cut E is captured between B's submit and its dequeue.
     let cut = epochs.open_cut();
     assert_eq!(
         cut, queued_at,
         "the cut takes the epoch the queued batch already carries",
     );
+    assert_eq!(
+        epochs.current().get(),
+        cut.get() + 1,
+        "and a batch submitted from here on would carry E + 1",
+    );
+
+    // When the hold lifts, B is dequeued — after the capture — and
+    // panics.
+    held.release();
     pool.quiesce();
 
-    // Then a panic in it fails cut E, not only later ones.
+    // Then the panic fails cut E, not only later ones: the epoch was
+    // stamped in `submit`, so a dequeue-assigned one (E + 1) would leave
+    // this cut free to stamp over the batch's unemitted remainder.
     let state = epochs.capture();
     assert_eq!(state.failed_epoch(), Some(cut));
     assert!(
@@ -459,17 +490,76 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
 /// `emit_concurrent`, reached on the record that crosses the size
 /// target.
 fn panicking_sink(rig: &BarrierRig) -> SharedParquetSink {
+    poisoned_sink(
+        rig,
+        Box::new(|| panic!("injected encode-worker panic")),
+        Arc::new(ourios_ingester::cadence::BarrierEpochs::new()),
+    )
+}
+
+/// The same sink, with its **first** emit held until released and every
+/// later one panicking — the hold that makes "queued across the cut"
+/// an observed state rather than a hoped-for interleaving.
+struct HeldSink {
+    sink: SharedParquetSink,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    release: Arc<AtomicBool>,
+}
+
+impl HeldSink {
+    fn new(rig: &BarrierRig) -> Self {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&calls);
+        let gate = Arc::clone(&release);
+        let sink = poisoned_sink(
+            rig,
+            Box::new(move || {
+                assert!(
+                    seen.fetch_add(1, Ordering::AcqRel) == 0,
+                    "injected encode-worker panic",
+                );
+                while !gate.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                true
+            }),
+            Arc::new(ourios_ingester::cadence::BarrierEpochs::new()),
+        );
+        Self {
+            sink,
+            calls,
+            release,
+        }
+    }
+
+    fn await_worker_inside_the_first_emit(&self) {
+        while self.calls.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    fn release(&self) {
+        self.release.store(true, Ordering::Release);
+    }
+}
+
+fn poisoned_sink(
+    rig: &BarrierRig,
+    barrier: Box<dyn FnMut() -> bool + Send>,
+    epochs: Arc<ourios_ingester::cadence::BarrierEpochs>,
+) -> SharedParquetSink {
     SharedParquetSink::with_cadence(
         ParquetRecordSink::new(
             Store::local(&rig.data_root).expect("store"),
             FlushConfig {
-                target_bytes: 1,
+                target_bytes: 1, // every emit crosses the target
                 max_buffer_age: Duration::from_secs(86_400),
                 ceiling_bytes: usize::MAX,
             },
         )
-        .with_audit_barrier(Box::new(|| panic!("injected encode-worker panic"))),
-        Arc::new(ourios_ingester::cadence::BarrierEpochs::new()),
+        .with_audit_barrier(barrier),
+        epochs,
     )
 }
 

@@ -9,6 +9,8 @@
 //! what the criteria are about, and a test that slept for five minutes
 //! would prove nothing a direct call does not.
 
+// The shared-`tests/` module shape: each `it` module compiles the whole
+// rig and uses only the part its criterion needs.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -73,9 +75,39 @@ impl BarrierRig {
         Self::with(tmp, never_flush(), 2, wal_config(&tmp.join("wal")))
     }
 
+    /// A rig whose encode worker panics on its first emit: the sink's
+    /// inline audit barrier is the seam a worker really runs inside
+    /// `emit_concurrent`, and a one-byte size target reaches it on every
+    /// record. Everything upstream — the WAL append, its fsync, the ack,
+    /// the miner — is the production path, so the batch is genuinely
+    /// acknowledged and genuinely replayable.
+    pub fn with_panicking_encode(tmp: &Path) -> Self {
+        Self::build(
+            tmp,
+            FlushConfig {
+                target_bytes: 1,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            },
+            1,
+            wal_config(&tmp.join("wal")),
+            Some(Box::new(|| panic!("injected encode-worker panic"))),
+        )
+    }
+
     /// A rig with an explicit flush policy, worker count and WAL config
     /// — the coalescing and idle-rotation legs need all three.
     pub fn with(tmp: &Path, flush: FlushConfig, workers: usize, wal: WalConfig) -> Self {
+        Self::build(tmp, flush, workers, wal, None)
+    }
+
+    fn build(
+        tmp: &Path,
+        flush: FlushConfig,
+        workers: usize,
+        wal: WalConfig,
+        poison: Option<Box<dyn FnMut() -> bool + Send>>,
+    ) -> Self {
         let wal_root = wal.root.clone();
         let data_root = tmp.join("data");
         let audit_root = tmp.join("audit");
@@ -90,9 +122,12 @@ impl BarrierRig {
             100_000,
         ));
         let barrier_audit = audit.clone();
+        let audit_barrier = poison.unwrap_or_else(|| {
+            Box::new(move || barrier_audit.flush()) as Box<dyn FnMut() -> bool + Send>
+        });
         let sink = SharedParquetSink::new(
             ParquetRecordSink::new(Store::local(&data_root).expect("data store"), flush)
-                .with_audit_barrier(Box::new(move || barrier_audit.flush())),
+                .with_audit_barrier(audit_barrier),
         );
         let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
             .with_record_sink(Box::new(sink.clone()));

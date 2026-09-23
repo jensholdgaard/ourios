@@ -278,7 +278,7 @@ fn flush_then_snapshot(
     audit_sink: &SharedParquetAuditSink,
     snapshots_root: &Path,
     miner: &MinerCluster,
-    stamp: Stamp,
+    stamp: &Stamp,
     cadence: &str,
 ) -> bool {
     // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
@@ -499,7 +499,7 @@ impl ReceiverHandle {
                     &self.audit_sink,
                     &self.snapshots_root,
                     miner,
-                    Stamp::Cadence(last_durable, Arc::clone(&self.epochs)),
+                    &Stamp::Cadence(last_durable, Arc::clone(&self.epochs)),
                     "shutdown",
                 );
             });
@@ -784,7 +784,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             // those frames. It is not a checkpoint mark, and the
             // pipeline's `DurableMark::Replayed` seed keeps the barrier
             // from mistaking it for one.
-            Stamp::PreFlight(report.max_delivered),
+            &Stamp::PreFlight(report.max_delivered),
             "post-recovery",
         );
     });
@@ -1170,7 +1170,7 @@ mod tests {
             &audit,
             &tmp.path().join("snapshots"),
             &miner,
-            Stamp::PreFlight(None),
+            &Stamp::PreFlight(None),
             "test",
         );
 
@@ -1201,7 +1201,7 @@ mod tests {
             &audit,
             &snapshots_root,
             &miner,
-            Stamp::PreFlight(None),
+            &Stamp::PreFlight(None),
             "test",
         );
 
@@ -1249,7 +1249,7 @@ mod tests {
             &audit,
             &snapshots_root,
             &miner,
-            Stamp::PreFlight(None),
+            &Stamp::PreFlight(None),
             "test",
         );
 

@@ -134,7 +134,19 @@ fn spawn_age_sweep(
             let step = tokio::task::spawn_blocking({
                 let coordinator = coordinator.clone();
                 move || {
-                    let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+                    // RFC 0052 §3.1: the sweep's drain takes the barrier
+                    // exclusion in shared mode, **before** the miner
+                    // lock. Under the miner lock alone a sweep could
+                    // begin after a cut's quiesce and before its stamp,
+                    // leaving a drained-but-undurable batch outside the
+                    // buffers that the barrier then reads as empty —
+                    // `quiesce_publishes` waits only for a sweep already
+                    // in flight and prevents no new drain. Taken inside
+                    // `with_miner` instead, the sweep would hold the
+                    // miner lock waiting for the shared exclusion while
+                    // a capture held the exclusive one waiting for the
+                    // miner.
+                    let drained = pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
                     // The cadence is best-effort: a partial write (transient store
                     // error) retains the un-published data + audit (the WAL is the
                     // durability of record) and the next tick retries — so the
@@ -1703,7 +1715,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let sweep_pipeline = pipeline.clone();
         let sweep = std::thread::spawn(move || {
-            let drained = sweep_pipeline.with_miner(|_miner| coordinator.drain_aged());
+            let drained = sweep_pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
             assert!(!drained.is_empty(), "the sweep drained batch A");
             drained_tx.send(()).expect("signal drained");
             release_rx.recv().expect("hold the write in flight");

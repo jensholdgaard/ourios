@@ -153,7 +153,7 @@ async fn main() {
         "sweep" => {
             let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024));
             let coordinator = PublishCoordinator::new(sink.clone(), audit);
-            let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+            let drained = pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
             assert!(!drained.is_empty(), "fixture: the sweep drained the batch");
             assert_eq!(
                 sink.buffered_records(),

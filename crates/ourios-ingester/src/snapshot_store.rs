@@ -93,10 +93,15 @@ pub fn write(
         drop(std::fs::remove_file(&tmp));
     }
     written?;
-    File::open(root)
-        .and_then(|dir| dir.sync_all())
-        .map_err(io("fsync(snapshots root)"))?;
-    Ok(())
+    // The root's *parent* too, not just the root: on a cold start the
+    // `create_dir_all` above may have created `<wal_root>/snapshots`
+    // itself, and fsyncing only the child leaves that new directory
+    // entry undurable — a crash could then lose the whole root after a
+    // cut had already advanced the checkpoint past the frames these
+    // artefacts cover. `fsync_root` is the same helper RFC0052.13's
+    // startup check uses, so both ends of the artefact's life make the
+    // same two directories durable.
+    fsync_root(root)
 }
 
 fn write_and_install(

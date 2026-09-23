@@ -259,6 +259,16 @@ impl Barrier {
     /// process's only stamping path.
     pub fn tick(&self, pipeline: &IngestPipeline, rotate_when_idle: bool) -> CutOutcome {
         let epoch = self.epochs.current();
+        // §3.1 checks the latch *before* the cut, and this is where that
+        // check belongs: `run_cut`'s is the authoritative one, but it
+        // runs after the capture has already quiesced the pool, rotated
+        // an idle segment and emptied both sinks. A latched node would
+        // keep doing all three on every tick — mutating WAL and sink
+        // state for a cut that cannot stamp — instead of standing still
+        // until a restart.
+        if self.epochs.capture().refuses(epoch) {
+            return CutOutcome::Latched;
+        }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.capture(pipeline, rotate_when_idle);
             self.run_pending()

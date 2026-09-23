@@ -171,7 +171,14 @@ async fn rfc0052_1_latched_epoch_refuses_checkpoint_and_snapshot_until_restart()
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = BarrierRig::new(tmp.path());
     rig.ingest("checkout", &["user 1 logged in"]).await;
+    // Quiesced here rather than left to the capture's own quiesce: with
+    // the latch checked before the cut there is no capture to do it, and
+    // the buffered-records assertion below has to be about a record that
+    // really is in the sink's buffers.
+    rig.pipeline.quiesce_encodes();
+    assert_eq!(rig.sink.buffered_records(), 1, "the record is buffered");
     rig.epochs.report(rig.epochs.current());
+    let latched_at = rig.epochs.current();
 
     // When however many timer passes run.
     for _ in 0..3 {
@@ -189,6 +196,12 @@ async fn rfc0052_1_latched_epoch_refuses_checkpoint_and_snapshot_until_restart()
         rig.sink.buffered_records(),
         1,
         "the records stay where a later cut — or a restart's replay — finds them",
+    );
+    assert_eq!(
+        rig.epochs.current(),
+        latched_at,
+        "and no cut was taken at all: a latched node stands still rather than \
+         quiescing, rotating and draining once per tick for a cut that cannot stamp",
     );
 
     // And a *failed publish* refuses only cuts captured before its

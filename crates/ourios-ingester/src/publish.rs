@@ -194,10 +194,14 @@ impl PublishCoordinator {
             guard,
         } = drained;
         let registered = guard.epoch();
-        drop(guard);
         self.audit.requeue(audit);
         self.record
             .park_ready(records.into_partitions(), watermark, registered);
+        // Dropped last, and deliberately: a `quiesce_publishes` that saw
+        // the count reach zero before the records were back would see
+        // them in neither the buffers nor the store, and stamp across
+        // them.
+        drop(guard);
     }
 
     /// Write a `drained` snapshot to durability **off the lock**, audit-first:

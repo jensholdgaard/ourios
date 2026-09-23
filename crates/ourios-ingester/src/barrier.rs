@@ -291,6 +291,14 @@ impl Barrier {
         self.lock_pending().as_ref().and_then(Cut::mark)
     }
 
+    /// The pending cut's epoch, for tests and the status surface. A
+    /// coalesced capture adopts its epoch; a parked one leaves it, which
+    /// is the difference RFC0052.14's ceiling leg is about.
+    #[must_use]
+    pub fn pending_epoch(&self) -> Option<Epoch> {
+        self.lock_pending().as_ref().map(Cut::epoch)
+    }
+
     /// Fill, coalesce into, or park against the pending slot (§3.1).
     fn offer(&self, cut: Cut) -> CaptureOutcome {
         let mut pending = self.lock_pending();

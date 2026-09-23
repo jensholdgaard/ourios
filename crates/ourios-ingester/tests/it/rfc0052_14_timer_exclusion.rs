@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use ourios_ingester::barrier::CaptureOutcome::Filled;
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, Journal, ReceiveError};
 use ourios_wal::WalOffset;
@@ -200,19 +201,86 @@ async fn rfc0052_14_mark_is_the_turns_frame_offset_not_the_flush_eof() {
 
 /// Scenario RFC0052.14 — a rotation capture past the sink's ceiling parks and advances nothing.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (RotationDecision on append_batch hands the cut to the barrier task)"]
-fn rfc0052_14_rotation_capture_past_the_ceiling_parks_every_drained_batch() {
-    todo!(
-        "RFC0052.14 — a rotation capture that would take the pending cut \
-         past the sink's ceiling parks every batch it drained and \
-         advances neither the mark, the snapshots nor the epoch; the \
-         checkpoint that pending cut eventually stamps covers only \
-         frames its own batches held, and the parked partitions are \
-         covered by the next cut; a rotation-fired cut performs no store \
-         I/O inside the ingest turn, and an append admitted after the \
-         turn is in neither that cut's checkpoint nor its snapshot"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_rotation_capture_past_the_ceiling_parks_every_drained_batch() {
+    // Given a rig whose rotation hook is the production capture-only one
+    // and whose barrier coalesces up to one byte — so any second capture
+    // carrying records exceeds it — over a WAL that rotates on age.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal_root = tmp.path().join("wal");
+    let rig = BarrierRig::with_rotation_capture(
+        tmp.path(),
+        ourios_wal::WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            ..wal_config(&wal_root)
+        },
+        1,
     );
+
+    // Batch A is captured into the pending slot, so the slot is occupied
+    // and carries A's mark and epoch.
+    let mark_a = rig.ingest("checkout", &["user 1 logged in"]).await;
+    assert_eq!(rig.barrier.capture(&rig.pipeline, false), Filled);
+    let pending_epoch = rig.barrier.pending_epoch().expect("a pending cut");
+    assert_eq!(rig.barrier.pending_mark(), Some(mark_a));
+
+    // Batch C acks and buffers behind it — records the pending cut does
+    // not hold, in the same segment.
+    let mark_c = rig.ingest("checkout", &["user 2 logged in"]).await;
+    rig.pipeline.quiesce_encodes();
+    assert_eq!(rig.sink.buffered_records(), 1, "C is buffered, undrained");
+    assert!(mark_c > mark_a, "C's frame is above A's");
+
+    // When the segment ages out and batch B's append observes the change:
+    // the rotation hook captures, drains C, and coalescing C into the
+    // pending cut would pass the ceiling.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mark_b = rig.ingest("checkout", &["payment 9 settled"]).await;
+    rig.pipeline.quiesce_encodes();
+
+    // Then the rotation parked every batch it drained and advanced
+    // nothing: not the pending cut's mark, not its epoch, no snapshot —
+    // and it did no store I/O inside the ingest turn.
+    assert_eq!(
+        rig.barrier.pending_mark(),
+        Some(mark_a),
+        "the pending cut's mark did not move to the rotation point",
+    );
+    assert_eq!(
+        rig.barrier.pending_epoch(),
+        Some(pending_epoch),
+        "nor did its epoch: a park is not a coalesce",
+    );
+    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
+    assert!(
+        rig.data_files().is_empty(),
+        "a rotation-fired cut performs no store I/O inside the ingest turn",
+    );
+    assert_eq!(
+        rig.sink.buffered_records(),
+        2,
+        "C is parked back in the buffers, beside B",
+    );
+
+    // And the checkpoint that pending cut stamps covers only the frames
+    // its own batches held — A's, not the rotation point's and not B's.
+    assert_eq!(rig.barrier.run_pending(), CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark_a),
+        "an append admitted after the turn is in neither the cut's checkpoint nor its snapshot",
+    );
+
+    // The parked partitions are covered by the next cut.
+    assert_eq!(rig.barrier.capture(&rig.pipeline, false), Filled);
+    assert_eq!(rig.barrier.run_pending(), CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark_b),
+        "the next cut covers the parked records and B's frame",
+    );
+    assert_eq!(rig.sink.buffered_records(), 0, "both are published");
+    assert!(!rig.data_files().is_empty(), "and reached the store");
 }
 
 /// Scenario RFC0052.14 — an idle rotation on the barrier tick rotates before the cut.

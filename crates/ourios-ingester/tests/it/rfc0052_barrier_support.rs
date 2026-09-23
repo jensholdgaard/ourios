@@ -69,10 +69,53 @@ pub fn wal_config(root: &Path) -> WalConfig {
     }
 }
 
+/// How to build a rig. A value rather than six parameters: the flush
+/// policy, the barrier's ceiling and the rotation hook are independent
+/// dials and most legs move one of them.
+pub struct RigSpec {
+    pub flush: FlushConfig,
+    pub workers: usize,
+    pub wal: WalConfig,
+    /// Replaces the sink's audit-flush barrier, which is the seam an
+    /// encode worker really runs inside `emit_concurrent`.
+    pub poison: Option<Box<dyn FnMut() -> bool + Send>>,
+    /// The barrier's coalescing ceiling (§3.1 uses the sink's own).
+    pub ceiling_bytes: usize,
+    /// Install the production capture-only rotation hook, so a segment
+    /// change inside `ingest` hands a cut to the barrier.
+    pub rotation_capture: bool,
+}
+
+impl RigSpec {
+    pub fn new(wal: WalConfig) -> Self {
+        Self {
+            flush: never_flush(),
+            workers: 2,
+            wal,
+            poison: None,
+            ceiling_bytes: usize::MAX,
+            rotation_capture: false,
+        }
+    }
+}
+
 impl BarrierRig {
     /// A rig under `tmp` with the default never-flush policy.
     pub fn new(tmp: &Path) -> Self {
-        Self::with(tmp, never_flush(), 2, wal_config(&tmp.join("wal")))
+        Self::build(tmp, RigSpec::new(wal_config(&tmp.join("wal"))))
+    }
+
+    /// A rig whose rotation hook is the production capture-only one, with
+    /// an explicit barrier ceiling — the rotation-capture legs need both.
+    pub fn with_rotation_capture(tmp: &Path, wal: WalConfig, ceiling_bytes: usize) -> Self {
+        Self::build(
+            tmp,
+            RigSpec {
+                ceiling_bytes,
+                rotation_capture: true,
+                ..RigSpec::new(wal)
+            },
+        )
     }
 
     /// A rig whose encode worker panics on its first emit: the sink's
@@ -84,30 +127,41 @@ impl BarrierRig {
     pub fn with_panicking_encode(tmp: &Path) -> Self {
         Self::build(
             tmp,
-            FlushConfig {
-                target_bytes: 1,
-                max_buffer_age: Duration::from_secs(86_400),
-                ceiling_bytes: usize::MAX,
+            RigSpec {
+                flush: FlushConfig {
+                    target_bytes: 1,
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+                workers: 1,
+                poison: Some(Box::new(|| panic!("injected encode-worker panic"))),
+                ..RigSpec::new(wal_config(&tmp.join("wal")))
             },
-            1,
-            wal_config(&tmp.join("wal")),
-            Some(Box::new(|| panic!("injected encode-worker panic"))),
         )
     }
 
     /// A rig with an explicit flush policy, worker count and WAL config
     /// — the coalescing and idle-rotation legs need all three.
     pub fn with(tmp: &Path, flush: FlushConfig, workers: usize, wal: WalConfig) -> Self {
-        Self::build(tmp, flush, workers, wal, None)
+        Self::build(
+            tmp,
+            RigSpec {
+                flush,
+                workers,
+                ..RigSpec::new(wal)
+            },
+        )
     }
 
-    fn build(
-        tmp: &Path,
-        flush: FlushConfig,
-        workers: usize,
-        wal: WalConfig,
-        poison: Option<Box<dyn FnMut() -> bool + Send>>,
-    ) -> Self {
+    fn build(tmp: &Path, spec: RigSpec) -> Self {
+        let RigSpec {
+            flush,
+            workers,
+            wal,
+            poison,
+            ceiling_bytes,
+            rotation_capture,
+        } = spec;
         let wal_root = wal.root.clone();
         let data_root = tmp.join("data");
         let audit_root = tmp.join("audit");
@@ -137,17 +191,27 @@ impl BarrierRig {
             Duration::from_millis(20),
             ourios_wal::MIN_SEGMENT_SIZE_BYTES,
         );
-        let pipeline: SharedPipeline = Arc::new(
-            IngestPipeline::new(Arc::clone(&commits), miner)
-                .with_encode_pool(EncodePool::new(&sink, workers)),
-        );
+        // The barrier is built before the pipeline, exactly as `serve`
+        // does it: the capture-only rotation hook the pipeline installs
+        // holds the barrier.
         let publish = PublishCoordinator::new(sink.clone(), audit.clone());
         let barrier = Arc::new(Barrier::new(
             publish.clone(),
             Arc::clone(&commits),
             snapshots_root.clone(),
-            usize::MAX,
+            ceiling_bytes,
         ));
+        let mut building =
+            IngestPipeline::new(Arc::clone(&commits), miner).with_encode_pool(EncodePool::new(
+                &sink, workers,
+            ));
+        if rotation_capture {
+            let hook_barrier = Arc::clone(&barrier);
+            building = building.with_rotation_hook(Box::new(move |miner, mark| {
+                hook_barrier.capture_rotation(miner, mark);
+            }));
+        }
+        let pipeline: SharedPipeline = Arc::new(building);
         let epochs = sink.epochs();
         Self {
             wal_root,

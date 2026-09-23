@@ -256,6 +256,27 @@ impl Drop for IngestGateGuard<'_> {
     }
 }
 
+/// Where the pipeline's durable high-water mark came from (RFC 0052
+/// §3.7). Two variants rather than an offset plus a flag: only one of
+/// them may be checkpointed, and a caller holding a bare `WalOffset`
+/// cannot tell which it has.
+#[derive(Clone, Copy, Debug)]
+enum DurableMark {
+    /// Recovery's seed — the highest offset replay *delivered*. It
+    /// stamps the shutdown snapshot's high-water and is never a mark.
+    Replayed(WalOffset),
+    /// A turn's own frame offset, acknowledged in this process.
+    Acknowledged(WalOffset),
+}
+
+impl DurableMark {
+    fn offset(self) -> WalOffset {
+        match self {
+            Self::Replayed(offset) | Self::Acknowledged(offset) => offset,
+        }
+    }
+}
+
 /// No `Debug`: `MinerCluster` holds the per-tenant Drain trees and does
 /// not implement it.
 pub struct IngestPipeline {
@@ -288,7 +309,7 @@ pub struct IngestPipeline {
     /// The durable high-water mark after the most recent acked batch (or
     /// the startup seed). Behind a mutex: concurrent acks update it, and
     /// the rotation-detection read-then-write must see a consistent value.
-    last_durable: Mutex<Option<WalOffset>>,
+    last_durable: Mutex<Option<DurableMark>>,
     rotation_hook: Mutex<Option<RotationHook>>,
     /// Ingest throughput + WAL-before-ack latency instruments (RFC 0014
     /// §6.3), recorded on durably-acked batches — plus the RFC 0026 §3.4
@@ -446,7 +467,7 @@ impl IngestPipeline {
     /// seed.
     #[must_use]
     pub fn with_last_durable(self, offset: Option<WalOffset>) -> Self {
-        *self.lock_last_durable() = offset;
+        *self.lock_last_durable() = offset.map(DurableMark::Replayed);
         self
     }
 
@@ -635,7 +656,7 @@ impl IngestPipeline {
                 // exactly the frames at or below that mark. In-order, so
                 // `before` is exactly the preceding seq's offset and no
                 // higher seq has ingested yet.
-                let before = *self.lock_last_durable();
+                let before = self.lock_last_durable().map(DurableMark::offset);
                 let mined = {
                     let mut miner = self.lock_miner();
                     if let Some(prev) = before
@@ -658,7 +679,7 @@ impl IngestPipeline {
                 // Only successful commits advance the durable mark, so the
                 // snapshot high-water never passes a failed sync — its tail
                 // replay re-covers those frames (no §3.5.3 divergence).
-                *self.lock_last_durable() = Some(now);
+                *self.lock_last_durable() = Some(DurableMark::Acknowledged(now));
                 // Throughput + WAL-before-ack latency for this acked batch.
                 // RFC 0018 §3.5: tag out-of-range-severity records on the
                 // ingest counter via `error.type` (post-materialise on the
@@ -822,7 +843,27 @@ impl IngestPipeline {
     /// its WAL high-water mark (RFC 0001 §6.9).
     #[must_use]
     pub fn last_durable(&self) -> Option<WalOffset> {
-        *self.lock_last_durable()
+        self.lock_last_durable().map(DurableMark::offset)
+    }
+
+    /// The mark a cut may stamp: the highest offset a turn **in this
+    /// process** acknowledged.
+    ///
+    /// RFC 0052 §3.7: recovery's seed is the highest offset *replay
+    /// delivered*, which is not proof of acknowledgement — a frame's
+    /// bytes can survive a crash whose group sync never completed, and
+    /// §3.1's rule is that such a frame is never a mark. The seed still
+    /// stamps the shutdown snapshot's high-water (RFC 0001 §6.9), which
+    /// is a different consumer: a snapshot only bounds replay depth,
+    /// while a checkpoint lets the WAL forget. So a node that has served
+    /// nothing since its restart has no mark, and its first successful
+    /// turn establishes one.
+    #[must_use]
+    pub fn acknowledged_durable(&self) -> Option<WalOffset> {
+        match *self.lock_last_durable() {
+            Some(DurableMark::Acknowledged(offset)) => Some(offset),
+            Some(DurableMark::Replayed(_)) | None => None,
+        }
     }
 
     fn lock_miner(&self) -> std::sync::MutexGuard<'_, MinerCluster> {
@@ -831,7 +872,7 @@ impl IngestPipeline {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_last_durable(&self) -> std::sync::MutexGuard<'_, Option<WalOffset>> {
+    fn lock_last_durable(&self) -> std::sync::MutexGuard<'_, Option<DurableMark>> {
         self.last_durable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -156,13 +156,45 @@ async fn rfc0052_14_mark_is_the_turns_frame_offset_not_the_flush_eof() {
         "the mark is the turn's own frame offset, strictly below the flush's EOF",
     );
 
-    // And the post-recovery seed is a delivered offset covered by a
-    // successful sync — the `CHECKPOINT` mark — never `max_delivered`
-    // alone; a node with no such offset seeds `None`.
+    // And the post-recovery seed is never `max_delivered` alone: a frame
+    // replay delivered can be one whose group sync never completed, so a
+    // seeded mark is not a mark. The barrier reads only what a turn in
+    // this process acknowledged.
     assert_eq!(
         commits.last_checkpoint(),
         None,
         "a node whose first barrier never ran seeds None and lets its first turn establish one",
+    );
+    let replayed = WalOffset {
+        segment: uuid::Uuid::from_u128(1),
+        byte: 9_999,
+    };
+    let seeded = IngestPipeline::new(
+        CommitCoordinator::new(
+            Box::new(TwoTurnJournal {
+                eof,
+                appended: 0,
+                segment: uuid::Uuid::from_u128(1),
+            }),
+            Duration::from_millis(20),
+            u64::MAX,
+        ),
+        ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default()),
+    )
+    .with_last_durable(Some(replayed));
+    assert_eq!(
+        seeded.last_durable(),
+        Some(replayed),
+        "the seed still stamps the shutdown snapshot's high-water (RFC 0001 §6.9)",
+    );
+    assert_eq!(
+        seeded.acknowledged_durable(),
+        None,
+        "but it is not a mark a cut may checkpoint at",
+    );
+    assert!(
+        pipeline.acknowledged_durable().is_some(),
+        "whereas a turn's own offset is",
     );
 }
 

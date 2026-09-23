@@ -1196,7 +1196,14 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, Stamp::PreFlight(None), "test");
+        let drained = flush_then_snapshot(
+            &sink,
+            &audit,
+            &snapshots_root,
+            &miner,
+            Stamp::PreFlight(None),
+            "test",
+        );
 
         assert!(!drained, "an unavailable store does not drain the sink");
         assert_eq!(
@@ -1237,7 +1244,14 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, Stamp::PreFlight(None), "test");
+        let drained = flush_then_snapshot(
+            &sink,
+            &audit,
+            &snapshots_root,
+            &miner,
+            Stamp::PreFlight(None),
+            "test",
+        );
 
         assert!(!drained, "a retained audit buffer blocks the drain");
         assert_eq!(

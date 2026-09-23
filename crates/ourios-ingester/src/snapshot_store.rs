@@ -23,6 +23,7 @@ use std::path::Path;
 use ourios_core::tenant::TenantId;
 use ourios_miner::snapshot::{SnapshotError, SnapshotState, snapshot};
 use ourios_parquet::{percent_decode_tenant, percent_encode_tenant};
+use uuid::Uuid;
 
 const EXTENSION: &str = "snap";
 
@@ -70,19 +71,20 @@ pub fn write(
     root: &Path,
     tenant: &TenantId,
     state: &SnapshotState,
-    mark: Option<ourios_wal::WalOffset>,
 ) -> Result<(), SnapshotStoreError> {
     let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
     let bytes = snapshot(state).map_err(SnapshotStoreError::Encode)?;
     std::fs::create_dir_all(root).map_err(io("create_dir_all(snapshots root)"))?;
     let stem = percent_encode_tenant(tenant.as_str());
-    // RFC 0052 §3.1: a **unique** temp name per writer. One fixed
-    // `.snap.tmp` could be truncated or interleaved by a concurrent cut
-    // before either rename, and the two would install each other's
-    // bytes.
+    // RFC 0052 §3.1: a **unique** temp name per attempt. One fixed
+    // `.snap.tmp` could be truncated or interleaved by a concurrent
+    // writer before either rename, and the two would install each
+    // other's bytes — or one would unlink the temp the other was still
+    // writing. The cut's mark does not make it unique (two writers can
+    // carry the same one), so the name carries a `UUIDv7` instead.
     let tmp = root.join(format!(
         "{stem}.{}.{EXTENSION}.tmp",
-        mark.map_or(0, |offset| offset.byte)
+        Uuid::now_v7().simple()
     ));
     let written = write_and_install(&tmp, root, &stem, &bytes);
     if written.is_err() {
@@ -294,8 +296,8 @@ mod tests {
         let spicy = TenantId::new("acme/EU=prod");
 
         // Act
-        write(tmp.path(), &plain, &state(1), None).expect("write plain");
-        write(tmp.path(), &spicy, &state(3), None).expect("write spicy");
+        write(tmp.path(), &plain, &state(1)).expect("write plain");
+        write(tmp.path(), &spicy, &state(3)).expect("write spicy");
         let loaded = load_all(tmp.path()).expect("load_all");
 
         // Assert — both tenants come back (sorted), each decoding to
@@ -327,10 +329,10 @@ mod tests {
         // Arrange — an existing artefact for the tenant.
         let tmp = tempfile::TempDir::new().expect("temp");
         let tenant = TenantId::new("checkout");
-        write(tmp.path(), &tenant, &state(1), None).expect("first write");
+        write(tmp.path(), &tenant, &state(1)).expect("first write");
 
         // Act — overwrite with a newer state.
-        write(tmp.path(), &tenant, &state(7), None).expect("overwrite");
+        write(tmp.path(), &tenant, &state(7)).expect("overwrite");
 
         // Assert — exactly one artefact survives, carrying the newer
         // state, and no `.tmp` residue is left behind.
@@ -353,7 +355,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp");
         std::fs::write(tmp.path().join("README.md"), b"not a snapshot").expect("write");
         std::fs::write(tmp.path().join("not ours.snap"), b"junk").expect("write");
-        write(tmp.path(), &TenantId::new("checkout"), &state(1), None).expect("write");
+        write(tmp.path(), &TenantId::new("checkout"), &state(1)).expect("write");
 
         // Act + Assert
         let loaded = load_all(tmp.path()).expect("load_all");
@@ -367,7 +369,7 @@ mod tests {
         // valid one; reading it as a file would abort recovery.
         let tmp = tempfile::TempDir::new().expect("temp");
         std::fs::create_dir(tmp.path().join("junk.snap")).expect("mkdir");
-        write(tmp.path(), &TenantId::new("checkout"), &state(1), None).expect("write");
+        write(tmp.path(), &TenantId::new("checkout"), &state(1)).expect("write");
 
         // Act + Assert
         let loaded = load_all(tmp.path()).expect("load_all");

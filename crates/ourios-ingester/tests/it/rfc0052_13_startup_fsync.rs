@@ -53,7 +53,6 @@ fn rfc0052_13_failed_snapshots_root_fsync_fails_startup_rather_than_pinning() {
         &tenant,
         &ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default())
             .snapshot_state(&tenant),
-        None,
     )
     .expect("write a snapshot");
     fsync_snapshots_root(&healthy).expect("a healthy root fsyncs");

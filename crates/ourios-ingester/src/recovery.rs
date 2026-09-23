@@ -213,7 +213,7 @@ pub fn write_snapshots(
             segment: offset.segment.to_string(),
             byte: offset.byte,
         });
-        snapshot_store::write(root, &tenant_id, &state, high_water)?;
+        snapshot_store::write(root, &tenant_id, &state)?;
     }
     Ok(())
 }

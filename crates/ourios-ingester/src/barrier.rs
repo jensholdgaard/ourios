@@ -116,6 +116,20 @@ pub enum CutOutcome {
     Idle,
 }
 
+/// What one cut's snapshot install did. Three states, not a `bool`: a
+/// cut whose mark is below the installed one did nothing *and* may
+/// stamp, which is not the same decision as a write that failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Install {
+    /// Every tenant's artefact was written and renamed.
+    Written,
+    /// Nothing to install — no mark, or an older cut behind a newer
+    /// snapshot.
+    Superseded,
+    /// A write failed, so the horizon on disk is behind this cut's.
+    Failed,
+}
+
 /// The barrier's owner: the pending slot, the snapshot-install
 /// serialisation, and the reach into the journal for the stamp.
 pub struct Barrier {
@@ -184,7 +198,7 @@ impl Barrier {
                 self.rotate_idle();
             }
             let epoch = self.epochs.open_cut();
-            let mark = pipeline.last_durable();
+            let mark = pipeline.acknowledged_durable();
             let (drained, snapshots) =
                 pipeline.with_miner(|miner| (self.publish.drain_all(), serialise(miner)));
             Cut {
@@ -223,13 +237,16 @@ impl Barrier {
         };
         let epoch = cut.epoch;
         let outcome = self.run_cut(cut);
-        // §3.1: a pending cut captured behind a *failed* one already
-        // folds frames whose only durable copy was that cut's batches,
-        // so installing or stamping it would suppress records now sitting
-        // requeued in the buffers. Its own batches are unflushed — the
-        // task is sequential — so merging them back loses nothing, and
-        // the next capture covers everything either cut held.
-        if outcome == CutOutcome::Retained {
+        // §3.1: a pending cut captured behind a cut that did **not**
+        // stamp already folds frames whose only durable copy was that
+        // cut's batches, so installing or stamping it would suppress
+        // records now sitting back in the buffers. Its own batches are
+        // unflushed — the task is sequential — so merging them back
+        // loses nothing, and the next capture covers everything either
+        // cut held. It also releases the publish guards those batches
+        // hold: left in the slot they would stall `quiesce_publishes`
+        // for the life of the process, shutdown included.
+        if outcome != CutOutcome::Stamped {
             self.invalidate_pending();
         }
         self.publish.record().settle_cut(epoch);
@@ -363,39 +380,57 @@ impl Barrier {
         if !outcomes.all_ok(epoch) {
             return CutOutcome::Retained;
         }
-        self.install(&snapshots, mark);
-        self.stamp(mark);
-        CutOutcome::Stamped
+        // A failed install must not be followed by a stamp. §3.1 says a
+        // snapshot write failure is not a checkpoint blocker, and adds
+        // the condition that makes that safe: recovery must gate the
+        // *Parquet* side on `max(X, S)`. `recovery::DriverSink` does not
+        // yet — that gate is RFC0052.10's — so advancing `X` over a
+        // snapshot still at `S` would republish every row in `(S, X]`
+        // on the next start. Until the gate lands, a failed install
+        // costs one cadence rather than duplicate rows.
+        match self.install(&snapshots, mark) {
+            Install::Failed => CutOutcome::Retained,
+            Install::Written | Install::Superseded => {
+                self.stamp(mark);
+                CutOutcome::Stamped
+            }
+        }
     }
 
     /// Install this cut's snapshot bytes, serialised against every other
     /// installer and monotone in the mark.
     ///
-    /// A write failure is deliberately not a stamp blocker: the data is
-    /// in the store and the snapshot only governs replay depth.
-    fn install(&self, snapshots: &[(TenantId, SnapshotState)], mark: Option<WalOffset>) {
+    /// A cut with no mark installs nothing: an artefact without a
+    /// concrete horizon is discarded at the next start, so writing one
+    /// over a tenant's only valid snapshot would trade a full replay for
+    /// a cut that had nothing to stamp anyway.
+    fn install(&self, snapshots: &[(TenantId, SnapshotState)], mark: Option<WalOffset>) -> Install {
+        let Some(mark) = mark else {
+            return Install::Superseded;
+        };
         let mut installed = self.install.lock().unwrap_or_else(PoisonError::into_inner);
-        if let (Some(previous), Some(mark)) = (*installed, mark)
-            && mark < previous
-        {
-            return;
+        if installed.is_some_and(|previous| mark < previous) {
+            return Install::Superseded;
         }
+        let high_water = WalHighWater {
+            segment: mark.segment.to_string(),
+            byte: mark.byte,
+        };
         for (tenant, state) in snapshots {
             let mut state = state.clone();
-            state.wal_high_water = mark.map(|offset| WalHighWater {
-                segment: offset.segment.to_string(),
-                byte: offset.byte,
-            });
-            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &state, mark) {
+            state.wal_high_water = Some(high_water.clone());
+            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &state) {
                 tracing::warn!(
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
                     error = %e,
-                    "barrier: snapshot write failed (the next start may replay more from the WAL)"
+                    "barrier: snapshot write failed, so this cut does not stamp; the next \
+                     one retries (no acknowledged data is lost — the WAL is durable)"
                 );
+                return Install::Failed;
             }
         }
-        if mark.is_some() {
-            *installed = mark;
-        }
+        *installed = Some(mark);
+        Install::Written
     }
 
     /// §6.7's monotone, idempotent stamp. A failure logs and leaves the

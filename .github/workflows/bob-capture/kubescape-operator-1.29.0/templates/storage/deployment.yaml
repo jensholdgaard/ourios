@@ -1,0 +1,156 @@
+{{- $components := fromYaml (include "components" .) }}
+{{- $configurations := fromYaml (include "configurations" .) }}
+{{- if $components.storage.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.storage.name }}
+  namespace: {{ .Values.ksNamespace }}
+  annotations:
+    {{- include "kubescape-operator.annotations" (dict "Values" .Values) | nindent 4 }}
+  labels:
+    {{- include "kubescape-operator.labels" (dict "Chart" .Chart "Release" .Release "Values" .Values "app" .Values.storage.name "tier" .Values.global.namespaceTier) | nindent 4 }}
+    kubescape.io/tier: "core"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kubescape-operator.selectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "app" .Values.storage.name) | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "kubescape-operator.annotations" (dict "Values" .Values) | nindent 8 }}
+        {{- with .Values.storage.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+      labels:
+        {{- include "kubescape-operator.labels" (dict "Chart" .Chart "Release" .Release "Values" .Values "app" .Values.storage.name "tier" .Values.global.namespaceTier) | nindent 8 }}
+        {{- with .Values.storage.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+        kubescape.io/tier: "core"
+      {{- if $components.otelCollector.enabled }}
+        otel: enabled
+      {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+      {{- if kindIs "string" .Values.imagePullSecrets }}
+      - name: {{ .Values.imagePullSecrets }}
+      {{- else }}
+      {{- range .Values.imagePullSecrets }}
+      - name: {{ . }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      serviceAccountName: {{ .Values.storage.name }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: apiserver
+        image: "{{ .Values.storage.image.repository }}:{{ .Values.storage.image.tag }}"
+        imagePullPolicy: {{ .Values.storage.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: {{ .Values.storage.serverPort }}
+            scheme: HTTPS
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: {{ .Values.storage.serverPort }}
+            scheme: HTTPS
+        env:
+          - name: GOMEMLIMIT
+            valueFrom:
+              resourceFieldRef:
+                resource: limits.memory
+                divisor: '1'
+          - name: GOMAXPROCS
+            valueFrom:
+              resourceFieldRef:
+                resource: limits.cpu
+                divisor: '1'
+          - name: KS_LOGGER_LEVEL
+            value: "{{ .Values.logger.level }}"
+          - name: KS_LOGGER_NAME
+            value: "{{ .Values.logger.name }}"
+          {{- if $components.otelCollector.enabled }}
+          - name: OTEL_COLLECTOR_SVC
+            value: "otel-collector:4318"
+          {{- end }}
+          {{- if .Values.configurations.otelUrl }}
+          - name: OTEL_COLLECTOR_SVC
+            value: {{ .Values.configurations.otelUrl }}
+          {{- end }}
+        volumeMounts:
+          - name: "data"
+            mountPath: "/data"
+          - name: {{ .Values.global.cloudConfig }}
+            mountPath: /etc/config/clusterData.json
+            readOnly: true
+            subPath: "clusterData.json"
+          - name: config
+            mountPath: /etc/config/config.json
+            readOnly: true
+            subPath: "config.json"
+          {{- if .Values.storage.mtls.enabled }}
+          - name: "ca-certificates"
+            mountPath: /etc/storage-ca-certificates
+            readOnly: true
+          {{- end }}
+        resources:
+{{ toYaml .Values.storage.resources | indent 12 }}
+      nodeSelector:
+      {{- if .Values.storage.nodeSelector }}
+      {{- toYaml .Values.storage.nodeSelector | nindent 8 }}
+      {{- else if .Values.customScheduling.nodeSelector }}
+      {{- toYaml .Values.customScheduling.nodeSelector | nindent 8 }}
+      {{- end }}
+      affinity:
+      {{- if .Values.storage.affinity }}
+      {{- toYaml .Values.storage.affinity | nindent 8 }}
+      {{- else if .Values.customScheduling.affinity }}
+      {{- toYaml .Values.customScheduling.affinity | nindent 8 }}
+      {{- end }}
+      tolerations:
+      {{- if .Values.storage.tolerations }}
+      {{- toYaml .Values.storage.tolerations | nindent 8 }}
+      {{- else if .Values.customScheduling.tolerations }}
+      {{- toYaml .Values.customScheduling.tolerations | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: "data"
+          {{- if eq .Values.configurations.persistence "enable" }}
+          persistentVolumeClaim:
+            claimName: kubescape-{{ .Values.storage.name }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: {{ .Values.global.cloudConfig }}
+          configMap:
+            name: {{ .Values.global.cloudConfig }}
+            items:
+            - key: "clusterData"
+              path: "clusterData.json"
+            {{- if $components.serviceDiscovery.enabled }}
+            - key: "services"
+              path: "services.json"
+            {{- end }}
+        - name: config
+          configMap:
+            name: {{ .Values.storage.name }}
+            items:
+              - key: "config.json"
+                path: "config.json"
+        {{- if .Values.storage.mtls.enabled }}
+        - name: "ca-certificates"
+          secret:
+            secretName: {{ .Values.storage.name }}-ca
+        {{- end }}
+{{- end }}

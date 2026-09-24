@@ -1,0 +1,39 @@
+apiVersion: v2
+appVersion: 1.29.0
+dependencies:
+- condition: alertCRD.scopeClustered
+  name: kubescape-alert-crd
+  repository: file://../dependency_chart/clustered-crds
+  version: 0.0.2
+- condition: alertCRD.scopeNamespaced
+  name: kubescape-alert-crd-ns
+  repository: file://../dependency_chart/namespaced-crds
+  version: 0.0.2
+- condition: serviceScanConfig.enabled
+  name: kubescape-service-scan-crd
+  repository: file://../dependency_chart/servicescanresult-crds
+  version: 0.0.1
+- name: kubescape-operator-command-crd
+  repository: file://../dependency_chart/operatorcommand-crds
+  version: 0.0.2
+description: Kubescape is an E2E Kubernetes cluster security platform
+home: https://kubescape.io/
+maintainers:
+- email: ben@armosec.io
+  name: Ben Hirschberg
+  url: https://www.linkedin.com/in/benyamin-ben-hirschberg-66141890
+- email: dw@armosec.io
+  name: David Wertenteil
+  url: https://www.linkedin.com/in/david-wertenteil-0ba277b9
+- email: bez@armosec.io
+  name: Bezalel Brandwine
+  url: https://www.linkedin.com/in/bezalel-brandwine
+- email: matthiasb@armosec.io
+  name: Matthias Bertschy
+  url: https://www.linkedin.com/in/matthias-bertschy-b427b815/
+- email: amirm@armosec.io
+  name: Amir Malka
+  url: https://www.linkedin.com/in/amirmalka
+name: kubescape-operator
+type: application
+version: 1.29.0

@@ -1,0 +1,290 @@
+name: Capture Software Bill of Behaviour (one-off)
+
+# One-off, dispatch-only capture of a real runtime behaviour profile for
+# ourios-server: an ephemeral kind cluster, Kubescape's node-agent
+# (eBPF-based; needs a real Linux kernel, which is why this runs on the
+# GitHub-hosted runner rather than a local VM), the real Ourios Helm chart,
+# and a mix of OTLP ingest + query traffic during the node-agent's learning
+# window. The output is the raw ContainerProfile CR(s) as a downloadable
+# artifact for manual review — this workflow does not commit anything back
+# to the repo, and it never fires automatically (no push/PR/schedule
+# trigger), matching the dispatch-only precedent in pages.yml. This is an
+# exploration, not a supply-chain gate: nothing here is required for a
+# release, and nothing about it belongs in CLAUDE.md hazards/invariants.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ourios
+  IMAGE_TAG: bob-capture
+  KIND_CLUSTER: ourios-bob
+  KS_NAMESPACE: honey
+  TENANT: ourios-bob
+  LOG_BODY: user 1 logged in
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Build image
+        run: docker build -t "${IMAGE_REPO}:${IMAGE_TAG}" .
+
+      - name: Create kind cluster
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+
+      - name: Load image into kind
+        run: kind load docker-image "${IMAGE_REPO}:${IMAGE_TAG}" --name "${KIND_CLUSTER}"
+
+      # OpenEBS local-hostpath: the StorageClass Kubescape's own storage
+      # component needs. Mirrors Vad1mo/bobctl's `make storage` target
+      # (openebs-operator-lite + a local-hostpath SC, set as cluster default).
+      # The operator manifest is vendored (not fetched from the mutable
+      # openebs.github.io Pages URL at run time) so this dispatch-only,
+      # cluster-admin-privileged install is pinned to reviewed content;
+      # re-vendor deliberately by re-running the curl in the PR that bumps it.
+      # bobctl's other manifest (openebs-lite-sc.yaml) only defines sample
+      # `openebs-hostpath`/`openebs-device` StorageClasses this workflow
+      # never uses — the `local-hostpath` class below is the one Kubescape
+      # actually gets pointed at, so that file is skipped entirely.
+      - name: Install OpenEBS (local-hostpath StorageClass)
+        run: |
+          kubectl apply -f .github/workflows/bob-capture/openebs-operator-lite.yaml
+          kubectl apply -f - <<'YAML'
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: local-hostpath
+            annotations:
+              openebs.io/cas-type: local
+              cas.openebs.io/config: |
+                - name: StorageType
+                  value: hostpath
+                - name: BasePath
+                  value: /var/local-hostpath
+          provisioner: openebs.io/local
+          reclaimPolicy: Delete
+          volumeBindingMode: WaitForFirstConsumer
+          YAML
+          kubectl patch storageclass local-hostpath -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+          kubectl rollout status deployment/openebs-localpv-provisioner -n openebs --timeout=180s
+
+      # Kubescape operator + node-agent (eBPF). Learning window kept short
+      # (this is a one-off capture, not a production tuning run) — long
+      # enough to observe a handful of ingest/query/compaction cycles.
+      # Chart is vendored unpacked (not `helm repo add` + live install, and not
+      # the opaque .tgz `helm pull` produces) for the same reason as the
+      # OpenEBS manifest above — a classic index.yaml Helm repo has no
+      # digest-pin mechanism, so the chart's extracted contents are the pin,
+      # and unpacked they're reviewable in the PR diff like any other vendored
+      # manifest; re-vendor deliberately (helm pull kubescape/kubescape-operator
+      # --version <new> --untar) in the PR that bumps it.
+      - name: Install Kubescape operator
+        run: |
+          helm upgrade --install kubescape \
+            .github/workflows/bob-capture/kubescape-operator-1.29.0 \
+            -n "${KS_NAMESPACE}" --create-namespace \
+            --values - <<YAML
+          nodeAgent:
+            config:
+              maxLearningPeriod: 6m
+              learningPeriod: 4m
+              updatePeriod: 10000m
+              ruleCooldown:
+                ruleCooldownDuration: 0h
+                ruleCooldownAfterCount: 1000000000
+                ruleCooldownOnProfileFailure: false
+                ruleCooldownMaxSize: 20000
+          capabilities:
+            runtimeDetection: enable
+            networkEventsStreaming: disable
+          alertCRD:
+            installDefault: true
+            scopeClustered: true
+          clusterName: ourios-bob-capture
+          ksNamespace: ${KS_NAMESPACE}
+          excludeNamespaces: "${KS_NAMESPACE},otlp-gen,kube-system,kube-public,kube-node-lease,kubeconfig,gmp-system,gmp-public,storm,lightening,cert-manager,kube-flannel,ingress-nginx"
+          # storage.mtls.enabled defaults true, but apiservice.yaml (which
+          # reads global.storageCA to build caBundle) renders alphabetically
+          # before ca-secret.yaml (which is what actually populates
+          # global.storageCA) — a template-render-order bug in the chart as
+          # published. Disabling mtls skips both branches; the aggregated
+          # Storage API only needs to be reachable inside this ephemeral
+          # cluster, not defended against a real adversary.
+          storage:
+            mtls:
+              enabled: false
+          YAML
+          kubectl wait --for=condition=ready pod -l app=kubevuln -n "${KS_NAMESPACE}" --timeout=180s
+          kubectl wait --for=condition=ready pod -l app=node-agent -n "${KS_NAMESPACE}" --timeout=180s
+
+      # The real chart, local storage backend (zero external deps — this
+      # exercise is about runtime behaviour, not the S3 path deploy-test.yml
+      # already covers). Single querier replica: one profile per role, not N.
+      - name: helm install ourios
+        run: |
+          helm install ourios deploy/helm/ourios \
+            --set image.repository="${IMAGE_REPO}" \
+            --set image.tag="${IMAGE_TAG}" \
+            --set image.pullPolicy=Never \
+            --set storage.backend=local \
+            --set querier.replicas=1 \
+            --set compactor.intervalSecs=30 \
+            --wait --timeout 5m
+
+      - name: Wait for workloads
+        run: |
+          kubectl rollout status statefulset/ourios-receiver --timeout=180s
+          kubectl rollout status deploy/ourios-querier --timeout=180s
+          kubectl rollout status deploy/ourios-compactor --timeout=180s
+
+      # Restart node-agent here, not right after the operator install: its
+      # maxLearningPeriod clock starts on pod start, and we want that window
+      # to cover real Ourios traffic, not the time spent installing the chart
+      # and waiting for PVCs/rollouts.
+      - name: Reset node-agent learning window
+        run: |
+          kubectl rollout restart -n "${KS_NAMESPACE}" ds node-agent
+          kubectl rollout status -n "${KS_NAMESPACE}" ds node-agent --timeout=180s
+
+      # Drive a realistic mix of ingest + query traffic across the learning
+      # window so the recorded profile reflects steady-state behaviour, not
+      # just startup. No receiver restarts here on purpose — a restart is
+      # itself atypical behaviour we don't want baked into the profile.
+      # telemetrygen runs in its own namespace, excluded above, so node-agent
+      # profiles the Ourios workloads only — not the traffic generator.
+      - name: Drive traffic for the learning window
+        run: |
+          kubectl create namespace otlp-gen
+          kubectl port-forward svc/ourios-querier 4319:4319 >/tmp/pf-q.log 2>&1 &
+          pf=$!; trap 'kill $pf 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do if (echo > /dev/tcp/127.0.0.1/4319) >/dev/null 2>&1; then break; fi; sleep 1; done
+
+          query_successes=0
+          for i in $(seq 1 9); do
+            kubectl delete job otlp-ingest -n otlp-gen --ignore-not-found >/dev/null
+            kubectl apply -n otlp-gen -f - <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: otlp-ingest
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: telemetrygen
+                    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.155.0@sha256:32d1762abb401e36dd8cfdf60a71075b41bd996a0cfb7c8d2e6eac4d609625b9
+                    args:
+                      - logs
+                      - --otlp-endpoint=ourios-receiver.default.svc.cluster.local:4317
+                      - --otlp-insecure
+                      - --logs=20
+                      - --otlp-header=x-ourios-tenant="${TENANT}"
+                      - --otlp-attributes=service.name="${TENANT}"
+                      - --body=${LOG_BODY}
+          YAML
+            if ! kubectl wait --for=condition=complete job/otlp-ingest -n otlp-gen --timeout=60s; then
+              echo "telemetrygen job did not complete on round $i/9"
+              kubectl logs job/otlp-ingest -n otlp-gen --tail=100 || true
+              kubectl describe job/otlp-ingest -n otlp-gen || true
+              exit 1
+            fi
+
+            if query_out="$(curl -sS -w '\n%{http_code}' -X POST 'http://127.0.0.1:4319/v1/query' \
+              -H "X-Ourios-Tenant: ${TENANT}" \
+              -H 'Content-Type: text/plain' \
+              --data "service == \"${TENANT}\" | range(-1h, now) | limit 50")"; then
+              query_status="$(printf '%s' "$query_out" | tail -1)"
+            else
+              query_status="curl-failed"
+              query_out=""
+            fi
+            if [ "$query_status" = "200" ]; then
+              query_successes=$((query_successes + 1))
+            else
+              echo "query round $i/9 failed (http $query_status): $(printf '%s' "$query_out" | head -n -1)"
+            fi
+
+            echo "traffic round $i/9 done"
+            sleep 30
+          done
+
+          if [ "$query_successes" -eq 0 ]; then
+            echo "no query round succeeded across 9 attempts"
+            exit 1
+          fi
+
+          # The ingester's Parquet age-flush trigger is 300s (the size trigger,
+          # 128 MiB, is unreachable at this volume) and the compactor above is
+          # set to a 30s interval — give both time to actually run at least
+          # once before the profile capture window closes, so the profile
+          # reflects real flush/compaction behaviour, not just ingest.
+          sleep 120
+
+      # maxLearningPeriod (6m) plus slack for Kubescape to flip the status
+      # annotation. Poll rather than a fixed sleep — completion timing isn't
+      # exact. Targets containerprofile, not the legacy applicationprofile:
+      # node-agent v0.2.357 only writes ContainerProfile objects (its
+      # ApplicationProfiles.List call in pkg/storage/v1/storage.go is just a
+      # startup readiness probe against the aggregated API, which still
+      # registers the applicationprofiles REST resource for back-compat even
+      # though nothing populates it) — kubectl get applicationprofile would
+      # sit at 0 items and time out.
+      - name: Wait for ContainerProfiles to complete
+        run: |
+          deadline=$((SECONDS + 600))
+          total=0
+          done_count=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if items_json="$(kubectl get containerprofile -o json)"; then
+              total="$(printf '%s' "$items_json" | jq '.items | length')"
+              done_count="$(printf '%s' "$items_json" | jq '[.items[] | select(.metadata.annotations["kubescape.io/status"] == "completed")] | length')"
+              echo "containerprofiles: ${done_count}/${total} completed"
+              if [ "${total}" -gt 0 ] && [ "${done_count}" = "${total}" ]; then break; fi
+            else
+              echo "kubectl get containerprofile failed, retrying"
+            fi
+            sleep 20
+          done
+          kubectl get containerprofile -o wide || true
+          if [ "${total}" -eq 0 ] || [ "${done_count}" != "${total}" ]; then
+            echo "ContainerProfiles did not all complete within the deadline (${done_count}/${total})"
+            exit 1
+          fi
+
+      - name: Export ContainerProfiles
+        run: |
+          mkdir -p bob-out
+          kubectl get containerprofile -o yaml > bob-out/containerprofiles.yaml
+          kubectl get containerprofile -o json \
+            | jq -r '.items[] | .metadata.name' > bob-out/profile-names.txt
+          cat bob-out/profile-names.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ourios-bob-capture
+          path: bob-out/
+          retention-days: 14
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get containerprofile -A -o yaml || true
+          echo "=== receiver logs ==="; kubectl logs -l app.kubernetes.io/component=receiver --tail=200 || true
+          echo "=== querier logs ===";  kubectl logs -l app.kubernetes.io/component=querier --tail=200 || true
+          echo "=== node-agent logs ==="; kubectl logs -n "${KS_NAMESPACE}" -l app=node-agent --tail=200 || true
+          echo "=== telemetrygen logs ==="; kubectl logs -n otlp-gen job/otlp-ingest --tail=200 || true

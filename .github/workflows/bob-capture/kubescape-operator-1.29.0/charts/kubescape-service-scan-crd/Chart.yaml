@@ -1,0 +1,6 @@
+apiVersion: v2
+appVersion: 0.0.1
+description: A Helm chart CRDs for Kubescape Operator for service authentication scan
+name: kubescape-service-scan-crd
+type: application
+version: 0.0.1

@@ -167,17 +167,33 @@ pub fn fsync_root(root: &Path) -> Result<(), SnapshotStoreError> {
     Ok(())
 }
 
-/// Remove every `*.snap.tmp` a previous process left, then list the
-/// durable artefacts ([`load_all`]).
+/// Fsync the root — and its parent with it — then remove every
+/// `*.snap.tmp` a previous process left and list the durable artefacts
+/// ([`load_all`]).
+///
+/// The fsync lives **here**, not at the caller, because RFC0052.13's
+/// guarantee is about every artefact this function returns: a horizon
+/// whose directory entry may not be durable must never govern
+/// reclamation, and a caller that forgets a separate preflight would
+/// trust one. [`crate::barrier::fsync_snapshots_root`] remains the
+/// startup preflight — it fails before the WAL is even opened, with its
+/// own error context — but is no longer what the guarantee rests on.
 ///
 /// A temp file is a writer's private scratch: unlinking its own is the
 /// writer's job while it lives, and this is what closes the gap left by
-/// one that died mid-write.
+/// one that died mid-write. Only this store's own suffix is swept, so a
+/// foreign temp under the root is left alone.
 ///
 /// # Errors
 ///
-/// [`SnapshotStoreError::Io`] on any directory or file failure.
+/// [`SnapshotStoreError::Io`] on any directory or file failure. A temp
+/// that vanished between the listing and the unlink is a concurrent
+/// writer cleaning up after itself, not a failure.
 pub fn load_all_durable(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, SnapshotStoreError> {
+    fsync_root(root)?;
+    // Built from `EXTENSION` rather than spelled out, so the sweep cannot
+    // drift from what `write` names its temps.
+    let tmp_suffix = format!(".{EXTENSION}.tmp");
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -194,8 +210,22 @@ pub fn load_all_durable(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, Snapsho
             source,
         })?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "tmp") {
-            drop(std::fs::remove_file(&path));
+        if !path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(tmp_suffix.as_str()))
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(SnapshotStoreError::Io {
+                    op: "remove_file(stranded snapshot temp)",
+                    source,
+                });
+            }
         }
     }
     load_all(root)

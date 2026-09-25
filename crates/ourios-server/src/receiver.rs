@@ -427,6 +427,11 @@ pub struct ReceiverHandle {
     /// joined before the shutdown flush so no cut is in flight when it
     /// runs.
     barrier_tick: JoinHandle<()>,
+    /// The same barrier the task and the rotation hook hold. Shutdown
+    /// runs whatever is left in its pending slot once the task is
+    /// joined — the hook can fill it after the last tick, and nothing
+    /// else would ever release the publish guards it holds.
+    barrier: Arc<Barrier>,
     /// The cadence latch every guard in this receiver reports into. The
     /// shutdown stamp consults it: it is the one stamping path left
     /// outside [`Barrier::run_cut`]'s own checks.
@@ -475,6 +480,17 @@ impl ReceiverHandle {
         if self.barrier_tick.await.is_err() {
             self.epochs.report(self.epochs.current());
         }
+        // The barrier task is gone, but the slot it fed need not be
+        // empty: the rotation hook is capture-only, so an append taken
+        // just before the signal can have left a cut there with nothing
+        // left to run it. Its `Drained` batches hold the sink's in-flight
+        // publish guards, and `flush_then_snapshot`'s own
+        // `quiesce_publishes` below would then wait on them forever.
+        // Running the cut here settles it either way: one that stamps
+        // publishes its batches, and one that cannot — a latched epoch, a
+        // retained sink — parks them back into the buffers, where the
+        // flush covers them.
+        tokio::task::block_in_place(|| self.barrier.run_pending());
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -680,8 +696,10 @@ struct Cadences {
 /// construction, and handing them separate ones would put two owners on
 /// one sink's in-flight accounting.
 struct CadenceInputs {
+    /// Already carrying RFC 0047 §3.3's graph emitter, if one is
+    /// configured: it is attached at construction so the barrier's clone
+    /// has it too.
     publisher: PublishCoordinator,
-    graph: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
     /// Built before the pipeline, because the capture-only rotation hook
     /// the pipeline installs holds it (RFC 0052 §3.1).
     barrier: Arc<Barrier>,
@@ -693,14 +711,7 @@ fn spawn_cadences(
     inputs: CadenceInputs,
     shutdown: &watch::Receiver<()>,
 ) -> Cadences {
-    let CadenceInputs {
-        mut publisher,
-        graph,
-        barrier,
-    } = inputs;
-    if let Some(emitter) = graph {
-        publisher = publisher.with_graph_emitter(emitter);
-    }
+    let CadenceInputs { publisher, barrier } = inputs;
     let overflow = publisher.audit().overflow_notify();
     Cadences {
         barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
@@ -806,7 +817,16 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // the pipeline's rotation hook is now a capture into it. Both
     // cadences share this one publish coordinator — two would put two
     // owners on a single sink's in-flight accounting.
-    let publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    //
+    // RFC 0047 §3.3's emitter is attached **here**, before the barrier
+    // takes its clone, and not in `spawn_cadences`. Attached there it
+    // would reach only the sweep's clone, and every batch a cut or the
+    // rotation hook published would be missing from the authorization
+    // graph until a compaction re-derived its tuples.
+    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    if let Some(emitter) = config.graph_emitter.clone() {
+        publisher = publisher.with_graph_emitter(emitter);
+    }
     let barrier = Arc::new(Barrier::new(
         publisher.clone(),
         Arc::clone(&commits),
@@ -847,7 +867,6 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         &pipeline,
         CadenceInputs {
             publisher,
-            graph: config.graph_emitter.clone(),
             barrier: Arc::clone(&barrier),
         },
         &shutdown_rx,
@@ -942,6 +961,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         audit_sink,
         flush_tick,
         barrier_tick,
+        barrier,
         epochs: pipeline_epochs,
     })
 }
@@ -1318,6 +1338,212 @@ mod tests {
         assert_ne!(handle.grpc_addr.port(), 0, "gRPC bound to a real port");
         assert_ne!(handle.http_addr.port(), 0, "HTTP bound to a real port");
         handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// RFC 0052 §3.1: the rotation hook is capture-only, so an append taken
+    /// just before the shutdown signal can leave a cut in the slot with the
+    /// barrier task already gone. Those `Drained` batches hold the sink's
+    /// in-flight publish guards, and `flush_then_snapshot`'s
+    /// `quiesce_publishes` waits on them — forever, unless shutdown runs the
+    /// pending cut first. `BARRIER_TICK` is five minutes and the task skips
+    /// its immediate first tick, so within this test nothing else can settle
+    /// the slot: the timeout is the assertion.
+    ///
+    /// The scenario runs on its own runtime thread and this one is the
+    /// clock. An in-runtime `timeout` would not do: the wait it guards is
+    /// `quiesce_publishes`, which blocks the worker inside `shutdown`'s own
+    /// poll, so the timer would never be polled again and a regression
+    /// would hang the job out rather than fail.
+    #[test]
+    fn shutdown_runs_the_cut_the_rotation_hook_left_pending() {
+        let (done, settled) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let published = runtime.block_on(shutdown_with_a_pending_cut());
+            let _ = done.send(published);
+        });
+
+        match settled.recv_timeout(Duration::from_secs(30)) {
+            Ok(published) => assert!(published, "the acknowledged records reached the store"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("shutdown waited on the pending cut's publish guards instead of running it")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the scenario panicked; its output is above")
+            }
+        }
+    }
+
+    /// The body of [`shutdown_runs_the_cut_the_rotation_hook_left_pending`]:
+    /// serve, leave a cut in the slot from the request path, shut down, and
+    /// report whether anything reached the store.
+    async fn shutdown_with_a_pending_cut() -> bool {
+        use prost::Message;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: WalConfig {
+                segment_age_secs: 1, // the WAL's floor; slept past below
+                ..test_wal_config(wal_dir.path())
+            },
+            store,
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        })
+        .await
+        .expect("serve");
+
+        // Given an acknowledged batch, then a second append that observes the
+        // aged-out segment and so captures a cut on the request path.
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        assert!(
+            handle.barrier.pending_mark().is_some(),
+            "the request path filled the slot and no tick has run",
+        );
+
+        // Then shutdown settles it rather than blocking on its publish guards.
+        handle.shutdown().await.expect("graceful shutdown");
+        !data_parquet_files(data_dir.path()).is_empty()
+    }
+
+    /// RFC 0047 §3.3: the graph emitter is attached to the coordinator the
+    /// **barrier** holds. Attached to the sweep's clone alone — inside
+    /// `spawn_cadences` — every batch a cut published would be missing from
+    /// the authorization graph until a compaction re-derived its tuples.
+    ///
+    /// The cut is run explicitly rather than left to shutdown, so this fails
+    /// for one reason only: the barrier's coordinator has no emitter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_barriers_own_publish_feeds_the_graph() {
+        use ourios_core::auth::openfga::{
+            OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
+        };
+        use ourios_ingester::graph_emitter::GraphEmitter;
+        use prost::Message;
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let api_url = serve_fake_graph(Arc::clone(&writes)).await;
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(api_url),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("2".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("openfga config");
+        let emitter = Arc::new(
+            GraphEmitter::from_config(&config)
+                .expect("emitter")
+                .expect("conversation bound"),
+        );
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: WalConfig {
+                segment_age_secs: 1, // the WAL's floor; slept past below
+                ..test_wal_config(wal_dir.path())
+            },
+            store,
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: Some(emitter),
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        })
+        .await
+        .expect("serve");
+
+        // Given a cut left in the slot by the rotation hook.
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        assert!(
+            handle.barrier.pending_mark().is_some(),
+            "the request path filled the slot and no tick has run",
+        );
+
+        // When the barrier publishes it, the graph sees the partition's
+        // tuples. Every published partition yields the tenant's tool tuples,
+        // so this holds without conversation attributes in the records.
+        tokio::task::block_in_place(|| handle.barrier.run_pending());
+        let saw_tuples = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let seen = writes.lock().expect("lock").join("");
+                if seen.contains("tool:checkout/query_logs") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        handle.shutdown().await.expect("graceful shutdown");
+        assert!(
+            saw_tuples.is_ok(),
+            "the cut's publish wrote tuples; the graph saw {:?}",
+            writes.lock().expect("lock"),
+        );
+    }
+
+    /// A fake `OpenFGA` recording every `/write` body (the `graph_emitter`
+    /// unit tests' `erase_fake`, write half only).
+    async fn serve_fake_graph(writes: Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::post;
+
+        async fn write(
+            State(writes): State<Arc<std::sync::Mutex<Vec<String>>>>,
+            body: axum::body::Bytes,
+        ) -> ([(&'static str, &'static str); 1], String) {
+            writes
+                .lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&body).into_owned());
+            ([("content-type", "application/json")], "{}".to_string())
+        }
+
+        let app = Router::new()
+            .route("/stores/{store}/write", post(write))
+            .with_state(writes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        url
     }
 
     /// The `OTel` Collector's OTLP exporter gzip-compresses by default, so the

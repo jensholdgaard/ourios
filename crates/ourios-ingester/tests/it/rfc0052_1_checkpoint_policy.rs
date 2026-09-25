@@ -228,6 +228,62 @@ async fn rfc0052_1_latched_epoch_refuses_checkpoint_and_snapshot_until_restart()
     );
 }
 
+/// The latch is checked before the cut, but the rotation hook does not
+/// consult it at all: it runs on the request path, where a cut it cannot
+/// take is still a drain it must not lose. So a latched node keeps
+/// acquiring pending cuts, and the tick's early return is the only place
+/// left that can settle them — left in the slot, their `Drained` batches
+/// hold the sink's in-flight publish guards, and every
+/// `quiesce_publishes` (shutdown's included) then waits on them for the
+/// life of the process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_latched_tick_settles_the_cut_the_rotation_hook_left_pending() {
+    // Given a latched node with one acknowledged batch buffered.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal_root = tmp.path().join("wal");
+    let rig = BarrierRig::with_rotation_capture(
+        tmp.path(),
+        ourios_wal::WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            ..wal_config(&wal_root)
+        },
+        usize::MAX,
+    );
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.epochs.report(rig.epochs.current());
+
+    // When the segment ages out and the next append observes the change,
+    // so the hook captures despite the latch.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    rig.ingest("checkout", &["payment 9 settled"]).await;
+    rig.pipeline.quiesce_encodes();
+    assert!(
+        rig.barrier.pending_mark().is_some(),
+        "the request path filled the slot while the node was latched",
+    );
+
+    // Then the tick that refuses the cut settles what it found.
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Latched);
+    assert_eq!(rig.barrier.pending_mark(), None, "the slot is empty");
+    assert_eq!(
+        rig.sink.buffered_records(),
+        2,
+        "the cut's batch is parked back beside the append that followed it",
+    );
+    assert!(rig.data_files().is_empty(), "and nothing was published");
+
+    // And the publish guards those batches held are released, so a
+    // quiesce returns rather than waiting out the process.
+    let sink = rig.sink.clone();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || sink.quiesce_publishes()),
+    )
+    .await
+    .expect("the parked batches released their publish guards")
+    .expect("the quiesce did not panic");
+}
+
 /// Scenario RFC0052.1 — unwind leg: an age-sweep publish panics inside `quiesce_publishes`.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

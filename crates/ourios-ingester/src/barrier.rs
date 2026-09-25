@@ -26,7 +26,11 @@
 //!   only the excess would move the pending cut's mark above frames
 //!   sitting in the buffers rather than in its batches, and `run_cut`
 //!   would checkpoint through them.
-//! - **Cuts are strictly ordered.** A pending cut's snapshot bytes
+//! - **Cuts are strictly ordered.** A capture holds the exclusion across
+//!   the handoff as well as the cut, so the slot never sees a later cut
+//!   before an earlier one — and the fold itself is written to be
+//!   order-independent, so an inversion could not move the pending cut's
+//!   horizon backwards. A pending cut's snapshot bytes
 //!   already fold frames whose only durable copy is the running cut's
 //!   batches, so it never installs or stamps before the running cut's
 //!   outcome — and when that cut *fails*, the pending one is
@@ -85,6 +89,39 @@ impl Cut {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Fold `other` into this cut — §3.1's coalesce, past the ceiling
+    /// check.
+    ///
+    /// The batches always join; the epoch, the mark and the per-tenant
+    /// snapshots come from whichever of the two captures is the **later**
+    /// one, so the fold is independent of the order the two arrive in.
+    /// The marks themselves cannot decide it: a `WalOffset` orders on a
+    /// segment uuid, which says nothing about which cut was taken first.
+    fn absorb(&mut self, other: Cut) {
+        let Cut {
+            epoch,
+            mark,
+            drained,
+            snapshots,
+            bytes,
+        } = other;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.drained.extend(drained);
+        match epoch.cmp(&self.epoch) {
+            std::cmp::Ordering::Greater => {
+                self.epoch = epoch;
+                self.mark = mark.or(self.mark);
+                merge_snapshots(&mut self.snapshots, snapshots);
+            }
+            // No two captures share an epoch, so `Equal` is unreachable;
+            // it folds with the older arm, which advances nothing.
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                self.mark = self.mark.or(mark);
+                backfill_snapshots(&mut self.snapshots, snapshots);
+            }
+        }
     }
 }
 
@@ -191,25 +228,28 @@ impl Barrier {
     /// mark itself is always `last_durable`, the last *acknowledged*
     /// turn's own frame offset, never the rotation boundary.
     pub fn capture(&self, pipeline: &IngestPipeline, rotate_when_idle: bool) -> CaptureOutcome {
-        let cut = {
-            let _bound = pipeline.exclude_ingest();
-            pipeline.quiesce_encodes();
-            if rotate_when_idle {
-                self.rotate_idle();
-            }
-            let epoch = self.epochs.open_cut();
-            let mark = pipeline.acknowledged_durable();
-            let (drained, snapshots) =
-                pipeline.with_miner(|miner| (self.publish.drain_all(), serialise(miner)));
-            Cut {
-                epoch,
-                mark,
-                bytes: drained.estimated_bytes(),
-                drained: vec![drained],
-                snapshots,
-            }
-        };
-        self.offer(cut)
+        // The offer runs **under the exclusion**, not after it. Released
+        // first, the rotation hook could capture a newer cut and fill the
+        // slot in the gap, and this — older — cut would then fold over
+        // its epoch, its mark and its snapshots. `capture_rotation` runs
+        // under the shared side of this same lock, so holding it across
+        // the handoff is what orders the two.
+        let _bound = pipeline.exclude_ingest();
+        pipeline.quiesce_encodes();
+        if rotate_when_idle {
+            self.rotate_idle();
+        }
+        let epoch = self.epochs.open_cut();
+        let mark = pipeline.acknowledged_durable();
+        let (drained, snapshots) =
+            pipeline.with_miner(|miner| (self.publish.drain_all(), serialise(miner)));
+        self.offer(Cut {
+            epoch,
+            mark,
+            bytes: drained.estimated_bytes(),
+            drained: vec![drained],
+            snapshots,
+        })
     }
 
     /// Capture a cut from inside an ingest turn that has already
@@ -267,6 +307,14 @@ impl Barrier {
         // state for a cut that cannot stamp — instead of standing still
         // until a restart.
         if self.epochs.capture().refuses(epoch) {
+            // The rotation hook does not consult the latch — it runs on
+            // the request path, where a cut it cannot take is still a
+            // drain it must not lose. So a latched node keeps acquiring
+            // pending cuts, and this early return is the only place left
+            // that can settle them: left in the slot their publish
+            // guards never drop, and `quiesce_publishes` waits on them
+            // for the life of the process, shutdown included.
+            self.invalidate_pending();
             return CutOutcome::Latched;
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -311,11 +359,7 @@ impl Barrier {
             self.park(cut);
             return CaptureOutcome::Parked;
         }
-        existing.bytes = existing.bytes.saturating_add(cut.bytes);
-        existing.drained.extend(cut.drained);
-        existing.mark = cut.mark.or(existing.mark);
-        existing.epoch = cut.epoch;
-        merge_snapshots(&mut existing.snapshots, cut.snapshots);
+        existing.absorb(cut);
         CaptureOutcome::Coalesced
     }
 
@@ -495,6 +539,19 @@ fn merge_snapshots(
     }
 }
 
+/// The same rule from the other side: `into` is already the later
+/// capture, so `older` only fills the tenants it has no bytes for.
+fn backfill_snapshots(
+    into: &mut Vec<(TenantId, SnapshotState)>,
+    older: Vec<(TenantId, SnapshotState)>,
+) {
+    for (tenant, state) in older {
+        if !into.iter().any(|(existing, _)| *existing == tenant) {
+            into.push((tenant, state));
+        }
+    }
+}
+
 /// The snapshots root is fsynced — and its parent with it — before any
 /// listed artefact is read as a horizon (RFC0052.13).
 ///
@@ -509,4 +566,93 @@ fn merge_snapshots(
 /// [`snapshot_store::SnapshotStoreError::Io`] when either fsync fails.
 pub fn fsync_snapshots_root(root: &Path) -> Result<(), snapshot_store::SnapshotStoreError> {
     snapshot_store::fsync_root(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::snapshot::{SnapshotState, WalHighWater};
+    use ourios_wal::WalOffset;
+
+    use super::Cut;
+    use crate::cadence::{BarrierEpochs, Epoch};
+
+    fn state(byte: u64) -> SnapshotState {
+        SnapshotState {
+            leaves: Vec::new(),
+            structured_templates: Vec::new(),
+            wal_high_water: Some(WalHighWater {
+                segment: "segment".to_owned(),
+                byte,
+            }),
+            adopted_templates: Vec::new(),
+        }
+    }
+
+    fn offset(byte: u64) -> WalOffset {
+        WalOffset {
+            segment: uuid::Uuid::from_u128(7),
+            byte,
+        }
+    }
+
+    fn cut(epoch: Epoch, byte: u64, snapshots: &[(&str, u64)]) -> Cut {
+        Cut {
+            epoch,
+            mark: Some(offset(byte)),
+            drained: Vec::new(),
+            snapshots: snapshots
+                .iter()
+                .map(|(tenant, at)| (TenantId::new(*tenant), state(*at)))
+                .collect(),
+            bytes: 0,
+        }
+    }
+
+    fn horizon(cut: &Cut, tenant: &str) -> Option<u64> {
+        cut.snapshots
+            .iter()
+            .find(|(id, _)| id.as_str() == tenant)
+            .and_then(|(_, state)| state.wal_high_water.as_ref())
+            .map(|high_water| high_water.byte)
+    }
+
+    /// §3.1's ordering rule, at the one place the two captures meet: the
+    /// newer cut's epoch, mark and per-tenant snapshots win whichever way
+    /// round the two arrive.
+    ///
+    /// The handoff is serialised under the ingest exclusion, so the
+    /// inverted order should be unreachable — but an inversion that ever
+    /// *did* occur would move the pending cut's horizon backwards while
+    /// leaving the newer capture's snapshot bytes in the slot: an
+    /// artefact covering frames above the mark it is stamped at, which
+    /// the next start would replay over.
+    #[test]
+    fn folding_two_cuts_is_independent_of_the_order_they_arrive_in() {
+        let epochs = BarrierEpochs::new();
+        let (first, second) = (epochs.open_cut(), epochs.open_cut());
+        assert!(second > first, "the later capture takes the later epoch");
+
+        let mut in_order = cut(first, 100, &[("checkout", 100), ("search", 100)]);
+        in_order.absorb(cut(second, 200, &[("checkout", 200)]));
+
+        let mut inverted = cut(second, 200, &[("checkout", 200)]);
+        inverted.absorb(cut(first, 100, &[("checkout", 100), ("search", 100)]));
+
+        for folded in [&in_order, &inverted] {
+            assert_eq!(folded.epoch(), second, "the newer capture's epoch");
+            assert_eq!(folded.mark(), Some(offset(200)), "and its mark");
+            assert_eq!(
+                horizon(folded, "checkout"),
+                Some(200),
+                "and its bytes for a tenant both captures hold",
+            );
+            assert_eq!(
+                horizon(folded, "search"),
+                Some(100),
+                "while a tenant only the older capture saw keeps its own \
+                 cut-consistent bytes",
+            );
+        }
+    }
 }

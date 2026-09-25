@@ -19,7 +19,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
-use ourios_ingester::barrier::Barrier;
+use ourios_ingester::barrier::{Barrier, CutOutcome};
 use ourios_ingester::cadence::BarrierEpochs;
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
@@ -490,7 +490,7 @@ impl ReceiverHandle {
         // publishes its batches, and one that cannot — a latched epoch, a
         // retained sink — parks them back into the buffers, where the
         // flush covers them.
-        tokio::task::block_in_place(|| self.barrier.run_pending());
+        run_pending_fail_closed(&self.barrier, &self.epochs);
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -525,6 +525,27 @@ impl ReceiverHandle {
             });
         });
         Ok(())
+    }
+}
+
+/// Run the barrier's pending cut at shutdown, fail-closed.
+///
+/// Caught for the same reason [`Barrier::tick`] catches: this call is
+/// outside `tick`'s own guard, the cut it runs may have drained batches
+/// it never settled, and an unwind here would take the shutdown flush
+/// and the snapshot with it. A panic latches, exactly as `shutdown`'s
+/// `JoinError` arm does, and the stamp after it refuses.
+fn run_pending_fail_closed(barrier: &Barrier, epochs: &BarrierEpochs) {
+    latch_on_panic(epochs, || barrier.run_pending());
+}
+
+/// Run `cut` off the runtime and swallow an unwind, latching `epochs` to
+/// the epoch current at the panic so every later stamp refuses.
+fn latch_on_panic(epochs: &BarrierEpochs, cut: impl FnOnce() -> CutOutcome) {
+    let ran =
+        tokio::task::block_in_place(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(cut)));
+    if ran.is_err() {
+        epochs.report(epochs.current());
     }
 }
 
@@ -1354,6 +1375,40 @@ mod tests {
         assert_ne!(handle.grpc_addr.port(), 0, "gRPC bound to a real port");
         assert_ne!(handle.http_addr.port(), 0, "HTTP bound to a real port");
         handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// RFC 0052 §3.1: the shutdown drain runs outside [`Barrier::tick`]'s
+    /// own guard, so an unwinding cut would otherwise take the shutdown
+    /// flush and the snapshot with it — the two steps that still have to
+    /// run for the acknowledged records to survive. The cut may also have
+    /// drained batches it never settled, so swallowing the panic is only
+    /// safe if it latches: the stamp that follows must refuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_latches_on_a_panic_rather_than_unwinding() {
+        let epochs = BarrierEpochs::new();
+        let epoch = epochs.current();
+        assert!(
+            !epochs.capture().refuses(epoch),
+            "a fresh node refuses nothing",
+        );
+
+        latch_on_panic(&epochs, || panic!("injected pending-cut panic"));
+
+        assert!(
+            epochs.capture().refuses(epoch),
+            "the drain's panic latched instead of escaping shutdown",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_leaves_a_clean_cut_unlatched() {
+        let epochs = BarrierEpochs::new();
+        let epoch = epochs.current();
+        latch_on_panic(&epochs, || CutOutcome::Stamped);
+        assert!(
+            !epochs.capture().refuses(epoch),
+            "a cut that returned is not a reason to refuse the stamp",
+        );
     }
 
     /// RFC 0052 §3.1: the rotation hook is capture-only, so an append taken

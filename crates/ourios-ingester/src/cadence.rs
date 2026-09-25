@@ -123,6 +123,14 @@ impl BarrierEpochs {
     /// wrapping: a node that somehow reached 2^32 cuts (about 40,000
     /// years at the 300-second default) stops stamping rather than
     /// wrapping into a stale comparison.
+    ///
+    /// "Stops stamping" is the latch, not the ceiling on its own. Held
+    /// at the ceiling the counter hands the *same* epoch to every later
+    /// cut, and a guard registered under one of them would be dated
+    /// indistinguishably from one registered under the cut before it —
+    /// the ordering the epoch exists to carry is gone. So exhaustion
+    /// reports, which refuses that cut and every later one until a
+    /// restart.
     pub fn open_cut(&self) -> Epoch {
         let taken = self
             .next
@@ -130,7 +138,12 @@ impl BarrierEpochs {
                 (next + 1 < Epoch::RESERVED).then_some(next + 1)
             });
         match taken {
-            Ok(previous) | Err(previous) => Self::narrow(previous),
+            Ok(previous) => Self::narrow(previous),
+            Err(previous) => {
+                let exhausted = Self::narrow(previous);
+                self.report(exhausted);
+                exhausted
+            }
         }
     }
 
@@ -247,6 +260,33 @@ mod tests {
             u64::from(a.get()),
             Epoch::RESERVED,
             "and never reaches the reserved sentinel",
+        );
+    }
+
+    #[test]
+    fn an_exhausted_counter_stops_stamping_rather_than_reusing_an_epoch() {
+        let epochs = BarrierEpochs::new();
+        let fresh = epochs.open_cut();
+        assert!(
+            !epochs.capture().refuses(fresh),
+            "a counter with room refuses nothing",
+        );
+        epochs
+            .next
+            .store(Epoch::RESERVED - 1, std::sync::atomic::Ordering::Release);
+
+        // The first cut past the ceiling is the first one whose epoch
+        // can no longer separate the guards registered under it.
+        let exhausted = epochs.open_cut();
+        let state = epochs.capture();
+        assert_eq!(state.failed_epoch(), Some(exhausted));
+        assert!(
+            state.refuses(exhausted),
+            "the cut that found the counter exhausted may not stamp",
+        );
+        assert!(
+            epochs.capture().refuses(epochs.open_cut()),
+            "nor may any later one, which is what 'stops stamping' means",
         );
     }
 }

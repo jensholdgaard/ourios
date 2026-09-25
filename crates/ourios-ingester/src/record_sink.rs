@@ -866,6 +866,15 @@ impl PublishOutcomes {
             .iter()
             .any(|settlement| settlement.refuses(epoch))
     }
+
+    /// How many settlements the sink was still carrying when this
+    /// outcome was taken — the size of the list `settle_cut` retires
+    /// from, for the status surface and for the leg that pins it
+    /// bounded on a latched node.
+    #[must_use]
+    pub fn recorded(&self) -> usize {
+        self.settlements.len()
+    }
 }
 
 /// Settles one in-flight publish on drop — including during unwinding, so a

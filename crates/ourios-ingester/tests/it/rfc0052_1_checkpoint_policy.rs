@@ -380,6 +380,123 @@ async fn rfc0052_1_encode_worker_panic_then_barrier_stamps_nothing_and_restart_r
     );
 }
 
+/// Scenario RFC0052.1 — unwind leg: a real barrier tick over the panic, every schedule.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_barrier_tick_concurrent_with_a_worker_panic_stamps_nothing_under_every_schedule()
+{
+    // The leg above pins the pool-level ordering — a settled count has
+    // a set latch — with `epochs.capture()` standing in for a barrier.
+    // This one runs the barrier itself, over the rig whose own encode
+    // worker panics, started at a seeded point in the panic's window
+    // and **without** a prior `quiesce_encodes`. A tick that read the
+    // latch only before its capture, or stamped after quiescing, would
+    // be caught here rather than assumed away.
+    for seed in 0..16u64 {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let rig = Arc::new(BarrierRig::with_panicking_encode(tmp.path()));
+        // The batch is genuinely acknowledged — durable in the WAL —
+        // and its worker then panics inside `emit_concurrent`.
+        rig.ingest("checkout", &["user 1 logged in", "user 2 logged in"])
+            .await;
+
+        let outcome = {
+            let rig = Arc::clone(&rig);
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..(seed % 8) {
+                    std::thread::yield_now();
+                }
+                rig.barrier.tick(&rig.pipeline, false)
+            })
+            .await
+            .expect("the tick is caught inside the barrier, not propagated")
+        };
+
+        // Then the cut refuses under every schedule. Whichever check
+        // catches it — the pre-capture one when the panic already
+        // landed, `run_cut`'s when the capture's own quiesce waited it
+        // out — the answer is the same, because the unwinding guard
+        // reports before the decrement that settles the count.
+        assert_eq!(outcome, CutOutcome::Latched, "seed {seed}");
+        assert_eq!(
+            rig.commits.last_checkpoint(),
+            None,
+            "seed {seed}: no mark passed the batch's unemitted remainder",
+        );
+        assert!(
+            rig.snapshots().is_empty(),
+            "seed {seed}: and no snapshot was installed",
+        );
+    }
+}
+
+/// Scenario RFC0052.1 — a latched node settles the cuts it can no longer run.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_a_latched_node_does_not_accumulate_the_cuts_it_refuses() {
+    // Given a latched node that keeps acquiring cuts: the rotation hook
+    // does not consult the latch, so captures keep filling the slot and
+    // `tick` keeps parking them. Each park dates a settlement, and the
+    // `settle_cut` that would retire it is on `run_pending`'s path —
+    // the one a latched tick returns before reaching.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    rig.ingest("checkout", &["user 0 logged in"]).await;
+    let guard = rig.sink.begin_publish();
+    let panicking = std::thread::spawn(move || {
+        let _held = guard;
+        panic!("injected publish panic");
+    });
+    assert!(panicking.join().is_err(), "the publish panicked");
+    assert!(
+        rig.epochs.capture().failed_epoch().is_some(),
+        "which latched the node",
+    );
+
+    // When it keeps ticking, for as long as a latched process would,
+    // with each round's capture holding real drained records.
+    let mut round = 0u32;
+    let few = latched_rounds(&rig, &mut round, 4).await;
+    let many = latched_rounds(&rig, &mut round, 32).await;
+
+    // Then the settlement list does not grow with the tick count: a
+    // latched node stands still rather than leaking a record per cut for
+    // the life of the process. The unwind's own settlement stays —
+    // `Unwound` is never spent, because the records exist only in the
+    // WAL until a restart re-mines them.
+    assert_eq!(
+        many, few,
+        "a latched node settles each refused cut instead of accumulating it",
+    );
+    assert!(
+        !rig.sink.quiesce_publishes().all_ok(rig.epochs.current()),
+        "and the unwind it is latched on is still recorded",
+    );
+}
+
+/// Ingest, capture and tick `rounds` times against a latched rig, and
+/// report how many settlements the sink is left carrying.
+///
+/// The capture is the **hook's**, not the timer's, because only the
+/// hook's order dates a settlement: it drains before opening the cut, so
+/// the batches are registered one epoch behind the one they are parked
+/// at, which is what `note_resettled` records. It is also the path
+/// Copilot's finding names — a latched node keeps taking rotation
+/// captures, because the hook does not consult the latch.
+async fn latched_rounds(rig: &BarrierRig, round: &mut u32, rounds: usize) -> usize {
+    for _ in 0..rounds {
+        *round += 1;
+        let body = format!("user {round} logged in");
+        let mark = rig.ingest("checkout", &[&body]).await;
+        rig.pipeline.quiesce_encodes();
+        let _captured = rig
+            .pipeline
+            .with_miner(|miner| rig.barrier.capture_rotation(miner, mark));
+        assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Latched);
+    }
+    rig.sink.quiesce_publishes().recorded()
+}
+
 /// Neither half of a cut landed: no checkpoint, no snapshot artefact, no
 /// Parquet object.
 fn assert_nothing_reached_durability(rig: &BarrierRig) {

@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ourios_config::MinerConfig;
@@ -153,6 +154,46 @@ impl BarrierRig {
         )
     }
 
+    /// A rig whose single encode worker is **held** inside the sink's
+    /// inline audit barrier until the returned handle releases it — the
+    /// same seam `with_panicking_encode` panics in, and the same
+    /// one-byte size target that reaches it on every record.
+    ///
+    /// The hold is what makes "an encode is still pending" an observed
+    /// state rather than a hoped-for interleaving: a leg that only
+    /// ingests and sleeps cannot tell a barrier that waits for the
+    /// encode phase from one that does not.
+    ///
+    /// The held barrier reports success without flushing the audit sink.
+    /// The legs that use it assert on the checkpoint, and an audit flush
+    /// under the hold would only add a second lock to reason about.
+    pub fn with_held_encode(tmp: &Path) -> (Self, HeldEncode) {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&entered);
+        let gate = Arc::clone(&release);
+        let rig = Self::build(
+            tmp,
+            RigSpec {
+                flush: FlushConfig {
+                    target_bytes: 1,
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+                workers: 1,
+                poison: Some(Box::new(move || {
+                    seen.fetch_add(1, Ordering::AcqRel);
+                    while !gate.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    true
+                })),
+                ..RigSpec::new(wal_config(&tmp.join("wal")))
+            },
+        );
+        (rig, HeldEncode { entered, release })
+    }
+
     fn build(tmp: &Path, spec: RigSpec) -> Self {
         let RigSpec {
             flush,
@@ -275,6 +316,26 @@ impl BarrierRig {
         // A non-empty directory cannot be replaced by a rename on any
         // platform, which is what makes the failure deterministic.
         std::fs::write(path.join("occupied"), b"x").expect("occupy it");
+    }
+}
+
+/// The handle on [`BarrierRig::with_held_encode`]'s held worker.
+pub struct HeldEncode {
+    entered: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
+}
+
+impl HeldEncode {
+    /// Block until a worker is inside the emit — the point from which
+    /// the pipeline genuinely has an unfinished encode.
+    pub fn await_worker_inside_the_emit(&self) {
+        while self.entered.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    pub fn release(&self) {
+        self.release.store(true, Ordering::Release);
     }
 }
 

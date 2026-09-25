@@ -13,8 +13,17 @@
 //! A cut is captured under the pipeline's `ingest_bound` exclusion — the
 //! quiesce, the mark read, the two drains and the snapshot serialisation
 //! — and nothing else runs there. The flush, the snapshot installs and
-//! the checkpoint all run outside it, so a slow object store stalls
-//! ingest for the length of a drain and never for a PUT.
+//! the checkpoint all run outside it, so the barrier's *own* PUTs never
+//! stall ingest: a cut costs a drain, not a round trip to the store.
+//!
+//! One PUT can still land inside the exclusion, and it is not the
+//! barrier's: the capture's `quiesce_encodes` waits out an encode worker
+//! that may be inside `emit_concurrent`, whose size/ceiling take
+//! publishes straight from the worker. A slow store therefore holds the
+//! exclusion for that worker's put. Routing those takes through the
+//! coordinator — the `detach_concurrent` seam — is issue #834; until
+//! then the exclusion's worst case is one in-flight encode's PUT, not a
+//! whole cut's.
 //!
 //! Three rules make the ordering sound, and each is a §5 criterion:
 //!
@@ -315,6 +324,14 @@ impl Barrier {
             // guards never drop, and `quiesce_publishes` waits on them
             // for the life of the process, shutdown included.
             self.invalidate_pending();
+            // Each of those parks dates a settlement, and on a latched
+            // node nothing ever retires them: `run_pending`'s
+            // `settle_cut` is on the path this return skips. A
+            // settlement dated at or below the epoch current now refuses
+            // no cut a later tick could take — `refuses` needs
+            // `epoch < at` — so settling against it here is what keeps
+            // the list from growing for the life of the process.
+            self.publish.record().settle_cut(self.epochs.current());
             return CutOutcome::Latched;
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

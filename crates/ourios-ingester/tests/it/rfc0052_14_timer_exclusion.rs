@@ -29,6 +29,9 @@ async fn rfc0052_14_no_checkpoint_passes_an_unemitted_frame_under_any_interleavi
     // continuously, under a seeded set of interleavings rather than a
     // wall clock: the window between the quiesce and the stamp is
     // narrow, and a timing test that happens to pass proves nothing.
+    // This leg is the one run against *real* traffic; the held-encode
+    // leg below is the one that forces a pending encode to exist when
+    // the tick starts. Neither subsumes the other.
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = Arc::new(BarrierRig::new(tmp.path()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -101,6 +104,73 @@ async fn rfc0052_14_no_checkpoint_passes_an_unemitted_frame_under_any_interleavi
     })
     .await
     .expect("final cut");
+}
+
+/// Scenario RFC0052.14 — the cut waits out a held encode rather than stamping past it.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_a_tick_started_over_a_held_encode_stamps_nothing_until_it_lands() {
+    // Given an acknowledged batch whose encode worker is held inside
+    // `emit_concurrent` — the deterministic half of the leg above. The
+    // seeded one drives real traffic and asserts the mark never passes
+    // an unfinished turn, but it cannot *force* an encode to be pending
+    // when the tick starts, so a barrier that read the mark before
+    // quiescing could still satisfy it. Here the pending encode is an
+    // observed state and the tick provably cannot finish without it.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (rig, held) = BarrierRig::with_held_encode(tmp.path());
+    let rig = Arc::new(rig);
+    let mark = rig.ingest("checkout", &["user 1 logged in"]).await;
+    held.await_worker_inside_the_emit();
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "nothing has stamped yet",
+    );
+
+    // When a tick starts while that worker is still inside the emit.
+    let tick = {
+        let rig = Arc::clone(&rig);
+        tokio::task::spawn_blocking(move || rig.barrier.tick(&rig.pipeline, false))
+    };
+
+    // Then it makes no progress at all: the capture's `quiesce_encodes`
+    // runs before the mark is read, so neither the checkpoint nor the
+    // store moves while the encode is outstanding.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !tick.is_finished(),
+        "the cut is still waiting on the encode phase",
+    );
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "and no mark was stamped across the record the held worker has not emitted",
+    );
+    assert!(
+        rig.data_files().is_empty(),
+        "nor did anything reach the store ahead of it",
+    );
+
+    // And once the worker lands, the same cut stamps — at the mark of
+    // the turn whose encode it waited for, with that turn's records in
+    // the store under it rather than only in the WAL.
+    held.release();
+    assert_eq!(
+        tick.await.expect("the tick did not panic"),
+        CutOutcome::Stamped,
+    );
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark),
+        "the mark the cut waited for is the one it stamps",
+    );
+    assert!(
+        !rig.data_files().is_empty(),
+        "and the encode it waited for is durable under that mark",
+    );
 }
 
 /// Scenario RFC0052.14 — the mark is a turn's own frame offset, never the sync's EOF.

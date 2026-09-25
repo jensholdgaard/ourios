@@ -656,10 +656,20 @@ impl IngestPipeline {
                 // exactly the frames at or below that mark. In-order, so
                 // `before` is exactly the preceding seq's offset and no
                 // higher seq has ingested yet.
-                let before = self.lock_last_durable().map(DurableMark::offset);
+                //
+                // The mark stays typed to here (RFC 0052 §3.7): the hook
+                // is a barrier capture that checkpoints at `prev`, and a
+                // replay seed is proof of *delivery*, not of a completed
+                // group sync. Rotating on one — the first acknowledged
+                // turn after a restart landing in a new segment, because
+                // the reopened one was full or had aged out — would let
+                // the WAL forget a frame no turn in this process
+                // acknowledged. The barrier's own timer covers that
+                // replayed tail at the next cut, under a mark that is one.
+                let before = *self.lock_last_durable();
                 let mined = {
                     let mut miner = self.lock_miner();
-                    if let Some(prev) = before
+                    if let Some(DurableMark::Acknowledged(prev)) = before
                         && prev.segment != now.segment
                     {
                         self.rotate_for_segment_change(&miner, prev);
@@ -1354,6 +1364,63 @@ mod tests {
             .await
             .expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
+    }
+
+    /// RFC 0052 §3.7: a replay seed is never a checkpoint mark, and the
+    /// rotation hook is a barrier capture that checkpoints at the mark it
+    /// is handed — so the seed must not reach it.
+    ///
+    /// The trigger is narrow and entirely ordinary: the process restarts,
+    /// and the first acknowledged turn after replay lands in a new
+    /// segment because the reopened one was full or had aged out. Firing
+    /// there would let the WAL forget frames whose group sync may never
+    /// have completed. The next turn's own offset *is* a mark, and the
+    /// hook fires then — the rotation is deferred, not lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replay_seed_never_reaches_the_rotation_hook() {
+        let replayed = WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 100,
+        };
+        let in_second = WalOffset {
+            segment: uuid::Uuid::from_u128(2),
+            byte: 40,
+        };
+        let in_third = WalOffset {
+            segment: uuid::Uuid::from_u128(3),
+            byte: 12,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let pipeline = sequence_pipeline(
+            vec![in_second, in_third],
+            Box::new(move |_, mark| seen.lock().expect("lock").push(mark)),
+        )
+        .with_last_durable(Some(replayed));
+
+        // Batch 1 lands in a different segment than the seed — a segment
+        // change, but the prior mark is `Replayed`, so no capture.
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 1");
+        assert!(
+            calls.lock().expect("lock").is_empty(),
+            "the seed's segment change must not fire a capture that would \
+             checkpoint at a frame no turn in this process acknowledged",
+        );
+
+        // Batch 2 rotates again, and now the prior mark is batch 1's own
+        // acknowledged offset — a real mark, so the hook fires at it.
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 2");
+        assert_eq!(
+            *calls.lock().expect("lock"),
+            vec![in_second],
+            "and the next rotation carries the acknowledged offset, never the seed",
+        );
     }
 
     /// The rotation branch on a `current_thread` runtime takes the

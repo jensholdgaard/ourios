@@ -566,6 +566,34 @@ fn build_write_sinks(
     (sink, audit_sink)
 }
 
+/// The one publish coordinator both cadences share — two would put two
+/// owners on a single sink's in-flight accounting — and the barrier that
+/// clones it (RFC 0052 §3.1).
+///
+/// RFC 0047 §3.3's emitter is attached **here**, before the barrier takes
+/// its clone. Attached after, it would reach only the sweep's clone, and
+/// every batch a cut or the rotation hook published would be missing from
+/// the authorization graph until a compaction re-derived its tuples.
+fn build_barrier(
+    sinks: (&SharedParquetSink, &SharedParquetAuditSink),
+    commits: &Arc<CommitCoordinator>,
+    snapshots_root: PathBuf,
+    graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+) -> (PublishCoordinator, Arc<Barrier>) {
+    let (sink, audit_sink) = sinks;
+    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    if let Some(emitter) = graph_emitter {
+        publisher = publisher.with_graph_emitter(emitter);
+    }
+    let barrier = Barrier::new(
+        publisher.clone(),
+        Arc::clone(commits),
+        snapshots_root,
+        SINK_CEILING_BYTES,
+    );
+    (publisher, Arc::new(barrier))
+}
+
 /// The WAL-segment-rotation hook (RFC 0001 §6.9 primary cadence point):
 /// capture a cut at the rotation `mark`, which the barrier then publishes
 /// and snapshots only if both sinks drained (the no-loss invariant). The
@@ -814,25 +842,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // artefacts with full-replay-only ones.
     let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     // RFC 0052 §3.1: the barrier is built before the pipeline, because
-    // the pipeline's rotation hook is now a capture into it. Both
-    // cadences share this one publish coordinator — two would put two
-    // owners on a single sink's in-flight accounting.
-    //
-    // RFC 0047 §3.3's emitter is attached **here**, before the barrier
-    // takes its clone, and not in `spawn_cadences`. Attached there it
-    // would reach only the sweep's clone, and every batch a cut or the
-    // rotation hook published would be missing from the authorization
-    // graph until a compaction re-derived its tuples.
-    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
-    if let Some(emitter) = config.graph_emitter.clone() {
-        publisher = publisher.with_graph_emitter(emitter);
-    }
-    let barrier = Arc::new(Barrier::new(
-        publisher.clone(),
-        Arc::clone(&commits),
+    // the pipeline's rotation hook is now a capture into it.
+    let (publisher, barrier) = build_barrier(
+        (&sink, &audit_sink),
+        &commits,
         snapshots_root.clone(),
-        SINK_CEILING_BYTES,
-    ));
+        config.graph_emitter.clone(),
+    );
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(Arc::clone(&commits), miner)
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
@@ -1432,33 +1448,10 @@ mod tests {
     /// for one reason only: the barrier's coordinator has no emitter.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_barriers_own_publish_feeds_the_graph() {
-        use ourios_core::auth::openfga::{
-            OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
-        };
-        use ourios_ingester::graph_emitter::GraphEmitter;
         use prost::Message;
 
         let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let api_url = serve_fake_graph(Arc::clone(&writes)).await;
-        let config = build_openfga_config(&OpenFgaSpec {
-            api_url: Some(api_url),
-            store_id: Some("s".to_string()),
-            request_timeout_secs: Some("2".to_string()),
-            visibility: VisibilitySpec {
-                objects: vec![VisibilityObjectSpec {
-                    object_type: Some("conversation".to_string()),
-                    column: Some("attr.gen_ai.conversation.id".to_string()),
-                }],
-                ..VisibilitySpec::default()
-            },
-            ..OpenFgaSpec::default()
-        })
-        .expect("openfga config");
-        let emitter = Arc::new(
-            GraphEmitter::from_config(&config)
-                .expect("emitter")
-                .expect("conversation bound"),
-        );
+        let emitter = fake_graph_emitter(Arc::clone(&writes)).await;
 
         let wal_dir = tempfile::TempDir::new().expect("wal dir");
         let data_dir = tempfile::TempDir::new().expect("data dir");
@@ -1513,6 +1506,37 @@ mod tests {
             "the cut's publish wrote tuples; the graph saw {:?}",
             writes.lock().expect("lock"),
         );
+    }
+
+    /// An emitter bound to a fake `OpenFGA` that records every `/write` body.
+    async fn fake_graph_emitter(
+        writes: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Arc<ourios_ingester::graph_emitter::GraphEmitter> {
+        use ourios_core::auth::openfga::{
+            OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
+        };
+        use ourios_ingester::graph_emitter::GraphEmitter;
+
+        let api_url = serve_fake_graph(writes).await;
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(api_url),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("2".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("openfga config");
+        Arc::new(
+            GraphEmitter::from_config(&config)
+                .expect("emitter")
+                .expect("conversation bound"),
+        )
     }
 
     /// A fake `OpenFGA` recording every `/write` body (the `graph_emitter`

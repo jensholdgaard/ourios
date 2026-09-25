@@ -265,12 +265,7 @@ async fn a_latched_tick_settles_the_cut_the_rotation_hook_left_pending() {
     // Then the tick that refuses the cut settles what it found.
     assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Latched);
     assert_eq!(rig.barrier.pending_mark(), None, "the slot is empty");
-    assert_eq!(
-        rig.sink.buffered_records(),
-        2,
-        "the cut's batch is parked back beside the append that followed it",
-    );
-    assert!(rig.data_files().is_empty(), "and nothing was published");
+    assert_parked_rather_than_published(&rig, 2);
 
     // And the publish guards those batches held are released, so a
     // quiesce returns rather than waiting out the process.
@@ -394,6 +389,17 @@ fn assert_nothing_reached_durability(rig: &BarrierRig) {
         rig.data_files().is_empty(),
         "and no batch reached a Parquet object",
     );
+}
+
+/// A refused cut's batches are back in the sink, dated, with nothing put
+/// to the store.
+fn assert_parked_rather_than_published(rig: &BarrierRig, records: usize) {
+    assert_eq!(
+        rig.sink.buffered_records(),
+        records,
+        "the cut's batch is parked back beside the appends around it",
+    );
+    assert!(rig.data_files().is_empty(), "and nothing was published");
 }
 
 /// Drop the rig — releasing its `Wal` — and recover from the roots it

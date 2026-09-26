@@ -18,7 +18,7 @@ use ourios_wal::{
     Wal, WalConfig,
 };
 
-use crate::rfc0052_support::backdate_segment;
+use crate::rfc0052_support::{backdate_segment, sweep};
 
 const BUDGET: u32 = 3;
 
@@ -220,7 +220,7 @@ fn rfc0052_5_open_succeeds_after_the_terminal_state() {
         BUDGET as usize,
         "the restart finds the debris without a pass listing the directory",
     );
-    reopened.housekeeping(None).expect("the first pass");
+    sweep(&mut reopened);
     assert!(
         partials(root).is_empty(),
         "and the surviving partials are swept by it",

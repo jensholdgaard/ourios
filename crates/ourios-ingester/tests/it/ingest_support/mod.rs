@@ -74,16 +74,20 @@ struct SpyJournal {
 }
 
 impl Journal for SpyJournal {
-    fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         self.log.lock().expect("call log").push(JournalCall::Append);
-        Ok(())
+        // A synthetic, monotonically-advancing offset: the spy persists
+        // nothing, but the coordinator needs a concrete per-frame mark
+        // (RFC 0052 §3.1) and a durable EOF at or above it.
+        self.byte += 1;
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: self.byte,
+        })
     }
 
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
         self.log.lock().expect("call log").push(JournalCall::Sync);
-        // A synthetic, monotonically-advancing offset: the spy persists
-        // nothing, but the coordinator needs a concrete durable mark.
-        self.byte += 1;
         Ok(WalOffset {
             segment: uuid::Uuid::from_u128(1),
             byte: self.byte,
@@ -108,8 +112,11 @@ pub fn spy_pipeline(log: CallLog) -> IngestPipeline {
 struct FailingSyncJournal;
 
 impl Journal for FailingSyncJournal {
-    fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
-        Ok(())
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 1,
+        })
     }
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
         Err(ReceiveError::WalSync(SyncError::Io {
@@ -138,7 +145,7 @@ struct FailingAppendJournal {
 }
 
 impl Journal for FailingAppendJournal {
-    fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         Err(ReceiveError::WalAppend((self.error)()))
     }
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
@@ -337,16 +344,19 @@ struct CapturingJournal {
 }
 
 impl Journal for CapturingJournal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         self.captured
             .lock()
             .expect("captured")
             .push(payload.to_vec());
-        Ok(())
+        self.byte += 1;
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: self.byte,
+        })
     }
 
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
-        self.byte += 1;
         Ok(WalOffset {
             segment: uuid::Uuid::from_u128(1),
             byte: self.byte,

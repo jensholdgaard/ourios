@@ -19,6 +19,8 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::barrier::{Barrier, CutOutcome};
+use ourios_ingester::cadence::BarrierEpochs;
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
@@ -59,6 +61,16 @@ const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
 /// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.
 const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
 
+/// RFC 0052 §3.1's `barrier_secs`, defaulting to the sink's age trigger.
+///
+/// Two cadences deliberately: a cut drains *every* buffered partition,
+/// so running it on the 60-second housekeeping interval would create a
+/// sub-target Parquet object per low-volume partition per tick — RFC
+/// 0014's small-file hazard reintroduced by the reclamation path. At the
+/// age trigger, a partition holding data that old would have flushed
+/// anyway.
+const BARRIER_TICK: Duration = SINK_MAX_BUFFER_AGE;
+
 /// Soft ceiling on the audit sink's in-memory event buffer (issue #302):
 /// reaching it signals an eager off-runtime flush, which keeps the buffer
 /// bounded whenever the store is healthy (the realistic case). It is **not** a
@@ -92,10 +104,12 @@ fn flush_config() -> FlushConfig {
 /// the shutdown path then drains both sinks fully.
 ///
 /// Each drained snapshot holds the record sink's in-flight publish guard
-/// until its off-lock write settles (issue #578), so a rotation or shutdown
-/// `wal_high_water` stamp racing the sweep waits it out in
-/// [`flush_then_snapshot`] rather than stamping over records that exist only
-/// in this task's memory.
+/// until its off-lock write settles (issue #578), so a `wal_high_water`
+/// stamp racing the sweep waits it out — a cut in [`Barrier::run_cut`],
+/// shutdown in [`flush_then_snapshot`] — rather than stamping over
+/// records that exist only in this task's memory. The drain itself runs
+/// under the barrier exclusion (RFC 0052 §3.1), so it cannot begin
+/// between a cut's quiesce and its stamp.
 fn spawn_age_sweep(
     pipeline: SharedPipeline,
     coordinator: PublishCoordinator,
@@ -123,7 +137,19 @@ fn spawn_age_sweep(
             let step = tokio::task::spawn_blocking({
                 let coordinator = coordinator.clone();
                 move || {
-                    let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+                    // RFC 0052 §3.1: the sweep's drain takes the barrier
+                    // exclusion in shared mode, **before** the miner
+                    // lock. Under the miner lock alone a sweep could
+                    // begin after a cut's quiesce and before its stamp,
+                    // leaving a drained-but-undurable batch outside the
+                    // buffers that the barrier then reads as empty —
+                    // `quiesce_publishes` waits only for a sweep already
+                    // in flight and prevents no new drain. Taken inside
+                    // `with_miner` instead, the sweep would hold the
+                    // miner lock waiting for the shared exclusion while
+                    // a capture held the exclusive one waiting for the
+                    // miner.
+                    let drained = pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
                     // The cadence is best-effort: a partial write (transient store
                     // error) retains the un-published data + audit (the WAL is the
                     // durability of record) and the next tick retries — so the
@@ -149,7 +175,7 @@ fn spawn_age_sweep(
             // want, and it is deliberately NOT done here. `write_ordered`
             // consumes the batches `drain_aged` has already taken out of the
             // sink, so a panic inside it drops them: they are neither in the
-            // buffers nor in Parquet, and a later rotation seeing empty buffers
+            // buffers nor in Parquet, and a later cut seeing empty buffers
             // can stamp a WAL high-water mark over frames that never landed
             // (#796). Stopping bounds that to one step's records; looping would
             // repeat it every tick, which is unbounded loss. Making it safe needs
@@ -211,27 +237,67 @@ fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::
 /// data is in the store); `false` means data was retained and the snapshot was
 /// skipped. Callers log via `cadence`; the value is for tests today and
 /// sink-flush metrics later (RFC 0014 §6.3).
+/// What a non-barrier cadence point may stamp, and the state it must
+/// clear first.
+///
+/// Two variants rather than an offset beside an `Option<&_>`: only one
+/// of the two call sites can have a cadence latch at all, and a caller
+/// holding a bare offset could not tell whether it owed the check.
+enum Stamp {
+    /// `serve`'s post-recovery point. It runs before the pipeline, its
+    /// encode pool and its publish guards exist, so nothing can have
+    /// latched and there is no state to consult.
+    PreFlight(Option<WalOffset>),
+    /// A running receiver's shutdown. Refused while the latch is set: a
+    /// latch means an encode or a publish unwound and dropped records
+    /// this process can no longer account for, and unlike a requeue
+    /// those records are in no buffer for the flush below to find.
+    /// Stamping over them would put the snapshot horizon above data that
+    /// reached neither the store nor a buffer, and recovery suppresses
+    /// frames at or below that horizon — silent loss.
+    Cadence(Option<WalOffset>, Arc<BarrierEpochs>),
+}
+
+impl Stamp {
+    fn high_water(&self) -> Option<WalOffset> {
+        match self {
+            Self::PreFlight(mark) | Self::Cadence(mark, _) => *mark,
+        }
+    }
+
+    fn refused(&self) -> bool {
+        match self {
+            Self::PreFlight(_) => false,
+            // Every epoch this process has handed out is at or below
+            // `current`, so a latch anywhere refuses the stamp.
+            Self::Cadence(_, epochs) => epochs.capture().refuses(epochs.current()),
+        }
+    }
+}
+
 fn flush_then_snapshot(
     sink: &SharedParquetSink,
     audit_sink: &SharedParquetAuditSink,
     snapshots_root: &Path,
     miner: &MinerCluster,
-    high_water: Option<WalOffset>,
+    stamp: &Stamp,
     cadence: &str,
 ) -> bool {
     // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
     // caller stamps `wal_high_water` from here with exclusive access to
-    // `miner` — the rotation hook and shutdown hold the pipeline's miner
-    // lock; the post-recovery call in `serve` runs before the pipeline
-    // (and its mutex) exists, so exclusivity is by construction. The stamp
+    // `miner` — shutdown holds the pipeline's miner lock; the
+    // post-recovery call in `serve` runs before the pipeline (and its
+    // mutex) exists, so exclusivity is by construction. (Rotation is no
+    // longer a caller: RFC 0052 §3.1 made that hook capture-only, and
+    // its cut stamps through `Barrier::run_cut`.) The stamp
     // asserts every acked record at or below the mark is durably captured.
     // At this point those records fall into three disjoint classes, and
     // the quiesce order — encodes, then publishes, then flush, then stamp
     // — covers each:
     //
     //  1. **In-flight encodes**: when an encode pool exists the caller
-    //     quiesced it first (the rotation branch in `pipeline.rs`,
-    //     `ReceiverHandle::shutdown`); the post-recovery call runs before
+    //     quiesced it first (`ReceiverHandle::shutdown`); the
+    //     post-recovery call runs before
     //     any pool is configured, so this class is empty there. Submission
     //     is ingest-gate-ordered, so every frame ≤ mark has finished its
     //     sink emit by then — its records are now buffered or already
@@ -253,7 +319,21 @@ fn flush_then_snapshot(
     // it gets here (`flush_tick.await`), but the barrier must not rely on
     // that ordering — this quiesce is what makes every stamping path safe by
     // construction.
-    sink.quiesce_publishes();
+    // A settlement that *failed* requeues its records into the buffers,
+    // where `flush_all` below finds them and the retained-records gate
+    // skips the stamp — so the outcomes need no separate check here. A
+    // settlement that *unwound* dropped them instead, and that is what
+    // the latch records.
+    let _outcomes = sink.quiesce_publishes();
+    if stamp.refused() {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SINK_RETAINED,
+            "{cadence}: the cadence latch is set (an encode or a publish unwound), so the \
+             snapshot is skipped — the next start replays from the checkpoint and re-mines \
+             those frames (no acknowledged data is lost; the WAL is durable)"
+        );
+        return false;
+    }
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
         tracing::warn!(
@@ -274,7 +354,7 @@ fn flush_then_snapshot(
         );
         return false;
     }
-    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, high_water) {
+    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, stamp.high_water()) {
         tracing::warn!(
             name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
             "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
@@ -343,6 +423,19 @@ pub struct ReceiverHandle {
     /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
     /// clean exit on shutdown via the `shutdown` watch signal.
     flush_tick: JoinHandle<()>,
+    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
+    /// joined before the shutdown flush so no cut is in flight when it
+    /// runs.
+    barrier_tick: JoinHandle<()>,
+    /// The same barrier the task and the rotation hook hold. Shutdown
+    /// runs whatever is left in its pending slot once the task is
+    /// joined — the hook can fill it after the last tick, and nothing
+    /// else would ever release the publish guards it holds.
+    barrier: Arc<Barrier>,
+    /// The cadence latch every guard in this receiver reports into. The
+    /// shutdown stamp consults it: it is the one stamping path left
+    /// outside [`Barrier::run_cut`]'s own checks.
+    epochs: Arc<BarrierEpochs>,
 }
 
 impl ReceiverHandle {
@@ -375,6 +468,29 @@ impl ReceiverHandle {
         // anyway. A `JoinError` (the task panicked) is ignored — the drain
         // below still runs.
         let _ = self.flush_tick.await;
+        // RFC 0052 §3.1: the receiver joins the barrier task after its
+        // running cut finishes, so the flush below cannot race a cut
+        // holding drained batches outside the buffers. A store failure
+        // in that last cut requeues into the buffers as any cut's does,
+        // and the flush covers the requeue.
+        // A `JoinError` is the barrier task panicking or being aborted
+        // outside `tick`'s own `catch_unwind`; the cut it was running
+        // may have drained batches it never settled, so latch its epoch
+        // and let the stamp below refuse rather than advance past them.
+        if self.barrier_tick.await.is_err() {
+            self.epochs.report(self.epochs.current());
+        }
+        // The barrier task is gone, but the slot it fed need not be
+        // empty: the rotation hook is capture-only, so an append taken
+        // just before the signal can have left a cut there with nothing
+        // left to run it. Its `Drained` batches hold the sink's in-flight
+        // publish guards, and `flush_then_snapshot`'s own
+        // `quiesce_publishes` below would then wait on them forever.
+        // Running the cut here settles it either way: one that stamps
+        // publishes its batches, and one that cannot — a latched epoch, a
+        // retained sink — parks them back into the buffers, where the
+        // flush covers them.
+        run_pending_fail_closed(&self.barrier, &self.epochs);
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -403,12 +519,33 @@ impl ReceiverHandle {
                     &self.audit_sink,
                     &self.snapshots_root,
                     miner,
-                    last_durable,
+                    &Stamp::Cadence(last_durable, Arc::clone(&self.epochs)),
                     "shutdown",
                 );
             });
         });
         Ok(())
+    }
+}
+
+/// Run the barrier's pending cut at shutdown, fail-closed.
+///
+/// Caught for the same reason [`Barrier::tick`] catches: this call is
+/// outside `tick`'s own guard, the cut it runs may have drained batches
+/// it never settled, and an unwind here would take the shutdown flush
+/// and the snapshot with it. A panic latches, exactly as `shutdown`'s
+/// `JoinError` arm does, and the stamp after it refuses.
+fn run_pending_fail_closed(barrier: &Barrier, epochs: &BarrierEpochs) {
+    latch_on_panic(epochs, || barrier.run_pending());
+}
+
+/// Run `cut` off the runtime and swallow an unwind, latching `epochs` to
+/// the epoch current at the panic so every later stamp refuses.
+fn latch_on_panic(epochs: &BarrierEpochs, cut: impl FnOnce() -> CutOutcome) {
+    let ran =
+        tokio::task::block_in_place(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(cut)));
+    if ran.is_err() {
+        epochs.report(epochs.current());
     }
 }
 
@@ -450,29 +587,111 @@ fn build_write_sinks(
     (sink, audit_sink)
 }
 
+/// The one publish coordinator both cadences share — two would put two
+/// owners on a single sink's in-flight accounting — and the barrier that
+/// clones it (RFC 0052 §3.1).
+///
+/// RFC 0047 §3.3's emitter is attached **here**, before the barrier takes
+/// its clone. Attached after, it would reach only the sweep's clone, and
+/// every batch a cut or the rotation hook published would be missing from
+/// the authorization graph until a compaction re-derived its tuples.
+fn build_barrier(
+    sinks: (&SharedParquetSink, &SharedParquetAuditSink),
+    commits: &Arc<CommitCoordinator>,
+    snapshots_root: PathBuf,
+    graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+) -> (PublishCoordinator, Arc<Barrier>) {
+    let (sink, audit_sink) = sinks;
+    let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    if let Some(emitter) = graph_emitter {
+        publisher = publisher.with_graph_emitter(emitter);
+    }
+    let barrier = Barrier::new(
+        publisher.clone(),
+        Arc::clone(commits),
+        snapshots_root,
+        SINK_CEILING_BYTES,
+    );
+    (publisher, Arc::new(barrier))
+}
+
 /// The WAL-segment-rotation hook (RFC 0001 §6.9 primary cadence point):
-/// force-flush every partition through `flush_then_snapshot`, then snapshot at
-/// the rotation `mark` only if both sinks drained (the no-loss invariant). The
+/// capture a cut at the rotation `mark`, which the barrier then publishes
+/// and snapshots only if both sinks drained (the no-loss invariant). The
 /// hook fires before the new segment's first record reaches the miner, so the
 /// buffers hold exactly the sealed segment's data (RFC0014.3/.5, `CLAUDE.md`
-/// §3.4). It runs on the request path (inside `ingest`) and does blocking
-/// Parquet/store I/O, so `block_in_place` lets the runtime relocate other tasks.
-fn rotation_snapshot_hook(
-    sink: SharedParquetSink,
-    audit_sink: SharedParquetAuditSink,
-    snapshots_root: PathBuf,
-) -> RotationHook {
+/// §3.4).
+///
+/// **Capture-only** (RFC 0052 §3.1). It runs on the request path, inside
+/// `ingest`, under the ingest gate and the miner lock — so it does no
+/// store I/O at all: it drains both sinks into owned batches, serialises
+/// the miner, and hands that cut to the barrier task, which flushes,
+/// installs and stamps outside every one of those locks. The invariant
+/// is unchanged — no snapshot is stamped at `mark` until every record at
+/// or below it is durable in the store — but it is now established by
+/// the cut the barrier runs rather than by a flush inside the request.
+/// The removed `flush_then_snapshot` here was the largest
+/// store-I/O-under-the-ingest-lock site in the receiver (issue #791).
+///
+fn rotation_capture_hook(barrier: Arc<Barrier>) -> RotationHook {
     Box::new(move |miner, mark| {
-        tokio::task::block_in_place(|| {
-            flush_then_snapshot(
-                &sink,
-                &audit_sink,
-                &snapshots_root,
-                miner,
-                Some(mark),
-                "rotation",
-            );
-        });
+        barrier.capture_rotation(miner, mark);
+    })
+}
+
+/// The RFC 0052 §3.1 barrier task: one cut per `BARRIER_TICK`, plus the
+/// idle rotation that lets a node with no traffic reclaim at all.
+///
+/// Append-independent by construction — which is the whole point: the
+/// rotation hook fires only after a successful append observes a segment
+/// change, so a node that stops receiving traffic would otherwise never
+/// advance its checkpoint again, and an idle node is exactly the one
+/// whose retained segments have the least reason to exist.
+///
+/// Every tick runs on the blocking pool: the capture quiesces the encode
+/// pool and the run does store I/O.
+fn spawn_barrier(
+    pipeline: SharedPipeline,
+    barrier: Arc<Barrier>,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    let epochs = barrier.epochs();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BARRIER_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick is immediate; skip it
+        loop {
+            // `shutdown` wins both races: the pre-check for a signal
+            // that arrived while the last cut ran, and `biased` for one
+            // that is ready alongside the tick. `ReceiverHandle::shutdown`
+            // awaits this task, so a cut started here after the signal
+            // makes a graceful stop wait out a whole capture and its
+            // store I/O.
+            if shutdown.has_changed().unwrap_or(true) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = tick.tick() => {}
+            }
+            let epoch = epochs.current();
+            let pipeline = pipeline.clone();
+            let barrier = barrier.clone();
+            // `tick` catches its own panic and lowers the latch itself,
+            // so a `JoinError` means the tick never reached a decision —
+            // a cancellation, or an abort `catch_unwind` cannot see. The
+            // cut it was running may have drained batches it never
+            // settled, so latch its epoch: shutdown's own stamp then
+            // refuses rather than advancing the horizon past them.
+            if tokio::task::spawn_blocking(move || barrier.tick(&pipeline, true))
+                .await
+                .is_err()
+            {
+                epochs.report(epoch);
+                break;
+            }
+        }
     })
 }
 
@@ -482,6 +701,75 @@ fn rotation_snapshot_hook(
 /// sockets bind (RFC0008.10). Returns once both sockets are bound — so
 /// the caller can observe the addresses (e.g. when binding `:0`) — with
 /// serving running on spawned tasks until [`ReceiverHandle::shutdown`].
+/// RFC 0030 §3.2: build each listener's TLS acceptor at startup, so
+/// unusable material fails here — the config path already preflighted
+/// it, but the served role re-derives from `TlsSettings`.
+///
+/// ALPN is per-listener: gRPC is h2-only, HTTP offers http/1.1 only
+/// (axum is built with just the http1 feature).
+type Acceptors = (
+    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
+    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
+);
+
+fn build_acceptors(
+    grpc_tls: Option<&TlsSettings>,
+    http_tls: Option<&TlsSettings>,
+) -> Result<Acceptors, String> {
+    let grpc = match grpc_tls {
+        Some(tls) => Some(
+            reloading_acceptor(tls, ALPN_GRPC, LISTENER_GRPC)
+                .map_err(|e| format!("receiver.grpc_tls: {e}"))?,
+        ),
+        None => None,
+    };
+    let http = match http_tls {
+        Some(tls) => Some(
+            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
+                .map_err(|e| format!("receiver.http_tls: {e}"))?,
+        ),
+        None => None,
+    };
+    Ok((grpc, http))
+}
+
+/// The two background cadences the receiver runs: RFC0014.2's age sweep
+/// and RFC 0052 §3.1's barrier.
+struct Cadences {
+    flush_tick: JoinHandle<()>,
+    barrier_tick: JoinHandle<()>,
+}
+
+/// What the cadences are built over. A value rather than three more
+/// parameters: the barrier and the sweep share a publish coordinator by
+/// construction, and handing them separate ones would put two owners on
+/// one sink's in-flight accounting.
+struct CadenceInputs {
+    /// Already carrying RFC 0047 §3.3's graph emitter, if one is
+    /// configured: it is attached at construction so the barrier's clone
+    /// has it too.
+    publisher: PublishCoordinator,
+    /// Built before the pipeline, because the capture-only rotation hook
+    /// the pipeline installs holds it (RFC 0052 §3.1).
+    barrier: Arc<Barrier>,
+}
+
+/// Start both cadences over one publish coordinator.
+fn spawn_cadences(
+    pipeline: &SharedPipeline,
+    inputs: CadenceInputs,
+    shutdown: &watch::Receiver<()>,
+) -> Cadences {
+    let CadenceInputs { publisher, barrier } = inputs;
+    let overflow = publisher.audit().overflow_notify();
+    Cadences {
+        barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
+        // The age sweep drains under the barrier exclusion and the miner
+        // lock, and writes audit-ordered off both (issue #302 #1/#2).
+        flush_tick: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+    }
+}
+
 /// Bind both listeners before serving, so a `:0` request resolves to the
 /// real port in the returned handle. gRPC first, then HTTP.
 async fn bind_listeners(
@@ -512,6 +800,15 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
     let segment_size_bytes = config.wal.segment_size_bytes;
+    // RFC0052.13: a snapshot listed at startup governs reclamation only
+    // once the snapshots root and its parent are durable **in this
+    // process**. A failure here fails startup rather than discarding the
+    // snapshots — reclamation may already have removed the frames they
+    // cover, so a horizon whose directory entry may not be durable must
+    // never be used, and throwing the artefacts away would lose state
+    // nothing else can rebuild.
+    ourios_ingester::barrier::fsync_snapshots_root(&snapshots_root)
+        .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
@@ -546,7 +843,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             &audit_sink,
             &snapshots_root,
             &miner,
-            report.max_delivered,
+            // The highest offset replay delivered is the right horizon
+            // for a *snapshot*: the miner state below covers exactly
+            // those frames. It is not a checkpoint mark, and the
+            // pipeline's `DurableMark::Replayed` seed keeps the barrier
+            // from mistaking it for one.
+            &Stamp::PreFlight(report.max_delivered),
             "post-recovery",
         );
     });
@@ -559,23 +861,27 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // snapshots with a concrete horizon — an unstamped snapshot is discarded at
     // the next start (RFC 0001 §6.9), which would overwrite the post-recovery
     // artefacts with full-replay-only ones.
-    let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
+    let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
+    // RFC 0052 §3.1: the barrier is built before the pipeline, because
+    // the pipeline's rotation hook is now a capture into it.
+    let (publisher, barrier) = build_barrier(
+        (&sink, &audit_sink),
+        &commits,
+        snapshots_root.clone(),
+        config.graph_emitter.clone(),
+    );
     let pipeline: SharedPipeline = Arc::new(
-        IngestPipeline::new(coordinator, miner)
+        IngestPipeline::new(Arc::clone(&commits), miner)
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
             .with_last_durable(report.max_delivered)
-            .with_rotation_hook(rotation_snapshot_hook(
-                sink.clone(),
-                audit_sink.clone(),
-                snapshots_root.clone(),
-            ))
+            .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier)))
             // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
             // global commit gate; the pool emits into the same shared
-            // sink the miner holds, so the rotation hook's flush_all
-            // covers it. The pipeline drains the pool before every
-            // rotation snapshot; shutdown drains it below.
+            // sink the miner holds, so a cut's drain covers it. The
+            // pipeline drains the pool inside every capture; shutdown
+            // drains it below.
             .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(
                 &sink,
                 config.encode_workers,
@@ -587,17 +893,20 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     let (shutdown, shutdown_rx) = watch::channel(());
 
-    // The cadence age-sweep publishes through the coordinator: atomic drain
-    // under the miner lock + audit-ordered off-lock write (issue #302 #1/#2).
-    let mut coordinator = PublishCoordinator::new(sink.clone(), audit_sink.clone());
-    if let Some(emitter) = config.graph_emitter.clone() {
-        coordinator = coordinator.with_graph_emitter(emitter);
-    }
-    let flush_tick = spawn_age_sweep(
-        pipeline.clone(),
-        coordinator,
-        audit_sink.overflow_notify(),
-        shutdown_rx.clone(),
+    // The pool's latch, which the pipeline adopted and the barrier shares
+    // — one word across every guard in the receiver (RFC 0052 §3.1).
+    let pipeline_epochs = pipeline.epochs();
+
+    let Cadences {
+        flush_tick,
+        barrier_tick,
+    } = spawn_cadences(
+        &pipeline,
+        CadenceInputs {
+            publisher,
+            barrier: Arc::clone(&barrier),
+        },
+        &shutdown_rx,
     );
 
     // RFC 0026 §3.2 / RFC 0029 §3.3: the auth layer resolves before the
@@ -605,25 +914,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // pipeline enforces the tenant binding it attaches. A tower layer
     // rather than a sync interceptor because OIDC resolution may await a
     // JWKS refetch.
-    // RFC 0030 §3.2: build each listener's TLS acceptor at startup so
-    // unusable material fails here (the config path already preflighted
-    // it, but the served role re-derives from `TlsSettings`). ALPN is
-    // per-listener — gRPC is h2-only, HTTP offers http/1.1 only
-    // (axum is built with just the http1 feature).
-    let grpc_acceptor = match &config.grpc_tls {
-        Some(tls) => Some(
-            reloading_acceptor(tls, ALPN_GRPC, LISTENER_GRPC)
-                .map_err(|e| format!("receiver.grpc_tls: {e}"))?,
-        ),
-        None => None,
-    };
-    let http_acceptor = match &config.http_tls {
-        Some(tls) => Some(
-            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
-                .map_err(|e| format!("receiver.http_tls: {e}"))?,
-        ),
-        None => None,
-    };
+    let (grpc_acceptor, http_acceptor) =
+        build_acceptors(config.grpc_tls.as_ref(), config.http_tls.as_ref())?;
 
     // The OTel Collector's OTLP exporter gzip-compresses by default, so the
     // receiver must accept gzip to interoperate with a stock Collector
@@ -705,6 +997,9 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         sink,
         audit_sink,
         flush_tick,
+        barrier_tick,
+        barrier,
+        epochs: pipeline_epochs,
     })
 }
 
@@ -936,7 +1231,7 @@ mod tests {
             &audit,
             &tmp.path().join("snapshots"),
             &miner,
-            None,
+            &Stamp::PreFlight(None),
             "test",
         );
 
@@ -962,7 +1257,14 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, None, "test");
+        let drained = flush_then_snapshot(
+            &sink,
+            &audit,
+            &snapshots_root,
+            &miner,
+            &Stamp::PreFlight(None),
+            "test",
+        );
 
         assert!(!drained, "an unavailable store does not drain the sink");
         assert_eq!(
@@ -1003,7 +1305,14 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, None, "test");
+        let drained = flush_then_snapshot(
+            &sink,
+            &audit,
+            &snapshots_root,
+            &miner,
+            &Stamp::PreFlight(None),
+            "test",
+        );
 
         assert!(!drained, "a retained audit buffer blocks the drain");
         assert_eq!(
@@ -1066,6 +1375,254 @@ mod tests {
         assert_ne!(handle.grpc_addr.port(), 0, "gRPC bound to a real port");
         assert_ne!(handle.http_addr.port(), 0, "HTTP bound to a real port");
         handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// RFC 0052 §3.1: the shutdown drain runs outside [`Barrier::tick`]'s
+    /// own guard, so an unwinding cut would otherwise take the shutdown
+    /// flush and the snapshot with it — the two steps that still have to
+    /// run for the acknowledged records to survive. The cut may also have
+    /// drained batches it never settled, so swallowing the panic is only
+    /// safe if it latches: the stamp that follows must refuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_latches_on_a_panic_rather_than_unwinding() {
+        let epochs = BarrierEpochs::new();
+        let epoch = epochs.current();
+        assert!(
+            !epochs.capture().refuses(epoch),
+            "a fresh node refuses nothing",
+        );
+
+        latch_on_panic(&epochs, || panic!("injected pending-cut panic"));
+
+        assert!(
+            epochs.capture().refuses(epoch),
+            "the drain's panic latched instead of escaping shutdown",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_leaves_a_clean_cut_unlatched() {
+        let epochs = BarrierEpochs::new();
+        let epoch = epochs.current();
+        latch_on_panic(&epochs, || CutOutcome::Stamped);
+        assert!(
+            !epochs.capture().refuses(epoch),
+            "a cut that returned is not a reason to refuse the stamp",
+        );
+    }
+
+    /// RFC 0052 §3.1: the rotation hook is capture-only, so an append taken
+    /// just before the shutdown signal can leave a cut in the slot with the
+    /// barrier task already gone. Those `Drained` batches hold the sink's
+    /// in-flight publish guards, and `flush_then_snapshot`'s
+    /// `quiesce_publishes` waits on them — forever, unless shutdown runs the
+    /// pending cut first. `BARRIER_TICK` is five minutes and the task skips
+    /// its immediate first tick, so within this test nothing else can settle
+    /// the slot: the timeout is the assertion.
+    ///
+    /// The scenario runs on its own runtime thread and this one is the
+    /// clock. An in-runtime `timeout` would not do: the wait it guards is
+    /// `quiesce_publishes`, which blocks the worker inside `shutdown`'s own
+    /// poll, so the timer would never be polled again and a regression
+    /// would hang the job out rather than fail.
+    #[test]
+    fn shutdown_runs_the_cut_the_rotation_hook_left_pending() {
+        let (done, settled) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let published = runtime.block_on(shutdown_with_a_pending_cut());
+            let _ = done.send(published);
+        });
+
+        match settled.recv_timeout(Duration::from_secs(30)) {
+            Ok(published) => assert!(published, "the acknowledged records reached the store"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("shutdown waited on the pending cut's publish guards instead of running it")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the scenario panicked; its output is above")
+            }
+        }
+    }
+
+    /// The body of [`shutdown_runs_the_cut_the_rotation_hook_left_pending`]:
+    /// serve, leave a cut in the slot from the request path, shut down, and
+    /// report whether anything reached the store.
+    async fn shutdown_with_a_pending_cut() -> bool {
+        use prost::Message;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: WalConfig {
+                segment_age_secs: 1, // the WAL's floor; slept past below
+                ..test_wal_config(wal_dir.path())
+            },
+            store,
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        })
+        .await
+        .expect("serve");
+
+        // Given an acknowledged batch, then a second append that observes the
+        // aged-out segment and so captures a cut on the request path.
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        assert!(
+            handle.barrier.pending_mark().is_some(),
+            "the request path filled the slot and no tick has run",
+        );
+
+        // Then shutdown settles it rather than blocking on its publish guards.
+        handle.shutdown().await.expect("graceful shutdown");
+        !data_parquet_files(data_dir.path()).is_empty()
+    }
+
+    /// RFC 0047 §3.3: the graph emitter is attached to the coordinator the
+    /// **barrier** holds. Attached to the sweep's clone alone — inside
+    /// `spawn_cadences` — every batch a cut published would be missing from
+    /// the authorization graph until a compaction re-derived its tuples.
+    ///
+    /// The cut is run explicitly rather than left to shutdown, so this fails
+    /// for one reason only: the barrier's coordinator has no emitter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_barriers_own_publish_feeds_the_graph() {
+        use prost::Message;
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let emitter = fake_graph_emitter(Arc::clone(&writes)).await;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: WalConfig {
+                segment_age_secs: 1, // the WAL's floor; slept past below
+                ..test_wal_config(wal_dir.path())
+            },
+            store,
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: Some(emitter),
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        })
+        .await
+        .expect("serve");
+
+        // Given a cut left in the slot by the rotation hook.
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(handle.http_addr, &export).await;
+        assert!(
+            handle.barrier.pending_mark().is_some(),
+            "the request path filled the slot and no tick has run",
+        );
+
+        // When the barrier publishes it, the graph sees the partition's
+        // tuples. Every published partition yields the tenant's tool tuples,
+        // so this holds without conversation attributes in the records.
+        tokio::task::block_in_place(|| handle.barrier.run_pending());
+        let saw_tuples = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let seen = writes.lock().expect("lock").join("");
+                if seen.contains("tool:checkout/query_logs") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        handle.shutdown().await.expect("graceful shutdown");
+        assert!(
+            saw_tuples.is_ok(),
+            "the cut's publish wrote tuples; the graph saw {:?}",
+            writes.lock().expect("lock"),
+        );
+    }
+
+    /// An emitter bound to a fake `OpenFGA` that records every `/write` body.
+    async fn fake_graph_emitter(
+        writes: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Arc<ourios_ingester::graph_emitter::GraphEmitter> {
+        use ourios_core::auth::openfga::{
+            OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
+        };
+        use ourios_ingester::graph_emitter::GraphEmitter;
+
+        let api_url = serve_fake_graph(writes).await;
+        let config = build_openfga_config(&OpenFgaSpec {
+            api_url: Some(api_url),
+            store_id: Some("s".to_string()),
+            request_timeout_secs: Some("2".to_string()),
+            visibility: VisibilitySpec {
+                objects: vec![VisibilityObjectSpec {
+                    object_type: Some("conversation".to_string()),
+                    column: Some("attr.gen_ai.conversation.id".to_string()),
+                }],
+                ..VisibilitySpec::default()
+            },
+            ..OpenFgaSpec::default()
+        })
+        .expect("openfga config");
+        Arc::new(
+            GraphEmitter::from_config(&config)
+                .expect("emitter")
+                .expect("conversation bound"),
+        )
+    }
+
+    /// A fake `OpenFGA` recording every `/write` body (the `graph_emitter`
+    /// unit tests' `erase_fake`, write half only).
+    async fn serve_fake_graph(writes: Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::post;
+
+        async fn write(
+            State(writes): State<Arc<std::sync::Mutex<Vec<String>>>>,
+            body: axum::body::Bytes,
+        ) -> ([(&'static str, &'static str); 1], String) {
+            writes
+                .lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&body).into_owned());
+            ([("content-type", "application/json")], "{}".to_string())
+        }
+
+        let app = Router::new()
+            .route("/stores/{store}/write", post(write))
+            .with_state(writes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        url
     }
 
     /// The `OTel` Collector's OTLP exporter gzip-compresses by default, so the
@@ -1381,20 +1938,22 @@ mod tests {
         );
     }
 
-    // --- RFC0035.2 flush half, through the REAL `flush_then_snapshot`
-    // path (`rotation_snapshot_hook`): a buffered-but-unflushed record
-    // ≤ the mark either flushes before the stamp, or the stamp is
-    // skipped. The ingester-side barrier test covers the drain half +
-    // inline-published records; these two arms pin the buffered case
-    // against the production hook. ---
+    // --- RFC0035.2 flush half, through the REAL rotation path
+    // (`rotation_capture_hook` → the cut the barrier runs): a
+    // buffered-but-unflushed record ≤ the mark is either published before
+    // the stamp, or the stamp is skipped. The ingester-side barrier test
+    // covers the drain half + inline-published records; these two arms
+    // pin the buffered case against the production hook. ---
 
     /// A pooled pipeline over a real 1 s-age WAL whose rotation hook is
-    /// the production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    /// the production capture-only `rotation_capture_hook`, plus the
+    /// barrier it captures into — the caller runs the cut where the hook
+    /// used to flush and stamp inline.
     fn rotating_pooled_pipeline(
         wal_root: &Path,
         store: Store,
         snapshots_root: &Path,
-    ) -> (SharedPipeline, SharedParquetSink) {
+    ) -> (SharedPipeline, SharedParquetSink, Arc<Barrier>) {
         let wal = Wal::open(WalConfig {
             segment_age_secs: 1,
             ..test_wal_config(wal_root)
@@ -1406,16 +1965,57 @@ mod tests {
                 .with_record_sink(Box::new(sink.clone()));
         let coordinator =
             CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let barrier = Arc::new(Barrier::new(
+            PublishCoordinator::new(sink.clone(), audit_sink),
+            Arc::clone(&coordinator),
+            snapshots_root.to_path_buf(),
+            SINK_CEILING_BYTES,
+        ));
         let pipeline = Arc::new(
             IngestPipeline::new(coordinator, miner)
                 .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
-                .with_rotation_hook(rotation_snapshot_hook(
-                    sink.clone(),
-                    audit_sink,
-                    snapshots_root.to_path_buf(),
-                )),
+                .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier))),
         );
-        (pipeline, sink)
+        (pipeline, sink, barrier)
+    }
+
+    /// The barrier task must not start a cut once shutdown is signalled:
+    /// `ReceiverHandle::shutdown` awaits this task, so a cut begun here
+    /// makes a graceful stop wait out a whole capture and its store I/O.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_task_takes_no_cut_once_shutdown_is_signalled() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).expect("store root");
+        let (pipeline, sink, barrier) = rotating_pooled_pipeline(
+            &tmp.path().join("wal"),
+            Store::local(&store_root).expect("local store"),
+            &tmp.path().join("snapshots"),
+        );
+        ingest_and_quiesce(&pipeline, &["user 1 logged in"]).await;
+        let epochs = barrier.epochs();
+        let before = epochs.current();
+
+        // Signalled before the task is spawned, so the very first loop
+        // iteration sees it — the arm the pre-check covers, and the one a
+        // signal arriving during a cut lands in.
+        let (shutdown, shutdown_rx) = watch::channel(());
+        shutdown.send(()).expect("signal shutdown");
+        spawn_barrier(pipeline.clone(), Arc::clone(&barrier), shutdown_rx)
+            .await
+            .expect("the barrier task exits cleanly");
+
+        assert_eq!(
+            epochs.current(),
+            before,
+            "no cut was opened after the shutdown signal",
+        );
+        assert_eq!(
+            sink.buffered_records(),
+            1,
+            "and the record was never drained out of the buffers",
+        );
+        assert_eq!(barrier.pending_mark(), None, "nothing was left pending");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1424,7 +2024,7 @@ mod tests {
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).expect("store root");
         let snapshots_root = tmp.path().join("snapshots");
-        let (pipeline, sink) = rotating_pooled_pipeline(
+        let (pipeline, sink, barrier) = rotating_pooled_pipeline(
             &tmp.path().join("wal"),
             Store::local(&store_root).expect("local store"),
             &snapshots_root,
@@ -1432,58 +2032,58 @@ mod tests {
 
         // Batch A buffers (the production 256 MiB size target never
         // fires for two records) — encoded but NOT flushed.
-        pipeline
-            .ingest(
-                export_request("checkout", &["user 1 logged in", "user 2 logged in"]),
-                ourios_core::tenant::TenantId::new("checkout"),
-            )
-            .await
-            .expect("batch A acks");
-        let rotation_point = pipeline.last_durable().expect("durable after batch A");
-        pipeline.quiesce_encodes();
+        let rotation_point =
+            ingest_and_quiesce(&pipeline, &["user 1 logged in", "user 2 logged in"]).await;
         assert_eq!(sink.buffered_records(), 2, "batch A is buffered, unflushed");
 
-        // Rotation: the hook must flush the buffered records ≤ mark
-        // before it stamps the snapshot.
+        // Rotation: the hook is now capture-only (RFC 0052 §3.1), so it
+        // takes batch A out of the buffers into a cut and returns without
+        // touching the store. Nothing is stamped yet — the invariant moves
+        // from "by the time `ingest` returns" to "by the time the cut the
+        // rotation handed over has run".
         tokio::time::sleep(Duration::from_millis(1_200)).await;
-        pipeline
-            .ingest(
-                export_request("checkout", &["payment 9 settled"]),
-                ourios_core::tenant::TenantId::new("checkout"),
-            )
-            .await
-            .expect("batch B acks");
-        pipeline.quiesce_encodes();
+        ingest_and_quiesce(&pipeline, &["payment 9 settled"]).await;
+        assert_eq!(
+            barrier.pending_mark(),
+            Some(rotation_point),
+            "the rotation handed the barrier a cut at the rotation point",
+        );
+        assert_no_snapshot_yet(&snapshots_root, "and stamped nothing on the request path");
+
+        // Run the cut the rotation captured: batch A's records reach the
+        // store, and only then is the snapshot stamped.
+        let cut = {
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || barrier.run_pending())
+                .await
+                .expect("the cut runs")
+        };
+        assert_eq!(cut, ourios_ingester::barrier::CutOutcome::Stamped);
 
         assert_eq!(
             sink.buffered_records(),
             1,
-            "only batch B's record remains buffered — the hook's flush_all \
-             drained batch A before the stamp",
+            "only batch B's record remains buffered — the cut took batch A \
+             out of the buffers and published it before the stamp",
         );
         assert!(
             !data_parquet_files(&store_root.join("data")).is_empty(),
             "batch A's records are durably in the store",
         );
-        let artefacts =
-            ourios_ingester::snapshot_store::load_all(&snapshots_root).expect("load snapshots");
-        assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
-        let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
-        let mark = state.wal_high_water.expect("stamped with a horizon");
-        assert_eq!(mark.segment, rotation_point.segment.to_string());
-        assert_eq!(mark.byte, rotation_point.byte);
+        assert_snapshot_stamped_at(&snapshots_root, rotation_point);
     }
 
     /// A pooled pipeline over a real 1 s-age WAL, an **age-zero** record
     /// sink (so `drain_aged` takes every partition — the sweep's view of an
     /// aged one, without waiting out a real age), an audit sink, and the
-    /// production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    /// production capture-only `rotation_capture_hook` with the barrier it
+    /// captures into.
     fn sweep_race_pipeline(
         wal_root: &Path,
         store_root: &Path,
         audit_root: &Path,
         snapshots_root: &Path,
-    ) -> (SharedPipeline, SharedParquetSink, SharedParquetAuditSink) {
+    ) -> SweepRaceRig {
         let wal = Wal::open(WalConfig {
             segment_age_secs: 1,
             ..test_wal_config(wal_root)
@@ -1503,16 +2103,97 @@ mod tests {
             .with_record_sink(Box::new(sink.clone()));
         let coordinator =
             CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let barrier = Arc::new(Barrier::new(
+            PublishCoordinator::new(sink.clone(), audit.clone()),
+            Arc::clone(&coordinator),
+            snapshots_root.to_path_buf(),
+            SINK_CEILING_BYTES,
+        ));
         let pipeline = Arc::new(
             IngestPipeline::new(coordinator, miner)
                 .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
-                .with_rotation_hook(rotation_snapshot_hook(
-                    sink.clone(),
-                    audit.clone(),
-                    snapshots_root.to_path_buf(),
-                )),
+                .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier))),
         );
-        (pipeline, sink, audit)
+        SweepRaceRig {
+            pipeline,
+            sink,
+            audit,
+            barrier,
+        }
+    }
+
+    /// Ingest one batch for `checkout`, wait out its encodes, and return
+    /// the turn's own durable offset — what a rotation fired by the next
+    /// append would use as its mark.
+    async fn ingest_and_quiesce(pipeline: &SharedPipeline, bodies: &[&str]) -> WalOffset {
+        pipeline
+            .ingest(
+                export_request("checkout", bodies),
+                ourios_core::tenant::TenantId::new("checkout"),
+            )
+            .await
+            .expect("the batch acks");
+        let mark = pipeline.last_durable().expect("durable after the batch");
+        pipeline.quiesce_encodes();
+        mark
+    }
+
+    /// No snapshot artefact has been installed yet.
+    fn assert_no_snapshot_yet(snapshots_root: &Path, reason: &str) {
+        let written = std::fs::read_dir(snapshots_root).is_ok_and(|mut d| d.next().is_some());
+        assert!(!written, "{reason}");
+    }
+
+    /// Exactly one snapshot artefact exists and it carries `mark` as its
+    /// WAL high-water — the "stamped, and stamped at the rotation point"
+    /// half of RFC0035.2's invariant.
+    fn assert_snapshot_stamped_at(snapshots_root: &Path, mark: WalOffset) {
+        let artefacts =
+            ourios_ingester::snapshot_store::load_all(snapshots_root).expect("load snapshots");
+        assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
+        let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
+        let stamped = state.wal_high_water.expect("stamped with a horizon");
+        assert_eq!(stamped.segment, mark.segment.to_string());
+        assert_eq!(stamped.byte, mark.byte);
+    }
+
+    /// An age sweep stopped halfway: the drain has happened, the
+    /// off-lock `write_ordered` has not, and it stays that way until
+    /// `release` is sent. That gap is the #578 window — batch A is in
+    /// neither the buffers nor the store.
+    struct HeldSweep {
+        sweep: std::thread::JoinHandle<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl HeldSweep {
+        /// Returns once the drain has happened, so the caller can observe
+        /// the window rather than race it.
+        fn drain_and_hold(pipeline: &SharedPipeline, coordinator: PublishCoordinator) -> Self {
+            let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let pipeline = pipeline.clone();
+            let sweep = std::thread::spawn(move || {
+                let drained = pipeline.with_bound_miner(|_miner| coordinator.drain_aged());
+                assert!(!drained.is_empty(), "the sweep drained batch A");
+                drained_tx.send(()).expect("signal drained");
+                release_rx.recv().expect("hold the write in flight");
+                assert!(
+                    coordinator.write_ordered(drained, "age"),
+                    "the held-back publish lands",
+                );
+            });
+            drained_rx.recv().expect("sweep drained");
+            Self { sweep, release }
+        }
+    }
+
+    /// Four values, so a struct rather than a tuple nobody can read.
+    struct SweepRaceRig {
+        pipeline: SharedPipeline,
+        sink: SharedParquetSink,
+        audit: SharedParquetAuditSink,
+        barrier: Arc<Barrier>,
     }
 
     /// Issue #578 — the publish half of the RFC0035.2 barrier: a rotation
@@ -1521,15 +2202,21 @@ mod tests {
     /// in-flight publish is the sweep's own two steps run by hand with the
     /// gap held open — the atomic drain under the miner lock, then (held
     /// back by the test) the off-lock ordered write — the exact window a
-    /// slow S3 PUT opens. Mutation check: reverting the `quiesce_publishes`
-    /// in `flush_then_snapshot` makes the rotation stamp during the window
-    /// and the mid-window assertion fail deterministically.
+    /// slow S3 PUT opens. Mutation check: reverting the
+    /// `quiesce_publishes` in `Barrier::run_cut` makes the cut stamp
+    /// during the window and the mid-window assertion fail
+    /// deterministically.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rfc0035_2_rotation_stamp_waits_for_the_sweeps_in_flight_publish() {
         let tmp = tempfile::TempDir::new().expect("temp");
         let store_root = tmp.path().join("store");
         let snapshots_root = tmp.path().join("snapshots");
-        let (pipeline, sink, audit) = sweep_race_pipeline(
+        let SweepRaceRig {
+            pipeline,
+            sink,
+            audit,
+            barrier,
+        } = sweep_race_pipeline(
             &tmp.path().join("wal"),
             &store_root,
             &tmp.path().join("audit"),
@@ -1537,34 +2224,14 @@ mod tests {
         );
 
         // Batch A: acked, encoded, buffered (no trigger flushes it).
-        pipeline
-            .ingest(
-                export_request("checkout", &["user 1 logged in", "user 2 logged in"]),
-                ourios_core::tenant::TenantId::new("checkout"),
-            )
-            .await
-            .expect("batch A acks");
-        let rotation_point = pipeline.last_durable().expect("durable after batch A");
-        pipeline.quiesce_encodes();
+        let rotation_point =
+            ingest_and_quiesce(&pipeline, &["user 1 logged in", "user 2 logged in"]).await;
         assert_eq!(sink.buffered_records(), 2, "batch A is buffered");
 
         // Sweep half 1: the atomic drain under the miner lock. Batch A's
         // records now exist only in `drained` and the WAL — the #578 window.
-        let coordinator = PublishCoordinator::new(sink.clone(), audit.clone());
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let sweep_pipeline = pipeline.clone();
-        let sweep = std::thread::spawn(move || {
-            let drained = sweep_pipeline.with_miner(|_miner| coordinator.drain_aged());
-            assert!(!drained.is_empty(), "the sweep drained batch A");
-            drained_tx.send(()).expect("signal drained");
-            release_rx.recv().expect("hold the write in flight");
-            assert!(
-                coordinator.write_ordered(drained, "age"),
-                "the held-back publish lands",
-            );
-        });
-        drained_rx.recv().expect("sweep drained");
+        let HeldSweep { sweep, release } =
+            HeldSweep::drain_and_hold(&pipeline, PublishCoordinator::new(sink.clone(), audit));
         assert_eq!(
             sink.buffered_records(),
             0,
@@ -1572,33 +2239,41 @@ mod tests {
         );
 
         // The rotation races the in-flight publish: batch B lands in a new
-        // segment and fires the production hook on the ingest path.
+        // segment and fires the production capture-only hook on the ingest
+        // path. RFC 0052 §3.1 moves the wait off that path — the capture
+        // returns at once and the cut it handed over does the waiting — so
+        // the rotating `ingest` is expected to complete here.
         tokio::time::sleep(Duration::from_millis(1_200)).await;
-        let rotate_pipeline = pipeline.clone();
-        let rotation = tokio::spawn(async move {
-            rotate_pipeline
-                .ingest(
-                    export_request("checkout", &["payment 9 settled"]),
-                    ourios_core::tenant::TenantId::new("checkout"),
-                )
-                .await
-                .expect("batch B acks")
+        ingest_and_quiesce(&pipeline, &["payment 9 settled"]).await;
+        assert_eq!(
+            barrier.pending_mark(),
+            Some(rotation_point),
+            "the rotation handed over a cut at the rotation point",
+        );
+
+        // Run that cut concurrently with the held publish. It must block in
+        // `quiesce_publishes` rather than stamp.
+        let cut = tokio::task::spawn_blocking({
+            let barrier = Arc::clone(&barrier);
+            move || barrier.run_pending()
         });
 
-        // Mid-window: the hook must be waiting in `quiesce_publishes`, not
-        // stamping. Without the barrier the rotation completes within the
-        // ~100 ms commit window, far inside this 800 ms observation point.
+        // Mid-window: the cut must still be waiting, not stamping. Without
+        // the barrier's quiesce the cut has nothing of its own to publish
+        // (the sweep already emptied the buffers) and would stamp
+        // immediately, far inside this 800 ms observation point.
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let snapshot_written =
-            std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
-        assert!(
-            !snapshot_written,
+        assert_no_snapshot_yet(
+            &snapshots_root,
             "the stamp waits while the sweep's publish is in flight (issue #578)",
         );
 
-        release_tx.send(()).expect("release the publish");
+        release.send(()).expect("release the publish");
         sweep.join().expect("sweep thread");
-        assert_eq!(rotation.await.expect("rotation task"), 1, "batch B acked");
+        assert_eq!(
+            cut.await.expect("the cut runs"),
+            ourios_ingester::barrier::CutOutcome::Stamped,
+        );
 
         // The stamp landed only after the publish settled: batch A is
         // durably in the store and the snapshot carries the rotation mark.
@@ -1606,13 +2281,7 @@ mod tests {
             !data_parquet_files(&store_root.join("data")).is_empty(),
             "batch A's records are durably in the store",
         );
-        let artefacts =
-            ourios_ingester::snapshot_store::load_all(&snapshots_root).expect("load snapshots");
-        assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
-        let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
-        let mark = state.wal_high_water.expect("stamped with a horizon");
-        assert_eq!(mark.segment, rotation_point.segment.to_string());
-        assert_eq!(mark.byte, rotation_point.byte);
+        assert_snapshot_stamped_at(&snapshots_root, rotation_point);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1621,48 +2290,45 @@ mod tests {
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).expect("store root");
         let snapshots_root = tmp.path().join("snapshots");
-        let (pipeline, sink) = rotating_pooled_pipeline(
+        let (pipeline, sink, barrier) = rotating_pooled_pipeline(
             &tmp.path().join("wal"),
             Store::local(&store_root).expect("local store"),
             &snapshots_root,
         );
 
-        pipeline
-            .ingest(
-                export_request("checkout", &["user 1 logged in"]),
-                ourios_core::tenant::TenantId::new("checkout"),
-            )
-            .await
-            .expect("batch A acks");
-        pipeline.quiesce_encodes();
+        ingest_and_quiesce(&pipeline, &["user 1 logged in"]).await;
         assert_eq!(sink.buffered_records(), 1, "batch A is buffered, unflushed");
 
-        // Sabotage the store: the hook's flush cannot drain, so the
+        // Sabotage the store: the cut's publish cannot land, so the
         // snapshot must be skipped — stamping would advance the horizon
-        // past a buffered-but-unflushed record ≤ the mark.
+        // past a record ≤ the mark that reached no Parquet object.
         std::fs::remove_dir_all(&store_root).expect("remove store dir");
         std::fs::write(&store_root, b"not a directory").expect("sabotage store");
 
         tokio::time::sleep(Duration::from_millis(1_200)).await;
-        pipeline
-            .ingest(
-                export_request("checkout", &["payment 9 settled"]),
-                ourios_core::tenant::TenantId::new("checkout"),
-            )
-            .await
-            .expect("batch B still acks — the hook is best-effort");
-        pipeline.quiesce_encodes();
+        ingest_and_quiesce(&pipeline, &["payment 9 settled"]).await;
+
+        let cut = {
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || barrier.run_pending())
+                .await
+                .expect("the cut runs")
+        };
+        assert_eq!(
+            cut,
+            ourios_ingester::barrier::CutOutcome::Retained,
+            "the cut retained rather than stamping",
+        );
 
         assert_eq!(
             sink.buffered_records(),
             2,
-            "the un-flushable records are retained (the WAL is the durability of record)",
+            "the un-publishable records are back in the buffers (the WAL is the \
+             durability of record)",
         );
-        let snapshot_written =
-            std::fs::read_dir(&snapshots_root).is_ok_and(|mut d| d.next().is_some());
-        assert!(
-            !snapshot_written,
-            "the stamp is skipped while a record ≤ the mark is buffered-but-unflushed",
+        assert_no_snapshot_yet(
+            &snapshots_root,
+            "the stamp is skipped while a record ≤ the mark reached no Parquet object",
         );
     }
 }

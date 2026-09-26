@@ -40,7 +40,8 @@ use ourios_core::record::MinedRecord;
 use ourios_parquet::PartitionKey;
 
 use crate::audit_sink::SharedParquetAuditSink;
-use crate::record_sink::SharedParquetSink;
+use crate::cadence::Epoch;
+use crate::record_sink::{SharedParquetSink, TakenPartitions};
 
 /// An atomic snapshot of both sinks' buffers, taken under the miner lock and
 /// written off-lock by [`PublishCoordinator::write_ordered`].
@@ -53,8 +54,8 @@ use crate::record_sink::SharedParquetSink;
 #[derive(Debug)]
 pub struct Drained {
     audit: Vec<AuditEvent>,
-    records: Vec<(PartitionKey, Vec<MinedRecord>)>,
-    _guard: crate::record_sink::PublishGuard,
+    records: TakenPartitions,
+    guard: crate::record_sink::PublishGuard,
 }
 
 impl Drained {
@@ -62,6 +63,32 @@ impl Drained {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.audit.is_empty() && self.records.is_empty()
+    }
+
+    /// The cut epoch this publish was registered under (RFC 0052 §3.1).
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.guard.epoch()
+    }
+
+    /// The audit position the records depend on — carried by any
+    /// `ready` partition the drain took (§3.1).
+    #[must_use]
+    pub fn audit_watermark(&self) -> u64 {
+        self.records.audit_watermark()
+    }
+
+    /// The estimated bytes the snapshot holds — the barrier's
+    /// coalescing bound (§3.1).
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.records.estimated_bytes()
+    }
+
+    /// The record partitions, borrowed.
+    #[must_use]
+    pub fn partitions(&self) -> &[(PartitionKey, Vec<MinedRecord>)] {
+        self.records.partitions()
     }
 }
 
@@ -128,7 +155,7 @@ impl PublishCoordinator {
         Drained {
             audit,
             records,
-            _guard: guard,
+            guard,
         }
     }
 
@@ -143,8 +170,38 @@ impl PublishCoordinator {
         Drained {
             audit,
             records,
-            _guard: guard,
+            guard,
         }
+    }
+
+    /// RFC 0052 §3.1's **park**: put a drained snapshot back where the
+    /// next drain finds it — the records into the sink's buffers as
+    /// `ready`, keeping the `audit_watermark` that makes them
+    /// publishable, and the events ahead of whatever the audit sink
+    /// buffered meanwhile.
+    ///
+    /// A park is a settlement with a date on it, exactly like a requeue:
+    /// without that, parking would be the one way out of §3.1's
+    /// predicate — a pre-cut guard could park its partition after a cut
+    /// had already drained the buffers, settle successfully, and the
+    /// barrier would checkpoint over records that exist only in buffers
+    /// it no longer holds.
+    pub fn park(&self, drained: Drained) {
+        let watermark = drained.audit_watermark();
+        let Drained {
+            audit,
+            records,
+            guard,
+        } = drained;
+        let registered = guard.epoch();
+        self.audit.requeue(audit);
+        self.record
+            .park_ready(records.into_partitions(), watermark, registered);
+        // Dropped last, and deliberately: a `quiesce_publishes` that saw
+        // the count reach zero before the records were back would see
+        // them in neither the buffers nor the store, and stamp across
+        // them.
+        drop(guard);
     }
 
     /// Write a `drained` snapshot to durability **off the lock**, audit-first:
@@ -165,19 +222,28 @@ impl PublishCoordinator {
     /// `SharedParquetSink::quiesce_publishes`.
     #[must_use]
     pub fn write_ordered(&self, drained: Drained, trigger: &'static str) -> bool {
-        let audit_durable = self.audit.write_owned(drained.audit);
+        let Drained {
+            audit,
+            records,
+            guard,
+        } = drained;
+        let registered = guard.epoch();
+        // The guard settles when this returns, whichever arm took it.
+        let _guard = guard;
+        let audit_durable = self.audit.write_owned(audit);
+        let records = records.into_partitions();
         if !audit_durable {
             // The audit stream didn't fully reach durability (a transient store
             // error). Do NOT publish the records — their template events aren't
             // durable yet. Requeue them for the next cadence (the WAL is the
             // durability of record).
-            self.record.requeue(drained.records);
+            self.record.requeue(records, registered);
             return false;
         }
         #[cfg(feature = "openfga")]
         let tuples = self.graph.as_ref().map(|emitter| {
             let mut tuples = std::collections::BTreeSet::new();
-            for (partition, records) in &drained.records {
+            for (partition, records) in &records {
                 tuples.extend(emitter.derive(&partition.tenant_id, records));
                 tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
                     &partition.tenant_id,
@@ -185,7 +251,7 @@ impl PublishCoordinator {
             }
             tuples
         });
-        let published = self.record.publish_owned(drained.records, trigger);
+        let published = self.record.publish_owned(records, trigger, registered);
         #[cfg(feature = "openfga")]
         if published
             && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)

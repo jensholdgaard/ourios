@@ -370,6 +370,16 @@ impl SharedParquetAuditSink {
         fully_durable
     }
 
+    /// Put `events` back at the head of the buffer, ahead of whatever
+    /// `emit` buffered meanwhile — RFC 0052 §3.1's park of a drained
+    /// snapshot the barrier could not take.
+    pub fn requeue(&self, events: Vec<AuditEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.lock().requeue_ahead(events);
+    }
+
     /// Drain the internal buffer to durability — the size-trigger audit barrier
     /// and standalone cadence/shutdown flush. Returns whether the buffer was
     /// fully drained (nothing retained for retry).

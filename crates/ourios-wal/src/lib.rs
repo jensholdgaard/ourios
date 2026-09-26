@@ -797,6 +797,26 @@ impl Wal {
             .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
     }
 
+    /// Whether the current segment has outlived `segment_age_secs` —
+    /// the barrier task's idle-rotation predicate (RFC 0052 §3.1). The
+    /// age is the `UUIDv7`'s embedded mint time, so this costs no
+    /// syscall; whether the segment holds a frame is
+    /// [`Self::rotate`]'s own [`RotationKind::Discretionary`] check.
+    #[must_use]
+    pub fn segment_age_exceeded(&self) -> bool {
+        segment_age(self.current_segment_uuid)
+            .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
+    }
+
+    /// Whether a rotation-origin directory fsync is still owed. The
+    /// segment a failed post-rename fsync leaves installed is fresh, so
+    /// [`Self::segment_age_exceeded`] alone would let an idle node hold
+    /// the obligation until traffic returned; the timer asks this too.
+    #[must_use]
+    pub fn owes_rotation_fsync(&self) -> bool {
+        self.dir_fsync == DirFsync::PendingRotation
+    }
+
     /// RFC 0052 §3.3's callable rotation: close the current segment and
     /// install a fresh one, without an append driving it.
     ///
@@ -1247,9 +1267,25 @@ impl Wal {
     /// The timer lives in the caller (`wal_housekeeping_secs`);
     /// this is one pass.
     ///
+    /// **Superseded, and unreachable from production (issue #827).**
+    /// RFC 0052 §3.2's per-segment rule replaces this global bound
+    /// rather than standing beside it: this entry point writes no
+    /// `planned` witness, drops the segment from the tenant-aware
+    /// ledger and honours no per-pass cap, so a pass run through it
+    /// after the ledger has recorded a consumer mode can remove frames
+    /// a pinned tenant still holds. It survives only because it is
+    /// RFC 0008 §6.7's asserted contract, and the `legacy-housekeeping`
+    /// feature is what keeps the two surfaces from ever meeting on a
+    /// live root: the feature is enabled by this crate's own
+    /// dev-dependency and nothing else, so no product binary can reach
+    /// it. Every other caller uses [`Self::housekeeping_pass`] or the
+    /// [`Self::housekeeping_prepare`] / [`Self::housekeeping_commit`]
+    /// pair.
+    ///
     /// # Errors
     ///
     /// See [`HousekeepingError`].
+    #[cfg(feature = "legacy-housekeeping")]
     pub fn housekeeping(
         &mut self,
         retain_floor: Option<WalOffset>,
@@ -1276,6 +1312,7 @@ impl Wal {
     /// Unlink every closed segment whose highest frame offset is at or
     /// below `bound`. Whole segments only; the current append segment
     /// is never unlinked.
+    #[cfg(feature = "legacy-housekeeping")]
     fn unlink_at_or_below(&mut self, bound: WalOffset) -> Result<(), HousekeepingError> {
         let io = |op: &'static str, source| HousekeepingError::Io { op, source };
         let segments = list_segments(&self.config.root).map_err(|e| match e {

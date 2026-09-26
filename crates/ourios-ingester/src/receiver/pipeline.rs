@@ -26,7 +26,10 @@ use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, TenantBatch, Wal, WalOffset};
+use ourios_wal::{
+    FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
+    ReclaimState, RotationKind, SnapshotHorizons, TenantBatch, UnlinkPermit, Wal, WalOffset,
+};
 use prost::Message;
 use tracing::Instrument as _;
 
@@ -58,12 +61,19 @@ pub type SharedPipeline = Arc<IngestPipeline>;
 /// `Send` so it can live behind the coordinator's `Mutex<Box<dyn Journal>>`
 /// as shared state in the async HTTP/gRPC listeners.
 pub trait Journal: Send {
-    /// Append one `OtlpBatch` frame carrying `payload` (not yet durable).
+    /// Append one `OtlpBatch` frame carrying `payload` (not yet durable),
+    /// yielding **this frame's own offset**.
+    ///
+    /// RFC 0052 §3.1: that offset, not the group sync's reported EOF, is
+    /// what the turn stores as `last_durable` and what the barrier reads
+    /// as its mark. A sync's EOF can cover a later turn's frame that has
+    /// not run yet, and a checkpoint at that EOF would stamp across a
+    /// frame nothing had mined.
     ///
     /// # Errors
     ///
     /// [`ReceiveError::WalAppend`] on a persistence failure.
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError>;
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError>;
 
     /// Fsync — appended frames are durable when this returns `Ok`,
     /// yielding the durable high-water offset. The real WAL always has
@@ -80,13 +90,104 @@ pub trait Journal: Send {
     /// by the coordinator's segment-fill early cut ("until the segment
     /// fills", §3.4). Cheap — an in-memory counter, no syscall.
     fn unflushed_bytes(&self) -> u64;
+
+    /// RFC 0052 §3.7's reclamation surface, reached through the trait
+    /// object rather than a downcast so the barrier's tests can drive a
+    /// double that observes reclamation.
+    ///
+    /// The defaults answer [`ReclaimError::NoReclamationSurface`]: the
+    /// spy journals the ingest-path tests use persist nothing, and a
+    /// silent no-op default would let a missing checkpoint read as a
+    /// clean pass. Only [`Wal`] overrides them.
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimError::Checkpoint`] on a sidecar write failure — the
+    /// in-memory mark is left where it was either way (§3.1's
+    /// fail-closed rule).
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
+        let _ = durable_to;
+        Err(ReclaimError::NoReclamationSurface)
+    }
+
+    /// The journal's persisted checkpoint mark, if any.
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        None
+    }
+
+    /// The ledger half of one capped housekeeping pass (§3.2), under the
+    /// journal's single-writer position.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::housekeeping_prepare`].
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        let _ = (horizons, max_unlinks);
+        Err(ReclaimError::NoReclamationSurface)
+    }
+
+    /// Write the plan's `planned` witness and take the unlink permit.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::write_plan_record`].
+    fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
+        let _ = plan;
+        Err(std::io::Error::other(
+            "this journal exposes no RFC 0052 reclamation surface",
+        ))
+    }
+
+    /// Fold the file half's outcome back under the writer position.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::housekeeping_commit`].
+    fn housekeeping_commit(
+        &mut self,
+        pass: PassId,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        let _ = (pass, outcome);
+        Err(ReclaimError::NoReclamationSurface)
+    }
+
+    /// §3.3's append-independent rotation — the barrier task's idle
+    /// rotation, and the discharge of a pending rotation-origin
+    /// directory fsync.
+    ///
+    /// # Errors
+    ///
+    /// As [`Wal::rotate`].
+    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
+        let _ = kind;
+        Ok(())
+    }
+
+    /// Whether the current segment has outlived `segment_age_secs` —
+    /// the barrier task's idle-rotation predicate (§3.1).
+    fn segment_age_exceeded(&self) -> bool {
+        false
+    }
+
+    /// Whether a rotation-origin directory fsync is still owed (§3.3).
+    fn owes_rotation_fsync(&self) -> bool {
+        false
+    }
+
+    /// §3.5's export surface.
+    fn reclaim_state(&self) -> ReclaimState {
+        ReclaimState::default()
+    }
 }
 
 impl Journal for Wal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
-        Wal::append(self, FrameKind::TenantOtlpBatch, payload)
-            .map(|_| ())
-            .map_err(ReceiveError::WalAppend)
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+        Wal::append(self, FrameKind::TenantOtlpBatch, payload).map_err(ReceiveError::WalAppend)
     }
 
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
@@ -95,6 +196,50 @@ impl Journal for Wal {
 
     fn unflushed_bytes(&self) -> u64 {
         self.metrics().unflushed_bytes
+    }
+
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
+        Wal::checkpoint(self, durable_to).map_err(ReclaimError::Checkpoint)
+    }
+
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        Wal::last_checkpoint(self)
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        Wal::housekeeping_prepare(self, horizons, max_unlinks)
+    }
+
+    fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
+        Wal::write_plan_record(self, plan)
+    }
+
+    fn housekeeping_commit(
+        &mut self,
+        pass: PassId,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        Wal::housekeeping_commit(self, pass, outcome)
+    }
+
+    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
+        Wal::rotate(self, kind).map_err(ReceiveError::WalAppend)
+    }
+
+    fn segment_age_exceeded(&self) -> bool {
+        Wal::segment_age_exceeded(self)
+    }
+
+    fn owes_rotation_fsync(&self) -> bool {
+        Wal::owes_rotation_fsync(self)
+    }
+
+    fn reclaim_state(&self) -> ReclaimState {
+        Wal::reclaim_state(self)
     }
 }
 
@@ -120,15 +265,60 @@ impl Drop for IngestGateGuard<'_> {
     }
 }
 
+/// Where the pipeline's durable high-water mark came from (RFC 0052
+/// §3.7). Two variants rather than an offset plus a flag: only one of
+/// them may be checkpointed, and a caller holding a bare `WalOffset`
+/// cannot tell which it has.
+#[derive(Clone, Copy, Debug)]
+enum DurableMark {
+    /// Recovery's seed — the highest offset replay *delivered*. It
+    /// stamps the shutdown snapshot's high-water and is never a mark.
+    Replayed(WalOffset),
+    /// A turn's own frame offset, acknowledged in this process.
+    Acknowledged(WalOffset),
+}
+
+impl DurableMark {
+    fn offset(self) -> WalOffset {
+        match self {
+            Self::Replayed(offset) | Self::Acknowledged(offset) => offset,
+        }
+    }
+}
+
 /// No `Debug`: `MinerCluster` holds the per-tenant Drain trees and does
 /// not implement it.
 pub struct IngestPipeline {
     coordinator: Arc<CommitCoordinator>,
     miner: Mutex<MinerCluster>,
+    /// RFC 0052 §3.1's **barrier exclusion**. Held shared across the
+    /// span that matters — the miner work, `pool.submit`, and the
+    /// `last_durable` update — by every ingest turn and by the age
+    /// sweep's drain; taken exclusively by a cut capture, and for
+    /// nothing else.
+    ///
+    /// Strictly wider than the miner lock and strictly narrower than the
+    /// ingest gate, so it does not change ingest ordering. The miner
+    /// lock alone is not enough: `ingest_bound` releases it *before*
+    /// `pool.submit` and before advancing `last_durable`, so a timer
+    /// holding only that lock could quiesce the pool and then have an
+    /// already-past-the-lock ingest submit an encode and advance the
+    /// mark underneath it.
+    ///
+    /// **Acquisition order is fixed**: exclusion, then miner lock, then
+    /// the `last_durable` mutex. Taking the miner lock first and then
+    /// waiting for the exclusion would deadlock against a capture
+    /// holding the exclusion and waiting for the miner.
+    ingest_bound: std::sync::RwLock<()>,
+    /// The cadence state (§3.1). Adopted from the encode pool's sink
+    /// when one is installed, so every party to a cut — the pool's batch
+    /// guards, the sink's publish guards, the barrier task — reports
+    /// into one latch.
+    epochs: Arc<crate::cadence::BarrierEpochs>,
     /// The durable high-water mark after the most recent acked batch (or
     /// the startup seed). Behind a mutex: concurrent acks update it, and
     /// the rotation-detection read-then-write must see a consistent value.
-    last_durable: Mutex<Option<WalOffset>>,
+    last_durable: Mutex<Option<DurableMark>>,
     rotation_hook: Mutex<Option<RotationHook>>,
     /// Ingest throughput + WAL-before-ack latency instruments (RFC 0014
     /// §6.3), recorded on durably-acked batches — plus the RFC 0026 §3.4
@@ -167,12 +357,48 @@ impl IngestPipeline {
         Self {
             coordinator,
             miner: Mutex::new(miner),
+            ingest_bound: std::sync::RwLock::new(()),
+            epochs: Arc::new(crate::cadence::BarrierEpochs::new()),
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
             encode_pool: None,
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
         }
+    }
+
+    /// The cadence state every guard in this pipeline reports into
+    /// (RFC 0052 §3.1).
+    #[must_use]
+    pub fn epochs(&self) -> Arc<crate::cadence::BarrierEpochs> {
+        Arc::clone(&self.epochs)
+    }
+
+    /// Take the barrier exclusion in **shared** mode, then run `f`.
+    ///
+    /// The age sweep's drain uses this rather than [`Self::with_miner`]:
+    /// taken inside `with_miner` the sweep would hold the miner lock
+    /// while waiting for the shared exclusion, and a capture holding the
+    /// exclusive lock would be waiting for the miner — both stuck. Held
+    /// only across the drain and the in-flight registration, never
+    /// across the off-lock publish (§3.1).
+    pub fn with_bound_miner<R>(&self, f: impl FnOnce(&MinerCluster) -> R) -> R {
+        let _bound = self.share_bound();
+        f(&self.lock_miner())
+    }
+
+    /// Take the barrier exclusion in **exclusive** mode — a cut capture,
+    /// and nothing else.
+    pub(crate) fn exclude_ingest(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.ingest_bound
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn share_bound(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.ingest_bound
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Enable the RFC 0035 §3.1 ordered/concurrent ingest split: the
@@ -183,6 +409,10 @@ impl IngestPipeline {
     /// drains all see one buffer.
     #[must_use]
     pub fn with_encode_pool(mut self, pool: crate::encode_pool::EncodePool) -> Self {
+        // One latch across the pool's batch guards, the sink's publish
+        // guards and this pipeline's cuts (RFC 0052 §3.1): the sink owns
+        // it, the pool adopted it, and the pipeline adopts the pool's.
+        self.epochs = pool.epochs();
         self.encode_pool = Some(pool);
         self
     }
@@ -227,8 +457,15 @@ impl IngestPipeline {
     /// worth failing the ack over.
     #[must_use]
     pub fn with_rotation_hook(self, hook: RotationHook) -> Self {
-        *self.lock_hook() = Some(hook);
+        self.set_rotation_hook(hook);
         self
+    }
+
+    /// [`Self::with_rotation_hook`] after construction — the barrier
+    /// owns the hook and is built from the same coordinator this
+    /// pipeline holds, so it cannot exist before the pipeline does.
+    pub fn set_rotation_hook(&self, hook: RotationHook) {
+        *self.lock_hook() = Some(hook);
     }
 
     /// Seed the durable high-water mark from startup recovery
@@ -239,7 +476,7 @@ impl IngestPipeline {
     /// seed.
     #[must_use]
     pub fn with_last_durable(self, offset: Option<WalOffset>) -> Self {
-        *self.lock_last_durable() = offset;
+        *self.lock_last_durable() = offset.map(DurableMark::Replayed);
         self
     }
 
@@ -401,8 +638,25 @@ impl IngestPipeline {
             coordinator: &self.coordinator,
             seq,
         };
-        let ack = match outcome.result {
-            Ok(now) => {
+        // RFC 0052 §3.1: the mark is this turn's **own** frame offset,
+        // never the sync's reported EOF — a flush spanning two turns
+        // reports an EOF that already covers the later frame, whose own
+        // turn has not run, and a checkpoint at that EOF would stamp
+        // across a frame nothing had mined. `own` is `Some` whenever
+        // `seq` is, so the `else` arm is unreachable; treating it as a
+        // sync failure keeps the invariant rather than inventing a mark.
+        let ack = match (outcome.result, outcome.own) {
+            (Ok(_), None) => Err(ReceiveError::WalSync(ourios_wal::SyncError::Io {
+                op: "group-commit sync",
+                source: std::io::Error::other("commit reported no frame offset"),
+            })),
+            (Ok(_), Some(now)) => {
+                // RFC 0052 §3.1: the barrier exclusion spans the miner
+                // work, the pool submission and the `last_durable`
+                // update — the whole region a cut must not straddle.
+                // Taken **before** the miner lock, and never requested
+                // while holding it.
+                let _bound = self.share_bound();
                 // §6.9 rotation cadence: a segment change since the prior
                 // (now strictly-previous) durable mark means the WAL
                 // rotated under this batch; fire the hook with the
@@ -411,10 +665,20 @@ impl IngestPipeline {
                 // exactly the frames at or below that mark. In-order, so
                 // `before` is exactly the preceding seq's offset and no
                 // higher seq has ingested yet.
+                //
+                // The mark stays typed to here (RFC 0052 §3.7): the hook
+                // is a barrier capture that checkpoints at `prev`, and a
+                // replay seed is proof of *delivery*, not of a completed
+                // group sync. Rotating on one — the first acknowledged
+                // turn after a restart landing in a new segment, because
+                // the reopened one was full or had aged out — would let
+                // the WAL forget a frame no turn in this process
+                // acknowledged. The barrier's own timer covers that
+                // replayed tail at the next cut, under a mark that is one.
                 let before = *self.lock_last_durable();
                 let mined = {
                     let mut miner = self.lock_miner();
-                    if let Some(prev) = before
+                    if let Some(DurableMark::Acknowledged(prev)) = before
                         && prev.segment != now.segment
                     {
                         self.rotate_for_segment_change(&miner, prev);
@@ -434,7 +698,7 @@ impl IngestPipeline {
                 // Only successful commits advance the durable mark, so the
                 // snapshot high-water never passes a failed sync — its tail
                 // replay re-covers those frames (no §3.5.3 divergence).
-                *self.lock_last_durable() = Some(now);
+                *self.lock_last_durable() = Some(DurableMark::Acknowledged(now));
                 // Throughput + WAL-before-ack latency for this acked batch.
                 // RFC 0018 §3.5: tag out-of-range-severity records on the
                 // ingest counter via `error.type` (post-materialise on the
@@ -454,7 +718,7 @@ impl IngestPipeline {
             }
             // Sync failed: the frame is not durable and not acked; it
             // reaches neither the miner nor the durable mark.
-            Err(e) => Err(e),
+            (Err(e), _) => Err(e),
         };
         // `_gate` releases the hand-off to `seq + 1` as it drops here.
         ack
@@ -598,7 +862,27 @@ impl IngestPipeline {
     /// its WAL high-water mark (RFC 0001 §6.9).
     #[must_use]
     pub fn last_durable(&self) -> Option<WalOffset> {
-        *self.lock_last_durable()
+        self.lock_last_durable().map(DurableMark::offset)
+    }
+
+    /// The mark a cut may stamp: the highest offset a turn **in this
+    /// process** acknowledged.
+    ///
+    /// RFC 0052 §3.7: recovery's seed is the highest offset *replay
+    /// delivered*, which is not proof of acknowledgement — a frame's
+    /// bytes can survive a crash whose group sync never completed, and
+    /// §3.1's rule is that such a frame is never a mark. The seed still
+    /// stamps the shutdown snapshot's high-water (RFC 0001 §6.9), which
+    /// is a different consumer: a snapshot only bounds replay depth,
+    /// while a checkpoint lets the WAL forget. So a node that has served
+    /// nothing since its restart has no mark, and its first successful
+    /// turn establishes one.
+    #[must_use]
+    pub fn acknowledged_durable(&self) -> Option<WalOffset> {
+        match *self.lock_last_durable() {
+            Some(DurableMark::Acknowledged(offset)) => Some(offset),
+            Some(DurableMark::Replayed(_)) | None => None,
+        }
     }
 
     fn lock_miner(&self) -> std::sync::MutexGuard<'_, MinerCluster> {
@@ -607,7 +891,7 @@ impl IngestPipeline {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_last_durable(&self) -> std::sync::MutexGuard<'_, Option<WalOffset>> {
+    fn lock_last_durable(&self) -> std::sync::MutexGuard<'_, Option<DurableMark>> {
         self.last_durable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -882,9 +1166,9 @@ mod tests {
     }
 
     impl Journal for FixedSyncJournal {
-        fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
             self.appends.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(self.offset)
         }
 
         fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
@@ -1002,19 +1286,29 @@ mod tests {
         assert_eq!(pipeline.last_durable(), Some(synced));
     }
 
-    /// `sync` reports offsets from a queue, so a segment change can be
-    /// staged mid-sequence.
+    /// `append_batch` reports each frame's own offset from a queue, so a
+    /// segment change can be staged mid-sequence. RFC 0052 §3.1 makes
+    /// that offset — not the sync's EOF — the rotation-detection input,
+    /// so the queue is drained per append and `sync` echoes the last one.
     struct SequenceJournal {
         offsets: Mutex<Vec<WalOffset>>,
+        last: Mutex<Option<WalOffset>>,
     }
 
     impl Journal for SequenceJournal {
-        fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
-            Ok(())
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+            let next = self.offsets.lock().expect("offsets").remove(0);
+            *self.last.lock().expect("last") = Some(next);
+            Ok(next)
         }
 
         fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
-            Ok(self.offsets.lock().expect("offsets").remove(0))
+            self.last.lock().expect("last").ok_or_else(|| {
+                ReceiveError::WalSync(ourios_wal::SyncError::Io {
+                    op: "fdatasync",
+                    source: std::io::Error::other("nothing appended"),
+                })
+            })
         }
 
         fn unflushed_bytes(&self) -> u64 {
@@ -1026,6 +1320,7 @@ mod tests {
         let coordinator = CommitCoordinator::new(
             Box::new(SequenceJournal {
                 offsets: Mutex::new(offsets),
+                last: Mutex::new(None),
             }),
             Duration::from_millis(5),
             u64::MAX,
@@ -1078,6 +1373,63 @@ mod tests {
             .await
             .expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
+    }
+
+    /// RFC 0052 §3.7: a replay seed is never a checkpoint mark, and the
+    /// rotation hook is a barrier capture that checkpoints at the mark it
+    /// is handed — so the seed must not reach it.
+    ///
+    /// The trigger is narrow and entirely ordinary: the process restarts,
+    /// and the first acknowledged turn after replay lands in a new
+    /// segment because the reopened one was full or had aged out. Firing
+    /// there would let the WAL forget frames whose group sync may never
+    /// have completed. The next turn's own offset *is* a mark, and the
+    /// hook fires then — the rotation is deferred, not lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replay_seed_never_reaches_the_rotation_hook() {
+        let replayed = WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 100,
+        };
+        let in_second = WalOffset {
+            segment: uuid::Uuid::from_u128(2),
+            byte: 40,
+        };
+        let in_third = WalOffset {
+            segment: uuid::Uuid::from_u128(3),
+            byte: 12,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let pipeline = sequence_pipeline(
+            vec![in_second, in_third],
+            Box::new(move |_, mark| seen.lock().expect("lock").push(mark)),
+        )
+        .with_last_durable(Some(replayed));
+
+        // Batch 1 lands in a different segment than the seed — a segment
+        // change, but the prior mark is `Replayed`, so no capture.
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 1");
+        assert!(
+            calls.lock().expect("lock").is_empty(),
+            "the seed's segment change must not fire a capture that would \
+             checkpoint at a frame no turn in this process acknowledged",
+        );
+
+        // Batch 2 rotates again, and now the prior mark is batch 1's own
+        // acknowledged offset — a real mark, so the hook fires at it.
+        pipeline
+            .ingest(request(), ourios_core::tenant::TenantId::new("checkout"))
+            .await
+            .expect("batch 2");
+        assert_eq!(
+            *calls.lock().expect("lock"),
+            vec![in_second],
+            "and the next rotation carries the acknowledged offset, never the seed",
+        );
     }
 
     /// The rotation branch on a `current_thread` runtime takes the

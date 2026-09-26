@@ -3339,7 +3339,14 @@ they are not substitutes for the rest.
   and housekeeping), §6.8 (counters), §6.9 (tunables) — the mechanism
   this RFC supplies the policy for; §6.5's durable-entry-first rule and
   Scenario RFC0008.6's permanent refusal are **superseded** by §3.3 and
-  RFC0052.4/.5.
+  RFC0052.4/.5. §6.7's single-call `Wal::housekeeping(retain_floor)` is
+  **superseded** by §3.2's `housekeeping_prepare` / `housekeeping_commit`
+  pair — a pass that records its plan before it unlinks cannot be one
+  call. The single-call form survives behind a `legacy-housekeeping`
+  feature that nothing but this crate's own dev-dependency enables, so
+  the RFC0008.7 tests keep their subject while the deployment invariant
+  the legacy-root branch above rests on — that no production path calls
+  it — becomes a property of the build rather than of a grep.
 - RFC 0046 (the tenant-prefixed frame) — **amended** by §3.2:
 
   > This RFC amends RFC 0046's replay validation and criterion RFC0046.11

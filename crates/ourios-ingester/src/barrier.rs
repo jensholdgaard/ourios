@@ -248,10 +248,18 @@ impl Barrier {
         if rotate_when_idle {
             self.rotate_idle();
         }
-        let epoch = self.epochs.open_cut();
         let mark = pipeline.acknowledged_durable();
         let (drained, snapshots) =
             pipeline.with_miner(|miner| (self.publish.drain_all(), serialise(miner)));
+        // Last, after the drain that registers this cut's own batches, and
+        // for the reason `cadence` states: a guard registered before cut
+        // `E`'s capture reads `E`. Allocated first, `begin_publish` would
+        // read `E + 1` for the very batches the cut is made of — they would
+        // refuse no cut a later drain could not see, and the coverage epoch
+        // the detached handoff carries would be one cut too high.
+        // `capture_rotation` has always ordered it this way; §3.1's
+        // pseudocode allocates it after `snaps` on both paths.
+        let epoch = self.epochs.open_cut();
         self.offer(Cut {
             epoch,
             mark,

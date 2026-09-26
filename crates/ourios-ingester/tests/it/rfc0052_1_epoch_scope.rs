@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ourios_ingester::barrier::{CaptureOutcome, CutOutcome};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_parquet::Store;
 
@@ -111,6 +112,48 @@ fn rfc0052_1_batch_queued_before_the_cut_carries_the_cuts_epoch() {
     assert!(
         state.refuses(cut),
         "the epoch was stamped at submit, not at dequeue",
+    );
+}
+
+/// Scenario RFC0052.1 — a capture's own batches carry its own cut's epoch, on the timer path too.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_a_timer_captures_own_batches_carry_the_cuts_epoch() {
+    // Given a ceiling that admits one capture, so the second parks
+    // everything it drained. A park is the reachable way to make a
+    // capture's own records re-enter the buffers at a later epoch, and so
+    // the one place the epoch they were registered under is observable
+    // from outside the capture.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::with_ceiling(tmp.path(), 1);
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    assert_eq!(
+        rig.barrier.capture(&rig.pipeline, false),
+        CaptureOutcome::Filled,
+    );
+
+    // When a second capture takes cut E and parks its batch.
+    rig.ingest("checkout", &["user 2 logged in"]).await;
+    let parked = rig.epochs.current();
+    assert_eq!(
+        rig.barrier.capture(&rig.pipeline, false),
+        CaptureOutcome::Parked,
+    );
+    assert_eq!(
+        rig.barrier.run_pending(),
+        CutOutcome::Stamped,
+        "the pending cut is below the park and still stamps",
+    );
+
+    // Then the return is dated against E — the epoch that capture
+    // registered its batch under — and refuses it. Allocated before the
+    // drain, `begin_publish` would read `E + 1` for the cut's own batch,
+    // the return would date at the epoch it was registered under, and
+    // `note_resettled` would record nothing at all.
+    let outcomes = rig.sink.quiesce_publishes();
+    assert!(
+        !outcomes.all_ok(parked),
+        "a capture's own drained batch, back in the buffers, refuses its cut",
     );
 }
 

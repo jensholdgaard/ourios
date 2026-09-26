@@ -174,6 +174,11 @@ pub trait Journal: Send {
         false
     }
 
+    /// Whether a rotation-origin directory fsync is still owed (§3.3).
+    fn owes_rotation_fsync(&self) -> bool {
+        false
+    }
+
     /// §3.5's export surface.
     fn reclaim_state(&self) -> ReclaimState {
         ReclaimState::default()
@@ -227,6 +232,10 @@ impl Journal for Wal {
 
     fn segment_age_exceeded(&self) -> bool {
         Wal::segment_age_exceeded(self)
+    }
+
+    fn owes_rotation_fsync(&self) -> bool {
+        Wal::owes_rotation_fsync(self)
     }
 
     fn reclaim_state(&self) -> ReclaimState {

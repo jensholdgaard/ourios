@@ -325,12 +325,18 @@ impl CommitCoordinator {
     /// outlived `segment_age_secs`, which is read under the same guard
     /// so the decision and the rotation cannot straddle an append.
     ///
+    /// An owed rotation-origin directory fsync also brings us in: the
+    /// segment a failed post-rename fsync leaves installed is fresh and
+    /// empty, so age alone would never call, and on an idle node no
+    /// append arrives to discharge it either. `rotate` discharges before
+    /// it reads the kind, so this still rotates nothing.
+    ///
     /// # Errors
     ///
     /// As [`crate::receiver::pipeline::Journal::rotate`].
     pub fn rotate_if_aged(&self) -> Result<(), ReceiveError> {
         let mut journal = self.lock_journal();
-        if !journal.segment_age_exceeded() {
+        if !journal.segment_age_exceeded() && !journal.owes_rotation_fsync() {
             return Ok(());
         }
         journal.rotate(ourios_wal::RotationKind::Discretionary)

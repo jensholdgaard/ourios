@@ -808,6 +808,15 @@ impl Wal {
             .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
     }
 
+    /// Whether a rotation-origin directory fsync is still owed. The
+    /// segment a failed post-rename fsync leaves installed is fresh, so
+    /// [`Self::segment_age_exceeded`] alone would let an idle node hold
+    /// the obligation until traffic returned; the timer asks this too.
+    #[must_use]
+    pub fn owes_rotation_fsync(&self) -> bool {
+        self.dir_fsync == DirFsync::PendingRotation
+    }
+
     /// RFC 0052 §3.3's callable rotation: close the current segment and
     /// install a fresh one, without an append driving it.
     ///

@@ -58,4 +58,5 @@ mod rfc0052_1_checkpoint_policy;
 mod rfc0052_1_epoch_scope;
 mod rfc0052_1_latch_policy;
 mod rfc0052_1_unwind_policy;
+mod rfc0052_4_timer_discharge;
 mod rfc0052_barrier_support;

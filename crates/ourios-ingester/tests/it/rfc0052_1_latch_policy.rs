@@ -178,10 +178,12 @@ async fn rfc0052_1_a_latched_node_does_not_accumulate_the_cuts_it_refuses() {
 /// Ingest, capture and tick `rounds` times against a latched rig, and
 /// report how many settlements the sink is left carrying.
 ///
-/// The capture is the **hook's**, not the timer's, because the hook does
-/// not consult the latch: it is the path a latched node keeps taking
-/// cuts on, for as long as segments keep rotating, and so the one that
-/// can accumulate.
+/// The capture is the **hook's**, not the timer's, because only the
+/// hook's order dates a settlement: it drains before opening the cut, so
+/// the batches are registered one epoch behind the one they are parked
+/// at, which is what `note_resettled` records. It is also the path a
+/// latched node keeps taking cuts on, because the hook does not consult
+/// the latch.
 async fn latched_rounds(rig: &BarrierRig, round: &mut u32, rounds: usize) -> usize {
     for _ in 0..rounds {
         *round += 1;

@@ -248,18 +248,22 @@ impl Barrier {
         if rotate_when_idle {
             self.rotate_idle();
         }
+        // First, and **before** the drain, because `current()` has to mean
+        // "the next cut that will drain the buffers" for the whole span in
+        // which this one is being captured. That is what dates a park by a
+        // publish registered before the cut: `publish::park` settles it at
+        // `current()`, and only `E + 1` there refuses `E`. Opened after the
+        // drain, a park landing in the gap reads `E`, `note_resettled`
+        // discards it as covered, and the cut stamps over records that
+        // exist only in buffers it no longer holds — the exact escape
+        // `publish::park` says the date exists to close. The cut's own
+        // batches then register at `E + 1`, which is right for the same
+        // reason: cut `E` carries them and cannot stamp without them, and
+        // `E + 1` is the cut that drains them if `E` parks them.
+        let epoch = self.epochs.open_cut();
         let mark = pipeline.acknowledged_durable();
         let (drained, snapshots) =
             pipeline.with_miner(|miner| (self.publish.drain_all(), serialise(miner)));
-        // Last, after the drain that registers this cut's own batches, and
-        // for the reason `cadence` states: a guard registered before cut
-        // `E`'s capture reads `E`. Allocated first, `begin_publish` would
-        // read `E + 1` for the very batches the cut is made of — they would
-        // refuse no cut a later drain could not see, and the coverage epoch
-        // the detached handoff carries would be one cut too high.
-        // `capture_rotation` has always ordered it this way; §3.1's
-        // pseudocode allocates it after `snaps` on both paths.
-        let epoch = self.epochs.open_cut();
         self.offer(Cut {
             epoch,
             mark,
@@ -275,6 +279,14 @@ impl Barrier {
     /// The caller holds the exclusion and the miner lock, and `mark` is
     /// the rotation point (`prev`), not `last_durable`: the frames at or
     /// below it are exactly the ones the closed segment holds.
+    ///
+    /// Unlike [`Self::capture`] this opens the cut *after* the drain, so
+    /// a publish registered before it and parking in between reads the
+    /// cut's own epoch and dates nothing — issue #835. Left as it is
+    /// here because the no-accumulation leg
+    /// (`rfc0052_1_a_latched_node_does_not_accumulate_the_cuts_it_refuses`)
+    /// rests on this path dating settlements, and needs a replacement
+    /// observable before the order can move.
     pub fn capture_rotation(&self, miner: &MinerCluster, mark: WalOffset) -> CaptureOutcome {
         let drained = self.publish.drain_all();
         let cut = Cut {
@@ -473,8 +485,11 @@ impl Barrier {
         // *Parquet* side on `max(X, S)`. `recovery::DriverSink` does not
         // yet — that gate is RFC0052.10's — so advancing `X` over a
         // snapshot still at `S` would republish every row in `(S, X]`
-        // on the next start. Until the gate lands, a failed install
-        // costs one cadence rather than duplicate rows.
+        // on the next start. Retaining does not make the next start
+        // clean: this cut's rows are already in the store, so replay
+        // re-mines them exactly as it would after a crash between the
+        // write and the stamp. What it buys is the bound — the
+        // duplicates are this cut's, not every row since `S`.
         match self.install(&snapshots, mark) {
             Install::Failed => CutOutcome::Retained,
             Install::Written | Install::Superseded => {

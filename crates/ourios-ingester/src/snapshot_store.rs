@@ -158,13 +158,28 @@ pub fn fsync_root(root: &Path) -> Result<(), SnapshotStoreError> {
             });
         }
     }
-    let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) else {
+    let Some(parent) = parent_to_fsync(root) else {
         return Ok(());
     };
     File::open(parent)
         .and_then(|dir| dir.sync_all())
         .map_err(io("fsync(snapshots root parent)"))?;
     Ok(())
+}
+
+/// The directory holding `root`'s own entry, which is what has to be
+/// durable for the rename that created it to survive.
+///
+/// A single-component relative root yields `Some("")` from
+/// [`Path::parent`] — the current directory, not "no parent". Treating
+/// the two alike would skip the fsync for the one root shape where the
+/// entry is still real. `None` is only a filesystem root, which has no
+/// entry to make durable.
+fn parent_to_fsync(root: &Path) -> Option<&Path> {
+    match root.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        other => other,
+    }
 }
 
 /// Fsync the root — and its parent with it — then remove every
@@ -291,6 +306,22 @@ mod tests {
     use ourios_miner::snapshot::{
         LeafRecord, StructuredTemplateRecord, TokenRecord, WalHighWater, load_snapshot,
     };
+
+    /// A single-component relative root's entry lives in the current
+    /// directory, which is a real directory to fsync — not the "no
+    /// parent" that [`Path::parent`]'s empty path reads as.
+    #[test]
+    fn parent_to_fsync_maps_an_empty_parent_to_the_current_directory() {
+        assert_eq!(
+            parent_to_fsync(Path::new("snapshots")),
+            Some(Path::new(".")),
+        );
+        assert_eq!(
+            parent_to_fsync(Path::new("/var/lib/ourios/wal/snapshots")),
+            Some(Path::new("/var/lib/ourios/wal")),
+        );
+        assert_eq!(parent_to_fsync(Path::new("/")), None);
+    }
 
     fn state(template_id: u64) -> SnapshotState {
         SnapshotState {

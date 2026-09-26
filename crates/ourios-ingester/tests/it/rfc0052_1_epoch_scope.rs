@@ -115,45 +115,55 @@ fn rfc0052_1_batch_queued_before_the_cut_carries_the_cuts_epoch() {
     );
 }
 
-/// Scenario RFC0052.1 — a capture's own batches carry its own cut's epoch, on the timer path too.
+/// Scenario RFC0052.1 — the capture's drain is registered above its own cut.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rfc0052_1_a_timer_captures_own_batches_carry_the_cuts_epoch() {
-    // Given a ceiling that admits one capture, so the second parks
-    // everything it drained. A park is the reachable way to make a
-    // capture's own records re-enter the buffers at a later epoch, and so
-    // the one place the epoch they were registered under is observable
-    // from outside the capture.
+async fn rfc0052_1_a_captures_drain_is_registered_above_its_own_cut() {
+    // Given one acknowledged, buffered batch and a store that will refuse
+    // the publish — the arm that puts the cut's own batch back into the
+    // buffers *dated*, which is where the registration becomes visible.
     let tmp = tempfile::TempDir::new().expect("temp");
-    let rig = BarrierRig::with_ceiling(tmp.path(), 1);
+    let rig = BarrierRig::new(tmp.path());
     rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.pipeline.quiesce_encodes();
+    let before = rig.sink.quiesce_publishes().recorded();
+
+    // When a cut is captured and cannot publish.
     assert_eq!(
         rig.barrier.capture(&rig.pipeline, false),
         CaptureOutcome::Filled,
     );
-
-    // When a second capture takes cut E and parks its batch.
-    rig.ingest("checkout", &["user 2 logged in"]).await;
-    let parked = rig.epochs.current();
+    let cut = rig.barrier.pending_epoch().expect("a cut is pending");
     assert_eq!(
-        rig.barrier.capture(&rig.pipeline, false),
-        CaptureOutcome::Parked,
+        rig.epochs.current().get(),
+        cut.get() + 1,
+        "the slot holds cut E, so a publish registering from here reads E + 1",
     );
-    assert_eq!(
-        rig.barrier.run_pending(),
-        CutOutcome::Stamped,
-        "the pending cut is below the park and still stamps",
-    );
+    rig.sabotage_data_store();
+    assert_eq!(rig.barrier.run_pending(), CutOutcome::Retained);
 
-    // Then the return is dated against E — the epoch that capture
-    // registered its batch under — and refuses it. Allocated before the
-    // drain, `begin_publish` would read `E + 1` for the cut's own batch,
-    // the return would date at the epoch it was registered under, and
-    // `note_resettled` would record nothing at all.
-    let outcomes = rig.sink.quiesce_publishes();
+    // Then the requeue dated nothing, because the batch was registered at
+    // `E + 1`: the epoch `current()` already read when the capture
+    // drained. `note_resettled` discards a settlement whose date is at or
+    // below its registration, so a recorded one here would mean the drain
+    // ran while `current()` still read `E`.
+    //
+    // That is what opening the cut *before* the drain buys, and it is not
+    // bookkeeping: `current()` has to mean "the next cut that will drain
+    // the buffers" for the whole span in which this one is captured, so a
+    // pre-cut publish parking concurrently settles at `E + 1` and refuses
+    // `E`. Opened after the drain, such a park reads `E`, is discarded as
+    // covered, and the cut stamps over records that exist only in buffers
+    // it no longer holds — the escape `PublishCoordinator::park` exists to
+    // close.
+    assert_eq!(
+        rig.sink.quiesce_publishes().recorded(),
+        before,
+        "a batch registered above the cut that drained it dates no settlement",
+    );
     assert!(
-        !outcomes.all_ok(parked),
-        "a capture's own drained batch, back in the buffers, refuses its cut",
+        rig.sink.buffered_records() > 0,
+        "and its records are back in the buffers, where the next cut drains them",
     );
 }
 

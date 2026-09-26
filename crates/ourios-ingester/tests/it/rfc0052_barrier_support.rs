@@ -119,18 +119,6 @@ impl BarrierRig {
         )
     }
 
-    /// A rig with an explicit barrier ceiling and **no** rotation hook —
-    /// the timer path on its own, for the legs about what a capture parks.
-    pub fn with_ceiling(tmp: &Path, ceiling_bytes: usize) -> Self {
-        Self::build(
-            tmp,
-            RigSpec {
-                ceiling_bytes,
-                ..RigSpec::new(wal_config(&tmp.join("wal")))
-            },
-        )
-    }
-
     /// A rig whose encode worker panics on its first emit: the sink's
     /// inline audit barrier is the seam a worker really runs inside
     /// `emit_concurrent`, and a one-byte size target reaches it on every

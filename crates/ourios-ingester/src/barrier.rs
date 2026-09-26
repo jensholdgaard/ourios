@@ -461,22 +461,27 @@ impl Barrier {
         for batch in drained {
             published &= self.publish.write_ordered(batch, "barrier");
         }
-        if !published {
-            return CutOutcome::Retained;
-        }
         // Publishes registered *before* this cut settle here — the wait
-        // §3.1 has always made, now also reporting.
+        // §3.1 has always made, now also reporting. Unconditional, and
+        // §3.1 says why: "always evaluated, so a failed cut flush cannot
+        // skip their outcome and requeue path". Returning on `!published`
+        // first would leave those publishes in flight past the cut that
+        // was meant to wait for them, and the requeue they are about to
+        // make would land beside a buffer the next capture had already
+        // drained.
         let outcomes = self.publish.record().quiesce_publishes();
-        // Two independent refusals, and the order is only about which
+        // Three independent refusals, and the order is only about which
         // one is *named*. The recheck defends the ordering: a publish
         // registered before the barrier began can panic while it waits
         // above, and the latch it sets lands after the first check. The
         // outcome defends the data: a failure in any of those publishes
-        // means no stamp even though the cut's own flush succeeded.
+        // means no stamp even though the cut's own flush succeeded. §3.1
+        // spells the conjunction out — `ok = cut_ok and prior_ok and
+        // failed_epoch > cut.epoch`.
         if self.epochs.capture().refuses(epoch) {
             return CutOutcome::Latched;
         }
-        if !outcomes.all_ok(epoch) {
+        if !published || !outcomes.all_ok(epoch) {
             return CutOutcome::Retained;
         }
         // A failed install must not be followed by a stamp. §3.1 says a

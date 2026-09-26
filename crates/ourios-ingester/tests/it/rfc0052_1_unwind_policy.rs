@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ourios_ingester::barrier::CutOutcome;
+use ourios_ingester::barrier::{CaptureOutcome, CutOutcome};
 
 use crate::rfc0052_barrier_support::{BarrierRig, wal_config};
 
@@ -68,6 +68,65 @@ async fn rfc0052_1_publish_panic_during_quiesce_leaves_checkpoint_and_snapshots_
         !rig.sink.quiesce_publishes().all_ok(epoch),
         "the unwind is recorded as a failed publish, not only as a latch",
     );
+}
+
+/// Scenario RFC0052.1 — unwind leg: a failed cut flush still waits out the publishes before it.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_a_cut_whose_own_flush_failed_still_reports_the_publishes_before_it() {
+    // Given a publish registered *before* the cut and still in flight,
+    // and a cut whose own flush will fail: §3.1's `prior_ok` is "always
+    // evaluated, so a failed cut flush cannot skip their outcome and
+    // requeue path".
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.pipeline.quiesce_encodes();
+    let guard = rig.sink.begin_publish();
+    let registered = guard.epoch();
+
+    assert_eq!(
+        rig.barrier.capture(&rig.pipeline, false),
+        CaptureOutcome::Filled,
+    );
+    assert_eq!(
+        rig.barrier.pending_epoch(),
+        Some(registered),
+        "the guard was taken before the cut, so the cut carries its epoch",
+    );
+    // The cut's own `write_ordered` now fails, which is the arm that used
+    // to return before the quiesce.
+    rig.sabotage_data_store();
+
+    // When the cut runs and the prior publish then panics — after the
+    // failed flush, so only a path that actually waits can observe it.
+    let panicking = Arc::new(AtomicBool::new(false));
+    let release = Arc::clone(&panicking);
+    let sweep = std::thread::spawn(move || {
+        while !release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let _held = guard;
+        panic!("injected age-sweep publish panic");
+    });
+    let barrier = Arc::clone(&rig.barrier);
+    let running = std::thread::spawn(move || barrier.run_pending());
+    std::thread::sleep(Duration::from_millis(50));
+    panicking.store(true, Ordering::Release);
+    assert!(sweep.join().is_err(), "the publish panicked");
+    let outcome = running.join().expect("the barrier itself did not panic");
+
+    // Then the cut reports the latch that publish set. Returning on the
+    // failed flush instead answers `Retained` — the publish is left in
+    // flight past the cut that was meant to wait for it, and the requeue
+    // it is about to make lands beside a buffer the next capture has
+    // already drained.
+    assert_eq!(
+        outcome,
+        CutOutcome::Latched,
+        "the prior publish's outcome is evaluated even when the cut's own flush failed",
+    );
+    assert_nothing_reached_durability(&rig);
 }
 
 /// Scenario RFC0052.1 — unwind leg: an encode worker panics mid-batch, barrier after.

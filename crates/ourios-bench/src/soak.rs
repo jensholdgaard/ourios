@@ -1391,6 +1391,10 @@ impl Journal for SharedWal {
         Journal::segment_age_exceeded(&*lock_wal(&self.0))
     }
 
+    fn owes_rotation_fsync(&self) -> bool {
+        Journal::owes_rotation_fsync(&*lock_wal(&self.0))
+    }
+
     fn reclaim_state(&self) -> ourios_wal::ReclaimState {
         Journal::reclaim_state(&*lock_wal(&self.0))
     }
@@ -1426,6 +1430,32 @@ fn us_to_ms(us: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trait method with a default answers for an impl that forgets to
+    /// forward it, and `false` here is "no obligation owed" — silent at
+    /// every call site. `SharedWal` is the one non-test `Journal`, so its
+    /// documented delegation is asserted rather than trusted.
+    #[test]
+    fn shared_wal_forwards_the_rotation_fsync_obligation() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let mut wal = Wal::open(wal_config(tmp.path().to_path_buf())).expect("open WAL");
+        wal.append(ourios_wal::FrameKind::OtlpBatch, b"a frame worth sealing")
+            .expect("append");
+        wal.sync().expect("sync");
+        wal.arm_rotation_faults(ourios_wal::RotationFaults::failing(
+            ourios_wal::RotationSite::ParentFsync,
+            1,
+        ));
+        wal.rotate(ourios_wal::RotationKind::Owed)
+            .expect_err("the parent fsync fails after the rename");
+
+        let shared = SharedWal(Arc::new(Mutex::new(wal)));
+
+        assert!(
+            Journal::owes_rotation_fsync(&shared),
+            "the wrapper reports the obligation the wrapped WAL owes",
+        );
+    }
 
     #[test]
     fn pacing_interval_matches_target_rate() {

@@ -206,6 +206,7 @@ pub(crate) struct CorpusLokiLabels {
 }
 
 impl CorpusLokiLabels {
+    /// Records every resource of one parsed `LogsData` line.
     pub(crate) fn observe_all(
         &mut self,
         resource_logs: &[opentelemetry_proto::tonic::logs::v1::ResourceLogs],
@@ -215,6 +216,9 @@ impl CorpusLokiLabels {
         }
     }
 
+    /// Records one resource's stream label set: its promoted attributes, plus
+    /// the [`LOKI_UNKNOWN_SERVICE`] fallback when it has no `service.name`. A
+    /// `None` resource is indexed like an attribute-less one.
     pub(crate) fn observe(
         &mut self,
         resource: Option<&opentelemetry_proto::tonic::resource::v1::Resource>,
@@ -238,6 +242,9 @@ impl CorpusLokiLabels {
         self.label_sets.insert(set);
     }
 
+    /// The `loki_stream_labels` object of `comparative-results.json`. It
+    /// carries distinct-value counts rather than the values, so the artifact
+    /// stays small whatever the corpus.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let labels: serde_json::Map<String, serde_json::Value> = self
             .values
@@ -252,9 +259,9 @@ impl CorpusLokiLabels {
     }
 }
 
-/// One report line: `name=distinct_values` per triggered label, plus the
-/// stream count.
 impl std::fmt::Display for CorpusLokiLabels {
+    /// One report line: `name=distinct_values` per triggered label, plus the
+    /// stream count.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let labels: Vec<String> = self
             .values

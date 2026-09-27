@@ -106,6 +106,18 @@ where
 /// backend doesn't expose one.
 pub type EtaggedBytes = (Vec<u8>, Option<String>);
 
+/// One `/`-delimited level of a listing, as returned by
+/// [`Store::list_delimited_blocking`]: store-relative keys, each list sorted
+/// and unique.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DelimitedListing {
+    /// Objects directly under the listed prefix (not in a child "directory").
+    pub objects: Vec<String>,
+    /// The immediate child common-prefixes ("directories"), without a
+    /// trailing `/`.
+    pub common_prefixes: Vec<String>,
+}
+
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
 /// same code path targets `LocalFileSystem` or `AmazonS3` / S3-compatible.
@@ -499,6 +511,21 @@ impl Store {
         Arc::clone(&self.inner)
     }
 
+    /// This store with its backend replaced by `wrap(backend)` — for layering
+    /// an instrumenting or fault-injecting [`ObjectStore`] over the real one.
+    /// The prefix and the conditional-update capability are kept, so the
+    /// wrapper must forward every call it does not mean to change.
+    #[must_use]
+    pub fn wrap_backend(
+        self,
+        wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+    ) -> Self {
+        Self {
+            inner: wrap(self.inner),
+            ..self
+        }
+    }
+
     /// The store's root key prefix.
     #[must_use]
     pub fn prefix(&self) -> &ObjectPath {
@@ -704,6 +731,13 @@ impl Store {
     /// (RFC0019.5): a string-prefix sibling of the requested prefix is excluded.
     /// `LocalFileSystem` and S3 both surface subdirectories as common-prefixes.
     async fn list_common_prefixes(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        Ok(self.list_delimited(prefix).await?.common_prefixes)
+    }
+
+    /// One `/`-delimited level under `prefix`: the objects directly under it
+    /// and its immediate child common-prefixes, each store-relative, sorted and
+    /// deduplicated, with the same segment-wise scope as [`Self::list_blocking`].
+    async fn list_delimited(&self, prefix: Option<&str>) -> Result<DelimitedListing, StoreError> {
         let scoped = match prefix {
             Some(p) => self.resolve(p)?,
             None => self.prefix.clone(),
@@ -714,28 +748,55 @@ impl Store {
             .await
             .map_err(StoreError::Backend)?;
         let root = &self.prefix;
-        let mut prefixes: Vec<String> = result
-            .common_prefixes
-            .into_iter()
-            .filter_map(|p| {
-                // Same segment-wise gating as `list_entries`: exclude a
-                // string-prefix sibling, then strip the store `root` to the
-                // caller's key space. `?` rejects a prefix not under the
-                // requested one; the matched iterator isn't needed (the key is
-                // built from the `root` strip), so bind it to `_`.
-                let _ = p.prefix_match(&scoped)?;
-                let parts = p.prefix_match(root)?;
-                Some(
-                    parts
-                        .map(|s| s.as_ref().to_owned())
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                )
-            })
+        // Same segment-wise gating as `list_entries`: exclude a string-prefix
+        // sibling, then strip the store `root` to the caller's key space. `?`
+        // rejects a path not under the requested prefix; the matched iterator
+        // isn't needed (the key is built from the `root` strip), so bind it
+        // to `_`.
+        let relative = |p: &ObjectPath| -> Option<String> {
+            let _ = p.prefix_match(&scoped)?;
+            let parts = p.prefix_match(root)?;
+            Some(
+                parts
+                    .map(|s| s.as_ref().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        };
+        let mut objects: Vec<String> = result
+            .objects
+            .iter()
+            .filter_map(|m| relative(&m.location))
             .collect();
-        prefixes.sort();
-        prefixes.dedup();
-        Ok(prefixes)
+        let mut common_prefixes: Vec<String> =
+            result.common_prefixes.iter().filter_map(relative).collect();
+        objects.sort();
+        objects.dedup();
+        common_prefixes.sort();
+        common_prefixes.dedup();
+        Ok(DelimitedListing {
+            objects,
+            common_prefixes,
+        })
+    }
+
+    /// Blocking one-level delimited listing for the **sync** storage call
+    /// sites — the objects directly under `prefix` plus its immediate child
+    /// common-prefixes, from one `list_with_delimiter` request. The querier
+    /// walks a tenant's Hive time levels with this so a windowed query lists
+    /// only the subtrees its window can reach, not the tenant's whole history.
+    /// Safe to call from inside a tokio runtime (see [`Self::get_blocking`]).
+    /// Same order + isolation contract as [`Self::list_blocking`]; a prefix
+    /// matching nothing is an empty listing.
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// [`StoreError::Backend`] on a listing failure.
+    pub fn list_delimited_blocking(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<DelimitedListing, StoreError> {
+        block_on_off_runtime(self.list_delimited(prefix))
     }
 
     /// Blocking immediate-child common-prefix listing for the **sync** storage
@@ -1191,6 +1252,77 @@ mod tests {
                 .list_common_prefixes_blocking(Some("data/tenant_id=z"))
                 .expect("roll up z")
                 .is_empty(),
+        );
+    }
+
+    /// `list_delimited_blocking` returns one level: the objects directly under
+    /// the prefix plus its immediate child "directories", never a deeper key —
+    /// with the same segment-wise tenant scope as `list_blocking`.
+    #[test]
+    fn list_delimited_returns_one_level_of_objects_and_prefixes() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        for key in [
+            "data/tenant_id=a/stray.parquet",
+            "data/tenant_id=a/year=2025/month=12/day=31/hour=23/h0.parquet",
+            "data/tenant_id=a/year=2026/month=04/day=02/hour=10/h1.parquet",
+            "data/tenant_id=ab/other.parquet",
+            "data/tenant_id=ab/year=2027/h2.parquet",
+        ] {
+            store.put_blocking(key, b"x".to_vec()).expect("put");
+        }
+
+        let level = store
+            .list_delimited_blocking(Some("data/tenant_id=a"))
+            .expect("list tenant a");
+
+        assert_eq!(
+            level,
+            super::DelimitedListing {
+                objects: vec!["data/tenant_id=a/stray.parquet".to_string()],
+                common_prefixes: vec![
+                    "data/tenant_id=a/year=2025".to_string(),
+                    "data/tenant_id=a/year=2026".to_string(),
+                ],
+            },
+        );
+        assert_eq!(
+            store
+                .list_delimited_blocking(Some("data/tenant_id=z"))
+                .expect("list absent tenant"),
+            super::DelimitedListing::default(),
+            "a prefix matching nothing is an empty listing, not an error",
+        );
+    }
+
+    /// `wrap_backend` routes every call through the wrapper while keeping the
+    /// store's key space: a key written through the wrapped store is readable
+    /// through the original backend at the same key.
+    #[test]
+    fn wrap_backend_routes_calls_through_the_wrapper() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let wrapped_with = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&wrapped_with);
+        let wrapped = store.clone().wrap_backend(move |inner| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner
+        });
+
+        wrapped
+            .put_blocking("data/tenant_id=a/k.parquet", b"v".to_vec())
+            .expect("put through the wrapper");
+
+        assert_eq!(wrapped_with.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .get_blocking("data/tenant_id=a/k.parquet")
+                .expect("get through the original"),
+            b"v".to_vec(),
+        );
+        assert_eq!(
+            wrapped.supports_conditional_update(),
+            store.supports_conditional_update(),
         );
     }
 

@@ -57,7 +57,7 @@ pub use partition::{
 pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_KEY};
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
 pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
-pub use store::{S3Config, Store, StoreConfig, StoreError};
+pub use store::{DelimitedListing, S3Config, Store, StoreConfig, StoreError};
 pub use writer::{
     COMPACTED_RG_BYTES_ENV, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, MIN_COMPACTED_RG_BYTES,
     ROW_GROUP_FLUSH_BYTES, SUB_BATCH_ROWS, TARGET_COMPACTED_ROW_GROUPS, Writer, WriterError,

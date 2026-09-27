@@ -2059,8 +2059,10 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   exported the one number that does not grow during an outage;
 - **the retain floor and its lag** — `lag_bytes`, the frame bytes in the
   segments at least one tenant still holds back, less the current append
-  segment, and `lag_segments`, their count; both are zero while the floor is
-  `Unknown` or `None`, which hold nothing back on any tenant's account. The
+  segment, and `lag_segments`, their count; both are reported as zero while
+  the floor is `Unknown` (no pass has derived one, so no lag is reported
+  yet, whatever the ledger holds) or `None` (the checkpoint alone governs,
+  so no tenant holds anything back). The
   figures are **conservative by construction**: equal to the bytes and
   segments the floor retains below the checkpoint whenever the checkpoint
   covers every held segment, larger by the held post-checkpoint tail

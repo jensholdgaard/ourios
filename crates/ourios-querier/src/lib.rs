@@ -16,8 +16,9 @@
 //!   skips row groups via statistics) and B2 (RFC0007.2 — scanned row
 //!   groups + bytes read track the result size, not the corpus size)
 //!   are tested here.
-//! - **Rendering** (RFC 0017) — returned rows come back as [`LogRow`]s,
-//!   their bodies rendered from the tenant's template registry. The
+//! - **Rendering** (RFC 0017) — returned rows come back as [`LogRow`]s.
+//!   String bodies render from the tenant's template registry; structured
+//!   bodies decode from their stored canonical JSON. The
 //!   registry and the RFC 0001 alias map are both derived from the audit
 //!   stream ([`derive_template_registry`], [`derive_alias_map`]).
 //! - **Drift** (RFC 0010) — [`Querier::run_drift`] folds the audit

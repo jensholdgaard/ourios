@@ -192,6 +192,10 @@ pub struct Barrier {
     /// overwrite a newer snapshot.
     install: Mutex<Option<WalOffset>>,
     ceiling_bytes: usize,
+    /// Runs inside `capture_rotation` between the drain and the cut's
+    /// epoch — the window a racing park must not land in.
+    #[cfg(test)]
+    window: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Barrier {
@@ -217,6 +221,8 @@ impl Barrier {
             pending: Mutex::new(None),
             install: Mutex::new(None),
             ceiling_bytes,
+            #[cfg(test)]
+            window: Mutex::new(None),
         }
     }
 
@@ -280,17 +286,23 @@ impl Barrier {
     /// the rotation point (`prev`), not `last_durable`: the frames at or
     /// below it are exactly the ones the closed segment holds.
     ///
-    /// Unlike [`Self::capture`] this opens the cut *after* the drain, so
-    /// a publish registered before it and parking in between reads the
-    /// cut's own epoch and dates nothing — issue #835. Left as it is
-    /// here because the no-accumulation leg
+    /// Unlike [`Self::capture`] this opens the cut *after* the drain. A
+    /// barrier park cannot land between the two — the drain and the
+    /// epoch are one step against it — but a requeue by a publish
+    /// registered before the capture still can, reads the cut's own
+    /// epoch and dates nothing: issue #835. Left as it is here because
+    /// the no-accumulation leg
     /// (`rfc0052_1_a_latched_node_does_not_accumulate_the_cuts_it_refuses`)
     /// rests on this path dating settlements, and needs a replacement
     /// observable before the order can move.
     pub fn capture_rotation(&self, miner: &MinerCluster, mark: WalOffset) -> CaptureOutcome {
-        let drained = self.publish.drain_all();
+        let (drained, epoch) = self.publish.drain_all_then(|| {
+            #[cfg(test)]
+            self.in_window();
+            self.epochs.open_cut()
+        });
         let cut = Cut {
-            epoch: self.epochs.open_cut(),
+            epoch,
             mark: Some(mark),
             bytes: drained.estimated_bytes(),
             drained: vec![drained],
@@ -416,6 +428,18 @@ impl Barrier {
             return;
         };
         self.park(cut);
+    }
+
+    #[cfg(test)]
+    fn in_window(&self) {
+        let hook = self
+            .window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn take_pending(&self) -> Option<Cut> {
@@ -619,8 +643,25 @@ mod tests {
     use ourios_miner::snapshot::{SnapshotState, WalHighWater};
     use ourios_wal::WalOffset;
 
-    use super::Cut;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ourios_config::MinerConfig;
+    use ourios_core::audit::{
+        AuditEvent, AuditPayload, AuditSink, ParamType, TemplateChange, hash_triggering_line,
+    };
+    use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_parquet::Store;
+
+    use super::{Barrier, Cut, CutOutcome};
+    use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
     use crate::cadence::{BarrierEpochs, Epoch};
+    use crate::publish::PublishCoordinator;
+    use crate::receiver::CommitCoordinator;
+    use crate::receiver::pipeline::{Journal, ReceiveError};
+    use crate::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 
     fn state(byte: u64) -> SnapshotState {
         SnapshotState {
@@ -699,5 +740,155 @@ mod tests {
                  cut-consistent bytes",
             );
         }
+    }
+
+    /// A journal the barrier only ever stamps through, and whose stamp
+    /// fails — the outcome under test is the cut's decision, not the
+    /// sidecar write.
+    struct Unwritten;
+
+    impl Journal for Unwritten {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+            unreachable!("the barrier never appends")
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+            unreachable!("the barrier never syncs")
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    fn mined() -> MinedRecord {
+        MinedRecord {
+            tenant_id: TenantId::new("checkout"),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
+            time_unix_nano: 1_775_127_480_000_000_000,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: "1".to_owned(),
+            }],
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        }
+    }
+
+    fn created() -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("checkout"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: hash_triggering_line(b"user 1 logged in"),
+                triggering_line_sample: Some("user 1 logged in".to_owned()),
+                change: TemplateChange::Created {
+                    new_template: "user <*> logged in".to_owned(),
+                },
+            },
+        }
+    }
+
+    /// A park that `run_cut` or `invalidate_pending` makes — outside the
+    /// ingest exclusion — racing the rotation hook's capture, forced into
+    /// the one window that matters: after the capture's drain and before
+    /// its epoch.
+    ///
+    /// Landing there, the parked records miss the cut's drain and the
+    /// settlement is dated at the cut's own epoch, which refuses nothing
+    /// — so the cut would stamp over records that exist only in the
+    /// buffers. The park must instead be ordered wholly before the drain
+    /// (the cut carries the records) or wholly after the epoch (its
+    /// settlement refuses the cut).
+    #[test]
+    fn a_park_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (data, audit_root) = (tmp.path().join("data"), tmp.path().join("audit"));
+        std::fs::create_dir_all(&data).expect("data root");
+        std::fs::create_dir_all(&audit_root).expect("audit root");
+        let records = SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(&data).expect("data store"),
+            FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::ZERO,
+                ceiling_bytes: usize::MAX,
+            },
+        ));
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            Store::local(&audit_root).expect("audit store"),
+            1024,
+        ));
+        let publish = PublishCoordinator::new(records.clone(), audit.clone());
+        let barrier = Arc::new(Barrier::new(
+            publish.clone(),
+            CommitCoordinator::new(Box::new(Unwritten), Duration::ZERO, u64::MAX),
+            tmp.path().join("snapshots"),
+            usize::MAX,
+        ));
+
+        // A batch an earlier cut drained and now has to put back.
+        records.clone().emit(mined());
+        audit.clone().emit(created());
+        let parking = Cut {
+            epoch: barrier.epochs.current(),
+            mark: None,
+            drained: vec![publish.drain_all()],
+            snapshots: Vec::new(),
+            bytes: 0,
+        };
+
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let parker = Arc::clone(&barrier);
+        *barrier
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let thread = std::thread::spawn(move || {
+                parker.park(parking);
+                // The window may have stopped listening; that is the point.
+                let _ = parked_tx.send(());
+            });
+            // Every chance to land inside the window. Ordered against the
+            // capture, the park cannot finish here and this times out.
+            let _ = parked_rx.recv_timeout(Duration::from_millis(500));
+            thread_tx.send(thread).expect("the test is waiting");
+        }));
+
+        let miner = MinerCluster::new(MinerConfig::default());
+        barrier.capture_rotation(&miner, offset(64));
+        thread_rx
+            .recv()
+            .expect("the window ran")
+            .join()
+            .expect("the park completed");
+
+        assert_eq!(
+            barrier.run_pending(),
+            CutOutcome::Retained,
+            "the cut missed the parked records, so it must not stamp",
+        );
+        assert_eq!(records.buffered_records(), 1, "the records are buffered");
+        assert_eq!(audit.buffered_events(), 1, "beside their audit event");
     }
 }

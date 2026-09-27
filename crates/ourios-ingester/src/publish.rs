@@ -35,6 +35,8 @@
 //! is gated by the record sink's audit barrier (also under the miner lock), so
 //! every publication path is audit-ordered.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use ourios_core::audit::AuditEvent;
 use ourios_core::record::MinedRecord;
 use ourios_parquet::PartitionKey;
@@ -98,6 +100,16 @@ impl Drained {
 pub struct PublishCoordinator {
     record: SharedParquetSink,
     audit: SharedParquetAuditSink,
+    /// Orders every take out of the two buffers against every park back
+    /// into them (RFC 0052 §3.1). A park runs outside the ingest
+    /// exclusion, so without it a drain could land between a park's two
+    /// requeues — splitting records from their audit events — or, in the
+    /// rotation hook, between the drain and the cut's epoch, where the
+    /// park's settlement would be dated at that cut and refuse nothing.
+    ///
+    /// Taken after the ingest exclusion and the miner lock, before the
+    /// sinks' own locks, and never held while waiting on anything else.
+    handoff: Arc<Mutex<()>>,
     /// The RFC 0047 §3.3 graph emitter — fed with every published batch
     /// (the flush-cadence bridge), when the graph is configured.
     #[cfg(feature = "openfga")]
@@ -117,6 +129,7 @@ impl PublishCoordinator {
         Self {
             record,
             audit,
+            handoff: Arc::new(Mutex::new(())),
             #[cfg(feature = "openfga")]
             graph: None,
         }
@@ -149,6 +162,7 @@ impl PublishCoordinator {
     /// or sees them counted in flight — never neither.
     #[must_use]
     pub fn drain_aged(&self) -> Drained {
+        let _handoff = self.lock_handoff();
         let guard = self.record.begin_publish();
         let audit = self.audit.take_buffer();
         let records = self.record.drain_aged();
@@ -164,6 +178,22 @@ impl PublishCoordinator {
     /// [`Self::drain_aged`].
     #[must_use]
     pub fn drain_all(&self) -> Drained {
+        let _handoff = self.lock_handoff();
+        self.take_all()
+    }
+
+    /// [`Self::drain_all`], then `then` — with no park able to land
+    /// between the two. The rotation hook opens its cut's epoch in
+    /// `then`, so a park is dated either before the drain (the cut
+    /// carries its records) or after the epoch (its settlement refuses
+    /// the cut).
+    pub fn drain_all_then<R>(&self, then: impl FnOnce() -> R) -> (Drained, R) {
+        let _handoff = self.lock_handoff();
+        let drained = self.take_all();
+        (drained, then())
+    }
+
+    fn take_all(&self) -> Drained {
         let guard = self.record.begin_publish();
         let audit = self.audit.take_buffer();
         let records = self.record.drain_all();
@@ -172,6 +202,10 @@ impl PublishCoordinator {
             records,
             guard,
         }
+    }
+
+    fn lock_handoff(&self) -> MutexGuard<'_, ()> {
+        self.handoff.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// RFC 0052 §3.1's **park**: put a drained snapshot back where the
@@ -186,7 +220,11 @@ impl PublishCoordinator {
     /// had already drained the buffers, settle successfully, and the
     /// barrier would checkpoint over records that exist only in buffers
     /// it no longer holds.
+    ///
+    /// Both requeues and the date are one step against every drain —
+    /// see `handoff`.
     pub fn park(&self, drained: Drained) {
+        let _handoff = self.lock_handoff();
         let watermark = drained.audit_watermark();
         let Drained {
             audit,

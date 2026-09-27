@@ -132,14 +132,21 @@ fn sweep_reports_a_candidate_whose_manifest_swap_lost() {
     let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
     // Assert
-    assert_eq!(report.partitions_compacted, 0);
-    assert_eq!(report.per_tenant[0].candidates_found, 1, "{report:?}");
-    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    let found: Vec<_> = report
+        .per_tenant
+        .iter()
+        .map(|t| t.candidates_found)
+        .collect();
+    assert_eq!(
+        (report.partitions_compacted, found),
+        (0, vec![1]),
+        "{report:?}"
+    );
     assert!(
-        report.errors[0].contains("\"a\" 2026-04-02T10")
-            && report.errors[0].contains("not committed"),
-        "{}",
-        report.errors[0]
+        matches!(report.errors.as_slice(),
+            [e] if e.contains("\"a\" 2026-04-02T10") && e.contains("not committed")),
+        "{:?}",
+        report.errors
     );
 }
 
@@ -177,18 +184,24 @@ fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
     .expect("sweep");
 
     // Assert
-    assert_eq!(report.erasures.len(), 1, "{report:?}");
-    assert_eq!(report.erasures[0].phase, ErasurePhase::Rows);
-    assert_eq!(report.erasures[0].partitions_rewritten, 0);
-    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    let outcomes: Vec<_> = report
+        .erasures
+        .iter()
+        .map(|o| (o.phase, o.partitions_rewritten))
+        .collect();
+    assert_eq!(outcomes, vec![(ErasurePhase::Rows, 0)], "{report:?}");
     assert!(
-        report.errors[0].contains("\"c-1\"") && report.errors[0].contains("not committed"),
-        "{}",
-        report.errors[0]
+        matches!(report.errors.as_slice(),
+            [e] if e.contains("\"c-1\"") && e.contains("not committed")),
+        "{:?}",
+        report.errors
     );
-    let pending = pending_erasures(&store).expect("pending");
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].phase, ErasurePhase::Rows);
+    let pending: Vec<_> = pending_erasures(&store)
+        .expect("pending")
+        .iter()
+        .map(|r| r.phase)
+        .collect();
+    assert_eq!(pending, vec![ErasurePhase::Rows]);
 }
 
 #[test]

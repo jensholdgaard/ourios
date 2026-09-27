@@ -107,6 +107,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # `--all-features` alone hides lints that fire only when a feature is
+      # off (#803: clippy 1.98's `unused_async_trait_impl` on helpers whose
+      # only `.await` is feature-gated). Default features catch that shape.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   docs:
     name: cargo doc

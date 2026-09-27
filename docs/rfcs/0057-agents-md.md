@@ -101,9 +101,10 @@ twice."*
 The stub is **required, not a courtesy.** Claude Code reads
 `AGENTS.md` natively, but by default *"only when you have no
 `CLAUDE.md` in your working directory or above it"* [CC-mem]. Without
-the stub, a contributor with an older Claude Code, or one whose
-`~/.claude/CLAUDE.md` or a parent directory's `CLAUDE.md` exists, would
-load nothing from this repo. With it, every Claude Code version that
+the stub, a contributor with a Claude Code version that predates
+native `AGENTS.md` support, or one whose checkout sits below a
+directory holding its own `CLAUDE.md`, would load nothing from this
+repo. With it, every Claude Code version that
 supports imports loads the full text.
 
 The approval dialog Claude Code shows on first use applies only to
@@ -410,7 +411,8 @@ RFC 0012's. Each carries a runnable check.
 
 > **Scenario RFC0057.1 — history follows the move.**
 > - **Given** the enacting PR's first commit
-> - **When** `git show --stat --find-renames=100% <commit>` is run
+> - **When** `git show --stat --summary --find-renames=100% <commit>` is
+>   run
 > - **Then** it reports exactly one change, `CLAUDE.md => AGENTS.md`
 >   with 100% similarity
 > - **And** `git log --follow --oneline AGENTS.md` lists the commits

@@ -1626,9 +1626,11 @@ fn rotation_record_failed(e: reclaim_store::StoreError) -> AppendError {
 /// Create the WAL root and make its directory entries durable before
 /// anything reads them (RFC 0052 §3.2). A rename's parent fsync can
 /// fail after the entry is already visible to this process, so a
-/// listing alone does not prove a sidecar survives the next crash;
-/// one fsync here makes every entry the listing saw durable, and
-/// failing it is a fault to surface rather than to continue past.
+/// listing alone does not prove a sidecar survives the next crash.
+/// Fsyncing the root — and, when open had to create it, every
+/// directory it created along with the one holding the outermost —
+/// makes every entry the listing saw durable, and any of those fsyncs
+/// failing is a fault to surface rather than to continue past.
 fn prepare_root(root: &std::path::Path) -> Result<(), OpenError> {
     prepare_root_with(root, sync_parent_dir)
 }
@@ -1644,13 +1646,12 @@ fn prepare_root_with(
         op: "create_dir_all(wal_root)",
         source,
     })?;
-    to_sync
-        .iter()
-        .try_for_each(|dir| sync_dir(dir))
-        .map_err(|source| OpenError::Io {
-            op: "fsync(wal_root before reading the sidecars)",
-            source,
+    to_sync.iter().try_for_each(|dir| {
+        sync_dir(dir).map_err(|source| OpenError::Io {
+            op: "fsync(wal_root or a created ancestor, before reading the sidecars)",
+            source: std::io::Error::new(source.kind(), format!("{}: {source}", dir.display())),
         })
+    })
 }
 
 /// The directories `prepare_root` fsyncs, shallowest first: `root`
@@ -2531,6 +2532,13 @@ mod tests {
         assert!(
             matches!(outcome, Err(OpenError::Io { .. })),
             "an ancestor whose entry cannot be made durable fails the open",
+        );
+        let Err(OpenError::Io { source, .. }) = outcome else {
+            return;
+        };
+        assert!(
+            source.to_string().contains(&holder.display().to_string()),
+            "and the error names the directory whose fsync failed: {source}",
         );
     }
 

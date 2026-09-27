@@ -134,6 +134,151 @@ pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &[
 pub(crate) const LOKI_LABEL_DENYLIST: &[&str] =
     &["trace_id", "span_id", "template_id", "ourios_template_id"];
 
+/// [`LOKI_LABEL_ALLOWLIST`] in the form Loki matches it against: the source
+/// resource-attribute keys, exactly as `/config` lists them.
+///
+/// Loki matches a resource attribute's key against this list exactly, and
+/// only then renders the label name with dots as underscores. Reversing that
+/// rendering is ambiguous: `cloud.availability_zone` already carries an
+/// underscore, and a custom key literally named `service_name` is not
+/// promoted. `loki_resource_attributes_render_to_the_allowlist` ties the two
+/// lists together.
+pub(crate) const LOKI_PROMOTED_RESOURCE_ATTRIBUTES: &[&str] = &[
+    "service.name",
+    "service.namespace",
+    "service.instance.id",
+    "deployment.environment",
+    "deployment.environment.name",
+    "cloud.region",
+    "cloud.availability_zone",
+    "k8s.cluster.name",
+    "k8s.namespace.name",
+    "k8s.pod.name",
+    "k8s.container.name",
+    "container.name",
+    "k8s.replicaset.name",
+    "k8s.deployment.name",
+    "k8s.statefulset.name",
+    "k8s.daemonset.name",
+    "k8s.cronjob.name",
+    "k8s.job.name",
+];
+
+/// The `service_name` Loki's OTLP ingest assigns a resource that carries no
+/// `service.name`, observed against the pinned image.
+pub(crate) const LOKI_UNKNOWN_SERVICE: &str = "unknown_service";
+
+/// A resource attribute's value as Loki renders it into a label value.
+fn label_value(value: Option<&opentelemetry_proto::tonic::common::v1::AnyValue>) -> String {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
+    match value.and_then(|v| v.value.as_ref()) {
+        Some(Value::StringValue(s)) => s.clone(),
+        Some(Value::IntValue(i)) => i.to_string(),
+        Some(Value::BoolValue(b)) => b.to_string(),
+        Some(Value::DoubleValue(d)) => d.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The stream labels a replayed corpus actually triggers in Loki (#800).
+///
+/// [`LOKI_LABEL_ALLOWLIST`] is what the config *may* index; this is what a
+/// given corpus *does* index, which is what a §9 ratio has to be read
+/// against. It is derived from each `ResourceLogs`' resource attributes
+/// whose key exactly matches [`LOKI_PROMOTED_RESOURCE_ATTRIBUTES`], rendered
+/// the way Loki's OTLP ingest renders them (dots become underscores), rather
+/// than read back from `/loki/api/v1/labels`:
+/// that endpoint filters by time range, and against the pinned image a
+/// readback bounded to a weeks-old replay's range came back empty although
+/// the streams existed. The match is exact because
+/// `rfc0031_10_loki_label_allowlist` proves the allowlist equals Loki's
+/// effective promotion list, and the source-form list renders to the
+/// allowlist. A resource with no `service.name` gets Loki's
+/// [`LOKI_UNKNOWN_SERVICE`] fallback, as Loki assigns it.
+///
+/// Each distinct label set is one Loki stream, so `label_sets` is the
+/// resource-level stream count.
+#[derive(Debug, Default)]
+pub(crate) struct CorpusLokiLabels {
+    pub(crate) values: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    pub(crate) label_sets: std::collections::BTreeSet<Vec<(String, String)>>,
+}
+
+impl CorpusLokiLabels {
+    /// Records every resource of one parsed `LogsData` line.
+    pub(crate) fn observe_all(
+        &mut self,
+        resource_logs: &[opentelemetry_proto::tonic::logs::v1::ResourceLogs],
+    ) {
+        for rl in resource_logs {
+            self.observe(rl.resource.as_ref());
+        }
+    }
+
+    /// Records one resource's stream label set: its promoted attributes, plus
+    /// the [`LOKI_UNKNOWN_SERVICE`] fallback when it has no `service.name`. A
+    /// `None` resource is indexed like an attribute-less one.
+    pub(crate) fn observe(
+        &mut self,
+        resource: Option<&opentelemetry_proto::tonic::resource::v1::Resource>,
+    ) {
+        let mut set: Vec<(String, String)> = resource
+            .map_or(&[][..], |r| r.attributes.as_slice())
+            .iter()
+            .filter(|kv| LOKI_PROMOTED_RESOURCE_ATTRIBUTES.contains(&kv.key.as_str()))
+            .map(|kv| (kv.key.replace('.', "_"), label_value(kv.value.as_ref())))
+            .collect();
+        if !set.iter().any(|(label, _)| label == "service_name") {
+            set.push(("service_name".to_string(), LOKI_UNKNOWN_SERVICE.to_string()));
+        }
+        for (label, value) in &set {
+            self.values
+                .entry(label.clone())
+                .or_default()
+                .insert(value.clone());
+        }
+        set.sort();
+        self.label_sets.insert(set);
+    }
+
+    /// The `loki_stream_labels` object of `comparative-results.json`. It
+    /// carries distinct-value counts rather than the values, so the artifact
+    /// stays small whatever the corpus.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let labels: serde_json::Map<String, serde_json::Value> = self
+            .values
+            .iter()
+            .map(|(name, values)| (name.clone(), serde_json::json!(values.len())))
+            .collect();
+        serde_json::json!({
+            "allowlist_size": LOKI_LABEL_ALLOWLIST.len(),
+            "distinct_values_per_label": labels,
+            "streams": self.label_sets.len(),
+        })
+    }
+}
+
+impl std::fmt::Display for CorpusLokiLabels {
+    /// One report line: `name=distinct_values` per triggered label, plus the
+    /// stream count.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let labels: Vec<String> = self
+            .values
+            .iter()
+            .map(|(name, values)| format!("{name}={}", values.len()))
+            .collect();
+        write!(
+            f,
+            "{} of {} allowlisted labels triggered [{}], {} resource-level streams",
+            self.values.len(),
+            LOKI_LABEL_ALLOWLIST.len(),
+            labels.join(" "),
+            self.label_sets.len(),
+        )
+    }
+}
+
 /// GET Loki's effective `default_resource_attributes_as_index_labels` list,
 /// in label form (dots become underscores, as Loki's own mapping does).
 ///
@@ -535,11 +680,14 @@ pub(crate) async fn loki_query_matrix(
 /// encoded to 5.28 MB (503 `ResourceExhausted`); adapting the pusher to
 /// Loki's stock limit is the anti-strawman direction (a real OTLP
 /// exporter batches under size limits too).
+///
+/// Returns the [`CorpusLokiLabels`] the replay triggered, collected on the
+/// same parse pass so recording them costs no extra read of the corpus.
 pub(crate) async fn push_corpus_to_loki(
     http: &reqwest::Client,
     base: &str,
     corpus_dir: &std::path::Path,
-) {
+) -> CorpusLokiLabels {
     use prost::Message as _;
     use std::io::BufRead as _;
 
@@ -566,6 +714,7 @@ pub(crate) async fn push_corpus_to_loki(
     let mut pending: Vec<opentelemetry_proto::tonic::logs::v1::ResourceLogs> = Vec::new();
     let (mut pending_bytes, mut pending_lines) = (0usize, 0u64);
     let (mut batched, mut pushed) = (0u64, 0u64);
+    let mut labels = CorpusLokiLabels::default();
     for path in paths {
         let file = std::fs::File::open(&path).expect("open corpus file");
         for line in std::io::BufReader::new(file).lines() {
@@ -600,6 +749,7 @@ pub(crate) async fn push_corpus_to_loki(
                     );
                 }
             }
+            labels.observe_all(&data.resource_logs);
             pending.extend(data.resource_logs);
             pending_bytes += line_bytes;
             pending_lines += 1;
@@ -614,7 +764,8 @@ pub(crate) async fn push_corpus_to_loki(
         push_otlp(http, base, payload).await;
         pushed += 1;
     }
-    eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests");
+    eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests; {labels}");
+    labels
 }
 
 /// The Loki half of the §3.6 latency channel: [`LATENCY_REPS`] timed

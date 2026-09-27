@@ -366,7 +366,9 @@ impl PublishCoordinator {
     /// they are requeued, not published — and returns `false`. A permanent audit
     /// failure (malformed content dropped, [`crate::audit_sink`]) does not block:
     /// the records publish (degraded — those templates render retained/empty).
-    /// Returns whether everything was published (no transient retention on
+    /// Records whose events may sit in an earlier drain that is not durable
+    /// are requeued the same way, after this drain's own events are written
+    /// (see `Ledger`). Returns whether everything was published (no transient retention on
     /// either sink) — the caller's snapshot-gating signal (no-loss, §3.4).
     ///
     /// Consuming `drained` settles its in-flight publish guard on return

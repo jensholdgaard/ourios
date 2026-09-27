@@ -1,9 +1,12 @@
 # Verification
 
-> **Status:** active. This document is the process spec. The proposed
-> amendments to `docs/rfcs/README.md` and `CLAUDE.md` at the bottom of
-> this file are tracked separately and applied in their own PR once
-> the structure here is settled.
+> **Status:** active. This document is the process spec. The two
+> amendments recorded at the bottom of this file — to
+> `docs/rfcs/README.md` and `CLAUDE.md` — have been applied: the RFC
+> process now carries the five-stage maturity model and the §5
+> *Acceptance criteria* section, and `CLAUDE.md` has §5.6
+> *Verification process*. Those sections are kept as the record of
+> what changed and why.
 
 ## What this doc is for
 
@@ -351,9 +354,9 @@ the performance owner.
 ## 6. Worked example
 
 A concrete trace of the chain in §1, against an artefact that already
-exists. RFC 0001 *Template miner* is currently `status: draft`
-(becoming `drafted` once the amendment to `docs/rfcs/README.md`
-lands). Its operationalisation of `CLAUDE.md` §3.1 *No silent template
+exists. RFC 0001 *Template miner* was `status: draft` when this example
+was written; it has since moved through every maturity stage and is
+`accepted`. Its operationalisation of `CLAUDE.md` §3.1 *No silent template
 merges* and `hazards.md` H1 *Template miner correctness* is the first
 place this process gets to bite on real material.
 
@@ -578,9 +581,10 @@ The earlier `superseded` and `rejected` entries remain unchanged.
 
 ### Existing RFC frontmatter
 
-RFC 0001 and RFC 0002 currently carry `status: draft`. The amendment
-PR renames both to `status: drafted` so the maturity model applies
-uniformly. No content change to the RFCs themselves at that step.
+RFC 0001 and RFC 0002 carried `status: draft` when this amendment was
+proposed. The amendment PR renamed both to `status: drafted` so the
+maturity model applies uniformly, with no content change to the RFCs
+themselves at that step. Both have since reached `accepted`.
 
 ---
 
@@ -607,18 +611,19 @@ that decides which technique is required where*.
 ## Applying the amendments
 
 The body of this document is the verification process spec. The two
-proposed amendments above are pending application:
+amendments above have been applied; this section records what the
+applying PR carried:
 
 - `docs/rfcs/README.md` — `status:` value list, new §5 *Acceptance
   criteria* in *Required sections* with renumbering, lifecycle
   rewrite, `draft` → `drafted` rename in RFC 0001 and 0002.
 - `CLAUDE.md` — new §5.6 *Verification process*.
 
-Both should land in a single PR. RFC 0001 then gets a §5 *Acceptance
-criteria* applied as the first concrete use of the process — the
-worked example in §6 of this document is the target shape, and
-applying it will probably surface specificity gaps in RFC 0001's
-existing design. That surfacing is the point.
+Both were planned to land in a single PR. RFC 0001 then got a §5
+*Acceptance criteria* applied as the first concrete use of the
+process — the worked example in §6 of this document was the target
+shape, and applying it was expected to surface specificity gaps in
+RFC 0001's existing design. That surfacing is the point.
 
-Add this document to `docs/SUMMARY.md` under the *Architecture*
-header in the same PR that applies the amendments.
+This document is listed in `docs/SUMMARY.md` under the *Architecture*
+header, as the amendment PR required.

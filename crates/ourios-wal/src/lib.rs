@@ -1663,18 +1663,55 @@ fn rotation_record_failed(e: reclaim_store::StoreError) -> AppendError {
 /// Create the WAL root and make its directory entries durable before
 /// anything reads them (RFC 0052 §3.2). A rename's parent fsync can
 /// fail after the entry is already visible to this process, so a
-/// listing alone does not prove a sidecar survives the next crash;
-/// one fsync here makes every entry the listing saw durable, and
-/// failing it is a fault to surface rather than to continue past.
+/// listing alone does not prove a sidecar survives the next crash.
+/// Fsyncing the root — and, when open had to create it, every
+/// directory it created along with the one holding the outermost —
+/// makes every entry the listing saw durable, and any of those fsyncs
+/// failing is a fault to surface rather than to continue past.
 fn prepare_root(root: &std::path::Path) -> Result<(), OpenError> {
+    prepare_root_with(root, sync_parent_dir)
+}
+
+/// [`prepare_root`] with the directory fsync injected, so a test can
+/// observe which directories it reaches.
+fn prepare_root_with(
+    root: &std::path::Path,
+    mut sync_dir: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(), OpenError> {
+    let to_sync = dirs_made_durable_by(root);
     std::fs::create_dir_all(root).map_err(|source| OpenError::Io {
         op: "create_dir_all(wal_root)",
         source,
     })?;
-    sync_parent_dir(root).map_err(|source| OpenError::Io {
-        op: "fsync(wal_root before reading the sidecars)",
-        source,
+    to_sync.iter().try_for_each(|dir| {
+        sync_dir(dir).map_err(|source| OpenError::Io {
+            op: "fsync(wal_root or a created ancestor, before reading the sidecars)",
+            source: std::io::Error::new(source.kind(), format!("{}: {source}", dir.display())),
+        })
     })
+}
+
+/// The directories `prepare_root` fsyncs, shallowest first: `root`
+/// itself, and — for every ancestor `create_dir_all` is about to
+/// create — the directory that will hold its new entry. Syncing only
+/// `root` would leave an outer created directory's entry one crash
+/// away from taking the whole tree with it.
+fn dirs_made_durable_by(root: &std::path::Path) -> Vec<PathBuf> {
+    let missing: Vec<&std::path::Path> = root
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+        .collect();
+    let Some(shallowest) = missing.last() else {
+        return vec![root.to_path_buf()];
+    };
+    let holder = match shallowest.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => Some(PathBuf::from(".")),
+        parent => parent.map(std::path::Path::to_path_buf),
+    };
+    holder
+        .into_iter()
+        .chain(missing.iter().rev().map(|dir| dir.to_path_buf()))
+        .collect()
 }
 
 /// The segment appends land in: the newest existing one (§6.1's
@@ -2480,6 +2517,67 @@ mod tests {
     }
 
     use super::*;
+
+    fn record_prepare_root(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut synced = Vec::new();
+        prepare_root_with(root, |dir| {
+            synced.push(dir.to_path_buf());
+            Ok(())
+        })
+        .expect("prepare the root");
+        synced
+    }
+
+    /// A root with several absent ancestors: every directory
+    /// `create_dir_all` made has its entry fsynced in the directory
+    /// holding it, not only the innermost one.
+    #[test]
+    fn prepare_root_fsyncs_every_created_ancestor() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let outer = tmp.path().join("var");
+        let middle = outer.join("lib");
+        let root = middle.join("wal");
+
+        let synced = record_prepare_root(&root);
+
+        assert!(root.is_dir(), "the whole tree is created");
+        assert_eq!(
+            synced,
+            vec![tmp.path().to_path_buf(), outer, middle, root],
+            "the pre-existing holder, then each created directory, shallowest first",
+        );
+    }
+
+    #[test]
+    fn prepare_root_on_an_existing_root_fsyncs_only_the_root() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        assert_eq!(
+            record_prepare_root(tmp.path()),
+            vec![tmp.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn prepare_root_surfaces_a_failed_ancestor_fsync() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path().join("a").join("wal");
+        let holder = tmp.path().to_path_buf();
+        let outcome = prepare_root_with(&root, |dir| match dir {
+            failing if failing == holder => Err(std::io::Error::other("injected")),
+            _ => Ok(()),
+        });
+        assert!(
+            matches!(outcome, Err(OpenError::Io { .. })),
+            "an ancestor whose entry cannot be made durable fails the open",
+        );
+        let Err(OpenError::Io { source, .. }) = outcome else {
+            return;
+        };
+        assert!(
+            source.to_string().contains(&holder.display().to_string()),
+            "and the error names the directory whose fsync failed: {source}",
+        );
+    }
 
     /// RFC 0052 §3.2 with §6.3: no segment is reclaimed under a
     /// checkpoint whose directory entry is only renamed, not fsynced.

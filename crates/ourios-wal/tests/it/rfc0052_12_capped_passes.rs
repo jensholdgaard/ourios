@@ -15,7 +15,9 @@ use ourios_wal::{
     unlink_planned,
 };
 
-use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files, write_partial};
+use crate::rfc0052_support::{
+    build_tenant_segment, default_config, known, open, segment_files, write_partial,
+};
 
 /// A backlog far larger than the cap under test. The incident's 1,113
 /// segments is the shape; seven against a cap of two is the same
@@ -1125,6 +1127,90 @@ fn rfc0052_12_a_pass_before_the_ledger_is_rebuilt_reclaims_nothing() {
         resumed.removed_segments > 0 && resumed.capped,
         "the gate is the walk, not the pass: {resumed:?}",
     );
+}
+
+/// A plan abandoned after its record write leaves a durable `planned`
+/// row, and a horizon that regresses over its segment withdraws the
+/// segment without re-planning it: the row is stranded until the
+/// tenant's snapshot restores again or the next open reconciles it.
+/// The record's planned array is sized to the cap, so another tenant's
+/// pass that popped a full cap beside that row would plan one row more
+/// than the slot can encode, and every record write — every pass —
+/// would fail for as long as the tenant stays pinned.
+///
+/// The pass instead distinguishes a pop that replaces a durable row
+/// from one that adds one, and adds only what the array has room for:
+/// the other tenant keeps reclaiming, the stranded row keeps its
+/// witness, and the pinned segment is reclaimed once it is covered.
+#[test]
+fn rfc0052_12_a_stranded_planned_row_does_not_wedge_other_tenants_passes() {
+    // Given: a record whose planned array holds exactly the cap, one
+    // segment of `pinned`, then a backlog of `other`'s.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let config = ourios_wal::WalConfig {
+        max_unlinks_per_pass: u32::try_from(CAP).expect("cap"),
+        // §3.8: one rotation's debris must clear in one pass.
+        rotation_retry_attempts: u32::try_from(CAP).expect("cap"),
+        ..default_config(root)
+    };
+    drop(ourios_wal::Wal::open(config.clone()).expect("create the record at the cap"));
+    for empty in segment_files(root) {
+        std::fs::remove_file(empty).expect("drop the empty first segment");
+    }
+    let stranded = build_tenant_segment(root, &[("pinned", b"p1")])[0];
+    for index in 0..BACKLOG {
+        build_tenant_segment(root, &[("other", format!("o{index}").as_bytes())]);
+    }
+    let covered = build_tenant_segment(root, &[("other", b"current")])[0];
+    let current = newest_segment(root);
+    let mut wal = ourios_wal::Wal::open(config).expect("open");
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    // When: a pass plans the pinned tenant's segment, writes its record
+    // and dies before unlinking anything...
+    let abandoned = wal
+        .housekeeping_prepare(&known(&[("pinned", stranded), ("other", covered)]), CAP)
+        .expect("prepare");
+    assert!(
+        abandoned
+            .segments()
+            .iter()
+            .any(|s| s.segment == stranded.segment),
+        "the pinned tenant's segment is in the abandoned plan",
+    );
+    let _durable_row = wal.write_plan_record(&abandoned).expect("record");
+
+    // ...and that tenant's snapshot stops restoring, while the other
+    // tenant's passes keep running.
+    let other = known(&[("other", covered)]);
+    let mut removed = 0;
+    for _ in 0..(BACKLOG * 2) {
+        let progress = wal.housekeeping_pass(&other, CAP).unwrap_or_else(|e| {
+            panic!("a stranded row must not fail the other tenant's pass: {e}")
+        });
+        removed += progress.removed_segments;
+    }
+
+    // Then: the other tenant's backlog drained and the pinned segment
+    // was never unlinked.
+    assert_eq!(removed, BACKLOG, "every closed segment of `other`");
+    let survivors = segment_files(root)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .collect::<Vec<_>>();
+    assert_eq!(survivors.len(), 2, "the pinned segment and the current one");
+    assert!(survivors.contains(&current));
+
+    // And: once the tenant's snapshot restores, the stranded row's
+    // segment is re-planned as the deletion it may already have been,
+    // and reclaimed.
+    let progress = wal
+        .housekeeping_pass(&known(&[("pinned", stranded), ("other", covered)]), CAP)
+        .expect("the stranded row clears");
+    assert_eq!(progress.removed_segments, 1);
+    assert_eq!(segment_files(root), vec![current]);
 }
 
 /// `count` closed segments for one tenant plus a current one. The

@@ -157,22 +157,46 @@ fn window_listing(
                 })?;
         keys.extend(listing.objects);
         for child in listing.common_prefixes {
-            if matches!(level, HiveLevel::Hour) {
-                if hour_partition_in_window(&PathBuf::from(&child), start, end) {
-                    keys.extend(list_recursive(store, &child)?);
-                }
-                continue;
-            }
-            let segment = child.rsplit('/').next().unwrap_or(&child);
-            match child_span(level, segment) {
-                Some((_, lo, hi)) if hi <= start || end <= lo => {}
-                Some((next, lo, hi)) if lo < start || end < hi => pending.push((child, next)),
-                _ => keys.extend(list_recursive(store, &child)?),
+            match visit(level, &child, (start, end)) {
+                Visit::Skip => {}
+                Visit::Descend(next) => pending.push((child, next)),
+                Visit::List => keys.extend(list_recursive(store, &child)?),
             }
         }
     }
     keys.sort_unstable();
     Ok(keys)
+}
+
+/// What the window walk does with one child prefix.
+enum Visit {
+    /// Provably out of the window: not listed.
+    Skip,
+    /// Listed recursively in one call.
+    List,
+    /// Partly in the window: walked one level further down.
+    Descend(HiveLevel),
+}
+
+/// Decide how the walk treats `child`, a prefix listed under a directory at
+/// `level`: `hour=` leaves go through the same conservative prune as a full
+/// listing; a parsed ancestor is skipped when its span misses the window,
+/// descended into when the window cuts it, and listed whole when the window
+/// covers it; an unparseable one is listed whole.
+fn visit(level: HiveLevel, child: &str, (start, end): (u64, u64)) -> Visit {
+    if matches!(level, HiveLevel::Hour) {
+        return if hour_partition_in_window(&PathBuf::from(child), start, end) {
+            Visit::List
+        } else {
+            Visit::Skip
+        };
+    }
+    let segment = child.rsplit('/').next().unwrap_or(child);
+    match child_span(level, segment) {
+        Some((_, lo, hi)) if hi <= start || end <= lo => Visit::Skip,
+        Some((next, lo, hi)) if lo < start || end < hi => Visit::Descend(next),
+        _ => Visit::List,
+    }
 }
 
 /// Parse `segment` as the child of a directory at `level`, returning the level
@@ -492,9 +516,9 @@ mod tests {
     /// A half-open `[start, end)` query window in UTC nanoseconds.
     type Window = (u64, u64);
 
-    fn ns(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> u64 {
-        let nanos = chrono::NaiveDate::from_ymd_opt(year, month, day)
-            .and_then(|d| d.and_hms_opt(hour, minute, 0))
+    /// UTC nanoseconds of a `YYYY-MM-DDTHH:MM` instant.
+    fn ns(instant: &str) -> u64 {
+        let nanos = chrono::NaiveDateTime::parse_from_str(instant, "%Y-%m-%dT%H:%M")
             .expect("valid instant")
             .and_utc()
             .timestamp_nanos_opt()
@@ -540,19 +564,24 @@ mod tests {
             .expect("put manifest");
     }
 
+    /// Four partitions a day on days 1–3 of `year`-`month`.
+    fn seed_month(store: &Store, year: i32, month: u32) {
+        for day in 1..=3 {
+            for hour in [0, 6, 12, 18] {
+                put(
+                    store,
+                    &format!("{}/f.parquet", hour_prefix(year, month, day, hour)),
+                );
+            }
+        }
+    }
+
     /// Three years of four-partitions-a-day history for tenant `a`, a sibling
     /// tenant `ab` inside the window, and the query hours of interest.
     fn seed_history(store: &Store) {
         for year in 2024..=2026 {
             for month in 1..=4 {
-                for day in 1..=3 {
-                    for hour in [0, 6, 12, 18] {
-                        put(
-                            store,
-                            &format!("{}/f.parquet", hour_prefix(year, month, day, hour)),
-                        );
-                    }
-                }
+                seed_month(store, year, month);
             }
         }
         for hour in [10, 11] {
@@ -640,7 +669,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp");
         let (plain, wrapped, counter) = counted(tmp.path());
         seed_history(&plain);
-        let window = (ns(2026, 4, 2, 10, 20), ns(2026, 4, 2, 10, 30));
+        let window = (ns("2026-04-02T10:20"), ns("2026-04-02T10:30"));
         let in_window_hour = hour_prefix(2026, 4, 2, 10);
 
         // Act
@@ -691,7 +720,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp");
         let (plain, wrapped, counter) = counted(tmp.path());
         seed_history(&plain);
-        let window = (ns(2025, 1, 1, 0, 0), ns(2025, 3, 2, 6, 0));
+        let window = (ns("2025-01-01T00:00"), ns("2025-03-02T06:00"));
 
         // Act
         let live = resolve_live_keys(&wrapped, TENANT_PREFIX, Some(window)).expect("resolve");
@@ -745,38 +774,38 @@ mod tests {
         let cases: [(&str, Option<Window>, &[String]); 9] = [
             (
                 "in-window",
-                Some((ns(2026, 4, 2, 10, 20), ns(2026, 4, 2, 10, 30))),
+                Some((ns("2026-04-02T10:20"), ns("2026-04-02T10:30"))),
                 &[],
             ),
             (
                 "exact hour",
-                Some((ns(2026, 4, 2, 10, 0), ns(2026, 4, 2, 11, 0))),
+                Some((ns("2026-04-02T10:00"), ns("2026-04-02T11:00"))),
                 &[],
             ),
             (
                 "hour boundary",
-                Some((ns(2026, 4, 2, 10, 59), ns(2026, 4, 2, 11, 1))),
+                Some((ns("2026-04-02T10:59"), ns("2026-04-02T11:01"))),
                 &[],
             ),
             (
                 "next hour",
-                Some((ns(2026, 4, 2, 11, 0), ns(2026, 4, 2, 11, 30))),
+                Some((ns("2026-04-02T11:00"), ns("2026-04-02T11:30"))),
                 below_hour_10,
             ),
             (
                 "year boundary",
-                Some((ns(2025, 12, 31, 23, 30), ns(2026, 1, 1, 0, 30))),
+                Some((ns("2025-12-31T23:30"), ns("2026-01-01T00:30"))),
                 below_april,
             ),
             (
                 "wide",
-                Some((ns(2024, 2, 15, 7, 0), ns(2026, 3, 2, 5, 0))),
+                Some((ns("2024-02-15T07:00"), ns("2026-03-02T05:00"))),
                 below_april,
             ),
             ("everything", Some((0, u64::MAX)), &[]),
             (
                 "no data",
-                Some((ns(2030, 1, 1, 0, 0), ns(2030, 1, 2, 0, 0))),
+                Some((ns("2030-01-01T00:00"), ns("2030-01-02T00:00"))),
                 &junk,
             ),
             ("no window", None, &[]),
@@ -808,7 +837,7 @@ mod tests {
         for window in [
             None,
             Some((0, u64::MAX)),
-            Some((ns(2026, 4, 2, 10, 0), ns(2026, 4, 2, 11, 0))),
+            Some((ns("2026-04-02T10:00"), ns("2026-04-02T11:00"))),
         ] {
             let live = resolve_live_keys(&store, TENANT_PREFIX, window).expect("resolve");
             assert!(live.is_empty(), "window {window:?}: {live:?}");

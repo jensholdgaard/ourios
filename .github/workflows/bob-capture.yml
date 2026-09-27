@@ -268,14 +268,30 @@ jobs:
             exit 1
           fi
 
-      # The ApplicationProfiles are the BoB.
+      # The ApplicationProfiles are the BoB. Fetch each one by name: the
+      # storage server's list call returns metadata only (StorageImpl.GetList
+      # in storage v0.0.206), so a single `kubectl get applicationprofile -o
+      # yaml` exports empty shells with no containers, syscalls or execs.
       - name: Export profiles
         run: |
           mkdir -p bob-out
-          kubectl get applicationprofile -o yaml > bob-out/applicationprofiles.yaml
           kubectl get applicationprofile -o json \
             | jq -r '.items[] | .metadata.name' > bob-out/profile-names.txt
           cat bob-out/profile-names.txt
+          while read -r name; do
+            kubectl get applicationprofile "$name" -o yaml > "bob-out/${name}.yaml"
+            echo "--- ${name}: $(jq -n --slurpfile x <(kubectl get applicationprofile "$name" -o json) \
+              '$x[0].spec.containers // [] | length') containers"
+          done < bob-out/profile-names.txt
+          # A profile with no containers means the capture recorded nothing.
+          empty=$(for name in $(cat bob-out/profile-names.txt); do
+            kubectl get applicationprofile "$name" -o json \
+              | jq -r --arg n "$name" 'select((.spec.containers // []) | length == 0) | $n'
+          done)
+          if [ -n "$empty" ]; then
+            echo "::error::ApplicationProfiles with no recorded containers: ${empty}"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

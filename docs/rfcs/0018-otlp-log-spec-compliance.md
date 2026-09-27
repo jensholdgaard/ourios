@@ -156,6 +156,20 @@ Amend the RFC 0003 error-mapping contract to distinguish *transient* from
   WAL outage: retrying it byte-identical can never succeed, so it MUST stay
   non-retryable even though it surfaces as a `WalAppend` error.
 
+> **Amendment 2026-09-27 — post-rotation quiesce (RFC 0052 §3.3).**
+> The *terminal* post-rotation quiesce, once the retry budget is
+> exhausted, is no longer in the transient class. Incident #791 showed the
+> latch is permanent until a restart, and RFC 0052 §3.3
+> puts rotation failure under a bounded retry and adds a third class to
+> the two above: **server-terminal, client-retryable** — the node needs an
+> operator, and the client keeps its data and retries with exponential
+> backoff. A rotation failure still within its retry budget stays
+> transient; only the terminal state, once the budget is exhausted, enters
+> the new class. Both map to gRPC `UNAVAILABLE` / HTTP `503` with no
+> `Retry-After` or `RetryInfo`, since the server cannot predict when the
+> terminal state clears. The binding rule below is unchanged: neither
+> carries a non-retryable code.
+
 The 429/503 *throttling* surface itself remains a **SHOULD** and may stay
 minimal (no rate-limiter yet, RFC 0003 §6.7); the binding change here is
 that a transient failure MUST NOT be reported with a non-retryable code.

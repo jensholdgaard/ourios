@@ -578,7 +578,7 @@ fn build_write_sinks(
     let sink = SharedParquetSink::new(
         ParquetRecordSink::new(store, flush_config())
             .with_promoted_attributes(promoted)
-            .with_audit_barrier(Box::new(move || barrier_audit.flush()))
+            .with_audit_barrier(Box::new(move || barrier_audit.barrier()))
             // RFC 0025 §3.3: permanently-rejected records quarantine
             // to the shared audit stream instead of wedging the
             // partition buffer (#362).

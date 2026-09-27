@@ -329,8 +329,10 @@ enacting PR's author.
 - **No `.github/copilot-instructions.md`, no `.cursor/rules/`, no
   `GEMINI.md`.** Copilot and Codex read `AGENTS.md` directly (verified).
   Cursor and Jules are reported to (unverified); if the enacting PR's
-  re-check finds either does not, that tool gets a pointer file under
-  the same rule as Gemini CLI below, never a copy.
+  re-check finds either does not, this RFC is amended before it
+  reaches `specified` to name that tool's pointer file and add it to
+  RFC0057.5 and RFC0057.6; the enacting PR adds no file those
+  scenarios do not list.
 - **Gemini CLI is the one genuine gap.** It reads `AGENTS.md` only when
   `context.fileName` lists it. The documented example is
   `{"context":{"fileName":["AGENTS.md","CONTEXT.md","GEMINI.md"]}}`
@@ -497,8 +499,10 @@ RFC 0012's. Each carries a runnable check.
 
 No code changes, so no `proptest`, corpus or `criterion` work
 (`CLAUDE.md` §6.2 techniques do not apply). RFC0057.1, .2, .4 and .6 are
-shell one-liners the enacting PR description runs and pastes;
-RFC0057.3's second clause and RFC0057.5 are reviewer checks. As with
+shell one-liners the enacting PR description runs and pastes, as is
+RFC0057.3's first clause (`cat CLAUDE.md`); RFC0057.3's second clause
+and RFC0057.5 are reviewer checks; RFC0057.7 is the existing CI
+`mdbook build` job. As with
 RFC 0012, the load-bearing gate is the footer's majority maintainer
 approval on the enacting PR.
 

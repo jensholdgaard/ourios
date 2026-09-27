@@ -28,6 +28,7 @@ and verify it with the GitHub CLI (the `--repo` bounds the accepted signer
 identity to this repo's release workflow):
 
 ```sh
+VERSION=X.Y.Z   # the release to verify, without the leading v
 gh release download "v${VERSION}" --repo jensholdgaard/ourios \
   --pattern 'ourios-server-x86_64-unknown-linux-gnu.tar.xz'
 gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \

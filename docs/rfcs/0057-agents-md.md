@@ -470,8 +470,9 @@ RFC 0012's. Each carries a runnable check.
 > - **When** its diff against the first is reviewed
 > - **Then** every hunk in `AGENTS.md` corresponds to an item in
 >   §3.4.1–§3.4.9, and the only other change is the new `CLAUDE.md`
->   stub of §3.2 (plus `.gemini/settings.json` if §3.6's option is
->   taken)
+>   stub of §3.2, plus exactly one Gemini CLI route from §3.6: a new
+>   `.gemini/settings.json`, or the one-sentence setting added to
+>   `CONTRIBUTING.md`
 > - **And** `grep -niE 'claude|anthropic' AGENTS.md` matches only the
 >   footer's history, §7's `.claude/` and `CLAUDE.md` stub lines, §8's
 >   parenthetical examples, and §9's example trailer / header

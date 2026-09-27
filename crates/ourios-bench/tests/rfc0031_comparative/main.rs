@@ -851,7 +851,7 @@ fn rfc0031_indicative_comparative_run() {
     // FIRST — before split/equivalence/gates can panic — so every run,
     // passing or failing, leaves a queryable completeness artifact.
     if let Ok(path) = std::env::var("OURIOS_COMPARATIVE_RESULTS") {
-        let mut results = comparative_results_json(
+        let results = comparative_results_json(
             &specs,
             &ourios,
             &loki,
@@ -863,13 +863,7 @@ fn rfc0031_indicative_comparative_run() {
             pair.total_records,
             &class_filter,
         );
-        results["loki_stream_labels"] = loki_labels.to_json();
-        let rendered = serde_json::to_string_pretty(&results).expect("results serialize");
-        match std::fs::write(&path, rendered) {
-            Ok(()) => eprintln!("comparative results artifact written to {path}"),
-            // Diagnostic-only output must never fail the run.
-            Err(e) => eprintln!("(couldn't write the results artifact to {path}: {e})"),
-        }
+        write_results_artifact(&path, results, &loki_labels);
     }
 
     let (ok_specs, ok_ourios, ok_loki, mut failures) = split_measurements(&specs, &ourios, loki);
@@ -1167,6 +1161,34 @@ fn run_l4_pair(
     )
 }
 
+/// Writes the per-pair record with the run's Loki label inventory (#800)
+/// alongside it.
+fn write_results_artifact(
+    path: &str,
+    mut results: serde_json::Value,
+    loki_labels: &CorpusLokiLabels,
+) {
+    results["loki_stream_labels"] = loki_labels.to_json();
+    let rendered = serde_json::to_string_pretty(&results).expect("results serialize");
+    match std::fs::write(path, rendered) {
+        Ok(()) => eprintln!("comparative results artifact written to {path}"),
+        // Diagnostic-only output must never fail the run.
+        Err(e) => eprintln!("(couldn't write the results artifact to {path}: {e})"),
+    }
+}
+
+/// The report block's opening lines. The job summary greps from the first
+/// line, so the label inventory (#800) sits inside the captured block.
+fn print_report_header(
+    corpus_dir: &std::path::Path,
+    total_records: u64,
+    loki_labels: &CorpusLokiLabels,
+) {
+    println!("=== RFC 0031 indicative comparative run ===");
+    println!("corpus: {} ({total_records} records)", corpus_dir.display());
+    println!("loki stream labels: {loki_labels}");
+}
+
 /// The indicative run's report block, one section per pair, labeled per
 /// the §7 partial freeze (2026-07-13) — the bytes-channel labeling
 /// itself is [`print_pair_bytes_gates`].
@@ -1186,9 +1208,7 @@ fn print_indicative_report(
     loki: &[Measured],
     loki_labels: &CorpusLokiLabels,
 ) {
-    println!("=== RFC 0031 indicative comparative run ===");
-    println!("corpus: {} ({total_records} records)", corpus_dir.display());
-    println!("loki stream labels: {loki_labels}");
+    print_report_header(corpus_dir, total_records, loki_labels);
     for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
         specs.iter().zip(ourios).zip(loki)
     {

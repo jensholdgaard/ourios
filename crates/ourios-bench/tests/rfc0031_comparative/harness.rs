@@ -1052,10 +1052,20 @@ fn corpus_loki_labels_counts_triggered_labels_and_streams() {
          service_name=5 service_namespace=1], 7 resource-level streams",
     );
     let json = labels.to_json();
-    assert_eq!(json["allowlist_size"], 18);
-    assert_eq!(json["streams"], 7);
-    assert_eq!(json["distinct_values_per_label"]["service_name"], 5);
-    assert!(json["distinct_values_per_label"].get("host_name").is_none());
+    let per_label = &json["distinct_values_per_label"];
+    assert_eq!(
+        (
+            &json["allowlist_size"],
+            &json["streams"],
+            &per_label["service_name"]
+        ),
+        (
+            &serde_json::json!(18),
+            &serde_json::json!(7),
+            &serde_json::json!(5)
+        ),
+    );
+    assert!(per_label.get("host_name").is_none());
 }
 
 pub(crate) fn split_measurements(

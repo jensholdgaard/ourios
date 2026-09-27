@@ -30,8 +30,11 @@ fn rfc0052_17_entry_with_undecodable_snapshot_halts_naming_the_tenant() {
     // horizons, so `RECLAIM` holds an entry per reclaimed tenant.
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
+    // `beta` keeps a surviving frame in the second segment: an entry
+    // whose tenant has none is satisfied by absence (§3.2), and that
+    // case is the churned-out test below.
     let first = build_tenant_segment(root, &[("alpha", b"a1"), ("beta", b"b1")]);
-    build_tenant_segment(root, &[("alpha", b"a2")]);
+    build_tenant_segment(root, &[("alpha", b"a2"), ("beta", b"b2")]);
     let mut wal = open(root);
     wal.rebuild_ledger().expect("ledger");
     wal.checkpoint(first[1]).expect("checkpoint past the first");
@@ -70,6 +73,124 @@ fn rfc0052_17_entry_with_undecodable_snapshot_halts_naming_the_tenant() {
     restarted
         .housekeeping_prepare(&horizons, CAP)
         .expect("a restorable horizon at or above the entry proceeds");
+}
+
+/// Scenario RFC0052.17 — entry present, no surviving frame, snapshot undecodable: satisfied by absence.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.2 and §5.
+#[test]
+fn rfc0052_17_churned_out_entry_is_satisfied_by_absence() {
+    // Given: a pass reclaimed the only segment `beta` ever wrote to, so
+    // the record holds an entry for `beta` and the ledger holds no
+    // frame of it; `alpha` keeps writing.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let first = build_tenant_segment(root, &[("alpha", b"a1"), ("beta", b"b1")]);
+    let second = build_tenant_segment(root, &[("alpha", b"a2")]);
+    build_tenant_segment(root, &[("alpha", b"a3")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(second[0])
+        .expect("checkpoint past the second");
+    assert_eq!(
+        wal.housekeeping_pass(&known(&[("alpha", first[0]), ("beta", first[1])]), CAP)
+            .expect("housekeeping")
+            .removed_segments,
+        1,
+    );
+    drop(wal);
+
+    // When: the node restarts with `beta`'s snapshot undecodable.
+    let mut restarted = open(root);
+    restarted.rebuild_ledger().expect("ledger");
+    assert!(
+        reclaimed_through(root).contains_key("beta"),
+        "the churned-out tenant's entry outlives its frames",
+    );
+    let before = segment_files(root).len();
+    let progress = restarted
+        .housekeeping_pass(&known(&[("alpha", second[0])]), CAP)
+        .expect("an entry with no surviving frame is satisfied by absence");
+
+    // Then: the pass succeeds and the other tenant reclaims.
+    assert_eq!(progress.removed_segments, 1, "alpha's covered segment goes");
+    assert_eq!(segment_files(root).len(), before - 1);
+}
+
+/// Scenario RFC0052.17 — absence is read only from a ledger that describes the root.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.2 and §5.
+#[test]
+fn rfc0052_17_absence_is_not_read_before_the_ledger_is_rebuilt() {
+    // Given: `beta`'s entry outlives the segment it was reclaimed from,
+    // but `beta` still has a frame on disk.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let first = build_tenant_segment(root, &[("alpha", b"a1"), ("beta", b"b1")]);
+    let second = build_tenant_segment(root, &[("alpha", b"a2"), ("beta", b"b2")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(first[1]).expect("checkpoint past the first");
+    wal.housekeeping_pass(&known(&[("alpha", first[0]), ("beta", first[1])]), CAP)
+        .expect("housekeeping");
+    drop(wal);
+
+    // When: a pass runs on the restarted node before the recovery walk
+    // has described the root, with `beta`'s snapshot undecodable.
+    let mut restarted = open(root);
+    assert!(reclaimed_through(root).contains_key("beta"));
+    let failure = restarted
+        .housekeeping_prepare(&known(&[("alpha", second[0])]), CAP)
+        .expect_err("an undescribed root proves no absence");
+
+    // Then: the entry is still pending and the halt names the tenant.
+    assert!(
+        format!("{failure}").contains("beta"),
+        "the halt names the tenant: {failure}",
+    );
+}
+
+/// Scenario RFC0052.17 — a churned-out tenant that writes again halts until its next snapshot.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.2 and §5.
+#[test]
+fn rfc0052_17_returning_tenant_halts_until_its_next_snapshot() {
+    // Given: `beta`'s only segment reclaimed, so its entry outlives its
+    // frames, and then `beta` writes again after its snapshot was lost.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let first = build_tenant_segment(root, &[("alpha", b"a1"), ("beta", b"b1")]);
+    let second = build_tenant_segment(root, &[("alpha", b"a2")]);
+    let returned = build_tenant_segment(root, &[("beta", b"b2")]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(first[1]).expect("checkpoint past the first");
+    wal.housekeeping_pass(&known(&[("alpha", first[0]), ("beta", first[1])]), CAP)
+        .expect("housekeeping");
+    drop(wal);
+
+    // When: the next pass runs with `beta` holding surviving frames and
+    // no restorable snapshot.
+    let mut restarted = open(root);
+    restarted.rebuild_ledger().expect("ledger");
+    assert!(reclaimed_through(root).contains_key("beta"));
+    restarted
+        .checkpoint(second[0])
+        .expect("checkpoint past the second");
+    let before = segment_files(root).len();
+    let failure = restarted
+        .housekeeping_pass(&known(&[("alpha", second[0])]), CAP)
+        .expect_err("the returning tenant's entry applies again");
+
+    // Then: reclamation halts naming the tenant, for every tenant.
+    assert!(
+        format!("{failure}").contains("beta"),
+        "the halt names the tenant: {failure}",
+    );
+    assert_eq!(segment_files(root).len(), before, "nothing is reclaimed");
+
+    // And: once `beta`'s first new snapshot installs, the pass proceeds.
+    let progress = restarted
+        .housekeeping_pass(&known(&[("alpha", second[0]), ("beta", returned[0])]), CAP)
+        .expect("a restorable horizon at or above the entry proceeds");
+    assert_eq!(progress.removed_segments, 1, "alpha's covered segment goes");
 }
 
 /// Scenario RFC0052.17 — no entry, snapshot undecodable: pin at the oldest surviving frame.

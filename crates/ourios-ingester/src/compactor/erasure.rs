@@ -266,16 +266,9 @@ pub(super) fn erase_pending(
                     }
                     Err(e) => {
                         clean = false;
-                        report.gc_failures += e.gc_failures;
-                        report.errors.push(format!(
-                            "erase {:?} {:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                            request.tenant,
-                            request.conversation_id,
-                            partition.year,
-                            partition.month,
-                            partition.day,
-                            partition.hour,
-                        ));
+                        let hour = hour_label(&partition);
+                        let (tenant, id) = (&request.tenant, &request.conversation_id);
+                        e.record(report, &format!("erase {tenant:?} {id:?} {hour}"));
                     }
                 }
             }

@@ -331,13 +331,10 @@ pub fn run_sweep_hooked(
                     }
                     report.gc_failures += outcome.gc_failures;
                 }
-                Err(e) => {
-                    report.gc_failures += e.gc_failures;
-                    report.errors.push(format!(
-                        "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                        partition.year, partition.month, partition.day, partition.hour,
-                    ));
-                }
+                Err(e) => e.record(
+                    &mut report,
+                    &format!("compact {tenant:?} {}", hour_label(&partition)),
+                ),
             }
         }
         report.per_tenant.push(TenantSweep {
@@ -729,9 +726,20 @@ struct Uncommitted {
     gc_failures: usize,
 }
 
-impl std::fmt::Display for Uncommitted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.reason)
+/// `partition`'s hour as `YYYY-MM-DDTHH`, for sweep error messages.
+fn hour_label(partition: &PartitionKey) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}",
+        partition.year, partition.month, partition.day, partition.hour
+    )
+}
+
+impl Uncommitted {
+    /// Record this as a sweep error under `context`, with its cleanup
+    /// failures.
+    fn record(self, report: &mut SweepReport, context: &str) {
+        report.gc_failures += self.gc_failures;
+        report.errors.push(format!("{context}: {}", self.reason));
     }
 }
 

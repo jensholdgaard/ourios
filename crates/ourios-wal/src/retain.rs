@@ -454,7 +454,8 @@ impl SegmentLedger {
     /// cursor-to-horizon span. Counting the span itself would cost a
     /// range count proportional to what a rising horizon newly covers,
     /// the unbounded work under the journal guard RFC0052.12 forbids.
-    /// Zero until a pass receives horizons, and zero again under
+    /// Zero before the first `Known` pass — an empty map counts as
+    /// one — and zero again under
     /// `NoConsumer`: the ledger keeps its tenant membership either way
     /// — a later `Known` pass resumes from it — but reporting it as
     /// remaining work would export a backlog no pass will ever reduce.

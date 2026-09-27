@@ -1188,7 +1188,7 @@ fn print_indicative_report(
 ) {
     println!("=== RFC 0031 indicative comparative run ===");
     println!("corpus: {} ({total_records} records)", corpus_dir.display());
-    println!("loki stream labels: {}", loki_labels.summary());
+    println!("loki stream labels: {loki_labels}");
     for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
         specs.iter().zip(ourios).zip(loki)
     {

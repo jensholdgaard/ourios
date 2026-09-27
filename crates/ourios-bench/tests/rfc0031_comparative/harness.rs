@@ -1033,7 +1033,7 @@ fn corpus_loki_labels_counts_triggered_labels_and_streams() {
     // recommendation resource is the same stream.
     assert_eq!(labels.label_sets.len(), 7);
     assert_eq!(
-        labels.summary(),
+        labels.to_string(),
         "3 of 18 allowlisted labels triggered [service_instance_id=4 \
          service_name=5 service_namespace=1], 7 resource-level streams",
     );

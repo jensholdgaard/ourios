@@ -196,23 +196,6 @@ impl CorpusLokiLabels {
         self.label_sets.insert(set);
     }
 
-    /// One report line: `name=distinct_values` per triggered label, plus the
-    /// stream count.
-    pub(crate) fn summary(&self) -> String {
-        let labels: Vec<String> = self
-            .values
-            .iter()
-            .map(|(name, values)| format!("{name}={}", values.len()))
-            .collect();
-        format!(
-            "{} of {} allowlisted labels triggered [{}], {} resource-level streams",
-            self.values.len(),
-            LOKI_LABEL_ALLOWLIST.len(),
-            labels.join(" "),
-            self.label_sets.len(),
-        )
-    }
-
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let labels: serde_json::Map<String, serde_json::Value> = self
             .values
@@ -224,6 +207,26 @@ impl CorpusLokiLabels {
             "distinct_values_per_label": labels,
             "streams": self.label_sets.len(),
         })
+    }
+}
+
+/// One report line: `name=distinct_values` per triggered label, plus the
+/// stream count.
+impl std::fmt::Display for CorpusLokiLabels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let labels: Vec<String> = self
+            .values
+            .iter()
+            .map(|(name, values)| format!("{name}={}", values.len()))
+            .collect();
+        write!(
+            f,
+            "{} of {} allowlisted labels triggered [{}], {} resource-level streams",
+            self.values.len(),
+            LOKI_LABEL_ALLOWLIST.len(),
+            labels.join(" "),
+            self.label_sets.len(),
+        )
     }
 }
 
@@ -712,10 +715,7 @@ pub(crate) async fn push_corpus_to_loki(
         push_otlp(http, base, payload).await;
         pushed += 1;
     }
-    eprintln!(
-        "loki ingest complete: {batched} LogsData lines in {pushed} requests; stream labels: {}",
-        labels.summary(),
-    );
+    eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests; {labels}");
     labels
 }
 

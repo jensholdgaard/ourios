@@ -20,9 +20,9 @@ use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionPolicy, PartitionKey, PromotedAttributes, RowHooks,
-    Store, compact_partition_hooked, gc_orphans, hour_partitions, percent_decode_tenant,
-    percent_encode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionOutcome, CompactionPolicy, PartitionKey,
+    PromotedAttributes, RowHooks, Store, compact_partition_hooked, gc_orphans, hour_partitions,
+    percent_decode_tenant, percent_encode_tenant, plan_candidates,
 };
 
 #[cfg(feature = "openfga")]
@@ -309,22 +309,10 @@ pub fn run_sweep_hooked(
                     .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
                 drop: None,
             };
-            match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
-                // An uncommitted outcome with two or more live files lost the
-                // manifest swap. With one sweeper that is never a benign race:
-                // surface it, or a store whose swaps always lose looks like an
-                // idle sweep.
-                Ok(outcome) if outcome.committed.is_none() && outcome.files_before >= 2 => {
-                    report.errors.push(format!(
-                        "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: selected with {} live files \
-                     but not committed (manifest compare-and-swap lost); retried next sweep",
-                        partition.year,
-                        partition.month,
-                        partition.day,
-                        partition.hour,
-                        outcome.files_before,
-                    ));
-                }
+            let result = compact_partition_hooked(store, &partition, promoted, &mut row_hooks)
+                .map_err(|e| e.to_string())
+                .and_then(swap_committed);
+            match result {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
@@ -736,6 +724,20 @@ pub(crate) fn to_u64(value: usize) -> u64 {
 /// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
 /// the sweep's wall clock; the partition is the canonical
 /// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
+/// An uncommitted outcome with two or more live files lost the manifest
+/// swap. With one sweeper that is never a benign race: it is an error, or a
+/// store whose swaps always lose looks like an idle sweep.
+fn swap_committed(outcome: CompactionOutcome) -> Result<CompactionOutcome, String> {
+    if outcome.committed.is_none() && outcome.files_before >= 2 {
+        return Err(format!(
+            "selected with {} live files but not committed \
+             (manifest compare-and-swap lost); retried next sweep",
+            outcome.files_before
+        ));
+    }
+    Ok(outcome)
+}
+
 fn compaction_audit_event(
     tenant: &str,
     now_unix_nanos: u64,

@@ -206,6 +206,31 @@ struct State {
     if_match_puts: AtomicUsize,
 }
 
+fn get(objects: &Objects, key: &str, stream: &TcpStream) {
+    let found = objects
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(key)
+        .cloned();
+    match found {
+        Some((bytes, etag)) => respond(
+            stream,
+            "200 OK",
+            &[
+                ("ETag", format!("\"{etag}\"")),
+                ("Last-Modified", "Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+            ],
+            &bytes,
+        ),
+        None => respond(
+            stream,
+            "404 Not Found",
+            &[],
+            b"<Error><Code>NoSuchKey</Code></Error>",
+        ),
+    }
+}
+
 fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
     let State {
         objects, next_etag, ..
@@ -224,30 +249,7 @@ fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
             let xml = list(objects, &req);
             respond(stream, "200 OK", &[], xml.as_bytes());
         }
-        "GET" | "HEAD" => {
-            let found = objects
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&key)
-                .cloned();
-            match found {
-                Some((bytes, etag)) => respond(
-                    stream,
-                    "200 OK",
-                    &[
-                        ("ETag", format!("\"{etag}\"")),
-                        ("Last-Modified", "Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
-                    ],
-                    &bytes,
-                ),
-                None => respond(
-                    stream,
-                    "404 Not Found",
-                    &[],
-                    b"<Error><Code>NoSuchKey</Code></Error>",
-                ),
-            }
-        }
+        "GET" | "HEAD" => get(objects, &key, stream),
         "PUT" => {
             if req.header("if-match").is_some() {
                 state.if_match_puts.fetch_add(1, Ordering::SeqCst);

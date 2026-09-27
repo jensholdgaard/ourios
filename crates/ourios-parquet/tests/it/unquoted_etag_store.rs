@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ourios_parquet::{PartitionKey, S3Config, Store, Writer, compact_partition};
@@ -164,17 +165,51 @@ fn list(objects: &Objects, req: &Request) -> String {
     )
 }
 
+/// Which `If-Match` spelling of the current `ETag` a store honours.
+#[derive(Clone, Copy)]
+enum IfMatch {
+    /// Only the unquoted form — the Ceph RGW quirk under test.
+    Unquoted,
+    /// Only the quoted `entity-tag` RFC 9110 §8.8.3 defines.
+    Quoted,
+    /// Either form, as lenient stores do.
+    Either,
+}
+
+impl IfMatch {
+    fn matches(self, expected: &str, etag: &str) -> bool {
+        let quoted = expected.strip_prefix('"').and_then(|e| e.strip_suffix('"'));
+        match (self, quoted) {
+            (Self::Unquoted | Self::Either, None) => expected == etag,
+            (Self::Quoted | Self::Either, Some(inner)) => inner == etag,
+            (Self::Unquoted, Some(_)) | (Self::Quoted, None) => false,
+        }
+    }
+}
+
 /// `412` unless the conditional headers hold, comparing `If-Match` against
-/// the **unquoted** `ETag` only — the quirk under test.
-fn precondition_holds(req: &Request, current: Option<&String>) -> bool {
+/// the current `ETag` as `mode` does.
+fn precondition_holds(mode: IfMatch, req: &Request, current: Option<&String>) -> bool {
     match (req.header("if-none-match"), req.header("if-match"), current) {
-        (_, Some(expected), Some(etag)) => expected == etag,
+        (_, Some(expected), Some(etag)) => mode.matches(expected, etag),
         (Some("*"), _, Some(_)) | (_, Some(_), None) => false,
         _ => true,
     }
 }
 
-fn handle(objects: &Objects, next_etag: &Mutex<u64>, stream: &TcpStream) {
+/// The fake's per-store state; `if_match_puts` counts every `PUT` carrying
+/// `If-Match`, so a test can see whether a retry was sent.
+#[derive(Default)]
+struct State {
+    objects: Objects,
+    next_etag: Mutex<u64>,
+    if_match_puts: AtomicUsize,
+}
+
+fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
+    let State {
+        objects, next_etag, ..
+    } = state;
     let Some(req) = read_request(stream) else {
         return;
     };
@@ -214,9 +249,12 @@ fn handle(objects: &Objects, next_etag: &Mutex<u64>, stream: &TcpStream) {
             }
         }
         "PUT" => {
+            if req.header("if-match").is_some() {
+                state.if_match_puts.fetch_add(1, Ordering::SeqCst);
+            }
             let mut objects = objects.lock().unwrap_or_else(PoisonError::into_inner);
             let current = objects.get(&key).map(|(_, etag)| etag);
-            if precondition_holds(&req, current) {
+            if precondition_holds(mode, &req, current) {
                 let mut n = next_etag.lock().unwrap_or_else(PoisonError::into_inner);
                 *n += 1;
                 let etag = format!("e{n}");
@@ -242,27 +280,45 @@ fn handle(objects: &Objects, next_etag: &Mutex<u64>, stream: &TcpStream) {
     }
 }
 
-/// Start the fake and return a [`Store`] pointed at it.
-fn unquoted_etag_store() -> Store {
+/// Start the fake honouring `mode` and return a [`Store`] pointed at it,
+/// with the fake's state for inspection.
+fn fake_store(mode: IfMatch) -> (Store, Arc<State>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let objects: Objects = Arc::default();
-    let next_etag = Arc::new(Mutex::new(0));
+    let state = Arc::new(State::default());
+    let served = Arc::clone(&state);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let objects = Arc::clone(&objects);
-            let next_etag = Arc::clone(&next_etag);
-            std::thread::spawn(move || handle(&objects, &next_etag, &stream));
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || handle(mode, &served, &stream));
         }
     });
-    Store::s3(
+    let store = Store::s3(
         S3Config::new(BUCKET)
             .with_endpoint(format!("http://{addr}"))
             .with_region("us-east-1")
             .with_access_key_id("test")
             .with_secret_access_key("test"),
     )
-    .expect("build s3 store")
+    .expect("build s3 store");
+    (store, state)
+}
+
+fn unquoted_etag_store() -> Store {
+    fake_store(IfMatch::Unquoted).0
+}
+
+/// Put `v1` then `v2` at `key`, returning the `ETag` `v1` had.
+fn stale_etag(store: &Store, key: &str) -> String {
+    store.put_blocking(key, b"v1".to_vec()).expect("put");
+    let (_, stale) = store
+        .get_with_etag_blocking_opt(key)
+        .expect("get")
+        .expect("present");
+    store
+        .put_blocking(key, b"v2".to_vec())
+        .expect("concurrent writer");
+    stale.expect("etag")
 }
 
 /// A compare-and-swap against the `ETag` the store itself just returned
@@ -339,4 +395,53 @@ fn compaction_commits_on_an_unquoted_etag_store() {
         .expect("the manifest swap commits instead of losing its CAS");
     assert_eq!(committed.input_files.len(), 2);
     assert_eq!(outcome.rows, 2);
+}
+
+/// A store that honours the quoted `ETag` is unaffected: the first swap wins
+/// and no unquoted retry is sent.
+#[test]
+fn put_if_match_sends_one_request_when_the_quoted_etag_wins() {
+    for mode in [IfMatch::Quoted, IfMatch::Either] {
+        let (store, state) = fake_store(mode);
+        store
+            .put_blocking("data/manifest.json", b"v1".to_vec())
+            .expect("put");
+        let (_, etag) = store
+            .get_with_etag_blocking_opt("data/manifest.json")
+            .expect("get")
+            .expect("present");
+        let etag = etag.expect("etag");
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+
+        store
+            .put_if_match_blocking("data/manifest.json", b"v2".to_vec(), &etag)
+            .expect("CAS against the current ETag wins");
+
+        assert_eq!(state.if_match_puts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get_blocking("data/manifest.json").expect("get"),
+            b"v2".to_vec()
+        );
+    }
+}
+
+/// Whichever spelling a store honours, a stale `ETag` loses in both
+/// spellings — the retry never lets a stale writer win.
+#[test]
+fn put_if_match_loses_with_a_stale_etag_on_every_store() {
+    for mode in [IfMatch::Unquoted, IfMatch::Quoted, IfMatch::Either] {
+        let (store, _) = fake_store(mode);
+        let stale = stale_etag(&store, "data/manifest.json");
+
+        for etag in [stale.clone(), stale.trim_matches('"').to_string()] {
+            let err = store
+                .put_if_match_blocking("data/manifest.json", b"lost".to_vec(), &etag)
+                .expect_err("a stale ETag must lose");
+            assert!(err.is_precondition(), "{err}");
+        }
+        assert_eq!(
+            store.get_blocking("data/manifest.json").expect("get"),
+            b"v2".to_vec()
+        );
+    }
 }

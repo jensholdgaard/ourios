@@ -450,13 +450,10 @@ impl SegmentLedger {
     /// over tenants.
     ///
     /// This is the count of (tenant, segment) pairs above each
-    /// tenant's cursor, which is an **upper bound** on §3.7's "between
-    /// its cursor and its horizon": the two agree whenever a tenant's
-    /// horizon covers its newest segment and this figure is the larger
-    /// otherwise. §3.7's own definition cannot be maintained without a
-    /// range count proportional to the span a rising horizon newly
-    /// covers, which is exactly the unbounded work under the journal
-    /// guard that RFC0052.12 forbids.
+    /// tenant's cursor — §3.7's conservative figure, never below the
+    /// cursor-to-horizon span. Counting the span itself would cost a
+    /// range count proportional to what a rising horizon newly covers,
+    /// the unbounded work under the journal guard RFC0052.12 forbids.
     /// Zero until a pass receives horizons, and zero again under
     /// `NoConsumer`: the ledger keeps its tenant membership either way
     /// — a later `Known` pass resumes from it — but reporting it as
@@ -968,16 +965,12 @@ impl SegmentLedger {
     /// has been derived. The ledger keeps its tenant membership either
     /// way, so a later `Known` pass reports from it.
     ///
-    /// This is §3.5's figure **without its "below the checkpoint"
-    /// clause**, which cannot be maintained beside it. The checkpoint
-    /// moves, so counting only the segments under it costs a range
-    /// count on every advance — the eager promotion RFC0052.12
-    /// forbids, and the same arithmetic §3.7 already spends to define
-    /// `unlink_remaining` without the bound. The figure is therefore
-    /// an upper bound on §3.5's: equal to it whenever the checkpoint
-    /// covers every held segment, and larger by the post-checkpoint
-    /// tail otherwise. It never under-reports retained bytes, which is
-    /// the safe direction for this gauge.
+    /// Not bounded by the checkpoint: the checkpoint moves, so
+    /// counting only the segments under it would cost a range count
+    /// on every advance — the eager promotion RFC0052.12 forbids. So
+    /// §3.5 defines the figure conservatively, larger by the held
+    /// post-checkpoint tail and never smaller, the safe direction for
+    /// a retention gauge.
     pub(crate) fn lag(&self, current: Uuid) -> (u64, usize) {
         let (bytes, segments) = match self.floor {
             RetainFloor::Unknown | RetainFloor::None => return (0, 0),

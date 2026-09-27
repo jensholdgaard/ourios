@@ -1256,6 +1256,10 @@ single-binary mode, fed over its native
 OTLP endpoint. Flag deviations from stock are documented below —
 all ingest-replay accommodations, all in Loki's favour, per the
 §3.7 anti-strawman commitment.
+*(2026-09-27: the stock config promotes eighteen resource attributes
+to stream labels. This corpus triggers three of them, which discriminate
+it by service. See §9.31, which records the set and why no number below
+changes.)*
 **Hardware.** `ci-runner` — **indicative, not the §1 baseline**;
 the authoritative `baseline-8vcpu-32gib` run remains a maintainer
 opt-in per RFC 0031 §3.2. Bytes-read, the primary channel, is
@@ -1895,7 +1899,8 @@ but an **exact replica of the `comparative-bench.yml` dispatch
 recipe** at main `9deecb1`: frozen `corpus/otel-demo-v8` (4,948,596
 records), `grafana/loki:3.5.3` digest-pinned via Docker,
 `OURIOS_COMPARATIVE_CLASSES=all`, release build, every §7 FROZEN
-gate asserting. Run logs and the machine-readable
+gate asserting. *(The Loki stream labels this corpus triggers
+are recorded in §9.31.)* Run logs and the machine-readable
 `comparative-results.json` artifacts for both runs are retained by
 the maintainer outside the repository (the gitignored local
 `scratch/` tree), as with every ad-hoc VM record in this series.
@@ -2362,3 +2367,75 @@ in-repo gates recompute `T = adaptive_flush_bytes(input_total)` and track
 the layout whatever it resolves to. The authoritative full-v8
 L6-scanned-bytes-vs-Loki arm and the ceiling/target-K sweep stay deferred
 to the paid `baseline-8vcpu-32gib` harness (RFC 0036 §7 / RFC0036.2).
+
+### 9.31 Results — 2026-09-27 (in-repo, deterministic) — which Loki stream labels the `corpus/otel-demo-v8` replay triggers (#800)
+
+**Purpose.** RFC0031.10's machine-check (`rfc0031_10_loki_label_allowlist`)
+established that the comparative Loki config, stock `grafana/loki:3.5.3`
+(digest `sha256:3165cecce301…`), promotes **eighteen** resource attributes
+to stream labels (`LOKI_LABEL_ALLOWLIST`), not the one earlier prose
+implied. What Loki indexes on a given run, though, depends on which of
+those eighteen keys the corpus carries, and no §9 comparative entry
+recorded that. This entry records it for `corpus/otel-demo-v8`, the
+corpus §9.13, §9.15, §9.24 and §9.26 name and the `comparative-bench.yml`
+dispatch default the other comparative entries (§9.14–§9.18) ran on. It is
+a property of a frozen,
+digest-pinned corpus, not a performance measurement, so hardware does not
+apply.
+
+**Method.** A full scan of the release asset `logs.jsonl.gz` from
+`corpus/otel-demo-v8` (sha256
+`c594448171b79a0e4c7272b08b94dd8656fc56ffaea6b56bea2bd4df5b99016c`,
+matching the release's recorded digest): 690,355 `LogsData` lines, one
+`ResourceLogs` each. Every resource attribute key was counted and every
+allowlisted key's values were tallied. As a cross-check, one real record
+per distinct resource shape was pushed over OTLP into the digest-pinned
+image running `LOKI_DISPATCH_FLAGS`. Loki's `/loki/api/v1/labels` returned
+exactly the three names below, and `loki_ingester_streams_created_total`
+read **6**.
+
+**Result — 3 of 18 allowlisted labels, 6 streams.**
+
+| Loki label | resource attribute | on `ResourceLogs` | distinct values |
+|---|---|---|---|
+| `service_name` | `service.name` | 690,355 (all) | 5 (`recommendation`, `ad`, `currency`, `cart`, `kafka`) |
+| `service_namespace` | `service.namespace` | 690,355 (all) | 1 (`opentelemetry-demo`) |
+| `service_instance_id` | `service.instance.id` | 220,761 | 4 (one each on `ad` and `cart`, two on `kafka`) |
+
+None of the fifteen other allowlisted keys (`deployment.environment*`,
+`cloud.*`, `k8s.*`, `container.name`) appears anywhere in the capture.
+The capture is not Kubernetes-attributed. The remaining keys it carries
+(`service.version`, `host.name`, `container.id`, `os.*`, `process.*`,
+`telemetry.*`) are outside the allowlist and are not promoted.
+
+| stream (`service_name`, `service_instance_id`) | `ResourceLogs` |
+|---|---|
+| `recommendation`, — | 322,725 |
+| `ad`, one id | 162,823 |
+| `currency`, — | 146,869 |
+| `cart`, one id | 34,549 |
+| `kafka`, id 1 | 16,462 |
+| `kafka`, id 2 | 6,927 |
+
+**Reading — no recorded comparative number changes.** Of the three
+triggered labels, `service_namespace` is constant and `service_instance_id`
+is determined by `service_name` everywhere except `kafka`, which it splits
+into two streams. Loki's index therefore discriminates the corpus exactly
+as finely as `service_name` alone, plus that one kafka split. Every LogQL
+selector the harness issues is either `{service_name=~".+"}` (L1, L3, L4:
+all streams) or `{service_name="<svc>"}` (L2, the window browses, the
+selective-resource diagnostic). No query can select on the other two
+labels, so they give Loki no pruning the queries could use. The runs used
+this stock config unchanged; #797 changed only the *declaration* of the
+allowlist, not a Loki flag or the image. So every comparative ratio in
+§9.13–§9.18, §9.24 and §9.26 stands. Read it as a comparison against a
+Loki whose index discriminates this corpus by service, which is what the
+stock config yields on this capture, not as a comparison against a
+multi-dimensional Kubernetes-label index. A corpus carrying `k8s.*`
+attributes would give Loki more streams and is a different measurement.
+
+**Recording going forward.** The dispatch run now derives this inventory
+on its corpus push pass and prints it as a `loki stream labels:` line in
+the report block. It also writes the inventory to `comparative-results.json`
+under `loki_stream_labels`, so each future run records which labels its
+Loki had.

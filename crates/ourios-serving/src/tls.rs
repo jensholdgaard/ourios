@@ -159,11 +159,10 @@ impl TlsSettings {
             TlsMinVersion::V1_2 => &[&rustls::version::TLS12, &rustls::version::TLS13],
             TlsMinVersion::V1_3 => &[&rustls::version::TLS13],
         };
-        let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(versions)
-        .map_err(|e| format!("TLS protocol-version selection failed: {e}"))?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(versions)
+            .map_err(|e| format!("TLS protocol-version selection failed: {e}"))?;
 
         let builder = match &self.client_ca_file {
             None => builder.with_no_client_auth(),
@@ -183,14 +182,15 @@ impl TlsSettings {
                         ca_path.display()
                     ));
                 }
-                let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-                    .build()
-                    .map_err(|e| {
-                        format!(
-                            "cannot build the client verifier from {}: {e}",
-                            ca_path.display()
-                        )
-                    })?;
+                let verifier =
+                    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                        .build()
+                        .map_err(|e| {
+                            format!(
+                                "cannot build the client verifier from {}: {e}",
+                                ca_path.display()
+                            )
+                        })?;
                 builder.with_client_cert_verifier(verifier)
             }
         };

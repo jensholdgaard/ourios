@@ -309,10 +309,7 @@ pub fn run_sweep_hooked(
                     .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
                 drop: None,
             };
-            let result = compact_partition_hooked(store, &partition, promoted, &mut row_hooks)
-                .map_err(|e| e.to_string())
-                .and_then(swap_committed);
-            match result {
+            match compact_candidate(store, &partition, promoted, &mut row_hooks) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
@@ -724,10 +721,18 @@ pub(crate) fn to_u64(value: usize) -> u64 {
 /// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
 /// the sweep's wall clock; the partition is the canonical
 /// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
-/// An uncommitted outcome with two or more live files lost the manifest
-/// swap. With one sweeper that is never a benign race: it is an error, or a
-/// store whose swaps always lose looks like an idle sweep.
-fn swap_committed(outcome: CompactionOutcome) -> Result<CompactionOutcome, String> {
+/// [`compact_partition_hooked`], where an uncommitted outcome with two or
+/// more live files lost the manifest swap. With one sweeper that is never a
+/// benign race: it is an error, or a store whose swaps always lose looks
+/// like an idle sweep.
+fn compact_candidate(
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+    hooks: &mut RowHooks<'_>,
+) -> Result<CompactionOutcome, String> {
+    let outcome =
+        compact_partition_hooked(store, partition, promoted, hooks).map_err(|e| e.to_string())?;
     if outcome.committed.is_none() && outcome.files_before >= 2 {
         return Err(format!(
             "selected with {} live files but not committed \

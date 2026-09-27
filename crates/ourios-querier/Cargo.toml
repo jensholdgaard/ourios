@@ -71,7 +71,7 @@ opentelemetry = { version = "0.32", default-features = false, features = ["metri
 # is how the querier reaches the `POST /v1/query` span's OTel `Context`
 # without threading one through every call site by hand (mirrors RFC 0039's
 # dep-promotion precedent in `ourios-server`).
-tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-opentelemetry = { version = "0.33", default-features = false }
 # RFC 0040 — the post-hoc `ExecutionPlan` -> OTel operator-span-tree crate.
 # `datafusion` + `opentelemetry` only, no `ourios-*` deps of its own.

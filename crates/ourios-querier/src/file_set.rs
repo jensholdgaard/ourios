@@ -489,6 +489,9 @@ mod tests {
 
     const TENANT_PREFIX: &str = "data/tenant_id=a";
 
+    /// A half-open `[start, end)` query window in UTC nanoseconds.
+    type Window = (u64, u64);
+
     fn ns(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> u64 {
         let nanos = chrono::NaiveDate::from_ymd_opt(year, month, day)
             .and_then(|d| d.and_hms_opt(hour, minute, 0))
@@ -623,7 +626,7 @@ mod tests {
     }
 
     /// The pre-#853 resolution: list every key under the tenant, then prune.
-    fn full_listing_oracle(store: &Store, window: Option<(u64, u64)>) -> Vec<String> {
+    fn full_listing_oracle(store: &Store, window: Option<Window>) -> Vec<String> {
         let keys = store.list_blocking(Some(TENANT_PREFIX)).expect("list");
         live_keys_from_listing(store, &keys, window).expect("resolve")
     }
@@ -739,7 +742,7 @@ mod tests {
         let below_april = &junk[1..];
         let below_hour_10 = &junk[3..];
         // (name, window, the junk keys the walk does not list)
-        let cases: [(&str, Option<(u64, u64)>, &[String]); 9] = [
+        let cases: [(&str, Option<Window>, &[String]); 9] = [
             (
                 "in-window",
                 Some((ns(2026, 4, 2, 10, 20), ns(2026, 4, 2, 10, 30))),

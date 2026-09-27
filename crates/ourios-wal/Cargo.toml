@@ -57,6 +57,15 @@ fuzzing = []
 # no other way in. Not part of the stable public API.
 fault-injection = []
 
+# RFC 0008 §6.7's `Wal::housekeeping(Option<WalOffset>)` — the global-bound
+# reclamation entry point RFC 0052 §3.2's per-segment rule replaces (issue
+# #827). Its contract is still asserted by
+# `tests/it/rfc0008_7_checkpoint.rs`, so the method stays; the feature is
+# what keeps it and the tenant-aware pass from ever meeting on a live root.
+# Enabled only by this crate's own dev-dependency below, and `cargo build`
+# does not resolve dev-dependencies, so no product binary carries it.
+legacy-housekeeping = []
+
 # §6.3's macOS strong-durability path: `fcntl(F_FULLFSYNC)` behind
 # rustix's safe wrapper (already in the tree via tempfile) — the
 # workspace denies `unsafe_code`, so the raw fcntl is not an option
@@ -68,7 +77,7 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # Self-dependency: turns `fault-injection` on for this crate's own test
 # targets (and nothing else — `cargo build` does not resolve
 # dev-dependencies, so no product binary carries the seam).
-ourios-wal = { path = ".", features = ["fault-injection"] }
+ourios-wal = { path = ".", features = ["fault-injection", "legacy-housekeeping"] }
 # Scratch directories for the segment-on-disk tests.
 tempfile = "=3.27.0"
 # Property test for the RFC0008.9 `wal_unflushed_bytes` bound

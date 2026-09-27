@@ -22,25 +22,30 @@ superseded-by: —
 ## 1. Summary
 
 The project context every contributor's agent must read lives in
-`CLAUDE.md`, a file name only Claude Code loads. This RFC moves it,
-with `git mv`, to `AGENTS.md`, the open convention that Codex, Cursor,
-GitHub Copilot's coding agent, Jules and others read. Every section
-number stays the same. `CLAUDE.md` becomes a one-line stub that imports
+`CLAUDE.md`, a file name that is Claude Code's default and only an
+optional fallback elsewhere (GitHub Copilot accepts it; Codex and
+Gemini CLI do not read it). This RFC moves it, with `git mv`, to
+`AGENTS.md`, the open convention that Codex and GitHub Copilot read
+natively and that Cursor and Jules are reported to read (§3.6).
+Every section number stays the same. `CLAUDE.md` becomes a one-line stub that imports
 `AGENTS.md`, so Claude Code sessions load the same text as today and the
 575 existing `CLAUDE.md` citations (507 of them `CLAUDE.md §N`) keep
 resolving without being rewritten. The handful of Claude-specific lines
-are reworded to be agent-neutral; no rule changes meaning.
+are reworded to be agent-neutral. One rule deliberately widens: the
+§9 attribution requirement now covers every AI assistant, not only
+Claude (§3.4.7).
 
 ## 2. Motivation
 
-### 2.1 The context is Claude-only by file name, not by content
+### 2.1 The context is Claude-first by file name, not by content
 
 Ourios is public OSS and states that AI-assisted contributions follow
 the same review, CI and RFC process as human ones (`CLAUDE.md` §9). The
 invariants in §3 (no silent merges, WAL-before-ack, tenancy) are exactly
 what an agent must know before touching the hot path. Today a
-contributor using Codex, Cursor, Copilot or Gemini CLI gets none of it
-unless they notice the file and paste it in by hand. The content is
+contributor using Codex or Gemini CLI gets none of it unless they notice
+the file and paste it in by hand; Copilot's documentation offers a root
+`CLAUDE.md` only as an alternative to `AGENTS.md` [GH-instr]. The content is
 already almost entirely agent-neutral (§3.4 below counts the exceptions),
 so the barrier is the file name.
 
@@ -232,6 +237,14 @@ contributors` becomes `## 9. AI-assisted contributions`. Body:
 > field (e.g. `drafting-assistance: Claude`, `drafting-assistance:
 > Codex`).
 
+**This is a scope change, not only a rewording.** Today §9 requires a
+trailer and a `drafting-assistance:` entry for *Claude*-assisted work
+only; the replacement requires them for work assisted by *any* AI
+tool. That follows from the project's stance that every agent gets the
+same context and the same rules, and it is approved or rejected with
+this RFC's majority maintainer vote, not as an editorial change.
+Contributions already merged are not affected.
+
 **3.4.8 Intro paragraph.** *"This document is your project context"*
 is already neutral and stays.
 
@@ -313,8 +326,10 @@ enacting PR's author.
 **Consequences for Ourios.**
 
 - **No `.github/copilot-instructions.md`, no `.cursor/rules/`, no
-  `GEMINI.md`.** Copilot, Codex, Cursor and Jules read `AGENTS.md`
-  directly.
+  `GEMINI.md`.** Copilot and Codex read `AGENTS.md` directly (verified).
+  Cursor and Jules are reported to (unverified); if the enacting PR's
+  re-check finds either does not, that tool gets a pointer file under
+  the same rule as Gemini CLI below, never a copy.
 - **Gemini CLI is the one genuine gap.** It reads `AGENTS.md` only when
   `context.fileName` lists it. The documented example is
   `{"context":{"fileName":["AGENTS.md","CONTEXT.md","GEMINI.md"]}}`

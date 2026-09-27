@@ -2,32 +2,24 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! **Implementation status (PR-J4 — RFC 0006 `green`):** all
-//! three writer-side gates — A1 (compression), C1
-//! (reconstruction), C2 (template-count convergence) — are
-//! live. [`run`] computes any combination in a single miner
-//! pass and returns a populated [`ResultsFile`]. The CLI
-//! (RFC 0006 §3.7) in `main.rs` drives `run`, writes the §3.6
-//! JSON results file via [`write_results_json`], and — with
-//! `--update-benchmarks-md` — folds the results into the
-//! `docs/benchmarks.md` §9 table via [`update_status_section`].
-//! Every §5 acceptance scenario has a passing test, so RFC 0006
-//! is at maturity `green`. (The one heavy ≥ 1 M-line C2 test
-//! is `#[ignore]`'d for the per-PR loop per §3.7 and runs
-//! on-demand via `cargo test -- --ignored`; its convergence
-//! math is covered by default by the colocated `c2` unit
-//! tests.) `Validated` follows once the gates are measured on
-//! a real corpus + the §1 hardware baseline.
+//! [`run`] computes any combination of the three writer-side gates —
+//! A1 (compression), C1 (reconstruction), C2 (template-count
+//! convergence) — in a single miner pass and returns a populated
+//! [`ResultsFile`]. The CLI (RFC 0006 §3.7) in `main.rs` drives `run`,
+//! writes the §3.6 JSON results file via [`write_results_json`], and —
+//! with `--update-benchmarks-md` — folds the results into the
+//! `docs/benchmarks.md` §9 table via [`update_status_section`]. The
+//! heavy ≥ 1 M-line C2 test is `#[ignore]`'d for the per-PR loop per
+//! §3.7 and runs on demand via `cargo test -- --ignored`; its
+//! convergence math is covered by default by the colocated `c2` unit
+//! tests.
 //!
-//! Per RFC 0006 §3.2 the module layout is `corpus`, `harness`,
-//! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
-//! `harness`, `c1`; PR-I2 added `a1`; PR-J1 added `report`
-//! (JSON half) + the CLI; PR-J2 added `c2`; PR-J3 added the
-//! §9 appender. Later RFCs grew the crate beyond that layout:
-//! `calibrate` + `reference` + `store` (RFC 0024 / the B1/B2 query
-//! stores), and the RFC 0031 comparative harness (`comparative` — the
-//! Loki equivalence check + measurement channel — and `lgates`, the
-//! comparative must-win / floor gate math), plus the RFC 0009 D1/D2
+//! Per RFC 0006 §3.2 the core module layout is `corpus`, `harness`,
+//! `a1`, `c1`, `c2`, `report`. Later RFCs grew the crate beyond that
+//! layout: `calibrate` + `reference` + `store` (RFC 0024 / the B1/B2
+//! query stores), and the RFC 0031 comparative harness (`comparative`
+//! — the Loki equivalence check + measurement channel — and `lgates`,
+//! the comparative must-win / floor gate math), plus the RFC 0009 D1/D2
 //! sustained-ingest soak harness (`soak`).
 
 #![deny(unsafe_code)]

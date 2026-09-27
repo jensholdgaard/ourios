@@ -5,9 +5,8 @@ name: Capture Software Bill of Behaviour (one-off)
 # (eBPF-based; needs a real Linux kernel, which is why this runs on the
 # GitHub-hosted runner rather than a local VM), the real Ourios Helm chart,
 # and a mix of OTLP ingest + query traffic during the node-agent's learning
-# window. The output is the raw ApplicationProfile CR(s), plus their
-# per-container ContainerProfiles, as a downloadable artifact for manual
-# review — this workflow does not commit anything back to the repo, and it
+# window. The output is the raw ApplicationProfile CR(s) as a downloadable
+# artifact for manual review — this workflow does not commit anything back to the repo, and it
 # never fires automatically (no push/PR/schedule trigger), matching the
 # dispatch-only precedent in pages.yml. This is an exploration, not a
 # supply-chain gate: nothing here is required for a release, and nothing
@@ -242,9 +241,10 @@ jobs:
       # storage v0.0.206 consolidates them and aggregates each workload's
       # containers into one ApplicationProfile, marking it completed only once
       # every main container is (containerprofile_processor.go,
-      # getAggregatedData). A containerprofile listing still carries the
-      # not-yet-consolidated time-series entries in "learning", so gating on
-      # it can stall. Upstream storage dropped ApplicationProfile in v0.0.299+;
+      # getAggregatedData). ContainerProfiles are storage-internal in this
+      # version: the aggregated API does not serve them as a resource, so
+      # `kubectl get containerprofile` errors. Upstream storage dropped
+      # ApplicationProfile in v0.0.299+;
       # re-vendoring the chart means re-deriving this gate.
       - name: Wait for ApplicationProfiles to complete
         run: |
@@ -268,13 +268,11 @@ jobs:
             exit 1
           fi
 
-      # The ApplicationProfiles are the BoB; the per-container profiles ride
-      # along for the manual review.
+      # The ApplicationProfiles are the BoB.
       - name: Export profiles
         run: |
           mkdir -p bob-out
           kubectl get applicationprofile -o yaml > bob-out/applicationprofiles.yaml
-          kubectl get containerprofile -o yaml > bob-out/containerprofiles.yaml
           kubectl get applicationprofile -o json \
             | jq -r '.items[] | .metadata.name' > bob-out/profile-names.txt
           cat bob-out/profile-names.txt
@@ -290,7 +288,6 @@ jobs:
         run: |
           kubectl get pods -A -o wide || true
           kubectl get applicationprofile -A -o yaml || true
-          kubectl get containerprofile -A -o yaml || true
           echo "=== receiver logs ==="; kubectl logs -l app.kubernetes.io/component=receiver --tail=200 || true
           echo "=== querier logs ===";  kubectl logs -l app.kubernetes.io/component=querier --tail=200 || true
           echo "=== node-agent logs ==="; kubectl logs -n "${KS_NAMESPACE}" -l app=node-agent --tail=200 || true

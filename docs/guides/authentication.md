@@ -280,7 +280,7 @@ never touches it.
 
 ## TLS
 
-Bearer tokens over plaintext are not auth. Every listener can serve TLS
+A plaintext listener exposes bearer tokens in transit. Every listener can serve TLS
 natively, and mTLS when given a client CA
 ([RFC 0030](../rfcs/0030-tls-mtls-listeners.md)); alternatively,
 terminate TLS in front (ingress, service mesh, or an L4 proxy). TLS is

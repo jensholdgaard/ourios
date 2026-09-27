@@ -958,7 +958,8 @@ impl Querier {
     /// The closure owns its captured `Backend` / `TenantId` clones so it
     /// satisfies the `'static + Send` bound. The caller's span is re-entered on
     /// the blocking thread — span context does not cross `spawn_blocking`
-    /// (RFC 0038 §3.3) — so spans the callee opens nest under the query span.
+    /// (RFC 0038 §3.3) — so logs the callee emits carry the query's trace
+    /// context (RFC0038.1).
     async fn spawn_blocking_io<T, F>(&self, work: F) -> Result<T, QueryError>
     where
         T: Send + 'static,
@@ -1018,9 +1019,8 @@ enum LiveSet {
     Keys(Vec<String>),
 }
 
-// RFC 0038: one span per file-set resolution — the listing + manifest reads
-// that precede the scan, which no operator span covers.
-#[tracing::instrument(skip_all, name = "resolve files", fields(otel.kind = "internal"))]
+/// Resolve the tenant's live data files for [`Querier::resolve_data_urls`] —
+/// blocking IO, run on the blocking pool.
 fn resolve_live_set(
     backend: &Backend,
     prefix: &str,

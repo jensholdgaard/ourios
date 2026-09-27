@@ -325,9 +325,6 @@ pub enum CacheOutcome {
 /// [`QueryError::Storage`] as [`derive_template_map`], and when a
 /// fetched artifact's body `tenant_id` differs from `tenant` (the
 /// row-vs-path stance — a loud failure, not a fresh-fold fallback).
-// RFC 0038: one span per acquisition — the audit listing, artifact GET and
-// any fallback fold that can follow the scan, which no operator span covers.
-#[tracing::instrument(skip_all, name = "load template_map", fields(otel.kind = "internal"))]
 pub fn load_or_derive(
     backend: StoreRef<'_>,
     tenant: &TenantId,

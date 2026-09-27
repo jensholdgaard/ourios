@@ -134,18 +134,50 @@ pub(crate) const LOKI_LABEL_ALLOWLIST: &[&str] = &[
 pub(crate) const LOKI_LABEL_DENYLIST: &[&str] =
     &["trace_id", "span_id", "template_id", "ourios_template_id"];
 
+/// [`LOKI_LABEL_ALLOWLIST`] in the form Loki matches it against: the source
+/// resource-attribute keys, exactly as `/config` lists them.
+///
+/// Loki matches a resource attribute's key against this list exactly, and
+/// only then renders the label name with dots as underscores. Reversing that
+/// rendering is ambiguous: `cloud.availability_zone` already carries an
+/// underscore, and a custom key literally named `service_name` is not
+/// promoted. `loki_resource_attributes_render_to_the_allowlist` ties the two
+/// lists together.
+pub(crate) const LOKI_PROMOTED_RESOURCE_ATTRIBUTES: &[&str] = &[
+    "service.name",
+    "service.namespace",
+    "service.instance.id",
+    "deployment.environment",
+    "deployment.environment.name",
+    "cloud.region",
+    "cloud.availability_zone",
+    "k8s.cluster.name",
+    "k8s.namespace.name",
+    "k8s.pod.name",
+    "k8s.container.name",
+    "container.name",
+    "k8s.replicaset.name",
+    "k8s.deployment.name",
+    "k8s.statefulset.name",
+    "k8s.daemonset.name",
+    "k8s.cronjob.name",
+    "k8s.job.name",
+];
+
 /// The stream labels a replayed corpus actually triggers in Loki (#800).
 ///
 /// [`LOKI_LABEL_ALLOWLIST`] is what the config *may* index; this is what a
 /// given corpus *does* index, which is what a §9 ratio has to be read
 /// against. It is derived from each `ResourceLogs`' resource attributes
-/// mapped through the allowlist, the way Loki's OTLP ingest maps them (dots
-/// become underscores), rather than read back from `/loki/api/v1/labels`:
+/// whose key exactly matches [`LOKI_PROMOTED_RESOURCE_ATTRIBUTES`], rendered
+/// the way Loki's OTLP ingest renders them (dots become underscores), rather
+/// than read back from `/loki/api/v1/labels`:
 /// that endpoint filters by time range, and against the pinned image a
 /// readback bounded to a weeks-old replay's range came back empty although
-/// the streams existed. The mapping is exact because
+/// the streams existed. The match is exact because
 /// `rfc0031_10_loki_label_allowlist` proves the allowlist equals Loki's
-/// effective promotion list. Not modelled: Loki's `unknown_service` fallback
+/// effective promotion list, and the source-form list renders to the
+/// allowlist. Not modelled: Loki's `unknown_service` fallback
 /// for a resource with no `service.name` (every `otel-demo-v8` resource
 /// carries one).
 ///
@@ -175,10 +207,10 @@ impl CorpusLokiLabels {
 
         let mut set = Vec::new();
         for kv in resource.map_or(&[][..], |r| r.attributes.as_slice()) {
-            let label = kv.key.replace('.', "_");
-            if !LOKI_LABEL_ALLOWLIST.contains(&label.as_str()) {
+            if !LOKI_PROMOTED_RESOURCE_ATTRIBUTES.contains(&kv.key.as_str()) {
                 continue;
             }
+            let label = kv.key.replace('.', "_");
             let value = match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
                 Some(Value::StringValue(s)) => s.clone(),
                 Some(Value::IntValue(i)) => i.to_string(),

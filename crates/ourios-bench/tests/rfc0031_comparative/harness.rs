@@ -979,6 +979,18 @@ fn comparative_results_json_with_no_l4_candidate_records_null_not_absence() {
     assert_eq!(json["pairs"].as_array().unwrap().len(), 0);
 }
 
+/// The source-form list Loki matches keys against renders, dots to
+/// underscores, to exactly the label-form allowlist `/config` is checked
+/// against.
+#[test]
+fn loki_resource_attributes_render_to_the_allowlist() {
+    let rendered: Vec<String> = LOKI_PROMOTED_RESOURCE_ATTRIBUTES
+        .iter()
+        .map(|key| key.replace('.', "_"))
+        .collect();
+    assert_eq!(rendered, LOKI_LABEL_ALLOWLIST);
+}
+
 /// The otel-demo-v8 capture's six resource shapes (#800): `service.name` and
 /// `service.namespace` everywhere, `service.instance.id` on three services
 /// with kafka carrying two, plus attributes Loki does not promote.
@@ -1002,6 +1014,8 @@ fn corpus_loki_labels_counts_triggered_labels_and_streams() {
             kv("service.version", "2.2.0"),
             kv("host.name", "node-1"),
             kv("telemetry.sdk.name", "opentelemetry"),
+            // Renders like a promoted label but is not a promoted key.
+            kv("service_name", "decoy"),
         ];
         if let Some(id) = instance {
             attributes.push(kv("service.instance.id", id));

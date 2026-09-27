@@ -2182,8 +2182,9 @@ So the design is:
                                  // rising horizon costs no range count. Conservative:
                                  // equal to the cursor-to-horizon span whenever each
                                  // tenant's horizon covers its newest segment,
-                                 // larger otherwise, never smaller; zero until a
-                                 // pass receives horizons, and under NoConsumer
+                                 // larger otherwise, never smaller; zero before
+                                 // the first Known pass (an empty Known map
+                                 // counts as one) and under NoConsumer
       unlink_remaining: usize,   // empty-set segments not yet popped (waiting on the
                                  // checkpoint or on a pass — counting only those at
                                  // or below the mark would cost a range count on

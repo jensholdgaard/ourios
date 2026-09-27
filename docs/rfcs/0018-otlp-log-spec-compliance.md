@@ -157,8 +157,9 @@ Amend the RFC 0003 error-mapping contract to distinguish *transient* from
   non-retryable even though it surfaces as a `WalAppend` error.
 
 > **Amendment 2026-09-27 — post-rotation quiesce (RFC 0052 §3.3).**
-> "Post-rotation quiesce" is no longer in the transient class. Incident
-> #791 showed the latch is permanent until a restart, and RFC 0052 §3.3
+> The *terminal* post-rotation quiesce, once the retry budget is
+> exhausted, is no longer in the transient class. Incident #791 showed the
+> latch is permanent until a restart, and RFC 0052 §3.3
 > puts rotation failure under a bounded retry and adds a third class to
 > the two above: **server-terminal, client-retryable** — the node needs an
 > operator, and the client keeps its data and retries with exponential

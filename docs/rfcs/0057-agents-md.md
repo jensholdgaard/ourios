@@ -114,8 +114,14 @@ supports imports loads the full text.
 
 The approval dialog Claude Code shows on first use applies only to
 *external* imports, those that *"resolve outside your working
-directory"* [CC-mem]; `AGENTS.md` sits beside the stub, so no dialog
-appears. RFC0057.3 checks the loaded context rather than assuming it.
+directory"* [CC-mem]. A session started at the repository root sees
+`AGENTS.md` inside its working directory, so no dialog appears. A
+session started in a subdirectory (e.g. `crates/ourios-wal/`) still
+loads the root stub, but `AGENTS.md` then resolves outside the working
+directory, so Claude Code asks once per project before loading it;
+declining disables the import. That is a one-time prompt, not a
+regression from today, and RFC0057.3 checks the root-started case,
+which is the documented contributor workflow.
 
 The stub is one line on purpose: Claude-only prose below it would
 reintroduce the split this RFC removes. Changes to the stub fall under

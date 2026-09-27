@@ -309,6 +309,13 @@ pub enum ReclaimError {
         progress: Box<HousekeepingProgress>,
         source: HousekeepingError,
     },
+    /// The journal behind the trait object has no reclamation surface
+    /// at all — the spy and capture doubles the receiver's tests drive
+    /// the ingest path with. A distinct arm rather than a fabricated
+    /// I/O failure: "this journal cannot reclaim" and "this WAL tried
+    /// and failed" call for different handling at the timer, and one
+    /// variant carrying a flag could not tell them apart.
+    NoReclamationSurface,
 }
 
 impl std::fmt::Display for ReclaimError {
@@ -316,6 +323,9 @@ impl std::fmt::Display for ReclaimError {
         match self {
             Self::Checkpoint(source) => write!(f, "{source}"),
             Self::Housekeeping { source, .. } => write!(f, "{source}"),
+            Self::NoReclamationSurface => {
+                write!(f, "this journal exposes no RFC 0052 reclamation surface")
+            }
         }
     }
 }
@@ -325,6 +335,7 @@ impl std::error::Error for ReclaimError {
         match self {
             Self::Checkpoint(source) => Some(source),
             Self::Housekeeping { source, .. } => Some(source),
+            Self::NoReclamationSurface => None,
         }
     }
 }

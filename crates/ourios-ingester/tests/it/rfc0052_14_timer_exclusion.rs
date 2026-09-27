@@ -10,65 +10,413 @@
 //! holds the timer artificially between the quiesce and the end of the
 //! cut while driving ingest — the lock is never held across store I/O.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use ourios_ingester::barrier::CaptureOutcome::Filled;
+use ourios_ingester::barrier::CutOutcome;
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, Journal, ReceiveError};
+use ourios_wal::WalOffset;
+
+use crate::rfc0052_barrier_support::{BarrierRig, wal_config};
+
 /// Scenario RFC0052.14 — no mark passes a frame whose encode had not emitted.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (mark read after the quiesce under the ingest exclusion)"]
-fn rfc0052_14_no_checkpoint_passes_an_unemitted_frame_under_any_interleaving() {
-    todo!(
-        "RFC0052.14 — the reclamation timer firing while ingest submits \
-         continuously, under every seeded interleaving: no checkpoint is \
-         advanced past a frame whose encode had not finished its sink \
-         emit, and the mark used is the one read after the quiesce \
-         under the same exclusion, not one read before either"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_no_checkpoint_passes_an_unemitted_frame_under_any_interleaving() {
+    // Given the reclamation timer firing while ingest submits
+    // continuously, under a seeded set of interleavings rather than a
+    // wall clock: the window between the quiesce and the stamp is
+    // narrow, and a timing test that happens to pass proves nothing.
+    // This leg is the one run against *real* traffic; the held-encode
+    // leg below is the one that forces a pending encode to exist when
+    // the tick starts. Neither subsumes the other.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = Arc::new(BarrierRig::new(tmp.path()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let submitted = Arc::new(AtomicU64::new(0));
+
+    let ingest = {
+        let rig = Arc::clone(&rig);
+        let stop = Arc::clone(&stop);
+        let submitted = Arc::clone(&submitted);
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                rig.ingest("checkout", &[&format!("user {n} logged in")])
+                    .await;
+                submitted.fetch_add(1, Ordering::Release);
+                n += 1;
+            }
+        })
+    };
+
+    // When the timer runs its sequence, repeatedly, across that traffic.
+    for seed in 0..16u64 {
+        tokio::time::sleep(Duration::from_millis(seed % 5)).await;
+        let rig = Arc::clone(&rig);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let outcome = rig.barrier.tick(&rig.pipeline, false);
+            // Then the mark used is the one read *after* the quiesce
+            // under the same exclusion. Every acknowledged frame at or
+            // below it has finished its turn, so it is never above the
+            // pipeline's own durable mark — and a mark read before the
+            // quiesce could be.
+            let stamped = rig.commits.last_checkpoint();
+            let durable = rig.pipeline.last_durable();
+            (outcome, stamped, durable)
+        })
+        .await
+        .expect("the barrier tick did not panic");
+        let (outcome, stamped, durable) = outcome;
+        assert_ne!(
+            outcome,
+            CutOutcome::Latched,
+            "seed {seed}: nothing panicked"
+        );
+        if let Some(stamped) = stamped {
+            assert!(
+                durable.is_some_and(|durable| stamped <= durable),
+                "seed {seed}: no checkpoint passes a frame whose turn had not finished",
+            );
+        }
+    }
+
+    stop.store(true, Ordering::Release);
+    ingest.await.expect("ingest loop");
+    assert!(
+        submitted.load(Ordering::Acquire) > 0,
+        "the interleaving was against real traffic",
+    );
+
+    // And a final cut, with ingest stopped, covers everything: no frame
+    // is stranded above the mark by the interleaving.
+    let rig = Arc::clone(&rig);
+    let final_mark = rig.pipeline.last_durable();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+        assert_eq!(
+            rig.commits.last_checkpoint(),
+            final_mark,
+            "the last acknowledged turn's own frame offset is the mark",
+        );
+    })
+    .await
+    .expect("final cut");
+}
+
+/// Scenario RFC0052.14 — the cut waits out a held encode rather than stamping past it.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_a_tick_started_over_a_held_encode_stamps_nothing_until_it_lands() {
+    // Given an acknowledged batch whose encode worker is held inside
+    // `emit_concurrent` — the deterministic half of the leg above. The
+    // seeded one drives real traffic and asserts the mark never passes
+    // an unfinished turn, but it cannot *force* an encode to be pending
+    // when the tick starts, so a barrier that read the mark before
+    // quiescing could still satisfy it. Here the pending encode is an
+    // observed state and the tick provably cannot finish without it.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (rig, held) = BarrierRig::with_held_encode(tmp.path());
+    let rig = Arc::new(rig);
+    let mark = rig.ingest("checkout", &["user 1 logged in"]).await;
+    held.await_worker_inside_the_emit();
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "nothing has stamped yet",
+    );
+
+    // When a tick starts while that worker is still inside the emit.
+    let tick = {
+        let rig = Arc::clone(&rig);
+        tokio::task::spawn_blocking(move || rig.barrier.tick(&rig.pipeline, false))
+    };
+
+    // Then it makes no progress at all: the capture's `quiesce_encodes`
+    // runs before the mark is read, so neither the checkpoint nor the
+    // store moves while the encode is outstanding.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !tick.is_finished(),
+        "the cut is still waiting on the encode phase",
+    );
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "and no mark was stamped across the record the held worker has not emitted",
+    );
+    assert!(
+        rig.data_files().is_empty(),
+        "nor did anything reach the store ahead of it",
+    );
+
+    // And once the worker lands, the same cut stamps — at the mark of
+    // the turn whose encode it waited for, with that turn's records in
+    // the store under it rather than only in the WAL.
+    held.release();
+    assert_eq!(
+        tick.await.expect("the tick did not panic"),
+        CutOutcome::Stamped,
+    );
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark),
+        "the mark the cut waited for is the one it stamps",
+    );
+    assert!(
+        !rig.data_files().is_empty(),
+        "and the encode it waited for is durable under that mark",
     );
 }
 
 /// Scenario RFC0052.14 — the mark is a turn's own frame offset, never the sync's EOF.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (a flush whose sync covers two turns with a barrier between them)"]
-fn rfc0052_14_mark_is_the_turns_frame_offset_not_the_flush_eof() {
-    todo!(
-        "RFC0052.14 — a flush whose sync covers two turns and a barrier \
-         between them: the mark is the first turn's own frame offset, so \
-         the later frame made durable by the same flush but not yet \
-         mined nor acknowledged is never covered; the post-recovery seed \
-         is a delivered offset covered by a successful sync, never \
-         max_delivered alone, and a node with no such offset seeds None"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_mark_is_the_turns_frame_offset_not_the_flush_eof() {
+    // Given a flush whose sync covers two turns: `TwoTurnJournal`
+    // reports an EOF that already includes the *second* frame while the
+    // first turn is the one being acknowledged, which is exactly the
+    // shape `CommitCoordinator::flush` produces when a later append
+    // lands during the sync.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let eof = WalOffset {
+        segment: uuid::Uuid::from_u128(1),
+        byte: 4_096,
+    };
+    let journal = TwoTurnJournal {
+        eof,
+        appended: 0,
+        segment: uuid::Uuid::from_u128(1),
+    };
+    let commits = CommitCoordinator::new(
+        Box::new(journal),
+        Duration::from_millis(20),
+        u64::MAX, // no fill cut: the window is what batches these
+    );
+    let miner = ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default());
+    let pipeline = IngestPipeline::new(Arc::clone(&commits), miner);
+    drop(tmp);
+
+    // When the first turn completes and a barrier runs between it and
+    // the second.
+    pipeline
+        .ingest(
+            crate::ingest_support::request(vec![crate::ingest_support::resource_logs(
+                "checkout",
+                &["user 1 logged in"],
+            )]),
+            ourios_core::tenant::TenantId::new("checkout"),
+        )
+        .await
+        .expect("turn one acks");
+
+    // Then the mark is the first turn's own frame offset, so the later
+    // frame the same flush made durable — but which is not yet mined nor
+    // acknowledged — is never covered.
+    let mark = pipeline.last_durable().expect("a mark");
+    assert_ne!(
+        mark, eof,
+        "the sync's reported EOF is not the mark: it already covers a turn that has not run",
+    );
+    assert!(
+        mark < eof,
+        "the mark is the turn's own frame offset, strictly below the flush's EOF",
+    );
+
+    // And the post-recovery seed is never `max_delivered` alone: a frame
+    // replay delivered can be one whose group sync never completed, so a
+    // seeded mark is not a mark. The barrier reads only what a turn in
+    // this process acknowledged.
+    assert_eq!(
+        commits.last_checkpoint(),
+        None,
+        "a node whose first barrier never ran seeds None and lets its first turn establish one",
+    );
+    assert_a_replayed_seed_is_not_a_mark(eof);
+    assert!(
+        pipeline.acknowledged_durable().is_some(),
+        "whereas a turn's own offset is a mark",
+    );
+}
+
+/// The seed half of RFC0052.14's mark leg: recovery's `max_delivered`
+/// still stamps the shutdown snapshot's high-water (RFC 0001 §6.9) and is
+/// still not a mark a cut may checkpoint at.
+fn assert_a_replayed_seed_is_not_a_mark(eof: WalOffset) {
+    let replayed = WalOffset {
+        segment: uuid::Uuid::from_u128(1),
+        byte: 9_999,
+    };
+    let seeded = IngestPipeline::new(
+        CommitCoordinator::new(
+            Box::new(TwoTurnJournal {
+                eof,
+                appended: 0,
+                segment: uuid::Uuid::from_u128(1),
+            }),
+            Duration::from_millis(20),
+            u64::MAX,
+        ),
+        ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default()),
+    )
+    .with_last_durable(Some(replayed));
+    assert_eq!(
+        seeded.last_durable(),
+        Some(replayed),
+        "the seed still stamps the shutdown snapshot's high-water (RFC 0001 §6.9)",
+    );
+    assert_eq!(
+        seeded.acknowledged_durable(),
+        None,
+        "but it is not a mark a cut may checkpoint at",
     );
 }
 
 /// Scenario RFC0052.14 — a rotation capture past the sink's ceiling parks and advances nothing.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (RotationDecision on append_batch hands the cut to the barrier task)"]
-fn rfc0052_14_rotation_capture_past_the_ceiling_parks_every_drained_batch() {
-    todo!(
-        "RFC0052.14 — a rotation capture that would take the pending cut \
-         past the sink's ceiling parks every batch it drained and \
-         advances neither the mark, the snapshots nor the epoch; the \
-         checkpoint that pending cut eventually stamps covers only \
-         frames its own batches held, and the parked partitions are \
-         covered by the next cut; a rotation-fired cut performs no store \
-         I/O inside the ingest turn, and an append admitted after the \
-         turn is in neither that cut's checkpoint nor its snapshot"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_rotation_capture_past_the_ceiling_parks_every_drained_batch() {
+    // Given a rig whose rotation hook is the production capture-only one
+    // and whose barrier coalesces up to one byte — so any second capture
+    // carrying records exceeds it — over a WAL that rotates on age.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal_root = tmp.path().join("wal");
+    let rig = BarrierRig::with_rotation_capture(
+        tmp.path(),
+        ourios_wal::WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            ..wal_config(&wal_root)
+        },
+        1,
     );
+
+    // Batch A is captured into the pending slot, so the slot is occupied
+    // and carries A's mark and epoch.
+    let mark_a = rig.ingest("checkout", &["user 1 logged in"]).await;
+    assert_eq!(rig.barrier.capture(&rig.pipeline, false), Filled);
+    let pending_epoch = rig.barrier.pending_epoch().expect("a pending cut");
+    assert_eq!(rig.barrier.pending_mark(), Some(mark_a));
+
+    // Batch C acks and buffers behind it — records the pending cut does
+    // not hold, in the same segment.
+    let mark_c = rig.ingest("checkout", &["user 2 logged in"]).await;
+    rig.pipeline.quiesce_encodes();
+    assert_eq!(rig.sink.buffered_records(), 1, "C is buffered, undrained");
+    assert!(mark_c > mark_a, "C's frame is above A's");
+
+    // When the segment ages out and batch B's append observes the change:
+    // the rotation hook captures, drains C, and coalescing C into the
+    // pending cut would pass the ceiling.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mark_b = rig.ingest("checkout", &["payment 9 settled"]).await;
+    rig.pipeline.quiesce_encodes();
+
+    // Then the rotation parked every batch it drained and advanced
+    // nothing: not the pending cut's mark, not its epoch, no snapshot —
+    // and it did no store I/O inside the ingest turn.
+    assert_eq!(
+        rig.barrier.pending_mark(),
+        Some(mark_a),
+        "the pending cut's mark did not move to the rotation point",
+    );
+    assert_eq!(
+        rig.barrier.pending_epoch(),
+        Some(pending_epoch),
+        "nor did its epoch: a park is not a coalesce",
+    );
+    assert!(rig.snapshots().is_empty(), "and no snapshot was installed");
+    assert!(
+        rig.data_files().is_empty(),
+        "a rotation-fired cut performs no store I/O inside the ingest turn",
+    );
+    assert_eq!(
+        rig.sink.buffered_records(),
+        2,
+        "C is parked back in the buffers, beside B",
+    );
+
+    // And the checkpoint that pending cut stamps covers only the frames
+    // its own batches held — A's, not the rotation point's and not B's.
+    assert_eq!(rig.barrier.run_pending(), CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark_a),
+        "an append admitted after the turn is in neither the cut's checkpoint nor its snapshot",
+    );
+
+    // The parked partitions are covered by the next cut.
+    assert_eq!(rig.barrier.capture(&rig.pipeline, false), Filled);
+    assert_eq!(rig.barrier.run_pending(), CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark_b),
+        "the next cut covers the parked records and B's frame",
+    );
+    assert_eq!(rig.sink.buffered_records(), 0, "both are published");
+    assert!(!rig.data_files().is_empty(), "and reached the store");
 }
 
 /// Scenario RFC0052.14 — an idle rotation on the barrier tick rotates before the cut.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (Journal::rotate(Discretionary) under the exclusion before the cut)"]
-fn rfc0052_14_idle_rotation_on_the_tick_marks_the_last_acked_turn_not_the_boundary() {
-    todo!(
-        "RFC0052.14 — an idle rotation on the barrier tick rotates before \
-         the cut under the exclusion: the mark is the last acknowledged \
-         turn's frame offset in the closed segment, never the rotation \
-         boundary; a frame appended after the release lands in the new \
-         segment above the mark; a frame written but never acknowledged \
-         is never a mark"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_idle_rotation_on_the_tick_marks_the_last_acked_turn_not_the_boundary() {
+    // Given an idle node whose current segment has outlived its age cap:
+    // no append will ever fire the rotation check again, so the barrier
+    // tick is the only caller that can close it.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal_root = tmp.path().join("wal");
+    let rig = BarrierRig::with(
+        tmp.path(),
+        crate::rfc0052_barrier_support::never_flush(),
+        2,
+        ourios_wal::WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            ..wal_config(&wal_root)
+        },
     );
+    let acked = rig.ingest("checkout", &["user 1 logged in"]).await;
+    let before = segment_files(&wal_root);
+    assert_eq!(before.len(), 1, "one open segment holding one frame");
+    // The age is the segment's `UUIDv7` mint time, so it has to elapse;
+    // the WAL refuses a cap below one second, and this is the only leg
+    // that needs one to pass.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // When the barrier tick rotates before the cut, under the exclusion.
+    let rig = Arc::new(rig);
+    {
+        let rig = Arc::clone(&rig);
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(rig.barrier.tick(&rig.pipeline, true), CutOutcome::Stamped);
+        })
+        .await
+        .expect("tick");
+    }
+
+    // Then the segment was closed and a fresh one installed...
+    let after = segment_files(&wal_root);
+    assert_eq!(after.len(), 2, "the idle segment rotated");
+
+    // ...and the mark is the last acknowledged turn's own frame offset in
+    // the closed segment, never the rotation boundary.
+    let stamped = rig.commits.last_checkpoint().expect("a checkpoint");
+    assert_eq!(
+        stamped, acked,
+        "the mark is `last_durable`, not the boundary the rotation created",
+    );
+
+    // And a frame appended after the release lands in the new segment,
+    // above the mark.
+    let next = rig.ingest("checkout", &["user 2 logged in"]).await;
+    assert_ne!(
+        next.segment, stamped.segment,
+        "the frame after the release is in the new segment",
+    );
+    assert!(next > stamped, "and above the mark");
 }
 
 /// Scenario RFC0052.14 — a pre-cut batch that detached mid-batch is fully in the cut.
@@ -90,31 +438,156 @@ fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting_on_th
 
 /// Scenario RFC0052.14 — cuts are strictly ordered; a failed A invalidates B.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (pending slot; B neither installs nor stamps before A's outcome)"]
-fn rfc0052_14_cut_b_behind_a_held_cut_a_is_invalidated_when_a_fails() {
-    todo!(
-        "RFC0052.14 — with cut A's flush held at a fault-injection point \
-         and cut B captured behind it, B neither installs nor \
-         checkpoints before A's outcome; when A fails, B is invalidated \
-         — no snapshot of B's installed, no mark of B's stamped, A's and \
-         B's records all in the buffers — and the re-captured cut covers \
-         them all; when A succeeds, B runs unchanged"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_cut_b_behind_a_held_cut_a_is_invalidated_when_a_fails() {
+    // Given cut A captured and its flush about to fail, with cut B
+    // captured behind it.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.barrier.capture(&rig.pipeline, false); // cut A fills the slot
+    let a_mark = rig.barrier.pending_mark().expect("A holds the mark");
+    rig.ingest("checkout", &["user 2 logged in"]).await;
+    rig.barrier.capture(&rig.pipeline, false); // B coalesces behind A
+    assert!(
+        rig.barrier.pending_mark().is_some_and(|b| b > a_mark),
+        "B's newer mark is what the coalesced cut would stamp",
     );
+
+    // When A's flush fails.
+    rig.sabotage_data_store();
+    let outcome = rig.barrier.run_pending();
+
+    // Then nothing of B's is installed and no mark of B's is stamped:
+    // B's snapshot bytes already fold frames whose only durable copy was
+    // A's batches.
+    assert_eq!(outcome, CutOutcome::Retained);
+    assert_eq!(rig.commits.last_checkpoint(), None, "no mark stamped");
+    assert!(rig.snapshots().is_empty(), "no snapshot installed");
+    assert_eq!(
+        rig.barrier.pending_mark(),
+        None,
+        "the pending cut is invalidated, not left to stamp behind a failure",
+    );
+    assert_eq!(
+        rig.sink.buffered_records(),
+        2,
+        "A's and B's records are all back in the buffers",
+    );
+
+    // And when A succeeds instead, B runs unchanged: the re-captured cut
+    // covers everything either held.
+    std::fs::remove_file(&rig.data_root).expect("un-sabotage");
+    std::fs::create_dir_all(&rig.data_root).expect("data root");
+    let recaptured = rig.pipeline.last_durable().expect("a mark");
+    let rig = Arc::new(rig);
+    let run = Arc::clone(&rig);
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(run.barrier.tick(&run.pipeline, false), CutOutcome::Stamped);
+    })
+    .await
+    .expect("tick");
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(recaptured),
+        "the re-captured cut covers A's and B's records alike",
+    );
+    assert_eq!(rig.sink.buffered_records(), 0, "and drained them");
 }
 
 /// Scenario RFC0052.14 — an age-sweep publish registered after the cut is neither covered nor lost.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (post-cut publish carries the next epoch; no exclusion around store I/O)"]
-fn rfc0052_14_post_cut_publish_failure_fails_no_cut_at_or_below_the_current_one() {
-    todo!(
-        "RFC0052.14 — an age-sweep publish registered between the \
-         barrier's quiesce_publishes and its checkpoint that fails \
-         transiently or panics: every frame it holds is above the cut's \
-         mark, a transient failure requeues it, and a panic carrying the \
-         next epoch fails no cut at or below the current one — which \
-         proceeds — and fails every later barrier until restart; the \
-         barrier does not re-take the exclusion around its store I/O"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_post_cut_publish_failure_fails_no_cut_at_or_below_the_current_one() {
+    // Given a cut captured, and an age-sweep publish registered *after*
+    // it — between the barrier's `quiesce_publishes` and its checkpoint.
+    // Every frame that publish holds is above the cut's mark, by §3.1's
+    // invariant.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let mark = rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.barrier.capture(&rig.pipeline, false);
+    let cut = rig.epochs.current();
+
+    // When that publish fails transiently: it requeues, dated with the
+    // epoch current at the return.
+    let after = rig.ingest("checkout", &["user 2 logged in"]).await;
+    assert!(after > mark, "its frames are above the cut's mark");
+    let registered = rig.epochs.current();
+    rig.sink.note_resettled(registered);
+
+    // Then the cut at or below the current one proceeds.
+    assert_eq!(rig.barrier.run_pending(), CutOutcome::Stamped);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark),
+        "a post-cut failure fails no cut at or below the current one",
     );
+    assert!(
+        cut <= registered,
+        "the publish was registered after the cut"
+    );
+
+    // And a panic in such a publish — carrying the next epoch — fails
+    // every *later* barrier until restart, while the one in flight had
+    // already proceeded.
+    let guard = rig.sink.begin_publish();
+    let panicking = std::thread::spawn(move || {
+        let _held = guard;
+        panic!("injected post-cut publish panic");
+    });
+    assert!(panicking.join().is_err(), "the publish panicked");
+    let rig = Arc::new(rig);
+    let later = Arc::clone(&rig);
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(
+            later.barrier.tick(&later.pipeline, false),
+            CutOutcome::Latched,
+            "every later barrier is refused until a restart",
+        );
+    })
+    .await
+    .expect("tick");
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        Some(mark),
+        "and the mark the proceeding cut stamped is still the last one",
+    );
+}
+
+/// A journal whose `sync` reports an EOF that already covers a frame no
+/// turn has run — the two-turn flush RFC 0052 §3.1 warns about.
+struct TwoTurnJournal {
+    eof: WalOffset,
+    appended: u64,
+    segment: uuid::Uuid,
+}
+
+impl Journal for TwoTurnJournal {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+        self.appended += 1;
+        Ok(WalOffset {
+            segment: self.segment,
+            byte: self.appended * 16,
+        })
+    }
+
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        Ok(self.eof)
+    }
+
+    fn unflushed_bytes(&self) -> u64 {
+        0
+    }
+}
+
+fn segment_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .collect();
+    out.sort();
+    out
 }

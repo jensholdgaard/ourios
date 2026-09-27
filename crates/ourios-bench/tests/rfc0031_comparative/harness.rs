@@ -1041,15 +1041,14 @@ fn corpus_loki_labels_counts_triggered_labels_and_streams() {
             ..ResourceLogs::default()
         }]);
     }
-    labels.observe(None);
 
-    // Six resource shapes plus the attribute-less resource; the repeated
-    // recommendation resource is the same stream.
-    assert_eq!(labels.label_sets.len(), 7);
+    // Six resource shapes; the repeated recommendation resource is the same
+    // stream.
+    assert_eq!(labels.label_sets.len(), 6);
     assert_eq!(
         labels.to_string(),
         "3 of 18 allowlisted labels triggered [service_instance_id=4 \
-         service_name=5 service_namespace=1], 7 resource-level streams",
+         service_name=5 service_namespace=1], 6 resource-level streams",
     );
     let json = labels.to_json();
     let per_label = &json["distinct_values_per_label"];
@@ -1061,11 +1060,44 @@ fn corpus_loki_labels_counts_triggered_labels_and_streams() {
         ),
         (
             &serde_json::json!(18),
-            &serde_json::json!(7),
+            &serde_json::json!(6),
             &serde_json::json!(5)
         ),
     );
     assert!(per_label.get("host_name").is_none());
+}
+
+/// A resource with no `service.name` is indexed under Loki's
+/// `unknown_service` fallback. Against the pinned image, three such resources
+/// (one bare, one with only an unpromoted key, one with `service.namespace`)
+/// produced two streams, and this inventory must count the same.
+#[test]
+fn corpus_loki_labels_models_the_unknown_service_fallback() {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    let with = |key: &str, value: &str| Resource {
+        attributes: vec![KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_string())),
+            }),
+            ..KeyValue::default()
+        }],
+        ..Resource::default()
+    };
+
+    let mut labels = CorpusLokiLabels::default();
+    labels.observe(None);
+    labels.observe(Some(&with("host.name", "h1")));
+    labels.observe(Some(&with("service.namespace", "ns")));
+
+    assert_eq!(
+        labels.to_string(),
+        "2 of 18 allowlisted labels triggered [service_name=1 \
+         service_namespace=1], 2 resource-level streams",
+    );
+    assert!(labels.values["service_name"].contains(LOKI_UNKNOWN_SERVICE));
 }
 
 pub(crate) fn split_measurements(

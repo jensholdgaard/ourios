@@ -164,6 +164,23 @@ pub(crate) const LOKI_PROMOTED_RESOURCE_ATTRIBUTES: &[&str] = &[
     "k8s.job.name",
 ];
 
+/// The `service_name` Loki's OTLP ingest assigns a resource that carries no
+/// `service.name`, observed against the pinned image.
+pub(crate) const LOKI_UNKNOWN_SERVICE: &str = "unknown_service";
+
+/// A resource attribute's value as Loki renders it into a label value.
+fn label_value(value: Option<&opentelemetry_proto::tonic::common::v1::AnyValue>) -> String {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
+    match value.and_then(|v| v.value.as_ref()) {
+        Some(Value::StringValue(s)) => s.clone(),
+        Some(Value::IntValue(i)) => i.to_string(),
+        Some(Value::BoolValue(b)) => b.to_string(),
+        Some(Value::DoubleValue(d)) => d.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// The stream labels a replayed corpus actually triggers in Loki (#800).
 ///
 /// [`LOKI_LABEL_ALLOWLIST`] is what the config *may* index; this is what a
@@ -177,9 +194,8 @@ pub(crate) const LOKI_PROMOTED_RESOURCE_ATTRIBUTES: &[&str] = &[
 /// the streams existed. The match is exact because
 /// `rfc0031_10_loki_label_allowlist` proves the allowlist equals Loki's
 /// effective promotion list, and the source-form list renders to the
-/// allowlist. Not modelled: Loki's `unknown_service` fallback
-/// for a resource with no `service.name` (every `otel-demo-v8` resource
-/// carries one).
+/// allowlist. A resource with no `service.name` gets Loki's
+/// [`LOKI_UNKNOWN_SERVICE`] fallback, as Loki assigns it.
 ///
 /// Each distinct label set is one Loki stream, so `label_sets` is the
 /// resource-level stream count.
@@ -203,26 +219,20 @@ impl CorpusLokiLabels {
         &mut self,
         resource: Option<&opentelemetry_proto::tonic::resource::v1::Resource>,
     ) {
-        use opentelemetry_proto::tonic::common::v1::any_value::Value;
-
-        let mut set = Vec::new();
-        for kv in resource.map_or(&[][..], |r| r.attributes.as_slice()) {
-            if !LOKI_PROMOTED_RESOURCE_ATTRIBUTES.contains(&kv.key.as_str()) {
-                continue;
-            }
-            let label = kv.key.replace('.', "_");
-            let value = match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
-                Some(Value::StringValue(s)) => s.clone(),
-                Some(Value::IntValue(i)) => i.to_string(),
-                Some(Value::BoolValue(b)) => b.to_string(),
-                Some(Value::DoubleValue(d)) => d.to_string(),
-                other => format!("{other:?}"),
-            };
+        let mut set: Vec<(String, String)> = resource
+            .map_or(&[][..], |r| r.attributes.as_slice())
+            .iter()
+            .filter(|kv| LOKI_PROMOTED_RESOURCE_ATTRIBUTES.contains(&kv.key.as_str()))
+            .map(|kv| (kv.key.replace('.', "_"), label_value(kv.value.as_ref())))
+            .collect();
+        if !set.iter().any(|(label, _)| label == "service_name") {
+            set.push(("service_name".to_string(), LOKI_UNKNOWN_SERVICE.to_string()));
+        }
+        for (label, value) in &set {
             self.values
                 .entry(label.clone())
                 .or_default()
                 .insert(value.clone());
-            set.push((label, value));
         }
         set.sort();
         self.label_sets.insert(set);

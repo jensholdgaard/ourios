@@ -1,27 +1,30 @@
 //! `ourios-parquet` — Parquet schema, writer, reader, and
 //! audit-event file series for Ourios.
 //!
-//! RFC 0005 is the normative on-disk contract. This crate
-//! implements that contract; the §3.10 "Crate shape" plan splits
-//! the work across follow-on PRs:
+//! RFC 0005 is the normative on-disk contract; this crate implements it:
 //!
-//! 1. **scaffold** (this PR) — `data_schema()` / `audit_schema()`
-//!    Arrow schemas plus column-name constants for greppability.
-//!    The RFC0005.10 "schema-as-spec" pin test lands alongside.
-//! 2. writer — `Writer` opening a file at a partition path,
-//!    appending rows in the §3.2 column order, rotating row
-//!    groups at the §3.5 threshold.
-//! 3. reader — `Reader` with the §3.9 forward-/backward-compat
-//!    contract (unknown columns ignored, missing OPTIONAL
-//!    columns surface as `None`, row-vs-path validation).
-//! 4. audit stream — `AuditWriter` / `AuditReader` for the §3.7
-//!    parallel file series.
+//! - **Schema** — [`data_schema()`] / [`audit_schema()`] Arrow schemas
+//!   plus the [`columns`] / [`audit_columns`] name constants. The
+//!   RFC0005.10 "schema-as-spec" pin test holds the declaration to the
+//!   RFC.
+//! - **Writer** — [`Writer`] opens a file at a [`partition`] path,
+//!   appends rows in the §3.2 column order, and rotates row groups at
+//!   the §3.5 threshold.
+//! - **Reader** — [`Reader`] carries the §3.9 forward-/backward-compat
+//!   contract (unknown columns ignored, missing OPTIONAL columns surface
+//!   as `None`, row-vs-path validation).
+//! - **Audit stream** — [`AuditWriter`] / [`AuditReader`] for the §3.7
+//!   parallel file series.
 //!
-//! Arrow's `SchemaRef` is the cross-crate interop point — the
-//! follow-on writer/reader hand the same `SchemaRef` to
-//! `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`
-//! without translating to `parquet::schema::types::SchemaDescriptor`
-//! by hand.
+//! Around that contract sit the object-storage seam ([`store`],
+//! RFC 0013), promoted attribute columns ([`promoted`], RFC 0022), and
+//! sealed-partition compaction with its per-partition manifest
+//! ([`compaction`], [`manifest`], RFC 0009).
+//!
+//! Arrow's `SchemaRef` is the cross-crate interop point — the writer and
+//! reader hand the same `SchemaRef` to `parquet::arrow::ArrowWriter` /
+//! `ParquetRecordBatchReader` without translating to
+//! `parquet::schema::types::SchemaDescriptor` by hand.
 
 #![deny(unsafe_code)]
 

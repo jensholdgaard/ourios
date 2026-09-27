@@ -1,0 +1,15 @@
+dependencies:
+- name: kubescape-alert-crd
+  repository: file://../dependency_chart/clustered-crds
+  version: 0.0.2
+- name: kubescape-alert-crd-ns
+  repository: file://../dependency_chart/namespaced-crds
+  version: 0.0.2
+- name: kubescape-service-scan-crd
+  repository: file://../dependency_chart/servicescanresult-crds
+  version: 0.0.1
+- name: kubescape-operator-command-crd
+  repository: file://../dependency_chart/operatorcommand-crds
+  version: 0.0.2
+digest: sha256:7d58f9fc1159459c2543dca460cf4aeceaab26923923280b6ae2bdd5b3d9c9ef
+generated: "2025-08-04T21:42:46.88724927Z"

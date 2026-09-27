@@ -43,6 +43,17 @@ receiver:
   enabled: true
   grpc_addr: 0.0.0.0:4317
   http_addr: 0.0.0.0:4318
+  # RFC 0030: native TLS per listener (omit a block for plaintext).
+  # Keys: cert_file + key_file (required together), client_ca_file
+  # (mTLS), min_version ("1.2" | "1.3"), reload_interval_secs.
+  grpc_tls:
+    cert_file: /etc/ourios/tls/tls.crt
+    key_file: /etc/ourios/tls/tls.key
+    client_ca_file: /etc/ourios/tls/ca.crt
+    reload_interval_secs: 60
+  http_tls:
+    cert_file: /etc/ourios/tls/tls.crt
+    key_file: /etc/ourios/tls/tls.key
   # The WAL stays on local disk by design, S3 or not (RFC 0019).
   wal_root: /var/lib/ourios/wal
   # RFC 0035: concurrent Parquet-encode workers (default: all cores).
@@ -52,6 +63,9 @@ querier:
   enabled: true
   http_addr: 0.0.0.0:4319
   default_window_secs: 3600
+  http_tls:                           # RFC 0030; also covers /mcp
+    cert_file: /etc/ourios/tls/tls.crt
+    key_file: /etc/ourios/tls/tls.key
   mcp:
     enabled: false
 
@@ -118,6 +132,27 @@ auth:
 Auth configuration is **file-only** — there are deliberately no
 `OURIOS_AUTH_*` variables; token values reach the file through
 `${env:…}` references.
+
+## Listener TLS
+
+TLS is **file-only** too ([RFC 0030](../rfcs/0030-tls-mtls-listeners.md));
+without `--config` every listener speaks plaintext. Each listener takes
+its own block — `receiver.grpc_tls`, `receiver.http_tls`,
+`querier.http_tls` — with the same keys:
+
+| Key | Meaning |
+|---|---|
+| `cert_file` | PEM certificate chain; required together with `key_file` to enable TLS |
+| `key_file` | PEM private key |
+| `client_ca_file` | optional; PEM CA — set it to require and verify client certificates (mTLS) |
+| `min_version` | optional; `"1.2"` (default) or `"1.3"` |
+| `reload_interval_secs` | optional; positive integer — re-read the files on this interval and swap in changed material (unset: never reload) |
+
+Setting any other key without the `cert_file` / `key_file` pair is a
+startup error, as is an unreadable or malformed PEM file. Paths accept
+`${env:…}` substitution like any other value. See the
+[authentication guide](./authentication.md#tls) for how TLS composes
+with bearer auth.
 
 There is no tenant-derivation configuration: the tenant is named **out of
 band on every export** (RFC 0046) — the `X-Ourios-Tenant` header over

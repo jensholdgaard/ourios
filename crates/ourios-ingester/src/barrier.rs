@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::{SnapshotState, WalHighWater};
-use ourios_wal::WalOffset;
+use ourios_wal::{ReclaimError, WalOffset};
 
 use crate::cadence::{BarrierEpochs, Epoch};
 use crate::publish::{Drained, PublishCoordinator};
@@ -152,6 +152,12 @@ pub enum CutOutcome {
     /// Snapshots installed and the checkpoint advanced — or there was no
     /// mark to stamp, which is the same decision with nothing to record.
     Stamped,
+    /// The records and snapshots are durable, but the journal has no
+    /// reclamation surface, so no checkpoint was written. Not a stamp: a
+    /// missing implementation must not read as one. A failed sidecar
+    /// write stays [`Self::Stamped`] — RFC0052.1 — because the WAL keeps
+    /// its previous mark usable and fail-closed.
+    Unstamped,
     /// A sink retained something, so neither the snapshots nor the mark
     /// moved. The records are back in the buffers and the next cut
     /// covers them.
@@ -328,8 +334,9 @@ impl Barrier {
         // cut held. It also releases the publish guards those batches
         // hold: left in the slot they would stall `quiesce_publishes`
         // for the life of the process, shutdown included.
-        if outcome != CutOutcome::Stamped {
-            self.invalidate_pending();
+        match outcome {
+            CutOutcome::Retained | CutOutcome::Latched => self.invalidate_pending(),
+            CutOutcome::Stamped | CutOutcome::Unstamped | CutOutcome::Idle => {}
         }
         self.publish.record().settle_cut(epoch);
         outcome
@@ -522,10 +529,7 @@ impl Barrier {
         // duplicates are this cut's, not every row since `S`.
         match self.install(&snapshots, mark) {
             Install::Failed => CutOutcome::Retained,
-            Install::Written | Install::Superseded => {
-                self.stamp(mark);
-                CutOutcome::Stamped
-            }
+            Install::Written | Install::Superseded => self.stamp(mark),
         }
     }
 
@@ -569,15 +573,27 @@ impl Barrier {
     /// in-memory mark where it was, so nothing past the *previous* mark
     /// becomes reclaimable — segments already eligible under it still
     /// are.
-    fn stamp(&self, mark: Option<WalOffset>) {
+    fn stamp(&self, mark: Option<WalOffset>) -> CutOutcome {
         let Some(mark) = mark else {
-            return;
+            return CutOutcome::Stamped;
         };
-        if let Err(e) = self.coordinator.checkpoint(mark) {
-            tracing::warn!(
-                error = %e,
-                "barrier: the checkpoint write failed; nothing past the previous mark is reclaimed"
-            );
+        match self.coordinator.checkpoint(mark) {
+            Ok(()) => CutOutcome::Stamped,
+            Err(ReclaimError::NoReclamationSurface) => {
+                tracing::warn!(
+                    "barrier: the journal exposes no reclamation surface, so no checkpoint was \
+                     written and nothing is reclaimed"
+                );
+                CutOutcome::Unstamped
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "barrier: the checkpoint write failed; nothing past the previous mark is \
+                     reclaimed"
+                );
+                CutOutcome::Stamped
+            }
         }
     }
 }
@@ -990,6 +1006,23 @@ mod tests {
         assert!(
             !rig.records.quiesce_publishes().all_ok(later),
             "and the unwind's settlement refuses it independently",
+        );
+    }
+
+    /// `Journal::checkpoint` defaults to `NoReclamationSurface` so a
+    /// journal that cannot reclaim fails closed. A cut over one wrote no
+    /// checkpoint, and must not report that it stamped.
+    #[test]
+    fn a_cut_over_a_journal_without_a_reclamation_surface_reports_no_stamp() {
+        let rig = Rig::new();
+        rig.buffer_one();
+        let miner = MinerCluster::new(MinerConfig::default());
+        rig.barrier.capture_rotation(&miner, offset(64));
+        assert_eq!(rig.barrier.run_pending(), CutOutcome::Unstamped);
+        assert_eq!(
+            rig.records.buffered_records(),
+            0,
+            "the cut's records still reached the store",
         );
     }
 }

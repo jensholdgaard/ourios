@@ -86,28 +86,156 @@ pub(super) fn resolve_live_files(
 /// manifest. Returns store-relative keys (the same key space `Store::get`/`put`
 /// take), addressed as object-store URLs by the caller.
 ///
-/// [`Store::list_blocking`] returns every key under `prefix` recursively, in
-/// lexicographic order, segment-wise prefix-scoped to this tenant (RFC0019.5).
-/// The keys are grouped by their partition directory (everything up to the last
-/// `/`); for each partition: skip it when an `hour=HH` window prune proves it
-/// out of range, then if it carries a `manifest.json` the manifest is
-/// authoritative (only its named files are live, joined onto the partition key),
-/// otherwise fall back to the partition's committed `*.parquet` keys
-/// (`*.parquet.tmp` is excluded — it does not end in `.parquet`).
+/// Every listing is segment-wise prefix-scoped to this tenant (RFC0019.5) and
+/// comes back in lexicographic order. With no window the whole prefix is listed
+/// recursively. With a window, [`window_listing`] lists only the subtrees the
+/// window can reach, so the cost follows the window rather than the tenant's
+/// history (#853). The keys are then grouped by their partition directory
+/// (everything up to the last `/`); for each partition: skip it when an
+/// `hour=HH` window prune proves it out of range, then if it carries a
+/// `manifest.json` the manifest is authoritative (only its named files are
+/// live, joined onto the partition key), otherwise fall back to the
+/// partition's committed `*.parquet` keys (`*.parquet.tmp` is excluded — it
+/// does not end in `.parquet`).
 pub(super) fn resolve_live_keys(
     store: &Store,
     prefix: &str,
     window: Option<(u64, u64)>,
 ) -> Result<Vec<String>, QueryError> {
-    let keys = store
+    let keys = match window {
+        Some(window) => window_listing(store, prefix, window)?,
+        None => list_recursive(store, prefix)?,
+    };
+    live_keys_from_listing(store, &keys, window)
+}
+
+fn list_recursive(store: &Store, prefix: &str) -> Result<Vec<String>, QueryError> {
+    store
         .list_blocking(Some(prefix))
         .map_err(|e| QueryError::Storage {
             detail: format!("list data prefix {prefix}: {e}"),
-        })?;
+        })
+}
+
+/// The Hive time level a delimited listing's children sit at, carrying the
+/// ancestors already parsed on the way down (RFC 0005 §3.4 layout
+/// `year=/month=/day=/hour=`).
+#[derive(Clone, Copy)]
+enum HiveLevel {
+    Year,
+    Month(i32),
+    Day(i32, u32),
+    Hour,
+}
+
+/// Every key under the tenant `prefix` that the window `[start, end)` can
+/// reach, sorted: a walk down the Hive time levels with one delimited listing
+/// per visited level. At each level a child whose segment parses to a UTC span
+/// is dropped when the span misses the window, listed recursively in one call
+/// when the window covers it whole (and at the `hour=` leaves), and descended
+/// into otherwise. A child that does not parse as the expected level (a foreign
+/// name, an impossible date, a pre-epoch span) is listed recursively, so it
+/// meets the same per-partition rule as a full listing would give it. Objects
+/// sitting directly at a visited level are kept.
+///
+/// Relative to listing everything and pruning afterwards, the one difference
+/// is that nothing below a parsed ancestor whose whole span misses the window
+/// is listed — the Hive path is the proof those keys are out of range.
+fn window_listing(
+    store: &Store,
+    prefix: &str,
+    (start, end): (u64, u64),
+) -> Result<Vec<String>, QueryError> {
+    let mut keys = Vec::new();
+    let mut pending = vec![(prefix.to_owned(), HiveLevel::Year)];
+    while let Some((dir, level)) = pending.pop() {
+        let listing =
+            store
+                .list_delimited_blocking(Some(&dir))
+                .map_err(|e| QueryError::Storage {
+                    detail: format!("list data prefix {dir}: {e}"),
+                })?;
+        keys.extend(listing.objects);
+        for child in listing.common_prefixes {
+            if matches!(level, HiveLevel::Hour) {
+                if hour_partition_in_window(&PathBuf::from(&child), start, end) {
+                    keys.extend(list_recursive(store, &child)?);
+                }
+                continue;
+            }
+            let segment = child.rsplit('/').next().unwrap_or(&child);
+            match child_span(level, segment) {
+                Some((_, lo, hi)) if hi <= start || end <= lo => {}
+                Some((next, lo, hi)) if lo < start || end < hi => pending.push((child, next)),
+                _ => keys.extend(list_recursive(store, &child)?),
+            }
+        }
+    }
+    keys.sort_unstable();
+    Ok(keys)
+}
+
+/// Parse `segment` as the child of a directory at `level`, returning the level
+/// below it and the child's `[lo, hi)` UTC-nanosecond span. `None` when the
+/// segment is not the expected `<name>=<n>`, names an impossible date, or
+/// starts before the epoch — the cases [`hour_partition_in_window`] refuses to
+/// prune. Numbers parse without a width check, as the leaf prune parses them.
+fn child_span(level: HiveLevel, segment: &str) -> Option<(HiveLevel, u64, u64)> {
+    fn value<T: std::str::FromStr>(segment: &str, name: &str) -> Option<T> {
+        segment.strip_prefix(name)?.strip_prefix('=')?.parse().ok()
+    }
+    let (next, from, to) = match level {
+        HiveLevel::Year => {
+            let year = value(segment, "year")?;
+            let from = chrono::NaiveDate::from_ymd_opt(year, 1, 1)?;
+            (
+                HiveLevel::Month(year),
+                from,
+                chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1),
+            )
+        }
+        HiveLevel::Month(year) => {
+            let month = value(segment, "month")?;
+            let from = chrono::NaiveDate::from_ymd_opt(year, month, 1)?;
+            (
+                HiveLevel::Day(year, month),
+                from,
+                from.checked_add_months(chrono::Months::new(1)),
+            )
+        }
+        HiveLevel::Day(year, month) => {
+            let from = chrono::NaiveDate::from_ymd_opt(year, month, value(segment, "day")?)?;
+            (HiveLevel::Hour, from, from.succ_opt())
+        }
+        HiveLevel::Hour => return None,
+    };
+    let midnight_ns = |date: chrono::NaiveDate| {
+        date.and_hms_opt(0, 0, 0)?
+            .and_utc()
+            .timestamp_nanos_opt()
+            .and_then(|ns| u64::try_from(ns).ok())
+    };
+    let lo = midnight_ns(from)?;
+    // A span running past the last representable instant still starts in
+    // range; it just never ends before the window does.
+    let hi = to.and_then(midnight_ns).unwrap_or(u64::MAX);
+    Some((next, lo, hi))
+}
+
+/// The per-partition half of [`resolve_live_keys`]: group `keys` by partition
+/// directory, drop the partitions an `hour=HH` window prune proves out of
+/// range, and resolve each remaining one through its manifest or the glob
+/// fallback. `keys` must hold every key of each partition it touches — a
+/// partition's manifest counts only when it is in the same listing.
+fn live_keys_from_listing(
+    store: &Store,
+    keys: &[String],
+    window: Option<(u64, u64)>,
+) -> Result<Vec<String>, QueryError> {
     // Group keys by partition directory (the key up to its last `/`).
     let mut by_partition: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
-    for key in &keys {
+    for key in keys {
         let (dir, _) = key.rsplit_once('/').unwrap_or(("", key.as_str()));
         by_partition.entry(dir).or_default().push(key);
     }
@@ -354,6 +482,334 @@ mod tests {
             decoded.ends_with("data/tenant_id=t/h.parquet"),
             "no-prefix URL is the bare key: {decoded}",
         );
+    }
+
+    use super::live_keys_from_listing;
+    use crate::test_support::{Call, CountingStore};
+
+    const TENANT_PREFIX: &str = "data/tenant_id=a";
+
+    fn ns(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> u64 {
+        let nanos = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(hour, minute, 0))
+            .expect("valid instant")
+            .and_utc()
+            .timestamp_nanos_opt()
+            .expect("in nanosecond range");
+        u64::try_from(nanos).expect("post-epoch")
+    }
+
+    fn hour_prefix(year: i32, month: u32, day: u32, hour: u32) -> String {
+        format!("{TENANT_PREFIX}/year={year:04}/month={month:02}/day={day:02}/hour={hour:02}")
+    }
+
+    /// A local store under `root`, and the same store seen through a
+    /// request-counting wrapper.
+    fn counted(root: &std::path::Path) -> (Store, Store, CountingStore) {
+        let plain = Store::local(root).expect("local store");
+        let mut counter = None;
+        let wrapped = plain.clone().wrap_backend(|inner| {
+            let counting = CountingStore::new(inner);
+            counter = Some(counting.clone());
+            Arc::new(counting)
+        });
+        (
+            plain,
+            wrapped,
+            counter.expect("wrap_backend calls the wrapper"),
+        )
+    }
+
+    fn put(store: &Store, key: &str) {
+        store.put_blocking(key, b"x".to_vec()).expect("put");
+    }
+
+    fn put_manifest(store: &Store, dir: &str, files: &[&str]) {
+        let manifest = ourios_parquet::Manifest {
+            generation: 1,
+            files: files.iter().map(ToString::to_string).collect(),
+        };
+        store
+            .put_blocking(
+                &format!("{dir}/{}", ourios_parquet::MANIFEST_FILENAME),
+                manifest.to_json().expect("manifest json"),
+            )
+            .expect("put manifest");
+    }
+
+    /// Three years of four-partitions-a-day history for tenant `a`, a sibling
+    /// tenant `ab` inside the window, and the query hours of interest.
+    fn seed_history(store: &Store) {
+        for year in 2024..=2026 {
+            for month in 1..=4 {
+                for day in 1..=3 {
+                    for hour in [0, 6, 12, 18] {
+                        put(
+                            store,
+                            &format!("{}/f.parquet", hour_prefix(year, month, day, hour)),
+                        );
+                    }
+                }
+            }
+        }
+        for hour in [10, 11] {
+            put(
+                store,
+                &format!("{}/a.parquet", hour_prefix(2026, 4, 2, hour)),
+            );
+        }
+        put(store, &format!("{}/b.parquet", hour_prefix(2026, 4, 2, 10)));
+        put(
+            store,
+            "data/tenant_id=ab/year=2026/month=04/day=02/hour=10/other.parquet",
+        );
+    }
+
+    /// Partitions the Hive walk cannot parse or prune, plus the manifest and
+    /// uncommitted-file cases, around the query hours.
+    fn seed_irregular(store: &Store) {
+        put(store, &format!("{TENANT_PREFIX}/stray.parquet"));
+        put(
+            store,
+            &format!("{TENANT_PREFIX}/year=abc/month=04/day=02/hour=10/u.parquet"),
+        );
+        put(
+            store,
+            &format!("{TENANT_PREFIX}/year=1969/month=12/day=31/hour=23/u.parquet"),
+        );
+        put(
+            store,
+            &format!("{TENANT_PREFIX}/year=2026/month=4/day=2/hour=10/u.parquet"),
+        );
+        put(
+            store,
+            &format!("{TENANT_PREFIX}/year=2026/month=4/day=2/hour=3/u.parquet"),
+        );
+        put(
+            store,
+            &format!("{TENANT_PREFIX}/foo/year=2026/month=04/day=02/hour=10/u.parquet"),
+        );
+        put(
+            store,
+            &format!("{TENANT_PREFIX}/foo/year=2024/month=04/day=02/hour=10/u.parquet"),
+        );
+        put(
+            store,
+            &format!("{}/c.parquet.tmp", hour_prefix(2026, 4, 2, 10)),
+        );
+        put_manifest(store, &hour_prefix(2026, 4, 2, 11), &["a.parquet"]);
+        put(
+            store,
+            &format!("{}/orphan.parquet", hour_prefix(2026, 4, 2, 11)),
+        );
+        put(
+            store,
+            &format!("{}/f.parquet", hour_prefix(2025, 12, 31, 23)),
+        );
+        put(store, &format!("{}/f.parquet", hour_prefix(2026, 1, 1, 0)));
+        put_manifest(store, &hour_prefix(2025, 12, 31, 23), &["f.parquet"]);
+    }
+
+    /// Stray keys below parsed Hive ancestors (`year=2026`, then the
+    /// 2026-04-02 hour 10 partition's): the full listing keeps them under every
+    /// window, the walk only when the window reaches those ancestors.
+    fn junk_below_parsed_ancestors() -> Vec<String> {
+        vec![
+            format!("{TENANT_PREFIX}/year=2026/month=13/day=01/hour=00/u.parquet"),
+            format!("{TENANT_PREFIX}/year=2026/month=04/stray.parquet"),
+            format!("{TENANT_PREFIX}/year=2026/month=04/day=02/hour=xx/u.parquet"),
+            format!("{}/sub/u.parquet", hour_prefix(2026, 4, 2, 10)),
+        ]
+    }
+
+    /// The pre-#853 resolution: list every key under the tenant, then prune.
+    fn full_listing_oracle(store: &Store, window: Option<(u64, u64)>) -> Vec<String> {
+        let keys = store.list_blocking(Some(TENANT_PREFIX)).expect("list");
+        live_keys_from_listing(store, &keys, window).expect("resolve")
+    }
+
+    /// #853: a ten-minute window lists only the one hour it can reach, and
+    /// the delimited levels on the way down to it — never the tenant's whole
+    /// history.
+    #[test]
+    fn windowed_resolution_lists_only_in_window_prefixes() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("temp");
+        let (plain, wrapped, counter) = counted(tmp.path());
+        seed_history(&plain);
+        let window = (ns(2026, 4, 2, 10, 20), ns(2026, 4, 2, 10, 30));
+        let in_window_hour = hour_prefix(2026, 4, 2, 10);
+
+        // Act
+        let live = resolve_live_keys(&wrapped, TENANT_PREFIX, Some(window)).expect("resolve");
+
+        // Assert
+        assert_eq!(
+            live,
+            vec![
+                format!("{in_window_hour}/a.parquet"),
+                format!("{in_window_hour}/b.parquet"),
+            ],
+        );
+        let calls = counter.calls();
+        let ancestors = [
+            TENANT_PREFIX.to_string(),
+            format!("{TENANT_PREFIX}/year=2026"),
+            format!("{TENANT_PREFIX}/year=2026/month=04"),
+            format!("{TENANT_PREFIX}/year=2026/month=04/day=02"),
+        ];
+        for call in &calls {
+            match call {
+                Call::List(prefix) => assert_eq!(prefix, &in_window_hour, "{calls:?}"),
+                Call::ListDelimited(prefix) => {
+                    assert!(ancestors.contains(prefix), "{prefix} in {calls:?}");
+                }
+                Call::Get(_) | Call::GetRanges(_) => {}
+            }
+        }
+        assert!(
+            calls.len() <= 5,
+            "one delimited listing per Hive level plus the hour: {calls:?}",
+        );
+        let listed = counter.listed_keys();
+        assert_eq!(
+            listed.len(),
+            2,
+            "only the in-window hour's keys: {listed:?}"
+        );
+    }
+
+    /// A window spanning whole months lists each fully covered subtree in one
+    /// recursive call and still returns no key outside the window: the listed
+    /// key count follows the window, not the tenant's three years of history.
+    #[test]
+    fn wide_window_lists_covered_subtrees_whole_and_nothing_outside() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("temp");
+        let (plain, wrapped, counter) = counted(tmp.path());
+        seed_history(&plain);
+        let window = (ns(2025, 1, 1, 0, 0), ns(2025, 3, 2, 6, 0));
+
+        // Act
+        let live = resolve_live_keys(&wrapped, TENANT_PREFIX, Some(window)).expect("resolve");
+
+        // Assert
+        assert_eq!(live, full_listing_oracle(&plain, Some(window)));
+        let listed = counter.listed_keys();
+        assert_eq!(
+            listed.len(),
+            live.len(),
+            "every listed key is in the window: {listed:?}",
+        );
+        for key in &listed {
+            assert!(
+                key.starts_with(&format!("{TENANT_PREFIX}/year=2025/")),
+                "{key}"
+            );
+        }
+        let recursive: Vec<Call> = counter
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::List(_)))
+            .collect();
+        assert!(
+            recursive.contains(&Call::List(format!("{TENANT_PREFIX}/year=2025/month=01"))),
+            "a fully covered month is one recursive listing: {recursive:?}",
+        );
+    }
+
+    /// The window walk returns exactly what listing the whole tenant and
+    /// pruning afterwards returned, for in-window, boundary-hour,
+    /// year-crossing, wide, and unbounded windows, including unparseable and
+    /// non-canonical partitions, manifests, and uncommitted files. The one
+    /// intended difference: a stray key below a parsed `year=`/`month=`/
+    /// `day=`/`hour=` ancestor whose whole span misses the window is not
+    /// listed, where the full listing kept it because its own directory did
+    /// not parse.
+    #[test]
+    fn windowed_resolution_matches_the_full_listing() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let store = Store::local(tmp.path()).expect("local store");
+        seed_history(&store);
+        seed_irregular(&store);
+        let junk = junk_below_parsed_ancestors();
+        for key in &junk {
+            put(&store, key);
+        }
+        let below_april = &junk[1..];
+        let below_hour_10 = &junk[3..];
+        // (name, window, the junk keys the walk does not list)
+        let cases: [(&str, Option<(u64, u64)>, &[String]); 9] = [
+            (
+                "in-window",
+                Some((ns(2026, 4, 2, 10, 20), ns(2026, 4, 2, 10, 30))),
+                &[],
+            ),
+            (
+                "exact hour",
+                Some((ns(2026, 4, 2, 10, 0), ns(2026, 4, 2, 11, 0))),
+                &[],
+            ),
+            (
+                "hour boundary",
+                Some((ns(2026, 4, 2, 10, 59), ns(2026, 4, 2, 11, 1))),
+                &[],
+            ),
+            (
+                "next hour",
+                Some((ns(2026, 4, 2, 11, 0), ns(2026, 4, 2, 11, 30))),
+                below_hour_10,
+            ),
+            (
+                "year boundary",
+                Some((ns(2025, 12, 31, 23, 30), ns(2026, 1, 1, 0, 30))),
+                below_april,
+            ),
+            (
+                "wide",
+                Some((ns(2024, 2, 15, 7, 0), ns(2026, 3, 2, 5, 0))),
+                below_april,
+            ),
+            ("everything", Some((0, u64::MAX)), &[]),
+            (
+                "no data",
+                Some((ns(2030, 1, 1, 0, 0), ns(2030, 1, 2, 0, 0))),
+                &junk,
+            ),
+            ("no window", None, &[]),
+        ];
+        for (name, window, skipped) in cases {
+            let walked = resolve_live_keys(&store, TENANT_PREFIX, window).expect("resolve");
+            let mut expected = full_listing_oracle(&store, window);
+            for key in skipped {
+                assert!(
+                    expected.contains(key),
+                    "case {name}: the full listing keeps {key}"
+                );
+            }
+            expected.retain(|k| !skipped.contains(k));
+            assert_eq!(walked, expected, "case {name}");
+        }
+    }
+
+    /// A tenant that never wrote anything resolves to nothing under any window.
+    #[test]
+    fn windowed_resolution_of_an_absent_tenant_is_empty() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let store = Store::local(tmp.path()).expect("local store");
+        put(
+            &store,
+            "data/tenant_id=ab/year=2026/month=04/day=02/hour=10/x.parquet",
+        );
+
+        for window in [
+            None,
+            Some((0, u64::MAX)),
+            Some((ns(2026, 4, 2, 10, 0), ns(2026, 4, 2, 11, 0))),
+        ] {
+            let live = resolve_live_keys(&store, TENANT_PREFIX, window).expect("resolve");
+            assert!(live.is_empty(), "window {window:?}: {live:?}");
+        }
     }
 
     /// Create `<root>/data/tenant_id=a/year=2026/.../hour=10` and

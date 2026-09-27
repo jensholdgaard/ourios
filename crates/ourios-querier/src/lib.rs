@@ -85,6 +85,8 @@ mod decode;
 mod exec;
 mod file_set;
 mod stats;
+#[cfg(test)]
+mod test_support;
 
 // Scope glue for the split (epic #745 wave 1): every pre-split
 // `crate::X` path — the sibling modules' imports included — resolves

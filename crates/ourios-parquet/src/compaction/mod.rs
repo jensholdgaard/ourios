@@ -91,11 +91,16 @@ pub struct CompactionOutcome {
     /// two live files — nothing to consolidate — or a lost CAS race that
     /// left the work for a later sweep).
     pub committed: Option<Committed>,
-    /// Superseded input files that could not be removed after the
-    /// commit. These are non-live (the committed manifest excludes
-    /// them) — harmless orphans a later GC sweep reclaims — so they
-    /// are *counted*, not fatal: a post-commit cleanup failure must
-    /// not report a successful compaction as failed.
+    /// Whether the rewrite was written but its final manifest swap lost.
+    /// `false` for every other no-op, including a lost bootstrap: that
+    /// race is decided before anything is written, and the winner owns
+    /// the partition.
+    pub commit_lost: bool,
+    /// Non-live files that could not be removed: superseded inputs after
+    /// a commit, or the discarded rewrite after a lost one. The manifest
+    /// never names them — harmless orphans a later GC sweep reclaims — so
+    /// they are *counted*, not fatal: a cleanup failure must not report a
+    /// compaction as failed.
     pub gc_failures: usize,
     /// Total bytes of the live input files read (`0` on a no-op) — the
     /// read volume for `ourios.compaction.io` (RFC 0009 §3.6).
@@ -479,9 +484,10 @@ fn compact_sorted_hooked(
     match commit_manifest(store, &key, &commit, commit_etag.as_deref())? {
         Published::Won => {}
         // Lost the CAS race (S3 only — the local overwrite always wins): the
-        // consolidated file is now a non-live orphan a later `gc_orphans`
-        // reclaims. Not an error — the work is left for the next sweep.
-        Published::Lost => return Ok(no_op_outcome(inputs.len())),
+        // work is left for the next sweep, and the consolidated file, which
+        // no manifest names, is removed now rather than left to a
+        // `gc_orphans` pass an erasure rewrite never runs.
+        Published::Lost => return Ok(lost_commit_outcome(store, &written.key, inputs.len())),
     }
 
     // GC the now-superseded inputs. The commit already succeeded, so a delete
@@ -508,6 +514,7 @@ fn compact_sorted_hooked(
             generation,
             input_files,
         }),
+        commit_lost: false,
         gc_failures,
         bytes_read,
         bytes_written,

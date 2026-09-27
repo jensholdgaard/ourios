@@ -175,6 +175,8 @@ enum IfMatch {
     Quoted,
     /// Either form, as lenient stores do.
     Either,
+    /// Neither: every compare-and-swap loses.
+    Never,
 }
 
 impl IfMatch {
@@ -183,7 +185,7 @@ impl IfMatch {
         match (self, quoted) {
             (Self::Unquoted | Self::Either, None) => expected == etag,
             (Self::Quoted | Self::Either, Some(inner)) => inner == etag,
-            (Self::Unquoted, Some(_)) | (Self::Quoted, None) => false,
+            (Self::Unquoted, Some(_)) | (Self::Quoted, None) | (Self::Never, _) => false,
         }
     }
 }
@@ -279,8 +281,29 @@ fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
                 .remove(&key);
             respond(stream, "204 No Content", &[], b"");
         }
+        "POST" if req.query("delete").is_some() => bulk_delete(objects, &req, stream),
         _ => respond(stream, "405 Method Not Allowed", &[], b""),
     }
+}
+
+/// `DeleteObjects` (`POST ?delete`), which `object_store` uses for every
+/// delete: removes each `<Key>` in the body and reports it deleted.
+fn bulk_delete(objects: &Objects, req: &Request, stream: &TcpStream) {
+    let body = String::from_utf8_lossy(&req.body);
+    let keys: Vec<&str> = body
+        .split("<Key>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Key>").map(|(key, _)| key))
+        .collect();
+    let mut objects = objects.lock().unwrap_or_else(PoisonError::into_inner);
+    let deleted = keys.iter().fold(String::new(), |mut out, key| {
+        objects.remove(*key);
+        let _ = write!(out, "<Deleted><Key>{key}</Key></Deleted>");
+        out
+    });
+    let xml =
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>{deleted}</DeleteResult>");
+    respond(stream, "200 OK", &[], xml.as_bytes());
 }
 
 /// Start the fake honouring `mode` and return a [`Store`] pointed at it,
@@ -447,4 +470,43 @@ fn put_if_match_loses_with_a_stale_etag_on_every_store() {
             b"v2".to_vec()
         );
     }
+}
+
+/// A rewrite whose final manifest swap loses reports `commit_lost` and
+/// removes its consolidated object: no manifest names it, and an erasure
+/// retrying the partition never runs `gc_orphans` on it.
+#[test]
+fn a_lost_final_swap_removes_its_rewrite() {
+    let (store, _) = fake_store(IfMatch::Never);
+    let partition = PartitionKey::derive(&rec_for("tenant-a", 0)).expect("derive");
+    for i in 0..2 {
+        let mut writer = Writer::open_in(&store, partition.clone()).expect("open writer");
+        writer
+            .append_records(&[rec_for("tenant-a", i)])
+            .expect("append");
+        writer.close().expect("close");
+    }
+    let parquet_keys = || -> Vec<String> {
+        let mut keys: Vec<_> = store
+            .list_blocking(Some("data/"))
+            .expect("list")
+            .into_iter()
+            .filter(|k| k.ends_with(".parquet"))
+            .collect();
+        keys.sort();
+        keys
+    };
+    let inputs = parquet_keys();
+
+    let outcome = compact_partition(&store, &partition).expect("compact");
+
+    assert_eq!(
+        (
+            outcome.committed.is_none(),
+            outcome.commit_lost,
+            outcome.gc_failures
+        ),
+        (true, true, 0)
+    );
+    assert_eq!(parquet_keys(), inputs, "only the inputs remain");
 }

@@ -80,22 +80,40 @@ pub(super) fn read_manifest_etag(
         .and_then(|(_manifest, etag)| etag))
 }
 
-/// An outcome that **committed nothing** (`committed: None`, zero rows/bytes).
-/// Used both for a sub-two-file partition (the listing + manifest read still
-/// happened, but no consolidation is performed) and for a lost manifest CAS: in
-/// the lost-race case inputs were read and a consolidated object was written,
-/// but it lost the swap and is left as an orphan (a later `gc_orphans` reclaims
-/// it), so from the sweep's accounting nothing was committed. The read/written
-/// bytes of a lost race are not attributed here (the work is discarded).
+/// An outcome that **committed nothing** (`committed: None`, zero rows/bytes):
+/// a partition below the input minimum, or a bootstrap lost to another
+/// compactor before anything was written.
 pub(super) fn no_op_outcome(files_before: usize) -> CompactionOutcome {
     CompactionOutcome {
         files_before,
         rows: 0,
         rows_dropped: 0,
         committed: None,
+        commit_lost: false,
         gc_failures: 0,
         bytes_read: 0,
         bytes_written: 0,
+    }
+}
+
+/// A rewrite whose final manifest swap lost. Its consolidated object at
+/// `orphan` is named by no manifest, so it is removed here; a failed delete
+/// is counted in `gc_failures`. The read/written bytes are not attributed
+/// (the work is discarded).
+pub(super) fn lost_commit_outcome(
+    store: &Store,
+    orphan: &str,
+    files_before: usize,
+) -> CompactionOutcome {
+    let gc_failures = match store.delete_blocking(orphan) {
+        Ok(()) => 0,
+        Err(e) if e.is_not_found() => 0,
+        Err(_) => 1,
+    };
+    CompactionOutcome {
+        commit_lost: true,
+        gc_failures,
+        ..no_op_outcome(files_before)
     }
 }
 

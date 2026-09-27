@@ -111,12 +111,13 @@ fn rfc0038_1_sweep_emits_one_internal_span() {
     );
 }
 
-/// #807 — a selected candidate whose manifest swap loses is surfaced as a
-/// sweep error, not reported as an idle sweep. The swap is made to lose by
-/// occupying the manifest key with a directory: it reads as absent, so the
-/// bootstrap create-if-absent runs, and is refused as already existing.
+/// A candidate whose manifest bootstrap loses to another compactor wrote
+/// nothing and belongs to the winner, so the sweep stays a clean no-op. The
+/// bootstrap is made to lose by occupying the manifest key with a
+/// directory: it reads as absent, so the create-if-absent runs, and is
+/// refused as already existing.
 #[test]
-fn sweep_reports_a_candidate_whose_manifest_swap_lost() {
+fn sweep_leaves_a_candidate_whose_bootstrap_lost_as_a_no_op() {
     // Arrange
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
@@ -138,16 +139,61 @@ fn sweep_reports_a_candidate_whose_manifest_swap_lost() {
         .map(|t| t.candidates_found)
         .collect();
     assert_eq!(
-        (report.partitions_compacted, found),
-        (0, vec![1]),
+        (report.partitions_compacted, found, report.errors.len()),
+        (0, vec![1], 0),
         "{report:?}"
     );
+}
+
+fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
+    CompactionOutcome {
+        files_before,
+        rows: 0,
+        rows_dropped: 0,
+        committed: None,
+        commit_lost,
+        gc_failures: 0,
+        bytes_read: 0,
+        bytes_written: 0,
+    }
+}
+
+/// #807 — a rewrite whose final manifest swap lost is a sweep error for a
+/// consolidation and an erasure alike, so a store whose swaps always lose
+/// never reads as an idle sweep.
+#[test]
+fn a_lost_final_swap_is_a_sweep_error() {
+    let lost = outcome(2, true);
+
+    let errors = [
+        uncommitted_rewrite(&lost, false),
+        uncommitted_rewrite(&lost, true),
+    ];
+
     assert!(
-        matches!(report.errors.as_slice(),
-            [e] if e.contains("\"a\" 2026-04-02T10") && e.contains("not committed")),
-        "{:?}",
-        report.errors
+        errors
+            .iter()
+            .all(|e| e.as_deref().is_some_and(|e| e.contains("not committed"))),
+        "{errors:?}"
     );
+}
+
+/// A lost bootstrap is benign for a consolidation but not for an erasure,
+/// whose rows are still on disk; a partition with nothing to rewrite is a
+/// no-op for both.
+#[test]
+fn a_lost_bootstrap_is_an_error_only_for_an_erasure() {
+    let bootstrap_lost = outcome(2, false);
+    let empty = outcome(0, false);
+
+    let verdicts = [
+        uncommitted_rewrite(&bootstrap_lost, false).is_some(),
+        uncommitted_rewrite(&bootstrap_lost, true).is_some(),
+        uncommitted_rewrite(&empty, false).is_some(),
+        uncommitted_rewrite(&empty, true).is_some(),
+    ];
+
+    assert_eq!(verdicts, [false, true, false, false]);
 }
 
 /// An erasure rewrite whose manifest swap loses leaves the marker in the

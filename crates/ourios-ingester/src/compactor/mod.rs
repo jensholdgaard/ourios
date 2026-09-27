@@ -721,28 +721,39 @@ pub(crate) fn to_u64(value: usize) -> u64 {
 /// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
 /// the sweep's wall clock; the partition is the canonical
 /// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
-/// [`compact_partition_hooked`], where an uncommitted outcome with enough
-/// live files to rewrite (two, or one when rows are dropped) lost the
-/// manifest swap. With one sweeper that is never a benign race: it is an
-/// error, or a store whose swaps always lose looks like an idle sweep, and
-/// an erasure would advance past rows it never rewrote.
+/// [`compact_partition_hooked`], with an uncommitted rewrite turned into an
+/// error by [`uncommitted_rewrite`]. With one sweeper a lost swap is never a
+/// benign race: a store whose swaps always lose must not look like an idle
+/// sweep, and an erasure must not advance past rows it never rewrote.
 fn compact_candidate(
     store: &Store,
     partition: &PartitionKey,
     promoted: &PromotedAttributes,
     hooks: &mut RowHooks<'_>,
 ) -> Result<CompactionOutcome, String> {
-    let minimum_inputs = if hooks.drop.is_some() { 1 } else { 2 };
+    let erasing = hooks.drop.is_some();
     let outcome =
         compact_partition_hooked(store, partition, promoted, hooks).map_err(|e| e.to_string())?;
-    if outcome.committed.is_none() && outcome.files_before >= minimum_inputs {
-        return Err(format!(
+    match uncommitted_rewrite(&outcome, erasing) {
+        Some(e) => Err(e),
+        None => Ok(outcome),
+    }
+}
+
+/// Why `outcome` must be a sweep error rather than a no-op, if it must. A
+/// lost final swap always is. An erasure is too whenever it left live rows
+/// unrewritten, even after losing only the bootstrap, because its marker
+/// must not advance past rows still on disk. A consolidation that lost the
+/// bootstrap wrote nothing and left the partition to the winner.
+fn uncommitted_rewrite(outcome: &CompactionOutcome, erasing: bool) -> Option<String> {
+    let unrewritten = erasing && outcome.committed.is_none() && outcome.files_before > 0;
+    (outcome.commit_lost || unrewritten).then(|| {
+        format!(
             "rewrite of {} live files not committed \
              (manifest compare-and-swap lost); retried next sweep",
             outcome.files_before
-        ));
-    }
-    Ok(outcome)
+        )
+    })
 }
 
 fn compaction_audit_event(

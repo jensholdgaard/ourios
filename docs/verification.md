@@ -168,7 +168,7 @@ implementation. We do not do that.
 Acceptance criteria are a new RFC §5, immediately before *Testing
 strategy*. The placement is deliberate: criteria are the spec the
 testing strategy operationalises, so reviewers reading the RFC top
-to bottom encounter the *what* before the *how*. The proposed
+to bottom encounter the *what* before the *how*. The applied
 amendment to `docs/rfcs/README.md` at the bottom of this file
 captures the renumbering: existing §5 *Testing strategy* shifts to
 §6, *Open questions* to §7, *References* to §8.
@@ -522,7 +522,10 @@ expansion so the rationale is preserved:
 
 ---
 
-## Proposed amendment — `docs/rfcs/README.md`
+## Applied amendment — `docs/rfcs/README.md`
+
+> *Historical record: the text below is the amendment as proposed; it
+> has since been applied.*
 
 Two changes. Shown as the new text:
 
@@ -588,7 +591,10 @@ themselves at that step. Both have since reached `accepted`.
 
 ---
 
-## Proposed amendment — `CLAUDE.md`
+## Applied amendment — `CLAUDE.md`
+
+> *Historical record: the text below is the amendment as proposed; it
+> has since been applied.*
 
 A single new subsection under §5 *Development workflow*, following
 §5.5 *One-word mode*:
@@ -608,7 +614,7 @@ that decides which technique is required where*.
 
 ---
 
-## Applying the amendments
+## How the amendments were applied
 
 The body of this document is the verification process spec. The two
 amendments above have been applied; this section records what the

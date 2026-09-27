@@ -119,9 +119,10 @@ directory"* [CC-mem]. A session started at the repository root sees
 session started in a subdirectory (e.g. `crates/ourios-wal/`) still
 loads the root stub, but `AGENTS.md` then resolves outside the working
 directory, so Claude Code asks once per project before loading it;
-declining disables the import. That is a one-time prompt, not a
-regression from today, and RFC0057.3 checks the root-started case,
-which is the documented contributor workflow.
+declining disables the import. Today such a session loads the root
+`CLAUDE.md` with no prompt, so this is a small new cost: one approval
+per contributor per project. It is accepted (§7 records it), and
+RFC0057.3 checks the root-started case.
 
 The stub is one line on purpose: Claude-only prose below it would
 reintroduce the split this RFC removes. Changes to the stub fall under
@@ -539,6 +540,9 @@ as an open question rather than required, since it is new CI surface.
 - [ ] **`rfc-check` location.** Move it to `.agents/skills/rfc-check/`
       with a `.claude/skills/rfc-check` symlink, matching the vendored
       OpenFGA skill (§3.5), or leave it in `.claude/skills/`?
+- [ ] **Subdirectory sessions.** Claude Code sessions started below the
+      repository root will prompt once to load the imported `AGENTS.md`
+      (§3.2). Acceptable, or document it in `CONTRIBUTING.md`?
 - [ ] **Stub-only rule.** Is "the stub stays one line; Claude-specific
       text needs a `meta:` RFC" (§3.2) the right bar, or should small
       Claude Code notes be allowed below the import without one?

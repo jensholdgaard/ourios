@@ -12,14 +12,14 @@ superseded-by: —
 # RFC 0056 — Audit-sink durability on permanent write failure
 
 > **Status note.** `drafted`. Split out of RFC 0053's status note so an
-> amendment to an *accepted* RFC is not hidden. Source wording: #802 @
+> amendment to an *accepted* RFC is not hidden. Source wording: [#802](https://github.com/jensholdgaard/ourios/pull/802) @
 > `30a21f80`, status note + the three-way `write_owned` result in §3.2.
-> **Blocked from `validated` by #809** — RFC 0026's denial-audit
+> **Blocked from `validated` by [#809](https://github.com/jensholdgaard/ourios/issues/809)** — RFC 0026's denial-audit
 > durability, which §7 explains this RFC cannot close.
 
 ## 1. Summary
 
-RFC 0005 §7 says the writer guarantees no audit event is lost across
+RFC 0005 §3.7 says the writer guarantees no audit event is lost across
 crashes. The current audit sink reports a *permanent* write failure as
 success and `write_ordered` then publishes the dependent records.
 
@@ -30,9 +30,17 @@ requeued. The tenant becomes server-terminal until repaired.
 ## 2. Motivation
 
 A record in Parquet without the template event that describes it
-breaks `CLAUDE.md` §3.1 (no silent template merges / audit
-durability). The 0053 draft changed that behaviour in a status note.
-An accepted RFC needs its own amendment and criterion.
+breaks one of two contracts, and which one depends on where the event
+went missing. `CLAUDE.md` §3.1 governs *emission*: it forbids a silent
+template merge and requires an audit event on every template change. RFC
+0005 §3.7 governs *durability*: an event the miner did emit survives a
+crash, because the writer routes audit events through the same WAL path
+as data records. A missing event does not by itself say which was broken
+— it may never have been emitted — so the sink's behaviour here is judged
+against §3.7 only once the event is known to have been emitted, which is
+the case this RFC is about: the sink held the event and dropped it on a
+permanent write failure. The 0053 draft changed that behaviour in a status
+note. An accepted RFC needs its own amendment and criterion.
 
 ## 3. Proposed design
 
@@ -48,7 +56,7 @@ An accepted RFC needs its own amendment and criterion.
 
 ## 4. Alternatives considered
 
-- Keep the silent drop. Rejected against RFC 0005 §7 and §3.1.
+- Keep the silent drop. Rejected against RFC 0005 §3.7 and §3.1.
 - Fold into RFC 0053. Rejected: wrong document.
 
 ## 5. Acceptance criteria
@@ -57,7 +65,7 @@ An accepted RFC needs its own amendment and criterion.
 > - **Given** a permanent audit-write failure for one tenant
 > - **When** `write_ordered` returns
 > - **Then** that tenant's records are unpublished and requeued, the
->   tenant is terminal, other tenants publish, and the RFC 0005 §7
+>   tenant is terminal, other tenants publish, and the RFC 0005 §3.7
 >   clause is the amended one
 
 > **RFC0056.2**
@@ -82,7 +90,7 @@ write path. Implementing PR.
   The path emits before any frame exists, so replay cannot regenerate it
   and §3's mechanism does not reach it; closing it takes an amendment to
   RFC 0026's denial-audit durability, not a widening of this RFC. It is
-  not a deferral but a standing contradiction with RFC 0005 §7 and RFC
+  not a deferral but a standing contradiction with RFC 0005 §3.7 and RFC
   0026's own accepted criterion, so **this RFC cannot reach `validated`
   until #809 lands**.
 
@@ -94,7 +102,7 @@ written. A future operator repair still ends in a restart.
 
 ## 8. References
 
-- RFC 0005 §7, RFC 0026, RFC 0053 draft status note on #802
+- RFC 0005 §3.7, RFC 0026, RFC 0053 draft status note on #802
 
 ## 9. Extracted wording (RFC 0053 draft, `30a21f80`)
 
@@ -167,7 +175,7 @@ binding denials do not fit it: `Pipeline::enforce_binding` emits an
 `IngestDenied` event to the denial sink and returns the error *before any
 frame is appended*, so there is nothing in the WAL for replay to
 regenerate and the restart argument simply does not apply. A permanent
-drop there is a real gap against RFC 0005 §7's no-loss contract, and it
+drop there is a real gap against RFC 0005 §3.7's no-loss contract, and it
 is **out of this RFC's scope** — its subject is the ordering between
 records and the events that describe them, not the denial stream, which
 has no records to order against. The gap is named here rather than papered
@@ -241,13 +249,13 @@ RFC0053.2 covers the derive failure beside the write failure.
       rejects writes permanently. §3.2's three-way outcome and its terminal
       rule cover the record-dependent stream only, because a denial is
       emitted before any frame exists and replay cannot regenerate it — so
-      a permanent drop there is an open gap against RFC 0005 §7. It needs
+      a permanent drop there is an open gap against RFC 0005 §3.7. It needs
       either a durable path of its own or an explicit exemption in that
       contract; either is RFC 0026's to settle, not this RFC's.
 
 ### 9.5 Draft references (§8)
 
-- RFC 0005 §7 (audit files and their durability clause) — **amended by §3.2
+- RFC 0005 §3.7 (audit files and their durability clause) — **amended by §3.2
   of this RFC**: the audit sink's permanent-failure path reports a third
   outcome rather than success, `write_ordered` refuses the dependent record
   publish on it, and the tenant becomes terminal until a **restart** clears

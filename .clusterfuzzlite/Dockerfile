@@ -3,7 +3,7 @@
 # cargo-fuzz preinstalled and the sanitizer flags wired up, so build.sh
 # only has to `cargo fuzz build` and stage the binaries. Its presence is
 # also what OpenSSF Scorecard's Fuzzing check detects (RFC0015.7).
-FROM gcr.io/oss-fuzz-base/base-builder-rust@sha256:433319ea1a6bbea6c1db1915a5d385021908cc62026d9f0efda2270ef6060de3
+FROM gcr.io/oss-fuzz-base/base-builder-rust@sha256:30133d6ddfd9d2649c2821e3ee928e399f17b17dd04697f553bcda403e4f58b2
 
 # The base image pins its own nightly through `RUSTUP_TOOLCHAIN`, which
 # rustup honours ahead of any `rust-toolchain.toml` — upstream sets it

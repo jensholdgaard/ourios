@@ -314,7 +314,12 @@ impl AuthResolver {
     }
 
     /// Who the bearer is: the static store first, then OIDC.
-    #[cfg_attr(not(feature = "oidc"), allow(clippy::unused_async))]
+    // clippy 1.98 reports these private helpers under `unused_async_trait_impl`
+    // rather than `unused_async`, so both names are allowed.
+    #[cfg_attr(
+        not(feature = "oidc"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn identify(&self, authorization: Option<&str>) -> Result<Identity, AuthError> {
         let token = authorization
             .and_then(parse_bearer)
@@ -351,7 +356,10 @@ impl AuthResolver {
     /// Which tenants the principal may query and write: the graph when
     /// configured (narrowed by the credential's own list), else the
     /// credential's list for both.
-    #[cfg_attr(not(feature = "openfga"), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(feature = "openfga"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn bind(&self, identity: Identity) -> Result<Option<AuthBinding>, AuthError> {
         #[cfg(feature = "openfga")]
         if let Some(openfga) = &self.openfga {

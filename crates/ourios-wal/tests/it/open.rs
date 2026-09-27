@@ -20,6 +20,8 @@ fn default_config(root: &Path) -> WalConfig {
         segment_size_bytes: 128 * 1024 * 1024,
         segment_age_secs: 600,
         housekeeping_secs: 60,
+        max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+        rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
         macos_full_fsync: false,
     }
 }
@@ -48,7 +50,9 @@ fn fresh_root_creates_one_segment_with_a_valid_header() {
     // (frames land with the `append` slice).
     assert_eq!(bytes.len(), 24, "fresh segment has only the header");
     assert_eq!(&bytes[0..4], b"OWAL", "magic");
-    assert_eq!(&bytes[4..6], &[0x01, 0x00], "version = 1");
+    // RFC 0052 §3.8's segment-header Invariant row: 2, the witness
+    // that separates a post-RFC root from a pre-RFC one.
+    assert_eq!(&bytes[4..6], &[0x02, 0x00], "version = 2");
     assert_eq!(&bytes[6..8], &[0x00, 0x00], "flags = 0");
     // The UUID in the header matches the filename stem — pin
     // the cross-check that lets a renamed file still decode.
@@ -139,6 +143,19 @@ fn every_tunable_out_of_range_value_is_rejected() {
         }),
         ("housekeeping_secs", &|root| WalConfig {
             housekeeping_secs: MIN_HOUSEKEEPING_SECS - 1,
+            ..default_config(root)
+        }),
+        // RFC 0052 §3.8: a cap of zero would make every pass a no-op,
+        // and one above the format ceiling cannot be addressed by the
+        // record's `planned` array.
+        ("max_unlinks_per_pass", &|root| WalConfig {
+            max_unlinks_per_pass: 0,
+            rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
+            ..default_config(root)
+        }),
+        ("max_unlinks_per_pass", &|root| WalConfig {
+            max_unlinks_per_pass: ourios_wal::MAX_UNLINKS_PER_PASS_CEILING + 1,
+            rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
             ..default_config(root)
         }),
     ];

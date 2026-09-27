@@ -55,6 +55,17 @@
         "cargo"
       ],
       "matchPackageNames": [
+        "/^opentelemetry([-_][a-z]+)*$/",
+        "tracing-opentelemetry"
+      ],
+      "groupName": "opentelemetry",
+      "description": "opentelemetry, opentelemetry_sdk, opentelemetry-proto, opentelemetry-otlp, opentelemetry-appender-tracing and tracing-opentelemetry share one opentelemetry minor and must move together: tracing-opentelemetry pins the opentelemetry it was built against, so bumping the rest ahead of it leaves two opentelemetry versions in the lockfile and SdkTracer no longer satisfies the Tracer bound OpenTelemetryLayer names (Renovate PR #815, held back in 3e230ef because tracing-opentelemetry 0.33.0 still pins opentelemetry 0.32). Grouped rather than held: the bump is wanted as soon as tracing-opentelemetry ships against the new minor, and a grouped PR either resolves cleanly or fails CI as one unit. Run cargo tree -i opentelemetry on the PR if it fails."
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
         "zstd"
       ],
       "allowedVersions": "<0.14.0",

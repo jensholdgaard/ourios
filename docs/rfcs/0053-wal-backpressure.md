@@ -15,7 +15,7 @@ superseded-by: —
 > the maintainer's direction — and since split again: this RFC is the WAL
 > **backpressure** bound alone. Publish unwind safety is **RFC 0054**,
 > publication frontiers and tenant settlement **RFC 0055**, and the
-> RFC 0005 §7 audit-durability amendment **RFC 0056**. The wording moved
+> RFC 0005 §3.7 audit-durability amendment **RFC 0056**. The wording moved
 > into each is the reviewed wording of this document at
 > [`#802`](https://github.com/jensholdgaard/ourios/pull/802) @ `30a21f80`,
 > which stays the quarry. This RFC **depends on RFC 0052** and cannot land

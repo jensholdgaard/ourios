@@ -77,12 +77,35 @@ struct FlushOutcome {
 }
 
 /// A `sync` failure, cloneable so it can ride the `watch` to every
-/// covered waiter (the source `SyncError` is not `Clone`). Carries the
-/// rendered detail; each covered waiter reconstructs a
-/// [`ReceiveError::WalSync`]-shaped error from it.
+/// covered waiter (the source `SyncError` is not `Clone`). Each covered
+/// waiter reconstructs a [`ReceiveError::WalSync`]-shaped error from it.
+///
+/// RFC 0052 §3.3: the failure's **class** rides along, not only its
+/// rendered text. Collapsing every sync error into a detail string erased
+/// the terminal rotation state before the classifier ever saw it, so a
+/// node past its retry budget was reported as an ordinary transient blip
+/// to every waiter behind the group commit. The terminal arm carries the
+/// `RotationFault` itself — it is `Clone`, and it is what
+/// [`crate::receiver::pipeline::IngestFailure`] matches on.
 #[derive(Clone)]
-struct SyncFailure {
-    detail: String,
+enum SyncFailure {
+    /// An ordinary retryable sync failure, rendered.
+    Transient { detail: String },
+    /// RFC 0052 §3.3's terminal rotation state, carried whole.
+    Terminal(ourios_wal::RotationFault),
+}
+
+impl SyncFailure {
+    fn of(error: &ReceiveError) -> Self {
+        match error {
+            ReceiveError::WalSync(ourios_wal::SyncError::RotationTerminal(fault)) => {
+                Self::Terminal(fault.clone())
+            }
+            other => Self::Transient {
+                detail: other.to_string(),
+            },
+        }
+    }
 }
 
 /// Coordinator state behind one std mutex: whether a windowed flush is
@@ -220,7 +243,7 @@ impl CommitCoordinator {
             // coordinator (held by the pipeline) outlives for any live
             // commit; treat it as a sync failure rather than panic.
             if rx.changed().await.is_err() {
-                break Err(sync_failure_error("commit coordinator stopped"));
+                break Err(flush_task_failed("commit coordinator stopped".to_owned()));
             }
         };
         CommitOutcome {
@@ -320,16 +343,14 @@ impl CommitCoordinator {
         let coordinator = Arc::clone(self);
         let result = tokio::task::spawn_blocking(move || coordinator.lock_journal().sync())
             .await
-            .unwrap_or_else(|join| Err(sync_failure_error(&format!("flush task failed: {join}"))));
+            .unwrap_or_else(|join| Err(flush_task_failed(format!("flush task failed: {join}"))));
 
         let new = FlushOutcome {
             generation: self.next_generation(),
             covered_seq,
             result: match result {
                 Ok(offset) => Ok(offset),
-                Err(e) => Err(SyncFailure {
-                    detail: e.to_string(),
-                }),
+                Err(e) => Err(SyncFailure::of(&e)),
             },
         };
         // Publish **monotonically in `covered_seq`**: two flushes can be
@@ -386,19 +407,31 @@ fn covered_outcome(outcome: &FlushOutcome, seq: u64) -> Option<Result<WalOffset,
     }
     Some(match &outcome.result {
         Ok(offset) => Ok(*offset),
-        Err(failure) => Err(sync_failure_error(&failure.detail)),
+        Err(failure) => Err(rebuilt_sync_error(failure)),
     })
 }
 
-/// A [`ReceiveError::WalSync`] reconstructed from a broadcast failure
-/// detail. The `watch` can't carry the non-`Clone` source `SyncError`, so
-/// the rendered detail is wrapped in a transport-equivalent error: the
-/// HTTP/gRPC layers map any `WalSync` to 500 / `INTERNAL` and surface its
-/// `Display`, which this preserves.
-fn sync_failure_error(detail: &str) -> ReceiveError {
+/// A [`ReceiveError::WalSync`] reconstructed from a broadcast failure.
+/// The `watch` can't carry the non-`Clone` source `SyncError`, so the
+/// transient arm re-wraps the rendered detail; the terminal arm rebuilds
+/// the real variant from the `RotationFault` it carried, so the waiter
+/// classifies the same way the WAL's own caller would (RFC 0052 §3.3).
+fn rebuilt_sync_error(failure: &SyncFailure) -> ReceiveError {
+    ReceiveError::WalSync(match failure {
+        SyncFailure::Transient { detail } => ourios_wal::SyncError::Io {
+            op: "group-commit sync",
+            source: std::io::Error::other(detail.clone()),
+        },
+        SyncFailure::Terminal(fault) => ourios_wal::SyncError::RotationTerminal(fault.clone()),
+    })
+}
+
+/// The transient error a failed flush *task* produces — a panic or a
+/// cancellation, never a WAL state.
+fn flush_task_failed(detail: String) -> ReceiveError {
     ReceiveError::WalSync(ourios_wal::SyncError::Io {
         op: "group-commit sync",
-        source: std::io::Error::other(detail.to_owned()),
+        source: std::io::Error::other(detail),
     })
 }
 
@@ -429,7 +462,7 @@ mod tests {
         fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
             self.syncs.fetch_add(1, Ordering::SeqCst);
             if self.fail_sync {
-                return Err(sync_failure_error("spy sync failure"));
+                return Err(flush_task_failed("spy sync failure".to_owned()));
             }
             self.byte += self.unflushed;
             self.unflushed = 0;

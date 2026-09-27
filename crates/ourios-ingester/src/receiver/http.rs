@@ -24,12 +24,12 @@
 //! over the inner service's body type, so giving those a `Status` is a
 //! separate change rather than part of this one.
 //!
-//! Durability failures are `503`, per RFC 0018 §3.2's transient class —
-//! including a WAL quiesced after a rotation failure, which today only a
-//! restart clears (#791). Reporting that case differently, and whether a
-//! `Retry-After` should accompany it, are RFC 0052's questions; until they
-//! are decided, the `Status` message is what tells an operator which failure
-//! it was.
+//! Durability failures are `503`, per RFC 0018 §3.2's transient class, and
+//! so is RFC 0052 §3.3's terminal rotation state under §3.2's third class —
+//! server-terminal, client-retryable. RFC 0052 settled both open questions
+//! this paragraph used to name: the state is reported distinctly through the
+//! `Status` message, and no `Retry-After` accompanies any of them, because
+//! the server schedules no retry of its own (§3.7).
 //!
 //! The pipeline is shared behind a plain `Arc`: its group-commit
 //! coordinator serializes the single-writer WAL internally (RFC 0008
@@ -373,15 +373,21 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     match IngestFailure::classify(error) {
         IngestFailure::Denied => StatusCode::FORBIDDEN,
         IngestFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        IngestFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        // Both durability classes are `503`: a non-retryable code would
+        // tell the client to drop a batch that was never acked (RFC 0018
+        // §3.2, as RFC 0052 §3.3 amends it). The `Status` message, not
+        // the code, carries the distinction.
+        IngestFailure::Unavailable | IngestFailure::ServerTerminal => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         IngestFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 /// The ingest-failure response: the mapped status and a `Status` body
-/// naming the reason. No `Retry-After`: the spec makes it optional, a client
-/// without one backs off exponentially, and what delay a durability failure
-/// should advertise is RFC 0052's question.
+/// naming the reason. No `Retry-After` on any arm: the server schedules no
+/// retry of its own (RFC 0052 §3.7), so a client without one backs off
+/// exponentially, which is what OTLP prescribes.
 ///
 /// The reason text is `ReceiveError`'s `Display`, which the gRPC arm
 /// already puts on the wire, so this adds no disclosure the other
@@ -546,10 +552,27 @@ mod tests {
         assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// RFC 0052 §3.3 replaced the permanent quiesce with a bounded
+    /// retry, so this arm now covers both of its states. Neither may
+    /// become a non-retryable code: the batch was never acked.
     #[test]
-    fn quiesced_wal_append_is_503() {
-        let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
-        assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    fn both_rotation_states_are_503() {
+        for error in [
+            AppendError::RotationRetrying(rotation_fault(1)),
+            AppendError::RotationTerminal(rotation_fault(3)),
+        ] {
+            let e = ReceiveError::WalAppend(error);
+            assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    fn rotation_fault(attempts: u32) -> ourios_wal::RotationFault {
+        ourios_wal::RotationFault::new(
+            ourios_wal::RotationSite::ParentFsync,
+            &std::io::Error::other("io"),
+            attempts,
+            3,
+        )
     }
 
     #[test]
@@ -630,26 +653,29 @@ mod tests {
             }
         }
 
-        /// A quiesced WAL is a retryable 503 under RFC 0018 §3.2 — whether it
-        /// should be, and what delay it should advertise, is RFC 0052's
-        /// question. What is guaranteed here is that the body names the
-        /// state, so an operator reading a single response learns what
-        /// happened instead of seeing an empty 503 (#791).
+        use super::rotation_fault;
+
+        /// A terminal rotation state is a 503 under RFC 0018 §3.2's third
+        /// class (RFC 0052 §3.3): the body names the state, so an operator
+        /// reading a single response learns what happened instead of seeing
+        /// an empty 503 (#791).
         #[tokio::test]
-        async fn quiesced_wal_is_503_and_says_why() {
-            let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
+        async fn a_terminal_rotation_state_is_503_and_says_why() {
+            let e = ReceiveError::WalAppend(AppendError::RotationTerminal(rotation_fault(3)));
             let response = ingest_error_response(&e);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             let decoded = tonic_types::Status::decode(body_bytes(response).await.as_slice())
                 .expect("decodable google.rpc.Status");
             assert_eq!(
                 decoded.message,
-                ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure).to_string(),
+                ReceiveError::WalAppend(AppendError::RotationTerminal(rotation_fault(3)))
+                    .to_string(),
                 "the reason the gRPC arm has always sent must now reach HTTP clients too",
             );
             assert!(
-                !decoded.message.is_empty(),
-                "an empty reason would reintroduce the #791 blind spot",
+                decoded.message.contains("terminal"),
+                "the body names the state, not just a generic failure: {:?}",
+                decoded.message,
             );
         }
     }

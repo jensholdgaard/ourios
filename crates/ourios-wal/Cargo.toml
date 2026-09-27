@@ -49,6 +49,14 @@ ourios-core = { path = "../ourios-core" }
 # default; not part of the stable public API.
 fuzzing = []
 
+# RFC 0052 §6's rotation fault-injection seam (`Wal::arm_rotation_faults`).
+# Off by default and enabled only by this crate's own test targets via the
+# dev-dependency below: §3.3's five rotation steps are `fsync`, `create`
+# and `rename` calls no directory permission can single out, so the
+# once-failing / always-failing matrix RFC0052.4 and RFC0052.5 require has
+# no other way in. Not part of the stable public API.
+fault-injection = []
+
 # §6.3's macOS strong-durability path: `fcntl(F_FULLFSYNC)` behind
 # rustix's safe wrapper (already in the tree via tempfile) — the
 # workspace denies `unsafe_code`, so the raw fcntl is not an option
@@ -57,6 +65,10 @@ fuzzing = []
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
+# Self-dependency: turns `fault-injection` on for this crate's own test
+# targets (and nothing else — `cargo build` does not resolve
+# dev-dependencies, so no product binary carries the seam).
+ourios-wal = { path = ".", features = ["fault-injection"] }
 # Scratch directories for the segment-on-disk tests.
 tempfile = "=3.27.0"
 # Property test for the RFC0008.9 `wal_unflushed_bytes` bound

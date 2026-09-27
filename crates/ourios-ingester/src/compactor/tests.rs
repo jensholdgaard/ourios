@@ -143,6 +143,54 @@ fn sweep_reports_a_candidate_whose_manifest_swap_lost() {
     );
 }
 
+/// An erasure rewrite whose manifest swap loses leaves the marker in the
+/// `rows` phase: advancing it would let the tuples be deleted while the
+/// conversation's rows are still live. One file, so the consolidation pass
+/// leaves the partition alone and only the erasure rewrite runs.
+#[test]
+fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, "a", 1, TS0);
+    std::fs::create_dir(
+        bucket
+            .path()
+            .join("data/tenant_id=a/year=2026/month=04/day=02/hour=10/manifest.json"),
+    )
+    .expect("occupy the manifest key");
+    request_erasure(&store, "a", "c-1").expect("request");
+    let erase_all = |_: &MinedRecord, _: &str| true;
+    let mut hooks = SweepHooks {
+        observe: None,
+        erasure_match: Some(&erase_all),
+    };
+
+    // Act
+    let report = run_sweep_hooked(
+        &store,
+        NOW_SEALED,
+        &CompactionPolicy::default(),
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("sweep");
+
+    // Assert
+    assert_eq!(report.erasures.len(), 1, "{report:?}");
+    assert_eq!(report.erasures[0].phase, ErasurePhase::Rows);
+    assert_eq!(report.erasures[0].partitions_rewritten, 0);
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("\"c-1\"") && report.errors[0].contains("not committed"),
+        "{}",
+        report.errors[0]
+    );
+    let pending = pending_erasures(&store).expect("pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].phase, ErasurePhase::Rows);
+}
+
 #[test]
 fn sweep_compacts_a_sealed_candidate() {
     // Arrange

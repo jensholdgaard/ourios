@@ -237,7 +237,7 @@ pub(super) fn erase_pending(
                     observe: None,
                     drop: Some(&drop),
                 };
-                match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
+                match compact_candidate(store, &partition, promoted, &mut row_hooks) {
                     Ok(o) => {
                         if let Some(committed) = &o.committed {
                             outcome.partitions_rewritten += 1;

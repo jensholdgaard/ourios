@@ -1,7 +1,8 @@
 //! Conditional-PUT interop with an S3-compatible store that honours
-//! `If-Match` only for the **unquoted** `ETag` (Ceph RGW-based stores do
-//! this: the quoted form a `GET` returns fails with `412` even when it
-//! matches). Every compaction commit against such a store used to lose its
+//! `If-Match` only for the **unquoted** `ETag`. Ceph RGW-based stores do
+//! this: a `GET` returns the `ETag` quoted, and an `If-Match` carrying that
+//! quoted value gets `412` even when the object is unchanged. Every
+//! compaction commit against such a store used to lose its
 //! compare-and-swap, so the sweep rewrote each partition, discarded the
 //! result as a "lost race", and reported a clean no-op forever (#807).
 //!

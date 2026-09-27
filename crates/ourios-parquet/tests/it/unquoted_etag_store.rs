@@ -183,7 +183,11 @@ impl IfMatch {
     fn matches(self, expected: &str, etag: &str) -> bool {
         let quoted = expected.strip_prefix('"').and_then(|e| e.strip_suffix('"'));
         match (self, quoted) {
-            (Self::Unquoted | Self::Either, None) => expected == etag,
+            // A bare `If-Match` is parsed as a server would: `*` matches any
+            // existing object, and a comma separates a list of tags.
+            (Self::Unquoted | Self::Either, None) => {
+                expected == "*" || expected.split(',').any(|tag| tag.trim() == etag)
+            }
             (Self::Quoted | Self::Either, Some(inner)) => inner == etag,
             (Self::Unquoted, Some(_)) | (Self::Quoted, None) | (Self::Never, _) => false,
         }
@@ -509,4 +513,36 @@ fn a_lost_final_swap_removes_its_rewrite() {
         (true, true, 0)
     );
     assert_eq!(parquet_keys(), inputs, "only the inputs remain");
+}
+
+/// The unquoted retry never turns one strong comparison into a wildcard or
+/// a list: a stale tag whose unquoted spelling is `*`, or a list naming the
+/// current tag, still loses and the object keeps its bytes. Each case gets
+/// its own store, so one wrongly accepted write cannot mask the next.
+#[test]
+fn put_if_match_never_retries_a_tag_that_would_change_meaning_unquoted() {
+    let wildcard = |_: &str| "\"*\"".to_string();
+    let listed = |current: &str| format!("\"stale,{}\"", current.trim_matches('"'));
+
+    let kept: Vec<Vec<u8>> = [&wildcard as &dyn Fn(&str) -> String, &listed]
+        .iter()
+        .map(|spell| {
+            let (store, _) = fake_store(IfMatch::Unquoted);
+            store
+                .put_blocking("data/manifest.json", b"v1".to_vec())
+                .expect("put");
+            let (_, current) = store
+                .get_with_etag_blocking_opt("data/manifest.json")
+                .expect("get")
+                .expect("present");
+            let etag = spell(&current.expect("etag"));
+            let err = store
+                .put_if_match_blocking("data/manifest.json", b"lost".to_vec(), &etag)
+                .expect_err("a tag that changes meaning unquoted must lose");
+            assert!(err.is_precondition(), "{etag}: {err}");
+            store.get_blocking("data/manifest.json").expect("get")
+        })
+        .collect();
+
+    assert_eq!(kept, [b"v1".to_vec(), b"v1".to_vec()]);
 }

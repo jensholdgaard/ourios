@@ -5,12 +5,13 @@ name: Capture Software Bill of Behaviour (one-off)
 # (eBPF-based; needs a real Linux kernel, which is why this runs on the
 # GitHub-hosted runner rather than a local VM), the real Ourios Helm chart,
 # and a mix of OTLP ingest + query traffic during the node-agent's learning
-# window. The output is the raw ContainerProfile CR(s) as a downloadable
-# artifact for manual review — this workflow does not commit anything back
-# to the repo, and it never fires automatically (no push/PR/schedule
-# trigger), matching the dispatch-only precedent in pages.yml. This is an
-# exploration, not a supply-chain gate: nothing here is required for a
-# release, and nothing about it belongs in CLAUDE.md hazards/invariants.
+# window. The output is the raw ApplicationProfile CR(s), plus their
+# per-container ContainerProfiles, as a downloadable artifact for manual
+# review — this workflow does not commit anything back to the repo, and it
+# never fires automatically (no push/PR/schedule trigger), matching the
+# dispatch-only precedent in pages.yml. This is an exploration, not a
+# supply-chain gate: nothing here is required for a release, and nothing
+# about it belongs in CLAUDE.md hazards/invariants.
 on:
   workflow_dispatch:
 
@@ -236,44 +237,49 @@ jobs:
 
       # maxLearningPeriod (6m) plus slack for Kubescape to flip the status
       # annotation. Poll rather than a fixed sleep — completion timing isn't
-      # exact. Targets containerprofile, not the legacy applicationprofile:
-      # node-agent v0.2.357 only writes ContainerProfile objects (its
-      # ApplicationProfiles.List call in pkg/storage/v1/storage.go is just a
-      # startup readiness probe against the aggregated API, which still
-      # registers the applicationprofiles REST resource for back-compat even
-      # though nothing populates it) — kubectl get applicationprofile would
-      # sit at 0 items and time out.
-      - name: Wait for ContainerProfiles to complete
+      # exact. Gates on applicationprofile, not containerprofile: node-agent
+      # v0.2.357 writes ContainerProfile time-series entries, and the vendored
+      # storage v0.0.206 consolidates them and aggregates each workload's
+      # containers into one ApplicationProfile, marking it completed only once
+      # every main container is (containerprofile_processor.go,
+      # getAggregatedData). A containerprofile listing still carries the
+      # not-yet-consolidated time-series entries in "learning", so gating on
+      # it can stall. Upstream storage dropped ApplicationProfile in v0.0.299+;
+      # re-vendoring the chart means re-deriving this gate.
+      - name: Wait for ApplicationProfiles to complete
         run: |
           deadline=$((SECONDS + 600))
           total=0
           done_count=0
           while [ "$SECONDS" -lt "$deadline" ]; do
-            if items_json="$(kubectl get containerprofile -o json)"; then
+            if items_json="$(kubectl get applicationprofile -o json)"; then
               total="$(printf '%s' "$items_json" | jq '.items | length')"
               done_count="$(printf '%s' "$items_json" | jq '[.items[] | select(.metadata.annotations["kubescape.io/status"] == "completed")] | length')"
-              echo "containerprofiles: ${done_count}/${total} completed"
+              echo "applicationprofiles: ${done_count}/${total} completed"
               if [ "${total}" -gt 0 ] && [ "${done_count}" = "${total}" ]; then break; fi
             else
-              echo "kubectl get containerprofile failed, retrying"
+              echo "kubectl get applicationprofile failed, retrying"
             fi
             sleep 20
           done
-          kubectl get containerprofile -o wide || true
+          kubectl get applicationprofile -o wide || true
           if [ "${total}" -eq 0 ] || [ "${done_count}" != "${total}" ]; then
-            echo "ContainerProfiles did not all complete within the deadline (${done_count}/${total})"
+            echo "ApplicationProfiles did not all complete within the deadline (${done_count}/${total})"
             exit 1
           fi
 
-      - name: Export ContainerProfiles
+      # The ApplicationProfiles are the BoB; the per-container profiles ride
+      # along for the manual review.
+      - name: Export profiles
         run: |
           mkdir -p bob-out
+          kubectl get applicationprofile -o yaml > bob-out/applicationprofiles.yaml
           kubectl get containerprofile -o yaml > bob-out/containerprofiles.yaml
-          kubectl get containerprofile -o json \
+          kubectl get applicationprofile -o json \
             | jq -r '.items[] | .metadata.name' > bob-out/profile-names.txt
           cat bob-out/profile-names.txt
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ourios-bob-capture
           path: bob-out/
@@ -283,6 +289,7 @@ jobs:
         if: failure()
         run: |
           kubectl get pods -A -o wide || true
+          kubectl get applicationprofile -A -o yaml || true
           kubectl get containerprofile -A -o yaml || true
           echo "=== receiver logs ==="; kubectl logs -l app.kubernetes.io/component=receiver --tail=200 || true
           echo "=== querier logs ===";  kubectl logs -l app.kubernetes.io/component=querier --tail=200 || true

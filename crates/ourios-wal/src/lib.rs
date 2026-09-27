@@ -1,5 +1,5 @@
-//! `ourios-wal` — the write-ahead log (RFC 0008) and its reclamation
-//! (RFC 0052).
+//! `ourios-wal` — the write-ahead log (RFC 0008) and its reclamation and
+//! quiesce recovery (RFC 0052).
 //!
 //! **RFC 0008** is the durability contract. The public API follows its
 //! §6.1 verbatim — the same `(WalOffset, FrameKind, FrameSink, Wal)`
@@ -21,7 +21,8 @@
 //! file halves; `reclaim` / `reclaim_store` are the `RECLAIM` sidecar
 //! codec and file; `reconcile` is the open-time reconciliation of
 //! `CHECKPOINT`, `RECLAIM` and segment headers; and `rotation` runs
-//! segment rotation under a bounded retry budget.
+//! segment rotation under a bounded retry budget, reporting whether the
+//! WAL is still retrying or has given up.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, ErrorKind};

@@ -105,16 +105,24 @@ pub(super) fn lost_commit_outcome(
     orphan: &str,
     files_before: usize,
 ) -> CompactionOutcome {
-    let gc_failures = match store.delete_blocking(orphan) {
-        Ok(()) => 0,
-        Err(e) if e.is_not_found() => 0,
-        Err(_) => 1,
-    };
     CompactionOutcome {
         commit_lost: true,
-        gc_failures,
+        gc_failures: delete_non_live(store, &[orphan]),
         ..no_op_outcome(files_before)
     }
+}
+
+/// Delete `keys`, which no manifest names, returning how many deletes
+/// failed. A not-found is already reclaimed (S3 DELETE is idempotent; the
+/// local backend reports not-found), so it is not a failure.
+pub(super) fn delete_non_live<K: AsRef<str>>(store: &Store, keys: &[K]) -> usize {
+    keys.iter()
+        .filter(|key| {
+            store
+                .delete_blocking(key.as_ref())
+                .is_err_and(|e| !e.is_not_found())
+        })
+        .count()
 }
 
 /// A committed data object: a `*.parquet` key (so `*.parquet.tmp` and

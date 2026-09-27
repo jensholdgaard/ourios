@@ -496,14 +496,7 @@ fn compact_sorted_hooked(
     // failure. Count such failures and continue; a not-found is
     // already-reclaimed (S3 DELETE is idempotent; the local backend reports
     // not-found — the GC treats both alike).
-    let mut gc_failures = 0;
-    for input in &inputs {
-        match store.delete_blocking(input) {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
-            Err(_) => gc_failures += 1,
-        }
-    }
+    let gc_failures = delete_non_live(store, &inputs);
 
     Ok(CompactionOutcome {
         files_before: inputs.len(),

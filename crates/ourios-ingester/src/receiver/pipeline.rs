@@ -160,12 +160,24 @@ pub trait Journal: Send {
     /// rotation, and the discharge of a pending rotation-origin
     /// directory fsync.
     ///
+    /// The default fails closed like the rest of this surface: a journal
+    /// that answers [`Self::segment_age_exceeded`] or
+    /// [`Self::owes_rotation_fsync`] but inherits a silent `Ok` here would
+    /// have `rotate_if_aged` read an owed rotation or fsync as discharged.
+    ///
     /// # Errors
     ///
-    /// As [`Wal::rotate`].
+    /// As [`Wal::rotate`]; the default answers
+    /// [`ourios_wal::AppendError::Io`] with an `Unsupported` source.
     fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
         let _ = kind;
-        Ok(())
+        Err(ReceiveError::WalAppend(ourios_wal::AppendError::Io {
+            op: "rotate",
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this journal exposes no RFC 0052 rotation surface",
+            ),
+        }))
     }
 
     /// Whether the current segment has outlived `segment_age_secs` —

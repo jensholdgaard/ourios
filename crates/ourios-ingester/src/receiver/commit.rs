@@ -729,4 +729,49 @@ mod tests {
         assert_eq!(offset.byte, 4);
         assert_eq!(syncs.load(Ordering::SeqCst), 1);
     }
+
+    /// A journal that owes a rotation but never says how to perform one.
+    struct OwesRotation {
+        aged: bool,
+    }
+
+    impl Journal for OwesRotation {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+            Err(flush_task_failed("never appended".to_owned()))
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+            Err(flush_task_failed("never synced".to_owned()))
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+
+        fn segment_age_exceeded(&self) -> bool {
+            self.aged
+        }
+
+        fn owes_rotation_fsync(&self) -> bool {
+            !self.aged
+        }
+    }
+
+    /// The inherited `rotate` must not read an owed rotation — or an owed
+    /// rotation-origin fsync — as discharged.
+    #[test]
+    fn an_owed_rotation_without_a_rotation_surface_fails_closed() {
+        for aged in [true, false] {
+            let coordinator =
+                CommitCoordinator::new(Box::new(OwesRotation { aged }), Duration::ZERO, u64::MAX);
+            assert!(
+                matches!(
+                    coordinator.rotate_if_aged(),
+                    Err(ReceiveError::WalAppend(ourios_wal::AppendError::Io { ref source, .. }))
+                        if source.kind() == std::io::ErrorKind::Unsupported
+                ),
+                "aged = {aged}: the default rotate reports the missing surface",
+            );
+        }
+    }
 }

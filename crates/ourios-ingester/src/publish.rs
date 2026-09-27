@@ -95,6 +95,14 @@ impl Drained {
     }
 }
 
+/// What a drain does about an earlier take whose events are not durable
+/// yet.
+#[derive(Clone, Copy)]
+enum Turn {
+    Wait,
+    Refuse,
+}
+
 /// Coordinates audit-ordered publication across the record + audit sinks
 /// (issue #302). Cloneable: every clone drives the same two sinks.
 #[derive(Clone)]
@@ -268,6 +276,19 @@ impl PublishCoordinator {
     /// `SharedParquetSink::quiesce_publishes`.
     #[must_use]
     pub fn write_ordered(&self, drained: Drained, trigger: &'static str) -> bool {
+        self.write(drained, trigger, Turn::Refuse)
+    }
+
+    /// [`Self::write_ordered`] for the barrier's own drains: records behind
+    /// an earlier take whose events are still being written wait for that
+    /// write instead of requeueing. Only the barrier task may wait — see
+    /// `audit_sink::Ledger` for why nothing it waits on waits on it.
+    #[must_use]
+    pub fn write_ordered_in_turn(&self, drained: Drained, trigger: &'static str) -> bool {
+        self.write(drained, trigger, Turn::Wait)
+    }
+
+    fn write(&self, drained: Drained, trigger: &'static str, turn: Turn) -> bool {
         let Drained {
             audit,
             records,
@@ -292,7 +313,11 @@ impl PublishCoordinator {
             drop(ticket);
             return false;
         }
-        if !ticket.clear() {
+        let cleared = match turn {
+            Turn::Wait => ticket.clear_in_turn(),
+            Turn::Refuse => ticket.clear(),
+        };
+        if !cleared {
             tracing::debug!(
                 trigger,
                 "publish held: an earlier drain's template events are not durable yet, so the \

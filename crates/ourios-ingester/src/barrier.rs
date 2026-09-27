@@ -491,7 +491,7 @@ impl Barrier {
         }
         let mut published = true;
         for batch in drained {
-            published &= self.publish.write_ordered(batch, "barrier");
+            published &= self.publish.write_ordered_in_turn(batch, "barrier");
         }
         // Publishes registered *before* this cut settle here — the wait
         // §3.1 has always made, now also reporting. Unconditional, and

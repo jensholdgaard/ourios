@@ -53,7 +53,7 @@
 //! batch can wait in the barrier's pending slot.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_parquet::{AuditWriter, AuditWriterError, PartitionKey, Store, derive_audit_partition};
@@ -302,8 +302,8 @@ impl AuditSink for BufferingAuditSink {
 #[derive(Clone)]
 pub struct SharedParquetAuditSink {
     inner: Arc<Mutex<BufferingAuditSink>>,
-    /// Taken only inside `inner`'s lock or alone — a leaf.
-    ledger: Arc<Mutex<Ledger>>,
+    /// Every take out of the buffer not yet settled.
+    takes: Arc<Takes>,
 }
 
 impl SharedParquetAuditSink {
@@ -312,7 +312,7 @@ impl SharedParquetAuditSink {
     pub fn new(sink: BufferingAuditSink) -> Self {
         Self {
             inner: Arc::new(Mutex::new(sink)),
-            ledger: Arc::new(Mutex::new(Ledger::default())),
+            takes: Arc::new(Takes::default()),
         }
     }
 
@@ -355,10 +355,10 @@ impl SharedParquetAuditSink {
         let mut guard = self.lock();
         let events = std::mem::take(&mut guard.buffer);
         guard.metrics.set_buffered(0);
-        let id = lock_ledger(&self.ledger).issue(!events.is_empty());
+        let id = self.takes.lock().issue(!events.is_empty());
         let ticket = Ticket {
             id,
-            ledger: Arc::clone(&self.ledger),
+            takes: Arc::clone(&self.takes),
         };
         (events, ticket)
     }
@@ -413,10 +413,10 @@ impl SharedParquetAuditSink {
     /// to the buffer during it (see [`Ledger`]).
     #[must_use]
     pub fn barrier(&self) -> bool {
-        let Some(before) = lock_ledger(&self.ledger).quiet() else {
+        let Some(before) = self.takes.lock().quiet() else {
             return false;
         };
-        self.flush() && lock_ledger(&self.ledger).quiet() == Some(before)
+        self.flush() && self.takes.lock().quiet() == Some(before)
     }
 }
 
@@ -438,11 +438,15 @@ impl SharedParquetAuditSink {
 /// records, and the next drain, which takes the returned events with
 /// them, publishes both in order.
 ///
-/// Never waited on: `quiesce_publishes` waits for every guard, and a
-/// drain waiting behind a pending cut would wait for the cut ahead of
-/// it, which is waiting for that drain's guard.
+/// Only the barrier's own drains wait on it ([`Ticket::clear_in_turn`]),
+/// and only for earlier takes: those belong to the age sweep and the
+/// audit flushes, which never wait, or to batches the barrier task has
+/// already written. Everyone else refuses instead — `quiesce_publishes`
+/// waits for every guard, so an age drain waiting behind a pending cut
+/// would wait for the cut ahead of it, which is waiting for that drain's
+/// guard.
 #[derive(Debug, Default)]
-pub(crate) struct Ledger {
+struct Ledger {
     next: u64,
     open: BTreeMap<u64, Standing>,
     /// How many takes went back to the buffer (or were lost) with their
@@ -477,9 +481,8 @@ impl Ledger {
     /// Close `id` with its own events durable, answering whether its
     /// records may publish.
     fn clear(&mut self, id: u64) -> bool {
-        let standing = self.open.remove(&id);
-        let earlier_in_limbo = self.open.range(..id).any(|(_, earlier)| earlier.in_limbo);
-        matches!(standing, Some(own) if !own.doomed) && !earlier_in_limbo
+        let earlier_in_limbo = self.earlier_in_limbo(id);
+        matches!(self.open.remove(&id), Some(own) if !own.doomed) && !earlier_in_limbo
     }
 
     /// Close `id` with its events back in the buffer or lost, dooming
@@ -496,6 +499,15 @@ impl Ledger {
         }
     }
 
+    fn earlier_in_limbo(&self, id: u64) -> bool {
+        self.open.range(..id).any(|(_, earlier)| earlier.in_limbo)
+    }
+
+    /// Whether `id` can still publish once every earlier take settles.
+    fn waiting(&self, id: u64) -> bool {
+        self.open.get(&id).is_some_and(|own| !own.doomed) && self.earlier_in_limbo(id)
+    }
+
     /// `Some(abandoned)` when no take's events are in limbo.
     fn quiet(&self) -> Option<u64> {
         (!self.open.values().any(|standing| standing.in_limbo)).then_some(self.abandoned)
@@ -509,25 +521,60 @@ impl Ledger {
 #[derive(Debug)]
 pub(crate) struct Ticket {
     id: u64,
-    ledger: Arc<Mutex<Ledger>>,
+    takes: Arc<Takes>,
 }
 
 impl Ticket {
     /// Close this take with its own events durable, answering whether
     /// records taken with it may publish.
     pub(crate) fn clear(&self) -> bool {
-        lock_ledger(&self.ledger).clear(self.id)
+        let cleared = self.takes.lock().clear(self.id);
+        self.takes.settled.notify_all();
+        cleared
+    }
+
+    /// [`Self::clear`], after waiting for every earlier take to settle —
+    /// the barrier's drains, whose earlier takes never wait on them.
+    pub(crate) fn clear_in_turn(&self) -> bool {
+        let mut ledger = self.takes.lock();
+        if let Some(own) = ledger.open.get_mut(&self.id) {
+            own.in_limbo = false;
+        }
+        self.takes.settled.notify_all();
+        while ledger.waiting(self.id) {
+            ledger = self
+                .takes
+                .settled
+                .wait(ledger)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        let cleared = ledger.clear(self.id);
+        drop(ledger);
+        self.takes.settled.notify_all();
+        cleared
     }
 }
 
 impl Drop for Ticket {
     fn drop(&mut self) {
-        lock_ledger(&self.ledger).abandon(self.id);
+        self.takes.lock().abandon(self.id);
+        self.takes.settled.notify_all();
     }
 }
 
-fn lock_ledger(ledger: &Mutex<Ledger>) -> MutexGuard<'_, Ledger> {
-    ledger.lock().unwrap_or_else(PoisonError::into_inner)
+/// The [`Ledger`] and the signal its settlements raise. A leaf: taken
+/// alone or inside the audit buffer's lock, and never held while taking
+/// anything else.
+#[derive(Debug, Default)]
+struct Takes {
+    ledger: Mutex<Ledger>,
+    settled: Condvar,
+}
+
+impl Takes {
+    fn lock(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl AuditSink for SharedParquetAuditSink {

@@ -410,7 +410,7 @@ impl SharedParquetAuditSink {
     /// The record sink's inline audit barrier: whether every event emitted
     /// so far is durable. Flushes the buffer, and refuses when any other
     /// take's events are in limbo before or after that flush, or went back
-    /// to the buffer during it (see [`Ledger`]).
+    /// to the buffer during it (see the sink's take ledger).
     #[must_use]
     pub fn barrier(&self) -> bool {
         let Some(before) = self.takes.lock().quiet() else {

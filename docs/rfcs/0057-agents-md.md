@@ -178,18 +178,10 @@ becomes
 **3.4.2 §5.2 (line 194).** *"This is for humans and for Claude
 equally"* becomes *"This is for humans and for AI agents equally"*.
 
-**3.4.3 §7 layout.** The tree gains the two root files and the skills
-comment is neutralised:
-
-```
-├── AGENTS.md                 # project context for humans and AI agents
-├── CLAUDE.md                 # one-line stub importing AGENTS.md
-…
-└── .claude/
-    └── skills/               # project skills (plain markdown, any agent)
-```
-
-The `.claude/` directory does not move (§3.5).
+**3.4.3 §7 layout.** The tree gains `AGENTS.md`, the `CLAUDE.md`
+stub and the existing `.agents/skills/` directory, and the skills
+comment is neutralised; the exact tree is in §3.5. Neither skills
+directory moves.
 
 **3.4.4 §8 heading.** `## 8. Context management (agent-specific)` is
 kept verbatim: "agent-specific" already means "for agents", and the
@@ -252,30 +244,53 @@ RFC and majority maintainer approval."*
 
 ### 3.5 Skills: `.claude/skills/` stays where it is
 
-`.claude/skills/rfc-check/SKILL.md` and `.claude/skills/openfga/` are
-plain markdown with YAML front matter; any agent can read them, and
-`AGENTS.md` §7 now says so. The directory **does not move**, because:
+The repository already has two skill locations:
 
-1. Claude Code discovers project skills only under `.claude/skills/`;
-   moving them would break the one agent that loads them automatically.
-2. `skills-lock.json` pins `openfga` from `openfga/agent-skills`, and
-   the installer writes to `.claude/skills/`; relocating means fighting
-   the tool on every update.
-3. There is no competing cross-agent skills location to move to
-   (§3.6: none of the other tools documents one it reads from this
-   repo). If one emerges, a symlink or a follow-up RFC handles it.
+- `.agents/skills/openfga/` — the vendored OpenFGA skill, the real
+  tracked files. `skills-lock.json` pins it from `openfga/agent-skills`,
+  and the skills installer writes it to this agent-neutral path.
+- `.claude/skills/` — Claude Code's discovery path. It holds
+  `rfc-check/SKILL.md` (tracked here, nowhere else) and `openfga`, a
+  tracked **symlink** to `../../.agents/skills/openfga`.
 
-`AGENTS.md` points to it through §7's tree comment (§3.4.3); no other
-section gains text.
+Every skill is plain markdown with YAML front matter, so any agent can
+read one. The directories **do not move**, because:
+
+1. Claude Code discovers project skills under `.claude/skills/`, so
+   that path must keep resolving for the one agent that loads skills
+   automatically.
+2. The installer already uses the neutral `.agents/skills/` path with a
+   symlink into `.claude/skills/`. That is the pattern to follow, not
+   something to replace.
+3. Whether `rfc-check` should follow the same pattern (move to
+   `.agents/skills/rfc-check/`, with a `.claude/skills/rfc-check`
+   symlink) is a separate, reversible choice that touches no rule, so
+   it is left as an open question (§7) rather than bundled into a
+   `meta:` change.
+
+`AGENTS.md` names both paths in §7's tree; no other section gains
+text. The tree for §3.4.3 is:
+
+```
+├── AGENTS.md                 # project context for humans and AI agents
+├── CLAUDE.md                 # one-line stub importing AGENTS.md
+…
+├── .agents/
+│   └── skills/               # vendored skills (skills-lock.json)
+└── .claude/
+    └── skills/               # project skills (plain markdown, any agent);
+                              # symlinks into .agents/skills/ where vendored
+```
 
 **Note: a nested `AGENTS.md` already exists** at
-`.claude/skills/openfga/AGENTS.md` (vendored upstream content). Tools
-treat nested files differently: Copilot applies the nearest one, so
-inside that directory it would see the OpenFGA guide *instead of* the
-root rules [GH-instr]; Codex concatenates root and nested files, so it
-sees both, subject to its byte budget [Codex-src]. Work inside a
-vendored skill directory is rare and never touches the hot path, so
-this is accepted and the file is not edited.
+`.agents/skills/openfga/AGENTS.md` (vendored upstream content, also
+reachable through the `.claude/skills/openfga` symlink). Tools treat
+nested files differently: Copilot applies the nearest one, so inside
+that directory it would see the OpenFGA guide *instead of* the root
+rules [GH-instr]; Codex concatenates root and nested files, so it sees
+both, subject to its byte budget [Codex-src]. Work inside a vendored
+skill directory is rare and never touches the hot path, so this is
+accepted and the file is not edited.
 
 ### 3.6 Per-tool support
 
@@ -309,7 +324,7 @@ enacting PR's author.
   file in the repo, the alternative is one sentence in `CONTRIBUTING.md`
   telling Gemini CLI users to set it in their user settings (§7).
 - **Codex's 32 KiB budget.** `AGENTS.md` is 19 021 bytes today, well
-  inside it. The vendored `.claude/skills/openfga/AGENTS.md` is
+  inside it. The vendored `.agents/skills/openfga/AGENTS.md` is
   104 117 bytes; Codex concatenates it only when working inside that
   directory, and it is truncated there. That is upstream content and a
   pre-existing condition; noted, not changed.
@@ -383,8 +398,10 @@ buys nothing the stub does not already give. Rejected; living docs only
 only Gemini CLI unable to read `AGENTS.md` by default, and that gap is
 closed by a one-key setting that points at `AGENTS.md`, not by a copy.
 
-**Move `.claude/skills/` to a neutral path.** Breaks Claude Code's
-discovery and the skills installer for no reader gain (§3.5).
+**Move `.claude/skills/` wholesale to `.agents/skills/`.** Without
+a symlink it breaks Claude Code's skill discovery; with one it is the
+pattern the vendored OpenFGA skill already uses, which §3.5 keeps and §7
+leaves open for `rfc-check`. Not bundled into this `meta:` RFC.
 
 ## 5. Acceptance criteria
 
@@ -430,7 +447,10 @@ RFC 0012's. Each carries a runnable check.
 > **Scenario RFC0057.5 — the only wording changes are §3.4's.**
 > - **Given** the enacting PR's second commit
 > - **When** its diff against the first is reviewed
-> - **Then** every hunk corresponds to an item in §3.4.1–§3.4.9
+> - **Then** every hunk in `AGENTS.md` corresponds to an item in
+>   §3.4.1–§3.4.9, and the only other change is the new `CLAUDE.md`
+>   stub of §3.2 (plus `.gemini/settings.json` if §3.6's option is
+>   taken)
 > - **And** `grep -niE 'claude|anthropic' AGENTS.md` matches only the
 >   footer's history, §7's `.claude/` and `CLAUDE.md` stub lines, §8's
 >   parenthetical examples, and §9's example trailer / header
@@ -482,6 +502,9 @@ as an open question rather than required, since it is new CI surface.
 - [ ] **Unverified rows.** Cursor and Jules support rests on secondary
       sources (§3.6); the enacting PR's author re-checks
       `cursor.com/docs` and `jules.google/docs`.
+- [ ] **`rfc-check` location.** Move it to `.agents/skills/rfc-check/`
+      with a `.claude/skills/rfc-check` symlink, matching the vendored
+      OpenFGA skill (§3.5), or leave it in `.claude/skills/`?
 - [ ] **Stub-only rule.** Is "the stub stays one line; Claude-specific
       text needs a `meta:` RFC" (§3.2) the right bar, or should small
       Claude Code notes be allowed below the import without one?

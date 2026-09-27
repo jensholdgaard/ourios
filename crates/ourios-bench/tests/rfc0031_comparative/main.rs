@@ -816,9 +816,6 @@ fn rfc0031_indicative_comparative_run() {
     let (loki, l4_loki, loki_labels) = runtime.block_on(async {
         let (container, base, http) = start_loki(LOKI_DISPATCH_FLAGS).await;
         let loki_labels = push_corpus_to_loki(&http, &base, &corpus_dir).await;
-        // Logged here, not only in the report: a run that fails before the
-        // report prints still says which labels Loki's index had (#800).
-        eprintln!("loki stream labels: {}", loki_labels.summary());
         let mut measured = Vec::with_capacity(specs.len());
         for spec in &specs {
             let result = match loki_measure_pair(&http, &base, spec).await {

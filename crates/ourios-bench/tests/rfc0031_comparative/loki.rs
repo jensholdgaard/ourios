@@ -158,6 +158,15 @@ pub(crate) struct CorpusLokiLabels {
 }
 
 impl CorpusLokiLabels {
+    pub(crate) fn observe_all(
+        &mut self,
+        resource_logs: &[opentelemetry_proto::tonic::logs::v1::ResourceLogs],
+    ) {
+        for rl in resource_logs {
+            self.observe(rl.resource.as_ref());
+        }
+    }
+
     pub(crate) fn observe(
         &mut self,
         resource: Option<&opentelemetry_proto::tonic::resource::v1::Resource>,
@@ -688,9 +697,7 @@ pub(crate) async fn push_corpus_to_loki(
                     );
                 }
             }
-            for rl in &data.resource_logs {
-                labels.observe(rl.resource.as_ref());
-            }
+            labels.observe_all(&data.resource_logs);
             pending.extend(data.resource_logs);
             pending_bytes += line_bytes;
             pending_lines += 1;
@@ -705,7 +712,10 @@ pub(crate) async fn push_corpus_to_loki(
         push_otlp(http, base, payload).await;
         pushed += 1;
     }
-    eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests");
+    eprintln!(
+        "loki ingest complete: {batched} LogsData lines in {pushed} requests; stream labels: {}",
+        labels.summary(),
+    );
     labels
 }
 

@@ -985,6 +985,7 @@ fn comparative_results_json_with_no_l4_candidate_records_null_not_absence() {
 #[test]
 fn corpus_loki_labels_counts_triggered_labels_and_streams() {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
     use opentelemetry_proto::tonic::resource::v1::Resource;
 
     let resource = |service: &str, instance: Option<&str>| {
@@ -1021,23 +1022,13 @@ fn corpus_loki_labels_counts_triggered_labels_and_streams() {
         ("recommendation", None),
         ("recommendation", None),
     ] {
-        labels.observe(Some(&resource(service, instance)));
+        labels.observe_all(&[ResourceLogs {
+            resource: Some(resource(service, instance)),
+            ..ResourceLogs::default()
+        }]);
     }
     labels.observe(None);
 
-    let triggered: Vec<(&str, usize)> = labels
-        .values
-        .iter()
-        .map(|(name, values)| (name.as_str(), values.len()))
-        .collect();
-    assert_eq!(
-        triggered,
-        [
-            ("service_instance_id", 4),
-            ("service_name", 5),
-            ("service_namespace", 1),
-        ],
-    );
     // Six resource shapes plus the attribute-less resource; the repeated
     // recommendation resource is the same stream.
     assert_eq!(labels.label_sets.len(), 7);

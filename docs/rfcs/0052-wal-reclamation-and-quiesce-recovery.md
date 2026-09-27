@@ -2058,8 +2058,21 @@ actually depend on. `ReclaimState` (§3.7) carries, and the exporter surfaces:
   report a growing age. An earlier draft said "below the checkpoint", which would have
   exported the one number that does not grow during an outage;
 - **the retain floor and its lag** — `lag_bytes`, the frame bytes in the
-  segments the floor retains below the checkpoint, and `lag_segments`, their
-  count; `WalOffset` is a `(UUIDv7, byte)` pair and has no subtraction of its
+  segments at least one tenant still holds back, less the current append
+  segment, and `lag_segments`, their count; both are reported as zero while
+  the floor is `Unknown` (no pass has derived one, so no lag is reported
+  yet, whatever the ledger holds) or `None` (the checkpoint alone governs,
+  so no tenant holds anything back). The
+  figures are **conservative by construction**: equal to the bytes and
+  segments the floor retains below the checkpoint whenever the checkpoint
+  covers every held segment, larger by the held post-checkpoint tail
+  otherwise, never smaller. An earlier revision bounded them by the
+  checkpoint, which made the held set move whenever the checkpoint does — a
+  range count on every advance, the eager promotion RFC0052.12 forbids — and
+  a retention gauge errs high safely. The current segment is excluded for the
+  reason `unlink_remaining` excludes it (§3.7): no pass can pop it, and
+  counting it would hold the gauge above zero on a healthy node.
+  `WalOffset` is a `(UUIDv7, byte)` pair and has no subtraction of its
   own, and the figures come from per-segment frame-byte accounting the WAL
   keeps incrementally (seeded by `rebuild_ledger()`, updated on every
   append and unlink) — never from an inspection, which §3.7's cap would
@@ -2159,14 +2172,21 @@ So the design is:
       removed_segments: usize,   // what the forced-rotation trigger reads (RFC 0053)
       removed_partials: usize,
       capped: bool,              // "more to do" versus "backlog drained"
-      horizon_remaining: usize,  // segments a received horizon has not yet been
-                                 // applied to: per tenant, the segments it spans
-                                 // between its cursor and its horizon, summed over
+      horizon_remaining: usize,  // segments a received horizon may not yet have
+                                 // been applied to: per tenant, the segments it
+                                 // has frames in above its cursor, summed over
                                  // tenants (a segment counts once per tenant behind
                                  // on it) — a counter the ledger keeps INCREMENTALLY,
-                                 // raised when a horizon arrives and lowered as the
+                                 // raised when a tenant's frame first lands in a
+                                 // segment above its cursor and lowered as the
                                  // cursor moves, so reading it is O(1) under the
-                                 // guard, never a per-tenant sum on the pass
+                                 // guard, never a per-tenant sum on the pass, and a
+                                 // rising horizon costs no range count. Conservative:
+                                 // equal to the cursor-to-horizon span whenever each
+                                 // tenant's horizon covers its newest segment,
+                                 // larger otherwise, never smaller; zero before
+                                 // the first Known pass (an empty Known map
+                                 // counts as one) and under NoConsumer
       unlink_remaining: usize,   // empty-set segments not yet popped (waiting on the
                                  // checkpoint or on a pass — counting only those at
                                  // or below the mark would cost a range count on
@@ -2275,7 +2295,7 @@ So the design is:
   pass.** The receiver passes `SnapshotHorizons` — what it knows — and the
   WAL combines them with its own ledger (§3.2) into `RetainFloor`, returns
   it in `HousekeepingProgress` and keeps it for `reclaim_state()`, with its
-  lag against the checkpoint and its `Pinned` count. Between passes that
+  lag (§3.5) and its `Pinned` count. Between passes that
   is by definition the floor governing retention, so the export is never
   stale and needs no hidden coupling; before the first pass it reports
   `Unknown`, which `maintain` treats as "reclaim nothing" and the export

@@ -100,12 +100,13 @@ impl Drained {
 pub struct PublishCoordinator {
     record: SharedParquetSink,
     audit: SharedParquetAuditSink,
-    /// Orders every take out of the two buffers against every park back
-    /// into them (RFC 0052 §3.1). A park runs outside the ingest
-    /// exclusion, so without it a drain could land between a park's two
-    /// requeues — splitting records from their audit events — or, in the
-    /// rotation hook, between the drain and the cut's epoch, where the
-    /// park's settlement would be dated at that cut and refuse nothing.
+    /// Orders every take out of the two buffers against every park, and
+    /// every audit-failure requeue, back into them (RFC 0052 §3.1). Both
+    /// run outside the ingest exclusion, so without it a drain could land
+    /// between their two requeues — splitting records from their audit
+    /// events — or, in the rotation hook, between the drain and the cut's
+    /// epoch, where the return would be dated at that cut and refuse
+    /// nothing.
     ///
     /// Taken after the ingest exclusion and the miner lock, before the
     /// sinks' own locks, and never held while waiting on anything else.
@@ -268,13 +269,16 @@ impl PublishCoordinator {
         let registered = guard.epoch();
         // The guard settles when this returns, whichever arm took it.
         let _guard = guard;
-        let audit_durable = self.audit.write_owned(audit);
+        let retained = self.audit.write_retaining(audit);
         let records = records.into_partitions();
-        if !audit_durable {
+        if !retained.is_empty() {
             // The audit stream didn't fully reach durability (a transient store
             // error). Do NOT publish the records — their template events aren't
-            // durable yet. Requeue them for the next cadence (the WAL is the
-            // durability of record).
+            // durable yet. Requeue both for the next cadence (the WAL is the
+            // durability of record), as one step against every drain: see
+            // `handoff`.
+            let _handoff = self.lock_handoff();
+            self.audit.requeue(retained);
             self.record.requeue(records, registered);
             return false;
         }

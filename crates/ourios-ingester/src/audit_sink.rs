@@ -358,16 +358,24 @@ impl SharedParquetAuditSink {
     /// retry** (the audit-before-record gate the publisher needs).
     #[must_use]
     pub fn write_owned(&self, events: Vec<AuditEvent>) -> bool {
+        let retained = self.write_retaining(events);
+        let fully_durable = retained.is_empty();
+        self.lock().requeue_ahead(retained);
+        fully_durable
+    }
+
+    /// [`Self::write_owned`] minus the requeue: the transient failures come
+    /// back to the caller, which puts them back together with whatever
+    /// depends on them.
+    #[must_use]
+    pub fn write_retaining(&self, events: Vec<AuditEvent>) -> Vec<AuditEvent> {
         if events.is_empty() {
-            return true;
+            return events;
         }
         let store = self.lock().store.clone();
         let (retained, summary) = write_events(&store, events);
-        let fully_durable = retained.is_empty();
-        let mut guard = self.lock();
-        guard.settle(&summary);
-        guard.requeue_ahead(retained);
-        fully_durable
+        self.lock().settle(&summary);
+        retained
     }
 
     /// Put `events` back at the head of the buffer, ahead of whatever

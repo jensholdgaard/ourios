@@ -331,10 +331,13 @@ pub fn run_sweep_hooked(
                     }
                     report.gc_failures += outcome.gc_failures;
                 }
-                Err(e) => report.errors.push(format!(
-                    "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                    partition.year, partition.month, partition.day, partition.hour,
-                )),
+                Err(e) => {
+                    report.gc_failures += e.gc_failures;
+                    report.errors.push(format!(
+                        "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
+                        partition.year, partition.month, partition.day, partition.hour,
+                    ));
+                }
             }
         }
         report.per_tenant.push(TenantSweep {
@@ -717,12 +720,23 @@ pub(crate) fn to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// Build the RFC 0009 §3.6 audit event for a committed compaction
-/// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
-/// the sweep's wall clock; the partition is the canonical
-/// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
+/// A candidate rewrite that failed or did not commit, carrying the
+/// non-live files its cleanup could not remove so the sweep still counts
+/// them in [`SweepReport::gc_failures`].
+#[derive(Debug)]
+struct Uncommitted {
+    reason: String,
+    gc_failures: usize,
+}
+
+impl std::fmt::Display for Uncommitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// [`compact_partition_hooked`], with an uncommitted rewrite turned into an
-/// error by [`uncommitted_rewrite`]. With one sweeper a lost swap is never a
+/// error by [`check_committed`]. With one sweeper a lost swap is never a
 /// benign race: a store whose swaps always lose must not look like an idle
 /// sweep, and an erasure must not advance past rows it never rewrote.
 fn compact_candidate(
@@ -730,32 +744,43 @@ fn compact_candidate(
     partition: &PartitionKey,
     promoted: &PromotedAttributes,
     hooks: &mut RowHooks<'_>,
-) -> Result<CompactionOutcome, String> {
+) -> Result<CompactionOutcome, Uncommitted> {
     let erasing = hooks.drop.is_some();
     let outcome =
-        compact_partition_hooked(store, partition, promoted, hooks).map_err(|e| e.to_string())?;
-    match uncommitted_rewrite(&outcome, erasing) {
-        Some(e) => Err(e),
-        None => Ok(outcome),
-    }
+        compact_partition_hooked(store, partition, promoted, hooks).map_err(|e| Uncommitted {
+            reason: e.to_string(),
+            gc_failures: 0,
+        })?;
+    check_committed(outcome, erasing)
 }
 
-/// Why `outcome` must be a sweep error rather than a no-op, if it must. A
-/// lost final swap always is. An erasure is too whenever it left live rows
+/// `outcome`, or the sweep error it must be rather than a no-op. A lost
+/// final swap always is. An erasure is too whenever it left live rows
 /// unrewritten, even after losing only the bootstrap, because its marker
 /// must not advance past rows still on disk. A consolidation that lost the
 /// bootstrap wrote nothing and left the partition to the winner.
-fn uncommitted_rewrite(outcome: &CompactionOutcome, erasing: bool) -> Option<String> {
+fn check_committed(
+    outcome: CompactionOutcome,
+    erasing: bool,
+) -> Result<CompactionOutcome, Uncommitted> {
     let unrewritten = erasing && outcome.committed.is_none() && outcome.files_before > 0;
-    (outcome.commit_lost || unrewritten).then(|| {
-        format!(
+    if !(outcome.commit_lost || unrewritten) {
+        return Ok(outcome);
+    }
+    Err(Uncommitted {
+        reason: format!(
             "rewrite of {} live files not committed \
              (manifest compare-and-swap lost); retried next sweep",
             outcome.files_before
-        )
+        ),
+        gc_failures: outcome.gc_failures,
     })
 }
 
+/// Build the RFC 0009 §3.6 audit event for a committed compaction
+/// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
+/// the sweep's wall clock; the partition is the canonical
+/// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
 fn compaction_audit_event(
     tenant: &str,
     now_unix_nanos: u64,

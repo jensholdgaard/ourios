@@ -163,17 +163,15 @@ fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
 /// never reads as an idle sweep.
 #[test]
 fn a_lost_final_swap_is_a_sweep_error() {
-    let lost = outcome(2, true);
-
     let errors = [
-        uncommitted_rewrite(&lost, false),
-        uncommitted_rewrite(&lost, true),
+        check_committed(outcome(2, true), false),
+        check_committed(outcome(2, true), true),
     ];
 
     assert!(
-        errors
-            .iter()
-            .all(|e| e.as_deref().is_some_and(|e| e.contains("not committed"))),
+        errors.iter().all(|e| e
+            .as_ref()
+            .is_err_and(|e| e.reason.contains("not committed"))),
         "{errors:?}"
     );
 }
@@ -183,17 +181,28 @@ fn a_lost_final_swap_is_a_sweep_error() {
 /// no-op for both.
 #[test]
 fn a_lost_bootstrap_is_an_error_only_for_an_erasure() {
-    let bootstrap_lost = outcome(2, false);
-    let empty = outcome(0, false);
-
     let verdicts = [
-        uncommitted_rewrite(&bootstrap_lost, false).is_some(),
-        uncommitted_rewrite(&bootstrap_lost, true).is_some(),
-        uncommitted_rewrite(&empty, false).is_some(),
-        uncommitted_rewrite(&empty, true).is_some(),
+        check_committed(outcome(2, false), false).is_err(),
+        check_committed(outcome(2, false), true).is_err(),
+        check_committed(outcome(0, false), false).is_err(),
+        check_committed(outcome(0, false), true).is_err(),
     ];
 
     assert_eq!(verdicts, [false, true, false, false]);
+}
+
+/// A lost swap whose discarded rewrite could not be deleted keeps that
+/// cleanup failure in the error, so the sweep still counts it.
+#[test]
+fn a_lost_swap_error_keeps_its_cleanup_failures() {
+    let lost = CompactionOutcome {
+        gc_failures: 1,
+        ..outcome(2, true)
+    };
+
+    let error = check_committed(lost, true).expect_err("a lost swap is an error");
+
+    assert_eq!(error.gc_failures, 1);
 }
 
 /// An erasure rewrite whose manifest swap loses leaves the marker in the

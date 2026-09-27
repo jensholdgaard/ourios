@@ -266,6 +266,7 @@ pub(super) fn erase_pending(
                     }
                     Err(e) => {
                         clean = false;
+                        report.gc_failures += e.gc_failures;
                         report.errors.push(format!(
                             "erase {:?} {:?} {:04}-{:02}-{:02}T{:02}: {e}",
                             request.tenant,

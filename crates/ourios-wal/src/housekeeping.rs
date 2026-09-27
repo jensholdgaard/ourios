@@ -482,13 +482,41 @@ impl Wal {
                 PassOutcome::Skipped(SkipReason::MigrationWindow),
             );
         }
+        let (durable, occupied) = self.durable_rows();
         let bound = retain::PopBound {
             checkpoint,
             current: self.current_segment_uuid,
             tenant_aware: matches!(horizons, SnapshotHorizons::Known(_)),
+            rows: retain::PlannedRows::new(&durable, occupied, self.row_capacity()),
         };
         let (popped, capped) = self.ledger.pop(bound, budget);
         (popped, capped, PassOutcome::Planned)
+    }
+
+    /// The segments the live record already holds a `planned` row
+    /// for, and how many rows it holds. The merge in
+    /// [`Self::write_plan_record`] reads the same record, and nothing
+    /// between the two halves adds a row: a later prepare supersedes
+    /// this plan rather than writing beside it.
+    fn durable_rows(&self) -> (std::collections::BTreeSet<uuid::Uuid>, usize) {
+        self.reclaim
+            .as_ref()
+            .map_or_else(Default::default, |store| {
+                let planned = &store.record().planned;
+                (planned.iter().map(|p| p.segment).collect(), planned.len())
+            })
+    }
+
+    /// How many `planned` rows a record write may carry. The store's
+    /// file can be wider than the configured cap, never narrower, and
+    /// the open-time reconciliation empties the array, so the
+    /// configured cap bounds every row this process writes. A root
+    /// with no record writes none, and nothing bounds its pops here.
+    fn row_capacity(&self) -> usize {
+        match self.reclaim {
+            Some(_) => self.pass_cap(),
+            None => usize::MAX,
+        }
     }
 
     /// Merge this pass's popped segments and its mode into the record

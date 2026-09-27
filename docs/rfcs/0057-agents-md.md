@@ -273,9 +273,10 @@ read one. The directories **do not move**, because:
 1. Claude Code discovers project skills under `.claude/skills/`, so
    that path must keep resolving for the one agent that loads skills
    automatically.
-2. The installer already uses the neutral `.agents/skills/` path with a
-   symlink into `.claude/skills/`. That is the pattern to follow, not
-   something to replace.
+2. The installer already keeps the real files in the neutral
+   `.agents/skills/` path, with a symlink at `.claude/skills/<name>`
+   pointing to `../../.agents/skills/<name>`. That is the pattern to
+   follow, not something to replace.
 3. Whether `rfc-check` should follow the same pattern (move to
    `.agents/skills/rfc-check/`, with a `.claude/skills/rfc-check`
    symlink) is a separate, reversible choice that touches no rule, so
@@ -293,7 +294,7 @@ text. The tree for §3.4.3 is:
 │   └── skills/               # vendored skills (skills-lock.json)
 └── .claude/
     └── skills/               # project skills (plain markdown, any agent);
-                              # symlinks into .agents/skills/ where vendored
+                              # vendored ones are symlinks to .agents/skills/
 ```
 
 **Note: a nested `AGENTS.md` already exists** at
@@ -337,8 +338,11 @@ enacting PR's author.
   `.gemini/settings.json` containing only
   `{"context":{"fileName":["AGENTS.md"]}}`: a pointer, not a copy of
   any rule, so it cannot drift. If the maintainer prefers no Gemini
-  file in the repo, the alternative is one sentence in `CONTRIBUTING.md`
-  telling Gemini CLI users to set it in their user settings (§7).
+  file in the repo, the enacting PR must instead add one sentence to
+  `CONTRIBUTING.md` giving Gemini CLI users that exact setting for their
+  user-level `~/.gemini/settings.json` (§7). One of the two is
+  mandatory: without either, Gemini CLI loads only `GEMINI.md` and gets
+  none of the project rules.
 - **Codex's 32 KiB budget.** `AGENTS.md` is 19 021 bytes today, well
   inside it. The vendored `.agents/skills/openfga/AGENTS.md` is
   104 117 bytes; Codex concatenates it only when working inside that
@@ -478,8 +482,10 @@ RFC 0012's. Each carries a runnable check.
 >   `.github/copilot-instructions.md`, `GEMINI.md`, `.cursorrules` and
 >   `.cursor/rules/`
 > - **Then** none exists
-> - **And** `.gemini/settings.json`, if added (§3.6), parses as JSON
->   whose `context.fileName` names `AGENTS.md` and holds no rule text
+> - **And** exactly one Gemini CLI route from §3.6 exists: either
+>   `.gemini/settings.json` parses as JSON whose `context.fileName`
+>   names `AGENTS.md` and holds no rule text, or `CONTRIBUTING.md`
+>   contains that `context.fileName` setting for the user-level file
 
 > **Scenario RFC0057.7 — the book still builds.**
 > - **Given** the enacted repository

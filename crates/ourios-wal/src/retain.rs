@@ -305,12 +305,14 @@ pub(crate) struct PlannedRows<'a> {
 }
 
 impl<'a> PlannedRows<'a> {
-    /// The rows a record holding `durable` leaves free in an array of
-    /// `capacity`.
-    pub(crate) fn new(durable: &'a BTreeSet<Uuid>, capacity: usize) -> Self {
+    /// The rows a record holding `occupied` rows, naming the segments
+    /// in `durable`, leaves free in an array of `capacity`. The count
+    /// is the record's own rather than the set's: a record that named
+    /// one segment twice still spends two positions.
+    pub(crate) fn new(durable: &'a BTreeSet<Uuid>, occupied: usize, capacity: usize) -> Self {
         Self {
             durable,
-            free: capacity.saturating_sub(durable.len()),
+            free: capacity.saturating_sub(occupied.max(durable.len())),
         }
     }
 
@@ -1114,7 +1116,7 @@ mod tests {
             checkpoint: offsets[5],
             current,
             tenant_aware: true,
-            rows: PlannedRows::new(&NO_ROWS, usize::MAX),
+            rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
         };
         let (popped, _) = ledger.pop(bound, 8);
         check(&ledger, current, "a pop");
@@ -1159,7 +1161,7 @@ mod tests {
                 checkpoint: newest,
                 current: rotated,
                 tenant_aware: false,
-                rows: PlannedRows::new(&NO_ROWS, usize::MAX),
+                rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
             },
             8,
         );
@@ -1245,7 +1247,7 @@ mod tests {
                 checkpoint: offsets[3],
                 current,
                 tenant_aware: true,
-                rows: PlannedRows::new(&durable, 1),
+                rows: PlannedRows::new(&durable, durable.len(), 1),
             },
             1,
         );
@@ -1282,7 +1284,7 @@ mod tests {
             checkpoint: offsets[5],
             current,
             tenant_aware: true,
-            rows: PlannedRows::new(&NO_ROWS, usize::MAX),
+            rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
         };
         caught_up(&mut walked, &offsets);
         assert!(
@@ -1299,7 +1301,7 @@ mod tests {
                         checkpoint: offsets[5],
                         current,
                         tenant_aware: true,
-                        rows: PlannedRows::new(&NO_ROWS, usize::MAX),
+                        rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
                     },
                     8,
                 )

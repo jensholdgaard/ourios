@@ -62,6 +62,15 @@ fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
     }
 }
 
+/// Whether `tag` (an `ETag` without its quotes) is safe to send unquoted in
+/// `If-Match`: non-empty ASCII letters, digits and hyphens, the shape of S3
+/// and Ceph `ETag`s (a hex digest, `-N` for a multipart upload). Anything
+/// else could change the header's meaning, not just its spelling: `*` would
+/// become a wildcard matching any existing object, and a comma a list.
+fn is_plain_opaque_tag(tag: &str) -> bool {
+    !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Drive `fut` to completion synchronously — the bridge from the **sync**
 /// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
 /// `object_store` (compaction must reach S3 per RFC0013.3, so a local-only
@@ -831,6 +840,14 @@ impl Store {
     /// supports conditional update — S3-compatible stores do;
     /// `LocalFileSystem` does not.
     ///
+    /// A `412` against a quoted `ETag` is retried once with the quotes
+    /// stripped: some S3-compatible stores (Ceph RGW-based ones) return the
+    /// quoted form from `GET` but honour `If-Match` only unquoted, so every
+    /// swap would otherwise lose. The retry cannot weaken the swap — it
+    /// still succeeds only if the object is unchanged — because it is sent
+    /// only for a plain opaque tag (letters, digits and hyphens), whose
+    /// unquoted spelling cannot become a wildcard or a list.
+    ///
     /// # Errors
     /// [`StoreError::Backend`] whose [`StoreError::is_precondition`] is true if
     /// the `ETag` no longer matches (the swap lost the race); otherwise as a
@@ -841,15 +858,26 @@ impl Store {
         bytes: Vec<u8>,
         e_tag: &str,
     ) -> Result<(), StoreError> {
-        let opts = PutOptions::from(PutMode::Update(UpdateVersion {
-            e_tag: Some(e_tag.to_string()),
-            version: None,
-        }));
-        self.inner
-            .put_opts(&self.resolve(key)?, PutPayload::from(bytes), opts)
-            .await
-            .map_err(StoreError::Backend)?;
-        Ok(())
+        let path = self.resolve(key)?;
+        let payload = PutPayload::from(bytes);
+        let put = |e_tag: &str| {
+            let opts = PutOptions::from(PutMode::Update(UpdateVersion {
+                e_tag: Some(e_tag.to_string()),
+                version: None,
+            }));
+            self.inner.put_opts(&path, payload.clone(), opts)
+        };
+        let unquoted = e_tag
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .filter(|tag| is_plain_opaque_tag(tag));
+        match (put(e_tag).await, unquoted) {
+            (Ok(_), _) => Ok(()),
+            (Err(object_store::Error::Precondition { .. }), Some(unquoted)) => {
+                put(unquoted).await.map(|_| ()).map_err(StoreError::Backend)
+            }
+            (Err(e), _) => Err(StoreError::Backend(e)),
+        }
     }
 
     /// Blocking [`Self::get_with_etag`], mapping a missing object to `None`

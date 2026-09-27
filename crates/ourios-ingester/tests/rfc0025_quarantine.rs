@@ -148,6 +148,7 @@ fn cadence_drain_publish_quarantines_instead_of_requeueing() {
     let all_published = shared.publish_owned(
         vec![(key, vec![healthy(1_000), poisoned(), healthy(2_000)])],
         "cadence",
+        shared.epochs().current(),
     );
 
     assert!(all_published, "the remainder publishes — nothing requeues");

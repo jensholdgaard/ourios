@@ -23,6 +23,7 @@ use std::path::Path;
 use ourios_core::tenant::TenantId;
 use ourios_miner::snapshot::{SnapshotError, SnapshotState, snapshot};
 use ourios_parquet::{percent_decode_tenant, percent_encode_tenant};
+use uuid::Uuid;
 
 const EXTENSION: &str = "snap";
 
@@ -75,16 +76,174 @@ pub fn write(
     let bytes = snapshot(state).map_err(SnapshotStoreError::Encode)?;
     std::fs::create_dir_all(root).map_err(io("create_dir_all(snapshots root)"))?;
     let stem = percent_encode_tenant(tenant.as_str());
-    let tmp = root.join(format!("{stem}.{EXTENSION}.tmp"));
-    let mut file = File::create(&tmp).map_err(io("create(snapshot tmp)"))?;
-    file.write_all(&bytes).map_err(io("write(snapshot tmp)"))?;
+    // RFC 0052 §3.1: a **unique** temp name per attempt. One fixed
+    // `.snap.tmp` could be truncated or interleaved by a concurrent
+    // writer before either rename, and the two would install each
+    // other's bytes — or one would unlink the temp the other was still
+    // writing. The cut's mark does not make it unique (two writers can
+    // carry the same one), so the name carries a `UUIDv7` instead.
+    let tmp = root.join(format!(
+        "{stem}.{}.{EXTENSION}.tmp",
+        Uuid::now_v7().simple()
+    ));
+    let written = write_and_install(&tmp, root, &stem, &bytes);
+    if written.is_err() {
+        // The writer unlinks its own temp on any write, fsync or rename
+        // failure, so a failing barrier cannot leak one file per attempt.
+        drop(std::fs::remove_file(&tmp));
+    }
+    written?;
+    // The root's *parent* too, not just the root: on a cold start the
+    // `create_dir_all` above may have created `<wal_root>/snapshots`
+    // itself, and fsyncing only the child leaves that new directory
+    // entry undurable — a crash could then lose the whole root after a
+    // cut had already advanced the checkpoint past the frames these
+    // artefacts cover. `fsync_root` is the same helper RFC0052.13's
+    // startup check uses, so both ends of the artefact's life make the
+    // same two directories durable.
+    fsync_root(root)
+}
+
+fn write_and_install(
+    tmp: &Path,
+    root: &Path,
+    stem: &str,
+    bytes: &[u8],
+) -> Result<(), SnapshotStoreError> {
+    let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
+    let mut file = File::create(tmp).map_err(io("create(snapshot tmp)"))?;
+    file.write_all(bytes).map_err(io("write(snapshot tmp)"))?;
     file.sync_all().map_err(io("fsync(snapshot tmp)"))?;
-    std::fs::rename(&tmp, root.join(format!("{stem}.{EXTENSION}")))
+    std::fs::rename(tmp, root.join(format!("{stem}.{EXTENSION}")))
         .map_err(io("rename(snapshot tmp -> snapshot)"))?;
-    File::open(root)
-        .and_then(|dir| dir.sync_all())
-        .map_err(io("fsync(snapshots root)"))?;
     Ok(())
+}
+
+/// Fsync the snapshots root **and its parent** (RFC0052.13).
+///
+/// Startup calls this before any listed artefact is read as a horizon.
+/// A failure is startup's to raise, not to swallow: reclamation may
+/// already have removed the frames the listed snapshots cover, so a
+/// horizon whose directory entry may not be durable must never govern
+/// reclamation — and discarding the snapshots instead would throw away
+/// state nothing else can rebuild.
+///
+/// An absent root is a cold start, not a failure.
+///
+/// # Errors
+///
+/// [`SnapshotStoreError::Io`] when either fsync fails.
+pub fn fsync_root(root: &Path) -> Result<(), SnapshotStoreError> {
+    let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
+    match File::open(root) {
+        // Fsyncing a *file* proves nothing about a directory entry, so
+        // a root that is not a directory is a failed step rather than a
+        // silently successful one — and it is the shape the
+        // file-in-place-of-directory fixture produces (§6).
+        Ok(handle) if !handle.metadata().is_ok_and(|meta| meta.is_dir()) => {
+            return Err(SnapshotStoreError::Io {
+                op: "fsync(snapshots root)",
+                source: std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("{} is not a directory", root.display()),
+                ),
+            });
+        }
+        Ok(dir) => dir.sync_all().map_err(io("fsync(snapshots root)"))?,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(SnapshotStoreError::Io {
+                op: "open(snapshots root)",
+                source,
+            });
+        }
+    }
+    let Some(parent) = parent_to_fsync(root) else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io("fsync(snapshots root parent)"))?;
+    Ok(())
+}
+
+/// The directory holding `root`'s own entry, which is what has to be
+/// durable for the rename that created it to survive.
+///
+/// A single-component relative root yields `Some("")` from
+/// [`Path::parent`] — the current directory, not "no parent". Treating
+/// the two alike would skip the fsync for the one root shape where the
+/// entry is still real. `None` is only a filesystem root, which has no
+/// entry to make durable.
+fn parent_to_fsync(root: &Path) -> Option<&Path> {
+    match root.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        other => other,
+    }
+}
+
+/// Fsync the root — and its parent with it — then remove every
+/// `*.snap.tmp` a previous process left and list the durable artefacts
+/// ([`load_all`]).
+///
+/// The fsync lives **here**, not at the caller, because RFC0052.13's
+/// guarantee is about every artefact this function returns: a horizon
+/// whose directory entry may not be durable must never govern
+/// reclamation, and a caller that forgets a separate preflight would
+/// trust one. [`crate::barrier::fsync_snapshots_root`] remains the
+/// startup preflight — it fails before the WAL is even opened, with its
+/// own error context — but is no longer what the guarantee rests on.
+///
+/// A temp file is a writer's private scratch: unlinking its own is the
+/// writer's job while it lives, and this is what closes the gap left by
+/// one that died mid-write. Only this store's own suffix is swept, so a
+/// foreign temp under the root is left alone.
+///
+/// # Errors
+///
+/// [`SnapshotStoreError::Io`] on any directory or file failure. A temp
+/// that vanished between the listing and the unlink is a concurrent
+/// writer cleaning up after itself, not a failure.
+pub fn load_all_durable(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, SnapshotStoreError> {
+    fsync_root(root)?;
+    // Built from `EXTENSION` rather than spelled out, so the sweep cannot
+    // drift from what `write` names its temps.
+    let tmp_suffix = format!(".{EXTENSION}.tmp");
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SnapshotStoreError::Io {
+                op: "read_dir(snapshots root)",
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| SnapshotStoreError::Io {
+            op: "read_dir entry",
+            source,
+        })?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(tmp_suffix.as_str()))
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(SnapshotStoreError::Io {
+                    op: "remove_file(stranded snapshot temp)",
+                    source,
+                });
+            }
+        }
+    }
+    load_all(root)
 }
 
 /// List every snapshot artefact under `root`, decoding the tenant id
@@ -147,6 +306,22 @@ mod tests {
     use ourios_miner::snapshot::{
         LeafRecord, StructuredTemplateRecord, TokenRecord, WalHighWater, load_snapshot,
     };
+
+    /// A single-component relative root's entry lives in the current
+    /// directory, which is a real directory to fsync — not the "no
+    /// parent" that [`Path::parent`]'s empty path reads as.
+    #[test]
+    fn parent_to_fsync_maps_an_empty_parent_to_the_current_directory() {
+        assert_eq!(
+            parent_to_fsync(Path::new("snapshots")),
+            Some(Path::new(".")),
+        );
+        assert_eq!(
+            parent_to_fsync(Path::new("/var/lib/ourios/wal/snapshots")),
+            Some(Path::new("/var/lib/ourios/wal")),
+        );
+        assert_eq!(parent_to_fsync(Path::new("/")), None);
+    }
 
     fn state(template_id: u64) -> SnapshotState {
         SnapshotState {

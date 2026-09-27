@@ -200,7 +200,7 @@ struct MetricsJournal {
 }
 
 impl Journal for MetricsJournal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         self.counter.appends.fetch_add(1, Ordering::SeqCst);
         Journal::append_batch(&mut self.inner, payload)
     }
@@ -223,9 +223,12 @@ struct RecordingSyncJournal {
 }
 
 impl Journal for RecordingSyncJournal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         self.byte += payload.len() as u64;
-        Ok(())
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: self.byte,
+        })
     }
 
     fn sync(&mut self) -> Result<WalOffset, ReceiveError> {

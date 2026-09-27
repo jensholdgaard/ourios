@@ -1340,7 +1340,7 @@ fn lock_wal(wal: &Arc<Mutex<Wal>>) -> MutexGuard<'_, Wal> {
 }
 
 impl Journal for SharedWal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         Journal::append_batch(&mut *lock_wal(&self.0), payload)
     }
 
@@ -1350,6 +1350,53 @@ impl Journal for SharedWal {
 
     fn unflushed_bytes(&self) -> u64 {
         Journal::unflushed_bytes(&*lock_wal(&self.0))
+    }
+
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ourios_wal::ReclaimError> {
+        Journal::checkpoint(&mut *lock_wal(&self.0), durable_to)
+    }
+
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        Journal::last_checkpoint(&*lock_wal(&self.0))
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &ourios_wal::SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ourios_wal::ReclaimPlan, ourios_wal::ReclaimError> {
+        Journal::housekeeping_prepare(&mut *lock_wal(&self.0), horizons, max_unlinks)
+    }
+
+    fn write_plan_record(
+        &mut self,
+        plan: &ourios_wal::ReclaimPlan,
+    ) -> Result<ourios_wal::UnlinkPermit, std::io::Error> {
+        Journal::write_plan_record(&mut *lock_wal(&self.0), plan)
+    }
+
+    fn housekeeping_commit(
+        &mut self,
+        pass: ourios_wal::PassId,
+        outcome: ourios_wal::ReclaimOutcome,
+    ) -> Result<ourios_wal::HousekeepingProgress, ourios_wal::ReclaimError> {
+        Journal::housekeeping_commit(&mut *lock_wal(&self.0), pass, outcome)
+    }
+
+    fn rotate(&mut self, kind: ourios_wal::RotationKind) -> Result<(), ReceiveError> {
+        Journal::rotate(&mut *lock_wal(&self.0), kind)
+    }
+
+    fn segment_age_exceeded(&self) -> bool {
+        Journal::segment_age_exceeded(&*lock_wal(&self.0))
+    }
+
+    fn owes_rotation_fsync(&self) -> bool {
+        Journal::owes_rotation_fsync(&*lock_wal(&self.0))
+    }
+
+    fn reclaim_state(&self) -> ourios_wal::ReclaimState {
+        Journal::reclaim_state(&*lock_wal(&self.0))
     }
 }
 
@@ -1383,6 +1430,32 @@ fn us_to_ms(us: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trait method with a default answers for an impl that forgets to
+    /// forward it, and `false` here is "no obligation owed" — silent at
+    /// every call site. `SharedWal` is the one non-test `Journal`, so its
+    /// documented delegation is asserted rather than trusted.
+    #[test]
+    fn shared_wal_forwards_the_rotation_fsync_obligation() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let mut wal = Wal::open(wal_config(tmp.path().to_path_buf())).expect("open WAL");
+        wal.append(ourios_wal::FrameKind::OtlpBatch, b"a frame worth sealing")
+            .expect("append");
+        wal.sync().expect("sync");
+        wal.arm_rotation_faults(ourios_wal::RotationFaults::failing(
+            ourios_wal::RotationSite::ParentFsync,
+            1,
+        ));
+        wal.rotate(ourios_wal::RotationKind::Owed)
+            .expect_err("the parent fsync fails after the rename");
+
+        let shared = SharedWal(Arc::new(Mutex::new(wal)));
+
+        assert!(
+            Journal::owes_rotation_fsync(&shared),
+            "the wrapper reports the obligation the wrapped WAL owes",
+        );
+    }
 
     #[test]
     fn pacing_interval_matches_target_rate() {

@@ -85,6 +85,7 @@
 - [RFC 0054 — Publish unwind safety](./rfcs/0054-publish-unwind-safety.md)
 - [RFC 0055 — Publication frontiers and tenant settlement](./rfcs/0055-publication-frontiers.md)
 - [RFC 0056 — Audit-sink durability on permanent write failure](./rfcs/0056-audit-durability.md)
+- [RFC 0057 — meta: move CLAUDE.md to AGENTS.md](./rfcs/0057-agents-md.md)
 
 # Talks
 

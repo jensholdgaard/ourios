@@ -631,6 +631,20 @@ mod tests {
             std::fs::create_dir_all(&self.audit_root).expect("audit root");
         }
 
+        /// `drained`'s audit write fails, so its events go back to the
+        /// buffer; the store is mended afterwards.
+        fn fail_audit_write(&self, drained: super::Drained) {
+            self.break_audit_store();
+            assert!(!self.coord.write_ordered(drained, "age"));
+            self.mend_audit_store();
+        }
+
+        /// `drained` is refused, and `buffered` records are held.
+        fn assert_refused(&self, drained: super::Drained, trigger: &'static str, buffered: usize) {
+            assert!(!self.coord.write_ordered(drained, trigger));
+            self.assert_held(buffered);
+        }
+
         /// No record is in the store, and `buffered` are held for a
         /// later drain.
         fn assert_held(&self, buffered: usize) {
@@ -659,9 +673,7 @@ mod tests {
     fn a_later_drain_does_not_publish_ahead_of_an_earlier_drains_unwritten_events() {
         let stores = Stores::new(usize::MAX);
         let (first, second) = stores.two_drains();
-
-        assert!(!stores.coord.write_ordered(second, "age"));
-        stores.assert_held(1);
+        stores.assert_refused(second, "age", 1);
 
         assert!(stores.coord.write_ordered(first, "barrier"));
         stores.assert_next_drain_publishes_everything();
@@ -673,12 +685,9 @@ mod tests {
     fn a_later_drain_does_not_publish_over_an_earlier_drains_requeued_events() {
         let stores = Stores::new(usize::MAX);
         let (first, second) = stores.two_drains();
-        stores.break_audit_store();
-        assert!(!stores.coord.write_ordered(first, "age"));
-        stores.mend_audit_store();
+        stores.fail_audit_write(first);
 
-        assert!(!stores.coord.write_ordered(second, "barrier"));
-        stores.assert_held(2);
+        stores.assert_refused(second, "barrier", 2);
         stores.assert_next_drain_publishes_everything();
     }
 

@@ -111,6 +111,38 @@ fn rfc0038_1_sweep_emits_one_internal_span() {
     );
 }
 
+/// #807 — a selected candidate whose manifest swap loses is surfaced as a
+/// sweep error, not reported as an idle sweep. The swap is made to lose by
+/// occupying the manifest key with a directory: it reads as absent, so the
+/// bootstrap create-if-absent runs, and is refused as already existing.
+#[test]
+fn sweep_reports_a_candidate_whose_manifest_swap_lost() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    std::fs::create_dir(
+        bucket
+            .path()
+            .join("data/tenant_id=a/year=2026/month=04/day=02/hour=10/manifest.json"),
+    )
+    .expect("occupy the manifest key");
+
+    // Act
+    let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+
+    // Assert
+    assert_eq!(report.partitions_compacted, 0);
+    assert_eq!(report.per_tenant[0].candidates_found, 1, "{report:?}");
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("\"a\" 2026-04-02T10")
+            && report.errors[0].contains("not committed"),
+        "{}",
+        report.errors[0]
+    );
+}
+
 #[test]
 fn sweep_compacts_a_sealed_candidate() {
     // Arrange

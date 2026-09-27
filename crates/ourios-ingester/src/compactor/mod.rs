@@ -310,6 +310,19 @@ pub fn run_sweep_hooked(
                 drop: None,
             };
             match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
+                // The planner only selects partitions with two or more live
+                // files, so an uncommitted candidate lost the manifest swap.
+                // With one sweeper that is never a benign race: surface it,
+                // or a store whose swaps always lose looks like an idle sweep.
+                Ok(outcome) if outcome.committed.is_none() => report.errors.push(format!(
+                    "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: selected with {} live files \
+                     but not committed (manifest compare-and-swap lost); retried next sweep",
+                    partition.year,
+                    partition.month,
+                    partition.day,
+                    partition.hour,
+                    outcome.files_before,
+                )),
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;

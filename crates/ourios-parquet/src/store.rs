@@ -831,6 +831,12 @@ impl Store {
     /// supports conditional update — S3-compatible stores do;
     /// `LocalFileSystem` does not.
     ///
+    /// A `412` against a quoted `ETag` is retried once with the quotes
+    /// stripped: some S3-compatible stores (Ceph RGW-based ones) return the
+    /// quoted form from `GET` but honour `If-Match` only unquoted, so every
+    /// swap would otherwise lose. The retry cannot weaken the swap — it
+    /// still succeeds only if the object is unchanged.
+    ///
     /// # Errors
     /// [`StoreError::Backend`] whose [`StoreError::is_precondition`] is true if
     /// the `ETag` no longer matches (the swap lost the race); otherwise as a
@@ -841,15 +847,25 @@ impl Store {
         bytes: Vec<u8>,
         e_tag: &str,
     ) -> Result<(), StoreError> {
-        let opts = PutOptions::from(PutMode::Update(UpdateVersion {
-            e_tag: Some(e_tag.to_string()),
-            version: None,
-        }));
-        self.inner
-            .put_opts(&self.resolve(key)?, PutPayload::from(bytes), opts)
-            .await
-            .map_err(StoreError::Backend)?;
-        Ok(())
+        let path = self.resolve(key)?;
+        let payload = PutPayload::from(bytes);
+        let put = |e_tag: &str| {
+            let opts = PutOptions::from(PutMode::Update(UpdateVersion {
+                e_tag: Some(e_tag.to_string()),
+                version: None,
+            }));
+            self.inner.put_opts(&path, payload.clone(), opts)
+        };
+        let unquoted = e_tag
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'));
+        match (put(e_tag).await, unquoted) {
+            (Ok(_), _) => Ok(()),
+            (Err(object_store::Error::Precondition { .. }), Some(unquoted)) => {
+                put(unquoted).await.map(|_| ()).map_err(StoreError::Backend)
+            }
+            (Err(e), _) => Err(StoreError::Backend(e)),
+        }
     }
 
     /// Blocking [`Self::get_with_etag`], mapping a missing object to `None`

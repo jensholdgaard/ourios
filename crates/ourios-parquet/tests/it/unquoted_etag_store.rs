@@ -1,0 +1,342 @@
+//! Conditional-PUT interop with an S3-compatible store that honours
+//! `If-Match` only for the **unquoted** `ETag` (Ceph RGW-based stores do
+//! this: the quoted form a `GET` returns fails with `412` even when it
+//! matches). Every compaction commit against such a store used to lose its
+//! compare-and-swap, so the sweep rewrote each partition, discarded the
+//! result as a "lost race", and reported a clean no-op forever (#807).
+//!
+//! The store is a minimal in-process S3 fake over `std::net` — `PUT`
+//! (plain, `If-None-Match: *`, `If-Match`), `GET`, `DELETE` and
+//! `ListObjectsV2` — enough for [`Store::s3`] and [`compact_partition`].
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use ourios_parquet::{PartitionKey, S3Config, Store, Writer, compact_partition};
+
+use super::rfc0013_object_store::rec_for;
+
+const BUCKET: &str = "rgw";
+
+/// Object key → (bytes, unquoted `ETag`).
+type Objects = Arc<Mutex<BTreeMap<String, (Vec<u8>, String)>>>;
+
+struct Request {
+    method: String,
+    path: String,
+    query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn query(&self, name: &str) -> Option<&str> {
+        self.query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("hex");
+                out.push(u8::from_str_radix(hex, 16).expect("hex digit"));
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).expect("utf8")
+}
+
+fn read_request(stream: &TcpStream) -> Option<Request> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let target = parts.next()?.to_string();
+    let mut headers = Vec::new();
+    loop {
+        let mut h = String::new();
+        reader.read_line(&mut h).ok()?;
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        let (k, v) = h.split_once(':')?;
+        headers.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    let len = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, v)| v.parse::<usize>().expect("content-length"));
+    let mut body = vec![0; len];
+    reader.read_exact(&mut body).ok()?;
+    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+    let query = query
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect();
+    Some(Request {
+        method,
+        path: percent_decode(path),
+        query,
+        headers,
+        body,
+    })
+}
+
+fn respond(mut stream: &TcpStream, status: &str, headers: &[(&str, String)], body: &[u8]) {
+    let mut head = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        let _ = write!(head, "{k}: {v}\r\n");
+    }
+    head.push_str("\r\n");
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+fn list(objects: &Objects, req: &Request) -> String {
+    let prefix = req.query("prefix").unwrap_or("");
+    let delimiter = req.query("delimiter");
+    let objects = objects.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut contents = String::new();
+    let mut prefixes = BTreeSet::new();
+    for (key, (bytes, etag)) in objects.range(prefix.to_string()..) {
+        let Some(rest) = key.strip_prefix(prefix) else {
+            break;
+        };
+        match delimiter.and_then(|d| rest.find(d).map(|i| (i, d))) {
+            Some((i, d)) => {
+                prefixes.insert(format!("{prefix}{}{d}", &rest[..i]));
+            }
+            None => {
+                let _ = write!(
+                    contents,
+                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                     <ETag>&quot;{etag}&quot;</ETag><Size>{}</Size></Contents>",
+                    bytes.len()
+                );
+            }
+        }
+    }
+    let common = prefixes.iter().fold(String::new(), |mut out, p| {
+        let _ = write!(out, "<CommonPrefixes><Prefix>{p}</Prefix></CommonPrefixes>");
+        out
+    });
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>{BUCKET}</Name>\
+         <Prefix>{prefix}</Prefix><IsTruncated>false</IsTruncated>{contents}{common}</ListBucketResult>"
+    )
+}
+
+/// `412` unless the conditional headers hold, comparing `If-Match` against
+/// the **unquoted** `ETag` only — the quirk under test.
+fn precondition_holds(req: &Request, current: Option<&String>) -> bool {
+    match (req.header("if-none-match"), req.header("if-match"), current) {
+        (_, Some(expected), Some(etag)) => expected == etag,
+        (Some("*"), _, Some(_)) | (_, Some(_), None) => false,
+        _ => true,
+    }
+}
+
+fn handle(objects: &Objects, next_etag: &Mutex<u64>, stream: &TcpStream) {
+    let Some(req) = read_request(stream) else {
+        return;
+    };
+    let key = req
+        .path
+        .strip_prefix(&format!("/{BUCKET}"))
+        .unwrap_or(&req.path)
+        .trim_start_matches('/')
+        .to_string();
+    match req.method.as_str() {
+        "GET" if key.is_empty() => {
+            let xml = list(objects, &req);
+            respond(stream, "200 OK", &[], xml.as_bytes());
+        }
+        "GET" | "HEAD" => {
+            let found = objects
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+            match found {
+                Some((bytes, etag)) => respond(
+                    stream,
+                    "200 OK",
+                    &[
+                        ("ETag", format!("\"{etag}\"")),
+                        ("Last-Modified", "Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+                    ],
+                    &bytes,
+                ),
+                None => respond(
+                    stream,
+                    "404 Not Found",
+                    &[],
+                    b"<Error><Code>NoSuchKey</Code></Error>",
+                ),
+            }
+        }
+        "PUT" => {
+            let mut objects = objects.lock().unwrap_or_else(PoisonError::into_inner);
+            let current = objects.get(&key).map(|(_, etag)| etag);
+            if precondition_holds(&req, current) {
+                let mut n = next_etag.lock().unwrap_or_else(PoisonError::into_inner);
+                *n += 1;
+                let etag = format!("e{n}");
+                objects.insert(key, (req.body, etag.clone()));
+                respond(stream, "200 OK", &[("ETag", format!("\"{etag}\""))], b"");
+            } else {
+                respond(
+                    stream,
+                    "412 Precondition Failed",
+                    &[],
+                    b"<Error><Code>PreconditionFailed</Code></Error>",
+                );
+            }
+        }
+        "DELETE" => {
+            objects
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+            respond(stream, "204 No Content", &[], b"");
+        }
+        _ => respond(stream, "405 Method Not Allowed", &[], b""),
+    }
+}
+
+/// Start the fake and return a [`Store`] pointed at it.
+fn unquoted_etag_store() -> Store {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let objects: Objects = Arc::default();
+    let next_etag = Arc::new(Mutex::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let objects = Arc::clone(&objects);
+            let next_etag = Arc::clone(&next_etag);
+            std::thread::spawn(move || handle(&objects, &next_etag, &stream));
+        }
+    });
+    Store::s3(
+        S3Config::new(BUCKET)
+            .with_endpoint(format!("http://{addr}"))
+            .with_region("us-east-1")
+            .with_access_key_id("test")
+            .with_secret_access_key("test"),
+    )
+    .expect("build s3 store")
+}
+
+/// A compare-and-swap against the `ETag` the store itself just returned
+/// must win, whichever `ETag` spelling the store honours.
+#[test]
+fn put_if_match_wins_with_the_current_etag() {
+    let store = unquoted_etag_store();
+    store
+        .put_blocking("data/manifest.json", b"v1".to_vec())
+        .expect("put");
+    let (_, etag) = store
+        .get_with_etag_blocking_opt("data/manifest.json")
+        .expect("get")
+        .expect("present");
+    let etag = etag.expect("etag");
+
+    store
+        .put_if_match_blocking("data/manifest.json", b"v2".to_vec(), &etag)
+        .expect("CAS against the current ETag wins");
+
+    assert_eq!(
+        store.get_blocking("data/manifest.json").expect("get"),
+        b"v2".to_vec()
+    );
+}
+
+/// The retry never weakens the swap: a stale `ETag` still loses, in both
+/// spellings, and the object keeps the winner's bytes.
+#[test]
+fn put_if_match_still_loses_with_a_stale_etag() {
+    let store = unquoted_etag_store();
+    store
+        .put_blocking("data/manifest.json", b"v1".to_vec())
+        .expect("put");
+    let (_, stale) = store
+        .get_with_etag_blocking_opt("data/manifest.json")
+        .expect("get")
+        .expect("present");
+    let stale = stale.expect("etag");
+    store
+        .put_blocking("data/manifest.json", b"v2".to_vec())
+        .expect("concurrent writer");
+
+    for etag in [stale.clone(), stale.trim_matches('"').to_string()] {
+        let err = store
+            .put_if_match_blocking("data/manifest.json", b"lost".to_vec(), &etag)
+            .expect_err("a stale ETag must lose");
+        assert!(err.is_precondition(), "{err}");
+    }
+    assert_eq!(
+        store.get_blocking("data/manifest.json").expect("get"),
+        b"v2".to_vec()
+    );
+}
+
+/// #807: a sealed two-file partition on such a store consolidates — the
+/// commit wins instead of being discarded as a lost race.
+#[test]
+fn compaction_commits_on_an_unquoted_etag_store() {
+    let store = unquoted_etag_store();
+    let partition = PartitionKey::derive(&rec_for("tenant-a", 0)).expect("derive");
+    for i in 0..2 {
+        let mut writer = Writer::open_in(&store, partition.clone()).expect("open writer");
+        writer
+            .append_records(&[rec_for("tenant-a", i)])
+            .expect("append");
+        writer.close().expect("close");
+    }
+
+    let outcome = compact_partition(&store, &partition).expect("compact");
+
+    let committed = outcome
+        .committed
+        .expect("the manifest swap commits instead of losing its CAS");
+    assert_eq!(committed.input_files.len(), 2);
+    assert_eq!(outcome.rows, 2);
+}

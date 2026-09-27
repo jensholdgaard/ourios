@@ -813,9 +813,12 @@ fn rfc0031_indicative_comparative_run() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (loki, l4_loki): (Vec<_>, Option<Result<L4Measured, String>>) = runtime.block_on(async {
+    let (loki, l4_loki, loki_labels) = runtime.block_on(async {
         let (container, base, http) = start_loki(LOKI_DISPATCH_FLAGS).await;
-        push_corpus_to_loki(&http, &base, &corpus_dir).await;
+        let loki_labels = push_corpus_to_loki(&http, &base, &corpus_dir).await;
+        // Logged here, not only in the report: a run that fails before the
+        // report prints still says which labels Loki's index had (#800).
+        eprintln!("loki stream labels: {}", loki_labels.summary());
         let mut measured = Vec::with_capacity(specs.len());
         for spec in &specs {
             let result = match loki_measure_pair(&http, &base, spec).await {
@@ -844,14 +847,14 @@ fn rfc0031_indicative_comparative_run() {
             }
             _ => None,
         };
-        (measured, l4)
+        (measured, l4, loki_labels)
     });
 
     // The machine-readable per-pair record (issue #538 item 3) writes
     // FIRST — before split/equivalence/gates can panic — so every run,
     // passing or failing, leaves a queryable completeness artifact.
     if let Ok(path) = std::env::var("OURIOS_COMPARATIVE_RESULTS") {
-        let results = comparative_results_json(
+        let mut results = comparative_results_json(
             &specs,
             &ourios,
             &loki,
@@ -863,6 +866,7 @@ fn rfc0031_indicative_comparative_run() {
             pair.total_records,
             &class_filter,
         );
+        results["loki_stream_labels"] = loki_labels.to_json();
         let rendered = serde_json::to_string_pretty(&results).expect("results serialize");
         match std::fs::write(&path, rendered) {
             Ok(()) => eprintln!("comparative results artifact written to {path}"),
@@ -890,6 +894,7 @@ fn rfc0031_indicative_comparative_run() {
         &ok_specs,
         &ok_ourios,
         &ok_loki,
+        &loki_labels,
     );
 
     // L4 (RFC 0031 §3.4/§3.5) is purely additive to the pair list above,
@@ -1182,9 +1187,11 @@ fn print_indicative_report(
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
     loki: &[Measured],
+    loki_labels: &CorpusLokiLabels,
 ) {
     println!("=== RFC 0031 indicative comparative run ===");
     println!("corpus: {} ({total_records} records)", corpus_dir.display());
+    println!("loki stream labels: {}", loki_labels.summary());
     for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
         specs.iter().zip(ourios).zip(loki)
     {

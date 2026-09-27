@@ -979,6 +979,80 @@ fn comparative_results_json_with_no_l4_candidate_records_null_not_absence() {
     assert_eq!(json["pairs"].as_array().unwrap().len(), 0);
 }
 
+/// The otel-demo-v8 capture's six resource shapes (#800): `service.name` and
+/// `service.namespace` everywhere, `service.instance.id` on three services
+/// with kafka carrying two, plus attributes Loki does not promote.
+#[test]
+fn corpus_loki_labels_counts_triggered_labels_and_streams() {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    let resource = |service: &str, instance: Option<&str>| {
+        let kv = |key: &str, value: &str| KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_string())),
+            }),
+            ..KeyValue::default()
+        };
+        let mut attributes = vec![
+            kv("service.name", service),
+            kv("service.namespace", "opentelemetry-demo"),
+            kv("service.version", "2.2.0"),
+            kv("host.name", "node-1"),
+            kv("telemetry.sdk.name", "opentelemetry"),
+        ];
+        if let Some(id) = instance {
+            attributes.push(kv("service.instance.id", id));
+        }
+        Resource {
+            attributes,
+            ..Resource::default()
+        }
+    };
+
+    let mut labels = CorpusLokiLabels::default();
+    for (service, instance) in [
+        ("ad", Some("i-ad")),
+        ("cart", Some("i-cart")),
+        ("currency", None),
+        ("kafka", Some("i-kafka-1")),
+        ("kafka", Some("i-kafka-2")),
+        ("recommendation", None),
+        ("recommendation", None),
+    ] {
+        labels.observe(Some(&resource(service, instance)));
+    }
+    labels.observe(None);
+
+    let triggered: Vec<(&str, usize)> = labels
+        .values
+        .iter()
+        .map(|(name, values)| (name.as_str(), values.len()))
+        .collect();
+    assert_eq!(
+        triggered,
+        [
+            ("service_instance_id", 4),
+            ("service_name", 5),
+            ("service_namespace", 1),
+        ],
+    );
+    // Six resource shapes plus the attribute-less resource; the repeated
+    // recommendation resource is the same stream.
+    assert_eq!(labels.label_sets.len(), 7);
+    assert_eq!(
+        labels.summary(),
+        "3 of 18 allowlisted labels triggered [service_instance_id=4 \
+         service_name=5 service_namespace=1], 7 resource-level streams",
+    );
+    let json = labels.to_json();
+    assert_eq!(json["allowlist_size"], 18);
+    assert_eq!(json["streams"], 7);
+    assert_eq!(json["distinct_values_per_label"]["service_name"], 5);
+    assert!(json["distinct_values_per_label"].get("host_name").is_none());
+}
+
 pub(crate) fn split_measurements(
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],

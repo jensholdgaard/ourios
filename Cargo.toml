@@ -74,3 +74,39 @@ debug = "line-tables-only"
 # silently detach from the binaries it exists for.
 [profile.test]
 debug = "line-tables-only"
+
+# DataFusion 56 readiness: build against an upstream `main` revision that
+# carries apache/datafusion#24770 (the #24769 row-group pruning fix).
+# Delete this section and take the crates.io release once DataFusion 56
+# (or a 55.x carrying the backport) ships.
+[patch.crates-io]
+datafusion = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-catalog = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-catalog-listing = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-common = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-common-runtime = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-datasource = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-datasource-arrow = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-datasource-csv = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-datasource-json = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-datasource-parquet = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-doc = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-execution = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-expr = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-expr-common = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions-aggregate-common = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions-nested = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions-table = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions-window = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-functions-window-common = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-macros = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-physical-expr-adapter = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-physical-expr-common = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-physical-optimizer = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-pruning = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }
+datafusion-session = { git = "https://github.com/apache/datafusion", rev = "f029b944c8d2f8e70f0c213f87160c12ddad6a09" }

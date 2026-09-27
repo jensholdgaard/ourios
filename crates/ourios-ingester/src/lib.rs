@@ -26,7 +26,9 @@
 //!   them per partition and flushes Parquet to the store; [`audit_sink`]
 //!   buffers the miner's template audit events; and [`publish`] orders
 //!   the two so no record becomes query-visible before its template's
-//!   audit event is durable.
+//!   audit event is durable. The one exception is a permanent audit
+//!   failure (malformed event dropped): its records still publish,
+//!   degraded, and those templates render retained or empty.
 //! - **Publication barrier** (RFC 0052) — [`barrier`] captures a cut
 //!   (encodes quiesced, both sinks drained), flushes it, and stamps the
 //!   WAL checkpoint; [`cadence`] holds the latch that decides whether a

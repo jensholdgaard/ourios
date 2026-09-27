@@ -1,0 +1,3058 @@
+use super::*;
+use ourios_core::audit::SharedAuditSink;
+use ourios_core::otlp::{AnyValue, ArrayValue, any_value::Value as AvValue};
+use ourios_core::record::SharedRecordSink;
+use proptest::prelude::*;
+
+use crate::snapshot::{
+    LeafRecord, ParamTypeRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
+};
+
+/// Test helper — a `Body::String` record for `tenant` carrying
+/// `text` and default severity (UNSPECIFIED) / scope (None).
+/// Keeps tests focused on their assertions rather than on
+/// record-construction boilerplate.
+fn string_record(tenant: &TenantId, text: &str) -> OtlpLogRecord {
+    OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    }
+}
+
+/// Test helper — a `Body::Structured` record for `tenant` with
+/// the given severity and scope.
+fn structured_record(tenant: &TenantId, severity: u8, scope: Option<&str>) -> OtlpLogRecord {
+    OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        severity_number: severity,
+        scope_name: scope.map(str::to_string),
+        body: Some(Body::Structured(AnyValue {
+            value: Some(AvValue::IntValue(0)),
+        })),
+        ..Default::default()
+    }
+}
+
+/// RFC0037.1 — a structured record's `event_name` participates in
+/// the template key, so distinct event types in one
+/// `(severity, scope)` get distinct `template_id`s (and identical
+/// ones share) instead of collapsing to a single sentinel. This is
+/// the mechanism behind `… | count by template_id` separating event
+/// types (asserted at the query layer once the ids differ).
+#[test]
+fn rfc0037_1_event_name_distinguishes_structured_templates() {
+    let tenant = TenantId::new("tenant-genai");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+
+    let mut inference = structured_record(&tenant, 9, Some("lib.agent"));
+    inference.event_name = Some("gen_ai.client.inference.operation.details".to_string());
+    let mut tool_call = structured_record(&tenant, 9, Some("lib.agent"));
+    tool_call.event_name = Some("gen_ai.execute_tool".to_string());
+
+    let id_inference = cluster.ingest(&inference);
+    let id_tool = cluster.ingest(&tool_call);
+    assert_ne!(
+        id_inference, id_tool,
+        "distinct event_name in one (severity, scope) must yield distinct template_ids"
+    );
+
+    // Same (severity, scope, event_name) shares its id.
+    assert_eq!(
+        id_inference,
+        cluster.ingest(&inference),
+        "identical structured key must share one template_id"
+    );
+
+    // A record with no event_name is its own class, distinct from both.
+    let no_event = structured_record(&tenant, 9, Some("lib.agent"));
+    let id_none = cluster.ingest(&no_event);
+    assert_ne!(id_none, id_inference);
+    assert_ne!(id_none, id_tool);
+}
+
+proptest! {
+    /// RFC0037.1 (property) — a structured record's `template_id` is a
+    /// pure function of exactly `(severity_number, scope_name,
+    /// event_name)`: equal tuples reuse an id, distinct tuples receive
+    /// distinct ids. Covers empty strings, `None`s, and repeated keys.
+    #[test]
+    fn rfc0037_1_structured_key_is_the_whole_template_identity(
+        keys in prop::collection::vec(
+            (
+                any::<u8>(),
+                prop::option::of("[a-z.]{0,8}"),
+                prop::option::of("[a-z_.]{0,12}"),
+            ),
+            1..16,
+        )
+    ) {
+        let tenant = TenantId::new("t");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let mut ids: std::collections::HashMap<
+            (u8, Option<String>, Option<String>),
+            u64,
+        > = std::collections::HashMap::new();
+        for (severity, scope, event) in keys {
+            let mut rec = structured_record(&tenant, severity, scope.as_deref());
+            rec.event_name = event.clone();
+            let id = cluster.ingest(&rec);
+            let key = (severity, scope, event);
+            if let Some(&prev) = ids.get(&key) {
+                prop_assert_eq!(id, prev, "equal structured key must reuse its template_id");
+            } else {
+                prop_assert!(
+                    !ids.values().any(|&existing| existing == id),
+                    "a distinct structured key must receive a fresh template_id"
+                );
+                ids.insert(key, id);
+            }
+        }
+    }
+}
+
+/// RFC0037.3 (unit) — the structured-body branch retains the body's
+/// canonical JSON byte-for-byte and never flags it lossy (§3.2 fidelity),
+/// colocated with `ingest_structured`. The per-service metric emission is
+/// covered end-to-end in `tests/rfc0037_structured_body.rs`.
+#[test]
+fn rfc0037_3_structured_body_retained_byte_for_byte() {
+    let tenant = TenantId::new("t");
+    let sink = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+
+    let body_av = AnyValue {
+        value: Some(AvValue::ArrayValue(ArrayValue {
+            values: vec![
+                AnyValue {
+                    value: Some(AvValue::StringValue("user turn".to_string())),
+                },
+                AnyValue {
+                    value: Some(AvValue::StringValue("assistant turn".to_string())),
+                },
+            ],
+        })),
+    };
+    let expected = String::from_utf8(
+        ourios_core::otlp::canonical::encode_any_value(&body_av)
+            .expect("canonical encode is infallible"),
+    )
+    .expect("canonical JSON is UTF-8");
+
+    let mut record = structured_record(&tenant, 9, Some("lib.agent"));
+    record.event_name = Some("gen_ai.client.inference.operation.details".to_string());
+    record.body = Some(Body::Structured(body_av));
+    cluster.ingest(&record);
+
+    let mined = sink.drain();
+    assert_eq!(mined.len(), 1);
+    assert_eq!(mined[0].body_kind, BodyKind::Structured);
+    assert_eq!(
+        mined[0].body.as_deref(),
+        Some(expected.as_str()),
+        "the structured body is retained as canonical JSON, byte-for-byte"
+    );
+    assert!(!mined[0].lossy_flag, "a structured body is never lossy");
+}
+
+/// Test helper — build a cluster wired to a [`SharedAuditSink`]
+/// and return both so the test can inspect emissions.
+fn cluster_with_observable_sink() -> (MinerCluster, SharedAuditSink) {
+    let sink = SharedAuditSink::new();
+    let cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    (cluster, sink)
+}
+
+/// Drain the sink and return only the template *changes* a widening /
+/// type-expansion / rejection test asserts on, dropping the per-leaf
+/// `Created` events RFC 0017 §3.1 emits on every allocation. Leaf
+/// creation is audited now (so a read-time registry can recover v1
+/// tokens), but its correctness is covered by
+/// `fresh_leaf_emits_created_event` and the RFC0017.1 acceptance test;
+/// filtering here keeps each widening test decoupled from how many
+/// leaves the scenario happens to allocate rather than re-asserting the
+/// creation count in every one.
+fn drain_changes(sink: &SharedAuditSink) -> Vec<AuditEvent> {
+    sink.drain()
+        .into_iter()
+        .filter(|e| {
+            !matches!(
+                &e.payload,
+                AuditPayload::Template {
+                    change: TemplateChange::Created { .. },
+                    ..
+                }
+            )
+        })
+        .collect()
+}
+
+// ---------- existing String-body behaviour preserved ----------
+
+#[test]
+fn ingest_returns_same_template_id_for_repeat_shape() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let id2 = cluster.ingest(&string_record(&t, "user 17 logged in"));
+
+    // Both lines mask to "user <NUM> logged in" → exact
+    // sim_seq match on the existing leaf, no widening, no
+    // audit, same template_id.
+    assert_eq!(id1, id2);
+    assert_eq!(cluster.template_count(&t), 1);
+    assert_eq!(cluster.merges_total(), 0);
+}
+
+#[test]
+fn ingest_returns_distinct_template_ids_for_distinct_shapes() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let id2 = cluster.ingest(&string_record(&t, "GET /home 200"));
+
+    // Distinct masked shapes land in different `(length,
+    // prefix)` buckets — no candidate selection happens at
+    // all, both create fresh leaves.
+    assert_ne!(id1, id2);
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.merges_total(), 0);
+}
+
+#[test]
+fn snapshot_state_orders_records_by_template_id() {
+    // The tree and the structured-template map both iterate in
+    // `HashMap` order; `snapshot_state` sorts by the cluster-unique
+    // `template_id` so the serialized snapshot is byte-deterministic.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    for line in [
+        "GET /home 200",
+        "user 42 logged in",
+        "cache evicted 5 keys",
+        "disk usage high",
+    ] {
+        let _ = cluster.ingest(&string_record(&t, line));
+    }
+    // Distinct (severity, scope) keys populate the structured-template
+    // map so its ordering is exercised too.
+    for (severity, scope) in [(9, Some("lib.a")), (5, Some("lib.b")), (13, None)] {
+        let _ = cluster.ingest(&structured_record(&t, severity, scope));
+    }
+
+    let state = cluster.snapshot_state(&t);
+
+    assert!(state.leaves.len() >= 2, "needs multiple leaves to order");
+    assert!(
+        state
+            .leaves
+            .windows(2)
+            .all(|w| w[0].template_id <= w[1].template_id),
+        "snapshot leaves must be sorted by template_id, got {:?}",
+        state
+            .leaves
+            .iter()
+            .map(|l| l.template_id)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        state.structured_templates.len() >= 2,
+        "needs multiple structured templates to order",
+    );
+    assert!(
+        state
+            .structured_templates
+            .windows(2)
+            .all(|w| w[0].template_id <= w[1].template_id),
+        "structured templates must be sorted by template_id, got {:?}",
+        state
+            .structured_templates
+            .iter()
+            .map(|s| s.template_id)
+            .collect::<Vec<_>>(),
+    );
+}
+
+// ---------- §6.9 restore (RFC 0001 v2 amendment) ----------
+
+#[test]
+fn restore_round_trips_snapshot_state() {
+    let mut original = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    // Varied shapes: typed wildcards (NUM, UUID), a widened slot
+    // ("in"/"out" → Str wildcard past the prefix path), and a
+    // no-wildcard leaf.
+    for line in [
+        "user 42 logged in",
+        "user 17 logged out",
+        "GET /home 200",
+        "request 550e8400-e29b-41d4-a716-446655440000 accepted",
+    ] {
+        let _ = original.ingest(&string_record(&t, line));
+    }
+    for (severity, scope) in [(9, Some("lib.a")), (13, None)] {
+        let _ = original.ingest(&structured_record(&t, severity, scope));
+    }
+    let s1 = original.snapshot_state(&t);
+
+    let mut restored = MinerCluster::new(MinerConfig::default());
+    restored
+        .restore_tenant(&t, &s1)
+        .expect("restore succeeds on a live-produced snapshot");
+
+    assert_eq!(restored.snapshot_state(&t), s1);
+    assert_eq!(restored.template_count(&t), original.template_count(&t));
+}
+
+#[test]
+fn restored_tree_continues_identically() {
+    let t = TenantId::new("tenant-x");
+    let mut original = MinerCluster::new(MinerConfig::default());
+    for line in ["user 42 logged in", "GET /home 200"] {
+        let _ = original.ingest(&string_record(&t, line));
+    }
+    let mut restored = MinerCluster::new(MinerConfig::default());
+    restored
+        .restore_tenant(&t, &original.snapshot_state(&t))
+        .expect("restore succeeds");
+
+    // §3.5.3 equivalence at the miner level: the same follow-up
+    // lines must match the same templates AND allocate the same
+    // fresh ids in both clusters.
+    for line in [
+        "user 17 logged in",    // attaches to the restored leaf
+        "cache evicted 5 keys", // allocates a fresh id
+    ] {
+        let rec = string_record(&t, line);
+        assert_eq!(
+            original.ingest(&rec),
+            restored.ingest(&rec),
+            "line {line:?}"
+        );
+    }
+    assert_eq!(restored.snapshot_state(&t), original.snapshot_state(&t));
+}
+
+#[test]
+fn restore_with_wildcard_in_prefix_path() {
+    // The first token masks (IPv4) → the leaf carries Wildcard
+    // at path position 0; restore must rebuild the descend path
+    // from the slot's mask tag.
+    let t = TenantId::new("tenant-x");
+    let mut original = MinerCluster::new(MinerConfig::default());
+    let id = original.ingest(&string_record(&t, "10.0.0.1 connection accepted"));
+    let s1 = original.snapshot_state(&t);
+    assert!(
+        matches!(s1.leaves[0].template[0], TokenRecord::Wildcard),
+        "precondition: the leaf must carry a wildcard at path position 0",
+    );
+
+    let mut restored = MinerCluster::new(MinerConfig::default());
+    restored.restore_tenant(&t, &s1).expect("restore succeeds");
+    assert_eq!(restored.snapshot_state(&t), s1);
+
+    // A new matching line attaches to the restored leaf: same
+    // id, no new template, version unchanged.
+    let id2 = restored.ingest(&string_record(&t, "10.0.0.2 connection accepted"));
+    assert_eq!(id2, id);
+    assert_eq!(restored.template_count(&t), 1);
+    assert_eq!(restored.templates_for(&t)[0].template_version, 1);
+}
+
+#[test]
+fn restore_rejects_live_tenant() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let _ = cluster.ingest(&string_record(&t, "hello world"));
+    let snapshot = cluster.snapshot_state(&t);
+
+    let err = cluster
+        .restore_tenant(&t, &snapshot)
+        .expect_err("restoring over a live tenant must fail");
+    assert!(matches!(err, RestoreError::TenantAlreadyLive));
+}
+
+#[test]
+fn mined_leaf_carries_mined_provenance() {
+    // RFC 0050 §3.3: every leaf minted by the Drain walk starts
+    // as `{Mined}` with no upstream associations.
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let _ = cluster.ingest(&string_record(&t, "hello world"));
+
+    let leaves = cluster.templates_for(&t);
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(
+        leaves[0].provenance,
+        ProvenanceSet::singleton(Provenance::Mined),
+    );
+    assert!(leaves[0].upstream_associations.is_empty());
+    assert_eq!(leaves[0].upstream_association_overflow, 0);
+}
+
+#[test]
+fn restore_maps_pre_rfc0050_empty_provenance_to_mined() {
+    // A snapshot written before RFC 0050 carries no provenance
+    // list; restore must read that as `{Mined}` (those leaves
+    // were minted by the Drain walk) while restoring the
+    // association fields verbatim when present.
+    let state = SnapshotState {
+        leaves: vec![LeafRecord {
+            template: vec![
+                TokenRecord::Fixed("disk".to_string()),
+                TokenRecord::Fixed("full".to_string()),
+            ],
+            template_id: 7,
+            template_version: 1,
+            severity_number: 0,
+            scope_name: None,
+            slot_types: vec![],
+            provenance: vec![],
+            upstream_associations: vec!["disk <*>".to_string()],
+            upstream_association_overflow: 3,
+        }],
+        structured_templates: vec![],
+        wal_high_water: None,
+        adopted_templates: vec![],
+    };
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    cluster
+        .restore_tenant(&t, &state)
+        .expect("pre-RFC0050 snapshot restores");
+
+    let leaves = cluster.templates_for(&t);
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(
+        leaves[0].provenance,
+        ProvenanceSet::singleton(Provenance::Mined),
+    );
+    assert_eq!(
+        leaves[0].upstream_associations,
+        vec!["disk <*>".to_string()]
+    );
+    assert_eq!(leaves[0].upstream_association_overflow, 3);
+
+    // And a re-snapshot now records the provenance explicitly —
+    // the migration happens once, on read.
+    let resnap = cluster.snapshot_state(&t);
+    assert_eq!(
+        resnap.leaves[0].provenance,
+        vec![crate::snapshot::ProvenanceRecord::Mined],
+    );
+}
+
+#[test]
+fn restore_rejects_inconsistent_slot() {
+    // A path-position wildcard can only arise from mask
+    // emission, so its recorded slot set must be a singleton
+    // mask-emitted type; `[Str]` at position 0 cannot come
+    // from a live tree.
+    let state = SnapshotState {
+        leaves: vec![LeafRecord {
+            template: vec![
+                TokenRecord::Wildcard,
+                TokenRecord::Fixed("connection".to_string()),
+                TokenRecord::Fixed("accepted".to_string()),
+            ],
+            template_id: 1,
+            template_version: 1,
+            severity_number: 0,
+            scope_name: None,
+            slot_types: vec![vec![ParamTypeRecord::Str]],
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+        }],
+        structured_templates: vec![],
+        wal_high_water: None,
+        adopted_templates: vec![],
+    };
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+
+    let err = cluster
+        .restore_tenant(&TenantId::new("tenant-x"), &state)
+        .expect_err("a Str slot at a path position must be inconsistent");
+    assert!(matches!(err, RestoreError::Inconsistent { .. }));
+}
+
+#[test]
+fn restore_rejects_duplicate_template_id() {
+    // Ids are unique cluster-wide; the same id on a leaf and a
+    // structured template could not come from a live tree.
+    let state = SnapshotState {
+        leaves: vec![LeafRecord {
+            template: vec![
+                TokenRecord::Fixed("disk".to_string()),
+                TokenRecord::Fixed("full".to_string()),
+            ],
+            template_id: 7,
+            template_version: 1,
+            severity_number: 0,
+            scope_name: None,
+            slot_types: vec![],
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+        }],
+        structured_templates: vec![StructuredTemplateRecord {
+            severity_number: 9,
+            scope_name: None,
+            event_name: None,
+            template_id: 7,
+        }],
+        wal_high_water: None,
+        adopted_templates: vec![],
+    };
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+
+    let err = cluster
+        .restore_tenant(&TenantId::new("tenant-x"), &state)
+        .expect_err("a duplicate template_id must be inconsistent");
+    match err {
+        RestoreError::Inconsistent { detail } => {
+            assert!(detail.contains('7'), "detail names the id, got {detail:?}");
+        }
+        other => panic!("expected Inconsistent, got {other:?}"),
+    }
+}
+
+#[test]
+fn restore_rejects_duplicate_structured_key() {
+    // The structured map keys on (severity, scope, event_name); a
+    // duplicate key would silently drop one entry while
+    // template_count counted both. Both records share the same
+    // (9, "lib.a", None) key, so restore must reject them.
+    let state = SnapshotState {
+        leaves: vec![],
+        structured_templates: vec![
+            StructuredTemplateRecord {
+                severity_number: 9,
+                scope_name: Some("lib.a".to_string()),
+                event_name: None,
+                template_id: 1,
+            },
+            StructuredTemplateRecord {
+                severity_number: 9,
+                scope_name: Some("lib.a".to_string()),
+                event_name: None,
+                template_id: 2,
+            },
+        ],
+        wal_high_water: None,
+        adopted_templates: vec![],
+    };
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+
+    let err = cluster
+        .restore_tenant(&TenantId::new("tenant-x"), &state)
+        .expect_err("a duplicate structured key must be inconsistent");
+    match err {
+        RestoreError::Inconsistent { detail } => {
+            assert!(
+                detail.contains('9') && detail.contains("lib.a"),
+                "detail names the key, got {detail:?}",
+            );
+        }
+        other => panic!("expected Inconsistent, got {other:?}"),
+    }
+}
+
+#[test]
+fn restore_bumps_the_id_allocator() {
+    // The allocator is cluster-wide; a restored id must never
+    // be re-minted for a new template.
+    let state = SnapshotState {
+        leaves: vec![LeafRecord {
+            template: vec![
+                TokenRecord::Fixed("disk".to_string()),
+                TokenRecord::Fixed("usage".to_string()),
+                TokenRecord::Fixed("high".to_string()),
+            ],
+            template_id: 7,
+            template_version: 1,
+            severity_number: 0,
+            scope_name: None,
+            slot_types: vec![],
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+        }],
+        structured_templates: vec![],
+        wal_high_water: None,
+        adopted_templates: vec![],
+    };
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    cluster
+        .restore_tenant(&t, &state)
+        .expect("restore succeeds");
+
+    let new_id = cluster.ingest(&string_record(&t, "cache evicted 5 keys"));
+    assert!(
+        new_id >= 8,
+        "new template must not collide with restored id 7, got {new_id}",
+    );
+}
+
+#[test]
+fn tenant_ids_returns_sorted_tenants() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    for name in ["tenant-b", "tenant-a", "tenant-c"] {
+        let _ = cluster.ingest(&string_record(&TenantId::new(name), "hello world"));
+    }
+
+    assert_eq!(
+        cluster.tenant_ids(),
+        vec![
+            TenantId::new("tenant-a"),
+            TenantId::new("tenant-b"),
+            TenantId::new("tenant-c"),
+        ],
+    );
+}
+
+#[test]
+fn template_count_is_zero_for_unseen_tenant() {
+    let cluster = MinerCluster::new(MinerConfig::default());
+    let unseen = TenantId::new("never-ingested");
+
+    assert_eq!(cluster.template_count(&unseen), 0);
+    assert!(cluster.templates_for(&unseen).is_empty());
+}
+
+#[test]
+fn ingest_lazily_allocates_per_tenant_state() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    assert_eq!(cluster.template_count(&t), 0);
+
+    let _ = cluster.ingest(&string_record(&t, "hello world"));
+
+    assert_eq!(cluster.template_count(&t), 1);
+}
+
+// ---------- widen behaviour (this PR's main story) ----------
+
+/// Replaces the pre-widen `ingest_creates_separate_leaves_for_
+/// near_match_under_same_parent` test, which locked in the
+/// no-widening contract. With `sim_seq >= threshold` widening
+/// now active, the two lines that previously created two
+/// distinct leaves collapse to a single template with a
+/// `<*>` at position 3.
+///
+/// Per `CLAUDE.md` §6.2 ("Tests are specifications") this
+/// contract change is explicit, not silent: the old test
+/// asserted *distinct ids*, the new one asserts *same id +
+/// audit event*. PR review must acknowledge the swap.
+#[test]
+fn near_match_under_same_parent_widens_into_single_template() {
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // Both lines mask to length-6 templates differing at
+    // position 3 ("in" vs "out"). sim_seq = 5/6 ≈ 0.833 ≥
+    // the default 0.7 threshold, so the second line widens
+    // the first leaf rather than creating a new one.
+    let id_in = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+    let id_out = cluster.ingest(&string_record(&t, "user 42 logged out from 10.0.0.1"));
+
+    // Same template, one widening event, count stays at 1.
+    assert_eq!(id_in, id_out);
+    assert_eq!(cluster.template_count(&t), 1);
+    assert_eq!(cluster.merges_total(), 1);
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1);
+    let AuditPayload::Template {
+        template_id,
+        change:
+            TemplateChange::Widened {
+                old_version,
+                new_version,
+                positions_widened,
+                old_template,
+                new_template,
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!("expected Template/Widened, got {:?}", events[0].payload);
+    };
+    assert_eq!(*template_id, id_in);
+    assert_eq!(*old_version, 1);
+    assert_eq!(*new_version, 2);
+    assert_eq!(*positions_widened, vec![3]);
+    // PR-B-1: mask-emit positions (`<NUM>` at index 1, `<IP>`
+    // at index 5) enter the leaf as `Wildcard` from creation,
+    // so the canonical-form template renders them as `<*>`,
+    // not as the tag string. The audit-event shape is
+    // unchanged — only the rendered template strings differ
+    // because the type information now lives in the parallel
+    // `slot_types` vector rather than encoded in the template
+    // (RFC 0001 §6.6 reconstruction substitutes back via
+    // `params`, not the template string).
+    assert_eq!(old_template, "user <*> logged in from <*>");
+    assert_eq!(new_template, "user <*> logged <*> from <*>");
+}
+
+#[test]
+fn fresh_leaf_emits_created_event() {
+    // RFC 0017 §3.1 overturns the former "fresh leaf emits nothing"
+    // contract: leaf allocation now emits a `template_created` audit
+    // event (so a read-time registry can recover v1 tokens), while
+    // still NOT counting as a merge. Two distinct fresh leaves →
+    // exactly two `Created` events, `merges_total` still 0.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let id_a = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let id_b = cluster.ingest(&string_record(&t, "GET /home 200"));
+
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.merges_total(), 0, "creation is not a merge");
+
+    let events = sink.drain();
+    assert_eq!(events.len(), 2, "one Created event per fresh leaf");
+    for (event, id) in events.iter().zip([id_a, id_b]) {
+        let AuditPayload::Template {
+            template_id,
+            change: TemplateChange::Created { new_template },
+            ..
+        } = &event.payload
+        else {
+            panic!("expected Template/Created, got {:?}", event.payload);
+        };
+        assert_eq!(*template_id, id);
+        assert!(
+            !new_template.is_empty(),
+            "creation carries the initial tokens",
+        );
+    }
+}
+
+#[test]
+fn exact_sim_seq_match_attaches_without_widening_or_audit() {
+    // A line whose mask matches an existing leaf exactly (no
+    // mismatched Fixed positions, no new ParamType at any
+    // existing wildcard) reuses the leaf with no version bump
+    // and no audit event.
+    //
+    // PR-B-1 locking-test update: under the new leaf model
+    // mask-emit positions enter the leaf as `Wildcard` from
+    // creation (with `slot_types[0] = {Num}` for the `<NUM>`
+    // at position 1). The relevant contract is therefore
+    // "no version bump, no audit, slot_types unchanged" — not
+    // "no wildcards in the template at all". Both lines mask
+    // to the same shape (`<NUM>` at position 1), and the
+    // second line's `<NUM>` is already in `slot_types[0]`'s
+    // set, so type-expansion doesn't fire either. The leaf's
+    // wildcard set is asserted explicitly so a future bug
+    // that accidentally widened position 2 or 3 still fails.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let id2 = cluster.ingest(&string_record(&t, "user 17 logged in"));
+
+    assert_eq!(id1, id2);
+    assert_eq!(cluster.merges_total(), 0);
+    assert!(drain_changes(&sink).is_empty());
+
+    let templates = cluster.templates_for(&t);
+    assert_eq!(templates.len(), 1);
+    assert_eq!(
+        templates[0].template_version, 1,
+        "no version bump on same-shape clean attach",
+    );
+    let wildcard_positions: Vec<usize> = templates[0]
+        .template
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| matches!(t, OwnedToken::Wildcard).then_some(i))
+        .collect();
+    assert_eq!(
+        wildcard_positions,
+        vec![1],
+        "leaf's wildcard set must match the line's mask set: {:?}",
+        templates[0].template,
+    );
+    // The slot's type set stayed at {Num} — the second `<NUM>`
+    // line is already in the set, so no expansion fired.
+    assert_eq!(templates[0].slot_types.len(), 1);
+    let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+    assert_eq!(types, vec![ParamType::Num]);
+}
+
+#[test]
+fn widening_increments_template_version() {
+    // H5.1 — the version stamp on the leaf bumps from 1 to 2.
+    // The first ingest creates the leaf at version 1; the
+    // second triggers a widening that bumps to version 2.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged out from 10.0.0.1"));
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1);
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_version,
+                new_version,
+                ..
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!("expected Template/Widened, got {:?}", events[0].payload);
+    };
+    assert_eq!(*old_version, 1);
+    assert_eq!(*new_version, 2);
+}
+
+#[test]
+fn second_widening_at_different_position_increments_version_again() {
+    // Three lines, two widening events. After the second
+    // widening, version is 3.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // L1: "user 42 alpha logged in from 10.0.0.1" — fresh leaf, v=1.
+    // L2: "user 42 alpha logged out from 10.0.0.1" — widens
+    //     position 4 ("in" → "out") to <*>, v=2.
+    // L3: "user 42 alpha logged out to 10.0.0.1" — widens
+    //     position 5 ("from" → "to") to <*>, v=3. The
+    //     position-4 wildcard already matches "out", so only
+    //     position 5 widens this round.
+    let _ = cluster.ingest(&string_record(&t, "user 42 alpha logged in from 10.0.0.1"));
+    let _ = cluster.ingest(&string_record(&t, "user 42 alpha logged out from 10.0.0.1"));
+    let _ = cluster.ingest(&string_record(&t, "user 42 alpha logged out to 10.0.0.1"));
+
+    assert_eq!(cluster.template_count(&t), 1);
+    assert_eq!(cluster.merges_total(), 2);
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 2);
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_version: ov0,
+                new_version: nv0,
+                positions_widened: p0,
+                ..
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!(
+            "event 0: expected Template/Widened, got {:?}",
+            events[0].payload
+        );
+    };
+    assert_eq!((*ov0, *nv0, p0.clone()), (1, 2, vec![4]));
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_version: ov1,
+                new_version: nv1,
+                positions_widened: p1,
+                ..
+            },
+        ..
+    } = &events[1].payload
+    else {
+        panic!(
+            "event 1: expected Template/Widened, got {:?}",
+            events[1].payload
+        );
+    };
+    assert_eq!((*ov1, *nv1, p1.clone()), (2, 3, vec![5]));
+}
+
+#[test]
+fn fresh_leaf_carries_wildcard_at_mask_positions_with_seeded_slot_types() {
+    // PR-B-1 contract: at fresh-leaf creation, `mask()`'s
+    // wildcard_positions feed directly into the leaf's
+    // template (Wildcard at those positions, Fixed elsewhere)
+    // and `slot_types` is seeded from `typed_params` in
+    // ordinal order (one entry per masked position).
+    //
+    // This is the structural prerequisite for §6.6
+    // reconstruction: the template Wildcard slots and the
+    // `params` vector now align position-for-ordinal.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // Mask emits at positions 1 (`<NUM>`) and 5 (`<IP>`).
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+
+    // Fresh-leaf creation emits a `Created` event now (RFC 0017 §3.1),
+    // but no *widening / type-expansion* — even with non-empty
+    // slot_types. `drain_changes` filters the Created event out.
+    assert!(drain_changes(&sink).is_empty());
+
+    let templates = cluster.templates_for(&t);
+    assert_eq!(templates.len(), 1);
+    let snap = &templates[0];
+
+    // Template shape: Wildcard at mask positions, Fixed
+    // elsewhere.
+    assert_eq!(snap.template.len(), 6);
+    assert!(matches!(snap.template[0], OwnedToken::Fixed(ref s) if s == "user"));
+    assert!(matches!(snap.template[1], OwnedToken::Wildcard));
+    assert!(matches!(snap.template[2], OwnedToken::Fixed(ref s) if s == "logged"));
+    assert!(matches!(snap.template[3], OwnedToken::Fixed(ref s) if s == "in"));
+    assert!(matches!(snap.template[4], OwnedToken::Fixed(ref s) if s == "from"));
+    assert!(matches!(snap.template[5], OwnedToken::Wildcard));
+
+    // slot_types seeded from typed_params in ordinal order.
+    assert_eq!(snap.slot_types.len(), 2);
+    assert_eq!(
+        snap.slot_types[0].iter().collect::<Vec<_>>(),
+        vec![ParamType::Num],
+    );
+    assert_eq!(
+        snap.slot_types[1].iter().collect::<Vec<_>>(),
+        vec![ParamType::Ip],
+    );
+}
+
+// ---------- §6.4 type expansion (PR-B-0) ----------
+
+#[test]
+fn literal_widening_seeds_slot_types_with_str_for_pre_widen_and_line() {
+    // A literal-vs-literal widening at a position that wasn't
+    // previously a wildcard. Under PR-B-1 the fresh leaf also
+    // carries a Wildcard at position 1 (the `<NUM>` from the
+    // mask emit at creation), so after widening position 3
+    // there are TWO wildcard slots: ordinal 0 = the mask-emit
+    // wildcard (slot_types = {Num}), ordinal 1 = the literal
+    // widening (slot_types = {Str}).
+    //
+    // PR-B-1 locking-test update (was
+    // `literal_widening_seeds_slot_types_with_str_for_both_
+    // observations` under PR-B-0, when fresh leaves had no
+    // wildcards yet). The contract being pinned now is:
+    //   - literal widening produces exactly one
+    //     `TemplateWidened` event (no type expansion at
+    //     position 1 — the existing `<NUM>` slot already
+    //     contains Num, and the second line's `<NUM>` doesn't
+    //     trigger an expansion).
+    //   - The newly-widened slot at ordinal 1 contains {Str}
+    //     (the pre-widen literal "in" and the triggering "out"
+    //     both classify as Str).
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged out"));
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1, "literal widening: one event only");
+    assert!(matches!(
+        events[0].payload,
+        AuditPayload::Template {
+            change: TemplateChange::Widened { .. },
+            ..
+        }
+    ));
+
+    let templates = cluster.templates_for(&t);
+    assert_eq!(templates.len(), 1);
+    assert_eq!(
+        templates[0].slot_types.len(),
+        2,
+        "two wildcard slots: ordinal 0 from mask emit, ordinal 1 from widening",
+    );
+    let ordinal_0: Vec<_> = templates[0].slot_types[0].iter().collect();
+    assert_eq!(ordinal_0, vec![ParamType::Num]);
+    let ordinal_1: Vec<_> = templates[0].slot_types[1].iter().collect();
+    assert_eq!(ordinal_1, vec![ParamType::Str]);
+}
+
+#[test]
+fn mask_tag_transition_at_typed_wildcard_emits_type_expanded() {
+    // CLAUDE.md §3.1 regression for mask-tag type transitions
+    // at a wildcard slot.
+    //
+    // Setup: the fresh leaf carries a Wildcard at position 2
+    // (from the `<NUM>` mask emit at creation) with
+    // `slot_types[0] = {Num}`. The second line lands `<UUID>`
+    // at the same position. Under PR-B-1 the leaf position is
+    // already a Wildcard, so `find_widening_positions` returns
+    // empty (no Fixed mismatch); the §3.1 signal moves to the
+    // type-expansion path instead, which fires
+    // `TemplateTypeExpanded` and grows the slot's type set.
+    //
+    // PR-B-1 locking-test update (was
+    // `fixed_mask_tag_widening_captures_both_param_types_in_
+    // slot` under PR-B-0, when fresh leaves stored
+    // `Fixed("<NUM>")` and the same case fired
+    // `TemplateWidened`). The §3.1 invariant — every mask-tag
+    // transition at a tree-routed slot must produce an audit
+    // signal — is preserved end-to-end; only the *event kind*
+    // changes.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // Prefix ["user", "logged"] shared; mask-tag divergence
+    // at position 2 (Num vs Uuid).
+    let _ = cluster.ingest(&string_record(&t, "user logged 42 in"));
+    let _ = cluster.ingest(&string_record(
+        &t,
+        "user logged 550e8400-e29b-41d4-a716-446655440000 in",
+    ));
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1, "single TemplateTypeExpanded, no widening");
+    let AuditPayload::Template {
+        change:
+            TemplateChange::TypeExpanded {
+                old_version,
+                new_version,
+                slots_expanded,
+                ..
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!(
+            "expected Template/TypeExpanded, got {:?}",
+            events[0].payload
+        );
+    };
+    assert_eq!((*old_version, *new_version), (1, 2));
+    assert_eq!(slots_expanded.len(), 1);
+    assert_eq!(slots_expanded[0].slot_index, 0);
+    assert_eq!(slots_expanded[0].added_types, vec![ParamType::Uuid]);
+
+    let templates = cluster.templates_for(&t);
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].slot_types.len(), 1);
+    let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+    assert_eq!(
+        types,
+        vec![ParamType::Uuid, ParamType::Num],
+        "slot must record both Num (from creation) and Uuid (from this attach)",
+    );
+}
+
+#[test]
+fn clean_attach_at_typed_wildcard_with_known_type_emits_no_audit() {
+    // After a widening that seeds slot_types[0] = {Num, Uuid}
+    // (one Num line, one Uuid line), a third line with `<NUM>`
+    // at the same position attaches cleanly with no events.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user logged 42 in"));
+    let _ = cluster.ingest(&string_record(
+        &t,
+        "user logged 550e8400-e29b-41d4-a716-446655440000 in",
+    ));
+    let _ = sink.drain();
+
+    // L3 — Num at position 2 (the wildcard) is already in the
+    // slot's set, so no expansion event fires.
+    let _ = cluster.ingest(&string_record(&t, "user logged 99 in"));
+
+    assert!(
+        drain_changes(&sink).is_empty(),
+        "known type at typed wildcard must not emit",
+    );
+    let templates = cluster.templates_for(&t);
+    assert_eq!(
+        templates[0].template_version, 2,
+        "version stays at 2 — no expansion",
+    );
+}
+
+#[test]
+fn clean_attach_at_typed_wildcard_with_new_type_emits_type_expanded() {
+    // Seed slot_types[0] = {Str} via literal widening
+    // ("in"/"out"), then ingest a `<NUM>` at the same position
+    // — Num is not in {Str}, so TemplateTypeExpanded fires.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // 5-token lines so the single-position widening keeps
+    // sim_seq at 4/5 = 0.8 ≥ default threshold 0.7. Shorter
+    // lines drop the similarity below threshold and split
+    // into a fresh leaf via the Lossy zone (RFC §6.2 step 5b).
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour in"));
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour out"));
+    let _ = sink.drain();
+
+    // "13" masks to "<NUM>"; it lands at position 4 where the
+    // leaf has a Wildcard with slot_types[0] = {Str}.
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour 13"));
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1, "exactly one TemplateTypeExpanded");
+    let AuditPayload::Template {
+        change:
+            TemplateChange::TypeExpanded {
+                old_version,
+                new_version,
+                slots_expanded,
+                ..
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!(
+            "expected Template/TypeExpanded, got {:?}",
+            events[0].payload
+        );
+    };
+    assert_eq!((*old_version, *new_version), (2, 3));
+    assert_eq!(slots_expanded.len(), 1);
+    assert_eq!(slots_expanded[0].slot_index, 0);
+    assert_eq!(slots_expanded[0].added_types, vec![ParamType::Num]);
+
+    let templates = cluster.templates_for(&t);
+    let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+    assert_eq!(types, vec![ParamType::Num, ParamType::Str]);
+}
+
+#[test]
+fn type_expansion_only_attach_counts_toward_merges_total() {
+    // RFC §6.4 — `merges_total` counts both `TemplateWidened`
+    // and `TemplateTypeExpanded` (see
+    // `TemplateChange::counts_as_merge`). A pure type-expansion
+    // attach must therefore bump the counter.
+    let (mut cluster, _sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour in"));
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour out"));
+    let merges_after_widen = cluster.merges_total();
+
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour 13"));
+    assert_eq!(
+        cluster.merges_total(),
+        merges_after_widen + 1,
+        "type-expansion-only attach must bump merges_total",
+    );
+}
+
+#[test]
+fn combined_widening_and_type_expansion_emits_two_events_in_order() {
+    // RFC §6.2: a single attach can trigger BOTH structural
+    // widening (Fixed mismatch) AND type expansion (new
+    // ParamType at a pre-existing wildcard). In that case
+    // template_version increments twice and two events emit
+    // in widening-then-expansion order.
+    //
+    // Setup: leaf with one pre-existing Wildcard whose
+    // slot_types = {Str}, plus a Fixed literal at another
+    // position. The triggering line widens the literal
+    // (literal-vs-literal Fixed mismatch) AND brings a `<NUM>`
+    // to the pre-existing wildcard.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // L1: fresh 5-token leaf [Fixed("user"), Fixed("logged"),
+    //     Fixed("at"), Fixed("hour"), Fixed("NOW")], slots=[].
+    //     Prefix ["user", "logged"] is shared.
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour NOW"));
+    // L2: literal "NOW" → "LATER" widens position 4. sim_seq
+    //     = 4/5 = 0.8 ≥ threshold. slot_types = [{Str}], v=2.
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour LATER"));
+    let _ = sink.drain();
+
+    // L3: Fixed mismatch at position 3 ("hour" → "minute")
+    //     AND position 4's pre-existing wildcard sees "<NUM>"
+    //     from "13". sim_seq = 4/5 = 0.8 → Clean. After
+    //     widening pos 3 the slot ordinals are: position 3 →
+    //     ordinal 0 (fresh, slot_types=[{Str}]), position 4
+    //     → ordinal 1 (existing, slot_types was [{Str}]).
+    //     Expansion fires at ordinal 1, adding Num.
+    let _ = cluster.ingest(&string_record(&t, "user logged at minute 13"));
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 2, "combined widening + type expansion");
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_version: w_old,
+                new_version: w_new,
+                positions_widened,
+                ..
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!(
+            "event 0 must be Template/Widened (widening fires before expansion), got {:?}",
+            events[0].payload,
+        );
+    };
+    assert_eq!((*w_old, *w_new), (2, 3));
+    assert_eq!(*positions_widened, vec![3]);
+
+    let AuditPayload::Template {
+        change:
+            TemplateChange::TypeExpanded {
+                old_version: e_old,
+                new_version: e_new,
+                slots_expanded,
+                ..
+            },
+        ..
+    } = &events[1].payload
+    else {
+        panic!(
+            "event 1 must be Template/TypeExpanded, got {:?}",
+            events[1].payload,
+        );
+    };
+    assert_eq!((*e_old, *e_new), (3, 4));
+    // Post-widen template: [Fixed, Fixed, Fixed, Wildcard,
+    // Wildcard]. The freshly-widened slot at position 3 is
+    // ordinal 0; the pre-existing slot at position 4 is
+    // ordinal 1 — that's the one expanding.
+    assert_eq!(slots_expanded.len(), 1);
+    assert_eq!(slots_expanded[0].slot_index, 1);
+    assert_eq!(slots_expanded[0].added_types, vec![ParamType::Num]);
+
+    let templates = cluster.templates_for(&t);
+    assert_eq!(
+        templates[0].template_version, 4,
+        "version is 4 after both bumps",
+    );
+    assert_eq!(templates[0].slot_types.len(), 2, "two wildcard slots");
+}
+
+#[test]
+fn slot_types_are_aligned_by_wildcard_ordinal_not_template_position() {
+    // The leaf's `slot_types[k]` is the type set for the k-th
+    // Wildcard from the left (ordinal), not for template
+    // position k. Pin the invariant by widening positions
+    // out-of-order across multiple attaches and checking the
+    // resulting alignment.
+    let (mut cluster, _sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // L1: 5-token leaf [Fixed("user"), Fixed("logged"),
+    //     Fixed("in"), Fixed("fast"), Fixed("NOW")], v=1.
+    //     Prefix ["user", "logged"] is shared.
+    let _ = cluster.ingest(&string_record(&t, "user logged in fast NOW"));
+    // L2: widen position 3 ("fast" → "slow"). sim_seq = 4/5
+    //     ≥ threshold. slot_types = [{Str}] (one wildcard at
+    //     ordinal 0).
+    let _ = cluster.ingest(&string_record(&t, "user logged in slow NOW"));
+    // L3: widen position 2 ("in" → "out"). Position 3 is a
+    //     pre-existing Wildcard matching "slow". sim_seq =
+    //     4/5 ≥ threshold. The new wildcard at template
+    //     position 2 is inserted at ordinal 0 (it sits left
+    //     of position 3's existing wildcard, now ordinal 1),
+    //     so slot_types = [{Str (new at pos 2)}, {Str (old
+    //     at pos 3)}].
+    let _ = cluster.ingest(&string_record(&t, "user logged out slow NOW"));
+
+    let templates = cluster.templates_for(&t);
+    assert_eq!(templates[0].slot_types.len(), 2);
+    // Both slots are Str-only (literal widenings).
+    for (i, st) in templates[0].slot_types.iter().enumerate() {
+        let types: Vec<_> = st.iter().collect();
+        assert_eq!(
+            types,
+            vec![ParamType::Str],
+            "slot {i}: literal widening seeds only Str",
+        );
+    }
+}
+
+#[test]
+fn silent_merge_across_mask_tag_types_is_audited_not_silent() {
+    // Regression for the CLAUDE.md §3.1 violation that closed
+    // PR #32. Two lines differing only by mask-tag type at a
+    // position beyond `prefix_depth` (default 2) MUST produce
+    // an audit signal, not a silent merge.
+    //
+    // - Line A: "GET /home 42 ok" — masks <NUM> at position 2.
+    // - Line B: "GET /home <UUID-string> ok" — masks <UUID>.
+    //
+    // Under PR-B-1's leaf model the §3.1 audit signal moves
+    // from `TemplateWidened` to `TemplateTypeExpanded`:
+    // masked positions enter the leaf as `Wildcard` from
+    // creation, so the second line doesn't trigger a Fixed
+    // mismatch; the divergence surfaces as the slot's type
+    // set growing to {Num, Uuid}. The §3.1 contract — every
+    // mask-tag transition at a tree-routed slot audits — is
+    // preserved; the event kind changes.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "GET /home 42 ok"));
+    let _ = cluster.ingest(&string_record(
+        &t,
+        "GET /home 550e8400-e29b-41d4-a716-446655440000 ok",
+    ));
+
+    let events = drain_changes(&sink);
+    assert!(
+        !events.is_empty(),
+        "§3.1: mask-tag type change at a tree-routed wildcard slot must audit",
+    );
+    let AuditPayload::Template {
+        change: TemplateChange::TypeExpanded { slots_expanded, .. },
+        ..
+    } = &events[0].payload
+    else {
+        panic!(
+            "expected Template/TypeExpanded, got {:?}",
+            events[0].payload
+        );
+    };
+    assert_eq!(slots_expanded.len(), 1);
+    assert_eq!(slots_expanded[0].slot_index, 0);
+    assert_eq!(slots_expanded[0].added_types, vec![ParamType::Uuid]);
+
+    // Confirm the slot's type set captures the divergence so a
+    // *third* mask-tag type at the same position would emit
+    // another TemplateTypeExpanded.
+    let templates = cluster.templates_for(&t);
+    let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+    assert_eq!(types, vec![ParamType::Uuid, ParamType::Num]);
+}
+
+#[test]
+fn literal_mask_tag_token_in_line_classifies_as_str_not_num() {
+    // Regression for PR #33's review feedback. If a log line
+    // literally contains the token `"<NUM>"` (e.g., a
+    // placeholder a developer wrote into the message),
+    // `mask()` does NOT classify it (the digit rule doesn't
+    // fire on non-digit strings). The cluster's per-position
+    // type classification therefore reports `Str` for that
+    // position, NOT `Num`.
+    //
+    // Setup at position 3: literal widening seeds
+    // slot_types[0] = {Str}. Then a third line brings the
+    // literal `"<NUM>"` at the same position. The classifier
+    // must read mask's `wildcard_positions` (empty for this
+    // position, since the rule didn't fire) and conclude
+    // `Str`, which is already in the slot's set — no audit
+    // event. The pre-fix code would have inferred `Num` from
+    // the masked-token string content and incorrectly fired
+    // `TemplateTypeExpanded`, corrupting slot_types.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour in"));
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour out"));
+    let _ = sink.drain();
+
+    // The third line's position-4 token is the literal
+    // string "<NUM>". mask() leaves it alone (not all-digits).
+    let _ = cluster.ingest(&string_record(&t, "user logged at hour <NUM>"));
+
+    assert!(
+        drain_changes(&sink).is_empty(),
+        "literal `<NUM>` must be Str (already in slot's set), not a spurious Num expansion",
+    );
+    let templates = cluster.templates_for(&t);
+    assert_eq!(
+        templates[0].template_version, 2,
+        "no version bump: the literal `<NUM>` did not introduce a new type",
+    );
+    let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+    assert_eq!(
+        types,
+        vec![ParamType::Str],
+        "slot_types stays at {{Str}} — Num must not leak in from a literal-tag token",
+    );
+}
+
+#[test]
+fn literal_mask_tag_in_leaf_vs_real_mask_emit_on_line_does_not_silently_merge() {
+    // Symmetric regression for the PR #35 review concern: a
+    // leaf with `Fixed("<NUM>")` (because the *first* line
+    // carried the literal token `<NUM>`) MUST NOT merge with a
+    // later line that puts a real numeric value at the same
+    // position. The masked-line token at that position is also
+    // `"<NUM>"`, so a naive string-equality match in
+    // `sim_seq_owned` / `find_widening_positions` would mark
+    // it as a Fixed match — silently merging the two log
+    // shapes AND dropping the numeric's value from `params`
+    // (§3.1 + §3.3 violation; reconstruct would render
+    // `<NUM>` literally instead of recovering `42`).
+    //
+    // `line_wildcard_positions` plumbed through sim_seq +
+    // find_widening fixes both: the line at position 1 is a
+    // mask emit (in `line_wildcard_positions`), so it does
+    // NOT match the leaf's literal `Fixed("<NUM>")`. sim_seq
+    // returns 2/3 ≈ 0.667 < 0.7 threshold → Lossy zone →
+    // fresh leaf. Two templates result, body retained on the
+    // Lossy line.
+    let (mut cluster, audit_sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    // L1: literal `<NUM>` token. mask() doesn't classify it.
+    let raw_l1 = "value <NUM> ok";
+    let id1 = cluster.ingest(&string_record(&t, raw_l1));
+    // L2: real numeric at the same position. mask() emits
+    // `<NUM>` here.
+    let raw_l2 = "value 42 ok";
+    let id2 = cluster.ingest(&string_record(&t, raw_l2));
+
+    // Distinct template ids — no silent merge.
+    assert_ne!(
+        id1, id2,
+        "leaf `Fixed(\"<NUM>\")` (literal) must not absorb a real mask-emit `<NUM>`",
+    );
+    assert_eq!(cluster.template_count(&t), 2);
+    // No widening fired (the Lossy zone created a new leaf rather than
+    // widening). The two leaf creations each emit a `Created` event
+    // (RFC 0017 §3.1), which `drain_changes` filters out — so there are
+    // no widening / type-expansion / rejection events.
+    assert!(drain_changes(&audit_sink).is_empty());
+    // The §6.3 lossy zone bumped body_retentions for L2 (and
+    // retained its body on the emitted record).
+    assert_eq!(cluster.body_retentions_total(), 1);
+}
+
+#[test]
+fn existing_wildcard_receives_literal_emits_str_param_and_reconstructs() {
+    // PR-B-2 STR-fallback regression for the "existing wildcard
+    // receives a literal observation" path (distinct from the
+    // freshly-widened-literal-slot case covered by H7.4).
+    //
+    // Setup: a prior `<NUM>` mask emit creates a Wildcard at
+    // position 2 with `slot_types[0] = {Num}`. A later line at
+    // the same position carries a literal whose mask does not
+    // classify (e.g. "abc-def-1234" — neither digits nor UUID
+    // nor IPv4). sim_seq still matches (Wildcard matches
+    // anything), so the attach is Clean — and `build_record_
+    // params` must emit `{Str, "abc-def-1234"}` for the slot
+    // so reconstruct round-trips the literal verbatim.
+    //
+    // The pre-PR-B-2 code (params_from_mask) would have emitted
+    // params=[] for this attach because mask emitted nothing —
+    // reconstruct would have produced no bytes at the wildcard
+    // position. PR-B-2's `build_record_params` walks the
+    // leaf's wildcards and inserts the STR fallback.
+    //
+    // **Scope note.** This test exercises a wildcard at
+    // template position **2** — that is, *beyond* the default
+    // `prefix_depth = 2`, so both ingests share the same
+    // tree parent (positions 0–1 = `["user", "logged"]` for
+    // both). The STR-fallback path is structurally
+    // unreachable for wildcards INSIDE the prefix depth: the
+    // tree partitions by the concrete masked token at each
+    // prefix level, so a line whose prefix masks to a
+    // different concrete token (e.g. literal `abc` vs mask-
+    // emitted `<NUM>` at position 1 under default
+    // `prefix_depth = 2`) ends up in a different parent and
+    // finds no candidate to attach to. That is a property of
+    // the Drain tree's prefix-routing scheme (paper §3.2,
+    // RFC 0001 §6.1), not a bug in PR-B-2's STR fallback;
+    // future work to make wildcard slots reachable from
+    // diverging prefix tokens (multi-bucket lookup or
+    // wildcard-aware re-bucketing) is its own RFC-level
+    // change. The test deliberately stays inside the
+    // structurally-reachable case.
+    let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+    let t = TenantId::new("tenant-x");
+    let make = |raw: &str| string_record(&t, raw);
+
+    // L1: creates the wildcard at position 2 with
+    // slot_types[0] = {Num} (mask emit).
+    let _ = cluster.ingest(&make("user logged 42 in"));
+    let l1_emit = records.drain();
+    assert_eq!(l1_emit.len(), 1);
+
+    // L2: literal at position 2 lands on the existing
+    // wildcard. {Str} expands the slot's type set → emits
+    // TemplateTypeExpanded, but the record's params must
+    // carry the literal so reconstruct works.
+    let raw_l2 = "user logged abc-def-1234 in";
+    let _ = cluster.ingest(&make(raw_l2));
+
+    let l2_emit = records.drain();
+    assert_eq!(l2_emit.len(), 1);
+    let rec = &l2_emit[0];
+
+    // params has exactly one entry for the one wildcard slot,
+    // and it's a STR fallback carrying the literal verbatim.
+    assert_eq!(rec.params.len(), 1, "one wildcard → one param");
+    assert_eq!(
+        rec.params[0].type_tag,
+        ParamType::Str,
+        "literal at an existing wildcard → STR fallback",
+    );
+    assert_eq!(rec.params[0].value, "abc-def-1234");
+
+    // End-to-end: reconstruct round-trips the original bytes.
+    let snapshots = cluster.templates_for(&t);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        crate::reconstruct::reconstruct(rec, &snapshots[0].template),
+        raw_l2.as_bytes().to_vec(),
+        "STR-fallback alignment must let reconstruct recover the literal byte-for-byte",
+    );
+}
+
+#[test]
+fn audit_event_carries_triggering_line_hash_and_sample() {
+    // RFC §6.4 fields: triggering_line_hash (truncated blake3)
+    // and triggering_line_sample (first 256 B at char
+    // boundary) must reflect the line that triggered the
+    // widening — i.e., L2, not L1.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+    let l2 = "user 42 logged out from 10.0.0.1";
+    let _ = cluster.ingest(&string_record(&t, l2));
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1);
+    let AuditPayload::Template {
+        triggering_line_hash,
+        triggering_line_sample,
+        ..
+    } = &events[0].payload
+    else {
+        panic!("expected Template, got {:?}", events[0].payload);
+    };
+    assert_eq!(*triggering_line_hash, hash_triggering_line(l2.as_bytes()));
+    assert_eq!(triggering_line_sample.as_deref(), Some(l2));
+}
+
+#[test]
+fn below_threshold_creates_separate_leaf_no_widening() {
+    // The H1.1 invariant: lines with `sim_seq < threshold`
+    // remain distinct templates. "user logged in" vs
+    // "user logged out" mask to two length-3 templates
+    // differing at position 2; sim_seq = 2/3 ≈ 0.667 <
+    // default 0.7, so no widening.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "user logged in"));
+    let id2 = cluster.ingest(&string_record(&t, "user logged out"));
+
+    assert_ne!(id1, id2);
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.merges_total(), 0);
+    assert!(drain_changes(&sink).is_empty());
+}
+
+#[test]
+fn degenerate_widening_is_rejected_and_emits_rejection_event() {
+    // RFC0001.2 — a widening that would leave zero Fixed
+    // tokens is rejected:
+    //  - returns NO_TEMPLATE
+    //  - emits TemplateWideningRejectedDegenerate
+    //  - increments parse_failures_total (not merges_total)
+    //  - increments body_retentions_total — §6.4 "treated as
+    //    a parse failure ... retain body"
+    //  - does NOT bump template_version or modify the leaf
+    //
+    // Construction notes:
+    //
+    // - We use a `with_prefix_depth(0)` cluster so all length-3
+    //   lines share one leaf list. The default prefix-tree
+    //   shape partitions on the first two tokens, which makes
+    //   the degenerate path structurally unreachable (the
+    //   prefix-path tokens are always Fixed in any reachable
+    //   leaf).
+    //
+    // - Threshold of 0.3 so a 1/3-similar attach still
+    //   triggers widening instead of creating a fresh leaf.
+    //
+    //   L1 = ["alpha", "beta", "gamma"] — fresh leaf v=1.
+    //   L2 = ["alpha", "xxx", "yyy"] — sim with L1 = 1/3 ≥ 0.3
+    //        → widens positions 1, 2 → template
+    //        ["alpha", <*>, <*>], v=2. 1 Fixed left, NOT
+    //        degenerate.
+    //   L3 = ["zzz", "qqq", "rrr"] — sim with the widened
+    //        template = 2/3 (the two wildcards match) ≥ 0.3
+    //        → would widen position 0 (the last Fixed)
+    //        → fully degenerate → rejected.
+    let config = MinerConfig::try_new(0.3, 256).expect("valid config");
+    let sink = SharedAuditSink::new();
+    let mut cluster =
+        MinerCluster::with_audit_sink(config, Box::new(sink.clone())).with_prefix_depth(0);
+    let t = TenantId::new("tenant-x");
+
+    // Construct records bypassing masking by using single-letter
+    // tokens that no mask rule fires on.
+    let l1 = cluster.ingest(&string_record(&t, "alpha beta gamma"));
+    let _l2 = cluster.ingest(&string_record(&t, "alpha xxx yyy"));
+    let l3 = cluster.ingest(&string_record(&t, "zzz qqq rrr"));
+
+    // L1 created the leaf, L2 widened it, L3 was rejected.
+    assert_ne!(l1, NO_TEMPLATE);
+    assert_eq!(l3, NO_TEMPLATE);
+    assert_eq!(cluster.merges_total(), 1, "only L2's widening counts");
+    assert_eq!(cluster.parse_failures_total(), 1, "L3 was rejected");
+    assert_eq!(
+        cluster.body_retentions_total(),
+        1,
+        "§6.4 says degenerate-rejected lines retain body",
+    );
+
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 2);
+    assert!(
+        matches!(
+            events[0].payload,
+            AuditPayload::Template {
+                change: TemplateChange::Widened { .. },
+                ..
+            }
+        ),
+        "event 0: expected Template/Widened, got {:?}",
+        events[0].payload,
+    );
+    // Rejection variant carries no version bump and surfaces
+    // the would-be template the operator was protected from.
+    let AuditPayload::Template {
+        change: TemplateChange::RejectedDegenerate {
+            would_be_template, ..
+        },
+        ..
+    } = &events[1].payload
+    else {
+        panic!(
+            "event 1: expected Template/RejectedDegenerate, got {:?}",
+            events[1].payload,
+        );
+    };
+    assert_eq!(would_be_template, "<*> <*> <*>");
+
+    // Leaf state was not mutated by the rejection — still has
+    // its post-widening template (1 Fixed at position 0).
+    let templates = cluster.templates_for(&t);
+    assert_eq!(templates.len(), 1);
+    let leaf_template = &templates[0].template;
+    assert_eq!(leaf_template.len(), 3);
+    assert!(matches!(leaf_template[0], OwnedToken::Fixed(ref s) if s == "alpha"));
+    assert!(matches!(leaf_template[1], OwnedToken::Wildcard));
+    assert!(matches!(leaf_template[2], OwnedToken::Wildcard));
+}
+
+#[test]
+fn ingest_returns_no_template_sentinel_for_empty_string_body() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id_empty = cluster.ingest(&string_record(&t, ""));
+    let id_blank = cluster.ingest(&string_record(&t, "   \t\n"));
+
+    assert_eq!(id_empty, NO_TEMPLATE);
+    assert_eq!(id_blank, NO_TEMPLATE);
+    assert_eq!(cluster.template_count(&t), 0);
+    assert_eq!(
+        cluster.body_retentions_total(),
+        2,
+        "empty input is still a parse failure that retains body \
+         (RFC §6.3: every parse-failure path bumps both counters)",
+    );
+    assert_eq!(
+        cluster.parse_failures_total(),
+        2,
+        "empty input is the parse-failure floor's simplest case",
+    );
+}
+
+#[test]
+fn template_count_grows_with_each_distinct_template() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let _ = cluster.ingest(&string_record(&t, "user 17 logged in"));
+    let _ = cluster.ingest(&string_record(&t, "GET /home 200"));
+
+    let cached = cluster.template_count(&t);
+    assert_eq!(cached, 2);
+}
+
+#[test]
+fn best_candidate_selection_picks_highest_similarity_in_parent_leaf_list() {
+    // Two leaves under the same parent, one matches the line
+    // better than the other. The miner must pick the higher-
+    // similarity leaf for the widen target — not the first or
+    // the one it happens to encounter.
+    //
+    // L1 = "alpha beta gamma delta epsilon" (length 5)
+    // L2 = "alpha beta gamma zeta epsilon" (length 5, also
+    //       under the same length-5/prefix-"alpha beta" bucket
+    //       — but it must be a distinct leaf, so we force
+    //       distinctness by ingesting under a tweaked
+    //       threshold-disabling config)
+    //
+    // Forcing two leaves under one parent requires that at
+    // least the second ingest land below threshold. Use a
+    // threshold of 1.0 so any mismatch makes a new leaf, then
+    // drop to a threshold-allowing scenario for the third.
+    //
+    // Simpler: build via a two-stage config swap is hard since
+    // MinerCluster owns the config. Instead, push leaves
+    // directly through `templates_for` is read-only.
+    //
+    // Real-world simpler: under a threshold of 1.0, every
+    // distinct mask creates its own leaf. Then we can't widen
+    // anything (no merges happen). That doesn't test the
+    // best-candidate logic.
+    //
+    // Under the default 0.7 threshold + 0.5 floor:
+    //
+    //   L1 = "alpha beta gamma delta epsilon"  → leaf A.
+    //   L2 = "alpha beta gamma rho sigma"      → sim with A = 3/5
+    //                                            = 0.6 ∈ [0.5, 0.7)
+    //                                            → lossy zone →
+    //                                            new leaf B (same
+    //                                            `(length, prefix)`
+    //                                            bucket).
+    //   L3 = "alpha beta gamma delta zeta"     → sim with A = 4/5
+    //                                            = 0.8 (clean), sim
+    //                                            with B = 3/5 = 0.6
+    //                                            (lossy). Best
+    //                                            candidate is A;
+    //                                            widens A at
+    //                                            position 4.
+    //
+    // (Pre-three-zone this test had L2 at sim 0.4 — that's
+    // now a parse failure rather than a leaf, so L2 was
+    // rewritten to land in the lossy zone where the
+    // best-candidate-selection question still makes sense.)
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let id_a = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+    let id_b = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
+    assert_ne!(id_a, id_b, "leaves are distinct after L2");
+    assert_eq!(cluster.template_count(&t), 2);
+    assert!(
+        drain_changes(&sink).is_empty(),
+        "L2 fell into the lossy zone → fresh leaf, no widening",
+    );
+    assert_eq!(
+        cluster.body_retentions_total(),
+        1,
+        "L2's lossy attach is one body retention",
+    );
+
+    let id_c = cluster.ingest(&string_record(&t, "alpha beta gamma delta zeta"));
+    // Must widen leaf A (sim 0.8, clean), not B (sim 0.6, lossy).
+    assert_eq!(
+        id_c, id_a,
+        "best-candidate selection must pick the higher-similarity leaf",
+    );
+    assert_eq!(cluster.merges_total(), 1);
+    let events = drain_changes(&sink);
+    assert_eq!(events.len(), 1);
+    let AuditPayload::Template {
+        template_id,
+        change: TemplateChange::Widened {
+            positions_widened, ..
+        },
+        ..
+    } = &events[0].payload
+    else {
+        panic!("expected Template/Widened, got {:?}", events[0].payload);
+    };
+    assert_eq!(*template_id, id_a);
+    assert_eq!(*positions_widened, vec![4]);
+}
+
+// ---------- new behaviour from PR #28: body fork + structured short-circuit ----------
+
+#[test]
+fn ingest_returns_no_template_for_absent_body() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let r = OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: None,
+        ..Default::default()
+    };
+
+    let id = cluster.ingest(&r);
+
+    assert_eq!(id, NO_TEMPLATE);
+    assert_eq!(cluster.template_count(&t), 0);
+}
+
+#[test]
+fn structured_body_short_circuit_allocates_one_template_per_severity_scope_tuple() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+    let id2 = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+    let id3 = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+
+    assert_eq!(id1, id2);
+    assert_eq!(id2, id3);
+    assert_eq!(cluster.template_count(&t), 1);
+}
+
+#[test]
+fn structured_body_distinguishes_severity_within_one_scope() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id_info = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+    let id_error = cluster.ingest(&structured_record(&t, 17, Some("lib.auth")));
+
+    assert_ne!(id_info, id_error);
+    assert_eq!(cluster.template_count(&t), 2);
+}
+
+#[test]
+fn structured_body_distinguishes_scope_within_one_severity() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id_a = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+    let id_b = cluster.ingest(&structured_record(&t, 9, Some("lib.payments")));
+
+    assert_ne!(id_a, id_b);
+    assert_eq!(cluster.template_count(&t), 2);
+}
+
+/// Pin the exact RFC 0005 §3.3 canonical-JSON bytes the
+/// miner stores in `MinedRecord.body` for a structured
+/// row. Catches a regression to debug formatting (the
+/// prior `format!("{any_value:?}")` placeholder), AND
+/// catches an `opentelemetry-proto` upgrade that breaks
+/// the OTLP-JSON spec mapping (camelCase, string-encoded
+/// `i64`, base64 bytes). A non-trivial `AnyValue` exercises
+/// the recursive `KvlistValue` path through the encoder.
+#[test]
+fn structured_body_is_stored_as_otlp_canonical_json() {
+    use ourios_core::otlp::{KeyValue as ProtoKv, KeyValueList};
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let av = AnyValue {
+        value: Some(AvValue::KvlistValue(KeyValueList {
+            values: vec![ProtoKv {
+                key: "user.id".to_string(),
+                value: Some(AnyValue {
+                    value: Some(AvValue::IntValue(42)),
+                }),
+                ..Default::default()
+            }],
+        })),
+    };
+    let record = OtlpLogRecord {
+        tenant_id: TenantId::new("tenant-x"),
+        severity_number: 9,
+        scope_name: Some("bench.scope".to_string()),
+        body: Some(Body::Structured(av)),
+        ..Default::default()
+    };
+    cluster.ingest(&record);
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let body = emitted[0].body.as_deref().expect("structured body is Some");
+    // Pinned canonical form per the proto3 JSON spec
+    // mapping: camelCase keys, `i64` as a quoted string,
+    // recursive `kvlistValue` shape. The opentelemetry-proto
+    // `with-serde` derives emit fields in struct-definition
+    // order, which is what serde_json::to_vec produces
+    // deterministically — RFC0006.7 reproducibility relies
+    // on this same byte stability.
+    assert_eq!(
+        body, r#"{"kvlistValue":{"values":[{"key":"user.id","value":{"intValue":"42"}}]}}"#,
+        "miner must store RFC 0005 §3.3 canonical JSON, not a debug rendering",
+    );
+    assert!(
+        !emitted[0].lossy_flag,
+        "RFC 0001 §6.1: lossy_flag is always false on BodyKind::Structured",
+    );
+}
+
+#[test]
+fn structured_body_with_scope_none_is_its_own_bucket() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id_none = cluster.ingest(&structured_record(&t, 9, None));
+    let id_some = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+
+    assert_ne!(id_none, id_some);
+    assert_eq!(cluster.template_count(&t), 2);
+}
+
+#[test]
+fn structured_body_isolates_template_ids_across_tenants() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let a = TenantId::new("tenant-a");
+    let b = TenantId::new("tenant-b");
+
+    let id_a = cluster.ingest(&structured_record(&a, 9, Some("lib.auth")));
+    let id_b = cluster.ingest(&structured_record(&b, 9, Some("lib.auth")));
+
+    assert_ne!(
+        id_a, id_b,
+        "structured records with identical key tuple must get distinct template_ids across tenants",
+    );
+    assert_eq!(cluster.template_count(&a), 1);
+    assert_eq!(cluster.template_count(&b), 1);
+}
+
+#[test]
+fn structured_and_string_share_no_template_ids_at_same_severity_scope() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let id_struct = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+    let id_string = cluster.ingest(&OtlpLogRecord {
+        tenant_id: t.clone(),
+        severity_number: 9,
+        scope_name: Some("lib.auth".to_string()),
+        body: Some(Body::String("hello".to_string())),
+        ..Default::default()
+    });
+
+    assert_ne!(id_struct, id_string);
+    assert_eq!(cluster.template_count(&t), 2);
+}
+
+#[test]
+fn string_body_distinguishes_severity_within_one_scope() {
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let info = OtlpLogRecord {
+        tenant_id: t.clone(),
+        severity_number: 9,
+        body: Some(Body::String("user 42 logged in".to_string())),
+        ..Default::default()
+    };
+    let error = OtlpLogRecord {
+        severity_number: 17,
+        ..info.clone()
+    };
+
+    let id_info = cluster.ingest(&info);
+    let id_error = cluster.ingest(&error);
+
+    assert_ne!(id_info, id_error);
+    assert_eq!(cluster.template_count(&t), 2);
+}
+
+// ---------- helper-function unit tests ----------
+
+#[test]
+fn find_widening_positions_returns_only_mismatched_fixed_positions() {
+    let template = vec![
+        OwnedToken::Fixed("user".to_string()),
+        OwnedToken::Fixed("42".to_string()),
+        OwnedToken::Wildcard,
+        OwnedToken::Fixed("in".to_string()),
+    ];
+    let line = ["user", "17", "anything", "out"];
+    let positions = find_widening_positions(&line, &template, &[]);
+    // Position 0: Fixed "user" == "user" → no widening.
+    // Position 1: Fixed "42" != "17" → widen.
+    // Position 2: Wildcard → never in the widening set.
+    // Position 3: Fixed "in" != "out" → widen.
+    assert_eq!(positions, vec![1, 3]);
+}
+
+#[test]
+fn would_be_degenerate_only_when_no_fixed_remain() {
+    let template = vec![
+        OwnedToken::Fixed("a".to_string()),
+        OwnedToken::Wildcard,
+        OwnedToken::Fixed("c".to_string()),
+    ];
+    // Widening only position 0 leaves position 2 Fixed → not degenerate.
+    assert!(!would_be_degenerate(&template, &[0]));
+    // Widening position 2 leaves position 0 Fixed → not degenerate.
+    assert!(!would_be_degenerate(&template, &[2]));
+    // Widening positions 0 AND 2 leaves nothing Fixed → degenerate.
+    assert!(would_be_degenerate(&template, &[0, 2]));
+    // Widening no positions on a template with Fixed left → not degenerate.
+    assert!(!would_be_degenerate(&template, &[]));
+}
+
+#[test]
+fn format_template_renders_canonical_form() {
+    let template = vec![
+        OwnedToken::Fixed("user".to_string()),
+        OwnedToken::Wildcard,
+        OwnedToken::Fixed("logged".to_string()),
+        OwnedToken::Wildcard,
+    ];
+    assert_eq!(format_template(&template), "user <*> logged <*>");
+}
+
+#[test]
+fn apply_widening_replaces_only_listed_positions() {
+    let mut template = vec![
+        OwnedToken::Fixed("a".to_string()),
+        OwnedToken::Fixed("b".to_string()),
+        OwnedToken::Fixed("c".to_string()),
+    ];
+    apply_widening(&mut template, &[1]);
+    assert!(matches!(template[0], OwnedToken::Fixed(ref s) if s == "a"));
+    assert!(matches!(template[1], OwnedToken::Wildcard));
+    assert!(matches!(template[2], OwnedToken::Fixed(ref s) if s == "c"));
+}
+
+#[test]
+fn ingest_string_routes_lines_above_u16_max_tokens_to_parse_failure() {
+    // The cap defends `positions_widened: Vec<u16>` (RFC §6.4)
+    // from a silent-merge bug: if the helper had to drop
+    // out-of-range positions, an attach with no surviving
+    // mismatches would have looked like a clean match
+    // (no widening, no audit, no `merges_total` bump).
+    // Producing a 65 537-token line here is the smallest input
+    // that exercises the cap.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    let n: usize = (u16::MAX as usize) + 2;
+    let mut text = String::with_capacity(n * 2);
+    for i in 0..n {
+        if i > 0 {
+            text.push(' ');
+        }
+        text.push('x');
+    }
+
+    let id = cluster.ingest(&string_record(&t, &text));
+
+    assert_eq!(id, NO_TEMPLATE);
+    assert_eq!(cluster.template_count(&t), 0);
+    assert_eq!(cluster.parse_failures_total(), 1);
+    assert_eq!(
+        cluster.body_retentions_total(),
+        1,
+        "RFC §6.3: over-cap lines retain body alongside the parse-failure count",
+    );
+    assert_eq!(cluster.merges_total(), 0);
+}
+
+// ---------- three-zone confidence (RFC §6.3) ----------
+
+#[test]
+fn lossy_zone_creates_new_leaf_and_bumps_body_retention() {
+    // L1 = "alpha beta gamma delta epsilon"  (length 5,
+    //                                         prefix "alpha beta").
+    // L2 = "alpha beta gamma rho sigma"      → sim with L1 = 3/5 = 0.6
+    //                                         → lossy zone
+    //                                         (0.4 ≤ 0.6 < 0.7 under
+    //                                         the RFC §6.3 defaults).
+    //
+    // Lossy attach: new leaf in the same parent (not widening),
+    // body_retentions_total bumps by one, no audit event, no
+    // merges_total bump.
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+    let id2 = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
+
+    assert_ne!(id1, id2, "lossy attach creates a distinct leaf");
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.body_retentions_total(), 1);
+    assert_eq!(cluster.merges_total(), 0);
+    assert_eq!(cluster.parse_failures_total(), 0);
+    assert!(
+        drain_changes(&sink).is_empty(),
+        "lossy attach emits no audit event"
+    );
+}
+
+#[test]
+fn parse_failure_zone_returns_no_template_and_bumps_counters() {
+    // L1 = "alpha beta gamma delta epsilon zeta"  (length 6).
+    // L2 = "alpha beta phi rho sigma omega"        → sim with L1 = 2/6
+    //                                              ≈ 0.333 →
+    //                                              parse-failure zone
+    //                                              (< 0.4 RFC §6.3 floor).
+    //
+    // Pre-§6.3 PR draft used length-5 lines with sim 0.4 and
+    // a 0.5 floor — that boundary collapsed once the floor
+    // was corrected to the RFC-pinned 0.4. Lengthening L2 by
+    // one token (sim 2/6 instead of 2/5) lands the line
+    // unambiguously below the floor without re-introducing a
+    // boundary-dependent assertion.
+    //
+    // Parse failure: no leaf created, NO_TEMPLATE returned,
+    // parse_failures_total AND body_retentions_total both
+    // bump (RFC §6.3 says parse failure also retains body).
+    let (mut cluster, sink) = cluster_with_observable_sink();
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
+    let id2 = cluster.ingest(&string_record(&t, "alpha beta phi rho sigma omega"));
+
+    assert_ne!(id1, NO_TEMPLATE, "L1 created the only leaf");
+    assert_eq!(
+        id2, NO_TEMPLATE,
+        "below-floor similarity → parse failure, not new leaf",
+    );
+    assert_eq!(
+        cluster.template_count(&t),
+        1,
+        "parse failure must not allocate a leaf",
+    );
+    assert_eq!(cluster.parse_failures_total(), 1);
+    assert_eq!(
+        cluster.body_retentions_total(),
+        1,
+        "RFC §6.3: parse failure retains body too",
+    );
+    assert_eq!(cluster.merges_total(), 0);
+    assert!(
+        drain_changes(&sink).is_empty(),
+        "parse failure emits no audit event"
+    );
+}
+
+#[test]
+fn clean_attach_does_not_bump_body_retentions() {
+    // sim ≥ threshold → ConfidenceZone::Clean →
+    // retains_body() == false → counter unchanged.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+
+    // Two structurally identical (post-mask) lines: sim == 1.0,
+    // clean attach to the existing leaf.
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let _ = cluster.ingest(&string_record(&t, "user 17 logged in"));
+
+    assert_eq!(cluster.body_retentions_total(), 0);
+    assert_eq!(cluster.parse_failures_total(), 0);
+    assert_eq!(cluster.template_count(&t), 1);
+}
+
+#[test]
+fn floor_at_threshold_collapses_lossy_zone() {
+    // With floor == threshold, the lossy zone is empty. Every
+    // below-threshold attach goes straight to parse failure.
+    // Pin the corner case so a future config refactor that
+    // accidentally re-introduces the lossy zone is caught.
+    let config = MinerConfig::try_new_full(0.7, 0.7, 256).expect("valid config");
+    let mut cluster = MinerCluster::new(config);
+    let t = TenantId::new("tenant-x");
+
+    // L1 establishes the leaf; L2 has sim 3/5 = 0.6 — under
+    // the collapsed-zone config this is < floor, so parse
+    // failure (not lossy, since lossy zone is empty).
+    let _id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+    let id2 = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
+
+    assert_eq!(id2, NO_TEMPLATE);
+    assert_eq!(cluster.template_count(&t), 1);
+    assert_eq!(cluster.parse_failures_total(), 1);
+    assert_eq!(cluster.body_retentions_total(), 1);
+}
+
+// ---------- record emission (RFC §6.1 / §6.6 scaffolding) ----------
+
+/// Test helper — a cluster whose audit and record sinks are
+/// both `SharedAuditSink`/`SharedRecordSink` clones so tests
+/// can inspect what was emitted on both streams.
+fn cluster_with_observable_sinks() -> (MinerCluster, SharedAuditSink, SharedRecordSink) {
+    let audit = SharedAuditSink::new();
+    let records = SharedRecordSink::new();
+    let cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+        .with_record_sink(Box::new(records.clone()));
+    (cluster, audit, records)
+}
+
+#[test]
+fn body_none_emits_absent_record_with_no_template() {
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+
+    let r = OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: None,
+        ..Default::default()
+    };
+    let id = cluster.ingest(&r);
+
+    assert_eq!(id, NO_TEMPLATE);
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+    assert_eq!(rec.tenant_id, t);
+    assert_eq!(rec.template_id, NO_TEMPLATE);
+    assert_eq!(rec.body_kind, BodyKind::Absent);
+    assert!(
+        !rec.lossy_flag,
+        "absence is not loss (RFC 0025 §3.1) — reconstruction renders nothing, exactly"
+    );
+    assert!(rec.separators.is_empty());
+    assert!(rec.params.is_empty());
+    assert!(rec.body.is_none());
+}
+
+#[test]
+fn clean_fresh_leaf_emits_record_with_separators_and_no_body() {
+    let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+    assert_eq!(rec.body_kind, BodyKind::String);
+    assert_ne!(rec.template_id, NO_TEMPLATE);
+    assert_eq!(rec.template_version, 1);
+    // tokenize("user 42 logged in") yields 4 tokens → 5
+    // separators per the §6.6 capture invariant.
+    assert_eq!(rec.separators.len(), 5);
+    // Clean attaches do not retain body and are not lossy.
+    assert!(rec.body.is_none());
+    assert!(!rec.lossy_flag);
+    // sim_seq against a fresh leaf is 1.0 by definition;
+    // confidence = sim / threshold = 1.0 / 0.7 ≈ 1.428, but
+    // the cluster reports the sentinel 1.0 for clean attaches.
+    assert!((rec.confidence - 1.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn clean_reuse_emits_record_at_same_template_id_and_version() {
+    let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+    let t = TenantId::new("tenant-x");
+
+    let id1 = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let id2 = cluster.ingest(&string_record(&t, "user 17 logged in"));
+
+    assert_eq!(id1, id2, "reuse same template");
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0].template_id, id1);
+    assert_eq!(emitted[1].template_id, id1);
+    assert_eq!(emitted[0].template_version, 1);
+    assert_eq!(
+        emitted[1].template_version, 1,
+        "clean reuse must not bump the version",
+    );
+}
+
+#[test]
+fn widening_emits_record_with_bumped_version() {
+    let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged out from 10.0.0.1"));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0].template_version, 1, "L1 at fresh-leaf version");
+    assert_eq!(
+        emitted[1].template_version, 2,
+        "L2's widening bumps version on the same template_id",
+    );
+    assert_eq!(
+        emitted[0].template_id, emitted[1].template_id,
+        "widening attaches to the same template_id",
+    );
+}
+
+#[test]
+fn lossy_attach_emits_record_with_retained_body_and_lossy_flag_false() {
+    let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+    let t = TenantId::new("tenant-x");
+
+    // L2 = sim 3/5 = 0.6 ∈ [0.4, 0.7) → lossy zone.
+    let _ = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+    let l2_raw = "alpha beta gamma rho sigma";
+    let _ = cluster.ingest(&string_record(&t, l2_raw));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2);
+    let lossy = &emitted[1];
+    assert_eq!(lossy.body.as_deref(), Some(l2_raw));
+    // §6.6: the lossy zone retains body but `lossy_flag`
+    // stays false — reconstruction is expected to match.
+    assert!(!lossy.lossy_flag);
+    // confidence = sim / threshold = 0.6 / 0.7.
+    let expected_conf = 0.6_f32 / 0.7_f32;
+    assert!(
+        (lossy.confidence - expected_conf).abs() < 1e-4,
+        "expected confidence ≈ {expected_conf}, got {}",
+        lossy.confidence,
+    );
+    // Lossy attach creates a fresh leaf, so version is 1.
+    assert_eq!(lossy.template_version, 1);
+    assert_ne!(lossy.template_id, NO_TEMPLATE);
+}
+
+#[test]
+fn parse_failure_zone_emits_record_with_lossy_flag_and_no_template() {
+    let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+    let t = TenantId::new("tenant-x");
+
+    // sim 2/6 ≈ 0.333 < 0.4 floor → parse-failure zone.
+    let _ = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
+    let l2_raw = "alpha beta phi rho sigma omega";
+    let _ = cluster.ingest(&string_record(&t, l2_raw));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2);
+    let pf = &emitted[1];
+    assert_eq!(pf.template_id, NO_TEMPLATE);
+    assert_eq!(pf.template_version, 0);
+    assert!(pf.lossy_flag, "parse-failure records are lossy");
+    assert_eq!(pf.body.as_deref(), Some(l2_raw));
+    assert!(
+        pf.confidence.abs() < f32::EPSILON,
+        "parse-failure confidence is the 0.0 sentinel",
+    );
+}
+
+#[test]
+fn empty_input_emits_parse_failure_record() {
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&string_record(&t, ""));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+    assert_eq!(rec.template_id, NO_TEMPLATE);
+    assert!(rec.lossy_flag);
+    assert_eq!(rec.body.as_deref(), Some(""));
+    // §6.6 capture invariant on the degenerate case: empty
+    // input still has separators.len() == tokens.len() + 1.
+    assert_eq!(rec.separators.len(), 1);
+}
+
+#[test]
+fn structured_body_emits_record_with_structured_kind() {
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+
+    let _ = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+    assert_eq!(rec.body_kind, BodyKind::Structured);
+    assert_ne!(rec.template_id, NO_TEMPLATE);
+    assert_eq!(rec.template_version, 1);
+    // RFC §6.1: Structured records always carry
+    // `lossy_flag = false`. The producer populates `body`
+    // with the Ourios-canonical JSON encoding of the
+    // structured value (`ingest_structured` →
+    // `canonical::encode_any_value`), so `reconstruct()`
+    // returns what we stored, satisfying §3.3.
+    assert!(rec.separators.is_empty());
+    assert!(rec.params.is_empty());
+    assert!(
+        rec.body.is_some(),
+        "structured records must carry the stored body representation"
+    );
+    assert!(!rec.lossy_flag);
+}
+
+#[test]
+fn default_sink_drops_records_silently() {
+    // `MinerCluster::new` defaults to `NoOpRecordSink`; tests
+    // that don't opt into `with_record_sink` simply see no
+    // records (the cluster doesn't crash, doesn't allocate,
+    // doesn't expose state). Pins the production-safe default.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    // No assertion beyond "the call succeeded" — the contract
+    // is no public observable side effect.
+    assert_eq!(cluster.template_count(&t), 1);
+}
+
+/// RFC 0035 §3.1 — `ingest_mined` is `ingest` with the sink emit
+/// diverted to the caller: identical template-id assignment, audit
+/// stream, and per-tenant state, and the returned record is
+/// field-identical to what `ingest` hands the record sink.
+#[test]
+fn rfc0035_ingest_mined_matches_ingest_except_the_sink_emit() {
+    use ourios_core::clock::TestClock;
+
+    let records = SharedRecordSink::new();
+    let audit = SharedAuditSink::new();
+    let mut via_ingest =
+        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+            .with_record_sink(Box::new(records.clone()))
+            .with_clock(Box::new(TestClock::epoch()));
+    let mined_audit = SharedAuditSink::new();
+    let mined_records = SharedRecordSink::new();
+    let mut via_mined =
+        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(mined_audit.clone()))
+            .with_record_sink(Box::new(mined_records.clone()))
+            .with_clock(Box::new(TestClock::epoch()));
+    let t = TenantId::new("tenant-x");
+
+    // A mix that exercises fresh-leaf, attach, widening, structured,
+    // and parse-failure paths through both entry points.
+    let inputs = [
+        string_record(&t, "user 42 logged in"),
+        string_record(&t, "user 43 logged in"),
+        string_record(&t, "user alpha logged in"),
+        string_record(&t, ""),
+        structured_record(&t, 9, Some("lib.auth")),
+    ];
+    let mut captured = Vec::new();
+    for input in &inputs {
+        let id = via_ingest.ingest(input);
+        let (mined_id, mined) = via_mined.ingest_mined(input);
+        assert_eq!(id, mined_id, "identical template-id assignment");
+        captured.push(mined.expect(
+            "every ingest emits exactly one record, so every ingest_mined captures exactly one",
+        ));
+    }
+
+    assert!(
+        mined_records.drain().is_empty(),
+        "the capture slot diverts the record away from the miner's own sink",
+    );
+    assert_eq!(
+        records.drain(),
+        captured,
+        "the captured record equals what ingest hands the sink",
+    );
+    assert_eq!(
+        audit.drain(),
+        mined_audit.drain(),
+        "audit emission stays in the ordered phase, identical on both paths",
+    );
+    assert_eq!(
+        via_ingest.snapshot_state(&t),
+        via_mined.snapshot_state(&t),
+        "per-tenant state identical across the two entry points",
+    );
+}
+
+/// An audit sink that panics on its first `Created` event, once —
+/// the injectable mid-`ingest` panic (audit runs in the ordered
+/// phase, before the record emit).
+struct PanicOnceAuditSink {
+    fired: bool,
+}
+
+impl AuditSink for PanicOnceAuditSink {
+    fn emit(&mut self, _event: AuditEvent) {
+        if !self.fired {
+            self.fired = true;
+            panic!("injected audit-sink panic");
+        }
+    }
+}
+
+/// RFC 0035 review F2 — a panic inside `ingest_mined` must leave the
+/// capture slot clean: the next call captures normally instead of
+/// silently losing its record to a stale slot state.
+#[test]
+fn rfc0035_f2_capture_slot_is_clean_after_a_panic() {
+    let records = SharedRecordSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(
+        MinerConfig::default(),
+        Box::new(PanicOnceAuditSink { fired: false }),
+    )
+    .with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.ingest_mined(&string_record(&t, "user 1 logged in"))
+    }));
+    assert!(panicked.is_err(), "the injected audit panic propagates");
+    // The panic fired before the record emit (audit precedes it), so
+    // nothing was captured and nothing is salvaged.
+    assert_eq!(cluster.mined_capture_salvages_total(), 0);
+
+    let (_, mined) = cluster.ingest_mined(&string_record(&t, "user 2 logged in"));
+    assert!(
+        mined.is_some(),
+        "the slot was reset across the unwind — the next batch item is \
+         captured, not swallowed by a stale Armed/Captured state",
+    );
+    assert!(
+        records.drain().is_empty(),
+        "capture still diverts away from the miner's own sink",
+    );
+}
+
+/// RFC 0035 review F2 — the unwind settle forwards a record captured
+/// before the panic to the real sink (and counts it) instead of
+/// dropping an acknowledged record until restart replay.
+#[test]
+fn rfc0035_f2_salvage_forwards_a_captured_record_to_the_sink() {
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+
+    // Stage the state a panic-after-capture leaves behind (the tail
+    // of `ingest` past the emit is not injectable from outside).
+    let (_, mined) = cluster.ingest_mined(&string_record(&t, "user 1 logged in"));
+    cluster.mined_capture = MinedCapture::Captured(Box::new(mined.expect("captured")));
+
+    cluster.salvage_mined_capture();
+
+    assert_eq!(cluster.mined_capture_salvages_total(), 1);
+    let salvaged = records.drain();
+    assert_eq!(salvaged.len(), 1, "the captured record reached the sink");
+    assert!(
+        matches!(cluster.mined_capture, MinedCapture::Off),
+        "the slot is reset after the salvage",
+    );
+}
+
+// ── RFC 0050 §3.2 upstream-template modes ────────────────────
+
+/// Test helper — a string record carrying a
+/// `log.record.template` attribute.
+fn annotated_record(tenant: &TenantId, body: &str, template: &str) -> OtlpLogRecord {
+    use ourios_core::otlp::KeyValue;
+    let mut record = string_record(tenant, body);
+    record.attributes.push(KeyValue {
+        key: LOG_RECORD_TEMPLATE_ATTR.to_string(),
+        value: Some(AnyValue {
+            value: Some(AvValue::StringValue(template.to_string())),
+        }),
+        ..Default::default()
+    });
+    record
+}
+
+fn adopt_config() -> MinerConfig {
+    MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt)
+}
+
+#[test]
+fn rfc0050_1_default_mines_as_if_unannotated_and_stores_verbatim() {
+    let t = TenantId::new("tenant-x");
+    let bodies = ["user alice logged in", "user bob logged in"];
+
+    // The pre-RFC build had no upstream-template handling at all,
+    // so its outcome on an annotated corpus is exactly what the
+    // miner produces when the attribute does not participate:
+    // mine the same bodies with and without the annotation under
+    // the unset default and require identical miner output.
+    let records = SharedRecordSink::new();
+    let plain_records = SharedRecordSink::new();
+    let mut annotated_run =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let mut plain_run =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(plain_records.clone()));
+    for body in bodies {
+        let with_attr = annotated_run.ingest(&annotated_record(&t, body, "user <*> logged in"));
+        let without = plain_run.ingest(&string_record(&t, body));
+        assert_eq!(with_attr, without, "the annotation changed a template_id");
+    }
+
+    // Identical miner-derived state: same leaves, ids, versions;
+    // no adoption surface was touched.
+    // `templates_for` carries no ordering contract — compare as
+    // a sorted set.
+    let shape = |c: &MinerCluster| -> Vec<(String, u64, u32)> {
+        let mut leaves: Vec<_> = c
+            .templates_for(&t)
+            .iter()
+            .map(|l| {
+                (
+                    format_template(&l.template),
+                    l.template_id,
+                    l.template_version,
+                )
+            })
+            .collect();
+        leaves.sort();
+        leaves
+    };
+    assert_eq!(shape(&annotated_run), shape(&plain_run));
+    assert!(annotated_run.adopted_templates_for(&t).is_empty());
+
+    // The attribute is stored as an ordinary attribute, verbatim
+    // (RFC 0018 fidelity — nothing consumed, nothing rewritten),
+    // and **every other emitted field** — params, body handling,
+    // confidence, severity, the lot — is identical to the plain
+    // run's record. The Parquet layout is a pure function of this
+    // record stream and the (identical) config, so record-level
+    // equality is the §5.1 "every miner-derived column and the
+    // file layout" clause at its source.
+    let stored = records.drain();
+    let plain = plain_records.drain();
+    assert_eq!(stored.len(), bodies.len());
+    assert_eq!(plain.len(), bodies.len());
+    for (record, plain_record) in stored.iter().zip(&plain) {
+        let claim = record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == LOG_RECORD_TEMPLATE_ATTR)
+            .expect("the annotation survives as an ordinary attribute");
+        assert_eq!(
+            claim.value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(&AvValue::StringValue("user <*> logged in".to_string())),
+        );
+        let mut stripped = record.clone();
+        stripped
+            .attributes
+            .retain(|kv| kv.key != LOG_RECORD_TEMPLATE_ATTR);
+        assert_eq!(
+            &stripped, plain_record,
+            "modulo the annotation itself, the emitted record is \
+             field-for-field the pre-RFC one",
+        );
+    }
+}
+
+#[test]
+fn rfc0050_2_adoption_uses_the_upstream_string() {
+    let t = TenantId::new("tenant-x");
+    let records = SharedRecordSink::new();
+    let audit = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()))
+        .with_record_sink(Box::new(records.clone()));
+
+    let id_a = cluster.ingest(&annotated_record(
+        &t,
+        "user alice logged in",
+        "user <*> logged in",
+    ));
+    let id_b = cluster.ingest(&annotated_record(
+        &t,
+        "user bob logged in",
+        "user <name> logged in",
+    ));
+
+    // Two records sharing a canonical shape share one id; the
+    // Drain tree gains no leaf for them (RFC0050.2).
+    assert_ne!(id_a, NO_TEMPLATE);
+    assert_eq!(id_a, id_b);
+    assert!(cluster.templates_for(&t).is_empty(), "no tree leaf");
+
+    let adopted = cluster.adopted_templates_for(&t);
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].canonical, "user <*> logged in");
+    assert!(adopted[0].owned);
+    assert_eq!(
+        adopted[0].provenance,
+        Some(ProvenanceSet::singleton(Provenance::UpstreamDerived)),
+    );
+    // Both raw spellings of the shape are associated.
+    assert_eq!(
+        adopted[0].upstream_associations,
+        vec![
+            "user <*> logged in".to_string(),
+            "user <name> logged in".to_string()
+        ],
+    );
+
+    // One provenance transition, one audit event (§3.3).
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0].payload,
+        AuditPayload::Template {
+            change: TemplateChange::Adopted {
+                template_version: 1,
+                ..
+            },
+            ..
+        }
+    ));
+
+    // Emitted rows reconstruct byte for byte (§3.4 step 2).
+    let rows = records.drain();
+    assert_eq!(rows.len(), 2);
+    let template = crate::tree::parse_template("user <*> logged in");
+    for (row, original) in rows
+        .iter()
+        .zip(["user alice logged in", "user bob logged in"])
+    {
+        assert!((row.confidence - 1.0).abs() < f32::EPSILON);
+        assert!(!row.lossy_flag);
+        assert_eq!(
+            crate::reconstruct::reconstruct(row, &template),
+            original.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn rfc0050_3_mixed_stream_adopts_and_mines_side_by_side() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(adopt_config());
+
+    let adopted_id = cluster.ingest(&annotated_record(&t, "job 7 finished", "job <*> finished"));
+    let mined_id = cluster.ingest(&string_record(&t, "cache warmed successfully"));
+
+    assert_ne!(adopted_id, NO_TEMPLATE);
+    assert_ne!(mined_id, NO_TEMPLATE);
+    assert_ne!(adopted_id, mined_id);
+    // Both provenances visible in the registry surfaces.
+    assert_eq!(cluster.adopted_templates_for(&t).len(), 1);
+    let leaves = cluster.templates_for(&t);
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(leaves[0].template_id, mined_id);
+    assert_eq!(
+        leaves[0].provenance,
+        ProvenanceSet::singleton(Provenance::Mined)
+    );
+    assert_eq!(cluster.template_count(&t), 2);
+}
+
+#[test]
+fn rfc0050_4_grammar_and_alignment_gate_adoption() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(adopt_config());
+
+    // Foreign placeholder syntaxes and misaligned claims are
+    // never adopted — the record is mined as if unannotated.
+    for (body, template) in [
+        ("User alice logged in", "User %s logged in"),
+        ("count {} reached", "count {} reached"),
+        ("path $HOME missing", "path $HOME missing"),
+        ("user alice logged out", "user <*> logged in"),
+        ("a b c", "a <*>"),
+    ] {
+        let id = cluster.ingest(&annotated_record(&t, body, template));
+        assert_ne!(id, NO_TEMPLATE, "{template:?} must fall back to mining");
+    }
+    assert!(
+        cluster.adopted_templates_for(&t).is_empty(),
+        "no rejected claim may intern",
+    );
+    assert_eq!(
+        cluster.templates_for(&t).len(),
+        5,
+        "each body mined normally"
+    );
+}
+
+#[test]
+fn rfc0050_5_ceiling_stops_adoption_interning() {
+    let t = TenantId::new("tenant-x");
+    let config = adopt_config()
+        .with_max_templates(2)
+        .expect("non-zero ceiling");
+    let mut cluster = MinerCluster::new(config);
+
+    let a = cluster.ingest(&annotated_record(&t, "alpha one", "alpha <*>"));
+    let b = cluster.ingest(&annotated_record(&t, "beta two", "beta <*>"));
+    assert_ne!(a, NO_TEMPLATE);
+    assert_ne!(b, NO_TEMPLATE);
+
+    // Third distinct shape: adoption refuses at the ceiling and
+    // the documented fallback (mining) also diverts — the
+    // record lands body-retained with NO_TEMPLATE.
+    let c = cluster.ingest(&annotated_record(&t, "gamma three", "gamma <*>"));
+    assert_eq!(c, NO_TEMPLATE);
+    assert_eq!(cluster.adopted_templates_for(&t).len(), 2);
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.parse_failures_total(), 1);
+}
+
+#[test]
+fn rfc0050_5_byte_limit_rejects_before_parsing() {
+    let t = TenantId::new("tenant-x");
+    let config = adopt_config().with_upstream_template_byte_limit(8);
+    let mut cluster = MinerCluster::new(config);
+
+    let id = cluster.ingest(&annotated_record(
+        &t,
+        "user alice logged in",
+        "user <*> logged in",
+    ));
+    assert_ne!(id, NO_TEMPLATE);
+    assert!(
+        cluster.adopted_templates_for(&t).is_empty(),
+        "over-cap value never interns"
+    );
+    assert_eq!(
+        cluster.templates_for(&t).len(),
+        1,
+        "the record mined instead"
+    );
+}
+
+#[test]
+fn rfc0050_6_mined_first_adopted_second_converges() {
+    let t = TenantId::new("tenant-x");
+    let audit = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()));
+
+    // Mining first: masking makes 42 a wildcard, so the mined
+    // canonical is exactly the upstream shape.
+    let mined_id = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let adopted_id = cluster.ingest(&annotated_record(
+        &t,
+        "user 43 logged in",
+        "user <*> logged in",
+    ));
+
+    assert_eq!(mined_id, adopted_id, "one template_id (RFC0050.6)");
+    let leaves = cluster.templates_for(&t);
+    assert_eq!(leaves.len(), 1);
+    assert!(leaves[0].provenance.contains(Provenance::Mined));
+    assert!(leaves[0].provenance.contains(Provenance::UpstreamDerived));
+    // The map entry rides the leaf — nothing owned, count unchanged.
+    let adopted = cluster.adopted_templates_for(&t);
+    assert_eq!(adopted.len(), 1);
+    assert!(!adopted[0].owned);
+    assert_eq!(cluster.template_count(&t), 1);
+    // Created (mined) + Adopted (first adoption) — exactly two.
+    let kinds: Vec<String> = audit
+        .drain()
+        .iter()
+        .map(|e| e.payload.event_type().to_string())
+        .collect();
+    assert_eq!(kinds, vec!["template_created", "template_adopted"]);
+}
+
+#[test]
+fn readoption_after_widening_emits_no_second_audit() {
+    // §3.3 "once per provenance transition": a leaf adopted at
+    // one canonical, widened to a new canonical, then adopted
+    // again under the new shape already carries
+    // `upstream_derived` — the second adoption is a cache fill,
+    // not a transition, and must not add audit noise.
+    let t = TenantId::new("tenant-x");
+    let audit = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()));
+
+    let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+    let first = cluster.ingest(&annotated_record(
+        &t,
+        "user 43 logged in",
+        "user <*> logged in",
+    ));
+    // Widen position 3: "in" vs "out" under a clean-zone match.
+    let _ = cluster.ingest(&string_record(&t, "user 44 logged out"));
+    let second = cluster.ingest(&annotated_record(
+        &t,
+        "user 45 logged off",
+        "user <*> logged <*>",
+    ));
+    assert_eq!(first, second, "both adoptions ride the one widened leaf");
+
+    let kinds: Vec<String> = audit
+        .drain()
+        .iter()
+        .map(|e| e.payload.event_type().to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["template_created", "template_adopted", "template_widened"],
+        "exactly one template_adopted — the re-adoption is silent",
+    );
+}
+
+#[test]
+fn rfc0050_6_adopted_first_mined_second_converges() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(adopt_config());
+
+    let adopted_id = cluster.ingest(&annotated_record(
+        &t,
+        "user 43 logged in",
+        "user <*> logged in",
+    ));
+    let mined_id = cluster.ingest(&string_record(&t, "user 42 logged in"));
+
+    assert_eq!(adopted_id, mined_id, "one template_id (RFC0050.6)");
+    let leaves = cluster.templates_for(&t);
+    assert_eq!(leaves.len(), 1, "the mined leaf took over the identity");
+    assert!(leaves[0].provenance.contains(Provenance::Mined));
+    assert!(leaves[0].provenance.contains(Provenance::UpstreamDerived));
+    let adopted = cluster.adopted_templates_for(&t);
+    assert_eq!(adopted.len(), 1);
+    assert!(!adopted[0].owned, "the entry flipped to tree-backed");
+    assert_eq!(cluster.template_count(&t), 1, "the identity counted once");
+}
+
+#[test]
+fn rfc0050_6_alias_binds_a_mined_template_to_an_adopted_one() {
+    use std::time::SystemTime;
+
+    use ourios_core::alias::{ActorId, AliasMap, Operator};
+
+    let t = TenantId::new("tenant-x");
+    let audit = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(adopt_config(), Box::new(audit.clone()));
+
+    let adopted_id = cluster.ingest(&annotated_record(&t, "job 7 finished", "job <*> finished"));
+    let mined_id = cluster.ingest(&string_record(&t, "task 9 done"));
+    assert_ne!(adopted_id, mined_id);
+
+    // The RFC 0007 alias surface takes both ids like any pair —
+    // adoption-interned ids live in the same id space as tree
+    // leaves, so an operator can bind across provenance.
+    let mut aliases = AliasMap::new();
+    let mut sink = audit.clone();
+    aliases
+        .assert(
+            &mut sink,
+            &t,
+            mined_id,
+            vec![adopted_id],
+            Operator {
+                actor: ActorId::new("ops@example.com").expect("actor"),
+                reason: "same job-completion shape".to_string(),
+                timestamp: SystemTime::UNIX_EPOCH,
+            },
+        )
+        .expect("alias binds a mined id to an adopted id");
+    let class = aliases.resolves(&t, adopted_id);
+    assert!(class.contains(&mined_id) && class.contains(&adopted_id));
+}
+
+#[test]
+fn rfc0050_9_observe_associates_without_touching_the_clustering() {
+    let t = TenantId::new("tenant-x");
+    let bodies = ["user 1 logged in", "user 2 logged in", "user 3 logged in"];
+    let observe_config = MinerConfig::default()
+        .with_upstream_templates(UpstreamTemplates::Observe)
+        .with_upstream_association_limit(1);
+
+    let mut ignored = MinerCluster::new(MinerConfig::default());
+    let mut observing = MinerCluster::new(observe_config);
+    for (i, body) in bodies.iter().enumerate() {
+        let _ = ignored.ingest(&string_record(&t, body));
+        // Two distinct upstream spellings map onto the one
+        // mined template — the coarser/finer disagreement made
+        // visible (§3.2), with the second one overflowing the
+        // bound of 1.
+        let template = if i == 0 {
+            "user <*> logged in"
+        } else {
+            "user <id> logged in"
+        };
+        let _ = observing.ingest(&annotated_record(&t, body, template));
+    }
+
+    // The clustering is untouched: identical templates and ids.
+    let base: Vec<(String, u64)> = ignored
+        .templates_for(&t)
+        .iter()
+        .map(|l| (format_template(&l.template), l.template_id))
+        .collect();
+    let observed: Vec<(String, u64)> = observing
+        .templates_for(&t)
+        .iter()
+        .map(|l| (format_template(&l.template), l.template_id))
+        .collect();
+    assert_eq!(base, observed);
+
+    // The mined entry carries the association, bounded, with
+    // the overflow counted (bound 1: the second distinct
+    // spelling overflows on both its observations).
+    let leaves = observing.templates_for(&t);
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(
+        leaves[0].upstream_associations,
+        vec!["user <*> logged in".to_string()]
+    );
+    assert_eq!(leaves[0].upstream_association_overflow, 2);
+    assert!(
+        observing.adopted_templates_for(&t).is_empty(),
+        "observe never interns"
+    );
+}
+
+#[test]
+fn rfc0050_adopted_state_round_trips_through_snapshot() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(adopt_config());
+    let id = cluster.ingest(&annotated_record(&t, "job 7 finished", "job <*> finished"));
+    let snapshot = cluster.snapshot_state(&t);
+
+    let mut restored = MinerCluster::new(adopt_config());
+    restored.restore_tenant(&t, &snapshot).expect("restores");
+    assert_eq!(
+        restored.adopted_templates_for(&t),
+        cluster.adopted_templates_for(&t)
+    );
+
+    // The restored cache resolves a new record of the same
+    // shape to the same id without re-interning.
+    let again = restored.ingest(&annotated_record(&t, "job 9 finished", "job <*> finished"));
+    assert_eq!(again, id);
+    assert_eq!(restored.template_count(&t), 1);
+}
+
+#[test]
+fn restore_rejects_dangling_tree_backed_adoption() {
+    let state = SnapshotState {
+        leaves: vec![],
+        structured_templates: vec![],
+        wal_high_water: None,
+        adopted_templates: vec![crate::snapshot::AdoptedTemplateRecord {
+            canonical: "job <*> done".to_string(),
+            severity_number: 0,
+            scope_name: None,
+            template_id: 5,
+            template_version: 1,
+            owned: false,
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+        }],
+    };
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let err = cluster
+        .restore_tenant(&TenantId::new("tenant-x"), &state)
+        .expect_err("a tree-backed entry with no leaf must be rejected");
+    assert!(matches!(err, RestoreError::Inconsistent { .. }));
+}
+
+#[test]
+fn restore_rejects_mismatched_tree_backed_adoption() {
+    // The leaf exists but its current-version tokens disagree
+    // with the recorded canonical.
+    let state = SnapshotState {
+        leaves: vec![LeafRecord {
+            template: vec![
+                TokenRecord::Fixed("disk".to_string()),
+                TokenRecord::Fixed("full".to_string()),
+            ],
+            template_id: 5,
+            template_version: 1,
+            severity_number: 0,
+            scope_name: None,
+            slot_types: vec![],
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+        }],
+        structured_templates: vec![],
+        wal_high_water: None,
+        adopted_templates: vec![crate::snapshot::AdoptedTemplateRecord {
+            canonical: "job <*> done".to_string(),
+            severity_number: 0,
+            scope_name: None,
+            template_id: 5,
+            template_version: 1,
+            owned: false,
+            provenance: vec![],
+            upstream_associations: vec![],
+            upstream_association_overflow: 0,
+        }],
+    };
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let err = cluster
+        .restore_tenant(&TenantId::new("tenant-x"), &state)
+        .expect_err("a canonical that disagrees with the leaf tokens must be rejected");
+    assert!(matches!(err, RestoreError::Inconsistent { .. }));
+}

@@ -1,23 +1,28 @@
-//! `ourios-wal` — RFC 0008 write-ahead log.
+//! `ourios-wal` — the write-ahead log (RFC 0008) and its reclamation and
+//! quiesce recovery (RFC 0052).
 //!
-//! **Status: RFC 0008 `accepted`.** All §5 acceptance arms (.1–.10) are
-//! green with no `#[ignore]`'d stubs remaining: `open`, `append` (with
-//! §6.5 rotation), `sync`, `replay`, `checkpoint`, `housekeeping`, and
-//! `metrics` back wal-before-ack, crash recovery (the real-SIGKILL CI
-//! gate), recovery O(N), torn-write heal, corruption halt, segment
-//! rotation, checkpoint + durable sidecar, batched-fsync group commit,
-//! the unflushed-bytes bound, and the startup recovery driver. The one
-//! deferral is the §9 corruption *audit event* (`encode_audit_event`
-//! stays `unimplemented!()` pending a system-scoped-audit design). See
-//! RFC 0008 for the design contract.
+//! **RFC 0008** is the durability contract. The public API follows its
+//! §6.1 verbatim — the same `(WalOffset, FrameKind, FrameSink, Wal)`
+//! surface the RFC pins — and `open`, `append`, `sync`, `replay`,
+//! `checkpoint`, `housekeeping` and `metrics` back wal-before-ack,
+//! crash recovery (the real-SIGKILL CI gate), recovery O(N), torn-write
+//! heal, corruption halt, segment rotation, checkpoint + durable sidecar,
+//! batched-fsync group commit, the unflushed-bytes bound, and the
+//! startup recovery driver. Segment file layout (`segment`), frame
+//! format (`frame`), fsync policy, recovery walk and the `CHECKPOINT`
+//! sidecar (`checkpoint`) follow §§6.2–6.7. The §9 corruption *audit
+//! event* is the open item: `encode_audit_event` stays `unimplemented!()`
+//! pending a system-scoped-audit design.
 //!
-//! The shape of the public API follows §6.1 verbatim — the
-//! same `(WalOffset, FrameKind, FrameSink, Wal)` surface the
-//! RFC pins. Implementation details (segment file layout,
-//! frame format, fsync policy, recovery walk, checkpoint
-//! sidecar) are spelled out in §§6.2–6.7; the durability
-//! (`sync`, §6.3) and crash-recovery (`replay`, §6.6) halves
-//! land here, with the remaining slices in follow-up PRs.
+//! **RFC 0052** covers giving disk back. `retain` derives which closed
+//! segments a pass may pop from the per-tenant snapshot horizons;
+//! `ledger` is the in-memory figure rebuilt from surviving segments;
+//! `pass` and `housekeeping` run the housekeeping pass in its ledger and
+//! file halves; `reclaim` / `reclaim_store` are the `RECLAIM` sidecar
+//! codec and file; `reconcile` is the open-time reconciliation of
+//! `CHECKPOINT`, `RECLAIM` and segment headers; and `rotation` runs
+//! segment rotation under a bounded retry budget, reporting whether the
+//! WAL is still retrying or has given up.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, ErrorKind};

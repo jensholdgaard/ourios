@@ -543,13 +543,18 @@ its own look.
 
 **Always on, not opt-in or separately sampled.** Under that scope the
 spans follow the trace's own sampling decision and have no switch of their
-own. The count is small and bounded by the query's shape. After #858, a
-windowed query's resolution makes one delimited listing per Hive level it
+own. Under `resolve files` the count is bounded by the query's window.
+After #858, a windowed query's resolution makes one delimited listing per Hive level it
 visits, one recursive listing per in-window partition it covers whole, and
 at most one manifest GET per in-window partition. Acquisition makes the
-RFC 0033 audit listing (one request per page of about 1000 keys) plus one
-artifact GET. That is the fan-out an operator needs to see in a #853-style
-incident. §3.4's lever, `OTEL_TRACES_SAMPLER`, is the one volume control, as
+RFC 0033 audit listing (one request per page of about 1000 keys, plus
+retries) and one artifact GET. That count is **not** bounded by the query:
+it grows with the tenant's audit history, because the audit listing is
+neither windowed nor capped (the open RFC 0033 fork on #853, left
+unbounded by RFC 0058 §3.4.3). The spans still record it, since that is
+exactly the fan-out an operator needs to see in a #853-style incident.
+The fix for its size is to bound the listing, not to hide it from the
+trace. §3.4's lever, `OTEL_TRACES_SAMPLER`, is the one volume control, as
 for every other span. A bespoke toggle would be the second configuration
 surface §3.4 rejects. **Capping how many requests a query may make is not
 a tracing concern.** It belongs to RFC 0058 (query resource limits); see
@@ -712,7 +717,9 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > `HttpConnector` seam (§3.7.3).
 >
 > **`CLIENT` spans opt-in, or on their own sampling ratio.** Rejected for the
-> reasons in §3.7.3. The count is bounded by the query's shape, the trace
+> reasons in §3.7.3. The count follows the query's work (bounded by the window
+> under `resolve files`, by audit history under `load template_map` until
+> RFC 0033 bounds that listing), the trace
 > sampler already governs volume, and a separate knob is the bespoke
 > surface §3.4 rejects.
 >

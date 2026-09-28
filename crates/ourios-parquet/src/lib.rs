@@ -11,8 +11,9 @@
 //!   appends rows in the §3.2 column order, and rotates row groups at
 //!   the §3.5 threshold.
 //! - **Reader** — [`Reader`] carries the §3.9 forward-/backward-compat
-//!   contract (unknown columns ignored, missing OPTIONAL columns surface
-//!   as `None`, row-vs-path validation).
+//!   contract (unknown columns ignored, missing OPTIONAL columns default
+//!   to `None` / empty `Vec` / sentinel per the column's declared type,
+//!   row-vs-path validation).
 //! - **Audit stream** — [`AuditWriter`] / [`AuditReader`] for the §3.7
 //!   parallel file series.
 //!

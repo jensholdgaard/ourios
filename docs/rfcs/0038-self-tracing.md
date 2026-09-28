@@ -360,7 +360,13 @@ flowchart TD
     T2 --> TG
 ```
 
-Children of `POST /v1/query`, in the order they start:
+A query run through MCP never passes through the HTTP handler. Its root is
+the `execute_tool query_logs` span (§3.5), which is itself the child of
+rmcp's `serve_inner`, and the same children below hang from that span
+instead. Wherever this section says `POST /v1/query` as a parent, read
+"the query's root span", which is one of those two.
+
+Children of the query's root span, in the order they start:
 
 - **`load template_map`** appears **at most once** per query. It opens
   around the one RFC 0033 acquisition (`template_map::load_or_derive`)
@@ -425,7 +431,7 @@ narrowed to the in-process steps above.
 | | `resolve files` | `load template_map` |
 |---|---|---|
 | Kind | `INTERNAL` | `INTERNAL` |
-| Parent | `POST /v1/query` | `POST /v1/query` |
+| Parent | the query's root: `POST /v1/query` (HTTP) or `execute_tool query_logs` (MCP) | same as `resolve files` |
 | Opens / ends | around `resolve_data_urls`, from before the first listing to the finished URLs | around `template_map::load_or_derive` |
 | Status | `Error` iff the phase returns an error (the query then fails with it); `Unset` otherwise | same |
 | Required attributes | `ourios.tenant`; `ourios.file_set.list_request_count`, `ourios.file_set.listed_objects`, `ourios.file_set.manifest_read_count`, `ourios.file_set.live_files` (§3.7.5) | `ourios.tenant`; `ourios.template_map.lookup.outcome` (`hit` / `miss` / `stale` / `torn` / `unknown_version`, the existing RFC 0033 §3.7 attribute and values) |
@@ -934,12 +940,18 @@ Mapped to `CLAUDE.md` §6.2:
       `server.address`. Confirm, or prefer leaving `rpc.system.name` unset
       off AWS. Leaving it unset is less honest about the protocol, and a
       backend would then group the same operation two ways.
-- [ ] **`rpc.method`'s exact value at the pinned upstream version.** The
-      RPC conventions have been reworked across recent releases (the
-      `rpc.system` → `rpc.system.name` move among them). Implementation
-      uses whatever form the pinned version defines (bare `GetObject` or
-      a qualified form), and RFC0038.11 is the arbiter. If the pinned
-      version predates `rpc.system.name`, the registry bump comes first.
+- [ ] **`rpc.method`'s exact value at the pinned upstream version.** In
+      semantic-conventions v1.42.0 (the version §3.6 pins),
+      `rpc.system.name`, `aws.request_id`, `aws.s3.bucket` and
+      `aws.s3.key` all exist in the registry, but two sources disagree
+      about `rpc.method`. The registry defines `rpc.method` as the
+      *fully-qualified* method name and deprecates `rpc.service` ("should
+      be included in `rpc.method`"). The AWS SDK page still gives the bare
+      operation (`GetItem`) and lists the deprecated `rpc.system` as
+      required. Two ways to settle it: the qualified `S3/GetObject`, which
+      follows the registry and gives no deprecation hit, or the bare
+      `GetObject`, which follows the page. RFC0038.11's live-check is the
+      arbiter either way. Recommend the qualified form.
 - [ ] **`CLIENT` spans under the compaction sweep.** Out of scope here
       (§3.7.3). A sweep over a large backlog (#807) could make thousands of
       requests. Revisit with a measurement, possibly with a per-sweep cap

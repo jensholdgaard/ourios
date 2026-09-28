@@ -280,7 +280,48 @@ never touches it.
 
 ## TLS
 
-The listeners speak plaintext today; terminate TLS in front (ingress,
-service mesh, or an L4 proxy) — bearer tokens over plaintext are not
-auth. Native listener TLS is tracked on the
-[auth epic](https://github.com/jensholdgaard/ourios/issues/331).
+A plaintext listener exposes bearer tokens in transit. Every listener can serve TLS
+natively, and mTLS when given a client CA
+([RFC 0030](../rfcs/0030-tls-mtls-listeners.md)); alternatively,
+terminate TLS in front (ingress, service mesh, or an L4 proxy). TLS is
+opt-in per listener and **file-only** — there are no `OURIOS_*` TLS
+variables:
+
+```yaml
+receiver:
+  grpc_tls:                     # OTLP/gRPC (:4317)
+    cert_file: /etc/ourios/tls/tls.crt
+    key_file: /etc/ourios/tls/tls.key
+    client_ca_file: /etc/ourios/tls/ca.crt   # optional: require client certs (mTLS)
+    min_version: "1.3"                       # optional: "1.2" (default) or "1.3"
+    reload_interval_secs: 60                 # optional: re-read the files on this cadence
+  http_tls:                     # OTLP/HTTP (:4318) — same keys
+    cert_file: /etc/ourios/tls/tls.crt
+    key_file: /etc/ourios/tls/tls.key
+querier:
+  http_tls:                     # query API and /mcp (:4319) — same keys
+    cert_file: /etc/ourios/tls/tls.crt
+    key_file: /etc/ourios/tls/tls.key
+```
+
+- `cert_file` and `key_file` are PEM paths and must be set together;
+  every other key requires them. The files are read and validated at
+  startup, so an unreadable or malformed PEM fails startup naming the
+  block and the path.
+- `client_ca_file` turns on mTLS: a handshake without a client
+  certificate that chains to this CA is refused before it reaches the
+  auth layer. mTLS admits the connection; it does not bind a tenant —
+  bearer auth still runs on every request.
+- `reload_interval_secs` (a positive integer; unset means never reload)
+  re-reads the files on that interval and swaps in changed material for
+  new handshakes, so rotating certificates (cert-manager,
+  `spiffe-helper`) need no restart. A reload that finds unreadable or
+  invalid files logs an error, counts
+  `ourios.receiver.tls.reload_failures`, and keeps serving the last good
+  certificate.
+
+With an `auth` section configured, any listener left without a `*_tls`
+block gets one startup warning naming it (bearer credentials over
+plaintext) — not an error, because TLS may terminate at a fronting
+proxy. The Helm chart cannot set these keys yet
+([#852](https://github.com/jensholdgaard/ourios/issues/852)).

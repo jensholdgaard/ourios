@@ -423,7 +423,7 @@ hostScanner:
   image:
     # -- source code: https://github.com/kubescape/host-scanner (public repo)
     repository: quay.io/kubescape/host-scanner
-    tag: v1.0.75
+    tag: v1.0.78
     pullPolicy: IfNotPresent
 
   nodeSelector:

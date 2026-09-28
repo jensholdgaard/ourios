@@ -18,12 +18,15 @@ superseded-by: —
 > window's partitions. This RFC is the defence in depth, so that the next
 > unbounded query is **rejected** instead of taking the process down. It
 > **amends** RFC 0016 §3.5 (error model) and §7 (the row cap becomes
-> configuration), RFC 0027's tool-error mapping, and RFC 0020 §3.4's file
-> schema, all additively. It also **narrows** two result contracts: the RFC
-> 0027 §3.2 `list_templates` and `template_drift` tools, whose RFC0027.4 and
-> RFC0027.5 scenarios return every row, and the RFC 0016 drift response. All
-> three may now be refused with `query_result_limit` when their rendered rows
-> exceed `max_result_bytes` (§3.4.3). It touches `CLAUDE.md` §3.6 (object storage is the
+> configuration), RFC 0027's tool-error mapping, and RFC 0020 §3.2 (the
+> env-only key set gains `OURIOS_QUERIER_LIMITS_*`) and §3.4 (the file
+> schema), all additively. It also **narrows** result contracts that today
+> return every row: the RFC 0027 §3.2 `list_templates` and `template_drift`
+> tools (RFC0027.4, RFC0027.5), the RFC 0016 drift response, and RFC 0010's
+> engine-level drift contract (RFC0010.1 returns exactly the affected rows).
+> Each may now be refused with `query_result_limit` when its rendered rows
+> exceed `max_result_bytes` (§3.4.3). RFC0010.5 (an empty result is not an
+> error) is unaffected, since a refusal is never an empty result. It touches `CLAUDE.md` §3.6 (object storage is the
 > source of truth, via the spill decision in §3.5), §3.7 (multi-tenancy: the
 > limits are per process, not per tenant, see §7), hazard #6 (no DataFusion
 > text in a rejection) and §6.3 (observability). It leaves RFC 0033's
@@ -131,7 +134,7 @@ pool size (§3.2) and builds one
 `Arc<dyn MemoryPool>`:
 
 ```rust
-TrackConsumersPool::new(GreedyMemoryPool::new(pool_bytes), NonZeroUsize::new(5).unwrap())
+TrackConsumersPool::new(GreedyMemoryPool::new(pool_bytes), NonZeroUsize::MIN.saturating_add(4))
 ```
 
 `Querier` holds it. Every query builds its `SessionContext` from a
@@ -144,7 +147,20 @@ figures, updated on the same calls: the bytes it holds now (decreased on
 still held) and the size of the request a refused `try_grow` asked for.
 A consumer dropped mid-query therefore leaves neither the shared pool nor the
 per-query count stale. When the query ends, every reservation has been
-dropped, and a debug assertion checks the per-query count is zero. The shared
+dropped, and a debug assertion checks the per-query count is zero.
+
+**Concurrency.** DataFusion calls `MemoryPool` methods concurrently from a
+query's partition tasks, so the wrapper's figures are synchronized. `held`
+is an `AtomicUsize`, changed with `fetch_add` on a successful `grow` or
+`try_grow` and `fetch_sub` on `shrink` and `unregister`, in the same call
+that forwards to the shared pool, after the shared pool accepts. At a
+refusal, the refused `try_grow` computes `needed = held.load() +
+additional`, where `additional` is that call's own argument. The two reads
+are not one atomic snapshot of the whole query, and they need not be: any
+concurrent growth of the same query can only raise `held`, and §3.6 already
+treats `needed` as a lower bound. The refusal records `needed` in the
+wrapper for the error to report, and a later refusal on the same query
+overwrites it with its own figure. The shared
 pool is the only place a limit is enforced. The wrapper adds no limit of its
 own. It exists so that a refusal can be classified (§3.6). `exec::session()` becomes
 `exec::session(&QueryRuntime)` and keeps its `collect_statistics = false`

@@ -423,7 +423,7 @@ hostScanner:
   image:
     # -- source code: https://github.com/kubescape/host-scanner (public repo)
     repository: quay.io/kubescape/host-scanner
-    tag: v1.0.75
+    tag: v1.0.78
     pullPolicy: IfNotPresent
 
   nodeSelector:
@@ -817,7 +817,7 @@ serviceDiscovery:
     name: url-discovery
     image:
       repository: quay.io/kubescape/http-request
-      tag: v0.2.12
+      tag: v0.2.23
       pullPolicy: IfNotPresent
 
     # Skip SSL certificate verification
@@ -950,7 +950,7 @@ kubescapeScheduler:
   image:
     # -- source code: https://github.com/kubescape/http-request (public repo)
     repository: quay.io/kubescape/http-request
-    tag: v0.2.12
+    tag: v0.2.23
     pullPolicy: IfNotPresent
 
   nodeSelector:
@@ -996,7 +996,7 @@ kubevulnScheduler:
   image:
     # source code - https://github.com/kubescape/http-request
     repository: quay.io/kubescape/http-request
-    tag: v0.2.12
+    tag: v0.2.23
     pullPolicy: IfNotPresent
 
   nodeSelector:
@@ -1044,7 +1044,7 @@ registryScanScheduler:
   image:
     # -- source code: https://github.com/kubescape/http-request (public repo)
     repository: quay.io/kubescape/http-request
-    tag: v0.2.12
+    tag: v0.2.23
     pullPolicy: IfNotPresent
 
   nodeSelector:

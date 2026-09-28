@@ -3456,10 +3456,13 @@ version = "0.10.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "bytes",
  "chrono",
  "datafusion",
+ "futures",
  "jsonschema",
+ "object_store",
  "opentelemetry",
  "opentelemetry_sdk",
  "ourios-config",

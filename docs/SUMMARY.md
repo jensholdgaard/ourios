@@ -85,6 +85,7 @@
 - [RFC 0055 — Publication frontiers and tenant settlement](./rfcs/0055-publication-frontiers.md)
 - [RFC 0056 — Audit-sink durability on permanent write failure](./rfcs/0056-audit-durability.md)
 - [RFC 0057 — meta: move CLAUDE.md to AGENTS.md](./rfcs/0057-agents-md.md)
+- [RFC 0058 — Query resource limits](./rfcs/0058-query-resource-limits.md)
 
 # Talks
 

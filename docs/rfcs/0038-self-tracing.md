@@ -371,10 +371,14 @@ Children of `POST /v1/query`, in the order they start:
   querier reuses a compile-time acquisition at render time, so no query
   opens both. A query that needs no map (a zero-row query with neither
   predicate, like #853's) opens none.
-- **`resolve files`** appears **exactly once** per query that reaches the
-  scan. It opens around `Querier::resolve_data_urls`: the window-scoped
-  listing and the per-partition manifest reads, through to the finished
-  table URLs.
+- **`resolve files`** appears **exactly once** per query that invokes
+  file-set resolution, which is every query that compiles. It opens around
+  `Querier::resolve_data_urls`: the window-scoped listing and the
+  per-partition manifest reads, through to the finished table URLs. When
+  resolution finds no live file, the query returns without a scan and
+  without operator spans. The span is still emitted, with
+  `ourios.file_set.live_files = 0`, since the listing and manifest work it
+  covers still ran.
 - **The RFC 0040 operator spans** are unchanged: one tree per executed
   physical plan.
 - On the **S3 backend**, `resolve files` and `load template_map` each
@@ -424,7 +428,7 @@ narrowed to the in-process steps above.
 | Parent | `POST /v1/query` | `POST /v1/query` |
 | Opens / ends | around `resolve_data_urls`, from before the first listing to the finished URLs | around `template_map::load_or_derive` |
 | Status | `Error` iff the phase returns an error (the query then fails with it); `Unset` otherwise | same |
-| Required attributes | `ourios.tenant`; `ourios.file_set.list_request_count`, `ourios.file_set.listed_objects`, `ourios.file_set.manifest_read_count`, `ourios.file_set.live_files` (§3.7.5) | `ourios.tenant`; `ourios.template_map.lookup.outcome` (`hit` / `miss` / `stale`, the existing RFC 0033 attribute) |
+| Required attributes | `ourios.tenant`; `ourios.file_set.list_request_count`, `ourios.file_set.listed_objects`, `ourios.file_set.manifest_read_count`, `ourios.file_set.live_files` (§3.7.5) | `ourios.tenant`; `ourios.template_map.lookup.outcome` (`hit` / `miss` / `stale` / `torn` / `unknown_version`, the existing RFC 0033 §3.7 attribute and values) |
 
 The four `ourios.file_set.*` counts are set when the phase ends, and are
 set on both backends. `list_request_count` counts **store listing calls**
@@ -549,9 +553,10 @@ low-cardinality.
 
 1. **Blocking pool.** `resolve files` and `load template_map` are opened
    on the calling async task, and each is closed when its phase's future
-   completes. The blocking closure re-enters the span (as
-   `spawn_blocking_io` does today) **and attaches its OTel `Context`**,
-   carrying the query-phase marker, for the duration of the closure.
+   completes. The blocking closure **must** re-enter the span, which
+   `spawn_blocking_io` already does, **and must attach the span's OTel
+   `Context`** carrying the query-phase marker for the duration of the
+   closure. Attaching the `Context` is new.
 2. **Store bridge.** `block_on_off_runtime` captures
    `opentelemetry::Context::current()` on the calling thread and runs the
    spawned future under it (`FutureExt::with_context`), so the
@@ -587,8 +592,6 @@ that repo, a `semconv/REGISTRY_REF` bump here, and regenerated
 | `ourios.file_set.listed_objects` | int | `{object}` | Objects returned across those listing calls, before window and manifest filtering. |
 | `ourios.file_set.manifest_read_count` | int | `{request}` | Manifest reads made by one file-set resolution. |
 | `ourios.file_set.live_files` | int | `{file}` | Live data files the resolution hands to the scan. |
-| span `resolve files` | `INTERNAL` | — | File-set resolution for one query (§3.7.2), referencing the attributes above. |
-| span `load template_map` | `INTERNAL` | — | One RFC 0033 template-map acquisition (§3.7.2). |
 
 They follow the upstream naming rules
 ([attribute naming](https://opentelemetry.io/docs/specs/semconv/general/naming/)):
@@ -597,8 +600,10 @@ project namespace `ourios.` first. `ourios.file_set` is a namespace and
 never an attribute itself. Counts use the upstream `_count` suffix pattern
 (`http.request.resend_count`, `messaging.batch.message_count`), and
 returned quantities mirror `db.response.returned_rows`. All are
-`stability: development`. The `CLIENT` spans reference the upstream S3 /
-AWS-SDK attribute groups and define no span group of their own.
+`stability: development`. Only attributes go to the registry. The span
+names `resolve files` and `load template_map` are fixed in this RFC, as
+§3.5 fixes every other Ourios span name, and `ourios-semconv` generates
+no span constants. The `CLIENT` spans use upstream attributes only.
 
 **Pinning the `Development` upstream conventions.** `semconv/REGISTRY_REF`
 pins a tag of the ourios-semconv registry. That registry's manifest pins
@@ -710,8 +715,8 @@ Collector expects, and Ourios's whole posture is OTel-native.
 
 > **Amendment 2026-09-28 — RFC0038.1's query arm (§3.7).** For the logs
 > query, "one server span" is replaced by the §3.7.1 tree. The server span
-> is the root. A query that reaches the scan has **exactly one** `resolve
-> files` child, **at most one**
+> is the root. A query that compiles has **exactly one** `resolve files`
+> child (also when it finds no live file and so runs no scan), **at most one**
 > `load template_map` child (exactly one iff the query acquires the RFC
 > 0033 map), and the RFC 0040 operator spans. On the S3 backend, each phase
 > span also parents one `CLIENT` span per object-store HTTP request it
@@ -793,11 +798,15 @@ are `drafted`.
 > job's RFC 0019 tests use), and a tenant with data files in hour
 > partitions both inside and outside a query window, with manifests and
 > audit files present,
-> **When** a windowed query that matches no rows runs, and then a windowed
-> query that returns rows and so acquires the template map,
+> **When** a windowed query that matches no rows and whose predicate uses
+> neither `body ==` / `!=` nor `resolves_to` runs, then a windowed query
+> that returns rows and so acquires the template map, and then a windowed
+> query for a tenant with no live file in the window,
 > **Then** each trace's root is `POST /v1/query`, with exactly one
 > `resolve files` child. The zero-row trace has **no** `load template_map`
-> span, and the row-returning trace has exactly one. The phase spans carry
+> span, and the row-returning trace has exactly one. The no-file trace has
+> a `resolve files` span with `ourios.file_set.live_files = 0` and no
+> operator span. The phase spans carry
 > `ourios.tenant` and the §3.7.2 attributes. `ourios.file_set.listed_objects`
 > and `ourios.file_set.live_files` equal the counts the fixture implies.
 > `load template_map` carries `ourios.template_map.lookup.outcome`,
@@ -1011,8 +1020,8 @@ scope, not ingest) already covers it.
   Adds §3.7: `resolve files` and `load template_map` as `INTERNAL` children
   of `POST /v1/query`, and per-request `S3.{Operation}` `CLIENT` spans
   under them on the S3 backend, scoped to query phases and to sampled
-  traces. Four new `ourios.file_set.*` attributes and two span definitions
-  go to the ourios-semconv registry. In-place notes in §3.1, §3.3, §3.5,
+  traces. Four new `ourios.file_set.*` attributes go to the ourios-semconv
+  registry; the span names are fixed in the RFC. In-place notes in §3.1, §3.3, §3.5,
   §4, §5 (RFC0038.1's query arm) and §6. New scenarios RFC0038.8–.11 and
   new open questions in §7. Motivated by #853, and by #858's removal of the
   spans RFC0038.1 then forbade. The seven original criteria stay `green`

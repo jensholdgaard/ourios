@@ -47,10 +47,12 @@ change.
 
 **DataFusion.** The Apache project providing the query engine
 Ourios uses. Ingests logical plans, optimises them, executes against
-*Parquet*. Ourios extends DataFusion with two custom logical nodes
-(`render`, `template_id.resolves_to`) but otherwise treats it as a
-black box. *DataFusion specifics never leak into the user-facing
-DSL* (H6).
+*Parquet*. Ourios registers no custom logical nodes or UDFs: the
+*DSL* compiles to stock DataFusion expressions — `resolves_to(<id>)`
+expands to a `template_id IN (…)` list over the alias set, and body
+rendering happens after execution from the read-time template
+registry (RFC 0017) — so DataFusion is treated as a black box.
+*DataFusion specifics never leak into the user-facing DSL* (H6).
 
 **Drain.** The 2017 paper (He, Zhu, Zheng, Lyu — ICWS 2017) that
 introduces a fixed-depth tree algorithm for online log parsing. The
@@ -130,7 +132,8 @@ Lives in the `ourios-miner` crate. Designed in RFC 0001.
 **Ourios-derived and tenant-local**, not an OTLP field and not
 portable. Two stores — or one store after an RFC 0023 eviction or a
 re-mint — can give the same log shape different ids, which is why
-drift is a first-class query (RFC 0010) and aliases exist (RFC 0007).
+drift is a first-class query (RFC 0010) and aliases exist (RFC 0001
+§6.7).
 It shares the Parquet record's flat namespace with genuine OTLP
 fields (`severity_number`, `trace_id`, `body`), so the name can read
 like a wire field; it is not one. The *portable* identity of a
@@ -216,9 +219,11 @@ templates online from raw logs. **(Ourios)** — every template is
 scoped per *tenant*; the same string in two tenants is two
 templates.
 
-**Template id.** The identifier of a *template* within a *tenant*.
-Either a hash of the canonical template string or a per-tenant
-monotonic integer (open question, RFC 0001 §6.1).
+**Template id.** See *`template_id`*: a `u64` the miner allocates
+from one cluster-wide counter in first-observation order, so it is
+monotonic within each *tenant* and never shared across tenants
+(RFC 0001 §6.1, "Template identity"). Not a hash of the template
+string — RFC 0001 rejects content hashing as a tenant-isolation leak.
 
 **Template tree.** The Drain parse tree, scoped per *tenant*. Its
 shape is `root → length group → token-prefix nodes (depth d) →

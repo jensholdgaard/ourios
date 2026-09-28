@@ -19,6 +19,16 @@ longer gates** — RFC 0011 (`accepted`) reclassified the
 compression-vs-zstd ratio as a recorded diagnostic (its failure is
 structural; see §2 / the §7 table).
 
+> **Current status (2026-09-27).** The 2026-06-14 summary above still
+> holds for the four thesis-gates, but predates two later programs.
+> **RFC 0031** (`accepted`) added comparative gates against Grafana
+> Loki, frozen in its §7: the first authoritative run passed all 11
+> frozen gate decisions (§9.24) and the post-RFC-0036 rerun showed no
+> regression (§9.26). **RFC 0034** (`accepted`) re-scoped D1 from a
+> per-core rate to a per-node capacity on baseline hardware (§5), which
+> the §9.23 asserting soak passes. §7 remains the thesis-gate summary;
+> §9 is the dated record, newest entry last.
+
 ## 0. How to read this document
 
 Every goal below carries two labels.

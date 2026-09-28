@@ -14,8 +14,7 @@
 
 # Architecture
 
-- [Overview]()
-- [OTLP log format vs. Ourios miner](./architecture/otlp-log-format.md)
+- [OTLP log format vs. Ourios miner (2026-05 finding, resolved)](./architecture/otlp-log-format.md)
 - [Hazards](./hazards.md)
 - [Verification](./verification.md)
 - [Glossary](./glossary.md)

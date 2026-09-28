@@ -10,15 +10,16 @@ Verify before you run anything.
 
 **Container image** — signed keyless with [cosign] (Sigstore; the signature is
 recorded in the Rekor transparency log, there is no long-lived key). The image
-tag drops the leading `v` (a `v0.1.0` tag publishes `:0.1.0`). The identity is
-pinned to the exact release tag being verified — substitute both occurrences of
-the version to verify a different release:
+tag drops the leading `v` (a `vX.Y.Z` release tag publishes `:X.Y.Z`). The
+identity is pinned to the exact release tag being verified — set `VERSION` to the
+release you are verifying:
 
 ```sh
+VERSION=X.Y.Z   # e.g. the latest release, without the leading v
 cosign verify \
-  --certificate-identity 'https://github.com/jensholdgaard/ourios/.github/workflows/image.yml@refs/tags/v0.1.0' \
+  --certificate-identity "https://github.com/jensholdgaard/ourios/.github/workflows/image.yml@refs/tags/v${VERSION}" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/jensholdgaard/ourios:0.1.0
+  "ghcr.io/jensholdgaard/ourios:${VERSION}"
 ```
 
 **Release artifacts** — release assets carry [SLSA build provenance]
@@ -27,7 +28,8 @@ and verify it with the GitHub CLI (the `--repo` bounds the accepted signer
 identity to this repo's release workflow):
 
 ```sh
-gh release download v0.1.0 --repo jensholdgaard/ourios \
+VERSION=X.Y.Z   # the release to verify, without the leading v
+gh release download "v${VERSION}" --repo jensholdgaard/ourios \
   --pattern 'ourios-server-x86_64-unknown-linux-gnu.tar.xz'
 gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \
   --repo jensholdgaard/ourios

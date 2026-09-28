@@ -10,7 +10,7 @@
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13499/badge)](https://www.bestpractices.dev/projects/13499)
 [![Release](https://img.shields.io/github/v/release/jensholdgaard/ourios?filter=v*)](https://github.com/jensholdgaard/ourios/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust: stable](https://img.shields.io/badge/rust-stable%20%C2%B7%20MSRV%201.88-orange.svg)](rust-toolchain.toml)
+[![Rust: stable](https://img.shields.io/badge/rust-stable%20%C2%B7%20MSRV%201.94-orange.svg)](rust-toolchain.toml)
 [![Docs: mdBook](https://img.shields.io/badge/docs-mdBook-brightgreen.svg)](https://jensholdgaard.github.io/ourios/)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https%3A%2F%2Fartifacthub.io%2Fbadge%2Frepository%2Fourios)](https://artifacthub.io/packages/search?repo=ourios)
 
@@ -46,9 +46,10 @@ modes of template mining rather than pretending they don't exist.
 > DataFusion queries out — is implemented and tested behind RFC
 > acceptance gates, and the performance thesis is measured (including
 > against Grafana Loki) in [`docs/benchmarks.md`](docs/benchmarks.md).
-> Signed pre-release binaries, container images, and a Helm chart exist
-> (`v0.2.x`), but interfaces and the on-disk schema can still move:
-> treat everything as pre-1.0.
+> Signed pre-release binaries, container images, and a Helm chart are
+> published with every [release](https://github.com/jensholdgaard/ourios/releases),
+> but interfaces and the on-disk schema can still move: treat everything
+> as pre-1.0.
 
 ---
 
@@ -110,8 +111,10 @@ under-counting) is evidence of fit, not a ranking.
   [`docs/benchmarks.md` §9.13](docs/benchmarks.md)). Flatness, not any
   single ratio, is the headline: cost tracks the *result*, not the
   corpus.
-- You want **one binary** on object storage: no index tier, no
-  distributor/ingester/querier fleet, no separate compactor service.
+- You want **one binary** on object storage: no index tier, and no
+  fleet of distinct services — the receiver, querier, and compactor are
+  roles of the same `ourios-server` binary, run together in one process
+  or (as the Helm chart does) as separately scaled workloads.
 
 **Choose something else when:**
 
@@ -194,8 +197,8 @@ stays on local disk by design.
 
 Everything below is built RFC-first: each RFC pins `Given / When / Then`
 acceptance scenarios, which land as failing (red-gate) tests before the
-code that turns them green. Statuses live in each RFC's frontmatter —
-33 RFCs and counting ([`docs/rfcs/`](docs/rfcs/README.md)).
+code that turns them green. Statuses live in each RFC's frontmatter
+([`docs/rfcs/`](docs/rfcs/README.md)).
 
 - **Ingest** — OTLP gRPC + HTTP receiver with the full
   compliance-scenario set ([RFC 0003](docs/rfcs/0003-otlp-receiver.md),
@@ -230,14 +233,22 @@ code that turns them green. Statuses live in each RFC's frontmatter —
   the `drift from <t1> to <t2>` audit query
   ([RFC 0010](docs/rfcs/0010-audit-stream-queries.md)); the HTTP query
   endpoint ([RFC 0016](docs/rfcs/0016-query-serving-endpoint.md)); a
-  cached template-map artifact is in flight
+  cached template-map artifact
   ([RFC 0033](docs/rfcs/0033-cached-template-map.md)).
 - **Security & tenancy** — enforced multi-tenant binding on every
   surface ([RFC 0026](docs/rfcs/0026-authentication-tenant-binding.md)),
-  static bearer tokens and OIDC
-  ([RFC 0029](docs/rfcs/0029-oidc-bearer-layer.md)), and TLS/mTLS with
-  hot certificate reload on the listeners
-  ([RFC 0030](docs/rfcs/0030-tls-mtls-listeners.md)).
+  with the tenant named out of band by the credential and request
+  header, never by the data
+  ([RFC 0046](docs/rfcs/0046-out-of-band-tenancy.md)); static bearer
+  tokens and OIDC
+  ([RFC 0029](docs/rfcs/0029-oidc-bearer-layer.md)); TLS/mTLS with hot
+  certificate reload on the listeners
+  ([RFC 0030](docs/rfcs/0030-tls-mtls-listeners.md)); an OpenFGA
+  (ReBAC) resolver that can bind tenants and scope visibility inside a
+  tenant ([RFC 0047](docs/rfcs/0047-rebac-resolver-and-graph-visibility.md));
+  and the `ourios-server graph {erase,erasures,backfill}` operator verbs
+  for erasure and graph backfill
+  ([RFC 0048](docs/rfcs/0048-graph-operational-surfaces.md)).
 - **Operations** — YAML config file with `${env:VAR}` substitution or
   pure `OURIOS_*` environment variables
   ([RFC 0020](docs/rfcs/0020-configuration-file.md)); signed releases
@@ -340,13 +351,14 @@ stand:
 
 ```text
 crates/      # Rust workspace: ourios-{core,config,miner,wal,parquet,
-             #   ingester,querier,server,telemetry,semconv,testgen,bench}
+             #   ingester,querier,server,serving,df-otel,telemetry,
+             #   semconv,testgen,bench}
 deploy/helm/ # the Helm chart
 docs/        # mdBook source: guides, architecture, hazards, RFCs,
              #   benchmarks, verification, roadmap, glossary, talks
 fuzz/        # cargo-fuzz harness (its own nightly-only workspace)
-semconv/     # OTel semantic-convention registry (weaver source of truth)
-templates/   # weaver codegen templates for crates/ourios-semconv
+semconv/     # REGISTRY_REF: the pinned ref of the external ourios-semconv
+             #   registry repo that crates/ourios-semconv is generated from
 testdata/    # anonymised seed corpora; the multi-GB bench corpora are
              #   captured by CI workflows and published as corpus/* tags
 ```
@@ -402,7 +414,7 @@ Apache License 2.0. See [`LICENSE`](LICENSE).
 
 - The Parquet project and the Apache Arrow ecosystem for making columnar
   storage a solved problem.
-- Pinjia He et al. for the original Drain paper (ICSE 2017) and IBM for
+- Pinjia He et al. for the original Drain paper (IEEE ICWS 2017) and IBM for
   Drain3.
 - The DataFusion and InfluxData teams for proving that a fast, vectorised,
   pluggable query engine can ship as an open-source library.

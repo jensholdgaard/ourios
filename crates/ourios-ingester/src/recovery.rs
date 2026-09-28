@@ -122,7 +122,8 @@ pub fn recover(
     miner: &mut MinerCluster,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
-    let artefacts = snapshot_store::load_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
+    let artefacts =
+        snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
     let mut tenants = Vec::with_capacity(artefacts.len());
     let mut horizons: HashMap<TenantId, WalOffset> = HashMap::new();
@@ -519,7 +520,9 @@ mod tests {
             state.stale_partials, 1,
             "and the partial list the sweep pops from, without a listing on the pass",
         );
-        wal.housekeeping(None).expect("housekeeping");
+        let cap = usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("cap fits");
+        wal.housekeeping_pass(&ourios_wal::SnapshotHorizons::NoConsumer, cap)
+            .expect("housekeeping");
         assert!(
             !partial.exists(),
             "so the very first pass sweeps the debris"

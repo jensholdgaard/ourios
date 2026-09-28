@@ -91,9 +91,8 @@ never swallow the role suffix, or all three roles collide on one SA. */ -}}
 {{- end }}
 
 {{/*
-The image reference (repository:tag). The tag defaults to `latest` (a
-publishable floating tag) rather than the chart appVersion — appVersion tracks
-the unreleased crate version (0.0.0), for which no image is ever pushed. Pin a
+The image reference (repository:tag). The tag defaults to `latest`, a floating
+tag that follows the newest release, rather than the chart appVersion. Pin a
 released tag via image.tag in production.
 */}}
 {{- define "ourios.image" -}}

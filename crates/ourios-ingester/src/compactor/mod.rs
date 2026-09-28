@@ -20,9 +20,9 @@ use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionPolicy, PartitionKey, PromotedAttributes, RowHooks,
-    Store, compact_partition_hooked, gc_orphans, hour_partitions, percent_decode_tenant,
-    percent_encode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionOutcome, CompactionPolicy, PartitionKey,
+    PromotedAttributes, RowHooks, Store, compact_partition_hooked, gc_orphans, hour_partitions,
+    percent_decode_tenant, percent_encode_tenant, plan_candidates,
 };
 
 #[cfg(feature = "openfga")]
@@ -309,7 +309,7 @@ pub fn run_sweep_hooked(
                     .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
                 drop: None,
             };
-            match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
+            match compact_candidate(store, &partition, promoted, &mut row_hooks) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
@@ -331,10 +331,10 @@ pub fn run_sweep_hooked(
                     }
                     report.gc_failures += outcome.gc_failures;
                 }
-                Err(e) => report.errors.push(format!(
-                    "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                    partition.year, partition.month, partition.day, partition.hour,
-                )),
+                Err(e) => e.record(
+                    &mut report,
+                    &format!("compact {tenant:?} {}", hour_label(&partition)),
+                ),
             }
         }
         report.per_tenant.push(TenantSweep {
@@ -715,6 +715,74 @@ async fn graph_phase(
 /// than truncating on a theoretically wider target).
 pub(crate) fn to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// A candidate rewrite that failed or did not commit, carrying the
+/// non-live files its cleanup could not remove so the sweep still counts
+/// them in [`SweepReport::gc_failures`].
+#[derive(Debug)]
+struct Uncommitted {
+    reason: String,
+    gc_failures: usize,
+}
+
+/// `partition`'s hour as `YYYY-MM-DDTHH`, for sweep error messages.
+fn hour_label(partition: &PartitionKey) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}",
+        partition.year, partition.month, partition.day, partition.hour
+    )
+}
+
+impl Uncommitted {
+    /// Record this as a sweep error under `context`, with its cleanup
+    /// failures.
+    fn record(self, report: &mut SweepReport, context: &str) {
+        report.gc_failures += self.gc_failures;
+        report.errors.push(format!("{context}: {}", self.reason));
+    }
+}
+
+/// [`compact_partition_hooked`], with an uncommitted rewrite turned into an
+/// error by [`check_committed`]. With one sweeper a lost swap is never a
+/// benign race: a store whose swaps always lose must not look like an idle
+/// sweep, and an erasure must not advance past rows it never rewrote.
+fn compact_candidate(
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+    hooks: &mut RowHooks<'_>,
+) -> Result<CompactionOutcome, Uncommitted> {
+    let erasing = hooks.drop.is_some();
+    let outcome =
+        compact_partition_hooked(store, partition, promoted, hooks).map_err(|e| Uncommitted {
+            reason: e.to_string(),
+            gc_failures: 0,
+        })?;
+    check_committed(outcome, erasing)
+}
+
+/// `outcome`, or the sweep error it must be rather than a no-op. A lost
+/// final swap always is. An erasure is too whenever it left live rows
+/// unrewritten, even after losing only the bootstrap, because its marker
+/// must not advance past rows still on disk. A consolidation that lost the
+/// bootstrap wrote nothing and left the partition to the winner.
+fn check_committed(
+    outcome: CompactionOutcome,
+    erasing: bool,
+) -> Result<CompactionOutcome, Uncommitted> {
+    let unrewritten = erasing && outcome.committed.is_none() && outcome.files_before > 0;
+    if !(outcome.commit_lost || unrewritten) {
+        return Ok(outcome);
+    }
+    Err(Uncommitted {
+        reason: format!(
+            "rewrite of {} live files not committed \
+             (manifest compare-and-swap lost); retried next sweep",
+            outcome.files_before
+        ),
+        gc_failures: outcome.gc_failures,
+    })
 }
 
 /// Build the RFC 0009 §3.6 audit event for a committed compaction

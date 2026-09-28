@@ -35,12 +35,15 @@
 //! is gated by the record sink's audit barrier (also under the miner lock), so
 //! every publication path is audit-ordered.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use ourios_core::audit::AuditEvent;
 use ourios_core::record::MinedRecord;
 use ourios_parquet::PartitionKey;
 
-use crate::audit_sink::SharedParquetAuditSink;
-use crate::record_sink::SharedParquetSink;
+use crate::audit_sink::{SharedParquetAuditSink, Ticket};
+use crate::cadence::Epoch;
+use crate::record_sink::{SharedParquetSink, TakenPartitions};
 
 /// An atomic snapshot of both sinks' buffers, taken under the miner lock and
 /// written off-lock by [`PublishCoordinator::write_ordered`].
@@ -53,8 +56,9 @@ use crate::record_sink::SharedParquetSink;
 #[derive(Debug)]
 pub struct Drained {
     audit: Vec<AuditEvent>,
-    records: Vec<(PartitionKey, Vec<MinedRecord>)>,
-    _guard: crate::record_sink::PublishGuard,
+    records: TakenPartitions,
+    guard: crate::record_sink::PublishGuard,
+    ticket: Ticket,
 }
 
 impl Drained {
@@ -63,6 +67,40 @@ impl Drained {
     pub fn is_empty(&self) -> bool {
         self.audit.is_empty() && self.records.is_empty()
     }
+
+    /// The cut epoch this publish was registered under (RFC 0052 §3.1).
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.guard.epoch()
+    }
+
+    /// The audit position the records depend on — carried by any
+    /// `ready` partition the drain took (§3.1).
+    #[must_use]
+    pub fn audit_watermark(&self) -> u64 {
+        self.records.audit_watermark()
+    }
+
+    /// The estimated bytes the snapshot holds — the barrier's
+    /// coalescing bound (§3.1).
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.records.estimated_bytes()
+    }
+
+    /// The record partitions, borrowed.
+    #[must_use]
+    pub fn partitions(&self) -> &[(PartitionKey, Vec<MinedRecord>)] {
+        self.records.partitions()
+    }
+}
+
+/// What a drain does about an earlier take whose events are not durable
+/// yet.
+#[derive(Clone, Copy)]
+enum Turn {
+    Wait,
+    Refuse,
 }
 
 /// Coordinates audit-ordered publication across the record + audit sinks
@@ -71,6 +109,17 @@ impl Drained {
 pub struct PublishCoordinator {
     record: SharedParquetSink,
     audit: SharedParquetAuditSink,
+    /// Orders every take out of the two buffers against every park, and
+    /// every audit-failure requeue, back into them (RFC 0052 §3.1). Both
+    /// run outside the ingest exclusion, so without it a drain could land
+    /// between their two requeues — splitting records from their audit
+    /// events — or, in the rotation hook, between the drain and the cut's
+    /// epoch, where the return would be dated at that cut and refuse
+    /// nothing.
+    ///
+    /// Taken after the ingest exclusion and the miner lock, before the
+    /// sinks' own locks, and never held while waiting on anything else.
+    handoff: Arc<Mutex<()>>,
     /// The RFC 0047 §3.3 graph emitter — fed with every published batch
     /// (the flush-cadence bridge), when the graph is configured.
     #[cfg(feature = "openfga")]
@@ -90,6 +139,7 @@ impl PublishCoordinator {
         Self {
             record,
             audit,
+            handoff: Arc::new(Mutex::new(())),
             #[cfg(feature = "openfga")]
             graph: None,
         }
@@ -122,13 +172,15 @@ impl PublishCoordinator {
     /// or sees them counted in flight — never neither.
     #[must_use]
     pub fn drain_aged(&self) -> Drained {
+        let _handoff = self.lock_handoff();
         let guard = self.record.begin_publish();
-        let audit = self.audit.take_buffer();
+        let (audit, ticket) = self.audit.take_ticketed();
         let records = self.record.drain_aged();
         Drained {
             audit,
             records,
-            _guard: guard,
+            guard,
+            ticket,
         }
     }
 
@@ -137,14 +189,71 @@ impl PublishCoordinator {
     /// [`Self::drain_aged`].
     #[must_use]
     pub fn drain_all(&self) -> Drained {
+        let _handoff = self.lock_handoff();
+        self.take_all()
+    }
+
+    /// [`Self::drain_all`], then `then` — with no park able to land
+    /// between the two. The rotation hook opens its cut's epoch in
+    /// `then`, so a park is dated either before the drain (the cut
+    /// carries its records) or after the epoch (its settlement refuses
+    /// the cut).
+    pub fn drain_all_then<R>(&self, then: impl FnOnce() -> R) -> (Drained, R) {
+        let _handoff = self.lock_handoff();
+        let drained = self.take_all();
+        (drained, then())
+    }
+
+    fn take_all(&self) -> Drained {
         let guard = self.record.begin_publish();
-        let audit = self.audit.take_buffer();
+        let (audit, ticket) = self.audit.take_ticketed();
         let records = self.record.drain_all();
         Drained {
             audit,
             records,
-            _guard: guard,
+            guard,
+            ticket,
         }
+    }
+
+    fn lock_handoff(&self) -> MutexGuard<'_, ()> {
+        self.handoff.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// RFC 0052 §3.1's **park**: put a drained snapshot back where the
+    /// next drain finds it — the records into the sink's buffers as
+    /// `ready`, keeping the `audit_watermark` that makes them
+    /// publishable, and the events ahead of whatever the audit sink
+    /// buffered meanwhile.
+    ///
+    /// A park is a settlement with a date on it, exactly like a requeue:
+    /// without that, parking would be the one way out of §3.1's
+    /// predicate — a pre-cut guard could park its partition after a cut
+    /// had already drained the buffers, settle successfully, and the
+    /// barrier would checkpoint over records that exist only in buffers
+    /// it no longer holds.
+    ///
+    /// Both requeues and the date are one step against every drain —
+    /// see `handoff`.
+    pub fn park(&self, drained: Drained) {
+        let _handoff = self.lock_handoff();
+        let watermark = drained.audit_watermark();
+        let Drained {
+            audit,
+            records,
+            guard,
+            ticket,
+        } = drained;
+        let registered = guard.epoch();
+        self.audit.requeue(audit);
+        self.record
+            .park_ready(records.into_partitions(), watermark, registered);
+        drop(ticket);
+        // Dropped last, and deliberately: a `quiesce_publishes` that saw
+        // the count reach zero before the records were back would see
+        // them in neither the buffers nor the store, and stamp across
+        // them.
+        drop(guard);
     }
 
     /// Write a `drained` snapshot to durability **off the lock**, audit-first:
@@ -155,7 +264,9 @@ impl PublishCoordinator {
     /// they are requeued, not published — and returns `false`. A permanent audit
     /// failure (malformed content dropped, [`crate::audit_sink`]) does not block:
     /// the records publish (degraded — those templates render retained/empty).
-    /// Returns whether everything was published (no transient retention on
+    /// Records whose events may sit in an earlier drain that is not durable
+    /// are requeued the same way, after this drain's own events are written
+    /// (see `audit_sink::Ledger`). Returns whether everything was published (no transient retention on
     /// either sink) — the caller's snapshot-gating signal (no-loss, §3.4).
     ///
     /// Consuming `drained` settles its in-flight publish guard on return
@@ -165,19 +276,72 @@ impl PublishCoordinator {
     /// `SharedParquetSink::quiesce_publishes`.
     #[must_use]
     pub fn write_ordered(&self, drained: Drained, trigger: &'static str) -> bool {
-        let audit_durable = self.audit.write_owned(drained.audit);
-        if !audit_durable {
+        self.write(drained, trigger, Turn::Refuse)
+    }
+
+    /// [`Self::write_ordered`] for the barrier's own drains: records behind
+    /// an earlier take whose events are still being written wait for that
+    /// write instead of requeueing. Only the barrier task may wait — see
+    /// `audit_sink::Ledger` for why nothing it waits on waits on it.
+    #[must_use]
+    pub fn write_ordered_in_turn(&self, drained: Drained, trigger: &'static str) -> bool {
+        self.write(drained, trigger, Turn::Wait)
+    }
+
+    fn write(&self, drained: Drained, trigger: &'static str, turn: Turn) -> bool {
+        let Drained {
+            audit,
+            records,
+            guard,
+            ticket,
+        } = drained;
+        let registered = guard.epoch();
+        // The guard settles when this returns, whichever arm took it.
+        let _guard = guard;
+        let retained = self.audit.write_retaining(audit);
+        let records = records.into_partitions();
+        if !retained.is_empty() {
             // The audit stream didn't fully reach durability (a transient store
             // error). Do NOT publish the records — their template events aren't
-            // durable yet. Requeue them for the next cadence (the WAL is the
-            // durability of record).
-            self.record.requeue(drained.records);
+            // durable yet. Requeue both for the next cadence (the WAL is the
+            // durability of record), as one step against every drain: see
+            // `handoff`. The ticket drops after the events are back, which
+            // holds every drain taken before the requeue: see `audit_sink::Ledger`.
+            let _handoff = self.lock_handoff();
+            self.audit.requeue(retained);
+            self.record.requeue(records, registered);
+            drop(ticket);
             return false;
         }
+        let cleared = match turn {
+            Turn::Wait => ticket.clear_in_turn(),
+            Turn::Refuse => ticket.clear(),
+        };
+        if !cleared {
+            tracing::debug!(
+                trigger,
+                "publish held: an earlier drain's template events are not durable yet, so the \
+                 records are requeued for the drain that carries both"
+            );
+            let _handoff = self.lock_handoff();
+            self.record.requeue(records, registered);
+            return false;
+        }
+        self.publish_and_feed(records, trigger, registered)
+    }
+
+    /// Publish `records` and, once they are durable, feed the RFC 0047
+    /// §3.3 graph from them.
+    fn publish_and_feed(
+        &self,
+        records: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        trigger: &'static str,
+        registered: Epoch,
+    ) -> bool {
         #[cfg(feature = "openfga")]
         let tuples = self.graph.as_ref().map(|emitter| {
             let mut tuples = std::collections::BTreeSet::new();
-            for (partition, records) in &drained.records {
+            for (partition, records) in &records {
                 tuples.extend(emitter.derive(&partition.tenant_id, records));
                 tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
                     &partition.tenant_id,
@@ -185,7 +349,7 @@ impl PublishCoordinator {
             }
             tuples
         });
-        let published = self.record.publish_owned(drained.records, trigger);
+        let published = self.record.publish_owned(records, trigger, registered);
         #[cfg(feature = "openfga")]
         if published
             && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)
@@ -399,5 +563,147 @@ mod tests {
             !data_files(&data_root).is_empty(),
             "the record partition is published once its audit event is durable",
         );
+    }
+
+    struct Stores {
+        _tmp: tempfile::TempDir,
+        data_root: std::path::PathBuf,
+        audit_root: std::path::PathBuf,
+        records: SharedParquetSink,
+        audit: SharedParquetAuditSink,
+        coord: PublishCoordinator,
+    }
+
+    impl Stores {
+        /// Both sinks as the server wires them: the record sink's inline
+        /// audit barrier is the audit sink's own.
+        fn new(target_bytes: usize) -> Self {
+            let tmp = tempfile::TempDir::new().expect("temp");
+            let data_root = tmp.path().join("data");
+            let audit_root = tmp.path().join("audit");
+            std::fs::create_dir_all(&data_root).expect("data root");
+            std::fs::create_dir_all(&audit_root).expect("audit root");
+            let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+                Store::local(&audit_root).expect("audit store"),
+                1024,
+            ));
+            let barrier_audit = audit.clone();
+            let records = SharedParquetSink::new(
+                ParquetRecordSink::new(
+                    Store::local(&data_root).expect("data store"),
+                    FlushConfig {
+                        target_bytes,
+                        ..never_age()
+                    },
+                )
+                .with_audit_barrier(Box::new(move || barrier_audit.barrier())),
+            );
+            let coord = PublishCoordinator::new(records.clone(), audit.clone());
+            Self {
+                _tmp: tmp,
+                data_root,
+                audit_root,
+                records,
+                audit,
+                coord,
+            }
+        }
+
+        /// A line that creates the template, then a drain; a second line
+        /// of the same template — no event of its own — then a second
+        /// drain. The second drain's record depends on the first's event.
+        fn two_drains(&self) -> (super::Drained, super::Drained) {
+            self.records.clone().emit(mined("checkout"));
+            self.audit.clone().emit(created_event("checkout"));
+            let first = self.coord.drain_aged();
+            self.records.clone().emit(mined("checkout"));
+            let second = self.coord.drain_aged();
+            (first, second)
+        }
+
+        fn break_audit_store(&self) {
+            std::fs::remove_dir_all(&self.audit_root).expect("remove audit dir");
+            std::fs::write(&self.audit_root, b"not a directory").expect("sabotage audit");
+        }
+
+        fn mend_audit_store(&self) {
+            std::fs::remove_file(&self.audit_root).expect("remove the sabotage");
+            std::fs::create_dir_all(&self.audit_root).expect("audit root");
+        }
+
+        /// `drained`'s audit write fails, so its events go back to the
+        /// buffer; the store is mended afterwards.
+        fn fail_audit_write(&self, drained: super::Drained) {
+            self.break_audit_store();
+            assert!(!self.coord.write_ordered(drained, "age"));
+            self.mend_audit_store();
+        }
+
+        /// `drained` is refused, and `buffered` records are held.
+        fn assert_refused(&self, drained: super::Drained, trigger: &'static str, buffered: usize) {
+            assert!(!self.coord.write_ordered(drained, trigger));
+            self.assert_held(buffered);
+        }
+
+        /// No record is in the store, and `buffered` are held for a
+        /// later drain.
+        fn assert_held(&self, buffered: usize) {
+            assert!(
+                data_files(&self.data_root).is_empty(),
+                "no record is published before its template event is durable",
+            );
+            assert_eq!(self.records.buffered_records(), buffered);
+        }
+
+        /// The next drain carries every held record with its event.
+        fn assert_next_drain_publishes_everything(&self) {
+            assert!(
+                self.coord.write_ordered(self.coord.drain_aged(), "age"),
+                "the next drain publishes",
+            );
+            assert_eq!(self.audit.buffered_events(), 0);
+            assert_eq!(self.records.buffered_records(), 0);
+        }
+    }
+
+    /// The age sweep and the barrier drain concurrently: a drain can hold
+    /// a template's created event, unwritten, while a later drain holds a
+    /// record of that template and nothing else.
+    #[test]
+    fn a_later_drain_does_not_publish_ahead_of_an_earlier_drains_unwritten_events() {
+        let stores = Stores::new(usize::MAX);
+        let (first, second) = stores.two_drains();
+        stores.assert_refused(second, "age", 1);
+
+        assert!(stores.coord.write_ordered(first, "barrier"));
+        stores.assert_next_drain_publishes_everything();
+    }
+
+    /// The earlier drain's audit write fails and its events go back to
+    /// the buffer — after the later drain was taken without them.
+    #[test]
+    fn a_later_drain_does_not_publish_over_an_earlier_drains_requeued_events() {
+        let stores = Stores::new(usize::MAX);
+        let (first, second) = stores.two_drains();
+        stores.fail_audit_write(first);
+
+        stores.assert_refused(second, "barrier", 2);
+        stores.assert_next_drain_publishes_everything();
+    }
+
+    /// The size trigger's inline publish runs beside the drains — on an
+    /// encode worker, off the miner lock — so its audit barrier must see
+    /// events a drain holds, not only the ones still buffered.
+    #[test]
+    fn an_inline_publish_does_not_run_ahead_of_events_a_drain_holds() {
+        let stores = Stores::new(1);
+        stores.audit.clone().emit(created_event("checkout"));
+        let held = stores.coord.drain_aged();
+
+        stores.records.clone().emit(mined("checkout"));
+        stores.assert_held(1);
+
+        assert!(stores.coord.write_ordered(held, "age"));
+        stores.assert_next_drain_publishes_everything();
     }
 }

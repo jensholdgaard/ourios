@@ -3,13 +3,15 @@
 Thanks for your interest! ourios is design-first and pre-release.
 
 ## Dev setup
-- Install Rust via the pinned `rust-toolchain.toml`.
+- Install Rust via `rust-toolchain.toml`, which selects the stable channel (the
+  MSRV is 1.94, set as `rust-version` in `Cargo.toml`).
 - Install [`just`](https://github.com/casey/just) and run `just --list` to see tasks.
 
 ## Before opening a PR
 - `cargo fmt --all`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-features`
+- `mdbook build` if you touched `docs/` (`just check` runs all four)
 - For significant changes, open an RFC under `docs/rfcs/` first (see `docs/rfcs/README.md`).
 
 ## Commits & merging
@@ -76,6 +78,8 @@ driver certifies origin.
 
 ## Conventions
 - Keep PRs small and focused.
-- Update `CHANGELOG.md` under `## [Unreleased]`.
+- Don't edit `CHANGELOG.md` in your PR. It is generated at release time: `just release`
+  runs git-cliff over the conventional commit messages on `main`, so your commit
+  message (or squashed PR title) is your changelog entry.
 
 See `CLAUDE.md` for architecture context and `CODE_OF_CONDUCT.md` for community expectations.

@@ -11,7 +11,9 @@ use super::*;
 /// Resolve the live data files a query must read under `dir` (a
 /// tenant's partition root), honouring the RFC 0009 §3.4
 /// per-partition manifest. Recursive because the data is nested
-/// `year=/month=/day=/hour=/`.
+/// `year=/month=/day=/hour=/`. With a window, the walk does not descend below
+/// a parsed Hive ancestor whose whole span misses it, the same rule the S3
+/// listing applies ([`visit`]), so both backends resolve the same set.
 ///
 /// For each partition directory: if it holds a `manifest.json`, the
 /// manifest is authoritative and contributes exactly the files it
@@ -34,8 +36,11 @@ pub(super) fn resolve_live_files(
         detail: format!("{op} {}: {e}", p.display()),
     };
     let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+    // `Some(level)` while the walk is still cutting through the window's Hive
+    // ancestors; `None` below a subtree the window covers whole (or cannot be
+    // parsed), where only the per-partition prune applies.
+    let mut stack = vec![(dir.to_path_buf(), window.map(|_| HiveLevel::Year))];
+    while let Some((d, level)) = stack.pop() {
         let entries = match std::fs::read_dir(&d) {
             Ok(entries) => entries,
             // The dir (or a subdir, lost to a concurrent housekeeping
@@ -75,7 +80,21 @@ pub(super) fn resolve_live_files(
                 None => files.append(&mut parquets),
             }
         }
-        stack.extend(subdirs);
+        for subdir in subdirs {
+            let (Some(level), Some(window)) = (level, window) else {
+                stack.push((subdir, None));
+                continue;
+            };
+            let segment = subdir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            match visit(level, segment, &subdir, window) {
+                Visit::Skip => {}
+                Visit::Descend(next) => stack.push((subdir, Some(next))),
+                Visit::List => stack.push((subdir, None)),
+            }
+        }
     }
     Ok(files)
 }
@@ -157,7 +176,8 @@ fn window_listing(
                 })?;
         keys.extend(listing.objects);
         for child in listing.common_prefixes {
-            match visit(level, &child, (start, end)) {
+            let segment = child.rsplit('/').next().unwrap_or(&child);
+            match visit(level, segment, &PathBuf::from(&child), (start, end)) {
                 Visit::Skip => {}
                 Visit::Descend(next) => pending.push((child, next)),
                 Visit::List => keys.extend(list_recursive(store, &child)?),
@@ -178,20 +198,26 @@ enum Visit {
     Descend(HiveLevel),
 }
 
-/// Decide how the walk treats `child`, a prefix listed under a directory at
-/// `level`: `hour=` leaves go through the same conservative prune as a full
-/// listing; a parsed ancestor is skipped when its span misses the window,
-/// descended into when the window cuts it, and listed whole when the window
-/// covers it; an unparseable one is listed whole.
-fn visit(level: HiveLevel, child: &str, (start, end): (u64, u64)) -> Visit {
+/// Decide how a window walk — the S3 listing or the local directory walk —
+/// treats `child` (last segment `segment`), found under a directory at `level`:
+/// `hour=` leaves go through the same conservative prune as a full listing; a
+/// parsed ancestor is skipped when its span misses the window, descended into
+/// when the window cuts it, and taken whole when the window covers it; an
+/// unparseable one is taken whole. Both backends share this so they resolve
+/// the same live set (RFC 0019 §3.3).
+fn visit(
+    level: HiveLevel,
+    segment: &str,
+    child: &std::path::Path,
+    (start, end): (u64, u64),
+) -> Visit {
     if matches!(level, HiveLevel::Hour) {
-        return if hour_partition_in_window(&PathBuf::from(child), start, end) {
+        return if hour_partition_in_window(child, start, end) {
             Visit::List
         } else {
             Visit::Skip
         };
     }
-    let segment = child.rsplit('/').next().unwrap_or(child);
     match child_span(level, segment) {
         Some((_, lo, hi)) if hi <= start || end <= lo => Visit::Skip,
         Some((next, lo, hi)) if lo < start || end < hi => Visit::Descend(next),
@@ -821,6 +847,45 @@ mod tests {
             }
             expected.retain(|k| !skipped.contains(k));
             assert_eq!(walked, expected, "case {name}");
+        }
+    }
+
+    /// RFC 0019 backend parity: over the same tree, the local walk and the S3
+    /// listing resolve the same live set for every window, including the stray
+    /// keys below an out-of-window Hive ancestor that neither lists.
+    #[test]
+    fn local_and_s3_resolution_agree_for_every_window() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let store = Store::local(tmp.path()).expect("local store");
+        seed_history(&store);
+        seed_irregular(&store);
+        for key in junk_below_parsed_ancestors() {
+            put(&store, &key);
+        }
+        let tenant_dir = tmp.path().join(TENANT_PREFIX);
+        let windows = [
+            Some((ns("2026-04-02T10:20"), ns("2026-04-02T10:30"))),
+            Some((ns("2026-04-02T11:00"), ns("2026-04-02T11:30"))),
+            Some((ns("2025-12-31T23:30"), ns("2026-01-01T00:30"))),
+            Some((ns("2024-02-15T07:00"), ns("2026-03-02T05:00"))),
+            Some((ns("2030-01-01T00:00"), ns("2030-01-02T00:00"))),
+            Some((0, u64::MAX)),
+            None,
+        ];
+        for window in windows {
+            let mut local: Vec<String> = resolve_live_files(&tenant_dir, window)
+                .expect("local resolve")
+                .into_iter()
+                .map(|path| {
+                    let relative = path.strip_prefix(tmp.path()).expect("under the root");
+                    relative.to_str().expect("utf-8 key").to_owned()
+                })
+                .collect();
+            local.sort_unstable();
+            let mut remote =
+                resolve_live_keys(&store, TENANT_PREFIX, window).expect("remote resolve");
+            remote.sort_unstable();
+            assert_eq!(local, remote, "window {window:?}");
         }
     }
 

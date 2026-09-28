@@ -481,16 +481,24 @@ which are at `Development` stability.
   `DeleteObject`. A request matching none of these is named `S3` alone
   (the service, per the general "most general low-cardinality string"
   rule) and still gets a span.
-- **Attributes.** `rpc.system.name = "aws-api"`; `rpc.method` (the
-  operation, as the pinned convention defines its value); `aws.s3.bucket`;
+- **Attributes.** The AWS SDK span definition as pinned (§3.7.5):
+  `rpc.system = "aws-api"` (`Required` there), `rpc.service = "S3"`, and
+  `rpc.method` = the bare operation (`GetObject`, `ListObjectsV2`), as that
+  definition gives it ("the name of the operation … as returned by the AWS
+  SDK", examples `GetItem`, `PutItem`); `aws.s3.bucket`;
   `aws.s3.key` on object operations (the full object key as sent, `Store`
   prefix included; never set on `ListObjectsV2`); `aws.request_id` from
   the `x-amz-request-id` response header when present; `cloud.region` when
   the store is configured with one; `server.address` / `server.port` from
   the endpoint. `url.full` is **not** recorded: the query string can carry
   continuation tokens, and the key already sits in `aws.s3.key`.
-  `rpc.system` is deprecated in favour of `rpc.system.name` and is not
-  emitted. Upstream names only; nothing here is Ourios-defined.
+  At v1.42.0 the registry deprecates `rpc.system` (renamed to
+  `rpc.system.name`) and `rpc.service` (folded into a fully-qualified
+  `rpc.method`), while the AWS SDK span definition still requires the old
+  shape, and `rpc.system.name` has no `aws-api` member yet. Upstream is
+  mid-migration. Ourios follows the span definition, not the half-migrated
+  registry (§3.7.5, §7). Upstream names only; nothing here is
+  Ourios-defined.
 - **Status.** Per [Recording errors](https://opentelemetry.io/docs/specs/semconv/general/recording-errors/):
   `Error` with `error.type` set to the HTTP status code (e.g. `"404"`,
   `"412"`) on any response `>= 400`, or to the transport error class on a
@@ -501,7 +509,9 @@ which are at `Development` stability.
 - **S3-compatible, non-AWS endpoints.** Ourios is S3-compatible, not
   AWS-specific (RFC 0019 §9). An S3-compatible endpoint implements the same
   S3 API operations over the same wire protocol, so the spans keep
-  `rpc.system.name = "aws-api"` and the `S3.{Operation}` names:
+  `rpc.system = "aws-api"` and the `S3.{Operation}` names. The convention
+  marks the value `Required` whatever the backend, because it names the
+  wire protocol, not the deployment:
   `aws-api` names the protocol spoken, not who runs the endpoint. The
   endpoint is identified by `server.address`. `cloud.provider` is never set,
   because Ourios cannot know it, and `cloud.region` only echoes
@@ -579,8 +589,8 @@ low-cardinality.
 
 #### 3.7.5 Names and the registry
 
-Upstream attributes are used where they exist: `rpc.system.name`,
-`rpc.method`, `aws.s3.bucket`, `aws.s3.key`, `aws.request_id`,
+Upstream attributes are used where they exist: `rpc.system`,
+`rpc.service`, `rpc.method`, `aws.s3.bucket`, `aws.s3.key`, `aws.request_id`,
 `cloud.region`, `server.address`, `server.port`, `error.type`. No upstream
 attribute counts listed objects or list requests.
 `db.response.returned_rows` counts rows a database operation returns, and
@@ -622,8 +632,14 @@ fails is a violation: an unknown or **deprecated** name. So the
 If an upstream bump renames one of these attributes, as it did
 `rpc.system` → `rpc.system.name`, the next ref bump makes live-check fail
 until the emitter follows. The bump and the code change then land
-together, deliberately. No exemption is added for these names, unlike
-the §3.6 genai relocation. If the pinned upstream version does not define
+together, deliberately. **One narrow exemption is needed.** At the pinned
+v1.42.0, the AWS SDK span definition (`span.aws.client`) itself requires
+`rpc.system` and uses `rpc.service`, both deprecated in the same release's
+registry. Live-check therefore exempts exactly those two names, on
+`CLIENT` spans named `S3.*` only, in the same shape as the §3.6 genai
+exemption. The exemption is removed by the ref bump that moves the AWS SDK
+definition to `rpc.system.name` and a fully-qualified `rpc.method`, and
+the emitter changes in that same bump. If the pinned upstream version does not define
 an attribute used here, that is a registry-bump prerequisite for
 implementation, not a reason to invent a local name.
 
@@ -818,7 +834,8 @@ are `drafted`.
 > `load template_map` carries `ourios.template_map.lookup.outcome`,
 > **And** every `CLIENT` span is a child of `resolve files` or `load
 > template_map`, has a §3.7.3 name (`S3.ListObjectsV2`, `S3.GetObject`,
-> …), `rpc.system.name = "aws-api"`, `rpc.method`, `aws.s3.bucket`,
+> …), `rpc.system = "aws-api"`, `rpc.service = "S3"`, `rpc.method` equal to
+> the bare operation, `aws.s3.bucket`,
 > `server.address`, and `aws.s3.key` exactly on the object operations. The
 > number of `S3.ListObjectsV2` spans under `resolve files` equals
 > `ourios.file_set.list_request_count` (the fixture stays under one page per
@@ -863,8 +880,12 @@ are `drafted`.
 > deterministic, unlike the best-effort MCP handshake,
 > **And** the report has no violation for any `ourios.file_set.*` name or
 > for the upstream `rpc.*` / `aws.*` / `cloud.region` / `server.*` /
-> `error.type` attributes. `stability: development` shows only as advice,
-> and the §3.6 genai exemption is not widened to cover any of these names.
+> `error.type` attributes, apart from the §3.7.5 exemption: the deprecated
+> `rpc.system` and `rpc.service` on `S3.*` `CLIENT` spans, which the pinned
+> `span.aws.client` definition requires. A deprecated-name finding for
+> those two names anywhere else, or for any other name, fails the job.
+> `stability: development` shows only as advice, and the §3.6 genai
+> exemption is not widened to cover any of these names.
 
 ## 6. Testing strategy
 
@@ -935,23 +956,28 @@ Mapped to `CLAUDE.md` §6.2:
 **Open questions added by the 2026-09-28 amendment (§3.7).**
 
 - [ ] **`aws-api` for S3-compatible endpoints.** §3.7.3 keeps
-      `rpc.system.name = "aws-api"` and `S3.{Operation}` for any endpoint
-      that speaks the S3 API, and identifies the endpoint by
-      `server.address`. Confirm, or prefer leaving `rpc.system.name` unset
-      off AWS. Leaving it unset is less honest about the protocol, and a
-      backend would then group the same operation two ways.
-- [ ] **`rpc.method`'s exact value at the pinned upstream version.** In
-      semantic-conventions v1.42.0 (the version §3.6 pins),
-      `rpc.system.name`, `aws.request_id`, `aws.s3.bucket` and
-      `aws.s3.key` all exist in the registry, but two sources disagree
-      about `rpc.method`. The registry defines `rpc.method` as the
-      *fully-qualified* method name and deprecates `rpc.service` ("should
-      be included in `rpc.method`"). The AWS SDK page still gives the bare
-      operation (`GetItem`) and lists the deprecated `rpc.system` as
-      required. Two ways to settle it: the qualified `S3/GetObject`, which
-      follows the registry and gives no deprecation hit, or the bare
-      `GetObject`, which follows the page. RFC0038.11's live-check is the
-      arbiter either way. Recommend the qualified form.
+      `rpc.system = "aws-api"` and `S3.{Operation}` for any endpoint that
+      speaks the S3 API, and identifies the endpoint by `server.address`.
+      This matches the convention: the value is `Required` and names the
+      wire protocol, and no alternative is defined for non-AWS endpoints.
+      Confirm.
+- [ ] **Which `rpc.*` shape to emit while upstream is mid-migration.** At
+      the pinned v1.42.0, the AWS SDK span definition requires the
+      deprecated `rpc.system = "aws-api"`, uses the deprecated
+      `rpc.service`, and gives `rpc.method` as the bare operation. The
+      registry has `rpc.system.name` (no `aws-api` member yet) and defines
+      `rpc.method` as fully qualified. Three options:
+      (a) **follow the span definition** (`rpc.system`, `rpc.service = S3`,
+      bare `rpc.method`) with §3.7.5's narrow live-check exemption;
+      (b) the migrated registry shape (`rpc.system.name = "aws-api"` as a
+      custom value, `rpc.method = "S3/GetObject"`), which no published AWS
+      convention yet describes;
+      (c) both, in the spirit of the RPC conventions'
+      `OTEL_SEMCONV_STABILITY_OPT_IN=rpc/dup` transition, although upstream
+      does not say whether that opt-in covers the AWS SDK conventions.
+      **Recommend (a):** it is what the pinned span convention specifies,
+      and the exemption and the emitter both change in the ref bump that
+      migrates it. Revisit at every semconv pin bump.
 - [ ] **`CLIENT` spans under the compaction sweep.** Out of scope here
       (§3.7.3). A sweep over a large backlog (#807) could make thousands of
       requests. Revisit with a measurement, possibly with a per-sweep cap
@@ -1019,8 +1045,8 @@ scope, not ingest) already covers it.
   names; kind, status, attributes and a companion duration metric);
   [object stores — S3](https://opentelemetry.io/docs/specs/semconv/object-stores/s3/)
   and [AWS SDK](https://opentelemetry.io/docs/specs/semconv/cloud-providers/aws-sdk/)
-  (`Development`; `CLIENT`, `Service.Operation`, `rpc.system.name =
-  aws-api`, `rpc.method`, `aws.s3.bucket`, `aws.s3.key`, `aws.request_id`,
+  (`Development`; `CLIENT`, `Service.Operation`, `rpc.system =
+  aws-api`, `rpc.service`, bare `rpc.method`, `aws.s3.bucket`, `aws.s3.key`, `aws.request_id`,
   `cloud.region`);
   [recording errors](https://opentelemetry.io/docs/specs/semconv/general/recording-errors/);
   [attribute naming](https://opentelemetry.io/docs/specs/semconv/general/naming/);

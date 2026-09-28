@@ -11,9 +11,11 @@ use super::*;
 /// Resolve the live data files a query must read under `dir` (a
 /// tenant's partition root), honouring the RFC 0009 §3.4
 /// per-partition manifest. Recursive because the data is nested
-/// `year=/month=/day=/hour=/`. With a window, the walk does not descend below
-/// a parsed Hive ancestor whose whole span misses it, the same rule the S3
-/// listing applies ([`visit`]), so both backends resolve the same set.
+/// `year=/month=/day=/hour=/`. With a window, nothing below a parsed
+/// `year=`/`month=`/`day=` ancestor whose whole span misses it is live, even a
+/// stray file whose own directory does not parse: the walk does not descend
+/// there. This is the contract [`resolve_live_keys`] follows too, through the
+/// shared [`visit`], so both backends resolve the same set (RFC 0019 §3.3).
 ///
 /// For each partition directory: if it holds a `manifest.json`, the
 /// manifest is authoritative and contributes exactly the files it
@@ -109,7 +111,11 @@ pub(super) fn resolve_live_files(
 /// comes back in lexicographic order. With no window the whole prefix is listed
 /// recursively. With a window, [`window_listing`] lists only the subtrees the
 /// window can reach, so the cost follows the window rather than the tenant's
-/// history (#853). The keys are then grouped by their partition directory
+/// history (#853). The contract, shared with [`resolve_live_files`] through
+/// [`visit`]: nothing below a parsed `year=`/`month=`/`day=` ancestor whose
+/// whole span misses the window is live, even a stray key whose own directory
+/// does not parse; anything else meets the per-partition rule below. The keys
+/// are then grouped by their partition directory
 /// (everything up to the last `/`); for each partition: skip it when an
 /// `hour=HH` window prune proves it out of range, then if it carries a
 /// `manifest.json` the manifest is authoritative (only its named files are

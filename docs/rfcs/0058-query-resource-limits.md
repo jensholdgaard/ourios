@@ -19,7 +19,11 @@ superseded-by: —
 > unbounded query is **rejected** instead of taking the process down. It
 > **amends** RFC 0016 §3.5 (error model) and §7 (the row cap becomes
 > configuration), RFC 0027's tool-error mapping, and RFC 0020 §3.4's file
-> schema, all additively. It touches `CLAUDE.md` §3.6 (object storage is the
+> schema, all additively. It also **narrows** two result contracts: the RFC
+> 0027 §3.2 `list_templates` and `template_drift` tools, whose RFC0027.4 and
+> RFC0027.5 scenarios return every row, and the RFC 0016 drift response. All
+> three may now be refused with `query_result_limit` when their rendered rows
+> exceed `max_result_bytes` (§3.4.3). It touches `CLAUDE.md` §3.6 (object storage is the
 > source of truth, via the spill decision in §3.5), §3.7 (multi-tenancy: the
 > limits are per process, not per tenant, see §7), hazard #6 (no DataFusion
 > text in a rejection) and §6.3 (observability). It leaves RFC 0033's
@@ -193,7 +197,10 @@ The pool size resolves in this order:
    win.
 2. Otherwise `share × effective_limit`, where `share` is
    `querier.limits.memory_pool_fraction` if set, else the default share
-   below.
+   below. The product is computed in integer arithmetic and **rounded
+   down**: the share is converted once to parts per million, and the pool is
+   `effective_limit × ppm / 1_000_000` in `u128`, so it never overflows and
+   never exceeds `share × effective_limit`.
 
 **`effective_limit`** is the smaller of the cgroup memory limit and physical
 RAM (`MemTotal` in `/proc/meminfo`). A cgroup limit above physical RAM is
@@ -279,7 +286,13 @@ point that does storage IO acquires a permit first: `run`,
   so concurrent arrivals cannot all pass a stale check. The slot is an RAII
   guard, decremented on drop, whether the wait ends in a permit, a timeout or
   cancellation, so a disconnect never leaks a slot. Tokio's semaphore is
-  FIFO-fair, so waiters are admitted in arrival order.
+  FIFO-fair among **registered** waiters, and a waiter registers when its
+  acquire future is first polled. Taking the slot and registering are not one
+  atomic step, so two arrivals within that scheduling gap may be admitted in
+  either order, and a permit released inside the gap can go to a later
+  `try_acquire`. The guarantee is FIFO among waiters already queued, not
+  strict arrival order. Strict order would need a mutex-held queue in front
+  of the semaphore, which is not worth its cost for a dashboard's panels.
 - **No free permit, no queue slot** → rejected at once with
   `QueryError::Overloaded { cause: QueueFull }`, without waiting.
 - **Waited `queue_timeout_ms`** (default **10 000**) without a permit →
@@ -753,6 +766,7 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 >   - v1, the unlimited sentinel → `MemTotal` × share
 >   - an explicit `memory_pool_bytes` → exactly that value, whatever the fixtures say
 >   - an explicit `memory_pool_fraction = 0.6` → 0.6 × the derived limit
+>   - `memory.max = 1000000007` at share 0.5 → 500000003, rounded down
 > - **And** a resolved size below 32 MiB, and a fraction outside `(0, 1]`,
 >   are startup configuration errors
 > - **And** startup logs the size, its source and the share
@@ -766,7 +780,8 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 >   rejected `503` `query_queue_timeout` after at least 200 ms
 > - **And** neither response carries `Retry-After`
 > - **And** with a long timeout instead, B and a later D queued behind it are
->   admitted in arrival order when A finishes
+>   admitted in the order they registered as waiters (D arriving only after
+>   B is observed waiting) when A finishes
 > - **And** a waiting query whose client disconnects leaves the queue, and
 >   A's permit is released when A's future is dropped mid-execution
 > - **And** the same gate applies to a `query_logs` MCP call, which is

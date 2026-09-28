@@ -961,7 +961,7 @@ Mapped to `CLAUDE.md` §6.2:
       This matches the convention: the value is `Required` and names the
       wire protocol, and no alternative is defined for non-AWS endpoints.
       Confirm.
-- [ ] **Which `rpc.*` shape to emit while upstream is mid-migration.** At
+- [x] **Which `rpc.*` shape to emit while upstream is mid-migration.** At
       the pinned v1.42.0, the AWS SDK span definition requires the
       deprecated `rpc.system = "aws-api"`, uses the deprecated
       `rpc.service`, and gives `rpc.method` as the bare operation. The
@@ -975,9 +975,10 @@ Mapped to `CLAUDE.md` §6.2:
       (c) both, in the spirit of the RPC conventions'
       `OTEL_SEMCONV_STABILITY_OPT_IN=rpc/dup` transition, although upstream
       does not say whether that opt-in covers the AWS SDK conventions.
-      **Recommend (a):** it is what the pinned span convention specifies,
-      and the exemption and the emitter both change in the ref bump that
-      migrates it. Revisit at every semconv pin bump.
+      **Decided (a)** by the maintainer on 2026-09-28: it is what the
+      pinned span convention specifies, and the exemption and the emitter
+      both change in the ref bump that migrates it. Revisit at every
+      semconv pin bump.
 - [ ] **`CLIENT` spans under the compaction sweep.** Out of scope here
       (§3.7.3). A sweep over a large backlog (#807) could make thousands of
       requests. Revisit with a measurement, possibly with a per-sweep cap

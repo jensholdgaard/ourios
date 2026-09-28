@@ -112,7 +112,7 @@ flowchart TD
     X --> L{listing and file caps}
     L -- over --> RL[reject: query_file_limit, 422]
     L -- within --> S[scan and operators reserve on the shared pool]
-    S -- refused --> M{own reservation at least the fair share?}
+    S -- refused --> M{held plus requested exceeds the whole pool?}
     M -- yes --> RM[reject: query_memory_limit, 422]
     M -- no --> RC[reject: query_memory_contended, 503]
     S -- ok --> C[materialize rows, reserving on the pool]
@@ -132,11 +132,17 @@ TrackConsumersPool::new(GreedyMemoryPool::new(pool_bytes), NonZeroUsize::new(5).
 
 `Querier` holds it. Every query builds its `SessionContext` from a
 `RuntimeEnv` whose memory pool is a thin per-query wrapper,
-`QueryMemoryPool`, that delegates every `register`, `grow`, `try_grow` and
-`shrink` to the shared pool and additionally counts the bytes this query
-holds. The shared pool is the only place a limit is enforced. The wrapper
-adds no limit of its own. It exists so that a refusal can say whose
-reservation it was (§3.6). `exec::session()` becomes
+`QueryMemoryPool`, that forwards **every** `MemoryPool` trait method to the
+shared pool: `register`, `unregister`, `grow`, `shrink`, `try_grow`,
+`reserved` and `memory_limit`. It additionally keeps this query's own
+figures, updated on the same calls: the bytes it holds now (decreased on
+`shrink` and on `unregister`, which releases whatever the dropped consumer
+still held) and the size of the request a refused `try_grow` asked for.
+A consumer dropped mid-query therefore leaves neither the shared pool nor the
+per-query count stale. When the query ends, every reservation has been
+dropped, and a debug assertion checks the per-query count is zero. The shared
+pool is the only place a limit is enforced. The wrapper adds no limit of its
+own. It exists so that a refusal can be classified (§3.6). `exec::session()` becomes
 `exec::session(&QueryRuntime)` and keeps its `collect_statistics = false`
 override and its test. The same seam serves `run_query_with`, `run` and
 `run_drift` (`drift.rs` calls `exec::session()` too). `collect_records`
@@ -237,7 +243,16 @@ configuration enables the receiver or compaction next to it:
 | querier with the receiver or compactor | **0.50** | 768 MiB |
 | querier only (the Helm chart's querier Deployment) | **0.75** | 1152 MiB |
 
-§7 keeps both shares open, with the reasoning.
+**What the share guarantees.** The pool bounds **tracked query memory**, not
+the process. The process stays under its limit only if the remainder (the
+limit minus the pool) holds everything else: the baseline, the untracked
+query costs §3.1 lists, and, on a shared process, the receiver and
+compactor. The receiver's sink ceiling (RFC 0014 §3.4) is a fixed 1 GiB
+today, not derived from this limit. So on a small shared node, 0.50 protects
+ingest only while the sinks run well below their ceiling, as they do at
+#853's ingest rate. It is not a guarantee. Deriving that ceiling from the same
+`MemorySource` would be an RFC 0014 amendment and is outside this RFC. §7
+keeps both shares open, with the reasoning.
 
 **Validation.** A resolved pool below **32 MiB** is a startup configuration
 error: it would reject nearly every non-trivial query, and a hard failure at
@@ -252,24 +267,35 @@ share, once.
 ### 3.3 Admission: the concurrency limit
 
 `Querier` holds a `tokio::sync::Semaphore` with `max_concurrent_queries`
-permits (default **4**) and a counter of waiters. Every `Querier` entry
+permits (default **4**) and an `AtomicU32` count of occupied queue slots. Every `Querier` entry
 point that does storage IO acquires a permit first: `run`,
 `run_query_with`, `run_drift`, and `template_registry` (the RFC 0027
 `list_templates` fold). Both serving surfaces therefore share one gate.
 
 - **A free permit** → the query runs immediately.
-- **No free permit, fewer than `max_queued_queries` waiters** (default
-  **16**) → the query waits. Tokio's semaphore is FIFO-fair, so waiters are
-  admitted in arrival order.
-- **No free permit, queue full** → rejected at once with
+- **No free permit, a queue slot free** (`max_queued_queries`, default
+  **16**) → the query takes a slot and waits. Taking a slot is one atomic
+  `fetch_update` that increments the count only while it is below the limit,
+  so concurrent arrivals cannot all pass a stale check. The slot is an RAII
+  guard, decremented on drop, whether the wait ends in a permit, a timeout or
+  cancellation, so a disconnect never leaks a slot. Tokio's semaphore is
+  FIFO-fair, so waiters are admitted in arrival order.
+- **No free permit, no queue slot** → rejected at once with
   `QueryError::Overloaded { cause: QueueFull }`, without waiting.
 - **Waited `queue_timeout_ms`** (default **10 000**) without a permit →
   rejected with `QueryError::Overloaded { cause: QueueTimeout }`.
 
-The permit is an RAII guard held for the whole engine call and released when
-it returns or its future is dropped. A client that disconnects mid-wait or
-mid-query frees its slot. The engine call ends before the server serializes
-the response. The response's size is bounded by §3.4.3, not by the permit.
+The permit is an RAII guard. It is **not** released when the engine call
+returns. The engine returns it inside the result, together with the
+`ourios_materialize` reservation (§3.4.3), as one `ResultGuard`. The server
+serializes the response, grows that reservation by the serialized body's
+length, and moves the guard into the response body. The guard drops when the
+body has been sent or the connection closes. So the permit count bounds the
+responses in flight, and the pool budget covers their bytes, including JSON
+expansion. A client that disconnects mid-wait or mid-query frees its slot
+and its memory through the same drops. A serialized body that does not fit
+the pool, or that exceeds `max_result_bytes`, is rejected under §3.6 like a
+materialization overflow.
 
 The `ourios.query.duration` histogram keeps measuring the full request, so
 queue wait is inside it. A rejected query's duration is its time in the
@@ -295,16 +321,44 @@ file-set resolution may enumerate, counted **incrementally** during the walk:
 `window_listing`'s delimited levels and recursive sub-listings on S3, and
 the `std::fs` walk on the local backend. It counts every key returned
 (Parquet files, `*.parquet.tmp`, manifests, superseded files), because the
-cost is the enumeration, whatever the key turns out to be. The walk aborts
-at the first listing that takes the running count past the cap. It never
-lists everything and checks afterwards, because by then the memory is
-spent. This is what bounds the "cost grows with tenant age" shape of #853,
-even under a backlog #858's window walk still has to descend into.
+cost is the enumeration, whatever the key turns out to be. This is what bounds
+the "cost grows with tenant age" shape of #853, even under a backlog #858's
+window walk still has to descend into.
+
+How early the walk can stop depends on the store call, and the guarantee is
+stated per call:
+
+- **Recursive listings** (`list_recursive` at a fully covered span or an
+  `hour=` leaf, and the `std::fs` walk). Today `Store::list` collects the
+  `ObjectStore::list` stream into a `Vec` before returning. The store gains a
+  bounded variant, `list_bounded_blocking(prefix, remaining)`, that consumes
+  the stream and returns `Exceeded` as soon as it has yielded `remaining + 1`
+  keys. The `std::fs` walk counts entries as it reads them. A recursive
+  listing therefore never holds more than the cap.
+- **Delimited listings** (one per visited Hive level). `list_with_delimiter`
+  is one logical request that the object-store client collects internally,
+  so it cannot be cut off mid-way through this seam. Its size is the level's
+  fan-out (at most 24 `hour=`, 31 `day=` or 12 `month=` prefixes, and one
+  `year=` per year of history), plus any objects stored directly at that
+  level, which the RFC 0005 writer never produces. The cap is checked after
+  each delimited listing. The residual exposure is foreign objects placed
+  at a Hive level by something other than Ourios, and it is accepted and
+  stated as such.
 
 #### 3.4.2 Files resolved per query
 
 `max_files` (default **10 000**) bounds the **live** file set after manifest
-resolution: the URLs handed to `register_listing_table`. Each resolved file
+resolution: the URLs handed to `register_listing_table`.
+
+Manifests are resolved before this count exists, so they are bounded on
+their own. A partition's `manifest.json` is read only if its size, known
+from the listing's object metadata, is at most **1 MiB**. That is roughly
+ten times the size of a manifest naming `max_files` UUIDv7 file names, and
+the figure is fixed rather than configurable. A larger manifest rejects the
+query with `LimitExceeded { Manifest }` before it is fetched, and a parsed
+manifest's entries count toward `max_files` as they are validated.
+`Manifest::read` and `read_with_etag` keep their signatures for the
+compactor. The querier uses a bounded read that takes the size limit. Each resolved file
 costs a footer read for per-file schema inference (`SchemaMode::Union`), plus
 at least one more footer read in the scan. A query over more files than the
 cap is rejected before registration. Both caps reject with
@@ -328,18 +382,37 @@ narrow the time range.
   and suggesting a smaller `limit` or a narrower window. Truncating instead
   would need a "truncated" field in the RFC 0016 response, which is a
   contract change this RFC does not make (§4).
-- **Reserved on the pool.** `collect_records` registers a
-  `MemoryConsumer("ourios_materialize")` on the query's pool and grows it by
-  each collected batch's `get_array_memory_size()` and each rendered row's
-  size. Result materialization, the one large buffer the querier sizes
-  itself, is thereby inside the process-wide budget: four concurrent
-  64 MiB results cost 256 MiB **of the pool**, not 256 MiB on top of it.
-  The count and aggregate scans' collected batches are a handful of rows and
-  are not worth a reservation.
+- **Reserve before retain.** Today `execute_plan` collects the whole
+  `Vec<RecordBatch>` before `collect_records` looks at it, so a check applied
+  afterwards cannot bound the peak. The materialize pass instead executes
+  the plan as a stream (`execute_stream`). For each batch, it calls
+  `try_grow` on a `MemoryConsumer("ourios_materialize")` for the batch's
+  `get_array_memory_size()` and adds the batch to the running
+  `max_result_bytes` total, **before** retaining the batch. A refused or
+  over-ceiling batch fails the query while it holds at most one unretained
+  batch. Decoding and rendering grow the same reservation by the rendered
+  size before each row is kept, and the pass shrinks it as the Arrow batches
+  are released. Result materialization is thereby inside the process-wide
+  budget: four concurrent 64 MiB results cost 256 MiB **of the pool**, not
+  256 MiB on top of it. The reservation lives in the `ResultGuard` until the
+  response has been sent (§3.3).
+- **Aggregations** follow the same rule. The grouped-count scan's output
+  is one row per group and, for a high-cardinality `count by`, is not small.
+  It is streamed, reserved and counted against `max_result_bytes` in the
+  same way. The bare count scan's single row is not reserved.
+- **Drift and template listings.** `run_drift`'s output rows and the
+  `list_templates` registry rows are results too. Both are reserved and
+  counted against `max_result_bytes` as they are built. The drift scan runs
+  on the pooled session. The registry rows are rendered one entry at a time
+  from the derived registry.
 
-The template-map acquisition (RFC 0033) stays unaccounted and uncapped here.
-Its cost is the audit fold, whose listing is the open fork in §3.9. The
-admission gate bounds how many run at once.
+**What stays unbounded, stated plainly.** The **audit fold** behind the
+template-map acquisition (RFC 0033), `run_drift`'s audit listing, and the
+registry derivation for `list_templates` are neither pool-accounted nor
+capped by this RFC. Their cost is a listing of the tenant's `audit/` prefix,
+which is the open RFC 0033 fork in §3.9, plus the fold's in-memory maps. The
+admission gate bounds how many run at once, and §3.2's headroom has to
+absorb one per permit. Bounding them belongs with that fork.
 
 ### 3.5 Spilling to local disk: off
 
@@ -386,15 +459,16 @@ LimitExceeded { limit: QueryLimit },
 Overloaded { cause: OverloadCause },
 
 pub enum QueryLimit {
-    Memory { held: u64, fair_share: u64, pool: u64 },
+    Memory { needed: u64, pool: u64 },
     ListedObjects { limit: u64 },
+    Manifest { bytes: u64, limit: u64 },
     Files { count: u64, limit: u64 },
     ResultBytes { limit: u64 },
 }
 pub enum OverloadCause {
     QueueFull { max_queued: u32 },
     QueueTimeout { waited_ms: u64 },
-    MemoryContended { held: u64, pool: u64 },
+    MemoryContended { needed: u64, pool: u64 },
 }
 ```
 
@@ -402,13 +476,26 @@ pub enum OverloadCause {
 `DataFusionError::ResourcesExhausted`, often wrapped (`Context`, `Shared`,
 `External`). The executor classifies on `DataFusionError::find_root()`
 before the generic `storage_err` mapping, so a refusal is never reported as
-`Storage`. The query's `QueryMemoryPool` wrapper knows how much this query
-held when refused. The **fair share** is `pool / max_concurrent_queries`.
+`Storage`. At the refusal, the query's `QueryMemoryPool` wrapper knows
+what this query held and what the refused `try_grow` asked for. Their sum,
+`needed`, is the least this query required at that moment. The question
+that decides retryability is whether `needed` could ever fit:
 
-- Held **at least** the fair share → `LimitExceeded { Memory }`. This query
-  is too big on its own merits; retrying will not help.
-- Held **less** → `Overloaded { MemoryContended }`. Other queries hold the
-  memory, and the same query may succeed once they finish.
+- `needed > pool` → `LimitExceeded { Memory }`. The query cannot fit even
+  with the pool to itself, so retrying unchanged will fail again. This
+  covers a lone query's first allocation too: with nothing else reserved, a
+  refusal means the request alone exceeds the pool.
+- `needed ≤ pool` → `Overloaded { MemoryContended }`. The query would have
+  fitted had other queries not held the rest, so it may succeed once they
+  finish.
+
+`needed` is a lower bound: the query might have asked for more later. So a
+`503` can precede a `422` for the same query once it runs alone. That order
+errs toward retrying, which is the cheap mistake. The reverse (telling a
+client that a query which would fit can never run) cannot happen under this
+rule. Comparing the held bytes with a per-query fair share instead would
+misclassify both ways, since a query can hold little and still need
+more than the pool, or hold a lot and fit fine alone.
 
 **Messages are Ourios-owned (hazard #6).** DataFusion's `ResourcesExhausted`
 text names internal operators (`GroupedHashAggregateStream[3]`) and must not
@@ -418,7 +505,8 @@ the remedy:
 
 | Variant | `Display` (user-facing) |
 |---|---|
-| `Memory` | the query exceeded the querier's memory budget (it held `{held}` of a `{pool}` pool); narrow the time range, add filters, or group by fewer distinct values |
+| `Memory` | the query needs at least `{needed}` bytes, more than the querier's `{pool}` memory budget; narrow the time range, add filters, or group by fewer distinct values |
+| `Manifest` | a partition manifest in the query's time range is `{bytes}` bytes, over the `{limit}` read limit; narrow the time range |
 | `ListedObjects` | the query's time range covers more than `{limit}` stored objects; narrow the time range |
 | `Files` | the query's time range covers `{count}` files, over the limit of `{limit}`; narrow the time range |
 | `ResultBytes` | the result exceeds `{limit}` bytes; lower the `limit` or narrow the time range |
@@ -433,7 +521,7 @@ above:
 | Variant | Status | `kind` |
 |---|---|---|
 | `LimitExceeded { Memory }` | `422` | `query_memory_limit` |
-| `LimitExceeded { ListedObjects \| Files }` | `422` | `query_file_limit` |
+| `LimitExceeded { ListedObjects \| Manifest \| Files }` | `422` | `query_file_limit` |
 | `LimitExceeded { ResultBytes }` | `422` | `query_result_limit` |
 | `Overloaded { QueueFull }` | `503` | `query_queue_full` |
 | `Overloaded { QueueTimeout }` | `503` | `query_queue_timeout` |
@@ -517,9 +605,12 @@ env-only mode), e.g. `OURIOS_QUERIER_LIMITS_MAX_CONCURRENT_QUERIES`.
 
 **Helm chart.**
 
-- `querier.limits` in `values.yaml` renders into the querier's config file,
-  in camelCase per chart convention (`maxConcurrentQueries`,
-  `memoryPoolBytes`, and so on).
+- `querier.limits` in `values.yaml` uses the chart's camelCase
+  (`maxConcurrentQueries`, `memoryPoolBytes`, and so on). The helper renders
+  them into the config file under the file's **snake_case** keys
+  (`max_concurrent_queries`, `memory_pool_bytes`), as it does for every
+  other key (RFC 0020 §3.4). A camelCase key in the file would fail
+  `deny_unknown_fields` at startup.
 - **`querier.resources.limits.memory` sets the cgroup `memory.max` the
   default derives from.** The chart's querier Deployment runs the querier
   alone, so its default pool is 75% of that limit.
@@ -565,8 +656,8 @@ env-only mode), e.g. `OURIOS_QUERIER_LIMITS_MAX_CONCURRENT_QUERIES`.
 concurrency limit, N queries each under the cap reach N × cap, and the OOM
 killer acts on the sum. It also idles memory: a query running alone cannot
 use what the others would have. The maintainer rejected this as the primary
-mechanism, and §3.1 derives the fair share from the shared pool instead. A
-per-query ceiling layered on the pool remains open (§7).
+mechanism in favour of one shared pool (§3.1). A per-query ceiling layered
+on the pool remains open (§7).
 
 **`FairSpillPool`.** Rejected in §3.1. Its fairness divides spillable
 consumers' memory on the assumption they can spill. With spilling off, it
@@ -619,7 +710,7 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 >   high-cardinality `param(n)` needs more than the pool
 > - **When** that query runs alone
 > - **Then** it is rejected `422` `query_memory_limit`, and the message names
->   the bytes the query held and the pool size, and contains no DataFusion
+>   the bytes the query needed and the pool size, and contains no DataFusion
 >   operator name or engine text
 > - **And** a small query issued immediately afterwards succeeds
 > - **And** the pool's reserved bytes return to zero after the rejection
@@ -630,9 +721,14 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 > - **Given** `max_concurrent_queries = 2` and a pool that fits query A alone
 >   and query B alone, but not both together
 > - **When** A holds its reservation (a test hook pauses it) and B then
->   reserves past the remainder while holding less than the fair share
+>   requests a reservation that exceeds the remainder but not the pool
 > - **Then** B is rejected `503` `query_memory_contended`, not
 >   `query_memory_limit`
+> - **And** a lone query whose **first** reservation exceeds the pool is
+>   rejected `422` `query_memory_limit`, not `503`
+> - **And** after a run that registers and drops operators mid-query (a
+>   consumer unregistered while holding bytes), the shared pool and the
+>   per-query count both read zero
 > - **And** the shared pool's reserved bytes never exceed its size at any
 >   point of the run
 > - **And** B run again after A finishes succeeds
@@ -675,6 +771,10 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 >   A's permit is released when A's future is dropped mid-execution
 > - **And** the same gate applies to a `query_logs` MCP call, which is
 >   refused with the §3.6 MCP code and `data.kind`
+> - **And** with `max_queued_queries = 4`, 32 concurrent arrivals against
+>   one held permit yield exactly 4 waiters and 28 `query_queue_full`, and
+>   the slot count returns to zero once every future has completed or been
+>   dropped
 
 > **Scenario RFC0058.6 — The listing and file caps reject over-wide queries early**
 > - **Given** the request-counting S3 test store and a tenant with more
@@ -685,7 +785,12 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 > - **And** with `max_listed_objects` above the key count but `max_files`
 >   below the live file count, the query is rejected `422`
 >   `query_file_limit` before any footer is read
-> - **And** the local backend enforces both caps identically
+> - **And** a recursive listing under a covered span holding more keys than
+>   the cap stops consuming the listing stream at cap + 1 keys (asserted on
+>   the stream the bounded list polls)
+> - **And** a partition whose `manifest.json` is listed at more than 1 MiB is
+>   rejected `422` `query_file_limit` with no `GET` for that manifest
+> - **And** the local backend enforces the listing and file caps identically
 
 > **Scenario RFC0058.7 — The result ceiling**
 > - **Given** a query whose `limit` exceeds `max_rows`
@@ -698,6 +803,16 @@ status, body `kind`, MCP code and `error.type` per §3.6's tables.
 > - **And** during materialization the pool's reserved bytes include the
 >   collected batches: a pool smaller than the result but larger than the
 >   scan rejects the query as a memory limit instead of serving it
+> - **And** the materialize pass never retains a batch it has not reserved:
+>   a test pool that refuses the Nth reservation fails the query with at most
+>   N − 1 batches retained
+> - **And** a `count by` whose group rows exceed `max_result_bytes`, a drift
+>   query whose rows do, and a `list_templates` call over a registry whose
+>   rendered rows do, are each rejected `422` `query_result_limit`
+> - **And** the permit and the reservation are held until the response body
+>   has been sent: with `max_concurrent_queries = 1`, a second query waits
+>   while the first response is still being written, and the pool includes
+>   the serialized body's length during that time
 
 > **Scenario RFC0058.8 — Configuration**
 > - **Given** each `querier.limits.*` key set in a config file, once
@@ -740,9 +855,14 @@ Per `CLAUDE.md` §6.2, mapped to the §5 ids.
   case. No test reads the host's real `/sys`.
 - **RFC0058.5 (admission).** `tokio::test` with paused time for the timeout
   legs, and the gated store to hold a permit. The disconnect leg drops the
-  request future and asserts the waiter count.
+  request future and asserts the slot count. The burst leg runs the arrivals
+  on a multi-threaded runtime behind a barrier, so a check-then-increment
+  race would overfill the queue and fail it.
 - **RFC0058.6 (caps).** The existing `Call::List` / `Call::ListDelimited`
   request-counting store (`file_set.rs` tests) asserts where the walk stopped.
+  The bounded recursive listing is tested against an in-memory
+  `ObjectStore` whose `list` stream counts the items polled. The manifest leg
+  lists an oversized `manifest.json` and asserts no `GET` for it.
   The local leg uses a fixture directory tree.
 - **RFC0058.7, .8.** The existing `apply_limit` tests keep passing unchanged
   against the constants' new configured defaults. New config-resolution
@@ -786,7 +906,7 @@ under the limit.
     fraction), since the baseline is roughly constant and dominates on small
     nodes?
 - [ ] **`max_concurrent_queries = 4`.** Enough for a dashboard's panels to
-      mostly run rather than queue. The fair share is `pool / 4` (192 MiB at
+      mostly run rather than queue. An even split is `pool / 4` (192 MiB at
       768 MiB). Should the default scale with CPUs, or stay fixed?
 - [ ] **The cap values.** `max_listed_objects = 100 000`, `max_files =
       10 000`, `max_result_bytes = 64 MiB`, `max_queued_queries = 16`,

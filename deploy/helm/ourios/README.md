@@ -100,9 +100,21 @@ Verify:
 helm test ourios
 ```
 
-> The image tag defaults to `latest` (no image is published for the
-> pre-release `0.0.0` app version); pin a released tag via `image.tag` in
-> production.
+> The image tag defaults to `latest`, not the chart's `appVersion`, so an
+> unpinned install floats to whatever the newest release is. Pin a released
+> tag via `image.tag` in production (the chart's `appVersion` names the
+> release it was published alongside).
+
+> **Warning: a default install runs unauthenticated and over plaintext.** The chart
+> renders the config file itself and has no values for `auth`, listener TLS
+> (`grpc_tls` / `http_tls`), `querier.mcp` or `openfga`, and no hook to merge
+> extra config into the file; because it passes `--config`, `OURIOS_*`
+> environment variables cannot fill the gap either. Every chart install
+> therefore runs in RFC 0026 **open mode**: any client that can reach the
+> receiver or querier Services can write or read any tenant. Keep those
+> Services inside a trusted network boundary until the chart can configure
+> the security surface
+> ([#852](https://github.com/jensholdgaard/ourios/issues/852)).
 
 ## Configuration
 
@@ -321,9 +333,11 @@ Two hardening notes:
 
 For mTLS identity rotation (SPIRE, cert-manager): the binary hot-reloads its TLS
 listener certificates (RFC 0030), so a sidecar like `spiffe-helper` writing
-rotating certs to a shared volume integrates without restarts. TLS listener
-config is delivered via the RFC 0020 config file out-of-band today — chart-level
-TLS values are not yet exposed.
+rotating certs to a shared volume would integrate without restarts. The chart
+cannot turn listener TLS on yet: it renders the config file itself and exposes
+no TLS values or extra-config hook, so a chart install serves plaintext (see the
+warning under [Install](#install) and
+[#852](https://github.com/jensholdgaard/ourios/issues/852)).
 
 ## Compactor topology
 

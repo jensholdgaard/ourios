@@ -46,13 +46,14 @@
 //!   barrier began can panic *while the barrier waits on it*, and the
 //!   latch it sets lands after the first check.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::{SnapshotState, WalHighWater};
-use ourios_wal::{ReclaimError, WalOffset};
+use ourios_wal::{ReclaimError, SnapshotHorizons, WalOffset};
 
 use crate::cadence::{BarrierEpochs, Epoch};
 use crate::publish::{Drained, PublishCoordinator};
@@ -192,6 +193,12 @@ pub struct Barrier {
     /// and carries the highest mark installed so an older cut cannot
     /// overwrite a newer snapshot.
     install: Mutex<Option<WalOffset>>,
+    /// §3.2's snapshot ledger: each tenant's horizon as of its last
+    /// snapshot write that returned `Ok`, which is what housekeeping may
+    /// reclaim against. Never read back from the directory after
+    /// startup: a write whose rename landed but whose fsync failed is
+    /// visible there and may not survive a crash.
+    horizons: Mutex<HashMap<TenantId, WalOffset>>,
     ceiling_bytes: usize,
     /// Runs inside `capture_rotation` between the drain and the cut's
     /// epoch — the window a racing park must not land in.
@@ -221,10 +228,36 @@ impl Barrier {
             epochs,
             pending: Mutex::new(None),
             install: Mutex::new(None),
+            horizons: Mutex::new(HashMap::new()),
             ceiling_bytes,
             #[cfg(test)]
             window: Mutex::new(None),
         }
+    }
+
+    /// Seed the snapshot ledger with the horizons startup found durable
+    /// (§3.2: the listing is trusted only after the root's fsync, and
+    /// only before this process has reclaimed anything).
+    #[must_use]
+    pub fn with_durable_horizons(
+        self,
+        marks: impl IntoIterator<Item = (TenantId, WalOffset)>,
+    ) -> Self {
+        self.lock_horizons().extend(marks);
+        self
+    }
+
+    /// The per-tenant horizons housekeeping reclaims against. A tenant
+    /// with frames in the WAL and no entry here pins the floor at its
+    /// oldest surviving frame, which is the conservative reading of a
+    /// snapshot that never landed.
+    #[must_use]
+    pub fn snapshot_horizons(&self) -> SnapshotHorizons {
+        SnapshotHorizons::restorable(
+            self.lock_horizons()
+                .iter()
+                .map(|(tenant, mark)| (tenant.clone(), *mark)),
+        )
     }
 
     /// The cadence state this barrier decides against.
@@ -445,6 +478,10 @@ impl Barrier {
         }
     }
 
+    fn lock_horizons(&self) -> std::sync::MutexGuard<'_, HashMap<TenantId, WalOffset>> {
+        self.horizons.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn take_pending(&self) -> Option<Cut> {
         self.lock_pending().take()
     }
@@ -559,6 +596,10 @@ impl Barrier {
                 );
                 return Install::Failed;
             }
+            // Per tenant, not per cut: the tenants written before a
+            // failure are durable at `mark`, and the rest keep their
+            // previous horizon.
+            self.lock_horizons().insert(tenant.clone(), mark);
         }
         *installed = Some(mark);
         Install::Written

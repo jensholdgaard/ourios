@@ -218,6 +218,32 @@ pub fn write_snapshots(
     Ok(())
 }
 
+/// Every tenant's durable snapshot horizon, for seeding the barrier's
+/// snapshot ledger (RFC 0052 §3.2) after the post-recovery snapshots are
+/// written and before anything is reclaimed in this process.
+///
+/// Listed through [`snapshot_store::load_all_durable`], which fsyncs the
+/// root before it lists. An artefact without a parseable horizon, or one
+/// that does not decode, yields no entry: recovery discards those, so the
+/// tenant is pinned rather than trusted.
+///
+/// # Errors
+///
+/// [`SnapshotStoreError`] on the fsync or the listing.
+pub fn durable_horizons(root: &Path) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
+    Ok(snapshot_store::load_all_durable(root)?
+        .into_iter()
+        .filter_map(
+            |(tenant, bytes)| match ourios_miner::snapshot::recover(Some(&bytes)) {
+                (Some(state), RecoveryOutcome::Restored) => {
+                    parse_high_water(state.wal_high_water.as_ref()).map(|horizon| (tenant, horizon))
+                }
+                _ => None,
+            },
+        )
+        .collect())
+}
+
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
 /// below the checkpoint whose segment never surfaced during replay
 /// means frames in `(S, oldest surviving)` are gone. Internally

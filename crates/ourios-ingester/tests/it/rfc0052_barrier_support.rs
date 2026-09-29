@@ -258,18 +258,7 @@ impl BarrierRig {
         }
 
         let journal = Wal::open(wal).expect("open WAL");
-        let mut audit_store = Store::local(&audit_root).expect("audit store");
-        if let Some(gate) = &audit_gate {
-            audit_store = held_puts(audit_store, gate);
-        }
-        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(audit_store, 100_000));
-        let poison = match audit_gate {
-            Some(_) => {
-                let settled = audit.clone();
-                Some(Box::new(move || settled.settled()) as Box<dyn FnMut() -> bool + Send>)
-            }
-            None => poison,
-        };
+        let (audit, poison) = rig_audit(&audit_root, audit_gate.as_ref(), poison);
         let sink = rig_sink(&data_root, flush, &audit, poison, put_gate.as_ref());
         let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
             .with_record_sink(Box::new(sink.clone()));
@@ -364,6 +353,32 @@ impl BarrierRig {
         // platform, which is what makes the failure deterministic.
         std::fs::write(path.join("occupied"), b"x").expect("occupy it");
     }
+}
+
+/// The rig's audit sink, with its PUTs held at `gate` when given — and
+/// then the record sink's inline barrier wired the way the receiver
+/// wires it (`settled`) in place of `poison`.
+fn rig_audit(
+    audit_root: &Path,
+    gate: Option<&Gate>,
+    poison: Option<Box<dyn FnMut() -> bool + Send>>,
+) -> (
+    SharedParquetAuditSink,
+    Option<Box<dyn FnMut() -> bool + Send>>,
+) {
+    let mut store = Store::local(audit_root).expect("audit store");
+    if let Some(gate) = gate {
+        store = held_puts(store, gate);
+    }
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 100_000));
+    let barrier = match gate {
+        Some(_) => {
+            let settled = audit.clone();
+            Some(Box::new(move || settled.settled()) as Box<dyn FnMut() -> bool + Send>)
+        }
+        None => poison,
+    };
+    (audit, barrier)
 }
 
 /// The rig's record sink: its inline audit barrier is `poison` when given,

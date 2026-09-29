@@ -426,11 +426,18 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // RFC 0035 §3.1: drain the encode pool before the final sample +
     // drain sweep, so every acked record has reached the sink (and the
     // D2 backlog counts it) before flush_all runs. The bounded queue
-    // keeps this residue to a few batches per core.
+    // keeps this residue to a few batches per core. RFC 0052 §3.1 moved
+    // the size-trigger PUTs onto the publisher, which the pool's quiesce
+    // does not wait for, so the publishes are waited out too — or a
+    // partition could land after the drain sweep had listed the store.
     let quiesce_pipeline = Arc::clone(&pipeline);
-    if tokio::task::spawn_blocking(move || quiesce_pipeline.quiesce_encodes())
-        .await
-        .is_err()
+    let quiesce_sink = sink.clone();
+    if tokio::task::spawn_blocking(move || {
+        quiesce_pipeline.quiesce_encodes();
+        let _outcomes = quiesce_sink.quiesce_publishes();
+    })
+    .await
+    .is_err()
     {
         return Err(SoakError::Setup("encode-pool quiesce panicked".into()));
     }

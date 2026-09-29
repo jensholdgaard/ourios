@@ -3,18 +3,19 @@
 //!
 //! The ledger half runs under the WAL's single-writer position and
 //! does no I/O at all: it applies horizons, derives the floor and pops
-//! at most the cap's worth of work. The unlinks and the parent fsync —
-//! [`unlink_planned`] — run on the plan's owned paths with no guard
-//! and no WAL handle, which is what keeps an append from waiting on an
-//! fsync.
+//! at most the cap's worth of work. The whole file half runs on the
+//! plan alone, with no guard and no WAL handle, which is what keeps an
+//! append from waiting on an fsync: [`write_plan_record`] merges the
+//! plan into the live `RECLAIM` record and rewrites the inactive slot,
+//! and [`unlink_planned`] then removes the plan's owned paths and
+//! fsyncs their parent.
 //!
-//! The `RECLAIM` slot write does **not** yet: `Wal::write_plan_record`
-//! takes `&mut Wal` because §3.2 puts the *merge* off the writer
-//! position while the record it merges into is the store's live one,
-//! which a concurrent checkpoint also writes. A coordinator holding
-//! the journal behind a mutex therefore holds it across that write.
-//! Closing it means giving the store an ownership of its own, which is
-//! §3.7's question, not this module's — see the PR's open question 11.
+//! The record write can leave the writer position because the plan
+//! carries the sidecar it was planned against: the `RECLAIM` store has
+//! an owner of its own, a mutex a checkpoint takes for its writes too,
+//! so the merge still reads the record as it stands when the slot is
+//! written (§3.2) and no two writers ever share the two-slot
+//! alternation.
 //!
 //! Nothing a pass has touched can become undiscoverable: a popped
 //! entry stays in the ledger and in the byte accounting, marked
@@ -28,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ourios_core::tenant::TenantId;
 use uuid::Uuid;
 
+use crate::reclaim_store::ReclaimSlot;
 use crate::retain::{RetainFloor, SnapshotHorizons};
 use crate::{
     CheckpointError, HousekeepingError, WalOffset, ledger, reclaim, segment, sync_parent_dir,
@@ -200,7 +202,8 @@ impl std::fmt::Display for PassId {
 /// public, unlocked and reachable from anywhere — so
 /// [`crate::Wal::write_plan_record`] hands this out and the unlink
 /// consumes it. It names the pass, so a permit from one plan cannot
-/// unlink another's.
+/// unlink another's. [`write_plan_record`] hands out the same receipt
+/// from the plan alone.
 ///
 /// It is also **revocable**, which naming the pass alone is not enough
 /// for: §3.7's abandoned-plan recovery lets a later
@@ -237,6 +240,12 @@ pub struct ReclaimPlan {
     pub(crate) records: bool,
     pub(crate) root: PathBuf,
     pub(crate) progress: HousekeepingProgress,
+    /// The mode the ledger half was checked against, which the record
+    /// merge adopts when the root has none recorded yet.
+    pub(crate) mode: reclaim::EntryMode,
+    /// The sidecar of the `Wal` that planned this pass, which is the
+    /// only one [`write_plan_record`] can write it into.
+    pub(crate) slot: ReclaimSlot,
 }
 
 impl ReclaimPlan {
@@ -346,9 +355,23 @@ impl From<CheckpointError> for ReclaimError {
     }
 }
 
+/// RFC 0052 §3.2's record half, on the plan alone: merge its popped
+/// segments into the live `RECLAIM` record and rewrite the inactive
+/// slot in place, fsynced. It takes no guard and no WAL handle, so the
+/// journal's writer position is free for appends and rotations while
+/// the slot write and its fsync run (§3.7).
+///
+/// # Errors
+///
+/// As [`crate::Wal::write_plan_record`], and also when the `Wal` that
+/// planned the pass has since been dropped.
+pub fn write_plan_record(plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
+    plan.slot.write_plan(plan)
+}
+
 /// RFC 0052 §3.2's unlink half, on the plan's **owned paths**: it
 /// takes no guard and no WAL handle, which is the whole point. The
-/// record write precedes it (`Wal::write_plan_record`), and
+/// record write precedes it ([`write_plan_record`]), and
 /// `Wal::housekeeping_commit` folds this result back under the writer
 /// position afterwards.
 ///
@@ -643,6 +666,13 @@ mod tests {
                 lag_segments: 0,
                 outcome: PassOutcome::Planned,
             },
+            mode: crate::reclaim::EntryMode::NoConsumer,
+            slot: crate::reclaim_store::ReclaimSlot::new(
+                None,
+                1,
+                Arc::new(AtomicU64::new(0)),
+                crate::DEFAULT_MAX_UNLINKS_PER_PASS,
+            ),
         }
     }
 }

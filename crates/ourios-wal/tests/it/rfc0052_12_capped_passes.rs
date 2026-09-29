@@ -614,6 +614,50 @@ fn rfc0052_12_a_superseded_plan_is_refused_at_the_record_write() {
         .expect("the live plan still writes");
 }
 
+/// The record write a caller runs on the plan alone, with no WAL
+/// handle and no guard (§3.7), refuses exactly what the `Wal` method
+/// refuses — and also a plan whose `Wal` is gone. That plan still
+/// carries its instance's handle on the root's `RECLAIM`, and writing
+/// through it beside a reopen's handle would interleave two writers on
+/// the two-slot alternation.
+#[test]
+fn rfc0052_12_the_plan_alone_writes_only_while_it_is_live() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let covered = backlog(root, BACKLOG);
+    let horizons = known(&[("alpha", covered)]);
+    let mut wal = open(root);
+    wal.rebuild_ledger().expect("ledger");
+    wal.checkpoint(covered).expect("checkpoint");
+
+    let superseded = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    let live = wal.housekeeping_prepare(&horizons, CAP).expect("re-plan");
+    let refused = ourios_wal::write_plan_record(&superseded)
+        .expect_err("a superseded plan must not reach the file half");
+    assert!(refused.to_string().contains("superseded"), "{refused}");
+
+    let permit = ourios_wal::write_plan_record(&live).expect("the live plan writes");
+    let progress = wal
+        .housekeeping_commit(live.pass(), unlink_planned(&live, permit))
+        .expect("commit");
+    assert_eq!(progress.removed_segments, CAP);
+
+    let orphan = wal.housekeeping_prepare(&horizons, CAP).expect("prepare");
+    drop(wal);
+    let refused = ourios_wal::write_plan_record(&orphan)
+        .expect_err("a plan that outlived its WAL writes nothing");
+    assert!(refused.to_string().contains("outlived"), "{refused}");
+    let mut reopened = open(root);
+    reopened.rebuild_ledger().expect("ledger");
+    assert_eq!(
+        reopened
+            .housekeeping_pass(&horizons, CAP)
+            .expect("the reopen's own pass runs")
+            .removed_segments,
+        CAP,
+    );
+}
+
 /// ...and a superseded plan's *commit* is refused too, with the live
 /// plan untouched. The record write's refusal is not enough on its
 /// own: §3.7's protocol says a record-write failure is reported as

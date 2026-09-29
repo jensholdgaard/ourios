@@ -23,7 +23,15 @@ use crate::{CheckpointError, OpenError, WalConfig, checkpoint, reclaim, reclaim_
 pub(crate) fn configured_geometry(
     config: &WalConfig,
 ) -> Result<reclaim::Geometry, reclaim::GeometryError> {
-    reclaim::Geometry::new(reclaim::DEFAULT_MAX_TENANTS, config.max_unlinks_per_pass)
+    geometry(config.max_unlinks_per_pass)
+}
+
+/// [`configured_geometry`] for the one knob it reads, for the file
+/// half of a pass, which holds no [`WalConfig`].
+pub(crate) fn geometry(
+    max_unlinks_per_pass: u32,
+) -> Result<reclaim::Geometry, reclaim::GeometryError> {
+    reclaim::Geometry::new(reclaim::DEFAULT_MAX_TENANTS, max_unlinks_per_pass)
 }
 
 /// What RFC 0052 §3.2's open-time matrix decided about this root.

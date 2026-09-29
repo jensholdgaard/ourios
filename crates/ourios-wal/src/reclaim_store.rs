@@ -25,6 +25,216 @@ use crate::reclaim::{
 };
 use crate::{OpenError, sync_file_data, sync_parent_dir};
 
+/// RFC 0052 §6's fault-injection point inside a pass's `RECLAIM` write:
+/// it runs immediately before the slot is written, so a test can hold
+/// the write in flight and observe what the rest of the WAL does
+/// meanwhile. Inert unless armed, and armed only through the
+/// `fault-injection` feature.
+#[derive(Clone, Default)]
+pub(crate) struct WriteHook(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
+
+impl WriteHook {
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn armed(hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Some(std::sync::Arc::new(hook)))
+    }
+
+    pub(crate) fn run(&self) {
+        if let Some(hook) = &self.0 {
+            hook();
+        }
+    }
+}
+
+impl std::fmt::Debug for WriteHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WriteHook").field(&self.0.is_some()).finish()
+    }
+}
+
+/// The `RECLAIM` sidecar as the [`crate::Wal`] and the file half of its
+/// passes share it (RFC 0052 §3.7).
+///
+/// A pass writes its record with the journal guard released, while a
+/// checkpoint still writes the same file under it, so the store has an
+/// owner of its own: one mutex over the store and its fd. Every slot
+/// write — a pass's record, a checkpoint's arming and witness, the
+/// record a rotation creates — and every read-modify-write of the live
+/// record goes through it, so no two writers ever interleave on the
+/// two-slot alternation.
+///
+/// The cell a pass's [`crate::UnlinkPermit`] reads lives here too, and
+/// it only moves with this lock held. That is what makes a pass's
+/// "is this plan still the live one?" and its record write one step: a
+/// later `housekeeping_prepare` cannot supersede a plan in the middle
+/// of writing it.
+///
+/// Whether a record exists and whether its checkpoint witness is
+/// terminal are also published lock-free, refreshed whenever a lock is
+/// released, because rotation and the §3.5 export read them under the
+/// journal guard and must not wait behind a pass's slot write.
+#[derive(Clone)]
+pub(crate) struct ReclaimSlot(std::sync::Arc<Shared>);
+
+struct Shared {
+    instance: u64,
+    live: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    max_unlinks_per_pass: u32,
+    state: std::sync::Mutex<SlotState>,
+    recorded: std::sync::atomic::AtomicBool,
+    witnessed: std::sync::atomic::AtomicBool,
+}
+
+struct SlotState {
+    store: Option<ReclaimStore>,
+    hook: WriteHook,
+    /// The owning `Wal` was dropped: a plan that outlives it writes
+    /// nothing, since a reopen of the root holds its own handle on the
+    /// same file.
+    closed: bool,
+}
+
+/// The slot, locked. Dereferences to the store, and publishes the
+/// lock-free summary when it is released.
+pub(crate) struct Held<'a> {
+    shared: &'a Shared,
+    state: std::sync::MutexGuard<'a, SlotState>,
+}
+
+impl ReclaimSlot {
+    pub(crate) fn new(
+        store: Option<ReclaimStore>,
+        instance: u64,
+        live: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        max_unlinks_per_pass: u32,
+    ) -> Self {
+        let slot = Self(std::sync::Arc::new(Shared {
+            instance,
+            live,
+            max_unlinks_per_pass,
+            state: std::sync::Mutex::new(SlotState {
+                store,
+                hook: WriteHook::default(),
+                closed: false,
+            }),
+            recorded: std::sync::atomic::AtomicBool::new(false),
+            witnessed: std::sync::atomic::AtomicBool::new(false),
+        }));
+        drop(slot.lock());
+        slot
+    }
+
+    /// Recovering a poisoned lock is sound here: a commit updates its
+    /// in-memory generation and live slot only after the write and the
+    /// fsync returned, so a panic part-way leaves the previous record
+    /// live on disk and in memory alike, and the next commit rewrites
+    /// the same inactive slot.
+    pub(crate) fn lock(&self) -> Held<'_> {
+        Held {
+            shared: &self.0,
+            state: self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    /// The `Wal` this slot belongs to, as its [`crate::PassId`]s name it.
+    pub(crate) fn instance(&self) -> u64 {
+        self.0.instance
+    }
+
+    /// The live-pass cell; see the type's documentation for when it
+    /// may move.
+    pub(crate) fn live(&self) -> &std::sync::Arc<std::sync::atomic::AtomicU64> {
+        &self.0.live
+    }
+
+    pub(crate) fn max_unlinks_per_pass(&self) -> u32 {
+        self.0.max_unlinks_per_pass
+    }
+
+    /// Whether the root has a record at all. Once it has one it never
+    /// loses it, so a `true` here needs no lock to act on.
+    pub(crate) fn has_record(&self) -> bool {
+        self.0.recorded.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the record's checkpoint witness is terminal.
+    pub(crate) fn checkpoint_witnessed(&self) -> bool {
+        self.0.witnessed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Revoke every outstanding permit and refuse every later record
+    /// write through this slot. Taken under the lock, so a write already
+    /// in flight finishes first rather than racing the reopen that may
+    /// follow.
+    ///
+    /// The store is dropped here rather than with the last handle: a
+    /// plan keeps the slot alive for as long as the caller holds it, and
+    /// its descriptor on `RECLAIM` must not outlive the `Wal`, or a
+    /// caller that keeps one plan per reopen leaks one fd per reopen.
+    pub(crate) fn close(&self) {
+        let mut held = self.lock();
+        held.state.closed = true;
+        held.state.store = None;
+        self.0.live.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn arm_hook(&self, hook: WriteHook) {
+        self.lock().state.hook = hook;
+    }
+}
+
+impl std::fmt::Debug for ReclaimSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReclaimSlot")
+            .field("instance", &self.0.instance)
+            .field("recorded", &self.has_record())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Held<'_> {
+    pub(crate) fn closed(&self) -> bool {
+        self.state.closed
+    }
+
+    pub(crate) fn hook(&self) -> WriteHook {
+        self.state.hook.clone()
+    }
+}
+
+impl std::ops::Deref for Held<'_> {
+    type Target = Option<ReclaimStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.store
+    }
+}
+
+impl std::ops::DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state.store
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let store = self.state.store.as_ref();
+        let witnessed = store
+            .is_some_and(|store| store.record().witness.checkpoint == reclaim::Witness::Terminal);
+        self.shared
+            .recorded
+            .store(store.is_some(), std::sync::atomic::Ordering::Release);
+        self.shared
+            .witnessed
+            .store(witnessed, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The first generation a slot is written at. Zero means "never
 /// written", which is how the untouched second slot of a freshly
 /// created file reads.

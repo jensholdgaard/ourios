@@ -344,10 +344,11 @@ impl CommitCoordinator {
 
     /// One capped housekeeping pass (§3.2 / §3.7), as a protocol rather
     /// than a single journal call: the guard is held for the ledger
-    /// half, released for the unlinks and the parent fsync, and taken
-    /// again to fold the outcome back. Between the two the WAL keeps
-    /// serving appends and rotations, which never touch an entry marked
-    /// reclaiming.
+    /// half, released for the whole file half — the `RECLAIM` slot
+    /// write and its fsync, the unlinks and the parent fsync — and
+    /// taken again to fold the outcome back. Between the two the WAL
+    /// keeps serving appends and rotations, which never touch an entry
+    /// marked reclaiming.
     ///
     /// # Errors
     ///
@@ -358,27 +359,26 @@ impl CommitCoordinator {
         horizons: &SnapshotHorizons,
         max_unlinks: usize,
     ) -> Result<HousekeepingProgress, ReclaimError> {
-        let (plan, permit) = {
-            let mut journal = self.lock_journal();
-            let plan = journal.housekeeping_prepare(horizons, max_unlinks)?;
-            match journal.write_plan_record(&plan) {
-                Ok(permit) => (plan, permit),
-                // §3.1: the commit still runs — it is what returns the
-                // popped entries to eligible and requeues the partials
-                // — and the failure is still the caller's to see.
-                Err(source) => {
-                    let pass = plan.pass();
-                    let (kind, detail) = (source.kind(), source.to_string());
-                    let progress =
-                        journal.housekeeping_commit(pass, ReclaimOutcome::RecordFailed(source))?;
-                    return Err(ReclaimError::Housekeeping {
-                        progress: Box::new(progress),
-                        source: ourios_wal::HousekeepingError::Io {
-                            op: "write(RECLAIM slot)",
-                            source: std::io::Error::new(kind, detail),
-                        },
-                    });
-                }
+        let plan = self
+            .lock_journal()
+            .housekeeping_prepare(horizons, max_unlinks)?;
+        let permit = match ourios_wal::write_plan_record(&plan) {
+            Ok(permit) => permit,
+            // §3.1: the commit still runs — it is what returns the
+            // popped entries to eligible and requeues the partials —
+            // and the failure is still the caller's to see.
+            Err(source) => {
+                let (kind, detail) = (source.kind(), source.to_string());
+                let progress = self
+                    .lock_journal()
+                    .housekeeping_commit(plan.pass(), ReclaimOutcome::RecordFailed(source))?;
+                return Err(ReclaimError::Housekeeping {
+                    progress: Box::new(progress),
+                    source: ourios_wal::HousekeepingError::Io {
+                        op: "write(RECLAIM slot)",
+                        source: std::io::Error::new(kind, detail),
+                    },
+                });
             }
         };
         let outcome = ourios_wal::unlink_planned(&plan, permit);

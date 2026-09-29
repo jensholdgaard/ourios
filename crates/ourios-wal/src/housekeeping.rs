@@ -46,38 +46,39 @@ fn superseded_commit(pass: pass::PassId, outstanding: pass::PassId) -> Housekeep
     }
 }
 
-/// A plan whose pass a commit has already settled (RFC 0052 §3.7).
-fn settled(plan: &ReclaimPlan) -> std::io::Error {
-    std::io::Error::new(
-        ErrorKind::InvalidInput,
-        format!(
-            "WAL housekeeping refused: plan from pass {} is already settled (RFC 0052 §3.7)",
-            plan.pass,
-        ),
-    )
+/// Why a plan's record write is refused (RFC 0052 §3.7).
+enum PlanRefusal {
+    /// A commit has already settled the plan's pass.
+    Settled,
+    /// The `Wal` that made the plan has been dropped.
+    Closed,
+    /// A later prepare replaced the plan's pass with this one.
+    Superseded(pass::PassId),
 }
 
-/// A plan that outlived the `Wal` that made it (RFC 0052 §3.7).
-fn closed(plan: &ReclaimPlan) -> std::io::Error {
-    std::io::Error::new(
-        ErrorKind::InvalidInput,
-        format!(
-            "WAL housekeeping refused: plan from pass {} outlived its WAL (RFC 0052 §3.7)",
-            plan.pass,
-        ),
-    )
+impl PlanRefusal {
+    fn error(self, plan: &ReclaimPlan) -> std::io::Error {
+        let why = match self {
+            Self::Settled => "is already settled".to_owned(),
+            Self::Closed => "outlived its WAL".to_owned(),
+            Self::Superseded(outstanding) => format!("was superseded by pass {outstanding}"),
+        };
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "WAL housekeeping refused: plan from pass {} {why} (RFC 0052 §3.7)",
+                plan.pass,
+            ),
+        )
+    }
 }
 
-/// A plan whose pass is no longer the outstanding one (RFC 0052 §3.7).
-fn superseded(plan: &ReclaimPlan, outstanding: pass::PassId) -> std::io::Error {
-    std::io::Error::new(
-        ErrorKind::InvalidInput,
-        format!(
-            "WAL housekeeping refused: plan from pass {} was superseded by pass {outstanding} \
-             (RFC 0052 §3.7)",
-            plan.pass,
-        ),
-    )
+/// What the unlink half verified: the paths it removed, and whether
+/// the one parent fsync covering all of them failed — §3.2's uncertain
+/// deletion, which leaves every removed path unverified.
+struct Unlinked {
+    removed: std::collections::HashSet<PathBuf>,
+    fsync_failed: bool,
 }
 
 impl Wal {
@@ -359,10 +360,12 @@ impl Wal {
             self.requeue_partials(outstanding.partials);
             return Ok(self.settled(outstanding.progress, 0, 0));
         };
-        let removed: std::collections::HashSet<PathBuf> = removed.into_iter().collect();
-        let segments =
-            self.settle_segments(&mut held, &outstanding.segments, &removed, fsync_failed)?;
-        let partials = self.settle_partials(outstanding.partials, &removed, fsync_failed);
+        let unlinked = Unlinked {
+            removed: removed.into_iter().collect(),
+            fsync_failed,
+        };
+        let segments = self.settle_segments(&mut held, &outstanding.segments, &unlinked)?;
+        let partials = self.settle_partials(outstanding.partials, &unlinked);
         Ok(self.settled(outstanding.progress, segments, partials))
     }
 
@@ -370,15 +373,10 @@ impl Wal {
     /// back on the sweep's list. An uncertain deletion is not verified:
     /// one parent fsync covers the whole pass, so its failure requeues
     /// every path the pass removed.
-    fn settle_partials(
-        &mut self,
-        popped: Vec<PathBuf>,
-        removed: &std::collections::HashSet<PathBuf>,
-        fsync_failed: bool,
-    ) -> usize {
+    fn settle_partials(&mut self, popped: Vec<PathBuf>, unlinked: &Unlinked) -> usize {
         let (done, requeued): (Vec<PathBuf>, Vec<PathBuf>) = popped
             .into_iter()
-            .partition(|path| removed.contains(path) && !fsync_failed);
+            .partition(|path| unlinked.removed.contains(path) && !unlinked.fsync_failed);
         self.requeue_partials(requeued);
         done.len()
     }
@@ -520,8 +518,7 @@ impl Wal {
         &mut self,
         store: &mut Option<ReclaimStore>,
         popped: &[retain::Popped],
-        removed: &std::collections::HashSet<PathBuf>,
-        fsync_failed: bool,
+        unlinked: &Unlinked,
     ) -> Result<usize, ReclaimError> {
         let Some(store) = store.as_mut() else {
             return Ok(0);
@@ -529,7 +526,10 @@ impl Wal {
         let mut record = store.record().clone();
         let mut done = 0;
         for entry in popped {
-            match (removed.contains(&entry.path), fsync_failed) {
+            match (
+                unlinked.removed.contains(&entry.path),
+                unlinked.fsync_failed,
+            ) {
                 (true, false) => {
                     self.raise_entry(&mut record, entry.segment)?;
                     record.planned.retain(|p| p.segment != entry.segment);
@@ -753,7 +753,7 @@ impl ReclaimSlot {
     ) -> Result<pass::UnlinkPermit, std::io::Error> {
         let mut held = self.lock();
         if held.closed() {
-            return Err(closed(plan));
+            return Err(PlanRefusal::Closed.error(plan));
         }
         match self.live().load(Ordering::Acquire) {
             // Not superseded but **settled**: a commit has already
@@ -762,11 +762,11 @@ impl ReclaimSlot {
             // caller's next `unlink_planned` would remove segments the
             // commit had returned to eligible with nothing on disk
             // accounting for them.
-            0 => return Err(settled(plan)),
+            0 => return Err(PlanRefusal::Settled.error(plan)),
             live => {
                 let live = pass::PassId::new(self.instance(), live);
                 if live != plan.pass {
-                    return Err(superseded(plan, live));
+                    return Err(PlanRefusal::Superseded(live).error(plan));
                 }
             }
         }

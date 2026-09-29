@@ -1,18 +1,19 @@
 //! The HTTP serve loop shared by the OTLP/HTTP and querier listeners,
-//! plaintext and TLS alike, and the transport deadlines it sets.
+//! plaintext and TLS alike, and the transport deadlines of all listeners.
 //!
 //! `axum::serve` builds its hyper connection with no timer and exposes no
 //! settings, so hyper's header-read timeout is off and a peer that stalls
 //! or goes quiet holds its socket for as long as it likes. [`serve_http`]
-//! keeps `axum::serve`'s accept → spawn → graceful-drain shape and sets:
+//! keeps `axum::serve`'s accept → spawn → graceful-drain shape, serves
+//! HTTP/1 only, and sets [`HEADER_READ_TIMEOUT`]. hyper runs that clock
+//! whenever a connection is waiting for a request head, including while an
+//! idle keep-alive connection waits for its next request, so it also
+//! closes idle keep-alive connections.
 //!
-//! - [`HEADER_READ_TIMEOUT`] on HTTP/1. hyper runs this clock whenever a
-//!   connection is waiting for a request head, including while an idle
-//!   keep-alive connection waits for its next request, so it also closes
-//!   idle keep-alive connections;
-//! - [`HTTP2_KEEPALIVE_INTERVAL`] / [`HTTP2_KEEPALIVE_TIMEOUT`] on HTTP/2;
-//! - [`TCP_KEEPALIVE`] on every accepted socket (via [`PlainListener`] and
-//!   [`TlsListener`](crate::tls_serve::TlsListener)).
+//! Every listener sets [`TCP_KEEPALIVE`] on the sockets it accepts
+//! ([`PlainListener`], [`TlsListener`](crate::tls_serve::TlsListener), and
+//! the gRPC `TcpIncoming`); the gRPC server also sends HTTP/2 keepalive
+//! PINGs ([`GRPC_KEEPALIVE_INTERVAL`] / [`GRPC_KEEPALIVE_TIMEOUT`]).
 //!
 //! None of these bounds a request once its head has arrived.
 
@@ -29,9 +30,9 @@ use axum::http::Request;
 use axum::serve::Listener;
 use futures_core::Stream;
 use hyper::body::Incoming;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -43,13 +44,12 @@ use tower_service::Service as _;
 /// default, which stays off unless a timer is set.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Interval between the server's HTTP/2 keepalive PINGs, on the HTTP
-/// listeners and on the gRPC listener.
-pub const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Interval between the gRPC server's HTTP/2 keepalive PINGs.
+pub const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long an HTTP/2 keepalive PING may go unanswered before the
-/// connection is closed.
-pub const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a gRPC keepalive PING may go unanswered before the connection
+/// is closed.
+pub const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Idle time before the kernel starts TCP keepalive probes on an accepted
 /// socket.
@@ -62,9 +62,9 @@ const FD_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(500);
 /// Pause after any other accept error.
 const ACCEPT_RETRY: Duration = Duration::from_millis(1);
 
-/// Serve `router` on `listener` until `shutdown` resolves, then stop
-/// accepting, let every open connection finish its in-flight requests,
-/// and return once all of them have closed.
+/// Serve `router` over HTTP/1 on `listener` until `shutdown` resolves,
+/// then stop accepting, let every open connection finish its in-flight
+/// requests, and return once all of them have closed.
 ///
 /// `listener` is a [`PlainListener`] or a
 /// [`TlsListener`](crate::tls_serve::TlsListener); both set
@@ -84,16 +84,10 @@ async fn serve_with<L>(
 ) where
     L: Listener,
 {
-    let mut builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = http1::Builder::new();
     builder
-        .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read);
-    builder
-        .http2()
-        .timer(TokioTimer::new())
-        .keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let (open_tx, open_rx) = watch::channel(());
@@ -120,7 +114,7 @@ async fn serve_with<L>(
 async fn serve_connection<I>(
     io: I,
     router: Router,
-    builder: auto::Builder<TokioExecutor>,
+    builder: http1::Builder,
     mut stop: watch::Receiver<bool>,
     _open: watch::Receiver<()>,
 ) where
@@ -128,7 +122,11 @@ async fn serve_connection<I>(
 {
     let service =
         service_fn(move |request: Request<Incoming>| router.clone().call(request.map(Body::new)));
-    let mut conn = pin!(builder.serve_connection_with_upgrades(TokioIo::new(io), service));
+    let mut conn = pin!(
+        builder
+            .serve_connection(TokioIo::new(io), service)
+            .with_upgrades()
+    );
     let served = tokio::select! {
         served = conn.as_mut() => Some(served),
         _ = stop.wait_for(|stop| *stop) => None,
@@ -268,7 +266,7 @@ mod tests {
 
     use axum::Router;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::Request;
     use axum::routing::get;
     use axum::serve::Listener as _;
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -278,8 +276,17 @@ mod tests {
     use tokio_rustls::client::TlsStream;
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-    use super::{HEADER_READ_TIMEOUT, PlainListener, fd_exhausted, serve_with};
-    use crate::tls_serve::{LISTENER_HTTP, ReloadingAcceptor, TlsListener};
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    use futures_core::Stream;
+
+    use super::{
+        FD_EXHAUSTED_BACKOFF, HEADER_READ_TIMEOUT, PlainListener, accept_backoff, fd_exhausted,
+        serve_with,
+    };
+    use crate::tls_serve::{LISTENER_GRPC, LISTENER_HTTP, ReloadingAcceptor, TlsListener};
 
     /// The header-read timeout the tests serve with, in place of 30 s.
     const SHORT: Duration = Duration::from_millis(300);
@@ -436,25 +443,30 @@ mod tests {
         get_ok(&mut stream, "/", "ok").await;
     }
 
-    /// An h2c connection is left to the HTTP/2 PING keepalive: the HTTP/1
-    /// header-read timeout does not close it between requests.
+    /// The HTTP listeners speak HTTP/1 only: a cleartext HTTP/2
+    /// prior-knowledge client gets no response.
     #[tokio::test]
-    async fn http2_connections_are_not_subject_to_the_http1_header_read_timeout() {
+    async fn h2c_prior_knowledge_is_not_served() {
         let addr = serve_plain().await;
         let tcp = TcpStream::connect(addr).await.expect("connect");
-        let (mut sender, conn) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
-                .await
-                .expect("h2 handshake");
-        tokio::spawn(conn);
-        for _ in 0..2 {
+        let exchange = async {
+            let (mut sender, conn) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+                    .await?;
+            tokio::spawn(conn);
             let request = Request::get("http://localhost/")
                 .body(Body::empty())
                 .expect("request");
-            let response = sender.send_request(request).await.expect("h2 request");
-            assert_eq!(response.status(), StatusCode::OK);
-            tokio::time::sleep(SHORT * 3).await;
-        }
+            sender.send_request(request).await
+        };
+        let exchange = tokio::time::timeout(PATIENCE, exchange)
+            .await
+            .expect("the server answers or closes in time");
+        assert!(
+            exchange.is_err(),
+            "h2c was served: {:?}",
+            exchange.map(|r| r.status())
+        );
     }
 
     /// Shutdown stops the listener, lets the in-flight request finish,
@@ -526,5 +538,54 @@ mod tests {
         assert!(!fd_exhausted(&std::io::Error::from(
             std::io::ErrorKind::ConnectionAborted
         )));
+    }
+
+    /// Yields a fixed script of accept results, then ends.
+    struct Scripted(VecDeque<std::io::Result<u8>>);
+
+    impl Stream for Scripted {
+        type Item = std::io::Result<u8>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.0.pop_front())
+        }
+    }
+
+    fn poll_once<S: Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {
+        Pin::new(stream).poll_next(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_pauses_after_descriptor_exhaustion_only() {
+        let mut incoming = accept_backoff(
+            Scripted(VecDeque::from([
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+                Ok(1),
+            ])),
+            LISTENER_GRPC,
+        );
+        match poll_once(&mut incoming) {
+            Poll::Ready(Some(Err(e))) => assert_eq!(e.raw_os_error(), Some(libc::EMFILE)),
+            other => panic!("expected the EMFILE error to be forwarded, got {other:?}"),
+        }
+        assert!(poll_once(&mut incoming).is_pending());
+        tokio::time::advance(FD_EXHAUSTED_BACKOFF / 2).await;
+        assert!(poll_once(&mut incoming).is_pending());
+        tokio::time::advance(FD_EXHAUSTED_BACKOFF / 2).await;
+        assert!(matches!(poll_once(&mut incoming), Poll::Ready(Some(Ok(1)))));
+
+        let mut incoming = accept_backoff(
+            Scripted(VecDeque::from([
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+                Ok(2),
+            ])),
+            LISTENER_GRPC,
+        );
+        assert!(matches!(
+            poll_once(&mut incoming),
+            Poll::Ready(Some(Err(_)))
+        ));
+        assert!(matches!(poll_once(&mut incoming), Poll::Ready(Some(Ok(2)))));
     }
 }

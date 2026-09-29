@@ -37,10 +37,10 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # Reload-loop and resolver diagnostics ride the workspace tracing setup.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The HTTP serve loop (`serve`): `axum::serve` sets no hyper timer and
-# exposes no connection settings, so the listeners drive hyper-util's auto
-# builder directly. All already in the tree via axum and tonic.
-hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
+# exposes no connection settings, so the listeners drive hyper's HTTP/1
+# connection builder directly. All already in the tree via axum and tonic.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 socket2 = { version = "0.6", default-features = false }
 tower-service = "0.3"
 
@@ -81,7 +81,7 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["std"
 # The serve-loop tests terminate TLS with a cert minted at test runtime,
 # speak raw HTTP/1 over the socket, and open an h2c connection.
 rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
-tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "test-util"] }
 hyper = { version = "1", default-features = false, features = ["client", "http2"] }
 
 [features]

@@ -32,8 +32,8 @@ use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
 use ourios_serving::serve::{
-    HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, PlainListener, TCP_KEEPALIVE,
-    accept_backoff, serve_http,
+    GRPC_KEEPALIVE_INTERVAL, GRPC_KEEPALIVE_TIMEOUT, PlainListener, TCP_KEEPALIVE, accept_backoff,
+    serve_http,
 };
 use ourios_serving::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{
@@ -976,8 +976,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
                 let _ = rx.changed().await;
             };
             let server = Server::builder()
-                .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
-                .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+                .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
                 .layer(auth_layer)
                 .add_service(grpc_service);
             let grpc_incoming = accept_backoff(grpc_incoming, LISTENER_GRPC);
@@ -1032,6 +1032,29 @@ mod tests {
     use ourios_core::tenant::TenantId;
 
     use super::*;
+
+    /// `Server::tcp_keepalive` is ignored under `serve_with_incoming`, so the
+    /// gRPC socket keepalive rides on the `TcpIncoming` the listener binds.
+    #[tokio::test]
+    async fn grpc_accepted_sockets_have_tcp_keepalive() {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let (mut grpc, grpc_addr, _http, _) =
+            bind_listeners(loopback, loopback).await.expect("bind");
+        let _client = tokio::net::TcpStream::connect(grpc_addr)
+            .await
+            .expect("connect");
+        let accepted = std::future::poll_fn(|cx| {
+            futures_core::Stream::poll_next(std::pin::Pin::new(&mut grpc), cx)
+        })
+        .await
+        .expect("an accepted socket")
+        .expect("accept");
+        assert!(
+            socket2::SockRef::from(&accepted)
+                .keepalive()
+                .expect("SO_KEEPALIVE")
+        );
+    }
 
     /// #791: the sweep could not tell a cancelled step from a panicked one —
     /// it broke its loop on either, so a panic retired the flush cadence for

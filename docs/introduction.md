@@ -39,12 +39,13 @@ on-disk schema can still move: treat everything as pre-1.0.
   [lock it down](./guides/authentication.md) before a listener leaves
   localhost.
 - **Architecture** — the load-bearing reading:
-  [OTLP's log data model vs. the miner's view of
-  it](./architecture/otlp-log-format.md),
   [hazards](./hazards.md) (where projects in this space die, and how
   we won't), [verification](./verification.md) (how an RFC criterion
   becomes a red-gate test becomes a green one), and the
-  [glossary](./glossary.md).
+  [glossary](./glossary.md). For history, the 2026-05 finding on
+  [OTLP's log data model vs. the miner's view of
+  it](./architecture/otlp-log-format.md) records why the ingest
+  contract changed; its gaps are resolved.
 - **[Benchmarks](./benchmarks.md)** — the thesis gates, stated so they
   could falsify the project, and every measurement against them with
   run IDs and caveats; plus the [roadmap](./roadmap.md).

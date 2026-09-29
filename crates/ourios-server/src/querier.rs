@@ -16,7 +16,7 @@
 //! `500` whose message is the engine's already-scrubbed `Display` (RFC0007.3).
 //!
 //! `serve` / `QuerierHandle` mirror the receiver role's topology (RFC 0003):
-//! bind a listener, serve it with `axum::serve(...).with_graceful_shutdown`,
+//! bind a listener, serve it with `ourios_serving::serve::serve_http`,
 //! and expose the bound address + a `shutdown()` future over a `watch` channel.
 
 use std::net::SocketAddr;
@@ -35,6 +35,7 @@ use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::extract_context;
+use ourios_serving::serve::{PlainListener, serve_http};
 use ourios_serving::tls::{ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{LISTENER_QUERIER, TlsListener, reloading_acceptor};
 use serde::Serialize;
@@ -107,7 +108,7 @@ pub struct QuerierConfig {
 pub struct QuerierHandle {
     pub http_addr: SocketAddr,
     shutdown: watch::Sender<()>,
-    http: JoinHandle<std::io::Result<()>>,
+    http: JoinHandle<()>,
 }
 
 impl QuerierHandle {
@@ -116,14 +117,13 @@ impl QuerierHandle {
     ///
     /// # Errors
     ///
-    /// The listener task's join/serve error, as a `String` (no engine type
+    /// The listener task's join error, as a `String` (no engine type
     /// crosses the boundary).
     pub async fn shutdown(self) -> Result<(), String> {
         let _ = self.shutdown.send(());
         self.http
             .await
-            .map_err(|e| format!("HTTP listener task: {e}"))?
-            .map_err(|e| format!("HTTP listener: {e}"))
+            .map_err(|e| format!("HTTP listener task: {e}"))
     }
 }
 
@@ -411,17 +411,22 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         let shutdown = async move {
             let _ = shutdown_rx.changed().await;
         };
-        let make = app.into_make_service();
         match acceptor {
             Some(acceptor) => {
-                axum::serve(TlsListener::new(listener, acceptor, LISTENER_QUERIER), make)
-                    .with_graceful_shutdown(shutdown)
-                    .await
+                serve_http(
+                    TlsListener::new(listener, acceptor, LISTENER_QUERIER),
+                    app,
+                    shutdown,
+                )
+                .await;
             }
             None => {
-                axum::serve(listener, make)
-                    .with_graceful_shutdown(shutdown)
-                    .await
+                serve_http(
+                    PlainListener::new(listener, LISTENER_QUERIER),
+                    app,
+                    shutdown,
+                )
+                .await;
             }
         }
     });

@@ -3,11 +3,12 @@
 //! candidate/widening primitives. Every item is `self`-free — moved
 //! verbatim from the flat `cluster.rs` (epic #745 wave 2).
 
-// The parent scope IS this module's import surface: the split was
-// mechanical code motion (epic #745 wave 2), and gluing back through
-// `super` keeps every pre-split path resolving unchanged.
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use ourios_core::audit::{ParamType, SlotExpansion, SlotTypes, TemplateChange};
+use ourios_core::otlp::{OtlpLogRecord, any_value};
+use ourios_core::record::Param;
+
+use crate::tree::{Leaf, OwnedToken, format_template};
+use crate::upstream::LOG_RECORD_TEMPLATE_ATTR;
 
 /// Free helper: clone tokenize's borrowed-from-input separators
 /// into the `Vec<String>` shape `MinedRecord::separators`
@@ -256,6 +257,8 @@ pub(super) fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[
 /// any change to make wildcards reachable from divergent prefix
 /// tokens (multi-bucket lookup, wildcard-aware re-bucketing) is
 /// its own RFC-level decision.
+///
+/// [`MinerCluster::ingest_string`]: super::MinerCluster::ingest_string
 pub(super) fn build_record_params(
     template: &[OwnedToken],
     masked_strs: &[&str],

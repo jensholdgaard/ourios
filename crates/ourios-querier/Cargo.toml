@@ -98,6 +98,12 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 zstd = "0.13"
 
 [dev-dependencies]
+# #853 — the request-counting `ObjectStore` wrapper (`src/test_support.rs`)
+# that pins which prefixes a windowed query lists. All three are already in
+# the tree via ourios-parquet / DataFusion.
+object_store = { version = "0.14", default-features = false }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
 ourios-config = { path = "../ourios-config" }
 # RFC0033.7 (`tests/rfc0033_7_observability.rs`) — the in-memory metrics

@@ -36,14 +36,24 @@ references resolved from the secret — never inline.
 
 The chart's
 [README](https://github.com/jensholdgaard/ourios/tree/main/deploy/helm/ourios#readme)
-is the authoritative reference: full `values.yaml` documentation, the
-topology diagram, local-development (MinIO) recipes, and sizing
-notes. This page stays a pointer so the two never drift.
+is the authoritative reference: the key `values.yaml` settings, the
+topology diagram, S3 credentials and per-role IAM, the compactor
+topology, and probes. This page stays a pointer so the two never
+drift.
 
 ## Sending and querying
 
 In-cluster, point Collectors at the receiver Service
 (`ourios-receiver:4317`) and query the querier Service on 4319 —
 fronted by whatever ingress/TLS termination your cluster standardises
-on. Configure [authentication](./authentication.md) before exposing
-either beyond the cluster boundary.
+on.
+
+> **Warning:** a chart install runs **unauthenticated and over
+> plaintext** (RFC 0026 open mode). The chart renders the config file
+> itself and cannot yet set `auth`, listener TLS, `querier.mcp` or
+> `openfga`, and `OURIOS_*` variables cannot override a `--config`
+> file, so [authentication](./authentication.md) cannot be turned on
+> through the chart today
+> ([#852](https://github.com/jensholdgaard/ourios/issues/852)). Keep
+> both Services inside a trusted network boundary; do not expose
+> either beyond the cluster until that lands.

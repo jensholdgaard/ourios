@@ -265,8 +265,8 @@ pub(crate) struct SegmentLedger {
 
 /// One walk of the ledger inside a pass.
 #[derive(Debug, Clone, Copy)]
-struct Drain {
-    bound: PopBound,
+struct Drain<'a> {
+    bound: PopBound<'a>,
     budget: usize,
     admit: Admit,
 }
@@ -277,13 +277,61 @@ enum Admit {
     /// Entries a pass left marked reclaiming, re-planned ahead of
     /// anything newly eligible (§3.7).
     Reclaiming,
+    /// Eligible segments that already hold a durable `planned` row: a
+    /// plan abandoned after its record write, then withdrawn by a
+    /// horizon that regressed over it. Re-planning one replaces its
+    /// row, so it costs the record nothing.
+    Rowed,
     /// Empty-set segments at or below the checkpoint.
     Eligible,
 }
 
+/// The `RECLAIM` record's planned array as one pass may fill it
+/// (RFC 0052 §3.2): the segments that already hold a durable row, and
+/// how many rows beyond those the array has room for.
+///
+/// A pop that re-plans a segment with a row **replaces** that row,
+/// since the record merge drops it before pushing the new one; any
+/// other pop **adds** one. Only an add spends `free`. Without the
+/// distinction a row no pass re-plans — its segment withdrawn under a
+/// regressed horizon — would sit beside a full cap of new rows, and
+/// the slot would refuse every record write until the tenant caught
+/// up. Reserving the cap instead would deadlock at a cap of one: the
+/// row clears only by being re-planned, which a zero budget forbids.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlannedRows<'a> {
+    durable: &'a BTreeSet<Uuid>,
+    free: usize,
+}
+
+impl<'a> PlannedRows<'a> {
+    /// The rows a record holding `occupied` rows, naming the segments
+    /// in `durable`, leaves free in an array of `capacity`. The count
+    /// is the record's own rather than the set's: a record that named
+    /// one segment twice still spends two positions.
+    pub(crate) fn new(durable: &'a BTreeSet<Uuid>, occupied: usize, capacity: usize) -> Self {
+        Self {
+            durable,
+            free: capacity.saturating_sub(occupied.max(durable.len())),
+        }
+    }
+
+    /// Whether popping `id` fits the array.
+    fn affords(&self, id: Uuid) -> bool {
+        self.free > 0 || self.durable.contains(&id)
+    }
+
+    /// Account for a pop of `id`.
+    fn spend(&mut self, id: Uuid) {
+        if !self.durable.contains(&id) {
+            self.free = self.free.saturating_sub(1);
+        }
+    }
+}
+
 /// What bounds one pass's pops (RFC 0052 §3.2).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PopBound {
+pub(crate) struct PopBound<'a> {
     /// Every pop is at or below this, inclusively.
     pub(crate) checkpoint: WalOffset,
     /// The append target, which is never popped: identity is the
@@ -292,6 +340,9 @@ pub(crate) struct PopBound {
     /// Whether tenant horizons constrain the candidates — false only
     /// under `SnapshotHorizons::NoConsumer`.
     pub(crate) tenant_aware: bool,
+    /// The record's planned array: the second budget, on rows added
+    /// rather than on pops.
+    pub(crate) rows: PlannedRows<'a>,
 }
 
 /// One segment a pass popped, with everything the record write and the
@@ -482,6 +533,13 @@ impl SegmentLedger {
             .iter()
             .find_map(|id| self.segments.get(id)?.members.get(tenant))
             .map(|span| span.first)
+    }
+
+    /// Whether `tenant` may still have a frame on the root. Before
+    /// [`crate::Wal::rebuild_ledger`] has walked it, a tenant missing
+    /// from `members` proves nothing, so the answer is yes.
+    pub(crate) fn may_hold_frames(&self, tenant: &TenantId) -> bool {
+        !self.describes_root || self.oldest_frame(tenant).is_some()
     }
 
     /// Tenants with surviving frames, in a stable order.
@@ -714,62 +772,70 @@ impl SegmentLedger {
 
     /// Pop at most `budget` segments for this pass: entries already
     /// reclaiming first — §3.7's re-plan of a pass that never
-    /// committed — then newly eligible ones, oldest first.
+    /// committed — then eligible segments that already hold a durable
+    /// row, then newly eligible ones, oldest first within each.
     ///
     /// `bound` carries the checkpoint every pop is bounded by
-    /// (inclusive), the segment that may never be popped, and whether
-    /// tenants constrain the candidates at all.
-    pub(crate) fn pop(&mut self, bound: PopBound, budget: usize) -> (Vec<Popped>, bool) {
+    /// (inclusive), the segment that may never be popped, whether
+    /// tenants constrain the candidates at all, and the rows the
+    /// record can still take. A candidate the record has no row for
+    /// is left where it is and the pass reports `capped`: it is work
+    /// the next pass can do once a commit has freed a row.
+    pub(crate) fn pop(&mut self, bound: PopBound<'_>, budget: usize) -> (Vec<Popped>, bool) {
         if !self.describes_root {
             return (Vec::new(), false);
         }
         let mut out = Vec::new();
-        let replan = Drain {
-            bound,
-            budget,
-            admit: Admit::Reclaiming,
-        };
-        if self.drain(&mut out, replan) {
-            return (out, true);
+        let mut rows = bound.rows;
+        let mut capped = false;
+        for admit in [Admit::Reclaiming, Admit::Rowed, Admit::Eligible] {
+            let drain = Drain {
+                bound,
+                budget,
+                admit,
+            };
+            capped |= self.drain(&mut out, drain, &mut rows);
         }
-        let capped = self.drain(
-            &mut out,
-            Drain {
-                admit: Admit::Eligible,
-                ..replan
-            },
-        );
         (out, capped)
     }
 
-    /// Pop the candidates `drain` admits, oldest first, while the
-    /// budget holds. Returns whether the budget bound.
-    fn drain(&mut self, out: &mut Vec<Popped>, drain: Drain) -> bool {
+    /// Pop the candidates `drain` admits, oldest first, while both
+    /// budgets hold. Returns whether either one bound.
+    fn drain(&mut self, out: &mut Vec<Popped>, drain: Drain<'_>, rows: &mut PlannedRows) -> bool {
+        let mut refused = false;
         for id in self.candidates(drain) {
             if out.len() >= drain.budget {
                 return true;
             }
-            if !self.admits(id, drain) {
-                continue;
-            }
-            if let Some(popped) = self.take(id, drain.bound.current) {
-                out.push(popped);
+            match (self.admits(id, drain), rows.affords(id)) {
+                (false, _) => {}
+                (true, false) => refused = true,
+                (true, true) => {
+                    out.extend(
+                        self.take(id, drain.bound.current)
+                            .inspect(|_| rows.spend(id)),
+                    );
+                }
             }
         }
-        false
+        refused
     }
 
-    /// The ids one drain walks, **bounded by the budget**. `Reclaiming`
-    /// is §3.7's re-plan of a pass that never committed, taken ahead of
-    /// anything newly eligible. `Eligible` under `NoConsumer` walks the
-    /// whole ledger, since no tenant constrains anything; otherwise it
-    /// walks the empty-set head, which is what keeps a pinned oldest
-    /// segment from shadowing a later eligible one.
+    /// The ids one drain walks. `Reclaiming` is §3.7's re-plan of a
+    /// pass that never committed, taken ahead of anything newly
+    /// eligible; `Rowed` is the eligible part of the record's durable
+    /// rows. Both are walked whole: a pass pops at most the cap and
+    /// the planned array holds at most the cap, so neither set grows
+    /// past it, and truncating them would let an entry the record has
+    /// no row for hide one it has. `Eligible` under `NoConsumer` walks
+    /// the whole ledger, since no tenant constrains anything;
+    /// otherwise it walks the empty-set head, which is what keeps a
+    /// pinned oldest segment from shadowing a later eligible one.
     ///
-    /// Every branch takes at most **one more than** the budget and
-    /// stops at the first segment above the checkpoint. That is what
-    /// makes the walk O(cap) and not O(backlog): both structures are
-    /// ordered by `UUIDv7`, which is the order of the segments' highest
+    /// `Eligible` takes at most **one more than** the budget and stops
+    /// at the first segment above the checkpoint. That is what makes
+    /// the walk O(cap) and not O(backlog): both structures are ordered
+    /// by `UUIDv7`, which is the order of the segments' highest
     /// offsets, so nothing after the first uncovered one is covered
     /// either, and `take` is lazy so nothing past it is even visited.
     /// The `NoConsumer` branch may additionally skip entries already
@@ -782,15 +848,30 @@ impl SegmentLedger {
     /// finished. The append target is dropped **before** that extra is
     /// taken, since [`Self::take`] would refuse it anyway and letting
     /// it be the lookahead reports work no pass can ever do.
-    fn candidates(&self, drain: Drain) -> Vec<Uuid> {
+    fn candidates(&self, drain: Drain<'_>) -> Vec<Uuid> {
         let take = drain.budget.saturating_add(1);
         let covered = |id: &Uuid| {
             self.segments
                 .get(id)
                 .is_some_and(|s| s.highest <= drain.bound.checkpoint)
         };
+        let unclaimed = |id: &Uuid| {
+            if drain.bound.tenant_aware {
+                self.unpinned.contains(id)
+            } else {
+                !self.reclaiming.contains(id)
+            }
+        };
         match (drain.admit, drain.bound.tenant_aware) {
-            (Admit::Reclaiming, _) => self.reclaiming.iter().take(take).copied().collect(),
+            (Admit::Reclaiming, _) => self.reclaiming.iter().copied().collect(),
+            (Admit::Rowed, _) => drain
+                .bound
+                .rows
+                .durable
+                .iter()
+                .filter(|id| **id != drain.bound.current && covered(id) && unclaimed(id))
+                .copied()
+                .collect(),
             (Admit::Eligible, true) => self
                 .unpinned
                 .iter()
@@ -803,19 +884,19 @@ impl SegmentLedger {
                 .segments
                 .keys()
                 .take_while(|id| covered(id))
-                .filter(|id| **id != drain.bound.current && !self.reclaiming.contains(id))
+                .filter(|id| **id != drain.bound.current && unclaimed(id))
                 .take(take)
                 .copied()
                 .collect(),
         }
     }
 
-    fn admits(&self, id: Uuid, drain: Drain) -> bool {
+    fn admits(&self, id: Uuid, drain: Drain<'_>) -> bool {
         self.segments
             .get(&id)
             .is_some_and(|segment| match drain.admit {
                 Admit::Reclaiming => true,
-                Admit::Eligible => {
+                Admit::Rowed | Admit::Eligible => {
                     segment.state == State::Eligible && segment.highest <= drain.bound.checkpoint
                 }
             })
@@ -1003,9 +1084,12 @@ mod tests {
 
     use std::collections::BTreeSet;
 
-    use super::{FrameAt, PopBound, SegmentLedger, SnapshotHorizons, State, is_above};
+    use super::{FrameAt, PlannedRows, PopBound, SegmentLedger, SnapshotHorizons, State, is_above};
     use crate::WalOffset;
     use ourios_core::tenant::TenantId;
+
+    /// A record with no rows and room for any pass.
+    static NO_ROWS: BTreeSet<uuid::Uuid> = BTreeSet::new();
 
     const ALPHA: &str = "alpha";
     const BETA: &str = "beta";
@@ -1033,6 +1117,7 @@ mod tests {
             checkpoint: offsets[5],
             current,
             tenant_aware: true,
+            rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
         };
         let (popped, _) = ledger.pop(bound, 8);
         check(&ledger, current, "a pop");
@@ -1077,6 +1162,7 @@ mod tests {
                 checkpoint: newest,
                 current: rotated,
                 tenant_aware: false,
+                rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
             },
             8,
         );
@@ -1136,6 +1222,48 @@ mod tests {
         );
     }
 
+    /// A segment that already holds a durable `planned` row is
+    /// re-planned even when the record has no room for another row and
+    /// older eligible segments stand ahead of it. Walking only the
+    /// eligible head's budget-plus-one window would reach those older
+    /// segments first, refuse each for want of a row, and never reach
+    /// the one pop that frees a row — the stranded row would hold the
+    /// array full for good.
+    #[test]
+    fn a_rowed_segment_is_re_planned_behind_segments_the_record_has_no_room_for() {
+        let mut ledger = SegmentLedger::default();
+        let offsets: Vec<WalOffset> = (0..4)
+            .map(|_| append(&mut ledger, uuid::Uuid::now_v7(), 64, ALPHA))
+            .collect();
+        ledger.describe_root();
+        let current = offsets[3].segment;
+        ledger.apply(&horizons(&[(ALPHA, offsets[3])]), 8);
+        let stranded = offsets[2].segment;
+        assert!(ledger.take(stranded, current).is_some());
+        ledger.withdraw(stranded);
+
+        let durable = BTreeSet::from([stranded]);
+        let (popped, capped) = ledger.pop(
+            PopBound {
+                checkpoint: offsets[3],
+                current,
+                tenant_aware: true,
+                rows: PlannedRows::new(&durable, durable.len(), 1),
+            },
+            1,
+        );
+
+        assert_eq!(
+            popped.iter().map(|p| p.segment).collect::<Vec<_>>(),
+            vec![stranded],
+            "the pop that replaces a row, not the older ones that would add one",
+        );
+        assert!(
+            capped,
+            "and the older segments are work left for a later pass"
+        );
+    }
+
     fn behind(ledger: &SegmentLedger, tenant: &str) -> usize {
         ledger.tenants[&TenantId::new(tenant)].behind
     }
@@ -1157,6 +1285,7 @@ mod tests {
             checkpoint: offsets[5],
             current,
             tenant_aware: true,
+            rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
         };
         caught_up(&mut walked, &offsets);
         assert!(
@@ -1173,6 +1302,7 @@ mod tests {
                         checkpoint: offsets[5],
                         current,
                         tenant_aware: true,
+                        rows: PlannedRows::new(&NO_ROWS, 0, usize::MAX),
                     },
                     8,
                 )

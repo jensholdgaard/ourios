@@ -16,7 +16,7 @@
 //! problem). This sink instead mirrors the RFC 0014 record sink
 //! ([`crate::record_sink::ParquetRecordSink`]): [`AuditSink::emit`] only
 //! buffers (a cheap, request-path-safe push), and the blocking store I/O
-//! happens on [`SharedParquetAuditSink::flush`] / [`SharedParquetAuditSink::write_owned`].
+//! happens on [`SharedParquetAuditSink::flush`] / [`SharedParquetAuditSink::write_retaining`].
 //!
 //! **`emit` never blocks on flush I/O (issue #302 fix #4).** A flush drains the
 //! buffer under the lock, releases it, does the `AuditWriter` store I/O
@@ -46,11 +46,14 @@
 //! [`crate::publish::PublishCoordinator`] drains both buffers atomically under
 //! the pipeline's miner lock and writes audit-before-record; and the record
 //! sink's inline size/ceiling publish first calls an audit barrier
-//! ([`crate::record_sink::ParquetRecordSink::with_audit_barrier`]) that flushes
-//! this sink to durability (race-free — that publish runs under the miner lock).
+//! ([`crate::record_sink::ParquetRecordSink::with_audit_barrier`]),
+//! [`SharedParquetAuditSink::barrier`], that flushes this sink to durability
+//! and refuses while any other take's events are still out of the buffer and
+//! not durable — the encode pool publishes off the miner lock, and a drained
+//! batch can wait in the barrier's pending slot.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_parquet::{AuditWriter, AuditWriterError, PartitionKey, Store, derive_audit_partition};
@@ -293,12 +296,14 @@ impl AuditSink for BufferingAuditSink {
 /// sink.
 ///
 /// `emit` is a short critical section. The flushes ([`Self::flush`] /
-/// [`Self::write_owned`]) take the lock only to drain the buffer and to settle
+/// [`Self::write_retaining`]) take the lock only to drain the buffer and to settle
 /// afterwards — the `AuditWriter` store I/O runs **unlocked** in between (issue
 /// #302 fix #4), so a slow store flush never blocks a concurrent `emit`.
 #[derive(Clone)]
 pub struct SharedParquetAuditSink {
     inner: Arc<Mutex<BufferingAuditSink>>,
+    /// Every take out of the buffer not yet settled.
+    takes: Arc<Takes>,
 }
 
 impl SharedParquetAuditSink {
@@ -307,6 +312,7 @@ impl SharedParquetAuditSink {
     pub fn new(sink: BufferingAuditSink) -> Self {
         Self {
             inner: Arc::new(Mutex::new(sink)),
+            takes: Arc::new(Takes::default()),
         }
     }
 
@@ -339,44 +345,255 @@ impl SharedParquetAuditSink {
         self.lock().flushes()
     }
 
-    /// Atomically take the whole buffer (a cheap memory move, no I/O). The
+    /// Atomically take the whole buffer (a cheap memory move, no I/O) with
+    /// its place in the take order. The
     /// [`crate::publish::PublishCoordinator`] calls this under the pipeline's
-    /// miner lock so the drain is atomic w.r.t. `miner.ingest`.
-    #[must_use]
-    pub fn take_buffer(&self) -> Vec<AuditEvent> {
+    /// miner lock so the drain is atomic w.r.t. `miner.ingest`, and the
+    /// ticket is issued under the same lock as the take, so no
+    /// [`Self::barrier`] can see the events gone without seeing them in limbo.
+    pub(crate) fn take_ticketed(&self) -> (Vec<AuditEvent>, Ticket) {
         let mut guard = self.lock();
         let events = std::mem::take(&mut guard.buffer);
         guard.metrics.set_buffered(0);
-        events
+        let id = self.takes.lock().issue(!events.is_empty());
+        let ticket = Ticket {
+            id,
+            takes: Arc::clone(&self.takes),
+        };
+        (events, ticket)
     }
 
     /// Write an owned `events` batch to durability, holding the lock only to
     /// read the store handle and to settle afterwards (the store I/O runs
-    /// unlocked). Transient failures are requeued ahead of newly-buffered
-    /// events; permanent failures drop. Returns whether every event reached
-    /// durability or was permanently dropped — i.e. **nothing is retained for
-    /// retry** (the audit-before-record gate the publisher needs).
+    /// unlocked). Permanent failures drop; the transient ones come back to
+    /// the caller, which puts them back together with whatever depends on
+    /// them.
     #[must_use]
-    pub fn write_owned(&self, events: Vec<AuditEvent>) -> bool {
+    pub fn write_retaining(&self, events: Vec<AuditEvent>) -> Vec<AuditEvent> {
         if events.is_empty() {
-            return true;
+            return events;
         }
         let store = self.lock().store.clone();
         let (retained, summary) = write_events(&store, events);
-        let fully_durable = retained.is_empty();
-        let mut guard = self.lock();
-        guard.settle(&summary);
-        guard.requeue_ahead(retained);
-        fully_durable
+        self.lock().settle(&summary);
+        retained
     }
 
-    /// Drain the internal buffer to durability — the size-trigger audit barrier
-    /// and standalone cadence/shutdown flush. Returns whether the buffer was
-    /// fully drained (nothing retained for retry).
+    /// Put `events` back at the head of the buffer, ahead of whatever
+    /// `emit` buffered meanwhile — RFC 0052 §3.1's park of a drained
+    /// snapshot the barrier could not take.
+    pub fn requeue(&self, events: Vec<AuditEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.lock().requeue_ahead(events);
+    }
+
+    /// Drain the internal buffer to durability — the standalone
+    /// cadence/shutdown flush, and the first half of [`Self::barrier`].
+    /// Returns whether the buffer was fully drained (nothing retained for
+    /// retry); transient failures are requeued ahead of newly-buffered
+    /// events.
     #[must_use]
     pub fn flush(&self) -> bool {
-        let events = self.take_buffer();
-        self.write_owned(events)
+        let (events, ticket) = self.take_ticketed();
+        let retained = self.write_retaining(events);
+        if retained.is_empty() {
+            ticket.clear();
+            return true;
+        }
+        self.requeue(retained);
+        drop(ticket);
+        false
+    }
+
+    /// Whether every event emitted so far is durable — nothing buffered
+    /// and no take's events in limbo — answered with **no store I/O**.
+    /// When it is not, the eager-flush signal is raised, so the age sweep
+    /// writes the buffer off the caller's thread.
+    ///
+    /// The record sink's inline barrier on the encode pool's path: a
+    /// barrier holding the ingest exclusion waits on the encode worker,
+    /// so the worker must never be inside an audit PUT (RFC 0052 §3.1).
+    /// A partition this refuses stays over its size target in the buffers
+    /// and is detached by the next append after the flush.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        let sink = self.lock();
+        let settled = sink.buffer.is_empty() && self.takes.lock().quiet().is_some();
+        if !settled {
+            sink.overflow_notify.notify_one();
+        }
+        settled
+    }
+
+    /// The record sink's inline audit barrier: whether every event emitted
+    /// so far is durable. Flushes the buffer, and refuses when any other
+    /// take's events are in limbo before or after that flush, or went back
+    /// to the buffer during it (see the sink's take ledger).
+    #[must_use]
+    pub fn barrier(&self) -> bool {
+        let Some(before) = self.takes.lock().quiet() else {
+            return false;
+        };
+        self.flush() && self.takes.lock().quiet() == Some(before)
+    }
+}
+
+/// Every take out of the audit buffer not yet settled, in the order the
+/// takes happened (RFC 0005 §3.7's audit-before-record, under concurrent
+/// takes).
+///
+/// A record may depend on any event emitted before it, and such an
+/// event is durable, still buffered, or in a take that has not reached
+/// the store yet — or has gone back to the buffer after the record's
+/// own take. The last two are what a publisher cannot see for itself:
+/// the age sweep and the barrier drain concurrently, the pending slot
+/// holds a drained batch for as long as the cut ahead of it runs, and
+/// the inline size and ceiling publishes run beside all of them. So a
+/// drain publishes its records only when no earlier take's events are
+/// in limbo and none went back after it, and an inline publish only
+/// when no take's events are in limbo at all (see
+/// [`SharedParquetAuditSink::barrier`]). A refused drain requeues its
+/// records, and the next drain, which takes the returned events with
+/// them, publishes both in order.
+///
+/// Only the barrier's own drains wait on it ([`Ticket::clear_in_turn`]),
+/// and only for earlier takes: those belong to the age sweep and the
+/// audit flushes, which never wait, or to batches the barrier task has
+/// already written. Everyone else refuses instead — `quiesce_publishes`
+/// waits for every guard, so an age drain waiting behind a pending cut
+/// would wait for the cut ahead of it, which is waiting for that drain's
+/// guard.
+#[derive(Debug, Default)]
+struct Ledger {
+    next: u64,
+    open: BTreeMap<u64, Standing>,
+    /// How many takes went back to the buffer (or were lost) with their
+    /// events undelivered — what an inline publish compares across its
+    /// own flush.
+    abandoned: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Standing {
+    /// The drain's audit batch is out of the buffer and not yet durable.
+    in_limbo: bool,
+    /// An earlier drain's events went back to the buffer after this one
+    /// was taken, so its records may depend on events it does not carry.
+    doomed: bool,
+}
+
+impl Ledger {
+    fn issue(&mut self, in_limbo: bool) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.open.insert(
+            id,
+            Standing {
+                in_limbo,
+                doomed: false,
+            },
+        );
+        id
+    }
+
+    /// Close `id` with its own events durable, answering whether its
+    /// records may publish.
+    fn clear(&mut self, id: u64) -> bool {
+        let earlier_in_limbo = self.earlier_in_limbo(id);
+        matches!(self.open.remove(&id), Some(own) if !own.doomed) && !earlier_in_limbo
+    }
+
+    /// Close `id` with its events back in the buffer or lost, dooming
+    /// every drain taken after it.
+    fn abandon(&mut self, id: u64) {
+        match self.open.remove(&id) {
+            Some(standing) if standing.in_limbo => {
+                self.abandoned += 1;
+                for later in self.open.range_mut(id..).map(|(_, later)| later) {
+                    later.doomed = true;
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    fn earlier_in_limbo(&self, id: u64) -> bool {
+        self.open.range(..id).any(|(_, earlier)| earlier.in_limbo)
+    }
+
+    /// Whether `id` can still publish once every earlier take settles.
+    fn waiting(&self, id: u64) -> bool {
+        self.open.get(&id).is_some_and(|own| !own.doomed) && self.earlier_in_limbo(id)
+    }
+
+    /// `Some(abandoned)` when no take's events are in limbo.
+    fn quiet(&self) -> Option<u64> {
+        (!self.open.values().any(|standing| standing.in_limbo)).then_some(self.abandoned)
+    }
+}
+
+/// A take's place in the [`Ledger`]. Dropping it without a
+/// [`Ticket::clear`] abandons the take — the requeue, park and unwind
+/// paths alike — so it must drop only once the events it carried are
+/// back in the buffer.
+#[derive(Debug)]
+pub(crate) struct Ticket {
+    id: u64,
+    takes: Arc<Takes>,
+}
+
+impl Ticket {
+    /// Close this take with its own events durable, answering whether
+    /// records taken with it may publish.
+    pub(crate) fn clear(&self) -> bool {
+        let cleared = self.takes.lock().clear(self.id);
+        self.takes.settled.notify_all();
+        cleared
+    }
+
+    /// [`Self::clear`], after waiting for every earlier take to settle —
+    /// the barrier's drains, whose earlier takes never wait on them.
+    pub(crate) fn clear_in_turn(&self) -> bool {
+        let mut ledger = self.takes.lock();
+        if let Some(own) = ledger.open.get_mut(&self.id) {
+            own.in_limbo = false;
+        }
+        self.takes.settled.notify_all();
+        while ledger.waiting(self.id) {
+            ledger = self
+                .takes
+                .settled
+                .wait(ledger)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        let cleared = ledger.clear(self.id);
+        drop(ledger);
+        self.takes.settled.notify_all();
+        cleared
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.takes.lock().abandon(self.id);
+        self.takes.settled.notify_all();
+    }
+}
+
+/// The [`Ledger`] and the signal its settlements raise. A leaf: taken
+/// alone or inside the audit buffer's lock, and never held while taking
+/// anything else.
+#[derive(Debug, Default)]
+struct Takes {
+    ledger: Mutex<Ledger>,
+    settled: Condvar,
+}
+
+impl Takes {
+    fn lock(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -578,7 +795,7 @@ mod tests {
 
     #[test]
     fn transient_store_failure_retains_for_retry() {
-        // End-to-end: a sabotaged store makes `write_owned` fail transiently;
+        // End-to-end: a sabotaged store makes `flush` fail transiently;
         // the events are retained (not durable, not dropped) and the flush
         // reports "not fully drained" so the publisher holds the records.
         let dir = tempfile::TempDir::new().expect("temp");

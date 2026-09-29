@@ -115,6 +115,10 @@ tokio = { version = "=1.53.1", default-features = false, features = ["io-util", 
 # Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
 # RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+# Poll the gRPC `TcpIncoming` and read `SO_KEEPALIVE` off the socket it
+# accepted.
+futures-core = { version = "=0.3.34", default-features = false }
+socket2 = { version = "=0.6.4", default-features = false }
 # In-memory metric exporter for the RFC0016.6 query-metrics test: install a
 # global meter provider and read the exported stream (the ingester pattern).
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }

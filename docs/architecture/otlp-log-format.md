@@ -1,5 +1,15 @@
 # OTLP log format — what crosses the wire vs. what Ourios consumes today
 
+> **Historical — resolved.** This is a dated investigation finding
+> (2026-05-13), kept as the record of why the ingest contract changed;
+> it does not describe the current architecture. Every gap it lists
+> was closed: the RFC 0001 §6.1 amendment moved the miner onto the OTLP
+> record shape, and the miner now ingests `&OtlpLogRecord`
+> (`crates/ourios-miner/src/cluster/mod.rs`), not a raw `&str`.
+> [RFC 0003](../rfcs/0003-otlp-receiver.md) (OTLP receiver) and
+> [RFC 0018](../rfcs/0018-otlp-log-spec-compliance.md) (OTLP log-spec
+> compliance) are both `accepted`. "Today" below means 2026-05-13.
+
 > Status: **investigation finding**. Drafted 2026-05-13 to answer
 > "is our template miner targeting the actual OTLP shape, or a
 > made-up one?" Conclusion: the latter. This doc surfaces the gap

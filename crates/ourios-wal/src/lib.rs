@@ -1,23 +1,28 @@
-//! `ourios-wal` — RFC 0008 write-ahead log.
+//! `ourios-wal` — the write-ahead log (RFC 0008) and its reclamation and
+//! quiesce recovery (RFC 0052).
 //!
-//! **Status: RFC 0008 `accepted`.** All §5 acceptance arms (.1–.10) are
-//! green with no `#[ignore]`'d stubs remaining: `open`, `append` (with
-//! §6.5 rotation), `sync`, `replay`, `checkpoint`, `housekeeping`, and
-//! `metrics` back wal-before-ack, crash recovery (the real-SIGKILL CI
-//! gate), recovery O(N), torn-write heal, corruption halt, segment
-//! rotation, checkpoint + durable sidecar, batched-fsync group commit,
-//! the unflushed-bytes bound, and the startup recovery driver. The one
-//! deferral is the §9 corruption *audit event* (`encode_audit_event`
-//! stays `unimplemented!()` pending a system-scoped-audit design). See
-//! RFC 0008 for the design contract.
+//! **RFC 0008** is the durability contract. The public API follows its
+//! §6.1 verbatim — the same `(WalOffset, FrameKind, FrameSink, Wal)`
+//! surface the RFC pins — and `open`, `append`, `sync`, `replay`,
+//! `checkpoint`, `housekeeping` and `metrics` back wal-before-ack,
+//! crash recovery (the real-SIGKILL CI gate), recovery O(N), torn-write
+//! heal, corruption halt, segment rotation, checkpoint + durable sidecar,
+//! batched-fsync group commit, the unflushed-bytes bound, and the
+//! startup recovery driver. Segment file layout (`segment`), frame
+//! format (`frame`), fsync policy, recovery walk and the `CHECKPOINT`
+//! sidecar (`checkpoint`) follow §§6.2–6.7. The §9 corruption *audit
+//! event* is the open item: `encode_audit_event` stays `unimplemented!()`
+//! pending a system-scoped-audit design.
 //!
-//! The shape of the public API follows §6.1 verbatim — the
-//! same `(WalOffset, FrameKind, FrameSink, Wal)` surface the
-//! RFC pins. Implementation details (segment file layout,
-//! frame format, fsync policy, recovery walk, checkpoint
-//! sidecar) are spelled out in §§6.2–6.7; the durability
-//! (`sync`, §6.3) and crash-recovery (`replay`, §6.6) halves
-//! land here, with the remaining slices in follow-up PRs.
+//! **RFC 0052** covers giving disk back. `retain` derives which closed
+//! segments a pass may pop from the per-tenant snapshot horizons;
+//! `ledger` is the in-memory figure rebuilt from surviving segments;
+//! `pass` and `housekeeping` run the housekeeping pass in its ledger and
+//! file halves; `reclaim` / `reclaim_store` are the `RECLAIM` sidecar
+//! codec and file; `reconcile` is the open-time reconciliation of
+//! `CHECKPOINT`, `RECLAIM` and segment headers; and `rotation` runs
+//! segment rotation under a bounded retry budget, reporting whether the
+//! WAL is still retrying or has given up.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, ErrorKind};
@@ -50,7 +55,7 @@ pub(crate) mod segment;
 pub use ledger::LedgerError;
 pub use pass::{
     HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
-    ReclaimPlan, SkipReason, UnlinkPermit, unlink_failure, unlink_planned,
+    ReclaimPlan, SkipReason, UnlinkPermit, unlink_failure, unlink_planned, write_plan_record,
 };
 pub use reclaim::{
     DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
@@ -424,8 +429,11 @@ pub struct Wal {
     checkpoint_version: Option<checkpoint::SidecarVersion>,
     /// The `RECLAIM` sidecar (RFC 0052 §3.2), when this root has one.
     /// A legacy root opens without a record and the first checkpoint
-    /// creates it on the upgrade path.
-    reclaim: Option<reclaim_store::ReclaimStore>,
+    /// creates it on the upgrade path. Shared with every plan this WAL
+    /// hands out, so a pass writes its record without the writer
+    /// position (§3.7); it also carries this `Wal`'s instance number
+    /// and the live-pass cell its permits read.
+    reclaim: reclaim_store::ReclaimSlot,
     /// Whether a housekeeping pass may plan segments (RFC 0052 §3.2).
     reclaim_gate: ReclaimGate,
     /// Stale `<uuid>.wal.partial` files, seeded by
@@ -449,15 +457,6 @@ pub struct Wal {
     /// the [`PassId`] on each plan comes from. Monotone, so a plan a
     /// later prepare superseded never matches the outstanding one.
     passes: u64,
-    /// This `Wal`'s own number, minted at open and never reused in the
-    /// process, so a [`PassId`] cannot be mistaken for one another
-    /// instance on the same root — a reopen — handed out.
-    instance: u64,
-    /// The pass an outstanding [`UnlinkPermit`] would still authorise,
-    /// zero when none is. Shared with the permits themselves, because
-    /// the unlink half holds no guard and no WAL handle and still has
-    /// to know that a later prepare has moved past its plan.
-    live_pass: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Bytes of validated frames in surviving segments, seeded after
     /// recovery by [`Self::rebuild_ledger`] (§3.7). Never file size
     /// less header, which would count a torn tail, and never the
@@ -542,6 +541,7 @@ impl Wal {
         let witness = reconcile::root(&config, sidecar, &existing_segments)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             append_target(&config.root, existing_segments)?;
+        let max_unlinks_per_pass = config.max_unlinks_per_pass;
         Ok(Self {
             config,
             current_segment,
@@ -556,7 +556,17 @@ impl Wal {
             faults: RotationFaults::default(),
             checkpoint: sidecar.map(|s| s.offset),
             checkpoint_version: sidecar.map(|s| s.version),
-            reclaim: witness.store,
+            // The instance number is minted here and never reused in
+            // the process, so a [`PassId`] cannot be mistaken for one
+            // another instance on the same root — a reopen — handed
+            // out. The live-pass cell is zero while no permit may
+            // unlink anything.
+            reclaim: reclaim_store::ReclaimSlot::new(
+                witness.store,
+                NEXT_WAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                max_unlinks_per_pass,
+            ),
             // `prepare_root` fsynced the root before the sidecars
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
@@ -564,8 +574,6 @@ impl Wal {
             ledger,
             outstanding: None,
             passes: 0,
-            instance: NEXT_WAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            live_pass: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unreclaimed_bytes: 0,
             appends_total: 0,
             syncs_total: 0,
@@ -627,6 +635,14 @@ impl Wal {
     #[cfg(feature = "fault-injection")]
     pub fn arm_rotation_faults(&mut self, faults: RotationFaults) {
         self.faults = faults;
+    }
+
+    /// Arm RFC 0052 §6's hold on a pass's `RECLAIM` slot write: `hook`
+    /// runs immediately before every such write, so a test can keep one
+    /// in flight while it drives the rest of the WAL.
+    #[cfg(feature = "fault-injection")]
+    pub fn arm_record_write_hook(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.reclaim.arm_hook(reclaim_store::WriteHook::armed(hook));
     }
 
     /// Append a frame of `kind` carrying `payload` (≤
@@ -797,6 +813,26 @@ impl Wal {
             .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
     }
 
+    /// Whether the current segment has outlived `segment_age_secs` —
+    /// the barrier task's idle-rotation predicate (RFC 0052 §3.1). The
+    /// age is the `UUIDv7`'s embedded mint time, so this costs no
+    /// syscall; whether the segment holds a frame is
+    /// [`Self::rotate`]'s own [`RotationKind::Discretionary`] check.
+    #[must_use]
+    pub fn segment_age_exceeded(&self) -> bool {
+        segment_age(self.current_segment_uuid)
+            .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
+    }
+
+    /// Whether a rotation-origin directory fsync is still owed. The
+    /// segment a failed post-rename fsync leaves installed is fresh, so
+    /// [`Self::segment_age_exceeded`] alone would let an idle node hold
+    /// the obligation until traffic returned; the timer asks this too.
+    #[must_use]
+    pub fn owes_rotation_fsync(&self) -> bool {
+        self.dir_fsync == DirFsync::PendingRotation
+    }
+
     /// RFC 0052 §3.3's callable rotation: close the current segment and
     /// install a fresh one, without an append driving it.
     ///
@@ -874,7 +910,13 @@ impl Wal {
         // segment beside no sidecar would leave the one shape the
         // open-time matrix fails closed on — a live pre-RFC root
         // bricked by rotating.
-        if let Err(e) = reconcile::ensure_record(&mut self.reclaim, &self.config) {
+        //
+        // Asked lock-free first: a root that has a record never loses
+        // it, and a rotation an append drives must not wait behind a
+        // pass's slot write for an answer it already has.
+        if !self.reclaim.has_record()
+            && let Err(e) = reconcile::ensure_record(&mut self.reclaim.lock(), &self.config)
+        {
             return Err(rotation_record_failed(e));
         }
         let (file, partial, uuid) = self.create_partial()?;
@@ -1167,7 +1209,7 @@ impl Wal {
                 return Ok(());
             }
         }
-        reconcile::arm(&mut self.reclaim, &self.config)?;
+        reconcile::arm(&mut self.reclaim.lock(), &self.config)?;
         // Split at the rename, because the two halves need opposite
         // answers. A failure inside `write` leaves nothing visible
         // under the final name, so nothing advances. A failure of the
@@ -1191,7 +1233,7 @@ impl Wal {
         // the open-time matrix, and an armed record beside a version-2
         // sidecar is promoted at the next open, so a failure here
         // loses nothing.
-        reconcile::witness(&mut self.reclaim)
+        reconcile::witness(&mut self.reclaim.lock())
     }
 
     /// Every part of the last checkpoint is on disk: the sidecar at
@@ -1218,9 +1260,7 @@ impl Wal {
         if self.checkpoint_version != Some(checkpoint::SidecarVersion::Current) {
             return false;
         }
-        self.reclaim
-            .as_ref()
-            .is_some_and(|store| store.record().witness.checkpoint == reclaim::Witness::Terminal)
+        self.reclaim.checkpoint_witnessed()
     }
 
     /// The `CHECKPOINT` sidecar's offset (`None` =
@@ -1247,9 +1287,25 @@ impl Wal {
     /// The timer lives in the caller (`wal_housekeeping_secs`);
     /// this is one pass.
     ///
+    /// **Superseded, and unreachable from production (issue #827).**
+    /// RFC 0052 §3.2's per-segment rule replaces this global bound
+    /// rather than standing beside it: this entry point writes no
+    /// `planned` witness, drops the segment from the tenant-aware
+    /// ledger and honours no per-pass cap, so a pass run through it
+    /// after the ledger has recorded a consumer mode can remove frames
+    /// a pinned tenant still holds. It survives only because it is
+    /// RFC 0008 §6.7's asserted contract, and the `legacy-housekeeping`
+    /// feature is what keeps the two surfaces from ever meeting on a
+    /// live root: the feature is enabled by this crate's own
+    /// dev-dependency and nothing else, so no product binary can reach
+    /// it. Every other caller uses [`Self::housekeeping_pass`] or the
+    /// [`Self::housekeeping_prepare`] / [`Self::housekeeping_commit`]
+    /// pair.
+    ///
     /// # Errors
     ///
     /// See [`HousekeepingError`].
+    #[cfg(feature = "legacy-housekeeping")]
     pub fn housekeeping(
         &mut self,
         retain_floor: Option<WalOffset>,
@@ -1276,6 +1332,7 @@ impl Wal {
     /// Unlink every closed segment whose highest frame offset is at or
     /// below `bound`. Whole segments only; the current append segment
     /// is never unlinked.
+    #[cfg(feature = "legacy-housekeeping")]
     fn unlink_at_or_below(&mut self, bound: WalOffset) -> Result<(), HousekeepingError> {
         let io = |op: &'static str, source| HousekeepingError::Io { op, source };
         let segments = list_segments(&self.config.root).map_err(|e| match e {
@@ -2329,10 +2386,12 @@ impl Drop for Wal {
     /// so dropping the WAL has to revoke it. Otherwise a caller could
     /// drop this instance, reopen the same root, and unlink against a
     /// cell the gone instance still owns, past a new `Wal` that
-    /// refuses the stale plan at both of its own checks.
+    /// refuses the stale plan at both of its own checks. The plan's own
+    /// record write is refused for the same reason: it would write the
+    /// root's `RECLAIM` through this instance's handle, beside the
+    /// reopen's.
     fn drop(&mut self) {
-        self.live_pass
-            .store(0, std::sync::atomic::Ordering::Release);
+        self.reclaim.close();
     }
 }
 
@@ -2594,15 +2653,18 @@ mod tests {
 
         // Wind the witness back to where a failed `checkpoint_seen`
         // write would have left it.
-        let store = wal.reclaim.as_mut().expect("a post-RFC root has a record");
-        let armed = reclaim::ReclaimRecord {
-            witness: reclaim::WitnessFlags {
-                checkpoint: reclaim::Witness::Armed,
-                ..store.record().witness
-            },
-            ..store.record().clone()
-        };
-        store.commit(&armed).expect("commit");
+        {
+            let mut held = wal.reclaim.lock();
+            let store = held.as_mut().expect("a post-RFC root has a record");
+            let armed = reclaim::ReclaimRecord {
+                witness: reclaim::WitnessFlags {
+                    checkpoint: reclaim::Witness::Armed,
+                    ..store.record().witness
+                },
+                ..store.record().clone()
+            };
+            store.commit(&armed).expect("commit");
+        }
 
         assert!(!wal.checkpoint_is_settled());
         wal.housekeeping(None).expect("housekeeping");
@@ -2611,6 +2673,134 @@ mod tests {
             2,
             "nothing is reclaimed while the loss witness is only armed",
         );
+    }
+
+    /// A pass's record write and a checkpoint's witness write never
+    /// share the two-slot alternation. With the pass held inside its
+    /// write, the checkpoint waits on the slot rather than writing
+    /// beside it, and once both land the file holds each one's part: a
+    /// checkpoint that wrote around the slot would have its witness
+    /// overwritten by the pass's merge of the record it read first.
+    #[test]
+    fn a_checkpoint_waits_for_a_pass_record_write_and_both_survive() {
+        let dest = tempfile::TempDir::new().expect("temp");
+        let offsets = mint_closed_segment(dest.path(), &[b"a1", b"a2"]);
+        mint_closed_segment(dest.path(), &[b"b1"]);
+        let mark = *offsets.last().expect("offsets");
+        let mut wal = Wal::open(default_config(dest.path())).expect("open");
+        wal.rebuild_ledger().expect("ledger");
+        wal.checkpoint(mark).expect("checkpoint");
+        let plan = wal
+            .housekeeping_prepare(&SnapshotHorizons::NoConsumer, 8)
+            .expect("prepare");
+        let planned: Vec<uuid::Uuid> = plan.segments().iter().map(|s| s.segment).collect();
+        assert!(!planned.is_empty(), "the pass owes a record write");
+
+        // So the next checkpoint owes a slot write of its own.
+        wind_witness_to_armed(&wal);
+        let (entered_rx, release_tx) = hold_record_writes(&mut wal);
+        let wait = std::time::Duration::from_secs(5);
+        let pass = std::thread::spawn(move || write_plan_record(&plan).map(drop));
+        entered_rx
+            .recv_timeout(wait)
+            .expect("the pass reached its RECLAIM write");
+        let checkpoint = std::thread::spawn(move || {
+            let result = wal.checkpoint(mark);
+            (wal, result)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let waited = !checkpoint.is_finished();
+        release_tx.send(()).expect("release the held write");
+        pass.join()
+            .expect("pass thread")
+            .expect("the record write lands");
+        let (wal, checkpointed) = checkpoint.join().expect("checkpoint thread");
+        checkpointed.expect("the checkpoint lands");
+        drop(wal);
+
+        let record = reopened_record(dest.path());
+        assert_eq!(
+            record.witness.checkpoint,
+            reclaim::Witness::Terminal,
+            "the checkpoint's witness survived the pass's write",
+        );
+        assert!(
+            planned
+                .iter()
+                .all(|segment| record.planned.iter().any(|p| p.segment == *segment)),
+            "and the pass's planned rows survived the checkpoint's",
+        );
+        assert!(waited, "the checkpoint waited on the slot, not beside it");
+    }
+
+    /// Wind the record's checkpoint witness back to where a failed
+    /// `checkpoint_seen` write leaves it.
+    fn wind_witness_to_armed(wal: &Wal) {
+        let mut held = wal.reclaim.lock();
+        let store = held.as_mut().expect("a post-RFC root has a record");
+        let armed = reclaim::ReclaimRecord {
+            witness: reclaim::WitnessFlags {
+                checkpoint: reclaim::Witness::Armed,
+                ..store.record().witness
+            },
+            ..store.record().clone()
+        };
+        store.commit(&armed).expect("commit");
+    }
+
+    /// Hold every pass record write at the fault-injection point:
+    /// the receiver hears when one arrives, and a send releases it.
+    fn hold_record_writes(
+        wal: &mut Wal,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered = std::sync::Mutex::new(entered_tx);
+        let release = std::sync::Mutex::new(release_rx);
+        wal.arm_record_write_hook(move || {
+            if let Ok(tx) = entered.lock() {
+                let _ = tx.send(());
+            }
+            if let Ok(rx) = release.lock() {
+                let _ = rx.recv();
+            }
+        });
+        (entered_rx, release_tx)
+    }
+
+    /// The `RECLAIM` record as a fresh open of `root` reads it back.
+    fn reopened_record(root: &std::path::Path) -> reclaim::ReclaimRecord {
+        let geometry = reconcile::configured_geometry(&default_config(root)).expect("geometry");
+        reclaim_store::ReclaimStore::open(root, geometry, false)
+            .expect("reopen the record")
+            .record()
+            .clone()
+    }
+
+    /// Dropping the `Wal` releases its `RECLAIM` descriptor even while
+    /// a plan it handed out is still held: the plan keeps the slot
+    /// alive, but not the file inside it.
+    #[test]
+    fn a_dropped_wal_releases_its_record_while_a_plan_outlives_it() {
+        let dest = tempfile::TempDir::new().expect("temp");
+        let offsets = mint_closed_segment(dest.path(), &[b"a1"]);
+        let mut wal = Wal::open(default_config(dest.path())).expect("open");
+        wal.rebuild_ledger().expect("ledger");
+        wal.checkpoint(*offsets.last().expect("offsets"))
+            .expect("checkpoint");
+        let plan = wal
+            .housekeeping_prepare(&SnapshotHorizons::NoConsumer, 8)
+            .expect("prepare");
+        assert!(plan.slot.lock().is_some(), "the live WAL holds its record");
+
+        drop(wal);
+
+        assert!(
+            plan.slot.lock().is_none(),
+            "the store and its descriptor went with the WAL",
+        );
+        let refused = write_plan_record(&plan).expect_err("an orphaned plan writes nothing");
+        assert!(refused.to_string().contains("outlived"), "{refused}");
     }
 
     /// Build a closed segment in a scratch root and move it into

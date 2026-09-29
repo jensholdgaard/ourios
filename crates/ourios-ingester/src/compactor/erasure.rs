@@ -237,7 +237,7 @@ pub(super) fn erase_pending(
                     observe: None,
                     drop: Some(&drop),
                 };
-                match compact_partition_hooked(store, &partition, promoted, &mut row_hooks) {
+                match compact_candidate(store, &partition, promoted, &mut row_hooks) {
                     Ok(o) => {
                         if let Some(committed) = &o.committed {
                             outcome.partitions_rewritten += 1;
@@ -266,15 +266,9 @@ pub(super) fn erase_pending(
                     }
                     Err(e) => {
                         clean = false;
-                        report.errors.push(format!(
-                            "erase {:?} {:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                            request.tenant,
-                            request.conversation_id,
-                            partition.year,
-                            partition.month,
-                            partition.day,
-                            partition.hour,
-                        ));
+                        let hour = hour_label(&partition);
+                        let (tenant, id) = (&request.tenant, &request.conversation_id);
+                        e.record(report, &format!("erase {tenant:?} {id:?} {hour}"));
                     }
                 }
             }

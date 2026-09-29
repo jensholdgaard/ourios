@@ -95,6 +95,9 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 ourios-semconv = { path = "../ourios-semconv" }
+# Arms the post-rename fsync failure the `SharedWal` delegation test
+# needs; a dev-dependency, so no shipped binary carries the hook.
+ourios-wal = { path = "../ourios-wal", features = ["fault-injection"] }
 # RFC0031.1 Loki container integration (CI-only, like the dex-oidc job):
 # testcontainers spins grafana/loki, reqwest pushes the OTLP fixture and
 # runs the LogQL query, prost encodes the OTLP protobuf payload (0.14 is

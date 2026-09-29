@@ -1716,6 +1716,41 @@ undecodable or missing snapshot is therefore safe to fall back from
 exactly when the record proves it is, and RFC0052.17 holds each of those
 cases.
 
+**An entry whose tenant has no surviving frame is satisfied by absence.**
+A tenant leaves the ledger when its last surviving segment is unlinked,
+but its `reclaimed_through` entry stays in the record; were the entry
+still pending, every later `Known` pass would need a restorable horizon
+for a tenant with nothing left in the WAL, and one lost snapshot after
+ordinary churn would halt reclamation for every other tenant on the root.
+The entry exists so that recovery never rebuilds a tenant's miner state
+from a log missing its oldest frames; with no surviving frame there is no
+log to rebuild from and nothing a pass could unlink on that tenant's
+behalf, so the check above applies only to a tenant the ledger holds. The
+ledger is the witness, since `rebuild_ledger()` rebuilds it from every
+surviving frame's prefix at the end of recovery and every live append
+updates it — and only once that walk has run: before it, the ledger knows
+only frames appended since open, a tenant missing from it proves nothing,
+and the entry stays pending. The entry is **not**
+removed: absence is not retirement — "no surviving frames" is not "will
+never write again" — and the WAL is the wrong place to decide the latter.
+The dictionary tombstone stays in the format for a caller that can decide
+it; nothing in this RFC writes one.
+
+**A churned-out tenant that writes again halts reclamation until its first
+new snapshot installs.** Its new frames put it back in the ledger, so the
+entry is pending once more, and with its snapshot lost there is no
+restorable horizon to satisfy it: the pass fails closed with
+`HousekeepingError::Unrecoverable` naming the tenant. That is intended.
+Treating the return as a fresh tenant would discard the entry that makes a
+missing snapshot loud, and a later restart would rebuild that tenant's
+miner state from frames that begin after the ones already reclaimed,
+silently. The pause lasts until the tenant's next snapshot installs and a
+pass runs — at default tunables about one `barrier_secs` (300 s) plus one
+`housekeeping_secs` (60 s) — and only reclamation pauses: ingest, acks and
+queries are untouched. If that tenant's snapshots keep failing to install,
+the pause and the WAL's growth last as long as the failures do; every pass
+meanwhile names the tenant, so the stall is loud rather than silent.
+
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` reclaims only segments every tenant's horizon covers, and
 never past the checkpoint, so a stale floor makes truncation conservative — it retains frames a snapshot has not
@@ -2968,8 +3003,8 @@ memory, and nothing here claims to.
 >   horizons, so `RECLAIM` holds an entry per reclaimed tenant
 > - **When** the node restarts with one tenant's snapshot undecodable
 > - **Then** recovery halts naming that tenant when the record holds an entry
->   for it, and proceeds with that tenant pinned at its oldest surviving
->   frame when the record holds none
+>   for it and the tenant has a surviving frame, and proceeds with that
+>   tenant pinned at its oldest surviving frame when the record holds none
 > - **And** a root with no record and **no checkpoint at all** — the
 >   pre-RFC layout on a node that never checkpointed — opens, gains an
 >   empty record durably before its first housekeeping pass, and pins
@@ -3359,7 +3394,14 @@ they are not substitutes for the rest.
   and housekeeping), §6.8 (counters), §6.9 (tunables) — the mechanism
   this RFC supplies the policy for; §6.5's durable-entry-first rule and
   Scenario RFC0008.6's permanent refusal are **superseded** by §3.3 and
-  RFC0052.4/.5.
+  RFC0052.4/.5. §6.7's single-call `Wal::housekeeping(retain_floor)` is
+  **superseded** by §3.2's `housekeeping_prepare` / `housekeeping_commit`
+  pair — a pass that records its plan before it unlinks cannot be one
+  call. The single-call form survives behind a `legacy-housekeeping`
+  feature that nothing but this crate's own dev-dependency enables, so
+  the RFC0008.7 tests keep their subject while the deployment invariant
+  the legacy-root branch above rests on — that no production path calls
+  it — becomes a property of the build rather than of a grep.
 - RFC 0046 (the tenant-prefixed frame) — **amended** by §3.2:
 
   > This RFC amends RFC 0046's replay validation and criterion RFC0046.11

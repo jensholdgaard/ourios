@@ -111,6 +111,154 @@ fn rfc0038_1_sweep_emits_one_internal_span() {
     );
 }
 
+/// A candidate whose manifest bootstrap loses to another compactor wrote
+/// nothing and belongs to the winner, so the sweep stays a clean no-op. The
+/// bootstrap is made to lose by occupying the manifest key with a
+/// directory: it reads as absent, so the create-if-absent runs, and is
+/// refused as already existing.
+#[test]
+fn sweep_leaves_a_candidate_whose_bootstrap_lost_as_a_no_op() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    std::fs::create_dir(
+        bucket
+            .path()
+            .join("data/tenant_id=a/year=2026/month=04/day=02/hour=10/manifest.json"),
+    )
+    .expect("occupy the manifest key");
+
+    // Act
+    let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+
+    // Assert
+    let found: Vec<_> = report
+        .per_tenant
+        .iter()
+        .map(|t| t.candidates_found)
+        .collect();
+    assert_eq!(
+        (report.partitions_compacted, found, report.errors.len()),
+        (0, vec![1], 0),
+        "{report:?}"
+    );
+}
+
+fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
+    CompactionOutcome {
+        files_before,
+        rows: 0,
+        rows_dropped: 0,
+        committed: None,
+        commit_lost,
+        gc_failures: 0,
+        bytes_read: 0,
+        bytes_written: 0,
+    }
+}
+
+/// #807 — a rewrite whose final manifest swap lost is a sweep error for a
+/// consolidation and an erasure alike, so a store whose swaps always lose
+/// never reads as an idle sweep.
+#[test]
+fn a_lost_final_swap_is_a_sweep_error() {
+    let errors = [
+        check_committed(outcome(2, true), false),
+        check_committed(outcome(2, true), true),
+    ];
+
+    assert!(
+        errors.iter().all(|e| e
+            .as_ref()
+            .is_err_and(|e| e.reason.contains("not committed"))),
+        "{errors:?}"
+    );
+}
+
+/// A lost bootstrap is benign for a consolidation but not for an erasure,
+/// whose rows are still on disk; a partition with nothing to rewrite is a
+/// no-op for both.
+#[test]
+fn a_lost_bootstrap_is_an_error_only_for_an_erasure() {
+    let verdicts = [
+        check_committed(outcome(2, false), false).is_err(),
+        check_committed(outcome(2, false), true).is_err(),
+        check_committed(outcome(0, false), false).is_err(),
+        check_committed(outcome(0, false), true).is_err(),
+    ];
+
+    assert_eq!(verdicts, [false, true, false, false]);
+}
+
+/// A lost swap whose discarded rewrite could not be deleted keeps that
+/// cleanup failure in the error, so the sweep still counts it.
+#[test]
+fn a_lost_swap_error_keeps_its_cleanup_failures() {
+    let lost = CompactionOutcome {
+        gc_failures: 1,
+        ..outcome(2, true)
+    };
+
+    let error = check_committed(lost, true).expect_err("a lost swap is an error");
+
+    assert_eq!(error.gc_failures, 1);
+}
+
+/// An erasure rewrite whose manifest swap loses leaves the marker in the
+/// `rows` phase: advancing it would let the tuples be deleted while the
+/// conversation's rows are still live. One file, so the consolidation pass
+/// leaves the partition alone and only the erasure rewrite runs.
+#[test]
+fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, "a", 1, TS0);
+    std::fs::create_dir(
+        bucket
+            .path()
+            .join("data/tenant_id=a/year=2026/month=04/day=02/hour=10/manifest.json"),
+    )
+    .expect("occupy the manifest key");
+    request_erasure(&store, "a", "c-1").expect("request");
+    let erase_all = |_: &MinedRecord, _: &str| true;
+    let mut hooks = SweepHooks {
+        observe: None,
+        erasure_match: Some(&erase_all),
+    };
+
+    // Act
+    let report = run_sweep_hooked(
+        &store,
+        NOW_SEALED,
+        &CompactionPolicy::default(),
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("sweep");
+
+    // Assert
+    let outcomes: Vec<_> = report
+        .erasures
+        .iter()
+        .map(|o| (o.phase, o.partitions_rewritten))
+        .collect();
+    assert_eq!(outcomes, vec![(ErasurePhase::Rows, 0)], "{report:?}");
+    assert!(
+        matches!(report.errors.as_slice(),
+            [e] if e.contains("\"c-1\"") && e.contains("not committed")),
+        "{:?}",
+        report.errors
+    );
+    let pending: Vec<_> = pending_erasures(&store)
+        .expect("pending")
+        .iter()
+        .map(|r| r.phase)
+        .collect();
+    assert_eq!(pending, vec![ErasurePhase::Rows]);
+}
+
 #[test]
 fn sweep_compacts_a_sealed_candidate() {
     // Arrange

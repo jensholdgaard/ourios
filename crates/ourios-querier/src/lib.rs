@@ -1,39 +1,43 @@
 //! `ourios-querier` — RFC 0007 querier (pillar #3, `DataFusion`).
 //!
-//! **Status: execution slice 3.** [`Querier::run`] executes a
-//! minimal query — tenant scope + optional time range + optional
-//! template-exact id + optional `severity_text` (the B1 `level='ERROR'`
-//! filter) — against the RFC 0005 Parquet store via `DataFusion`,
-//! returning a matching-row count **and the scan's row-group pruning
-//! stats** ([`QueryStats`]). Tenant isolation
-//! (RFC0007.5), B1 pruning (RFC0007.1 — a selective query provably
-//! skips row groups via statistics) and B2 (RFC0007.2 — the work
-//! the engine does tracks the result size, not the corpus size;
-//! scanned row groups + bytes read stay flat as the corpus grows,
-//! the growth absorbed by pruning) are live + tested.
-//!
-//! This crate is the **read path**: it runs the query against the
-//! RFC 0005 store — scoped to the tenant's partition directory,
+//! This crate is the **read path**: it runs queries against the
+//! RFC 0005 Parquet store — scoped to the tenant's partition directory,
 //! with `template_id` / `time_unix_nano` column filters (RFC 0005
-//! §3.3/§3.6) — and returns results **without** leaking
-//! `DataFusion` or SQL through the public API (hazard `CLAUDE.md`
-//! §4.6). It reads the shipped RFC 0005 store; it needs neither
-//! the WAL nor the receiver.
+//! §3.3/§3.6) — and returns results **without** leaking `DataFusion`
+//! or SQL through the public API (hazard `CLAUDE.md` §4.6). It needs
+//! neither the WAL nor the receiver.
 //!
-//! Partition-level *time* pruning is live: a query with a time range
-//! skips whole `year/month/day/hour` partitions whose span can't
-//! overlap the window (`hour_partition_in_window`) before `DataFusion`
-//! opens any footer, so scanned row groups stay flat as the corpus's
-//! time span grows. It layers on the `time_unix_nano` column predicate
-//! (still the row-level correctness authority); the pruning is
-//! conservative and never drops an in-window partition.
+//! - **Logs DSL** (RFC 0002) — [`dsl`] holds the string parser and the
+//!   structured JSON surface, both producing one IR;
+//!   [`Querier::run_query`] compiles that IR to `DataFusion` and runs it,
+//!   returning the match count, grouped `count [by …]` aggregates, and
+//!   row-group pruning stats ([`QueryStats`]). Tenant isolation
+//!   (RFC0007.5), B1 pruning (RFC0007.1 — a selective query provably
+//!   skips row groups via statistics) and B2 (RFC0007.2 — scanned row
+//!   groups + bytes read track the result size, not the corpus size)
+//!   are tested here.
+//! - **Rendering** (RFC 0017) — returned rows come back as [`LogRow`]s.
+//!   String bodies render from the tenant's template registry; structured
+//!   bodies decode from their stored canonical JSON. The
+//!   registry and the RFC 0001 alias map are both derived from the audit
+//!   stream ([`derive_template_registry`], [`derive_alias_map`]).
+//! - **Drift** (RFC 0010) — [`Querier::run_drift`] folds the audit
+//!   stream's widening / type-expansion events per template.
+//! - **Visibility** (RFC 0047) — [`visibility`] applies a caller-made
+//!   authorization decision as a plan-time rewrite: an extra predicate
+//!   over a promoted column, or column masking on returned rows.
 //!
-//! **Structured query surface.** [`QueryRequest`] is intentionally
-//! minimal — just the predicates B1/B2 need. The logs DSL (RFC 0002,
-//! now `specified`) lands in [`dsl`]: a Branch-B parser + a structured
-//! surface that both compile to one IR in front of this layer. The DSL
-//! is the stable user-facing contract; `QueryRequest` remains the
-//! internal execution request it targets.
+//! Partition-level *time* pruning: a query with a time range skips
+//! whole `year/month/day/hour` partitions whose span can't overlap the
+//! window (`hour_partition_in_window`) before `DataFusion` opens any
+//! footer, so scanned row groups stay flat as the corpus's time span
+//! grows. It layers on the `time_unix_nano` column predicate (still the
+//! row-level correctness authority); the pruning is conservative and
+//! never drops an in-window partition.
+//!
+//! The DSL is the stable user-facing contract; [`QueryRequest`] is the
+//! internal execution request it targets, and [`Querier::run`] runs one
+//! directly.
 
 #![deny(unsafe_code)]
 
@@ -85,6 +89,8 @@ mod decode;
 mod exec;
 mod file_set;
 mod stats;
+#[cfg(test)]
+mod test_support;
 
 // Scope glue for the split (epic #745 wave 1): every pre-split
 // `crate::X` path — the sibling modules' imports included — resolves
@@ -510,7 +516,7 @@ impl Querier {
         let mut acquired: Option<AcquiredTemplateMap> = None;
         if needs_alias_fold || needs_registry {
             let (template_map, acquisition_bytes, _outcome) = self
-                .spawn_blocking_audit({
+                .spawn_blocking_io({
                     let backend = self.backend.clone();
                     let tenant = tenant.clone();
                     move || template_map::load_or_derive(backend.store_ref(), &tenant)
@@ -582,7 +588,7 @@ impl Querier {
         &self,
         tenant: &TenantId,
     ) -> Result<TemplateRegistry, QueryError> {
-        self.spawn_blocking_audit({
+        self.spawn_blocking_io({
             let backend = self.backend.clone();
             let tenant = tenant.clone();
             move || derive_template_registry(backend.store_ref(), &tenant)
@@ -664,7 +670,9 @@ impl Querier {
         // case and a partition holding only `*.parquet.tmp` (a poisoned /
         // crashed writer) — where building a table over zero files would
         // otherwise error and wrongly fail the query.
-        let urls = self.resolve_data_urls(&ctx, &data_prefix, partition_window)?;
+        let urls = self
+            .resolve_data_urls(&ctx, &data_prefix, partition_window)
+            .await?;
         if urls.is_empty() {
             return Ok(empty_result(terminal.aggregate()));
         }
@@ -925,7 +933,7 @@ impl Querier {
             acquired
         } else {
             let (map, acquisition_bytes, _outcome) = self
-                .spawn_blocking_audit({
+                .spawn_blocking_io({
                     let backend = self.backend.clone();
                     let tenant = tenant.clone();
                     move || template_map::load_or_derive(backend.store_ref(), &tenant)
@@ -946,53 +954,89 @@ impl Querier {
         })
     }
 
-    /// Run a blocking audit derivation (`derive_alias_map` /
-    /// `derive_template_registry`) on the tokio blocking pool so the async query
-    /// path doesn't tie up a runtime worker on the S3 `get_blocking` (or local
-    /// `std::fs`) reads — the same offload `run_drift` applies to the listing.
+    /// Run blocking storage work — an audit derivation (`derive_alias_map` /
+    /// `derive_template_registry` / the template-map acquisition) or the
+    /// data file-set resolution — on the tokio blocking pool so the async
+    /// query path doesn't tie up a runtime worker on the S3 bridge calls (or
+    /// local `std::fs`) — the same offload `run_drift` applies to the listing.
     /// The closure owns its captured `Backend` / `TenantId` clones so it
-    /// satisfies the `'static + Send` bound.
-    async fn spawn_blocking_audit<T, F>(&self, derive: F) -> Result<T, QueryError>
+    /// satisfies the `'static + Send` bound. The caller's span is re-entered on
+    /// the blocking thread — span context does not cross `spawn_blocking`
+    /// (RFC 0038 §3.3) — so logs the callee emits carry the query's trace
+    /// context (RFC0038.1).
+    async fn spawn_blocking_io<T, F>(&self, work: F) -> Result<T, QueryError>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, QueryError> + Send + 'static,
     {
-        tokio::task::spawn_blocking(derive)
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || span.in_scope(work))
             .await
             .map_err(|e| QueryError::Storage {
-                detail: format!("audit derivation task: {e}"),
+                detail: format!("blocking storage task: {e}"),
             })?
     }
 
     /// Resolve the live data files under the tenant's `data/` prefix and turn
-    /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3):
+    /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
+    /// with the listing and manifest reads on the blocking pool:
     ///
     /// - **Local backend** ([`Backend::Local`]): walk `std::fs` under
     ///   `<root>/<prefix>` honouring the RFC 0009 §3.4 manifest, then address
     ///   each file by its absolute local path — byte-for-byte the pre-RFC-0019
     ///   read path, with the canonical-path tenant-isolation backstop intact.
-    /// - **S3 backend** ([`Backend::Remote`]): list the keys under `prefix`
-    ///   through [`Store::list_blocking`] (segment-wise prefix-scoped, the
+    /// - **S3 backend** ([`Backend::Remote`]): list the window's keys under
+    ///   `prefix` through the [`Store`] (segment-wise prefix-scoped, the
     ///   RFC0019.5 tenant guarantee), resolve the per-partition manifest through
     ///   the [`Store`], register the store on `ctx`, and address each key by the
     ///   `ourios://store/<key>` object-store URL.
-    fn resolve_data_urls(
+    async fn resolve_data_urls(
         &self,
         ctx: &SessionContext,
         prefix: &str,
         window: Option<(u64, u64)>,
     ) -> Result<Vec<ListingTableUrl>, QueryError> {
-        match &self.backend {
-            Backend::Local(root) => {
-                let tenant_dir = root.join(prefix);
-                let live_files = resolve_live_files(&tenant_dir, window)?;
-                local_file_urls(&tenant_dir, &live_files)
-            }
-            Backend::Remote(store) => {
-                let live_keys = resolve_live_keys(store, prefix, window)?;
-                object_store_urls(ctx, store, &live_keys)
-            }
+        let resolved = self
+            .spawn_blocking_io({
+                let backend = self.backend.clone();
+                let prefix = prefix.to_owned();
+                move || resolve_live_set(&backend, &prefix, window)
+            })
+            .await?;
+        match (resolved, &self.backend) {
+            (LiveSet::Urls(urls), _) => Ok(urls),
+            (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),
+            // Keys come only from the remote branch of `resolve_live_set`,
+            // which read this same backend; surfaced rather than unwrapped.
+            (LiveSet::Keys(_), Backend::Local(_)) => Err(QueryError::Storage {
+                detail: "internal: S3 data keys reached with a local backend".to_string(),
+            }),
         }
+    }
+}
+
+/// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
+/// the local backend, store keys on S3 (their URLs need the query's
+/// `SessionContext`, which stays on the async side).
+enum LiveSet {
+    Urls(Vec<ListingTableUrl>),
+    Keys(Vec<String>),
+}
+
+/// Resolve the tenant's live data files for [`Querier::resolve_data_urls`] —
+/// blocking IO, run on the blocking pool.
+fn resolve_live_set(
+    backend: &Backend,
+    prefix: &str,
+    window: Option<(u64, u64)>,
+) -> Result<LiveSet, QueryError> {
+    match backend {
+        Backend::Local(root) => {
+            let tenant_dir = root.join(prefix);
+            let live_files = resolve_live_files(&tenant_dir, window)?;
+            local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
+        }
+        Backend::Remote(store) => resolve_live_keys(store, prefix, window).map(LiveSet::Keys),
     }
 }
 
@@ -1101,5 +1145,178 @@ mod tests {
             format!("{err:?}").contains("Parquet"),
             "Debug must preserve the engine detail for logs",
         );
+    }
+
+    /// #853 on the S3 path: which prefixes a query touches beyond the scan.
+    mod storage_reach {
+        use super::*;
+        use crate::test_support::{Call, CountingStore};
+        use ourios_core::audit::{
+            AuditEvent, AuditPayload, AuditSink as _, TemplateChange, hash_triggering_line,
+        };
+        use ourios_core::record::{BodyKind, MinedRecord, Param};
+
+        /// 2026-04-02T10:58:00 UTC.
+        const TS0: u64 = 1_775_127_480_000_000_000;
+        const MINUTE_NS: u64 = 60_000_000_000;
+
+        fn record(ts_ns: u64) -> MinedRecord {
+            MinedRecord {
+                tenant_id: TenantId::new("acme"),
+                template_id: 7,
+                template_version: 1,
+                severity_number: 9,
+                severity_text: None,
+                scope_name: None,
+                scope_version: None,
+                scope_attributes: Vec::new(),
+                resource_schema_url: None,
+                scope_schema_url: None,
+                time_unix_nano: ts_ns,
+                observed_time_unix_nano: None,
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+                resource_attributes: Vec::new(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                event_name: None,
+                body_kind: BodyKind::String,
+                params: vec![Param {
+                    type_tag: ourios_core::audit::ParamType::Num,
+                    value: "42".to_string(),
+                }],
+                separators: vec![String::new(), " ".to_string()],
+                body: None,
+                confidence: 1.0,
+                lossy_flag: false,
+            }
+        }
+
+        fn adopted(ts_ns: u64) -> AuditEvent {
+            AuditEvent {
+                tenant_id: TenantId::new("acme"),
+                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts_ns),
+                payload: AuditPayload::Template {
+                    template_id: 7,
+                    triggering_line_hash: hash_triggering_line(b"line"),
+                    triggering_line_sample: None,
+                    change: TemplateChange::Adopted {
+                        template_version: 1,
+                        new_template: "user <*>".to_string(),
+                    },
+                },
+            }
+        }
+
+        /// A counted S3-path querier over a local store holding one hour of
+        /// `acme` rows and an audit stream spread over many days.
+        fn seeded(root: &std::path::Path) -> (Querier, CountingStore) {
+            let store = Store::local(root).expect("local store");
+            let rows: Vec<MinedRecord> = (0..3).map(|i| record(TS0 + i * 1_000)).collect();
+            let partition = ourios_parquet::PartitionKey::derive(&rows[0]).expect("partition");
+            let mut writer = ourios_parquet::Writer::open_in(&store, partition).expect("writer");
+            writer.append_records(&rows).expect("append");
+            writer.close().expect("close");
+            let mut sink = ourios_parquet::ParquetAuditSink::new(store.clone());
+            for day in 0..5 {
+                sink.emit(adopted(TS0 - day * 24 * 60 * MINUTE_NS));
+            }
+            assert_eq!(sink.write_failures(), 0);
+            let mut counter = None;
+            let store = store.wrap_backend(|inner| {
+                let counting = CountingStore::new(inner);
+                counter = Some(counting.clone());
+                Arc::new(counting)
+            });
+            let querier = Querier {
+                backend: Backend::Remote(store),
+                promoted: ourios_parquet::PromotedAttributes::default(),
+            };
+            (querier, counter.expect("wrapped"))
+        }
+
+        fn windowed(template_id: u64) -> QueryRequest {
+            QueryRequest {
+                tenant: TenantId::new("acme"),
+                time_range: Some((TS0 - 5 * MINUTE_NS, TS0 + 5 * MINUTE_NS)),
+                template_id: Some(template_id),
+                severity_text: None,
+                limit: Some(100),
+            }
+        }
+
+        fn audit_calls(counter: &CountingStore) -> Vec<Call> {
+            counter
+                .calls()
+                .into_iter()
+                .filter(|call| match call {
+                    Call::List(key)
+                    | Call::ListDelimited(key)
+                    | Call::Get(key)
+                    | Call::GetRanges(key) => key.starts_with("audit/"),
+                })
+                .collect()
+        }
+
+        /// A query that renders no row never acquires the template map, so it
+        /// never touches the tenant's audit stream — the shape of the #853
+        /// query (`rows: 0`, no `body ==` / `resolves_to` in the predicate).
+        #[tokio::test]
+        async fn a_query_that_renders_no_row_does_not_touch_the_audit_stream() {
+            let tmp = tempfile::tempdir().expect("temp");
+            let (querier, counter) = seeded(tmp.path());
+
+            let result = querier.run(windowed(999)).await.expect("query");
+
+            assert_eq!(result.rows, 0);
+            assert_eq!(result.registry_bytes_read, 0);
+            assert!(
+                audit_calls(&counter).is_empty(),
+                "{:?}",
+                audit_calls(&counter),
+            );
+        }
+
+        /// A query that renders rows acquires the template map once. On an
+        /// RFC 0033 cache hit that costs one listing of the tenant's whole
+        /// audit prefix (the §3.3 freshness frontier) and one artifact GET, and
+        /// no audit-file GET — the listing is per query and not bounded by the
+        /// query window.
+        #[tokio::test]
+        async fn a_cache_hit_lists_the_whole_audit_prefix_once_and_reads_only_the_artifact() {
+            let tmp = tempfile::tempdir().expect("temp");
+            let (querier, counter) = seeded(tmp.path());
+            let first = querier
+                .run(windowed(7))
+                .await
+                .expect("miss: fold + publish");
+            assert_eq!(first.records.len(), 3);
+            counter.reset();
+
+            let hit = querier.run(windowed(7)).await.expect("hit");
+
+            assert_eq!(hit.records.len(), 3);
+            let calls = audit_calls(&counter);
+            let lists: Vec<&Call> = calls
+                .iter()
+                .filter(|c| matches!(c, Call::List(_) | Call::ListDelimited(_)))
+                .collect();
+            assert_eq!(lists, vec![&Call::List("audit/tenant_id=acme".to_string())]);
+            let gets: Vec<&Call> = calls
+                .iter()
+                .filter(|c| matches!(c, Call::Get(_) | Call::GetRanges(_)))
+                .collect();
+            assert_eq!(gets.len(), 1, "only the artifact is read: {gets:?}");
+            let audit_keys = counter
+                .listed_keys()
+                .into_iter()
+                .filter(|k| k.starts_with("audit/"))
+                .count();
+            assert!(
+                audit_keys >= 5,
+                "every day's audit file is listed: {audit_keys}"
+            );
+        }
     }
 }

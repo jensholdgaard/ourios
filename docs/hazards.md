@@ -98,9 +98,8 @@ compression claim evaporates for that workload.
 pre-redacts the offending field. Broad spike → revisit the limit
 (still ≤ 1 KiB). Anyone proposing > 1 KiB → RFC.
 
-**Structured bodies (RFC 0037, proposed mitigation — not yet
-implemented).** The per-parameter byte limit above guards the *string*
-path only. A structured (non-string) body — a GenAI event's
+**Structured bodies (RFC 0037, `green` — implemented).** The
+per-parameter byte limit above guards the *string* path only. A structured (non-string) body — a GenAI event's
 `gen_ai.input.messages` array, any `AnyValue` kvlist/array — is
 retained **whole** as canonical JSON in the `body` column and is **not**
 capped: truncating it would violate the bit-identical-reconstruction
@@ -110,12 +109,16 @@ writer **disables the dictionary on the `body` column by design**
 (`crates/ourios-parquet/src/writer.rs` §3.6 — bodies are unbounded and
 high-entropy), so a large structured body has no dictionary to collapse.
 The residual risk is raw storage size, not dictionary collapse, so
-RFC 0037 proposes to guard it by **observation, not truncation**: a
-`structured_body_bytes` metric (dimensioned by service) plus a
-per-service alert to flag oversized emitters, with RFC 0036's write-side
-row-group/file sizing bounding the on-disk footprint. The fix for an
-oversized structured body is at the emitter (redaction/truncation before
-export), not a store-side cap.
+RFC 0037 guards it by **observation, not truncation**: the miner records
+every structured body's canonical-JSON byte length on the
+`ourios.miner.structured_body.size` histogram (the RFC's
+`structured_body_bytes`), dimensioned by `(tenant, service)`
+(`crates/ourios-miner/src/metrics.rs`; asserted by
+`crates/ourios-miner/tests/rfc0037_structured_body.rs`). The per-service
+alert on that distribution is an operator rule, not shipped in this
+repo; RFC 0036's write-side row-group/file sizing bounds the on-disk
+footprint. The fix for an oversized structured body is at the emitter
+(redaction/truncation before export), not a store-side cap.
 
 **See also.** `CLAUDE.md` §3.2, §3.3; RFC 0001 §6.5; RFC 0037;
 benchmarks C4.

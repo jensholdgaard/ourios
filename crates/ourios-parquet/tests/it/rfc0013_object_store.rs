@@ -77,7 +77,7 @@ async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, Store) {
 }
 
 /// A clean-round-trip record for `tenant` at a fixed in-hour offset `i`.
-fn rec_for(tenant: &str, i: u64) -> MinedRecord {
+pub(crate) fn rec_for(tenant: &str, i: u64) -> MinedRecord {
     MinedRecord {
         tenant_id: TenantId::new(tenant),
         template_id: 1,

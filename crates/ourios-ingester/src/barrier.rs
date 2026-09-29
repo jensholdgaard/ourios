@@ -1,0 +1,1078 @@
+//! RFC 0052 §3.1's publication barrier: the cut, its ordering, and the
+//! checkpoint it stamps.
+//!
+//! `flush_then_snapshot` already computed the predicate a checkpoint
+//! needs — in-flight encodes quiesced, drained publishes settled, both
+//! sinks fully drained — but it was reachable only behind an append.
+//! An idle node therefore never advanced its checkpoint again, and an
+//! idle node is exactly the one whose retained segments have the least
+//! reason to exist. So the same barrier runs on its own timer, and the
+//! rotation hook becomes capture-only: both hand a **cut** to one owner
+//! of barrier I/O rather than doing PUTs inside an ingest turn.
+//!
+//! A cut is captured under the pipeline's `ingest_bound` exclusion — the
+//! quiesce, the mark read, the two drains and the snapshot serialisation
+//! — and nothing else runs there. The flush, the snapshot installs and
+//! the checkpoint all run outside it, so the barrier's PUTs never stall
+//! ingest: a cut costs a drain, not a round trip to the store. Nor does
+//! an encode worker's: the size and ceiling triggers hand what they take
+//! to the publisher thread (`crate::publisher`), so the capture's
+//! `quiesce_encodes` waits on encodes alone, and those PUTs settle under
+//! `run_cut`'s `quiesce_publishes_through`, outside the exclusion.
+//!
+//! Three rules make the ordering sound, and each is a §5 criterion:
+//!
+//! - **The slot is one cut deep.** A capture arriving while a cut is
+//!   pending coalesces into it; one arriving while nothing is pending
+//!   fills it. Coalescing is all-or-nothing and bounded by the sink's
+//!   own `ceiling_bytes`: a capture that would take the pending cut past
+//!   it parks *every* batch it drained and advances nothing. Parking
+//!   only the excess would move the pending cut's mark above frames
+//!   sitting in the buffers rather than in its batches, and `run_cut`
+//!   would checkpoint through them.
+//! - **Cuts are strictly ordered.** A capture holds the exclusion across
+//!   the handoff as well as the cut, so the slot never sees a later cut
+//!   before an earlier one — and the fold itself is written to be
+//!   order-independent, so an inversion could not move the pending cut's
+//!   horizon backwards. A pending cut's snapshot bytes
+//!   already fold frames whose only durable copy is the running cut's
+//!   batches, so it never installs or stamps before the running cut's
+//!   outcome — and when that cut *fails*, the pending one is
+//!   invalidated: its bytes discarded, its batches merged back into the
+//!   buffers, its mark withdrawn.
+//! - **The latch is checked twice.** Once before the cut and again
+//!   immediately before the install and the stamp, after
+//!   `quiesce_publishes` has returned. A publish registered before the
+//!   barrier began can panic *while the barrier waits on it*, and the
+//!   latch it sets lands after the first check.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use ourios_core::tenant::TenantId;
+use ourios_miner::cluster::MinerCluster;
+use ourios_miner::snapshot::{SnapshotState, WalHighWater};
+use ourios_wal::{ReclaimError, WalOffset};
+
+use crate::cadence::{BarrierEpochs, Epoch};
+use crate::publish::{Drained, PublishCoordinator};
+use crate::receiver::CommitCoordinator;
+use crate::receiver::pipeline::IngestPipeline;
+use crate::snapshot_store;
+
+/// One capture: the frames at or below `mark` taken out of both sinks,
+/// plus each tenant's miner state as of that instant.
+///
+/// No public fields: a caller that could raise `mark` without owning the
+/// matching batches would checkpoint over records that are still in the
+/// buffers, which is the one thing this type exists to prevent.
+pub struct Cut {
+    epoch: Epoch,
+    mark: Option<WalOffset>,
+    drained: Vec<Drained>,
+    snapshots: Vec<(TenantId, SnapshotState)>,
+    bytes: usize,
+}
+
+impl Cut {
+    /// The cut's number — the epoch every guard registered before its
+    /// capture carries.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// The high-water mark this cut would checkpoint at, if any.
+    #[must_use]
+    pub fn mark(&self) -> Option<WalOffset> {
+        self.mark
+    }
+
+    /// Estimated bytes of acknowledged records the cut holds outside the
+    /// sink's own accounting.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Fold `other` into this cut — §3.1's coalesce, past the ceiling
+    /// check.
+    ///
+    /// The batches always join; the epoch, the mark and the per-tenant
+    /// snapshots come from whichever of the two captures is the **later**
+    /// one, so the fold is independent of the order the two arrive in.
+    /// The marks themselves cannot decide it: a `WalOffset` orders on a
+    /// segment uuid, which says nothing about which cut was taken first.
+    fn absorb(&mut self, other: Cut) {
+        let Cut {
+            epoch,
+            mark,
+            drained,
+            snapshots,
+            bytes,
+        } = other;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.drained.extend(drained);
+        match epoch.cmp(&self.epoch) {
+            std::cmp::Ordering::Greater => {
+                self.epoch = epoch;
+                self.mark = mark.or(self.mark);
+                merge_snapshots(&mut self.snapshots, snapshots);
+            }
+            // No two captures share an epoch, so `Equal` is unreachable;
+            // it folds with the older arm, which advances nothing.
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                self.mark = self.mark.or(mark);
+                backfill_snapshots(&mut self.snapshots, snapshots);
+            }
+        }
+    }
+}
+
+/// What one capture did to the pending slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureOutcome {
+    /// The slot was empty and now holds this cut.
+    Filled,
+    /// The slot held a cut and this capture folded into it.
+    Coalesced,
+    /// Coalescing would have taken the pending cut past the sink's
+    /// ceiling, so every drained batch was parked and nothing advanced.
+    Parked,
+}
+
+/// What one cut's run decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CutOutcome {
+    /// Snapshots installed and the checkpoint advanced — or there was no
+    /// mark to stamp, which is the same decision with nothing to record.
+    Stamped,
+    /// The records and snapshots are durable, but the journal has no
+    /// reclamation surface, so no checkpoint was written. Not a stamp: a
+    /// missing implementation must not read as one. A failed sidecar
+    /// write stays [`Self::Stamped`] — RFC0052.1 — because the WAL keeps
+    /// its previous mark usable and fail-closed.
+    Unstamped,
+    /// A sink retained something, so neither the snapshots nor the mark
+    /// moved. The records are back in the buffers and the next cut
+    /// covers them.
+    Retained,
+    /// The cadence latch held an epoch at or below this cut's.
+    Latched,
+    /// Nothing was pending.
+    Idle,
+}
+
+/// What one cut's snapshot install did. Three states, not a `bool`: a
+/// cut whose mark is below the installed one did nothing *and* may
+/// stamp, which is not the same decision as a write that failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Install {
+    /// Every tenant's artefact was written and renamed.
+    Written,
+    /// Nothing to install — no mark, or an older cut behind a newer
+    /// snapshot.
+    Superseded,
+    /// A write failed, so the horizon on disk is behind this cut's.
+    Failed,
+}
+
+/// The barrier's owner: the pending slot, the snapshot-install
+/// serialisation, and the reach into the journal for the stamp.
+pub struct Barrier {
+    publish: PublishCoordinator,
+    coordinator: Arc<CommitCoordinator>,
+    snapshots_root: PathBuf,
+    epochs: Arc<BarrierEpochs>,
+    /// The single pending slot (§3.1) — metadata *and* the drained
+    /// batches, which is why coalescing is bounded by bytes.
+    pending: Mutex<Option<Cut>>,
+    /// Serialises the whole temp-write / fsync / rename of every
+    /// snapshot file across the timer, the rotation hook and shutdown,
+    /// and carries the highest mark installed so an older cut cannot
+    /// overwrite a newer snapshot.
+    install: Mutex<Option<WalOffset>>,
+    ceiling_bytes: usize,
+    /// Runs inside `capture_rotation` between the drain and the cut's
+    /// epoch — the window a racing park must not land in.
+    #[cfg(test)]
+    window: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Barrier {
+    /// Build the barrier over the sinks it drains, the journal owner it
+    /// stamps through, and the snapshots root it installs into.
+    ///
+    /// `ceiling_bytes` is the sink's own limit, not a new number: §3.1
+    /// bounds coalescing by the figure the buffers already answer to,
+    /// because RFC 0053 owns the client-facing one.
+    #[must_use]
+    pub fn new(
+        publish: PublishCoordinator,
+        coordinator: Arc<CommitCoordinator>,
+        snapshots_root: PathBuf,
+        ceiling_bytes: usize,
+    ) -> Self {
+        let epochs = publish.record().epochs();
+        Self {
+            publish,
+            coordinator,
+            snapshots_root,
+            epochs,
+            pending: Mutex::new(None),
+            install: Mutex::new(None),
+            ceiling_bytes,
+            #[cfg(test)]
+            window: Mutex::new(None),
+        }
+    }
+
+    /// The cadence state this barrier decides against.
+    #[must_use]
+    pub fn epochs(&self) -> Arc<BarrierEpochs> {
+        Arc::clone(&self.epochs)
+    }
+
+    /// Capture a cut under the ingest exclusion and hand it to the
+    /// pending slot.
+    ///
+    /// `rotate_when_idle` is the timer's leg: an idle node's last
+    /// segment is rotated **first, under the same exclusion**, so no
+    /// turn can run between the rotate and the mark read — every frame
+    /// at or below the mark is then in the closed segment and every
+    /// frame appended after the release is in the new one, above it. The
+    /// mark itself is always `last_durable`, the last *acknowledged*
+    /// turn's own frame offset, never the rotation boundary.
+    pub fn capture(&self, pipeline: &IngestPipeline, rotate_when_idle: bool) -> CaptureOutcome {
+        // The offer runs **under the exclusion**, not after it. Released
+        // first, the rotation hook could capture a newer cut and fill the
+        // slot in the gap, and this — older — cut would then fold over
+        // its epoch, its mark and its snapshots. `capture_rotation` runs
+        // under the shared side of this same lock, so holding it across
+        // the handoff is what orders the two.
+        let _bound = pipeline.exclude_ingest();
+        pipeline.quiesce_encodes();
+        if rotate_when_idle {
+            self.rotate_idle();
+        }
+        // First, and **before** the drain, because `current()` has to mean
+        // "the next cut that will drain the buffers" for the whole span in
+        // which this one is being captured. That is what dates a park by a
+        // publish registered before the cut: `publish::park` settles it at
+        // `current()`, and only `E + 1` there refuses `E`. Opened after the
+        // drain, a park landing in the gap reads `E`, `note_resettled`
+        // discards it as covered, and the cut stamps over records that
+        // exist only in buffers it no longer holds — the exact escape
+        // `publish::park` says the date exists to close. The cut's own
+        // batches then register at `E + 1`, which is right for the same
+        // reason: cut `E` carries them and cannot stamp without them, and
+        // `E + 1` is the cut that drains them if `E` parks them.
+        let epoch = self.epochs.open_cut();
+        let mark = pipeline.acknowledged_durable();
+        let (drained, snapshots) =
+            pipeline.with_miner(|miner| (self.publish.drain_all(), serialise(miner)));
+        self.offer(Cut {
+            epoch,
+            mark,
+            bytes: drained.estimated_bytes(),
+            drained: vec![drained],
+            snapshots,
+        })
+    }
+
+    /// Capture a cut from inside an ingest turn that has already
+    /// observed a segment change — the rotation hook, now capture-only.
+    ///
+    /// The caller holds the exclusion and the miner lock, and `mark` is
+    /// the rotation point (`prev`), not `last_durable`: the frames at or
+    /// below it are exactly the ones the closed segment holds.
+    ///
+    /// Unlike [`Self::capture`] this opens the cut *after* the drain. A
+    /// park, or `write_ordered`'s audit-failure requeue, cannot land
+    /// between the two — the drain and the epoch are one step against
+    /// them — but `publish_owned`'s own requeue after a failed put still
+    /// can, reads the cut's own epoch and dates nothing: issue #835.
+    /// Left as it is here because
+    /// the no-accumulation leg
+    /// (`rfc0052_1_a_latched_node_does_not_accumulate_the_cuts_it_refuses`)
+    /// rests on this path dating settlements, and needs a replacement
+    /// observable before the order can move.
+    pub fn capture_rotation(&self, miner: &MinerCluster, mark: WalOffset) -> CaptureOutcome {
+        let (drained, epoch) = self.publish.drain_all_then(|| {
+            #[cfg(test)]
+            self.in_window();
+            self.epochs.open_cut()
+        });
+        let cut = Cut {
+            epoch,
+            mark: Some(mark),
+            bytes: drained.estimated_bytes(),
+            drained: vec![drained],
+            snapshots: serialise(miner),
+        };
+        self.offer(cut)
+    }
+
+    /// Run the pending cut, if any — outside the exclusion.
+    pub fn run_pending(&self) -> CutOutcome {
+        let Some(cut) = self.take_pending() else {
+            return CutOutcome::Idle;
+        };
+        let epoch = cut.epoch;
+        let outcome = self.run_cut(cut);
+        // §3.1: a pending cut captured behind a cut that did **not**
+        // stamp already folds frames whose only durable copy was that
+        // cut's batches, so installing or stamping it would suppress
+        // records now sitting back in the buffers. Its own batches are
+        // unflushed — the task is sequential — so merging them back
+        // loses nothing, and the next capture covers everything either
+        // cut held. It also releases the publish guards those batches
+        // hold: left in the slot they would stall `quiesce_publishes`
+        // for the life of the process, shutdown included.
+        match outcome {
+            CutOutcome::Retained | CutOutcome::Latched => self.invalidate_pending(),
+            CutOutcome::Stamped | CutOutcome::Unstamped | CutOutcome::Idle => {}
+        }
+        self.publish.record().settle_cut(epoch);
+        outcome
+    }
+
+    /// One barrier tick: capture, then run. A panic anywhere inside is
+    /// caught and lowers the latch to the tick's own epoch, so the
+    /// barrier task takes the next tick instead of dying with the
+    /// process's only stamping path.
+    pub fn tick(&self, pipeline: &IngestPipeline, rotate_when_idle: bool) -> CutOutcome {
+        let epoch = self.epochs.current();
+        // §3.1 checks the latch *before* the cut, and this is where that
+        // check belongs: `run_cut`'s is the authoritative one, but it
+        // runs after the capture has already quiesced the pool, rotated
+        // an idle segment and emptied both sinks. A latched node would
+        // keep doing all three on every tick — mutating WAL and sink
+        // state for a cut that cannot stamp — instead of standing still
+        // until a restart.
+        if self.epochs.capture().refuses(epoch) {
+            // The rotation hook does not consult the latch — it runs on
+            // the request path, where a cut it cannot take is still a
+            // drain it must not lose. So a latched node keeps acquiring
+            // pending cuts, and this early return is the only place left
+            // that can settle them: left in the slot their publish
+            // guards never drop, and `quiesce_publishes` waits on them
+            // for the life of the process, shutdown included.
+            self.invalidate_pending();
+            // Each of those parks dates a settlement, and on a latched
+            // node nothing ever retires them: `run_pending`'s
+            // `settle_cut` is on the path this return skips. A
+            // settlement dated at or below the epoch current now refuses
+            // no cut a later tick could take — `refuses` needs
+            // `epoch < at` — so settling against it here is what keeps
+            // the list from growing for the life of the process.
+            self.publish.record().settle_cut(self.epochs.current());
+            return CutOutcome::Latched;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.capture(pipeline, rotate_when_idle);
+            self.run_pending()
+        }));
+        if let Ok(outcome) = outcome {
+            return outcome;
+        }
+        // The tick panicked outside any batch guard, so nothing reported
+        // for it. Lower the latch to this tick's epoch and drop whatever
+        // it left in the slot: the frames stay in the WAL and a restart
+        // replays them.
+        self.epochs.report(epoch);
+        self.invalidate_pending();
+        CutOutcome::Latched
+    }
+
+    /// The pending cut's mark, for tests and the status surface.
+    #[must_use]
+    pub fn pending_mark(&self) -> Option<WalOffset> {
+        self.lock_pending().as_ref().and_then(Cut::mark)
+    }
+
+    /// The pending cut's epoch, for tests and the status surface. A
+    /// coalesced capture adopts its epoch; a parked one leaves it, which
+    /// is the difference RFC0052.14's ceiling leg is about.
+    #[must_use]
+    pub fn pending_epoch(&self) -> Option<Epoch> {
+        self.lock_pending().as_ref().map(Cut::epoch)
+    }
+
+    /// Fill, coalesce into, or park against the pending slot (§3.1).
+    fn offer(&self, cut: Cut) -> CaptureOutcome {
+        let mut pending = self.lock_pending();
+        let Some(existing) = pending.as_mut() else {
+            *pending = Some(cut);
+            return CaptureOutcome::Filled;
+        };
+        if existing.bytes.saturating_add(cut.bytes) > self.ceiling_bytes {
+            drop(pending);
+            self.park(cut);
+            return CaptureOutcome::Parked;
+        }
+        existing.absorb(cut);
+        CaptureOutcome::Coalesced
+    }
+
+    /// All-or-nothing: put every batch this capture drained back into
+    /// the buffers as `ready`, dated with the capture's own epoch, and
+    /// advance nothing.
+    fn park(&self, cut: Cut) {
+        for batch in cut.drained {
+            self.publish.park(batch);
+        }
+    }
+
+    /// Discard a pending cut: its snapshot bytes go, its batches go back
+    /// into the buffers, its mark is withdrawn and its epoch is spent.
+    fn invalidate_pending(&self) {
+        let Some(cut) = self.take_pending() else {
+            return;
+        };
+        self.park(cut);
+    }
+
+    #[cfg(test)]
+    fn in_window(&self) {
+        let hook = self
+            .window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn take_pending(&self) -> Option<Cut> {
+        self.lock_pending().take()
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<Cut>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// §3.3's idle rotation, under the exclusion and before the cut. A
+    /// failure is logged rather than raised: the rotation is
+    /// discretionary, and refusing to cut over it would stop reclamation
+    /// on exactly the node whose segments have least reason to exist.
+    fn rotate_idle(&self) {
+        if let Err(e) = self.coordinator.rotate_if_aged() {
+            tracing::warn!(
+                error = %e,
+                "barrier: the idle rotation failed; the cut proceeds against the open segment"
+            );
+        }
+    }
+
+    /// The store-I/O half, outside the exclusion (§3.1's pseudocode from
+    /// `cut_ok` on).
+    fn run_cut(&self, cut: Cut) -> CutOutcome {
+        let Cut {
+            epoch,
+            mark,
+            drained,
+            snapshots,
+            ..
+        } = cut;
+        if self.epochs.capture().refuses(epoch) {
+            // Nothing in the store yet, so the batches go back where a
+            // later cut can find them.
+            for batch in drained {
+                self.publish.park(batch);
+            }
+            return CutOutcome::Latched;
+        }
+        let mut published = true;
+        for batch in drained {
+            published &= self.publish.write_ordered_in_turn(batch, "barrier");
+        }
+        // Publishes registered *before* this cut settle here — the wait
+        // §3.1 has always made, now also reporting. Unconditional, and
+        // §3.1 says why: "always evaluated, so a failed cut flush cannot
+        // skip their outcome and requeue path". Returning on `!published`
+        // first would leave those publishes in flight past the cut that
+        // was meant to wait for them, and the requeue they are about to
+        // make would land beside a buffer the next capture had already
+        // drained.
+        let outcomes = self.publish.record().quiesce_publishes_through(epoch);
+        // Three independent refusals, and the order is only about which
+        // one is *named*. The recheck defends the ordering: a publish
+        // registered before the barrier began can panic while it waits
+        // above, and the latch it sets lands after the first check. The
+        // outcome defends the data: a failure in any of those publishes
+        // means no stamp even though the cut's own flush succeeded. §3.1
+        // spells the conjunction out — `ok = cut_ok and prior_ok and
+        // failed_epoch > cut.epoch`.
+        if self.epochs.capture().refuses(epoch) {
+            return CutOutcome::Latched;
+        }
+        if !published || !outcomes.all_ok(epoch) {
+            return CutOutcome::Retained;
+        }
+        // A failed install must not be followed by a stamp. §3.1 says a
+        // snapshot write failure is not a checkpoint blocker, and adds
+        // the condition that makes that safe: recovery must gate the
+        // *Parquet* side on `max(X, S)`. `recovery::DriverSink` does not
+        // yet — that gate is RFC0052.10's — so advancing `X` over a
+        // snapshot still at `S` would republish every row in `(S, X]`
+        // on the next start. Retaining does not make the next start
+        // clean: this cut's rows are already in the store, so replay
+        // re-mines them exactly as it would after a crash between the
+        // write and the stamp. What it buys is the bound — the
+        // duplicates are this cut's, not every row since `S`.
+        match self.install(&snapshots, mark) {
+            Install::Failed => CutOutcome::Retained,
+            Install::Written | Install::Superseded => self.stamp(mark),
+        }
+    }
+
+    /// Install this cut's snapshot bytes, serialised against every other
+    /// installer and monotone in the mark.
+    ///
+    /// A cut with no mark installs nothing: an artefact without a
+    /// concrete horizon is discarded at the next start, so writing one
+    /// over a tenant's only valid snapshot would trade a full replay for
+    /// a cut that had nothing to stamp anyway.
+    fn install(&self, snapshots: &[(TenantId, SnapshotState)], mark: Option<WalOffset>) -> Install {
+        let Some(mark) = mark else {
+            return Install::Superseded;
+        };
+        let mut installed = self.install.lock().unwrap_or_else(PoisonError::into_inner);
+        if installed.is_some_and(|previous| mark < previous) {
+            return Install::Superseded;
+        }
+        let high_water = WalHighWater {
+            segment: mark.segment.to_string(),
+            byte: mark.byte,
+        };
+        for (tenant, state) in snapshots {
+            let mut state = state.clone();
+            state.wal_high_water = Some(high_water.clone());
+            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &state) {
+                tracing::warn!(
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
+                    error = %e,
+                    "barrier: snapshot write failed, so this cut does not stamp; the next \
+                     one retries (no acknowledged data is lost — the WAL is durable)"
+                );
+                return Install::Failed;
+            }
+        }
+        *installed = Some(mark);
+        Install::Written
+    }
+
+    /// §6.7's monotone, idempotent stamp. A failure logs and leaves the
+    /// in-memory mark where it was, so nothing past the *previous* mark
+    /// becomes reclaimable — segments already eligible under it still
+    /// are.
+    fn stamp(&self, mark: Option<WalOffset>) -> CutOutcome {
+        let Some(mark) = mark else {
+            return CutOutcome::Stamped;
+        };
+        match self.coordinator.checkpoint(mark) {
+            Ok(()) => CutOutcome::Stamped,
+            Err(ReclaimError::NoReclamationSurface) => {
+                tracing::warn!(
+                    "barrier: the journal exposes no reclamation surface, so no checkpoint was \
+                     written and nothing is reclaimed"
+                );
+                CutOutcome::Unstamped
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "barrier: the checkpoint write failed; nothing past the previous mark is \
+                     reclaimed"
+                );
+                CutOutcome::Stamped
+            }
+        }
+    }
+}
+
+/// Each tenant's miner state as of the cut, serialised under the miner
+/// lock so it never runs past the mark.
+fn serialise(miner: &MinerCluster) -> Vec<(TenantId, SnapshotState)> {
+    miner
+        .tenant_ids()
+        .into_iter()
+        .map(|tenant| {
+            let state = miner.snapshot_state(&tenant);
+            (tenant, state)
+        })
+        .collect()
+}
+
+/// Latest wins per tenant; a tenant absent from the newer capture keeps
+/// the older bytes, which are still cut-consistent at its own horizon.
+fn merge_snapshots(
+    into: &mut Vec<(TenantId, SnapshotState)>,
+    newer: Vec<(TenantId, SnapshotState)>,
+) {
+    for (tenant, state) in newer {
+        match into.iter_mut().find(|(existing, _)| *existing == tenant) {
+            Some(slot) => slot.1 = state,
+            None => into.push((tenant, state)),
+        }
+    }
+}
+
+/// The same rule from the other side: `into` is already the later
+/// capture, so `older` only fills the tenants it has no bytes for.
+fn backfill_snapshots(
+    into: &mut Vec<(TenantId, SnapshotState)>,
+    older: Vec<(TenantId, SnapshotState)>,
+) {
+    for (tenant, state) in older {
+        if !into.iter().any(|(existing, _)| *existing == tenant) {
+            into.push((tenant, state));
+        }
+    }
+}
+
+/// The snapshots root is fsynced — and its parent with it — before any
+/// listed artefact is read as a horizon (RFC0052.13).
+///
+/// A failure **fails startup** rather than discarding the snapshots:
+/// reclamation may already have removed the frames they cover, so a
+/// horizon whose directory entry may not be durable must never govern
+/// reclamation, and no state only a snapshot could rebuild may be thrown
+/// away on the strength of a directory read that might not survive.
+///
+/// # Errors
+///
+/// [`snapshot_store::SnapshotStoreError::Io`] when either fsync fails.
+pub fn fsync_snapshots_root(root: &Path) -> Result<(), snapshot_store::SnapshotStoreError> {
+    snapshot_store::fsync_root(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::snapshot::{SnapshotState, WalHighWater};
+    use ourios_wal::WalOffset;
+
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ourios_config::MinerConfig;
+    use ourios_core::audit::{
+        AuditEvent, AuditPayload, AuditSink, ParamType, TemplateChange, hash_triggering_line,
+    };
+    use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_parquet::Store;
+
+    use super::{Barrier, Cut, CutOutcome};
+    use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+    use crate::cadence::{BarrierEpochs, Epoch};
+    use crate::publish::PublishCoordinator;
+    use crate::receiver::CommitCoordinator;
+    use crate::receiver::pipeline::{Journal, ReceiveError};
+    use crate::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+
+    fn state(byte: u64) -> SnapshotState {
+        SnapshotState {
+            leaves: Vec::new(),
+            structured_templates: Vec::new(),
+            wal_high_water: Some(WalHighWater {
+                segment: "segment".to_owned(),
+                byte,
+            }),
+            adopted_templates: Vec::new(),
+        }
+    }
+
+    fn offset(byte: u64) -> WalOffset {
+        WalOffset {
+            segment: uuid::Uuid::from_u128(7),
+            byte,
+        }
+    }
+
+    fn cut(epoch: Epoch, byte: u64, snapshots: &[(&str, u64)]) -> Cut {
+        Cut {
+            epoch,
+            mark: Some(offset(byte)),
+            drained: Vec::new(),
+            snapshots: snapshots
+                .iter()
+                .map(|(tenant, at)| (TenantId::new(*tenant), state(*at)))
+                .collect(),
+            bytes: 0,
+        }
+    }
+
+    fn horizon(cut: &Cut, tenant: &str) -> Option<u64> {
+        cut.snapshots
+            .iter()
+            .find(|(id, _)| id.as_str() == tenant)
+            .and_then(|(_, state)| state.wal_high_water.as_ref())
+            .map(|high_water| high_water.byte)
+    }
+
+    /// §3.1's ordering rule, at the one place the two captures meet: the
+    /// newer cut's epoch, mark and per-tenant snapshots win whichever way
+    /// round the two arrive.
+    ///
+    /// The handoff is serialised under the ingest exclusion, so the
+    /// inverted order should be unreachable — but an inversion that ever
+    /// *did* occur would move the pending cut's horizon backwards while
+    /// leaving the newer capture's snapshot bytes in the slot: an
+    /// artefact covering frames above the mark it is stamped at, which
+    /// the next start would replay over.
+    #[test]
+    fn folding_two_cuts_is_independent_of_the_order_they_arrive_in() {
+        let epochs = BarrierEpochs::new();
+        let (first, second) = (epochs.open_cut(), epochs.open_cut());
+        assert!(second > first, "the later capture takes the later epoch");
+
+        let mut in_order = cut(first, 100, &[("checkout", 100), ("search", 100)]);
+        in_order.absorb(cut(second, 200, &[("checkout", 200)]));
+
+        let mut inverted = cut(second, 200, &[("checkout", 200)]);
+        inverted.absorb(cut(first, 100, &[("checkout", 100), ("search", 100)]));
+
+        for folded in [&in_order, &inverted] {
+            assert_eq!(folded.epoch(), second, "the newer capture's epoch");
+            assert_eq!(folded.mark(), Some(offset(200)), "and its mark");
+            assert_eq!(
+                horizon(folded, "checkout"),
+                Some(200),
+                "and its bytes for a tenant both captures hold",
+            );
+            assert_eq!(
+                horizon(folded, "search"),
+                Some(100),
+                "while a tenant only the older capture saw keeps its own \
+                 cut-consistent bytes",
+            );
+        }
+    }
+
+    /// A journal the barrier only ever stamps through, and whose stamp
+    /// fails — the outcome under test is the cut's decision, not the
+    /// sidecar write.
+    struct Unwritten;
+
+    impl Journal for Unwritten {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+            unreachable!("the barrier never appends")
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+            unreachable!("the barrier never syncs")
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    fn mined() -> MinedRecord {
+        MinedRecord {
+            tenant_id: TenantId::new("checkout"),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
+            time_unix_nano: 1_775_127_480_000_000_000,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: "1".to_owned(),
+            }],
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        }
+    }
+
+    fn created() -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("checkout"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: hash_triggering_line(b"user 1 logged in"),
+                triggering_line_sample: Some("user 1 logged in".to_owned()),
+                change: TemplateChange::Created {
+                    new_template: "user <*> logged in".to_owned(),
+                },
+            },
+        }
+    }
+
+    /// Two sinks on local stores and a barrier over them, as the server
+    /// wires them minus the pipeline: the rotation hook's capture is
+    /// driven directly.
+    struct Rig {
+        _tmp: tempfile::TempDir,
+        audit_root: std::path::PathBuf,
+        records: SharedParquetSink,
+        audit: SharedParquetAuditSink,
+        publish: PublishCoordinator,
+        barrier: Arc<Barrier>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().expect("temp");
+            let (data, audit_root) = (tmp.path().join("data"), tmp.path().join("audit"));
+            std::fs::create_dir_all(&data).expect("data root");
+            std::fs::create_dir_all(&audit_root).expect("audit root");
+            let records = SharedParquetSink::new(ParquetRecordSink::new(
+                Store::local(&data).expect("data store"),
+                FlushConfig {
+                    target_bytes: usize::MAX,
+                    max_buffer_age: Duration::ZERO,
+                    ceiling_bytes: usize::MAX,
+                },
+            ));
+            let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+                Store::local(&audit_root).expect("audit store"),
+                1024,
+            ));
+            let publish = PublishCoordinator::new(records.clone(), audit.clone());
+            let barrier = Arc::new(Barrier::new(
+                publish.clone(),
+                CommitCoordinator::new(Box::new(Unwritten), Duration::ZERO, u64::MAX),
+                tmp.path().join("snapshots"),
+                usize::MAX,
+            ));
+            Self {
+                _tmp: tmp,
+                audit_root,
+                records,
+                audit,
+                publish,
+                barrier,
+            }
+        }
+
+        /// Buffer one record and its template event.
+        fn buffer_one(&self) {
+            self.records.clone().emit(mined());
+            self.audit.clone().emit(created());
+        }
+
+        /// Run `racer` on its own thread from inside the rotation
+        /// capture's window — after its drain, before its epoch — and
+        /// give it every chance to finish there. Ordered against the
+        /// capture, it cannot, and the wait times out.
+        fn capture_rotation_racing(&self, racer: impl FnOnce() + Send + 'static) {
+            let (done_tx, done_rx) = mpsc::channel();
+            let (thread_tx, thread_rx) = mpsc::channel();
+            *self
+                .barrier
+                .window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+                let thread = std::thread::spawn(move || {
+                    racer();
+                    // The window may have stopped listening; that is the point.
+                    let _ = done_tx.send(());
+                });
+                let _ = done_rx.recv_timeout(Duration::from_millis(500));
+                thread_tx.send(thread).expect("the test is waiting");
+            }));
+            let miner = MinerCluster::new(MinerConfig::default());
+            self.barrier.capture_rotation(&miner, offset(64));
+            thread_rx
+                .recv()
+                .expect("the window ran")
+                .join()
+                .expect("the racer completed");
+        }
+
+        /// Break the data store so every partition write fails.
+        fn sabotage_data_store(&self) {
+            let data = self.audit_root.with_file_name("data");
+            std::fs::remove_dir_all(&data).expect("remove data dir");
+            std::fs::write(&data, b"not a directory").expect("sabotage data");
+        }
+
+        /// The cut the capture left pending must not stamp: the record
+        /// the racer put back missed its drain.
+        fn assert_the_publish_came_back(&self) {
+            assert_eq!(
+                self.barrier.run_pending(),
+                CutOutcome::Retained,
+                "the cut missed the returned record, so it must not stamp",
+            );
+            assert_eq!(self.records.buffered_records(), 1, "the record is buffered");
+        }
+
+        /// The cut the capture left pending must not stamp: it missed
+        /// records that are now back in the buffers beside their event.
+        fn assert_the_cut_retains(&self) {
+            assert_eq!(
+                self.barrier.run_pending(),
+                CutOutcome::Retained,
+                "the cut missed the returned records, so it must not stamp",
+            );
+            assert_eq!(
+                self.records.buffered_records(),
+                1,
+                "the records are buffered"
+            );
+            assert_eq!(self.audit.buffered_events(), 1, "beside their audit event");
+        }
+    }
+
+    /// A park that `run_cut` or `invalidate_pending` makes — outside the
+    /// ingest exclusion — racing the rotation hook's capture, forced into
+    /// the one window that matters: after the capture's drain and before
+    /// its epoch.
+    ///
+    /// Landing there, the parked records miss the cut's drain and the
+    /// settlement is dated at the cut's own epoch, which refuses nothing
+    /// — so the cut would stamp over records that exist only in the
+    /// buffers. The park must instead be ordered wholly before the drain
+    /// (the cut carries the records) or wholly after the epoch (its
+    /// settlement refuses the cut).
+    #[test]
+    fn a_park_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let rig = Rig::new();
+        // A batch an earlier cut drained and now has to put back.
+        rig.buffer_one();
+        let parking = Cut {
+            epoch: rig.barrier.epochs.current(),
+            mark: None,
+            drained: vec![rig.publish.drain_all()],
+            snapshots: Vec::new(),
+            bytes: 0,
+        };
+        let parker = Arc::clone(&rig.barrier);
+        rig.capture_rotation_racing(move || parker.park(parking));
+        rig.assert_the_cut_retains();
+    }
+
+    /// The same window, entered by the other way records come back: an
+    /// age publish whose audit write fails transiently and requeues the
+    /// events and then the records. Outside the handoff the two requeues
+    /// could straddle a drain — records taken without their events — and
+    /// the records' return would be dated at the cut it missed.
+    #[test]
+    fn an_audit_failure_requeue_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let rig = Rig::new();
+        rig.buffer_one();
+        let drained = rig.publish.drain_aged();
+        // A transient audit-store failure: the write retains every event.
+        std::fs::remove_dir_all(&rig.audit_root).expect("remove audit dir");
+        std::fs::write(&rig.audit_root, b"not a directory").expect("sabotage audit");
+        let publish = rig.publish.clone();
+        rig.capture_rotation_racing(move || {
+            assert!(
+                !publish.write_ordered(drained, "age"),
+                "the audit write fails and holds the records",
+            );
+        });
+        rig.assert_the_cut_retains();
+    }
+
+    /// The publisher's own returns, entered the same window. Since RFC
+    /// 0052 §3.1 moved the size and ceiling PUTs onto the publisher
+    /// thread, a failed PUT's requeue runs concurrently with the rotation
+    /// hook, where it used to run on an encode worker the hook had
+    /// already quiesced.
+    #[test]
+    fn a_publisher_requeue_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let rig = Rig::new();
+        rig.records.clone().emit(mined());
+        // A size take, registered before the capture, whose PUT fails.
+        let guard = rig.records.begin_publish();
+        let taken = rig.records.drain_all().into_partitions();
+        rig.sabotage_data_store();
+        let feed = rig.publish.feed().clone();
+        rig.capture_rotation_racing(move || {
+            assert!(
+                !feed.publish(taken, "size", guard.epoch()),
+                "the PUT fails and the partition is requeued",
+            );
+            drop(guard);
+        });
+        rig.assert_the_publish_came_back();
+    }
+
+    /// And a detached partition parked — a full queue, a retired
+    /// publisher, or the item's destructor — in the same window.
+    #[test]
+    fn a_publisher_park_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let rig = Rig::new();
+        rig.records.clone().emit(mined());
+        let completion = rig.publish.publisher().begin_batch();
+        let item = crate::publisher::Detached::new(rig.records.drain_all(), "size", &completion);
+        drop(completion);
+        rig.capture_rotation_racing(move || drop(item));
+        rig.assert_the_publish_came_back();
+    }
+
+    /// A panic inside the rotation capture after its drain — the hook
+    /// catches it and ingest carries on — must not leave the drained
+    /// records in neither the buffers nor the store with nothing
+    /// refusing a later cut. The batch's publish guard drops while
+    /// unwinding, which latches the node at its epoch and records an
+    /// unwind that no cut at or above it can pass.
+    #[test]
+    fn a_rotation_capture_that_panics_after_its_drain_latches_every_later_cut() {
+        let rig = Rig::new();
+        rig.buffer_one();
+        *rig.barrier
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Box::new(|| panic!("a capture panics after its drain")));
+        let barrier = Arc::clone(&rig.barrier);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let miner = MinerCluster::new(MinerConfig::default());
+            barrier.capture_rotation(&miner, offset(64));
+        }));
+        assert!(unwound.is_err(), "the capture panicked");
+
+        let later = rig.barrier.epochs.open_cut();
+        assert!(
+            rig.barrier.epochs.capture().refuses(later),
+            "the latch refuses every later cut",
+        );
+        assert!(
+            !rig.records.quiesce_publishes().all_ok(later),
+            "and the unwind's settlement refuses it independently",
+        );
+    }
+
+    /// `Journal::checkpoint` defaults to `NoReclamationSurface` so a
+    /// journal that cannot reclaim fails closed. A cut over one wrote no
+    /// checkpoint, and must not report that it stamped.
+    #[test]
+    fn a_cut_over_a_journal_without_a_reclamation_surface_reports_no_stamp() {
+        let rig = Rig::new();
+        rig.buffer_one();
+        let miner = MinerCluster::new(MinerConfig::default());
+        rig.barrier.capture_rotation(&miner, offset(64));
+        assert_eq!(rig.barrier.run_pending(), CutOutcome::Unstamped);
+        assert_eq!(
+            rig.records.buffered_records(),
+            0,
+            "the cut's records still reached the store",
+        );
+    }
+}

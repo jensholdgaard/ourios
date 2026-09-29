@@ -139,7 +139,7 @@ fn publish_path_projects_the_configured_set() {
     producer.emit(rec());
     let batches = shared.drain_all();
     assert!(
-        shared.publish_owned(batches, "test"),
+        shared.publish_owned(batches.into_partitions(), "test", shared.epochs().current()),
         "the drained partition publishes"
     );
     assert_promoted(&flushed_schemas(dir.path()));

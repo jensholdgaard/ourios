@@ -24,6 +24,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::receiver::IngestPipeline;
+use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
@@ -62,6 +63,35 @@ fn store_rows(root: &Path) -> usize {
     rows
 }
 
+/// A rotation hook that records `(buffered, durably-stored rows)` at
+/// the moment it stamps, then writes the snapshots at the mark.
+fn observing_stamper(
+    sink: &SharedParquetSink,
+    store_root: &Path,
+    snapshots_root: &Path,
+    observed: &Arc<Mutex<Vec<(usize, usize)>>>,
+) -> RotationHook {
+    let (sink, observed) = (sink.clone(), Arc::clone(observed));
+    let (store_root, snapshots_root) = (store_root.to_path_buf(), snapshots_root.to_path_buf());
+    Box::new(move |miner, mark| {
+        // Since RFC 0052 §3.1 moved the size-trigger PUT from the encode
+        // worker to the publisher, the pipeline's `quiesce_encodes` covers
+        // the encode phase only: a record is then either written by the
+        // publisher or parked back in the buffers when its queue was full.
+        // So this hand-rolled stamper does what the production barrier does
+        // before it stamps — waits out the publishes registered before it
+        // and flushes the buffers. A record whose encode had not finished
+        // is in neither, so the row count still catches it.
+        let _outcomes = sink.quiesce_publishes();
+        sink.flush_all();
+        observed
+            .lock()
+            .expect("lock")
+            .push((sink.buffered_records(), store_rows(&store_root)));
+        recovery::write_snapshots(&snapshots_root, miner, Some(mark)).expect("snapshot write");
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -97,21 +127,16 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     // What the rotation hook — the wal_high_water stamping point —
     // observed: (buffered, durably-stored rows) at stamp time.
     let observed: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
-    let hook_observed = Arc::clone(&observed);
-    let hook_sink = sink.clone();
-    let hook_store = store_root.clone();
-    let hook_snapshots = snapshots_root.clone();
 
     let miner = MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let pipeline = IngestPipeline::new(coordinator(Box::new(wal)), miner)
         .with_encode_pool(EncodePool::new(&sink, 1))
-        .with_rotation_hook(Box::new(move |miner, mark| {
-            hook_observed
-                .lock()
-                .expect("lock")
-                .push((hook_sink.buffered_records(), store_rows(&hook_store)));
-            recovery::write_snapshots(&hook_snapshots, miner, Some(mark)).expect("snapshot write");
-        }));
+        .with_rotation_hook(observing_stamper(
+            &sink,
+            &store_root,
+            &snapshots_root,
+            &observed,
+        ));
 
     // Batch A: one frame, PRE_ROTATION_RECORDS records — acked long
     // before its encodes finish (the ack never waits on the pool).

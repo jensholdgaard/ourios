@@ -47,7 +47,7 @@ use ourios_config::MinerConfig;
 use ourios_ingester::compactor::run_sweep;
 use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::receiver::pipeline::{Journal, ReceiveError};
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{
@@ -423,17 +423,7 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // drain sweep below are measurement overhead, not load.
     let load_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
 
-    // RFC 0035 §3.1: drain the encode pool before the final sample +
-    // drain sweep, so every acked record has reached the sink (and the
-    // D2 backlog counts it) before flush_all runs. The bounded queue
-    // keeps this residue to a few batches per core.
-    let quiesce_pipeline = Arc::clone(&pipeline);
-    if tokio::task::spawn_blocking(move || quiesce_pipeline.quiesce_encodes())
-        .await
-        .is_err()
-    {
-        return Err(SoakError::Setup("encode-pool quiesce panicked".into()));
-    }
+    settle_writes(&pipeline, &sink).await?;
 
     // A send error just means the sampler already exited.
     let _ = stop_tx.send(true);
@@ -454,6 +444,29 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
         samples,
         final_backlog,
     ))
+}
+
+/// Wait until every acked record has reached the sink and every write
+/// the pool handed off has settled, before the final sample and drain
+/// sweep.
+///
+/// RFC 0035 §3.1: the encode pool is drained so the D2 backlog counts
+/// every acked record before `flush_all` runs; the bounded queue keeps
+/// that residue to a few batches per core. RFC 0052 §3.1 moved the
+/// size-trigger PUTs onto the publisher, which the pool's quiesce does not
+/// wait for, so the publishes are waited out too — or a partition could
+/// land after the drain sweep had listed the store.
+async fn settle_writes(
+    pipeline: &SharedPipeline,
+    sink: &SharedParquetSink,
+) -> Result<(), SoakError> {
+    let (pipeline, sink) = (Arc::clone(pipeline), sink.clone());
+    tokio::task::spawn_blocking(move || {
+        pipeline.quiesce_encodes();
+        let _outcomes = sink.quiesce_publishes();
+    })
+    .await
+    .map_err(|_| SoakError::Setup("encode-pool quiesce panicked".into()))
 }
 
 /// Final drain: advance the synthetic clock past the last partition's
@@ -1340,7 +1353,7 @@ fn lock_wal(wal: &Arc<Mutex<Wal>>) -> MutexGuard<'_, Wal> {
 }
 
 impl Journal for SharedWal {
-    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
         Journal::append_batch(&mut *lock_wal(&self.0), payload)
     }
 
@@ -1350,6 +1363,53 @@ impl Journal for SharedWal {
 
     fn unflushed_bytes(&self) -> u64 {
         Journal::unflushed_bytes(&*lock_wal(&self.0))
+    }
+
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ourios_wal::ReclaimError> {
+        Journal::checkpoint(&mut *lock_wal(&self.0), durable_to)
+    }
+
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        Journal::last_checkpoint(&*lock_wal(&self.0))
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &ourios_wal::SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ourios_wal::ReclaimPlan, ourios_wal::ReclaimError> {
+        Journal::housekeeping_prepare(&mut *lock_wal(&self.0), horizons, max_unlinks)
+    }
+
+    fn write_plan_record(
+        &mut self,
+        plan: &ourios_wal::ReclaimPlan,
+    ) -> Result<ourios_wal::UnlinkPermit, std::io::Error> {
+        Journal::write_plan_record(&mut *lock_wal(&self.0), plan)
+    }
+
+    fn housekeeping_commit(
+        &mut self,
+        pass: ourios_wal::PassId,
+        outcome: ourios_wal::ReclaimOutcome,
+    ) -> Result<ourios_wal::HousekeepingProgress, ourios_wal::ReclaimError> {
+        Journal::housekeeping_commit(&mut *lock_wal(&self.0), pass, outcome)
+    }
+
+    fn rotate(&mut self, kind: ourios_wal::RotationKind) -> Result<(), ReceiveError> {
+        Journal::rotate(&mut *lock_wal(&self.0), kind)
+    }
+
+    fn segment_age_exceeded(&self) -> bool {
+        Journal::segment_age_exceeded(&*lock_wal(&self.0))
+    }
+
+    fn owes_rotation_fsync(&self) -> bool {
+        Journal::owes_rotation_fsync(&*lock_wal(&self.0))
+    }
+
+    fn reclaim_state(&self) -> ourios_wal::ReclaimState {
+        Journal::reclaim_state(&*lock_wal(&self.0))
     }
 }
 
@@ -1383,6 +1443,32 @@ fn us_to_ms(us: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trait method with a default answers for an impl that forgets to
+    /// forward it, and `false` here is "no obligation owed" — silent at
+    /// every call site. `SharedWal` is the one non-test `Journal`, so its
+    /// documented delegation is asserted rather than trusted.
+    #[test]
+    fn shared_wal_forwards_the_rotation_fsync_obligation() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let mut wal = Wal::open(wal_config(tmp.path().to_path_buf())).expect("open WAL");
+        wal.append(ourios_wal::FrameKind::OtlpBatch, b"a frame worth sealing")
+            .expect("append");
+        wal.sync().expect("sync");
+        wal.arm_rotation_faults(ourios_wal::RotationFaults::failing(
+            ourios_wal::RotationSite::ParentFsync,
+            1,
+        ));
+        wal.rotate(ourios_wal::RotationKind::Owed)
+            .expect_err("the parent fsync fails after the rename");
+
+        let shared = SharedWal(Arc::new(Mutex::new(wal)));
+
+        assert!(
+            Journal::owes_rotation_fsync(&shared),
+            "the wrapper reports the obligation the wrapped WAL owes",
+        );
+    }
 
     #[test]
     fn pacing_interval_matches_target_rate() {

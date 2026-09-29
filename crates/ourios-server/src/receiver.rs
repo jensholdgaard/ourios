@@ -819,9 +819,9 @@ fn build_acceptors(
 /// The three background cadences the receiver runs: RFC0014.2's age
 /// sweep, RFC 0052 §3.1's barrier and §3.2's housekeeping.
 struct Cadences {
-    flush_tick: JoinHandle<()>,
-    barrier_tick: JoinHandle<()>,
-    housekeeping_tick: JoinHandle<()>,
+    sweep: JoinHandle<()>,
+    barrier: JoinHandle<()>,
+    housekeeping: JoinHandle<()>,
 }
 
 /// What the cadences are built over. A value rather than three more
@@ -855,16 +855,16 @@ fn spawn_cadences(
     } = inputs;
     let overflow = publisher.audit().overflow_notify();
     Cadences {
-        housekeeping_tick: spawn_housekeeping(
+        housekeeping: spawn_housekeeping(
             housekeeper,
             housekeeping_every,
             barrier.epochs(),
             shutdown.clone(),
         ),
-        barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
+        barrier: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
         // The age sweep drains under the barrier exclusion and the miner
         // lock, and writes audit-ordered off both (issue #302 #1/#2).
-        flush_tick: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+        sweep: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
     }
 }
 
@@ -1026,9 +1026,9 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let pipeline_epochs = pipeline.epochs();
 
     let Cadences {
-        flush_tick,
-        barrier_tick,
-        housekeeping_tick,
+        sweep: flush_tick,
+        barrier: barrier_tick,
+        housekeeping: housekeeping_tick,
     } = spawn_cadences(
         &pipeline,
         CadenceInputs {

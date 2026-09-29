@@ -663,13 +663,13 @@ impl Journal for FaultyJournal {
         max_unlinks: usize,
     ) -> Result<ReclaimPlan, ReclaimError> {
         let plan = Journal::housekeeping_prepare(&mut self.wal, horizons, max_unlinks);
-        if self
-            .faults
-            .panic_after_prepare
-            .swap(false, Ordering::AcqRel)
-        {
-            panic!("injected housekeeping panic after the plan was taken");
-        }
+        assert!(
+            !self
+                .faults
+                .panic_after_prepare
+                .swap(false, Ordering::AcqRel),
+            "injected housekeeping panic after the plan was taken"
+        );
         plan
     }
 
@@ -686,9 +686,10 @@ impl Journal for FaultyJournal {
     }
 
     fn segment_age_exceeded(&self) -> bool {
-        if self.faults.panic_on_age_check.swap(false, Ordering::AcqRel) {
-            panic!("injected barrier-tick panic outside any batch guard");
-        }
+        assert!(
+            !self.faults.panic_on_age_check.swap(false, Ordering::AcqRel),
+            "injected barrier-tick panic outside any batch guard"
+        );
         Journal::segment_age_exceeded(&self.wal)
     }
 

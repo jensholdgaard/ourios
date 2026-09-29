@@ -1,4 +1,5 @@
 use super::*;
+use crate::upstream::LOG_RECORD_TEMPLATE_ATTR;
 
 // ── RFC 0050 §3.2 upstream-template modes ────────────────────
 

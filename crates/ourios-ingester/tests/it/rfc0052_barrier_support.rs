@@ -87,6 +87,9 @@ pub struct RigSpec {
     pub rotation_capture: bool,
     /// Hold the data store's PUTs at this gate — the publisher's write.
     pub held_puts: Option<Gate>,
+    /// Hold the audit store's PUTs at this gate, and wire the record
+    /// sink's inline barrier the way the receiver does (`settled`).
+    pub held_audit_puts: Option<Gate>,
 }
 
 impl RigSpec {
@@ -99,6 +102,7 @@ impl RigSpec {
             ceiling_bytes: usize::MAX,
             rotation_capture: false,
             held_puts: None,
+            held_audit_puts: None,
         }
     }
 }
@@ -175,6 +179,25 @@ impl BarrierRig {
         )
     }
 
+    /// A rig wired like the receiver — the record sink's inline barrier
+    /// is the audit sink's `settled`, which does no store I/O — with every
+    /// record crossing the size target and the audit store's PUTs held at
+    /// `gate`.
+    pub fn with_held_audit_puts(tmp: &Path, gate: &Gate) -> Self {
+        Self::build(
+            tmp,
+            RigSpec {
+                flush: FlushConfig {
+                    target_bytes: 1,
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+                held_audit_puts: Some(gate.clone()),
+                ..RigSpec::new(wal_config(&tmp.join("wal")))
+            },
+        )
+    }
+
     /// A rig whose single encode worker is **held** inside the sink's
     /// inline audit barrier until the returned handle releases it — the
     /// same seam `with_panicking_encode` panics in, and the same
@@ -224,6 +247,7 @@ impl BarrierRig {
             ceiling_bytes,
             rotation_capture,
             held_puts: put_gate,
+            held_audit_puts: audit_gate,
         } = spec;
         let wal_root = wal.root.clone();
         let data_root = tmp.join("data");
@@ -234,10 +258,18 @@ impl BarrierRig {
         }
 
         let journal = Wal::open(wal).expect("open WAL");
-        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
-            Store::local(&audit_root).expect("audit store"),
-            100_000,
-        ));
+        let mut audit_store = Store::local(&audit_root).expect("audit store");
+        if let Some(gate) = &audit_gate {
+            audit_store = held_puts(audit_store, gate);
+        }
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(audit_store, 100_000));
+        let poison = match audit_gate {
+            Some(_) => {
+                let settled = audit.clone();
+                Some(Box::new(move || settled.settled()) as Box<dyn FnMut() -> bool + Send>)
+            }
+            None => poison,
+        };
         let sink = rig_sink(&data_root, flush, &audit, poison, put_gate.as_ref());
         let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
             .with_record_sink(Box::new(sink.clone()));

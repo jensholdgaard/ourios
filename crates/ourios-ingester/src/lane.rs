@@ -361,7 +361,10 @@ mod tests {
         };
         serve.release.store(true, Ordering::Release);
         blocked.join().expect("the blocked send returned");
+        // The next generation can serve item 2 before the retiring thread
+        // has finished salvaging item 1, so wait for both.
         await_count(&serve.served, 1);
+        await_count(&serve.salvaged, 1);
         assert_eq!(
             serve.served.load(Ordering::Acquire) + serve.salvaged.load(Ordering::Acquire),
             2,

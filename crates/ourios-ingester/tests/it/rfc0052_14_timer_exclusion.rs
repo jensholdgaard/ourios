@@ -506,6 +506,79 @@ async fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting
     assert!(rig.data_files().len() >= 2, "both partitions are durable");
 }
 
+/// Scenario RFC0052.14 — no audit-store PUT is waited on inside the exclusion.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+///
+/// A partition's template events must be durable before its records are
+/// written, and making them durable is a store write. Done on the encode
+/// worker's inline barrier, a capture's `quiesce_encodes` would wait out
+/// that write while holding the exclusion; the receiver's barrier
+/// (`settled`) only reads the ledger, and the write happens in the cut's
+/// own flush, outside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_a_held_audit_put_does_not_stall_admission() {
+    // Given an acknowledged batch, wired as the receiver wires it, whose
+    // template event is still buffered — so its partition waits over the
+    // size target — and an audit store whose writes are held.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let put = Gate::default();
+    let rig = Arc::new(BarrierRig::with_held_audit_puts(tmp.path(), &put));
+    let _release = put.opened_on_drop();
+    let mark = rig.ingest("checkout", &["user 1 logged in"]).await;
+
+    // When a tick starts and opens its cut, whose own flush then holds on
+    // the audit write.
+    let before = rig.epochs.current();
+    let tick = {
+        let rig = Arc::clone(&rig);
+        tokio::task::spawn_blocking(move || rig.barrier.tick(&rig.pipeline, false))
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while rig.epochs.current() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the tick opened its cut");
+
+    // Then the next turn is admitted while the audit write is still held:
+    // the capture waited on the encode phase, which does no store I/O.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        rig.ingest("checkout", &["user 2 logged in"]),
+    )
+    .await
+    .expect("ingest is not stalled behind the held audit PUT");
+    tokio::task::spawn_blocking({
+        let put = put.clone();
+        move || put.await_entered(1)
+    })
+    .await
+    .expect("the cut's audit write reached the held store");
+    assert!(!tick.is_finished(), "the cut still waits for the publish");
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "and nothing is stamped"
+    );
+    assert!(rig.data_files().is_empty(), "no record ahead of its event");
+
+    // And once the audit write lands, the cut stamps at the batch's mark.
+    put.open();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(30), tick)
+            .await
+            .expect("the tick finished once the audit PUT landed")
+            .expect("the tick did not panic"),
+        CutOutcome::Stamped,
+    );
+    assert_eq!(rig.commits.last_checkpoint(), Some(mark));
+    assert!(
+        !rig.data_files().is_empty(),
+        "the record followed its event"
+    );
+}
+
 /// Scenario RFC0052.14 — cuts are strictly ordered; a failed A invalidates B.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

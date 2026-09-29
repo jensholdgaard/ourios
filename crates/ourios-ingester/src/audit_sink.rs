@@ -407,6 +407,26 @@ impl SharedParquetAuditSink {
         false
     }
 
+    /// Whether every event emitted so far is durable — nothing buffered
+    /// and no take's events in limbo — answered with **no store I/O**.
+    /// When it is not, the eager-flush signal is raised, so the age sweep
+    /// writes the buffer off the caller's thread.
+    ///
+    /// The record sink's inline barrier on the encode pool's path: a
+    /// barrier holding the ingest exclusion waits on the encode worker,
+    /// so the worker must never be inside an audit PUT (RFC 0052 §3.1).
+    /// A partition this refuses stays over its size target in the buffers
+    /// and is detached by the next append after the flush.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        let sink = self.lock();
+        let settled = sink.buffer.is_empty() && self.takes.lock().quiet().is_some();
+        if !settled {
+            sink.overflow_notify.notify_one();
+        }
+        settled
+    }
+
     /// The record sink's inline audit barrier: whether every event emitted
     /// so far is durable. Flushes the buffer, and refuses when any other
     /// take's events are in limbo before or after that flush, or went back

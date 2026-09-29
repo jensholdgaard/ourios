@@ -561,11 +561,13 @@ fn latch_on_panic(epochs: &BarrierEpochs, cut: impl FnOnce() -> CutOutcome) {
 /// `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md` §3.6).
 ///
 /// The audit sink is built first so the record sink can take an **audit
-/// barrier** (issue #302 fix #2): before any inline size/ceiling publish the
-/// record sink flushes the audit sink to durability, so a partition is never
-/// put to the store before its template events are durable. That inline publish
-/// runs under the miner lock, so the barrier flush + the publish are atomic
-/// w.r.t. ingest.
+/// barrier** (issue #302 fix #2), so a partition is never put to the store
+/// before its template events are durable. Since RFC 0052 §3.1 the barrier
+/// runs on an encode worker, which a barrier holding the ingest exclusion
+/// waits on, so it is `settled`: every emitted event already durable,
+/// answered without store I/O. When it is not, it signals the age sweep to
+/// flush the audit buffer, and the partition waits in the buffers for the
+/// next append.
 fn build_write_sinks(
     store: Store,
     promoted: PromotedAttributes,
@@ -579,7 +581,7 @@ fn build_write_sinks(
     let sink = SharedParquetSink::new(
         ParquetRecordSink::new(store, flush_config())
             .with_promoted_attributes(promoted)
-            .with_audit_barrier(Box::new(move || barrier_audit.barrier()))
+            .with_audit_barrier(Box::new(move || barrier_audit.settled()))
             // RFC 0025 §3.3: permanently-rejected records quarantine
             // to the shared audit stream instead of wedging the
             // partition buffer (#362).
@@ -1591,7 +1593,7 @@ mod tests {
                     ceiling_bytes: usize::MAX,
                 },
             )
-            .with_audit_barrier(Box::new(move || barrier_audit.barrier())),
+            .with_audit_barrier(Box::new(move || barrier_audit.settled())),
         );
         let coordinator = PublishCoordinator::new(sink.clone(), audit).with_graph_emitter(emitter);
         let pool =

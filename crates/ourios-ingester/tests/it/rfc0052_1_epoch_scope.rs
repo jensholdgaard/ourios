@@ -356,10 +356,11 @@ fn rfc0052_1_publisher_panic_parks_queued_batches_and_respawns() {
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
 fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
-    // Given the production wiring — the record sink's inline barrier is
-    // the audit sink's own `barrier` — and a template event taken out of
-    // the audit buffer by an age drain whose write has not finished: the
-    // buffer is empty, and the event is not durable.
+    // Given the receiver's wiring — the record sink's inline barrier is
+    // the audit sink's `settled`, which answers without store I/O — and a
+    // template event taken out of the audit buffer by an age drain whose
+    // write has not finished: the buffer is empty, and the event is not
+    // durable.
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = BarrierRig::new(tmp.path());
     let barrier_audit = rig.audit.clone();
@@ -372,7 +373,7 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
                 ceiling_bytes: usize::MAX,
             },
         )
-        .with_audit_barrier(Box::new(move || barrier_audit.barrier())),
+        .with_audit_barrier(Box::new(move || barrier_audit.settled())),
     );
     let coordinator = PublishCoordinator::new(sink.clone(), rig.audit.clone());
     let pool = ourios_ingester::encode_pool::EncodePool::with_publisher(coordinator.publisher(), 1);
@@ -399,8 +400,8 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
     );
 
     // And when that in-flight write fails, the dependent partition still
-    // does not land: the event is back in the buffer and the store
-    // refuses it, so the next trigger is refused too.
+    // does not land: the event is back in the buffer, not durable, so the
+    // next trigger is refused too.
     let audit_root = rig.audit_root.clone();
     std::fs::remove_dir_all(&audit_root).expect("remove audit root");
     std::fs::write(&audit_root, b"not a directory").expect("sabotage audit store");
@@ -411,6 +412,7 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
     assert_eq!(rig.audit.buffered_events(), 1, "its event was requeued");
     pool.submit(vec![mined("alpha")]);
     pool.quiesce();
+    let _outcomes = sink.quiesce_publishes();
     assert!(
         rig.data_files().is_empty(),
         "still nothing ahead of the event"
@@ -421,12 +423,15 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
         "the partition waits in the buffers"
     );
 
-    // And once the store recovers, the next trigger writes the event and
-    // then the records it gates.
+    // And once the store recovers, the age sweep — which each refusal
+    // signalled, because `settled` flushes nothing itself — writes the
+    // event and then the records it gates, in that order.
     std::fs::remove_file(&audit_root).expect("unsabotage");
     std::fs::create_dir_all(&audit_root).expect("audit root");
-    pool.submit(vec![mined("alpha")]);
-    pool.quiesce();
+    assert!(
+        coordinator.write_ordered(coordinator.drain_aged(), "age"),
+        "the sweep publishes the event and then the records",
+    );
     let _outcomes = sink.quiesce_publishes();
     assert_eq!(rig.audit.buffered_events(), 0, "the event is durable");
     assert!(

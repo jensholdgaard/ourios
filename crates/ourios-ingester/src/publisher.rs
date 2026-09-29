@@ -26,9 +26,13 @@
 //!
 //! Audit ordering is not re-established here. A partition is detached
 //! only after the sink's inline audit barrier found every emitted event
-//! durable with no other take in limbo (`SharedParquetAuditSink::barrier`),
-//! so the events its records depend on are durable before the item
-//! exists, and stay so.
+//! durable — in the receiver `SharedParquetAuditSink::settled`, which
+//! answers without store I/O, because a barrier holding the ingest
+//! exclusion waits on the worker — so the events its records depend on
+//! are durable before the item exists, and stay so. The publisher does
+//! no audit I/O either: an audit flush here would race a cut's own take
+//! of the audit buffer, refuse, and return records the cut is waiting
+//! for.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -179,6 +183,13 @@ impl Feed {
         }
     }
 
+    /// Put `records` back into the buffers, dated against `registered`,
+    /// ordered against every drain.
+    fn requeue(&self, records: Vec<(PartitionKey, Vec<MinedRecord>)>, registered: Epoch) {
+        let _handoff = self.returns.lock_handoff();
+        self.returns.record.requeue(records, registered);
+    }
+
     #[cfg(feature = "openfga")]
     pub(crate) fn with_graph_emitter(
         mut self,
@@ -210,8 +221,7 @@ impl Feed {
         let failed = self.returns.record.publish_unrequeued(records, trigger);
         let published = failed.is_empty();
         if !published {
-            let _handoff = self.returns.lock_handoff();
-            self.returns.record.requeue(failed, registered);
+            self.requeue(failed, registered);
         }
         #[cfg(feature = "openfga")]
         if published

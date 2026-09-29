@@ -712,6 +712,9 @@ fn spawn_barrier(
 /// `housekeeping_secs`, separate from the barrier and the age sweep so
 /// that neither a latched barrier nor a stopped sweep (#795) stops it.
 ///
+/// The first pass runs at once: the task is spawned after recovery has
+/// seeded the durable horizons, and a node restarting onto a backlog —
+/// #793's restart loop — must not wait a whole interval to shed it.
 /// [`Housekeeper::tick`] catches its own panic and counts it, and a
 /// failed pass is logged there; either way the next tick retries.
 fn spawn_housekeeping(
@@ -724,7 +727,6 @@ fn spawn_housekeeping(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await; // the first tick is immediate; skip it
         loop {
             if shutdown.has_changed().unwrap_or(true) {
                 break;
@@ -1627,6 +1629,82 @@ mod tests {
         // Then shutdown settles it rather than blocking on its publish guards.
         handle.shutdown().await.expect("graceful shutdown");
         !data_parquet_files(data_dir.path()).is_empty()
+    }
+
+    /// RFC 0052 §3.2 and #793: a node that restarts onto reclaimable
+    /// segments reclaims them on its first housekeeping pass, which runs as
+    /// soon as the durable horizons are seeded, not a whole
+    /// `housekeeping_secs` later. The interval here is an hour, so only
+    /// that immediate pass can explain the removal; a restart loop shorter
+    /// than the interval would otherwise never reclaim anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_node_reclaims_on_its_first_pass_without_waiting_an_interval() {
+        use prost::Message;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let wal = WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            housekeeping_secs: 3_600,
+            ..test_wal_config(wal_dir.path())
+        };
+        let config = || ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: wal.clone(),
+            store: Store::local(data_dir.path()).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        };
+
+        // Given a node that sealed a segment and stamped past it: the second
+        // append observes the aged-out segment and captures a cut, and
+        // shutdown runs that cut, which publishes, snapshots and checkpoints.
+        let first = serve(config()).await.expect("serve");
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(first.http_addr, &export).await;
+        let sealed = wal_segments(wal_dir.path());
+        assert_eq!(sealed.len(), 1, "one segment before the rotation");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(first.http_addr, &export).await;
+        first.shutdown().await.expect("graceful shutdown");
+        assert!(
+            sealed[0].exists(),
+            "the sealed segment survives the first process: its only pass ran at start",
+        );
+
+        // When the node restarts with an hour-long housekeeping interval.
+        let second = serve(config()).await.expect("serve again");
+
+        // Then the sealed segment is reclaimed well inside that interval.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sealed[0].exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let reclaimed = !sealed[0].exists();
+        second.shutdown().await.expect("graceful shutdown");
+        assert!(
+            reclaimed,
+            "the first pass after recovery reclaimed the stamped segment",
+        );
+    }
+
+    /// Every `*.wal` segment directly under the WAL root.
+    fn wal_segments(root: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the WAL root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        out.sort();
+        out
     }
 
     /// RFC 0047 §3.3: the graph emitter is attached to the coordinator the

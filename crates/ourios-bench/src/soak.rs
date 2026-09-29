@@ -1381,13 +1381,6 @@ impl Journal for SharedWal {
         Journal::housekeeping_prepare(&mut *lock_wal(&self.0), horizons, max_unlinks)
     }
 
-    fn write_plan_record(
-        &mut self,
-        plan: &ourios_wal::ReclaimPlan,
-    ) -> Result<ourios_wal::UnlinkPermit, std::io::Error> {
-        Journal::write_plan_record(&mut *lock_wal(&self.0), plan)
-    }
-
     fn housekeeping_commit(
         &mut self,
         pass: ourios_wal::PassId,

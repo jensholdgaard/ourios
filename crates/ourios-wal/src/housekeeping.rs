@@ -8,11 +8,13 @@
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use crate::pass::{
     HousekeepingProgress, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome, ReclaimPlan,
     SkipReason,
 };
+use crate::reclaim_store::{ReclaimSlot, ReclaimStore};
 use crate::retain::{SnapshotHorizons, TenantHorizon};
 use crate::{
     HousekeepingError, Outstanding, ReclaimGate, Wal, WalOffset, mark_uncertain, pass, reclaim,
@@ -50,6 +52,17 @@ fn settled(plan: &ReclaimPlan) -> std::io::Error {
         ErrorKind::InvalidInput,
         format!(
             "WAL housekeeping refused: plan from pass {} is already settled (RFC 0052 §3.7)",
+            plan.pass,
+        ),
+    )
+}
+
+/// A plan that outlived the `Wal` that made it (RFC 0052 §3.7).
+fn closed(plan: &ReclaimPlan) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "WAL housekeeping refused: plan from pass {} outlived its WAL (RFC 0052 §3.7)",
             plan.pass,
         ),
     )
@@ -95,9 +108,18 @@ impl Wal {
     /// figures and the lag figures are all aggregates the ledger moves
     /// on mutation, so reading them costs nothing here.
     ///
-    /// The returned [`ReclaimPlan`] is owned, so the file half needs
+    /// The returned [`ReclaimPlan`] is owned and carries the `RECLAIM`
+    /// sidecar it was planned against, so the whole file half —
+    /// [`crate::write_plan_record`] and [`unlink_planned`] — needs
     /// neither the guard nor a WAL handle; feed its outcome back
     /// through [`Self::housekeeping_commit`].
+    ///
+    /// The sidecar's own lock is held for the whole of this half, and
+    /// that is the one wait it can add: a pass whose record write is
+    /// still in flight finishes it first. Passes do not overlap under
+    /// the coordinator's single housekeeping task, so in practice there
+    /// is nothing to wait for; the lock is what guarantees that a plan
+    /// is never superseded half-way through its record write.
     ///
     /// # Errors
     ///
@@ -122,14 +144,16 @@ impl Wal {
         // decides to exist. A refusal after this point leaves no
         // outstanding state, so a permit still live across it could
         // unlink past the very decision that failed closed.
-        self.live_pass
-            .store(0, std::sync::atomic::Ordering::Release);
+        let slot = self.reclaim.clone();
+        let held = slot.lock();
+        let record = held.as_ref().map(ReclaimStore::record);
+        slot.live().store(0, Ordering::Release);
         if let Some(abandoned) = self.outstanding.take() {
             self.withdraw_across_modes(&abandoned, horizons);
             self.requeue_partials(abandoned.partials);
         }
-        self.refuse_mode_disagreement(horizons)?;
-        self.refuse_unexplained_tenants(horizons)?;
+        self.refuse_mode_disagreement(record, horizons)?;
+        self.refuse_unexplained_tenants(record, horizons)?;
         // Never above what the `RECLAIM` geometry was built for: the
         // record's `planned` array is sized from the configured cap,
         // so a larger pass would plan entries the slot cannot encode
@@ -145,16 +169,16 @@ impl Wal {
         // only signal that the budget bound it.
         let partials_capped = !self.stale_partials.is_empty();
         let budget = cap - partials.len();
-        let (segments, pops_capped, outcome) = self.pop_segments(horizons, budget);
+        let (segments, pops_capped, outcome) = self.pop_segments(record, horizons, budget);
         let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
         self.passes += 1;
-        let pass = pass::PassId::new(self.instance, self.passes);
+        let pass = pass::PassId::new(slot.instance(), self.passes);
         // Any permit an earlier pass still holds stops authorising
         // anything here: §3.7 lets this prepare supersede that plan,
         // and a horizon that regressed in between has re-pinned the
         // segments it names.
-        self.live_pass
-            .store(self.passes, std::sync::atomic::Ordering::Release);
+        slot.live().store(self.passes, Ordering::Release);
+        let mode = pass::entry_mode(horizons);
         let plan = ReclaimPlan {
             pass,
             segments: segments
@@ -183,12 +207,14 @@ impl Wal {
                 lag_segments,
                 outcome,
             },
+            mode,
+            slot: slot.clone(),
         };
         self.outstanding = Some(Outstanding {
             pass,
             segments,
             partials: plan.partials.clone(),
-            mode: pass::entry_mode(horizons),
+            mode,
             progress: plan.progress,
         });
         Ok(plan)
@@ -245,6 +271,13 @@ impl Wal {
     /// witness them under the live pass's mode, and the unlinks after
     /// it would remove frames the ledger has since re-pinned.
     ///
+    /// It needs nothing of the WAL but its `RECLAIM` sidecar, which
+    /// has a lock of its own, so it takes `&self`: a caller whose
+    /// journal is behind a mutex uses [`crate::write_plan_record`] on
+    /// the plan instead and holds no guard at all. This form writes
+    /// through **this** `Wal`'s sidecar, whichever one the plan came
+    /// from — a plan from another instance is refused as superseded.
+    ///
     /// # Errors
     ///
     /// The plan was superseded, the merge could not assign a slot id,
@@ -252,36 +285,10 @@ impl Wal {
     /// unlinked either way, and [`ReclaimOutcome::RecordFailed`] is
     /// what [`Self::housekeeping_commit`] expects in response.
     pub fn write_plan_record(
-        &mut self,
+        &self,
         plan: &ReclaimPlan,
     ) -> Result<pass::UnlinkPermit, std::io::Error> {
-        let mode = match self.outstanding.as_ref() {
-            Some(outstanding) if outstanding.pass == plan.pass => outstanding.mode,
-            Some(outstanding) => return Err(superseded(plan, outstanding.pass)),
-            // Not superseded but **settled**: a commit has already
-            // taken this pass's outstanding state. Answering `Ok` here
-            // would say the witness was written when none was, and the
-            // caller's next `unlink_planned` would remove segments the
-            // commit had returned to eligible with nothing on disk
-            // accounting for them.
-            None => return Err(settled(plan)),
-        };
-        let permit = pass::UnlinkPermit::new(plan.pass, std::sync::Arc::clone(&self.live_pass));
-        if !plan.records {
-            return Ok(permit);
-        }
-        let Some(record) = self.merge_plan(plan, mode)? else {
-            return Ok(permit);
-        };
-        let Some(store) = self.reclaim.as_mut() else {
-            return Ok(permit);
-        };
-        store.commit(&record).map(|()| permit).map_err(|e| match e {
-            reclaim_store::StoreError::Io { source, .. } => source,
-            reclaim_store::StoreError::Corrupt { detail } => {
-                std::io::Error::new(ErrorKind::InvalidData, detail)
-            }
-        })
+        self.reclaim.write_plan(plan)
     }
 
     /// RFC 0052 §3.2's **ledger half again**, with what the file half
@@ -318,11 +325,12 @@ impl Wal {
         pass: pass::PassId,
         outcome: ReclaimOutcome,
     ) -> Result<HousekeepingProgress, ReclaimError> {
+        let slot = self.reclaim.clone();
+        let mut held = slot.lock();
         let settle = self.outstanding.as_ref().is_some_and(|o| o.pass == pass);
         if settle {
             // The plan is being accounted for, so its permit is spent.
-            self.live_pass
-                .store(0, std::sync::atomic::Ordering::Release);
+            slot.live().store(0, Ordering::Release);
         }
         let Some(outstanding) = self.outstanding.take() else {
             // Not "nothing to do": a commit has already taken this
@@ -352,7 +360,8 @@ impl Wal {
             return Ok(self.settled(outstanding.progress, 0, 0));
         };
         let removed: std::collections::HashSet<PathBuf> = removed.into_iter().collect();
-        let segments = self.settle_segments(&outstanding.segments, &removed, fsync_failed)?;
+        let segments =
+            self.settle_segments(&mut held, &outstanding.segments, &removed, fsync_failed)?;
         let partials = self.settle_partials(outstanding.partials, &removed, fsync_failed);
         Ok(self.settled(outstanding.progress, segments, partials))
     }
@@ -465,6 +474,7 @@ impl Wal {
     /// partial sweep runs on every pass, witness or not.
     fn pop_segments(
         &mut self,
+        record: Option<&reclaim::ReclaimRecord>,
         horizons: &SnapshotHorizons,
         budget: usize,
     ) -> (Vec<retain::Popped>, bool, PassOutcome) {
@@ -482,29 +492,15 @@ impl Wal {
                 PassOutcome::Skipped(SkipReason::MigrationWindow),
             );
         }
-        let (durable, occupied) = self.durable_rows();
+        let (durable, occupied) = durable_rows(record);
         let bound = retain::PopBound {
             checkpoint,
             current: self.current_segment_uuid,
             tenant_aware: matches!(horizons, SnapshotHorizons::Known(_)),
-            rows: retain::PlannedRows::new(&durable, occupied, self.row_capacity()),
+            rows: retain::PlannedRows::new(&durable, occupied, self.row_capacity(record)),
         };
         let (popped, capped) = self.ledger.pop(bound, budget);
         (popped, capped, PassOutcome::Planned)
-    }
-
-    /// The segments the live record already holds a `planned` row
-    /// for, and how many rows it holds. The merge in
-    /// [`Self::write_plan_record`] reads the same record, and nothing
-    /// between the two halves adds a row: a later prepare supersedes
-    /// this plan rather than writing beside it.
-    fn durable_rows(&self) -> (std::collections::BTreeSet<uuid::Uuid>, usize) {
-        self.reclaim
-            .as_ref()
-            .map_or_else(Default::default, |store| {
-                let planned = &store.record().planned;
-                (planned.iter().map(|p| p.segment).collect(), planned.len())
-            })
     }
 
     /// How many `planned` rows a record write may carry. The store's
@@ -512,68 +508,22 @@ impl Wal {
     /// the open-time reconciliation empties the array, so the
     /// configured cap bounds every row this process writes. A root
     /// with no record writes none, and nothing bounds its pops here.
-    fn row_capacity(&self) -> usize {
-        match self.reclaim {
+    fn row_capacity(&self, record: Option<&reclaim::ReclaimRecord>) -> usize {
+        match record {
             Some(_) => self.pass_cap(),
             None => usize::MAX,
-        }
-    }
-
-    /// Merge this pass's popped segments and its mode into the record
-    /// the file half will write. A pass that plans nothing and owes no
-    /// mode writes no record at all — and a **skipped** pass writes
-    /// none whatever it would otherwise owe: §3.2's gate is on segment
-    /// planning *and* the record write, because a record written under
-    /// a version-1 checkpoint is a witness to a reclamation that never
-    /// happened.
-    fn merge_plan(
-        &self,
-        plan: &ReclaimPlan,
-        mode: reclaim::EntryMode,
-    ) -> Result<Option<reclaim::ReclaimRecord>, std::io::Error> {
-        let Some(store) = self.reclaim.as_ref() else {
-            return Ok(None);
-        };
-        let invalid =
-            |e: &dyn std::fmt::Display| std::io::Error::new(ErrorKind::InvalidData, e.to_string());
-        let geometry = reconcile::configured_geometry(&self.config).map_err(|e| invalid(&e))?;
-        // The record as it is **now**, not as prepare saw it.
-        let mut record = store.record().clone();
-        // §3.2: the first pass adopts its own mode durably before it
-        // unlinks anything. A root whose mode is already recorded was
-        // checked for disagreement before anything was planned.
-        let adopting = record.consumer_mode == reclaim::RecordedMode::Unrecorded;
-        if adopting {
-            record.consumer_mode = pass::recorded_mode(mode);
-        }
-        for entry in &plan.segments {
-            record.planned.retain(|p| p.segment != entry.segment);
-            let planned = pass::plan_entry(
-                &mut record.dictionary,
-                geometry,
-                entry.segment,
-                entry.uncertain,
-                &entry.last_offsets,
-            )
-            .map_err(|e| invalid(&e))?;
-            record.planned.push(planned);
-        }
-        // A pass that plans nothing and owes no mode writes no record.
-        if adopting || !plan.segments.is_empty() {
-            Ok(Some(record))
-        } else {
-            Ok(None)
         }
     }
 
     /// Fold the unlink results back into the ledger and the record.
     fn settle_segments(
         &mut self,
+        store: &mut Option<ReclaimStore>,
         popped: &[retain::Popped],
         removed: &std::collections::HashSet<PathBuf>,
         fsync_failed: bool,
     ) -> Result<usize, ReclaimError> {
-        let Some(store) = self.reclaim.as_ref() else {
+        let Some(store) = store.as_mut() else {
             return Ok(0);
         };
         let mut record = store.record().clone();
@@ -597,9 +547,7 @@ impl Wal {
                 (false, _) => self.ledger.hold(entry.segment, entry.uncertain),
             }
         }
-        if let Some(store) = self.reclaim.as_mut() {
-            store.adopt(record);
-        }
+        store.adopt(record);
         Ok(done)
     }
 
@@ -645,11 +593,15 @@ impl Wal {
     /// disagreement is refused before anything is planned. A root that
     /// has checkpointed but never reclaimed has no entry to infer
     /// from, which is why the header and not an entry is the witness.
-    fn refuse_mode_disagreement(&self, horizons: &SnapshotHorizons) -> Result<(), ReclaimError> {
-        let Some(store) = self.reclaim.as_ref() else {
+    fn refuse_mode_disagreement(
+        &self,
+        record: Option<&reclaim::ReclaimRecord>,
+        horizons: &SnapshotHorizons,
+    ) -> Result<(), ReclaimError> {
+        let Some(record) = record else {
             return Ok(());
         };
-        let recorded = store.record().consumer_mode;
+        let recorded = record.consumer_mode;
         let attempted = pass::entry_mode(horizons);
         match recorded {
             reclaim::RecordedMode::Unrecorded => Ok(()),
@@ -670,12 +622,16 @@ impl Wal {
     /// all — is unrecoverable state: the frames below that horizon are
     /// gone and a pin cannot rebuild what they held. A tenant with no
     /// entry has lost nothing and pins at its oldest surviving frame.
-    fn refuse_unexplained_tenants(&self, horizons: &SnapshotHorizons) -> Result<(), ReclaimError> {
+    fn refuse_unexplained_tenants(
+        &self,
+        record: Option<&reclaim::ReclaimRecord>,
+        horizons: &SnapshotHorizons,
+    ) -> Result<(), ReclaimError> {
         let SnapshotHorizons::Known(marks) = horizons else {
             return Ok(());
         };
-        if let Some(store) = self.reclaim.as_ref() {
-            for (_, held) in store.record().dictionary.live() {
+        if let Some(record) = record {
+            for (_, held) in record.dictionary.live() {
                 let reclaim::SlotState::Live {
                     reclaimed_through: Some(entry),
                 } = &held.state
@@ -773,5 +729,115 @@ impl Wal {
     /// behind it.
     fn requeue_partials(&mut self, paths: Vec<PathBuf>) {
         self.stale_partials.splice(..0, paths);
+    }
+}
+
+impl ReclaimSlot {
+    /// [`Wal::write_plan_record`] and [`crate::write_plan_record`]
+    /// both land here, holding this slot's lock and nothing else.
+    ///
+    /// The plan is checked against the live-pass cell under the same
+    /// lock the write holds, and every prepare and commit moves that
+    /// cell only with the lock held, so "this plan is still the live
+    /// one" stays true until the slot is written. The same lock is
+    /// what keeps two record writes — two passes, or a pass and a
+    /// checkpoint — from ever sharing the two-slot alternation.
+    pub(crate) fn write_plan(
+        &self,
+        plan: &ReclaimPlan,
+    ) -> Result<pass::UnlinkPermit, std::io::Error> {
+        let mut held = self.lock();
+        if held.closed() {
+            return Err(closed(plan));
+        }
+        match self.live().load(Ordering::Acquire) {
+            // Not superseded but **settled**: a commit has already
+            // taken this pass's outstanding state. Answering `Ok` here
+            // would say the witness was written when none was, and the
+            // caller's next `unlink_planned` would remove segments the
+            // commit had returned to eligible with nothing on disk
+            // accounting for them.
+            0 => return Err(settled(plan)),
+            live => {
+                let live = pass::PassId::new(self.instance(), live);
+                if live != plan.pass {
+                    return Err(superseded(plan, live));
+                }
+            }
+        }
+        let permit = pass::UnlinkPermit::new(plan.pass, std::sync::Arc::clone(self.live()));
+        if !plan.records {
+            return Ok(permit);
+        }
+        let hook = held.hook();
+        let Some(store) = held.as_mut() else {
+            return Ok(permit);
+        };
+        let Some(record) = merge_plan(store.record(), plan, self.max_unlinks_per_pass())? else {
+            return Ok(permit);
+        };
+        hook.run();
+        store.commit(&record).map(|()| permit).map_err(|e| match e {
+            reclaim_store::StoreError::Io { source, .. } => source,
+            reclaim_store::StoreError::Corrupt { detail } => {
+                std::io::Error::new(ErrorKind::InvalidData, detail)
+            }
+        })
+    }
+}
+
+/// The segments the live record already holds a `planned` row for,
+/// and how many rows it holds. The merge in [`ReclaimSlot::write_plan`]
+/// reads the same record, and nothing between the two halves adds a
+/// row: a later prepare supersedes this plan rather than writing
+/// beside it, and a superseded plan's write is refused.
+fn durable_rows(
+    record: Option<&reclaim::ReclaimRecord>,
+) -> (std::collections::BTreeSet<uuid::Uuid>, usize) {
+    record.map_or_else(Default::default, |record| {
+        let planned = &record.planned;
+        (planned.iter().map(|p| p.segment).collect(), planned.len())
+    })
+}
+
+/// Merge this pass's popped segments and its mode into `current`, the
+/// record as it stands **now** rather than as prepare saw it. A pass
+/// that plans nothing and owes no mode writes no record at all — and
+/// a **skipped** pass writes none whatever it would otherwise owe:
+/// §3.2's gate is on segment planning *and* the record write, because
+/// a record written under a version-1 checkpoint is a witness to a
+/// reclamation that never happened.
+fn merge_plan(
+    current: &reclaim::ReclaimRecord,
+    plan: &ReclaimPlan,
+    max_unlinks_per_pass: u32,
+) -> Result<Option<reclaim::ReclaimRecord>, std::io::Error> {
+    let invalid =
+        |e: &dyn std::fmt::Display| std::io::Error::new(ErrorKind::InvalidData, e.to_string());
+    let geometry = reconcile::geometry(max_unlinks_per_pass).map_err(|e| invalid(&e))?;
+    let mut record = current.clone();
+    // §3.2: the first pass adopts its own mode durably before it
+    // unlinks anything. A root whose mode is already recorded was
+    // checked for disagreement before anything was planned.
+    let adopting = record.consumer_mode == reclaim::RecordedMode::Unrecorded;
+    if adopting {
+        record.consumer_mode = pass::recorded_mode(plan.mode);
+    }
+    for entry in &plan.segments {
+        record.planned.retain(|p| p.segment != entry.segment);
+        let planned = pass::plan_entry(
+            &mut record.dictionary,
+            geometry,
+            entry.segment,
+            entry.uncertain,
+            &entry.last_offsets,
+        )
+        .map_err(|e| invalid(&e))?;
+        record.planned.push(planned);
+    }
+    if adopting || !plan.segments.is_empty() {
+        Ok(Some(record))
+    } else {
+        Ok(None)
     }
 }

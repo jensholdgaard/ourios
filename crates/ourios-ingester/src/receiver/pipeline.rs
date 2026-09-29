@@ -28,7 +28,7 @@ use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{
     FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
-    ReclaimState, RotationKind, SnapshotHorizons, TenantBatch, UnlinkPermit, Wal, WalOffset,
+    ReclaimState, RotationKind, SnapshotHorizons, TenantBatch, Wal, WalOffset,
 };
 use prost::Message;
 use tracing::Instrument as _;
@@ -116,7 +116,11 @@ pub trait Journal: Send {
     }
 
     /// The ledger half of one capped housekeeping pass (§3.2), under the
-    /// journal's single-writer position.
+    /// journal's single-writer position. There is no file-half method:
+    /// the plan carries the `RECLAIM` sidecar it was planned against, so
+    /// [`ourios_wal::write_plan_record`] and [`ourios_wal::unlink_planned`]
+    /// run on the plan alone, and no implementation can put that I/O
+    /// back under the guard.
     ///
     /// # Errors
     ///
@@ -128,18 +132,6 @@ pub trait Journal: Send {
     ) -> Result<ReclaimPlan, ReclaimError> {
         let _ = (horizons, max_unlinks);
         Err(ReclaimError::NoReclamationSurface)
-    }
-
-    /// Write the plan's `planned` witness and take the unlink permit.
-    ///
-    /// # Errors
-    ///
-    /// As [`Wal::write_plan_record`].
-    fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
-        let _ = plan;
-        Err(std::io::Error::other(
-            "this journal exposes no RFC 0052 reclamation surface",
-        ))
     }
 
     /// Fold the file half's outcome back under the writer position.
@@ -224,10 +216,6 @@ impl Journal for Wal {
         max_unlinks: usize,
     ) -> Result<ReclaimPlan, ReclaimError> {
         Wal::housekeeping_prepare(self, horizons, max_unlinks)
-    }
-
-    fn write_plan_record(&mut self, plan: &ReclaimPlan) -> Result<UnlinkPermit, std::io::Error> {
-        Wal::write_plan_record(self, plan)
     }
 
     fn housekeeping_commit(

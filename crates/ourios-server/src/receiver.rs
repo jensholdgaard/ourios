@@ -1633,6 +1633,139 @@ mod tests {
         !data_parquet_files(data_dir.path()).is_empty()
     }
 
+    /// A journal whose housekeeping prepare counts its calls and unwinds
+    /// on the first — the pass the task must survive.
+    struct CountedPasses(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ourios_ingester::receiver::Journal for CountedPasses {
+        fn append_batch(
+            &mut self,
+            _payload: &[u8],
+        ) -> Result<WalOffset, ourios_ingester::receiver::ReceiveError> {
+            unreachable!("the housekeeping task appends nothing")
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ourios_ingester::receiver::ReceiveError> {
+            unreachable!("the housekeeping task syncs nothing")
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+
+        fn housekeeping_prepare(
+            &mut self,
+            _horizons: &ourios_wal::SnapshotHorizons,
+            _max_unlinks: usize,
+        ) -> Result<ourios_wal::ReclaimPlan, ourios_wal::ReclaimError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            assert!(n != 0, "injected panic in the first housekeeping pass");
+            Err(ourios_wal::ReclaimError::NoReclamationSurface)
+        }
+    }
+
+    /// A production [`Housekeeper`] over [`CountedPasses`], and the latch
+    /// its barrier shares.
+    fn counted_housekeeper(
+        root: &Path,
+        passes: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Housekeeper, Arc<BarrierEpochs>) {
+        std::fs::create_dir_all(root.join("store")).expect("store root");
+        let (sink, audit) = build_write_sinks(
+            Store::local(root.join("store")).expect("local store"),
+            PromotedAttributes::default(),
+        );
+        let publisher = PublishCoordinator::new(sink, audit);
+        let commits = CommitCoordinator::new(
+            Box::new(CountedPasses(Arc::clone(passes))),
+            Duration::from_millis(20),
+            u64::MAX,
+        );
+        let barrier = Arc::new(Barrier::new(
+            publisher.clone(),
+            Arc::clone(&commits),
+            root.join("snapshots"),
+            SINK_CEILING_BYTES,
+        ));
+        let epochs = barrier.epochs();
+        (Housekeeper::new(commits, barrier, publisher, 8), epochs)
+    }
+
+    /// Yield until `passes` reaches `n`. Paused time does not advance
+    /// while a `spawn_blocking` pass runs, so this waits on the pass
+    /// itself rather than on the clock.
+    async fn passes_reach(passes: &std::sync::atomic::AtomicUsize, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while passes.load(std::sync::atomic::Ordering::Acquire) < n {
+            assert!(std::time::Instant::now() < deadline, "pass {n} never ran");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The production housekeeping loop: the first pass runs at once, a
+    /// pass that panics costs that tick and not the task, and shutdown
+    /// stops every later pass.
+    #[tokio::test(start_paused = true)]
+    async fn housekeeping_task_passes_at_once_survives_a_panic_and_stops_on_shutdown() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
+        let (shutdown, shutdown_rx) = watch::channel(());
+        let every = Duration::from_secs(60);
+        let task = spawn_housekeeping(housekeeper, every, Arc::clone(&epochs), shutdown_rx);
+
+        // The first pass runs without waiting an interval, and panics.
+        passes_reach(&passes, 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "one pass before the first interval elapses",
+        );
+        assert_eq!(
+            epochs.capture().failed_epoch(),
+            None,
+            "a caught housekeeping panic fails no cut",
+        );
+
+        // The next tick runs another pass: the panic did not end the task.
+        tokio::time::sleep(every).await;
+        passes_reach(&passes, 2).await;
+
+        // Shutdown ends the task cleanly, and no later tick runs a pass.
+        shutdown.send(()).expect("signal shutdown");
+        task.await.expect("the housekeeping task exits cleanly");
+        tokio::time::sleep(every * 10).await;
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "no pass after shutdown",
+        );
+        assert_eq!(epochs.capture().failed_epoch(), None);
+    }
+
+    /// The pre-check: a signal that arrived before the loop's first
+    /// iteration — the arm a signal landing during a pass also takes —
+    /// runs no pass at all.
+    #[tokio::test(start_paused = true)]
+    async fn housekeeping_task_runs_no_pass_once_shutdown_is_signalled() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
+        let (shutdown, shutdown_rx) = watch::channel(());
+        shutdown.send(()).expect("signal shutdown");
+
+        spawn_housekeeping(housekeeper, Duration::from_secs(60), epochs, shutdown_rx)
+            .await
+            .expect("the housekeeping task exits cleanly");
+
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "no pass ran after the shutdown signal",
+        );
+    }
+
     /// RFC 0052 §3.2 and #793: a node that restarts onto reclaimable
     /// segments reclaims them on its first housekeeping pass, which runs as
     /// soon as the durable horizons are seeded, not a whole

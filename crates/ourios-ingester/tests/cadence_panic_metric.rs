@@ -4,7 +4,8 @@
 //! Before this, a panic in the age sweep's step retired the flush cadence
 //! for the life of the process with no log, no counter, and a `JoinHandle`
 //! that still joined cleanly — so the only eventual symptom was an OOM
-//! kill with no trail back to the cause.
+//! kill with no trail back to the cause. RFC 0052 §3.2's housekeeping
+//! tick counts its own unwind on the same dimension.
 //!
 //! Its own test binary, like `perf_metrics.rs`: `SinkMetrics` resolves
 //! through the **global** meter, and two global-installing tests in one
@@ -23,10 +24,15 @@ use opentelemetry_sdk::metrics::data::{
 use ourios_core::record::{BodyKind, MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::barrier::Barrier;
+use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
 use ourios_ingester::publish::PublishCoordinator;
+use ourios_ingester::receiver::{CommitCoordinator, Journal, ReceiveError};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_parquet::store::Store;
 use ourios_semconv as semconv;
+use ourios_wal::{ReclaimError, ReclaimPlan, SnapshotHorizons, WalOffset};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Sum of the named u64 counter's datapoints, optionally restricted to
@@ -50,6 +56,32 @@ fn counter_sum(rms: &[ResourceMetrics], name: &str, attribute: Option<(&str, &st
         })
         .map(SumDataPoint::value)
         .sum()
+}
+
+/// A journal whose housekeeping pass unwinds — the one seam a
+/// housekeeping tick reaches that no batch guard covers.
+struct PanickingHousekeeping;
+
+impl Journal for PanickingHousekeeping {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+        unreachable!("the housekeeping leg appends nothing")
+    }
+
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        unreachable!("the housekeeping leg syncs nothing")
+    }
+
+    fn unflushed_bytes(&self) -> u64 {
+        0
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        _horizons: &SnapshotHorizons,
+        _max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        panic!("injected housekeeping panic")
+    }
 }
 
 /// One record, enough to give a partition something to fail to flush.
@@ -157,5 +189,36 @@ async fn a_cadence_panic_is_counted_and_tagged_apart_from_a_store_error() {
         "exactly one of the two carries the cadence_panic dimension: the \
          store error must stay untagged, or alerting on a dead sweep would \
          fire on every transient store blip",
+    );
+
+    // RFC 0052 §3.2: a housekeeping tick that unwinds counts on the same
+    // counter and dimension — through `Housekeeper::tick` itself, so a
+    // tick that caught the panic without counting it fails here.
+    let snapshots = tempfile::TempDir::new().expect("snapshots dir");
+    let journal = CommitCoordinator::new(
+        Box::new(PanickingHousekeeping),
+        Duration::from_millis(20),
+        u64::MAX,
+    );
+    let barrier = Arc::new(Barrier::new(
+        coordinator.clone(),
+        Arc::clone(&journal),
+        snapshots.path().to_path_buf(),
+        usize::MAX,
+    ));
+    let housekeeper = Housekeeper::new(journal, barrier, coordinator, 8);
+    exporter.reset();
+    let tick = housekeeper.tick();
+    assert!(matches!(tick, HousekeepingTick::Panicked), "{tick:?}");
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    assert_eq!(
+        counter_sum(
+            &rms,
+            semconv::OURIOS_SINK_FLUSH_ERRORS,
+            Some(("error.type", "cadence_panic")),
+        ),
+        2,
+        "the housekeeping panic is the second cadence_panic on the counter",
     );
 }

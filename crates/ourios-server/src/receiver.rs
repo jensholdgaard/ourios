@@ -31,9 +31,13 @@ use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
+use ourios_serving::serve::{
+    GRPC_KEEPALIVE_INTERVAL, GRPC_KEEPALIVE_TIMEOUT, PlainListener, TCP_KEEPALIVE, accept_backoff,
+    serve_http,
+};
 use ourios_serving::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{
-    LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
+    LISTENER_GRPC, LISTENER_HTTP, ReloadingAcceptor, TlsListener, reloading_acceptor, tls_incoming,
 };
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
@@ -409,7 +413,7 @@ pub struct ReceiverHandle {
     pub http_addr: SocketAddr,
     shutdown: watch::Sender<()>,
     grpc: JoinHandle<Result<(), tonic::transport::Error>>,
-    http: JoinHandle<std::io::Result<()>>,
+    http: JoinHandle<()>,
     pipeline: SharedPipeline,
     snapshots_root: PathBuf,
     /// The data sink (RFC 0014). Drained on graceful shutdown, before the
@@ -457,8 +461,7 @@ impl ReceiverHandle {
             .map_err(|e| format!("gRPC listener: {e}"))?;
         self.http
             .await
-            .map_err(|e| format!("HTTP listener task: {e}"))?
-            .map_err(|e| format!("HTTP listener: {e}"))?;
+            .map_err(|e| format!("HTTP listener task: {e}"))?;
         // Both listeners are stopped, so no more records reach the sink. The
         // `shutdown.send` above already signalled the age-sweep task; await it
         // (rather than abort it) so an in-flight `spawn_blocking` flush runs to
@@ -710,10 +713,40 @@ fn spawn_barrier(
 ///
 /// ALPN is per-listener: gRPC is h2-only, HTTP offers http/1.1 only
 /// (axum is built with just the http1 feature).
-type Acceptors = (
-    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
-    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
-);
+type Acceptors = (Option<ReloadingAcceptor>, Option<ReloadingAcceptor>);
+
+/// Serve the OTLP/HTTP router on `listener`, over TLS when `acceptor` is
+/// set, until `shutdown` fires; the task returns once the listener drains.
+fn spawn_http(
+    listener: TcpListener,
+    acceptor: Option<ReloadingAcceptor>,
+    router: axum::Router,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = shutdown.changed().await;
+        };
+        match acceptor {
+            Some(acceptor) => {
+                serve_http(
+                    TlsListener::new(listener, acceptor, LISTENER_HTTP),
+                    router,
+                    shutdown,
+                )
+                .await;
+            }
+            None => {
+                serve_http(
+                    PlainListener::new(listener, LISTENER_HTTP),
+                    router,
+                    shutdown,
+                )
+                .await;
+            }
+        }
+    })
+}
 
 fn build_acceptors(
     grpc_tls: Option<&TlsSettings>,
@@ -779,7 +812,11 @@ async fn bind_listeners(
     grpc: SocketAddr,
     http: SocketAddr,
 ) -> Result<(TcpIncoming, SocketAddr, TcpListener, SocketAddr), String> {
-    let grpc_incoming = TcpIncoming::bind(grpc).map_err(|e| format!("bind gRPC {grpc}: {e}"))?;
+    // `Server::tcp_keepalive` is ignored under `serve_with_incoming`; the
+    // incoming stream sets it on each accepted socket instead.
+    let grpc_incoming = TcpIncoming::bind(grpc)
+        .map_err(|e| format!("bind gRPC {grpc}: {e}"))?
+        .with_keepalive(Some(TCP_KEEPALIVE));
     let grpc_addr = grpc_incoming
         .local_addr()
         .map_err(|e| format!("gRPC local_addr: {e}"))?;
@@ -939,8 +976,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
                 let _ = rx.changed().await;
             };
             let server = Server::builder()
+                .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
                 .layer(auth_layer)
                 .add_service(grpc_service);
+            let grpc_incoming = accept_backoff(grpc_incoming, LISTENER_GRPC);
             match grpc_acceptor {
                 Some(acceptor) => {
                     server
@@ -966,30 +1006,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             ..HttpConfig::default()
         },
     );
-    let http = tokio::spawn({
-        let mut rx = shutdown_rx;
-        async move {
-            let shutdown = async move {
-                let _ = rx.changed().await;
-            };
-            let make = http_router.into_make_service();
-            match http_acceptor {
-                Some(acceptor) => {
-                    axum::serve(
-                        TlsListener::new(http_listener, acceptor, LISTENER_HTTP),
-                        make,
-                    )
-                    .with_graceful_shutdown(shutdown)
-                    .await
-                }
-                None => {
-                    axum::serve(http_listener, make)
-                        .with_graceful_shutdown(shutdown)
-                        .await
-                }
-            }
-        }
-    });
+    let http = spawn_http(http_listener, http_acceptor, http_router, shutdown_rx);
 
     Ok(ReceiverHandle {
         grpc_addr,
@@ -1015,6 +1032,29 @@ mod tests {
     use ourios_core::tenant::TenantId;
 
     use super::*;
+
+    /// `Server::tcp_keepalive` is ignored under `serve_with_incoming`, so the
+    /// gRPC socket keepalive rides on the `TcpIncoming` the listener binds.
+    #[tokio::test]
+    async fn grpc_accepted_sockets_have_tcp_keepalive() {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let (mut grpc, grpc_addr, _http, _) =
+            bind_listeners(loopback, loopback).await.expect("bind");
+        let _client = tokio::net::TcpStream::connect(grpc_addr)
+            .await
+            .expect("connect");
+        let accepted = std::future::poll_fn(|cx| {
+            futures_core::Stream::poll_next(std::pin::Pin::new(&mut grpc), cx)
+        })
+        .await
+        .expect("an accepted socket")
+        .expect("accept");
+        assert!(
+            socket2::SockRef::from(&accepted)
+                .keepalive()
+                .expect("SO_KEEPALIVE")
+        );
+    }
 
     /// #791: the sweep could not tell a cancelled step from a panicked one —
     /// it broke its loop on either, so a panic retired the flush cadence for

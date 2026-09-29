@@ -10,6 +10,7 @@
 //! - [`tls`] / [`tls_serve`] — listener TLS settings and the reloading
 //!   acceptors (RFC 0030).
 //! - [`propagation`] — inbound W3C trace-context extraction (RFC 0039).
+//! - [`serve`] — the HTTP serve loop and the listeners' connection deadlines.
 //! - [`metrics`] — the `ourios.auth.resolutions` instrument and the
 //!   shared `error.type` class values the roles tag rejections with.
 //!
@@ -26,6 +27,7 @@ pub mod oidc;
 #[cfg(feature = "openfga")]
 pub mod openfga;
 pub mod propagation;
+pub mod serve;
 pub mod tls;
 pub mod tls_serve;
 

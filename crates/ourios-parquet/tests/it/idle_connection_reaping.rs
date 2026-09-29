@@ -211,8 +211,11 @@ fn bridged_calls_strand_no_connection() {
     assert_every_close_observed(&counts);
 }
 
+/// The default idle-connection cap per host `Store::s3` configures.
+const IDLE_CONNECTIONS_KEPT: usize = 32;
+
 /// A burst of concurrent requests opens one connection each; once it is
-/// over, the pool keeps only a bounded number of them rather than every one.
+/// over, the pool keeps exactly its cap idle and closes the rest.
 #[test]
 fn the_pool_keeps_a_bounded_number_of_idle_connections() {
     const BURST: usize = 96;
@@ -233,9 +236,9 @@ fn the_pool_keeps_a_bounded_number_of_idle_connections() {
     std::thread::sleep(Duration::from_millis(500));
 
     assert_eq!(Counts::get(&counts.accepted), BURST, "one connection each");
-    let kept = counts.open();
-    assert!(
-        kept <= BURST / 2,
-        "the pool kept {kept} of {BURST} connections idle"
+    assert_eq!(
+        counts.open(),
+        IDLE_CONNECTIONS_KEPT,
+        "idle connections the pool kept of {BURST}"
     );
 }

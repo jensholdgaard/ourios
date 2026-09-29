@@ -1,4 +1,5 @@
 use super::*;
+use crate::cluster::plan::{apply_widening, find_widening_positions, would_be_degenerate};
 
 // ---------- widen behaviour (this PR's main story) ----------
 

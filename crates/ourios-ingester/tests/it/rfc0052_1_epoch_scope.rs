@@ -450,14 +450,21 @@ fn held_wait(
     why: &str,
 ) -> HeldWait {
     let (done, settled) = std::sync::mpsc::channel();
+    let (entering, entered) = std::sync::mpsc::channel();
     let sink = sink.clone();
     std::thread::spawn(move || {
+        let _ = entering.send(());
         let outcomes = match cut {
             Some(cut) => sink.quiesce_publishes_through(cut),
             None => sink.quiesce_publishes(),
         };
         let _ = done.send(outcomes);
     });
+    // The waiter is running and about to wait before anything is released
+    // — otherwise a release racing its spawn would test nothing.
+    entered
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the waiter started");
     for _ in 0..256 {
         std::thread::yield_now();
     }

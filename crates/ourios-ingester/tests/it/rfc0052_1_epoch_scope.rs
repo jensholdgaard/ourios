@@ -14,11 +14,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ourios_core::audit::AuditSink;
 use ourios_ingester::barrier::{CaptureOutcome, CutOutcome};
+use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_parquet::Store;
 
-use crate::rfc0052_barrier_support::BarrierRig;
+use crate::rfc0052_barrier_support::{BarrierRig, Gate, held_puts};
 
 /// Scenario RFC0052.1 — unwind leg: the barrier starts concurrently with the panic, every schedule.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
@@ -170,48 +172,369 @@ async fn rfc0052_1_a_captures_drain_is_registered_above_its_own_cut() {
 /// Scenario RFC0052.1 — the publish guard is created in `submit` and settles on the last detach.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (guard-at-submit; shared completion across detached partitions)"]
 fn rfc0052_1_publish_guard_covers_detaches_between_capture_and_enqueue() {
-    todo!(
-        "RFC0052.1 — a partition detached by a batch's first record with \
-         the cut captured between the detach and the enqueue is covered, \
-         the guard having been created in submit before the exclusion \
-         was released; a batch that detaches nothing releases its guard \
-         unused; a batch detaching several partitions settles its guard \
-         only when the last completes, in any completion order"
+    // Given a batch still sitting in the queue — the worker is held
+    // inside the previous batch's emit — and a publisher that will hold
+    // the queued batch's PUT, so "detached but not durable" is an
+    // observed state.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let detach = Gate::default();
+    let put = Gate::letting_through(1);
+    let sink = gated_sink(&rig, Some(&detach), &put, Quarantine::Records);
+    let epochs = sink.epochs();
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&sink, 1);
+    let _release = (detach.opened_on_drop(), put.opened_on_drop());
+    pool.submit(vec![mined("zulu")]);
+    detach.await_entered(1);
+    pool.submit(vec![mined("alpha")]);
+
+    // When cut E is captured after its submit and before its worker has
+    // dequeued it, let alone detached anything.
+    let cut = epochs.open_cut();
+    detach.open();
+    pool.quiesce();
+    put.await_entered(2);
+
+    // Then its detach is already in flight at E: the guard was made in
+    // `submit`, so the cut waits for its PUT instead of stamping past it.
+    // A guard made by the worker would read E + 1 and let this wait
+    // return at once.
+    let waiting = {
+        let sink = sink.clone();
+        std::thread::spawn(move || sink.quiesce_publishes_through(cut))
+    };
+    for _ in 0..256 {
+        std::thread::yield_now();
+    }
+    assert!(
+        !waiting.is_finished(),
+        "the cut waits for the batch's publish"
     );
+    assert!(
+        tenant_files(&rig, "alpha").is_empty(),
+        "which is not durable yet"
+    );
+    put.open();
+    let outcomes = waiting.join().expect("the wait returned");
+    assert!(outcomes.all_ok(cut), "the detach settled durably");
+    assert_eq!(tenant_files(&rig, "alpha").len(), 1);
+    assert_eq!(sink.publishes_in_flight(), 0);
+
+    // And a batch that detaches nothing releases its guard unused, at the
+    // end of its own encode phase.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let buffering = SharedParquetSink::new(ParquetRecordSink::new(
+        Store::local(&rig.data_root).expect("store"),
+        crate::rfc0052_barrier_support::never_flush(),
+    ));
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&buffering, 1);
+    pool.submit(vec![mined("alpha"), mined("bravo")]);
+    pool.quiesce();
+    assert_eq!(buffering.buffered_records(), 2, "both records are buffered");
+    assert_eq!(
+        buffering.publishes_in_flight(),
+        0,
+        "and the batch's guard settled with its encode phase",
+    );
+
+    // And a batch detaching several partitions settles its guard only
+    // when the last of them completes: with the second one's PUT held,
+    // the first being durable does not release the cut.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let put = Gate::letting_through(1);
+    let sink = gated_sink(&rig, None, &put, Quarantine::Records);
+    let epochs = sink.epochs();
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&sink, 1);
+    let _release = put.opened_on_drop();
+    pool.submit(vec![mined("alpha"), mined("bravo")]);
+    put.await_entered(2);
+    pool.quiesce();
+    let cut = epochs.open_cut();
+    assert_eq!(
+        tenant_files(&rig, "alpha").len(),
+        1,
+        "the first partition is durable"
+    );
+    assert_eq!(
+        sink.publishes_in_flight(),
+        1,
+        "and the batch's one guard is still held for the second",
+    );
+    let waiting = {
+        let sink = sink.clone();
+        std::thread::spawn(move || sink.quiesce_publishes_through(cut))
+    };
+    for _ in 0..256 {
+        std::thread::yield_now();
+    }
+    assert!(!waiting.is_finished(), "so the cut still waits");
+    put.open();
+    assert!(waiting.join().expect("the wait returned").all_ok(cut));
+    assert_eq!(tenant_files(&rig, "bravo").len(), 1);
+    assert_eq!(sink.publishes_in_flight(), 0);
 }
 
 /// Scenario RFC0052.1 — publisher panic and closed-channel send park batches and respawn.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (bounded publisher queue; park under the sink lock before releasing the guard)"]
 fn rfc0052_1_publisher_panic_parks_queued_batches_and_respawns() {
-    todo!(
-        "RFC0052.1 — a publisher panic with batches still queued behind \
-         the failing one latches only the failing batch's epoch, parks \
-         every queued batch in the buffers with its guard released, and \
-         a quiesce_publishes started during the panic returns; the next \
-         enqueue finds a respawned publisher; a worker whose send fails \
-         on a closed channel parks that batch under the sink lock before \
-         releasing its guard, so the records are covered by the next \
-         drain"
+    // Given a publisher held on one batch's PUT, with a batch behind it
+    // whose publish will panic (a permanently rejected record, whose
+    // quarantine write panics) and two more batches behind that — each
+    // batch under its own cut, so the epochs tell them apart.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let put = Gate::default();
+    let sink = gated_sink(&rig, None, &put, Quarantine::Panics);
+    let epochs = sink.epochs();
+    let pool = ourios_ingester::encode_pool::EncodePool::new(&sink, 1);
+    let _release = put.opened_on_drop();
+    pool.submit(vec![mined("alpha")]);
+    put.await_entered(1);
+    let _alpha = epochs.open_cut();
+    let failing = epochs.current();
+    pool.submit(vec![poisoned("papa")]);
+    let _papa = epochs.open_cut();
+    pool.submit(vec![mined("bravo")]);
+    pool.submit(vec![mined("charlie")]);
+    pool.quiesce();
+    assert_eq!(sink.buffered_records(), 0, "every batch is detached");
+
+    // When the held PUT is released and the next publish panics, with a
+    // `quiesce_publishes` already waiting.
+    let waiting = {
+        let sink = sink.clone();
+        std::thread::spawn(move || sink.quiesce_publishes())
+    };
+    for _ in 0..256 {
+        std::thread::yield_now();
+    }
+    assert!(!waiting.is_finished(), "the wait is held by the publisher");
+    put.open();
+
+    // Then the wait returns, only the failing batch's epoch is latched —
+    // not the durable batch's before it, nor the parked ones' after — and
+    // every queued batch is back in the buffers with its guard released.
+    let _outcomes = waiting.join().expect("quiesce_publishes returned");
+    assert_eq!(epochs.capture().failed_epoch(), Some(failing));
+    assert_eq!(
+        tenant_files(&rig, "alpha").len(),
+        1,
+        "the batch ahead landed"
     );
+    assert_eq!(sink.buffered_records(), 2, "bravo and charlie were parked");
+    assert_eq!(sink.publishes_in_flight(), 0);
+
+    // And the first enqueue after it finds the retired publisher: that
+    // batch is parked under the sink lock before its guard is released,
+    // so the next drain covers it — and the publisher is restarted.
+    pool.submit(vec![mined("delta")]);
+    pool.quiesce();
+    assert_eq!(sink.buffered_records(), 3, "delta was parked, not dropped");
+    assert_eq!(
+        sink.publishes_in_flight(),
+        0,
+        "and its guard released after the park"
+    );
+
+    // And the enqueue after that is written by the new publisher.
+    pool.submit(vec![mined("echo")]);
+    pool.quiesce();
+    let _outcomes = sink.quiesce_publishes();
+    assert_eq!(
+        tenant_files(&rig, "echo").len(),
+        1,
+        "the respawned publisher wrote it"
+    );
+    assert_eq!(
+        sink.buffered_records(),
+        3,
+        "and the parked batches wait for a drain"
+    );
+    sink.flush_all();
+    assert_eq!(
+        sink.buffered_records(),
+        0,
+        "which publishes every one of them"
+    );
+    for tenant in ["bravo", "charlie", "delta"] {
+        assert_eq!(
+            tenant_files(&rig, tenant).len(),
+            1,
+            "{tenant} reached the store"
+        );
+    }
 }
 
 /// Scenario RFC0052.1 — a detached partition waits for the in-flight audit write it depends on.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.1 stub — implemented in the barrier green slice D (PublishItem::Detached carries audit_watermark; empty buffer is not a durable prefix)"]
 fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
-    todo!(
-        "RFC0052.1 — a detached partition whose audit_watermark is \
-         covered by another writer's in-flight audit write is not \
-         published until that write is durable: an empty audit buffer \
-         is not read as a durable prefix, and when that write fails the \
-         dependent partition requeues rather than landing in Parquet \
-         ahead of its template events"
+    // Given the production wiring — the record sink's inline barrier is
+    // the audit sink's own `barrier` — and a template event taken out of
+    // the audit buffer by an age drain whose write has not finished: the
+    // buffer is empty, and the event is not durable.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    let barrier_audit = rig.audit.clone();
+    let sink = SharedParquetSink::new(
+        ParquetRecordSink::new(
+            Store::local(&rig.data_root).expect("store"),
+            FlushConfig {
+                target_bytes: 1, // every emit crosses the target
+                max_buffer_age: Duration::ZERO,
+                ceiling_bytes: usize::MAX,
+            },
+        )
+        .with_audit_barrier(Box::new(move || barrier_audit.barrier())),
     );
+    let coordinator = PublishCoordinator::new(sink.clone(), rig.audit.clone());
+    let pool = ourios_ingester::encode_pool::EncodePool::with_publisher(coordinator.publisher(), 1);
+    let mut events = rig.audit.clone();
+    events.emit(template_event("alpha"));
+    let in_flight = coordinator.drain_aged();
+    assert_eq!(rig.audit.buffered_events(), 0, "the audit buffer is empty");
+
+    // When a record that depends on it crosses the size target.
+    pool.submit(vec![mined("alpha")]);
+    pool.quiesce();
+
+    // Then it is not published: the empty buffer is not read as a durable
+    // prefix, so the partition is never detached and stays in the buffers.
+    assert!(
+        rig.data_files().is_empty(),
+        "no record ahead of its template event"
+    );
+    assert_eq!(sink.buffered_records(), 1);
+    assert_eq!(
+        sink.publishes_in_flight(),
+        1,
+        "the only publish in flight is the age drain's own",
+    );
+
+    // And when that in-flight write fails, the dependent partition still
+    // does not land: the event is back in the buffer and the store
+    // refuses it, so the next trigger is refused too.
+    let audit_root = rig.audit_root.clone();
+    std::fs::remove_dir_all(&audit_root).expect("remove audit root");
+    std::fs::write(&audit_root, b"not a directory").expect("sabotage audit store");
+    assert!(
+        !coordinator.write_ordered(in_flight, "age"),
+        "the in-flight audit write failed",
+    );
+    assert_eq!(rig.audit.buffered_events(), 1, "its event was requeued");
+    pool.submit(vec![mined("alpha")]);
+    pool.quiesce();
+    assert!(
+        rig.data_files().is_empty(),
+        "still nothing ahead of the event"
+    );
+    assert_eq!(
+        sink.buffered_records(),
+        2,
+        "the partition waits in the buffers"
+    );
+
+    // And once the store recovers, the next trigger writes the event and
+    // then the records it gates.
+    std::fs::remove_file(&audit_root).expect("unsabotage");
+    std::fs::create_dir_all(&audit_root).expect("audit root");
+    pool.submit(vec![mined("alpha")]);
+    pool.quiesce();
+    let _outcomes = sink.quiesce_publishes();
+    assert_eq!(rig.audit.buffered_events(), 0, "the event is durable");
+    assert!(
+        !crate::rfc0052_barrier_support::parquet_files(&audit_root).is_empty(),
+        "in the audit store",
+    );
+    assert_eq!(sink.buffered_records(), 0, "and every record followed it");
+    assert!(!rig.data_files().is_empty());
+}
+
+/// What the record sink's quarantine write — the RFC 0025 §3.3 audit
+/// emit a permanently rejected record takes on the publisher's thread —
+/// does in a leg.
+#[derive(Clone, Copy)]
+enum Quarantine {
+    /// Records the event and returns, as production does.
+    Records,
+    /// Panics: the injected publisher panic.
+    Panics,
+}
+
+impl AuditSink for Quarantine {
+    fn emit(&mut self, _event: ourios_core::audit::AuditEvent) {
+        assert!(matches!(self, Self::Records), "injected publisher panic");
+    }
+}
+
+/// A sink whose every emit crosses the size target, whose inline audit
+/// barrier waits at `detach` (when given) on its first call, whose data
+/// store holds its PUTs at `put`, and whose quarantine write is
+/// `quarantine`.
+fn gated_sink(
+    rig: &BarrierRig,
+    detach: Option<&Gate>,
+    put: &Gate,
+    quarantine: Quarantine,
+) -> SharedParquetSink {
+    let detach = detach.cloned();
+    let first = Arc::new(AtomicBool::new(true));
+    SharedParquetSink::new(
+        ParquetRecordSink::new(
+            held_puts(Store::local(&rig.data_root).expect("store"), put),
+            FlushConfig {
+                target_bytes: 1,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            },
+        )
+        .with_audit_barrier(Box::new(move || {
+            if first.swap(false, Ordering::AcqRel)
+                && let Some(detach) = &detach
+            {
+                detach.wait_here();
+            }
+            true
+        }))
+        .with_audit_sink(Box::new(quarantine)),
+    )
+}
+
+/// The data files written for `tenant`.
+fn tenant_files(rig: &BarrierRig, tenant: &str) -> Vec<std::path::PathBuf> {
+    rig.data_files()
+        .into_iter()
+        .filter(|path| path.to_string_lossy().contains(tenant))
+        .collect()
+}
+
+/// A permanently rejected record: `observed_time_unix_nano` past
+/// `i64::MAX` trips RFC 0005 §3.2's timestamp contract at encode, so its
+/// publish goes through the quarantine write.
+fn poisoned(tenant: &str) -> ourios_core::record::MinedRecord {
+    ourios_core::record::MinedRecord {
+        observed_time_unix_nano: Some(u64::MAX),
+        ..mined(tenant)
+    }
+}
+
+fn template_event(tenant: &str) -> ourios_core::audit::AuditEvent {
+    ourios_core::audit::AuditEvent {
+        tenant_id: ourios_core::tenant::TenantId::new(tenant),
+        timestamp: std::time::UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+        payload: ourios_core::audit::AuditPayload::Template {
+            template_id: 1,
+            triggering_line_hash: ourios_core::audit::hash_triggering_line(b"user 1 logged in"),
+            triggering_line_sample: Some("user 1 logged in".to_owned()),
+            change: ourios_core::audit::TemplateChange::Created {
+                new_template: "user <*> logged in".to_owned(),
+            },
+        },
+    }
 }
 
 /// A sink over the rig's store whose inline audit barrier panics — the

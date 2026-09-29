@@ -408,4 +408,84 @@ mod tests {
             "and reported its epoch before the decrement (RFC 0052 §3.1)",
         );
     }
+
+    /// Issue #837: a worker that panics mid-batch must neither wedge
+    /// `quiesce` nor take the pool down with it. Before the lane, the
+    /// last worker's unwind dropped the queue's receiver: every batch
+    /// queued behind the panic, and every batch submitted after it, was
+    /// discarded without an emit — `quiesce` returned, but acknowledged
+    /// records reached neither the buffers nor the store until a restart
+    /// replayed them.
+    #[test]
+    fn a_panicked_worker_leaves_a_pool_that_still_encodes_every_later_batch() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&calls);
+        let gate = Arc::clone(&release);
+        // The inline audit barrier is the seam a worker really runs
+        // inside its emit: the first call holds, then panics.
+        let sink = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                store,
+                FlushConfig {
+                    target_bytes: 1, // every emit crosses the target
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+            )
+            .with_audit_barrier(Box::new(move || {
+                if seen.fetch_add(1, Ordering::AcqRel) == 0 {
+                    while !gate.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    panic!("injected encode-worker panic");
+                }
+                true
+            })),
+        );
+        let epochs = sink.epochs();
+        let failing = epochs.current();
+        let pool = Arc::new(EncodePool::new(&sink, 1));
+
+        // Given a batch queued behind one whose worker is about to panic,
+        pool.submit(vec![rec("tenant-a")]);
+        while calls.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        pool.submit(vec![rec("tenant-b")]);
+        release.store(true, Ordering::Release);
+        // and one submitted once the panic has retired the worker.
+        while calls.load(Ordering::Acquire) < 2 {
+            std::thread::yield_now();
+        }
+        pool.submit(vec![rec("tenant-c")]);
+
+        // When the pool is quiesced, it returns.
+        let (done, quiesced) = std::sync::mpsc::channel();
+        let waiter = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            waiter.quiesce();
+            let _ = done.send(());
+        });
+        assert!(
+            quiesced.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "quiesce returned after the worker panic",
+        );
+        let _outcomes = sink.quiesce_publishes();
+
+        // Then both later batches were encoded and published, and only
+        // the panicking batch's own record is outside the store — in the
+        // buffers, where it was appended before the trigger ran.
+        assert_eq!(sink.flushes(), 2, "every batch after the panic published");
+        assert_eq!(sink.buffered_records(), 1);
+        assert_eq!(
+            epochs.capture().failed_epoch(),
+            Some(failing),
+            "and the panic latched its own batch's epoch",
+        );
+    }
 }

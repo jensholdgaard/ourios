@@ -291,3 +291,85 @@ impl Publisher {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use ourios_parquet::Store;
+
+    use super::*;
+    use crate::record_sink::{FlushConfig, ParquetRecordSink};
+
+    fn sink(root: &std::path::Path) -> SharedParquetSink {
+        SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(root).expect("local store"),
+            FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            },
+        ))
+    }
+
+    /// One holder of a batch's completion.
+    #[allow(dead_code)] // the payloads are held only to be dropped
+    enum Share {
+        Encode(Arc<BatchCompletion>),
+        Detached(Detached),
+    }
+
+    /// Every order of `items`' indices.
+    fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut out = Vec::new();
+        for (i, &first) in items.iter().enumerate() {
+            let mut rest = items.to_vec();
+            rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, first);
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// RFC 0052 §3.1: one guard covers every partition a batch detaches,
+    /// and it settles only when the batch's encode phase *and* the last
+    /// of those partitions are done — in whichever order they finish.
+    #[test]
+    fn a_batch_completion_settles_on_its_last_share_in_any_order() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sink = sink(dir.path());
+        for order in permutations(&[0, 1, 2, 3]) {
+            let completion = BatchCompletion::begin(&sink);
+            // Share 0 is the batch's own encode phase; 1..=3 are detached
+            // partitions (empty here — the count is what is under test).
+            let mut shares: Vec<Option<Share>> = (0..3)
+                .map(|_| {
+                    Some(Share::Detached(Detached::new(
+                        TakenPartitions::default(),
+                        "size",
+                        &completion,
+                    )))
+                })
+                .collect();
+            shares.insert(0, Some(Share::Encode(completion)));
+            for (step, &share) in order.iter().enumerate() {
+                assert_eq!(
+                    sink.publishes_in_flight(),
+                    1,
+                    "order {order:?}: the guard is held before step {step}",
+                );
+                shares[share] = None;
+            }
+            assert_eq!(
+                sink.publishes_in_flight(),
+                0,
+                "order {order:?}: the last share settled the guard",
+            );
+        }
+    }
+}

@@ -19,7 +19,15 @@ use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, Journal, ReceiveError};
 use ourios_wal::WalOffset;
 
-use crate::rfc0052_barrier_support::{BarrierRig, wal_config};
+use ourios_core::tenant::TenantId;
+
+use crate::ingest_support::{request, resource_logs};
+use crate::rfc0052_barrier_support::{BarrierRig, Gate, wal_config};
+
+/// 2026-04-02T10:58:00Z, and an hour — two records an hour apart fall in
+/// two partitions.
+const TS0: u64 = 1_775_127_480_000_000_000;
+const HOUR_NS: u64 = 3_600_000_000_000;
 
 /// Scenario RFC0052.14 — no mark passes a frame whose encode had not emitted.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
@@ -421,19 +429,69 @@ async fn rfc0052_14_idle_rotation_on_the_tick_marks_the_last_acked_turn_not_the_
 
 /// Scenario RFC0052.14 — a pre-cut batch that detached mid-batch is fully in the cut.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (quiesce waits for the encode phase, not for a registered publish)"]
-fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting_on_the_put() {
-    todo!(
-        "RFC0052.14 — a pre-cut batch whose first record detached a \
-         partition mid-batch has its remaining records in the cut under \
-         any interleaving: the quiesce waits for the batch's encode \
-         phase, not for a worker to register a publish, and the detached \
-         partition's PUT is not waited on; with several partitions \
-         detached from one pre-cut batch completing in any order, the \
-         batch's shared completion holds the in-flight count until the \
-         last finishes"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting_on_the_put() {
+    // Given an acknowledged batch whose records fall in two partitions
+    // (two hours), each detached by the size trigger as the worker
+    // reaches it: the first partition's PUT goes through, the second's is
+    // held — so the batch is past its encode phase with one detached
+    // partition durable and one not.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let put = Gate::letting_through(1);
+    let rig = Arc::new(BarrierRig::with_held_puts(tmp.path(), &put));
+    let _release = put.opened_on_drop();
+    let mut group = resource_logs("checkout", &["user 1 logged in", "user 2 logged in"]);
+    for (hour, record) in group.scope_logs[0].log_records.iter_mut().enumerate() {
+        record.time_unix_nano = TS0 + u64::try_from(hour).expect("hour") * HOUR_NS;
+    }
+    rig.pipeline
+        .ingest(request(vec![group]), TenantId::new("checkout"))
+        .await
+        .expect("the batch acks");
+    let mark = rig.pipeline.last_durable().expect("a durable mark");
+    put.await_entered(2);
+
+    // When a tick starts.
+    let tick = {
+        let rig = Arc::clone(&rig);
+        tokio::task::spawn_blocking(move || rig.barrier.tick(&rig.pipeline, false))
+    };
+
+    // Then the capture does not wait for the held PUT: the quiesce
+    // covers the batch's encode phase only, so the exclusion is released
+    // and the next turn is admitted while the tick is still waiting...
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        rig.ingest("checkout", &["user 3 logged in"]),
+    )
+    .await
+    .expect("ingest is not stalled behind the held PUT");
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    // ...while the cut itself waits, because the batch's one shared
+    // completion is held until its *last* detached partition finishes —
+    // the first being durable does not release it.
+    assert!(
+        !tick.is_finished(),
+        "the cut waits for the batch's last partition"
     );
+    assert_eq!(rig.data_files().len(), 1, "one partition is durable");
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "and nothing is stamped"
+    );
+
+    // And once the held PUT lands, the cut stamps at the pre-cut batch's
+    // mark with both of its partitions under it.
+    put.open();
+    assert_eq!(
+        tick.await.expect("the tick did not panic"),
+        CutOutcome::Stamped,
+    );
+    assert_eq!(rig.commits.last_checkpoint(), Some(mark));
+    assert!(rig.data_files().len() >= 2, "both partitions are durable");
 }
 
 /// Scenario RFC0052.14 — cuts are strictly ordered; a failed A invalidates B.

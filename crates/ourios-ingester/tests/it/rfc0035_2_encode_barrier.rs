@@ -106,6 +106,17 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     let pipeline = IngestPipeline::new(coordinator(Box::new(wal)), miner)
         .with_encode_pool(EncodePool::new(&sink, 1))
         .with_rotation_hook(Box::new(move |miner, mark| {
+            // Since RFC 0052 §3.1 moved the size-trigger PUT from the
+            // encode worker to the publisher, the pipeline's
+            // `quiesce_encodes` covers the encode phase only: a record
+            // is then either written by the publisher or parked back in
+            // the buffers when its queue was full. So this hand-rolled
+            // stamper does what the production barrier does before it
+            // stamps — waits out the publishes registered before it and
+            // flushes the buffers. A record whose encode had not finished
+            // is in neither, so the row count below still catches it.
+            let _outcomes = hook_sink.quiesce_publishes();
+            hook_sink.flush_all();
             hook_observed
                 .lock()
                 .expect("lock")

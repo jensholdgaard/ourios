@@ -1,0 +1,293 @@
+//! RFC 0052 §3.1's publisher: the one thread that performs the store I/O
+//! for partitions an encode worker detached on the size or ceiling
+//! trigger, so the worker is never inside a PUT and a barrier's
+//! `quiesce_encodes` waits on encodes alone.
+//!
+//! A worker hands the publisher a [`Detached`] item and moves on. It
+//! never blocks on the queue: a bound the worker waited on would put a
+//! stuck PUT back in front of the barrier. So a full queue — or a
+//! publisher retired by a panic — hands the item back, and the worker
+//! **parks** it into the sink's buffers as a `ready` partition, where the
+//! next drain or flush takes it. A park is a settlement with a date on
+//! it: it records the `barrier_epoch` current when the records came back,
+//! so a cut captured before the park — one whose drain could not have
+//! seen them — is refused.
+//!
+//! One publish guard covers every partition a batch detaches. It is
+//! created in `submit`, under the ingest exclusion, before any record of
+//! the batch can leave the buffers, and shared through a
+//! [`BatchCompletion`]: it settles when the batch's encode phase has ended
+//! *and* the last of its detached partitions is durable, requeued, parked
+//! or unwound, in whichever order they finish.
+//!
+//! The thread is a [`Lane`]: a panicking publish latches only its own
+//! batch's epoch, every item queued behind it is parked, and the next
+//! enqueue starts a new publisher.
+//!
+//! Audit ordering is not re-established here. A partition is detached
+//! only after the sink's inline audit barrier found every emitted event
+//! durable with no other take in limbo (`SharedParquetAuditSink::barrier`),
+//! so the events its records depend on are durable before the item
+//! exists, and stay so.
+
+use std::sync::Arc;
+
+use ourios_core::record::MinedRecord;
+use ourios_parquet::PartitionKey;
+
+use crate::cadence::Epoch;
+use crate::lane::{Lane, Refused, Serve};
+use crate::record_sink::{PublishGuard, SharedParquetSink, TakenPartitions};
+
+/// How many detached items may wait for the publisher. Each is at most a
+/// size-target partition and sits outside the sink's byte accounting, so
+/// the bound is kept small: past it, partitions park back under that
+/// accounting instead.
+const QUEUE_ITEMS: usize = 16;
+
+/// The publish guard one encode batch shares across every partition it
+/// detaches (RFC 0052 §3.1). Its count is the `Arc`'s: the batch holds one
+/// reference for its encode phase and each [`Detached`] item one more, so
+/// the guard drops — settling the publish — when the last of them does.
+pub struct BatchCompletion {
+    guard: PublishGuard,
+    sink: SharedParquetSink,
+}
+
+impl BatchCompletion {
+    /// Register the batch's publish on `sink`. Call under the ingest
+    /// exclusion, as `submit` does, so the epoch is ordered against every
+    /// cut's capture.
+    #[must_use]
+    pub fn begin(sink: &SharedParquetSink) -> Arc<Self> {
+        Arc::new(Self {
+            guard: sink.begin_publish(),
+            sink: sink.clone(),
+        })
+    }
+
+    /// The epoch the batch was registered under.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.guard.epoch()
+    }
+}
+
+/// Partitions an encode worker detached on the size or ceiling trigger,
+/// on their way to the publisher.
+///
+/// Its destructor is the backstop: an item dropped with its records still
+/// in hand parks them before its share of the completion is released, so
+/// even an item lost to a path nobody anticipated is data-safe rather
+/// than silently settled.
+pub struct Detached {
+    taken: Option<TakenPartitions>,
+    trigger: &'static str,
+    completion: Arc<BatchCompletion>,
+}
+
+impl Detached {
+    /// `taken`, detached by a batch whose publish is `completion`.
+    #[must_use]
+    pub fn new(
+        taken: TakenPartitions,
+        trigger: &'static str,
+        completion: &Arc<BatchCompletion>,
+    ) -> Self {
+        Self {
+            taken: Some(taken),
+            trigger,
+            completion: Arc::clone(completion),
+        }
+    }
+
+    /// The epoch the owning batch was registered under.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.completion.epoch()
+    }
+
+    /// Put the records back into the buffers as `ready`, keeping their
+    /// `audit_watermark`, and date the return. The share of the
+    /// completion is released only afterwards, when `self` drops.
+    fn park(mut self) {
+        self.park_in_place();
+    }
+
+    fn park_in_place(&mut self) {
+        if let Some(taken) = self.taken.take() {
+            let watermark = taken.audit_watermark();
+            self.completion.sink.park_ready(
+                taken.into_partitions(),
+                watermark,
+                self.completion.epoch(),
+            );
+        }
+    }
+
+    fn take_partitions(&mut self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        self.taken
+            .take()
+            .map(TakenPartitions::into_partitions)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        if self.taken.is_some() {
+            self.park_in_place();
+        } else if std::thread::panicking() {
+            // The records left with the unwinding write: they are in
+            // neither the buffers nor the store. The completion may not
+            // drop here — the batch can still hold other shares — so the
+            // unwind is reported now, before this share is released.
+            self.completion.guard.report_unwound();
+        }
+    }
+}
+
+/// Encode-and-publish for one batch of partitions, feeding the RFC 0047
+/// §3.3 graph once they are durable. The one derivation site both the
+/// coordinator's ordered writes and the publisher go through.
+#[derive(Clone)]
+pub(crate) struct Feed {
+    record: SharedParquetSink,
+    #[cfg(feature = "openfga")]
+    graph: Option<Arc<crate::graph_emitter::GraphEmitter>>,
+}
+
+impl Feed {
+    pub(crate) fn new(record: SharedParquetSink) -> Self {
+        Self {
+            record,
+            #[cfg(feature = "openfga")]
+            graph: None,
+        }
+    }
+
+    #[cfg(feature = "openfga")]
+    pub(crate) fn with_graph_emitter(
+        mut self,
+        emitter: Arc<crate::graph_emitter::GraphEmitter>,
+    ) -> Self {
+        self.graph = Some(emitter);
+        self
+    }
+
+    /// Publish `records` and, once they are durable, feed the RFC 0047
+    /// §3.3 graph from them.
+    pub(crate) fn publish(
+        &self,
+        records: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        trigger: &'static str,
+        registered: Epoch,
+    ) -> bool {
+        #[cfg(feature = "openfga")]
+        let tuples = self.graph.as_ref().map(|emitter| {
+            let mut tuples = std::collections::BTreeSet::new();
+            for (partition, records) in &records {
+                tuples.extend(emitter.derive(&partition.tenant_id, records));
+                tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
+                    &partition.tenant_id,
+                ));
+            }
+            tuples
+        });
+        let published = self.record.publish_owned(records, trigger, registered);
+        #[cfg(feature = "openfga")]
+        if published
+            && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)
+            && !tuples.is_empty()
+        {
+            // Off the publish path: the graph is fed after the batch is
+            // durable, and never delays the next flush.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = emitter.emit(&tuples).await {
+                        tracing::warn!(
+                            error = %e,
+                            "graph emit after flush failed; the sweep re-derives these tuples \
+                             (RFC 0047 §3.3)"
+                        );
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    "graph emit after flush skipped: no runtime handle; the sweep re-derives \
+                     these tuples (RFC 0047 §3.3)"
+                );
+            }
+        }
+        published
+    }
+}
+
+/// The lane's work: write an item, or park it when the publisher that
+/// accepted it has retired.
+struct Write {
+    feed: Feed,
+    /// The runtime the publisher was built on. A bare thread has no
+    /// current runtime, and the graph feed spawns onto one, so each write
+    /// enters it — without it every detached partition would skip the
+    /// RFC 0047 §3.3 feed on exactly the deployments that configure it.
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Serve<Detached> for Write {
+    fn serve(&self, mut item: Detached) {
+        let _entered = self.runtime.as_ref().map(tokio::runtime::Handle::enter);
+        let records = item.take_partitions();
+        let _published = self.feed.publish(records, item.trigger, item.epoch());
+    }
+
+    fn salvage(&self, item: Detached) {
+        item.park();
+    }
+}
+
+/// A handle on the publisher thread. Clones share the thread and its
+/// queue; the thread is started by the first enqueue, and joined once the
+/// last handle drops, after it has written what was queued.
+#[derive(Clone)]
+pub struct Publisher {
+    lane: Arc<Lane<Detached>>,
+    record: SharedParquetSink,
+}
+
+impl Publisher {
+    pub(crate) fn new(feed: Feed) -> Self {
+        let record = feed.record.clone();
+        let write = Write {
+            feed,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        };
+        Self {
+            lane: Arc::new(Lane::new(1, QUEUE_ITEMS, Arc::new(write))),
+            record,
+        }
+    }
+
+    /// A publisher over `sink` alone — no graph feed.
+    #[must_use]
+    pub fn over(sink: &SharedParquetSink) -> Self {
+        Self::new(Feed::new(sink.clone()))
+    }
+
+    /// The record sink this publisher writes to.
+    #[must_use]
+    pub fn record(&self) -> &SharedParquetSink {
+        &self.record
+    }
+
+    /// Hand `item` to the publisher, never waiting. A full queue, or a
+    /// publisher retired by a panic, parks the item instead; the latter
+    /// also starts the next publisher, so the enqueue after this one is
+    /// written.
+    pub fn publish(&self, item: Detached) {
+        match self.lane.try_send(item) {
+            Ok(()) => {}
+            Err(Refused::Full(item) | Refused::Closed(item)) => item.park(),
+        }
+    }
+}

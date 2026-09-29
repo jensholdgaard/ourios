@@ -43,6 +43,7 @@ use ourios_parquet::PartitionKey;
 
 use crate::audit_sink::{SharedParquetAuditSink, Ticket};
 use crate::cadence::Epoch;
+use crate::publisher::{Feed, Publisher};
 use crate::record_sink::{SharedParquetSink, TakenPartitions};
 
 /// An atomic snapshot of both sinks' buffers, taken under the miner lock and
@@ -120,10 +121,13 @@ pub struct PublishCoordinator {
     /// Taken after the ingest exclusion and the miner lock, before the
     /// sinks' own locks, and never held while waiting on anything else.
     handoff: Arc<Mutex<()>>,
-    /// The RFC 0047 §3.3 graph emitter — fed with every published batch
-    /// (the flush-cadence bridge), when the graph is configured.
-    #[cfg(feature = "openfga")]
-    graph: Option<std::sync::Arc<crate::graph_emitter::GraphEmitter>>,
+    /// Publishes a batch and feeds the RFC 0047 §3.3 graph from it — the
+    /// one derivation site this coordinator's writes and its publisher
+    /// share.
+    feed: Feed,
+    /// RFC 0052 §3.1's publisher thread, which writes what the encode
+    /// pool detaches — through the same feed.
+    publisher: Publisher,
 }
 
 impl PublishCoordinator {
@@ -136,28 +140,42 @@ impl PublishCoordinator {
     /// Build a coordinator over the two shared sinks.
     #[must_use]
     pub fn new(record: SharedParquetSink, audit: SharedParquetAuditSink) -> Self {
+        let feed = Feed::new(record.clone());
         Self {
             record,
             audit,
             handoff: Arc::new(Mutex::new(())),
-            #[cfg(feature = "openfga")]
-            graph: None,
+            publisher: Publisher::new(feed.clone()),
+            feed,
         }
     }
 
     /// Feed the RFC 0047 §3.3 graph from every batch this coordinator
-    /// publishes: tuples are derived from the records about to be written
-    /// and sent — asynchronously, best-effort, idempotent — once the batch
-    /// is durable. The compaction sweep re-derives the same tuples later,
-    /// so a failed send here only delays visibility.
+    /// publishes — its ordered writes and everything its publisher writes
+    /// for the encode pool: tuples are derived from the records about to
+    /// be written and sent — asynchronously, best-effort, idempotent —
+    /// once the batch is durable. The compaction sweep re-derives the
+    /// same tuples later, so a failed send here only delays visibility.
+    ///
+    /// Attach before the coordinator is cloned or its publisher handed
+    /// out: the publisher is rebuilt here, and a handle taken earlier
+    /// keeps the feed it was built with.
     #[cfg(feature = "openfga")]
     #[must_use]
     pub fn with_graph_emitter(
         mut self,
         emitter: std::sync::Arc<crate::graph_emitter::GraphEmitter>,
     ) -> Self {
-        self.graph = Some(emitter);
+        self.feed = self.feed.with_graph_emitter(emitter);
+        self.publisher = Publisher::new(self.feed.clone());
         self
+    }
+
+    /// The publisher the encode pool hands its detached partitions to
+    /// (RFC 0052 §3.1), writing through this coordinator's feed.
+    #[must_use]
+    pub fn publisher(&self) -> &Publisher {
+        &self.publisher
     }
 
     /// Atomically take the audit buffer + the aged record partitions (the
@@ -327,54 +345,7 @@ impl PublishCoordinator {
             self.record.requeue(records, registered);
             return false;
         }
-        self.publish_and_feed(records, trigger, registered)
-    }
-
-    /// Publish `records` and, once they are durable, feed the RFC 0047
-    /// §3.3 graph from them.
-    fn publish_and_feed(
-        &self,
-        records: Vec<(PartitionKey, Vec<MinedRecord>)>,
-        trigger: &'static str,
-        registered: Epoch,
-    ) -> bool {
-        #[cfg(feature = "openfga")]
-        let tuples = self.graph.as_ref().map(|emitter| {
-            let mut tuples = std::collections::BTreeSet::new();
-            for (partition, records) in &records {
-                tuples.extend(emitter.derive(&partition.tenant_id, records));
-                tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
-                    &partition.tenant_id,
-                ));
-            }
-            tuples
-        });
-        let published = self.record.publish_owned(records, trigger, registered);
-        #[cfg(feature = "openfga")]
-        if published
-            && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)
-            && !tuples.is_empty()
-        {
-            // Off the publish path: the graph is fed after the batch is
-            // durable, and never delays the next flush.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if let Err(e) = emitter.emit(&tuples).await {
-                        tracing::warn!(
-                            error = %e,
-                            "graph emit after flush failed; the sweep re-derives these tuples \
-                             (RFC 0047 §3.3)"
-                        );
-                    }
-                });
-            } else {
-                tracing::warn!(
-                    "graph emit after flush skipped: no runtime handle; the sweep re-derives \
-                     these tuples (RFC 0047 §3.3)"
-                );
-            }
-        }
-        published
+        self.feed.publish(records, trigger, registered)
     }
 
     /// The record sink handle (for the receiver's existing flush/snapshot paths).

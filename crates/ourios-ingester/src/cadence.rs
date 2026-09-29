@@ -40,6 +40,10 @@ impl Epoch {
     /// Never assigned to a cut — the clear sentinel's value.
     const RESERVED: u64 = u32::MAX as u64;
 
+    /// At or above every epoch a guard can carry — the bound for "every
+    /// registered publish".
+    pub(crate) const LAST: Self = Self(u32::MAX);
+
     /// The epoch's ordinal, for logs and tests.
     #[must_use]
     pub fn get(self) -> u32 {

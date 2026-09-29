@@ -20,7 +20,7 @@
 //! Buffers are keyed by [`PartitionKey`], which carries `tenant_id`, so they
 //! are tenant-scoped by construction (`CLAUDE.md` §3.7).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -778,7 +778,11 @@ fn publish_partition(
 /// encode pool's pending counter.
 #[derive(Debug)]
 struct InFlightPublishes {
-    count: Mutex<usize>,
+    /// Unsettled publishes, by the epoch each was registered under — so
+    /// a cut can wait for the publishes registered before its capture
+    /// without also waiting for every one registered since (RFC 0052
+    /// §3.1: "every publish registered before the cut").
+    registered: Mutex<BTreeMap<Epoch, usize>>,
     settled: Condvar,
     /// RFC 0052 §3.1's dated settlements: for each publish whose records
     /// re-entered the buffers — a requeue after a transient failure, or
@@ -798,6 +802,24 @@ struct InFlightPublishes {
 }
 
 impl InFlightPublishes {
+    fn lock_registered(&self) -> std::sync::MutexGuard<'_, BTreeMap<Epoch, usize>> {
+        self.registered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Block until no publish registered at or below `through` is
+    /// unsettled.
+    fn wait_through(&self, through: Epoch) {
+        let mut registered = self.lock_registered();
+        while registered.range(..=through).next().is_some() {
+            registered = self
+                .settled
+                .wait(registered)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     fn record(&self, settlement: Settlement) {
         self.settlements
             .lock()
@@ -900,29 +922,37 @@ impl PublishGuard {
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
+
+    /// Record that a share of this publish unwound with its records in
+    /// neither the buffers nor the store — for a guard shared across
+    /// several partitions (RFC 0052 §3.1's shared completion), whose drop
+    /// may come later and not on the unwinding thread.
+    pub(crate) fn report_unwound(&self) {
+        // Two records of the same unwind, because §3.1 needs both: the
+        // latch defends the *ordering* (a cut's recheck sees it), and the
+        // settlement defends the *data* (`all_ok` is false for it
+        // independently). Either alone refuses the stamp.
+        self.in_flight.epochs.report(self.epoch);
+        self.in_flight.record(Settlement::Unwound {
+            registered: self.epoch,
+        });
+    }
 }
 
 impl Drop for PublishGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            // Two records of the same unwind, because §3.1 needs both:
-            // the latch defends the *ordering* (a cut's recheck sees it),
-            // and the settlement defends the *data* (`all_ok` is false
-            // for it independently). Either alone refuses the stamp.
-            self.in_flight.epochs.report(self.epoch);
-            self.in_flight.record(Settlement::Unwound {
-                registered: self.epoch,
-            });
+            self.report_unwound();
         }
-        let mut count = self
-            .in_flight
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            self.in_flight.settled.notify_all();
+        let mut registered = self.in_flight.lock_registered();
+        if let Some(count) = registered.get_mut(&self.epoch) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                registered.remove(&self.epoch);
+            }
         }
+        drop(registered);
+        self.in_flight.settled.notify_all();
     }
 }
 
@@ -975,7 +1005,7 @@ impl SharedParquetSink {
         Self {
             inner: Arc::new(Mutex::new(sink)),
             in_flight: Arc::new(InFlightPublishes {
-                count: Mutex::new(0),
+                registered: Mutex::new(BTreeMap::new()),
                 settled: Condvar::new(),
                 settlements: Mutex::new(Vec::new()),
                 epochs,
@@ -998,15 +1028,19 @@ impl SharedParquetSink {
     /// is ordered against the capture (RFC 0052 §3.1).
     #[must_use]
     pub fn begin_publish(&self) -> PublishGuard {
-        *self
-            .in_flight
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
+        let epoch = self.in_flight.epochs.current();
+        *self.in_flight.lock_registered().entry(epoch).or_insert(0) += 1;
         PublishGuard {
-            epoch: self.in_flight.epochs.current(),
+            epoch,
             in_flight: Arc::clone(&self.in_flight),
         }
+    }
+
+    /// Unsettled publishes, across every epoch — for tests and the
+    /// status surface.
+    #[must_use]
+    pub fn publishes_in_flight(&self) -> usize {
+        self.in_flight.lock_registered().values().sum()
     }
 
     /// Record that a publish registered at `registered` put its records
@@ -1049,19 +1083,21 @@ impl SharedParquetSink {
     /// succeeded.
     #[must_use]
     pub fn quiesce_publishes(&self) -> PublishOutcomes {
-        let mut count = self
-            .in_flight
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while *count > 0 {
-            count = self
-                .in_flight
-                .settled
-                .wait(count)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        drop(count);
+        self.quiesce_publishes_through(Epoch::LAST)
+    }
+
+    /// [`Self::quiesce_publishes`] for the publishes a cut of `epoch`
+    /// covers — those registered at or below it, before its capture.
+    ///
+    /// A cut must not wait for publishes registered after it: those hold
+    /// only frames above its mark, and under steady ingest there is
+    /// always another — every encode batch registers one at `submit`
+    /// (RFC 0052 §3.1) — so a cut waiting for all of them might never
+    /// stamp. Neither may it wait for the pending cut's own drains, which
+    /// register above it and run only once it has finished.
+    #[must_use]
+    pub fn quiesce_publishes_through(&self, epoch: Epoch) -> PublishOutcomes {
+        self.in_flight.wait_through(epoch);
         PublishOutcomes {
             settlements: self
                 .in_flight

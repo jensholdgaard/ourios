@@ -501,7 +501,7 @@ impl Barrier {
         // was meant to wait for them, and the requeue they are about to
         // make would land beside a buffer the next capture had already
         // drained.
-        let outcomes = self.publish.record().quiesce_publishes();
+        let outcomes = self.publish.record().quiesce_publishes_through(epoch);
         // Three independent refusals, and the order is only about which
         // one is *named*. The recheck defends the ordering: a publish
         // registered before the barrier began can panic while it waits

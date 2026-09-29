@@ -51,8 +51,10 @@ pub mod compactor;
 pub mod encode_pool;
 #[cfg(feature = "openfga")]
 pub mod graph_emitter;
+mod lane;
 pub mod metrics;
 pub mod publish;
+pub mod publisher;
 pub mod receiver;
 pub mod record_sink;
 pub mod recovery;

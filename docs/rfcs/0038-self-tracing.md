@@ -488,7 +488,11 @@ which are at `Development` stability.
   SDK", examples `GetItem`, `PutItem`); `aws.s3.bucket`;
   `aws.s3.key` on object operations (the full object key as sent, `Store`
   prefix included; never set on `ListObjectsV2`); `aws.request_id` from
-  the `x-amz-request-id` response header when present; `cloud.region` when
+  the `x-amz-request-id` response header when present;
+  `aws.extended_request_id` from the `x-amz-id-2` response header when
+  present (`Conditionally Required` "if available" in the pinned S3
+  convention; S3-compatible endpoints may omit the header, in which case it
+  is not set); `cloud.region` when
   the store is configured with one; `server.address` / `server.port` from
   the endpoint. `url.full` is **not** recorded: the query string can carry
   continuation tokens, and the key already sits in `aws.s3.key`.
@@ -596,7 +600,7 @@ low-cardinality.
 
 Upstream attributes are used where they exist: `rpc.system`,
 `rpc.service`, `rpc.method`, `aws.s3.bucket`, `aws.s3.key`, `aws.request_id`,
-`cloud.region`, `server.address`, `server.port`, `error.type`. No upstream
+`aws.extended_request_id`, `cloud.region`, `server.address`, `server.port`, `error.type`. No upstream
 attribute counts listed objects or list requests.
 `db.response.returned_rows` counts rows a database operation returns, and
 reusing it would collide with that meaning (the RFC 0040 §3.3 argument).
@@ -843,7 +847,10 @@ are `drafted`.
 > template_map`, has a §3.7.3 name (`S3.ListObjectsV2`, `S3.GetObject`,
 > …), `rpc.system = "aws-api"`, `rpc.service = "S3"`, `rpc.method` equal to
 > the bare operation, `aws.s3.bucket`,
-> `server.address`, and `aws.s3.key` exactly on the object operations. The
+> `server.address`, and `aws.s3.key` exactly on the object operations,
+> **And** `aws.extended_request_id` equals the fixture's `x-amz-id-2` header
+> on every response that sends one, and is absent where the fixture omits
+> it. The
 > number of `S3.ListObjectsV2` spans under `resolve files` equals
 > `ourios.file_set.list_request_count` (the fixture stays under one page per
 > listing). Every `CLIENT` span lies within its parent's interval,
@@ -1055,7 +1062,7 @@ scope, not ingest) already covers it.
   and [AWS SDK](https://opentelemetry.io/docs/specs/semconv/cloud-providers/aws-sdk/)
   (`Development`; `CLIENT`, `Service.Operation`, `rpc.system =
   aws-api`, `rpc.service`, bare `rpc.method`, `aws.s3.bucket`, `aws.s3.key`, `aws.request_id`,
-  `cloud.region`);
+  `aws.extended_request_id`, `cloud.region`);
   [recording errors](https://opentelemetry.io/docs/specs/semconv/general/recording-errors/);
   [attribute naming](https://opentelemetry.io/docs/specs/semconv/general/naming/);
   `db.response.returned_rows` (`Development`, opt-in; not reused, §3.7.5).

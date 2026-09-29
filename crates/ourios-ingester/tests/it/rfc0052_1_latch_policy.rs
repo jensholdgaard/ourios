@@ -298,7 +298,8 @@ async fn housekeeping_tick_panic_leaves_the_checkpoint_and_the_next_pass_replans
     let panicked = housekeeper.tick();
 
     // Then the tick reports the panic (counted as `cadence_panic`; the
-    // metric half is `cadence_panic_metric.rs`), the checkpoint is
+    // metric half is `rfc0052_1_housekeeping_panic_metric.rs`), the
+    // checkpoint is
     // untouched, no cut is failed, and nothing was unlinked.
     assert!(
         matches!(panicked, HousekeepingTick::Panicked),

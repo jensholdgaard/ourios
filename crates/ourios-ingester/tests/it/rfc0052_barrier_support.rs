@@ -85,6 +85,11 @@ pub struct RigSpec {
     /// Install the production capture-only rotation hook, so a segment
     /// change inside `ingest` hands a cut to the barrier.
     pub rotation_capture: bool,
+    /// Hold the data store's PUTs at this gate — the publisher's write.
+    pub held_puts: Option<Gate>,
+    /// Hold the audit store's PUTs at this gate, and wire the record
+    /// sink's inline barrier the way the receiver does (`settled`).
+    pub held_audit_puts: Option<Gate>,
 }
 
 impl RigSpec {
@@ -96,6 +101,8 @@ impl RigSpec {
             poison: None,
             ceiling_bytes: usize::MAX,
             rotation_capture: false,
+            held_puts: None,
+            held_audit_puts: None,
         }
     }
 }
@@ -154,6 +161,43 @@ impl BarrierRig {
         )
     }
 
+    /// A rig whose every record crosses the size target, with the data
+    /// store's PUTs held at `gate` — the publisher's write, reached with
+    /// no sink lock held.
+    pub fn with_held_puts(tmp: &Path, gate: &Gate) -> Self {
+        Self::build(
+            tmp,
+            RigSpec {
+                flush: FlushConfig {
+                    target_bytes: 1,
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+                held_puts: Some(gate.clone()),
+                ..RigSpec::new(wal_config(&tmp.join("wal")))
+            },
+        )
+    }
+
+    /// A rig wired like the receiver — the record sink's inline barrier
+    /// is the audit sink's `settled`, which does no store I/O — with every
+    /// record crossing the size target and the audit store's PUTs held at
+    /// `gate`.
+    pub fn with_held_audit_puts(tmp: &Path, gate: &Gate) -> Self {
+        Self::build(
+            tmp,
+            RigSpec {
+                flush: FlushConfig {
+                    target_bytes: 1,
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+                held_audit_puts: Some(gate.clone()),
+                ..RigSpec::new(wal_config(&tmp.join("wal")))
+            },
+        )
+    }
+
     /// A rig whose single encode worker is **held** inside the sink's
     /// inline audit barrier until the returned handle releases it — the
     /// same seam `with_panicking_encode` panics in, and the same
@@ -202,6 +246,8 @@ impl BarrierRig {
             poison,
             ceiling_bytes,
             rotation_capture,
+            held_puts: put_gate,
+            held_audit_puts: audit_gate,
         } = spec;
         let wal_root = wal.root.clone();
         let data_root = tmp.join("data");
@@ -212,18 +258,8 @@ impl BarrierRig {
         }
 
         let journal = Wal::open(wal).expect("open WAL");
-        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
-            Store::local(&audit_root).expect("audit store"),
-            100_000,
-        ));
-        let barrier_audit = audit.clone();
-        let audit_barrier = poison.unwrap_or_else(|| {
-            Box::new(move || barrier_audit.flush()) as Box<dyn FnMut() -> bool + Send>
-        });
-        let sink = SharedParquetSink::new(
-            ParquetRecordSink::new(Store::local(&data_root).expect("data store"), flush)
-                .with_audit_barrier(audit_barrier),
-        );
+        let (audit, poison) = rig_audit(&audit_root, audit_gate.as_ref(), poison);
+        let sink = rig_sink(&data_root, flush, &audit, poison, put_gate.as_ref());
         let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
             .with_record_sink(Box::new(sink.clone()));
 
@@ -243,7 +279,7 @@ impl BarrierRig {
             ceiling_bytes,
         ));
         let mut building = IngestPipeline::new(Arc::clone(&commits), miner)
-            .with_encode_pool(EncodePool::new(&sink, workers));
+            .with_encode_pool(EncodePool::with_publisher(publish.publisher(), workers));
         if rotation_capture {
             let hook_barrier = Arc::clone(&barrier);
             building = building.with_rotation_hook(Box::new(move |miner, mark| {
@@ -319,6 +355,54 @@ impl BarrierRig {
     }
 }
 
+/// The rig's audit sink, with its PUTs held at `gate` when given — and
+/// then the record sink's inline barrier wired the way the receiver
+/// wires it (`settled`) in place of `poison`.
+fn rig_audit(
+    audit_root: &Path,
+    gate: Option<&Gate>,
+    poison: Option<Box<dyn FnMut() -> bool + Send>>,
+) -> (
+    SharedParquetAuditSink,
+    Option<Box<dyn FnMut() -> bool + Send>>,
+) {
+    let mut store = Store::local(audit_root).expect("audit store");
+    if let Some(gate) = gate {
+        store = held_puts(store, gate);
+    }
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 100_000));
+    let barrier = match gate {
+        Some(_) => {
+            let settled = audit.clone();
+            Some(Box::new(move || settled.settled()) as Box<dyn FnMut() -> bool + Send>)
+        }
+        None => poison,
+    };
+    (audit, barrier)
+}
+
+/// The rig's record sink: its inline audit barrier is `poison` when given,
+/// else a flush of `audit`, and its PUTs are held at `put_gate` when given.
+fn rig_sink(
+    data_root: &Path,
+    flush: FlushConfig,
+    audit: &SharedParquetAuditSink,
+    poison: Option<Box<dyn FnMut() -> bool + Send>>,
+    put_gate: Option<&Gate>,
+) -> SharedParquetSink {
+    let barrier_audit = audit.clone();
+    let audit_barrier = poison.unwrap_or_else(|| {
+        Box::new(move || barrier_audit.flush()) as Box<dyn FnMut() -> bool + Send>
+    });
+    let mut data_store = Store::local(data_root).expect("data store");
+    if let Some(gate) = put_gate {
+        data_store = held_puts(data_store, gate);
+    }
+    SharedParquetSink::new(
+        ParquetRecordSink::new(data_store, flush).with_audit_barrier(audit_barrier),
+    )
+}
+
 /// The handle on [`BarrierRig::with_held_encode`]'s held worker.
 pub struct HeldEncode {
     entered: Arc<AtomicUsize>,
@@ -357,4 +441,163 @@ pub fn parquet_files(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// A point a production seam waits at until the test opens it.
+#[derive(Clone, Default)]
+pub struct Gate {
+    entered: Arc<AtomicUsize>,
+    open: Arc<AtomicBool>,
+    /// How many calls pass before the gate starts holding.
+    free: usize,
+}
+
+impl Gate {
+    /// A gate that lets the first `calls` through and holds the rest.
+    pub fn letting_through(calls: usize) -> Self {
+        Self {
+            free: calls,
+            ..Self::default()
+        }
+    }
+
+    pub fn wait_here(&self) {
+        if self.entered.fetch_add(1, Ordering::AcqRel) < self.free {
+            return;
+        }
+        while !self.open.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Block until `calls` calls have reached the gate — failing, not
+    /// hanging, when a regression means they never will.
+    pub fn await_entered(&self, calls: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while self.entered.load(Ordering::Acquire) < calls {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{calls} call(s) never reached the gate",
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    pub fn open(&self) {
+        self.open.store(true, Ordering::Release);
+    }
+
+    /// Open the gate when the returned value drops — so a failing
+    /// assertion releases whatever is held rather than hanging the
+    /// teardown that joins it. Bind it after the pool it releases.
+    #[must_use]
+    pub fn opened_on_drop(&self) -> OpenOnDrop {
+        OpenOnDrop(self.clone())
+    }
+}
+
+/// See [`Gate::opened_on_drop`].
+pub struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// `store` with every PUT held at `gate` — the object-store call the
+/// publisher's write waits on, reached with no sink lock held.
+pub fn held_puts(store: Store, gate: &Gate) -> Store {
+    let gate = gate.clone();
+    store.wrap_backend(move |inner| Arc::new(HeldStore { inner, gate }))
+}
+
+struct HeldStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    gate: Gate,
+}
+
+impl std::fmt::Debug for HeldStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldStore({})", self.inner)
+    }
+}
+
+impl std::fmt::Display for HeldStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for HeldStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let gate = self.gate.clone();
+        tokio::task::spawn_blocking(move || gate.wait_here())
+            .await
+            .expect("the gate wait does not panic");
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
 }

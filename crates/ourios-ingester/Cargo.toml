@@ -187,6 +187,13 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.
 tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
+# RFC 0052 §3.1's publisher legs hold a PUT at the object-store seam
+# (`Store::wrap_backend`) — the one place the publisher's write waits with
+# no sink lock held. All four are already in the tree via ourios-parquet.
+object_store = { version = "0.13", default-features = false }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
 
 [lints]
 workspace = true

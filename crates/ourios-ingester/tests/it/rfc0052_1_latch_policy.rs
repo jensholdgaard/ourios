@@ -212,7 +212,7 @@ fn assert_parked_rather_than_published(rig: &BarrierRig, records: usize) {
 /// Scenario RFC0052.1 — a panic in a cadence tick itself, and a `JoinError` at shutdown.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.1 stub — implemented in the timer green slice E (barrier-tick panic lowers failed_epoch; housekeeping-tick panic counts cadence_panic)"]
+#[ignore = "RFC0052.1 stub — implemented in the timer green slice E (barrier-tick panic lowers failed_epoch; housekeeping-tick panic counts cadence_panic; also lands §3.1's PublishItem::Drained arm, deferred from D2 (#867) until the age sweep's panic policy is decided here)"]
 fn rfc0052_1_cadence_tick_panic_and_join_error_read_as_a_failed_cut() {
     todo!(
         "RFC0052.1 — a panic in the barrier tick outside any batch guard \

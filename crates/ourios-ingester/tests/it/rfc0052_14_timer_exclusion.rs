@@ -419,23 +419,6 @@ async fn rfc0052_14_idle_rotation_on_the_tick_marks_the_last_acked_turn_not_the_
     assert!(next > stamped, "and above the mark");
 }
 
-/// Scenario RFC0052.14 — a pre-cut batch that detached mid-batch is fully in the cut.
-/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.14 stub — implemented in the barrier green slice D (quiesce waits for the encode phase, not for a registered publish)"]
-fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting_on_the_put() {
-    todo!(
-        "RFC0052.14 — a pre-cut batch whose first record detached a \
-         partition mid-batch has its remaining records in the cut under \
-         any interleaving: the quiesce waits for the batch's encode \
-         phase, not for a worker to register a publish, and the detached \
-         partition's PUT is not waited on; with several partitions \
-         detached from one pre-cut batch completing in any order, the \
-         batch's shared completion holds the in-flight count until the \
-         last finishes"
-    );
-}
-
 /// Scenario RFC0052.14 — cuts are strictly ordered; a failed A invalidates B.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

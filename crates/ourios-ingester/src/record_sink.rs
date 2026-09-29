@@ -20,8 +20,9 @@
 //! Buffers are keyed by [`PartitionKey`], which carries `tenant_id`, so they
 //! are tenant-scoped by construction (`CLAUDE.md` §3.7).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -116,17 +117,15 @@ impl PartitionBuffer {
 ///
 /// The watermark is the **maximum** over the `ready` partitions taken —
 /// each carrying the position its park preserved — and nothing else
-/// contributes to it yet. An ordinary partition's own position is the
-/// audit sink's count at drain time, which only the publish coordinator
-/// can read (it owns both sinks); until §3.1's publisher lands and
-/// supplies it, an ordinary drain reports `0`.
+/// contributes to it: an ordinary drain reports `0`.
 ///
-/// **So this value is not yet a sufficient gate.** Every current
+/// **So this value is not a sufficient gate on its own.** Every
 /// consumer is audit-ordered by other means: `write_ordered` writes the
-/// audit batch first, and the inline size / ceiling publish runs behind
-/// the sink's audit barrier, which is strictly stronger (it requires the
-/// whole buffer durable). A publisher that gated on this alone would
-/// publish records ahead of their template events.
+/// audit batch first, and a size / ceiling take — whether the encode
+/// pool's publisher writes it or `emit_concurrent` does — happens only
+/// behind the sink's audit barrier, which is strictly stronger (every
+/// emitted event durable, no other take in limbo). A consumer that gated
+/// on this alone would publish records ahead of their template events.
 ///
 /// Accessors rather than public fields — a caller that could rebuild
 /// this value could defeat the dependency parking preserves.
@@ -778,7 +777,11 @@ fn publish_partition(
 /// encode pool's pending counter.
 #[derive(Debug)]
 struct InFlightPublishes {
-    count: Mutex<usize>,
+    /// Unsettled publishes, by the epoch each was registered under — so
+    /// a cut can wait for the publishes registered before its capture
+    /// without also waiting for every one registered since (RFC 0052
+    /// §3.1: "every publish registered before the cut").
+    registered: Mutex<BTreeMap<Epoch, usize>>,
     settled: Condvar,
     /// RFC 0052 §3.1's dated settlements: for each publish whose records
     /// re-entered the buffers — a requeue after a transient failure, or
@@ -798,6 +801,24 @@ struct InFlightPublishes {
 }
 
 impl InFlightPublishes {
+    fn lock_registered(&self) -> std::sync::MutexGuard<'_, BTreeMap<Epoch, usize>> {
+        self.registered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Block until no publish registered at or below `through` is
+    /// unsettled.
+    fn wait_through(&self, through: Epoch) {
+        let mut registered = self.lock_registered();
+        while registered.range(..=through).next().is_some() {
+            registered = self
+                .settled
+                .wait(registered)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     fn record(&self, settlement: Settlement) {
         self.settlements
             .lock()
@@ -892,6 +913,10 @@ impl PublishOutcomes {
 pub struct PublishGuard {
     in_flight: Arc<InFlightPublishes>,
     epoch: Epoch,
+    /// Set by the first report of this publish's unwind, so a shared
+    /// guard whose last share drops on the same unwinding thread records
+    /// it once.
+    unwound: AtomicBool,
 }
 
 impl PublishGuard {
@@ -900,29 +925,40 @@ impl PublishGuard {
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
+
+    /// Record that a share of this publish unwound with its records in
+    /// neither the buffers nor the store — for a guard shared across
+    /// several partitions (RFC 0052 §3.1's shared completion), whose drop
+    /// may come later and not on the unwinding thread.
+    pub(crate) fn report_unwound(&self) {
+        if self.unwound.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Two records of the same unwind, because §3.1 needs both: the
+        // latch defends the *ordering* (a cut's recheck sees it), and the
+        // settlement defends the *data* (`all_ok` is false for it
+        // independently). Either alone refuses the stamp.
+        self.in_flight.epochs.report(self.epoch);
+        self.in_flight.record(Settlement::Unwound {
+            registered: self.epoch,
+        });
+    }
 }
 
 impl Drop for PublishGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            // Two records of the same unwind, because §3.1 needs both:
-            // the latch defends the *ordering* (a cut's recheck sees it),
-            // and the settlement defends the *data* (`all_ok` is false
-            // for it independently). Either alone refuses the stamp.
-            self.in_flight.epochs.report(self.epoch);
-            self.in_flight.record(Settlement::Unwound {
-                registered: self.epoch,
-            });
+            self.report_unwound();
         }
-        let mut count = self
-            .in_flight
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            self.in_flight.settled.notify_all();
+        let mut registered = self.in_flight.lock_registered();
+        if let Some(count) = registered.get_mut(&self.epoch) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                registered.remove(&self.epoch);
+            }
         }
+        drop(registered);
+        self.in_flight.settled.notify_all();
     }
 }
 
@@ -975,7 +1011,7 @@ impl SharedParquetSink {
         Self {
             inner: Arc::new(Mutex::new(sink)),
             in_flight: Arc::new(InFlightPublishes {
-                count: Mutex::new(0),
+                registered: Mutex::new(BTreeMap::new()),
                 settled: Condvar::new(),
                 settlements: Mutex::new(Vec::new()),
                 epochs,
@@ -998,15 +1034,20 @@ impl SharedParquetSink {
     /// is ordered against the capture (RFC 0052 §3.1).
     #[must_use]
     pub fn begin_publish(&self) -> PublishGuard {
-        *self
-            .in_flight
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
+        let epoch = self.in_flight.epochs.current();
+        *self.in_flight.lock_registered().entry(epoch).or_insert(0) += 1;
         PublishGuard {
-            epoch: self.in_flight.epochs.current(),
+            epoch,
             in_flight: Arc::clone(&self.in_flight),
+            unwound: AtomicBool::new(false),
         }
+    }
+
+    /// Unsettled publishes, across every epoch — for tests and the
+    /// status surface.
+    #[must_use]
+    pub fn publishes_in_flight(&self) -> usize {
+        self.in_flight.lock_registered().values().sum()
     }
 
     /// Record that a publish registered at `registered` put its records
@@ -1049,19 +1090,21 @@ impl SharedParquetSink {
     /// succeeded.
     #[must_use]
     pub fn quiesce_publishes(&self) -> PublishOutcomes {
-        let mut count = self
-            .in_flight
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while *count > 0 {
-            count = self
-                .in_flight
-                .settled
-                .wait(count)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        drop(count);
+        self.quiesce_publishes_through(Epoch::LAST)
+    }
+
+    /// [`Self::quiesce_publishes`] for the publishes a cut of `epoch`
+    /// covers — those registered at or below it, before its capture.
+    ///
+    /// A cut must not wait for publishes registered after it: those hold
+    /// only frames above its mark, and under steady ingest there is
+    /// always another — every encode batch registers one at `submit`
+    /// (RFC 0052 §3.1) — so a cut waiting for all of them might never
+    /// stamp. Neither may it wait for the pending cut's own drains, which
+    /// register above it and run only once it has finished.
+    #[must_use]
+    pub fn quiesce_publishes_through(&self, epoch: Epoch) -> PublishOutcomes {
+        self.in_flight.wait_through(epoch);
         PublishOutcomes {
             settlements: self
                 .in_flight
@@ -1192,21 +1235,40 @@ impl SharedParquetSink {
         trigger: &'static str,
         registered: Epoch,
     ) -> bool {
+        let failed = self.publish_unrequeued(batches, trigger, |_, _| {});
+        let all_published = failed.is_empty();
+        self.requeue(failed, registered);
+        all_published
+    }
+
+    /// [`Self::publish_owned`] without the requeue: the partitions whose
+    /// put failed come back to the caller, which requeues them under
+    /// whatever ordering it owes the capture (RFC 0052 §3.1's handoff).
+    ///
+    /// `on_stored` sees each partition once its put succeeded, with exactly
+    /// the records that were stored: a quarantined record never reaches it,
+    /// and a partition that failed is not reported even when others landed.
+    pub(crate) fn publish_unrequeued(
+        &self,
+        batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        trigger: &'static str,
+        mut on_stored: impl FnMut(&PartitionKey, &[MinedRecord]),
+    ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        let mut requeue = Vec::new();
         if batches.is_empty() {
-            return true;
+            return requeue;
         }
         let (store, promoted) = {
             let sink = self.lock();
             (sink.store(), sink.promoted.clone())
         };
-        let mut requeue = Vec::new();
-        let mut all_published = true;
         for (key, records) in batches {
             let start = Instant::now();
             match publish_partition(&store, &key, &records, &promoted) {
                 Ok(()) => {
                     self.lock()
                         .note_published(records.len(), start.elapsed(), trigger);
+                    on_stored(&key, &records);
                 }
                 Err(FlushError::Encode(WriterError::Batch(e))) if is_per_record_rejection(&e) => {
                     // Permanent per-record rejection: requeueing would
@@ -1219,21 +1281,19 @@ impl SharedParquetSink {
                     if publish_partition(&store, &key, &kept, &promoted).is_ok() {
                         self.lock()
                             .note_published(kept.len(), start.elapsed(), trigger);
+                        on_stored(&key, &kept);
                     } else {
                         self.lock().note_flush_error();
                         requeue.push((key, kept));
-                        all_published = false;
                     }
                 }
                 Err(_) => {
                     self.lock().note_flush_error();
                     requeue.push((key, records));
-                    all_published = false;
                 }
             }
         }
-        self.requeue(requeue, registered);
-        all_published
+        requeue
     }
 
     /// The concurrent-phase emit (RFC 0035 §3.1). Safe to call from many
@@ -1244,6 +1304,10 @@ impl SharedParquetSink {
     /// the lock** via [`Self::publish_owned`] (which settles counters,
     /// quarantines poison records, and requeues on transient failure) —
     /// so one worker's Parquet encode never blocks the others' appends.
+    ///
+    /// The encode pool does not call this: its workers hand what
+    /// [`Self::detach_concurrent`] takes to RFC 0052 §3.1's publisher, so
+    /// no worker is inside a PUT while a barrier quiesces the pool.
     pub fn emit_concurrent(&self, record: MinedRecord, registered: Epoch) {
         for (trigger, taken) in self.detach_concurrent(record) {
             if !taken.is_empty() {
@@ -1388,6 +1452,54 @@ mod tests {
             max_buffer_age: Duration::from_secs(86_400),
             ceiling_bytes: usize::MAX,
         }
+    }
+
+    /// `on_stored` sees exactly the rows that reached the store. A row the
+    /// writer quarantines never does, and a partition whose put fails does
+    /// not hide the one that landed. The RFC 0047 §3.3 graph feed derives
+    /// its tuples from this, so a rejected row cannot grant visibility.
+    #[test]
+    fn on_stored_reports_exactly_the_stored_rows() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // A plain file where tenant `blocked`'s partition directory would go:
+        // its put fails, while tenant `ok`'s lands.
+        std::fs::create_dir_all(dir.path().join("data")).expect("data dir");
+        std::fs::write(dir.path().join("data").join("tenant_id=blocked"), b"")
+            .expect("blocking file");
+        let handle = SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(dir.path()).expect("local store"),
+            never_flush(),
+        ));
+        let stored_row = rec("ok");
+        let mut rejected_row = rec("ok");
+        rejected_row.observed_time_unix_nano = Some(u64::MAX);
+        let ok_key = PartitionKey::derive(&stored_row).expect("ok key");
+        let blocked_row = rec("blocked");
+        let blocked_key = PartitionKey::derive(&blocked_row).expect("blocked key");
+
+        let mut seen: Vec<(PartitionKey, Vec<MinedRecord>)> = Vec::new();
+        let failed = handle.publish_unrequeued(
+            vec![
+                (ok_key.clone(), vec![stored_row.clone(), rejected_row]),
+                (blocked_key.clone(), vec![blocked_row]),
+            ],
+            "test",
+            |key, stored| seen.push((key.clone(), stored.to_vec())),
+        );
+
+        assert_eq!(
+            seen,
+            vec![(ok_key, vec![stored_row])],
+            "only the stored row of the partition that landed is reported"
+        );
+        assert_eq!(
+            failed
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            vec![blocked_key],
+            "the failed partition comes back for requeue, unreported"
+        );
     }
 
     #[test]

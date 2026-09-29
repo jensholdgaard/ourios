@@ -3,38 +3,40 @@
 //!
 //! The ingest pipeline's ordered phase (Drain match + template-id
 //! assignment under the global gate) hands each batch's mined records
-//! here; N workers run the order-insensitive
-//! [`SharedParquetSink::emit_concurrent`] off the gate.
+//! here; N workers append them to the record sink off the gate
+//! ([`SharedParquetSink::detach_concurrent`]) and hand whatever the size
+//! and ceiling triggers take to RFC 0052 §3.1's publisher, so no worker
+//! is ever inside a PUT.
 //!
-//! - **Backpressure**: the queue is a fixed-bound `sync_channel` — a
-//!   full queue blocks [`EncodePool::submit`], which runs under the
-//!   ingest gate, so an encode-bound burst throttles admission instead
-//!   of growing an unbounded in-flight backlog (§3.1 / hazard #4). Depth
-//!   is exported as `ourios.ingest.encode.queue_depth`.
+//! - **Backpressure**: the queue is bounded — a full queue blocks
+//!   [`EncodePool::submit`], which runs under the ingest gate, so an
+//!   encode-bound burst throttles admission instead of growing an
+//!   unbounded in-flight backlog (§3.1 / hazard #4). Depth is exported
+//!   as `ourios.ingest.encode.queue_depth`.
 //! - **Quiesce**: [`EncodePool::quiesce`] blocks until every submitted
-//!   batch has completed its sink emit. Whole-pool (not keyed to a WAL
+//!   batch has finished its encode phase. Whole-pool (not keyed to a WAL
 //!   mark) — sound because submission happens inside the gated region,
 //!   so at any rotation check every in-flight encode is for a frame at
 //!   or below the mark; see the §3.1 barrier reasoning in
 //!   `receiver/pipeline.rs`. Rotation is per-segment (128 MiB default),
 //!   so the drain's cost amortizes to ~zero.
 
-use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::thread::JoinHandle;
 
 use ourios_core::record::MinedRecord;
 
 use crate::cadence::{BarrierEpochs, Epoch};
+use crate::lane::{Lane, Serve};
 use crate::metrics::EncodePoolMetrics;
+use crate::publisher::{BatchCompletion, Detached, Publisher};
 use crate::record_sink::SharedParquetSink;
 
-/// Queue bound in batches per worker: deep enough to keep workers fed,
-/// shallow enough that the in-flight backlog stays a few batches per
-/// core (memory bound + backpressure to the gate).
 /// Upper bound on encode workers (see `new`): thread-budget +
 /// overflow safety for the queue-capacity multiplication.
 const MAX_WORKERS: usize = 256;
+/// Queue bound in batches per worker: deep enough to keep workers fed,
+/// shallow enough that the in-flight backlog stays a few batches per
+/// core (memory bound + backpressure to the gate).
 const QUEUE_BATCHES_PER_WORKER: usize = 4;
 
 /// Outstanding-batch accounting shared between submitters, workers, and
@@ -55,9 +57,9 @@ impl Pending {
 }
 
 /// Decrements the pending count on drop — so a batch is settled even if
-/// `emit_concurrent` panics mid-batch. Without this, a worker panic
-/// would strand `quiesce` forever, which turns one poisoned record into
-/// a wedged rotation barrier (and a hung shutdown).
+/// its emit panics mid-batch. Without this, a worker panic would strand
+/// `quiesce` forever, which turns one poisoned record into a wedged
+/// rotation barrier (and a hung shutdown).
 ///
 /// RFC 0052 §3.1 makes it do two more things. It is **constructed in
 /// `submit`**, under the barrier exclusion, and travels with the queued
@@ -66,10 +68,10 @@ impl Pending {
 /// the wrong cut. And an unwinding drop **reports** its epoch to the
 /// cadence latch *before* the decrement that settles the count — so a
 /// barrier that observes the pool's pending count at zero has already
-/// observed the latch. `emit_concurrent` runs after the frame was
-/// acknowledged, so a worker panic mid-batch leaves the batch's
-/// unemitted remainder in neither the buffers nor Parquet; without the
-/// report, a barrier after it would stamp across that frame.
+/// observed the latch. The emit runs after the frame was acknowledged,
+/// so a worker panic mid-batch leaves the batch's unemitted remainder in
+/// neither the buffers nor Parquet; without the report, a barrier after
+/// it would stamp across that frame.
 struct BatchGuard {
     pending: Arc<Pending>,
     metrics: Arc<EncodePoolMetrics>,
@@ -88,79 +90,114 @@ impl Drop for BatchGuard {
 }
 
 /// One batch on its way to a worker, carrying the guards `submit`
-/// created for it under the exclusion.
+/// created for it under the exclusion: the encode phase's, and the
+/// publish completion every partition it detaches will share.
 struct QueuedBatch {
     records: Vec<MinedRecord>,
     guard: BatchGuard,
+    completion: Arc<BatchCompletion>,
 }
 
-/// A bounded pool of OS threads draining mined-record batches into
-/// [`SharedParquetSink::emit_concurrent`]. Dedicated threads rather than
-/// the tokio blocking pool: the encode is CPU-bound and its concurrency
-/// must stay fixed at the configured worker count, not compete with the
-/// runtime's elastic blocking pool. Dropping the pool closes the queue
+/// A worker's work: append each record to the buffers and hand whatever
+/// the size and ceiling triggers detach to the publisher — never a PUT
+/// of its own (RFC 0052 §3.1).
+struct Encode {
+    sink: SharedParquetSink,
+    publisher: Publisher,
+}
+
+impl Serve<QueuedBatch> for Encode {
+    fn serve(&self, batch: QueuedBatch) {
+        let QueuedBatch {
+            records,
+            guard,
+            completion,
+        } = batch;
+        // Locals drop in reverse, so the batch's share of its publish is
+        // released before its encode phase settles: a `quiesce` that
+        // returns then sees the guard held only by detached partitions.
+        let _settle = guard;
+        let completion = completion;
+        for record in records {
+            for (trigger, taken) in self.sink.detach_concurrent(record) {
+                if !taken.is_empty() {
+                    self.publisher
+                        .publish(Detached::new(taken, trigger, &completion));
+                }
+            }
+        }
+    }
+
+    /// A batch queued behind a panicking one is still encoded: its
+    /// records were acknowledged, and settling it without an emit would
+    /// strand them outside both the buffers and the store (issue #837).
+    fn salvage(&self, batch: QueuedBatch) {
+        self.serve(batch);
+    }
+}
+
+/// A bounded pool of OS threads appending mined-record batches to the
+/// record sink. Dedicated threads rather than the tokio blocking pool: the
+/// encode is CPU-bound and its concurrency must stay fixed at the
+/// configured worker count, not compete with the runtime's elastic
+/// blocking pool. A worker panic retires the pool's generation — the
+/// batches queued behind it are still encoded — and the next `submit`
+/// starts a new one (`crate::lane`). Dropping the pool closes the queue
 /// and joins the workers.
 pub struct EncodePool {
-    /// `Some` until drop; taking it closes the channel so workers exit.
-    tx: Option<SyncSender<QueuedBatch>>,
+    lane: Lane<QueuedBatch>,
+    publisher: Publisher,
     pending: Arc<Pending>,
     metrics: Arc<EncodePoolMetrics>,
     epochs: Arc<BarrierEpochs>,
-    workers: Vec<JoinHandle<()>>,
+    workers: usize,
 }
 
 impl EncodePool {
-    /// Spawn `workers` (min 1) threads emitting into `sink`. The sink
-    /// must be the same sink the miner was built with, so flush triggers
-    /// and the rotation/shutdown drains see one buffer.
+    /// Spawn `workers` (min 1) threads emitting into `sink`, with a
+    /// publisher of their own for what the size and ceiling triggers
+    /// detach. The sink must be the same sink the miner was built with,
+    /// so flush triggers and the rotation/shutdown drains see one buffer.
+    ///
+    /// That publisher's returns are ordered against its own handoff, not
+    /// a coordinator's, so a `Barrier` cannot order them against its
+    /// drains. A pipeline with a barrier uses [`Self::with_publisher`]
+    /// with the barrier coordinator's publisher.
     #[must_use]
     pub fn new(sink: &SharedParquetSink, workers: usize) -> Self {
+        Self::with_publisher(&Publisher::over(sink), workers)
+    }
+
+    /// [`Self::new`], handing detached partitions to `publisher` — the
+    /// publish coordinator's, in the receiver, so they feed the RFC 0047
+    /// §3.3 graph like every other publish.
+    #[must_use]
+    pub fn with_publisher(publisher: &Publisher, workers: usize) -> Self {
         // Clamp to a sane OS-thread budget: a mistyped config value must
         // not spawn thousands of threads or overflow the queue-capacity
         // multiplication below. 256 is far above any per-node core count
         // this targets while keeping capacity arithmetic trivially safe.
         let workers = workers.clamp(1, MAX_WORKERS);
-        let (tx, rx) = sync_channel::<QueuedBatch>(workers * QUEUE_BATCHES_PER_WORKER);
-        // `mpsc::Receiver` is single-consumer; the mutex turns it into a
-        // shared work queue — pickup serializes, the emit work does not.
-        let rx = Arc::new(Mutex::new(rx));
-        let pending = Arc::new(Pending {
-            count: Mutex::new(0),
-            idle: Condvar::new(),
-        });
-        let metrics = Arc::new(EncodePoolMetrics::new());
-        let handles = (0..workers)
-            .map(|_| {
-                let rx = Arc::clone(&rx);
-                let sink = sink.clone();
-                std::thread::spawn(move || {
-                    loop {
-                        let batch = {
-                            let rx = rx.lock().unwrap_or_else(PoisonError::into_inner);
-                            rx.recv()
-                        };
-                        let Ok(batch) = batch else {
-                            return; // channel closed: pool dropped
-                        };
-                        // The guard was made in `submit`, under the
-                        // exclusion, with the epoch of the cut whose
-                        // mark could cover this batch (RFC 0052 §3.1);
-                        // the worker only drops what it received.
-                        let epoch = batch.guard.epoch;
-                        let _settle = batch.guard;
-                        for record in batch.records {
-                            sink.emit_concurrent(record, epoch);
-                        }
-                    }
-                })
-            })
-            .collect();
+        let sink = publisher.record().clone();
+        let lane = Lane::new(
+            workers,
+            workers * QUEUE_BATCHES_PER_WORKER,
+            Arc::new(Encode {
+                sink: sink.clone(),
+                publisher: publisher.clone(),
+            }),
+        );
+        lane.start();
         Self {
-            tx: Some(tx),
-            pending,
-            metrics,
+            lane,
             epochs: sink.epochs(),
-            workers: handles,
+            publisher: publisher.clone(),
+            pending: Arc::new(Pending {
+                count: Mutex::new(0),
+                idle: Condvar::new(),
+            }),
+            metrics: Arc::new(EncodePoolMetrics::new()),
+            workers,
         }
     }
 
@@ -172,15 +209,15 @@ impl EncodePool {
         Arc::clone(&self.epochs)
     }
 
+    /// The number of OS worker threads per generation (post-clamp).
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.workers
+    }
+
     /// Queue one batch's mined records for concurrent emit. Blocks when
     /// the queue is full — the backpressure to the caller (the ingest
     /// gate).
-    /// The number of OS worker threads actually spawned (post-clamp).
-    #[must_use]
-    pub fn worker_count(&self) -> usize {
-        self.workers.len()
-    }
-
     pub fn submit(&self, batch: Vec<MinedRecord>) {
         if batch.is_empty() {
             return;
@@ -191,34 +228,31 @@ impl EncodePool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += 1;
         self.metrics.batch_submitted();
-        // RFC 0052 §3.1: the guard and its epoch are assigned here, under
-        // the caller's barrier exclusion, and travel with the batch. A
-        // batch queued before cut `E`'s capture and dequeued after it
-        // therefore still carries `E`.
+        // RFC 0052 §3.1: the guards and their epoch are assigned here,
+        // under the caller's barrier exclusion, and travel with the
+        // batch. A batch queued before cut `E`'s capture and dequeued
+        // after it therefore still carries `E`, and every partition it
+        // detaches is in flight from the instant it leaves the buffers.
+        let completion = self.publisher.begin_batch();
         let guard = BatchGuard {
             pending: Arc::clone(&self.pending),
             metrics: Arc::clone(&self.metrics),
             epochs: Arc::clone(&self.epochs),
-            epoch: self.epochs.current(),
+            epoch: completion.epoch(),
         };
-        let queued = QueuedBatch {
+        self.lane.send(QueuedBatch {
             records: batch,
             guard,
-        };
-        // Workers already gone (drop in progress): the returned batch's
-        // guard settles the count as it drops here, so a concurrent
-        // quiesce cannot wait forever on a batch nobody will run.
-        match self.tx.as_ref() {
-            Some(tx) => drop(tx.send(queued)),
-            None => drop(queued),
-        }
+            completion,
+        });
     }
 
-    /// Block until the queue is empty and every worker has finished its
-    /// batch — the drain half of the RFC 0035 §3.1 encode-drain-and-flush
-    /// barrier. The caller owns the flush half (and the reasoning for why
-    /// a whole-pool drain covers the WAL mark lives at the call sites in
-    /// `receiver/pipeline.rs`).
+    /// Block until every submitted batch has finished its **encode
+    /// phase** — each record appended to the buffers or detached into a
+    /// registered publish — the drain half of the RFC 0035 §3.1
+    /// encode-drain-and-flush barrier. It does not wait for the
+    /// publisher's PUTs: those settle under `quiesce_publishes`, outside
+    /// the exclusion a barrier holds here (RFC 0052 §3.1).
     pub fn quiesce(&self) {
         let mut count = self
             .pending
@@ -231,17 +265,6 @@ impl EncodePool {
                 .idle
                 .wait(count)
                 .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-}
-
-impl Drop for EncodePool {
-    fn drop(&mut self) {
-        // Closing the channel ends each worker's `recv` loop; joining
-        // guarantees no worker still holds a sink handle after drop.
-        drop(self.tx.take());
-        for handle in self.workers.drain(..) {
-            drop(handle.join());
         }
     }
 }
@@ -332,6 +355,9 @@ mod tests {
             pool.submit(vec![rec("tenant-a")]);
         }
         pool.quiesce();
+        // RFC 0052 §3.1: the quiesce covers the encode phase only; the
+        // publisher's PUTs settle under `quiesce_publishes`.
+        let _outcomes = sink.quiesce_publishes();
         assert_eq!(sink.buffered_records(), 0, "everything published");
         assert_eq!(sink.flushes(), 8, "one size-triggered publish per emit");
     }
@@ -390,5 +416,94 @@ mod tests {
             Some(epoch),
             "and reported its epoch before the decrement (RFC 0052 §3.1)",
         );
+    }
+
+    /// Issue #837: a worker that panics mid-batch must neither wedge
+    /// `quiesce` nor take the pool down with it. Before the lane, the
+    /// last worker's unwind dropped the queue's receiver: every batch
+    /// queued behind the panic, and every batch submitted after it, was
+    /// discarded without an emit — `quiesce` returned, but acknowledged
+    /// records reached neither the buffers nor the store until a restart
+    /// replayed them.
+    #[test]
+    fn a_panicked_worker_leaves_a_pool_that_still_encodes_every_later_batch() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&calls);
+        let gate = Arc::clone(&release);
+        // The inline audit barrier is the seam a worker really runs
+        // inside its emit: the first call holds, then panics.
+        let sink = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                store,
+                FlushConfig {
+                    target_bytes: 1, // every emit crosses the target
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+            )
+            .with_audit_barrier(Box::new(move || {
+                if seen.fetch_add(1, Ordering::AcqRel) == 0 {
+                    while !gate.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    panic!("injected encode-worker panic");
+                }
+                true
+            })),
+        );
+        let epochs = sink.epochs();
+        let failing = epochs.current();
+        let pool = Arc::new(EncodePool::new(&sink, 1));
+
+        // Given a batch queued behind one whose worker is about to panic,
+        pool.submit(vec![rec("tenant-a")]);
+        await_calls(&calls, 1);
+        pool.submit(vec![rec("tenant-b")]);
+        release.store(true, Ordering::Release);
+        // and one submitted once the panic has retired the worker.
+        await_calls(&calls, 2);
+        pool.submit(vec![rec("tenant-c")]);
+
+        // When the pool is quiesced, it returns.
+        let (done, quiesced) = std::sync::mpsc::channel();
+        let waiter = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            waiter.quiesce();
+            let _ = done.send(());
+        });
+        assert!(
+            quiesced.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "quiesce returned after the worker panic",
+        );
+        let _outcomes = sink.quiesce_publishes();
+
+        // Then both later batches were encoded and published, and only
+        // the panicking batch's own record is outside the store — in the
+        // buffers, where it was appended before the trigger ran.
+        assert_eq!(sink.flushes(), 2, "every batch after the panic published");
+        assert_eq!(sink.buffered_records(), 1);
+        assert_eq!(
+            epochs.capture().failed_epoch(),
+            Some(failing),
+            "and the panic latched its own batch's epoch",
+        );
+    }
+
+    /// Wait until the audit barrier has been entered `want` times —
+    /// failing, not hanging, when a regression means it never is.
+    fn await_calls(calls: &std::sync::atomic::AtomicUsize, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while calls.load(std::sync::atomic::Ordering::Acquire) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the barrier was never reached {want} time(s)",
+            );
+            std::thread::yield_now();
+        }
     }
 }

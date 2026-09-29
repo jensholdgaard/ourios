@@ -3370,10 +3370,14 @@ dependencies = [
 name = "ourios-ingester"
 version = "0.10.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "flate2",
+ "futures",
  "futures-core",
  "http",
+ "object_store",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",

@@ -510,8 +510,9 @@ impl ReceiverHandle {
             // guarantees no record ≤ the stamped high-water is still
             // in-flight or buffered-but-unflushed. The publish half of the
             // barrier (issue #578) is `flush_then_snapshot`'s own
-            // `quiesce_publishes` — trivially settled here because the
-            // sweep task was joined above, but not reliant on that.
+            // `quiesce_publishes`, which also waits out whatever the pool
+            // handed the publisher (RFC 0052 §3.1): a detached partition
+            // is written, requeued or parked before the flush below.
             self.pipeline.quiesce_encodes();
             self.pipeline.with_miner(|miner| {
                 flush_then_snapshot(
@@ -560,11 +561,13 @@ fn latch_on_panic(epochs: &BarrierEpochs, cut: impl FnOnce() -> CutOutcome) {
 /// `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md` §3.6).
 ///
 /// The audit sink is built first so the record sink can take an **audit
-/// barrier** (issue #302 fix #2): before any inline size/ceiling publish the
-/// record sink flushes the audit sink to durability, so a partition is never
-/// put to the store before its template events are durable. That inline publish
-/// runs under the miner lock, so the barrier flush + the publish are atomic
-/// w.r.t. ingest.
+/// barrier** (issue #302 fix #2), so a partition is never put to the store
+/// before its template events are durable. Since RFC 0052 §3.1 the barrier
+/// runs on an encode worker, which a barrier holding the ingest exclusion
+/// waits on, so it is `settled`: every emitted event already durable,
+/// answered without store I/O. When it is not, it signals the age sweep to
+/// flush the audit buffer, and the partition waits in the buffers for the
+/// next append.
 fn build_write_sinks(
     store: Store,
     promoted: PromotedAttributes,
@@ -578,7 +581,7 @@ fn build_write_sinks(
     let sink = SharedParquetSink::new(
         ParquetRecordSink::new(store, flush_config())
             .with_promoted_attributes(promoted)
-            .with_audit_barrier(Box::new(move || barrier_audit.barrier()))
+            .with_audit_barrier(Box::new(move || barrier_audit.settled()))
             // RFC 0025 §3.3: permanently-rejected records quarantine
             // to the shared audit stream instead of wedging the
             // partition buffer (#362).
@@ -881,9 +884,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             // global commit gate; the pool emits into the same shared
             // sink the miner holds, so a cut's drain covers it. The
             // pipeline drains the pool inside every capture; shutdown
-            // drains it below.
-            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(
-                &sink,
+            // drains it below. What the size and ceiling triggers detach
+            // goes to the coordinator's publisher (RFC 0052 §3.1), so it
+            // feeds the RFC 0047 §3.3 graph like every other publish.
+            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::with_publisher(
+                publisher.publisher(),
                 config.encode_workers,
             )),
     );
@@ -1559,6 +1564,68 @@ mod tests {
         assert!(
             saw_tuples.is_ok(),
             "the cut's publish wrote tuples; the graph saw {:?}",
+            writes.lock().expect("lock"),
+        );
+    }
+
+    /// RFC 0047 §3.3, issue #834: a partition the **size trigger** takes
+    /// feeds the graph too. It used to be written by the encode worker
+    /// straight through the sink, which never reached the emitter; it now
+    /// goes to the coordinator's publisher (RFC 0052 §3.1), which writes
+    /// through the same feed as the cadence and the barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_size_triggered_publish_feeds_the_graph() {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let emitter = fake_graph_emitter(Arc::clone(&writes)).await;
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            store.clone(),
+            AUDIT_SINK_CEILING_EVENTS,
+        ));
+        let barrier_audit = audit.clone();
+        let sink = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                store,
+                FlushConfig {
+                    target_bytes: 1, // every record crosses the size target
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+            )
+            .with_audit_barrier(Box::new(move || barrier_audit.settled())),
+        );
+        let coordinator = PublishCoordinator::new(sink.clone(), audit).with_graph_emitter(emitter);
+        let pool =
+            ourios_ingester::encode_pool::EncodePool::with_publisher(coordinator.publisher(), 1);
+
+        // Given a record whose emit crosses the size target.
+        pool.submit(vec![rec()]);
+        tokio::task::block_in_place(|| {
+            pool.quiesce();
+            let _outcomes = sink.quiesce_publishes();
+        });
+        assert_eq!(
+            sink.flushes(),
+            1,
+            "the size trigger published the partition"
+        );
+
+        // Then the graph sees the partition's tuples, without any cut.
+        let tenant = rec().tenant_id;
+        let tool = format!("tool:{}/query_logs", tenant.as_str());
+        let saw_tuples = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if writes.lock().expect("lock").join("").contains(&tool) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            saw_tuples.is_ok(),
+            "the size-triggered publish wrote tuples; the graph saw {:?}",
             writes.lock().expect("lock"),
         );
     }

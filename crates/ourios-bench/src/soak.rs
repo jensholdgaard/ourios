@@ -47,7 +47,7 @@ use ourios_config::MinerConfig;
 use ourios_ingester::compactor::run_sweep;
 use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::receiver::pipeline::{Journal, ReceiveError};
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{
@@ -423,17 +423,7 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // drain sweep below are measurement overhead, not load.
     let load_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
 
-    // RFC 0035 §3.1: drain the encode pool before the final sample +
-    // drain sweep, so every acked record has reached the sink (and the
-    // D2 backlog counts it) before flush_all runs. The bounded queue
-    // keeps this residue to a few batches per core.
-    let quiesce_pipeline = Arc::clone(&pipeline);
-    if tokio::task::spawn_blocking(move || quiesce_pipeline.quiesce_encodes())
-        .await
-        .is_err()
-    {
-        return Err(SoakError::Setup("encode-pool quiesce panicked".into()));
-    }
+    settle_writes(&pipeline, &sink).await?;
 
     // A send error just means the sampler already exited.
     let _ = stop_tx.send(true);
@@ -454,6 +444,29 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
         samples,
         final_backlog,
     ))
+}
+
+/// Wait until every acked record has reached the sink and every write
+/// the pool handed off has settled, before the final sample and drain
+/// sweep.
+///
+/// RFC 0035 §3.1: the encode pool is drained so the D2 backlog counts
+/// every acked record before `flush_all` runs; the bounded queue keeps
+/// that residue to a few batches per core. RFC 0052 §3.1 moved the
+/// size-trigger PUTs onto the publisher, which the pool's quiesce does not
+/// wait for, so the publishes are waited out too — or a partition could
+/// land after the drain sweep had listed the store.
+async fn settle_writes(
+    pipeline: &SharedPipeline,
+    sink: &SharedParquetSink,
+) -> Result<(), SoakError> {
+    let (pipeline, sink) = (Arc::clone(pipeline), sink.clone());
+    tokio::task::spawn_blocking(move || {
+        pipeline.quiesce_encodes();
+        let _outcomes = sink.quiesce_publishes();
+    })
+    .await
+    .map_err(|_| SoakError::Setup("encode-pool quiesce panicked".into()))
 }
 
 /// Final drain: advance the synthetic clock past the last partition's

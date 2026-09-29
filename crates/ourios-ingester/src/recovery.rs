@@ -51,6 +51,18 @@ pub struct RecoveryReport {
     pub tenants: Vec<TenantRecovery>,
 }
 
+impl RecoveryReport {
+    /// The horizons of the snapshots recovery actually restored — the
+    /// seed for the barrier's snapshot ledger (RFC 0052 §3.2).
+    #[must_use]
+    pub fn accepted_horizons(&self) -> Vec<(TenantId, WalOffset)> {
+        self.tenants
+            .iter()
+            .filter_map(|tenant| tenant.horizon.map(|h| (tenant.tenant_id.clone(), h)))
+            .collect()
+    }
+}
+
 /// One tenant's snapshot-recovery outcome.
 #[derive(Debug)]
 pub struct TenantRecovery {
@@ -60,6 +72,12 @@ pub struct TenantRecovery {
     /// and `S`'s segment did not survive to replay (RFC 0001 §3.5.4
     /// — external mutation; see [`recover`]). The caller warns.
     pub stale_gap: bool,
+    /// The horizon recovery restored this tenant at — `Some` only when
+    /// the artefact decoded, carried a horizon, **and** the miner
+    /// accepted its state. An artefact that decodes but that
+    /// `restore_tenant` rejects is `None`: the next start would discard
+    /// it too, so it must never govern reclamation.
+    pub horizon: Option<WalOffset>,
 }
 
 /// Failure during startup recovery. Recovery aborts loudly — a frame
@@ -150,6 +168,7 @@ pub fn recover(
             (_, outcome) => outcome,
         };
         tenants.push(TenantRecovery {
+            horizon: horizons.get(&tenant_id).copied(),
             tenant_id,
             outcome,
             stale_gap: false,
@@ -216,32 +235,6 @@ pub fn write_snapshots(
         snapshot_store::write(root, &tenant_id, &state)?;
     }
     Ok(())
-}
-
-/// Every tenant's durable snapshot horizon, for seeding the barrier's
-/// snapshot ledger (RFC 0052 §3.2) after the post-recovery snapshots are
-/// written and before anything is reclaimed in this process.
-///
-/// Listed through [`snapshot_store::load_all_durable`], which fsyncs the
-/// root before it lists. An artefact without a parseable horizon, or one
-/// that does not decode, yields no entry: recovery discards those, so the
-/// tenant is pinned rather than trusted.
-///
-/// # Errors
-///
-/// [`SnapshotStoreError`] on the fsync or the listing.
-pub fn durable_horizons(root: &Path) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
-    Ok(snapshot_store::load_all_durable(root)?
-        .into_iter()
-        .filter_map(
-            |(tenant, bytes)| match ourios_miner::snapshot::recover(Some(&bytes)) {
-                (Some(state), RecoveryOutcome::Restored) => {
-                    parse_high_water(state.wal_high_water.as_ref()).map(|horizon| (tenant, horizon))
-                }
-                _ => None,
-            },
-        )
-        .collect())
 }
 
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`

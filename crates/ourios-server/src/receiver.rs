@@ -426,17 +426,8 @@ pub struct ReceiverHandle {
     /// data sink (before it, so a row's template event is durable no later than
     /// the row), and likewise gates the shutdown snapshot.
     audit_sink: SharedParquetAuditSink,
-    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
-    /// clean exit on shutdown via the `shutdown` watch signal.
-    flush_tick: JoinHandle<()>,
-    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
-    /// joined before the shutdown flush so no cut is in flight when it
-    /// runs.
-    barrier_tick: JoinHandle<()>,
-    /// The RFC 0052 §3.2 housekeeping task (one capped pass per
-    /// `housekeeping_secs`); joined with the other cadences, before the
-    /// shutdown flush, so no pass holds the journal past the handle.
-    housekeeping_tick: JoinHandle<()>,
+    /// The three cadence tasks, each joined before the shutdown flush.
+    cadences: Cadences,
     /// The same barrier the task and the rotation hook hold. Shutdown
     /// runs whatever is left in its pending slot once the task is
     /// joined — the hook can fill it after the last tick, and nothing
@@ -476,7 +467,7 @@ impl ReceiverHandle {
         // holding the sink mutex, which the drain below would then wait on
         // anyway. A `JoinError` (the task panicked) is ignored — the drain
         // below still runs.
-        let _ = self.flush_tick.await;
+        let _ = self.cadences.sweep.await;
         // RFC 0052 §3.1: the receiver joins the barrier task after its
         // running cut finishes, so the flush below cannot race a cut
         // holding drained batches outside the buffers. A store failure
@@ -486,8 +477,12 @@ impl ReceiverHandle {
         // its tick's own `catch_unwind`; a cut it was running may have
         // drained batches it never settled, so it is logged and latched,
         // and the stamp below refuses rather than advance past them.
-        cadence::read_join(&self.epochs, "barrier", self.barrier_tick.await);
-        cadence::read_join(&self.epochs, "housekeeping", self.housekeeping_tick.await);
+        cadence::read_join(&self.epochs, "barrier", self.cadences.barrier.await);
+        cadence::read_join(
+            &self.epochs,
+            "housekeeping",
+            self.cadences.housekeeping.await,
+        );
         // The barrier task is gone, but the slot it fed need not be
         // empty: the rotation hook is capture-only, so an append taken
         // just before the signal can have left a cut there with nothing
@@ -821,9 +816,34 @@ fn build_acceptors(
 /// The three background cadences the receiver runs: RFC0014.2's age
 /// sweep, RFC 0052 §3.1's barrier and §3.2's housekeeping.
 struct Cadences {
+    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
+    /// clean exit on shutdown via the `shutdown` watch signal.
     sweep: JoinHandle<()>,
+    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
+    /// joined before the shutdown flush so no cut is in flight when it
+    /// runs.
     barrier: JoinHandle<()>,
+    /// The RFC 0052 §3.2 housekeeping task (one capped pass per
+    /// `housekeeping_secs`); joined with the other cadences, before the
+    /// shutdown flush, so no pass holds the journal past the handle.
     housekeeping: JoinHandle<()>,
+}
+
+/// The housekeeping knobs, captured before `WalConfig` moves into
+/// `Wal::open`.
+struct HousekeepingPlan {
+    every: Duration,
+    max_unlinks: usize,
+}
+
+impl HousekeepingPlan {
+    fn of(wal: &WalConfig) -> Self {
+        Self {
+            // `interval` panics on a zero period; the config layer's floor is 1.
+            every: Duration::from_secs(wal.housekeeping_secs.max(1)),
+            max_unlinks: usize::try_from(wal.max_unlinks_per_pass).unwrap_or(usize::MAX),
+        }
+    }
 }
 
 /// What the cadences are built over. A value rather than three more
@@ -838,9 +858,9 @@ struct CadenceInputs {
     /// Built before the pipeline, because the capture-only rotation hook
     /// the pipeline installs holds it (RFC 0052 §3.1).
     barrier: Arc<Barrier>,
-    housekeeper: Housekeeper,
-    /// `WalConfig::housekeeping_secs`.
-    housekeeping_every: Duration,
+    /// The journal owner housekeeping reclaims through.
+    commits: Arc<CommitCoordinator>,
+    housekeeping: HousekeepingPlan,
 }
 
 /// Start the cadences over one publish coordinator.
@@ -852,14 +872,20 @@ fn spawn_cadences(
     let CadenceInputs {
         publisher,
         barrier,
-        housekeeper,
-        housekeeping_every,
+        commits,
+        housekeeping,
     } = inputs;
     let overflow = publisher.audit().overflow_notify();
+    let housekeeper = Housekeeper::new(
+        commits,
+        Arc::clone(&barrier),
+        publisher.clone(),
+        housekeeping.max_unlinks,
+    );
     Cadences {
         housekeeping: spawn_housekeeping(
             housekeeper,
-            housekeeping_every,
+            housekeeping.every,
             barrier.epochs(),
             shutdown.clone(),
         ),
@@ -904,9 +930,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
     let segment_size_bytes = config.wal.segment_size_bytes;
-    // `interval` panics on a zero period; the config layer's floor is 1.
-    let housekeeping_every = Duration::from_secs(config.wal.housekeeping_secs.max(1));
-    let max_unlinks = usize::try_from(config.wal.max_unlinks_per_pass).unwrap_or(usize::MAX);
+    let housekeeping = HousekeepingPlan::of(&config.wal);
     // RFC0052.13: a snapshot listed at startup governs reclamation only
     // once the snapshots root and its parent are durable **in this
     // process**. A failure here fails startup rather than discarding the
@@ -959,20 +983,6 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             "post-recovery",
         );
     });
-    // RFC 0052 §3.2: the snapshot ledger housekeeping reclaims against is
-    // seeded from the directory once, here — after the post-recovery
-    // snapshots and before anything is reclaimed in this process. An
-    // unreadable listing seeds nothing, which pins every tenant with
-    // frames: reclamation waits for the barrier's first install.
-    let horizons = recovery::durable_horizons(&snapshots_root).unwrap_or_else(|e| {
-        tracing::warn!(
-            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
-            error = %e,
-            "the durable snapshot listing failed; housekeeping retains every tenant's frames \
-             until the barrier's next snapshot install"
-        );
-        Vec::new()
-    });
 
     // The group-commit coordinator owns the single-writer WAL and folds
     // concurrent appends into one fsync per `wal_batch_window_ms`
@@ -990,13 +1000,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         &commits,
         snapshots_root.clone(),
         config.graph_emitter.clone(),
-        horizons,
-    );
-    let housekeeper = Housekeeper::new(
-        Arc::clone(&commits),
-        Arc::clone(&barrier),
-        publisher.clone(),
-        max_unlinks,
+        // RFC 0052 §3.2's snapshot ledger starts from the snapshots
+        // recovery actually restored: an artefact it rejected would be
+        // rejected again on the next start, so its horizon must never
+        // let housekeeping unlink the frames that start would replay.
+        report.accepted_horizons(),
     );
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(Arc::clone(&commits), miner)
@@ -1027,17 +1035,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // — one word across every guard in the receiver (RFC 0052 §3.1).
     let pipeline_epochs = pipeline.epochs();
 
-    let Cadences {
-        sweep: flush_tick,
-        barrier: barrier_tick,
-        housekeeping: housekeeping_tick,
-    } = spawn_cadences(
+    let cadences = spawn_cadences(
         &pipeline,
         CadenceInputs {
             publisher,
             barrier: Arc::clone(&barrier),
-            housekeeper,
-            housekeeping_every,
+            commits,
+            housekeeping,
         },
         &shutdown_rx,
     );
@@ -1109,9 +1113,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         snapshots_root,
         sink,
         audit_sink,
-        flush_tick,
-        barrier_tick,
-        housekeeping_tick,
+        cadences,
         barrier,
         epochs: pipeline_epochs,
     })

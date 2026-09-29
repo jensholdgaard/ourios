@@ -52,6 +52,7 @@ mod rfc0043_event_name_derivation;
 mod rfc0046_4_wal_frame_carries_tenant;
 mod rfc0052_10_no_loss;
 mod rfc0052_12_record_write_off_guard;
+mod rfc0052_13_snapshot_ledger;
 mod rfc0052_13_startup_fsync;
 mod rfc0052_14_publisher_exclusion;
 mod rfc0052_14_timer_exclusion;

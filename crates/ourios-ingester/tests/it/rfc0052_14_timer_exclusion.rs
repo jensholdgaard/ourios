@@ -451,11 +451,20 @@ async fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting
     let mark = rig.pipeline.last_durable().expect("a durable mark");
     put.await_entered(2);
 
-    // When a tick starts.
+    // When a tick starts, and has opened its cut: the next turn must be
+    // admitted after the capture, or its frame would be in this cut.
+    let before = rig.epochs.current();
     let tick = {
         let rig = Arc::clone(&rig);
         tokio::task::spawn_blocking(move || rig.barrier.tick(&rig.pipeline, false))
     };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while rig.epochs.current() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the tick opened its cut");
 
     // Then the capture does not wait for the held PUT: the quiesce
     // covers the batch's encode phase only, so the exclusion is released

@@ -30,7 +30,7 @@
 //! so the events its records depend on are durable before the item
 //! exists, and stay so.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ourios_core::record::MinedRecord;
 use ourios_parquet::PartitionKey;
@@ -51,21 +51,10 @@ const QUEUE_ITEMS: usize = 16;
 /// the guard drops — settling the publish — when the last of them does.
 pub struct BatchCompletion {
     guard: PublishGuard,
-    sink: SharedParquetSink,
+    returns: Returns,
 }
 
 impl BatchCompletion {
-    /// Register the batch's publish on `sink`. Call under the ingest
-    /// exclusion, as `submit` does, so the epoch is ordered against every
-    /// cut's capture.
-    #[must_use]
-    pub fn begin(sink: &SharedParquetSink) -> Arc<Self> {
-        Arc::new(Self {
-            guard: sink.begin_publish(),
-            sink: sink.clone(),
-        })
-    }
-
     /// The epoch the batch was registered under.
     #[must_use]
     pub fn epoch(&self) -> Epoch {
@@ -116,12 +105,12 @@ impl Detached {
 
     fn park_in_place(&mut self) {
         if let Some(taken) = self.taken.take() {
+            let returns = &self.completion.returns;
             let watermark = taken.audit_watermark();
-            self.completion.sink.park_ready(
-                taken.into_partitions(),
-                watermark,
-                self.completion.epoch(),
-            );
+            let _handoff = returns.lock_handoff();
+            returns
+                .record
+                .park_ready(taken.into_partitions(), watermark, self.completion.epoch());
         }
     }
 
@@ -147,20 +136,44 @@ impl Drop for Detached {
     }
 }
 
+/// How records that left the buffers go back into them: through the
+/// record sink, under the publish coordinator's handoff.
+///
+/// The handoff orders every return against every drain (see
+/// `PublishCoordinator`'s field). The publisher's returns — a failed
+/// PUT's requeue, a park — run on their own threads, so without it one
+/// could land between a rotation capture's drain and its epoch, dated
+/// at the cut it missed, and refuse nothing.
+#[derive(Clone)]
+pub(crate) struct Returns {
+    record: SharedParquetSink,
+    handoff: Arc<Mutex<()>>,
+}
+
+impl Returns {
+    pub(crate) fn new(record: SharedParquetSink, handoff: Arc<Mutex<()>>) -> Self {
+        Self { record, handoff }
+    }
+
+    fn lock_handoff(&self) -> MutexGuard<'_, ()> {
+        self.handoff.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Encode-and-publish for one batch of partitions, feeding the RFC 0047
 /// §3.3 graph once they are durable. The one derivation site both the
 /// coordinator's ordered writes and the publisher go through.
 #[derive(Clone)]
 pub(crate) struct Feed {
-    record: SharedParquetSink,
+    returns: Returns,
     #[cfg(feature = "openfga")]
     graph: Option<Arc<crate::graph_emitter::GraphEmitter>>,
 }
 
 impl Feed {
-    pub(crate) fn new(record: SharedParquetSink) -> Self {
+    pub(crate) fn new(returns: Returns) -> Self {
         Self {
-            record,
+            returns,
             #[cfg(feature = "openfga")]
             graph: None,
         }
@@ -194,7 +207,12 @@ impl Feed {
             }
             tuples
         });
-        let published = self.record.publish_owned(records, trigger, registered);
+        let failed = self.returns.record.publish_unrequeued(records, trigger);
+        let published = failed.is_empty();
+        if !published {
+            let _handoff = self.returns.lock_handoff();
+            self.returns.record.requeue(failed, registered);
+        }
         #[cfg(feature = "openfga")]
         if published
             && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)
@@ -253,11 +271,13 @@ impl Serve<Detached> for Write {
 pub struct Publisher {
     lane: Arc<Lane<Detached>>,
     record: SharedParquetSink,
+    returns: Returns,
 }
 
 impl Publisher {
     pub(crate) fn new(feed: Feed) -> Self {
-        let record = feed.record.clone();
+        let record = feed.returns.record.clone();
+        let returns = feed.returns.clone();
         let write = Write {
             feed,
             runtime: tokio::runtime::Handle::try_current().ok(),
@@ -265,13 +285,30 @@ impl Publisher {
         Self {
             lane: Arc::new(Lane::new(1, QUEUE_ITEMS, Arc::new(write))),
             record,
+            returns,
         }
     }
 
-    /// A publisher over `sink` alone — no graph feed.
+    /// A publisher over `sink` alone — no graph feed, and a handoff of
+    /// its own rather than a coordinator's.
     #[must_use]
     pub fn over(sink: &SharedParquetSink) -> Self {
-        Self::new(Feed::new(sink.clone()))
+        Self::new(Feed::new(Returns::new(
+            sink.clone(),
+            Arc::new(Mutex::new(())),
+        )))
+    }
+
+    /// Register one encode batch's publish — the guard every partition
+    /// it detaches will share. Call under the ingest exclusion, as
+    /// `submit` does, so the epoch is ordered against every cut's
+    /// capture.
+    #[must_use]
+    pub fn begin_batch(&self) -> Arc<BatchCompletion> {
+        Arc::new(BatchCompletion {
+            guard: self.record.begin_publish(),
+            returns: self.returns.clone(),
+        })
     }
 
     /// The record sink this publisher writes to.
@@ -344,7 +381,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let sink = sink(dir.path());
         for order in permutations(&[0, 1, 2, 3]) {
-            let completion = BatchCompletion::begin(&sink);
+            let completion = Publisher::over(&sink).begin_batch();
             // Share 0 is the batch's own encode phase; 1..=3 are detached
             // partitions (empty here — the count is what is under test).
             let mut shares: Vec<Option<Share>> = (0..3)

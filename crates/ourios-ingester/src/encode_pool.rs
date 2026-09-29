@@ -113,7 +113,11 @@ impl Serve<QueuedBatch> for Encode {
             guard,
             completion,
         } = batch;
+        // Locals drop in reverse, so the batch's share of its publish is
+        // released before its encode phase settles: a `quiesce` that
+        // returns then sees the guard held only by detached partitions.
         let _settle = guard;
+        let completion = completion;
         for record in records {
             for (trigger, taken) in self.sink.detach_concurrent(record) {
                 if !taken.is_empty() {
@@ -142,7 +146,7 @@ impl Serve<QueuedBatch> for Encode {
 /// and joins the workers.
 pub struct EncodePool {
     lane: Lane<QueuedBatch>,
-    sink: SharedParquetSink,
+    publisher: Publisher,
     pending: Arc<Pending>,
     metrics: Arc<EncodePoolMetrics>,
     epochs: Arc<BarrierEpochs>,
@@ -182,7 +186,7 @@ impl EncodePool {
         Self {
             lane,
             epochs: sink.epochs(),
-            sink,
+            publisher: publisher.clone(),
             pending: Arc::new(Pending {
                 count: Mutex::new(0),
                 idle: Condvar::new(),
@@ -224,7 +228,7 @@ impl EncodePool {
         // batch. A batch queued before cut `E`'s capture and dequeued
         // after it therefore still carries `E`, and every partition it
         // detaches is in flight from the instant it leaves the buffers.
-        let completion = BatchCompletion::begin(&self.sink);
+        let completion = self.publisher.begin_batch();
         let guard = BatchGuard {
             pending: Arc::clone(&self.pending),
             metrics: Arc::clone(&self.metrics),

@@ -1226,15 +1226,28 @@ impl SharedParquetSink {
         trigger: &'static str,
         registered: Epoch,
     ) -> bool {
+        let failed = self.publish_unrequeued(batches, trigger);
+        let all_published = failed.is_empty();
+        self.requeue(failed, registered);
+        all_published
+    }
+
+    /// [`Self::publish_owned`] without the requeue: the partitions whose
+    /// put failed come back to the caller, which requeues them under
+    /// whatever ordering it owes the capture (RFC 0052 §3.1's handoff).
+    pub(crate) fn publish_unrequeued(
+        &self,
+        batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        trigger: &'static str,
+    ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        let mut requeue = Vec::new();
         if batches.is_empty() {
-            return true;
+            return requeue;
         }
         let (store, promoted) = {
             let sink = self.lock();
             (sink.store(), sink.promoted.clone())
         };
-        let mut requeue = Vec::new();
-        let mut all_published = true;
         for (key, records) in batches {
             let start = Instant::now();
             match publish_partition(&store, &key, &records, &promoted) {
@@ -1256,18 +1269,15 @@ impl SharedParquetSink {
                     } else {
                         self.lock().note_flush_error();
                         requeue.push((key, kept));
-                        all_published = false;
                     }
                 }
                 Err(_) => {
                     self.lock().note_flush_error();
                     requeue.push((key, records));
-                    all_published = false;
                 }
             }
         }
-        self.requeue(requeue, registered);
-        all_published
+        requeue
     }
 
     /// The concurrent-phase emit (RFC 0035 §3.1). Safe to call from many

@@ -43,7 +43,7 @@ use ourios_parquet::PartitionKey;
 
 use crate::audit_sink::{SharedParquetAuditSink, Ticket};
 use crate::cadence::Epoch;
-use crate::publisher::{Feed, Publisher};
+use crate::publisher::{Feed, Publisher, Returns};
 use crate::record_sink::{SharedParquetSink, TakenPartitions};
 
 /// An atomic snapshot of both sinks' buffers, taken under the miner lock and
@@ -140,11 +140,12 @@ impl PublishCoordinator {
     /// Build a coordinator over the two shared sinks.
     #[must_use]
     pub fn new(record: SharedParquetSink, audit: SharedParquetAuditSink) -> Self {
-        let feed = Feed::new(record.clone());
+        let handoff = Arc::new(Mutex::new(()));
+        let feed = Feed::new(Returns::new(record.clone(), Arc::clone(&handoff)));
         Self {
             record,
             audit,
-            handoff: Arc::new(Mutex::new(())),
+            handoff,
             publisher: Publisher::new(feed.clone()),
             feed,
         }
@@ -169,6 +170,12 @@ impl PublishCoordinator {
         self.feed = self.feed.with_graph_emitter(emitter);
         self.publisher = Publisher::new(self.feed.clone());
         self
+    }
+
+    /// The feed this coordinator writes through.
+    #[cfg(test)]
+    pub(crate) fn feed(&self) -> &Feed {
+        &self.feed
     }
 
     /// The publisher the encode pool hands its detached partitions to

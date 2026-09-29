@@ -423,8 +423,15 @@ impl Gate {
         }
     }
 
+    /// Block until `calls` calls have reached the gate — failing, not
+    /// hanging, when a regression means they never will.
     pub fn await_entered(&self, calls: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while self.entered.load(Ordering::Acquire) < calls {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{calls} call(s) never reached the gate",
+            );
             std::thread::yield_now();
         }
     }

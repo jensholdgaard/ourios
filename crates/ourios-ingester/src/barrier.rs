@@ -903,6 +903,24 @@ mod tests {
                 .expect("the racer completed");
         }
 
+        /// Break the data store so every partition write fails.
+        fn sabotage_data_store(&self) {
+            let data = self.audit_root.with_file_name("data");
+            std::fs::remove_dir_all(&data).expect("remove data dir");
+            std::fs::write(&data, b"not a directory").expect("sabotage data");
+        }
+
+        /// The cut the capture left pending must not stamp: the record
+        /// the racer put back missed its drain.
+        fn assert_the_publish_came_back(&self) {
+            assert_eq!(
+                self.barrier.run_pending(),
+                CutOutcome::Retained,
+                "the cut missed the returned record, so it must not stamp",
+            );
+            assert_eq!(self.records.buffered_records(), 1, "the record is buffered");
+        }
+
         /// The cut the capture left pending must not stamp: it missed
         /// records that are now back in the buffers beside their event.
         fn assert_the_cut_retains(&self) {
@@ -969,6 +987,43 @@ mod tests {
             );
         });
         rig.assert_the_cut_retains();
+    }
+
+    /// The publisher's own returns, entered the same window. Since RFC
+    /// 0052 §3.1 moved the size and ceiling PUTs onto the publisher
+    /// thread, a failed PUT's requeue runs concurrently with the rotation
+    /// hook, where it used to run on an encode worker the hook had
+    /// already quiesced.
+    #[test]
+    fn a_publisher_requeue_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let rig = Rig::new();
+        rig.records.clone().emit(mined());
+        // A size take, registered before the capture, whose PUT fails.
+        let guard = rig.records.begin_publish();
+        let taken = rig.records.drain_all().into_partitions();
+        rig.sabotage_data_store();
+        let feed = rig.publish.feed().clone();
+        rig.capture_rotation_racing(move || {
+            assert!(
+                !feed.publish(taken, "size", guard.epoch()),
+                "the PUT fails and the partition is requeued",
+            );
+            drop(guard);
+        });
+        rig.assert_the_publish_came_back();
+    }
+
+    /// And a detached partition parked — a full queue, a retired
+    /// publisher, or the item's destructor — in the same window.
+    #[test]
+    fn a_publisher_park_racing_a_rotation_capture_cannot_let_the_cut_stamp_over_it() {
+        let rig = Rig::new();
+        rig.records.clone().emit(mined());
+        let completion = rig.publish.publisher().begin_batch();
+        let item = crate::publisher::Detached::new(rig.records.drain_all(), "size", &completion);
+        drop(completion);
+        rig.capture_rotation_racing(move || drop(item));
+        rig.assert_the_publish_came_back();
     }
 
     /// A panic inside the rotation capture after its drain — the hook

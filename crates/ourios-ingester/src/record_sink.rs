@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -912,6 +913,10 @@ impl PublishOutcomes {
 pub struct PublishGuard {
     in_flight: Arc<InFlightPublishes>,
     epoch: Epoch,
+    /// Set by the first report of this publish's unwind, so a shared
+    /// guard whose last share drops on the same unwinding thread records
+    /// it once.
+    unwound: AtomicBool,
 }
 
 impl PublishGuard {
@@ -926,6 +931,9 @@ impl PublishGuard {
     /// several partitions (RFC 0052 §3.1's shared completion), whose drop
     /// may come later and not on the unwinding thread.
     pub(crate) fn report_unwound(&self) {
+        if self.unwound.swap(true, Ordering::AcqRel) {
+            return;
+        }
         // Two records of the same unwind, because §3.1 needs both: the
         // latch defends the *ordering* (a cut's recheck sees it), and the
         // settlement defends the *data* (`all_ok` is false for it
@@ -1031,6 +1039,7 @@ impl SharedParquetSink {
         PublishGuard {
             epoch,
             in_flight: Arc::clone(&self.in_flight),
+            unwound: AtomicBool::new(false),
         }
     }
 

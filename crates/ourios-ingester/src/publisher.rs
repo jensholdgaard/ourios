@@ -419,4 +419,35 @@ mod tests {
             );
         }
     }
+
+    /// A publish that unwinds on the item holding its batch's last share
+    /// reaches two reports — the item's own, and the guard's as the share
+    /// drops on the same unwinding thread. It is one unwind: one
+    /// settlement, one bump of the latch's generation.
+    #[test]
+    fn an_unwind_on_the_last_share_is_reported_once() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sink = sink(dir.path());
+        let completion = Publisher::over(&sink).begin_batch();
+        let mut item = Detached::new(TakenPartitions::default(), "size", &completion);
+        drop(completion);
+        let before = sink.epochs().capture().generation();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _records = item.take_partitions();
+            panic!("injected publish panic");
+        }));
+
+        assert!(unwound.is_err(), "the publish panicked");
+        assert_eq!(
+            sink.epochs().capture().generation() - before,
+            1,
+            "the latch counted one unwind",
+        );
+        assert_eq!(
+            sink.quiesce_publishes().recorded(),
+            1,
+            "and one settlement records it",
+        );
+    }
 }

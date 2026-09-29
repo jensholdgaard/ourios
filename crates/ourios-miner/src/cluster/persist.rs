@@ -2,11 +2,14 @@
 //! API, snapshot flattening, and validated restore. Moved verbatim
 //! from the flat `cluster.rs` (epic #745 wave 2).
 
-// The parent scope IS this module's import surface: the split was
-// mechanical code motion (epic #745 wave 2), and gluing back through
-// `super` keeps every pre-split path resolving unchanged.
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+
+use ourios_core::audit::{ParamType, Provenance, ProvenanceSet, SlotTypes};
+use ourios_core::tenant::TenantId;
+
+use super::{AdoptedEntry, MinerCluster, OwnedAdopted, TenantState};
+use crate::mask::tag_str_for;
+use crate::tree::{Leaf, OwnedToken, UpstreamAssociations, format_template};
 
 impl MinerCluster {
     /// Number of distinct templates this tenant has accumulated

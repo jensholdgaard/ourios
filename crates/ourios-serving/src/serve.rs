@@ -59,8 +59,10 @@ pub const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 /// once would spin: the condition clears only as other connections close.
 const FD_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Pause after any other accept error.
-const ACCEPT_RETRY: Duration = Duration::from_millis(1);
+/// Pause after an accept fails for any reason other than a connection-level
+/// error or descriptor exhaustion (`ENOBUFS`, `ENOMEM`, …), so a persistent
+/// listener failure neither spins nor floods the log.
+const LISTENER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Serve `router` over HTTP/1 on `listener` until `shutdown` resolves,
 /// then stop accepting, let every open connection finish its in-flight
@@ -189,16 +191,35 @@ pub(crate) fn set_tcp_keepalive(tcp: &TcpStream) {
 }
 
 pub(crate) async fn accept_failed(e: &io::Error, listener: &'static str) {
-    if fd_exhausted(e) {
-        tracing::warn!(
-            error = %e,
-            listener,
-            "accept failed: out of file descriptors; backing off before retrying",
-        );
-        tokio::time::sleep(FD_EXHAUSTED_BACKOFF).await;
-    } else {
-        tracing::debug!(error = %e, listener, "TCP accept failed");
-        tokio::time::sleep(ACCEPT_RETRY).await;
+    if let Some(pause) = accept_pause(e, listener) {
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// Log a failed accept and return how long to wait before the next one:
+/// none for a connection-level error (the peer went away between SYN and
+/// accept), [`FD_EXHAUSTED_BACKOFF`] when the process is out of file
+/// descriptors, and [`LISTENER_ERROR_BACKOFF`] for anything else.
+fn accept_pause(e: &io::Error, listener: &'static str) -> Option<Duration> {
+    match e.kind() {
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset => {
+            tracing::debug!(error = %e, listener, "TCP accept failed; retrying");
+            None
+        }
+        _ if fd_exhausted(e) => {
+            tracing::warn!(
+                error = %e,
+                listener,
+                "accept failed: out of file descriptors; backing off before retrying",
+            );
+            Some(FD_EXHAUSTED_BACKOFF)
+        }
+        _ => {
+            tracing::warn!(error = %e, listener, "accept failed; backing off before retrying");
+            Some(LISTENER_ERROR_BACKOFF)
+        }
     }
 }
 
@@ -212,10 +233,12 @@ fn fd_exhausted(_: &io::Error) -> bool {
     false
 }
 
-/// Wrap a stream of accepted sockets (tonic's `TcpIncoming`) so that an
-/// accept failing for want of file descriptors is logged at WARN and the
-/// next accept waits 500 ms, instead of tonic retrying in a tight loop.
-/// Every item passes through unchanged.
+/// Wrap a stream of accepted sockets (tonic's `TcpIncoming`) with the same
+/// accept-failure policy as the HTTP listeners: after a connection-level
+/// error the next accept goes ahead at once, after descriptor exhaustion it
+/// waits 500 ms, and after any other error it waits 1 s. tonic itself
+/// retries at once, which spins on a persistent failure. Every item passes
+/// through unchanged.
 pub fn accept_backoff<S>(incoming: S, listener: &'static str) -> AcceptBackoff<S> {
     AcceptBackoff {
         incoming,
@@ -245,14 +268,9 @@ where
         }
         let next = ready!(Pin::new(&mut this.incoming).poll_next(cx));
         if let Some(Err(e)) = &next
-            && fd_exhausted(e)
+            && let Some(pause) = accept_pause(e, this.listener)
         {
-            tracing::warn!(
-                error = %e,
-                listener = this.listener,
-                "accept failed: out of file descriptors; backing off before retrying",
-            );
-            this.pause = Some(Box::pin(tokio::time::sleep(FD_EXHAUSTED_BACKOFF)));
+            this.pause = Some(Box::pin(tokio::time::sleep(pause)));
         }
         Poll::Ready(next)
     }
@@ -283,8 +301,8 @@ mod tests {
     use futures_core::Stream;
 
     use super::{
-        FD_EXHAUSTED_BACKOFF, HEADER_READ_TIMEOUT, PlainListener, accept_backoff, fd_exhausted,
-        serve_with,
+        FD_EXHAUSTED_BACKOFF, HEADER_READ_TIMEOUT, LISTENER_ERROR_BACKOFF, PlainListener,
+        accept_backoff, accept_pause, fd_exhausted, serve_with,
     };
     use crate::tls_serve::{LISTENER_GRPC, LISTENER_HTTP, ReloadingAcceptor, TlsListener};
 
@@ -587,5 +605,71 @@ mod tests {
             Poll::Ready(Some(Err(_)))
         ));
         assert!(matches!(poll_once(&mut incoming), Poll::Ready(Some(Ok(2)))));
+    }
+
+    /// The policy both HTTP listeners and the gRPC wrapper share: a
+    /// connection-level error retries at once, descriptor exhaustion waits
+    /// 500 ms, and any other listener error waits 1 s.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn accept_failures_back_off_by_tier() {
+        let reset = || std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let emfile = || std::io::Error::from_raw_os_error(libc::EMFILE);
+        let enobufs = || std::io::Error::from_raw_os_error(libc::ENOBUFS);
+        let other = || std::io::Error::other("listener failure");
+
+        assert_eq!(accept_pause(&reset(), LISTENER_HTTP), None);
+        assert_eq!(
+            accept_pause(&emfile(), LISTENER_HTTP),
+            Some(FD_EXHAUSTED_BACKOFF)
+        );
+        assert_eq!(
+            accept_pause(&enobufs(), LISTENER_HTTP),
+            Some(LISTENER_ERROR_BACKOFF)
+        );
+        assert_eq!(
+            accept_pause(&other(), LISTENER_HTTP),
+            Some(LISTENER_ERROR_BACKOFF)
+        );
+        assert_eq!(FD_EXHAUSTED_BACKOFF, Duration::from_millis(500));
+        assert_eq!(LISTENER_ERROR_BACKOFF, Duration::from_secs(1));
+
+        let mut incoming = accept_backoff(
+            Scripted(VecDeque::from([
+                Err(reset()),
+                Ok(1),
+                Err(emfile()),
+                Ok(2),
+                Err(enobufs()),
+                Ok(3),
+                Err(other()),
+                Ok(4),
+            ])),
+            LISTENER_GRPC,
+        );
+        assert!(matches!(
+            poll_once(&mut incoming),
+            Poll::Ready(Some(Err(_)))
+        ));
+        assert!(matches!(poll_once(&mut incoming), Poll::Ready(Some(Ok(1)))));
+
+        for (pause, next) in [
+            (FD_EXHAUSTED_BACKOFF, 2),
+            (LISTENER_ERROR_BACKOFF, 3),
+            (LISTENER_ERROR_BACKOFF, 4),
+        ] {
+            assert!(matches!(
+                poll_once(&mut incoming),
+                Poll::Ready(Some(Err(_)))
+            ));
+            assert!(poll_once(&mut incoming).is_pending());
+            tokio::time::advance(pause.saturating_sub(Duration::from_millis(1))).await;
+            assert!(poll_once(&mut incoming).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            match poll_once(&mut incoming) {
+                Poll::Ready(Some(Ok(n))) => assert_eq!(n, next),
+                polled => panic!("expected item {next} after {pause:?}, got {polled:?}"),
+            }
+        }
     }
 }

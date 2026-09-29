@@ -622,6 +622,9 @@ impl Wal {
     /// all — is unrecoverable state: the frames below that horizon are
     /// gone and a pin cannot rebuild what they held. A tenant with no
     /// entry has lost nothing and pins at its oldest surviving frame.
+    /// An entry whose tenant has no surviving frame is satisfied by
+    /// absence: there is no log left to rebuild from, and a tenant that
+    /// writes again is back in the ledger and checked as before.
     fn refuse_unexplained_tenants(
         &self,
         record: Option<&reclaim::ReclaimRecord>,
@@ -638,7 +641,9 @@ impl Wal {
                 else {
                     continue;
                 };
-                if entry.mode != reclaim::EntryMode::Known {
+                if entry.mode != reclaim::EntryMode::Known
+                    || !self.ledger.may_hold_frames(&held.key)
+                {
                     continue;
                 }
                 let restorable = marks.get(&held.key).and_then(|h| h.restorable());

@@ -101,12 +101,15 @@ fn rfc0052_2_only_segments_under_every_horizon_are_unlinked() {
 fn rfc0052_2_horizon_frame_segment_is_unlinked_and_restart_is_clean() {
     // Given: a segment whose only frame for an idle tenant is exactly
     // that tenant's horizon frame, and a later one holding two frames
-    // for a tenant whose horizon reaches only the first.
+    // for a tenant whose horizon reaches only the first. The idle tenant
+    // keeps one frame in the newest segment, above the checkpoint, so its
+    // entry is never satisfied by absence (the churned-out case is
+    // RFC0052.17's) and the refusal below is still the entry's to make.
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let idle = build_tenant_segment(root, &[("idle", b"i1")]);
     let busy = build_tenant_segment(root, &[("alpha", b"b1"), ("alpha", b"b2")]);
-    build_tenant_segment(root, &[("alpha", b"c1")]);
+    build_tenant_segment(root, &[("alpha", b"c1"), ("idle", b"i2")]);
     let before = segment_files(root);
 
     let mut wal = open(root);

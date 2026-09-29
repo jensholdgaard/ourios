@@ -230,6 +230,8 @@ impl Feed {
         trigger: &'static str,
         registered: Epoch,
     ) -> bool {
+        // `Gathered` is `()` without the `openfga` feature.
+        #[cfg_attr(not(feature = "openfga"), allow(clippy::let_unit_value))]
         let mut tuples = Gathered::default();
         let failed =
             self.returns

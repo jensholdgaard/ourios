@@ -3548,7 +3548,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "futures-core",
- "http-body",
  "hyper",
  "hyper-util",
  "jsonwebtoken",

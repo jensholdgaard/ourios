@@ -1,64 +1,47 @@
 //! The HTTP serve loop shared by the OTLP/HTTP and querier listeners,
-//! plaintext and TLS alike, and the connection deadlines it enforces.
+//! plaintext and TLS alike, and the transport deadlines it sets.
 //!
 //! `axum::serve` builds its hyper connection with no timer and exposes no
-//! deadlines, so a peer that stalls mid-request, or parks an idle
-//! keep-alive connection, holds its socket for as long as it likes.
-//! [`serve_http`] keeps `axum::serve`'s accept → spawn → graceful-drain
-//! shape and adds:
+//! settings, so hyper's header-read timeout is off and a peer that stalls
+//! or goes quiet holds its socket for as long as it likes. [`serve_http`]
+//! keeps `axum::serve`'s accept → spawn → graceful-drain shape and sets:
 //!
-//! - [`HEADER_READ_TIMEOUT`]: a request head must be complete this long
-//!   after its first byte (after the accept, for a connection's first
-//!   request), or the connection is dropped;
-//! - [`KEEP_ALIVE_IDLE_TIMEOUT`]: an HTTP/1 connection with no request in
-//!   flight is closed after this long;
-//! - [`HTTP2_KEEPALIVE_INTERVAL`] / [`HTTP2_KEEPALIVE_TIMEOUT`]: HTTP/2
-//!   PINGs that reap a peer which vanished without a FIN;
-//! - [`TCP_KEEPALIVE`] on every accepted socket.
+//! - [`HEADER_READ_TIMEOUT`] on HTTP/1. hyper runs this clock whenever a
+//!   connection is waiting for a request head, including while an idle
+//!   keep-alive connection waits for its next request, so it also closes
+//!   idle keep-alive connections;
+//! - [`HTTP2_KEEPALIVE_INTERVAL`] / [`HTTP2_KEEPALIVE_TIMEOUT`] on HTTP/2;
+//! - [`TCP_KEEPALIVE`] on every accepted socket (via [`PlainListener`] and
+//!   [`TlsListener`](crate::tls_serve::TlsListener)).
 //!
-//! None of these bounds a request once its head has arrived: a request
-//! deadline is client-visible and belongs to the ingest and query
-//! admission contracts, not to transport hygiene.
-//!
-//! The two HTTP/1 clocks are kept here rather than on hyper's
-//! `header_read_timeout`, because hyper starts that timer the moment a
-//! keep-alive connection goes idle: it would also close idle connections
-//! after the header-read timeout, and the idle timeout could never be the
-//! longer of the two.
+//! None of these bounds a request once its head has arrived.
 
-use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::Request;
 use axum::serve::Listener;
 use futures_core::Stream;
-use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, watch};
-use tokio::time::{Instant, Sleep};
+use tokio::sync::watch;
+use tokio::time::Sleep;
 use tower_service::Service as _;
 
-/// How long a client may take to send a complete HTTP/1 request head,
-/// counted from its first byte. hyper's own default.
+/// How long an HTTP/1 connection may wait for a complete request head,
+/// its first one or the next one on a keep-alive connection. hyper's own
+/// default, which stays off unless a timer is set.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long an HTTP/1 connection may sit with no request in flight before
-/// the server closes it. At least as long as common client pool idle
-/// timeouts, so the client is usually the side that closes first.
-pub const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Interval between the server's HTTP/2 keepalive PINGs, on the HTTP
 /// listeners and on the gRPC listener.
@@ -79,19 +62,6 @@ const FD_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(500);
 /// Pause after any other accept error.
 const ACCEPT_RETRY: Duration = Duration::from_millis(1);
 
-const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-#[derive(Clone, Copy, Debug)]
-struct Deadlines {
-    header_read: Duration,
-    idle: Duration,
-}
-
-const DEADLINES: Deadlines = Deadlines {
-    header_read: HEADER_READ_TIMEOUT,
-    idle: KEEP_ALIVE_IDLE_TIMEOUT,
-};
-
 /// Serve `router` on `listener` until `shutdown` resolves, then stop
 /// accepting, let every open connection finish its in-flight requests,
 /// and return once all of them have closed.
@@ -103,18 +73,22 @@ pub async fn serve_http<L>(listener: L, router: Router, shutdown: impl Future<Ou
 where
     L: Listener,
 {
-    serve_with(listener, router, shutdown, DEADLINES).await;
+    serve_with(listener, router, shutdown, HEADER_READ_TIMEOUT).await;
 }
 
 async fn serve_with<L>(
     mut listener: L,
     router: Router,
     shutdown: impl Future<Output = ()>,
-    deadlines: Deadlines,
+    header_read: Duration,
 ) where
     L: Listener,
 {
     let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read);
     builder
         .http2()
         .timer(TokioTimer::new())
@@ -135,7 +109,6 @@ async fn serve_with<L>(
             builder.clone(),
             stop_rx.clone(),
             open_rx.clone(),
-            deadlines,
         ));
     }
     drop(listener);
@@ -150,307 +123,24 @@ async fn serve_connection<I>(
     builder: auto::Builder<TokioExecutor>,
     mut stop: watch::Receiver<bool>,
     _open: watch::Receiver<()>,
-    deadlines: Deadlines,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let activity = Arc::new(Activity::new());
-    let io = TokioIo::new(Tracked::new(io, Arc::clone(&activity)));
-    let service = service_fn({
-        let activity = Arc::clone(&activity);
-        move |request: Request<Incoming>| {
-            let guard = activity.begin_request();
-            let mut router = router.clone();
-            async move {
-                let response = router.call(request.map(Body::new)).await?;
-                Ok::<_, Infallible>(response.map(|body| GuardedBody {
-                    body,
-                    _guard: guard,
-                }))
-            }
-        }
-    });
-    let mut conn = pin!(builder.serve_connection_with_upgrades(io, service));
-    let mut stopping = false;
-    loop {
-        let deadline = activity.next_deadline(deadlines);
-        tokio::select! {
-            served = conn.as_mut() => {
-                if let Err(e) = served {
-                    tracing::debug!(error = %e, "HTTP connection ended with an error");
-                }
-                return;
-            }
-            _ = stop.wait_for(|stop| *stop), if !stopping => {
-                stopping = true;
-                activity.close();
-                conn.as_mut().graceful_shutdown();
-            }
-            () = activity.changed.notified() => {}
-            () = sleep_until(deadline) => {
-                // Re-read: a request may have begun since the deadline was
-                // taken, and a stale header deadline must not drop it.
-                match activity.next_deadline(deadlines) {
-                    Some((at, Expiry::HeaderRead)) if at <= Instant::now() => {
-                        tracing::debug!("request head not received in time; dropping the connection");
-                        return;
-                    }
-                    Some((at, Expiry::Idle)) if at <= Instant::now() => {
-                        activity.close();
-                        conn.as_mut().graceful_shutdown();
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
-async fn sleep_until(deadline: Option<(Instant, Expiry)>) {
-    match deadline {
-        Some((at, _)) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Expiry {
-    HeaderRead,
-    Idle,
-}
-
-/// Where a connection is between requests. HTTP/1 only: an HTTP/2
-/// connection is detected from its preface and left to the PING
-/// keepalive.
-#[derive(Clone, Copy, Debug)]
-enum Phase {
-    /// Waiting for, or part-way through, a request head.
-    Head {
-        since: Instant,
-    },
-    /// No request in flight and no byte of the next one yet.
-    Idle {
-        since: Instant,
-    },
-    /// A request is being handled or its response is being written.
-    Busy {
-        requests: usize,
-    },
-    Http2,
-}
-
-#[derive(Debug)]
-struct ConnState {
-    phase: Phase,
-    /// Set once the connection has been told to close; an idle deadline
-    /// is then moot, a header deadline is not.
-    closing: bool,
-}
-
-#[derive(Debug)]
-struct Activity {
-    state: Mutex<ConnState>,
-    changed: Notify,
-}
-
-impl Activity {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(ConnState {
-                phase: Phase::Head {
-                    since: Instant::now(),
-                },
-                closing: false,
-            }),
-            changed: Notify::new(),
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, ConnState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn next_deadline(&self, deadlines: Deadlines) -> Option<(Instant, Expiry)> {
-        let state = self.lock();
-        match state.phase {
-            Phase::Head { since } => Some((since + deadlines.header_read, Expiry::HeaderRead)),
-            Phase::Idle { since } if !state.closing => Some((since + deadlines.idle, Expiry::Idle)),
-            Phase::Idle { .. } | Phase::Busy { .. } | Phase::Http2 => None,
-        }
-    }
-
-    fn bytes_read(&self) {
-        let mut state = self.lock();
-        if let Phase::Idle { .. } = state.phase {
-            state.phase = Phase::Head {
-                since: Instant::now(),
-            };
-            drop(state);
-            self.changed.notify_one();
-        }
-    }
-
-    fn detected_http2(&self) {
-        self.lock().phase = Phase::Http2;
-    }
-
-    fn close(&self) {
-        self.lock().closing = true;
-    }
-
-    fn begin_request(self: &Arc<Self>) -> RequestGuard {
-        let mut state = self.lock();
-        state.phase = match state.phase {
-            Phase::Head { .. } | Phase::Idle { .. } => Phase::Busy { requests: 1 },
-            Phase::Busy { requests } => Phase::Busy {
-                requests: requests + 1,
-            },
-            Phase::Http2 => Phase::Http2,
-        };
-        RequestGuard(Arc::clone(self))
-    }
-}
-
-/// Holds its connection busy from the moment hyper hands the request to
-/// the router until the response body has been written out.
-#[derive(Debug)]
-struct RequestGuard(Arc<Activity>);
-
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        let mut state = self.0.lock();
-        match state.phase {
-            Phase::Busy { requests: 1 } => {
-                state.phase = Phase::Idle {
-                    since: Instant::now(),
-                };
-                drop(state);
-                self.0.changed.notify_one();
-            }
-            Phase::Busy { requests } => {
-                state.phase = Phase::Busy {
-                    requests: requests.saturating_sub(1),
-                };
-            }
-            Phase::Head { .. } | Phase::Idle { .. } | Phase::Http2 => {}
-        }
-    }
-}
-
-/// The router's response body, carrying the request's [`RequestGuard`]
-/// so the connection counts as busy until hyper drops the body.
-struct GuardedBody {
-    body: Body,
-    _guard: RequestGuard,
-}
-
-impl HttpBody for GuardedBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        Pin::new(&mut self.body).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.body.size_hint()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Sniff {
-    /// This many bytes of the HTTP/2 preface have matched so far.
-    Matching(usize),
-    Http1,
-    Http2,
-}
-
-/// The connection's byte stream, reporting reads to its [`Activity`].
-struct Tracked<I> {
-    io: I,
-    activity: Arc<Activity>,
-    sniff: Sniff,
-}
-
-impl<I> Tracked<I> {
-    fn new(io: I, activity: Arc<Activity>) -> Self {
-        Self {
-            io,
-            activity,
-            sniff: Sniff::Matching(0),
-        }
-    }
-
-    fn observe(&mut self, read: &[u8]) {
-        if let Sniff::Matching(seen) = self.sniff {
-            let n = read.len().min(H2_PREFACE.len() - seen);
-            let matched = read[..n] == H2_PREFACE[seen..seen + n];
-            self.sniff = match seen + n {
-                _ if !matched => Sniff::Http1,
-                total if total == H2_PREFACE.len() => {
-                    self.activity.detected_http2();
-                    Sniff::Http2
-                }
-                total => Sniff::Matching(total),
-            };
-        }
-        if !matches!(self.sniff, Sniff::Http2) {
-            self.activity.bytes_read();
-        }
-    }
-}
-
-impl<I: AsyncRead + Unpin> AsyncRead for Tracked<I> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let before = buf.filled().len();
-        ready!(Pin::new(&mut this.io).poll_read(cx, buf))?;
-        let read = &buf.filled()[before..];
-        if !read.is_empty() {
-            this.observe(read);
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<I: AsyncWrite + Unpin> AsyncWrite for Tracked<I> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.io.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    let service =
+        service_fn(move |request: Request<Incoming>| router.clone().call(request.map(Body::new)));
+    let mut conn = pin!(builder.serve_connection_with_upgrades(TokioIo::new(io), service));
+    let served = tokio::select! {
+        served = conn.as_mut() => Some(served),
+        _ = stop.wait_for(|stop| *stop) => None,
+    };
+    let served = if let Some(served) = served {
+        served
+    } else {
+        conn.as_mut().graceful_shutdown();
+        conn.await
+    };
+    if let Err(e) = served {
+        tracing::debug!(error = %e, "HTTP connection ended with an error");
     }
 }
 
@@ -588,27 +278,14 @@ mod tests {
     use tokio_rustls::client::TlsStream;
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-    use super::{Deadlines, PlainListener, fd_exhausted, serve_with};
+    use super::{HEADER_READ_TIMEOUT, PlainListener, fd_exhausted, serve_with};
     use crate::tls_serve::{LISTENER_HTTP, ReloadingAcceptor, TlsListener};
 
+    /// The header-read timeout the tests serve with, in place of 30 s.
     const SHORT: Duration = Duration::from_millis(300);
-    const LONG: Duration = Duration::from_secs(30);
     const SLOW_HANDLER: Duration = Duration::from_millis(900);
     const PATIENCE: Duration = Duration::from_secs(5);
     const PARTIAL_HEAD: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n";
-
-    const HEADER_ONLY: Deadlines = Deadlines {
-        header_read: SHORT,
-        idle: LONG,
-    };
-    const IDLE_ONLY: Deadlines = Deadlines {
-        header_read: LONG,
-        idle: SHORT,
-    };
-    const BOTH: Deadlines = Deadlines {
-        header_read: SHORT,
-        idle: SHORT,
-    };
 
     fn app() -> Router {
         Router::new().route("/", get(|| async { "ok" })).route(
@@ -626,13 +303,13 @@ mod tests {
         (listener, addr)
     }
 
-    async fn serve_plain(deadlines: Deadlines) -> SocketAddr {
+    async fn serve_plain() -> SocketAddr {
         let (listener, addr) = bind().await;
         tokio::spawn(serve_with(
             PlainListener::new(listener, LISTENER_HTTP),
             app(),
             std::future::pending(),
-            deadlines,
+            SHORT,
         ));
         addr
     }
@@ -662,18 +339,6 @@ mod tests {
             ReloadingAcceptor::fixed(TlsAcceptor::from(Arc::new(server))),
             TlsConnector::from(Arc::new(client)),
         )
-    }
-
-    async fn serve_tls(deadlines: Deadlines) -> (SocketAddr, TlsConnector) {
-        let (listener, addr) = bind().await;
-        let (acceptor, connector) = tls_pair();
-        tokio::spawn(serve_with(
-            TlsListener::new(listener, acceptor, LISTENER_HTTP),
-            app(),
-            std::future::pending(),
-            deadlines,
-        ));
-        (addr, connector)
     }
 
     async fn tls_connect(addr: SocketAddr, connector: &TlsConnector) -> TlsStream<TcpStream> {
@@ -720,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_slowloris_is_dropped_after_the_header_read_timeout() {
-        let addr = serve_plain(HEADER_ONLY).await;
+        let addr = serve_plain().await;
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         stream.write_all(PARTIAL_HEAD).await.expect("write");
         assert!(time_to_close(&mut stream).await >= SHORT / 2);
@@ -728,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_stalled_second_request_is_dropped_after_the_header_read_timeout() {
-        let addr = serve_plain(HEADER_ONLY).await;
+        let addr = serve_plain().await;
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         get_ok(&mut stream, "/", "ok").await;
         stream.write_all(PARTIAL_HEAD).await.expect("write");
@@ -736,45 +401,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plaintext_idle_keep_alive_is_closed_after_the_idle_timeout() {
-        let addr = serve_plain(IDLE_ONLY).await;
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        get_ok(&mut stream, "/", "ok").await;
-        assert!(time_to_close(&mut stream).await >= SHORT / 2);
-    }
-
-    #[tokio::test]
     async fn tls_slowloris_is_dropped_after_the_header_read_timeout() {
-        let (addr, connector) = serve_tls(HEADER_ONLY).await;
+        let (listener, addr) = bind().await;
+        let (acceptor, connector) = tls_pair();
+        tokio::spawn(serve_with(
+            TlsListener::new(listener, acceptor, LISTENER_HTTP),
+            app(),
+            std::future::pending(),
+            SHORT,
+        ));
         let mut stream = tls_connect(addr, &connector).await;
         stream.write_all(PARTIAL_HEAD).await.expect("write");
         stream.flush().await.expect("flush");
         assert!(time_to_close(&mut stream).await >= SHORT / 2);
     }
 
+    /// hyper's header-read clock also runs while a keep-alive connection
+    /// waits for its next request, so an idle connection closes on it.
     #[tokio::test]
-    async fn tls_idle_keep_alive_is_closed_after_the_idle_timeout() {
-        let (addr, connector) = serve_tls(IDLE_ONLY).await;
-        let mut stream = tls_connect(addr, &connector).await;
+    async fn idle_keep_alive_is_closed_after_the_header_read_timeout() {
+        let addr = serve_plain().await;
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
         get_ok(&mut stream, "/", "ok").await;
         assert!(time_to_close(&mut stream).await >= SHORT / 2);
     }
 
-    /// Neither deadline cuts a request whose head has arrived, however
-    /// long the handler takes, and the connection stays usable after it.
+    /// The header-read timeout does not cut a request whose head has
+    /// arrived, however long the handler takes.
     #[tokio::test]
-    async fn a_slow_request_outlives_both_deadlines_and_keeps_its_connection() {
-        let addr = serve_plain(BOTH).await;
+    async fn a_slow_request_outlives_the_header_read_timeout_and_keeps_its_connection() {
+        let addr = serve_plain().await;
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         get_ok(&mut stream, "/slow", "slow").await;
         get_ok(&mut stream, "/", "ok").await;
     }
 
     /// An h2c connection is left to the HTTP/2 PING keepalive: the HTTP/1
-    /// deadlines do not close it between requests.
+    /// header-read timeout does not close it between requests.
     #[tokio::test]
-    async fn http2_connections_are_not_subject_to_the_http1_deadlines() {
-        let addr = serve_plain(BOTH).await;
+    async fn http2_connections_are_not_subject_to_the_http1_header_read_timeout() {
+        let addr = serve_plain().await;
         let tcp = TcpStream::connect(addr).await.expect("connect");
         let (mut sender, conn) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
@@ -803,7 +469,7 @@ mod tests {
             async move {
                 let _ = stopped.await;
             },
-            super::DEADLINES,
+            HEADER_READ_TIMEOUT,
         ));
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let client = tokio::spawn(async move {

@@ -535,6 +535,13 @@ impl SegmentLedger {
             .map(|span| span.first)
     }
 
+    /// Whether `tenant` may still have a frame on the root. Before
+    /// [`crate::Wal::rebuild_ledger`] has walked it, a tenant missing
+    /// from `members` proves nothing, so the answer is yes.
+    pub(crate) fn may_hold_frames(&self, tenant: &TenantId) -> bool {
+        !self.describes_root || self.oldest_frame(tenant).is_some()
+    }
+
     /// Tenants with surviving frames, in a stable order.
     pub(crate) fn tenants(&self) -> Vec<TenantId> {
         let mut out: Vec<TenantId> = self.tenants.keys().cloned().collect();

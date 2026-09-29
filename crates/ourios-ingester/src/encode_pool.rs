@@ -158,6 +158,11 @@ impl EncodePool {
     /// publisher of their own for what the size and ceiling triggers
     /// detach. The sink must be the same sink the miner was built with,
     /// so flush triggers and the rotation/shutdown drains see one buffer.
+    ///
+    /// That publisher's returns are ordered against its own handoff, not
+    /// a coordinator's, so a `Barrier` cannot order them against its
+    /// drains. A pipeline with a barrier uses [`Self::with_publisher`]
+    /// with the barrier coordinator's publisher.
     #[must_use]
     pub fn new(sink: &SharedParquetSink, workers: usize) -> Self {
         Self::with_publisher(&Publisher::over(sink), workers)
@@ -457,15 +462,11 @@ mod tests {
 
         // Given a batch queued behind one whose worker is about to panic,
         pool.submit(vec![rec("tenant-a")]);
-        while calls.load(Ordering::Acquire) == 0 {
-            std::thread::yield_now();
-        }
+        await_calls(&calls, 1);
         pool.submit(vec![rec("tenant-b")]);
         release.store(true, Ordering::Release);
         // and one submitted once the panic has retired the worker.
-        while calls.load(Ordering::Acquire) < 2 {
-            std::thread::yield_now();
-        }
+        await_calls(&calls, 2);
         pool.submit(vec![rec("tenant-c")]);
 
         // When the pool is quiesced, it returns.
@@ -491,5 +492,18 @@ mod tests {
             Some(failing),
             "and the panic latched its own batch's epoch",
         );
+    }
+
+    /// Wait until the audit barrier has been entered `want` times —
+    /// failing, not hanging, when a regression means it never is.
+    fn await_calls(calls: &std::sync::atomic::AtomicUsize, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while calls.load(std::sync::atomic::Ordering::Acquire) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the barrier was never reached {want} time(s)",
+            );
+            std::thread::yield_now();
+        }
     }
 }

@@ -294,7 +294,9 @@ mod tests {
     }
 
     fn await_flag(flag: &AtomicBool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !flag.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "timed out");
             std::thread::yield_now();
         }
     }

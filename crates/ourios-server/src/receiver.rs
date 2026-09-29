@@ -37,7 +37,7 @@ use ourios_serving::serve::{
 };
 use ourios_serving::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{
-    LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
+    LISTENER_GRPC, LISTENER_HTTP, ReloadingAcceptor, TlsListener, reloading_acceptor, tls_incoming,
 };
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
@@ -713,10 +713,40 @@ fn spawn_barrier(
 ///
 /// ALPN is per-listener: gRPC is h2-only, HTTP offers http/1.1 only
 /// (axum is built with just the http1 feature).
-type Acceptors = (
-    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
-    Option<ourios_serving::tls_serve::ReloadingAcceptor>,
-);
+type Acceptors = (Option<ReloadingAcceptor>, Option<ReloadingAcceptor>);
+
+/// Serve the OTLP/HTTP router on `listener`, over TLS when `acceptor` is
+/// set, until `shutdown` fires; the task returns once the listener drains.
+fn spawn_http(
+    listener: TcpListener,
+    acceptor: Option<ReloadingAcceptor>,
+    router: axum::Router,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = shutdown.changed().await;
+        };
+        match acceptor {
+            Some(acceptor) => {
+                serve_http(
+                    TlsListener::new(listener, acceptor, LISTENER_HTTP),
+                    router,
+                    shutdown,
+                )
+                .await;
+            }
+            None => {
+                serve_http(
+                    PlainListener::new(listener, LISTENER_HTTP),
+                    router,
+                    shutdown,
+                )
+                .await;
+            }
+        }
+    })
+}
 
 fn build_acceptors(
     grpc_tls: Option<&TlsSettings>,
@@ -976,32 +1006,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             ..HttpConfig::default()
         },
     );
-    let http = tokio::spawn({
-        let mut rx = shutdown_rx;
-        async move {
-            let shutdown = async move {
-                let _ = rx.changed().await;
-            };
-            match http_acceptor {
-                Some(acceptor) => {
-                    serve_http(
-                        TlsListener::new(http_listener, acceptor, LISTENER_HTTP),
-                        http_router,
-                        shutdown,
-                    )
-                    .await;
-                }
-                None => {
-                    serve_http(
-                        PlainListener::new(http_listener, LISTENER_HTTP),
-                        http_router,
-                        shutdown,
-                    )
-                    .await;
-                }
-            }
-        }
-    });
+    let http = spawn_http(http_listener, http_acceptor, http_router, shutdown_rx);
 
     Ok(ReceiverHandle {
         grpc_addr,

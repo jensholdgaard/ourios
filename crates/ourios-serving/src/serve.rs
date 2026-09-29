@@ -216,8 +216,8 @@ fn fd_exhausted(_: &io::Error) -> bool {
 
 /// Wrap a stream of accepted sockets (tonic's `TcpIncoming`) so that an
 /// accept failing for want of file descriptors is logged at WARN and the
-/// next accept waits [`FD_EXHAUSTED_BACKOFF`], instead of tonic retrying
-/// in a tight loop. Every item passes through unchanged.
+/// next accept waits 500 ms, instead of tonic retrying in a tight loop.
+/// Every item passes through unchanged.
 pub fn accept_backoff<S>(incoming: S, listener: &'static str) -> AcceptBackoff<S> {
     AcceptBackoff {
         incoming,

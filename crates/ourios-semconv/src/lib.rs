@@ -72,6 +72,24 @@ pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 /// `ourios.graph.tuples` (counter, unit `{tuple}`).
 pub const OURIOS_GRAPH_TUPLES: &str = "ourios.graph.tuples";
 
+/// `ourios.ingest.barrier.captures` (counter, unit `{capture}`).
+pub const OURIOS_INGEST_BARRIER_CAPTURES: &str = "ourios.ingest.barrier.captures";
+
+/// `ourios.ingest.barrier.checkpoint.writes` (counter, unit `{write}`).
+pub const OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES: &str = "ourios.ingest.barrier.checkpoint.writes";
+
+/// `ourios.ingest.barrier.cuts` (counter, unit `{cut}`).
+pub const OURIOS_INGEST_BARRIER_CUTS: &str = "ourios.ingest.barrier.cuts";
+
+/// `ourios.ingest.barrier.epoch` (gauge, unit `{epoch}`).
+pub const OURIOS_INGEST_BARRIER_EPOCH: &str = "ourios.ingest.barrier.epoch";
+
+/// `ourios.ingest.barrier.failed_epoch` (gauge, unit `{epoch}`).
+pub const OURIOS_INGEST_BARRIER_FAILED_EPOCH: &str = "ourios.ingest.barrier.failed_epoch";
+
+/// `ourios.ingest.barrier.snapshot.writes` (counter, unit `{write}`).
+pub const OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES: &str = "ourios.ingest.barrier.snapshot.writes";
+
 /// `ourios.ingest.batches` (counter, unit `{batch}`).
 pub const OURIOS_INGEST_BATCHES: &str = "ourios.ingest.batches";
 
@@ -176,6 +194,50 @@ pub const OURIOS_TEMPLATE_MAP_PUBLISHES: &str = "ourios.template_map.publishes";
 /// `ourios.wal.append.duration` (histogram, unit `s`).
 pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
 
+/// `ourios.wal.housekeeping.horizon.remaining` (gauge, unit `{segment}`).
+pub const OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING: &str =
+    "ourios.wal.housekeeping.horizon.remaining";
+
+/// `ourios.wal.housekeeping.unlink.remaining` (gauge, unit `{segment}`).
+pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING: &str =
+    "ourios.wal.housekeeping.unlink.remaining";
+
+/// `ourios.wal.retain_floor.lag.segment.count` (updowncounter, unit `{segment}`).
+pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT: &str =
+    "ourios.wal.retain_floor.lag.segment.count";
+
+/// `ourios.wal.retain_floor.lag.size` (updowncounter, unit `By`).
+pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE: &str = "ourios.wal.retain_floor.lag.size";
+
+/// `ourios.wal.retain_floor.pinned_tenant.count` (updowncounter, unit `{tenant}`).
+pub const OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT: &str =
+    "ourios.wal.retain_floor.pinned_tenant.count";
+
+/// `ourios.wal.retain_floor.status` (updowncounter, unit `1`).
+pub const OURIOS_WAL_RETAIN_FLOOR_STATUS: &str = "ourios.wal.retain_floor.status";
+
+/// `ourios.wal.rotation.consecutive_failures` (gauge, unit `{failure}`).
+pub const OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES: &str =
+    "ourios.wal.rotation.consecutive_failures";
+
+/// `ourios.wal.rotation.status` (updowncounter, unit `1`).
+pub const OURIOS_WAL_ROTATION_STATUS: &str = "ourios.wal.rotation.status";
+
+/// `ourios.wal.segment.count` (updowncounter, unit `{segment}`).
+pub const OURIOS_WAL_SEGMENT_COUNT: &str = "ourios.wal.segment.count";
+
+/// `ourios.wal.size` (updowncounter, unit `By`).
+pub const OURIOS_WAL_SIZE: &str = "ourios.wal.size";
+
+/// `ourios.wal.unflushed.size` (updowncounter, unit `By`).
+pub const OURIOS_WAL_UNFLUSHED_SIZE: &str = "ourios.wal.unflushed.size";
+
+/// `ourios.wal.unreclaimed.age` (gauge, unit `s`).
+pub const OURIOS_WAL_UNRECLAIMED_AGE: &str = "ourios.wal.unreclaimed.age";
+
+/// `ourios.wal.unreclaimed.size` (updowncounter, unit `By`).
+pub const OURIOS_WAL_UNRECLAIMED_SIZE: &str = "ourios.wal.unreclaimed.size";
+
 // Attribute keys.
 
 /// `datafusion.operator.elapsed_compute` attribute key.
@@ -204,6 +266,12 @@ pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
 
 /// `ourios.graph.tuple.operation` attribute key.
 pub const OURIOS_GRAPH_TUPLE_OPERATION: &str = "ourios.graph.tuple.operation";
+
+/// `ourios.ingest.barrier.capture.outcome` attribute key.
+pub const OURIOS_INGEST_BARRIER_CAPTURE_OUTCOME: &str = "ourios.ingest.barrier.capture.outcome";
+
+/// `ourios.ingest.barrier.cut.outcome` attribute key.
+pub const OURIOS_INGEST_BARRIER_CUT_OUTCOME: &str = "ourios.ingest.barrier.cut.outcome";
 
 /// `ourios.ingest.json.lenient` attribute key.
 pub const OURIOS_INGEST_JSON_LENIENT: &str = "ourios.ingest.json.lenient";
@@ -265,6 +333,12 @@ pub const OURIOS_TLS_LISTENER: &str = "ourios.tls.listener";
 /// `ourios.tls.reload_error` attribute key.
 pub const OURIOS_TLS_RELOAD_ERROR: &str = "ourios.tls.reload_error";
 
+/// `ourios.wal.retain_floor.state` attribute key.
+pub const OURIOS_WAL_RETAIN_FLOOR_STATE: &str = "ourios.wal.retain_floor.state";
+
+/// `ourios.wal.rotation.state` attribute key.
+pub const OURIOS_WAL_ROTATION_STATE: &str = "ourios.wal.rotation.state";
+
 // Log event names (the server's own dogfooded logs; every `tracing` call
 // site names its event with one of these — `weaver registry live-check`
 // enforces it at emission time).
@@ -284,6 +358,9 @@ pub const EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR: &str = "ourios.querier.shutdown.e
 /// `ourios.receiver.audit_sink.retained` log event name.
 pub const EVENT_OURIOS_RECEIVER_AUDIT_SINK_RETAINED: &str = "ourios.receiver.audit_sink.retained";
 
+/// `ourios.receiver.barrier.latched` log event name.
+pub const EVENT_OURIOS_RECEIVER_BARRIER_LATCHED: &str = "ourios.receiver.barrier.latched";
+
 /// `ourios.receiver.shutdown.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR: &str = "ourios.receiver.shutdown.error";
 
@@ -299,6 +376,33 @@ pub const EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE: &str = "ourios.receiver.tenan
 /// `ourios.receiver.tenant.watch_saturated` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED: &str =
     "ourios.receiver.tenant.watch_saturated";
+
+/// `ourios.receiver.wal.checkpoint.error` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR: &str = "ourios.receiver.wal.checkpoint.error";
+
+/// `ourios.receiver.wal.idle_rotation.error` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR: &str =
+    "ourios.receiver.wal.idle_rotation.error";
+
+/// `ourios.receiver.wal.retain_floor.lifted` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_LIFTED: &str =
+    "ourios.receiver.wal.retain_floor.lifted";
+
+/// `ourios.receiver.wal.retain_floor.pinned` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_PINNED: &str =
+    "ourios.receiver.wal.retain_floor.pinned";
+
+/// `ourios.receiver.wal.rotation.recovered` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_ROTATION_RECOVERED: &str =
+    "ourios.receiver.wal.rotation.recovered";
+
+/// `ourios.receiver.wal.rotation.retrying` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_ROTATION_RETRYING: &str =
+    "ourios.receiver.wal.rotation.retrying";
+
+/// `ourios.receiver.wal.rotation.terminal` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_ROTATION_TERMINAL: &str =
+    "ourios.receiver.wal.rotation.terminal";
 
 /// `ourios.receiver.wal.truncated` log event name.
 pub const EVENT_OURIOS_RECEIVER_WAL_TRUNCATED: &str = "ourios.receiver.wal.truncated";

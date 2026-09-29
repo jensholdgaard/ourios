@@ -170,9 +170,15 @@ impl ReclaimSlot {
     /// write through this slot. Taken under the lock, so a write already
     /// in flight finishes first rather than racing the reopen that may
     /// follow.
+    ///
+    /// The store is dropped here rather than with the last handle: a
+    /// plan keeps the slot alive for as long as the caller holds it, and
+    /// its descriptor on `RECLAIM` must not outlive the `Wal`, or a
+    /// caller that keeps one plan per reopen leaks one fd per reopen.
     pub(crate) fn close(&self) {
         let mut held = self.lock();
         held.state.closed = true;
+        held.state.store = None;
         self.0.live.store(0, std::sync::atomic::Ordering::Release);
     }
 

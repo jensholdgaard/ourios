@@ -2675,6 +2675,119 @@ mod tests {
         );
     }
 
+    /// A pass's record write and a checkpoint's witness write never
+    /// share the two-slot alternation. With the pass held inside its
+    /// write, the checkpoint waits on the slot rather than writing
+    /// beside it, and once both land the file holds each one's part: a
+    /// checkpoint that wrote around the slot would have its witness
+    /// overwritten by the pass's merge of the record it read first.
+    #[test]
+    fn a_checkpoint_waits_for_a_pass_record_write_and_both_survive() {
+        let dest = tempfile::TempDir::new().expect("temp");
+        let offsets = mint_closed_segment(dest.path(), &[b"a1", b"a2"]);
+        mint_closed_segment(dest.path(), &[b"b1"]);
+        let mark = *offsets.last().expect("offsets");
+        let mut wal = Wal::open(default_config(dest.path())).expect("open");
+        wal.rebuild_ledger().expect("ledger");
+        wal.checkpoint(mark).expect("checkpoint");
+        let plan = wal
+            .housekeeping_prepare(&SnapshotHorizons::NoConsumer, 8)
+            .expect("prepare");
+        let planned: Vec<uuid::Uuid> = plan.segments().iter().map(|s| s.segment).collect();
+        assert!(!planned.is_empty(), "the pass owes a record write");
+
+        // Wind the witness back to where a failed `checkpoint_seen`
+        // write leaves it, so the next checkpoint owes a slot write of
+        // its own.
+        {
+            let mut held = wal.reclaim.lock();
+            let store = held.as_mut().expect("a post-RFC root has a record");
+            let armed = reclaim::ReclaimRecord {
+                witness: reclaim::WitnessFlags {
+                    checkpoint: reclaim::Witness::Armed,
+                    ..store.record().witness
+                },
+                ..store.record().clone()
+            };
+            store.commit(&armed).expect("commit");
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered = std::sync::Mutex::new(entered_tx);
+        let release = std::sync::Mutex::new(release_rx);
+        wal.arm_record_write_hook(move || {
+            if let Ok(tx) = entered.lock() {
+                let _ = tx.send(());
+            }
+            if let Ok(rx) = release.lock() {
+                let _ = rx.recv();
+            }
+        });
+        let wait = std::time::Duration::from_secs(5);
+        let pass = std::thread::spawn(move || write_plan_record(&plan).map(drop));
+        entered_rx
+            .recv_timeout(wait)
+            .expect("the pass reached its RECLAIM write");
+        let checkpoint = std::thread::spawn(move || {
+            let result = wal.checkpoint(mark);
+            (wal, result)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let waited = !checkpoint.is_finished();
+        release_tx.send(()).expect("release the held write");
+        pass.join()
+            .expect("pass thread")
+            .expect("the record write lands");
+        let (wal, checkpointed) = checkpoint.join().expect("checkpoint thread");
+        checkpointed.expect("the checkpoint lands");
+        drop(wal);
+
+        let geometry =
+            reconcile::configured_geometry(&default_config(dest.path())).expect("geometry");
+        let reopened = reclaim_store::ReclaimStore::open(dest.path(), geometry, false)
+            .expect("reopen the record");
+        let record = reopened.record();
+        assert_eq!(
+            record.witness.checkpoint,
+            reclaim::Witness::Terminal,
+            "the checkpoint's witness survived the pass's write",
+        );
+        assert!(
+            planned
+                .iter()
+                .all(|segment| record.planned.iter().any(|p| p.segment == *segment)),
+            "and the pass's planned rows survived the checkpoint's",
+        );
+        assert!(waited, "the checkpoint waited on the slot, not beside it");
+    }
+
+    /// Dropping the `Wal` releases its `RECLAIM` descriptor even while
+    /// a plan it handed out is still held: the plan keeps the slot
+    /// alive, but not the file inside it.
+    #[test]
+    fn a_dropped_wal_releases_its_record_while_a_plan_outlives_it() {
+        let dest = tempfile::TempDir::new().expect("temp");
+        let offsets = mint_closed_segment(dest.path(), &[b"a1"]);
+        let mut wal = Wal::open(default_config(dest.path())).expect("open");
+        wal.rebuild_ledger().expect("ledger");
+        wal.checkpoint(*offsets.last().expect("offsets"))
+            .expect("checkpoint");
+        let plan = wal
+            .housekeeping_prepare(&SnapshotHorizons::NoConsumer, 8)
+            .expect("prepare");
+        assert!(plan.slot.lock().is_some(), "the live WAL holds its record");
+
+        drop(wal);
+
+        assert!(
+            plan.slot.lock().is_none(),
+            "the store and its descriptor went with the WAL",
+        );
+        let refused = write_plan_record(&plan).expect_err("an orphaned plan writes nothing");
+        assert!(refused.to_string().contains("outlived"), "{refused}");
+    }
+
     /// Build a closed segment in a scratch root and move it into
     /// `dest`, bringing the record the producing root created with it
     /// (RFC 0052 §3.2 fails closed on a version-2 segment beside no

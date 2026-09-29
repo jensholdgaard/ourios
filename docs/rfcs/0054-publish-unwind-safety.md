@@ -294,14 +294,15 @@ completion**, an `Arc` holding the guard and a count incremented per
 detach and decremented per completion (durable, requeued, parked or
 dropped), settling the guard when the count reaches zero and the batch's
 encode phase has ended. Each queued item
-(`PublishItem::{ Drained(Drained), Detached { records, guard,
-audit_watermark } }`) carries a handle to that completion — so no
+(`PublishItem::Detached { records, guard, audit_watermark }`; RFC 0052
+§3.1's queue carries detached partitions only) carries a handle to that
+completion — so no
 partition is ever outside both the buffers and the in-flight set, and the worker moves
 to its next record with `quiesce` waiting on encodes alone. Everything this section says about `write_ordered` — the `Drained`
 destructor, the `RecoverableBatch` handle, the unwind arm — therefore
 attaches to the publisher thread for detached batches exactly as it does
-to the age sweep's step, since both run the same function on the same
-thread; nothing attaches to a worker-side PUT, because there is none. What a worker panic can still drop is
+to the age sweep's step, since both run the same function — the sweep on
+its own task, a detached batch on the publisher thread; nothing attaches to a worker-side PUT, because there is none. What a worker panic can still drop is
 the *unappended remainder* of its mined `Vec`, and RFC 0052 has
 `BatchGuard` lower `failed_epoch` for exactly that; the latch stays, and
 the worker's batch takes the same recoverable shape so a cut can clear it —

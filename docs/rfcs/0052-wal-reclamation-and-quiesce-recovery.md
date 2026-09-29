@@ -46,8 +46,9 @@ superseded-by: —
 > **C** rotation (temporary name, bounded retry, terminal state, the
 > `hold/794-wedged-classification` reintroduction → .4, .5, .15, .11's
 > post-RFC rotation leg, .17's legacy-root rotation leg);
-> **D** barrier (guard-at-submit, publisher thread, epoch latch,
-> ingest exclusion → .1's cut legs, .14, .13's startup leg);
+> **D** barrier (guard-at-submit, publisher thread carrying detached
+> partitions only, epoch latch, ingest exclusion → .1's cut legs, .14,
+> .13's startup leg);
 > **E** timer and telemetry (§3.5 instruments and events → .7, .1's
 > cadence-tick panic leg);
 > **F** crash and soak (.10 on the rfc0014_5 fixture, .3 on the extended
@@ -383,12 +384,20 @@ of its own; the queue carries the handle with the records.
 What the queue carries is **not** a `Drained`: that value is the audit
 buffer's own snapshot taken under the miner lock beside the records, and a
 worker holds neither — it sees `MinedRecord`s after their template events
-were already emitted into the audit sink. So the queue's item is
-`PublishItem::{ Drained(Drained), Detached { records, guard,
-audit_watermark } }`. The `Drained` arm is the age sweep's and the
-barrier's existing value, written by `write_ordered` unchanged. The
-`Detached` arm carries the **audit-sink position observed under the miner
-lock at detach time** — the count of events the sink has accepted for that
+were already emitted into the audit sink. So the queue carries **detached
+partitions only**: its item is `PublishItem::Detached { records, guard,
+audit_watermark }`. A `Drained` never enters it. The age sweep and the
+barrier keep writing theirs through `write_ordered`, synchronously on
+their own tasks, unchanged. The barrier must: `run_cut` needs its flush's
+outcome (`cut_ok`) before it decides whether to stamp. The sweep stays
+there so that a `write_ordered` unwind keeps happening on the sweep's own
+task, where #795's stop-on-panic (§3.2) stops it and its `JoinError`
+counts `cadence_panic`; on the publisher thread the sweep would tick on
+under the latch, which is RFC 0053's decision to make, not this one's.
+An earlier revision gave the item a `Drained` arm as well; slice D shipped
+without it (#867) because no producer fitted §3.2, and #875 settled the
+question by dropping it. The item carries the **audit-sink position
+observed under the miner lock at detach time** — the count of events the sink has accepted for that
 tenant when the partition left the buffers, which is at or above every
 event the partition's records produced, since emission precedes the
 append. Before writing a detached partition the publisher requires the
@@ -942,7 +951,9 @@ uncommitted plan is re-planned by the next `housekeeping_prepare`, which
 is exactly the case §3.7 already defines. At shutdown a `JoinError` from
 either task is logged and read as a failed cut — no stamp, nothing
 assumed drained — rather than as a clean join. The sweep keeps #795's
-stop-on-panic until RFC 0053 makes it survivable; what changes here is
+stop-on-panic until RFC 0053 makes it survivable, and keeps its writes on
+its own task for that reason (§3.1: the publisher queue carries detached
+partitions only); what changes here is
 that stopping the sweep no longer stops reclamation or the barrier. The sweep's
 panic is the one #795 already stops the sweep on; what this RFC adds is that
 the same unwind now latches *before* the sweep's publish guard drops, so the

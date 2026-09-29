@@ -72,7 +72,7 @@ use ourios_core::tenant::TenantId;
 
 use ourios_config::UpstreamTemplates;
 
-use crate::mask::mask;
+use crate::mask::{TypedParam, mask};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
 use crate::tokenize::tokenize;
@@ -364,6 +364,25 @@ impl TenantState {
     }
 }
 
+/// A `Body::String` line in flight through the mining path: the
+/// record it arrived on, its resolved `service.name`, and the raw
+/// body bytes every §6.3 / §6.5 retention path keeps verbatim.
+#[derive(Clone, Copy)]
+struct StringLine<'a> {
+    record: &'a OtlpLogRecord,
+    service: Option<&'a str>,
+    raw: &'a str,
+}
+
+/// [`mask`]'s view of a line. `wildcard_positions` and
+/// `typed_params` are parallel: one entry per mask-emitted slot.
+#[derive(Clone, Copy)]
+struct MaskedLine<'a> {
+    strs: &'a [&'a str],
+    wildcard_positions: &'a [usize],
+    typed_params: &'a [TypedParam<'a>],
+}
+
 /// Which §6.3 zone a fresh-leaf mint came from — the axis
 /// [`MinerCluster::emit_fresh_leaf_record`] varies on.
 #[derive(Clone, Copy)]
@@ -414,13 +433,12 @@ impl MinerCluster {
     /// record's body must always carry the original line bytes
     /// so `reconstruct()`'s `Overflow` branch (RFC §6.6) has
     /// something to fall back to.
-    fn apply_overflow_retention(
-        &self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        rec: &mut MinedRecord,
-        raw: &str,
-    ) {
+    fn apply_overflow_retention(&self, line: StringLine<'_>, rec: &mut MinedRecord) {
+        let StringLine {
+            record,
+            service,
+            raw,
+        } = line;
         let overflow_count = rec
             .params
             .iter()
@@ -622,7 +640,11 @@ impl MinerCluster {
                 self.emit_record(rec, service);
                 NO_TEMPLATE
             }
-            Some(Body::String(raw)) => self.ingest_string(record, service, raw),
+            Some(Body::String(raw)) => self.ingest_string(StringLine {
+                record,
+                service,
+                raw,
+            }),
             Some(Body::Structured(av)) => self.ingest_structured(record, service, av),
         };
         // §6.8 `ourios.miner.duration` histogram (hot-path budget
@@ -715,7 +737,12 @@ impl MinerCluster {
     // too_many_lines lint is silenced here rather than
     // fragmenting the per-step structure.
     #[allow(clippy::too_many_lines)]
-    fn ingest_string(&mut self, record: &OtlpLogRecord, service: Option<&str>, raw: &str) -> u64 {
+    fn ingest_string(&mut self, line: StringLine<'_>) -> u64 {
+        let StringLine {
+            record,
+            service,
+            raw,
+        } = line;
         // RFC §6.2 step 1 (H7.2): a tokenizer failure (today:
         // embedded NUL byte) routes the line to the parse-failure
         // path with `lossy_flag = true` and the original body
@@ -751,6 +778,11 @@ impl MinerCluster {
         let separators = separators_to_owned(&tokenized.separators);
         let params = params_from_mask(&masked.typed_params, effective_config.param_byte_limit);
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
+        let masked_line = MaskedLine {
+            strs: &masked_strs,
+            wildcard_positions: &masked.wildcard_positions,
+            typed_params: &masked.typed_params,
+        };
 
         if masked_strs.is_empty() {
             // Empty / whitespace-only input is a §6.2 step 1
@@ -774,14 +806,7 @@ impl MinerCluster {
         // Vec<u16>`), whose violation would otherwise be the
         // silent-merge bug `[CLAUDE.md §3.1]` exists to prevent.
         if masked_strs.len() > usize::from(effective_config.max_line_tokens) {
-            return self.emit_string_parse_failure(
-                record,
-                service,
-                raw,
-                separators,
-                params,
-                "line_too_long",
-            );
+            return self.emit_string_parse_failure(line, separators, params, "line_too_long");
         }
 
         // RFC 0050 §3.2 — the upstream-template dial. `ignore`
@@ -804,15 +829,7 @@ impl MinerCluster {
         };
         if effective_config.upstream_templates == UpstreamTemplates::Adopt
             && let Some(s) = upstream_raw
-            && let Some(id) = self.try_adopt(
-                record,
-                service,
-                raw,
-                s,
-                &masked.wildcard_positions,
-                &masked.typed_params,
-                &effective_config,
-            )
+            && let Some(id) = self.try_adopt(line, s, masked_line, &effective_config)
         {
             return id;
         }
@@ -844,7 +861,7 @@ impl MinerCluster {
         // immutable so we can early-return (or fall through to
         // fresh-leaf creation) without committing a
         // `template_id` allocation.
-        let best = self.find_best_candidate(record, &masked_strs, &masked.wildcard_positions);
+        let best = self.find_best_candidate(record, masked_line);
 
         let threshold = effective_config.similarity_threshold;
         let floor = effective_config.similarity_floor;
@@ -861,31 +878,14 @@ impl MinerCluster {
                 // never force-merged.
                 if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
                     return self.emit_string_parse_failure(
-                        record,
-                        service,
-                        raw,
+                        line,
                         separators,
                         params,
                         "template_ceiling",
                     );
                 }
-                let new_id = self.create_new_leaf(
-                    record,
-                    raw,
-                    &masked_strs,
-                    &masked.wildcard_positions,
-                    &masked.typed_params,
-                    observed,
-                );
-                self.emit_fresh_leaf_record(
-                    record,
-                    service,
-                    raw,
-                    separators,
-                    params,
-                    new_id,
-                    FreshLeafZone::Clean,
-                )
+                let new_id = self.create_new_leaf(line, masked_line, observed);
+                self.emit_fresh_leaf_record(line, separators, params, new_id, FreshLeafZone::Clean)
             }
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
@@ -898,12 +898,8 @@ impl MinerCluster {
                     // helper's rebuilt aligned params also get
                     // §6.5 capping.
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
-                        record,
-                        service,
-                        raw,
-                        &masked_strs,
-                        &masked.wildcard_positions,
-                        &masked.typed_params,
+                        line,
+                        masked_line,
                         c,
                         separators,
                         params,
@@ -927,26 +923,15 @@ impl MinerCluster {
                             .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
                         {
                             return self.emit_string_parse_failure(
-                                record,
-                                service,
-                                raw,
+                                line,
                                 separators,
                                 params,
                                 "template_ceiling",
                             );
                         }
-                        let new_id = self.create_new_leaf(
-                            record,
-                            raw,
-                            &masked_strs,
-                            &masked.wildcard_positions,
-                            &masked.typed_params,
-                            observed,
-                        );
+                        let new_id = self.create_new_leaf(line, masked_line, observed);
                         self.emit_fresh_leaf_record(
-                            record,
-                            service,
-                            raw,
+                            line,
                             separators,
                             params,
                             new_id,
@@ -957,14 +942,9 @@ impl MinerCluster {
                     }
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
-                    ConfidenceZone::ParseFailure => self.emit_string_parse_failure(
-                        record,
-                        service,
-                        raw,
-                        separators,
-                        params,
-                        "below_floor",
-                    ),
+                    ConfidenceZone::ParseFailure => {
+                        self.emit_string_parse_failure(line, separators, params, "below_floor")
+                    }
                 }
             }
         };
@@ -991,20 +971,19 @@ impl MinerCluster {
     ///   retention counters, and carries `similarity / threshold` as
     ///   its confidence; `lossy_flag` stays false (§6.6: "body
     ///   retained, reconstruction expected to match").
-    // Eight arguments: the record-emission context ingest_string holds
-    // (the same shape as its attach/parse-failure siblings, which carry
-    // the same allow).
-    #[allow(clippy::too_many_arguments)]
     fn emit_fresh_leaf_record(
         &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        raw: &str,
+        line: StringLine<'_>,
         separators: Vec<String>,
         params: Vec<Param>,
         new_id: u64,
         zone: FreshLeafZone,
     ) -> u64 {
+        let StringLine {
+            record,
+            service,
+            raw,
+        } = line;
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.template_id = new_id;
         rec.template_version = 1;
@@ -1020,7 +999,7 @@ impl MinerCluster {
             }
         }
         // §6.5: overflowed params force retention on either zone.
-        self.apply_overflow_retention(record, service, &mut rec, raw);
+        self.apply_overflow_retention(line, &mut rec);
         self.emit_record(rec, service);
         new_id
     }
@@ -1032,13 +1011,16 @@ impl MinerCluster {
     /// template, body retained verbatim, lossy-flagged, counted.
     fn emit_string_parse_failure(
         &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        raw: &str,
+        line: StringLine<'_>,
         separators: Vec<String>,
         params: Vec<Param>,
         reason: &'static str,
     ) -> u64 {
+        let StringLine {
+            record,
+            service,
+            raw,
+        } = line;
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.separators = separators;
         rec.params = params;
@@ -1046,7 +1028,7 @@ impl MinerCluster {
         rec.lossy_flag = true;
         // §6.5: bump `params_overflow_total` for any overflow params
         // (body is already retained for the parse-failure reason).
-        self.apply_overflow_retention(record, service, &mut rec, raw);
+        self.apply_overflow_retention(line, &mut rec);
         self.emit_record(rec, service);
         self.record_parse_failure(record, service, reason);
         NO_TEMPLATE
@@ -1070,17 +1052,18 @@ impl MinerCluster {
     /// entry is interned with no tree leaf (RFC0050.2), under the
     /// RFC 0023 ceiling. Either resolution is cached, so the scan
     /// is once per canonical, never per record.
-    #[allow(clippy::too_many_arguments)] // mirrors the mining path's threading
     fn try_adopt(
         &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        raw: &str,
+        line: StringLine<'_>,
         upstream: &str,
-        line_wildcard_positions: &[usize],
-        line_typed_params: &[crate::mask::TypedParam<'_>],
+        masked: MaskedLine<'_>,
         config: &MinerConfig,
     ) -> Option<u64> {
+        let StringLine {
+            record,
+            service,
+            raw,
+        } = line;
         // §3.2: the byte cap runs before any work proportional to
         // the attribute's length.
         if upstream.len() > config.upstream_template_byte_limit as usize {
@@ -1118,12 +1101,12 @@ impl MinerCluster {
                     // transition, audited once (§3.3 / CLAUDE.md §3.1:
                     // a clustering decision made elsewhere is audited
                     // like a merge).
-                    self.emit_adopted_audit(record, raw, id, version, &canonical);
+                    self.emit_adopted_audit(line, id, version, &canonical);
                     (id, version)
                 }
                 AdoptResolution::Interned(id) => {
                     self.next_template_id += 1;
-                    self.emit_adopted_audit(record, raw, id, 1, &canonical);
+                    self.emit_adopted_audit(line, id, 1, &canonical);
                     (id, 1)
                 }
             };
@@ -1147,8 +1130,11 @@ impl MinerCluster {
             .iter()
             .zip(&wildcard_body_positions)
             .map(|(p, &pos)| {
-                let ty =
-                    param_type_for_line_position(pos, line_wildcard_positions, line_typed_params);
+                let ty = param_type_for_line_position(
+                    pos,
+                    masked.wildcard_positions,
+                    masked.typed_params,
+                );
                 crate::overflow::cap_param_value(ty, p.value.to_string(), config.param_byte_limit)
             })
             .collect();
@@ -1164,7 +1150,7 @@ impl MinerCluster {
         rec.separators = separators;
         rec.params = params;
         rec.confidence = 1.0;
-        self.apply_overflow_retention(record, service, &mut rec, raw);
+        self.apply_overflow_retention(line, &mut rec);
         self.emit_record(rec, service);
         self.metrics
             .record_upstream_template_processed(&record.tenant_id, service, None);
@@ -1176,13 +1162,10 @@ impl MinerCluster {
     /// `observe` association, holding the leaf borrow only over
     /// the mutation. No association on a rejection — the record
     /// exits via the parse-failure path, taking no template.
-    #[allow(clippy::too_many_arguments)] // mirrors the mining path's threading
     fn plan_attach_on_candidate(
         &mut self,
         record: &OtlpLogRecord,
-        masked_strs: &[&str],
-        line_wildcard_positions: &[usize],
-        line_typed_params: &[crate::mask::TypedParam<'_>],
+        masked: MaskedLine<'_>,
         candidate: &Candidate,
         byte_limit: u32,
         observed: Option<&str>,
@@ -1195,13 +1178,13 @@ impl MinerCluster {
             state.config.prefix_depth as usize,
             usize::from(state.config.max_node_children),
         );
-        let parent = state.tree.descend_mut(masked_strs, depth, fanout);
+        let parent = state.tree.descend_mut(masked.strs, depth, fanout);
         let leaf = &mut parent.leaves[candidate.leaf_idx];
         let plan = plan_attach(
             leaf,
-            masked_strs,
-            line_wildcard_positions,
-            line_typed_params,
+            masked.strs,
+            masked.wildcard_positions,
+            masked.typed_params,
             byte_limit,
         );
         if !matches!(plan, AttachPlan::Rejected { .. }) {
@@ -1357,12 +1340,12 @@ impl MinerCluster {
     /// Emit the RFC 0050 §3.3 `template_adopted` audit event.
     fn emit_adopted_audit(
         &mut self,
-        record: &OtlpLogRecord,
-        raw: &str,
+        line: StringLine<'_>,
         template_id: u64,
         template_version: u32,
         canonical: &str,
     ) {
+        let StringLine { record, raw, .. } = line;
         self.audit_sink.emit(AuditEvent {
             tenant_id: record.tenant_id.clone(),
             timestamp: self.clock.now(),
@@ -1381,17 +1364,16 @@ impl MinerCluster {
     /// Emit the §6.4 degenerate-widening rejection audit event —
     /// the record of *why* the attach refused to widen (RFC 0017
     /// §3.1 keeps the audit stream the template history of record).
-    #[allow(clippy::too_many_arguments)] // mirrors the audit payload's fields 1:1
     fn emit_rejected_degenerate_audit(
         &mut self,
-        record: &OtlpLogRecord,
-        raw: &str,
+        line: StringLine<'_>,
         template_id: u64,
         version: u32,
         current_template: String,
         would_be_template: String,
         would_be_positions: Vec<u16>,
     ) {
+        let StringLine { record, raw, .. } = line;
         self.audit_sink.emit(AuditEvent {
             tenant_id: record.tenant_id.clone(),
             timestamp: self.clock.now(),
@@ -1429,9 +1411,13 @@ impl MinerCluster {
     fn find_best_candidate(
         &self,
         record: &OtlpLogRecord,
-        masked_strs: &[&str],
-        line_wildcard_positions: &[usize],
+        masked: MaskedLine<'_>,
     ) -> Option<Candidate> {
+        let MaskedLine {
+            strs: masked_strs,
+            wildcard_positions: line_wildcard_positions,
+            ..
+        } = masked;
         let state = self.tenants.get(&record.tenant_id)?;
         // Per-tenant `prefix_depth` (RFC 0004 §3.4) — read from
         // the captured `state.config` rather than the cluster
@@ -1499,13 +1485,16 @@ impl MinerCluster {
     /// "creation emits nothing" contract.)
     fn create_new_leaf(
         &mut self,
-        record: &OtlpLogRecord,
-        raw: &str,
-        masked_strs: &[&str],
-        line_wildcard_positions: &[usize],
-        line_typed_params: &[crate::mask::TypedParam<'_>],
+        line: StringLine<'_>,
+        masked: MaskedLine<'_>,
         observed: Option<&str>,
     ) -> u64 {
+        let StringLine { record, raw, .. } = line;
+        let MaskedLine {
+            strs: masked_strs,
+            wildcard_positions: line_wildcard_positions,
+            typed_params: line_typed_params,
+        } = masked;
         debug_assert_eq!(
             line_wildcard_positions.len(),
             line_typed_params.len(),
@@ -1666,18 +1655,19 @@ impl MinerCluster {
     #[allow(clippy::too_many_arguments)]
     fn attach_and_maybe_widen(
         &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        raw: &str,
-        masked_strs: &[&str],
-        line_wildcard_positions: &[usize],
-        line_typed_params: &[crate::mask::TypedParam<'_>],
+        line: StringLine<'_>,
+        masked: MaskedLine<'_>,
         candidate: Candidate,
         separators: Vec<String>,
         params: Vec<Param>,
         byte_limit: u32,
         observed: Option<&str>,
     ) -> u64 {
+        let StringLine {
+            record,
+            service,
+            raw,
+        } = line;
         // Ownership rationale: each exit path emits **one** data
         // record and never reuses `separators` / `params` after
         // that emit. Taking the vectors by value lets each branch
@@ -1687,15 +1677,7 @@ impl MinerCluster {
         // Phase 1 — mutate the leaf and accumulate the audit-event
         // payloads (the helper holds the leaf borrow only over the
         // mutation); emitting through `self.audit_sink` is phase 2.
-        let plan = self.plan_attach_on_candidate(
-            record,
-            masked_strs,
-            line_wildcard_positions,
-            line_typed_params,
-            &candidate,
-            byte_limit,
-            observed,
-        );
+        let plan = self.plan_attach_on_candidate(record, masked, &candidate, byte_limit, observed);
 
         match plan {
             AttachPlan::CleanReuse {
@@ -1718,7 +1700,7 @@ impl MinerCluster {
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this clean-reuse
                 // record if any of its aligned params overflowed.
-                self.apply_overflow_retention(record, service, &mut rec, raw);
+                self.apply_overflow_retention(line, &mut rec);
                 self.emit_record(rec, service);
                 template_id
             }
@@ -1730,8 +1712,7 @@ impl MinerCluster {
                 would_be_positions,
             } => {
                 self.emit_rejected_degenerate_audit(
-                    record,
-                    raw,
+                    line,
                     template_id,
                     version,
                     current_template,
@@ -1742,14 +1723,7 @@ impl MinerCluster {
                 // failure that retains body (the line-ordered
                 // params fallback is fine — reconstruct ignores
                 // `params` on the lossy path).
-                self.emit_string_parse_failure(
-                    record,
-                    service,
-                    raw,
-                    separators,
-                    params,
-                    "degenerate_widening",
-                )
+                self.emit_string_parse_failure(line, separators, params, "degenerate_widening")
             }
             AttachPlan::Mutated {
                 template_id,
@@ -1785,7 +1759,7 @@ impl MinerCluster {
                 // §6.5: force body retention on this widened /
                 // type-expanded record if any of its aligned
                 // params overflowed.
-                self.apply_overflow_retention(record, service, &mut rec, raw);
+                self.apply_overflow_retention(line, &mut rec);
                 self.emit_record(rec, service);
                 template_id
             }

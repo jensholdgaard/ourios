@@ -243,7 +243,7 @@ impl BarrierRig {
             ceiling_bytes,
         ));
         let mut building = IngestPipeline::new(Arc::clone(&commits), miner)
-            .with_encode_pool(EncodePool::new(&sink, workers));
+            .with_encode_pool(EncodePool::with_publisher(publish.publisher(), workers));
         if rotation_capture {
             let hook_barrier = Arc::clone(&barrier);
             building = building.with_rotation_hook(Box::new(move |miner, mark| {

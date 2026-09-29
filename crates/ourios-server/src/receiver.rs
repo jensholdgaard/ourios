@@ -510,8 +510,9 @@ impl ReceiverHandle {
             // guarantees no record ≤ the stamped high-water is still
             // in-flight or buffered-but-unflushed. The publish half of the
             // barrier (issue #578) is `flush_then_snapshot`'s own
-            // `quiesce_publishes` — trivially settled here because the
-            // sweep task was joined above, but not reliant on that.
+            // `quiesce_publishes`, which also waits out whatever the pool
+            // handed the publisher (RFC 0052 §3.1): a detached partition
+            // is written, requeued or parked before the flush below.
             self.pipeline.quiesce_encodes();
             self.pipeline.with_miner(|miner| {
                 flush_then_snapshot(
@@ -881,9 +882,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             // global commit gate; the pool emits into the same shared
             // sink the miner holds, so a cut's drain covers it. The
             // pipeline drains the pool inside every capture; shutdown
-            // drains it below.
-            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(
-                &sink,
+            // drains it below. What the size and ceiling triggers detach
+            // goes to the coordinator's publisher (RFC 0052 §3.1), so it
+            // feeds the RFC 0047 §3.3 graph like every other publish.
+            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::with_publisher(
+                publisher.publisher(),
                 config.encode_workers,
             )),
     );
@@ -1559,6 +1562,68 @@ mod tests {
         assert!(
             saw_tuples.is_ok(),
             "the cut's publish wrote tuples; the graph saw {:?}",
+            writes.lock().expect("lock"),
+        );
+    }
+
+    /// RFC 0047 §3.3, issue #834: a partition the **size trigger** takes
+    /// feeds the graph too. It used to be written by the encode worker
+    /// straight through the sink, which never reached the emitter; it now
+    /// goes to the coordinator's publisher (RFC 0052 §3.1), which writes
+    /// through the same feed as the cadence and the barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_size_triggered_publish_feeds_the_graph() {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let emitter = fake_graph_emitter(Arc::clone(&writes)).await;
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            store.clone(),
+            AUDIT_SINK_CEILING_EVENTS,
+        ));
+        let barrier_audit = audit.clone();
+        let sink = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                store,
+                FlushConfig {
+                    target_bytes: 1, // every record crosses the size target
+                    max_buffer_age: Duration::from_secs(86_400),
+                    ceiling_bytes: usize::MAX,
+                },
+            )
+            .with_audit_barrier(Box::new(move || barrier_audit.barrier())),
+        );
+        let coordinator = PublishCoordinator::new(sink.clone(), audit).with_graph_emitter(emitter);
+        let pool =
+            ourios_ingester::encode_pool::EncodePool::with_publisher(coordinator.publisher(), 1);
+
+        // Given a record whose emit crosses the size target.
+        pool.submit(vec![rec()]);
+        tokio::task::block_in_place(|| {
+            pool.quiesce();
+            let _outcomes = sink.quiesce_publishes();
+        });
+        assert_eq!(
+            sink.flushes(),
+            1,
+            "the size trigger published the partition"
+        );
+
+        // Then the graph sees the partition's tuples, without any cut.
+        let tenant = rec().tenant_id;
+        let tool = format!("tool:{}/query_logs", tenant.as_str());
+        let saw_tuples = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if writes.lock().expect("lock").join("").contains(&tool) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            saw_tuples.is_ok(),
+            "the size-triggered publish wrote tuples; the graph saw {:?}",
             writes.lock().expect("lock"),
         );
     }

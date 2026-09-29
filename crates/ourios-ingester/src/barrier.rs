@@ -13,17 +13,12 @@
 //! A cut is captured under the pipeline's `ingest_bound` exclusion — the
 //! quiesce, the mark read, the two drains and the snapshot serialisation
 //! — and nothing else runs there. The flush, the snapshot installs and
-//! the checkpoint all run outside it, so the barrier's *own* PUTs never
-//! stall ingest: a cut costs a drain, not a round trip to the store.
-//!
-//! One PUT can still land inside the exclusion, and it is not the
-//! barrier's: the capture's `quiesce_encodes` waits out an encode worker
-//! that may be inside `emit_concurrent`, whose size/ceiling take
-//! publishes straight from the worker. A slow store therefore holds the
-//! exclusion for that worker's put. Routing those takes through the
-//! coordinator — the `detach_concurrent` seam — is issue #834; until
-//! then the exclusion's worst case is one in-flight encode's PUT, not a
-//! whole cut's.
+//! the checkpoint all run outside it, so the barrier's PUTs never stall
+//! ingest: a cut costs a drain, not a round trip to the store. Nor does
+//! an encode worker's: the size and ceiling triggers hand what they take
+//! to the publisher thread (`crate::publisher`), so the capture's
+//! `quiesce_encodes` waits on encodes alone, and those PUTs settle under
+//! `run_cut`'s `quiesce_publishes_through`, outside the exclusion.
 //!
 //! Three rules make the ordering sound, and each is a §5 criterion:
 //!

@@ -116,17 +116,15 @@ impl PartitionBuffer {
 ///
 /// The watermark is the **maximum** over the `ready` partitions taken —
 /// each carrying the position its park preserved — and nothing else
-/// contributes to it yet. An ordinary partition's own position is the
-/// audit sink's count at drain time, which only the publish coordinator
-/// can read (it owns both sinks); until §3.1's publisher lands and
-/// supplies it, an ordinary drain reports `0`.
+/// contributes to it: an ordinary drain reports `0`.
 ///
-/// **So this value is not yet a sufficient gate.** Every current
+/// **So this value is not a sufficient gate on its own.** Every
 /// consumer is audit-ordered by other means: `write_ordered` writes the
-/// audit batch first, and the inline size / ceiling publish runs behind
-/// the sink's audit barrier, which is strictly stronger (it requires the
-/// whole buffer durable). A publisher that gated on this alone would
-/// publish records ahead of their template events.
+/// audit batch first, and a size / ceiling take — whether the encode
+/// pool's publisher writes it or `emit_concurrent` does — happens only
+/// behind the sink's audit barrier, which is strictly stronger (every
+/// emitted event durable, no other take in limbo). A consumer that gated
+/// on this alone would publish records ahead of their template events.
 ///
 /// Accessors rather than public fields — a caller that could rebuild
 /// this value could defeat the dependency parking preserves.
@@ -1280,6 +1278,10 @@ impl SharedParquetSink {
     /// the lock** via [`Self::publish_owned`] (which settles counters,
     /// quarantines poison records, and requeues on transient failure) —
     /// so one worker's Parquet encode never blocks the others' appends.
+    ///
+    /// The encode pool does not call this: its workers hand what
+    /// [`Self::detach_concurrent`] takes to RFC 0052 §3.1's publisher, so
+    /// no worker is inside a PUT while a barrier quiesces the pool.
     pub fn emit_concurrent(&self, record: MinedRecord, registered: Epoch) {
         for (trigger, taken) in self.detach_concurrent(record) {
             if !taken.is_empty() {

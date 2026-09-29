@@ -24,7 +24,9 @@ use std::sync::{Arc, OnceLock};
 use std::panic::AssertUnwindSafe;
 
 use futures::{FutureExt, TryStreamExt};
-use object_store::aws::AmazonS3Builder;
+use object_store::ClientConfigKey;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::client::SpawnedReqwestConnector;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
@@ -42,7 +44,9 @@ use tokio::runtime::Runtime;
 /// Its workers are the long-lived threads every bridged future is polled on
 /// (see [`block_on_off_runtime`]), so they are sized to the host but capped at
 /// [`MAX_BRIDGE_WORKERS`]: the work is object-store I/O, and the local backend
-/// moves its file I/O onto tokio's blocking pool anyway.
+/// moves its file I/O onto tokio's blocking pool anyway. The S3 backend's
+/// HTTP connections also live here, whichever runtime issues the request
+/// (see [`Store::s3`]).
 fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
     static RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
     match RT.get_or_init(|| {
@@ -70,6 +74,12 @@ fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
 
 /// Upper bound on the bridge runtime's worker threads.
 const MAX_BRIDGE_WORKERS: usize = 4;
+
+/// Idle connections the S3 client keeps per host once a burst of concurrent
+/// requests is over; the rest close instead of holding a descriptor each.
+/// When credentials come from the chain, an `AWS_POOL_MAX_IDLE_PER_HOST` in
+/// the environment takes precedence (explicit credentials read no `AWS_*`).
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
 
 /// Whether `tag` (an `ETag` without its quotes) is safe to send unquoted in
 /// `If-Match`: non-empty ASCII letters, digits and hyphens, the shape of S3
@@ -422,7 +432,8 @@ impl Store {
     /// # Errors
     /// [`StoreError::Config`] if `cfg.bucket` is empty or the explicit
     /// credential fields are a partial set; [`StoreError::Backend`] if the
-    /// `AmazonS3` backend cannot be built from `cfg`.
+    /// `AmazonS3` backend cannot be built from `cfg`; [`StoreError::Runtime`]
+    /// if the bridge runtime its connections run on cannot be built.
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
         let S3Config {
             bucket,
@@ -506,7 +517,22 @@ impl Store {
         if let Some(region) = region {
             builder = builder.with_region(region);
         }
-        let s3 = builder.build().map_err(StoreError::Backend)?;
+        let pool_cap = AmazonS3ConfigKey::Client(ClientConfigKey::PoolMaxIdlePerHost);
+        if builder.get_config_value(&pool_cap).is_none() {
+            builder = builder.with_config(pool_cap, MAX_IDLE_CONNECTIONS_PER_HOST.to_string());
+        }
+        // reqwest runs each pooled connection on the runtime that issued the
+        // request, and a connection only notices the store closing it while
+        // that runtime polls it. Callers' runtimes stall (a current-thread
+        // caller between requests, busy `DataFusion` workers), which left
+        // connections in `CLOSE_WAIT` and handed them to later requests
+        // (#791). The bridge runtime is never a caller's, so it always does.
+        let s3 = builder
+            .with_http_connector(SpawnedReqwestConnector::new(
+                bridge_runtime()?.handle().clone(),
+            ))
+            .build()
+            .map_err(StoreError::Backend)?;
         let prefix = prefix.map_or_else(ObjectPath::default, ObjectPath::from);
         Ok(Self {
             inner: Arc::new(s3),

@@ -20,7 +20,7 @@
 //! *and* the last of its detached partitions is durable, requeued, parked
 //! or unwound, in whichever order they finish.
 //!
-//! The thread is a [`Lane`]: a panicking publish latches only its own
+//! The thread runs on the crate's lane: a panicking publish latches only its own
 //! batch's epoch, every item queued behind it is parked, and the next
 //! enqueue starts a new publisher.
 //!

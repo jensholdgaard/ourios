@@ -66,49 +66,61 @@ fn serve(stream: &TcpStream, behaviour: Behaviour, counts: &Counts) {
             }
             Ok(_) => {}
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                let _ = stream.shutdown(Shutdown::Write);
-                stream.set_read_timeout(Some(LINGER)).expect("timeout");
-                let outcome = match reader.read(&mut [0; 64]) {
-                    Ok(0) => &counts.closed_by_client,
-                    Ok(_) => &counts.reused_after_close,
-                    Err(_) => &counts.held_by_client,
-                };
-                outcome.fetch_add(1, Ordering::SeqCst);
+                close_idle(stream, &mut reader, counts);
                 return;
             }
             Err(_) => return,
         }
-        let mut len = 0;
-        loop {
-            let mut header = String::new();
-            if reader.read_line(&mut header).is_err() {
-                return;
-            }
-            let header = header.trim_end();
-            if header.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = header.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().expect("content-length");
-            }
-        }
-        if reader.read_exact(&mut vec![0; len]).is_err() {
+        if skip_request_rest(&mut reader).is_err() {
             return;
         }
         std::thread::sleep(behaviour.respond_after);
-        let body = b"hello";
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"e1\"\r\n\
-             Last-Modified: Thu, 01 Jan 2026 00:00:00 GMT\r\n\r\n",
-            body.len()
-        );
-        let mut out = stream;
-        if out.write_all(head.as_bytes()).is_err() || out.write_all(body).is_err() {
+        if respond(stream).is_err() {
             return;
         }
     }
+}
+
+/// Close our side of an idle connection and record what the client does.
+fn close_idle(stream: &TcpStream, reader: &mut BufReader<&TcpStream>, counts: &Counts) {
+    let _ = stream.shutdown(Shutdown::Write);
+    stream.set_read_timeout(Some(LINGER)).expect("timeout");
+    let outcome = match reader.read(&mut [0; 64]) {
+        Ok(0) => &counts.closed_by_client,
+        Ok(_) => &counts.reused_after_close,
+        Err(_) => &counts.held_by_client,
+    };
+    outcome.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Consume the headers and body that follow a request line.
+fn skip_request_rest(reader: &mut BufReader<&TcpStream>) -> std::io::Result<()> {
+    let mut len = 0;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header)?;
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = header.split_once(':')
+            && k.eq_ignore_ascii_case("content-length")
+        {
+            len = v.trim().parse().expect("content-length");
+        }
+    }
+    reader.read_exact(&mut vec![0; len])
+}
+
+fn respond(mut stream: &TcpStream) -> std::io::Result<()> {
+    let body = b"hello";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"e1\"\r\n\
+         Last-Modified: Thu, 01 Jan 2026 00:00:00 GMT\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)
 }
 
 fn fake_store(behaviour: Behaviour) -> (Store, Arc<Counts>) {

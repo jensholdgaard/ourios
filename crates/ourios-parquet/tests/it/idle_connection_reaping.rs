@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
@@ -47,8 +47,9 @@ impl Counts {
 struct Behaviour {
     /// The server closes a connection idle for this long.
     idle: Duration,
-    /// Delay before each response, so concurrent requests overlap.
-    respond_after: Duration,
+    /// Hold every response until this many connections are open, so a
+    /// concurrent burst needs one connection per request.
+    respond_once_accepted: usize,
 }
 
 /// Serve requests on `stream` until the client closes it or it idles out.
@@ -74,10 +75,18 @@ fn serve(stream: &TcpStream, behaviour: Behaviour, counts: &Counts) {
         if skip_request_rest(&mut reader).is_err() {
             return;
         }
-        std::thread::sleep(behaviour.respond_after);
+        wait_for_accepted(counts, behaviour.respond_once_accepted);
         if respond(stream).is_err() {
             return;
         }
+    }
+}
+
+fn wait_for_accepted(counts: &Counts, target: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Counts::get(&counts.accepted) < target {
+        assert!(Instant::now() < deadline, "only some connections opened");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -175,7 +184,7 @@ fn assert_every_close_observed(counts: &Counts) {
 fn an_idle_caller_runtime_strands_no_connection() {
     let (store, counts) = fake_store(Behaviour {
         idle: IDLE,
-        respond_after: Duration::ZERO,
+        respond_once_accepted: 0,
     });
     let caller = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -200,7 +209,7 @@ fn an_idle_caller_runtime_strands_no_connection() {
 fn bridged_calls_strand_no_connection() {
     let (store, counts) = fake_store(Behaviour {
         idle: IDLE,
-        respond_after: Duration::ZERO,
+        respond_once_accepted: 0,
     });
     for _ in 0..8 {
         store.get_blocking("k").expect("get");
@@ -221,7 +230,7 @@ fn the_pool_keeps_a_bounded_number_of_idle_connections() {
     const BURST: usize = 96;
     let (store, counts) = fake_store(Behaviour {
         idle: Duration::from_secs(30),
-        respond_after: Duration::from_millis(300),
+        respond_once_accepted: BURST,
     });
     let caller = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

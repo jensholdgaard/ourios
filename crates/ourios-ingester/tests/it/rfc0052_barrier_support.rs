@@ -238,17 +238,7 @@ impl BarrierRig {
             Store::local(&audit_root).expect("audit store"),
             100_000,
         ));
-        let barrier_audit = audit.clone();
-        let audit_barrier = poison.unwrap_or_else(|| {
-            Box::new(move || barrier_audit.flush()) as Box<dyn FnMut() -> bool + Send>
-        });
-        let mut data_store = Store::local(&data_root).expect("data store");
-        if let Some(gate) = &put_gate {
-            data_store = held_puts(data_store, gate);
-        }
-        let sink = SharedParquetSink::new(
-            ParquetRecordSink::new(data_store, flush).with_audit_barrier(audit_barrier),
-        );
+        let sink = rig_sink(&data_root, flush, &audit, poison, put_gate.as_ref());
         let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
             .with_record_sink(Box::new(sink.clone()));
 
@@ -342,6 +332,28 @@ impl BarrierRig {
         // platform, which is what makes the failure deterministic.
         std::fs::write(path.join("occupied"), b"x").expect("occupy it");
     }
+}
+
+/// The rig's record sink: its inline audit barrier is `poison` when given,
+/// else a flush of `audit`, and its PUTs are held at `put_gate` when given.
+fn rig_sink(
+    data_root: &Path,
+    flush: FlushConfig,
+    audit: &SharedParquetAuditSink,
+    poison: Option<Box<dyn FnMut() -> bool + Send>>,
+    put_gate: Option<&Gate>,
+) -> SharedParquetSink {
+    let barrier_audit = audit.clone();
+    let audit_barrier = poison.unwrap_or_else(|| {
+        Box::new(move || barrier_audit.flush()) as Box<dyn FnMut() -> bool + Send>
+    });
+    let mut data_store = Store::local(data_root).expect("data store");
+    if let Some(gate) = put_gate {
+        data_store = held_puts(data_store, gate);
+    }
+    SharedParquetSink::new(
+        ParquetRecordSink::new(data_store, flush).with_audit_barrier(audit_barrier),
+    )
 }
 
 /// The handle on [`BarrierRig::with_held_encode`]'s held worker.

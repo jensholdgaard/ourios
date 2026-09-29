@@ -200,17 +200,7 @@ fn rfc0052_1_publish_guard_covers_detaches_between_capture_and_enqueue() {
     // `submit`, so the cut waits for its PUT instead of stamping past it.
     // A guard made by the worker would read E + 1 and let this wait
     // return at once.
-    let waiting = {
-        let sink = sink.clone();
-        std::thread::spawn(move || sink.quiesce_publishes_through(cut))
-    };
-    for _ in 0..256 {
-        std::thread::yield_now();
-    }
-    assert!(
-        !waiting.is_finished(),
-        "the cut waits for the batch's publish"
-    );
+    let waiting = held_wait(&sink, Some(cut), "the cut waits for the batch's publish");
     assert!(
         tenant_files(&rig, "alpha").is_empty(),
         "which is not durable yet"
@@ -221,6 +211,11 @@ fn rfc0052_1_publish_guard_covers_detaches_between_capture_and_enqueue() {
     assert_eq!(tenant_files(&rig, "alpha").len(), 1);
     assert_eq!(sink.publishes_in_flight(), 0);
 
+    a_batch_that_detaches_nothing_releases_its_guard_unused();
+    a_batch_detaching_several_partitions_settles_on_the_last();
+}
+
+fn a_batch_that_detaches_nothing_releases_its_guard_unused() {
     // And a batch that detaches nothing releases its guard unused, at the
     // end of its own encode phase.
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -238,7 +233,9 @@ fn rfc0052_1_publish_guard_covers_detaches_between_capture_and_enqueue() {
         0,
         "and the batch's guard settled with its encode phase",
     );
+}
 
+fn a_batch_detaching_several_partitions_settles_on_the_last() {
     // And a batch detaching several partitions settles its guard only
     // when the last of them completes: with the second one's PUT held,
     // the first being durable does not release the cut.
@@ -263,14 +260,7 @@ fn rfc0052_1_publish_guard_covers_detaches_between_capture_and_enqueue() {
         1,
         "and the batch's one guard is still held for the second",
     );
-    let waiting = {
-        let sink = sink.clone();
-        std::thread::spawn(move || sink.quiesce_publishes_through(cut))
-    };
-    for _ in 0..256 {
-        std::thread::yield_now();
-    }
-    assert!(!waiting.is_finished(), "so the cut still waits");
+    let waiting = held_wait(&sink, Some(cut), "so the cut still waits");
     put.open();
     assert!(waiting.join().expect("the wait returned").all_ok(cut));
     assert_eq!(tenant_files(&rig, "bravo").len(), 1);
@@ -305,14 +295,7 @@ fn rfc0052_1_publisher_panic_parks_queued_batches_and_respawns() {
 
     // When the held PUT is released and the next publish panics, with a
     // `quiesce_publishes` already waiting.
-    let waiting = {
-        let sink = sink.clone();
-        std::thread::spawn(move || sink.quiesce_publishes())
-    };
-    for _ in 0..256 {
-        std::thread::yield_now();
-    }
-    assert!(!waiting.is_finished(), "the wait is held by the publisher");
+    let waiting = held_wait(&sink, None, "the wait is held by the publisher");
     put.open();
 
     // Then the wait returns, only the failing batch's epoch is latched —
@@ -452,6 +435,27 @@ fn rfc0052_1_detached_partition_waits_for_its_audit_watermark() {
     );
     assert_eq!(sink.buffered_records(), 0, "and every record followed it");
     assert!(!rig.data_files().is_empty());
+}
+
+/// Start `quiesce_publishes_through(cut)` — or `quiesce_publishes()` for
+/// `None` — on its own thread, and assert it is still waiting.
+fn held_wait(
+    sink: &SharedParquetSink,
+    cut: Option<ourios_ingester::cadence::Epoch>,
+    why: &str,
+) -> std::thread::JoinHandle<ourios_ingester::record_sink::PublishOutcomes> {
+    let waiting = {
+        let sink = sink.clone();
+        std::thread::spawn(move || match cut {
+            Some(cut) => sink.quiesce_publishes_through(cut),
+            None => sink.quiesce_publishes(),
+        })
+    };
+    for _ in 0..256 {
+        std::thread::yield_now();
+    }
+    assert!(!waiting.is_finished(), "{why}");
+    waiting
 }
 
 /// What the record sink's quarantine write — the RFC 0025 §3.3 audit

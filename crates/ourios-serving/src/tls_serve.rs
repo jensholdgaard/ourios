@@ -34,6 +34,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use crate::serve::{accept_failed, set_tcp_keepalive};
 use crate::tls::TlsSettings;
 
 /// A [`TlsAcceptor`] whose backing config can be hot-swapped without
@@ -425,6 +426,7 @@ impl axum::serve::Listener for TlsListener {
                     if self.handshakes.len() < MAX_CONCURRENT_HANDSHAKES => {
                     match accepted {
                         Ok((tcp, addr)) => {
+                            set_tcp_keepalive(&tcp);
                             // Live acceptor per connection (reload-visible).
                             let acceptor = self.acceptor.current();
                             let metrics = self.metrics.clone();
@@ -432,10 +434,7 @@ impl axum::serve::Listener for TlsListener {
                                 handshake(&acceptor, tcp, &metrics).await.map(|tls| (tls, addr))
                             });
                         }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "TCP accept failed on the TLS HTTP listener");
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
+                        Err(e) => accept_failed(&e, self.metrics.listener).await,
                     }
                 }
                 // A pending handshake finished — return it if it succeeded.

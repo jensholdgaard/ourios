@@ -36,6 +36,18 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 # Reload-loop and resolver diagnostics ride the workspace tracing setup.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The HTTP serve loop (`serve`): `axum::serve` exposes no connection
+# deadlines, so the listeners drive hyper-util's auto builder directly.
+# All already in the tree via axum and tonic.
+http-body = "1"
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
+socket2 = { version = "0.6", default-features = false }
+tower-service = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+# EMFILE/ENFILE, to tell descriptor exhaustion apart from other accept errors.
+libc = { version = "0.2", default-features = false }
 
 # --- oidc / openfga client stack (feature-gated; RFC 0051) ---
 # decode pins the cached key's algorithm, so `alg: none` and HMAC are
@@ -67,6 +79,11 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 # The resolver tests stand up a fake OpenFGA endpoint and speak its
 # JSON wire shape.
 serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+# The serve-loop tests terminate TLS with a cert minted at test runtime,
+# speak raw HTTP/1 over the socket, and open an h2c connection.
+rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+hyper = { version = "1", default-features = false, features = ["client", "http2"] }
 
 [features]
 # The RFC 0029 OIDC bearer layer (verifier + JWKS cache) — moved here

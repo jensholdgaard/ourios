@@ -31,6 +31,10 @@ use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
+use ourios_serving::serve::{
+    HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, PlainListener, TCP_KEEPALIVE,
+    accept_backoff, serve_http,
+};
 use ourios_serving::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{
     LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
@@ -409,7 +413,7 @@ pub struct ReceiverHandle {
     pub http_addr: SocketAddr,
     shutdown: watch::Sender<()>,
     grpc: JoinHandle<Result<(), tonic::transport::Error>>,
-    http: JoinHandle<std::io::Result<()>>,
+    http: JoinHandle<()>,
     pipeline: SharedPipeline,
     snapshots_root: PathBuf,
     /// The data sink (RFC 0014). Drained on graceful shutdown, before the
@@ -457,8 +461,7 @@ impl ReceiverHandle {
             .map_err(|e| format!("gRPC listener: {e}"))?;
         self.http
             .await
-            .map_err(|e| format!("HTTP listener task: {e}"))?
-            .map_err(|e| format!("HTTP listener: {e}"))?;
+            .map_err(|e| format!("HTTP listener task: {e}"))?;
         // Both listeners are stopped, so no more records reach the sink. The
         // `shutdown.send` above already signalled the age-sweep task; await it
         // (rather than abort it) so an in-flight `spawn_blocking` flush runs to
@@ -779,7 +782,11 @@ async fn bind_listeners(
     grpc: SocketAddr,
     http: SocketAddr,
 ) -> Result<(TcpIncoming, SocketAddr, TcpListener, SocketAddr), String> {
-    let grpc_incoming = TcpIncoming::bind(grpc).map_err(|e| format!("bind gRPC {grpc}: {e}"))?;
+    // `Server::tcp_keepalive` is ignored under `serve_with_incoming`; the
+    // incoming stream sets it on each accepted socket instead.
+    let grpc_incoming = TcpIncoming::bind(grpc)
+        .map_err(|e| format!("bind gRPC {grpc}: {e}"))?
+        .with_keepalive(Some(TCP_KEEPALIVE));
     let grpc_addr = grpc_incoming
         .local_addr()
         .map_err(|e| format!("gRPC local_addr: {e}"))?;
@@ -939,8 +946,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
                 let _ = rx.changed().await;
             };
             let server = Server::builder()
+                .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
                 .layer(auth_layer)
                 .add_service(grpc_service);
+            let grpc_incoming = accept_backoff(grpc_incoming, LISTENER_GRPC);
             match grpc_acceptor {
                 Some(acceptor) => {
                     server
@@ -972,20 +982,22 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             let shutdown = async move {
                 let _ = rx.changed().await;
             };
-            let make = http_router.into_make_service();
             match http_acceptor {
                 Some(acceptor) => {
-                    axum::serve(
+                    serve_http(
                         TlsListener::new(http_listener, acceptor, LISTENER_HTTP),
-                        make,
+                        http_router,
+                        shutdown,
                     )
-                    .with_graceful_shutdown(shutdown)
-                    .await
+                    .await;
                 }
                 None => {
-                    axum::serve(http_listener, make)
-                        .with_graceful_shutdown(shutdown)
-                        .await
+                    serve_http(
+                        PlainListener::new(http_listener, LISTENER_HTTP),
+                        http_router,
+                        shutdown,
+                    )
+                    .await;
                 }
             }
         }

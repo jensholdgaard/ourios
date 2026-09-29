@@ -158,13 +158,13 @@ fn rfc0052_17_returning_tenant_halts_until_its_next_snapshot() {
     let root = tmp.path();
     let first = build_tenant_segment(root, &[("alpha", b"a1"), ("beta", b"b1")]);
     let second = build_tenant_segment(root, &[("alpha", b"a2")]);
-    let returned = build_tenant_segment(root, &[("beta", b"b2")]);
     let mut wal = open(root);
     wal.rebuild_ledger().expect("ledger");
     wal.checkpoint(first[1]).expect("checkpoint past the first");
     wal.housekeeping_pass(&known(&[("alpha", first[0]), ("beta", first[1])]), CAP)
         .expect("housekeeping");
     drop(wal);
+    let returned = build_tenant_segment(root, &[("beta", b"b2")]);
 
     // When: the next pass runs with `beta` holding surviving frames and
     // no restorable snapshot.

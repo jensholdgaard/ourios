@@ -1744,10 +1744,12 @@ restorable horizon to satisfy it: the pass fails closed with
 Treating the return as a fresh tenant would discard the entry that makes a
 missing snapshot loud, and a later restart would rebuild that tenant's
 miner state from frames that begin after the ones already reclaimed,
-silently. The pause is bounded by the tenant's next snapshot — at default
-tunables about one `barrier_secs` (300 s) plus one `housekeeping_secs`
-(60 s) — and only reclamation pauses: ingest, acks and queries are
-untouched, and the WAL grows by at most that window's writes.
+silently. The pause lasts until the tenant's next snapshot installs and a
+pass runs — at default tunables about one `barrier_secs` (300 s) plus one
+`housekeeping_secs` (60 s) — and only reclamation pauses: ingest, acks and
+queries are untouched. If that tenant's snapshots keep failing to install,
+the pause and the WAL's growth last as long as the failures do; every pass
+meanwhile names the tenant, so the stall is loud rather than silent.
 
 The floor is also the reason §3.1 can tolerate a failed snapshot write.
 `housekeeping` reclaims only segments every tenant's horizon covers, and

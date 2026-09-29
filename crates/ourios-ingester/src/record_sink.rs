@@ -1235,7 +1235,7 @@ impl SharedParquetSink {
         trigger: &'static str,
         registered: Epoch,
     ) -> bool {
-        let failed = self.publish_unrequeued(batches, trigger);
+        let failed = self.publish_unrequeued(batches, trigger, |_, _| {});
         let all_published = failed.is_empty();
         self.requeue(failed, registered);
         all_published
@@ -1244,10 +1244,15 @@ impl SharedParquetSink {
     /// [`Self::publish_owned`] without the requeue: the partitions whose
     /// put failed come back to the caller, which requeues them under
     /// whatever ordering it owes the capture (RFC 0052 §3.1's handoff).
+    ///
+    /// `on_stored` sees each partition once its put succeeded, with exactly
+    /// the records that were stored: a quarantined record never reaches it,
+    /// and a partition that failed is not reported even when others landed.
     pub(crate) fn publish_unrequeued(
         &self,
         batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
         trigger: &'static str,
+        mut on_stored: impl FnMut(&PartitionKey, &[MinedRecord]),
     ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
         let mut requeue = Vec::new();
         if batches.is_empty() {
@@ -1263,6 +1268,7 @@ impl SharedParquetSink {
                 Ok(()) => {
                     self.lock()
                         .note_published(records.len(), start.elapsed(), trigger);
+                    on_stored(&key, &records);
                 }
                 Err(FlushError::Encode(WriterError::Batch(e))) if is_per_record_rejection(&e) => {
                     // Permanent per-record rejection: requeueing would
@@ -1275,6 +1281,7 @@ impl SharedParquetSink {
                     if publish_partition(&store, &key, &kept, &promoted).is_ok() {
                         self.lock()
                             .note_published(kept.len(), start.elapsed(), trigger);
+                        on_stored(&key, &kept);
                     } else {
                         self.lock().note_flush_error();
                         requeue.push((key, kept));
@@ -1445,6 +1452,54 @@ mod tests {
             max_buffer_age: Duration::from_secs(86_400),
             ceiling_bytes: usize::MAX,
         }
+    }
+
+    /// `on_stored` sees exactly the rows that reached the store. A row the
+    /// writer quarantines never does, and a partition whose put fails does
+    /// not hide the one that landed. The RFC 0047 §3.3 graph feed derives
+    /// its tuples from this, so a rejected row cannot grant visibility.
+    #[test]
+    fn on_stored_reports_exactly_the_stored_rows() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // A plain file where tenant `blocked`'s partition directory would go:
+        // its put fails, while tenant `ok`'s lands.
+        std::fs::create_dir_all(dir.path().join("data")).expect("data dir");
+        std::fs::write(dir.path().join("data").join("tenant_id=blocked"), b"")
+            .expect("blocking file");
+        let handle = SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(dir.path()).expect("local store"),
+            never_flush(),
+        ));
+        let stored_row = rec("ok");
+        let mut rejected_row = rec("ok");
+        rejected_row.observed_time_unix_nano = Some(u64::MAX);
+        let ok_key = PartitionKey::derive(&stored_row).expect("ok key");
+        let blocked_row = rec("blocked");
+        let blocked_key = PartitionKey::derive(&blocked_row).expect("blocked key");
+
+        let mut seen: Vec<(PartitionKey, Vec<MinedRecord>)> = Vec::new();
+        let failed = handle.publish_unrequeued(
+            vec![
+                (ok_key.clone(), vec![stored_row.clone(), rejected_row]),
+                (blocked_key.clone(), vec![blocked_row]),
+            ],
+            "test",
+            |key, stored| seen.push((key.clone(), stored.to_vec())),
+        );
+
+        assert_eq!(
+            seen,
+            vec![(ok_key, vec![stored_row])],
+            "only the stored row of the partition that landed is reported"
+        );
+        assert_eq!(
+            failed
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            vec![blocked_key],
+            "the failed partition comes back for requeue, unreported"
+        );
     }
 
     #[test]

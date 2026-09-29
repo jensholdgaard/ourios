@@ -164,6 +164,12 @@ impl Returns {
     }
 }
 
+/// The graph tuples gathered from one publish's stored partitions.
+#[cfg(feature = "openfga")]
+type Gathered = std::collections::BTreeSet<ourios_serving::openfga::TupleKey>;
+#[cfg(not(feature = "openfga"))]
+type Gathered = ();
+
 /// Encode-and-publish for one batch of partitions, feeding the RFC 0047
 /// §3.3 graph once they are durable. The one derivation site both the
 /// coordinator's ordered writes and the publisher go through.
@@ -199,36 +205,47 @@ impl Feed {
         self
     }
 
-    /// Publish `records` and, once they are durable, feed the RFC 0047
-    /// §3.3 graph from them.
+    /// The graph tuples one stored partition contributes.
+    #[cfg(feature = "openfga")]
+    fn gather(&self, tuples: &mut Gathered, partition: &PartitionKey, stored: &[MinedRecord]) {
+        if let Some(emitter) = &self.graph {
+            tuples.extend(emitter.derive(&partition.tenant_id, stored));
+            tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
+                &partition.tenant_id,
+            ));
+        }
+    }
+
+    #[cfg(not(feature = "openfga"))]
+    #[allow(clippy::unused_self)] // mirrors the `openfga` build's signature
+    fn gather(&self, _tuples: &mut Gathered, _partition: &PartitionKey, _stored: &[MinedRecord]) {}
+
+    /// Publish `records` and feed the RFC 0047 §3.3 graph from exactly the
+    /// rows that were stored. A quarantined row grants nothing, and a
+    /// partition that failed does not hold back the tuples of those that
+    /// landed; its rows are requeued and feed the graph when they publish.
     pub(crate) fn publish(
         &self,
         records: Vec<(PartitionKey, Vec<MinedRecord>)>,
         trigger: &'static str,
         registered: Epoch,
     ) -> bool {
-        #[cfg(feature = "openfga")]
-        let tuples = self.graph.as_ref().map(|emitter| {
-            let mut tuples = std::collections::BTreeSet::new();
-            for (partition, records) in &records {
-                tuples.extend(emitter.derive(&partition.tenant_id, records));
-                tuples.extend(crate::graph_emitter::GraphEmitter::tool_tuples(
-                    &partition.tenant_id,
-                ));
-            }
-            tuples
-        });
-        let failed = self.returns.record.publish_unrequeued(records, trigger);
+        let mut tuples = Gathered::default();
+        let failed =
+            self.returns
+                .record
+                .publish_unrequeued(records, trigger, |partition, stored| {
+                    self.gather(&mut tuples, partition, stored);
+                });
         let published = failed.is_empty();
         if !published {
             self.requeue(failed, registered);
         }
         #[cfg(feature = "openfga")]
-        if published
-            && let (Some(emitter), Some(tuples)) = (self.graph.clone(), tuples)
+        if let Some(emitter) = self.graph.clone()
             && !tuples.is_empty()
         {
-            // Off the publish path: the graph is fed after the batch is
+            // Off the publish path: the graph is fed after the rows are
             // durable, and never delays the next flush.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {

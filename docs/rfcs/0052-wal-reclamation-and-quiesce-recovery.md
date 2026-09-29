@@ -393,7 +393,8 @@ outcome (`cut_ok`) before it decides whether to stamp. The sweep stays
 there so that a `write_ordered` unwind keeps happening on the sweep's own
 task, where #795's stop-on-panic (§3.2) stops it and its `JoinError`
 counts `cadence_panic`; on the publisher thread the sweep would tick on
-under the latch, which is RFC 0053's decision to make, not this one's.
+under the latch, and whether the sweep survives an unwind is RFC 0054's
+(publish unwind safety) decision to make, not this one's.
 An earlier revision gave the item a `Drained` arm as well; slice D shipped
 without it (#867) because no producer fitted §3.2, and #875 settled the
 question by dropping it. The item carries the **audit-sink position
@@ -951,8 +952,8 @@ uncommitted plan is re-planned by the next `housekeeping_prepare`, which
 is exactly the case §3.7 already defines. At shutdown a `JoinError` from
 either task is logged and read as a failed cut — no stamp, nothing
 assumed drained — rather than as a clean join. The sweep keeps #795's
-stop-on-panic until RFC 0053 makes it survivable, and keeps its writes on
-its own task for that reason (§3.1: the publisher queue carries detached
+stop-on-panic until RFC 0054 (publish unwind safety) makes it
+survivable, and keeps its writes on its own task for that reason (§3.1: the publisher queue carries detached
 partitions only); what changes here is
 that stopping the sweep no longer stops reclamation or the barrier. The sweep's
 panic is the one #795 already stops the sweep on; what this RFC adds is that

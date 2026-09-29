@@ -2696,34 +2696,9 @@ mod tests {
         let planned: Vec<uuid::Uuid> = plan.segments().iter().map(|s| s.segment).collect();
         assert!(!planned.is_empty(), "the pass owes a record write");
 
-        // Wind the witness back to where a failed `checkpoint_seen`
-        // write leaves it, so the next checkpoint owes a slot write of
-        // its own.
-        {
-            let mut held = wal.reclaim.lock();
-            let store = held.as_mut().expect("a post-RFC root has a record");
-            let armed = reclaim::ReclaimRecord {
-                witness: reclaim::WitnessFlags {
-                    checkpoint: reclaim::Witness::Armed,
-                    ..store.record().witness
-                },
-                ..store.record().clone()
-            };
-            store.commit(&armed).expect("commit");
-        }
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let entered = std::sync::Mutex::new(entered_tx);
-        let release = std::sync::Mutex::new(release_rx);
-        wal.arm_record_write_hook(move || {
-            if let Ok(tx) = entered.lock() {
-                let _ = tx.send(());
-            }
-            if let Ok(rx) = release.lock() {
-                let _ = rx.recv();
-            }
-        });
+        // So the next checkpoint owes a slot write of its own.
+        wind_witness_to_armed(&wal);
+        let (entered_rx, release_tx) = hold_record_writes(&mut wal);
         let wait = std::time::Duration::from_secs(5);
         let pass = std::thread::spawn(move || write_plan_record(&plan).map(drop));
         entered_rx
@@ -2743,11 +2718,7 @@ mod tests {
         checkpointed.expect("the checkpoint lands");
         drop(wal);
 
-        let geometry =
-            reconcile::configured_geometry(&default_config(dest.path())).expect("geometry");
-        let reopened = reclaim_store::ReclaimStore::open(dest.path(), geometry, false)
-            .expect("reopen the record");
-        let record = reopened.record();
+        let record = reopened_record(dest.path());
         assert_eq!(
             record.witness.checkpoint,
             reclaim::Witness::Terminal,
@@ -2760,6 +2731,50 @@ mod tests {
             "and the pass's planned rows survived the checkpoint's",
         );
         assert!(waited, "the checkpoint waited on the slot, not beside it");
+    }
+
+    /// Wind the record's checkpoint witness back to where a failed
+    /// `checkpoint_seen` write leaves it.
+    fn wind_witness_to_armed(wal: &Wal) {
+        let mut held = wal.reclaim.lock();
+        let store = held.as_mut().expect("a post-RFC root has a record");
+        let armed = reclaim::ReclaimRecord {
+            witness: reclaim::WitnessFlags {
+                checkpoint: reclaim::Witness::Armed,
+                ..store.record().witness
+            },
+            ..store.record().clone()
+        };
+        store.commit(&armed).expect("commit");
+    }
+
+    /// Hold every pass record write at the fault-injection point:
+    /// the receiver hears when one arrives, and a send releases it.
+    fn hold_record_writes(
+        wal: &mut Wal,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered = std::sync::Mutex::new(entered_tx);
+        let release = std::sync::Mutex::new(release_rx);
+        wal.arm_record_write_hook(move || {
+            if let Ok(tx) = entered.lock() {
+                let _ = tx.send(());
+            }
+            if let Ok(rx) = release.lock() {
+                let _ = rx.recv();
+            }
+        });
+        (entered_rx, release_tx)
+    }
+
+    /// The `RECLAIM` record as a fresh open of `root` reads it back.
+    fn reopened_record(root: &std::path::Path) -> reclaim::ReclaimRecord {
+        let geometry = reconcile::configured_geometry(&default_config(root)).expect("geometry");
+        reclaim_store::ReclaimStore::open(root, geometry, false)
+            .expect("reopen the record")
+            .record()
+            .clone()
     }
 
     /// Dropping the `Wal` releases its `RECLAIM` descriptor even while

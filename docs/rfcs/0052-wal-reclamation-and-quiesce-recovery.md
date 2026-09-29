@@ -385,8 +385,9 @@ What the queue carries is **not** a `Drained`: that value is the audit
 buffer's own snapshot taken under the miner lock beside the records, and a
 worker holds neither — it sees `MinedRecord`s after their template events
 were already emitted into the audit sink. So the queue carries **detached
-partitions only**: its item is `PublishItem::Detached { records, guard,
-audit_watermark }`. A `Drained` never enters it. The age sweep and the
+partitions only**: its item is a `Detached` partition, which holds the
+detached records with their audit watermark and a handle to the batch's
+shared completion. A `Drained` never enters it. The age sweep and the
 barrier keep writing theirs through `write_ordered`, synchronously on
 their own tasks, unchanged. The barrier must: `run_cut` needs its flush's
 outcome (`cut_ok`) before it decides whether to stamp. The sweep stays
@@ -483,7 +484,7 @@ First, **the slot is closed before the queue is drained**: a publisher
 about to exit marks the slot closed under the publisher-slot mutex and
 only then drains its receiver, so a worker cannot succeed at an enqueue
 into a channel that is about to be abandoned — it observes the closed
-mark, parks, and joins the restart gate below. Second, **`PublishItem`'s
+mark, parks, and joins the restart gate below. Second, **the queue item's
 destructor is the backstop**: dropping an item that never settled
 requeues its records into the buffers under the sink lock and settles its
 share of the batch's completion, so even an item lost to a drop no code

@@ -293,10 +293,8 @@ detach several partitions into several queue slots; it is a **shared
 completion**, an `Arc` holding the guard and a count incremented per
 detach and decremented per completion (durable, requeued, parked or
 dropped), settling the guard when the count reaches zero and the batch's
-encode phase has ended. Each queued item
-(`PublishItem::Detached { records, guard, audit_watermark }`; RFC 0052
-§3.1's queue carries detached partitions only) carries a handle to that
-completion — so no
+encode phase has ended. Each queued `Detached` item (RFC 0052 §3.1's queue carries detached
+partitions only) carries a handle to that completion — so no
 partition is ever outside both the buffers and the in-flight set, and the worker moves
 to its next record with `quiesce` waiting on encodes alone. Everything this section says about `write_ordered` — the `Drained`
 destructor, the `RecoverableBatch` handle, the unwind arm — applies to the

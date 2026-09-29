@@ -496,7 +496,10 @@ async fn rfc0052_14_pre_cut_batch_detaching_mid_batch_is_covered_without_waiting
     // mark with both of its partitions under it.
     put.open();
     assert_eq!(
-        tick.await.expect("the tick did not panic"),
+        tokio::time::timeout(Duration::from_secs(30), tick)
+            .await
+            .expect("the tick finished once the PUT landed")
+            .expect("the tick did not panic"),
         CutOutcome::Stamped,
     );
     assert_eq!(rig.commits.last_checkpoint(), Some(mark));

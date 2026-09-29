@@ -206,7 +206,7 @@ fn rfc0052_1_publish_guard_covers_detaches_between_capture_and_enqueue() {
         "which is not durable yet"
     );
     put.open();
-    let outcomes = waiting.join().expect("the wait returned");
+    let outcomes = waiting.finish();
     assert!(outcomes.all_ok(cut), "the detach settled durably");
     assert_eq!(tenant_files(&rig, "alpha").len(), 1);
     assert_eq!(sink.publishes_in_flight(), 0);
@@ -262,7 +262,7 @@ fn a_batch_detaching_several_partitions_settles_on_the_last() {
     );
     let waiting = held_wait(&sink, Some(cut), "so the cut still waits");
     put.open();
-    assert!(waiting.join().expect("the wait returned").all_ok(cut));
+    assert!(waiting.finish().all_ok(cut));
     assert_eq!(tenant_files(&rig, "bravo").len(), 1);
     assert_eq!(sink.publishes_in_flight(), 0);
 }
@@ -301,7 +301,7 @@ fn rfc0052_1_publisher_panic_parks_queued_batches_and_respawns() {
     // Then the wait returns, only the failing batch's epoch is latched —
     // not the durable batch's before it, nor the parked ones' after — and
     // every queued batch is back in the buffers with its guard released.
-    let _outcomes = waiting.join().expect("quiesce_publishes returned");
+    let _outcomes = waiting.finish();
     assert_eq!(epochs.capture().failed_epoch(), Some(failing));
     assert_eq!(
         tenant_files(&rig, "alpha").len(),
@@ -443,19 +443,42 @@ fn held_wait(
     sink: &SharedParquetSink,
     cut: Option<ourios_ingester::cadence::Epoch>,
     why: &str,
-) -> std::thread::JoinHandle<ourios_ingester::record_sink::PublishOutcomes> {
-    let waiting = {
-        let sink = sink.clone();
-        std::thread::spawn(move || match cut {
+) -> HeldWait {
+    let (done, settled) = std::sync::mpsc::channel();
+    let sink = sink.clone();
+    std::thread::spawn(move || {
+        let outcomes = match cut {
             Some(cut) => sink.quiesce_publishes_through(cut),
             None => sink.quiesce_publishes(),
-        })
-    };
+        };
+        let _ = done.send(outcomes);
+    });
     for _ in 0..256 {
         std::thread::yield_now();
     }
-    assert!(!waiting.is_finished(), "{why}");
-    waiting
+    assert!(
+        matches!(
+            settled.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "{why}",
+    );
+    HeldWait { settled }
+}
+
+/// A publish wait started by [`held_wait`].
+struct HeldWait {
+    settled: std::sync::mpsc::Receiver<ourios_ingester::record_sink::PublishOutcomes>,
+}
+
+impl HeldWait {
+    /// The wait's outcome — failing, not hanging, when a stranded guard
+    /// means it never returns.
+    fn finish(self) -> ourios_ingester::record_sink::PublishOutcomes {
+        self.settled
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the publish wait returned")
+    }
 }
 
 /// What the record sink's quarantine write — the RFC 0025 §3.3 audit

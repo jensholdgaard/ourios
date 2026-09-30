@@ -2056,6 +2056,147 @@ mod tests {
         );
     }
 
+    /// RFC 0052 §3.2: the post-recovery seed sets the WAL reclamation
+    /// floor. When the flush is skipped, nothing replaced the restored
+    /// artefacts, so the ledger must be the restored horizons and not the
+    /// higher ones the write would have installed. The durable mark still
+    /// takes the replay mark: it bounds what the miner covers, and the
+    /// shutdown stamp that reads it is gated on its own drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_skipped_post_recovery_write_seeds_the_restored_horizons() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (restored, replayed) = two_offsets(&tmp.path().join("wal"));
+        let report = restoring("alpha", restored, replayed);
+        let sink = buffered_sink(&tmp.path().join("store"));
+        let audit_root = tmp.path().join("audit");
+        let audit = audit_sink(&audit_root);
+        audit.clone().emit(audit_event("alpha"));
+        std::fs::remove_dir_all(&audit_root).expect("remove audit dir");
+        std::fs::write(&audit_root, b"not a directory").expect("sabotage audit store");
+        let snapshots_root = tmp.path().join("snapshots");
+
+        let seed = snapshot_post_recovery(
+            (&sink, &audit),
+            &snapshots_root,
+            &mined(&["alpha", "beta"]),
+            &report,
+        );
+
+        assert!(
+            std::fs::read_dir(&snapshots_root).is_err(),
+            "the retained audit event skipped the write",
+        );
+        assert_eq!(
+            seed.ledger,
+            vec![(TenantId::new("alpha"), restored)],
+            "the ledger is what the untouched artefacts carry",
+        );
+        assert_eq!(seed.last_durable, Some(replayed));
+    }
+
+    /// RFC 0052 §3.2: a write that fails partway has replaced some
+    /// artefacts and not others, so the ledger falls back to the restored
+    /// horizons. Every installed horizon is at or above the restored one,
+    /// so that is never above what is durable for any tenant. Lower is
+    /// the safe direction: a lower floor only retains more WAL, while a
+    /// horizon above the artefact on disk would let housekeeping unlink
+    /// frames the next start must replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_post_recovery_write_never_seeds_above_the_disk() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (restored, replayed) = two_offsets(&tmp.path().join("wal"));
+        let snapshots_root = tmp.path().join("snapshots");
+        let miner = mined(&["alpha", "beta"]);
+        recovery::write_snapshots_with(&snapshots_root, &miner, |tenant| {
+            (tenant.as_str() == "alpha").then_some(restored)
+        })
+        .expect("alpha's restored artefact");
+        // Beta, known to replay only, is written second; a non-empty
+        // directory cannot be replaced by a rename, so its write fails.
+        std::fs::remove_file(snapshots_root.join("beta.snap")).expect("unstamped beta");
+        std::fs::create_dir(snapshots_root.join("beta.snap")).expect("block beta");
+        std::fs::write(snapshots_root.join("beta.snap").join("occupied"), b"x").expect("occupy");
+
+        let seed = snapshot_post_recovery(
+            (
+                &buffered_sink(&tmp.path().join("store")),
+                &audit_sink(&tmp.path().join("audit")),
+            ),
+            &snapshots_root,
+            &miner,
+            &restoring("alpha", restored, replayed),
+        );
+
+        assert_eq!(
+            disk_high_water(&snapshots_root, "alpha"),
+            Some(replayed),
+            "alpha, first, was replaced before beta failed",
+        );
+        assert_eq!(seed.ledger, vec![(TenantId::new("alpha"), restored)]);
+        assert!(
+            restored < replayed,
+            "below alpha's artefact, never above it"
+        );
+        assert!(
+            !seed
+                .ledger
+                .iter()
+                .any(|(tenant, _)| tenant.as_str() == "beta"),
+            "beta has no durable artefact, so no horizon may cover its frames",
+        );
+    }
+
+    /// Two synced offsets, the first below the second.
+    fn two_offsets(wal_root: &Path) -> (WalOffset, WalOffset) {
+        let mut wal = Wal::open(test_wal_config(wal_root)).expect("open");
+        let mut sync = |payload: &[u8]| {
+            wal.append(ourios_wal::FrameKind::TenantOtlpBatch, payload)
+                .expect("append");
+            wal.sync().expect("sync")
+        };
+        (sync(b"first"), sync(b"second"))
+    }
+
+    /// A report that restored `tenant` at `restored` and replayed up to
+    /// `replayed`.
+    fn restoring(tenant: &str, restored: WalOffset, replayed: WalOffset) -> RecoveryReport {
+        RecoveryReport {
+            max_delivered: Some(replayed),
+            tenants: vec![recovery::TenantRecovery {
+                tenant_id: TenantId::new(tenant),
+                outcome: ourios_miner::snapshot::RecoveryOutcome::Restored,
+                stale_gap: false,
+                horizon: Some(restored),
+            }],
+            ..RecoveryReport::default()
+        }
+    }
+
+    /// A miner holding one mined line per tenant.
+    fn mined(tenants: &[&str]) -> MinerCluster {
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        for tenant in tenants {
+            let tenant = TenantId::new(*tenant);
+            let request = export_request(tenant.as_str(), &["user 1 logged in"]);
+            for record in ourios_ingester::receiver::assign(request, &tenant) {
+                miner.ingest(&record);
+            }
+        }
+        miner
+    }
+
+    /// The high-water mark `tenant`'s artefact carries on disk.
+    fn disk_high_water(snapshots_root: &Path, tenant: &str) -> Option<WalOffset> {
+        let bytes = std::fs::read(snapshots_root.join(format!("{tenant}.snap"))).expect("read");
+        let (state, _) = ourios_miner::snapshot::recover(Some(&bytes));
+        let high_water = state.expect("decodes").wal_high_water?;
+        let segment = high_water.segment.parse().expect("segment uuid");
+        Some(WalOffset {
+            segment,
+            byte: high_water.byte,
+        })
+    }
+
     /// Every `*.wal` segment directly under the WAL root.
     fn wal_segments(root: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = std::fs::read_dir(root)

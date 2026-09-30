@@ -284,24 +284,26 @@ alone, and neither can a `catch_unwind` at one call site.
 RFC 0052 §3.1 a worker performs no store I/O: `emit_concurrent` appends
 each record to the buffers, and a size- or ceiling-detached partition is
 enqueued to the **publisher** — the one dedicated thread the
-`PublishCoordinator` owns behind a bounded queue, which runs
-`write_ordered` on each batch and settles its guard as durable, requeued,
-quarantined or, on an unwind, latched. The guard is **not** the worker's
+`PublishCoordinator` owns behind a bounded queue, which publishes each
+detached partition through `Feed::publish` and settles its share of the
+guard as durable, requeued, quarantined or, on an unwind, latched. The guard is **not** the worker's
 to create: RFC 0052 §3.1 has `submit` create it under the exclusion with
 the batch's own epoch. Nor is it moved into one item, since a batch can
 detach several partitions into several queue slots; it is a **shared
 completion**, an `Arc` holding the guard and a count incremented per
 detach and decremented per completion (durable, requeued, parked or
 dropped), settling the guard when the count reaches zero and the batch's
-encode phase has ended. Each queued item
-(`PublishItem::{ Drained(Drained), Detached { records, guard,
-audit_watermark } }`) carries a handle to that completion — so no
+encode phase has ended. Each queued `Detached` item (RFC 0052 §3.1's queue carries detached
+partitions only) carries a handle to that completion — so no
 partition is ever outside both the buffers and the in-flight set, and the worker moves
 to its next record with `quiesce` waiting on encodes alone. Everything this section says about `write_ordered` — the `Drained`
-destructor, the `RecoverableBatch` handle, the unwind arm — therefore
-attaches to the publisher thread for detached batches exactly as it does
-to the age sweep's step, since both run the same function on the same
-thread; nothing attaches to a worker-side PUT, because there is none. What a worker panic can still drop is
+destructor, the `RecoverableBatch` handle, the unwind arm — applies to the
+age sweep's step, which calls `write_ordered` with a `Drained` on its own
+task. The publisher thread runs a different path for detached partitions
+(`Feed::publish`; RFC 0052 §3.1's queue carries detached partitions
+only), whose unwind is owned by the queue item's destructor and the shared
+completion above, so the `Drained`-specific rules stay the sweep's
+concern; nothing attaches to a worker-side PUT, because there is none. What a worker panic can still drop is
 the *unappended remainder* of its mined `Vec`, and RFC 0052 has
 `BatchGuard` lower `failed_epoch` for exactly that; the latch stays, and
 the worker's batch takes the same recoverable shape so a cut can clear it —

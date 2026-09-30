@@ -606,13 +606,11 @@ impl Wal {
         Ok(())
     }
 
-    /// The WAL state RFC 0052 §3.5 exports. The retain floor with its
-    /// lag, the rotation-failure state and the age of the oldest
-    /// unreclaimed frame arrive with the slices that own them; this is
-    /// what the WAL knows once the sidecar is wired.
+    /// The WAL state RFC 0052 §3.5 exports.
     #[must_use]
     pub fn reclaim_state(&self) -> ReclaimState {
         let metrics = self.metrics();
+        let (lag_bytes, lag_segments) = self.ledger.lag(self.current_segment_uuid);
         ReclaimState {
             unflushed_bytes: metrics.unflushed_bytes,
             disk_bytes: metrics.disk_bytes,
@@ -623,7 +621,27 @@ impl Wal {
             reclaimable: self.checkpoint_is_settled(),
             floor: self.ledger.floor(),
             rotation: self.rotation.clone(),
+            oldest_unreclaimed: self.oldest_unreclaimed(),
+            lag_bytes,
+            lag_segments,
         }
+    }
+
+    /// RFC 0052 §3.3's rotation state alone — what the commit
+    /// coordinator compares across every call under the journal guard to
+    /// emit the rotation edges, without [`Self::reclaim_state`]'s
+    /// directory walk.
+    #[must_use]
+    pub fn rotation_state(&self) -> &RotationState {
+        &self.rotation
+    }
+
+    fn oldest_unreclaimed(&self) -> Option<std::time::SystemTime> {
+        if self.unreclaimed_bytes == 0 {
+            return None;
+        }
+        let (secs, nanos) = self.ledger.oldest_with_frames()?.get_timestamp()?.to_unix();
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos))
     }
 
     /// Arm RFC 0052 §6's rotation fault-injection seam.
@@ -2435,6 +2453,18 @@ pub struct ReclaimState {
     /// attempt count, or terminal. §3.5 exports the distinction because
     /// "retrying" and "given up" need different operator responses.
     pub rotation: RotationState,
+    /// §3.5's age proxy: the creation time of the oldest surviving
+    /// segment that holds a frame, read from its `UUIDv7`. No frame
+    /// carries a timestamp, and every frame in a segment is at least as
+    /// young as the segment, so the age it yields is conservative.
+    /// `None` exactly when `unreclaimed_bytes` is zero, so an idle WAL
+    /// holding only an empty open segment reports no growing age.
+    pub oldest_unreclaimed: Option<std::time::SystemTime>,
+    /// §3.5's retain-floor lag: frame bytes and segments at least one
+    /// tenant holds back, less the current append segment. Zero while
+    /// the floor is `Unknown` or `None`.
+    pub lag_bytes: u64,
+    pub lag_segments: usize,
 }
 
 /// Errors from [`Wal::replay`].

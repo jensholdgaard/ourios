@@ -28,6 +28,9 @@ pub struct Event {
     pub name: &'static str,
     pub severity: i32,
     pub attributes: BTreeMap<String, String>,
+    /// The rendered message. weaver never sees it; a test that asserts
+    /// what the message names reads it here.
+    pub body: Option<String>,
 }
 
 impl Event {
@@ -39,6 +42,7 @@ impl Event {
                 .attributes_iter()
                 .map(|(key, value)| (key.as_str().to_owned(), render(value)))
                 .collect(),
+            body: record.body().map(render),
         })
     }
 
@@ -304,6 +308,7 @@ mod tests {
                 .iter()
                 .map(|key| ((*key).to_owned(), "x".to_owned()))
                 .collect::<BTreeMap<_, _>>(),
+            body: None,
         }
     }
 

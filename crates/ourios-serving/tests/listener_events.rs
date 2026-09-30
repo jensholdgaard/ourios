@@ -195,8 +195,11 @@ async fn drive_tls_reloads(capture: &EventCapture) {
                 && e.error_type() == Some("panic")
                 && e.attributes.get(semconv::OURIOS_SERVER_LISTENER_NAME)
                     == Some(&LISTENER_HTTP.to_owned())
+                && e.body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(&cert.display().to_string()))
         }),
-        "the unwound reload names its listener"
+        "the unwound reload names its listener and its certificate path"
     );
 }
 

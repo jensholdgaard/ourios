@@ -219,7 +219,11 @@ impl ReloadTask {
                             { ERROR_TYPE } = RELOAD_PANIC,
                             { semconv::OURIOS_SERVER_LISTENER_NAME } = self.listener,
                         },
-                        "TLS reload task panicked; retrying next tick: {e}"
+                        "TLS reload task panicked (cert {}, key {}, client CA {:?}); retrying next \
+                         tick: {e}",
+                        self.settings.cert_file.display(),
+                        self.settings.key_file.display(),
+                        self.settings.client_ca_file,
                     );
                     continue;
                 }

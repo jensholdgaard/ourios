@@ -683,7 +683,7 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     // template renders the claim" would be circular — the built-in
     // miner converges on the same canonical for this corpus even
     // under `ignore`.
-    let mut adopted_events: Vec<(u64, String)> = Vec::new();
+    let mut adopted_events: Vec<(u64, u32, String)> = Vec::new();
     for f in data_parquet_files(&tmp.path().join("audit")) {
         let events = ourios_parquet::AuditReader::open_file(&f)
             .expect("open audit file")
@@ -692,18 +692,22 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
         for event in events {
             if let ourios_core::audit::AuditPayload::Template {
                 template_id,
-                change: ourios_core::audit::TemplateChange::Adopted { new_template, .. },
+                change:
+                    ourios_core::audit::TemplateChange::Adopted {
+                        template_version,
+                        new_template,
+                    },
                 ..
             } = event.payload
             {
-                adopted_events.push((template_id, new_template));
+                adopted_events.push((template_id, template_version, new_template));
             }
         }
     }
     assert!(
         adopted_events
             .iter()
-            .any(|(_, template)| template == CONVERGED),
+            .any(|(_, _, template)| template == CONVERGED),
         "the adopt path audited the drainprocessor's converged template: {adopted_events:?}",
     );
 
@@ -732,16 +736,22 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
                 "every stored claim is drain's known output for this corpus, \
                  got {claim:?} (line {line:?})",
             );
-            // A converged claim was adopted: the audit stream carries
-            // its template_adopted event for this row's id, and the
-            // registry tokens at the row's key render the claim.
+            // A converged claim was adopted: the audit stream carries a
+            // template_adopted event for exactly this row's (id, version)
+            // naming this claim — an adoption of the same id at another
+            // version or template does not count — and the registry
+            // tokens at the row's key render the claim.
             if claim == CONVERGED {
                 assert!(
-                    adopted_events
-                        .iter()
-                        .any(|(id, _)| *id == record.template_id),
-                    "row {} adopted via the audited adopt path",
+                    adopted_events.iter().any(|(id, version, template)| {
+                        *id == record.template_id
+                            && *version == record.template_version
+                            && *template == claim
+                    }),
+                    "row ({}, v{}) adopted via the audited adopt path with its claim \
+                     {claim:?}: {adopted_events:?}",
                     record.template_id,
+                    record.template_version,
                 );
                 let tokens = registry
                     .get(&(record.template_id, record.template_version))

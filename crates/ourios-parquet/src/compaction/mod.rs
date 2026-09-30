@@ -87,11 +87,17 @@ pub struct CompactionOutcome {
     pub rows: u64,
     /// Rows an erasure filter removed (RFC 0047 §3.6); `0` without one.
     pub rows_dropped: u64,
-    /// The commit, or `None` when nothing was committed: fewer than two
-    /// live files (nothing to consolidate), a bootstrap manifest lost to a
-    /// concurrent compactor before anything was written, or a final
-    /// manifest swap lost after the rewrite. Only the last is a failure,
-    /// and it is distinguished by [`commit_lost`](Self::commit_lost).
+    /// The commit, or `None` when nothing was committed: too few live files
+    /// (fewer than two to consolidate; none for an erasure), a bootstrap
+    /// manifest lost to a concurrent compactor before anything was
+    /// written, or a final manifest swap lost after the rewrite.
+    ///
+    /// For a consolidation only the last is a failure, and it is
+    /// distinguished by [`commit_lost`](Self::commit_lost). An erasure
+    /// ([`RowHooks::drop`]) is the exception: any `None` with
+    /// `files_before > 0`, a lost bootstrap included, leaves live rows
+    /// unrewritten, so its caller must treat it as a failure too and not
+    /// advance the erasure marker.
     pub committed: Option<Committed>,
     /// Whether the rewrite was written but its final manifest swap lost.
     /// `false` for every other no-op, including a lost bootstrap: that
@@ -210,6 +216,11 @@ impl std::error::Error for CompactionError {
 /// is deleted immediately (a failed delete is counted in
 /// [`CompactionOutcome::gc_failures`]), the inputs stay live, and the
 /// compaction sweep surfaces the loss as a sweep error so it is retried.
+///
+/// That classification is for consolidation. An erasure through
+/// [`compact_partition_hooked`] with a [`RowHooks::drop`] rewrites a
+/// single-file partition too, and even a lost bootstrap there is a failure;
+/// see [`CompactionOutcome::committed`].
 ///
 /// # Errors
 ///

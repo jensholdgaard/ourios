@@ -349,6 +349,31 @@ impl std::error::Error for ReclaimError {
     }
 }
 
+impl ReclaimError {
+    /// The `error.type` value RFC 0052 §3.5's counters and events carry:
+    /// the failure's class, never its rendered detail.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Checkpoint(CheckpointError::Io { .. })
+            | Self::Housekeeping {
+                source: HousekeepingError::Io { .. },
+                ..
+            } => "io",
+            Self::Checkpoint(CheckpointError::NonMonotonic { .. }) => "non_monotonic",
+            Self::Housekeeping {
+                source: HousekeepingError::ModeDisagreement { .. },
+                ..
+            } => "mode_disagreement",
+            Self::Housekeeping {
+                source: HousekeepingError::Unrecoverable { .. },
+                ..
+            } => "unrecoverable",
+            Self::NoReclamationSurface => "no_reclamation_surface",
+        }
+    }
+}
+
 impl From<CheckpointError> for ReclaimError {
     fn from(e: CheckpointError) -> Self {
         Self::Checkpoint(e)
@@ -596,6 +621,60 @@ mod tests {
         Arc, AtomicU64, HousekeepingProgress, PassId, PassOutcome, ReclaimOutcome, ReclaimPlan,
         RetainFloor, UnlinkPermit, Uuid, unlink_planned,
     };
+
+    /// `error.type` is the class, so a counter keyed on it stays bounded
+    /// whatever the I/O detail says.
+    #[test]
+    fn reclaim_errors_map_to_bounded_error_types() {
+        use super::{CheckpointError, HousekeepingError, ReclaimError};
+        let io = || std::io::Error::other("detail that must not leak into the class");
+        let progress = || {
+            Box::new(HousekeepingProgress {
+                removed_segments: 0,
+                removed_partials: 0,
+                capped: false,
+                horizon_remaining: 0,
+                unlink_remaining: 0,
+                floor: RetainFloor::Unknown,
+                lag_bytes: 0,
+                lag_segments: 0,
+                outcome: PassOutcome::Planned,
+            })
+        };
+        let cases = [
+            (
+                ReclaimError::Checkpoint(CheckpointError::Io {
+                    op: "rename",
+                    source: io(),
+                }),
+                "io",
+            ),
+            (
+                ReclaimError::Housekeeping {
+                    progress: progress(),
+                    source: HousekeepingError::ModeDisagreement {
+                        recorded: "known",
+                        attempted: "no_consumer",
+                    },
+                },
+                "mode_disagreement",
+            ),
+            (
+                ReclaimError::Housekeeping {
+                    progress: progress(),
+                    source: HousekeepingError::Io {
+                        op: "unlink",
+                        source: io(),
+                    },
+                },
+                "io",
+            ),
+            (ReclaimError::NoReclamationSurface, "no_reclamation_surface"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.error_type(), expected, "{error}");
+        }
+    }
 
     /// The plan's paths are the crate's own, but [`unlink_planned`] is
     /// public, holds no guard and removes files — so the reserved

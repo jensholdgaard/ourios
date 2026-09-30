@@ -37,10 +37,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ourios_wal::{HousekeepingProgress, ReclaimError, ReclaimOutcome, SnapshotHorizons, WalOffset};
+use ourios_wal::{
+    HousekeepingProgress, ReclaimError, ReclaimOutcome, RotationState, SnapshotHorizons, WalOffset,
+};
 use tokio::sync::watch;
 
 use crate::receiver::pipeline::{Journal, ReceiveError};
+use crate::reclaim_telemetry::{RotationCell, emit_rotation_edge};
 
 /// The result of a [`CommitCoordinator::commit`]: the durability outcome
 /// plus the append **sequence number** the frame consumed, if any.
@@ -128,8 +131,12 @@ struct FlushState {
 /// ingester process (it owns the single-writer WAL).
 pub struct CommitCoordinator {
     /// The durability sink, serialized: append + sync both run under this
-    /// lock, never held across an `.await`.
-    journal: Mutex<Box<dyn Journal>>,
+    /// lock, never held across an `.await`. The rotation state it last
+    /// showed rides beside it, so every guard release compares against
+    /// what the previous one saw.
+    journal: Mutex<JournalSlot>,
+    /// RFC 0052 §3.5's rotation cell, for the exporter.
+    rotation: Arc<RotationCell>,
     /// `wal_batch_window_ms` (§3.4 / §6.9): the max time from first
     /// `append` to its `sync`.
     window: Duration,
@@ -176,8 +183,13 @@ impl CommitCoordinator {
         // the first commit runs its miner step immediately.
         let (ingest_gate, _ingest_rx) = watch::channel(1u64);
         let (fill, _fill_rx) = watch::channel(0u64);
+        let seen = journal.rotation_state();
         Arc::new(Self {
-            journal: Mutex::new(journal),
+            rotation: Arc::new(RotationCell::new(&seen)),
+            journal: Mutex::new(JournalSlot {
+                journal,
+                rotation: seen,
+            }),
             window,
             segment_size_bytes,
             flush_state: Mutex::new(FlushState {
@@ -500,16 +512,67 @@ impl CommitCoordinator {
         self.outcome_tx.borrow().generation + 1
     }
 
-    fn lock_journal(&self) -> std::sync::MutexGuard<'_, Box<dyn Journal>> {
-        self.journal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock_journal(&self) -> JournalGuard<'_> {
+        JournalGuard {
+            slot: self
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            cell: &self.rotation,
+        }
+    }
+
+    /// RFC 0052 §3.5's rotation cell, read by the exporter without
+    /// taking the journal guard.
+    #[must_use]
+    pub fn rotation_cell(&self) -> Arc<RotationCell> {
+        Arc::clone(&self.rotation)
     }
 
     fn lock_flush_state(&self) -> std::sync::MutexGuard<'_, FlushState> {
         self.flush_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct JournalSlot {
+    journal: Box<dyn Journal>,
+    rotation: RotationState,
+}
+
+/// The journal guard. Its release is where RFC 0052 §3.5's rotation
+/// edges are emitted: synchronously, still under the journal mutex, and
+/// in the order the WAL observed its outcomes — every append, sync and
+/// rotation runs under this guard, so no edge can happen between two
+/// comparisons.
+struct JournalGuard<'a> {
+    slot: std::sync::MutexGuard<'a, JournalSlot>,
+    cell: &'a RotationCell,
+}
+
+impl std::ops::Deref for JournalGuard<'_> {
+    type Target = Box<dyn Journal>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slot.journal
+    }
+}
+
+impl std::ops::DerefMut for JournalGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slot.journal
+    }
+}
+
+impl Drop for JournalGuard<'_> {
+    fn drop(&mut self) {
+        let now = self.slot.journal.rotation_state();
+        if now != self.slot.rotation {
+            emit_rotation_edge(&self.slot.rotation, &now);
+            self.cell.store(&now);
+            self.slot.rotation = now;
+        }
     }
 }
 

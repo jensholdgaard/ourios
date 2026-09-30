@@ -40,6 +40,17 @@ pub enum SnapshotStoreError {
     Encode(SnapshotError),
 }
 
+impl SnapshotStoreError {
+    /// The `error.type` value the barrier's snapshot-write counter carries.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "io",
+            Self::Encode(_) => "encode",
+        }
+    }
+}
+
 impl std::fmt::Display for SnapshotStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

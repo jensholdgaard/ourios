@@ -700,4 +700,8 @@ impl Journal for FaultyJournal {
     fn reclaim_state(&self) -> ReclaimState {
         Journal::reclaim_state(&self.wal)
     }
+
+    fn rotation_state(&self) -> ourios_wal::RotationState {
+        Journal::rotation_state(&self.wal)
+    }
 }

@@ -26,10 +26,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opentelemetry::metrics::{Counter, Histogram, ObservableUpDownCounter, UpDownCounter};
+use opentelemetry::metrics::{
+    Counter, Histogram, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
+};
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
+use crate::cadence::BarrierEpochs;
 use crate::compactor::{IngestError, SweepReport, to_u64};
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
@@ -401,6 +404,114 @@ pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 impl Default for IngestMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RFC 0052 §3.1's publication-barrier instruments (#833): what each cut
+/// and capture decided, the checkpoint and snapshot writes the barrier
+/// attempts, and the epoch pair that says whether the `cadence_failed`
+/// latch is set. Built once per barrier on the global `ourios.ingest`
+/// meter.
+#[derive(Debug)]
+pub struct BarrierMetrics {
+    cuts: Counter<u64>,
+    captures: Counter<u64>,
+    checkpoint_writes: Counter<u64>,
+    snapshot_writes: Counter<u64>,
+    #[expect(dead_code, reason = "retains the observable-callback registrations")]
+    epochs: [ObservableGauge<u64>; 2],
+}
+
+impl BarrierMetrics {
+    /// Build the instruments; the epoch gauges read `epochs` at collect
+    /// time.
+    #[must_use]
+    pub fn new(epochs: &Arc<BarrierEpochs>) -> Self {
+        let meter = global::meter("ourios.ingest");
+        let cuts = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_CUTS)
+            .with_unit("{cut}")
+            .build();
+        let captures = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_CAPTURES)
+            .with_unit("{capture}")
+            .build();
+        let checkpoint_writes = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES)
+            .with_unit("{write}")
+            .build();
+        let snapshot_writes = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES)
+            .with_unit("{write}")
+            .build();
+        let current = Arc::clone(epochs);
+        let epoch = meter
+            .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_EPOCH)
+            .with_unit("{epoch}")
+            .with_callback(move |observer| {
+                observer.observe(u64::from(current.current().get()), &[]);
+            })
+            .build();
+        let latch = Arc::clone(epochs);
+        let failed_epoch = meter
+            .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH)
+            .with_unit("{epoch}")
+            .with_callback(move |observer| {
+                if let Some(failed) = latch.capture().failed_epoch() {
+                    observer.observe(u64::from(failed.get()), &[]);
+                }
+            })
+            .build();
+        Self {
+            cuts,
+            captures,
+            checkpoint_writes,
+            snapshot_writes,
+            epochs: [epoch, failed_epoch],
+        }
+    }
+
+    /// One cut's decision, as `ourios.ingest.barrier.cut.outcome`.
+    pub fn record_cut(&self, outcome: &'static str) {
+        self.cuts.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_INGEST_BARRIER_CUT_OUTCOME,
+                outcome,
+            )],
+        );
+    }
+
+    /// One capture's effect on the pending slot.
+    pub fn record_capture(&self, outcome: &'static str) {
+        self.captures.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_INGEST_BARRIER_CAPTURE_OUTCOME,
+                outcome,
+            )],
+        );
+    }
+
+    /// One checkpoint write: `error_type` is `None` on success.
+    pub fn record_checkpoint_write(&self, error_type: Option<&'static str>) {
+        match error_type {
+            None => self.checkpoint_writes.add(1, &[]),
+            Some(class) => self
+                .checkpoint_writes
+                .add(1, &[KeyValue::new(ERROR_TYPE, class)]),
+        }
+    }
+
+    /// One tenant's snapshot write: `error_type` is `None` on success.
+    pub fn record_snapshot_write(&self, tenant: &str, error_type: Option<&'static str>) {
+        let tenant = KeyValue::new(semconv::OURIOS_TENANT, tenant.to_owned());
+        match error_type {
+            None => self.snapshot_writes.add(1, &[tenant]),
+            Some(class) => self
+                .snapshot_writes
+                .add(1, &[tenant, KeyValue::new(ERROR_TYPE, class)]),
+        }
     }
 }
 

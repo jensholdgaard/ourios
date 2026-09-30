@@ -14,6 +14,7 @@ use ourios_wal::{HousekeepingProgress, ReclaimError};
 use crate::barrier::Barrier;
 use crate::publish::PublishCoordinator;
 use crate::receiver::CommitCoordinator;
+use crate::reclaim_telemetry::WalExport;
 
 /// What one housekeeping tick came to.
 #[derive(Debug)]
@@ -32,12 +33,15 @@ pub enum HousekeepingTick {
 
 /// The owner of the housekeeping cadence's inputs: the journal owner it
 /// reclaims through, the barrier whose installs are the horizons, and
-/// the counter a panic is recorded on.
+/// the counter a panic is recorded on. It is also RFC 0052 §3.5's
+/// single observer of the states that change on ticks, so it owns the
+/// WAL export.
 pub struct Housekeeper {
     coordinator: Arc<CommitCoordinator>,
     barrier: Arc<Barrier>,
     cadence: PublishCoordinator,
     max_unlinks: usize,
+    export: WalExport,
 }
 
 impl Housekeeper {
@@ -49,22 +53,44 @@ impl Housekeeper {
         cadence: PublishCoordinator,
         max_unlinks: usize,
     ) -> Self {
+        let export = WalExport::new(&coordinator.rotation_cell(), barrier.epochs());
         Self {
             coordinator,
             barrier,
             cadence,
             max_unlinks,
+            export,
         }
     }
 
     /// One capped pass under `catch_unwind`, so a panic costs one tick
     /// rather than the task: reclamation is the only thing standing
-    /// between a healthy node and #793's unbounded WAL.
+    /// between a healthy node and #793's unbounded WAL. Every tick, the
+    /// panicked one included, ends by handing the WAL's state to the
+    /// export, which is how a run whose checkpoint never advances still
+    /// reports its unreclaimed bytes growing.
     pub fn tick(&self) -> HousekeepingTick {
         let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.coordinator
                 .maintain(&self.barrier.snapshot_horizons(), self.max_unlinks)
         }));
+        let tick = self.settle(pass);
+        let progress = match &tick {
+            HousekeepingTick::Completed(progress) => Some(*progress),
+            HousekeepingTick::Failed(ReclaimError::Housekeeping { progress, .. }) => {
+                Some(**progress)
+            }
+            HousekeepingTick::Failed(_) | HousekeepingTick::Panicked => None,
+        };
+        self.export
+            .observe(self.coordinator.reclaim_state(), progress);
+        tick
+    }
+
+    fn settle(
+        &self,
+        pass: std::thread::Result<Result<HousekeepingProgress, ReclaimError>>,
+    ) -> HousekeepingTick {
         match pass {
             Ok(Ok(progress)) => HousekeepingTick::Completed(progress),
             Ok(Err(e)) => {

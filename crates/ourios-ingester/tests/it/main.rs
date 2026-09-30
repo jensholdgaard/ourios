@@ -17,6 +17,7 @@ mod ingest_support;
 mod otlp_strategy;
 
 mod http_transport_errors;
+mod rfc0001_3_5_restore_after_upgrade;
 mod rfc0001_3_5_snapshot_restore;
 mod rfc0003_10_dropped_attributes_count;
 mod rfc0003_11_transport_errors;

@@ -9,7 +9,7 @@ use ourios_core::tenant::TenantId;
 
 use super::{AdoptedEntry, MinerCluster, OwnedAdopted, TenantState};
 use crate::mask::tag_str_for;
-use crate::tree::{Leaf, OwnedToken, UpstreamAssociations, format_template};
+use crate::tree::{Leaf, OwnedToken, UpstreamAssociations, WILDCARD_CHILD, format_template};
 
 impl MinerCluster {
     /// Number of distinct templates this tenant has accumulated
@@ -144,9 +144,9 @@ impl MinerCluster {
         // unchanged tree).
         let mut leaves: Vec<LeafRecord> = state
             .tree
-            .collect_leaves()
+            .collect_routed_leaves()
             .into_iter()
-            .map(|leaf| LeafRecord {
+            .map(|(leaf, wildcard_routed)| LeafRecord {
                 template: leaf.template.iter().map(TokenRecord::from).collect(),
                 template_id: leaf.template_id,
                 template_version: leaf.template_version,
@@ -160,6 +160,7 @@ impl MinerCluster {
                     .map(str::to_string)
                     .collect(),
                 upstream_association_overflow: leaf.upstream_associations.overflow(),
+                wildcard_routed,
             })
             .collect();
         leaves.sort_by_key(|leaf| leaf.template_id);
@@ -410,16 +411,13 @@ impl MinerCluster {
 /// the RFC 0050 provenance/association fields, and the masked
 /// descent path.
 ///
-/// `descend_mut` reads the slice length as the length bucket and
-/// only the first `min(prefix_depth, len)` entries as the prefix
-/// path, so positions past the path take a filler. A path-position
-/// wildcard can only arise from mask emission at leaf creation, and
-/// every line reaching the leaf carries the identical masked tag
-/// there — widening and type-expansion are impossible at path
-/// positions because tree candidates share their first walk-depth
-/// masked tokens by construction. Its recorded slot set is
-/// therefore a singleton of a mask-emitted type, whose tag string
-/// is the path component.
+/// Under a keyed branch every line reaching the leaf carries the
+/// identical masked token at that path position, so a path-position
+/// wildcard there came from mask emission and its recorded slot set is
+/// a singleton mask-emitted type, whose tag string is the path
+/// component. Under RFC 0023 §3.1's wildcard child lines differ there,
+/// so the leaf may widen or type-expand at that position; the snapshot
+/// records those positions and the path takes the wildcard child.
 pub(super) fn restore_leaf_into(
     tenant: &mut TenantState,
     record: &crate::snapshot::LeafRecord,
@@ -441,23 +439,7 @@ pub(super) fn restore_leaf_into(
         .filter(|t| matches!(t, OwnedToken::Wildcard))
         .count();
     let slot_types = restore_slot_types(record, wildcard_count)?;
-
-    let walk_depth = prefix_depth.min(template.len());
-    let mut masked: Vec<&str> = Vec::with_capacity(template.len());
-    let mut slot = 0usize;
-    for (position, token) in template.iter().enumerate() {
-        match token {
-            OwnedToken::Fixed(s) => masked.push(s),
-            OwnedToken::Wildcard if position < walk_depth => {
-                masked.push(path_tag(record, slot, position)?);
-                slot += 1;
-            }
-            OwnedToken::Wildcard => {
-                masked.push("<*>");
-                slot += 1;
-            }
-        }
-    }
+    let masked = descent_path(record, &template, prefix_depth.min(template.len()))?;
 
     // Index the restored canonical for the RFC0050.6 convergence
     // guard, before `template` moves into the leaf.
@@ -483,6 +465,41 @@ pub(super) fn restore_leaf_into(
         ),
     });
     Ok(())
+}
+
+/// The masked descent path that re-creates `record`'s leaf position:
+/// [`WILDCARD_CHILD`] at each recorded wildcard-routed position, the
+/// template's own token or mask tag at every other one. Positions past
+/// the walk only fix the length bucket, so they take a filler.
+fn descent_path<'r>(
+    record: &crate::snapshot::LeafRecord,
+    template: &'r [OwnedToken],
+    walk_depth: usize,
+) -> Result<Vec<&'r str>, RestoreError> {
+    let routed = &record.wildcard_routed;
+    let ascending = routed.windows(2).all(|pair| pair[0] < pair[1]);
+    if !ascending || routed.last().is_some_and(|&last| last >= walk_depth) {
+        return Err(RestoreError::Inconsistent {
+            detail: format!(
+                "template_id {}: wildcard-routed positions {routed:?} are not ascending \
+                 positions below the walk depth {walk_depth}",
+                record.template_id,
+            ),
+        });
+    }
+    let mut masked = Vec::with_capacity(template.len());
+    let mut slot = 0usize;
+    for (position, token) in template.iter().enumerate() {
+        let on_path = position < walk_depth;
+        masked.push(match token {
+            _ if on_path && routed.contains(&position) => WILDCARD_CHILD,
+            OwnedToken::Fixed(s) => s.as_str(),
+            OwnedToken::Wildcard if on_path => path_tag(record, slot, position)?,
+            OwnedToken::Wildcard => "<*>",
+        });
+        slot += usize::from(matches!(token, OwnedToken::Wildcard));
+    }
+    Ok(masked)
 }
 
 /// Reject a tree-backed adopted-template record whose leaf
@@ -630,7 +647,7 @@ pub(super) fn path_tag(
 }
 
 /// Errors from [`MinerCluster::restore_tenant`].
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RestoreError {
     /// The tenant already has live state. Restore runs before live

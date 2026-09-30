@@ -371,6 +371,7 @@ mod tests {
                 provenance: vec![],
                 upstream_associations: vec![],
                 upstream_association_overflow: 0,
+                wildcard_routed: vec![],
             }],
             structured_templates: vec![StructuredTemplateRecord {
                 severity_number: 17,

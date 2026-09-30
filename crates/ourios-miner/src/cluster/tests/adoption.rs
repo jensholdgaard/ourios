@@ -518,6 +518,7 @@ fn restore_rejects_mismatched_tree_backed_adoption() {
             provenance: vec![],
             upstream_associations: vec![],
             upstream_association_overflow: 0,
+            wildcard_routed: vec![],
         }],
         structured_templates: vec![],
         wal_high_water: None,

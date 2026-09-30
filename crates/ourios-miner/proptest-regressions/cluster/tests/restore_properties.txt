@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2fb5645bfca9b80ef4aaf6d05ee5885451c849b6232efa97159bd82930dbad5d # shrinks to config = MinerConfig { similarity_threshold: 0.7, similarity_floor: 0.4, param_byte_limit: 256, prefix_depth: 1, max_node_children: 1, max_templates: 20000, max_line_tokens: 512, upstream_templates: Adopt, upstream_template_byte_limit: 8192, upstream_association_limit: 4 }, before = [Line { tenant: 0, words: [0], severity: 0 }, Line { tenant: 0, words: [6], severity: 9 }, Line { tenant: 0, words: [8], severity: 9 }], after = []

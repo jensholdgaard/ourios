@@ -401,6 +401,40 @@ impl Tree {
         }
         out
     }
+
+    /// Every [`Leaf`] with the prefix-path positions at which its node
+    /// was reached through [`WILDCARD_CHILD`] (ascending). A leaf under
+    /// that child can widen or type-expand at a path position, so the
+    /// route is not derivable from its template; a snapshot records it.
+    /// Order is not guaranteed.
+    #[must_use]
+    pub fn collect_routed_leaves(&self) -> Vec<(&Leaf, Vec<usize>)> {
+        let mut out = Vec::new();
+        for length_node in self.by_length.values() {
+            collect_routed_recursive(&length_node.root, &mut Vec::new(), &mut out);
+        }
+        out
+    }
+}
+
+fn collect_routed_recursive<'t>(
+    node: &'t PrefixNode,
+    route: &mut Vec<bool>,
+    out: &mut Vec<(&'t Leaf, Vec<usize>)>,
+) {
+    if !node.leaves.is_empty() {
+        let routed: Vec<usize> = route
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &wildcard)| wildcard.then_some(position))
+            .collect();
+        out.extend(node.leaves.iter().map(|leaf| (leaf, routed.clone())));
+    }
+    for (key, child) in &node.children {
+        route.push(key == WILDCARD_CHILD);
+        collect_routed_recursive(child, route, out);
+        route.pop();
+    }
 }
 
 /// Reserved child key for RFC 0023 §3.1 overflow routing: when a

@@ -157,6 +157,14 @@ pub struct LeafRecord {
     pub upstream_associations: Vec<String>,
     #[serde(default)]
     pub upstream_association_overflow: u64,
+    /// Prefix-path positions (ascending) at which the leaf's node was
+    /// reached through RFC 0023 §3.1's wildcard child rather than a
+    /// keyed branch. There the leaf can hold any token, widen, or
+    /// type-expand, so restore cannot derive the route from the
+    /// template. Absent in earlier snapshots, which restore by
+    /// derivation alone. No `SNAPSHOT_VERSION` bump (additive).
+    #[serde(default)]
+    pub wildcard_routed: Vec<usize>,
 }
 
 /// One `(severity_number, scope_name, event_name) → template_id`
@@ -523,6 +531,7 @@ mod tests {
                     provenance: vec![ProvenanceRecord::Mined],
                     upstream_associations: vec!["user <*> logged in".to_string()],
                     upstream_association_overflow: 2,
+                    wildcard_routed: vec![],
                 },
                 LeafRecord {
                     template: vec![
@@ -537,6 +546,7 @@ mod tests {
                     provenance: vec![],
                     upstream_associations: vec![],
                     upstream_association_overflow: 0,
+                    wildcard_routed: vec![],
                 },
             ],
             structured_templates: vec![StructuredTemplateRecord {

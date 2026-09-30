@@ -29,7 +29,10 @@ async fn rfc0052_3_wal_bytes_and_segments_stay_bounded_over_a_long_run() {
     // three tenants that each snapshot on every cut.
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let config = ReclaimSoakConfig::default();
-    let bound = config.growth_bound();
+    let bound = config.growth_bound().expect("the default config is valid");
+    let objects_per_cut = config
+        .objects_per_cut_bound()
+        .expect("the default config is valid");
     let mut soak = ReclaimSoak::open(tmp.path(), config.clone()).expect("open the soak");
 
     // When it runs long enough to roll many segments.
@@ -68,9 +71,8 @@ async fn rfc0052_3_wal_bytes_and_segments_stay_bounded_over_a_long_run() {
     // the rotation flushes coalesced into it — measured, not assumed.
     for cut in soak.cuts() {
         assert!(
-            cut.objects_written <= config.objects_per_cut_bound(),
-            "{cut:?} over {}",
-            config.objects_per_cut_bound()
+            cut.objects_written <= objects_per_cut,
+            "{cut:?} over {objects_per_cut}"
         );
     }
 }

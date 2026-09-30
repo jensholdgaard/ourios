@@ -130,22 +130,21 @@ impl ReclaimSoakConfig {
     }
 
     /// The fewest frames a closed segment holds: a segment rotates on
-    /// size only when the next frame would not fit.
+    /// size only when the next frame would not fit. Zero when a frame
+    /// at the ceiling would not fit at all, which [`Self::validate`]
+    /// refuses.
     #[must_use]
     pub fn fewest_frames_per_segment(&self) -> u64 {
-        (self
-            .segment_size_bytes
+        self.segment_size_bytes
             .saturating_sub(segment_header_bytes())
-            / self.frame_ceiling_bytes().max(1))
-        .max(1)
+            / self.frame_ceiling_bytes()
     }
 
-    /// The shortest synthetic time between two size rotations.
-    #[must_use]
-    pub fn segment_period_secs(&self) -> u64 {
+    /// The shortest synthetic time between two size rotations; non-zero
+    /// on a config [`Self::validate`] accepts.
+    fn segment_period_secs(&self) -> u64 {
         self.fewest_frames_per_segment()
             .saturating_mul(self.secs_per_batch)
-            .max(1)
     }
 
     /// The bound RFC0052.3 holds a size-rotated run to.
@@ -153,47 +152,72 @@ impl ReclaimSoakConfig {
     /// A closed segment is covered by the first barrier tick after it
     /// closes — within `barrier_secs` — and unlinked by the first pass
     /// after that, within `housekeeping_secs` more. Size rotations are at
-    /// least [`Self::segment_period_secs`] apart, so at most
+    /// least `fewest_frames_per_segment × secs_per_batch` apart, so at most
     /// `⌈(barrier_secs + housekeeping_secs) / period⌉ + 1` closed segments
     /// are inside that window at once, beside the open one.
     ///
     /// That holds only while one pass can unlink every segment the
-    /// window closes — the rate is within the pass cap — which
-    /// [`Self::validate`] checks and [`ReclaimSoak::open`] enforces.
-    #[must_use]
-    pub fn growth_bound(&self) -> GrowthBound {
+    /// window closes — the rate is within the pass cap — so the bound
+    /// exists only for a config [`Self::validate`] accepts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::validate`].
+    pub fn growth_bound(&self) -> Result<GrowthBound, ReclaimSoakError> {
+        self.validate()?;
         let segments = self.closed_per_window().saturating_add(1);
-        GrowthBound {
+        Ok(GrowthBound {
             segments: u32::try_from(segments).unwrap_or(u32::MAX),
             segment_bytes: segments.saturating_mul(self.segment_size_bytes),
-        }
+        })
     }
 
     /// The most data objects one cut may write (§3.1): one per partition
     /// an interval touches — each tenant's hour partitions — for the
     /// barrier's own drain, and again for each rotation-hook cut the
     /// pending slot coalesced into it.
-    #[must_use]
-    pub fn objects_per_cut_bound(&self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::validate`].
+    pub fn objects_per_cut_bound(&self) -> Result<u64, ReclaimSoakError> {
+        self.validate()?;
         let hours = self.barrier_secs.div_ceil(HOUR_SECS).saturating_add(1);
         let drains = self
             .barrier_secs
             .div_ceil(self.segment_period_secs())
             .saturating_add(1);
-        to_u64(self.tenants)
+        Ok(to_u64(self.tenants)
             .saturating_mul(hours)
-            .saturating_mul(drains)
+            .saturating_mul(drains))
     }
 
-    /// Refuse a rate reclamation cannot keep up with: the closed
-    /// segments one barrier-plus-pass window can hold must fit in one
-    /// pass's unlink cap, or the backlog outgrows the bound by
-    /// construction — RFC0052.3 claims nothing above capacity.
+    /// Refuse a config no bound can be derived for: a zero step or
+    /// cadence — with no step, time never reaches a tick — a frame that
+    /// does not fit a segment, or a rate reclamation cannot keep up with.
     ///
     /// # Errors
     ///
-    /// [`ReclaimSoakError::OverCapacity`] naming both numbers.
+    /// The [`ReclaimSoakError`] naming the first knob at fault.
     pub fn validate(&self) -> Result<(), ReclaimSoakError> {
+        match self {
+            config if config.secs_per_batch == 0 => Err(ReclaimSoakError::ZeroStep),
+            config if config.barrier_secs == 0 => Err(ReclaimSoakError::ZeroBarrierSecs),
+            config if config.housekeeping_secs == 0 => Err(ReclaimSoakError::ZeroHousekeepingSecs),
+            config if config.fewest_frames_per_segment() == 0 => {
+                Err(ReclaimSoakError::FrameOverSegment {
+                    frame_ceiling_bytes: config.frame_ceiling_bytes(),
+                    segment_size_bytes: config.segment_size_bytes,
+                })
+            }
+            config => config.within_capacity(),
+        }
+    }
+
+    /// The closed segments one barrier-plus-pass window can hold must fit
+    /// in one pass's unlink cap, or the backlog outgrows the bound by
+    /// construction — RFC0052.3 claims nothing above capacity.
+    fn within_capacity(&self) -> Result<(), ReclaimSoakError> {
         let closed = self.closed_per_window();
         let cap = u64::from(MAX_UNLINKS_PER_PASS);
         match closed {
@@ -310,6 +334,15 @@ pub enum ReclaimSoakError {
     NoMark,
     /// A tick's blocking task was cancelled or aborted.
     TickAborted(&'static str),
+    /// `secs_per_batch` is zero: the clock would never reach a tick.
+    ZeroStep,
+    ZeroBarrierSecs,
+    ZeroHousekeepingSecs,
+    /// A frame at the config's ceiling does not fit one segment.
+    FrameOverSegment {
+        frame_ceiling_bytes: u64,
+        segment_size_bytes: u64,
+    },
     /// The config offers segments faster than one pass can unlink them.
     OverCapacity {
         closed_per_window: u64,
@@ -324,6 +357,19 @@ impl std::fmt::Display for ReclaimSoakError {
             Self::Ingest(e) => write!(f, "reclaim soak ingest: {e}"),
             Self::NoMark => write!(f, "reclaim soak: an acked batch left no mark"),
             Self::TickAborted(which) => write!(f, "reclaim soak: the {which} tick aborted"),
+            Self::ZeroStep => write!(f, "reclaim soak config: secs_per_batch must be > 0"),
+            Self::ZeroBarrierSecs => write!(f, "reclaim soak config: barrier_secs must be > 0"),
+            Self::ZeroHousekeepingSecs => {
+                write!(f, "reclaim soak config: housekeeping_secs must be > 0")
+            }
+            Self::FrameOverSegment {
+                frame_ceiling_bytes,
+                segment_size_bytes,
+            } => write!(
+                f,
+                "reclaim soak config: a {frame_ceiling_bytes} B frame does not fit a \
+                 {segment_size_bytes} B segment"
+            ),
             Self::OverCapacity {
                 closed_per_window,
                 max_unlinks_per_pass,
@@ -360,9 +406,9 @@ struct Schedule {
 impl Schedule {
     fn new(config: &ReclaimSoakConfig) -> Self {
         Self {
-            barrier_secs: config.barrier_secs.max(1),
-            housekeeping_secs: config.housekeeping_secs.max(1),
-            next_barrier: config.barrier_secs.max(1),
+            barrier_secs: config.barrier_secs,
+            housekeeping_secs: config.housekeeping_secs,
+            next_barrier: config.barrier_secs,
             next_housekeeping: 0,
         }
     }
@@ -855,6 +901,47 @@ mod tests {
     }
 
     #[test]
+    fn zero_steps_and_cadences_are_refused_before_any_bound() {
+        let refused = |config: ReclaimSoakConfig| {
+            let refusal = config.validate().expect_err("refused");
+            assert_eq!(
+                format!("{refusal}"),
+                format!("{}", config.growth_bound().expect_err("no bound")),
+            );
+            refusal
+        };
+        assert!(matches!(
+            refused(ReclaimSoakConfig {
+                secs_per_batch: 0,
+                ..ReclaimSoakConfig::default()
+            }),
+            ReclaimSoakError::ZeroStep
+        ));
+        assert!(matches!(
+            refused(ReclaimSoakConfig {
+                barrier_secs: 0,
+                ..ReclaimSoakConfig::default()
+            }),
+            ReclaimSoakError::ZeroBarrierSecs
+        ));
+        assert!(matches!(
+            refused(ReclaimSoakConfig {
+                housekeeping_secs: 0,
+                ..ReclaimSoakConfig::default()
+            }),
+            ReclaimSoakError::ZeroHousekeepingSecs
+        ));
+        assert!(matches!(
+            refused(ReclaimSoakConfig {
+                record_bytes: 64 * 1024 * 1024,
+                ..ReclaimSoakConfig::default()
+            }),
+            ReclaimSoakError::FrameOverSegment { .. }
+        ));
+        assert!(ReclaimSoakConfig::default().validate().is_ok());
+    }
+
+    #[test]
     fn a_rate_one_pass_cannot_clear_is_refused() {
         let config = ReclaimSoakConfig {
             barrier_secs: 3_600,
@@ -899,7 +986,7 @@ mod tests {
         let config = ReclaimSoakConfig::default();
         assert_eq!(config.fewest_frames_per_segment(), 16);
         assert_eq!(
-            config.growth_bound(),
+            config.growth_bound().expect("the default config is valid"),
             GrowthBound {
                 segments: 4,
                 segment_bytes: 4 * ourios_wal::MIN_SEGMENT_SIZE_BYTES,

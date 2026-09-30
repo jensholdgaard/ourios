@@ -223,6 +223,58 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     assert_equivalent(&recovered, &control);
 }
 
+/// RFC 0052 §3.1: a version-1 artefact carries the old global mark, so
+/// it is never restored as a version-2 horizon. It is discarded like any
+/// unknown version, and the tenant rebuilds from the WAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0001_3_5_a_version_1_artefact_discards_and_full_replays() {
+    // Arrange: a WAL with two batches and a well-formed snapshot of
+    // them, horizon and all, written under version 1.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let snapshots_root = root.join("snapshots");
+
+    let batches = [
+        request(vec![resource_logs("checkout", &["user 1 logged in"])]),
+        request(vec![resource_logs("checkout", &["user 2 logged in"])]),
+    ];
+    let pipeline = open_pipeline(root);
+    for r in &batches {
+        pipeline
+            .ingest(r.clone(), tenant_for(r))
+            .await
+            .expect("ingest");
+    }
+    let mark = pipeline.last_durable();
+    pipeline
+        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, mark))
+        .expect("snapshot at the mark");
+    drop(pipeline);
+    let artefact = snapshots_root.join("checkout.snap");
+    let mut bytes = std::fs::read(&artefact).expect("the artefact");
+    bytes[0] = 1;
+    std::fs::write(&artefact, bytes).expect("rewrite as version 1");
+
+    let mut control = MinerCluster::new(MinerConfig::default());
+    let total_records = ingest_all(&mut control, &batches);
+
+    // Act
+    let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
+    let mut recovered = MinerCluster::new(MinerConfig::default());
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
+
+    // Assert: discarded, no horizon seeded, and the replay rebuilt the
+    // tenant from every frame.
+    assert_eq!(
+        report.tenants[0].outcome,
+        RecoveryOutcome::UnknownOrCorruptDiscarded,
+    );
+    assert!(report.accepted_horizons().is_empty());
+    assert_eq!(report.records_suppressed_for_miner, 0);
+    assert_eq!(report.records_fed_to_miner, total_records);
+    assert_equivalent(&recovered, &control);
+}
+
 /// Mint a closed segment holding one `TenantOtlpBatch` frame per request:
 /// build it in a scratch root through the public API, then move the
 /// file into `dest_root` (rotation, RFC0008.6, is not implemented

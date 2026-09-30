@@ -53,7 +53,13 @@ use crate::tree::OwnedToken;
 /// a matching byte 0 deserialises the payload; any other value is
 /// a [`SnapshotError::UnknownVersion`] that recovery treats as
 /// "discard and full-replay" (§3.5.2).
-pub const SNAPSHOT_VERSION: u8 = 1;
+///
+/// Version 2 (RFC 0052 §3.1) changed what `wal_high_water` means —
+/// from the cut's global mark to the tenant's own folded horizon — so
+/// a version-1 artefact takes the unknown-version path: one byte never
+/// carries both readings, and before production a persisted layout is
+/// broken rather than dual-read.
+pub const SNAPSHOT_VERSION: u8 = 2;
 
 /// One tenant's full snapshot payload (the bytes after the version
 /// byte) — the per-tenant state a restore would rebuild the miner
@@ -73,10 +79,11 @@ pub struct SnapshotState {
     /// observation. The `BodyKind::Structured` discriminator is
     /// implicit from the map's identity (RFC 0001 §6.1).
     pub structured_templates: Vec<StructuredTemplateRecord>,
-    /// WAL high-water mark this snapshot's tree state reflects, or
-    /// `None` if no offset was recorded. On the known-version
-    /// recovery path the driver replays only the WAL tail above
-    /// this mark (RFC 0008 §6.7 offset-resume).
+    /// The tenant's folded horizon (RFC 0052 §3.1): the WAL offset of
+    /// its own last frame this state folds — never another tenant's —
+    /// or `None` if no offset was recorded. On the known-version
+    /// recovery path the driver replays only this tenant's frames
+    /// above it (RFC 0008 §6.7 offset-resume).
     pub wal_high_water: Option<WalHighWater>,
     /// RFC 0050 §3.3 adopted-template map entries.
     /// `#[serde(default)]` — absent in pre-RFC snapshots, which had
@@ -599,6 +606,24 @@ mod tests {
 
         // Assert
         assert!(matches!(err, SnapshotError::UnknownVersion(0xFF)));
+    }
+
+    /// RFC 0052 §3.1: a version-1 artefact's `wal_high_water` is the
+    /// old global mark, so it is never read as a version-2 horizon —
+    /// whatever its payload, it takes the discard path.
+    #[test]
+    fn a_version_1_artefact_is_discarded() {
+        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
+        bytes[0] = 1;
+
+        assert!(matches!(
+            load_snapshot(&bytes),
+            Err(SnapshotError::UnknownVersion(1))
+        ));
+        assert_eq!(
+            recover(Some(&bytes)),
+            (None, RecoveryOutcome::UnknownOrCorruptDiscarded)
+        );
     }
 
     #[test]

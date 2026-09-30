@@ -125,6 +125,16 @@ async fn recovery_names_each_discarded_snapshot_once() {
         vec![(TenantId::new("restored"), horizon())],
         "only the control restored"
     );
+    let legacy = discards_of(&events, "legacy");
+    let body = legacy[0].body.as_deref().unwrap_or_default();
+    assert!(
+        body.contains("snapshot format version 1"),
+        "the v1 discard names its version byte: {body:?}"
+    );
+    assert!(
+        body.contains("will be rebuilt next") && body.contains("if the restart succeeds"),
+        "replay and the legacy check still follow, and either can fail startup: {body:?}"
+    );
     assert!(
         discards_of(&events, "restored").is_empty(),
         "a restored tenant is not announced: {events:#?}"
@@ -145,7 +155,7 @@ async fn recovery_names_each_discarded_snapshot_once() {
 #[test]
 fn every_discard_reason_has_its_registry_error_type() {
     for (reason, class) in [
-        (DiscardReason::UnknownVersion, "unknown_version"),
+        (DiscardReason::UnknownVersion(1), "unknown_version"),
         (DiscardReason::Corrupt, "corrupt"),
         (DiscardReason::Empty, "empty"),
         (DiscardReason::NoHorizon, "no_horizon"),
@@ -154,4 +164,9 @@ fn every_discard_reason_has_its_registry_error_type() {
     ] {
         assert_eq!(reason.error_type(), class);
     }
+    assert_eq!(
+        DiscardReason::UnknownVersion(1).to_string(),
+        "snapshot format version 1",
+        "the message names the version byte; error.type does not"
+    );
 }

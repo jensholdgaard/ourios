@@ -123,8 +123,9 @@ pub enum SnapshotFate {
 /// `error.type` of `ourios.receiver.snapshot.discarded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscardReason {
-    /// Another format version, including every version-1 artefact.
-    UnknownVersion,
+    /// Another format version, including every version-1 artefact;
+    /// carries the artefact's version byte.
+    UnknownVersion(u8),
     /// The payload does not decode.
     Corrupt,
     /// A zero-length artefact.
@@ -142,7 +143,7 @@ impl DiscardReason {
     #[must_use]
     pub fn error_type(self) -> &'static str {
         match self {
-            Self::UnknownVersion => "unknown_version",
+            Self::UnknownVersion(_) => "unknown_version",
             Self::Corrupt => "corrupt",
             Self::Empty => "empty",
             Self::NoHorizon => "no_horizon",
@@ -153,10 +154,19 @@ impl DiscardReason {
 
     fn of(error: &SnapshotError) -> Self {
         match error {
-            SnapshotError::UnknownVersion(_) => Self::UnknownVersion,
+            SnapshotError::UnknownVersion(version) => Self::UnknownVersion(*version),
             SnapshotError::Corrupt(_) => Self::Corrupt,
             SnapshotError::Empty => Self::Empty,
             _ => Self::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for DiscardReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownVersion(version) => write!(f, "snapshot format version {version}"),
+            other => f.write_str(other.error_type()),
         }
     }
 }
@@ -534,11 +544,11 @@ fn announce_discard(tenant_id: &TenantId, reason: DiscardReason) {
             { ourios_semconv::OURIOS_TENANT } = tenant_id.as_str(),
             { ERROR_TYPE } = reason.error_type(),
         },
-        "startup recovery discarded tenant {:?}'s miner snapshot ({}); its miner state is \
-         rebuilt from the WAL, and templates first seen in reclaimed frames re-mint — drift \
-         is observable via the RFC 0010 drift query",
+        "startup recovery discarded tenant {:?}'s miner snapshot ({reason}); its miner state \
+         will be rebuilt next by replaying the remaining WAL frames, and if the restart \
+         succeeds, templates first seen in reclaimed frames re-mint — drift is observable via \
+         the RFC 0010 drift query",
         tenant_id.as_str(),
-        reason.error_type(),
     );
 }
 

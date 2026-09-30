@@ -25,13 +25,14 @@ use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, WalHighWater};
+use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, SnapshotError, WalHighWater};
 use ourios_wal::{
     FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
     TenantHorizon, Wal, WalOffset,
 };
 use prost::Message;
 
+use crate::metrics::ERROR_TYPE;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
 
@@ -70,7 +71,7 @@ impl RecoveryReport {
     pub fn accepted_horizons(&self) -> Vec<(TenantId, WalOffset)> {
         self.tenants
             .iter()
-            .filter_map(|tenant| tenant.horizon.map(|h| (tenant.tenant_id.clone(), h)))
+            .filter_map(|tenant| tenant.horizon().map(|h| (tenant.tenant_id.clone(), h)))
             .collect()
     }
 }
@@ -79,17 +80,95 @@ impl RecoveryReport {
 #[derive(Debug)]
 pub struct TenantRecovery {
     pub tenant_id: TenantId,
-    pub outcome: RecoveryOutcome,
+    pub fate: SnapshotFate,
     /// The restored high-water mark `S` lies below the checkpoint
     /// and `S`'s segment did not survive to replay (RFC 0001 §3.5.4
     /// — external mutation; see [`recover`]). The caller warns.
     pub stale_gap: bool,
-    /// The horizon recovery restored this tenant at — `Some` only when
-    /// the artefact decoded, carried a horizon, **and** the miner
-    /// accepted its state. An artefact that decodes but that
-    /// `restore_tenant` rejects is `None`: the next start would discard
-    /// it too, so it must never govern reclamation.
-    pub horizon: Option<WalOffset>,
+}
+
+impl TenantRecovery {
+    /// The miner's view of the outcome, for snapshot-load telemetry.
+    #[must_use]
+    pub fn outcome(&self) -> RecoveryOutcome {
+        match self.fate {
+            SnapshotFate::Restored(_) => RecoveryOutcome::Restored,
+            SnapshotFate::Discarded(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
+        }
+    }
+
+    /// The horizon recovery restored this tenant at. An artefact that
+    /// decodes but that `restore_tenant` rejects has none: the next
+    /// start would discard it too, so it must never govern reclamation.
+    #[must_use]
+    pub fn horizon(&self) -> Option<WalOffset> {
+        match self.fate {
+            SnapshotFate::Restored(horizon) => Some(horizon),
+            SnapshotFate::Discarded(_) => None,
+        }
+    }
+}
+
+/// What recovery did with one tenant's snapshot artefact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotFate {
+    /// The artefact decoded, carried a horizon, and the miner accepted
+    /// its state; replay suppresses the tenant's frames at or below it.
+    Restored(WalOffset),
+    /// The artefact was discarded and the tenant full-replays.
+    Discarded(DiscardReason),
+}
+
+/// Why recovery discarded a tenant's snapshot artefact: the
+/// `error.type` of `ourios.receiver.snapshot.discarded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardReason {
+    /// Another format version, including every version-1 artefact;
+    /// carries the artefact's version byte.
+    UnknownVersion(u8),
+    /// The payload does not decode.
+    Corrupt,
+    /// A zero-length artefact.
+    Empty,
+    /// The artefact records no usable WAL high-water, so it cannot
+    /// suppress replay.
+    NoHorizon,
+    /// The miner rejected the decoded state.
+    RestoreFailed,
+    /// A decode failure outside the classes above.
+    Other,
+}
+
+impl DiscardReason {
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::UnknownVersion(_) => "unknown_version",
+            Self::Corrupt => "corrupt",
+            Self::Empty => "empty",
+            Self::NoHorizon => "no_horizon",
+            Self::RestoreFailed => "restore_failed",
+            Self::Other => "_OTHER",
+        }
+    }
+
+    fn of(error: &SnapshotError) -> Self {
+        match error {
+            SnapshotError::UnknownVersion(version) => Self::UnknownVersion(*version),
+            SnapshotError::Corrupt(_) => Self::Corrupt,
+            SnapshotError::Empty => Self::Empty,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for DiscardReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownVersion(version) => write!(f, "snapshot format version {version}"),
+            other => f.write_str(other.error_type()),
+        }
+    }
 }
 
 /// Failure during startup recovery. Recovery aborts loudly — a frame
@@ -155,7 +234,9 @@ impl std::error::Error for RecoveryDriverError {
 /// parsing, or whose payload `MinerCluster::restore_tenant` rejects,
 /// is treated exactly like a corrupt artefact: discarded,
 /// [`RecoveryOutcome::UnknownOrCorruptDiscarded`], full replay for
-/// that tenant (RFC 0001 §6.9 — inconsistent means corrupt).
+/// that tenant (RFC 0001 §6.9 — inconsistent means corrupt). Each
+/// discard emits one `ourios.receiver.snapshot.discarded` event naming
+/// the tenant and the [`DiscardReason`].
 ///
 /// # Errors
 ///
@@ -419,28 +500,28 @@ fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>
         legacy: LegacyMarks::default(),
     };
     for (tenant_id, bytes) in artefacts {
-        let outcome = restore_artefact(miner, &tenant_id, &bytes, &mut restored.horizons);
+        let fate = restore_artefact(miner, &tenant_id, &bytes);
+        match fate {
+            SnapshotFate::Restored(horizon) => {
+                restored.horizons.insert(tenant_id.clone(), horizon);
+            }
+            SnapshotFate::Discarded(reason) => announce_discard(&tenant_id, reason),
+        }
         restored.legacy.note(&tenant_id, &bytes);
         restored.tenants.push(TenantRecovery {
-            horizon: restored.horizons.get(&tenant_id).copied(),
             tenant_id,
-            outcome,
+            fate,
             stale_gap: false,
         });
     }
     restored
 }
 
-/// Restore one artefact into `miner`, recording its horizon on success.
-fn restore_artefact(
-    miner: &mut MinerCluster,
-    tenant_id: &TenantId,
-    bytes: &[u8],
-    horizons: &mut HashMap<TenantId, WalOffset>,
-) -> RecoveryOutcome {
-    let (Some(state), RecoveryOutcome::Restored) = ourios_miner::snapshot::recover(Some(bytes))
-    else {
-        return RecoveryOutcome::UnknownOrCorruptDiscarded;
+/// Restore one artefact into `miner`.
+fn restore_artefact(miner: &mut MinerCluster, tenant_id: &TenantId, bytes: &[u8]) -> SnapshotFate {
+    let state = match ourios_miner::snapshot::load_snapshot(bytes) {
+        Ok(state) => state,
+        Err(e) => return SnapshotFate::Discarded(DiscardReason::of(&e)),
     };
     // A restorable snapshot requires a concrete horizon: restoring
     // without one cannot suppress, so replay would re-feed every frame
@@ -448,15 +529,27 @@ fn restore_artefact(
     // §6.9 maps a missing horizon to the discard class, same as an
     // unparseable one.
     let Some(horizon) = parse_high_water(state.wal_high_water.as_ref()) else {
-        return RecoveryOutcome::UnknownOrCorruptDiscarded;
+        return SnapshotFate::Discarded(DiscardReason::NoHorizon);
     };
     match miner.restore_tenant(tenant_id, &state) {
-        Ok(()) => {
-            horizons.insert(tenant_id.clone(), horizon);
-            RecoveryOutcome::Restored
-        }
-        Err(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
+        Ok(()) => SnapshotFate::Restored(horizon),
+        Err(_) => SnapshotFate::Discarded(DiscardReason::RestoreFailed),
     }
+}
+
+fn announce_discard(tenant_id: &TenantId, reason: DiscardReason) {
+    tracing::warn!(
+        name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_DISCARDED,
+        {
+            { ourios_semconv::OURIOS_TENANT } = tenant_id.as_str(),
+            { ERROR_TYPE } = reason.error_type(),
+        },
+        "startup recovery discarded tenant {:?}'s miner snapshot ({reason}); its miner state \
+         will be rebuilt next by replaying the remaining WAL frames, and if the restart \
+         succeeds, templates first seen in reclaimed frames re-mint — drift is observable via \
+         the RFC 0010 drift query",
+        tenant_id.as_str(),
+    );
 }
 
 /// RFC 0052 §3.2's legacy stale-gap belt, over every restored horizon

@@ -2172,9 +2172,8 @@ mod tests {
             max_delivered: Some(replayed),
             tenants: vec![recovery::TenantRecovery {
                 tenant_id: TenantId::new(tenant),
-                outcome: ourios_miner::snapshot::RecoveryOutcome::Restored,
+                fate: recovery::SnapshotFate::Restored(restored),
                 stale_gap: false,
-                horizon: Some(restored),
             }],
             ..RecoveryReport::default()
         }

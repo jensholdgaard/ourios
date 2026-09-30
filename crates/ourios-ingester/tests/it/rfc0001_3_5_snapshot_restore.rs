@@ -87,7 +87,7 @@ fn assert_discarded_and_full_replayed(
         recovery::recover(&mut wal, &root.join("snapshots"), &mut recovered).expect("recover");
     assert_eq!(report.tenants.len(), 1);
     assert_eq!(
-        report.tenants[0].outcome,
+        report.tenants[0].outcome(),
         RecoveryOutcome::UnknownOrCorruptDiscarded,
     );
     assert_eq!(report.records_suppressed_for_miner, 0);
@@ -165,7 +165,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // Assert (c): both tenants restored, no stale gap.
     assert_eq!(report.tenants.len(), 2);
     for tenant in &report.tenants {
-        assert_eq!(tenant.outcome, RecoveryOutcome::Restored);
+        assert_eq!(tenant.outcome(), RecoveryOutcome::Restored);
         assert!(!tenant.stale_gap, "{:?}", tenant.tenant_id.as_str());
     }
 }
@@ -360,7 +360,7 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
 
     // Assert: restored + flagged, surviving frames folded, no error.
     assert_eq!(report.tenants.len(), 1);
-    assert_eq!(report.tenants[0].outcome, RecoveryOutcome::Restored);
+    assert_eq!(report.tenants[0].outcome(), RecoveryOutcome::Restored);
     assert!(
         report.tenants[0].stale_gap,
         "the gap between S and the oldest survivor is flagged",

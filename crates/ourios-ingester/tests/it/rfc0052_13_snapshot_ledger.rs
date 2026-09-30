@@ -58,7 +58,7 @@ async fn a_snapshot_recovery_rejects_seeds_no_horizon_and_the_pass_keeps_its_fra
     let mut miner = MinerCluster::new(MinerConfig::default());
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("recover");
     assert_eq!(
-        report.tenants[0].outcome,
+        report.tenants[0].outcome(),
         RecoveryOutcome::UnknownOrCorruptDiscarded,
         "recovery discards the artefact",
     );

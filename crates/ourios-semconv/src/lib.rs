@@ -376,6 +376,9 @@ pub const EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR: &str = "ourios.receiver.shutdown
 /// `ourios.receiver.sink.retained` log event name.
 pub const EVENT_OURIOS_RECEIVER_SINK_RETAINED: &str = "ourios.receiver.sink.retained";
 
+/// `ourios.receiver.snapshot.discarded` log event name.
+pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_DISCARDED: &str = "ourios.receiver.snapshot.discarded";
+
 /// `ourios.receiver.snapshot.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR: &str = "ourios.receiver.snapshot.error";
 

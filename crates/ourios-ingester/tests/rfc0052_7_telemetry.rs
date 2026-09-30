@@ -414,6 +414,70 @@ async fn drive_floor_and_latch_edges(rig: &Arc<BarrierRig>, housekeeper: &Arc<Ho
     tick(housekeeper).await;
 }
 
+/// The unreclaimed bytes still grow with no checkpoint: the figure is
+/// every unreclaimed frame, not the below-checkpoint one, which would read
+/// flat through exactly this outage.
+fn assert_unreclaimed_grows(first: &[ResourceMetrics], second: &[ResourceMetrics]) {
+    let (Value::I(before), Value::I(after)) = (
+        value(first, semconv::OURIOS_WAL_UNRECLAIMED_SIZE),
+        value(second, semconv::OURIOS_WAL_UNRECLAIMED_SIZE),
+    ) else {
+        panic!("ourios.wal.unreclaimed.size is an i64 UpDownCounter");
+    };
+    assert!(
+        after > before && before > 0,
+        "unreclaimed bytes grow with no checkpoint: {before} -> {after}"
+    );
+    let Value::F(age) = value(second, semconv::OURIOS_WAL_UNRECLAIMED_AGE) else {
+        panic!("ourios.wal.unreclaimed.age is an f64 gauge");
+    };
+    assert!(age >= 0.0, "the oldest unreclaimed frame has an age");
+}
+
+/// The state metrics report every member, 1 for the current state and 0
+/// for the others, and the latch is the failed epoch beside the barrier
+/// epoch.
+fn assert_state_metrics(rms: &[ResourceMetrics]) {
+    assert_eq!(
+        states(
+            rms,
+            semconv::OURIOS_WAL_RETAIN_FLOOR_STATUS,
+            semconv::OURIOS_WAL_RETAIN_FLOOR_STATE
+        ),
+        BTreeMap::from([
+            ("min".to_owned(), 1),
+            ("none".to_owned(), 0),
+            ("pinned".to_owned(), 0),
+            ("unknown".to_owned(), 0),
+        ]),
+        "the cut installed the tenant's snapshot, so the floor is its minimum",
+    );
+    assert_eq!(
+        states(
+            rms,
+            semconv::OURIOS_WAL_ROTATION_STATUS,
+            semconv::OURIOS_WAL_ROTATION_STATE
+        ),
+        BTreeMap::from([
+            ("healthy".to_owned(), 1),
+            ("retrying".to_owned(), 0),
+            ("terminal".to_owned(), 0),
+        ]),
+    );
+
+    // The latch is exported as the failed epoch beside the barrier epoch.
+    let (Value::U(failed), Value::U(epoch)) = (
+        value(rms, semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH),
+        value(rms, semconv::OURIOS_INGEST_BARRIER_EPOCH),
+    ) else {
+        panic!("the epoch gauges are u64");
+    };
+    assert!(
+        failed <= epoch,
+        "the failed epoch {failed} is at or below {epoch}"
+    );
+}
+
 /// Scenario RFC0052.7 — every registry name is in the exported stream.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -434,24 +498,8 @@ async fn rfc0052_7_every_wal_instrument_is_exported_under_its_registry_name() {
     tick(&housekeeper).await;
     let second = harness.collect();
 
-    // Then the unreclaimed bytes still grow: the figure is every
-    // unreclaimed frame, not the below-checkpoint one, which would read
-    // flat through exactly this outage.
     assert_eq!(rig.commits.last_checkpoint(), None, "nothing stamped");
-    let (Value::I(before), Value::I(after)) = (
-        value(&first, semconv::OURIOS_WAL_UNRECLAIMED_SIZE),
-        value(&second, semconv::OURIOS_WAL_UNRECLAIMED_SIZE),
-    ) else {
-        panic!("ourios.wal.unreclaimed.size is an i64 UpDownCounter");
-    };
-    assert!(
-        after > before && before > 0,
-        "unreclaimed bytes grow with no checkpoint: {before} -> {after}"
-    );
-    let Value::F(age) = value(&second, semconv::OURIOS_WAL_UNRECLAIMED_AGE) else {
-        panic!("ourios.wal.unreclaimed.age is an f64 gauge");
-    };
-    assert!(age >= 0.0, "the oldest unreclaimed frame has an age");
+    assert_unreclaimed_grows(&first, &second);
 
     // When a cut stamps and the latch is set, and housekeeping passes.
     assert_eq!(cut(&rig, false).await, CutOutcome::Stamped);
@@ -467,46 +515,7 @@ async fn rfc0052_7_every_wal_instrument_is_exported_under_its_registry_name() {
         );
     }
 
-    // The state metrics report every member, 1 for the current state and
-    // 0 for the others.
-    assert_eq!(
-        states(
-            &rms,
-            semconv::OURIOS_WAL_RETAIN_FLOOR_STATUS,
-            semconv::OURIOS_WAL_RETAIN_FLOOR_STATE
-        ),
-        BTreeMap::from([
-            ("min".to_owned(), 1),
-            ("none".to_owned(), 0),
-            ("pinned".to_owned(), 0),
-            ("unknown".to_owned(), 0),
-        ]),
-        "the cut installed the tenant's snapshot, so the floor is its minimum",
-    );
-    assert_eq!(
-        states(
-            &rms,
-            semconv::OURIOS_WAL_ROTATION_STATUS,
-            semconv::OURIOS_WAL_ROTATION_STATE
-        ),
-        BTreeMap::from([
-            ("healthy".to_owned(), 1),
-            ("retrying".to_owned(), 0),
-            ("terminal".to_owned(), 0),
-        ]),
-    );
-
-    // The latch is exported as the failed epoch beside the barrier epoch.
-    let (Value::U(failed), Value::U(epoch)) = (
-        value(&rms, semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH),
-        value(&rms, semconv::OURIOS_INGEST_BARRIER_EPOCH),
-    ) else {
-        panic!("the epoch gauges are u64");
-    };
-    assert!(
-        failed <= epoch,
-        "the failed epoch {failed} is at or below {epoch}"
-    );
+    assert_state_metrics(&rms);
 
     assert_one_cut_counted(&second, &rms);
 }

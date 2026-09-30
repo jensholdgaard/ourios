@@ -55,7 +55,8 @@ pub(crate) mod segment;
 pub use ledger::LedgerError;
 pub use pass::{
     HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
-    ReclaimPlan, SkipReason, UnlinkPermit, unlink_failure, unlink_planned, write_plan_record,
+    ReclaimPlan, ReclaimState, SkipReason, UnlinkPermit, unlink_failure, unlink_planned,
+    write_plan_record,
 };
 pub use reclaim::{
     DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
@@ -2425,46 +2426,6 @@ fn mark_uncertain(record: &mut reclaim::ReclaimRecord, segment: uuid::Uuid) {
             entry.uncertain = true;
         }
     }
-}
-
-/// The WAL state RFC 0052 §3.5 exports, as [`Wal::reclaim_state`]
-/// returns it. `disk_bytes` stays the best-effort diagnostic
-/// [`WalMetrics`] documents; `unreclaimed_bytes` is the exact figure,
-/// seeded from the post-recovery ledger walk.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReclaimState {
-    pub unflushed_bytes: u64,
-    pub disk_bytes: u64,
-    pub segment_count: u32,
-    pub unreclaimed_bytes: u64,
-    pub checkpoint: Option<WalOffset>,
-    /// `<uuid>.wal.partial` files awaiting the housekeeping sweep.
-    pub stale_partials: usize,
-    /// Whether a pass may plan segments: RFC 0052 §3.2's witness, a
-    /// version-2 `CHECKPOINT` beside a `RECLAIM` record.
-    pub reclaimable: bool,
-    /// The floor the WAL derived on its last pass (RFC 0052 §3.7).
-    /// Between passes that is by definition the floor governing
-    /// retention, so the export is never stale; before the first it is
-    /// [`RetainFloor::Unknown`], which is not the same claim as "no
-    /// consumer exists".
-    pub floor: RetainFloor,
-    /// RFC 0052 §3.3's rotation state — healthy, retrying with its
-    /// attempt count, or terminal. §3.5 exports the distinction because
-    /// "retrying" and "given up" need different operator responses.
-    pub rotation: RotationState,
-    /// §3.5's age proxy: the creation time of the oldest surviving
-    /// segment that holds a frame, read from its `UUIDv7`. No frame
-    /// carries a timestamp, and every frame in a segment is at least as
-    /// young as the segment, so the age it yields is conservative.
-    /// `None` exactly when `unreclaimed_bytes` is zero, so an idle WAL
-    /// holding only an empty open segment reports no growing age.
-    pub oldest_unreclaimed: Option<std::time::SystemTime>,
-    /// §3.5's retain-floor lag: frame bytes and segments at least one
-    /// tenant holds back, less the current append segment. Zero while
-    /// the floor is `Unknown` or `None`.
-    pub lag_bytes: u64,
-    pub lag_segments: usize,
 }
 
 /// Errors from [`Wal::replay`].

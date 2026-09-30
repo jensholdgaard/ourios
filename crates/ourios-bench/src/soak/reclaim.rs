@@ -62,6 +62,8 @@ const RECORD_OVERHEAD_BYTES: u64 = 128;
 /// run checks this ceiling against.
 const FRAME_OVERHEAD_BYTES: u64 = 1024;
 const HOUR_SECS: u64 = 3_600;
+/// The receiver's pass cap, which both the WAL and the housekeeper get.
+const MAX_UNLINKS_PER_PASS: u32 = ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS;
 /// Past the WAL's strict `>` and the `UUIDv7`'s millisecond truncation.
 const AGE_MARGIN: Duration = Duration::from_millis(50);
 
@@ -154,12 +156,13 @@ impl ReclaimSoakConfig {
     /// least [`Self::segment_period_secs`] apart, so at most
     /// `⌈(barrier_secs + housekeeping_secs) / period⌉ + 1` closed segments
     /// are inside that window at once, beside the open one.
+    ///
+    /// That holds only while one pass can unlink every segment the
+    /// window closes — the rate is within the pass cap — which
+    /// [`Self::validate`] checks and [`ReclaimSoak::open`] enforces.
     #[must_use]
     pub fn growth_bound(&self) -> GrowthBound {
-        let window = self.barrier_secs.saturating_add(self.housekeeping_secs);
-        let segments = window
-            .div_ceil(self.segment_period_secs())
-            .saturating_add(2);
+        let segments = self.closed_per_window().saturating_add(1);
         GrowthBound {
             segments: u32::try_from(segments).unwrap_or(u32::MAX),
             segment_bytes: segments.saturating_mul(self.segment_size_bytes),
@@ -182,6 +185,34 @@ impl ReclaimSoakConfig {
             .saturating_mul(drains)
     }
 
+    /// Refuse a rate reclamation cannot keep up with: the closed
+    /// segments one barrier-plus-pass window can hold must fit in one
+    /// pass's unlink cap, or the backlog outgrows the bound by
+    /// construction — RFC0052.3 claims nothing above capacity.
+    ///
+    /// # Errors
+    ///
+    /// [`ReclaimSoakError::OverCapacity`] naming both numbers.
+    pub fn validate(&self) -> Result<(), ReclaimSoakError> {
+        let closed = self.closed_per_window();
+        let cap = u64::from(MAX_UNLINKS_PER_PASS);
+        match closed {
+            closed if closed <= cap => Ok(()),
+            closed => Err(ReclaimSoakError::OverCapacity {
+                closed_per_window: closed,
+                max_unlinks_per_pass: cap,
+            }),
+        }
+    }
+
+    /// The most closed segments inside one barrier-plus-pass window.
+    fn closed_per_window(&self) -> u64 {
+        self.barrier_secs
+            .saturating_add(self.housekeeping_secs)
+            .div_ceil(self.segment_period_secs())
+            .saturating_add(1)
+    }
+
     fn wal_config(&self, root: PathBuf) -> WalConfig {
         WalConfig {
             root,
@@ -189,7 +220,7 @@ impl ReclaimSoakConfig {
             segment_size_bytes: self.segment_size_bytes,
             segment_age_secs: self.segment_age_secs,
             housekeeping_secs: self.housekeeping_secs,
-            max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+            max_unlinks_per_pass: MAX_UNLINKS_PER_PASS,
             rotation_retry_attempts: ourios_wal::DEFAULT_ROTATION_RETRY_ATTEMPTS,
             macos_full_fsync: false,
         }
@@ -279,6 +310,11 @@ pub enum ReclaimSoakError {
     NoMark,
     /// A tick's blocking task was cancelled or aborted.
     TickAborted(&'static str),
+    /// The config offers segments faster than one pass can unlink them.
+    OverCapacity {
+        closed_per_window: u64,
+        max_unlinks_per_pass: u64,
+    },
 }
 
 impl std::fmt::Display for ReclaimSoakError {
@@ -288,6 +324,14 @@ impl std::fmt::Display for ReclaimSoakError {
             Self::Ingest(e) => write!(f, "reclaim soak ingest: {e}"),
             Self::NoMark => write!(f, "reclaim soak: an acked batch left no mark"),
             Self::TickAborted(which) => write!(f, "reclaim soak: the {which} tick aborted"),
+            Self::OverCapacity {
+                closed_per_window,
+                max_unlinks_per_pass,
+            } => write!(
+                f,
+                "reclaim soak config: {closed_per_window} segments can close in one barrier-plus-\
+                 pass window, more than the {max_unlinks_per_pass} one pass unlinks"
+            ),
         }
     }
 }
@@ -398,6 +442,7 @@ impl ReclaimSoak {
             std::fs::create_dir_all(dir)
                 .map_err(|e| ReclaimSoakError::Setup(format!("create {}: {e}", dir.display())))?;
         }
+        config.validate()?;
         let wal = Wal::open(config.wal_config(wal_root.clone()))
             .map_err(|e| ReclaimSoakError::Setup(format!("open WAL: {e:?}")))?;
         let sinks = sinks(&data_root, &audit_root)?;
@@ -691,7 +736,7 @@ fn wire(
                 hook.capture_rotation(miner, mark);
             })),
     );
-    let max_unlinks = usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).unwrap_or(1);
+    let max_unlinks = usize::try_from(MAX_UNLINKS_PER_PASS).unwrap_or(1);
     let housekeeper = Arc::new(Housekeeper::new(
         Arc::clone(&commits),
         Arc::clone(&barrier),
@@ -807,6 +852,29 @@ mod tests {
                 (240, Timer::Barrier),
             ]
         );
+    }
+
+    #[test]
+    fn a_rate_one_pass_cannot_clear_is_refused() {
+        let config = ReclaimSoakConfig {
+            barrier_secs: 3_600,
+            secs_per_batch: 1,
+            ..ReclaimSoakConfig::default()
+        };
+        // 16 frames a segment, one a second: 3,660 s holds 229 + 1 closes.
+        assert!(matches!(
+            config.validate(),
+            Err(ReclaimSoakError::OverCapacity {
+                closed_per_window: 230,
+                max_unlinks_per_pass: 128,
+            })
+        ));
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        assert!(matches!(
+            ReclaimSoak::open(dir.path(), config),
+            Err(ReclaimSoakError::OverCapacity { .. })
+        ));
+        assert!(ReclaimSoakConfig::default().validate().is_ok());
     }
 
     #[test]

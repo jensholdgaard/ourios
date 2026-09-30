@@ -20,8 +20,11 @@ superseded-by: —
 > (.7, its own binary per RFC0028.2) and
 > `ourios-bench/tests/rfc0052_3_bounded_growth.rs` (.3). Slices A–E have
 > landed and discharged their stubs, .7 included. The stubs still
-> ignored are slice F's (.10 and .3) and .17's `PUBLISHED` row, which
-> waits on RFC 0055. Implementation proceeds in six green slices, each
+> ignored are slice F's (.10 and .3) and .17's `PUBLISHED` row. That
+> row is **recorded as partial at green and handed to RFC 0055**, as
+> RFC 0041 handed on its deferred rows: this RFC turns green on the
+> other rows once slice F lands, and RFC 0055's writer discharges the
+> row. Implementation proceeds in six green slices, each
 > un-ignoring the stubs it discharges. Where a criterion's legs span slices, the mapping
 > below is by leg and each stub's `#[ignore]` reason names its slice:
 > **A** reclaim record and sidecars (§3.2 `RECLAIM`, `CHECKPOINT` v2,
@@ -59,10 +62,13 @@ superseded-by: —
 > **Snapshot v2 (#877)** sits outside the six slices and has landed as
 > its own breaking change: §3.1's per-tenant folded horizon in
 > `wal_high_water` (each ingest turn and each replayed frame folds its
-> tenant's horizon, and the cut, the shutdown write and the ledger carry
-> it per tenant) and `SNAPSHOT_VERSION` 1 → 2, a version-1 artefact
-> taking the unknown-version discard path. The §8 amendment of RFC
-> 0001 §6.9's global high-water wording is live from that landing.
+> tenant's horizon, and the cut, the post-recovery and shutdown writes
+> and the ledger carry it per tenant) and `SNAPSHOT_VERSION` 1 → 2, a
+> version-1 artefact taking the unknown-version discard path. The same
+> landing restates recovery's stale-gap check on the `RECLAIM` record
+> (§3.2): an absent horizon segment is explained when the tenant's
+> reclaimed-through is at or above `S`. The §8 amendment of RFC 0001
+> §6.9's global high-water wording is live from that landing.
 > **Stage 1 of two.** Motivated by a production
 > incident (issue #791) and the defects found tracing it (#791, #793). Amends
 > RFC 0008 §6.5 and §6.7 with the *policy* those sections left to a caller

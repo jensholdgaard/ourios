@@ -2320,7 +2320,9 @@ tenant independently; there is no cluster-wide combined artefact.
 > the cut that took the snapshot. An idle tenant keeps its older
 > horizon across later snapshots. A version-1 artefact, whose mark
 > had the old global meaning, takes the unknown-version path of
-> step (3) below.
+> step (3) below. The §3.5.4 stale-gap check reads an absent `S`
+> segment as explained when the WAL's `RECLAIM` record shows the
+> tenant reclaimed through `S` or beyond (RFC 0052 §3.2).
 
 *Cadence: per WAL-segment rotation.* A snapshot is taken at
 WAL-segment-rotation boundaries. The snapshot records the WAL

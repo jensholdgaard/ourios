@@ -51,6 +51,7 @@ pub mod compactor;
 pub mod encode_pool;
 #[cfg(feature = "openfga")]
 pub mod graph_emitter;
+pub mod housekeeping;
 mod lane;
 pub mod metrics;
 pub mod publish;

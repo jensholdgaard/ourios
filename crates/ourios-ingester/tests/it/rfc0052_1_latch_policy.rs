@@ -8,11 +8,15 @@
 //! default run stays green while the RFC is red; each names the green
 //! slice that discharges it.
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ourios_ingester::barrier::CutOutcome;
+use ourios_ingester::cadence;
+use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
 
-use crate::rfc0052_barrier_support::{BarrierRig, wal_config};
+use crate::rfc0052_barrier_support::{BarrierRig, JournalFaults, RigSpec, wal_config};
 
 /// Scenario RFC0052.1 — the `cadence_failed` latch refuses every barrier until restart.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
@@ -211,16 +215,144 @@ fn assert_parked_rather_than_published(rig: &BarrierRig, records: usize) {
 
 /// Scenario RFC0052.1 — a panic in a cadence tick itself, and a `JoinError` at shutdown.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
-#[test]
-#[ignore = "RFC0052.1 stub — implemented in the timer green slice E (barrier-tick panic lowers failed_epoch; housekeeping-tick panic counts cadence_panic; also lands §3.1's PublishItem::Drained arm, deferred from D2 (#867) until the age sweep's panic policy is decided here)"]
-fn rfc0052_1_cadence_tick_panic_and_join_error_read_as_a_failed_cut() {
-    todo!(
-        "RFC0052.1 — a panic in the barrier tick outside any batch guard \
-         lowers failed_epoch to that tick's epoch, invalidates the \
-         pending slot, and the barrier task takes the next tick; a panic \
-         in a housekeeping tick counts with error.type = cadence_panic, \
-         leaves the checkpoint untouched, and the next pass re-plans the \
-         uncommitted plan; a JoinError from either task at shutdown is \
-         logged and read as a failed cut"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_1_cadence_tick_panic_and_join_error_read_as_a_failed_cut() {
+    barrier_tick_panic_lowers_the_latch_and_invalidates_the_pending_slot().await;
+    housekeeping_tick_panic_leaves_the_checkpoint_and_the_next_pass_replans().await;
+    a_join_error_at_shutdown_is_read_as_a_failed_cut().await;
+}
+
+async fn barrier_tick_panic_lowers_the_latch_and_invalidates_the_pending_slot() {
+    // Given a pending cut the request path left in the slot, and a
+    // barrier tick armed to panic in its own capture, before any batch
+    // guard exists.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let faults = Arc::new(JournalFaults::default());
+    let rig = BarrierRig::build(
+        tmp.path(),
+        RigSpec {
+            rotation_capture: true,
+            journal_faults: Some(Arc::clone(&faults)),
+            ..RigSpec::new(aging_wal(tmp.path()))
+        },
     );
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    rig.ingest("checkout", &["payment 9 settled"]).await;
+    rig.pipeline.quiesce_encodes();
+    assert!(rig.barrier.pending_mark().is_some(), "the slot is filled");
+    faults.panic_on_age_check.store(true, Ordering::Release);
+
+    // When the barrier tick panics.
+    let epoch = rig.epochs.current();
+    let outcome = rig.barrier.tick(&rig.pipeline, true);
+
+    // Then the latch is lowered to that tick's epoch, the pending slot is
+    // invalidated with its batches parked rather than dropped, and
+    // nothing was stamped.
+    assert_eq!(outcome, CutOutcome::Latched);
+    assert_eq!(
+        rig.epochs.capture().failed_epoch(),
+        Some(epoch),
+        "the tick's own epoch is the failed one",
+    );
+    assert_eq!(rig.barrier.pending_mark(), None, "the pending cut is gone");
+    assert_parked_rather_than_published(&rig, 2);
+    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
+    assert!(rig.snapshots().is_empty(), "no snapshot");
+
+    // And the barrier takes the next tick, which refuses rather than
+    // stamping over the batches the panic may have stranded.
+    rig.ingest("checkout", &["user 2 logged in"]).await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, true), CutOutcome::Latched);
+    assert_eq!(rig.commits.last_checkpoint(), None, "still no checkpoint");
+}
+
+async fn housekeeping_tick_panic_leaves_the_checkpoint_and_the_next_pass_replans() {
+    // Given a closed segment the barrier has stamped past and
+    // snapshotted, so housekeeping has something to reclaim.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let faults = Arc::new(JournalFaults::default());
+    let rig = BarrierRig::build(
+        tmp.path(),
+        RigSpec {
+            journal_faults: Some(Arc::clone(&faults)),
+            ..RigSpec::new(aging_wal(tmp.path()))
+        },
+    );
+    let mark = rig.ingest("checkout", &["user 1 logged in"]).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, true), CutOutcome::Stamped);
+    assert_eq!(rig.commits.last_checkpoint(), Some(mark));
+    let sealed = rig.wal_root.join(format!("{}.wal", mark.segment));
+    assert!(sealed.exists(), "the stamped segment is still on disk");
+    let housekeeper = Housekeeper::new(
+        Arc::clone(&rig.commits),
+        Arc::clone(&rig.barrier),
+        rig.publish.clone(),
+        usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("the cap fits"),
+    );
+
+    // When a housekeeping tick panics after the WAL took its plan.
+    faults.panic_after_prepare.store(true, Ordering::Release);
+    let panicked = housekeeper.tick();
+
+    // Then the tick reports the panic (counted as `cadence_panic`; the
+    // metric half is `rfc0052_1_housekeeping_panic_metric.rs`), the
+    // checkpoint is
+    // untouched, no cut is failed, and nothing was unlinked.
+    assert!(
+        matches!(panicked, HousekeepingTick::Panicked),
+        "{panicked:?}"
+    );
+    assert_eq!(rig.commits.last_checkpoint(), Some(mark), "the checkpoint");
+    assert_eq!(
+        rig.epochs.capture().failed_epoch(),
+        None,
+        "a housekeeping panic fails no cut",
+    );
+    assert!(sealed.exists(), "the uncommitted plan unlinked nothing");
+
+    // And the next pass re-plans the uncommitted plan and reclaims it.
+    let HousekeepingTick::Completed(progress) = housekeeper.tick() else {
+        panic!("the next pass runs");
+    };
+    assert_eq!(progress.removed_segments, 1, "{progress:?}");
+    assert!(!sealed.exists(), "the stamped segment is reclaimed");
+    assert_eq!(rig.commits.last_checkpoint(), Some(mark));
+}
+
+async fn a_join_error_at_shutdown_is_read_as_a_failed_cut() {
+    // Given a healthy node with an acknowledged batch buffered.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.pipeline.quiesce_encodes();
+    assert_eq!(rig.epochs.capture().failed_epoch(), None);
+
+    // When a cadence task joins cleanly, and then one joins with a panic
+    // no tick caught.
+    let clean = tokio::spawn(async {}).await;
+    assert!(!cadence::read_join(&rig.epochs, "housekeeping", clean));
+    assert_eq!(rig.epochs.capture().failed_epoch(), None, "a clean join");
+    let panicked = tokio::spawn(async { panic!("injected cadence task panic") }).await;
+    let latched = cadence::read_join(&rig.epochs, "barrier", panicked);
+
+    // Then it is read as a failed cut: nothing stamps, nothing is
+    // assumed drained.
+    assert!(latched, "a JoinError latches");
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Latched);
+    assert_eq!(rig.commits.last_checkpoint(), None, "no checkpoint");
+    assert!(rig.snapshots().is_empty(), "no snapshot");
+    assert_eq!(rig.sink.buffered_records(), 1, "the record stays buffered");
+}
+
+/// A WAL whose segment ages out after one second — the floor — so a
+/// sleep past it makes the next append, or the barrier's idle rotation,
+/// close it.
+fn aging_wal(tmp: &std::path::Path) -> ourios_wal::WalConfig {
+    ourios_wal::WalConfig {
+        segment_age_secs: 1,
+        ..wal_config(&tmp.join("wal"))
+    }
 }

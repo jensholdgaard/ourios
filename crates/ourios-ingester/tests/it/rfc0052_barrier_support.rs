@@ -24,11 +24,16 @@ use ourios_ingester::barrier::Barrier;
 use ourios_ingester::cadence::BarrierEpochs;
 use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::publish::PublishCoordinator;
-use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
+use ourios_ingester::receiver::{
+    CommitCoordinator, IngestPipeline, Journal, ReceiveError, SharedPipeline,
+};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::Store;
-use ourios_wal::{Wal, WalConfig, WalOffset};
+use ourios_wal::{
+    HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan, ReclaimState,
+    RotationKind, SnapshotHorizons, Wal, WalConfig, WalOffset,
+};
 
 use crate::ingest_support::{request, resource_logs};
 
@@ -90,6 +95,8 @@ pub struct RigSpec {
     /// Hold the audit store's PUTs at this gate, and wire the record
     /// sink's inline barrier the way the receiver does (`settled`).
     pub held_audit_puts: Option<Gate>,
+    /// Panics armed on the journal the coordinator owns.
+    pub journal_faults: Option<Arc<JournalFaults>>,
 }
 
 impl RigSpec {
@@ -103,6 +110,7 @@ impl RigSpec {
             rotation_capture: false,
             held_puts: None,
             held_audit_puts: None,
+            journal_faults: None,
         }
     }
 }
@@ -238,7 +246,8 @@ impl BarrierRig {
         (rig, HeldEncode { entered, release })
     }
 
-    fn build(tmp: &Path, spec: RigSpec) -> Self {
+    /// A rig built from an explicit spec.
+    pub fn build(tmp: &Path, spec: RigSpec) -> Self {
         let RigSpec {
             flush,
             workers,
@@ -248,6 +257,7 @@ impl BarrierRig {
             rotation_capture,
             held_puts: put_gate,
             held_audit_puts: audit_gate,
+            journal_faults,
         } = spec;
         let wal_root = wal.root.clone();
         let data_root = tmp.join("data");
@@ -263,8 +273,15 @@ impl BarrierRig {
         let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
             .with_record_sink(Box::new(sink.clone()));
 
+        let journal: Box<dyn Journal> = match journal_faults {
+            Some(faults) => Box::new(FaultyJournal {
+                wal: journal,
+                faults,
+            }),
+            None => Box::new(journal),
+        };
         let commits = CommitCoordinator::new(
-            Box::new(journal),
+            journal,
             Duration::from_millis(20),
             ourios_wal::MIN_SEGMENT_SIZE_BYTES,
         );
@@ -599,5 +616,88 @@ impl object_store::ObjectStore for HeldStore {
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// One-shot panics on the journal, each at a seam the cadences reach
+/// with no batch guard held.
+#[derive(Default)]
+pub struct JournalFaults {
+    /// The barrier's idle-rotation age check, inside its capture.
+    pub panic_on_age_check: AtomicBool,
+    /// Housekeeping's ledger half, **after** the WAL has taken its plan:
+    /// the entries are marked reclaiming and nothing commits them.
+    pub panic_after_prepare: AtomicBool,
+}
+
+/// A real `Wal` behind the journal seam, with [`JournalFaults`] armed.
+struct FaultyJournal {
+    wal: Wal,
+    faults: Arc<JournalFaults>,
+}
+
+impl Journal for FaultyJournal {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+        Journal::append_batch(&mut self.wal, payload)
+    }
+
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        Journal::sync(&mut self.wal)
+    }
+
+    fn unflushed_bytes(&self) -> u64 {
+        Journal::unflushed_bytes(&self.wal)
+    }
+
+    fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), ReclaimError> {
+        Journal::checkpoint(&mut self.wal, durable_to)
+    }
+
+    fn last_checkpoint(&self) -> Option<WalOffset> {
+        Journal::last_checkpoint(&self.wal)
+    }
+
+    fn housekeeping_prepare(
+        &mut self,
+        horizons: &SnapshotHorizons,
+        max_unlinks: usize,
+    ) -> Result<ReclaimPlan, ReclaimError> {
+        let plan = Journal::housekeeping_prepare(&mut self.wal, horizons, max_unlinks);
+        assert!(
+            !self
+                .faults
+                .panic_after_prepare
+                .swap(false, Ordering::AcqRel),
+            "injected housekeeping panic after the plan was taken"
+        );
+        plan
+    }
+
+    fn housekeeping_commit(
+        &mut self,
+        pass: PassId,
+        outcome: ReclaimOutcome,
+    ) -> Result<HousekeepingProgress, ReclaimError> {
+        Journal::housekeeping_commit(&mut self.wal, pass, outcome)
+    }
+
+    fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
+        Journal::rotate(&mut self.wal, kind)
+    }
+
+    fn segment_age_exceeded(&self) -> bool {
+        assert!(
+            !self.faults.panic_on_age_check.swap(false, Ordering::AcqRel),
+            "injected barrier-tick panic outside any batch guard"
+        );
+        Journal::segment_age_exceeded(&self.wal)
+    }
+
+    fn owes_rotation_fsync(&self) -> bool {
+        Journal::owes_rotation_fsync(&self.wal)
+    }
+
+    fn reclaim_state(&self) -> ReclaimState {
+        Journal::reclaim_state(&self.wal)
     }
 }

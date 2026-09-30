@@ -17,6 +17,9 @@ one-per-binary:
 - `perf_metrics.rs` — ingest + sink instruments through the global meter.
 - `cadence_panic_metric.rs` — the sink's flush-error counter through the
   global meter, for the `error.type=cadence_panic` dimension (#791).
+- `rfc0052_1_housekeeping_panic_metric.rs` — the same counter and
+  dimension, reached through a housekeeping tick that unwinds (RFC 0052
+  §3.2).
 - `audit_sink_metrics.rs` — audit-sink instruments through the global meter.
 - `rfc0018_otlp_compliance.rs` — its `.6` telemetry arm installs the
   global in-memory provider.

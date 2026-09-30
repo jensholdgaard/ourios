@@ -24,7 +24,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
-use ourios_miner::cluster::MinerCluster;
+use ourios_miner::cluster::{MinerCluster, RestoreError};
 use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, SnapshotError, WalHighWater};
 use ourios_wal::{
     FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
@@ -91,7 +91,7 @@ impl TenantRecovery {
     /// The miner's view of the outcome, for snapshot-load telemetry.
     #[must_use]
     pub fn outcome(&self) -> RecoveryOutcome {
-        match self.fate {
+        match &self.fate {
             SnapshotFate::Restored(_) => RecoveryOutcome::Restored,
             SnapshotFate::Discarded(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
         }
@@ -102,15 +102,15 @@ impl TenantRecovery {
     /// start would discard it too, so it must never govern reclamation.
     #[must_use]
     pub fn horizon(&self) -> Option<WalOffset> {
-        match self.fate {
-            SnapshotFate::Restored(horizon) => Some(horizon),
+        match &self.fate {
+            SnapshotFate::Restored(horizon) => Some(*horizon),
             SnapshotFate::Discarded(_) => None,
         }
     }
 }
 
 /// What recovery did with one tenant's snapshot artefact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotFate {
     /// The artefact decoded, carried a horizon, and the miner accepted
     /// its state; replay suppresses the tenant's frames at or below it.
@@ -121,7 +121,7 @@ pub enum SnapshotFate {
 
 /// Why recovery discarded a tenant's snapshot artefact: the
 /// `error.type` of `ourios.receiver.snapshot.discarded`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscardReason {
     /// Another format version, including every version-1 artefact;
     /// carries the artefact's version byte.
@@ -133,21 +133,21 @@ pub enum DiscardReason {
     /// The artefact records no usable WAL high-water, so it cannot
     /// suppress replay.
     NoHorizon,
-    /// The miner rejected the decoded state.
-    RestoreFailed,
+    /// The miner rejected the decoded state, for the reason it carries.
+    RestoreFailed(RestoreError),
     /// A decode failure outside the classes above.
     Other,
 }
 
 impl DiscardReason {
     #[must_use]
-    pub fn error_type(self) -> &'static str {
+    pub fn error_type(&self) -> &'static str {
         match self {
             Self::UnknownVersion(_) => "unknown_version",
             Self::Corrupt => "corrupt",
             Self::Empty => "empty",
             Self::NoHorizon => "no_horizon",
-            Self::RestoreFailed => "restore_failed",
+            Self::RestoreFailed(_) => "restore_failed",
             Self::Other => "_OTHER",
         }
     }
@@ -166,6 +166,7 @@ impl std::fmt::Display for DiscardReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownVersion(version) => write!(f, "snapshot format version {version}"),
+            Self::RestoreFailed(error) => write!(f, "{}: {error}", self.error_type()),
             other => f.write_str(other.error_type()),
         }
     }
@@ -501,9 +502,9 @@ fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>
     };
     for (tenant_id, bytes) in artefacts {
         let fate = restore_artefact(miner, &tenant_id, &bytes);
-        match fate {
+        match &fate {
             SnapshotFate::Restored(horizon) => {
-                restored.horizons.insert(tenant_id.clone(), horizon);
+                restored.horizons.insert(tenant_id.clone(), *horizon);
             }
             SnapshotFate::Discarded(reason) => announce_discard(&tenant_id, reason),
         }
@@ -533,11 +534,11 @@ fn restore_artefact(miner: &mut MinerCluster, tenant_id: &TenantId, bytes: &[u8]
     };
     match miner.restore_tenant(tenant_id, &state) {
         Ok(()) => SnapshotFate::Restored(horizon),
-        Err(_) => SnapshotFate::Discarded(DiscardReason::RestoreFailed),
+        Err(error) => SnapshotFate::Discarded(DiscardReason::RestoreFailed(error)),
     }
 }
 
-fn announce_discard(tenant_id: &TenantId, reason: DiscardReason) {
+fn announce_discard(tenant_id: &TenantId, reason: &DiscardReason) {
     tracing::warn!(
         name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_DISCARDED,
         {

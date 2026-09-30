@@ -165,9 +165,12 @@ above the mark has run, and everything at or below it has finished —
 *including its Parquet emit*, because emit runs inside the gated section.
 Design A breaks that second half: after the ordered phase releases the
 gate, a record's **encode may still be in flight** in the concurrent pool
-when the WAL rotates. The snapshot's global `wal_high_water`
-(`recovery.rs:199–205`; per tenant since RFC 0052 §3.1's snapshot
-format 2, bounded by the same mark) asserts frames ≤ mark are durably captured, so
+when the WAL rotates. The snapshot's `wal_high_water` asserts frames ≤ mark
+are durably captured (at the time of this RFC, one global mark stamped on
+every tenant; since RFC 0052 §3.1's snapshot format 2, each tenant's own
+folded horizon — its last frame folded into its state, never above the
+cut's mark — written by the barrier's `install` and by
+`recovery::write_folded_snapshots`), so
 advancing it while an encode ≤ mark is unfinished would let a crash lose a
 record the mark claims is safe. Design A therefore adds an explicit
 **encode-drain-and-flush barrier**: the rotation hook (and shutdown

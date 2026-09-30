@@ -30,6 +30,7 @@ use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, PostRecoveryHorizons, RecoveryReport};
+use ourios_ingester::snapshot_store;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
@@ -254,21 +255,27 @@ enum Stamp<'a> {
     /// latched and there is no state to consult. Each tenant is stamped
     /// at [`PostRecoveryHorizons::horizon`].
     PreFlight(&'a PostRecoveryHorizons),
-    /// A running receiver's shutdown. Refused while the latch is set: a
-    /// latch means an encode or a publish unwound and dropped records
-    /// this process can no longer account for, and unlike a requeue
-    /// those records are in no buffer for the flush below to find.
-    /// Stamping over them would put the snapshot horizon above data that
-    /// reached neither the store nor a buffer, and recovery suppresses
-    /// frames at or below that horizon — silent loss.
-    Cadence(Option<WalOffset>, Arc<BarrierEpochs>),
+    /// A running receiver's shutdown. Each tenant is stamped at its own
+    /// folded horizon (RFC 0052 §3.1), read from the miner it snapshots,
+    /// so an idle tenant keeps the older horizon its state reflects.
+    ///
+    /// Refused while the latch is set: a latch means an encode or a
+    /// publish unwound and dropped records this process can no longer
+    /// account for, and unlike a requeue those records are in no buffer
+    /// for the flush below to find. Stamping over them would put the
+    /// snapshot horizon above data that reached neither the store nor a
+    /// buffer, and recovery suppresses frames at or below that horizon —
+    /// silent loss.
+    Cadence(Arc<BarrierEpochs>),
 }
 
 impl Stamp<'_> {
-    fn high_water(&self, tenant: &TenantId) -> Option<WalOffset> {
+    fn high_water(&self, miner: &MinerCluster, tenant: &TenantId) -> Option<WalOffset> {
         match self {
             Self::PreFlight(horizons) => horizons.horizon(tenant),
-            Self::Cadence(mark, _) => *mark,
+            Self::Cadence(_) => miner
+                .folded_horizon(tenant)
+                .and_then(snapshot_store::offset_of),
         }
     }
 
@@ -277,7 +284,7 @@ impl Stamp<'_> {
             Self::PreFlight(_) => false,
             // Every epoch this process has handed out is at or below
             // `current`, so a latch anywhere refuses the stamp.
-            Self::Cadence(_, epochs) => epochs.capture().refuses(epochs.current()),
+            Self::Cadence(epochs) => epochs.capture().refuses(epochs.current()),
         }
     }
 }
@@ -361,7 +368,9 @@ fn flush_then_snapshot(
         );
         return Snapshotted::Skipped;
     }
-    match recovery::write_snapshots_with(snapshots_root, miner, |tenant| stamp.high_water(tenant)) {
+    match recovery::write_snapshots_with(snapshots_root, miner, |tenant| {
+        stamp.high_water(miner, tenant)
+    }) {
         Ok(installed) => Snapshotted::Installed(installed),
         Err(e) => {
             tracing::warn!(
@@ -529,7 +538,6 @@ impl ReceiverHandle {
         // replay (the snapshot is a rebuildable cache). `flush_then_snapshot`
         // drains the sink first and writes the snapshot only if it drained —
         // the no-loss invariant (see `serve`).
-        let last_durable = self.pipeline.last_durable();
         tokio::task::block_in_place(|| {
             // RFC 0035 §3.1 barrier at the shutdown cadence point: the
             // listeners are stopped (every acked batch has submitted its
@@ -547,7 +555,7 @@ impl ReceiverHandle {
                     &self.audit_sink,
                     &self.snapshots_root,
                     miner,
-                    &Stamp::Cadence(last_durable, Arc::clone(&self.epochs)),
+                    &Stamp::Cadence(Arc::clone(&self.epochs)),
                     "shutdown",
                 );
             });
@@ -933,9 +941,10 @@ struct PostRecoverySeed {
     /// RFC 0052 §3.2's snapshot ledger: only horizons the artefacts on disk
     /// carry, or lower ones.
     ledger: Vec<(TenantId, WalOffset)>,
-    /// The mark an idle shutdown stamps. The highest installed horizon
-    /// covers every tenant: replay folded each tenant's surviving frames
-    /// above its own horizon.
+    /// The pipeline's replayed durable mark: the highest installed
+    /// horizon or delivered offset. It is never a checkpoint mark, and
+    /// since snapshot format 2 it stamps no snapshot either — shutdown
+    /// stamps each tenant at its own folded horizon.
     last_durable: Option<WalOffset>,
 }
 
@@ -1056,13 +1065,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // The group-commit coordinator owns the single-writer WAL and folds
     // concurrent appends into one fsync per `wal_batch_window_ms`
     // (RFC0008.8); the pipeline owns the miner + the rotation hook (the §6.9
-    // *primary* cadence point). `with_last_durable` seeds the durable mark from
-    // the post-recovery horizons so a process serving zero requests still
-    // stamps its shutdown snapshots with a concrete horizon — an unstamped
-    // snapshot is discarded at the next start (RFC 0001 §6.9), which would
-    // overwrite the post-recovery artefacts with full-replay-only ones. The
-    // highest of them covers every tenant: replay folded each tenant's
-    // surviving frames above its own horizon.
+    // *primary* cadence point). `with_last_durable` seeds the durable mark
+    // from the post-recovery horizons as a replayed mark, which no cut may
+    // checkpoint at. A process serving zero requests still stamps concrete
+    // shutdown horizons, because the miner carries each tenant's folded
+    // horizon from its restore or its replay (RFC 0052 §3.1).
     let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     // RFC 0052 §3.1: the barrier is built before the pipeline, because
     // the pipeline's rotation hook is now a capture into it.
@@ -1980,6 +1987,58 @@ mod tests {
                 "{start} start: the shutdown keeps it too"
             );
             assert_eq!(state, templates, "{start} start: the templates survive");
+        }
+    }
+
+    /// RFC 0052 §3.1: shutdown stamps each tenant at its own folded
+    /// horizon. A tenant idle since its last frame keeps that frame's
+    /// offset rather than rising to the node's last acknowledged turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_stamps_each_tenant_at_its_own_folded_horizon() {
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let node = serve(local_config(wal_dir.path(), data_dir.path()))
+            .await
+            .expect("serve");
+        let mut acknowledged = Vec::new();
+        for tenant in ["search", "checkout"] {
+            node.pipeline
+                .ingest(
+                    export_request(tenant, &["user 1 logged in"]),
+                    TenantId::new(tenant),
+                )
+                .await
+                .expect("ingest");
+            acknowledged.push(node.pipeline.last_durable());
+        }
+
+        node.shutdown().await.expect("graceful shutdown");
+
+        let snapshots_root = wal_dir.path().join(SNAPSHOTS_DIR);
+        assert_eq!(disk_high_water(&snapshots_root, "search"), acknowledged[0]);
+        assert_eq!(
+            disk_high_water(&snapshots_root, "checkout"),
+            acknowledged[1]
+        );
+        assert!(
+            acknowledged[0] < acknowledged[1],
+            "fixture: search is older"
+        );
+    }
+
+    fn local_config(wal_root: &Path, data_root: &Path) -> ReceiverConfig {
+        ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: test_wal_config(wal_root),
+            store: Store::local(data_root).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
         }
     }
 

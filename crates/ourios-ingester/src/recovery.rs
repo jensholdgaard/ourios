@@ -21,7 +21,10 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::{RecoveryOutcome, WalHighWater};
-use ourios_wal::{FrameKind, FrameSink, LedgerError, RecoveryError, TenantBatch, Wal, WalOffset};
+use ourios_wal::{
+    FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
+    TenantHorizon, Wal, WalOffset,
+};
 use prost::Message;
 
 use crate::receiver::tenant::assign;
@@ -94,6 +97,10 @@ pub enum RecoveryDriverError {
     /// a frame carrying a tenant above RFC 0048 §3.1's bound, which
     /// fails startup closed rather than truncating the key.
     Ledger(LedgerError),
+    /// RFC 0052 §3.2's legacy stale-gap belt refused a pre-RFC root: a
+    /// tenant's oldest surviving frame is above the mark its version-1
+    /// snapshot recorded, or the tenant has no decodable mark at all.
+    LegacyStaleGap(HousekeepingError),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -102,6 +109,7 @@ impl std::fmt::Display for RecoveryDriverError {
             Self::Store(e) => write!(f, "recovery snapshot store: {e}"),
             Self::Replay(e) => write!(f, "recovery WAL replay: {e:?}"),
             Self::Ledger(e) => write!(f, "recovery WAL ledger rebuild: {e}"),
+            Self::LegacyStaleGap(e) => write!(f, "recovery legacy stale-gap check: {e}"),
         }
     }
 }
@@ -111,7 +119,7 @@ impl std::error::Error for RecoveryDriverError {
         match self {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
-            Self::Replay(_) => None,
+            Self::LegacyStaleGap(_) | Self::Replay(_) => None,
         }
     }
 }
@@ -142,38 +150,11 @@ pub fn recover(
     let artefacts =
         snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
-    let mut tenants = Vec::with_capacity(artefacts.len());
-    let mut horizons: HashMap<TenantId, WalOffset> = HashMap::new();
-    for (tenant_id, bytes) in artefacts {
-        let outcome = match ourios_miner::snapshot::recover(Some(&bytes)) {
-            (Some(state), RecoveryOutcome::Restored) => {
-                // A restorable snapshot requires a concrete horizon:
-                // restoring without one cannot suppress, so replay
-                // would re-feed every frame the snapshot already
-                // folded — exactly the v1 double-apply hazard. §6.9
-                // maps a missing horizon to the discard class, same
-                // as an unparseable one.
-                match parse_high_water(state.wal_high_water.as_ref()) {
-                    Some(horizon) => match miner.restore_tenant(&tenant_id, &state) {
-                        Ok(()) => {
-                            horizons.insert(tenant_id.clone(), horizon);
-                            RecoveryOutcome::Restored
-                        }
-                        Err(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
-                    },
-                    None => RecoveryOutcome::UnknownOrCorruptDiscarded,
-                }
-            }
-            (_, outcome) => outcome,
-        };
-        tenants.push(TenantRecovery {
-            horizon: horizons.get(&tenant_id).copied(),
-            tenant_id,
-            outcome,
-            stale_gap: false,
-        });
-    }
-
+    let Restored {
+        mut tenants,
+        horizons,
+        recorded,
+    } = restore_artefacts(miner, artefacts);
     let mut sink = DriverSink {
         miner,
         horizons: &horizons,
@@ -192,6 +173,9 @@ pub fn recover(
     // restart debris to pop, which is #793's shape all over again: a
     // method whose only callers are tests.
     wal.rebuild_ledger().map_err(RecoveryDriverError::Ledger)?;
+    // Before the caller's post-recovery write replaces the version-1
+    // artefacts whose marks this check reads.
+    refuse_legacy_stale_gaps(wal, &horizons, recorded)?;
 
     let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
@@ -209,6 +193,88 @@ pub fn recover(
         max_delivered: sink.max_delivered,
         tenants,
     })
+}
+
+/// What restoring the snapshot artefacts left: each tenant's outcome,
+/// the horizons of those restored, and the global marks version-1
+/// artefacts recorded for RFC 0052 §3.2's legacy check.
+struct Restored {
+    tenants: Vec<TenantRecovery>,
+    horizons: HashMap<TenantId, WalOffset>,
+    recorded: HashMap<TenantId, WalOffset>,
+}
+
+fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>)>) -> Restored {
+    let mut restored = Restored {
+        tenants: Vec::with_capacity(artefacts.len()),
+        horizons: HashMap::new(),
+        recorded: HashMap::new(),
+    };
+    for (tenant_id, bytes) in artefacts {
+        let outcome = restore_artefact(miner, &tenant_id, &bytes, &mut restored.horizons);
+        if let Some(mark) = ourios_miner::snapshot::legacy_v1_high_water(&bytes)
+            .as_ref()
+            .and_then(snapshot_store::offset_of)
+        {
+            restored.recorded.insert(tenant_id.clone(), mark);
+        }
+        restored.tenants.push(TenantRecovery {
+            horizon: restored.horizons.get(&tenant_id).copied(),
+            tenant_id,
+            outcome,
+            stale_gap: false,
+        });
+    }
+    restored
+}
+
+/// Restore one artefact into `miner`, recording its horizon on success.
+fn restore_artefact(
+    miner: &mut MinerCluster,
+    tenant_id: &TenantId,
+    bytes: &[u8],
+    horizons: &mut HashMap<TenantId, WalOffset>,
+) -> RecoveryOutcome {
+    let (Some(state), RecoveryOutcome::Restored) = ourios_miner::snapshot::recover(Some(bytes))
+    else {
+        return RecoveryOutcome::UnknownOrCorruptDiscarded;
+    };
+    // A restorable snapshot requires a concrete horizon: restoring
+    // without one cannot suppress, so replay would re-feed every frame
+    // the snapshot already folded — exactly the v1 double-apply hazard.
+    // §6.9 maps a missing horizon to the discard class, same as an
+    // unparseable one.
+    let Some(horizon) = parse_high_water(state.wal_high_water.as_ref()) else {
+        return RecoveryOutcome::UnknownOrCorruptDiscarded;
+    };
+    match miner.restore_tenant(tenant_id, &state) {
+        Ok(()) => {
+            horizons.insert(tenant_id.clone(), horizon);
+            RecoveryOutcome::Restored
+        }
+        Err(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
+    }
+}
+
+/// RFC 0052 §3.2's legacy stale-gap belt, over every restored horizon
+/// and every version-1 mark. Only a pre-RFC root is checked; the WAL
+/// decides which roots those are.
+fn refuse_legacy_stale_gaps(
+    wal: &Wal,
+    horizons: &HashMap<TenantId, WalOffset>,
+    recorded: HashMap<TenantId, WalOffset>,
+) -> Result<(), RecoveryDriverError> {
+    let mut marks: HashMap<TenantId, TenantHorizon> = recorded
+        .into_iter()
+        .map(|(tenant, mark)| (tenant, TenantHorizon::RecordedOnly(mark)))
+        .collect();
+    marks.extend(
+        horizons
+            .iter()
+            .map(|(tenant, horizon)| (tenant.clone(), TenantHorizon::Restorable(*horizon))),
+    );
+    wal.refuse_legacy_stale_gaps_at_open(&marks)
+        .map_err(RecoveryDriverError::LegacyStaleGap)
 }
 
 /// Write one snapshot artefact per live tenant in `miner`, each stamped

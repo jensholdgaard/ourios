@@ -18,9 +18,11 @@ use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_config::MinerConfig;
+use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::{Barrier, CutOutcome};
-use ourios_ingester::cadence::BarrierEpochs;
+use ourios_ingester::cadence::{self, BarrierEpochs};
+use ourios_ingester::housekeeping::Housekeeper;
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
@@ -424,13 +426,8 @@ pub struct ReceiverHandle {
     /// data sink (before it, so a row's template event is durable no later than
     /// the row), and likewise gates the shutdown snapshot.
     audit_sink: SharedParquetAuditSink,
-    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
-    /// clean exit on shutdown via the `shutdown` watch signal.
-    flush_tick: JoinHandle<()>,
-    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
-    /// joined before the shutdown flush so no cut is in flight when it
-    /// runs.
-    barrier_tick: JoinHandle<()>,
+    /// The three cadence tasks, each joined before the shutdown flush.
+    cadences: Cadences,
     /// The same barrier the task and the rotation hook hold. Shutdown
     /// runs whatever is left in its pending slot once the task is
     /// joined — the hook can fill it after the last tick, and nothing
@@ -470,19 +467,22 @@ impl ReceiverHandle {
         // holding the sink mutex, which the drain below would then wait on
         // anyway. A `JoinError` (the task panicked) is ignored — the drain
         // below still runs.
-        let _ = self.flush_tick.await;
+        let _ = self.cadences.sweep.await;
         // RFC 0052 §3.1: the receiver joins the barrier task after its
         // running cut finishes, so the flush below cannot race a cut
         // holding drained batches outside the buffers. A store failure
         // in that last cut requeues into the buffers as any cut's does,
         // and the flush covers the requeue.
-        // A `JoinError` is the barrier task panicking or being aborted
-        // outside `tick`'s own `catch_unwind`; the cut it was running
-        // may have drained batches it never settled, so latch its epoch
-        // and let the stamp below refuse rather than advance past them.
-        if self.barrier_tick.await.is_err() {
-            self.epochs.report(self.epochs.current());
-        }
+        // A `JoinError` from either task is a panic or an abort outside
+        // its tick's own `catch_unwind`; a cut it was running may have
+        // drained batches it never settled, so it is logged and latched,
+        // and the stamp below refuses rather than advance past them.
+        cadence::read_join(&self.epochs, "barrier", self.cadences.barrier.await);
+        cadence::read_join(
+            &self.epochs,
+            "housekeeping",
+            self.cadences.housekeeping.await,
+        );
         // The barrier task is gone, but the slot it fed need not be
         // empty: the rotation hook is capture-only, so an append taken
         // just before the signal can have left a cut there with nothing
@@ -606,6 +606,7 @@ fn build_barrier(
     commits: &Arc<CommitCoordinator>,
     snapshots_root: PathBuf,
     graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+    horizons: Vec<(TenantId, WalOffset)>,
 ) -> (PublishCoordinator, Arc<Barrier>) {
     let (sink, audit_sink) = sinks;
     let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
@@ -617,7 +618,8 @@ fn build_barrier(
         Arc::clone(commits),
         snapshots_root,
         SINK_CEILING_BYTES,
-    );
+    )
+    .with_durable_horizons(horizons);
     (publisher, Arc::new(barrier))
 }
 
@@ -701,6 +703,48 @@ fn spawn_barrier(
     })
 }
 
+/// RFC 0052 §3.2's housekeeping task: one capped reclamation pass every
+/// `housekeeping_secs`, separate from the barrier and the age sweep so
+/// that neither a latched barrier nor a stopped sweep (#795) stops it.
+///
+/// The first pass runs at once: the task is spawned after recovery has
+/// seeded the durable horizons, and a node restarting onto a backlog —
+/// #793's restart loop — must not wait a whole interval to shed it.
+/// [`Housekeeper::tick`] catches its own panic and counts it, and a
+/// failed pass is logged there; either way the next tick retries.
+fn spawn_housekeeping(
+    housekeeper: Housekeeper,
+    every: Duration,
+    epochs: Arc<BarrierEpochs>,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    let housekeeper = Arc::new(housekeeper);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            if shutdown.has_changed().unwrap_or(true) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = tick.tick() => {}
+            }
+            let housekeeper = Arc::clone(&housekeeper);
+            // The tick catches its own unwind, so a `JoinError` is a
+            // cancellation or an abort; §3.2 reads it as a failed cut,
+            // the same as the barrier task's.
+            let joined = tokio::task::spawn_blocking(move || housekeeper.tick())
+                .await
+                .map(drop);
+            if cadence::read_join(&epochs, "housekeeping", joined) {
+                break;
+            }
+        }
+    })
+}
+
 /// Bind both transports and start serving over one shared
 /// `IngestPipeline`. Recovery (RFC 0008 §6.6) runs to completion first,
 /// then the post-recovery snapshots are written, and only then do the
@@ -769,11 +813,37 @@ fn build_acceptors(
     Ok((grpc, http))
 }
 
-/// The two background cadences the receiver runs: RFC0014.2's age sweep
-/// and RFC 0052 §3.1's barrier.
+/// The three background cadences the receiver runs: RFC0014.2's age
+/// sweep, RFC 0052 §3.1's barrier and §3.2's housekeeping.
 struct Cadences {
-    flush_tick: JoinHandle<()>,
-    barrier_tick: JoinHandle<()>,
+    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
+    /// clean exit on shutdown via the `shutdown` watch signal.
+    sweep: JoinHandle<()>,
+    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
+    /// joined before the shutdown flush so no cut is in flight when it
+    /// runs.
+    barrier: JoinHandle<()>,
+    /// The RFC 0052 §3.2 housekeeping task (one capped pass per
+    /// `housekeeping_secs`); joined with the other cadences, before the
+    /// shutdown flush, so no pass holds the journal past the handle.
+    housekeeping: JoinHandle<()>,
+}
+
+/// The housekeeping knobs, captured before `WalConfig` moves into
+/// `Wal::open`.
+struct HousekeepingPlan {
+    every: Duration,
+    max_unlinks: usize,
+}
+
+impl HousekeepingPlan {
+    fn of(wal: &WalConfig) -> Self {
+        Self {
+            // `interval` panics on a zero period; the config layer's floor is 1.
+            every: Duration::from_secs(wal.housekeeping_secs.max(1)),
+            max_unlinks: usize::try_from(wal.max_unlinks_per_pass).unwrap_or(usize::MAX),
+        }
+    }
 }
 
 /// What the cadences are built over. A value rather than three more
@@ -788,21 +858,41 @@ struct CadenceInputs {
     /// Built before the pipeline, because the capture-only rotation hook
     /// the pipeline installs holds it (RFC 0052 §3.1).
     barrier: Arc<Barrier>,
+    /// The journal owner housekeeping reclaims through.
+    commits: Arc<CommitCoordinator>,
+    housekeeping: HousekeepingPlan,
 }
 
-/// Start both cadences over one publish coordinator.
+/// Start the cadences over one publish coordinator.
 fn spawn_cadences(
     pipeline: &SharedPipeline,
     inputs: CadenceInputs,
     shutdown: &watch::Receiver<()>,
 ) -> Cadences {
-    let CadenceInputs { publisher, barrier } = inputs;
+    let CadenceInputs {
+        publisher,
+        barrier,
+        commits,
+        housekeeping,
+    } = inputs;
     let overflow = publisher.audit().overflow_notify();
+    let housekeeper = Housekeeper::new(
+        commits,
+        Arc::clone(&barrier),
+        publisher.clone(),
+        housekeeping.max_unlinks,
+    );
     Cadences {
-        barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
+        housekeeping: spawn_housekeeping(
+            housekeeper,
+            housekeeping.every,
+            barrier.epochs(),
+            shutdown.clone(),
+        ),
+        barrier: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
         // The age sweep drains under the barrier exclusion and the miner
         // lock, and writes audit-ordered off both (issue #302 #1/#2).
-        flush_tick: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+        sweep: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
     }
 }
 
@@ -840,6 +930,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
     let segment_size_bytes = config.wal.segment_size_bytes;
+    let housekeeping = HousekeepingPlan::of(&config.wal);
     // RFC0052.13: a snapshot listed at startup governs reclamation only
     // once the snapshots root and its parent are durable **in this
     // process**. A failure here fails startup rather than discarding the
@@ -909,6 +1000,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         &commits,
         snapshots_root.clone(),
         config.graph_emitter.clone(),
+        // RFC 0052 §3.2's snapshot ledger starts from the snapshots
+        // recovery actually restored: an artefact it rejected would be
+        // rejected again on the next start, so its horizon must never
+        // let housekeeping unlink the frames that start would replay.
+        report.accepted_horizons(),
     );
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(Arc::clone(&commits), miner)
@@ -939,14 +1035,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // — one word across every guard in the receiver (RFC 0052 §3.1).
     let pipeline_epochs = pipeline.epochs();
 
-    let Cadences {
-        flush_tick,
-        barrier_tick,
-    } = spawn_cadences(
+    let cadences = spawn_cadences(
         &pipeline,
         CadenceInputs {
             publisher,
             barrier: Arc::clone(&barrier),
+            commits,
+            housekeeping,
         },
         &shutdown_rx,
     );
@@ -1018,8 +1113,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         snapshots_root,
         sink,
         audit_sink,
-        flush_tick,
-        barrier_tick,
+        cadences,
         barrier,
         epochs: pipeline_epochs,
     })
@@ -1537,6 +1631,215 @@ mod tests {
         // Then shutdown settles it rather than blocking on its publish guards.
         handle.shutdown().await.expect("graceful shutdown");
         !data_parquet_files(data_dir.path()).is_empty()
+    }
+
+    /// A journal whose housekeeping prepare counts its calls and unwinds
+    /// on the first — the pass the task must survive.
+    struct CountedPasses(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ourios_ingester::receiver::Journal for CountedPasses {
+        fn append_batch(
+            &mut self,
+            _payload: &[u8],
+        ) -> Result<WalOffset, ourios_ingester::receiver::ReceiveError> {
+            unreachable!("the housekeeping task appends nothing")
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ourios_ingester::receiver::ReceiveError> {
+            unreachable!("the housekeeping task syncs nothing")
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+
+        fn housekeeping_prepare(
+            &mut self,
+            _horizons: &ourios_wal::SnapshotHorizons,
+            _max_unlinks: usize,
+        ) -> Result<ourios_wal::ReclaimPlan, ourios_wal::ReclaimError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            assert!(n != 0, "injected panic in the first housekeeping pass");
+            Err(ourios_wal::ReclaimError::NoReclamationSurface)
+        }
+    }
+
+    /// A production [`Housekeeper`] over [`CountedPasses`], and the latch
+    /// its barrier shares.
+    fn counted_housekeeper(
+        root: &Path,
+        passes: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Housekeeper, Arc<BarrierEpochs>) {
+        std::fs::create_dir_all(root.join("store")).expect("store root");
+        let (sink, audit) = build_write_sinks(
+            Store::local(root.join("store")).expect("local store"),
+            PromotedAttributes::default(),
+        );
+        let publisher = PublishCoordinator::new(sink, audit);
+        let commits = CommitCoordinator::new(
+            Box::new(CountedPasses(Arc::clone(passes))),
+            Duration::from_millis(20),
+            u64::MAX,
+        );
+        let barrier = Arc::new(Barrier::new(
+            publisher.clone(),
+            Arc::clone(&commits),
+            root.join("snapshots"),
+            SINK_CEILING_BYTES,
+        ));
+        let epochs = barrier.epochs();
+        (Housekeeper::new(commits, barrier, publisher, 8), epochs)
+    }
+
+    /// Yield until `passes` reaches `n`. Paused time does not advance
+    /// while a `spawn_blocking` pass runs, so this waits on the pass
+    /// itself rather than on the clock.
+    async fn passes_reach(passes: &std::sync::atomic::AtomicUsize, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while passes.load(std::sync::atomic::Ordering::Acquire) < n {
+            assert!(std::time::Instant::now() < deadline, "pass {n} never ran");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The production housekeeping loop: the first pass runs at once, a
+    /// pass that panics costs that tick and not the task, and shutdown
+    /// stops every later pass.
+    #[tokio::test(start_paused = true)]
+    async fn housekeeping_task_passes_at_once_survives_a_panic_and_stops_on_shutdown() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
+        let (shutdown, shutdown_rx) = watch::channel(());
+        let every = Duration::from_secs(60);
+        let task = spawn_housekeeping(housekeeper, every, Arc::clone(&epochs), shutdown_rx);
+
+        // The first pass runs without waiting an interval, and panics.
+        passes_reach(&passes, 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "one pass before the first interval elapses",
+        );
+        assert_eq!(
+            epochs.capture().failed_epoch(),
+            None,
+            "a caught housekeeping panic fails no cut",
+        );
+
+        // The next tick runs another pass: the panic did not end the task.
+        tokio::time::sleep(every).await;
+        passes_reach(&passes, 2).await;
+
+        // Shutdown ends the task cleanly, and no later tick runs a pass.
+        shutdown.send(()).expect("signal shutdown");
+        task.await.expect("the housekeeping task exits cleanly");
+        tokio::time::sleep(every * 10).await;
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "no pass after shutdown",
+        );
+        assert_eq!(epochs.capture().failed_epoch(), None);
+    }
+
+    /// The pre-check: a signal that arrived before the loop's first
+    /// iteration — the arm a signal landing during a pass also takes —
+    /// runs no pass at all.
+    #[tokio::test(start_paused = true)]
+    async fn housekeeping_task_runs_no_pass_once_shutdown_is_signalled() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
+        let (shutdown, shutdown_rx) = watch::channel(());
+        shutdown.send(()).expect("signal shutdown");
+
+        spawn_housekeeping(housekeeper, Duration::from_secs(60), epochs, shutdown_rx)
+            .await
+            .expect("the housekeeping task exits cleanly");
+
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "no pass ran after the shutdown signal",
+        );
+    }
+
+    /// RFC 0052 §3.2 and #793: a node that restarts onto reclaimable
+    /// segments reclaims them on its first housekeeping pass, which runs as
+    /// soon as the durable horizons are seeded, not a whole
+    /// `housekeeping_secs` later. The interval here is an hour, so only
+    /// that immediate pass can explain the removal; a restart loop shorter
+    /// than the interval would otherwise never reclaim anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_node_reclaims_on_its_first_pass_without_waiting_an_interval() {
+        use prost::Message;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let wal = WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            housekeeping_secs: 3_600,
+            ..test_wal_config(wal_dir.path())
+        };
+        let config = || ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: wal.clone(),
+            store: Store::local(data_dir.path()).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        };
+
+        // Given a node that sealed a segment and stamped past it: the second
+        // append observes the aged-out segment and captures a cut, and
+        // shutdown runs that cut, which publishes, snapshots and checkpoints.
+        let first = serve(config()).await.expect("serve");
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(first.http_addr, &export).await;
+        let sealed = wal_segments(wal_dir.path());
+        assert_eq!(sealed.len(), 1, "one segment before the rotation");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(first.http_addr, &export).await;
+        first.shutdown().await.expect("graceful shutdown");
+        assert!(
+            sealed[0].exists(),
+            "the sealed segment survives the first process: its only pass ran at start",
+        );
+
+        // When the node restarts with an hour-long housekeeping interval.
+        let second = serve(config()).await.expect("serve again");
+
+        // Then the sealed segment is reclaimed well inside that interval.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sealed[0].exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let reclaimed = !sealed[0].exists();
+        second.shutdown().await.expect("graceful shutdown");
+        assert!(
+            reclaimed,
+            "the first pass after recovery reclaimed the stamped segment",
+        );
+    }
+
+    /// Every `*.wal` segment directly under the WAL root.
+    fn wal_segments(root: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the WAL root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        out.sort();
+        out
     }
 
     /// RFC 0047 §3.3: the graph emitter is attached to the coordinator the

@@ -358,9 +358,15 @@ const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
-/// The `error.type` value for a cadence sweep step that panicked (#791).
+/// The `error.type` value for a cadence sweep step that panicked (#791),
+/// and for an RFC 0052 §3.2 housekeeping tick that panicked.
 ///
-/// One such count means the **age/cadence** flush trigger is dead for the
+/// The housekeeping case is survivable: the task takes the next tick, the
+/// checkpoint is untouched and the next pass re-plans what the failed one
+/// left uncommitted, so it is only a stall in reclamation. The panic
+/// message on stderr names which of the two it was.
+///
+/// A count from the sweep means the **age/cadence** flush trigger is dead for the
 /// life of the process: the sweep stops on a panic, because continuing would
 /// repeat #796's data-loss window every tick.
 ///

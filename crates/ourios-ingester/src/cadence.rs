@@ -189,6 +189,31 @@ impl BarrierEpochs {
     }
 }
 
+/// Read a cadence task's join at shutdown (RFC 0052 §3.2).
+///
+/// Each tick catches its own unwind, so a `JoinError` here is a panic or
+/// an abort that no tick saw — and the cut that task was running may
+/// have drained batches it never settled. So it is logged and read as a
+/// failed cut: the latch takes the current epoch and every later stamp,
+/// shutdown's included, refuses. Returns whether it latched.
+pub fn read_join(
+    epochs: &BarrierEpochs,
+    task: &'static str,
+    joined: Result<(), tokio::task::JoinError>,
+) -> bool {
+    let Err(e) = joined else {
+        return false;
+    };
+    tracing::error!(
+        task,
+        error = %e,
+        "a cadence task did not join cleanly; read as a failed cut, so nothing is stamped \
+         and nothing is assumed drained (the WAL replays it on the next start)"
+    );
+    epochs.report(epochs.current());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BarrierEpochs, Epoch};

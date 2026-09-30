@@ -62,8 +62,26 @@ impl RecoveryReport {
             .collect()
     }
 
-    /// The horizon `tenant`'s post-recovery snapshot records (RFC 0052
-    /// §3.7): the later of its restored horizon and the replay mark.
+    /// The horizons the post-recovery snapshot write stamps (RFC 0052
+    /// §3.7), indexed once so the write looks each tenant up in O(1).
+    #[must_use]
+    pub fn post_recovery_horizons(&self) -> PostRecoveryHorizons {
+        PostRecoveryHorizons {
+            restored: self.accepted_horizons().into_iter().collect(),
+            replayed: self.max_delivered,
+        }
+    }
+}
+
+/// Each tenant's post-recovery snapshot horizon (RFC 0052 §3.7).
+#[derive(Debug, Default)]
+pub struct PostRecoveryHorizons {
+    restored: HashMap<TenantId, WalOffset>,
+    replayed: Option<WalOffset>,
+}
+
+impl PostRecoveryHorizons {
+    /// The later of `tenant`'s restored horizon and the replay mark.
     /// Replay folds every frame above the restored horizon into the
     /// miner, so the later of the two covers what the state holds, and
     /// neither is ever written below the other. A replay that delivered
@@ -71,14 +89,9 @@ impl RecoveryReport {
     /// horizon rather than writing `None` over it, which the next start
     /// would discard with no frames left to rebuild from.
     #[must_use]
-    pub fn post_recovery_horizon(&self, tenant: &TenantId) -> Option<WalOffset> {
-        let restored = self
-            .tenants
-            .iter()
-            .find(|t| &t.tenant_id == tenant)
-            .and_then(|t| t.horizon);
+    pub fn horizon(&self, tenant: &TenantId) -> Option<WalOffset> {
         // `None` orders below every `Some`.
-        restored.max(self.max_delivered)
+        self.restored.get(tenant).copied().max(self.replayed)
     }
 }
 
@@ -473,13 +486,16 @@ mod tests {
             stale_gap: false,
             horizon: Some(horizon),
         };
-        let report = |max_delivered| RecoveryReport {
-            max_delivered,
-            tenants: vec![restored("behind", early), restored("ahead", late)],
-            ..RecoveryReport::default()
+        let report = |max_delivered| {
+            RecoveryReport {
+                max_delivered,
+                tenants: vec![restored("behind", early), restored("ahead", late)],
+                ..RecoveryReport::default()
+            }
+            .post_recovery_horizons()
         };
-        let horizon = |report: &RecoveryReport, tenant: &str| {
-            report.post_recovery_horizon(&TenantId::new(tenant))
+        let horizon = |horizons: &PostRecoveryHorizons, tenant: &str| {
+            horizons.horizon(&TenantId::new(tenant))
         };
 
         let idle = report(None);

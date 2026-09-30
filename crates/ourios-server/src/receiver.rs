@@ -29,7 +29,7 @@ use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
-use ourios_ingester::recovery;
+use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
@@ -237,23 +237,23 @@ fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::
 /// same store would fail anyway, and flushing it would expose a clean row
 /// before its template event is durable.
 ///
-/// Returns whether both sinks fully drained: `true` means both buffers cleared
-/// and the snapshot was *attempted* (a write failure there is a separate,
-/// logged, rebuildable-cache miss — it does not endanger no-loss, since the
-/// data is in the store); `false` means data was retained and the snapshot was
-/// skipped. Callers log via `cadence`; the value is for tests today and
-/// sink-flush metrics later (RFC 0014 §6.3).
+/// Returns what the cadence point left on disk: [`Snapshotted::Skipped`] when
+/// data was retained and the snapshot skipped, otherwise the outcome of the
+/// write it attempted (a write failure there is a separate, logged,
+/// rebuildable-cache miss — it does not endanger no-loss, since the data is in
+/// the store). `serve` seeds the snapshot ledger from it.
 /// What a non-barrier cadence point may stamp, and the state it must
 /// clear first.
 ///
 /// Two variants rather than an offset beside an `Option<&_>`: only one
 /// of the two call sites can have a cadence latch at all, and a caller
 /// holding a bare offset could not tell whether it owed the check.
-enum Stamp {
+enum Stamp<'a> {
     /// `serve`'s post-recovery point. It runs before the pipeline, its
     /// encode pool and its publish guards exist, so nothing can have
-    /// latched and there is no state to consult.
-    PreFlight(Option<WalOffset>),
+    /// latched and there is no state to consult. Each tenant is stamped
+    /// at [`RecoveryReport::post_recovery_horizon`].
+    PreFlight(&'a RecoveryReport),
     /// A running receiver's shutdown. Refused while the latch is set: a
     /// latch means an encode or a publish unwound and dropped records
     /// this process can no longer account for, and unlike a requeue
@@ -264,10 +264,11 @@ enum Stamp {
     Cadence(Option<WalOffset>, Arc<BarrierEpochs>),
 }
 
-impl Stamp {
-    fn high_water(&self) -> Option<WalOffset> {
+impl Stamp<'_> {
+    fn high_water(&self, tenant: &TenantId) -> Option<WalOffset> {
         match self {
-            Self::PreFlight(mark) | Self::Cadence(mark, _) => *mark,
+            Self::PreFlight(report) => report.post_recovery_horizon(tenant),
+            Self::Cadence(mark, _) => *mark,
         }
     }
 
@@ -286,9 +287,9 @@ fn flush_then_snapshot(
     audit_sink: &SharedParquetAuditSink,
     snapshots_root: &Path,
     miner: &MinerCluster,
-    stamp: &Stamp,
+    stamp: &Stamp<'_>,
     cadence: &str,
-) -> bool {
+) -> Snapshotted {
     // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
     // caller stamps `wal_high_water` from here with exclusive access to
     // `miner` — shutdown holds the pipeline's miner lock; the
@@ -338,7 +339,7 @@ fn flush_then_snapshot(
              snapshot is skipped — the next start replays from the checkpoint and re-mines \
              those frames (no acknowledged data is lost; the WAL is durable)"
         );
-        return false;
+        return Snapshotted::Skipped;
     }
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
@@ -348,7 +349,7 @@ fn flush_then_snapshot(
              the record flush + snapshot this cycle so a clean row isn't exposed before its \
              template event is durable — no acknowledged data is lost (the WAL is durable)"
         );
-        return false;
+        return Snapshotted::Skipped;
     }
     sink.flush_all();
     let records = sink.buffered_records();
@@ -358,15 +359,38 @@ fn flush_then_snapshot(
             "{cadence}: record sink retained {records} record(s) (store unavailable?); skipping the \
              snapshot so recovery re-mines them — no acknowledged data is lost (the WAL is durable)"
         );
-        return false;
+        return Snapshotted::Skipped;
     }
-    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, stamp.high_water()) {
-        tracing::warn!(
-            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
-            "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
-        );
+    match recovery::write_snapshots_with(snapshots_root, miner, |tenant| stamp.high_water(tenant)) {
+        Ok(installed) => Snapshotted::Installed(installed),
+        Err(e) => {
+            tracing::warn!(
+                name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
+                "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
+            );
+            Snapshotted::WriteFailed
+        }
     }
-    true
+}
+
+/// What [`flush_then_snapshot`] left on disk.
+#[derive(Debug)]
+enum Snapshotted {
+    /// Data was retained or the stamp refused: no artefact was touched.
+    Skipped,
+    /// Both sinks drained, but the write failed partway: the artefacts
+    /// before the failure were replaced and the rest were not.
+    WriteFailed,
+    /// Every live tenant's artefact was replaced, carrying these
+    /// horizons.
+    Installed(Vec<(TenantId, WalOffset)>),
+}
+
+#[cfg(test)]
+impl Snapshotted {
+    fn drained(&self) -> bool {
+        !matches!(self, Self::Skipped)
+    }
 }
 
 /// Where the receiver role binds, the WAL it persists to, and the object
@@ -975,30 +999,45 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // doesn't redo it. `flush_then_snapshot` gates the snapshot on the drain
     // succeeding (the no-loss invariant); `block_in_place` keeps its blocking
     // Parquet/store I/O off a runtime worker, as at the other cadence points.
-    tokio::task::block_in_place(|| {
+    let snapshotted = tokio::task::block_in_place(|| {
         flush_then_snapshot(
             &sink,
             &audit_sink,
             &snapshots_root,
             &miner,
-            // The highest offset replay delivered is the right horizon
-            // for a *snapshot*: the miner state below covers exactly
-            // those frames. It is not a checkpoint mark, and the
+            // Each tenant's restored horizon, advanced to the highest
+            // offset replay delivered: the miner state below covers
+            // exactly those frames. It is not a checkpoint mark, and the
             // pipeline's `DurableMark::Replayed` seed keeps the barrier
             // from mistaking it for one.
-            &Stamp::PreFlight(report.max_delivered),
+            &Stamp::PreFlight(&report),
             "post-recovery",
-        );
+        )
     });
+    // RFC 0052 §3.2's ledger may hold only horizons the artefacts on disk
+    // carry. A skipped or failed write left the restored artefacts in
+    // place, and every horizon the write installs is at or above the
+    // restored one, so those are a floor under whatever did land.
+    let installed = match snapshotted {
+        Snapshotted::Installed(installed) => installed,
+        Snapshotted::Skipped | Snapshotted::WriteFailed => report.accepted_horizons(),
+    };
+    let replayed = installed
+        .iter()
+        .map(|(_, mark)| *mark)
+        .max()
+        .max(report.max_delivered);
 
     // The group-commit coordinator owns the single-writer WAL and folds
     // concurrent appends into one fsync per `wal_batch_window_ms`
     // (RFC0008.8); the pipeline owns the miner + the rotation hook (the §6.9
     // *primary* cadence point). `with_last_durable` seeds the durable mark from
-    // replay so a process serving zero requests still stamps its shutdown
-    // snapshots with a concrete horizon — an unstamped snapshot is discarded at
-    // the next start (RFC 0001 §6.9), which would overwrite the post-recovery
-    // artefacts with full-replay-only ones.
+    // the post-recovery horizons so a process serving zero requests still
+    // stamps its shutdown snapshots with a concrete horizon — an unstamped
+    // snapshot is discarded at the next start (RFC 0001 §6.9), which would
+    // overwrite the post-recovery artefacts with full-replay-only ones. The
+    // highest of them covers every tenant: replay folded each tenant's
+    // surviving frames above its own horizon.
     let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     // RFC 0052 §3.1: the barrier is built before the pipeline, because
     // the pipeline's rotation hook is now a capture into it.
@@ -1007,18 +1046,18 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         &commits,
         snapshots_root.clone(),
         config.graph_emitter.clone(),
-        // RFC 0052 §3.2's snapshot ledger starts from the snapshots
-        // recovery actually restored: an artefact it rejected would be
-        // rejected again on the next start, so its horizon must never
-        // let housekeeping unlink the frames that start would replay.
-        report.accepted_horizons(),
+        // RFC 0052 §3.2's snapshot ledger starts from the snapshots on
+        // disk: an artefact recovery rejected would be rejected again on
+        // the next start, so its horizon must never let housekeeping
+        // unlink the frames that start would replay.
+        installed,
     );
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(Arc::clone(&commits), miner)
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
-            .with_last_durable(report.max_delivered)
+            .with_last_durable(replayed)
             .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier)))
             // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
             // global commit gate; the pool emits into the same shared
@@ -1377,9 +1416,10 @@ mod tests {
             &audit,
             &tmp.path().join("snapshots"),
             &miner,
-            &Stamp::PreFlight(None),
+            &Stamp::PreFlight(&RecoveryReport::default()),
             "test",
-        );
+        )
+        .drained();
 
         assert!(drained, "a working store drains the sink");
         assert_eq!(sink.buffered_records(), 0, "the buffer cleared on flush");
@@ -1408,9 +1448,10 @@ mod tests {
             &audit,
             &snapshots_root,
             &miner,
-            &Stamp::PreFlight(None),
+            &Stamp::PreFlight(&RecoveryReport::default()),
             "test",
-        );
+        )
+        .drained();
 
         assert!(!drained, "an unavailable store does not drain the sink");
         assert_eq!(
@@ -1456,9 +1497,10 @@ mod tests {
             &audit,
             &snapshots_root,
             &miner,
-            &Stamp::PreFlight(None),
+            &Stamp::PreFlight(&RecoveryReport::default()),
             "test",
-        );
+        )
+        .drained();
 
         assert!(!drained, "a retained audit buffer blocks the drain");
         assert_eq!(
@@ -1845,6 +1887,108 @@ mod tests {
             reclaimed,
             "the first pass after recovery reclaimed the stamped segment",
         );
+    }
+
+    /// RFC 0052 §3.7: once housekeeping has reclaimed every closed frame,
+    /// replay delivers nothing, and a node that restarts idle must keep
+    /// each tenant's restored horizon. Writing `None` over it made the
+    /// next start discard every snapshot with no frames left to rebuild
+    /// from, so the whole miner state was lost and templates re-minted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_restart_onto_a_reclaimed_wal_keeps_every_restored_horizon() {
+        use prost::Message;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let snapshots_root = wal_dir.path().join(SNAPSHOTS_DIR);
+        let tenant = TenantId::new("checkout");
+
+        // Given a snapshot at the tenant's last frame, and a WAL whose
+        // every segment housekeeping reclaimed against that horizon.
+        let mut wal = Wal::open(test_wal_config(wal_dir.path())).expect("open");
+        let request = export_request("checkout", &["user 1 logged in", "user 2 logged in"]);
+        let payload = ourios_wal::TenantBatch::encode(tenant.as_str(), &request.encode_to_vec())
+            .expect("frame");
+        wal.append(ourios_wal::FrameKind::TenantOtlpBatch, &payload)
+            .expect("append");
+        let horizon = wal.sync().expect("sync");
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        for record in ourios_ingester::receiver::assign(request, &tenant) {
+            miner.ingest(&record);
+        }
+        let templates = miner.snapshot_state(&tenant);
+        recovery::write_snapshots(&snapshots_root, &miner, Some(horizon)).expect("snapshot");
+        wal.checkpoint(horizon).expect("checkpoint");
+        wal.rotate(ourios_wal::RotationKind::Owed).expect("rotate");
+        let cap = usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("cap fits");
+        let pass = wal
+            .housekeeping_pass(
+                &ourios_wal::SnapshotHorizons::restorable([(tenant.clone(), horizon)]),
+                cap,
+            )
+            .expect("housekeeping");
+        assert_eq!(pass.removed_segments, 1, "{pass:?}");
+        drop(wal);
+
+        let config = || ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: test_wal_config(wal_dir.path()),
+            store: Store::local(data_dir.path()).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        };
+        let on_disk = || {
+            let artefacts =
+                ourios_ingester::snapshot_store::load_all(&snapshots_root).expect("load");
+            assert_eq!(artefacts.len(), 1, "one tenant's artefact");
+            let (state, outcome) = ourios_miner::snapshot::recover(Some(&artefacts[0].1));
+            assert_eq!(outcome, ourios_miner::snapshot::RecoveryOutcome::Restored);
+            let mut state = state.expect("known-version artefact decodes");
+            let high_water = state.wal_high_water.take();
+            (state, high_water)
+        };
+        let expected = Some(ourios_miner::snapshot::WalHighWater {
+            segment: horizon.segment.to_string(),
+            byte: horizon.byte,
+        });
+
+        // When the node restarts idle twice.
+        for start in ["first", "second"] {
+            let node = serve(config()).await.expect("serve");
+
+            // Then each start seeds the ledger and the durable mark from
+            // the horizon its post-recovery write installed.
+            assert_eq!(
+                on_disk().1,
+                expected,
+                "{start} start: the post-recovery write keeps the restored horizon",
+            );
+            assert_eq!(
+                node.barrier.snapshot_horizons(),
+                ourios_wal::SnapshotHorizons::restorable([(tenant.clone(), horizon)]),
+                "{start} start: the ledger is what the artefact carries",
+            );
+            assert_eq!(
+                node.pipeline.last_durable(),
+                Some(horizon),
+                "{start} start: an idle shutdown stamps the installed horizon",
+            );
+            node.shutdown().await.expect("graceful shutdown");
+
+            // And the miner state and its horizon survive the shutdown.
+            let (state, high_water) = on_disk();
+            assert_eq!(
+                high_water, expected,
+                "{start} start: the shutdown keeps it too"
+            );
+            assert_eq!(state, templates, "{start} start: the templates survive");
+        }
     }
 
     /// Every `*.wal` segment directly under the WAL root.

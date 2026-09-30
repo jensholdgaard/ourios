@@ -29,7 +29,7 @@ use crate::snapshot_store::{self, SnapshotStoreError};
 
 /// What recovery did, for the caller to log and for the
 /// RFC0008.10 / RFC 0001 §3.5.3–.4 assertions.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RecoveryReport {
     /// Frames `Wal::replay` delivered (every surviving frame).
     pub frames_delivered: u64,
@@ -60,6 +60,25 @@ impl RecoveryReport {
             .iter()
             .filter_map(|tenant| tenant.horizon.map(|h| (tenant.tenant_id.clone(), h)))
             .collect()
+    }
+
+    /// The horizon `tenant`'s post-recovery snapshot records (RFC 0052
+    /// §3.7): the later of its restored horizon and the replay mark.
+    /// Replay folds every frame above the restored horizon into the
+    /// miner, so the later of the two covers what the state holds, and
+    /// neither is ever written below the other. A replay that delivered
+    /// nothing — every closed frame reclaimed — keeps the restored
+    /// horizon rather than writing `None` over it, which the next start
+    /// would discard with no frames left to rebuild from.
+    #[must_use]
+    pub fn post_recovery_horizon(&self, tenant: &TenantId) -> Option<WalOffset> {
+        let restored = self
+            .tenants
+            .iter()
+            .find(|t| &t.tenant_id == tenant)
+            .and_then(|t| t.horizon);
+        // `None` orders below every `Some`.
+        restored.max(self.max_delivered)
     }
 }
 
@@ -226,15 +245,37 @@ pub fn write_snapshots(
     miner: &MinerCluster,
     high_water: Option<WalOffset>,
 ) -> Result<(), SnapshotStoreError> {
+    write_snapshots_with(root, miner, |_| high_water).map(drop)
+}
+
+/// [`write_snapshots`] with each tenant's high-water mark chosen by
+/// `high_water` — the post-recovery write's per-tenant horizons (RFC
+/// 0052 §3.7). Returns the horizon every written artefact carries, for
+/// seeding the snapshot ledger with exactly what was installed.
+///
+/// # Errors
+///
+/// As [`write_snapshots`]; the artefacts written before the failure
+/// stay written.
+pub fn write_snapshots_with(
+    root: &Path,
+    miner: &MinerCluster,
+    high_water: impl Fn(&TenantId) -> Option<WalOffset>,
+) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
+    let mut installed = Vec::new();
     for tenant_id in miner.tenant_ids() {
+        let mark = high_water(&tenant_id);
         let mut state = miner.snapshot_state(&tenant_id);
-        state.wal_high_water = high_water.map(|offset| WalHighWater {
+        state.wal_high_water = mark.map(|offset| WalHighWater {
             segment: offset.segment.to_string(),
             byte: offset.byte,
         });
         snapshot_store::write(root, &tenant_id, &state)?;
+        if let Some(mark) = mark {
+            installed.push((tenant_id, mark));
+        }
     }
-    Ok(())
+    Ok(installed)
 }
 
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
@@ -416,6 +457,49 @@ mod tests {
         let x = offset("00000000-0000-7000-8000-000000000002", 5);
         let seen = HashSet::from([s.segment, x.segment]);
         assert!(!stale_gap(s, Some(x), &seen));
+    }
+
+    /// RFC 0052 §3.7: the post-recovery horizon is the later of the
+    /// restored one and the replay mark, per tenant, so a replay that
+    /// delivered nothing keeps the restored horizon and one that
+    /// delivered frames never writes a tenant below where it restored.
+    #[test]
+    fn post_recovery_horizon_is_the_later_of_the_restored_horizon_and_the_replay_mark() {
+        let early = offset("00000000-0000-7000-8000-000000000001", 10);
+        let late = offset("00000000-0000-7000-8000-000000000002", 5);
+        let restored = |tenant: &str, horizon| TenantRecovery {
+            tenant_id: TenantId::new(tenant),
+            outcome: RecoveryOutcome::Restored,
+            stale_gap: false,
+            horizon: Some(horizon),
+        };
+        let report = |max_delivered| RecoveryReport {
+            max_delivered,
+            tenants: vec![restored("behind", early), restored("ahead", late)],
+            ..RecoveryReport::default()
+        };
+        let horizon = |report: &RecoveryReport, tenant: &str| {
+            report.post_recovery_horizon(&TenantId::new(tenant))
+        };
+
+        let idle = report(None);
+        assert_eq!(horizon(&idle, "behind"), Some(early), "nothing replayed");
+        assert_eq!(horizon(&idle, "ahead"), Some(late));
+        assert_eq!(
+            horizon(&idle, "fresh"),
+            None,
+            "nothing restored or replayed"
+        );
+
+        let replayed = report(Some(early));
+        assert_eq!(horizon(&replayed, "behind"), Some(early));
+        assert_eq!(horizon(&replayed, "ahead"), Some(late), "never downgraded");
+        assert_eq!(horizon(&replayed, "fresh"), Some(early), "replay alone");
+
+        let past = offset("00000000-0000-7000-8000-000000000003", 1);
+        let caught_up = report(Some(past));
+        assert_eq!(horizon(&caught_up, "behind"), Some(past));
+        assert_eq!(horizon(&caught_up, "ahead"), Some(past));
     }
 
     fn sink<'a>(

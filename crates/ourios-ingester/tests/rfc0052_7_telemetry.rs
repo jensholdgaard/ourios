@@ -18,18 +18,16 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use opentelemetry::logs::AnyValue;
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLogRecord, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use ourios_ingester::barrier::CutOutcome;
+use ourios_ingester::cadence;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
 use ourios_ingester::receiver::{CommitCoordinator, Journal, ReceiveError};
 use ourios_semconv as semconv;
 use ourios_telemetry::TelemetryGuard;
+use ourios_telemetry::live_check::{self, Checked, Event, EventCapture};
 use ourios_wal::{RotationFault, RotationSite, RotationState, WalOffset};
-use tracing_subscriber::layer::SubscriberExt;
 
 use crate::rfc0052_barrier_support::{BarrierRig, JournalFaults, RigSpec, wal_config};
 
@@ -37,7 +35,7 @@ const CAP: usize = 128;
 
 /// The RFC 0052 log events, every one of which the live-check leg must
 /// see emitted.
-const RFC0052_EVENTS: [&str; 8] = [
+const RFC0052_EVENTS: [&str; 11] = [
     semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
     semconv::EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR,
     semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RETRYING,
@@ -46,7 +44,13 @@ const RFC0052_EVENTS: [&str; 8] = [
     semconv::EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_PINNED,
     semconv::EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_LIFTED,
     semconv::EVENT_OURIOS_RECEIVER_BARRIER_LATCHED,
+    semconv::EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR,
+    semconv::EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR,
+    semconv::EVENT_OURIOS_RECEIVER_PUBLISH_HELD,
 ];
+
+/// The only attributes those events declare.
+const EVENT_ATTRIBUTES: [&str; 2] = ["error.type", semconv::OURIOS_SINK_FLUSH_TRIGGER];
 
 /// Every RFC0052.7 instrument: the WAL state and the barrier's.
 const INSTRUMENTS: [&str; 19] = [
@@ -75,27 +79,17 @@ const INSTRUMENTS: [&str; 19] = [
 struct Harness {
     metrics_guard: TelemetryGuard,
     metrics: InMemoryMetricExporter,
-    logs: InMemoryLogExporter,
-    _logger: SdkLoggerProvider,
+    events: &'static EventCapture,
 }
 
 fn harness() -> &'static Harness {
     static HARNESS: OnceLock<Harness> = OnceLock::new();
     HARNESS.get_or_init(|| {
         let (metrics_guard, metrics) = ourios_telemetry::init_in_memory("ourios-rfc0052-7");
-        let logs = InMemoryLogExporter::default();
-        let logger = SdkLoggerProvider::builder()
-            .with_simple_exporter(logs.clone())
-            .build();
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&logger)),
-        )
-        .expect("the only subscriber this binary installs");
         Harness {
             metrics_guard,
             metrics,
-            logs,
-            _logger: logger,
+            events: live_check::event_capture().expect("the only subscriber this binary installs"),
         }
     })
 }
@@ -104,8 +98,7 @@ fn harness() -> &'static Harness {
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let guard = SERIAL.lock().await;
-    let harness = harness();
-    harness.logs.reset();
+    harness().events.reset();
     guard
 }
 
@@ -121,48 +114,7 @@ impl Harness {
 
     /// The named events emitted since the leg began, in order.
     fn events(&self) -> Vec<Event> {
-        self.logs
-            .get_emitted_logs()
-            .expect("logs exported")
-            .iter()
-            .filter_map(|log| Event::of(&log.record))
-            .collect()
-    }
-}
-
-/// One exported log record that carries an event name.
-#[derive(Debug, Clone)]
-struct Event {
-    name: &'static str,
-    severity: i32,
-    attributes: BTreeMap<String, String>,
-}
-
-impl Event {
-    fn of(record: &SdkLogRecord) -> Option<Self> {
-        let name = record.event_name()?;
-        let attributes = record
-            .attributes_iter()
-            .map(|(key, value)| (key.as_str().to_owned(), render(value)))
-            .collect();
-        Some(Self {
-            name,
-            severity: record.severity_number().map_or(0, |s| s as i32),
-            attributes,
-        })
-    }
-
-    fn error_type(&self) -> Option<&str> {
-        self.attributes.get("error.type").map(String::as_str)
-    }
-}
-
-fn render(value: &AnyValue) -> String {
-    match value {
-        AnyValue::String(s) => s.as_str().to_owned(),
-        AnyValue::Int(i) => i.to_string(),
-        AnyValue::Boolean(b) => b.to_string(),
-        other => format!("{other:?}"),
+        self.events.events()
     }
 }
 
@@ -292,7 +244,7 @@ fn assert_one_cut_counted(before: &[ResourceMetrics], after: &[ResourceMetrics])
     }
 }
 
-fn housekeeper(rig: &BarrierRig) -> Arc<Housekeeper> {
+fn housekeeper_of(rig: &BarrierRig) -> Arc<Housekeeper> {
     Arc::new(Housekeeper::new(
         Arc::clone(&rig.commits),
         Arc::clone(&rig.barrier),
@@ -486,7 +438,7 @@ async fn rfc0052_7_every_wal_instrument_is_exported_under_its_registry_name() {
     let harness = harness();
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = Arc::new(BarrierRig::new(tmp.path()));
-    let housekeeper = housekeeper(&rig);
+    let housekeeper = housekeeper_of(&rig);
 
     // Given a running node whose checkpoint never advances: frames land,
     // housekeeping passes, and no cut ever stamps.
@@ -559,10 +511,10 @@ async fn rfc0052_7_each_transition_emits_its_registry_event_once() {
     );
 
     // When the floor is pinned and lifted, and the latch is set.
-    harness.logs.reset();
+    harness.events.reset();
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = Arc::new(BarrierRig::new(tmp.path()));
-    let housekeeper = housekeeper(&rig);
+    let housekeeper = housekeeper_of(&rig);
     drive_floor_and_latch_edges(&rig, &housekeeper).await;
 
     // Then each emits exactly one event, in the order it happened.
@@ -597,7 +549,7 @@ async fn emit_every_event() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let faults = Arc::new(JournalFaults::default());
     let rig = rig_with(tmp.path(), &faults);
-    let housekeeper = housekeeper(&rig);
+    let housekeeper = housekeeper_of(&rig);
     drive_floor_and_latch_edges(&rig, &housekeeper).await;
 
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -610,130 +562,68 @@ async fn emit_every_event() {
         CutOutcome::Stamped,
         "a failed sidecar write keeps the previous mark usable (RFC0052.1)"
     );
-}
 
-/// The live-check leg's view of what was emitted: every event is a
-/// registry name, and every attribute a registry attribute. A tracing
-/// field left over from before the naming (`error = %e`) fails here as
-/// weaver would fail it.
-fn weaver_samples(events: &[Event]) -> serde_json::Value {
-    serde_json::Value::Array(
-        events
-            .iter()
-            .map(|event| {
-                let attributes: Vec<serde_json::Value> = event
-                    .attributes
-                    .iter()
-                    .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
-                    .collect();
-                serde_json::json!({ "log": {
-                    "event_name": event.name,
-                    "severity_number": event.severity,
-                    "attributes": attributes,
-                }})
-            })
-            .collect(),
-    )
+    // A housekeeping pass that unwinds after the WAL took its plan.
+    faults.panic_after_prepare.store(true, Ordering::Release);
+    assert!(matches!(
+        tick(&housekeeper_of(&rig)).await,
+        HousekeepingTick::Panicked
+    ));
+
+    // A cadence task whose join is a panic, read at shutdown.
+    let joined = tokio::spawn(async { panic!("injected cadence-task panic") })
+        .await
+        .map(drop);
+    assert!(cadence::read_join(&rig.epochs, "barrier", joined));
+
+    // A later drain held behind an earlier one whose template events are
+    // still unwritten.
+    rig.ingest("checkout", &["cache warmed in 5 ms"]).await;
+    let earlier = rig.publish.drain_all();
+    rig.ingest("checkout", &["cache warmed in 5 ms"]).await;
+    let later = rig.publish.drain_all();
+    assert!(
+        !rig.publish.write_ordered(later, "age"),
+        "the later drain is held"
+    );
+    assert!(rig.publish.write_ordered(earlier, "age"));
 }
 
 /// Scenario RFC0052.7 — `weaver registry live-check` sees every new event emitted.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 ///
-/// With `OURIOS_LIVE_CHECK_WEAVER` (the weaver binary) and
-/// `OURIOS_LIVE_CHECK_REGISTRY` (the pinned registry's `registry/`
-/// directory) set — CI's `live-check` job sets both — the emitted
-/// records are handed to `weaver registry live-check` and any
-/// `violation` fails the leg. Without them the leg still checks every
-/// emitted name and attribute against the generated registry constants,
-/// and says that weaver did not run.
+/// Every emitted RFC 0052 event is checked against its registry name and
+/// the attributes the registry declares for it — so a tracing field left
+/// over from before the naming (`error = %e`) fails here as weaver would
+/// fail it — and, where CI's `live-check` job configures weaver
+/// (`OURIOS_LIVE_CHECK_WEAVER`, `OURIOS_LIVE_CHECK_REGISTRY`), through
+/// `weaver registry live-check` itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0052_7_live_check_covers_every_new_log_event() {
     let _serial = serial().await;
-    let harness = harness();
     emit_every_event().await;
-    let events: Vec<Event> = harness
-        .events()
-        .into_iter()
-        .filter(|e| RFC0052_EVENTS.contains(&e.name))
-        .collect();
+    let events = harness().events();
+    let checked = live_check::live_check(&events, &RFC0052_EVENTS, &EVENT_ATTRIBUTES)
+        .expect("every RFC 0052 event is emitted and registry-conformant");
 
-    for name in RFC0052_EVENTS {
+    // The failure events carry the error.type values the registry lists.
+    for (name, class) in [
+        (semconv::EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR, "io"),
+        (semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR, "io"),
+        (
+            semconv::EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR,
+            "cadence_panic",
+        ),
+        (semconv::EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR, "panic"),
+    ] {
         assert!(
-            events.iter().any(|e| e.name == name),
-            "{name} was never emitted, so the live-check would never check it"
+            events
+                .iter()
+                .any(|e| e.name == name && e.error_type() == Some(class)),
+            "{name} with error.type {class}"
         );
     }
-    for event in &events {
-        for key in event.attributes.keys() {
-            assert_eq!(
-                key, "error.type",
-                "{}: `{key}` is not a registry attribute",
-                event.name
-            );
-        }
-    }
-
-    let (Some(weaver), Some(registry)) = (
-        std::env::var_os("OURIOS_LIVE_CHECK_WEAVER"),
-        std::env::var_os("OURIOS_LIVE_CHECK_REGISTRY"),
-    ) else {
-        eprintln!(
-            "RFC0052.7: weaver not configured (OURIOS_LIVE_CHECK_WEAVER / \
-             OURIOS_LIVE_CHECK_REGISTRY); checked names and attributes against the \
-             generated constants only"
-        );
-        return;
-    };
-    let dir = tempfile::TempDir::new().expect("temp");
-    let samples = dir.path().join("samples.json");
-    std::fs::write(
-        &samples,
-        serde_json::to_vec(&weaver_samples(&events)).expect("serialise"),
-    )
-    .expect("write samples");
-    let report_dir = dir.path().join("report");
-    let status = std::process::Command::new(weaver)
-        .args(["registry", "live-check", "--future", "-r"])
-        .arg(&registry)
-        .args(["--input-source"])
-        .arg(&samples)
-        .args(["--input-format", "json", "--format", "json", "--no-stream"])
-        .arg("--output")
-        .arg(&report_dir)
-        .status()
-        .expect("run weaver");
-    let report: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(report_dir.join("live_check.json")).expect("the live-check report"),
-    )
-    .expect("a JSON report");
-    let mut violations = Vec::new();
-    collect_violations(&report, &mut violations);
-    assert!(
-        violations.is_empty(),
-        "weaver live-check (exit {status}) found violations: {violations:#?}"
-    );
-    let seen: Vec<&str> = report["samples"]
-        .as_array()
-        .expect("the report lists its samples")
-        .iter()
-        .filter_map(|s| s["log"]["event_name"].as_str())
-        .collect();
-    for name in RFC0052_EVENTS {
-        assert!(seen.contains(&name), "weaver never saw {name}");
-    }
-}
-
-fn collect_violations(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if map.get("type").and_then(serde_json::Value::as_str) == Some("PolicyFinding")
-                && map.get("level").and_then(serde_json::Value::as_str) == Some("violation")
-            {
-                out.push(value.clone());
-            }
-            map.values().for_each(|v| collect_violations(v, out));
-        }
-        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_violations(v, out)),
-        _ => {}
+    if checked == Checked::NamesOnly {
+        eprintln!("RFC0052.7: weaver is not configured here; checked names and attributes only");
     }
 }

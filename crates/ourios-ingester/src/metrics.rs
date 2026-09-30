@@ -357,7 +357,7 @@ pub use ourios_serving::metrics::{
 /// Deliberately **not** in the Ourios weaver registry — it is an upstream
 /// OpenTelemetry attribute used here per the "recording errors on metrics"
 /// convention, not an Ourios-coined name.
-const ERROR_TYPE: &str = "error.type";
+pub(crate) const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use ourios_wal::{HousekeepingProgress, ReclaimError};
 
 use crate::barrier::Barrier;
+use crate::metrics::{CADENCE_PANIC, ERROR_TYPE};
 use crate::publish::PublishCoordinator;
 use crate::receiver::CommitCoordinator;
 use crate::reclaim_telemetry::WalExport;
@@ -95,15 +96,18 @@ impl Housekeeper {
             Ok(Ok(progress)) => HousekeepingTick::Completed(progress),
             Ok(Err(e)) => {
                 tracing::warn!(
-                    error = %e,
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR,
+                    { { ERROR_TYPE } = e.error_type() },
                     "housekeeping: the pass failed; nothing past its bound was unlinked and \
-                     the next pass retries"
+                     the next pass retries: {e}"
                 );
                 HousekeepingTick::Failed(e)
             }
             Err(_) => {
                 self.cadence.record_cadence_panic();
                 tracing::error!(
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR,
+                    { { ERROR_TYPE } = CADENCE_PANIC },
                     "housekeeping: the pass panicked; the checkpoint is untouched and the next \
                      pass re-plans what this one left uncommitted"
                 );

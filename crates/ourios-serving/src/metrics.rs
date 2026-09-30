@@ -26,7 +26,7 @@ pub const ERROR_TYPE_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
 /// Deliberately **not** in the Ourios weaver registry — it is an upstream
 /// OpenTelemetry attribute used here per the "recording errors on metrics"
 /// convention, not an Ourios-coined name.
-const ERROR_TYPE: &str = "error.type";
+pub(crate) const ERROR_TYPE: &str = "error.type";
 
 /// `ourios.auth.resolutions` (RFC 0047 §5): one count per credential
 /// resolution by the [`AuthResolver`](crate::auth::AuthResolver),

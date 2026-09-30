@@ -27,6 +27,7 @@ use ourios_wal::{
 };
 
 use crate::cadence::BarrierEpochs;
+use crate::metrics::ERROR_TYPE;
 
 /// The categorical half of [`RotationState`] — what the rotation status
 /// metric reports and what an edge is detected on.
@@ -127,7 +128,7 @@ pub(crate) fn emit_rotation_edge(before: &RotationState, after: &RotationState) 
     match (RotationPhase::of(before), after) {
         (RotationPhase::Healthy, RotationState::Retrying(fault)) => tracing::warn!(
             name: semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RETRYING,
-            { "error.type" = fault_error_type(fault) },
+            { { ERROR_TYPE } = fault_error_type(fault) },
             "WAL rotation failed ({fault}); the next append retries it within the budget"
         ),
         (RotationPhase::Retrying, RotationState::Healthy) => tracing::info!(
@@ -137,7 +138,7 @@ pub(crate) fn emit_rotation_edge(before: &RotationState, after: &RotationState) 
         (RotationPhase::Healthy | RotationPhase::Retrying, RotationState::Terminal(fault)) => {
             tracing::error!(
                 name: semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_TERMINAL,
-                { "error.type" = fault_error_type(fault) },
+                { { ERROR_TYPE } = fault_error_type(fault) },
                 "WAL rotation retry budget spent ({fault}); appends are refused until a restart"
             );
         }

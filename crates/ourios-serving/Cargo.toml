@@ -82,6 +82,8 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["std"
 # speak raw HTTP/1 over the socket, and open an h2c connection.
 rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "test-util"] }
+# The listener-event test's certificate directory.
+tempfile = "=3.27.0"
 hyper = { version = "1", default-features = false, features = ["client", "http2"] }
 
 [features]

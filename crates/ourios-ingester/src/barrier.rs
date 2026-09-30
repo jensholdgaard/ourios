@@ -56,7 +56,7 @@ use ourios_miner::snapshot::{SnapshotState, WalHighWater};
 use ourios_wal::{AppendError, ReclaimError, SnapshotHorizons, WalOffset};
 
 use crate::cadence::{BarrierEpochs, Epoch};
-use crate::metrics::BarrierMetrics;
+use crate::metrics::{BarrierMetrics, ERROR_TYPE};
 use crate::publish::{Drained, PublishCoordinator};
 use crate::receiver::CommitCoordinator;
 use crate::receiver::ReceiveError;
@@ -544,7 +544,7 @@ impl Barrier {
         if let Err(e) = self.coordinator.rotate_if_aged() {
             tracing::warn!(
                 name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR,
-                { "error.type" = rotation_error_type(&e) },
+                { { ERROR_TYPE } = rotation_error_type(&e) },
                 "barrier: the idle rotation failed; the cut proceeds against the open segment: {e}"
             );
         }
@@ -670,7 +670,7 @@ impl Barrier {
             Err(e @ ReclaimError::NoReclamationSurface) => {
                 tracing::warn!(
                     name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
-                    { "error.type" = e.error_type() },
+                    { { ERROR_TYPE } = e.error_type() },
                     "barrier: the journal exposes no reclamation surface, so no checkpoint was \
                      written and nothing is reclaimed"
                 );
@@ -679,9 +679,8 @@ impl Barrier {
             Err(e) => {
                 tracing::warn!(
                     name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
-                    { "error.type" = e.error_type() },
-                    "barrier: the checkpoint write failed; nothing past the previous mark is \
-                     reclaimed: {e}"
+                    { { ERROR_TYPE } = e.error_type() },
+                    "barrier: the checkpoint write failed; a later cut retries the stamp: {e}"
                 );
                 CutOutcome::Stamped
             }
@@ -689,16 +688,17 @@ impl Barrier {
     }
 }
 
-/// The `error.type` of a failed idle rotation: the rotation step for a
-/// charged rotation failure, otherwise the append error's class.
+/// The `error.type` of a failed idle rotation, as the registry lists it:
+/// the rotation step for a failure charged to the budget, `io` for any
+/// other I/O failure, and `_OTHER` for what a rotation cannot return.
 fn rotation_error_type(error: &ReceiveError) -> &'static str {
     match error {
         ReceiveError::WalAppend(
             AppendError::RotationRetrying(fault) | AppendError::RotationTerminal(fault),
         ) => fault_error_type(fault),
         ReceiveError::WalAppend(AppendError::Io { .. }) => "io",
-        ReceiveError::WalAppend(AppendError::TooLarge { .. }) => "too_large",
-        ReceiveError::TenantDenied { .. }
+        ReceiveError::WalAppend(AppendError::TooLarge { .. })
+        | ReceiveError::TenantDenied { .. }
         | ReceiveError::TenantFrame(_)
         | ReceiveError::WalSync(_) => "_OTHER",
     }

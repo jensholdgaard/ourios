@@ -59,7 +59,7 @@ use crate::tree::OwnedToken;
 /// a version-1 artefact takes the unknown-version path: one byte never
 /// carries both readings, and before production a persisted layout is
 /// broken rather than dual-read; only the version-1 mark is still read,
-/// by [`legacy_v1_high_water`], for RFC 0052 §3.2's legacy stale-gap
+/// by [`legacy_v1_mark`], for RFC 0052 §3.2's legacy stale-gap
 /// check. The cost is paid once, on upgrade: a
 /// tenant whose frames the WAL already reclaimed past its version-1
 /// snapshot rebuilds from what remains, and re-mints the template ids
@@ -405,26 +405,40 @@ const LEGACY_V1: u8 = 1;
 
 /// The one field RFC 0052 §3.2 still reads from a version-1 artefact.
 #[derive(Deserialize)]
-struct LegacyMark {
+struct LegacyPayload {
     wal_high_water: Option<WalHighWater>,
+}
+
+/// What a snapshot artefact offers RFC 0052 §3.2's legacy stale-gap
+/// check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyMark {
+    /// Not a version-1 artefact: the check has nothing to read here.
+    NotLegacy,
+    /// A version-1 artefact and the global mark it recorded.
+    Recorded(WalHighWater),
+    /// A version-1 artefact whose payload does not decode even for its
+    /// mark, or that recorded none. There is no horizon to compare, so
+    /// the check fails closed on it.
+    Unreadable,
 }
 
 /// The global mark a version-1 artefact recorded, decoded for RFC 0052
 /// §3.2's legacy stale-gap check alone. It restores nothing and feeds no
 /// miner: [`recover`] still discards the artefact.
-///
-/// `None` when the artefact is not version 1, when its payload does not
-/// decode even for this field, or when it recorded no mark. The caller
-/// then has no horizon to compare, and the check fails closed.
 #[must_use]
-pub fn legacy_v1_high_water(bytes: &[u8]) -> Option<WalHighWater> {
-    match bytes.split_first() {
-        Some((&LEGACY_V1, payload)) => {
-            serde_json::from_slice::<LegacyMark>(payload)
-                .ok()?
-                .wal_high_water
-        }
-        Some(_) | None => None,
+pub fn legacy_v1_mark(bytes: &[u8]) -> LegacyMark {
+    let Some((&LEGACY_V1, payload)) = bytes.split_first() else {
+        return LegacyMark::NotLegacy;
+    };
+    match serde_json::from_slice::<LegacyPayload>(payload) {
+        Ok(LegacyPayload {
+            wal_high_water: Some(mark),
+        }) => LegacyMark::Recorded(mark),
+        Ok(LegacyPayload {
+            wal_high_water: None,
+        })
+        | Err(_) => LegacyMark::Unreadable,
     }
 }
 
@@ -667,15 +681,27 @@ mod tests {
         let mut v1 = snapshot(&sample_state()).expect("snapshot encodes");
         v1[0] = 1;
 
-        assert_eq!(legacy_v1_high_water(&v1), sample_state().wal_high_water);
+        assert_eq!(
+            Some(legacy_v1_mark(&v1)),
+            sample_state().wal_high_water.map(LegacyMark::Recorded)
+        );
         assert_eq!(
             recover(Some(&v1)),
             (None, RecoveryOutcome::UnknownOrCorruptDiscarded)
         );
         let current = snapshot(&sample_state()).expect("snapshot encodes");
-        assert_eq!(legacy_v1_high_water(&current), None, "not version 1");
-        assert_eq!(legacy_v1_high_water(&[1, 0x7B, 0x21]), None, "undecodable");
-        assert_eq!(legacy_v1_high_water(&[]), None, "empty");
+        assert_eq!(legacy_v1_mark(&current), LegacyMark::NotLegacy);
+        assert_eq!(legacy_v1_mark(&[]), LegacyMark::NotLegacy, "empty");
+        assert_eq!(
+            legacy_v1_mark(&[1, 0x7B, 0x21]),
+            LegacyMark::Unreadable,
+            "undecodable"
+        );
+        let mut unmarked = sample_state();
+        unmarked.wal_high_water = None;
+        let mut unmarked = snapshot(&unmarked).expect("snapshot encodes");
+        unmarked[0] = 1;
+        assert_eq!(legacy_v1_mark(&unmarked), LegacyMark::Unreadable, "no mark");
     }
 
     #[test]

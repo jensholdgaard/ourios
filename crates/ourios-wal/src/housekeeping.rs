@@ -695,14 +695,23 @@ impl Wal {
         &self,
         marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
     ) -> Result<(), HousekeepingError> {
-        let legacy = self.reclaim_gate == ReclaimGate::Unwitnessed && !self.reclaim.has_record();
         match self.first_legacy_stale_gap(marks) {
-            Some((tenant, horizon)) if legacy => Err(HousekeepingError::Unrecoverable {
-                tenant: tenant.as_str().to_owned(),
-                horizon,
-            }),
+            Some((tenant, horizon)) if self.on_legacy_branch() => {
+                Err(HousekeepingError::Unrecoverable {
+                    tenant: tenant.as_str().to_owned(),
+                    horizon,
+                })
+            }
             Some(_) | None => Ok(()),
         }
+    }
+
+    /// Whether this is a pre-RFC root (RFC 0052 §3.2): still on the
+    /// legacy branch, with no `RECLAIM` record yet. Only such a root is
+    /// held to the startup legacy stale-gap check.
+    #[must_use]
+    pub fn on_legacy_branch(&self) -> bool {
+        self.reclaim_gate == ReclaimGate::Unwitnessed && !self.reclaim.has_record()
     }
 
     /// The first tenant whose oldest surviving frame is not explained

@@ -20,7 +20,7 @@ use std::path::Path;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_miner::snapshot::{RecoveryOutcome, WalHighWater};
+use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, WalHighWater};
 use ourios_wal::{
     FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
     TenantHorizon, Wal, WalOffset,
@@ -101,6 +101,11 @@ pub enum RecoveryDriverError {
     /// tenant's oldest surviving frame is above the mark its version-1
     /// snapshot recorded, or the tenant has no decodable mark at all.
     LegacyStaleGap(HousekeepingError),
+    /// The same belt, for a tenant whose version-1 snapshot does not
+    /// decode even for its mark. It fails closed whether or not the
+    /// tenant still has frames in the WAL: with none left, booting
+    /// would silently discard the only record of its templates.
+    LegacyMarkUnreadable(TenantId),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -110,6 +115,12 @@ impl std::fmt::Display for RecoveryDriverError {
             Self::Replay(e) => write!(f, "recovery WAL replay: {e:?}"),
             Self::Ledger(e) => write!(f, "recovery WAL ledger rebuild: {e}"),
             Self::LegacyStaleGap(e) => write!(f, "recovery legacy stale-gap check: {e}"),
+            Self::LegacyMarkUnreadable(tenant) => write!(
+                f,
+                "recovery legacy stale-gap check: tenant {} has a version-1 snapshot whose \
+                 high-water mark cannot be read (RFC 0052 §3.2)",
+                tenant.as_str()
+            ),
         }
     }
 }
@@ -119,7 +130,7 @@ impl std::error::Error for RecoveryDriverError {
         match self {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
-            Self::LegacyStaleGap(_) | Self::Replay(_) => None,
+            Self::LegacyStaleGap(_) | Self::LegacyMarkUnreadable(_) | Self::Replay(_) => None,
         }
     }
 }
@@ -153,7 +164,7 @@ pub fn recover(
     let Restored {
         mut tenants,
         horizons,
-        recorded,
+        legacy,
     } = restore_artefacts(miner, artefacts);
     let mut sink = DriverSink {
         miner,
@@ -175,7 +186,7 @@ pub fn recover(
     wal.rebuild_ledger().map_err(RecoveryDriverError::Ledger)?;
     // Before the caller's post-recovery write replaces the version-1
     // artefacts whose marks this check reads.
-    refuse_legacy_stale_gaps(wal, &horizons, recorded)?;
+    refuse_legacy_stale_gaps(wal, &horizons, legacy)?;
 
     let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
@@ -196,28 +207,45 @@ pub fn recover(
 }
 
 /// What restoring the snapshot artefacts left: each tenant's outcome,
-/// the horizons of those restored, and the global marks version-1
-/// artefacts recorded for RFC 0052 §3.2's legacy check.
+/// the horizons of those restored, and what version-1 artefacts offer
+/// RFC 0052 §3.2's legacy check.
 struct Restored {
     tenants: Vec<TenantRecovery>,
     horizons: HashMap<TenantId, WalOffset>,
+    legacy: LegacyMarks,
+}
+
+/// Every version-1 artefact's tenant, split by whether its mark reads.
+#[derive(Default)]
+struct LegacyMarks {
     recorded: HashMap<TenantId, WalOffset>,
+    unreadable: Vec<TenantId>,
+}
+
+impl LegacyMarks {
+    fn note(&mut self, tenant: &TenantId, bytes: &[u8]) {
+        match ourios_miner::snapshot::legacy_v1_mark(bytes) {
+            LegacyMark::NotLegacy => {}
+            LegacyMark::Recorded(mark) => match snapshot_store::offset_of(&mark) {
+                Some(offset) => {
+                    self.recorded.insert(tenant.clone(), offset);
+                }
+                None => self.unreadable.push(tenant.clone()),
+            },
+            LegacyMark::Unreadable => self.unreadable.push(tenant.clone()),
+        }
+    }
 }
 
 fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>)>) -> Restored {
     let mut restored = Restored {
         tenants: Vec::with_capacity(artefacts.len()),
         horizons: HashMap::new(),
-        recorded: HashMap::new(),
+        legacy: LegacyMarks::default(),
     };
     for (tenant_id, bytes) in artefacts {
         let outcome = restore_artefact(miner, &tenant_id, &bytes, &mut restored.horizons);
-        if let Some(mark) = ourios_miner::snapshot::legacy_v1_high_water(&bytes)
-            .as_ref()
-            .and_then(snapshot_store::offset_of)
-        {
-            restored.recorded.insert(tenant_id.clone(), mark);
-        }
+        restored.legacy.note(&tenant_id, &bytes);
         restored.tenants.push(TenantRecovery {
             horizon: restored.horizons.get(&tenant_id).copied(),
             tenant_id,
@@ -257,14 +285,21 @@ fn restore_artefact(
 }
 
 /// RFC 0052 §3.2's legacy stale-gap belt, over every restored horizon
-/// and every version-1 mark. Only a pre-RFC root is checked; the WAL
+/// and every version-1 artefact. Only a pre-RFC root is checked; the WAL
 /// decides which roots those are.
 fn refuse_legacy_stale_gaps(
     wal: &Wal,
     horizons: &HashMap<TenantId, WalOffset>,
-    recorded: HashMap<TenantId, WalOffset>,
+    legacy: LegacyMarks,
 ) -> Result<(), RecoveryDriverError> {
-    let mut marks: HashMap<TenantId, TenantHorizon> = recorded
+    if !wal.on_legacy_branch() {
+        return Ok(());
+    }
+    if let Some(tenant) = legacy.unreadable.into_iter().next() {
+        return Err(RecoveryDriverError::LegacyMarkUnreadable(tenant));
+    }
+    let mut marks: HashMap<TenantId, TenantHorizon> = legacy
+        .recorded
         .into_iter()
         .map(|(tenant, mark)| (tenant, TenantHorizon::RecordedOnly(mark)))
         .collect();

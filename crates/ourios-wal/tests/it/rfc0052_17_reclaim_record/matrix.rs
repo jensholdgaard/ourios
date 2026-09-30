@@ -582,8 +582,8 @@ fn rfc0052_17_the_startup_legacy_check_refuses_only_a_pre_rfc_root() {
         .expect("a post-RFC root is not on the legacy branch");
 }
 
-/// Scenario RFC0052.17 — slot ids and the `published_seeded_*` flag rows.
-/// RFC0055.5 (moved from RFC0052.17); see
+/// Scenario RFC0055.5 (moved from RFC0052.17) — slot ids and the
+/// `published_seeded_*` flag rows; see
 /// `docs/rfcs/0055-publication-frontiers.md` §5.
 ///
 /// Both legs read the `PUBLISHED` sidecar. §3.2 defines the two
@@ -596,9 +596,9 @@ fn rfc0052_17_the_startup_legacy_check_refuses_only_a_pre_rfc_root() {
 /// wrong RFC.
 #[test]
 #[ignore = "RFC0055.5 stub (moved from RFC0052.17) — RFC 0055 (publication frontiers) owns the PUBLISHED writer and format; the slice that lands it discharges this"]
-fn rfc0052_17_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve() {
+fn rfc0055_5_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve() {
     todo!(
-        "RFC0052.17 — a tenant introduced by a PUBLISHED-only write keeps \
+        "RFC0055.5 — a tenant introduced by a PUBLISHED-only write keeps \
          its slot id across a restart; published_seeded_armed without \
          confirmed and PUBLISHED absent leaves the next start free to \
          seed again, while the same record with PUBLISHED present is \

@@ -77,7 +77,7 @@ this RFC makes it; it does not.
 ## 5. Acceptance criteria
 
 > **Stage note.** This RFC is `drafted`; full `Given / When / Then`
-> criteria are written at the `specified` gate. The four labels below are
+> criteria are written at the `specified` gate. The five labels below are
 > the plan for that gate, not the final criteria text.
 
 - RFC0055.1 restart does not republish a settled audit group
@@ -96,7 +96,7 @@ this RFC makes it; it does not.
   when `PUBLISHED` is absent, and is promoted to confirmed durably at
   open, never read as a fault, when `PUBLISHED` is present. The stub is
   `ourios-wal/tests/it/rfc0052_17_reclaim_record/matrix.rs`'s
-  `rfc0052_17_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve`.
+  `rfc0055_5_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve`.
 
 ## 6. Testing strategy
 

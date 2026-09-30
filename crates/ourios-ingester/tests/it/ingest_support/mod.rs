@@ -20,6 +20,19 @@ use ourios_wal::{
 };
 
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, Journal, ReceiveError};
+use ourios_ingester::snapshot_store;
+
+/// Every tenant's artefact at one explicit horizon, the fixture shape for
+/// a snapshot whose tenants' frames all sit at or below `high_water` (or
+/// one with no horizon at all). Production stamps each tenant's own
+/// folded horizon instead (`recovery::write_folded_snapshots`).
+pub fn write_snapshots_at(root: &Path, miner: &MinerCluster, high_water: Option<WalOffset>) {
+    for tenant in miner.tenant_ids() {
+        let mut state = miner.snapshot_state(&tenant);
+        state.wal_high_water = high_water.map(snapshot_store::high_water);
+        snapshot_store::write(root, &tenant, &state).expect("snapshot write");
+    }
+}
 
 pub fn wal_config(root: &Path) -> WalConfig {
     WalConfig {

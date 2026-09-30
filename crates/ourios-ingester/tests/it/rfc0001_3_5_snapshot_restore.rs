@@ -11,7 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ingest_support::{open_pipeline, request, resource_logs, tenant_for, wal_config};
+use crate::ingest_support::{
+    open_pipeline, request, resource_logs, tenant_for, wal_config, write_snapshots_at,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 
@@ -86,9 +88,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let s = pipeline
         .last_durable()
         .expect("a synced batch yields the durable mark");
-    pipeline
-        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, Some(s)))
-        .expect("snapshot at S");
+    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, Some(s)));
     for r in &post {
         pipeline
             .ingest(r.clone(), tenant_for(r))
@@ -198,9 +198,7 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
             .await
             .expect("ingest");
     }
-    pipeline
-        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, None))
-        .expect("snapshot without a high-water mark");
+    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, None));
     drop(pipeline);
 
     let mut control = MinerCluster::new(MinerConfig::default());
@@ -246,9 +244,7 @@ async fn rfc0001_3_5_a_version_1_artefact_discards_and_full_replays() {
             .expect("ingest");
     }
     let mark = pipeline.last_durable();
-    pipeline
-        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, mark))
-        .expect("snapshot at the mark");
+    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, mark));
     drop(pipeline);
     let artefact = snapshots_root.join("checkout.snap");
     let mut bytes = std::fs::read(&artefact).expect("the artefact");
@@ -358,7 +354,7 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
 
     let mut snap_miner = MinerCluster::new(MinerConfig::default());
     ingest_all(&mut snap_miner, &seg1_batches);
-    recovery::write_snapshots(&snapshots_root, &snap_miner, Some(s)).expect("snapshot at S");
+    write_snapshots_at(&snapshots_root, &snap_miner, Some(s));
 
     {
         let mut wal = Wal::open(wal_config(root)).expect("open for checkpoint");

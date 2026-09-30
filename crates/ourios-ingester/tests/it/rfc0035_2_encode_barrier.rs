@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
+use crate::ingest_support::{coordinator, request, resource_logs, wal_config, write_snapshots_at};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 use ourios_ingester::encode_pool::EncodePool;
@@ -88,7 +88,7 @@ fn observing_stamper(
             .lock()
             .expect("lock")
             .push((sink.buffered_records(), store_rows(&store_root)));
-        recovery::write_snapshots(&snapshots_root, miner, Some(mark)).expect("snapshot write");
+        write_snapshots_at(&snapshots_root, miner, Some(mark));
     })
 }
 

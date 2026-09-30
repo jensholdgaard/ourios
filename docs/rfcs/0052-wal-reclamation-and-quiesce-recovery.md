@@ -2506,16 +2506,25 @@ So the design is:
   the commit coordinator exists**, so there is no journal owner to checkpoint
   through. That call therefore deliberately advances no checkpoint; the first
   timer pass after the coordinator is built does it instead, from the same
-  mark or a later one. And when replay delivers **nothing** — the normal
-  shape once housekeeping has reclaimed every closed frame and the node
-  restarts idle — that post-recovery snapshot write preserves each tenant's
-  *restored* horizon rather than writing `None` over it, which would have
-  discarded the snapshots on the next restart and forced a full replay every
-  time. The mixed case needs the same care: a replay that delivered frames
-  for tenant A only must record A's progress and keep B's restored horizon,
-  which one global `max_delivered` cannot express, so `RecoveryReport`
-  returns **per-tenant delivered horizons** and the post-recovery write is
-  driven from those. §3.1's "behind the barrier and nowhere else" holds —
+  mark or a later one. The post-recovery snapshot write stamps each tenant
+  at its own **folded horizon** (§3.1), read from `MinerCluster::folded_horizon`
+  and written by `recovery::write_folded_snapshots`, the one writer the
+  shutdown point shares: restoring a snapshot sets the tenant's horizon to
+  the one it carries, and replay advances it to each frame it feeds. So when
+  replay delivers **nothing** — the normal shape once housekeeping has
+  reclaimed every closed frame and the node restarts idle — each tenant keeps
+  its *restored* horizon rather than having `None` written over it, which
+  would discard the snapshots on the next restart and force a full replay
+  every time; and a replay that delivered frames for tenant A only records
+  A's own last frame and keeps B's restored horizon, which no global
+  `max_delivered` could express. The snapshot ledger is seeded from what that
+  write installed, and **fail-closed**: a skipped or partly failed write
+  falls back to the horizons recovery restored, never to the higher ones it
+  attempted, so the ledger is never above what is on disk. Before any of
+  it — inside recovery, after the ledger rebuild — a pre-RFC root runs the
+  §3.2 legacy stale-gap check against the marks its version-1 artefacts
+  recorded, since the post-recovery write replaces those artefacts and
+  would destroy the evidence. §3.1's "behind the barrier and nowhere else" holds —
   this is a caller that has the mark but not yet the owner, not a second
   checkpoint site.
 - **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
@@ -2922,10 +2931,11 @@ memory, and nothing here claims to.
 > - **And** the mark used is the one read after the quiesce under the same
 >   exclusion, not one read before either
 > - **And** that mark is a turn's own frame offset, never the sync's reported
->   EOF, and the post-recovery seed is a delivered offset covered by a
->   successful sync — never `max_delivered` alone, so a replayed frame whose
->   group sync failed before the crash is not seeded as a mark, and a node
->   with no such offset seeds `None` and lets its first turn establish one —
+>   EOF, and nothing replay delivered is ever a mark: a restarted node has no
+>   mark until its first acknowledged turn establishes one, so a replayed
+>   frame whose group sync failed before the crash is never checkpointed
+>   across (a replayed seed, where a caller still supplies one, stays
+>   distinct from a mark; whether that seed survives is #883) —
 >   so a later frame made durable by the same flush but not yet mined
 >   (nor acknowledged) is never
 >   covered — asserted by a flush whose sync covers two turns and a barrier

@@ -75,6 +75,7 @@ use ourios_config::UpstreamTemplates;
 use crate::mask::{TypedParam, mask};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
+use crate::snapshot::WalHighWater;
 use crate::tokenize::tokenize;
 use crate::tree::{Leaf, OwnedToken, Tree, UpstreamAssociations, format_template};
 use crate::upstream;
@@ -319,6 +320,11 @@ struct TenantState {
     /// reconfiguration as an open question; today's contract is
     /// startup-only).
     config: MinerConfig,
+    /// RFC 0052 §3.1's folded horizon: the WAL offset of this
+    /// tenant's own last frame folded into the state above. Opaque
+    /// here — the cluster never compares it — and `None` until a
+    /// caller records one.
+    folded: Option<WalHighWater>,
 }
 
 impl TenantState {
@@ -332,6 +338,7 @@ impl TenantState {
             template_count: 0,
             leaf_count: 0,
             config,
+            folded: None,
         }
     }
 
@@ -372,6 +379,23 @@ struct StringLine<'a> {
     record: &'a OtlpLogRecord,
     service: Option<&'a str>,
     raw: &'a str,
+}
+
+/// What a string line contributes to its data record whichever way it
+/// is mined: its separators and its line-ordered, byte-capped params.
+/// Owned, because each exit path moves them into exactly one record.
+struct LineParts {
+    separators: Vec<String>,
+    params: Vec<Param>,
+}
+
+/// A `Body::Structured` line in flight: the record, its resolved
+/// `service.name`, and the body the §6.2 step-0 short-circuit keys on.
+#[derive(Clone, Copy)]
+struct StructuredLine<'a> {
+    record: &'a OtlpLogRecord,
+    service: Option<&'a str>,
+    body: &'a ourios_core::otlp::AnyValue,
 }
 
 /// [`mask`]'s view of a line. `wildcard_positions` and
@@ -645,7 +669,11 @@ impl MinerCluster {
                 service,
                 raw,
             }),
-            Some(Body::Structured(av)) => self.ingest_structured(record, service, av),
+            Some(Body::Structured(body)) => self.ingest_structured(StructuredLine {
+                record,
+                service,
+                body,
+            }),
         };
         // §6.8 `ourios.miner.duration` histogram (hot-path budget
         // D1) and the `ourios.miner.template.count` observable-gauge
@@ -775,8 +803,10 @@ impl MinerCluster {
         // empty/over-cap paths); the attach paths rebuild via
         // `build_record_params` so they apply the same check on
         // the aligned per-Wildcard-slot params.
-        let separators = separators_to_owned(&tokenized.separators);
-        let params = params_from_mask(&masked.typed_params, effective_config.param_byte_limit);
+        let parts = LineParts {
+            separators: separators_to_owned(&tokenized.separators),
+            params: params_from_mask(&masked.typed_params, effective_config.param_byte_limit),
+        };
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
         let masked_line = MaskedLine {
             strs: &masked_strs,
@@ -790,7 +820,7 @@ impl MinerCluster {
             // separator entry covering the entire input
             // (`tokens.len() + 1 == 1`).
             let mut rec = Self::record_envelope(record, BodyKind::String);
-            rec.separators = separators;
+            rec.separators = parts.separators;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
             self.emit_record(rec, service);
@@ -806,7 +836,7 @@ impl MinerCluster {
         // Vec<u16>`), whose violation would otherwise be the
         // silent-merge bug `[CLAUDE.md §3.1]` exists to prevent.
         if masked_strs.len() > usize::from(effective_config.max_line_tokens) {
-            return self.emit_string_parse_failure(line, separators, params, "line_too_long");
+            return self.emit_string_parse_failure(line, parts, "line_too_long");
         }
 
         // RFC 0050 §3.2 — the upstream-template dial. `ignore`
@@ -877,15 +907,10 @@ impl MinerCluster {
                 // parse-failure path — body retained, counted,
                 // never force-merged.
                 if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
-                    return self.emit_string_parse_failure(
-                        line,
-                        separators,
-                        params,
-                        "template_ceiling",
-                    );
+                    return self.emit_string_parse_failure(line, parts, "template_ceiling");
                 }
                 let new_id = self.create_new_leaf(line, masked_line, observed);
-                self.emit_fresh_leaf_record(line, separators, params, new_id, FreshLeafZone::Clean)
+                self.emit_fresh_leaf_record(line, parts, new_id, FreshLeafZone::Clean)
             }
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
@@ -901,8 +926,7 @@ impl MinerCluster {
                         line,
                         masked_line,
                         c,
-                        separators,
-                        params,
+                        parts,
                         effective_config.param_byte_limit,
                         observed,
                     ),
@@ -922,18 +946,12 @@ impl MinerCluster {
                         if self
                             .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
                         {
-                            return self.emit_string_parse_failure(
-                                line,
-                                separators,
-                                params,
-                                "template_ceiling",
-                            );
+                            return self.emit_string_parse_failure(line, parts, "template_ceiling");
                         }
                         let new_id = self.create_new_leaf(line, masked_line, observed);
                         self.emit_fresh_leaf_record(
                             line,
-                            separators,
-                            params,
+                            parts,
                             new_id,
                             FreshLeafZone::Lossy {
                                 confidence: c.similarity / threshold,
@@ -943,7 +961,7 @@ impl MinerCluster {
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
                     ConfidenceZone::ParseFailure => {
-                        self.emit_string_parse_failure(line, separators, params, "below_floor")
+                        self.emit_string_parse_failure(line, parts, "below_floor")
                     }
                 }
             }
@@ -974,8 +992,7 @@ impl MinerCluster {
     fn emit_fresh_leaf_record(
         &mut self,
         line: StringLine<'_>,
-        separators: Vec<String>,
-        params: Vec<Param>,
+        parts: LineParts,
         new_id: u64,
         zone: FreshLeafZone,
     ) -> u64 {
@@ -987,8 +1004,8 @@ impl MinerCluster {
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.template_id = new_id;
         rec.template_version = 1;
-        rec.separators = separators;
-        rec.params = params;
+        rec.separators = parts.separators;
+        rec.params = parts.params;
         match zone {
             FreshLeafZone::Clean => rec.confidence = 1.0,
             FreshLeafZone::Lossy { confidence } => {
@@ -1012,8 +1029,7 @@ impl MinerCluster {
     fn emit_string_parse_failure(
         &mut self,
         line: StringLine<'_>,
-        separators: Vec<String>,
-        params: Vec<Param>,
+        parts: LineParts,
         reason: &'static str,
     ) -> u64 {
         let StringLine {
@@ -1022,8 +1038,8 @@ impl MinerCluster {
             raw,
         } = line;
         let mut rec = Self::record_envelope(record, BodyKind::String);
-        rec.separators = separators;
-        rec.params = params;
+        rec.separators = parts.separators;
+        rec.params = parts.params;
         rec.body = Some(raw.to_string());
         rec.lossy_flag = true;
         // §6.5: bump `params_overflow_total` for any overflow params
@@ -1652,14 +1668,12 @@ impl MinerCluster {
     ///     `TemplateTypeExpanded` per RFC §6.2's combined-attach
     ///     contract (`template_version` increments twice, two events
     ///     emitted in widening-then-expansion order).
-    #[allow(clippy::too_many_arguments)]
     fn attach_and_maybe_widen(
         &mut self,
         line: StringLine<'_>,
         masked: MaskedLine<'_>,
         candidate: Candidate,
-        separators: Vec<String>,
-        params: Vec<Param>,
+        parts: LineParts,
         byte_limit: u32,
         observed: Option<&str>,
     ) -> u64 {
@@ -1669,10 +1683,9 @@ impl MinerCluster {
             raw,
         } = line;
         // Ownership rationale: each exit path emits **one** data
-        // record and never reuses `separators` / `params` after
-        // that emit. Taking the vectors by value lets each branch
-        // move them straight into the record without a `.to_vec()`
-        // clone.
+        // record and never reuses `parts` after that emit. Taking it
+        // by value lets each branch move its vectors straight into
+        // the record without a `.to_vec()` clone.
 
         // Phase 1 — mutate the leaf and accumulate the audit-event
         // payloads (the helper holds the leaf borrow only over the
@@ -1695,7 +1708,7 @@ impl MinerCluster {
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = template_id;
                 rec.template_version = template_version;
-                rec.separators = separators;
+                rec.separators = parts.separators;
                 rec.params = aligned_params;
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this clean-reuse
@@ -1723,7 +1736,7 @@ impl MinerCluster {
                 // failure that retains body (the line-ordered
                 // params fallback is fine — reconstruct ignores
                 // `params` on the lossy path).
-                self.emit_string_parse_failure(line, separators, params, "degenerate_widening")
+                self.emit_string_parse_failure(line, parts, "degenerate_widening")
             }
             AttachPlan::Mutated {
                 template_id,
@@ -1753,7 +1766,7 @@ impl MinerCluster {
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = template_id;
                 rec.template_version = final_version;
-                rec.separators = separators;
+                rec.separators = parts.separators;
                 rec.params = aligned_params;
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this widened /
@@ -1772,12 +1785,15 @@ impl MinerCluster {
     /// template_id` map is the entire lookup. First observation of a
     /// tuple allocates; subsequent records with the same tuple reuse.
     /// Structured records never widen and never emit audit events.
-    fn ingest_structured(
-        &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        any_value: &ourios_core::otlp::AnyValue,
-    ) -> u64 {
+    fn ingest_structured(&mut self, line: StructuredLine<'_>) -> u64 {
+        let template_id = self.structured_template_id(line.record);
+        self.emit_structured(line, template_id);
+        template_id
+    }
+
+    /// The structured-template id for `record`'s `(severity_number,
+    /// scope_name, event_name)` tuple, allocated on its first sight.
+    fn structured_template_id(&mut self, record: &OtlpLogRecord) -> u64 {
         let key = (
             record.severity_number,
             record.scope_name.clone(),
@@ -1791,18 +1807,25 @@ impl MinerCluster {
             .tenants
             .entry(record.tenant_id.clone())
             .or_insert_with(|| TenantState::new(effective_config));
-        let template_id = if let Some(&existing_id) = state.structured_templates.get(&key) {
-            existing_id
-        } else {
-            let new_id = self.next_template_id;
-            self.next_template_id += 1;
-            state.structured_templates.insert(key, new_id);
-            // Same cache invariant as create_new_leaf: one fresh
-            // allocation, one cache increment.
-            state.template_count += 1;
-            new_id
-        };
+        if let Some(&existing_id) = state.structured_templates.get(&key) {
+            return existing_id;
+        }
+        let new_id = self.next_template_id;
+        self.next_template_id += 1;
+        state.structured_templates.insert(key, new_id);
+        // Same cache invariant as create_new_leaf: one fresh
+        // allocation, one cache increment.
+        state.template_count += 1;
+        new_id
+    }
 
+    /// Emit a structured record's data row under `template_id`.
+    fn emit_structured(&mut self, line: StructuredLine<'_>, template_id: u64) {
+        let StructuredLine {
+            record,
+            service,
+            body: any_value,
+        } = line;
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
         // `body` field (per §6.2 step 0), and `lossy_flag = false`
@@ -1857,8 +1880,6 @@ impl MinerCluster {
         rec.confidence = 1.0;
         rec.body = Some(String::from_utf8(bytes).expect("serde_json emits valid UTF-8"));
         self.emit_record(rec, service);
-
-        template_id
     }
 }
 

@@ -11,7 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ingest_support::{open_pipeline, request, resource_logs, tenant_for, wal_config};
+use crate::ingest_support::{
+    open_pipeline, request, resource_logs, tenant_for, wal_config, write_snapshots_at,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 
@@ -47,6 +49,51 @@ fn assert_equivalent(recovered: &MinerCluster, control: &MinerCluster) {
             tenant.as_str(),
         );
     }
+}
+
+/// Two single-line batches for one tenant.
+fn two_checkout_batches() -> [ExportLogsServiceRequest; 2] {
+    [
+        request(vec![resource_logs("checkout", &["user 1 logged in"])]),
+        request(vec![resource_logs("checkout", &["user 2 logged in"])]),
+    ]
+}
+
+/// A live pipeline over `root` that has ingested `batches` in order.
+async fn ingested(
+    root: &Path,
+    batches: &[ExportLogsServiceRequest],
+) -> ourios_ingester::receiver::IngestPipeline {
+    let pipeline = open_pipeline(root);
+    for r in batches {
+        pipeline
+            .ingest(r.clone(), tenant_for(r))
+            .await
+            .expect("ingest");
+    }
+    pipeline
+}
+
+/// Recover `root` into a fresh miner, and assert its one artefact was
+/// discarded and every record full-replayed to the control's state.
+fn assert_discarded_and_full_replayed(
+    root: &Path,
+    control: &MinerCluster,
+    total_records: u64,
+) -> recovery::RecoveryReport {
+    let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
+    let mut recovered = MinerCluster::new(MinerConfig::default());
+    let report =
+        recovery::recover(&mut wal, &root.join("snapshots"), &mut recovered).expect("recover");
+    assert_eq!(report.tenants.len(), 1);
+    assert_eq!(
+        report.tenants[0].outcome,
+        RecoveryOutcome::UnknownOrCorruptDiscarded,
+    );
+    assert_eq!(report.records_suppressed_for_miner, 0);
+    assert_eq!(report.records_fed_to_miner, total_records);
+    assert_equivalent(&recovered, control);
+    report
 }
 
 /// Scenario §3.5.3 — Known-version restore + tail replay is
@@ -86,9 +133,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let s = pipeline
         .last_durable()
         .expect("a synced batch yields the durable mark");
-    pipeline
-        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, Some(s)))
-        .expect("snapshot at S");
+    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, Some(s)));
     for r in &post {
         pipeline
             .ingest(r.clone(), tenant_for(r))
@@ -136,17 +181,8 @@ async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
 
-    let batches = [
-        request(vec![resource_logs("checkout", &["user 1 logged in"])]),
-        request(vec![resource_logs("checkout", &["user 2 logged in"])]),
-    ];
-    let pipeline = open_pipeline(root);
-    for r in &batches {
-        pipeline
-            .ingest(r.clone(), tenant_for(r))
-            .await
-            .expect("ingest");
-    }
+    let batches = two_checkout_batches();
+    let pipeline = ingested(root, &batches).await;
     drop(pipeline);
 
     std::fs::create_dir_all(&snapshots_root).expect("snapshots dir");
@@ -156,22 +192,10 @@ async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     let mut control = MinerCluster::new(MinerConfig::default());
     let total_records = ingest_all(&mut control, &batches);
 
-    // Act
-    let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
-    let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
-
-    // Assert: artefact discarded, nothing suppressed, full-replay
+    // Act + Assert: artefact discarded, nothing suppressed, full-replay
     // state equals the control.
-    assert_eq!(report.tenants.len(), 1);
-    assert_eq!(
-        report.tenants[0].outcome,
-        RecoveryOutcome::UnknownOrCorruptDiscarded,
-    );
+    let report = assert_discarded_and_full_replayed(root, &control, total_records);
     assert!(!report.tenants[0].stale_gap);
-    assert_eq!(report.records_suppressed_for_miner, 0);
-    assert_eq!(report.records_fed_to_miner, total_records);
-    assert_equivalent(&recovered, &control);
 }
 
 /// A known-version artefact with no recorded high-water mark is
@@ -187,40 +211,47 @@ async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
 
-    let batches = [
-        request(vec![resource_logs("checkout", &["user 1 logged in"])]),
-        request(vec![resource_logs("checkout", &["user 2 logged in"])]),
-    ];
-    let pipeline = open_pipeline(root);
-    for r in &batches {
-        pipeline
-            .ingest(r.clone(), tenant_for(r))
-            .await
-            .expect("ingest");
-    }
-    pipeline
-        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, None))
-        .expect("snapshot without a high-water mark");
+    let batches = two_checkout_batches();
+    let pipeline = ingested(root, &batches).await;
+    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, None));
     drop(pipeline);
 
     let mut control = MinerCluster::new(MinerConfig::default());
     let total_records = ingest_all(&mut control, &batches);
 
-    // Act
-    let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
-    let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
+    // Act + Assert: discarded (not restored without suppression),
+    // nothing suppressed, full-replay state equals the control.
+    assert_discarded_and_full_replayed(root, &control, total_records);
+}
 
-    // Assert: discarded (not restored without suppression), nothing
-    // suppressed, full-replay state equals the control.
-    assert_eq!(report.tenants.len(), 1);
-    assert_eq!(
-        report.tenants[0].outcome,
-        RecoveryOutcome::UnknownOrCorruptDiscarded,
-    );
-    assert_eq!(report.records_suppressed_for_miner, 0);
-    assert_eq!(report.records_fed_to_miner, total_records);
-    assert_equivalent(&recovered, &control);
+/// RFC 0052 §3.1: a version-1 artefact carries the old global mark, so
+/// it is never restored as a version-2 horizon. It is discarded like any
+/// unknown version, and the tenant rebuilds from the WAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0001_3_5_a_version_1_artefact_discards_and_full_replays() {
+    // Arrange: a WAL with two batches and a well-formed snapshot of
+    // them, horizon and all, written under version 1.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let snapshots_root = root.join("snapshots");
+
+    let batches = two_checkout_batches();
+    let pipeline = ingested(root, &batches).await;
+    let mark = pipeline.last_durable();
+    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, mark));
+    drop(pipeline);
+    let artefact = snapshots_root.join("checkout.snap");
+    let mut bytes = std::fs::read(&artefact).expect("the artefact");
+    bytes[0] = 1;
+    std::fs::write(&artefact, bytes).expect("rewrite as version 1");
+
+    let mut control = MinerCluster::new(MinerConfig::default());
+    let total_records = ingest_all(&mut control, &batches);
+
+    // Act + Assert: discarded, no horizon seeded, and the replay rebuilt
+    // the tenant from every frame.
+    let report = assert_discarded_and_full_replayed(root, &control, total_records);
+    assert!(report.accepted_horizons().is_empty());
 }
 
 /// Mint a closed segment holding one `TenantOtlpBatch` frame per request:
@@ -306,7 +337,7 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
 
     let mut snap_miner = MinerCluster::new(MinerConfig::default());
     ingest_all(&mut snap_miner, &seg1_batches);
-    recovery::write_snapshots(&snapshots_root, &snap_miner, Some(s)).expect("snapshot at S");
+    write_snapshots_at(&snapshots_root, &snap_miner, Some(s));
 
     {
         let mut wal = Wal::open(wal_config(root)).expect("open for checkpoint");

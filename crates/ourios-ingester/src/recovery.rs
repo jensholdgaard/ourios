@@ -20,8 +20,11 @@ use std::path::Path;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_miner::snapshot::{RecoveryOutcome, WalHighWater};
-use ourios_wal::{FrameKind, FrameSink, LedgerError, RecoveryError, TenantBatch, Wal, WalOffset};
+use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, WalHighWater};
+use ourios_wal::{
+    FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
+    TenantHorizon, Wal, WalOffset,
+};
 use prost::Message;
 
 use crate::receiver::tenant::assign;
@@ -44,8 +47,7 @@ pub struct RecoveryReport {
     /// write path joins the pipeline (no data-side consumer exists
     /// yet to suppress for).
     pub parquet_horizon: Option<WalOffset>,
-    /// Highest offset delivered during replay — the high-water mark
-    /// a post-recovery snapshot records.
+    /// Highest offset delivered during replay.
     pub max_delivered: Option<WalOffset>,
     /// Per-tenant snapshot outcome, one entry per artefact found.
     pub tenants: Vec<TenantRecovery>,
@@ -60,38 +62,6 @@ impl RecoveryReport {
             .iter()
             .filter_map(|tenant| tenant.horizon.map(|h| (tenant.tenant_id.clone(), h)))
             .collect()
-    }
-
-    /// The horizons the post-recovery snapshot write stamps (RFC 0052
-    /// §3.7), indexed once so the write looks each tenant up in O(1).
-    #[must_use]
-    pub fn post_recovery_horizons(&self) -> PostRecoveryHorizons {
-        PostRecoveryHorizons {
-            restored: self.accepted_horizons().into_iter().collect(),
-            replayed: self.max_delivered,
-        }
-    }
-}
-
-/// Each tenant's post-recovery snapshot horizon (RFC 0052 §3.7).
-#[derive(Debug, Default)]
-pub struct PostRecoveryHorizons {
-    restored: HashMap<TenantId, WalOffset>,
-    replayed: Option<WalOffset>,
-}
-
-impl PostRecoveryHorizons {
-    /// The later of `tenant`'s restored horizon and the replay mark.
-    /// Replay folds every frame above the restored horizon into the
-    /// miner, so the later of the two covers what the state holds, and
-    /// neither is ever written below the other. A replay that delivered
-    /// nothing — every closed frame reclaimed — keeps the restored
-    /// horizon rather than writing `None` over it, which the next start
-    /// would discard with no frames left to rebuild from.
-    #[must_use]
-    pub fn horizon(&self, tenant: &TenantId) -> Option<WalOffset> {
-        // `None` orders below every `Some`.
-        self.restored.get(tenant).copied().max(self.replayed)
     }
 }
 
@@ -127,6 +97,15 @@ pub enum RecoveryDriverError {
     /// a frame carrying a tenant above RFC 0048 §3.1's bound, which
     /// fails startup closed rather than truncating the key.
     Ledger(LedgerError),
+    /// RFC 0052 §3.2's legacy stale-gap belt refused a pre-RFC root: a
+    /// tenant's oldest surviving frame is above the mark its version-1
+    /// snapshot recorded, or the tenant has no decodable mark at all.
+    LegacyStaleGap(HousekeepingError),
+    /// The same belt, for a tenant whose version-1 snapshot does not
+    /// decode even for its mark. It fails closed whether or not the
+    /// tenant still has frames in the WAL: with none left, booting
+    /// would silently discard the only record of its templates.
+    LegacyMarkUnreadable(TenantId),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -135,6 +114,13 @@ impl std::fmt::Display for RecoveryDriverError {
             Self::Store(e) => write!(f, "recovery snapshot store: {e}"),
             Self::Replay(e) => write!(f, "recovery WAL replay: {e:?}"),
             Self::Ledger(e) => write!(f, "recovery WAL ledger rebuild: {e}"),
+            Self::LegacyStaleGap(e) => write!(f, "recovery legacy stale-gap check: {e}"),
+            Self::LegacyMarkUnreadable(tenant) => write!(
+                f,
+                "recovery legacy stale-gap check: tenant {} has a version-1 snapshot whose \
+                 high-water mark cannot be read (RFC 0052 §3.2)",
+                tenant.as_str()
+            ),
         }
     }
 }
@@ -144,7 +130,7 @@ impl std::error::Error for RecoveryDriverError {
         match self {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
-            Self::Replay(_) => None,
+            Self::LegacyStaleGap(_) | Self::LegacyMarkUnreadable(_) | Self::Replay(_) => None,
         }
     }
 }
@@ -175,38 +161,11 @@ pub fn recover(
     let artefacts =
         snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
-    let mut tenants = Vec::with_capacity(artefacts.len());
-    let mut horizons: HashMap<TenantId, WalOffset> = HashMap::new();
-    for (tenant_id, bytes) in artefacts {
-        let outcome = match ourios_miner::snapshot::recover(Some(&bytes)) {
-            (Some(state), RecoveryOutcome::Restored) => {
-                // A restorable snapshot requires a concrete horizon:
-                // restoring without one cannot suppress, so replay
-                // would re-feed every frame the snapshot already
-                // folded — exactly the v1 double-apply hazard. §6.9
-                // maps a missing horizon to the discard class, same
-                // as an unparseable one.
-                match parse_high_water(state.wal_high_water.as_ref()) {
-                    Some(horizon) => match miner.restore_tenant(&tenant_id, &state) {
-                        Ok(()) => {
-                            horizons.insert(tenant_id.clone(), horizon);
-                            RecoveryOutcome::Restored
-                        }
-                        Err(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
-                    },
-                    None => RecoveryOutcome::UnknownOrCorruptDiscarded,
-                }
-            }
-            (_, outcome) => outcome,
-        };
-        tenants.push(TenantRecovery {
-            horizon: horizons.get(&tenant_id).copied(),
-            tenant_id,
-            outcome,
-            stale_gap: false,
-        });
-    }
-
+    let Restored {
+        mut tenants,
+        horizons,
+        legacy,
+    } = restore_artefacts(miner, artefacts);
     let mut sink = DriverSink {
         miner,
         horizons: &horizons,
@@ -225,10 +184,15 @@ pub fn recover(
     // restart debris to pop, which is #793's shape all over again: a
     // method whose only callers are tests.
     wal.rebuild_ledger().map_err(RecoveryDriverError::Ledger)?;
+    // Before the caller's post-recovery write replaces the version-1
+    // artefacts whose marks this check reads.
+    refuse_legacy_stale_gaps(wal, &horizons, legacy)?;
 
+    let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
         if let Some(horizon) = horizons.get(&tenant.tenant_id) {
-            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &sink.segments_seen);
+            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &sink.segments_seen)
+                && !reclaim_explains(*horizon, reclaimed.get(&tenant.tenant_id));
         }
     }
 
@@ -242,47 +206,135 @@ pub fn recover(
     })
 }
 
-/// Write one snapshot artefact per live tenant in `miner`, recording
-/// `high_water` as each artefact's WAL high-water mark (RFC 0001
-/// §6.9 cadence points: post-recovery and graceful shutdown today;
-/// per-segment-rotation once rotation lands). A `None` high water is
-/// honest degradation: the next start full-replays for that tenant.
-///
-/// # Errors
-///
-/// [`SnapshotStoreError`] on encode or filesystem failure. The
-/// snapshot is a rebuildable cache, so callers on the shutdown path
-/// downgrade this to a warning.
-pub fn write_snapshots(
-    root: &Path,
-    miner: &MinerCluster,
-    high_water: Option<WalOffset>,
-) -> Result<(), SnapshotStoreError> {
-    write_snapshots_with(root, miner, |_| high_water).map(drop)
+/// What restoring the snapshot artefacts left: each tenant's outcome,
+/// the horizons of those restored, and what version-1 artefacts offer
+/// RFC 0052 §3.2's legacy check.
+struct Restored {
+    tenants: Vec<TenantRecovery>,
+    horizons: HashMap<TenantId, WalOffset>,
+    legacy: LegacyMarks,
 }
 
-/// [`write_snapshots`] with each tenant's high-water mark chosen by
-/// `high_water` — the post-recovery write's per-tenant horizons (RFC
-/// 0052 §3.7). Returns the horizon every written artefact carries, for
-/// seeding the snapshot ledger with exactly what was installed.
+/// Every version-1 artefact's tenant, split by whether its mark reads.
+#[derive(Default)]
+struct LegacyMarks {
+    recorded: HashMap<TenantId, WalOffset>,
+    unreadable: Vec<TenantId>,
+}
+
+impl LegacyMarks {
+    fn note(&mut self, tenant: &TenantId, bytes: &[u8]) {
+        match ourios_miner::snapshot::legacy_v1_mark(bytes) {
+            LegacyMark::NotLegacy => {}
+            LegacyMark::Recorded(mark) => match snapshot_store::offset_of(&mark) {
+                Some(offset) => {
+                    self.recorded.insert(tenant.clone(), offset);
+                }
+                None => self.unreadable.push(tenant.clone()),
+            },
+            LegacyMark::Unreadable => self.unreadable.push(tenant.clone()),
+        }
+    }
+}
+
+fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>)>) -> Restored {
+    let mut restored = Restored {
+        tenants: Vec::with_capacity(artefacts.len()),
+        horizons: HashMap::new(),
+        legacy: LegacyMarks::default(),
+    };
+    for (tenant_id, bytes) in artefacts {
+        let outcome = restore_artefact(miner, &tenant_id, &bytes, &mut restored.horizons);
+        restored.legacy.note(&tenant_id, &bytes);
+        restored.tenants.push(TenantRecovery {
+            horizon: restored.horizons.get(&tenant_id).copied(),
+            tenant_id,
+            outcome,
+            stale_gap: false,
+        });
+    }
+    restored
+}
+
+/// Restore one artefact into `miner`, recording its horizon on success.
+fn restore_artefact(
+    miner: &mut MinerCluster,
+    tenant_id: &TenantId,
+    bytes: &[u8],
+    horizons: &mut HashMap<TenantId, WalOffset>,
+) -> RecoveryOutcome {
+    let (Some(state), RecoveryOutcome::Restored) = ourios_miner::snapshot::recover(Some(bytes))
+    else {
+        return RecoveryOutcome::UnknownOrCorruptDiscarded;
+    };
+    // A restorable snapshot requires a concrete horizon: restoring
+    // without one cannot suppress, so replay would re-feed every frame
+    // the snapshot already folded — exactly the v1 double-apply hazard.
+    // §6.9 maps a missing horizon to the discard class, same as an
+    // unparseable one.
+    let Some(horizon) = parse_high_water(state.wal_high_water.as_ref()) else {
+        return RecoveryOutcome::UnknownOrCorruptDiscarded;
+    };
+    match miner.restore_tenant(tenant_id, &state) {
+        Ok(()) => {
+            horizons.insert(tenant_id.clone(), horizon);
+            RecoveryOutcome::Restored
+        }
+        Err(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
+    }
+}
+
+/// RFC 0052 §3.2's legacy stale-gap belt, over every restored horizon
+/// and every version-1 artefact. Only a pre-RFC root is checked; the WAL
+/// decides which roots those are.
+fn refuse_legacy_stale_gaps(
+    wal: &Wal,
+    horizons: &HashMap<TenantId, WalOffset>,
+    legacy: LegacyMarks,
+) -> Result<(), RecoveryDriverError> {
+    if !wal.on_legacy_branch() {
+        return Ok(());
+    }
+    if let Some(tenant) = legacy.unreadable.into_iter().next() {
+        return Err(RecoveryDriverError::LegacyMarkUnreadable(tenant));
+    }
+    let mut marks: HashMap<TenantId, TenantHorizon> = legacy
+        .recorded
+        .into_iter()
+        .map(|(tenant, mark)| (tenant, TenantHorizon::RecordedOnly(mark)))
+        .collect();
+    marks.extend(
+        horizons
+            .iter()
+            .map(|(tenant, horizon)| (tenant.clone(), TenantHorizon::Restorable(*horizon))),
+    );
+    wal.refuse_legacy_stale_gaps_at_open(&marks)
+        .map_err(RecoveryDriverError::LegacyStaleGap)
+}
+
+/// Write one snapshot artefact per live tenant in `miner`, each stamped
+/// at that tenant's own folded horizon (RFC 0052 §3.1) — the
+/// post-recovery and shutdown cadence points' stamp. Returns the horizon
+/// every written artefact carries, for seeding the snapshot ledger with
+/// exactly what was installed. A tenant with no folded horizon is written
+/// without one, which the next start discards and full-replays.
 ///
 /// # Errors
 ///
-/// As [`write_snapshots`]; the artefacts written before the failure
-/// stay written.
-pub fn write_snapshots_with(
+/// [`SnapshotStoreError`] on encode or filesystem failure; the artefacts
+/// written before the failure stay written. The snapshot is a rebuildable
+/// cache, so callers on the shutdown path downgrade this to a warning.
+pub fn write_folded_snapshots(
     root: &Path,
     miner: &MinerCluster,
-    high_water: impl Fn(&TenantId) -> Option<WalOffset>,
 ) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
     let mut installed = Vec::new();
     for tenant_id in miner.tenant_ids() {
-        let mark = high_water(&tenant_id);
+        let mark = miner
+            .folded_horizon(&tenant_id)
+            .and_then(snapshot_store::offset_of);
         let mut state = miner.snapshot_state(&tenant_id);
-        state.wal_high_water = mark.map(|offset| WalHighWater {
-            segment: offset.segment.to_string(),
-            byte: offset.byte,
-        });
+        state.wal_high_water = mark.map(snapshot_store::high_water);
         snapshot_store::write(root, &tenant_id, &state)?;
         if let Some(mark) = mark {
             installed.push((tenant_id, mark));
@@ -292,18 +344,14 @@ pub fn write_snapshots_with(
 }
 
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
-/// below the checkpoint whose segment never surfaced during replay
-/// means frames in `(S, oldest surviving)` are gone. Internally
-/// unreachable: the §6.7 retain floor (min over tenant horizons)
-/// keeps any segment holding frames above the floor, and a lagging
-/// tenant's own `S.segment` is protected by its own membership in
-/// the min — so a hit means external mutation of `wal_root`, and the
+/// below the checkpoint whose segment never surfaced during replay may
+/// mean frames in `(S, oldest surviving)` are gone. Under per-tenant
+/// horizons (RFC 0052 §3.1) that shape is also the normal one — an idle
+/// tenant's own last segment is reclaimed once its horizon covers it —
+/// so a hit is a gap only when [`reclaim_explains`] does not account
+/// for it. What remains is external mutation of `wal_root`, and the
 /// warning names the gap rather than staying silent (hazard #5; the
-/// re-minting drift is observable via the RFC 0010 drift query). The
-/// rule has no steady-state false positive: in normal operation
-/// `S`'s segment either survives (seen during replay) or was
-/// reclaimed only after the checkpoint passed it, in which case
-/// `S ≥` every reclaimed frame and `S < checkpoint` fails.
+/// re-minting drift is observable via the RFC 0010 drift query).
 fn stale_gap(
     horizon: WalOffset,
     checkpoint: Option<WalOffset>,
@@ -315,17 +363,20 @@ fn stale_gap(
     }
 }
 
+/// RFC 0052 §3.2's restated witness: an absent horizon segment is
+/// explained when the `RECLAIM` record says a pass reclaimed the
+/// tenant's frames at or above `S`. Only `S` above the tenant's
+/// reclaimed-through, or no entry at all, leaves the absence unexplained.
+fn reclaim_explains(horizon: WalOffset, reclaimed_through: Option<&WalOffset>) -> bool {
+    reclaimed_through.is_some_and(|through| *through >= horizon)
+}
+
 /// Parse a snapshot's recorded high-water mark into a [`WalOffset`].
 /// `None` — the mark is absent or its segment UUID is unparseable —
 /// is the caller's discard-as-corrupt signal: a restorable snapshot
 /// requires a concrete horizon.
 fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
-    let hw = high_water?;
-    let segment = uuid::Uuid::parse_str(&hw.segment).ok()?;
-    Some(WalOffset {
-        segment,
-        byte: hw.byte,
-    })
+    snapshot_store::offset_of(high_water?)
 }
 
 /// The §6.6 [`FrameSink`]: per `TenantOtlpBatch` frame, decode the tenant
@@ -368,25 +419,7 @@ impl FrameSink for DriverSink<'_> {
                       version, or delete it",
                 ));
             }
-            FrameKind::TenantOtlpBatch => {
-                let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
-                let tenant = TenantId::new(batch.tenant);
-                let request = ExportLogsServiceRequest::decode(batch.protobuf)
-                    .map_err(|e| reject(kind, offset, &e))?;
-                let records = assign(request, &tenant);
-                for record in &records {
-                    let feed = match self.horizons.get(&record.tenant_id) {
-                        Some(horizon) => offset > *horizon,
-                        None => true,
-                    };
-                    if feed {
-                        self.miner.ingest(record);
-                        self.records_fed += 1;
-                    } else {
-                        self.records_suppressed += 1;
-                    }
-                }
-            }
+            FrameKind::TenantOtlpBatch => self.consume_batch(offset, payload)?,
             // Nothing writes AuditEvent frames yet (`encode_audit_event`
             // is the RFC 0008 §9 stub); when the encoder lands these
             // reinject into the audit Parquet queue, gated on the
@@ -394,6 +427,36 @@ impl FrameSink for DriverSink<'_> {
             // panic — the frame kind is valid on the wire today.
             FrameKind::AuditEvent => {}
         }
+        Ok(())
+    }
+}
+
+impl DriverSink<'_> {
+    /// Feed one tenant's frame to the miner unless its restored horizon
+    /// already folds it, and advance that tenant's folded horizon to the
+    /// frame (RFC 0052 §3.1) — replay folds in WAL order, as ingest does.
+    fn consume_batch(&mut self, offset: WalOffset, payload: &[u8]) -> Result<(), RecoveryError> {
+        let kind = FrameKind::TenantOtlpBatch;
+        let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
+        let tenant = TenantId::new(batch.tenant);
+        let request = ExportLogsServiceRequest::decode(batch.protobuf)
+            .map_err(|e| reject(kind, offset, &e))?;
+        let records = assign(request, &tenant);
+        let count = records.len() as u64;
+        if self
+            .horizons
+            .get(&tenant)
+            .is_some_and(|horizon| offset <= *horizon)
+        {
+            self.records_suppressed += count;
+            return Ok(());
+        }
+        for record in &records {
+            self.miner.ingest(record);
+        }
+        self.records_fed += count;
+        self.miner
+            .fold_through(&tenant, snapshot_store::high_water(offset));
         Ok(())
     }
 }
@@ -459,6 +522,15 @@ mod tests {
     }
 
     #[test]
+    fn a_reclaim_entry_at_or_above_the_horizon_explains_its_absent_segment() {
+        let s = offset(SEGMENT, 10);
+        assert!(reclaim_explains(s, Some(&offset(SEGMENT, 10))), "at S");
+        assert!(reclaim_explains(s, Some(&offset(SEGMENT, 11))), "above S");
+        assert!(!reclaim_explains(s, Some(&offset(SEGMENT, 9))), "below S");
+        assert!(!reclaim_explains(s, None), "nothing reclaimed");
+    }
+
+    #[test]
     fn stale_gap_is_false_without_a_checkpoint() {
         let s = offset("00000000-0000-7000-8000-000000000001", 10);
         assert!(!stale_gap(s, None, &HashSet::new()));
@@ -470,52 +542,6 @@ mod tests {
         let x = offset("00000000-0000-7000-8000-000000000002", 5);
         let seen = HashSet::from([s.segment, x.segment]);
         assert!(!stale_gap(s, Some(x), &seen));
-    }
-
-    /// RFC 0052 §3.7: the post-recovery horizon is the later of the
-    /// restored one and the replay mark, per tenant, so a replay that
-    /// delivered nothing keeps the restored horizon and one that
-    /// delivered frames never writes a tenant below where it restored.
-    #[test]
-    fn post_recovery_horizon_is_the_later_of_the_restored_horizon_and_the_replay_mark() {
-        let early = offset("00000000-0000-7000-8000-000000000001", 10);
-        let late = offset("00000000-0000-7000-8000-000000000002", 5);
-        let restored = |tenant: &str, horizon| TenantRecovery {
-            tenant_id: TenantId::new(tenant),
-            outcome: RecoveryOutcome::Restored,
-            stale_gap: false,
-            horizon: Some(horizon),
-        };
-        let report = |max_delivered| {
-            RecoveryReport {
-                max_delivered,
-                tenants: vec![restored("behind", early), restored("ahead", late)],
-                ..RecoveryReport::default()
-            }
-            .post_recovery_horizons()
-        };
-        let horizon = |horizons: &PostRecoveryHorizons, tenant: &str| {
-            horizons.horizon(&TenantId::new(tenant))
-        };
-
-        let idle = report(None);
-        assert_eq!(horizon(&idle, "behind"), Some(early), "nothing replayed");
-        assert_eq!(horizon(&idle, "ahead"), Some(late));
-        assert_eq!(
-            horizon(&idle, "fresh"),
-            None,
-            "nothing restored or replayed"
-        );
-
-        let replayed = report(Some(early));
-        assert_eq!(horizon(&replayed, "behind"), Some(early));
-        assert_eq!(horizon(&replayed, "ahead"), Some(late), "never downgraded");
-        assert_eq!(horizon(&replayed, "fresh"), Some(early), "replay alone");
-
-        let past = offset("00000000-0000-7000-8000-000000000003", 1);
-        let caught_up = report(Some(past));
-        assert_eq!(horizon(&caught_up, "behind"), Some(past));
-        assert_eq!(horizon(&caught_up, "ahead"), Some(past));
     }
 
     fn sink<'a>(
@@ -580,6 +606,61 @@ mod tests {
             assert!(detail.contains(needle), "{needle}: {detail}");
             assert!(detail.contains(&format!("{SEGMENT}+64")));
         }
+    }
+
+    fn one_line_frame(tenant: &str) -> Vec<u8> {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("user 1 logged in".to_owned())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        TenantBatch::encode(tenant, &request.encode_to_vec()).expect("frame")
+    }
+
+    /// RFC 0052 §3.1: replay folds each tenant to its **own** last
+    /// replayed frame. A restored tenant whose frames are all at or
+    /// below its horizon keeps that horizon, however far another
+    /// tenant's frames reach.
+    #[test]
+    fn replay_folds_each_tenant_to_its_own_last_frame() {
+        let (idle, busy) = (TenantId::new("idle"), TenantId::new("busy"));
+        let restored_at = offset(SEGMENT, 50);
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let mut state = miner.snapshot_state(&idle);
+        state.wal_high_water = Some(snapshot_store::high_water(restored_at));
+        miner.restore_tenant(&idle, &state).expect("restore");
+        let horizons = HashMap::from([(idle.clone(), restored_at)]);
+        let mut sink = sink(&mut miner, &horizons);
+
+        for (tenant, byte) in [("idle", 40), ("busy", 60), ("busy", 80)] {
+            sink.consume(
+                offset(SEGMENT, byte),
+                FrameKind::TenantOtlpBatch,
+                &one_line_frame(tenant),
+            )
+            .expect("consume");
+        }
+
+        assert_eq!(sink.records_suppressed, 1, "idle's frame is folded already");
+        let folded = |tenant| {
+            miner
+                .folded_horizon(tenant)
+                .and_then(snapshot_store::offset_of)
+        };
+        assert_eq!(folded(&idle), Some(restored_at), "idle keeps its horizon");
+        assert_eq!(folded(&busy), Some(offset(SEGMENT, 80)), "busy's own last");
     }
 
     // RFC0046.5 — a legacy 0x01 frame is unsupported for replay (a

@@ -255,8 +255,8 @@ async fn rfc0052_7_a_failed_snapshot_write_is_counted_and_retains_the_cut() {
     let harness = harness();
     let tmp = tempfile::TempDir::new().expect("temp");
     let rig = Arc::new(BarrierRig::new(tmp.path()));
-    rig.ingest("alpha", &["user 1 logged in"]).await;
-    let mark = rig.ingest("beta", &["invoice 7 sent"]).await;
+    let alpha = rig.ingest("alpha", &["user 1 logged in"]).await;
+    rig.ingest("beta", &["invoice 7 sent"]).await;
     // A non-empty directory where `beta`'s artefact is renamed to makes
     // exactly that tenant's install fail.
     let occupied = rig.snapshots_root.join("beta.snap");
@@ -290,8 +290,8 @@ async fn rfc0052_7_a_failed_snapshot_write_is_counted_and_retains_the_cut() {
     };
     assert_eq!(
         horizons.get(&ourios_core::tenant::TenantId::new("alpha")),
-        Some(&ourios_wal::TenantHorizon::Restorable(mark)),
-        "alpha's horizon advanced to the cut's mark"
+        Some(&ourios_wal::TenantHorizon::Restorable(alpha)),
+        "alpha's horizon advanced to its own folded frame"
     );
     assert!(
         !horizons.contains_key(&ourios_core::tenant::TenantId::new("beta")),

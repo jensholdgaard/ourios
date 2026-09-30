@@ -21,8 +21,9 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use ourios_core::tenant::TenantId;
-use ourios_miner::snapshot::{SnapshotError, SnapshotState, snapshot};
+use ourios_miner::snapshot::{SnapshotError, SnapshotState, WalHighWater, snapshot};
 use ourios_parquet::{percent_decode_tenant, percent_encode_tenant};
+use ourios_wal::WalOffset;
 use uuid::Uuid;
 
 const EXTENSION: &str = "snap";
@@ -309,6 +310,27 @@ pub fn load_all(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, SnapshotStoreEr
     }
     out.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
     Ok(out)
+}
+
+/// The artefact's `wal_high_water` for a WAL offset.
+#[must_use]
+pub fn high_water(offset: WalOffset) -> WalHighWater {
+    WalHighWater {
+        segment: offset.segment.to_string(),
+        byte: offset.byte,
+    }
+}
+
+/// The WAL offset an artefact's `wal_high_water` names, or `None` when
+/// its segment is not a UUID — which no writer produces, so a caller
+/// reads it as corrupt.
+#[must_use]
+pub fn offset_of(high_water: &WalHighWater) -> Option<WalOffset> {
+    let segment = Uuid::parse_str(&high_water.segment).ok()?;
+    Some(WalOffset {
+        segment,
+        byte: high_water.byte,
+    })
 }
 
 #[cfg(test)]

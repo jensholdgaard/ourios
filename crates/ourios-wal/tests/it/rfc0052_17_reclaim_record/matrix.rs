@@ -543,6 +543,44 @@ fn legacy_stale_gap_fails_closed_naming_the_tenant() {
         );
     }
 }
+
+/// The same belt at startup, before the post-recovery write replaces
+/// the version-1 artefacts it reads. It applies to a pre-RFC root and to
+/// nothing else: a post-RFC root before its first checkpoint holds
+/// tenants with frames and no snapshot as a matter of course.
+#[test]
+fn rfc0052_17_the_startup_legacy_check_refuses_only_a_pre_rfc_root() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let legacy = tmp.path().join("legacy");
+    let frames = build_tenant_segment(&legacy, &[("alpha", b"a1")]);
+    build_tenant_segment(&legacy, &[("alpha", b"a2")]);
+    std::fs::remove_file(legacy.join(RECLAIM)).expect("a pre-RFC root has no record");
+    downgrade_segments(&legacy);
+    write_legacy_checkpoint(&legacy, frames[0]);
+    let below = WalOffset {
+        segment: uuid::Uuid::nil(),
+        byte: 0,
+    };
+    let recorded =
+        |offset| HashMap::from([(tenant_id("alpha"), TenantHorizon::RecordedOnly(offset))]);
+
+    let mut wal = open(&legacy);
+    wal.rebuild_ledger().expect("ledger");
+    wal.refuse_legacy_stale_gaps_at_open(&recorded(frames[0]))
+        .expect("a mark at the oldest surviving frame explains it");
+    let refused = wal
+        .refuse_legacy_stale_gaps_at_open(&recorded(below))
+        .expect_err("a mark below it is the stale gap");
+    assert!(format!("{refused}").contains("alpha"), "{refused}");
+
+    let fresh = tmp.path().join("fresh");
+    build_tenant_segment(&fresh, &[("alpha", b"a1")]);
+    let mut wal = open(&fresh);
+    wal.rebuild_ledger().expect("ledger");
+    wal.refuse_legacy_stale_gaps_at_open(&HashMap::new())
+        .expect("a post-RFC root is not on the legacy branch");
+}
+
 /// Scenario RFC0052.17 — slot ids and the `published_seeded_*` flag rows.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 ///

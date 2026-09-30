@@ -53,7 +53,19 @@ use crate::tree::OwnedToken;
 /// a matching byte 0 deserialises the payload; any other value is
 /// a [`SnapshotError::UnknownVersion`] that recovery treats as
 /// "discard and full-replay" (§3.5.2).
-pub const SNAPSHOT_VERSION: u8 = 1;
+///
+/// Version 2 (RFC 0052 §3.1) changed what `wal_high_water` means —
+/// from the cut's global mark to the tenant's own folded horizon — so
+/// a version-1 artefact takes the unknown-version path: one byte never
+/// carries both readings, and before production a persisted layout is
+/// broken rather than dual-read; only the version-1 mark is still read,
+/// by [`legacy_v1_mark`], for RFC 0052 §3.2's legacy stale-gap
+/// check. The cost is paid once, on upgrade: a
+/// tenant whose frames the WAL already reclaimed past its version-1
+/// snapshot rebuilds from what remains, and re-mints the template ids
+/// of what was reclaimed (hazard #5, visible in the RFC 0010 drift
+/// query).
+pub const SNAPSHOT_VERSION: u8 = 2;
 
 /// One tenant's full snapshot payload (the bytes after the version
 /// byte) — the per-tenant state a restore would rebuild the miner
@@ -73,10 +85,11 @@ pub struct SnapshotState {
     /// observation. The `BodyKind::Structured` discriminator is
     /// implicit from the map's identity (RFC 0001 §6.1).
     pub structured_templates: Vec<StructuredTemplateRecord>,
-    /// WAL high-water mark this snapshot's tree state reflects, or
-    /// `None` if no offset was recorded. On the known-version
-    /// recovery path the driver replays only the WAL tail above
-    /// this mark (RFC 0008 §6.7 offset-resume).
+    /// The tenant's folded horizon (RFC 0052 §3.1): the WAL offset of
+    /// its own last frame this state folds — never another tenant's —
+    /// or `None` if no offset was recorded. On the known-version
+    /// recovery path the driver replays only this tenant's frames
+    /// above it (RFC 0008 §6.7 offset-resume).
     pub wal_high_water: Option<WalHighWater>,
     /// RFC 0050 §3.3 adopted-template map entries.
     /// `#[serde(default)]` — absent in pre-RFC snapshots, which had
@@ -387,6 +400,48 @@ pub fn load_snapshot(bytes: &[u8]) -> Result<SnapshotState, SnapshotError> {
     }
 }
 
+/// The format version whose `wal_high_water` held the cut's global mark.
+const LEGACY_V1: u8 = 1;
+
+/// The one field RFC 0052 §3.2 still reads from a version-1 artefact.
+#[derive(Deserialize)]
+struct LegacyPayload {
+    wal_high_water: Option<WalHighWater>,
+}
+
+/// What a snapshot artefact offers RFC 0052 §3.2's legacy stale-gap
+/// check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyMark {
+    /// Not a version-1 artefact: the check has nothing to read here.
+    NotLegacy,
+    /// A version-1 artefact and the global mark it recorded.
+    Recorded(WalHighWater),
+    /// A version-1 artefact whose payload does not decode even for its
+    /// mark, or that recorded none. There is no horizon to compare, so
+    /// the check fails closed on it.
+    Unreadable,
+}
+
+/// The global mark a version-1 artefact recorded, decoded for RFC 0052
+/// §3.2's legacy stale-gap check alone. It restores nothing and feeds no
+/// miner: [`recover`] still discards the artefact.
+#[must_use]
+pub fn legacy_v1_mark(bytes: &[u8]) -> LegacyMark {
+    let Some((&LEGACY_V1, payload)) = bytes.split_first() else {
+        return LegacyMark::NotLegacy;
+    };
+    match serde_json::from_slice::<LegacyPayload>(payload) {
+        Ok(LegacyPayload {
+            wal_high_water: Some(mark),
+        }) => LegacyMark::Recorded(mark),
+        Ok(LegacyPayload {
+            wal_high_water: None,
+        })
+        | Err(_) => LegacyMark::Unreadable,
+    }
+}
+
 /// Which recovery path ran, for snapshot-load telemetry (RFC 0001
 /// §6.9 *Snapshot-load telemetry*): restore-then-tail-replay versus
 /// the two full-replay fallbacks.
@@ -599,6 +654,54 @@ mod tests {
 
         // Assert
         assert!(matches!(err, SnapshotError::UnknownVersion(0xFF)));
+    }
+
+    /// RFC 0052 §3.1: a version-1 artefact's `wal_high_water` is the
+    /// old global mark, so it is never read as a version-2 horizon —
+    /// whatever its payload, it takes the discard path.
+    #[test]
+    fn a_version_1_artefact_is_discarded() {
+        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
+        bytes[0] = 1;
+
+        assert!(matches!(
+            load_snapshot(&bytes),
+            Err(SnapshotError::UnknownVersion(1))
+        ));
+        assert_eq!(
+            recover(Some(&bytes)),
+            (None, RecoveryOutcome::UnknownOrCorruptDiscarded)
+        );
+    }
+
+    /// RFC 0052 §3.2: the version-1 mark is decoded for the legacy
+    /// check, while the artefact itself is still discarded.
+    #[test]
+    fn a_version_1_artefact_yields_its_mark_and_nothing_else() {
+        let mut v1 = snapshot(&sample_state()).expect("snapshot encodes");
+        v1[0] = 1;
+
+        assert_eq!(
+            Some(legacy_v1_mark(&v1)),
+            sample_state().wal_high_water.map(LegacyMark::Recorded)
+        );
+        assert_eq!(
+            recover(Some(&v1)),
+            (None, RecoveryOutcome::UnknownOrCorruptDiscarded)
+        );
+        let current = snapshot(&sample_state()).expect("snapshot encodes");
+        assert_eq!(legacy_v1_mark(&current), LegacyMark::NotLegacy);
+        assert_eq!(legacy_v1_mark(&[]), LegacyMark::NotLegacy, "empty");
+        assert_eq!(
+            legacy_v1_mark(&[1, 0x7B, 0x21]),
+            LegacyMark::Unreadable,
+            "undecodable"
+        );
+        let mut unmarked = sample_state();
+        unmarked.wal_high_water = None;
+        let mut unmarked = snapshot(&unmarked).expect("snapshot encodes");
+        unmarked[0] = 1;
+        assert_eq!(legacy_v1_mark(&unmarked), LegacyMark::Unreadable, "no mark");
     }
 
     #[test]

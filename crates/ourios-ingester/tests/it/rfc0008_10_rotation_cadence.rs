@@ -14,9 +14,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
+use crate::ingest_support::{coordinator, request, resource_logs, wal_config, write_snapshots_at};
 use ourios_ingester::receiver::IngestPipeline;
-use ourios_ingester::{recovery, snapshot_store};
+use ourios_ingester::snapshot_store;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::load_snapshot;
 use ourios_wal::{Wal, WalConfig};
@@ -33,7 +33,7 @@ fn rotating_pipeline(root: &Path, snapshots_root: &Path) -> IngestPipeline {
         MinerCluster::new(ourios_config::MinerConfig::default()),
     )
     .with_rotation_hook(Box::new(move |miner, mark| {
-        recovery::write_snapshots(&hook_root, miner, Some(mark)).expect("snapshot write");
+        write_snapshots_at(&hook_root, miner, Some(mark));
     }))
 }
 
@@ -119,7 +119,7 @@ async fn no_rotation_means_no_cadence_write() {
     )
     .with_rotation_hook(Box::new(move |miner, mark| {
         *count.lock().expect("lock") += 1;
-        recovery::write_snapshots(&hook_root, miner, Some(mark)).expect("snapshot write");
+        write_snapshots_at(&hook_root, miner, Some(mark));
     }));
 
     for body in ["a 1", "b 2", "c 3"] {

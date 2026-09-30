@@ -294,6 +294,9 @@ pub const OURIOS_QUERY_ROW_GROUP_STATE: &str = "ourios.query.row_group.state";
 /// `ourios.query.visibility.branch` attribute key.
 pub const OURIOS_QUERY_VISIBILITY_BRANCH: &str = "ourios.query.visibility.branch";
 
+/// `ourios.server.listener.name` attribute key.
+pub const OURIOS_SERVER_LISTENER_NAME: &str = "ourios.server.listener.name";
+
 /// `ourios.service` attribute key.
 pub const OURIOS_SERVICE: &str = "ourios.service";
 
@@ -361,6 +364,12 @@ pub const EVENT_OURIOS_RECEIVER_AUDIT_SINK_RETAINED: &str = "ourios.receiver.aud
 /// `ourios.receiver.barrier.latched` log event name.
 pub const EVENT_OURIOS_RECEIVER_BARRIER_LATCHED: &str = "ourios.receiver.barrier.latched";
 
+/// `ourios.receiver.cadence.join.error` log event name.
+pub const EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR: &str = "ourios.receiver.cadence.join.error";
+
+/// `ourios.receiver.publish.held` log event name.
+pub const EVENT_OURIOS_RECEIVER_PUBLISH_HELD: &str = "ourios.receiver.publish.held";
+
 /// `ourios.receiver.shutdown.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR: &str = "ourios.receiver.shutdown.error";
 
@@ -379,6 +388,10 @@ pub const EVENT_OURIOS_RECEIVER_TENANT_WATCH_SATURATED: &str =
 
 /// `ourios.receiver.wal.checkpoint.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR: &str = "ourios.receiver.wal.checkpoint.error";
+
+/// `ourios.receiver.wal.housekeeping.error` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR: &str =
+    "ourios.receiver.wal.housekeeping.error";
 
 /// `ourios.receiver.wal.idle_rotation.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR: &str =
@@ -416,9 +429,22 @@ pub const EVENT_OURIOS_SERVER_COMPACTION_DISABLED: &str = "ourios.server.compact
 /// `ourios.server.graph.list_deadline` log event name.
 pub const EVENT_OURIOS_SERVER_GRAPH_LIST_DEADLINE: &str = "ourios.server.graph.list_deadline";
 
+/// `ourios.server.listener.accept.error` log event name.
+pub const EVENT_OURIOS_SERVER_LISTENER_ACCEPT_ERROR: &str = "ourios.server.listener.accept.error";
+
+/// `ourios.server.listener.connection.error` log event name.
+pub const EVENT_OURIOS_SERVER_LISTENER_CONNECTION_ERROR: &str =
+    "ourios.server.listener.connection.error";
+
 /// `ourios.server.signal_handler.error` log event name.
 pub const EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR: &str = "ourios.server.signal_handler.error";
 
 /// `ourios.server.tls.plaintext_credentials` log event name.
 pub const EVENT_OURIOS_SERVER_TLS_PLAINTEXT_CREDENTIALS: &str =
     "ourios.server.tls.plaintext_credentials";
+
+/// `ourios.server.tls.reload.completed` log event name.
+pub const EVENT_OURIOS_SERVER_TLS_RELOAD_COMPLETED: &str = "ourios.server.tls.reload.completed";
+
+/// `ourios.server.tls.reload.error` log event name.
+pub const EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR: &str = "ourios.server.tls.reload.error";

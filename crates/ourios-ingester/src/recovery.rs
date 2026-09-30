@@ -279,10 +279,7 @@ pub fn write_snapshots_with(
     for tenant_id in miner.tenant_ids() {
         let mark = high_water(&tenant_id);
         let mut state = miner.snapshot_state(&tenant_id);
-        state.wal_high_water = mark.map(|offset| WalHighWater {
-            segment: offset.segment.to_string(),
-            byte: offset.byte,
-        });
+        state.wal_high_water = mark.map(snapshot_store::high_water);
         snapshot_store::write(root, &tenant_id, &state)?;
         if let Some(mark) = mark {
             installed.push((tenant_id, mark));
@@ -320,12 +317,7 @@ fn stale_gap(
 /// is the caller's discard-as-corrupt signal: a restorable snapshot
 /// requires a concrete horizon.
 fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
-    let hw = high_water?;
-    let segment = uuid::Uuid::parse_str(&hw.segment).ok()?;
-    Some(WalOffset {
-        segment,
-        byte: hw.byte,
-    })
+    snapshot_store::offset_of(high_water?)
 }
 
 /// The §6.6 [`FrameSink`]: per `TenantOtlpBatch` frame, decode the tenant
@@ -368,25 +360,7 @@ impl FrameSink for DriverSink<'_> {
                       version, or delete it",
                 ));
             }
-            FrameKind::TenantOtlpBatch => {
-                let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
-                let tenant = TenantId::new(batch.tenant);
-                let request = ExportLogsServiceRequest::decode(batch.protobuf)
-                    .map_err(|e| reject(kind, offset, &e))?;
-                let records = assign(request, &tenant);
-                for record in &records {
-                    let feed = match self.horizons.get(&record.tenant_id) {
-                        Some(horizon) => offset > *horizon,
-                        None => true,
-                    };
-                    if feed {
-                        self.miner.ingest(record);
-                        self.records_fed += 1;
-                    } else {
-                        self.records_suppressed += 1;
-                    }
-                }
-            }
+            FrameKind::TenantOtlpBatch => self.consume_batch(offset, payload)?,
             // Nothing writes AuditEvent frames yet (`encode_audit_event`
             // is the RFC 0008 §9 stub); when the encoder lands these
             // reinject into the audit Parquet queue, gated on the
@@ -394,6 +368,36 @@ impl FrameSink for DriverSink<'_> {
             // panic — the frame kind is valid on the wire today.
             FrameKind::AuditEvent => {}
         }
+        Ok(())
+    }
+}
+
+impl DriverSink<'_> {
+    /// Feed one tenant's frame to the miner unless its restored horizon
+    /// already folds it, and advance that tenant's folded horizon to the
+    /// frame (RFC 0052 §3.1) — replay folds in WAL order, as ingest does.
+    fn consume_batch(&mut self, offset: WalOffset, payload: &[u8]) -> Result<(), RecoveryError> {
+        let kind = FrameKind::TenantOtlpBatch;
+        let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
+        let tenant = TenantId::new(batch.tenant);
+        let request = ExportLogsServiceRequest::decode(batch.protobuf)
+            .map_err(|e| reject(kind, offset, &e))?;
+        let records = assign(request, &tenant);
+        let count = records.len() as u64;
+        if self
+            .horizons
+            .get(&tenant)
+            .is_some_and(|horizon| offset <= *horizon)
+        {
+            self.records_suppressed += count;
+            return Ok(());
+        }
+        for record in &records {
+            self.miner.ingest(record);
+        }
+        self.records_fed += count;
+        self.miner
+            .fold_through(&tenant, snapshot_store::high_water(offset));
         Ok(())
     }
 }
@@ -580,6 +584,61 @@ mod tests {
             assert!(detail.contains(needle), "{needle}: {detail}");
             assert!(detail.contains(&format!("{SEGMENT}+64")));
         }
+    }
+
+    fn one_line_frame(tenant: &str) -> Vec<u8> {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("user 1 logged in".to_owned())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        TenantBatch::encode(tenant, &request.encode_to_vec()).expect("frame")
+    }
+
+    /// RFC 0052 §3.1: replay folds each tenant to its **own** last
+    /// replayed frame. A restored tenant whose frames are all at or
+    /// below its horizon keeps that horizon, however far another
+    /// tenant's frames reach.
+    #[test]
+    fn replay_folds_each_tenant_to_its_own_last_frame() {
+        let (idle, busy) = (TenantId::new("idle"), TenantId::new("busy"));
+        let restored_at = offset(SEGMENT, 50);
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let mut state = miner.snapshot_state(&idle);
+        state.wal_high_water = Some(snapshot_store::high_water(restored_at));
+        miner.restore_tenant(&idle, &state).expect("restore");
+        let horizons = HashMap::from([(idle.clone(), restored_at)]);
+        let mut sink = sink(&mut miner, &horizons);
+
+        for (tenant, byte) in [("idle", 40), ("busy", 60), ("busy", 80)] {
+            sink.consume(
+                offset(SEGMENT, byte),
+                FrameKind::TenantOtlpBatch,
+                &one_line_frame(tenant),
+            )
+            .expect("consume");
+        }
+
+        assert_eq!(sink.records_suppressed, 1, "idle's frame is folded already");
+        let folded = |tenant| {
+            miner
+                .folded_horizon(tenant)
+                .and_then(snapshot_store::offset_of)
+        };
+        assert_eq!(folded(&idle), Some(restored_at), "idle keeps its horizon");
+        assert_eq!(folded(&busy), Some(offset(SEGMENT, 80)), "busy's own last");
     }
 
     // RFC0046.5 — a legacy 0x01 frame is unsupported for replay (a

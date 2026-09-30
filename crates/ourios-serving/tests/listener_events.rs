@@ -179,6 +179,25 @@ async fn drive_tls_reloads(capture: &EventCapture) {
         )
     })
     .await;
+
+    ourios_serving::tls_serve::panic_next_reload();
+    let events = wait_for(capture, "the panicked reload", |events| {
+        has(
+            events,
+            semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR,
+            Some("panic"),
+        )
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| {
+            e.name == semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR
+                && e.error_type() == Some("panic")
+                && e.attributes.get(semconv::OURIOS_SERVER_LISTENER_NAME)
+                    == Some(&LISTENER_HTTP.to_owned())
+        }),
+        "the unwound reload names its listener"
+    );
 }
 
 /// #873 — every listener event is emitted under its registry name with

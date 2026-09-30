@@ -225,3 +225,76 @@ async fn rfc0052_7_a_failed_checkpoint_write_is_not_counted_as_stamped() {
         1
     );
 }
+
+/// The `snapshot.writes` total for `tenant` whose `error.type` is `class`
+/// (`None` for the successes).
+fn snapshot_writes(rms: &[ResourceMetrics], tenant: &str, class: Option<&str>) -> u64 {
+    points(rms, semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES)
+        .into_iter()
+        .filter(|(attributes, _)| {
+            attributes.get(semconv::OURIOS_TENANT).map(String::as_str) == Some(tenant)
+                && attributes.get("error.type").map(String::as_str) == class
+        })
+        .map(|(_, value)| match value {
+            Value::U(v) => v,
+            other => panic!("snapshot.writes is a u64 counter, got {other:?}"),
+        })
+        .sum()
+}
+
+/// Scenario RFC0052.7 — a failed snapshot write is counted with its
+/// tenant and `error.type`, and the cut is `retained`.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.1.
+///
+/// Snapshots install per tenant in tenant order: `alpha` is written and
+/// its horizon advances before `beta`'s write fails, so this `retained`
+/// cut moved the snapshots of some tenants and not of others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0052_7_a_failed_snapshot_write_is_counted_and_retains_the_cut() {
+    let _serial = serial().await;
+    let harness = harness();
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = Arc::new(BarrierRig::new(tmp.path()));
+    rig.ingest("alpha", &["user 1 logged in"]).await;
+    let mark = rig.ingest("beta", &["invoice 7 sent"]).await;
+    // A non-empty directory where `beta`'s artefact is renamed to makes
+    // exactly that tenant's install fail.
+    let occupied = rig.snapshots_root.join("beta.snap");
+    std::fs::create_dir_all(occupied.join("occupied")).expect("occupy beta's artefact");
+    let before = harness.collect();
+
+    assert_eq!(cut(&rig, false).await, CutOutcome::Retained);
+    let after = harness.collect();
+
+    let delta = |tenant, class| {
+        snapshot_writes(&after, tenant, class) - snapshot_writes(&before, tenant, class)
+    };
+    assert_eq!(delta("beta", Some("io")), 1, "beta's failed write");
+    assert_eq!(delta("alpha", None), 1, "alpha's write, before beta's");
+    let retained = |rms: &[ResourceMetrics]| {
+        counted(
+            rms,
+            semconv::OURIOS_INGEST_BARRIER_CUTS,
+            semconv::OURIOS_INGEST_BARRIER_CUT_OUTCOME,
+            Some("retained"),
+        )
+    };
+    assert_eq!(retained(&after) - retained(&before), 1);
+    assert_eq!(
+        rig.commits.last_checkpoint(),
+        None,
+        "a retained cut stamps nothing"
+    );
+    let ourios_wal::SnapshotHorizons::Known(horizons) = rig.barrier.snapshot_horizons() else {
+        panic!("the barrier holds miner state");
+    };
+    assert_eq!(
+        horizons.get(&ourios_core::tenant::TenantId::new("alpha")),
+        Some(&ourios_wal::TenantHorizon::Restorable(mark)),
+        "alpha's horizon advanced to the cut's mark"
+    );
+    assert!(
+        !horizons.contains_key(&ourios_core::tenant::TenantId::new("beta")),
+        "beta's did not"
+    );
+}

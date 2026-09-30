@@ -104,6 +104,11 @@ fn fingerprint(settings: &TlsSettings) -> Option<u64> {
 /// blocking filesystem + PEM work, so the caller runs it in
 /// `spawn_blocking`.
 fn reload_once(settings: &TlsSettings, alpn: &[Vec<u8>], last: Option<u64>) -> ReloadOutcome {
+    #[cfg(feature = "fault-injection")]
+    assert!(
+        !PANIC_NEXT_RELOAD.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "injected TLS reload panic"
+    );
     let Some(fp) = fingerprint(settings) else {
         return ReloadOutcome::Unreadable;
     };
@@ -115,6 +120,19 @@ fn reload_once(settings: &TlsSettings, alpn: &[Vec<u8>], last: Option<u64>) -> R
         Ok(acceptor) => ReloadOutcome::Reloaded(fp, Box::new(acceptor)),
         Err(e) => ReloadOutcome::Invalid(e),
     }
+}
+
+#[cfg(feature = "fault-injection")]
+static PANIC_NEXT_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Make the next certificate reload, on any listener, unwind inside its
+/// blocking task — the one reload failure no file on disk can cause.
+///
+/// Behind the `fault-injection` feature, which only this crate's own
+/// test targets enable. Not part of the stable public API.
+#[cfg(feature = "fault-injection")]
+pub fn panic_next_reload() {
+    PANIC_NEXT_RELOAD.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Build a [`ReloadingAcceptor`] for `settings` advertising `alpn`. When

@@ -3558,6 +3558,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ourios-core",
  "ourios-semconv",
+ "ourios-serving",
  "ourios-telemetry",
  "p256",
  "rand 0.8.8",

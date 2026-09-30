@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use proptest::prelude::*;
 
 use ourios_wal::{
-    AppendError, FrameKind, RotationFault, RotationFaults, RotationSite, RotationState, SyncError,
-    Wal, WalConfig,
+    AppendError, FrameKind, RotationFault, RotationFaults, RotationKind, RotationSite,
+    RotationState, SyncError, Wal, WalConfig,
 };
 
 use crate::rfc0052_support::{backdate_segment, sweep};
@@ -271,5 +271,100 @@ proptest! {
 
         drop(wal);
         Wal::open(config(root)).expect("Wal::open succeeds afterwards");
+    }
+}
+
+/// Scenario RFC0052.5 — a terminal owed directory fsync outranks a failing data sync.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.3.
+///
+/// Frames land in the installed segment while the budget still holds;
+/// the idle timer's `rotate` then spends the rest of it on the owed
+/// directory fsync. The next flush's data sync fails on the same sick
+/// disk. Reported as an ordinary I/O error it would read as retryable
+/// against a WAL that has already given up, so the terminal state has
+/// to be reported first — and by every later `sync` the same way.
+#[test]
+fn rfc0052_5_a_terminal_owed_dir_fsync_outranks_a_failing_data_sync() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = wal_failing_always(root, RotationSite::ParentFsync);
+
+    let err = wal
+        .append(FrameKind::OtlpBatch, b"the append that rotates")
+        .expect_err("the parent fsync fails");
+    assert!(matches!(err, AppendError::RotationRetrying(_)), "{err:?}");
+    wal.append(FrameKind::OtlpBatch, b"appended, never flushed")
+        .expect("appends land in the installed segment");
+
+    let spent: Vec<AppendError> = (1..BUDGET)
+        .map(|_| {
+            wal.rotate(RotationKind::Discretionary)
+                .expect_err("the owed directory fsync fails again")
+        })
+        .collect();
+    assert!(
+        matches!(spent.last(), Some(AppendError::RotationTerminal(_))),
+        "the timer's discharge spends the budget: {spent:?}",
+    );
+    assert!(wal.owes_rotation_fsync(), "the obligation is still owed");
+
+    wal.arm_rotation_faults(
+        RotationFaults::always(RotationSite::ParentFsync).and_failing_segment_sync(),
+    );
+    for _ in 0..3 {
+        match wal.sync().expect_err("nothing is acked") {
+            SyncError::RotationTerminal(fault) => {
+                assert_eq!(fault.attempts(), BUDGET);
+                assert_eq!(fault.op(), RotationSite::ParentFsync.op());
+            }
+            other => panic!("expected the terminal state, not an ordinary sync error: {other:?}"),
+        }
+    }
+}
+
+/// Scenario RFC0052.5 — a pre-rename terminal state still syncs the old segment.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.3.
+///
+/// A rotation that failed before its rename installed nothing, so the
+/// old segment still holds every frame appended before it. Those frames
+/// were never refused, and a `sync` must still make them durable and
+/// report them; only new appends are refused.
+#[test]
+fn rfc0052_5_a_pre_rename_terminal_state_still_syncs_the_old_segment() {
+    for site in RotationSite::ALL
+        .into_iter()
+        .filter(|site| *site != RotationSite::ParentFsync)
+    {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path();
+        let mut wal = Wal::open(config(root)).expect("open");
+        let appended = wal
+            .append(FrameKind::OtlpBatch, b"appended before the rotation failed")
+            .expect("append");
+        wal.arm_rotation_faults(RotationFaults::always(site));
+
+        for _ in 0..BUDGET {
+            wal.rotate(RotationKind::Discretionary)
+                .expect_err("every attempt fails");
+        }
+        assert!(
+            matches!(wal.reclaim_state().rotation, RotationState::Terminal(_)),
+            "{site:?}: the budget is spent",
+        );
+        assert!(!wal.owes_rotation_fsync(), "{site:?}: nothing was renamed");
+
+        for _ in 0..3 {
+            let durable = wal
+                .sync()
+                .unwrap_or_else(|e| panic!("{site:?}: the old segment still syncs: {e:?}"));
+            assert_eq!(durable, appended, "{site:?}: and reports the frame durable");
+        }
+        assert!(
+            matches!(
+                wal.append(FrameKind::OtlpBatch, b"after"),
+                Err(AppendError::RotationTerminal(_)),
+            ),
+            "{site:?}: new appends are still refused",
+        );
     }
 }

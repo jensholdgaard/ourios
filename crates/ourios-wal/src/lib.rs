@@ -1064,6 +1064,16 @@ impl Wal {
     ///
     /// See [`SyncError`].
     pub fn sync(&mut self) -> Result<WalOffset, SyncError> {
+        // A spent budget on the post-rename obligation means nothing in
+        // the installed segment can ever be acked, and the closing sync
+        // already covered the old one — so a data sync failing on the
+        // same disk must not mask the state as a retryable I/O error. A
+        // pre-rename terminal state never owes this fsync, and still
+        // syncs the old segment's unflushed frames below.
+        if let (Some(fault), DirFsync::PendingRotation) = (self.rotation.terminal(), self.dir_fsync)
+        {
+            return Err(SyncError::RotationTerminal(fault.clone()));
+        }
         self.sync_segment_data()?;
         self.discharge_dir_fsync()?;
         // Everything written so far is now durable; the highest
@@ -1091,9 +1101,10 @@ impl Wal {
     /// post-rename one) is outstanding.
     ///
     /// A rotation-origin discharge is the second operation §3.3's retry
-    /// budget counts, and a terminal state short-circuits it rather than
-    /// hammering a disk that has already failed the same fsync its whole
-    /// budget's worth of times. An `open`-origin failure stays an
+    /// budget counts, and a terminal state short-circuits it — at the top
+    /// of [`Self::sync`], ahead of the data sync — rather than hammering a
+    /// disk that has already failed the same fsync its whole budget's
+    /// worth of times. An `open`-origin failure stays an
     /// ordinary retryable sync error, outside the budget — which is what
     /// keeps RFC0052.15's reclassification narrow.
     fn discharge_dir_fsync(&mut self) -> Result<(), SyncError> {
@@ -1114,9 +1125,6 @@ impl Wal {
     }
 
     fn discharge_rotation_fsync(&mut self) -> Result<(), SyncError> {
-        if let Some(fault) = self.rotation.terminal() {
-            return Err(SyncError::RotationTerminal(fault.clone()));
-        }
         match self.step(RotationSite::ParentFsync, |wal| {
             sync_parent_dir(&wal.config.root)
         }) {
@@ -1131,12 +1139,14 @@ impl Wal {
 
     /// The live segment's §6.3 data sync — [`sync_file_data`] with
     /// this WAL's knob.
-    fn sync_segment_data(&self) -> Result<(), SyncError> {
-        sync_file_data(&self.current_segment, self.config.macos_full_fsync).map_err(|source| {
-            SyncError::Io {
-                op: "sync(current_segment)",
-                source,
-            }
+    fn sync_segment_data(&mut self) -> Result<(), SyncError> {
+        let outcome = match self.faults.take_segment_sync() {
+            Some(injected) => Err(injected),
+            None => sync_file_data(&self.current_segment, self.config.macos_full_fsync),
+        };
+        outcome.map_err(|source| SyncError::Io {
+            op: "sync(current_segment)",
+            source,
         })
     }
 

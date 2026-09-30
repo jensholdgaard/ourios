@@ -1134,6 +1134,48 @@ mod tests {
             }
         }
 
+        /// A real WAL whose idle timer spent the budget on an owed
+        /// directory fsync, then whose flush's data sync fails on the
+        /// same disk: the flush must still classify terminal, not as
+        /// the ordinary sync failure a client should retry.
+        #[test]
+        fn a_failing_data_sync_behind_a_terminal_owed_dir_fsync_is_terminal() {
+            use ourios_wal::{FrameKind, RotationFaults, RotationKind, Wal, WalConfig};
+
+            let tmp = tempfile::TempDir::new().expect("temp");
+            let mut wal = Wal::open(WalConfig {
+                root: tmp.path().to_path_buf(),
+                batch_window_ms: 20,
+                segment_size_bytes: ourios_wal::MIN_SEGMENT_SIZE_BYTES,
+                segment_age_secs: 600,
+                housekeeping_secs: 60,
+                max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+                rotation_retry_attempts: 2,
+                macos_full_fsync: false,
+            })
+            .expect("open WAL");
+            wal.append(FrameKind::OtlpBatch, b"seed").expect("seed");
+            wal.arm_rotation_faults(RotationFaults::always(RotationSite::ParentFsync));
+            wal.rotate(RotationKind::Owed)
+                .expect_err("the rotation's parent fsync fails");
+            wal.append(FrameKind::OtlpBatch, b"appended, never flushed")
+                .expect("appends land in the installed segment");
+            wal.rotate(RotationKind::Discretionary)
+                .expect_err("the timer's discharge spends the budget");
+            wal.arm_rotation_faults(
+                RotationFaults::always(RotationSite::ParentFsync).and_failing_segment_sync(),
+            );
+
+            for _ in 0..3 {
+                let error = ReceiveError::WalSync(wal.sync().expect_err("nothing is acked"));
+                assert_eq!(
+                    IngestFailure::classify(&error),
+                    IngestFailure::ServerTerminal,
+                    "{error}",
+                );
+            }
+        }
+
         #[test]
         fn other_append_and_sync_failures_stay_transient() {
             assert_eq!(

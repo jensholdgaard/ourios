@@ -2324,6 +2324,35 @@ tenant independently; there is no cluster-wide combined artefact.
 > segment as explained when the WAL's `RECLAIM` record shows the
 > tenant reclaimed through `S` or beyond (RFC 0052 §3.2).
 
+> **Amendment 2026-09-30 (leaf route, #892).** Each leaf record also
+> carries **`wildcard_routed`**: the prefix-path positions, ascending,
+> at which the leaf's node was reached through RFC 0023 §3.1's
+> wildcard child `<*>` rather than a keyed branch. Under that child,
+> lines differ at the path position, so a leaf there can widen or
+> type-expand at it, and restore cannot derive the route from the
+> template. Without the field, restore rejected every such leaf as a
+> malformed path tag, and every snapshot of a tree that had filled a
+> prefix node was discarded on the next start (#892). Restore descends
+> through `<*>` at the recorded positions and rejects a list that is
+> not ascending or reaches past the walk depth. The field is additive
+> and optional (`#[serde(default)]`, an absent field reads as empty):
+> a snapshot written without it restores under the strict rule that
+> every path-position wildcard is a singleton mask-emitted type, so a
+> 0.11.0-written artefact holding such a leaf is discarded once more
+> and full-replays through step (3). No `SNAPSHOT_VERSION` bump,
+> following the precedent of RFC 0037's `event_name` and RFC 0050's
+> provenance and association fields.
+>
+> Restore rebuilds the tree from the snapshot, not from the history
+> that built it, so §3.5.3's equivalence also requires every choice
+> live ingest makes to be a function of the tree. Three were not. §6.2
+> step 4 candidate selection broke similarity ties by leaf-list order.
+> The RFC0050.6 convergence lookup took whichever leaf of a shared
+> shape it reached first in map order. Its guard index was a set, so
+> one of two leaves sharing a shape widening away hid the other. Ties
+> in both lookups now go to the lowest `template_id`, and the index
+> counts leaves per shape. The format is unchanged by these.
+
 *Cadence: per WAL-segment rotation.* A snapshot is taken at
 WAL-segment-rotation boundaries. The snapshot records the WAL
 **high-water mark** — the `WalOffset` (RFC 0008 §6.1) up to which
@@ -2336,8 +2365,9 @@ the snapshot format version; the remaining bytes are that version's
 serialised payload. The payload captures the per-tenant state needed
 to reconstruct the miner: the tree leaves (template token sequence,
 `template_id`, `template_version`, the `(severity_number,
-scope_name)` template key of §6.1, and the per-slot `slot_types`
-of §6.1), the structured-template-id map allocated in §6.2's
+scope_name)` template key of §6.1, the per-slot `slot_types`
+of §6.1, and the wildcard-routed path positions of the 2026-09-30
+amendment above), the structured-template-id map allocated in §6.2's
 structured short-circuit, and the WAL high-water mark above.
 The concrete payload codec is an implementation detail *behind* the
 version byte — the version byte is what makes format evolution safe,

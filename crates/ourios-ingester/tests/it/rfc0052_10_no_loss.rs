@@ -12,7 +12,10 @@
 //! process and stop the node without a shutdown write — what a kill
 //! leaves on disk — then run startup recovery over it.
 
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Lines};
 use std::path::{Path, PathBuf};
+use std::process::{ChildStdout, Command, Stdio};
 use std::time::SystemTime;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -22,6 +25,7 @@ use ourios_core::clock::TestClock;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;
+use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::receiver::tenant::assign;
 use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
@@ -37,18 +41,145 @@ use crate::rfc0052_barrier_support::{BarrierRig, never_flush, wal_config};
 
 const TENANT: &str = "checkout";
 
+/// Acknowledgements the fixture must print after its first reclaiming
+/// pass before the kill, so the kill lands with reclamation under way.
+const ACKS_AFTER_RECLAIM: usize = 25;
+
 /// Scenario RFC0052.10 — SIGKILL with reclamation and rotation retry live.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
 #[test]
-#[ignore = "RFC0052.10 stub — implemented in the crash-and-soak green slice F (rfc0014_5 fixture on a short reclamation cadence)"]
 fn rfc0052_10_every_acked_record_survives_a_kill_during_reclamation() {
-    todo!(
-        "RFC0052.10 — a node killed with SIGKILL mid-batch while \
-         reclamation and rotation retry are both live; it restarts and \
-         recovery completes: every acknowledged record is present in \
-         Parquet, including those whose segments were candidates for \
-         reclamation at the moment of the kill"
+    // Given a node ingesting batch after batch while its barrier stamps
+    // and its housekeeping pass reclaims on a 100 ms cadence.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (wal_root, data_root, audit_root) = (
+        tmp.path().join("wal"),
+        tmp.path().join("data"),
+        tmp.path().join("audit"),
     );
+    for dir in [&data_root, &audit_root] {
+        std::fs::create_dir_all(dir).expect("store root");
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_receiver_reclaim_crash_fixture"))
+        .args([&wal_root, &data_root, &audit_root])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn reclaim crash fixture");
+    let mut lines = BufReader::new(child.stdout.take().expect("fixture stdout piped")).lines();
+    let acked = acks_until_reclaiming(&mut lines);
+
+    // When it is killed mid-batch — it never stops ingesting — and restarts.
+    child.kill().expect("SIGKILL fixture");
+    child.wait().expect("reap fixture");
+    drop(lines);
+    let surviving = segments(&wal_root);
+    let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen");
+    let checkpoint = wal
+        .last_checkpoint()
+        .expect("the barrier stamped before the kill");
+    let candidates: Vec<u64> = acked
+        .iter()
+        .filter(|(_, frame)| *frame <= checkpoint)
+        .map(|(n, _)| *n)
+        .collect();
+    let reclaimed: Vec<u64> = acked
+        .iter()
+        .filter(|(_, frame)| !surviving.contains(&frame.segment))
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        !reclaimed.is_empty() && reclaimed.iter().all(|n| candidates.contains(n)),
+        "the kill landed after reclamation removed acknowledged frames, all below X",
+    );
+    let recovered = recover_into_stores(&mut wal, &wal_root, &data_root, &audit_root);
+
+    // Then every acknowledged record is in Parquet — above the checkpoint
+    // from replay, at or below it from the cuts, whether or not its
+    // segment survived.
+    let published: HashSet<u64> = stamps(&rows(&data_root)).into_iter().collect();
+    let lost: Vec<u64> = acked
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| !published.contains(n))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "acknowledged records missing after recovery: {lost:?} ({} acked, {} candidates \
+         for reclamation, {} in reclaimed segments, {} replayed)",
+        acked.len(),
+        candidates.len(),
+        reclaimed.len(),
+        recovered.records_fed_to_miner,
+    );
+}
+
+/// Read the fixture's `ACK` lines until [`ACKS_AFTER_RECLAIM`] of them
+/// follow its first reclaiming pass. The reader stays with the caller so
+/// the pipe is open until the kill: a closed pipe would fail the child's
+/// next write and end it by panic instead.
+fn acks_until_reclaiming(lines: &mut Lines<BufReader<ChildStdout>>) -> Vec<(u64, WalOffset)> {
+    let mut acked = Vec::new();
+    let mut since_reclaim: Option<usize> = None;
+    for line in lines.by_ref() {
+        let line = line.expect("fixture line");
+        match line.split_whitespace().collect::<Vec<_>>()[..] {
+            ["ACK", n, segment, byte] => {
+                let frame = WalOffset {
+                    segment: segment.parse().expect("segment id"),
+                    byte: byte.parse().expect("byte offset"),
+                };
+                acked.push((n.parse().expect("batch number"), frame));
+                if let Some(count) = since_reclaim.as_mut() {
+                    *count += 1;
+                }
+            }
+            ["RECLAIMED", _] => {
+                since_reclaim.get_or_insert(0);
+            }
+            _ => panic!("unexpected fixture line {line:?}"),
+        }
+        if since_reclaim.is_some_and(|count| count >= ACKS_AFTER_RECLAIM) {
+            return acked;
+        }
+    }
+    panic!("the fixture exited before a pass reclaimed anything");
+}
+
+/// The segment ids whose files are in `wal_root`.
+fn segments(wal_root: &Path) -> HashSet<uuid::Uuid> {
+    std::fs::read_dir(wal_root)
+        .expect("wal root")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".wal")?.parse().ok()
+        })
+        .collect()
+}
+
+/// Restart the way `serve` does — both sinks wired into the miner before
+/// recovery — and flush what recovery published.
+fn recover_into_stores(
+    wal: &mut Wal,
+    wal_root: &Path,
+    data_root: &Path,
+    audit_root: &Path,
+) -> RecoveryReport {
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+        Store::local(audit_root).expect("audit store"),
+        100_000,
+    ));
+    let sink = SharedParquetSink::new(ParquetRecordSink::new(
+        Store::local(data_root).expect("data store"),
+        never_flush(),
+    ));
+    let mut miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+        .with_record_sink(Box::new(sink.clone()));
+    let report =
+        recovery::recover(wal, &wal_root.join("snapshots"), &mut miner).expect("startup recovery");
+    sink.flush_all();
+    assert!(audit.flush(), "the regenerated audit events land");
+    report
 }
 
 /// Scenario RFC0052.10 — recovery republishes nothing at or below `max(X, S)`.

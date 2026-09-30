@@ -180,6 +180,12 @@ async fn drive_tls_reloads(capture: &EventCapture) {
     })
     .await;
 
+    drive_panicked_reload(capture, &cert).await;
+}
+
+/// A reload that unwinds inside its blocking task still names its
+/// listener and, in its message, the certificate it was reloading.
+async fn drive_panicked_reload(capture: &EventCapture, cert: &std::path::Path) {
     ourios_serving::tls_serve::panic_next_reload();
     let events = wait_for(capture, "the panicked reload", |events| {
         has(

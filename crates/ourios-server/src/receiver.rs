@@ -2021,8 +2021,9 @@ mod tests {
         for record in ourios_ingester::receiver::assign(request, tenant) {
             miner.ingest(&record);
         }
+        miner.fold_through(tenant, ourios_ingester::snapshot_store::high_water(horizon));
         let snapshots_root = wal_root.join(SNAPSHOTS_DIR);
-        recovery::write_snapshots(&snapshots_root, &miner, Some(horizon)).expect("snapshot");
+        recovery::write_folded_snapshots(&snapshots_root, &miner).expect("snapshot");
         wal.checkpoint(horizon).expect("checkpoint");
         wal.rotate(ourios_wal::RotationKind::Owed).expect("rotate");
         let cap = usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("cap fits");
@@ -2117,13 +2118,13 @@ mod tests {
         let [restored, alpha_replayed, beta_replayed] = offsets(&tmp.path().join("wal"));
         let snapshots_root = tmp.path().join("snapshots");
         let miner = mined(&[("alpha", alpha_replayed), ("beta", beta_replayed)]);
-        recovery::write_snapshots_with(&snapshots_root, &miner, |tenant| {
-            (tenant.as_str() == "alpha").then_some(restored)
-        })
-        .expect("alpha's restored artefact");
+        let alpha = TenantId::new("alpha");
+        let mut restored_state = miner.snapshot_state(&alpha);
+        restored_state.wal_high_water = Some(ourios_ingester::snapshot_store::high_water(restored));
+        ourios_ingester::snapshot_store::write(&snapshots_root, &alpha, &restored_state)
+            .expect("alpha's restored artefact");
         // Beta, known to replay only, is written second; a non-empty
         // directory cannot be replaced by a rename, so its write fails.
-        std::fs::remove_file(snapshots_root.join("beta.snap")).expect("unstamped beta");
         std::fs::create_dir(snapshots_root.join("beta.snap")).expect("block beta");
         std::fs::write(snapshots_root.join("beta.snap").join("occupied"), b"x").expect("occupy");
 

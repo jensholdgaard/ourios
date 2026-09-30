@@ -211,41 +211,27 @@ pub fn recover(
     })
 }
 
-/// Write one snapshot artefact per live tenant in `miner`, recording
-/// `high_water` as each artefact's WAL high-water mark (RFC 0001
-/// §6.9 cadence points: post-recovery and graceful shutdown today;
-/// per-segment-rotation once rotation lands). A `None` high water is
-/// honest degradation: the next start full-replays for that tenant.
+/// Write one snapshot artefact per live tenant in `miner`, each stamped
+/// at that tenant's own folded horizon (RFC 0052 §3.1) — the
+/// post-recovery and shutdown cadence points' stamp. Returns the horizon
+/// every written artefact carries, for seeding the snapshot ledger with
+/// exactly what was installed. A tenant with no folded horizon is written
+/// without one, which the next start discards and full-replays.
 ///
 /// # Errors
 ///
-/// [`SnapshotStoreError`] on encode or filesystem failure. The
-/// snapshot is a rebuildable cache, so callers on the shutdown path
-/// downgrade this to a warning.
-pub fn write_snapshots(
+/// [`SnapshotStoreError`] on encode or filesystem failure; the artefacts
+/// written before the failure stay written. The snapshot is a rebuildable
+/// cache, so callers on the shutdown path downgrade this to a warning.
+pub fn write_folded_snapshots(
     root: &Path,
     miner: &MinerCluster,
-    high_water: Option<WalOffset>,
-) -> Result<(), SnapshotStoreError> {
-    write_snapshots_with(root, miner, |_| high_water).map(drop)
-}
-
-/// [`write_snapshots`] with each tenant's high-water mark chosen by
-/// `high_water`. Returns the horizon every written artefact carries, for
-/// seeding the snapshot ledger with exactly what was installed.
-///
-/// # Errors
-///
-/// As [`write_snapshots`]; the artefacts written before the failure
-/// stay written.
-pub fn write_snapshots_with(
-    root: &Path,
-    miner: &MinerCluster,
-    high_water: impl Fn(&TenantId) -> Option<WalOffset>,
 ) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
     let mut installed = Vec::new();
     for tenant_id in miner.tenant_ids() {
-        let mark = high_water(&tenant_id);
+        let mark = miner
+            .folded_horizon(&tenant_id)
+            .and_then(snapshot_store::offset_of);
         let mut state = miner.snapshot_state(&tenant_id);
         state.wal_high_water = mark.map(snapshot_store::high_water);
         snapshot_store::write(root, &tenant_id, &state)?;
@@ -254,23 +240,6 @@ pub fn write_snapshots_with(
         }
     }
     Ok(installed)
-}
-
-/// [`write_snapshots_with`] at each tenant's own folded horizon (RFC 0052
-/// §3.1) — the post-recovery and shutdown cadence points' stamp.
-///
-/// # Errors
-///
-/// As [`write_snapshots`].
-pub fn write_folded_snapshots(
-    root: &Path,
-    miner: &MinerCluster,
-) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
-    write_snapshots_with(root, miner, |tenant| {
-        miner
-            .folded_horizon(tenant)
-            .and_then(snapshot_store::offset_of)
-    })
 }
 
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`

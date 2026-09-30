@@ -667,6 +667,16 @@ jobs:
             echo "::error::ourios-server exited with status $server_status"
           fi
           [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ]
+      # RFC0052.7: the WAL's rotation, floor and latch events fire only
+      # when a disk fails or a tenant pins the floor, which the served
+      # binary above never reaches. This test binary drives each one and
+      # hands what it emitted to weaver, so an event is never registered
+      # without also being live-checked.
+      - name: Live-check the RFC 0052 events
+        env:
+          OURIOS_LIVE_CHECK_WEAVER: weaver
+          OURIOS_LIVE_CHECK_REGISTRY: ${{ steps.semconv.outputs.dir }}/registry
+        run: cargo test -p ourios-ingester --test rfc0052_7_telemetry
       - name: Upload live-check report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

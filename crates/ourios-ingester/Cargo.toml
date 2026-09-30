@@ -173,7 +173,11 @@ ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # The SDK data types (`ResourceMetrics` etc.) the metrics test reads;
 # `trace` adds the `InMemorySpanExporter`/`SdkTracerProvider` the RFC0038.2
 # request-span test collects the ingest batch span through.
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "logs", "trace", "testing"] }
+# RFC0052.7: bridge the named `tracing` events onto the in-memory log
+# exporter (`logs` above), the same appender the server's logs pipeline
+# uses, so the test reads each event's name and attributes as exported.
+opentelemetry-appender-tracing = { version = "=0.32.0", default-features = false }
 # RFC0038.2: the `TracerProvider::tracer` trait method + `SpanId`/`TraceId`
 # the batch-span assertions read (the crate's non-dev dep is metrics-only).
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }

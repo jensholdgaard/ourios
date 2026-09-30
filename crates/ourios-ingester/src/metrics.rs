@@ -444,20 +444,24 @@ impl BarrierMetrics {
             .u64_counter(semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES)
             .with_unit("{write}")
             .build();
-        let current = Arc::clone(epochs);
+        // Weak, so a barrier that is gone stops reporting rather than
+        // being kept alive by the meter provider.
+        let current = Arc::downgrade(epochs);
         let epoch = meter
             .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_EPOCH)
             .with_unit("{epoch}")
             .with_callback(move |observer| {
-                observer.observe(u64::from(current.current().get()), &[]);
+                if let Some(epochs) = current.upgrade() {
+                    observer.observe(u64::from(epochs.current().get()), &[]);
+                }
             })
             .build();
-        let latch = Arc::clone(epochs);
+        let latch = Arc::downgrade(epochs);
         let failed_epoch = meter
             .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH)
             .with_unit("{epoch}")
             .with_callback(move |observer| {
-                if let Some(failed) = latch.capture().failed_epoch() {
+                if let Some(failed) = latch.upgrade().and_then(|e| e.capture().failed_epoch()) {
                     observer.observe(u64::from(failed.get()), &[]);
                 }
             })

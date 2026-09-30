@@ -10,17 +10,21 @@
 //! move on every pass and are never part of it.
 //!
 //! The instruments are observable and read shared cells, never the
-//! journal: a collection must not queue behind an fsync, and a callback
-//! the meter provider outlives must not keep the WAL open.
+//! journal, so a collection never queues behind an fsync. The callbacks
+//! hold those cells weakly: the meter provider outlives a receiver that
+//! shuts down, and a restarted one in the same process must not see the
+//! old one's figures reported beside its own.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::SystemTime;
 
 use opentelemetry::metrics::{Meter, ObservableGauge, ObservableUpDownCounter};
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
-use ourios_wal::{HousekeepingProgress, ReclaimState, RetainFloor, RotationState};
+use ourios_wal::{
+    HousekeepingProgress, ReclaimState, RetainFloor, RotationFault, RotationSite, RotationState,
+};
 
 use crate::cadence::BarrierEpochs;
 
@@ -109,6 +113,12 @@ impl RotationCell {
     }
 }
 
+/// The `error.type` a rotation fault is reported under: the step that
+/// first failed, as a bounded token rather than its rendered `op`.
+pub(crate) fn fault_error_type(fault: &RotationFault) -> &'static str {
+    fault.site().map_or("_OTHER", RotationSite::error_type)
+}
+
 /// Emit the registry event for a rotation edge, if `before → after` is
 /// one. Entering `Retrying` and leaving it are edges; a further failed
 /// attempt inside `Retrying` is not. Entering `Terminal` is, from either
@@ -117,7 +127,7 @@ pub(crate) fn emit_rotation_edge(before: &RotationState, after: &RotationState) 
     match (RotationPhase::of(before), after) {
         (RotationPhase::Healthy, RotationState::Retrying(fault)) => tracing::warn!(
             name: semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RETRYING,
-            { "error.type" = fault.op() },
+            { "error.type" = fault_error_type(fault) },
             "WAL rotation failed ({fault}); the next append retries it within the budget"
         ),
         (RotationPhase::Retrying, RotationState::Healthy) => tracing::info!(
@@ -127,7 +137,7 @@ pub(crate) fn emit_rotation_edge(before: &RotationState, after: &RotationState) 
         (RotationPhase::Healthy | RotationPhase::Retrying, RotationState::Terminal(fault)) => {
             tracing::error!(
                 name: semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_TERMINAL,
-                { "error.type" = fault.op() },
+                { "error.type" = fault_error_type(fault) },
                 "WAL rotation retry budget spent ({fault}); appends are refused until a restart"
             );
         }
@@ -156,6 +166,7 @@ pub struct WalExport {
     observed: Arc<Mutex<Observed>>,
     projection: Mutex<Projection>,
     epochs: Arc<BarrierEpochs>,
+    _rotation: Arc<RotationCell>,
     _instruments: Instruments,
 }
 
@@ -166,11 +177,12 @@ impl WalExport {
     #[must_use]
     pub fn new(rotation: &Arc<RotationCell>, epochs: Arc<BarrierEpochs>) -> Self {
         let observed = Arc::new(Mutex::new(Observed::default()));
-        let instruments = Instruments::register(&observed, rotation);
+        let instruments = Instruments::register(&Arc::downgrade(&observed), rotation);
         Self {
             observed,
             projection: Mutex::new(Projection::default()),
             epochs,
+            _rotation: Arc::clone(rotation),
             _instruments: instruments,
         }
     }
@@ -230,7 +242,7 @@ struct Instruments {
     gauges: Vec<ObservableGauge<u64>>,
 }
 
-type Shared = Arc<Mutex<Observed>>;
+type Shared = Weak<Mutex<Observed>>;
 type StateRead = fn(&ReclaimState) -> u64;
 type BacklogRead = fn(&HousekeepingProgress) -> usize;
 
@@ -275,13 +287,13 @@ impl Instruments {
         let mut updown: Vec<_> = STATE_SUMS
             .into_iter()
             .map(|(name, unit, read)| {
-                let observed = Arc::clone(observed);
+                let observed = Weak::clone(observed);
                 meter
                     .i64_observable_up_down_counter(name)
                     .with_unit(unit)
                     .with_callback(move |observer| {
-                        if let Some(state) = lock(&observed).state.as_ref() {
-                            observer.observe(to_i64(read(state)), &[]);
+                        if let Some(value) = with(&observed, |o| o.state.as_ref().map(read)) {
+                            observer.observe(to_i64(value), &[]);
                         }
                     })
                     .build()
@@ -290,22 +302,26 @@ impl Instruments {
         updown.push(floor_status(&meter, observed));
         updown.push(rotation_status(&meter, rotation));
 
-        let cell = Arc::clone(rotation);
+        let cell = Arc::downgrade(rotation);
         let mut gauges = vec![
             meter
                 .u64_observable_gauge(semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES)
                 .with_unit("{failure}")
-                .with_callback(move |observer| observer.observe(u64::from(cell.load().1), &[]))
+                .with_callback(move |observer| {
+                    if let Some(cell) = cell.upgrade() {
+                        observer.observe(u64::from(cell.load().1), &[]);
+                    }
+                })
                 .build(),
         ];
         gauges.extend(BACKLOG.into_iter().map(|(name, read)| {
-            let observed = Arc::clone(observed);
+            let observed = Weak::clone(observed);
             meter
                 .u64_observable_gauge(name)
                 .with_unit("{segment}")
                 .with_callback(move |observer| {
-                    if let Some(progress) = lock(&observed).progress.as_ref() {
-                        observer.observe(to_u64(read(progress)), &[]);
+                    if let Some(value) = with(&observed, |o| o.progress.as_ref().map(read)) {
+                        observer.observe(to_u64(value), &[]);
                     }
                 })
                 .build()
@@ -323,12 +339,14 @@ impl Instruments {
 /// for the current one and 0 for the rest, so a transition never leaves
 /// a stale series at 1.
 fn floor_status(meter: &Meter, observed: &Shared) -> ObservableUpDownCounter<i64> {
-    let observed = Arc::clone(observed);
+    let observed = Weak::clone(observed);
     meter
         .i64_observable_up_down_counter(semconv::OURIOS_WAL_RETAIN_FLOOR_STATUS)
         .with_unit("1")
         .with_callback(move |observer| {
-            let Some(current) = lock(&observed).state.as_ref().map(|s| floor_state(s.floor)) else {
+            let Some(current) = with(&observed, |o| {
+                o.state.as_ref().map(|s| floor_state(s.floor))
+            }) else {
                 return;
             };
             for kind in FLOOR_STATES {
@@ -344,12 +362,14 @@ fn floor_status(meter: &Meter, observed: &Shared) -> ObservableUpDownCounter<i64
 /// The rotation state metric, read live from the coordinator's cell —
 /// the same every-member shape as [`floor_status`].
 fn rotation_status(meter: &Meter, rotation: &Arc<RotationCell>) -> ObservableUpDownCounter<i64> {
-    let cell = Arc::clone(rotation);
+    let cell = Arc::downgrade(rotation);
     meter
         .i64_observable_up_down_counter(semconv::OURIOS_WAL_ROTATION_STATUS)
         .with_unit("1")
         .with_callback(move |observer| {
-            let (current, _) = cell.load();
+            let Some((current, _)) = cell.upgrade().map(|cell| cell.load()) else {
+                return;
+            };
             for phase in RotationPhase::ALL {
                 observer.observe(
                     i64::from(phase == current),
@@ -367,16 +387,12 @@ fn rotation_status(meter: &Meter, rotation: &Arc<RotationCell>) -> ObservableUpD
 /// keeps rising between passes during exactly the stall it exists to
 /// show.
 fn unreclaimed_age(meter: &Meter, observed: &Shared) -> ObservableGauge<f64> {
-    let observed = Arc::clone(observed);
+    let observed = Weak::clone(observed);
     meter
         .f64_observable_gauge(semconv::OURIOS_WAL_UNRECLAIMED_AGE)
         .with_unit("s")
         .with_callback(move |observer| {
-            let oldest = lock(&observed)
-                .state
-                .as_ref()
-                .and_then(|s| s.oldest_unreclaimed);
-            if let Some(oldest) = oldest {
+            if let Some(oldest) = with(&observed, |o| o.state.as_ref()?.oldest_unreclaimed) {
                 let age = SystemTime::now()
                     .duration_since(oldest)
                     .unwrap_or_default()
@@ -399,8 +415,11 @@ fn floor_state(floor: RetainFloor) -> &'static str {
     }
 }
 
-fn lock(observed: &Mutex<Observed>) -> std::sync::MutexGuard<'_, Observed> {
-    observed.lock().unwrap_or_else(PoisonError::into_inner)
+/// Read what the timer last observed, if its export is still alive.
+fn with<T>(observed: &Shared, read: impl FnOnce(&Observed) -> Option<T>) -> Option<T> {
+    let observed = observed.upgrade()?;
+    let guard = observed.lock().unwrap_or_else(PoisonError::into_inner);
+    read(&guard)
 }
 
 fn to_u64(value: usize) -> u64 {

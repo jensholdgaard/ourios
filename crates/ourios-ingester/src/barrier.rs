@@ -61,6 +61,7 @@ use crate::publish::{Drained, PublishCoordinator};
 use crate::receiver::CommitCoordinator;
 use crate::receiver::ReceiveError;
 use crate::receiver::pipeline::IngestPipeline;
+use crate::reclaim_telemetry::fault_error_type;
 use crate::snapshot_store;
 
 /// One capture: the frames at or below `mark` taken out of both sinks,
@@ -694,7 +695,7 @@ fn rotation_error_type(error: &ReceiveError) -> &'static str {
     match error {
         ReceiveError::WalAppend(
             AppendError::RotationRetrying(fault) | AppendError::RotationTerminal(fault),
-        ) => fault.op(),
+        ) => fault_error_type(fault),
         ReceiveError::WalAppend(AppendError::Io { .. }) => "io",
         ReceiveError::WalAppend(AppendError::TooLarge { .. }) => "too_large",
         ReceiveError::TenantDenied { .. }

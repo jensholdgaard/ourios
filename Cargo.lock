@@ -3379,6 +3379,7 @@ dependencies = [
  "http",
  "object_store",
  "opentelemetry",
+ "opentelemetry-appender-tracing",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "ourios-config",

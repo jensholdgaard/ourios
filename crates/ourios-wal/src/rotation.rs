@@ -66,6 +66,19 @@ impl RotationSite {
         }
     }
 
+    /// The `error.type` value a failure at this site is reported under:
+    /// the step's class, never the rendered detail.
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::CloseSync => "close_sync",
+            Self::Create => "create",
+            Self::HeaderSync => "header_sync",
+            Self::Rename => "rename",
+            Self::ParentFsync => "parent_fsync",
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             Self::CloseSync => 0,
@@ -203,6 +216,14 @@ impl RotationFault {
         self.op
     }
 
+    /// The site the first failure happened at.
+    #[must_use]
+    pub fn site(&self) -> Option<RotationSite> {
+        RotationSite::ALL
+            .into_iter()
+            .find(|site| site.op() == self.op)
+    }
+
     /// The first failure's `ErrorKind`.
     #[must_use]
     pub fn kind(&self) -> std::io::ErrorKind {
@@ -326,6 +347,17 @@ mod tests {
 
     fn io() -> std::io::Error {
         std::io::Error::other("disk")
+    }
+
+    #[test]
+    fn every_site_is_recovered_from_its_fault_with_a_distinct_error_type() {
+        let mut classes = std::collections::BTreeSet::new();
+        for site in RotationSite::ALL {
+            let fault = RotationState::default().charge(site.op(), &io(), 3);
+            assert_eq!(fault.site(), Some(site));
+            classes.insert(site.error_type());
+        }
+        assert_eq!(classes.len(), RotationSite::ALL.len());
     }
 
     #[test]

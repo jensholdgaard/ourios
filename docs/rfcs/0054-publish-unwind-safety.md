@@ -284,9 +284,9 @@ alone, and neither can a `catch_unwind` at one call site.
 RFC 0052 §3.1 a worker performs no store I/O: `emit_concurrent` appends
 each record to the buffers, and a size- or ceiling-detached partition is
 enqueued to the **publisher** — the one dedicated thread the
-`PublishCoordinator` owns behind a bounded queue, which runs
-`write_ordered` on each batch and settles its guard as durable, requeued,
-quarantined or, on an unwind, latched. The guard is **not** the worker's
+`PublishCoordinator` owns behind a bounded queue, which publishes each
+detached partition through `Feed::publish` and settles its share of the
+guard as durable, requeued, quarantined or, on an unwind, latched. The guard is **not** the worker's
 to create: RFC 0052 §3.1 has `submit` create it under the exclusion with
 the batch's own epoch. Nor is it moved into one item, since a batch can
 detach several partitions into several queue slots; it is a **shared

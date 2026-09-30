@@ -11,5 +11,6 @@
 //! segment headers, or a pass.
 
 mod format;
+mod legacy_rotation;
 mod matrix;
 mod pass;

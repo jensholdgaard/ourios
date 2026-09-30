@@ -439,6 +439,9 @@ pub struct Wal {
     reclaim: reclaim_store::ReclaimSlot,
     /// Whether a housekeeping pass may plan segments (RFC 0052 §3.2).
     reclaim_gate: ReclaimGate,
+    /// Whether open found a pre-RFC root, which [`Self::on_legacy_branch`]
+    /// holds to the stale-gap belt until its first version-2 checkpoint.
+    legacy_origin: bool,
     /// Stale `<uuid>.wal.partial` files, seeded by
     /// [`Self::rebuild_ledger`] and popped by the housekeeping sweep.
     /// §3.3: the sweep lists nothing on the pass, so restart debris is
@@ -573,6 +576,7 @@ impl Wal {
             // `prepare_root` fsynced the root before the sidecars
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
+            legacy_origin: witness.legacy,
             stale_partials,
             ledger,
             outstanding: None,

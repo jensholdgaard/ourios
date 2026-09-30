@@ -633,34 +633,46 @@ impl Wal {
         let SnapshotHorizons::Known(marks) = horizons else {
             return Ok(());
         };
-        if let Some(record) = record {
-            for (_, held) in record.dictionary.live() {
-                let reclaim::SlotState::Live {
-                    reclaimed_through: Some(entry),
-                } = &held.state
-                else {
-                    continue;
-                };
-                if entry.mode != reclaim::EntryMode::Known
-                    || !self.ledger.may_hold_frames(&held.key)
-                {
-                    continue;
-                }
-                let restorable = marks.get(&held.key).and_then(|h| h.restorable());
-                if restorable.is_none_or(|horizon| horizon < entry.offset) {
-                    return Err(self.unrecoverable(&held.key, entry.offset));
-                }
-            }
+        match record.and_then(|record| self.first_lost_entry(record, marks)) {
+            Some((tenant, offset)) => Err(self.unrecoverable(&tenant, offset)),
+            // A post-RFC root is unwitnessed too until its first
+            // checkpoint, and its tenants have frames and no snapshot
+            // as a matter of course: that pass is §3.2's skip.
+            None if self.on_legacy_branch() => self.refuse_legacy_stale_gaps(marks),
+            None => Ok(()),
         }
-        // A post-RFC root is unwitnessed too until its first checkpoint,
-        // and its tenants have frames and no snapshot as a matter of
-        // course: that pass is §3.2's skip, not a refusal (issue #889).
-        match self.reclaim_gate {
-            ReclaimGate::Unwitnessed if self.on_legacy_branch() => {
-                self.refuse_legacy_stale_gaps(marks)
-            }
-            ReclaimGate::Unwitnessed | ReclaimGate::FsyncPending | ReclaimGate::Open => Ok(()),
-        }
+    }
+
+    /// The first live tenant whose `Known` entry its restorable horizon
+    /// does not reach, with the entry's offset.
+    fn first_lost_entry(
+        &self,
+        record: &reclaim::ReclaimRecord,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Option<(ourios_core::tenant::TenantId, WalOffset)> {
+        record.dictionary.live().find_map(|(_, held)| {
+            self.lost_entry(held, marks)
+                .map(|offset| (held.key.clone(), offset))
+        })
+    }
+
+    /// `held`'s entry offset when it is `Known`, its tenant may still
+    /// hold frames, and no restorable horizon reaches it.
+    fn lost_entry(
+        &self,
+        held: &reclaim::DictRecord,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Option<WalOffset> {
+        let reclaim::SlotState::Live {
+            reclaimed_through: Some(entry),
+        } = &held.state
+        else {
+            return None;
+        };
+        let checked =
+            entry.mode == reclaim::EntryMode::Known && self.ledger.may_hold_frames(&held.key);
+        let restorable = marks.get(&held.key).and_then(|h| h.restorable());
+        (checked && restorable.is_none_or(|horizon| horizon < entry.offset)).then_some(entry.offset)
     }
 
     /// The legacy branch rests on "#793 means no served root ever
@@ -682,8 +694,8 @@ impl Wal {
     }
 
     /// The same belt, at startup and before anything replaces the
-    /// snapshots it reads (RFC 0052 §3.2): on a pre-RFC root — the
-    /// legacy branch with no `RECLAIM` record yet — a version-1
+    /// snapshots it reads (RFC 0052 §3.2): on a pre-RFC root — see
+    /// [`Self::on_legacy_branch`] — a version-1
     /// artefact's mark is decoded for this check alone and offered as
     /// [`TenantHorizon::RecordedOnly`]. Checked here, the evidence is
     /// still on disk; once the post-recovery write has replaced those
@@ -711,12 +723,15 @@ impl Wal {
         }
     }
 
-    /// Whether this is a pre-RFC root (RFC 0052 §3.2): still on the
-    /// legacy branch, with no `RECLAIM` record yet. Only such a root is
-    /// held to the startup legacy stale-gap check.
+    /// Whether this is a pre-RFC root still on the legacy branch (RFC
+    /// 0052 §3.2): open found a version-1 `CHECKPOINT` or segment, and
+    /// no version-2 checkpoint has landed since. A record alone does not
+    /// end the branch — the root's first rotation writes one — and a
+    /// post-RFC root is never on it. Only such a root is held to the
+    /// legacy stale-gap belt, at open and on every pass.
     #[must_use]
     pub fn on_legacy_branch(&self) -> bool {
-        self.reclaim_gate == ReclaimGate::Unwitnessed && !self.reclaim.has_record()
+        self.reclaim_gate == ReclaimGate::Unwitnessed && self.legacy_origin
     }
 
     /// The first tenant whose oldest surviving frame is not explained

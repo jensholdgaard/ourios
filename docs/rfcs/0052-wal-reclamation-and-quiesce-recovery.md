@@ -19,8 +19,16 @@ superseded-by: —
 > startup leg, .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry/`
 > (.7, its own binary per RFC0028.2) and
 > `ourios-bench/tests/rfc0052_3_bounded_growth.rs` (.3). Slices A–E have
-> landed and discharged their stubs, .7 included. The stubs still
-> ignored are slice F's (.10 and .3) and .17's `PUBLISHED` row. That
+> landed and discharged their stubs, .7 included, and slice F's first
+> half (F1) has discharged .10: a `SIGKILL` of
+> `receiver_reclaim_crash_fixture` with the barrier and housekeeping on
+> a 100 ms cadence loses no acknowledged record, and recovery now gates
+> the replayed records on `max(X, S)` and the regenerated audit events
+> on `X` (§3.7), withholding and counting the rest. The barrier still
+> retains a cut whose snapshot write failed (RFC0052.7 pins that), so
+> the `S < X` leg reconstructs that state on disk rather than reaching
+> it through a cut. The stubs still
+> ignored are slice F2's (.3) and .17's `PUBLISHED` row. That
 > row is **recorded as partial at green and handed to RFC 0055**, as
 > RFC 0041 handed on its deferred rows: this RFC turns green on the
 > other rows once slice F lands, and RFC 0055's writer discharges the

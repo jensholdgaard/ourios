@@ -641,17 +641,12 @@ impl Barrier {
         if !published || !outcomes.all_ok(epoch) {
             return CutOutcome::Retained.into();
         }
-        // A failed install must not be followed by a stamp. §3.1 says a
-        // snapshot write failure is not a checkpoint blocker, and adds
-        // the condition that makes that safe: recovery must gate the
-        // *Parquet* side on `max(X, S)`. `recovery::DriverSink` does not
-        // yet — that gate is RFC0052.10's — so advancing `X` over a
-        // snapshot still at `S` would republish every row in `(S, X]`
-        // on the next start. Retaining does not make the next start
-        // clean: this cut's rows are already in the store, so replay
-        // re-mines them exactly as it would after a crash between the
-        // write and the stamp. What it buys is the bound — the
-        // duplicates are this cut's, not every row since `S`.
+        // A failed install is not followed by a stamp; RFC0052.7 pins the
+        // `retained` outcome. §3.1 would allow the stamp — recovery gates
+        // the sinks on `max(X, S)` (RFC0052.10), so advancing `X` over a
+        // snapshot still at `S` republishes nothing in `(S, X]`. Retaining
+        // instead costs this cut's rows, already in the store, one
+        // republish if the node restarts before a later cut stamps.
         match self.install(&snapshots, mark) {
             Install::Failed => CutOutcome::Retained.into(),
             Install::Written | Install::Superseded => self.stamp(mark),

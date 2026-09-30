@@ -381,6 +381,23 @@ struct StringLine<'a> {
     raw: &'a str,
 }
 
+/// What a string line contributes to its data record whichever way it
+/// is mined: its separators and its line-ordered, byte-capped params.
+/// Owned, because each exit path moves them into exactly one record.
+struct LineParts {
+    separators: Vec<String>,
+    params: Vec<Param>,
+}
+
+/// A `Body::Structured` line in flight: the record, its resolved
+/// `service.name`, and the body the §6.2 step-0 short-circuit keys on.
+#[derive(Clone, Copy)]
+struct StructuredLine<'a> {
+    record: &'a OtlpLogRecord,
+    service: Option<&'a str>,
+    body: &'a ourios_core::otlp::AnyValue,
+}
+
 /// [`mask`]'s view of a line. `wildcard_positions` and
 /// `typed_params` are parallel: one entry per mask-emitted slot.
 #[derive(Clone, Copy)]
@@ -652,7 +669,11 @@ impl MinerCluster {
                 service,
                 raw,
             }),
-            Some(Body::Structured(av)) => self.ingest_structured(record, service, av),
+            Some(Body::Structured(body)) => self.ingest_structured(StructuredLine {
+                record,
+                service,
+                body,
+            }),
         };
         // §6.8 `ourios.miner.duration` histogram (hot-path budget
         // D1) and the `ourios.miner.template.count` observable-gauge
@@ -782,8 +803,10 @@ impl MinerCluster {
         // empty/over-cap paths); the attach paths rebuild via
         // `build_record_params` so they apply the same check on
         // the aligned per-Wildcard-slot params.
-        let separators = separators_to_owned(&tokenized.separators);
-        let params = params_from_mask(&masked.typed_params, effective_config.param_byte_limit);
+        let parts = LineParts {
+            separators: separators_to_owned(&tokenized.separators),
+            params: params_from_mask(&masked.typed_params, effective_config.param_byte_limit),
+        };
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
         let masked_line = MaskedLine {
             strs: &masked_strs,
@@ -797,7 +820,7 @@ impl MinerCluster {
             // separator entry covering the entire input
             // (`tokens.len() + 1 == 1`).
             let mut rec = Self::record_envelope(record, BodyKind::String);
-            rec.separators = separators;
+            rec.separators = parts.separators;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
             self.emit_record(rec, service);
@@ -813,7 +836,7 @@ impl MinerCluster {
         // Vec<u16>`), whose violation would otherwise be the
         // silent-merge bug `[CLAUDE.md §3.1]` exists to prevent.
         if masked_strs.len() > usize::from(effective_config.max_line_tokens) {
-            return self.emit_string_parse_failure(line, separators, params, "line_too_long");
+            return self.emit_string_parse_failure(line, parts, "line_too_long");
         }
 
         // RFC 0050 §3.2 — the upstream-template dial. `ignore`
@@ -884,15 +907,10 @@ impl MinerCluster {
                 // parse-failure path — body retained, counted,
                 // never force-merged.
                 if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
-                    return self.emit_string_parse_failure(
-                        line,
-                        separators,
-                        params,
-                        "template_ceiling",
-                    );
+                    return self.emit_string_parse_failure(line, parts, "template_ceiling");
                 }
                 let new_id = self.create_new_leaf(line, masked_line, observed);
-                self.emit_fresh_leaf_record(line, separators, params, new_id, FreshLeafZone::Clean)
+                self.emit_fresh_leaf_record(line, parts, new_id, FreshLeafZone::Clean)
             }
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
@@ -908,8 +926,7 @@ impl MinerCluster {
                         line,
                         masked_line,
                         c,
-                        separators,
-                        params,
+                        parts,
                         effective_config.param_byte_limit,
                         observed,
                     ),
@@ -929,18 +946,12 @@ impl MinerCluster {
                         if self
                             .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
                         {
-                            return self.emit_string_parse_failure(
-                                line,
-                                separators,
-                                params,
-                                "template_ceiling",
-                            );
+                            return self.emit_string_parse_failure(line, parts, "template_ceiling");
                         }
                         let new_id = self.create_new_leaf(line, masked_line, observed);
                         self.emit_fresh_leaf_record(
                             line,
-                            separators,
-                            params,
+                            parts,
                             new_id,
                             FreshLeafZone::Lossy {
                                 confidence: c.similarity / threshold,
@@ -950,7 +961,7 @@ impl MinerCluster {
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
                     ConfidenceZone::ParseFailure => {
-                        self.emit_string_parse_failure(line, separators, params, "below_floor")
+                        self.emit_string_parse_failure(line, parts, "below_floor")
                     }
                 }
             }
@@ -981,8 +992,7 @@ impl MinerCluster {
     fn emit_fresh_leaf_record(
         &mut self,
         line: StringLine<'_>,
-        separators: Vec<String>,
-        params: Vec<Param>,
+        parts: LineParts,
         new_id: u64,
         zone: FreshLeafZone,
     ) -> u64 {
@@ -994,8 +1004,8 @@ impl MinerCluster {
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.template_id = new_id;
         rec.template_version = 1;
-        rec.separators = separators;
-        rec.params = params;
+        rec.separators = parts.separators;
+        rec.params = parts.params;
         match zone {
             FreshLeafZone::Clean => rec.confidence = 1.0,
             FreshLeafZone::Lossy { confidence } => {
@@ -1019,8 +1029,7 @@ impl MinerCluster {
     fn emit_string_parse_failure(
         &mut self,
         line: StringLine<'_>,
-        separators: Vec<String>,
-        params: Vec<Param>,
+        parts: LineParts,
         reason: &'static str,
     ) -> u64 {
         let StringLine {
@@ -1029,8 +1038,8 @@ impl MinerCluster {
             raw,
         } = line;
         let mut rec = Self::record_envelope(record, BodyKind::String);
-        rec.separators = separators;
-        rec.params = params;
+        rec.separators = parts.separators;
+        rec.params = parts.params;
         rec.body = Some(raw.to_string());
         rec.lossy_flag = true;
         // §6.5: bump `params_overflow_total` for any overflow params
@@ -1659,14 +1668,12 @@ impl MinerCluster {
     ///     `TemplateTypeExpanded` per RFC §6.2's combined-attach
     ///     contract (`template_version` increments twice, two events
     ///     emitted in widening-then-expansion order).
-    #[allow(clippy::too_many_arguments)]
     fn attach_and_maybe_widen(
         &mut self,
         line: StringLine<'_>,
         masked: MaskedLine<'_>,
         candidate: Candidate,
-        separators: Vec<String>,
-        params: Vec<Param>,
+        parts: LineParts,
         byte_limit: u32,
         observed: Option<&str>,
     ) -> u64 {
@@ -1675,6 +1682,7 @@ impl MinerCluster {
             service,
             raw,
         } = line;
+        let LineParts { separators, params } = parts;
         // Ownership rationale: each exit path emits **one** data
         // record and never reuses `separators` / `params` after
         // that emit. Taking the vectors by value lets each branch
@@ -1730,7 +1738,11 @@ impl MinerCluster {
                 // failure that retains body (the line-ordered
                 // params fallback is fine — reconstruct ignores
                 // `params` on the lossy path).
-                self.emit_string_parse_failure(line, separators, params, "degenerate_widening")
+                self.emit_string_parse_failure(
+                    line,
+                    LineParts { separators, params },
+                    "degenerate_widening",
+                )
             }
             AttachPlan::Mutated {
                 template_id,
@@ -1779,14 +1791,9 @@ impl MinerCluster {
     /// template_id` map is the entire lookup. First observation of a
     /// tuple allocates; subsequent records with the same tuple reuse.
     /// Structured records never widen and never emit audit events.
-    fn ingest_structured(
-        &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        any_value: &ourios_core::otlp::AnyValue,
-    ) -> u64 {
-        let template_id = self.structured_template_id(record);
-        self.emit_structured(record, service, any_value, template_id);
+    fn ingest_structured(&mut self, line: StructuredLine<'_>) -> u64 {
+        let template_id = self.structured_template_id(line.record);
+        self.emit_structured(line, template_id);
         template_id
     }
 
@@ -1819,13 +1826,12 @@ impl MinerCluster {
     }
 
     /// Emit a structured record's data row under `template_id`.
-    fn emit_structured(
-        &mut self,
-        record: &OtlpLogRecord,
-        service: Option<&str>,
-        any_value: &ourios_core::otlp::AnyValue,
-        template_id: u64,
-    ) {
+    fn emit_structured(&mut self, line: StructuredLine<'_>, template_id: u64) {
+        let StructuredLine {
+            record,
+            service,
+            body: any_value,
+        } = line;
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
         // `body` field (per §6.2 step 0), and `lossy_flag = false`

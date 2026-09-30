@@ -5,14 +5,15 @@
 //! in `README.md`): it installs the **global** in-memory meter provider
 //! and a global `tracing` subscriber bridged onto an in-memory log
 //! exporter, and two global-installing tests in one binary would race.
-//! The three legs here share both installs, so they run one at a time.
+//! The four legs here share both installs, so they run one at a time.
 //!
-//! One binary, three legs, one module each: `instruments` (the exported
-//! stream), `transitions` (each edge's event) and `live_check` (every
-//! event against the registry); `harness`, `metric_read` and `drivers`
-//! are what they share. `snapshot_discard` rides the same event capture
-//! for startup recovery's discard event (#884), so CI's weaver rerun of
-//! this binary live-checks it too.
+//! One binary, four legs, one module each: `instruments` (the exported
+//! stream), `transitions` (each edge's event), `live_check` (every
+//! RFC 0052 event against the registry) and `snapshot_discard` (#884:
+//! startup recovery emits `ourios.receiver.snapshot.discarded` once per
+//! discarded tenant with its `error.type`, none for a restored one, and
+//! live-checks the event, so CI's weaver rerun of this binary covers it
+//! too); `harness`, `metric_read` and `drivers` are what they share.
 
 #[path = "../it/ingest_support/mod.rs"]
 mod ingest_support;

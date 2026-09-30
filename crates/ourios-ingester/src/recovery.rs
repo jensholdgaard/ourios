@@ -44,8 +44,7 @@ pub struct RecoveryReport {
     /// write path joins the pipeline (no data-side consumer exists
     /// yet to suppress for).
     pub parquet_horizon: Option<WalOffset>,
-    /// Highest offset delivered during replay — the high-water mark
-    /// a post-recovery snapshot records.
+    /// Highest offset delivered during replay.
     pub max_delivered: Option<WalOffset>,
     /// Per-tenant snapshot outcome, one entry per artefact found.
     pub tenants: Vec<TenantRecovery>,
@@ -60,38 +59,6 @@ impl RecoveryReport {
             .iter()
             .filter_map(|tenant| tenant.horizon.map(|h| (tenant.tenant_id.clone(), h)))
             .collect()
-    }
-
-    /// The horizons the post-recovery snapshot write stamps (RFC 0052
-    /// §3.7), indexed once so the write looks each tenant up in O(1).
-    #[must_use]
-    pub fn post_recovery_horizons(&self) -> PostRecoveryHorizons {
-        PostRecoveryHorizons {
-            restored: self.accepted_horizons().into_iter().collect(),
-            replayed: self.max_delivered,
-        }
-    }
-}
-
-/// Each tenant's post-recovery snapshot horizon (RFC 0052 §3.7).
-#[derive(Debug, Default)]
-pub struct PostRecoveryHorizons {
-    restored: HashMap<TenantId, WalOffset>,
-    replayed: Option<WalOffset>,
-}
-
-impl PostRecoveryHorizons {
-    /// The later of `tenant`'s restored horizon and the replay mark.
-    /// Replay folds every frame above the restored horizon into the
-    /// miner, so the later of the two covers what the state holds, and
-    /// neither is ever written below the other. A replay that delivered
-    /// nothing — every closed frame reclaimed — keeps the restored
-    /// horizon rather than writing `None` over it, which the next start
-    /// would discard with no frames left to rebuild from.
-    #[must_use]
-    pub fn horizon(&self, tenant: &TenantId) -> Option<WalOffset> {
-        // `None` orders below every `Some`.
-        self.restored.get(tenant).copied().max(self.replayed)
     }
 }
 
@@ -262,8 +229,7 @@ pub fn write_snapshots(
 }
 
 /// [`write_snapshots`] with each tenant's high-water mark chosen by
-/// `high_water` — the post-recovery write's per-tenant horizons (RFC
-/// 0052 §3.7). Returns the horizon every written artefact carries, for
+/// `high_water`. Returns the horizon every written artefact carries, for
 /// seeding the snapshot ledger with exactly what was installed.
 ///
 /// # Errors
@@ -286,6 +252,23 @@ pub fn write_snapshots_with(
         }
     }
     Ok(installed)
+}
+
+/// [`write_snapshots_with`] at each tenant's own folded horizon (RFC 0052
+/// §3.1) — the post-recovery and shutdown cadence points' stamp.
+///
+/// # Errors
+///
+/// As [`write_snapshots`].
+pub fn write_folded_snapshots(
+    root: &Path,
+    miner: &MinerCluster,
+) -> Result<Vec<(TenantId, WalOffset)>, SnapshotStoreError> {
+    write_snapshots_with(root, miner, |tenant| {
+        miner
+            .folded_horizon(tenant)
+            .and_then(snapshot_store::offset_of)
+    })
 }
 
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
@@ -474,52 +457,6 @@ mod tests {
         let x = offset("00000000-0000-7000-8000-000000000002", 5);
         let seen = HashSet::from([s.segment, x.segment]);
         assert!(!stale_gap(s, Some(x), &seen));
-    }
-
-    /// RFC 0052 §3.7: the post-recovery horizon is the later of the
-    /// restored one and the replay mark, per tenant, so a replay that
-    /// delivered nothing keeps the restored horizon and one that
-    /// delivered frames never writes a tenant below where it restored.
-    #[test]
-    fn post_recovery_horizon_is_the_later_of_the_restored_horizon_and_the_replay_mark() {
-        let early = offset("00000000-0000-7000-8000-000000000001", 10);
-        let late = offset("00000000-0000-7000-8000-000000000002", 5);
-        let restored = |tenant: &str, horizon| TenantRecovery {
-            tenant_id: TenantId::new(tenant),
-            outcome: RecoveryOutcome::Restored,
-            stale_gap: false,
-            horizon: Some(horizon),
-        };
-        let report = |max_delivered| {
-            RecoveryReport {
-                max_delivered,
-                tenants: vec![restored("behind", early), restored("ahead", late)],
-                ..RecoveryReport::default()
-            }
-            .post_recovery_horizons()
-        };
-        let horizon = |horizons: &PostRecoveryHorizons, tenant: &str| {
-            horizons.horizon(&TenantId::new(tenant))
-        };
-
-        let idle = report(None);
-        assert_eq!(horizon(&idle, "behind"), Some(early), "nothing replayed");
-        assert_eq!(horizon(&idle, "ahead"), Some(late));
-        assert_eq!(
-            horizon(&idle, "fresh"),
-            None,
-            "nothing restored or replayed"
-        );
-
-        let replayed = report(Some(early));
-        assert_eq!(horizon(&replayed, "behind"), Some(early));
-        assert_eq!(horizon(&replayed, "ahead"), Some(late), "never downgraded");
-        assert_eq!(horizon(&replayed, "fresh"), Some(early), "replay alone");
-
-        let past = offset("00000000-0000-7000-8000-000000000003", 1);
-        let caught_up = report(Some(past));
-        assert_eq!(horizon(&caught_up, "behind"), Some(past));
-        assert_eq!(horizon(&caught_up, "ahead"), Some(past));
     }
 
     fn sink<'a>(

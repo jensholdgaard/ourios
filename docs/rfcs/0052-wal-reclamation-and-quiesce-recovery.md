@@ -56,6 +56,13 @@ superseded-by: —
 > cadence-tick panic leg);
 > **F** crash and soak (.10 on the rfc0014_5 fixture, .3 on the extended
 > soak harness). A before B; B before D and E; F last.
+> **Snapshot v2 (#877)** sits outside the six slices and has landed as
+> its own breaking change: §3.1's per-tenant folded horizon in
+> `wal_high_water` (each ingest turn and each replayed frame folds its
+> tenant's horizon, and the cut, the shutdown write and the ledger carry
+> it per tenant) and `SNAPSHOT_VERSION` 1 → 2, a version-1 artefact
+> taking the unknown-version discard path. The §8 amendment of RFC
+> 0001 §6.9's global high-water wording is live from that landing.
 > **Stage 1 of two.** Motivated by a production
 > incident (issue #791) and the defects found tracing it (#791, #793). Amends
 > RFC 0008 §6.5 and §6.7 with the *policy* those sections left to a caller

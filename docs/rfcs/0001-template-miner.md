@@ -2314,6 +2314,14 @@ deferred for that reason.
 `[§3.7]`'s per-tenant trees. Recovery loads the latest snapshot per
 tenant independently; there is no cluster-wide combined artefact.
 
+> **Amended by RFC 0052 §3.1 (snapshot format 2, #877).** The
+> recorded high-water mark is **per tenant**: the WAL offset of that
+> tenant's own last frame folded into its state, not the one mark of
+> the cut that took the snapshot. An idle tenant keeps its older
+> horizon across later snapshots. A version-1 artefact, whose mark
+> had the old global meaning, takes the unknown-version path of
+> step (3) below.
+
 *Cadence: per WAL-segment rotation.* A snapshot is taken at
 WAL-segment-rotation boundaries. The snapshot records the WAL
 **high-water mark** — the `WalOffset` (RFC 0008 §6.1) up to which

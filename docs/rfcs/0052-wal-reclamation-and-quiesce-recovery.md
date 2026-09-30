@@ -27,9 +27,17 @@ superseded-by: —
 > on `X` (§3.7), withholding and counting the rest. The barrier still
 > retains a cut whose snapshot write failed (RFC0052.7 pins that), so
 > the `S < X` leg reconstructs that state on disk rather than reaching
-> it through a cut. The stubs still
-> ignored are slice F2's (.3) and .17's `PUBLISHED` row. That
-> row is **recorded as partial at green and handed to RFC 0055**, as
+> it through a cut. Slice F2 has discharged .3 on the reclamation soak
+> harness (`ourios-bench/src/soak/reclaim.rs`), which runs the
+> receiver's barrier and housekeeping ticks on a stepped synthetic
+> clock: a capacity-balanced run over three tenants rolls twelve
+> segments under the 300 s / 60 s cadences and never holds more than
+> the bound its config derives (four segments), and an idle node
+> reclaims every closed segment one `barrier_secs` plus one
+> `housekeeping_secs` after its last append, and its last segment within
+> `segment_age_secs` more. The recorded long soak run §6 requires before
+> `validated` is still to come. The only stub still ignored is .17's
+> `PUBLISHED` row. That row is **recorded as partial at green and handed to RFC 0055**, as
 > RFC 0041 handed on its deferred rows: this RFC turns green on the
 > other rows once slice F lands, and RFC 0055's writer discharges the
 > row. Implementation proceeds in six green slices, each

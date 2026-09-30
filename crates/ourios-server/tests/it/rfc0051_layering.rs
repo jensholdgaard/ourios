@@ -70,6 +70,13 @@ fn reached_span(text: &str, after: usize) -> &str {
     }
 }
 
+/// The 1-based line holding byte offset `at` of `text`. Counting
+/// `lines()` of the prefix instead is 0 for a hit on the first line and
+/// one short for any hit at the start of a line.
+fn line_of(text: &str, at: usize) -> usize {
+    text[..at].matches('\n').count() + 1
+}
+
 fn names_offend(span: &str) -> bool {
     let mentions = |name: &str| {
         span.split(|c: char| !(c.is_alphanumeric() || c == '_'))
@@ -118,7 +125,7 @@ fn rfc0051_1_server_and_querier_shed_the_ingest_serving_paths() {
             let after = from + hit + RECEIVER_PATH.len();
             let span = reached_span(&text, after);
             if names_offend(span) {
-                let line = text[..from + hit].lines().count();
+                let line = line_of(&text, from + hit);
                 offences.push(format!(
                     "{}:{}: ourios_ingester::receiver::{}",
                     path.display(),
@@ -174,7 +181,19 @@ fn rfc0051_2_core_manifest_has_no_http_stack() {
 
 #[cfg(test)]
 mod gate_self_tests {
-    use super::{names_offend, reached_span};
+    use super::{line_of, names_offend, reached_span};
+
+    /// Offences are reported at 1-based lines, including a hit that opens
+    /// the file or starts a line.
+    #[test]
+    fn offence_lines_are_one_based() {
+        let text =
+            "ourios_ingester::receiver::auth;\nfn f() {}\nourios_ingester::receiver::tls;\n  x";
+        assert_eq!(line_of(text, 0), 1);
+        let second = text.rfind("ourios_ingester").expect("test data");
+        assert_eq!(line_of(text, second), 3);
+        assert_eq!(line_of(text, text.len() - 1), 4);
+    }
 
     /// The scanner sees through every import form the gate must catch —
     /// including the brace-grouped and multi-line shapes a line-based

@@ -31,8 +31,8 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::timeout;
 
 const DEX_IMAGE: &str = "ghcr.io/dexidp/dex";
@@ -81,76 +81,18 @@ const APP_LINES: &[&str] = &[
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Docker (real Dex + otelcol-contrib containers); run by the collector-interop CI job via --ignored"]
 async fn collector_exports_over_tls_and_oidc() {
-    use testcontainers_modules::testcontainers::core::{ContainerPort, Host};
+    use testcontainers_modules::testcontainers::core::Host;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
 
-    // Reserve the Dex host port up front — the issuer URL is baked into the
-    // Dex config and enforced by the verifier, so it must be known before the
-    // container starts (RFC0029.7 precedent).
-    fn reserve_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        l.local_addr().expect("addr").port()
-    }
-
     // --- Dex (OIDC provider) -------------------------------------------------
-    let dex_config_for = |issuer: &str| {
-        format!(
-            "issuer: {issuer}\n\
-             storage:\n  type: memory\n\
-             web:\n  http: 0.0.0.0:5556\n\
-             enablePasswordDB: true\n\
-             oauth2:\n  grantTypes: [\"client_credentials\"]\n\
-             expiry:\n  idTokens: \"120s\"\n\
-             staticClients:\n\
-             \x20\x20- id: {CLIENT_ID}\n\
-             \x20\x20\x20\x20name: Edge Collector\n\
-             \x20\x20\x20\x20secret: {CLIENT_SECRET}\n\
-             \x20\x20\x20\x20clientCredentialsClaims:\n\
-             \x20\x20\x20\x20\x20\x20groups: [\"{TENANT}\", \"globex\"]\n"
-        )
-    };
-    let mut started = None;
-    for attempt in 0..3 {
-        let dex_port = reserve_port();
-        let issuer = format!("http://127.0.0.1:{dex_port}/dex");
-        match GenericImage::new(DEX_IMAGE, DEX_TAG)
-            .with_copy_to(
-                "/etc/dex/config.docker.yaml",
-                dex_config_for(&issuer).into_bytes(),
-            )
-            .with_env_var("DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
-            .with_mapped_port(dex_port, ContainerPort::Tcp(5556))
-            .start()
-            .await
-        {
-            Ok(container) => {
-                started = Some((container, issuer, dex_port));
-                break;
-            }
-            Err(e) if attempt < 2 => eprintln!("dex start attempt {attempt} failed: {e}"),
-            Err(e) => panic!("dex never started: {e}"),
-        }
-    }
-    let (dex, issuer, dex_port) = started.expect("dex started");
-
+    let (dex, issuer, dex_port) = start_dex().await;
     let http = reqwest::Client::new();
-    let discovery_url = format!("{issuer}/.well-known/openid-configuration");
-    if timeout(Duration::from_secs(90), async {
-        loop {
-            if let Ok(r) = http.get(&discovery_url).send().await
-                && r.status().is_success()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        panic!("dex never became ready:\n{}", container_logs(&dex).await);
-    }
+    assert!(
+        dex_ready(&http, &issuer).await,
+        "dex never became ready:\n{}",
+        container_logs(&dex).await
+    );
 
     // --- TLS material --------------------------------------------------------
     // The cert carries `host.docker.internal` so the Collector (in a
@@ -213,28 +155,18 @@ async fn collector_exports_over_tls_and_oidc() {
     });
     let stdout = child.stdout.take().expect("stdout piped");
     let mut out_lines = BufReader::new(stdout).lines();
-    let (grpc_addr, querier_addr) = timeout(Duration::from_secs(15), async {
-        let (mut grpc, mut querier) = (None, None);
-        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
-            if let Some(a) = line.strip_prefix("receiver gRPC listening on ") {
-                grpc = Some(a.trim().to_string());
-            }
-            if let Some(a) = line.strip_prefix("querier HTTP listening on ") {
-                querier = Some(a.trim().to_string());
-            }
-            if let (Some(g), Some(q)) = (&grpc, &querier) {
-                return (g.clone(), q.clone());
-            }
-        }
-        panic!("ourios role announcements never appeared");
-    })
+    let [grpc_addr, querier_addr] = timeout(
+        Duration::from_secs(15),
+        announced(
+            &mut out_lines,
+            ["receiver gRPC listening on ", "querier HTTP listening on "],
+            "ourios role announcements never appeared",
+        ),
+    )
     .await
     .expect("ourios ready before timeout");
     // "0.0.0.0:PORT" — the container reaches the same port on the host gateway.
-    let grpc_port: u16 = grpc_addr
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .expect("grpc port");
+    let grpc_port = port_of(&grpc_addr);
 
     // --- The OTel Collector --------------------------------------------------
     let collector_config = format!(
@@ -275,8 +207,7 @@ async fn collector_exports_over_tls_and_oidc() {
 
     // Baseline the WAL before the Collector can export, so a segment header
     // written at startup isn't mistaken for a delivered batch.
-    let wal_bytes = || dir_bytes(&wal);
-    let wal_baseline = wal_bytes();
+    let wal_baseline = dir_bytes(&wal);
 
     let collector = GenericImage::new(COLLECTOR_IMAGE, COLLECTOR_TAG)
         .with_copy_to(
@@ -296,28 +227,11 @@ async fn collector_exports_over_tls_and_oidc() {
     // written before the receiver acks the Collector — so a WAL that has grown
     // past its baseline and then gone quiet means the batch landed. Then we
     // flush and read back.
-    let acked = timeout(Duration::from_secs(120), async {
-        let (mut last, mut stable) = (wal_baseline, 0u32);
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let cur = wal_bytes();
-            if cur > wal_baseline && cur == last {
-                stable += 1;
-                if stable >= 2 {
-                    return;
-                }
-            } else {
-                stable = 0;
-            }
-            last = cur;
-        }
-    })
-    .await;
     assert!(
-        acked.is_ok(),
+        wal_acked(&wal, wal_baseline).await,
         "collector never delivered a batch (WAL stayed empty at {} bytes).\n\
          --- otelcol logs ---\n{}",
-        wal_bytes(),
+        dir_bytes(&wal),
         container_logs(&collector).await,
     );
 
@@ -347,19 +261,7 @@ async fn collector_exports_over_tls_and_oidc() {
     // --- Flush and read the store back ---------------------------------------
     // SIGTERM (what k8s sends) drains the sink; the querier dies with it, so
     // we assert landing by reading the flushed Parquet directly.
-    let pid = child.id().expect("pid").to_string();
-    Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .await
-        .expect("kill")
-        .success()
-        .then_some(())
-        .expect("SIGTERM delivered");
-    timeout(Duration::from_secs(20), child.wait())
-        .await
-        .expect("exit before timeout")
-        .expect("child exits");
+    sigterm_and_wait(&mut child).await;
     let stderr_lines = timeout(Duration::from_secs(15), drain)
         .await
         .expect("stderr drains")
@@ -377,23 +279,12 @@ async fn collector_exports_over_tls_and_oidc() {
     );
 
     let mut rendered = Vec::new();
-    for f in data_parquet_files(&tmp.path().join("data")) {
-        let records = ourios_parquet::Reader::open_file(&f)
-            .expect("open data file")
-            .read_all()
-            .expect("read records");
-        for record in records {
-            assert_eq!(
-                record.tenant_id, tenant,
-                "every Collector-shipped record binds to the JWT-derived tenant",
-            );
-            let ourios_querier::LogBody::Rendered { line, .. } =
-                ourios_querier::render_log_body(&record, &registry)
-            else {
-                panic!("a string body renders to a line");
-            };
-            rendered.push(String::from_utf8(line).expect("utf8 line"));
-        }
+    for record in stored_records(&tmp.path().join("data")) {
+        assert_eq!(
+            record.tenant_id, tenant,
+            "every Collector-shipped record binds to the JWT-derived tenant",
+        );
+        rendered.push(rendered_line(&record, &registry));
     }
     rendered.sort();
     let mut want: Vec<String> = APP_LINES.iter().map(|s| (*s).to_owned()).collect();
@@ -431,44 +322,210 @@ async fn mint_token(http: &reqwest::Client, issuer: &str) -> String {
         .to_string()
 }
 
-/// Total bytes of all regular files under `dir` (0 if absent).
-fn dir_bytes(dir: &std::path::Path) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(meta) = path.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
+/// Reserve a host port up front — the Dex issuer URL is baked into its
+/// config and enforced by the verifier, so it must be known before the
+/// container starts (RFC0029.7 precedent).
+fn reserve_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    l.local_addr().expect("addr").port()
 }
 
-/// All `.parquet` files under `root`, recursively (empty when absent).
-fn data_parquet_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+/// Dex's config for `issuer`: client-credentials grants for the Collector's
+/// client, whose token carries the tenant groups.
+fn dex_config(issuer: &str) -> String {
+    format!(
+        "issuer: {issuer}\n\
+         storage:\n  type: memory\n\
+         web:\n  http: 0.0.0.0:5556\n\
+         enablePasswordDB: true\n\
+         oauth2:\n  grantTypes: [\"client_credentials\"]\n\
+         expiry:\n  idTokens: \"120s\"\n\
+         staticClients:\n\
+         \x20\x20- id: {CLIENT_ID}\n\
+         \x20\x20\x20\x20name: Edge Collector\n\
+         \x20\x20\x20\x20secret: {CLIENT_SECRET}\n\
+         \x20\x20\x20\x20clientCredentialsClaims:\n\
+         \x20\x20\x20\x20\x20\x20groups: [\"{TENANT}\", \"globex\"]\n"
+    )
+}
+
+type Dex = testcontainers_modules::testcontainers::ContainerAsync<
+    testcontainers_modules::testcontainers::GenericImage,
+>;
+
+/// Start Dex on a freshly reserved port, retrying twice (a reserved port can
+/// be taken before the container binds it). Returns the container, its
+/// issuer URL and its host port.
+async fn start_dex() -> (Dex, String, u16) {
+    use testcontainers_modules::testcontainers::core::ContainerPort;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+    for attempt in 0..3 {
+        let dex_port = reserve_port();
+        let issuer = format!("http://127.0.0.1:{dex_port}/dex");
+        let started = GenericImage::new(DEX_IMAGE, DEX_TAG)
+            .with_copy_to(
+                "/etc/dex/config.docker.yaml",
+                dex_config(&issuer).into_bytes(),
+            )
+            .with_env_var("DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
+            .with_mapped_port(dex_port, ContainerPort::Tcp(5556))
+            .start()
+            .await;
+        match started {
+            Ok(container) => return (container, issuer, dex_port),
+            Err(e) if attempt < 2 => eprintln!("dex start attempt {attempt} failed: {e}"),
+            Err(e) => panic!("dex never started: {e}"),
+        }
+    }
+    unreachable!("dex started: the last attempt returns or panics")
+}
+
+/// Whether Dex's discovery document served a success within 90 s.
+async fn dex_ready(http: &reqwest::Client, issuer: &str) -> bool {
+    let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+    let serves = || async {
+        http.get(&discovery_url)
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    };
+    timeout(Duration::from_secs(90), async {
+        while !serves().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Every non-directory path under `root`, recursively (empty when absent;
+/// unreadable directories are skipped).
+fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+        for path in entries.map(|entry| entry.path()) {
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "parquet") {
+            } else {
                 files.push(path);
             }
         }
     }
     files
+}
+
+/// Total bytes of all regular files under `dir` (0 if absent).
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    walk_files(dir)
+        .iter()
+        .filter_map(|path| path.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// All `.parquet` files under `root`, recursively (empty when absent).
+fn data_parquet_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    walk_files(root)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|e| e == "parquet"))
+        .collect()
+}
+
+/// Every record in the `.parquet` files under `root`.
+fn stored_records(root: &std::path::Path) -> Vec<ourios_core::record::MinedRecord> {
+    data_parquet_files(root)
+        .iter()
+        .flat_map(|f| {
+            ourios_parquet::Reader::open_file(f)
+                .expect("open data file")
+                .read_all()
+                .expect("read records")
+        })
+        .collect()
+}
+
+/// `record`'s body rendered through `registry`, as UTF-8.
+fn rendered_line(
+    record: &ourios_core::record::MinedRecord,
+    registry: &ourios_querier::TemplateRegistry,
+) -> String {
+    let ourios_querier::LogBody::Rendered { line, .. } =
+        ourios_querier::render_log_body(record, registry)
+    else {
+        panic!("a string body renders to a line");
+    };
+    String::from_utf8(line).expect("utf8 line")
+}
+
+/// Read `lines` until every prefix in `prefixes` has announced an address,
+/// returning the addresses in prefix order; panics with `missing` if stdout
+/// closes first.
+async fn announced<const N: usize>(
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    prefixes: [&str; N],
+    missing: &str,
+) -> [String; N] {
+    let mut found: [Option<String>; N] = std::array::from_fn(|_| None);
+    while let Some(line) = lines.next_line().await.expect("read stdout") {
+        for (slot, prefix) in found.iter_mut().zip(prefixes) {
+            if let Some(a) = line.strip_prefix(prefix) {
+                *slot = Some(a.trim().to_string());
+            }
+        }
+        if found.iter().all(Option::is_some) {
+            return found.map(Option::unwrap_or_default);
+        }
+    }
+    panic!("{missing}");
+}
+
+/// The port of a `host:port` listen address.
+fn port_of(addr: &str) -> u16 {
+    addr.rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .expect("grpc port")
+}
+
+/// Whether the WAL under `wal` grew past `baseline` and then held still for
+/// two one-second ticks within 120 s — WAL-before-ack means the receiver
+/// acked the batch.
+async fn wal_acked(wal: &std::path::Path, baseline: u64) -> bool {
+    timeout(Duration::from_secs(120), async {
+        let (mut last, mut stable) = (baseline, 0u32);
+        while stable < 2 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let cur = dir_bytes(wal);
+            stable = if cur > baseline && cur == last {
+                stable + 1
+            } else {
+                0
+            };
+            last = cur;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// SIGTERM `child` (what k8s sends; it drains the sink) and wait for it.
+async fn sigterm_and_wait(child: &mut Child) {
+    let pid = child.id().expect("pid").to_string();
+    Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .await
+        .expect("kill")
+        .success()
+        .then_some(())
+        .expect("SIGTERM delivered");
+    timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("exit before timeout")
+        .expect("child exits");
 }
 
 /// A container's stdout + stderr, for surfacing a config rejection that would
@@ -562,20 +619,17 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
         .expect("spawn ourios-server");
     let stdout = child.stdout.take().expect("stdout piped");
     let mut out_lines = BufReader::new(stdout).lines();
-    let grpc_addr = timeout(Duration::from_secs(15), async {
-        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
-            if let Some(a) = line.strip_prefix("receiver gRPC listening on ") {
-                return a.trim().to_string();
-            }
-        }
-        panic!("receiver announcement never appeared");
-    })
+    let [grpc_addr] = timeout(
+        Duration::from_secs(15),
+        announced(
+            &mut out_lines,
+            ["receiver gRPC listening on "],
+            "receiver announcement never appeared",
+        ),
+    )
     .await
     .expect("ourios ready before timeout");
-    let grpc_port: u16 = grpc_addr
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .expect("grpc port");
+    let grpc_port = port_of(&grpc_addr);
 
     let collector_config = format!(
         "receivers:\n\
@@ -605,8 +659,7 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     );
     let app_log = format!("{}\n", DRAIN_LINES.join("\n"));
 
-    let wal_bytes = || dir_bytes(&wal);
-    let wal_baseline = wal_bytes();
+    let wal_baseline = dir_bytes(&wal);
 
     let collector = GenericImage::new(COLLECTOR_IMAGE, COLLECTOR_TAG)
         .with_copy_to(
@@ -621,43 +674,14 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
 
     // WAL-before-ack: growth past the baseline, then quiet, means the
     // annotated batch landed (the sibling test's ack heuristic).
-    let acked = timeout(Duration::from_secs(120), async {
-        let (mut last, mut stable) = (wal_baseline, 0u32);
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let cur = wal_bytes();
-            if cur > wal_baseline && cur == last {
-                stable += 1;
-                if stable >= 2 {
-                    return;
-                }
-            } else {
-                stable = 0;
-            }
-            last = cur;
-        }
-    })
-    .await;
     assert!(
-        acked.is_ok(),
+        wal_acked(&wal, wal_baseline).await,
         "collector never delivered a batch (WAL stayed at {} bytes).\n{}",
-        wal_bytes(),
+        dir_bytes(&wal),
         container_logs(&collector).await,
     );
 
-    let pid = child.id().expect("pid").to_string();
-    Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .await
-        .expect("kill")
-        .success()
-        .then_some(())
-        .expect("SIGTERM delivered");
-    timeout(Duration::from_secs(20), child.wait())
-        .await
-        .expect("exit before timeout")
-        .expect("child exits");
+    sigterm_and_wait(&mut child).await;
 
     let tenant = ourios_core::tenant::TenantId::new(TENANT);
     let registry = ourios_querier::derive_template_registry(
@@ -666,95 +690,37 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     )
     .expect("derive registry");
 
-    let claim_of = |record: &ourios_core::record::MinedRecord| -> Option<String> {
-        record.attributes.iter().find_map(|kv| {
-            (kv.key == "log.record.template")
-                .then(|| kv.value.as_ref()?.value.as_ref())
-                .flatten()
-                .and_then(|v| match v {
-                    ourios_core::otlp::any_value::Value::StringValue(s) => Some(s.clone()),
-                    _ => None,
-                })
-        })
-    };
-
     // The adopt discriminator: only the RFC 0050 adopt path emits
     // `template_adopted` audit events. Without this, "the row's
     // template renders the claim" would be circular — the built-in
     // miner converges on the same canonical for this corpus even
     // under `ignore`.
-    let mut adopted_events: Vec<(u64, String)> = Vec::new();
-    for f in data_parquet_files(&tmp.path().join("audit")) {
-        let events = ourios_parquet::AuditReader::open_file(&f)
-            .expect("open audit file")
-            .read_all()
-            .expect("read audit events");
-        for event in events {
-            if let ourios_core::audit::AuditPayload::Template {
-                template_id,
-                change: ourios_core::audit::TemplateChange::Adopted { new_template, .. },
-                ..
-            } = event.payload
-            {
-                adopted_events.push((template_id, new_template));
-            }
-        }
-    }
+    let adoptions = adopted_events(&tmp.path().join("audit"));
     assert!(
-        adopted_events
-            .iter()
-            .any(|(_, template)| template == CONVERGED),
-        "the adopt path audited the drainprocessor's converged template: {adopted_events:?}",
+        adoptions.iter().any(|a| a.template == CONVERGED),
+        "the adopt path audited the drainprocessor's converged template: {adoptions:?}",
     );
 
     let mut converged_adoptions = 0usize;
     let mut rendered = Vec::new();
-    for f in data_parquet_files(&tmp.path().join("data")) {
-        let records = ourios_parquet::Reader::open_file(&f)
-            .expect("open data file")
-            .read_all()
-            .expect("read records");
-        for record in records {
-            // RFC 0018: the drainprocessor's annotation is stored
-            // verbatim — checked against the a-priori oracle, not
-            // against the store's own contents.
-            let claim = claim_of(&record)
-                .unwrap_or_else(|| panic!("drain annotated every record: {record:?}"));
-            let ourios_querier::LogBody::Rendered { line, .. } =
-                ourios_querier::render_log_body(&record, &registry)
-            else {
-                panic!("a string body renders to a line");
-            };
-            let line = String::from_utf8(line).expect("utf8 line");
-            // Pre-convergence, drain annotates a line with itself.
-            assert!(
-                claim == CONVERGED || claim == line,
-                "every stored claim is drain's known output for this corpus, \
-                 got {claim:?} (line {line:?})",
-            );
-            // A converged claim was adopted: the audit stream carries
-            // its template_adopted event for this row's id, and the
-            // registry tokens at the row's key render the claim.
-            if claim == CONVERGED {
-                assert!(
-                    adopted_events
-                        .iter()
-                        .any(|(id, _)| *id == record.template_id),
-                    "row {} adopted via the audited adopt path",
-                    record.template_id,
-                );
-                let tokens = registry
-                    .get(&(record.template_id, record.template_version))
-                    .expect("adopted row's (id, version) resolves in the registry");
-                assert_eq!(
-                    ourios_miner::tree::format_template(tokens),
-                    claim,
-                    "the row's template IS the drainprocessor's claim",
-                );
-                converged_adoptions += 1;
-            }
-            rendered.push(line);
+    for record in stored_records(&tmp.path().join("data")) {
+        // RFC 0018: the drainprocessor's annotation is stored
+        // verbatim — checked against the a-priori oracle, not
+        // against the store's own contents.
+        let claim = drain_claim(&record)
+            .unwrap_or_else(|| panic!("drain annotated every record: {record:?}"));
+        let line = rendered_line(&record, &registry);
+        // Pre-convergence, drain annotates a line with itself.
+        assert!(
+            claim == CONVERGED || claim == line,
+            "every stored claim is drain's known output for this corpus, \
+             got {claim:?} (line {line:?})",
+        );
+        if claim == CONVERGED {
+            assert_adopted(&record, &claim, &adoptions, &registry);
+            converged_adoptions += 1;
         }
+        rendered.push(line);
     }
     assert!(
         converged_adoptions >= DRAIN_LINES.len() / 2,
@@ -768,5 +734,91 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     assert_eq!(
         rendered, want,
         "every line reconstructs byte-identically (RFC0050.4)",
+    );
+}
+
+/// The drainprocessor's `log.record.template` annotation on `record`.
+fn drain_claim(record: &ourios_core::record::MinedRecord) -> Option<String> {
+    record.attributes.iter().find_map(|kv| {
+        (kv.key == "log.record.template")
+            .then(|| kv.value.as_ref()?.value.as_ref())
+            .flatten()
+            .and_then(|v| match v {
+                ourios_core::otlp::any_value::Value::StringValue(s) => Some(s.clone()),
+                _ => None,
+            })
+    })
+}
+
+/// One `template_adopted` audit event: the adoption binds `template`
+/// to the registry key `(template_id, template_version)`.
+#[derive(Debug)]
+struct Adoption {
+    template_id: u64,
+    template_version: u32,
+    template: String,
+}
+
+/// Every `template_adopted` event under `audit_root`.
+fn adopted_events(audit_root: &std::path::Path) -> Vec<Adoption> {
+    data_parquet_files(audit_root)
+        .iter()
+        .flat_map(|f| {
+            ourios_parquet::AuditReader::open_file(f)
+                .expect("open audit file")
+                .read_all()
+                .expect("read audit events")
+        })
+        .filter_map(|event| adoption(event.payload))
+        .collect()
+}
+
+/// `payload` as an [`Adoption`], if it is a `template_adopted` event.
+fn adoption(payload: ourios_core::audit::AuditPayload) -> Option<Adoption> {
+    match payload {
+        ourios_core::audit::AuditPayload::Template {
+            template_id,
+            change:
+                ourios_core::audit::TemplateChange::Adopted {
+                    template_version,
+                    new_template,
+                },
+            ..
+        } => Some(Adoption {
+            template_id,
+            template_version,
+            template: new_template,
+        }),
+        _ => None,
+    }
+}
+
+/// A converged claim was adopted: the audit stream carries a
+/// `template_adopted` event for exactly this row's (id, version) naming
+/// this claim — an adoption of the same id at another version or
+/// template does not count — and the registry tokens at the row's key
+/// render the claim.
+fn assert_adopted(
+    record: &ourios_core::record::MinedRecord,
+    claim: &str,
+    adoptions: &[Adoption],
+    registry: &ourios_querier::TemplateRegistry,
+) {
+    assert!(
+        adoptions.iter().any(|a| a.template_id == record.template_id
+            && a.template_version == record.template_version
+            && a.template == claim),
+        "row ({}, v{}) adopted via the audited adopt path with its claim \
+         {claim:?}: {adoptions:?}",
+        record.template_id,
+        record.template_version,
+    );
+    let tokens = registry
+        .get(&(record.template_id, record.template_version))
+        .expect("adopted row's (id, version) resolves in the registry");
+    assert_eq!(
+        ourios_miner::tree::format_template(tokens),
+        claim,
+        "the row's template IS the drainprocessor's claim",
     );
 }

@@ -31,8 +31,9 @@ one-per-binary:
   global in-memory meter provider and a global `tracing` subscriber
   bridged onto an in-memory log exporter; its legs share both and run
   one at a time, so they stay one binary, split into a module per leg
-  (`instruments`, `transitions`, `live_check`) over shared support
-  modules. CI's `live-check` job reruns it with weaver configured.
+  (`instruments`, `transitions`, `live_check`, and `snapshot_discard`
+  for startup recovery's discard event) over shared support modules.
+  CI's `live-check` job reruns it with weaver configured.
 - `rfc0038_3_spawn_boundary.rs` — installs the global in-memory **tracer**;
   a global (not scoped) tracer is required to capture the `ingest logs` /
   `sweep partitions` spans across the receiver's `tokio::spawn` and the

@@ -10,7 +10,9 @@
 //! One binary, three legs, one module each: `instruments` (the exported
 //! stream), `transitions` (each edge's event) and `live_check` (every
 //! event against the registry); `harness`, `metric_read` and `drivers`
-//! are what they share.
+//! are what they share. `snapshot_discard` rides the same event capture
+//! for startup recovery's discard event (#884), so CI's weaver rerun of
+//! this binary live-checks it too.
 
 #[path = "../it/ingest_support/mod.rs"]
 mod ingest_support;
@@ -22,4 +24,5 @@ mod harness;
 mod instruments;
 mod live_check;
 mod metric_read;
+mod snapshot_discard;
 mod transitions;

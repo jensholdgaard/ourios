@@ -64,5 +64,7 @@ pub mod snapshot_store;
 
 pub use compactor::{Compactor, IngestError, SweepReport, run_sweep, run_sweep_with_promoted};
 pub use metrics::CompactionMetrics;
-pub use recovery::{RecoveryDriverError, RecoveryReport, TenantRecovery};
+pub use recovery::{
+    DiscardReason, RecoveryDriverError, RecoveryReport, SnapshotFate, TenantRecovery,
+};
 pub use snapshot_store::SnapshotStoreError;

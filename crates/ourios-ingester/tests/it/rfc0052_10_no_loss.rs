@@ -157,6 +157,7 @@ impl Drop for Fixture {
 }
 
 /// One line the fixture prints.
+#[derive(Clone, Copy)]
 enum FixtureLine {
     Ack(u64, WalOffset),
     Reclaimed,
@@ -180,41 +181,65 @@ fn parse_line(line: &str) -> FixtureLine {
 /// follow its first reclaiming pass, within [`WATCHDOG`] and [`MAX_ACKS`].
 fn acks_until_reclaiming(lines: &Receiver<String>) -> Vec<(u64, WalOffset)> {
     let deadline = Instant::now() + WATCHDOG;
-    let mut acked = Vec::new();
-    let mut since_reclaim: Option<usize> = None;
+    let mut progress = Progress::default();
     loop {
-        let line = match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        let line = progress.next_line(lines, deadline);
+        progress.record(parse_line(&line));
+        assert!(
+            progress.acked.len() <= MAX_ACKS,
+            "no kill point after {MAX_ACKS} acknowledgements ({:?} since the \
+             first reclaiming pass)",
+            progress.since_reclaim,
+        );
+        if progress.at_kill_point() {
+            return progress.acked;
+        }
+    }
+}
+
+/// What the fixture has acknowledged, and how many of those followed its
+/// first reclaiming pass.
+#[derive(Default)]
+struct Progress {
+    acked: Vec<(u64, WalOffset)>,
+    since_reclaim: Option<usize>,
+}
+
+impl Progress {
+    /// The next fixture line, or a panic naming the counts so far once the
+    /// watchdog expires or the fixture exits.
+    fn next_line(&self, lines: &Receiver<String>, deadline: Instant) -> String {
+        let since_reclaim = self.since_reclaim;
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(line) => line,
             Err(RecvTimeoutError::Timeout) => panic!(
                 "watchdog: no kill point within {WATCHDOG:?} ({} acked, {since_reclaim:?} \
                  acked since the first reclaiming pass)",
-                acked.len(),
+                self.acked.len(),
             ),
             Err(RecvTimeoutError::Disconnected) => panic!(
                 "the fixture exited before the kill point ({} acked, {since_reclaim:?} acked \
                  since the first reclaiming pass)",
-                acked.len(),
+                self.acked.len(),
             ),
-        };
-        match parse_line(&line) {
+        }
+    }
+
+    fn record(&mut self, line: FixtureLine) {
+        match line {
             FixtureLine::Ack(n, frame) => {
-                acked.push((n, frame));
-                if let Some(count) = since_reclaim.as_mut() {
-                    *count += 1;
-                }
+                self.acked.push((n, frame));
+                self.since_reclaim = self.since_reclaim.map(|count| count + 1);
             }
             FixtureLine::Reclaimed => {
-                since_reclaim.get_or_insert(0);
+                self.since_reclaim.get_or_insert(0);
             }
         }
-        assert!(
-            acked.len() <= MAX_ACKS,
-            "no kill point after {MAX_ACKS} acknowledgements ({since_reclaim:?} since the \
-             first reclaiming pass)",
-        );
-        if since_reclaim.is_some_and(|count| count >= ACKS_AFTER_RECLAIM) {
-            return acked;
-        }
+    }
+
+    fn at_kill_point(&self) -> bool {
+        self.since_reclaim
+            .is_some_and(|count| count >= ACKS_AFTER_RECLAIM)
     }
 }
 

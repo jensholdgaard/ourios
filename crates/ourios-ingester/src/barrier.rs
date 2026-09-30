@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_miner::snapshot::{SnapshotState, WalHighWater};
+use ourios_miner::snapshot::SnapshotState;
 use ourios_wal::{AppendError, ReclaimError, SnapshotHorizons, WalOffset};
 
 use crate::cadence::{BarrierEpochs, Epoch};
@@ -65,7 +65,8 @@ use crate::reclaim_telemetry::fault_error_type;
 use crate::snapshot_store;
 
 /// One capture: the frames at or below `mark` taken out of both sinks,
-/// plus each tenant's miner state as of that instant.
+/// plus each tenant's miner state as of that instant and the horizon it
+/// folds.
 ///
 /// No public fields: a caller that could raise `mark` without owning the
 /// matching batches would checkpoint over records that are still in the
@@ -74,8 +75,30 @@ pub struct Cut {
     epoch: Epoch,
     mark: Option<WalOffset>,
     drained: Vec<Drained>,
-    snapshots: Vec<(TenantId, SnapshotState)>,
+    snapshots: Vec<(TenantId, TenantCut)>,
     bytes: usize,
+}
+
+/// One tenant's share of a cut: its miner state, and RFC 0052 §3.1's
+/// folded horizon — the offset of that tenant's own last frame the state
+/// folds, which is what its artefact and the ledger carry. Never the
+/// cut's mark: an idle tenant must keep the older horizon its state
+/// actually reflects.
+#[derive(Clone)]
+struct TenantCut {
+    horizon: WalOffset,
+    state: SnapshotState,
+}
+
+impl TenantCut {
+    /// The artefact this share installs: the state, stamped with its
+    /// own horizon.
+    fn artefact(&self) -> SnapshotState {
+        SnapshotState {
+            wal_high_water: Some(snapshot_store::high_water(self.horizon)),
+            ..self.state.clone()
+        }
+    }
 }
 
 impl Cut {
@@ -638,11 +661,14 @@ impl Barrier {
     /// Install this cut's snapshot bytes, serialised against every other
     /// installer and monotone in the mark.
     ///
-    /// A cut with no mark installs nothing: an artefact without a
-    /// concrete horizon is discarded at the next start, so writing one
-    /// over a tenant's only valid snapshot would trade a full replay for
-    /// a cut that had nothing to stamp anyway.
-    fn install(&self, snapshots: &[(TenantId, SnapshotState)], mark: Option<WalOffset>) -> Install {
+    /// A cut with no mark installs nothing: no turn in this process has
+    /// been acknowledged, and installs are ordered by the mark.
+    ///
+    /// Each tenant is installed at its own folded horizon, never at the
+    /// mark, and the ledger records exactly that — so an idle tenant
+    /// keeps the older horizon its state reflects, and the floor stays
+    /// the minimum over what each tenant truly folded.
+    fn install(&self, snapshots: &[(TenantId, TenantCut)], mark: Option<WalOffset>) -> Install {
         let Some(mark) = mark else {
             return Install::Superseded;
         };
@@ -650,14 +676,8 @@ impl Barrier {
         if installed.is_some_and(|previous| mark < previous) {
             return Install::Superseded;
         }
-        let high_water = WalHighWater {
-            segment: mark.segment.to_string(),
-            byte: mark.byte,
-        };
-        for (tenant, state) in snapshots {
-            let mut state = state.clone();
-            state.wal_high_water = Some(high_water.clone());
-            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &state) {
+        for (tenant, share) in snapshots {
+            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &share.artefact()) {
                 self.metrics
                     .record_snapshot_write(tenant.as_str(), Some(e.error_type()));
                 tracing::warn!(
@@ -669,9 +689,9 @@ impl Barrier {
             }
             self.metrics.record_snapshot_write(tenant.as_str(), None);
             // Per tenant, not per cut: the tenants written before a
-            // failure are durable at `mark`, and the rest keep their
-            // previous horizon.
-            self.lock_horizons().insert(tenant.clone(), mark);
+            // failure are durable at their horizons, and the rest keep
+            // their previous ones.
+            self.lock_horizons().insert(tenant.clone(), share.horizon);
         }
         *installed = Some(mark);
         Install::Written
@@ -730,25 +750,29 @@ fn rotation_error_type(error: &ReceiveError) -> &'static str {
     }
 }
 
-/// Each tenant's miner state as of the cut, serialised under the miner
-/// lock so it never runs past the mark.
-fn serialise(miner: &MinerCluster) -> Vec<(TenantId, SnapshotState)> {
+/// Each tenant's miner state as of the cut and the horizon it folds,
+/// read together under the miner lock so neither runs past the other or
+/// past the mark.
+///
+/// A tenant with no folded horizon has no frame this process or its
+/// recovery folded, so it has nothing to install: an artefact without a
+/// horizon is discarded at the next start, and writing one would replace
+/// whatever valid snapshot it has.
+fn serialise(miner: &MinerCluster) -> Vec<(TenantId, TenantCut)> {
     miner
         .tenant_ids()
         .into_iter()
-        .map(|tenant| {
+        .filter_map(|tenant| {
+            let horizon = snapshot_store::offset_of(miner.folded_horizon(&tenant)?)?;
             let state = miner.snapshot_state(&tenant);
-            (tenant, state)
+            Some((tenant, TenantCut { horizon, state }))
         })
         .collect()
 }
 
 /// Latest wins per tenant; a tenant absent from the newer capture keeps
 /// the older bytes, which are still cut-consistent at its own horizon.
-fn merge_snapshots(
-    into: &mut Vec<(TenantId, SnapshotState)>,
-    newer: Vec<(TenantId, SnapshotState)>,
-) {
+fn merge_snapshots(into: &mut Vec<(TenantId, TenantCut)>, newer: Vec<(TenantId, TenantCut)>) {
     for (tenant, state) in newer {
         match into.iter_mut().find(|(existing, _)| *existing == tenant) {
             Some(slot) => slot.1 = state,
@@ -759,10 +783,7 @@ fn merge_snapshots(
 
 /// The same rule from the other side: `into` is already the later
 /// capture, so `older` only fills the tenants it has no bytes for.
-fn backfill_snapshots(
-    into: &mut Vec<(TenantId, SnapshotState)>,
-    older: Vec<(TenantId, SnapshotState)>,
-) {
+fn backfill_snapshots(into: &mut Vec<(TenantId, TenantCut)>, older: Vec<(TenantId, TenantCut)>) {
     for (tenant, state) in older {
         if !into.iter().any(|(existing, _)| *existing == tenant) {
             into.push((tenant, state));
@@ -789,7 +810,7 @@ pub fn fsync_snapshots_root(root: &Path) -> Result<(), snapshot_store::SnapshotS
 #[cfg(test)]
 mod tests {
     use ourios_core::tenant::TenantId;
-    use ourios_miner::snapshot::{SnapshotState, WalHighWater};
+    use ourios_miner::snapshot::SnapshotState;
     use ourios_wal::WalOffset;
 
     use std::sync::Arc;
@@ -804,7 +825,7 @@ mod tests {
     use ourios_miner::cluster::MinerCluster;
     use ourios_parquet::Store;
 
-    use super::{Barrier, Cut, CutOutcome};
+    use super::{Barrier, Cut, CutOutcome, TenantCut};
     use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
     use crate::cadence::{BarrierEpochs, Epoch};
     use crate::publish::PublishCoordinator;
@@ -812,15 +833,15 @@ mod tests {
     use crate::receiver::pipeline::{Journal, ReceiveError};
     use crate::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 
-    fn state(byte: u64) -> SnapshotState {
-        SnapshotState {
-            leaves: Vec::new(),
-            structured_templates: Vec::new(),
-            wal_high_water: Some(WalHighWater {
-                segment: "segment".to_owned(),
-                byte,
-            }),
-            adopted_templates: Vec::new(),
+    fn share(byte: u64) -> TenantCut {
+        TenantCut {
+            horizon: offset(byte),
+            state: SnapshotState {
+                leaves: Vec::new(),
+                structured_templates: Vec::new(),
+                wal_high_water: None,
+                adopted_templates: Vec::new(),
+            },
         }
     }
 
@@ -838,7 +859,7 @@ mod tests {
             drained: Vec::new(),
             snapshots: snapshots
                 .iter()
-                .map(|(tenant, at)| (TenantId::new(*tenant), state(*at)))
+                .map(|(tenant, at)| (TenantId::new(*tenant), share(*at)))
                 .collect(),
             bytes: 0,
         }
@@ -848,8 +869,7 @@ mod tests {
         cut.snapshots
             .iter()
             .find(|(id, _)| id.as_str() == tenant)
-            .and_then(|(_, state)| state.wal_high_water.as_ref())
-            .map(|high_water| high_water.byte)
+            .map(|(_, share)| share.horizon.byte)
     }
 
     /// §3.1's ordering rule, at the one place the two captures meet: the

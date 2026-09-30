@@ -129,6 +129,10 @@ impl Budget {
 #[derive(Debug, Clone, Default)]
 pub struct RotationFaults {
     sites: [Budget; 5],
+    /// The live segment's `sync` data sync. Not a rotation step and
+    /// never charged to the budget: it is how a test puts the sick disk
+    /// a rotation failed on under the ordinary flush path as well.
+    segment_sync: Budget,
 }
 
 impl RotationFaults {
@@ -160,6 +164,24 @@ impl RotationFaults {
                 "RFC 0052 §6 injected rotation fault at {}",
                 site.op()
             )));
+        }
+        None
+    }
+
+    /// Also fail every data sync of the live segment that `sync` makes.
+    #[must_use]
+    pub fn and_failing_segment_sync(mut self) -> Self {
+        self.segment_sync = Budget::Always;
+        self
+    }
+
+    /// The error the live segment's data sync should fail with, if it
+    /// should.
+    pub(crate) fn take_segment_sync(&mut self) -> Option<std::io::Error> {
+        if self.segment_sync.take() {
+            return Some(std::io::Error::other(
+                "RFC 0052 §6 injected fault at sync(current_segment)",
+            ));
         }
         None
     }
@@ -419,6 +441,20 @@ mod tests {
         for _ in 0..64 {
             assert!(always.take(RotationSite::ParentFsync).is_some());
         }
+    }
+
+    #[test]
+    fn the_segment_sync_fault_is_armed_apart_from_every_site() {
+        let mut faults = RotationFaults::default();
+        assert!(faults.take_segment_sync().is_none());
+
+        let mut armed =
+            RotationFaults::always(RotationSite::ParentFsync).and_failing_segment_sync();
+        for _ in 0..8 {
+            assert!(armed.take_segment_sync().is_some());
+        }
+        assert!(armed.take(RotationSite::ParentFsync).is_some());
+        assert!(armed.take(RotationSite::CloseSync).is_none());
     }
 
     #[test]

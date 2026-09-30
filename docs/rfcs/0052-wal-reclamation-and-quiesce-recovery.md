@@ -12,14 +12,12 @@ superseded-by: —
 # RFC 0052 — WAL reclamation and quiesce recovery
 
 > **Status: `green` (2026-09-30, maintainer-approved flip).** Every live
-> §5 scenario passes, with **one recorded deferral: RFC0052.17 is
-> partial at `green`**. Its `PUBLISHED` row stays an `#[ignore]`d stub
-> handed to RFC 0055 (publication frontiers), which owns the
-> `PUBLISHED` writer and format and discharges the row. Precedent for a
-> recorded deferral at green: RFC 0041's RFC0041.5 and RFC 0005's sizing
-> criterion. Every other RFC0052.17 row is green. The recorded long soak
-> run §6 requires before `validated` is still to come. The history of
-> the `red` stage follows.
+> §5 scenario passes. RFC0052.17's two `PUBLISHED` legs **moved to RFC
+> 0055 as RFC0055.5** before the flip, because RFC 0055 (publication
+> frontiers) owns the `PUBLISHED` writer and format. Their stub stays
+> `#[ignore]`d under that criterion, as .6, .8 and .9 moved to RFC 0053.
+> The recorded long soak run §6 requires before `validated` is still to
+> come. The history of the `red` stage follows.
 >
 > *(`red` — test stubs existed and failed
 > (`docs/rfcs/README.md` §Lifecycle).)* Every live §5 scenario was stubbed
@@ -3063,8 +3061,7 @@ memory, and nothing here claims to.
 > survives a panic).** Number retained; no obligation here.
 
 > **Scenario RFC0052.17 — The reclaim record is the only startup witness,
-> and it is fail-closed** *(partial at `green` — the `PUBLISHED` row is
-> a recorded deferral to RFC 0055; see the status banner)*
+> and it is fail-closed**
 > - **Given** a WAL root housekeeping has reclaimed from under per-tenant
 >   horizons, so `RECLAIM` holds an entry per reclaimed tenant
 > - **When** the node restarts with one tenant's snapshot undecodable
@@ -3157,17 +3154,10 @@ memory, and nothing here claims to.
 >   **segments present** it is a legacy root mid migration and the record
 >   is **retained** with its arming and its mode, the root opening on the
 >   legacy branch with the upgrade retried by the next checkpoint
-> - **And** a tenant introduced by a `PUBLISHED`-only write — no
->   intervening `RECLAIM` write — keeps its slot id across a restart: the
->   table is seeded from the union of both dictionaries and `next_slot_id`
->   is the maximum of the two headers, so the id is never reissued to a
->   different tenant
-> - **And** a record carrying `published_seeded_armed` without
->   `published_seeded_confirmed` with `PUBLISHED` **absent** — the crash
->   before the accepting start's own `PUBLISHED` write — leaves the next
->   start free to seed again, while the same record with `PUBLISHED`
->   **present** is the ordinary post-write state and is promoted to
->   confirmed durably at open, never read as a fault
+> - *(The two `PUBLISHED` legs — slot ids surviving a `PUBLISHED`-only
+>   write, and the `published_seeded_*` flags resolving at open — moved
+>   to RFC 0055 as RFC0055.5, since RFC 0055 owns the `PUBLISHED` writer
+>   and format. No obligation here.)*
 > - **And** the same record beside a **present** version-2 `CHECKPOINT` —
 >   the crash after the rename and before the record's next write — opens
 >   normally and is promoted to `seen` durably at open, never read as a

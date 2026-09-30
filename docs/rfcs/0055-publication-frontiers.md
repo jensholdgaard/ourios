@@ -86,6 +86,17 @@ this RFC makes it; it does not.
 - RFC0055.3 settlement rebuild does not publish under a `template_id`
   the replay did not allocate
 - RFC0055.4 `max_tenants` holds across unwind and restart
+- RFC0055.5 *(moved from RFC0052.17, whose `PUBLISHED` legs need this
+  RFC's writer)*: a tenant introduced by a `PUBLISHED`-only write — no
+  intervening `RECLAIM` write — keeps its slot id across a restart (the
+  table is seeded from the union of both dictionaries and
+  `next_slot_id` is the maximum of the two headers); and a `RECLAIM`
+  record carrying `published_seeded_armed` without
+  `published_seeded_confirmed` leaves the next start free to seed again
+  when `PUBLISHED` is absent, and is promoted to confirmed durably at
+  open, never read as a fault, when `PUBLISHED` is present. The stub is
+  `ourios-wal/tests/it/rfc0052_17_reclaim_record/matrix.rs`'s
+  `rfc0052_17_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve`.
 
 ## 6. Testing strategy
 

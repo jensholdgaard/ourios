@@ -27,7 +27,7 @@ use ourios_wal::{
 };
 
 use crate::cadence::BarrierEpochs;
-use crate::metrics::ERROR_TYPE;
+use crate::metrics::{ERROR_TYPE, PairedReading};
 
 /// The categorical half of [`RotationState`] — what the rotation status
 /// metric reports and what an edge is detected on.
@@ -301,16 +301,19 @@ impl Instruments {
             })
             .collect();
         updown.push(floor_status(&meter, observed));
-        updown.push(rotation_status(&meter, rotation));
+        let rotation = Arc::new(RotationReading {
+            cell: Arc::downgrade(rotation),
+            paired: PairedReading::default(),
+        });
+        updown.push(rotation_status(&meter, &rotation));
 
-        let cell = Arc::downgrade(rotation);
         let mut gauges = vec![
             meter
                 .u64_observable_gauge(semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES)
                 .with_unit("{failure}")
                 .with_callback(move |observer| {
-                    if let Some(cell) = cell.upgrade() {
-                        observer.observe(u64::from(cell.load().1), &[]);
+                    if let Some((_, attempts)) = rotation.read() {
+                        observer.observe(u64::from(attempts), &[]);
                     }
                 })
                 .build(),
@@ -332,6 +335,21 @@ impl Instruments {
             age: unreclaimed_age(&meter, observed),
             gauges,
         }
+    }
+}
+
+/// The rotation status and its failure count read one `load()` per
+/// collection between them, so the pair never shows `retrying` beside a
+/// zero count or `healthy` beside a nonzero one.
+struct RotationReading {
+    cell: Weak<RotationCell>,
+    paired: PairedReading<Option<(RotationPhase, u32)>>,
+}
+
+impl RotationReading {
+    fn read(&self) -> Option<(RotationPhase, u32)> {
+        self.paired
+            .read(|| self.cell.upgrade().map(|cell| cell.load()))
     }
 }
 
@@ -362,13 +380,13 @@ fn floor_status(meter: &Meter, observed: &Shared) -> ObservableUpDownCounter<i64
 
 /// The rotation state metric, read live from the coordinator's cell —
 /// the same every-member shape as [`floor_status`].
-fn rotation_status(meter: &Meter, rotation: &Arc<RotationCell>) -> ObservableUpDownCounter<i64> {
-    let cell = Arc::downgrade(rotation);
+fn rotation_status(meter: &Meter, rotation: &Arc<RotationReading>) -> ObservableUpDownCounter<i64> {
+    let rotation = Arc::clone(rotation);
     meter
         .i64_observable_up_down_counter(semconv::OURIOS_WAL_ROTATION_STATUS)
         .with_unit("1")
         .with_callback(move |observer| {
-            let Some((current, _)) = cell.upgrade().map(|cell| cell.load()) else {
+            let Some((current, _)) = rotation.read() else {
                 return;
             };
             for phase in RotationPhase::ALL {

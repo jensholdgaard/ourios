@@ -64,6 +64,14 @@ impl Housekeeper {
         }
     }
 
+    /// Hand the WAL's state to the export without a pass. Shutdown calls
+    /// this after its last latch-producing step: the timer is joined by
+    /// then, and a latch that a cadence task's join error or the final
+    /// cut sets would otherwise never reach an observation.
+    pub fn observe_state(&self) {
+        self.export.observe(self.coordinator.reclaim_state(), None);
+    }
+
     /// One capped pass under `catch_unwind`, so a panic costs one tick
     /// rather than the task: reclamation is the only thing standing
     /// between a healthy node and #793's unbounded WAL. Every tick, the

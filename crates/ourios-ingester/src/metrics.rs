@@ -407,6 +407,42 @@ impl Default for IngestMetrics {
     }
 }
 
+/// One reading shared by two observable instruments that must agree.
+///
+/// The SDK runs one callback per instrument, each exactly once per
+/// collection, and has no multi-instrument callback, so the pair shares
+/// a slot: whichever callback runs first takes a fresh reading and parks
+/// it, and the other consumes that same reading. Each collection
+/// therefore reports one reading on both instruments, whatever order
+/// the callbacks run in.
+#[derive(Debug)]
+pub(crate) struct PairedReading<T> {
+    parked: Mutex<Option<T>>,
+}
+
+impl<T> Default for PairedReading<T> {
+    fn default() -> Self {
+        Self {
+            parked: Mutex::new(None),
+        }
+    }
+}
+
+impl<T: Copy> PairedReading<T> {
+    pub(crate) fn read(&self, fresh: impl Fn() -> T) -> T {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reading) = parked.take() {
+            return reading;
+        }
+        let reading = fresh();
+        *parked = Some(reading);
+        reading
+    }
+}
+
 /// RFC 0052 §3.1's publication-barrier instruments (#833): what each cut
 /// and capture decided, the checkpoint and snapshot writes the barrier
 /// attempts, and the epoch pair that says whether the `cadence_failed`
@@ -445,24 +481,38 @@ impl BarrierMetrics {
             .with_unit("{write}")
             .build();
         // Weak, so a barrier that is gone stops reporting rather than
-        // being kept alive by the meter provider.
-        let current = Arc::downgrade(epochs);
+        // being kept alive by the meter provider. One paired reading per
+        // collection, the latch read before the epoch it can only trail,
+        // so the pair never shows a failed epoch above the current one.
+        let reading = Arc::new(PairedReading::default());
+        let read = {
+            let epochs = Arc::downgrade(epochs);
+            move || {
+                epochs.upgrade().map(|epochs| {
+                    let failed = epochs.capture().failed_epoch();
+                    (
+                        failed.map(|f| u64::from(f.get())),
+                        u64::from(epochs.current().get()),
+                    )
+                })
+            }
+        };
+        let (paired, fresh) = (Arc::clone(&reading), read.clone());
         let epoch = meter
             .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_EPOCH)
             .with_unit("{epoch}")
             .with_callback(move |observer| {
-                if let Some(epochs) = current.upgrade() {
-                    observer.observe(u64::from(epochs.current().get()), &[]);
+                if let Some((_, current)) = paired.read(&fresh) {
+                    observer.observe(current, &[]);
                 }
             })
             .build();
-        let latch = Arc::downgrade(epochs);
         let failed_epoch = meter
             .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH)
             .with_unit("{epoch}")
             .with_callback(move |observer| {
-                if let Some(failed) = latch.upgrade().and_then(|e| e.capture().failed_epoch()) {
-                    observer.observe(u64::from(failed.get()), &[]);
+                if let Some((Some(failed), _)) = reading.read(&read) {
+                    observer.observe(failed, &[]);
                 }
             })
             .build();
@@ -779,6 +829,20 @@ mod tests {
 
     use super::*;
     use crate::compactor::{CompactedFile, TenantSweep};
+
+    /// Two callbacks in one collection see one reading, whichever runs
+    /// first, even when the source moves between them; the next
+    /// collection reads afresh.
+    #[test]
+    fn a_paired_reading_is_shared_by_both_callbacks_of_a_collection() {
+        let source = std::sync::atomic::AtomicU64::new(1);
+        let fresh = || source.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let paired = PairedReading::default();
+        assert_eq!(paired.read(fresh), 1, "the first callback reads");
+        assert_eq!(paired.read(fresh), 1, "the second sees the same reading");
+        assert_eq!(paired.read(fresh), 2, "the next collection reads afresh");
+        assert_eq!(paired.read(fresh), 2);
+    }
 
     // Collected metric names across the in-memory export.
     fn collected_names(rms: &[ResourceMetrics]) -> Vec<String> {

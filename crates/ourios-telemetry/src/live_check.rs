@@ -5,10 +5,12 @@
 //! fails or a certificate goes bad never fires there, so the live-check
 //! never sees it. A test that drives such an event captures what the
 //! `tracing` bridge exported and hands it to [`live_check`]: always
-//! against the names and attributes the test expects, and through weaver
-//! as well when `OURIOS_LIVE_CHECK_WEAVER` (the binary) and
+//! against the caller's per-event specification of the registry (each
+//! event's required and optional attributes), and through weaver as well
+//! when `OURIOS_LIVE_CHECK_WEAVER` (the binary) and
 //! `OURIOS_LIVE_CHECK_REGISTRY` (the pinned registry's `registry/`
-//! directory) are set.
+//! directory) are set. Only the weaver mode checks against the registry
+//! itself; the other checks against what the caller says it declares.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,65 +110,86 @@ pub fn event_capture() -> Result<&'static EventCapture, String> {
         .map_err(Clone::clone)
 }
 
+/// What the registry declares for one event, as the caller states it.
+#[derive(Debug, Clone, Copy)]
+pub struct EventSpec {
+    pub name: &'static str,
+    /// Attributes every emission must carry.
+    pub required: &'static [&'static str],
+    /// Attributes an emission may carry.
+    pub optional: &'static [&'static str],
+}
+
 /// How far a [`live_check`] went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checked {
-    /// Names and attributes against the caller's lists, then weaver.
+    /// Every emission against its [`EventSpec`], then through weaver
+    /// against the registry itself.
     Weaver,
-    /// Names and attributes against the caller's lists only: weaver is
-    /// not configured in this environment.
-    NamesOnly,
+    /// Every emission against its [`EventSpec`] only: weaver is not
+    /// configured here, so the registry itself was not consulted.
+    SpecOnly,
 }
 
-/// Check that every `expected` event was emitted and that the emitted
-/// ones carry no attribute outside `attributes`, then — when configured
-/// — that `weaver registry live-check` reports no violation for them.
+/// Check that every event in `specs` was emitted, and that every
+/// emission of it carries each required attribute and nothing outside
+/// its required and optional ones; then, when configured, that
+/// `weaver registry live-check` exits cleanly with no violation for them.
 ///
 /// # Errors
 ///
 /// The first failed check, described.
-pub fn live_check(
-    events: &[Event],
-    expected: &[&str],
-    attributes: &[&str],
-) -> Result<Checked, String> {
-    let emitted: Vec<&Event> = events
-        .iter()
-        .filter(|e| expected.contains(&e.name))
-        .collect();
-    if let Some(missing) = expected
-        .iter()
-        .find(|name| !emitted.iter().any(|e| e.name == **name))
-    {
-        return Err(format!(
-            "{missing} was never emitted, so no live-check would ever check it"
-        ));
-    }
-    for event in &emitted {
-        if let Some(key) = event
-            .attributes
-            .keys()
-            .find(|key| !attributes.contains(&key.as_str()))
-        {
+pub fn live_check(events: &[Event], specs: &[EventSpec]) -> Result<Checked, String> {
+    let mut emitted = Vec::new();
+    for spec in specs {
+        let mine: Vec<&Event> = events.iter().filter(|e| e.name == spec.name).collect();
+        if mine.is_empty() {
             return Err(format!(
-                "{}: `{key}` is not an attribute the registry declares for it",
-                event.name
+                "{} was never emitted, so no live-check would ever check it",
+                spec.name
             ));
         }
+        for event in &mine {
+            check_attributes(event, spec)?;
+        }
+        emitted.extend(mine);
     }
     let (Some(weaver), Some(registry)) = (
         std::env::var_os("OURIOS_LIVE_CHECK_WEAVER"),
         std::env::var_os("OURIOS_LIVE_CHECK_REGISTRY"),
     ) else {
-        return Ok(Checked::NamesOnly);
+        return Ok(Checked::SpecOnly);
     };
+    let names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
     weaver_live_check(
         &PathBuf::from(weaver),
         &PathBuf::from(registry),
         &emitted,
-        expected,
+        &names,
     )?;
     Ok(Checked::Weaver)
+}
+
+fn check_attributes(event: &Event, spec: &EventSpec) -> Result<(), String> {
+    if let Some(missing) = spec
+        .required
+        .iter()
+        .find(|key| !event.attributes.contains_key(**key))
+    {
+        return Err(format!(
+            "{}: the required attribute `{missing}` is missing",
+            event.name
+        ));
+    }
+    match event.attributes.keys().find(|key| {
+        !spec.required.contains(&key.as_str()) && !spec.optional.contains(&key.as_str())
+    }) {
+        Some(key) => Err(format!(
+            "{}: `{key}` is not an attribute the registry declares for it",
+            event.name
+        )),
+        None => Ok(()),
+    }
 }
 
 fn weaver_live_check(
@@ -203,6 +226,11 @@ fn weaver_live_check(
     if !violations.is_empty() {
         return Err(format!(
             "weaver live-check (exit {status}) found violations: {violations:#?}"
+        ));
+    }
+    if !status.success() {
+        return Err(format!(
+            "weaver live-check failed (exit {status}) without reporting a violation"
         ));
     }
     let seen: Vec<&str> = report["samples"]
@@ -253,5 +281,43 @@ fn collect_violations(value: &serde_json::Value, out: &mut Vec<serde_json::Value
         }
         serde_json::Value::Array(items) => items.iter().for_each(|v| collect_violations(v, out)),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{Event, EventSpec, check_attributes};
+
+    const SPEC: EventSpec = EventSpec {
+        name: "ourios.test.event",
+        required: &["error.type"],
+        optional: &["ourios.test.optional"],
+    };
+
+    fn event(attributes: &[&str]) -> Event {
+        Event {
+            name: SPEC.name,
+            severity: 13,
+            attributes: attributes
+                .iter()
+                .map(|key| ((*key).to_owned(), "x".to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn an_emission_is_held_to_its_own_spec() {
+        assert!(check_attributes(&event(&["error.type"]), &SPEC).is_ok());
+        assert!(check_attributes(&event(&["error.type", "ourios.test.optional"]), &SPEC).is_ok());
+        assert!(
+            check_attributes(&event(&[]), &SPEC).is_err(),
+            "a missing required attribute fails"
+        );
+        assert!(
+            check_attributes(&event(&["error.type", "error"]), &SPEC).is_err(),
+            "an undeclared attribute fails"
+        );
     }
 }

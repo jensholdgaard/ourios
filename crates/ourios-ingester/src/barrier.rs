@@ -193,6 +193,28 @@ impl CutOutcome {
     }
 }
 
+/// A cut's decision and what `ourios.ingest.barrier.cut.outcome` records
+/// for it. They differ in one case: a checkpoint write that failed
+/// decides [`CutOutcome::Stamped`] (RFC0052.1) but did not stamp, and the
+/// registry's `stamped` means the checkpoint advanced.
+#[derive(Clone, Copy, Debug)]
+struct Ran {
+    outcome: CutOutcome,
+    recorded: &'static str,
+}
+
+impl From<CutOutcome> for Ran {
+    fn from(outcome: CutOutcome) -> Self {
+        Self {
+            outcome,
+            recorded: outcome.as_str(),
+        }
+    }
+}
+
+/// The cut outcome recorded when the checkpoint write failed.
+const CUT_CHECKPOINT_FAILED: &str = "checkpoint_failed";
+
 /// What one cut's snapshot install did. Three states, not a `bool`: a
 /// cut whose mark is below the installed one did nothing *and* may
 /// stamp, which is not the same decision as a write that failed.
@@ -380,17 +402,18 @@ impl Barrier {
 
     /// Run the pending cut, if any — outside the exclusion.
     pub fn run_pending(&self) -> CutOutcome {
-        let outcome = self.run_taken();
-        self.metrics.record_cut(outcome.as_str());
-        outcome
+        let ran = self.run_taken();
+        self.metrics.record_cut(ran.recorded);
+        ran.outcome
     }
 
-    fn run_taken(&self) -> CutOutcome {
+    fn run_taken(&self) -> Ran {
         let Some(cut) = self.take_pending() else {
-            return CutOutcome::Idle;
+            return CutOutcome::Idle.into();
         };
         let epoch = cut.epoch;
-        let outcome = self.run_cut(cut);
+        let ran = self.run_cut(cut);
+        let outcome = ran.outcome;
         // §3.1: a pending cut captured behind a cut that did **not**
         // stamp already folds frames whose only durable copy was that
         // cut's batches, so installing or stamping it would suppress
@@ -405,7 +428,7 @@ impl Barrier {
             CutOutcome::Stamped | CutOutcome::Unstamped | CutOutcome::Idle => {}
         }
         self.publish.record().settle_cut(epoch);
-        outcome
+        ran
     }
 
     /// One barrier tick: capture, then run. A panic anywhere inside is
@@ -552,7 +575,7 @@ impl Barrier {
 
     /// The store-I/O half, outside the exclusion (§3.1's pseudocode from
     /// `cut_ok` on).
-    fn run_cut(&self, cut: Cut) -> CutOutcome {
+    fn run_cut(&self, cut: Cut) -> Ran {
         let Cut {
             epoch,
             mark,
@@ -566,7 +589,7 @@ impl Barrier {
             for batch in drained {
                 self.publish.park(batch);
             }
-            return CutOutcome::Latched;
+            return CutOutcome::Latched.into();
         }
         let mut published = true;
         for batch in drained {
@@ -590,10 +613,10 @@ impl Barrier {
         // spells the conjunction out — `ok = cut_ok and prior_ok and
         // failed_epoch > cut.epoch`.
         if self.epochs.capture().refuses(epoch) {
-            return CutOutcome::Latched;
+            return CutOutcome::Latched.into();
         }
         if !published || !outcomes.all_ok(epoch) {
-            return CutOutcome::Retained;
+            return CutOutcome::Retained.into();
         }
         // A failed install must not be followed by a stamp. §3.1 says a
         // snapshot write failure is not a checkpoint blocker, and adds
@@ -607,7 +630,7 @@ impl Barrier {
         // write and the stamp. What it buys is the bound — the
         // duplicates are this cut's, not every row since `S`.
         match self.install(&snapshots, mark) {
-            Install::Failed => CutOutcome::Retained,
+            Install::Failed => CutOutcome::Retained.into(),
             Install::Written | Install::Superseded => self.stamp(mark),
         }
     }
@@ -658,15 +681,15 @@ impl Barrier {
     /// in-memory mark where it was, so nothing past the *previous* mark
     /// becomes reclaimable — segments already eligible under it still
     /// are.
-    fn stamp(&self, mark: Option<WalOffset>) -> CutOutcome {
+    fn stamp(&self, mark: Option<WalOffset>) -> Ran {
         let Some(mark) = mark else {
-            return CutOutcome::Stamped;
+            return CutOutcome::Stamped.into();
         };
         let written = self.coordinator.checkpoint(mark);
         self.metrics
             .record_checkpoint_write(written.as_ref().err().map(ReclaimError::error_type));
         match written {
-            Ok(()) => CutOutcome::Stamped,
+            Ok(()) => CutOutcome::Stamped.into(),
             Err(e @ ReclaimError::NoReclamationSurface) => {
                 tracing::warn!(
                     name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
@@ -674,7 +697,7 @@ impl Barrier {
                     "barrier: the journal exposes no reclamation surface, so no checkpoint was \
                      written and nothing is reclaimed"
                 );
-                CutOutcome::Unstamped
+                CutOutcome::Unstamped.into()
             }
             Err(e) => {
                 tracing::warn!(
@@ -682,7 +705,10 @@ impl Barrier {
                     { { ERROR_TYPE } = e.error_type() },
                     "barrier: the checkpoint write failed; a later cut retries the stamp: {e}"
                 );
-                CutOutcome::Stamped
+                Ran {
+                    outcome: CutOutcome::Stamped,
+                    recorded: CUT_CHECKPOINT_FAILED,
+                }
             }
         }
     }

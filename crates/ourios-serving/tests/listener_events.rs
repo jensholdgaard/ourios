@@ -16,17 +16,35 @@ use ourios_semconv as semconv;
 use ourios_serving::serve::{PlainListener, accept_backoff, serve_http};
 use ourios_serving::tls::{ALPN_HTTP, TlsSettings};
 use ourios_serving::tls_serve::{LISTENER_HTTP, reloading_acceptor};
-use ourios_telemetry::live_check::{self, Checked, Event, EventCapture};
+use ourios_telemetry::live_check::{self, Checked, Event, EventCapture, EventSpec};
 use tokio::io::AsyncWriteExt as _;
 
-const LISTENER_EVENTS: [&str; 4] = [
-    semconv::EVENT_OURIOS_SERVER_LISTENER_ACCEPT_ERROR,
-    semconv::EVENT_OURIOS_SERVER_LISTENER_CONNECTION_ERROR,
-    semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_COMPLETED,
-    semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR,
-];
+const WITH_LISTENER: &[&str] = &[semconv::OURIOS_SERVER_LISTENER_NAME];
+const FAILURE_ON_LISTENER: &[&str] = &["error.type", semconv::OURIOS_SERVER_LISTENER_NAME];
 
-const LISTENER_ATTRIBUTES: [&str; 2] = ["error.type", semconv::OURIOS_SERVER_LISTENER_NAME];
+/// The listener events as the registry declares them.
+const LISTENER_EVENTS: [EventSpec; 4] = [
+    EventSpec {
+        name: semconv::EVENT_OURIOS_SERVER_LISTENER_ACCEPT_ERROR,
+        required: FAILURE_ON_LISTENER,
+        optional: &[],
+    },
+    EventSpec {
+        name: semconv::EVENT_OURIOS_SERVER_LISTENER_CONNECTION_ERROR,
+        required: FAILURE_ON_LISTENER,
+        optional: &[],
+    },
+    EventSpec {
+        name: semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_COMPLETED,
+        required: WITH_LISTENER,
+        optional: &[],
+    },
+    EventSpec {
+        name: semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR,
+        required: FAILURE_ON_LISTENER,
+        optional: &[],
+    },
+];
 
 /// A listener's accept stream that fails with each error in turn.
 struct FailingAccepts(VecDeque<io::Error>);
@@ -186,9 +204,9 @@ async fn every_listener_event_is_named_and_live_checked() {
             "an accept failure classed {class} (backs off: {pause}) names its listener"
         );
     }
-    let checked = live_check::live_check(&events, &LISTENER_EVENTS, &LISTENER_ATTRIBUTES)
+    let checked = live_check::live_check(&events, &LISTENER_EVENTS)
         .expect("every listener event is emitted and registry-conformant");
-    if checked == Checked::NamesOnly {
-        eprintln!("#873: weaver is not configured here; checked names and attributes only");
+    if checked == Checked::SpecOnly {
+        eprintln!("#873: weaver is not configured here; checked each event against its spec only");
     }
 }

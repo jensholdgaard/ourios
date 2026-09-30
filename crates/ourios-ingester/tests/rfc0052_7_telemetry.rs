@@ -26,31 +26,48 @@ use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
 use ourios_ingester::receiver::{CommitCoordinator, Journal, ReceiveError};
 use ourios_semconv as semconv;
 use ourios_telemetry::TelemetryGuard;
-use ourios_telemetry::live_check::{self, Checked, Event, EventCapture};
+use ourios_telemetry::live_check::{self, Checked, Event, EventCapture, EventSpec};
 use ourios_wal::{RotationFault, RotationSite, RotationState, WalOffset};
 
 use crate::rfc0052_barrier_support::{BarrierRig, JournalFaults, RigSpec, wal_config};
 
 const CAP: usize = 128;
 
-/// The RFC 0052 log events, every one of which the live-check leg must
-/// see emitted.
-const RFC0052_EVENTS: [&str; 11] = [
-    semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RETRYING,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RECOVERED,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_TERMINAL,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_PINNED,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_LIFTED,
-    semconv::EVENT_OURIOS_RECEIVER_BARRIER_LATCHED,
-    semconv::EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR,
-    semconv::EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR,
-    semconv::EVENT_OURIOS_RECEIVER_PUBLISH_HELD,
+/// The RFC 0052 log events as the registry declares them, every one of
+/// which the live-check leg must see emitted.
+const RFC0052_EVENTS: [EventSpec; 11] = [
+    failure(semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR),
+    failure(semconv::EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR),
+    failure(semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RETRYING),
+    plain(semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_RECOVERED),
+    failure(semconv::EVENT_OURIOS_RECEIVER_WAL_ROTATION_TERMINAL),
+    plain(semconv::EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_PINNED),
+    plain(semconv::EVENT_OURIOS_RECEIVER_WAL_RETAIN_FLOOR_LIFTED),
+    plain(semconv::EVENT_OURIOS_RECEIVER_BARRIER_LATCHED),
+    failure(semconv::EVENT_OURIOS_RECEIVER_WAL_HOUSEKEEPING_ERROR),
+    failure(semconv::EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR),
+    EventSpec {
+        name: semconv::EVENT_OURIOS_RECEIVER_PUBLISH_HELD,
+        required: &[],
+        optional: &[semconv::OURIOS_SINK_FLUSH_TRIGGER],
+    },
 ];
 
-/// The only attributes those events declare.
-const EVENT_ATTRIBUTES: [&str; 2] = ["error.type", semconv::OURIOS_SINK_FLUSH_TRIGGER];
+const fn failure(name: &'static str) -> EventSpec {
+    EventSpec {
+        name,
+        required: &["error.type"],
+        optional: &[],
+    }
+}
+
+const fn plain(name: &'static str) -> EventSpec {
+    EventSpec {
+        name,
+        required: &[],
+        optional: &[],
+    }
+}
 
 /// Every RFC0052.7 instrument: the WAL state and the barrier's.
 const INSTRUMENTS: [&str; 19] = [
@@ -424,9 +441,9 @@ fn assert_state_metrics(rms: &[ResourceMetrics]) {
     ) else {
         panic!("the epoch gauges are u64");
     };
-    assert!(
-        failed <= epoch,
-        "the failed epoch {failed} is at or below {epoch}"
+    assert_eq!(
+        failed, epoch,
+        "the latch was reported at the current epoch just before collection"
     );
 }
 
@@ -541,6 +558,96 @@ async fn rfc0052_7_each_transition_emits_its_registry_event_once() {
     );
 }
 
+/// Scenario RFC0052.7 — a latch set at shutdown, after the timer is
+/// joined, still emits its event exactly once.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.5.
+///
+/// The receiver's shutdown joins the housekeeping task and only then
+/// reads the cadence joins, where a `JoinError` sets the latch, so the
+/// timer's own tick never sees it; shutdown's last step is
+/// `Housekeeper::observe_state`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0052_7_a_latch_set_at_shutdown_emits_its_event_once() {
+    let _serial = serial().await;
+    let harness = harness();
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = Arc::new(BarrierRig::new(tmp.path()));
+    let housekeeper = housekeeper_of(&rig);
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    tick(&housekeeper).await;
+
+    let joined = tokio::spawn(async { panic!("injected cadence-task panic") })
+        .await
+        .map(drop);
+    assert!(cadence::read_join(&rig.epochs, "barrier", joined));
+    let latched = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| e.name == semconv::EVENT_OURIOS_RECEIVER_BARRIER_LATCHED)
+            .count()
+    };
+    assert_eq!(latched(&harness.events()), 0, "no tick has run since");
+
+    housekeeper.observe_state();
+    housekeeper.observe_state();
+    assert_eq!(
+        latched(&harness.events()),
+        1,
+        "the shutdown observation emits the latch once"
+    );
+}
+
+/// Scenario RFC0052.7 — a cut whose checkpoint write fails is not counted
+/// as `stamped`.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.5.
+///
+/// The cut still decides `Stamped` (RFC0052.1: the WAL keeps a usable
+/// mark), but the registry's `stamped` means the checkpoint advanced, so
+/// the cut is recorded as `checkpoint_failed` and the write carries its
+/// `error.type`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0052_7_a_failed_checkpoint_write_is_not_counted_as_stamped() {
+    let _serial = serial().await;
+    let harness = harness();
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = Arc::new(BarrierRig::new(tmp.path()));
+    rig.ingest("checkout", &["user 1 logged in"]).await;
+    rig.sabotage_checkpoint();
+    let before = harness.collect();
+
+    assert_eq!(cut(&rig, false).await, CutOutcome::Stamped);
+    let after = harness.collect();
+
+    let delta =
+        |name, key, want| counted(&after, name, key, want) - counted(&before, name, key, want);
+    let outcome = semconv::OURIOS_INGEST_BARRIER_CUT_OUTCOME;
+    assert_eq!(
+        delta(
+            semconv::OURIOS_INGEST_BARRIER_CUTS,
+            outcome,
+            Some("checkpoint_failed")
+        ),
+        1
+    );
+    assert_eq!(
+        delta(
+            semconv::OURIOS_INGEST_BARRIER_CUTS,
+            outcome,
+            Some("stamped")
+        ),
+        0,
+        "a failed checkpoint write never reads as a stamp"
+    );
+    assert_eq!(
+        delta(
+            semconv::OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES,
+            "error.type",
+            Some("io")
+        ),
+        1
+    );
+}
+
 /// Every RFC 0052 event, emitted: the rotation, floor and latch edges,
 /// a failed idle rotation and a failed checkpoint write.
 async fn emit_every_event() {
@@ -603,7 +710,7 @@ async fn rfc0052_7_live_check_covers_every_new_log_event() {
     let _serial = serial().await;
     emit_every_event().await;
     let events = harness().events();
-    let checked = live_check::live_check(&events, &RFC0052_EVENTS, &EVENT_ATTRIBUTES)
+    let checked = live_check::live_check(&events, &RFC0052_EVENTS)
         .expect("every RFC 0052 event is emitted and registry-conformant");
 
     // The failure events carry the error.type values the registry lists.
@@ -623,7 +730,9 @@ async fn rfc0052_7_live_check_covers_every_new_log_event() {
             "{name} with error.type {class}"
         );
     }
-    if checked == Checked::NamesOnly {
-        eprintln!("RFC0052.7: weaver is not configured here; checked names and attributes only");
+    if checked == Checked::SpecOnly {
+        eprintln!(
+            "RFC0052.7: weaver is not configured here; checked each event against its spec only"
+        );
     }
 }

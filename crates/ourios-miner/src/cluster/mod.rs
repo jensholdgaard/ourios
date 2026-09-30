@@ -1785,6 +1785,14 @@ impl MinerCluster {
         service: Option<&str>,
         any_value: &ourios_core::otlp::AnyValue,
     ) -> u64 {
+        let template_id = self.structured_template_id(record);
+        self.emit_structured(record, service, any_value, template_id);
+        template_id
+    }
+
+    /// The structured-template id for `record`'s `(severity_number,
+    /// scope_name, event_name)` tuple, allocated on its first sight.
+    fn structured_template_id(&mut self, record: &OtlpLogRecord) -> u64 {
         let key = (
             record.severity_number,
             record.scope_name.clone(),
@@ -1798,18 +1806,26 @@ impl MinerCluster {
             .tenants
             .entry(record.tenant_id.clone())
             .or_insert_with(|| TenantState::new(effective_config));
-        let template_id = if let Some(&existing_id) = state.structured_templates.get(&key) {
-            existing_id
-        } else {
-            let new_id = self.next_template_id;
-            self.next_template_id += 1;
-            state.structured_templates.insert(key, new_id);
-            // Same cache invariant as create_new_leaf: one fresh
-            // allocation, one cache increment.
-            state.template_count += 1;
-            new_id
-        };
+        if let Some(&existing_id) = state.structured_templates.get(&key) {
+            return existing_id;
+        }
+        let new_id = self.next_template_id;
+        self.next_template_id += 1;
+        state.structured_templates.insert(key, new_id);
+        // Same cache invariant as create_new_leaf: one fresh
+        // allocation, one cache increment.
+        state.template_count += 1;
+        new_id
+    }
 
+    /// Emit a structured record's data row under `template_id`.
+    fn emit_structured(
+        &mut self,
+        record: &OtlpLogRecord,
+        service: Option<&str>,
+        any_value: &ourios_core::otlp::AnyValue,
+        template_id: u64,
+    ) {
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
         // `body` field (per §6.2 step 0), and `lossy_flag = false`
@@ -1864,8 +1880,6 @@ impl MinerCluster {
         rec.confidence = 1.0;
         rec.body = Some(String::from_utf8(bytes).expect("serde_json emits valid UTF-8"));
         self.emit_record(rec, service);
-
-        template_id
     }
 }
 

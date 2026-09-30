@@ -8,16 +8,21 @@
 //! every surviving frame, and this driver routes: the miner consumes
 //! only frames above its restored snapshot's high-water mark `S` per
 //! tenant (frames ≤ `S` are already folded into the snapshot;
-//! re-feeding would double-apply), and the Parquet path — once it
-//! exists — only frames above the checkpoint `X`
-//! ([`Wal::last_checkpoint`]). The two horizons are independent, so
-//! a lagging snapshot (`S < X`) still has its retained `(S, X]`
-//! frames delivered to the miner.
+//! re-feeding would double-apply), and the configured record and audit
+//! sinks only what the miner regenerates for frames above the checkpoint
+//! `X` ([`Wal::last_checkpoint`]) — those at or below it are published
+//! already (RFC 0052 §3.1, §3.7). The two horizons are independent, so a
+//! lagging snapshot (`S < X`) still has its retained `(S, X]` frames
+//! delivered to the miner, and a snapshot ahead of a failed checkpoint
+//! write (`S > X`) folds `(X, S]` without mining it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use ourios_core::audit::{AuditEvent, AuditSink};
+use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, WalHighWater};
@@ -42,11 +47,16 @@ pub struct RecoveryReport {
     /// Records suppressed for the miner (frame offset at or below
     /// the tenant's restored high-water mark).
     pub records_suppressed_for_miner: u64,
-    /// `Wal::last_checkpoint()` at entry — the Parquet-side
-    /// suppression horizon. Recorded now, consumed once the Parquet
-    /// write path joins the pipeline (no data-side consumer exists
-    /// yet to suppress for).
+    /// `Wal::last_checkpoint()` at entry — the publication horizon `X`:
+    /// what the miner regenerates for a frame at or below it is withheld
+    /// from the configured sinks.
     pub parquet_horizon: Option<WalOffset>,
+    /// Mined records withheld from the record sink (frame at or below
+    /// `X`, above the tenant's `S`).
+    pub records_suppressed_for_parquet: u64,
+    /// Audit events the miner regenerated for frames at or below `X`,
+    /// withheld from the audit sink.
+    pub audit_events_suppressed: u64,
     /// Highest offset delivered during replay.
     pub max_delivered: Option<WalOffset>,
     /// Per-tenant snapshot outcome, one entry per artefact found.
@@ -166,16 +176,7 @@ pub fn recover(
         horizons,
         legacy,
     } = restore_artefacts(miner, artefacts);
-    let mut sink = DriverSink {
-        miner,
-        horizons: &horizons,
-        frames_delivered: 0,
-        records_fed: 0,
-        records_suppressed: 0,
-        segments_seen: HashSet::new(),
-        max_delivered: None,
-    };
-    wal.replay(&mut sink).map_err(RecoveryDriverError::Replay)?;
+    let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
     // ends there rather than at `Wal::open` because open runs before
     // replay has healed a torn tail — a figure taken there would count
@@ -191,19 +192,190 @@ pub fn recover(
     let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
         if let Some(horizon) = horizons.get(&tenant.tenant_id) {
-            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &sink.segments_seen)
+            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &replay.segments_seen)
                 && !reclaim_explains(*horizon, reclaimed.get(&tenant.tenant_id));
         }
     }
 
     Ok(RecoveryReport {
-        frames_delivered: sink.frames_delivered,
-        records_fed_to_miner: sink.records_fed,
-        records_suppressed_for_miner: sink.records_suppressed,
+        frames_delivered: replay.frames_delivered,
+        records_fed_to_miner: replay.records_fed,
+        records_suppressed_for_miner: replay.records_suppressed,
         parquet_horizon,
-        max_delivered: sink.max_delivered,
+        records_suppressed_for_parquet: replay.withheld.records,
+        audit_events_suppressed: replay.withheld.events,
+        max_delivered: replay.max_delivered,
         tenants,
     })
+}
+
+/// What one replay pass saw and withheld.
+struct Replayed {
+    frames_delivered: u64,
+    records_fed: u64,
+    records_suppressed: u64,
+    segments_seen: HashSet<uuid::Uuid>,
+    max_delivered: Option<WalOffset>,
+    withheld: Withheld,
+}
+
+/// Replay the WAL into `miner` with its configured sinks held aside, so
+/// that nothing it regenerates for a frame at or below `checkpoint`
+/// reaches them (RFC 0052 §3.7). The sinks are handed back whether or
+/// not the replay succeeds.
+fn replay_gated(
+    wal: &mut Wal,
+    miner: &mut MinerCluster,
+    horizons: &HashMap<TenantId, WalOffset>,
+    checkpoint: Option<WalOffset>,
+) -> Result<Replayed, RecoveryDriverError> {
+    let capture = ReplayCapture::install(miner);
+    let mut sink = DriverSink {
+        miner,
+        horizons,
+        checkpoint,
+        capture,
+        frames_delivered: 0,
+        records_fed: 0,
+        records_suppressed: 0,
+        segments_seen: HashSet::new(),
+        max_delivered: None,
+    };
+    let replayed = wal.replay(&mut sink);
+    let DriverSink {
+        miner,
+        capture,
+        frames_delivered,
+        records_fed,
+        records_suppressed,
+        segments_seen,
+        max_delivered,
+        ..
+    } = sink;
+    let withheld = capture.restore(miner);
+    replayed.map_err(RecoveryDriverError::Replay)?;
+    Ok(Replayed {
+        frames_delivered,
+        records_fed,
+        records_suppressed,
+        segments_seen,
+        max_delivered,
+        withheld,
+    })
+}
+
+/// Where one replayed frame goes. A frame the tenant's snapshot folds is
+/// not mined at all; one at or below the checkpoint is mined for the
+/// miner's state alone, its rows and events being published already; any
+/// other is mined and published. `max(X, S)` is therefore the record
+/// gate, and `X` the audit gate, since a folded frame regenerates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Folded,
+    MinerOnly,
+    Published,
+}
+
+fn route(offset: WalOffset, snapshot: Option<&WalOffset>, checkpoint: Option<WalOffset>) -> Route {
+    match (snapshot, checkpoint) {
+        (Some(horizon), _) if offset <= *horizon => Route::Folded,
+        (_, Some(mark)) if offset <= mark => Route::MinerOnly,
+        _ => Route::Published,
+    }
+}
+
+/// A buffer the miner emits into during replay, drained once per frame.
+struct Capture<T>(Arc<Mutex<Vec<T>>>);
+
+impl<T> Clone for Capture<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> Capture<T> {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn push(&self, item: T) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(item);
+    }
+
+    fn take(&self) -> Vec<T> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl RecordSink for Capture<MinedRecord> {
+    fn emit(&mut self, record: MinedRecord) {
+        self.push(record);
+    }
+}
+
+impl AuditSink for Capture<AuditEvent> {
+    fn emit(&mut self, event: AuditEvent) {
+        self.push(event);
+    }
+}
+
+/// What the gate kept from the configured sinks.
+#[derive(Debug, Default, Clone, Copy)]
+struct Withheld {
+    records: u64,
+    events: u64,
+}
+
+/// The miner's configured sinks, held aside for the replay while it emits
+/// into capture buffers.
+struct ReplayCapture {
+    records: Capture<MinedRecord>,
+    events: Capture<AuditEvent>,
+    record_sink: Box<dyn RecordSink>,
+    audit_sink: Box<dyn AuditSink>,
+    withheld: Withheld,
+}
+
+impl ReplayCapture {
+    fn install(miner: &mut MinerCluster) -> Self {
+        let (records, events) = (Capture::new(), Capture::new());
+        Self {
+            record_sink: miner.replace_record_sink(Box::new(records.clone())),
+            audit_sink: miner.replace_audit_sink(Box::new(events.clone())),
+            records,
+            events,
+            withheld: Withheld::default(),
+        }
+    }
+
+    /// Forward what the frame just mined emitted, in emission order, or
+    /// count it as withheld.
+    fn settle(&mut self, route: Route) {
+        let (records, events) = (self.records.take(), self.events.take());
+        match route {
+            Route::Published => {
+                for record in records {
+                    self.record_sink.emit(record);
+                }
+                for event in events {
+                    self.audit_sink.emit(event);
+                }
+            }
+            Route::MinerOnly | Route::Folded => {
+                self.withheld.records += records.len() as u64;
+                self.withheld.events += events.len() as u64;
+            }
+        }
+    }
+
+    fn restore(self, miner: &mut MinerCluster) -> Withheld {
+        drop(miner.replace_record_sink(self.record_sink));
+        drop(miner.replace_audit_sink(self.audit_sink));
+        self.withheld
+    }
 }
 
 /// What restoring the snapshot artefacts left: each tenant's outcome,
@@ -386,6 +558,8 @@ fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
 struct DriverSink<'a> {
     miner: &'a mut MinerCluster,
     horizons: &'a HashMap<TenantId, WalOffset>,
+    checkpoint: Option<WalOffset>,
+    capture: ReplayCapture,
     frames_delivered: u64,
     records_fed: u64,
     records_suppressed: u64,
@@ -420,11 +594,11 @@ impl FrameSink for DriverSink<'_> {
                 ));
             }
             FrameKind::TenantOtlpBatch => self.consume_batch(offset, payload)?,
-            // Nothing writes AuditEvent frames yet (`encode_audit_event`
-            // is the RFC 0008 §9 stub); when the encoder lands these
-            // reinject into the audit Parquet queue, gated on the
-            // Parquet horizon. Counted in frames_delivered, never a
-            // panic — the frame kind is valid on the wire today.
+            // The miner's regeneration is the only source of replayed
+            // events (RFC 0052 §3.7): feeding a stored event as well
+            // would forward it twice. Nothing writes the kind yet
+            // (`encode_audit_event` is RFC 0008 §9's stub), and an
+            // encoder that lands must keep this arm or amend §3.7.
             FrameKind::AuditEvent => {}
         }
         Ok(())
@@ -433,8 +607,9 @@ impl FrameSink for DriverSink<'_> {
 
 impl DriverSink<'_> {
     /// Feed one tenant's frame to the miner unless its restored horizon
-    /// already folds it, and advance that tenant's folded horizon to the
-    /// frame (RFC 0052 §3.1) — replay folds in WAL order, as ingest does.
+    /// already folds it, advance that tenant's folded horizon to the
+    /// frame (RFC 0052 §3.1) — replay folds in WAL order, as ingest does —
+    /// and publish what it regenerated only above the checkpoint.
     fn consume_batch(&mut self, offset: WalOffset, payload: &[u8]) -> Result<(), RecoveryError> {
         let kind = FrameKind::TenantOtlpBatch;
         let batch = TenantBatch::decode(payload).map_err(|e| reject(kind, offset, &e))?;
@@ -443,20 +618,18 @@ impl DriverSink<'_> {
             .map_err(|e| reject(kind, offset, &e))?;
         let records = assign(request, &tenant);
         let count = records.len() as u64;
-        if self
-            .horizons
-            .get(&tenant)
-            .is_some_and(|horizon| offset <= *horizon)
-        {
-            self.records_suppressed += count;
-            return Ok(());
+        match route(offset, self.horizons.get(&tenant), self.checkpoint) {
+            Route::Folded => self.records_suppressed += count,
+            mined => {
+                for record in &records {
+                    self.miner.ingest(record);
+                }
+                self.records_fed += count;
+                self.miner
+                    .fold_through(&tenant, snapshot_store::high_water(offset));
+                self.capture.settle(mined);
+            }
         }
-        for record in &records {
-            self.miner.ingest(record);
-        }
-        self.records_fed += count;
-        self.miner
-            .fold_through(&tenant, snapshot_store::high_water(offset));
         Ok(())
     }
 }
@@ -544,13 +717,50 @@ mod tests {
         assert!(!stale_gap(s, Some(x), &seen));
     }
 
+    #[test]
+    fn route_folds_at_or_below_the_snapshot_whatever_the_checkpoint() {
+        let s = offset(SEGMENT, 50);
+        for checkpoint in [None, Some(offset(SEGMENT, 20)), Some(offset(SEGMENT, 80))] {
+            assert_eq!(route(s, Some(&s), checkpoint), Route::Folded);
+        }
+    }
+
+    #[test]
+    fn route_mines_only_between_the_snapshot_and_the_checkpoint() {
+        let (s, x) = (offset(SEGMENT, 20), offset(SEGMENT, 80));
+        assert_eq!(
+            route(offset(SEGMENT, 50), Some(&s), Some(x)),
+            Route::MinerOnly
+        );
+        assert_eq!(route(x, Some(&s), Some(x)), Route::MinerOnly);
+        assert_eq!(route(x, None, Some(x)), Route::MinerOnly);
+    }
+
+    #[test]
+    fn route_publishes_above_both_marks() {
+        let (s, x) = (offset(SEGMENT, 20), offset(SEGMENT, 80));
+        assert_eq!(
+            route(offset(SEGMENT, 81), Some(&s), Some(x)),
+            Route::Published
+        );
+        assert_eq!(route(offset(SEGMENT, 81), None, None), Route::Published);
+        assert_eq!(route(offset(SEGMENT, 60), Some(&x), Some(s)), Route::Folded);
+        assert_eq!(
+            route(offset(SEGMENT, 90), Some(&x), Some(s)),
+            Route::Published
+        );
+    }
+
     fn sink<'a>(
         miner: &'a mut MinerCluster,
         horizons: &'a HashMap<TenantId, WalOffset>,
     ) -> DriverSink<'a> {
+        let capture = ReplayCapture::install(miner);
         DriverSink {
             miner,
             horizons,
+            checkpoint: None,
+            capture,
             frames_delivered: 0,
             records_fed: 0,
             records_suppressed: 0,

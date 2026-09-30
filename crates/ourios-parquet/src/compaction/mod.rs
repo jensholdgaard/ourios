@@ -87,9 +87,11 @@ pub struct CompactionOutcome {
     pub rows: u64,
     /// Rows an erasure filter removed (RFC 0047 §3.6); `0` without one.
     pub rows_dropped: u64,
-    /// The commit, or `None` when compaction was a no-op (fewer than
-    /// two live files — nothing to consolidate — or a lost CAS race that
-    /// left the work for a later sweep).
+    /// The commit, or `None` when nothing was committed: fewer than two
+    /// live files (nothing to consolidate), a bootstrap manifest lost to a
+    /// concurrent compactor before anything was written, or a final
+    /// manifest swap lost after the rewrite. Only the last is a failure,
+    /// and it is distinguished by [`commit_lost`](Self::commit_lost).
     pub committed: Option<Committed>,
     /// Whether the rewrite was written but its final manifest swap lost.
     /// `false` for every other no-op, including a lost bootstrap: that
@@ -200,11 +202,14 @@ impl std::error::Error for CompactionError {
 /// rewrite them as one file, then atomically commit the manifest to name only
 /// that file and remove the superseded inputs.
 ///
-/// A no-op (returns `committed: None`) when the partition has fewer than two
-/// live files (nothing to consolidate), or when a compare-and-swap on the
-/// manifest is lost to a concurrent sweep (S3 only) — in the latter case the
-/// freshly written consolidated file is a non-live orphan a later
-/// [`gc_orphans`] reclaims.
+/// Returns `committed: None` when the partition has fewer than two live files
+/// (nothing to consolidate), or when a manifest compare-and-swap is lost to a
+/// concurrent compactor (S3 only). A lost bootstrap happens before anything is
+/// written and is a plain no-op. A lost final swap sets
+/// [`CompactionOutcome::commit_lost`]: the consolidated file no manifest names
+/// is deleted immediately (a failed delete is counted in
+/// [`CompactionOutcome::gc_failures`]), the inputs stay live, and the
+/// compaction sweep surfaces the loss as a sweep error so it is retried.
 ///
 /// # Errors
 ///

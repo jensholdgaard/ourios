@@ -384,8 +384,14 @@ impl MinerCluster {
         tenant.leaf_count = state.leaves.len();
         tenant.folded.clone_from(&state.wal_high_water);
 
-        // The id allocator is cluster-wide; without this bump a
-        // post-restore allocation would collide with a restored id.
+        self.allocate_past(state);
+        self.tenants.insert(tenant_id.clone(), tenant);
+        Ok(())
+    }
+
+    /// The id allocator is cluster-wide; without this bump a post-restore
+    /// allocation would collide with a restored id.
+    fn allocate_past(&mut self, state: &crate::snapshot::SnapshotState) {
         let max_restored = state
             .leaves
             .iter()
@@ -396,9 +402,6 @@ impl MinerCluster {
         if let Some(max_restored) = max_restored {
             self.next_template_id = self.next_template_id.max(max_restored + 1);
         }
-
-        self.tenants.insert(tenant_id.clone(), tenant);
-        Ok(())
     }
 }
 

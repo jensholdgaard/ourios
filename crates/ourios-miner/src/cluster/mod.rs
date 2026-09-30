@@ -1682,12 +1682,10 @@ impl MinerCluster {
             service,
             raw,
         } = line;
-        let LineParts { separators, params } = parts;
         // Ownership rationale: each exit path emits **one** data
-        // record and never reuses `separators` / `params` after
-        // that emit. Taking the vectors by value lets each branch
-        // move them straight into the record without a `.to_vec()`
-        // clone.
+        // record and never reuses `parts` after that emit. Taking it
+        // by value lets each branch move its vectors straight into
+        // the record without a `.to_vec()` clone.
 
         // Phase 1 — mutate the leaf and accumulate the audit-event
         // payloads (the helper holds the leaf borrow only over the
@@ -1710,7 +1708,7 @@ impl MinerCluster {
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = template_id;
                 rec.template_version = template_version;
-                rec.separators = separators;
+                rec.separators = parts.separators;
                 rec.params = aligned_params;
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this clean-reuse
@@ -1738,11 +1736,7 @@ impl MinerCluster {
                 // failure that retains body (the line-ordered
                 // params fallback is fine — reconstruct ignores
                 // `params` on the lossy path).
-                self.emit_string_parse_failure(
-                    line,
-                    LineParts { separators, params },
-                    "degenerate_widening",
-                )
+                self.emit_string_parse_failure(line, parts, "degenerate_widening")
             }
             AttachPlan::Mutated {
                 template_id,
@@ -1772,7 +1766,7 @@ impl MinerCluster {
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = template_id;
                 rec.template_version = final_version;
-                rec.separators = separators;
+                rec.separators = parts.separators;
                 rec.params = aligned_params;
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this widened /

@@ -1,7 +1,7 @@
 ---
 rfc: 0052
 title: WAL reclamation and quiesce recovery
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-12
@@ -11,8 +11,18 @@ superseded-by: —
 
 # RFC 0052 — WAL reclamation and quiesce recovery
 
-> **Status note.** `red` — test stubs exist and fail
-> (`docs/rfcs/README.md` §Lifecycle). Every live §5 scenario was stubbed
+> **Status: `green` (2026-09-30, maintainer-approved flip).** Every live
+> §5 scenario passes, with **one recorded deferral: RFC0052.17 is
+> partial at `green`**. Its `PUBLISHED` row stays an `#[ignore]`d stub
+> handed to RFC 0055 (publication frontiers), which owns the
+> `PUBLISHED` writer and format and discharges the row. Precedent for a
+> recorded deferral at green: RFC 0041's RFC0041.5 and RFC 0005's sizing
+> criterion. Every other RFC0052.17 row is green. The recorded long soak
+> run §6 requires before `validated` is still to come. The history of
+> the `red` stage follows.
+>
+> *(`red` — test stubs existed and failed
+> (`docs/rfcs/README.md` §Lifecycle).)* Every live §5 scenario was stubbed
 > as one or more `#[ignore]`d `todo!` stubs, per leg where §6 separates
 > the legs, in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12,
 > .13, .16, .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's
@@ -3053,7 +3063,8 @@ memory, and nothing here claims to.
 > survives a panic).** Number retained; no obligation here.
 
 > **Scenario RFC0052.17 — The reclaim record is the only startup witness,
-> and it is fail-closed**
+> and it is fail-closed** *(partial at `green` — the `PUBLISHED` row is
+> a recorded deferral to RFC 0055; see the status banner)*
 > - **Given** a WAL root housekeeping has reclaimed from under per-tenant
 >   horizons, so `RECLAIM` holds an entry per reclaimed tenant
 > - **When** the node restarts with one tenant's snapshot undecodable

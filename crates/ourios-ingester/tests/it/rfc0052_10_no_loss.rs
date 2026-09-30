@@ -13,14 +13,15 @@
 //! leaves on disk — then run startup recovery over it.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Lines};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
-use std::time::SystemTime;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
-use ourios_core::audit::{AuditEvent, SharedAuditSink};
+use ourios_core::audit::{AuditEvent, AuditPayload, SharedAuditSink};
 use ourios_core::clock::TestClock;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
@@ -28,11 +29,11 @@ use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::receiver::tenant::assign;
-use ourios_ingester::record_sink::{ParquetRecordSink, SharedParquetSink};
+use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::{Reader, Store};
+use ourios_parquet::{AuditReader, Reader, Store};
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, TenantBatch, Wal, WalConfig, WalOffset};
 use prost::Message;
 
@@ -60,18 +61,11 @@ fn rfc0052_10_every_acked_record_survives_a_kill_during_reclamation() {
     for dir in [&data_root, &audit_root] {
         std::fs::create_dir_all(dir).expect("store root");
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_receiver_reclaim_crash_fixture"))
-        .args([&wal_root, &data_root, &audit_root])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn reclaim crash fixture");
-    let mut lines = BufReader::new(child.stdout.take().expect("fixture stdout piped")).lines();
-    let acked = acks_until_reclaiming(&mut lines);
+    let (mut fixture, lines) = Fixture::spawn(&[&wal_root, &data_root, &audit_root]);
+    let acked = acks_until_reclaiming(&lines);
 
     // When it is killed mid-batch — it never stops ingesting — and restarts.
-    child.kill().expect("SIGKILL fixture");
-    child.wait().expect("reap fixture");
-    drop(lines);
+    fixture.kill();
     let surviving = segments(&wal_root);
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen");
     let checkpoint = wal
@@ -113,36 +107,115 @@ fn rfc0052_10_every_acked_record_survives_a_kill_during_reclamation() {
     );
 }
 
+/// How long the fixture has to reach the kill point. A normal run takes
+/// under three seconds; the fixture never exits on its own.
+const WATCHDOG: Duration = Duration::from_secs(20);
+
+/// Acknowledgements past which the run is treated as stuck even inside the
+/// watchdog: a normal run kills at well under a hundred.
+const MAX_ACKS: usize = 10_000;
+
+/// The fixture child, killed and reaped however the test ends — a timeout,
+/// a failed assertion or a panic — since it never exits on its own.
+struct Fixture(Child);
+
+impl Fixture {
+    /// Spawn the fixture with a thread forwarding its stdout lines. The
+    /// thread keeps the pipe open until the child dies: a closed pipe would
+    /// fail the child's next write and end it by panic instead of the kill.
+    fn spawn(args: &[&Path]) -> (Self, Receiver<String>) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_receiver_reclaim_crash_fixture"))
+            .args(args)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn reclaim crash fixture");
+        let stdout = child.stdout.take().expect("fixture stdout piped");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        (Self(child), rx)
+    }
+
+    /// `SIGKILL` the child and reap it.
+    fn kill(&mut self) {
+        self.0.kill().expect("SIGKILL fixture");
+        self.0.wait().expect("reap fixture");
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Already reaped on the passing path; these only matter on a failing one.
+        drop(self.0.kill());
+        drop(self.0.wait());
+    }
+}
+
+/// One line the fixture prints.
+enum FixtureLine {
+    Ack(u64, WalOffset),
+    Reclaimed,
+}
+
+fn parse_line(line: &str) -> FixtureLine {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        ["ACK", n, segment, byte] => FixtureLine::Ack(
+            n.parse().expect("batch number"),
+            WalOffset {
+                segment: segment.parse().expect("segment id"),
+                byte: byte.parse().expect("byte offset"),
+            },
+        ),
+        ["RECLAIMED", _] => FixtureLine::Reclaimed,
+        _ => panic!("unexpected fixture line {line:?}"),
+    }
+}
+
 /// Read the fixture's `ACK` lines until [`ACKS_AFTER_RECLAIM`] of them
-/// follow its first reclaiming pass. The reader stays with the caller so
-/// the pipe is open until the kill: a closed pipe would fail the child's
-/// next write and end it by panic instead.
-fn acks_until_reclaiming(lines: &mut Lines<BufReader<ChildStdout>>) -> Vec<(u64, WalOffset)> {
+/// follow its first reclaiming pass, within [`WATCHDOG`] and [`MAX_ACKS`].
+fn acks_until_reclaiming(lines: &Receiver<String>) -> Vec<(u64, WalOffset)> {
+    let deadline = Instant::now() + WATCHDOG;
     let mut acked = Vec::new();
     let mut since_reclaim: Option<usize> = None;
-    for line in lines.by_ref() {
-        let line = line.expect("fixture line");
-        match line.split_whitespace().collect::<Vec<_>>()[..] {
-            ["ACK", n, segment, byte] => {
-                let frame = WalOffset {
-                    segment: segment.parse().expect("segment id"),
-                    byte: byte.parse().expect("byte offset"),
-                };
-                acked.push((n.parse().expect("batch number"), frame));
+    loop {
+        let line = match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "watchdog: no kill point within {WATCHDOG:?} ({} acked, {since_reclaim:?} \
+                 acked since the first reclaiming pass)",
+                acked.len(),
+            ),
+            Err(RecvTimeoutError::Disconnected) => panic!(
+                "the fixture exited before the kill point ({} acked, {since_reclaim:?} acked \
+                 since the first reclaiming pass)",
+                acked.len(),
+            ),
+        };
+        match parse_line(&line) {
+            FixtureLine::Ack(n, frame) => {
+                acked.push((n, frame));
                 if let Some(count) = since_reclaim.as_mut() {
                     *count += 1;
                 }
             }
-            ["RECLAIMED", _] => {
+            FixtureLine::Reclaimed => {
                 since_reclaim.get_or_insert(0);
             }
-            _ => panic!("unexpected fixture line {line:?}"),
         }
+        assert!(
+            acked.len() <= MAX_ACKS,
+            "no kill point after {MAX_ACKS} acknowledgements ({since_reclaim:?} since the \
+             first reclaiming pass)",
+        );
         if since_reclaim.is_some_and(|count| count >= ACKS_AFTER_RECLAIM) {
             return acked;
         }
     }
-    panic!("the fixture exited before a pass reclaimed anything");
 }
 
 /// The segment ids whose files are in `wal_root`.
@@ -237,6 +310,75 @@ async fn rfc0052_10_a_discarded_snapshot_republishes_nothing_at_or_below_the_che
         "the miner rebuilds from scratch"
     );
     assert_eq!(report.records_suppressed_for_parquet, 2);
+}
+
+/// Scenario RFC0052.10 — a replayed record that publishes inline is never
+/// durable ahead of the template event replay regenerated for it.
+/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §3.7.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0052_10_a_replayed_record_is_never_durable_before_its_template_event() {
+    // Given record 3 above X, whose template replay creates, and a record
+    // sink that publishes inline on every emit behind the audit barrier.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let node = lagging_snapshot_node(tmp.path(), Leftover::Lagging).await;
+    let audit_root = tmp.path().join("replay-audit");
+    std::fs::create_dir_all(&audit_root).expect("audit root");
+    let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+        Store::local(&audit_root).expect("audit store"),
+        100_000,
+    ));
+    let barrier = audit.clone();
+    let inline = FlushConfig {
+        target_bytes: 1,
+        ..never_flush()
+    };
+    let sink = SharedParquetSink::new(
+        ParquetRecordSink::new(Store::local(&node.data_root).expect("store"), inline)
+            .with_audit_barrier(Box::new(move || barrier.flush())),
+    );
+    let mut miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit))
+        .with_record_sink(Box::new(sink));
+
+    // When recovery replays it, with no flush afterwards.
+    let mut wal = Wal::open(node.wal()).expect("reopen");
+    recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+
+    // Then the record reached the store inline, and its template event is
+    // durable beside it.
+    let published: Vec<MinedRecord> = rows(&node.data_root)
+        .into_iter()
+        .filter(|r| r.time_unix_nano == 3)
+        .collect();
+    assert_eq!(
+        published.len(),
+        1,
+        "record 3 published inline during replay"
+    );
+    let durable_templates: HashSet<u64> = audit_events(&audit_root)
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AuditPayload::Template { template_id, .. } => Some(*template_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        durable_templates.contains(&published[0].template_id),
+        "the template event for record 3 must be durable no later than the record \
+         (durable templates: {durable_templates:?})",
+    );
+}
+
+/// Every audit event in the Parquet files under `root`.
+fn audit_events(root: &Path) -> Vec<AuditEvent> {
+    crate::rfc0052_barrier_support::parquet_files(root)
+        .iter()
+        .flat_map(|path| {
+            AuditReader::open_file(path)
+                .expect("open audit file")
+                .read_all()
+                .expect("read audit file")
+        })
+        .collect()
 }
 
 /// Scenario RFC0052.10 — the `S > X` shape: the snapshot landed and the

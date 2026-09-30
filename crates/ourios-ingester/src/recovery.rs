@@ -356,12 +356,15 @@ impl ReplayCapture {
     fn settle(&mut self, route: Route) {
         let (records, events) = (self.records.take(), self.events.take());
         match route {
+            // Events first: a record emit can publish inline, and the sink's
+            // audit barrier must already see the template event it flushes
+            // ahead of that record.
             Route::Published => {
-                for record in records {
-                    self.record_sink.emit(record);
-                }
                 for event in events {
                     self.audit_sink.emit(event);
+                }
+                for record in records {
+                    self.record_sink.emit(record);
                 }
             }
             Route::MinerOnly | Route::Folded => {

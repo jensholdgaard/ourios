@@ -1,7 +1,7 @@
 ---
 rfc: 0052
 title: WAL reclamation and quiesce recovery
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-12
@@ -11,8 +11,16 @@ superseded-by: —
 
 # RFC 0052 — WAL reclamation and quiesce recovery
 
-> **Status note.** `red` — test stubs exist and fail
-> (`docs/rfcs/README.md` §Lifecycle). Every live §5 scenario was stubbed
+> **Status: `green` (2026-09-30, maintainer-approved flip).** Every live
+> §5 scenario passes. RFC0052.17's two `PUBLISHED` legs **moved to RFC
+> 0055 as RFC0055.5** before the flip, because RFC 0055 (publication
+> frontiers) owns the `PUBLISHED` writer and format. Their stub stays
+> `#[ignore]`d under that criterion, as .6, .8 and .9 moved to RFC 0053.
+> The recorded long soak run §6 requires before `validated` is still to
+> come. The history of the `red` stage follows.
+>
+> *(`red` — test stubs existed and failed
+> (`docs/rfcs/README.md` §Lifecycle).)* Every live §5 scenario was stubbed
 > as one or more `#[ignore]`d `todo!` stubs, per leg where §6 separates
 > the legs, in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12,
 > .13, .16, .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's
@@ -3146,17 +3154,10 @@ memory, and nothing here claims to.
 >   **segments present** it is a legacy root mid migration and the record
 >   is **retained** with its arming and its mode, the root opening on the
 >   legacy branch with the upgrade retried by the next checkpoint
-> - **And** a tenant introduced by a `PUBLISHED`-only write — no
->   intervening `RECLAIM` write — keeps its slot id across a restart: the
->   table is seeded from the union of both dictionaries and `next_slot_id`
->   is the maximum of the two headers, so the id is never reissued to a
->   different tenant
-> - **And** a record carrying `published_seeded_armed` without
->   `published_seeded_confirmed` with `PUBLISHED` **absent** — the crash
->   before the accepting start's own `PUBLISHED` write — leaves the next
->   start free to seed again, while the same record with `PUBLISHED`
->   **present** is the ordinary post-write state and is promoted to
->   confirmed durably at open, never read as a fault
+> - *(The two `PUBLISHED` legs — slot ids surviving a `PUBLISHED`-only
+>   write, and the `published_seeded_*` flags resolving at open — moved
+>   to RFC 0055 as RFC0055.5, since RFC 0055 owns the `PUBLISHED` writer
+>   and format. No obligation here.)*
 > - **And** the same record beside a **present** version-2 `CHECKPOINT` —
 >   the crash after the rename and before the record's next write — opens
 >   normally and is promoted to `seen` durably at open, never read as a

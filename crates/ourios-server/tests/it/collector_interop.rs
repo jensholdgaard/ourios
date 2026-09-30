@@ -666,49 +666,15 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     )
     .expect("derive registry");
 
-    let claim_of = |record: &ourios_core::record::MinedRecord| -> Option<String> {
-        record.attributes.iter().find_map(|kv| {
-            (kv.key == "log.record.template")
-                .then(|| kv.value.as_ref()?.value.as_ref())
-                .flatten()
-                .and_then(|v| match v {
-                    ourios_core::otlp::any_value::Value::StringValue(s) => Some(s.clone()),
-                    _ => None,
-                })
-        })
-    };
-
     // The adopt discriminator: only the RFC 0050 adopt path emits
     // `template_adopted` audit events. Without this, "the row's
     // template renders the claim" would be circular — the built-in
     // miner converges on the same canonical for this corpus even
     // under `ignore`.
-    let mut adopted_events: Vec<(u64, u32, String)> = Vec::new();
-    for f in data_parquet_files(&tmp.path().join("audit")) {
-        let events = ourios_parquet::AuditReader::open_file(&f)
-            .expect("open audit file")
-            .read_all()
-            .expect("read audit events");
-        for event in events {
-            if let ourios_core::audit::AuditPayload::Template {
-                template_id,
-                change:
-                    ourios_core::audit::TemplateChange::Adopted {
-                        template_version,
-                        new_template,
-                    },
-                ..
-            } = event.payload
-            {
-                adopted_events.push((template_id, template_version, new_template));
-            }
-        }
-    }
+    let adoptions = adopted_events(&tmp.path().join("audit"));
     assert!(
-        adopted_events
-            .iter()
-            .any(|(_, _, template)| template == CONVERGED),
-        "the adopt path audited the drainprocessor's converged template: {adopted_events:?}",
+        adoptions.iter().any(|a| a.template == CONVERGED),
+        "the adopt path audited the drainprocessor's converged template: {adoptions:?}",
     );
 
     let mut converged_adoptions = 0usize;
@@ -722,7 +688,7 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
             // RFC 0018: the drainprocessor's annotation is stored
             // verbatim — checked against the a-priori oracle, not
             // against the store's own contents.
-            let claim = claim_of(&record)
+            let claim = drain_claim(&record)
                 .unwrap_or_else(|| panic!("drain annotated every record: {record:?}"));
             let ourios_querier::LogBody::Rendered { line, .. } =
                 ourios_querier::render_log_body(&record, &registry)
@@ -736,31 +702,8 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
                 "every stored claim is drain's known output for this corpus, \
                  got {claim:?} (line {line:?})",
             );
-            // A converged claim was adopted: the audit stream carries a
-            // template_adopted event for exactly this row's (id, version)
-            // naming this claim — an adoption of the same id at another
-            // version or template does not count — and the registry
-            // tokens at the row's key render the claim.
             if claim == CONVERGED {
-                assert!(
-                    adopted_events.iter().any(|(id, version, template)| {
-                        *id == record.template_id
-                            && *version == record.template_version
-                            && *template == claim
-                    }),
-                    "row ({}, v{}) adopted via the audited adopt path with its claim \
-                     {claim:?}: {adopted_events:?}",
-                    record.template_id,
-                    record.template_version,
-                );
-                let tokens = registry
-                    .get(&(record.template_id, record.template_version))
-                    .expect("adopted row's (id, version) resolves in the registry");
-                assert_eq!(
-                    ourios_miner::tree::format_template(tokens),
-                    claim,
-                    "the row's template IS the drainprocessor's claim",
-                );
+                assert_adopted(&record, &claim, &adoptions, &registry);
                 converged_adoptions += 1;
             }
             rendered.push(line);
@@ -778,5 +721,85 @@ async fn drainprocessor_annotates_and_ourios_adopts() {
     assert_eq!(
         rendered, want,
         "every line reconstructs byte-identically (RFC0050.4)",
+    );
+}
+
+/// The drainprocessor's `log.record.template` annotation on `record`.
+fn drain_claim(record: &ourios_core::record::MinedRecord) -> Option<String> {
+    record.attributes.iter().find_map(|kv| {
+        (kv.key == "log.record.template")
+            .then(|| kv.value.as_ref()?.value.as_ref())
+            .flatten()
+            .and_then(|v| match v {
+                ourios_core::otlp::any_value::Value::StringValue(s) => Some(s.clone()),
+                _ => None,
+            })
+    })
+}
+
+/// One `template_adopted` audit event: the adoption binds `template`
+/// to the registry key `(template_id, template_version)`.
+#[derive(Debug)]
+struct Adoption {
+    template_id: u64,
+    template_version: u32,
+    template: String,
+}
+
+/// Every `template_adopted` event under `audit_root`.
+fn adopted_events(audit_root: &std::path::Path) -> Vec<Adoption> {
+    let mut out = Vec::new();
+    for f in data_parquet_files(audit_root) {
+        let events = ourios_parquet::AuditReader::open_file(&f)
+            .expect("open audit file")
+            .read_all()
+            .expect("read audit events");
+        out.extend(events.into_iter().filter_map(|event| match event.payload {
+            ourios_core::audit::AuditPayload::Template {
+                template_id,
+                change:
+                    ourios_core::audit::TemplateChange::Adopted {
+                        template_version,
+                        new_template,
+                    },
+                ..
+            } => Some(Adoption {
+                template_id,
+                template_version,
+                template: new_template,
+            }),
+            _ => None,
+        }));
+    }
+    out
+}
+
+/// A converged claim was adopted: the audit stream carries a
+/// `template_adopted` event for exactly this row's (id, version) naming
+/// this claim — an adoption of the same id at another version or
+/// template does not count — and the registry tokens at the row's key
+/// render the claim.
+fn assert_adopted(
+    record: &ourios_core::record::MinedRecord,
+    claim: &str,
+    adoptions: &[Adoption],
+    registry: &ourios_querier::TemplateRegistry,
+) {
+    assert!(
+        adoptions.iter().any(|a| a.template_id == record.template_id
+            && a.template_version == record.template_version
+            && a.template == claim),
+        "row ({}, v{}) adopted via the audited adopt path with its claim \
+         {claim:?}: {adoptions:?}",
+        record.template_id,
+        record.template_version,
+    );
+    let tokens = registry
+        .get(&(record.template_id, record.template_version))
+        .expect("adopted row's (id, version) resolves in the registry");
+    assert_eq!(
+        ourios_miner::tree::format_template(tokens),
+        claim,
+        "the row's template IS the drainprocessor's claim",
     );
 }

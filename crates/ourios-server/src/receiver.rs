@@ -1196,6 +1196,14 @@ mod tests {
         );
     }
 
+    /// One test at a time among those that increment the global sink
+    /// counter's `cadence_panic` dimension, held for the whole test: the
+    /// assertion on that count would otherwise see a sibling's increment.
+    async fn cadence_panic_serial() -> tokio::sync::MutexGuard<'static, ()> {
+        static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        SERIAL.lock().await
+    }
+
     /// #791: the sweep could not tell a cancelled step from a panicked one —
     /// it broke its loop on either, so a panic retired the flush cadence for
     /// the life of the process while the task returned `()` cleanly and
@@ -1212,7 +1220,8 @@ mod tests {
     /// binary, a different process) and no sibling asserts on metrics. It is
     /// still one installer only — which is why the two cases are one test
     /// rather than two, since siblings sharing a global meter accumulate on
-    /// the same counter.
+    /// the same counter. A sibling that *increments* the counter holds
+    /// [`cadence_panic_serial`] for the same reason.
     ///
     /// `ourios-ingester`'s `cadence_panic_metric` covers the complementary
     /// half: that the dimension distinguishes a dead sweep from an ordinary
@@ -1266,6 +1275,7 @@ mod tests {
                 AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
             };
 
+            let _serial = super::cadence_panic_serial().await;
             let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
             let root = tempfile::TempDir::new().expect("root");
             let join_error = tokio::spawn(async { panic!("the step blew up") })
@@ -1756,6 +1766,7 @@ mod tests {
     /// stops every later pass.
     #[tokio::test(start_paused = true)]
     async fn housekeeping_task_passes_at_once_survives_a_panic_and_stops_on_shutdown() {
+        let _serial = cadence_panic_serial().await;
         let tmp = tempfile::TempDir::new().expect("temp");
         let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);

@@ -304,6 +304,40 @@ fn rfc0050_6_mined_first_adopted_second_converges() {
     assert_eq!(kinds, vec!["template_created", "template_adopted"]);
 }
 
+/// RFC0050.6 when two mined leaves share a canonical: one widening away
+/// must not hide the other from the convergence guard, or the adoption
+/// interns an owned id beside a mined leaf of exactly its shape.
+#[test]
+fn rfc0050_6_converges_on_a_leaf_whose_twin_widened_away() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(adopt_config().with_prefix_depth(1).expect("in range"));
+    // Different masked first tokens (IP, NUM): two leaves, one shape.
+    let _ = cluster.ingest(&string_record(&t, "10.0.0.1 did a b"));
+    let twin = cluster.ingest(&string_record(&t, "42 did a b"));
+    let _ = cluster.ingest(&string_record(&t, "10.0.0.2 did a c"));
+
+    let adopted = cluster.ingest(&annotated_record(&t, "7 did a b", "<*> did a b"));
+
+    assert_eq!(adopted, twin, "the adoption rides the remaining mined leaf");
+    assert!(cluster.adopted_templates_for(&t).iter().all(|a| !a.owned));
+}
+
+/// RFC0050.6 when two mined leaves share a canonical: the adoption
+/// lands on the lower id, whatever order the tree's maps iterate in, so
+/// a restored tenant converges exactly as the live one did.
+#[test]
+fn rfc0050_6_converges_on_the_lowest_id_of_a_shared_shape() {
+    let t = TenantId::new("tenant-x");
+    let mut cluster = MinerCluster::new(adopt_config());
+    let lower = cluster.ingest(&string_record(&t, "10.0.0.1"));
+    let higher = cluster.ingest(&string_record(&t, "550e8400-e29b-41d4-a716-446655440000"));
+    assert!(lower < higher, "fixture: two leaves of shape <*>");
+
+    let adopted = cluster.ingest(&annotated_record(&t, "logout", "<*>"));
+
+    assert_eq!(adopted, lower);
+}
+
 #[test]
 fn readoption_after_widening_emits_no_second_audit() {
     // §3.3 "once per provenance transition": a leaf adopted at

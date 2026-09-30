@@ -56,7 +56,7 @@
 //! [`AuditSink`]: ourios_core::audit::AuditSink
 //! [`TemplateChange`]: ourios_core::audit::TemplateChange
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_config::MinerConfig;
@@ -299,12 +299,7 @@ struct TenantState {
     /// (including one already at the ceiling) costs a hash miss per
     /// canonical instead of a tree walk. Maintained at leaf
     /// creation, on template-changing widenings, and on restore.
-    /// When two leaves ever share a canonical (distinct masked
-    /// paths converging on one shape), one widening away removes
-    /// the shared entry and later adoptions of that shape intern
-    /// separately — safe, and multi-id shapes are RFC 0007 alias
-    /// territory.
-    mined_canonicals: HashSet<(String, u8, Option<String>)>,
+    mined_canonicals: canonicals::MinedCanonicals,
     template_count: usize,
     /// Drain-tree leaves only (excludes structured-template
     /// entries) — the quantity RFC 0023 §3.1's `max_templates`
@@ -334,7 +329,7 @@ impl TenantState {
             structured_templates: HashMap::new(),
             adopted_templates: HashMap::new(),
             owned_adopted_count: 0,
-            mined_canonicals: HashSet::new(),
+            mined_canonicals: canonicals::MinedCanonicals::default(),
             template_count: 0,
             leaf_count: 0,
             config,
@@ -600,6 +595,7 @@ impl MinerCluster {
 }
 
 mod build;
+mod canonicals;
 mod persist;
 mod plan;
 
@@ -1234,16 +1230,10 @@ impl MinerCluster {
         if let Some((old_canonical, new_canonical)) = widened_move
             && let Some(state) = self.tenants.get_mut(&record.tenant_id)
         {
-            state.mined_canonicals.remove(&(
-                old_canonical,
-                record.severity_number,
-                record.scope_name.clone(),
-            ));
-            state.mined_canonicals.insert((
-                new_canonical,
-                record.severity_number,
-                record.scope_name.clone(),
-            ));
+            let key = |canonical| (canonical, record.severity_number, record.scope_name.clone());
+            state
+                .mined_canonicals
+                .replace(&key(old_canonical), key(new_canonical));
         }
     }
 
@@ -1444,44 +1434,35 @@ impl MinerCluster {
             usize::from(state.config.max_node_children),
         )?;
 
-        let mut best: Option<Candidate> = None;
-        for (leaf_idx, leaf) in parent.leaves.iter().enumerate() {
-            // Length is structurally guaranteed by the tree's
-            // length-keyed first level (`Tree::descend` looks up
-            // `by_length[masked_strs.len()]`), so a length
-            // mismatch here would be a tree-invariant bug rather
-            // than a runtime case to handle. Debug-only assert.
-            debug_assert_eq!(
-                leaf.template.len(),
-                masked_strs.len(),
-                "tree partitions by length; every leaf under this parent must match",
-            );
-            // Filter on the non-token half of the §6.1
-            // template-key composition tuple. (Severity and
-            // scope are *not* part of the tree's keying today —
-            // we instead keep one leaf per `(severity, scope)`
-            // pair under each `(length, prefix)` bucket and
-            // filter on the leaf-list side.)
-            if leaf.severity_number != record.severity_number
-                || leaf.scope_name.as_deref() != record.scope_name.as_deref()
-            {
-                continue;
-            }
-            // Allocation-free over `&[OwnedToken]`. The borrowed
-            // `Token` view + `Vec::collect` form would allocate
-            // per leaf on every ingest call.
-            let similarity = sim_seq_owned(masked_strs, &leaf.template, line_wildcard_positions);
-            let candidate = Candidate {
-                leaf_idx,
-                similarity,
-            };
-            best = match best {
-                None => Some(candidate),
-                Some(prev) if similarity > prev.similarity => Some(candidate),
-                Some(prev) => Some(prev),
-            };
-        }
-        best
+        // Severity and scope are not part of the tree's keying: each
+        // `(length, prefix)` bucket holds one leaf per `(severity, scope)`
+        // pair and filters on the leaf-list side. A similarity tie goes to
+        // the lowest `template_id` — a property of the leaves, not of
+        // list order, which a snapshot restore does not reproduce.
+        parent
+            .leaves
+            .iter()
+            .enumerate()
+            .filter(|(_, leaf)| {
+                leaf.severity_number == record.severity_number
+                    && leaf.scope_name.as_deref() == record.scope_name.as_deref()
+            })
+            .map(|(leaf_idx, leaf)| {
+                debug_assert_eq!(leaf.template.len(), masked_strs.len());
+                let similarity =
+                    sim_seq_owned(masked_strs, &leaf.template, line_wildcard_positions);
+                (
+                    Candidate {
+                        leaf_idx,
+                        similarity,
+                    },
+                    leaf.template_id,
+                )
+            })
+            .max_by(|(a, a_id), (b, b_id)| {
+                a.similarity.total_cmp(&b.similarity).then(b_id.cmp(a_id))
+            })
+            .map(|(candidate, _)| candidate)
     }
 
     /// RFC §6.2 step 4 (fresh-leaf branch). Allocates a new

@@ -228,6 +228,35 @@ fn a_leaf_widened_under_the_wildcard_child_restores() {
     assert_eq!(fresh.ingest(&rec), original.ingest(&rec));
 }
 
+/// Adopted first, mined second: the converged leaf reuses the adopted
+/// (lower) id but joins its node's list after a leaf minted in between.
+/// Restore lists by id, so a similarity tie must not be broken by list
+/// order.
+#[test]
+fn a_similarity_tie_resolves_the_same_after_restore() {
+    let t = TenantId::new("tenant-x");
+    let config = MinerConfig::default()
+        .with_upstream_templates(UpstreamTemplates::Adopt)
+        .with_prefix_depth(0)
+        .expect("in range");
+    let mut original = MinerCluster::new(config);
+    let mut adopted = string_record(&t, "user user");
+    adopted.attributes.push(ourios_core::otlp::KeyValue {
+        key: LOG_RECORD_TEMPLATE_ATTR.to_string(),
+        value: Some(AnyValue {
+            value: Some(AvValue::StringValue("<*> <*>".to_string())),
+        }),
+        ..Default::default()
+    });
+    let _ = original.ingest(&adopted);
+    let _ = original.ingest(&string_record(&t, "x=1 42"));
+    let _ = original.ingest(&string_record(&t, "10.0.0.1 42"));
+
+    let mut fresh = restored(&original, config).expect("restores");
+    let rec = string_record(&t, "x=1 user");
+    assert_eq!(fresh.ingest(&rec), original.ingest(&rec));
+}
+
 #[test]
 fn restore_rejects_a_wildcard_route_past_the_walk() {
     let state = SnapshotState {

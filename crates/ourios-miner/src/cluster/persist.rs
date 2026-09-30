@@ -9,7 +9,7 @@ use ourios_core::tenant::TenantId;
 
 use super::{AdoptedEntry, MinerCluster, OwnedAdopted, TenantState};
 use crate::mask::tag_str_for;
-use crate::tree::{Leaf, OwnedToken, UpstreamAssociations, WILDCARD_CHILD, format_template};
+use crate::tree::{Leaf, OwnedToken, Tree, UpstreamAssociations, WILDCARD_CHILD, format_template};
 
 impl MinerCluster {
     /// Number of distinct templates this tenant has accumulated
@@ -124,8 +124,8 @@ impl MinerCluster {
     #[must_use]
     pub fn snapshot_state(&self, tenant_id: &TenantId) -> crate::snapshot::SnapshotState {
         use crate::snapshot::{
-            AdoptedTemplateRecord, LeafRecord, SnapshotState, StructuredTemplateRecord,
-            TokenRecord, provenance_set_to_record, slot_types_vec_to_record,
+            AdoptedTemplateRecord, SnapshotState, StructuredTemplateRecord,
+            provenance_set_to_record,
         };
 
         let Some(state) = self.tenants.get(tenant_id) else {
@@ -137,34 +137,10 @@ impl MinerCluster {
             };
         };
 
-        // `collect_leaves` and the `structured_templates` map both iterate
-        // in `HashMap` order, which varies across runs — sort by the
-        // cluster-unique `template_id` so the serialized snapshot is
-        // byte-deterministic (no spurious churn between snapshots of an
-        // unchanged tree).
-        let mut leaves: Vec<LeafRecord> = state
-            .tree
-            .collect_routed_leaves()
-            .into_iter()
-            .map(|(leaf, wildcard_routed)| LeafRecord {
-                template: leaf.template.iter().map(TokenRecord::from).collect(),
-                template_id: leaf.template_id,
-                template_version: leaf.template_version,
-                severity_number: leaf.severity_number,
-                scope_name: leaf.scope_name.clone(),
-                slot_types: slot_types_vec_to_record(&leaf.slot_types),
-                provenance: provenance_set_to_record(leaf.provenance),
-                upstream_associations: leaf
-                    .upstream_associations
-                    .strings()
-                    .map(str::to_string)
-                    .collect(),
-                upstream_association_overflow: leaf.upstream_associations.overflow(),
-                wildcard_routed,
-            })
-            .collect();
-        leaves.sort_by_key(|leaf| leaf.template_id);
+        let leaves = leaf_records(&state.tree);
 
+        // The maps iterate in `HashMap` order, which varies across runs;
+        // sorting keeps the serialized snapshot byte-deterministic.
         let mut structured_templates: Vec<StructuredTemplateRecord> = state
             .structured_templates
             .iter()
@@ -404,6 +380,35 @@ impl MinerCluster {
             self.next_template_id = self.next_template_id.max(max_restored + 1);
         }
     }
+}
+
+/// Every leaf of `tree` as a snapshot record, sorted by the
+/// cluster-unique `template_id` so the snapshot is byte-deterministic.
+fn leaf_records(tree: &Tree) -> Vec<crate::snapshot::LeafRecord> {
+    use crate::snapshot::{LeafRecord, TokenRecord, slot_types_vec_to_record};
+
+    let mut leaves: Vec<LeafRecord> = tree
+        .collect_routed_leaves()
+        .into_iter()
+        .map(|(leaf, wildcard_routed)| LeafRecord {
+            template: leaf.template.iter().map(TokenRecord::from).collect(),
+            template_id: leaf.template_id,
+            template_version: leaf.template_version,
+            severity_number: leaf.severity_number,
+            scope_name: leaf.scope_name.clone(),
+            slot_types: slot_types_vec_to_record(&leaf.slot_types),
+            provenance: crate::snapshot::provenance_set_to_record(leaf.provenance),
+            upstream_associations: leaf
+                .upstream_associations
+                .strings()
+                .map(str::to_string)
+                .collect(),
+            upstream_association_overflow: leaf.upstream_associations.overflow(),
+            wildcard_routed,
+        })
+        .collect();
+    leaves.sort_by_key(|leaf| leaf.template_id);
+    leaves
 }
 
 /// Rebuild one tree leaf from its snapshot record during

@@ -75,6 +75,7 @@ use ourios_config::UpstreamTemplates;
 use crate::mask::{TypedParam, mask};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
+use crate::snapshot::WalHighWater;
 use crate::tokenize::tokenize;
 use crate::tree::{Leaf, OwnedToken, Tree, UpstreamAssociations, format_template};
 use crate::upstream;
@@ -319,6 +320,11 @@ struct TenantState {
     /// reconfiguration as an open question; today's contract is
     /// startup-only).
     config: MinerConfig,
+    /// RFC 0052 §3.1's folded horizon: the WAL offset of this
+    /// tenant's own last frame folded into the state above. Opaque
+    /// here — the cluster never compares it — and `None` until a
+    /// caller records one.
+    folded: Option<WalHighWater>,
 }
 
 impl TenantState {
@@ -332,6 +338,7 @@ impl TenantState {
             template_count: 0,
             leaf_count: 0,
             config,
+            folded: None,
         }
     }
 

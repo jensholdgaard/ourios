@@ -117,10 +117,10 @@ impl MinerCluster {
     /// captures every `Body::String` leaf (template tokens,
     /// `template_id`, `template_version`, the `(severity_number,
     /// scope_name)` template key, and per-slot `slot_types`) plus the
-    /// §6.2 step-0 structured-template-id map. `wal_high_water` is the
-    /// caller's to supply — the cluster does not track WAL offsets —
-    /// so it is left `None` here; the snapshot writer fills it from
-    /// the WAL at the segment-rotation boundary it snapshots on.
+    /// §6.2 step-0 structured-template-id map. `wal_high_water` is
+    /// left `None`: the snapshot writer stamps the tenant's
+    /// [`Self::folded_horizon`] into it, read under the same borrow so
+    /// the two cannot disagree.
     #[must_use]
     pub fn snapshot_state(&self, tenant_id: &TenantId) -> crate::snapshot::SnapshotState {
         use crate::snapshot::{
@@ -224,6 +224,32 @@ impl MinerCluster {
             wal_high_water: None,
             adopted_templates,
         }
+    }
+
+    /// RFC 0052 §3.1's **folded horizon**: the WAL offset of
+    /// `tenant_id`'s own last frame folded into its state, as last
+    /// recorded by [`Self::fold_through`] or restored from its
+    /// snapshot. `None` for an unseen tenant or one no caller has
+    /// recorded a frame for.
+    #[must_use]
+    pub fn folded_horizon(&self, tenant_id: &TenantId) -> Option<&crate::snapshot::WalHighWater> {
+        self.tenants.get(tenant_id)?.folded.as_ref()
+    }
+
+    /// Record that `tenant_id`'s state now folds every one of its
+    /// frames through `horizon`. The caller records frames in WAL
+    /// order, each after mining its records, so the horizon never runs
+    /// past what the state holds.
+    ///
+    /// A tenant whose frames allocated no state — every record
+    /// body-less — is allocated here: its horizon must still reach a
+    /// snapshot, or its frames would pin reclamation for good.
+    pub fn fold_through(&mut self, tenant_id: &TenantId, horizon: crate::snapshot::WalHighWater) {
+        let config = self.effective_config(tenant_id);
+        self.tenants
+            .entry(tenant_id.clone())
+            .or_insert_with(|| TenantState::new(config))
+            .folded = Some(horizon);
     }
 
     /// Every tenant with allocated state, sorted for determinism —
@@ -356,6 +382,7 @@ impl MinerCluster {
         tenant.template_count =
             state.leaves.len() + state.structured_templates.len() + tenant.owned_adopted_count;
         tenant.leaf_count = state.leaves.len();
+        tenant.folded.clone_from(&state.wal_high_water);
 
         // The id allocator is cluster-wide; without this bump a
         // post-restore allocation would collide with a restored id.

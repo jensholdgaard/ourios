@@ -8,7 +8,7 @@
 //! listing (RFC 0052 §6) and lives in
 //! `ourios-ingester/tests/it/rfc0052_13_startup_fsync.rs`.
 
-use ourios_wal::{RetainFloor, SnapshotHorizons};
+use ourios_wal::{FrameKind, PassOutcome, RetainFloor, SkipReason, SnapshotHorizons, TenantBatch};
 
 use crate::rfc0052_support::{build_tenant_segment, known, open, segment_files};
 
@@ -285,4 +285,39 @@ fn rfc0052_13_tenant_leaves_the_ledger_with_its_last_segment() {
         after.floor,
         "and the export is the floor the last pass derived",
     );
+}
+
+/// Issue #889: a post-RFC root before its first checkpoint holds tenants
+/// with frames and no snapshot as a matter of course. Its passes are
+/// §3.2's skipped pass, reason and all — never the legacy root's
+/// stale-gap refusal, which only a pre-RFC root is held to.
+#[test]
+fn rfc0052_13_a_fresh_root_skips_its_passes_before_the_first_checkpoint() {
+    // Given: a fresh root whose tenants have written, and no checkpoint.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let mut wal = open(root);
+    for tenant in ["alpha", "beta"] {
+        let payload = TenantBatch::encode(tenant, b"body").expect("encode");
+        wal.append(FrameKind::TenantOtlpBatch, &payload)
+            .expect("append");
+    }
+    wal.sync().expect("sync");
+    let before = segment_files(root);
+
+    // When: passes run before any snapshot or checkpoint exists.
+    for _ in 0..2 {
+        let progress = wal
+            .housekeeping_pass(&known(&[]), CAP)
+            .expect("a skipped pass, not a refusal");
+
+        // Then: each is the no-checkpoint skip and unlinks nothing.
+        assert_eq!(
+            progress.outcome,
+            PassOutcome::Skipped(SkipReason::NoCheckpoint),
+            "{progress:?}"
+        );
+        assert_eq!(progress.removed_segments, 0, "{progress:?}");
+    }
+    assert_eq!(segment_files(root), before);
 }

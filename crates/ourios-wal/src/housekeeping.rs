@@ -652,9 +652,14 @@ impl Wal {
                 }
             }
         }
+        // A post-RFC root is unwitnessed too until its first checkpoint,
+        // and its tenants have frames and no snapshot as a matter of
+        // course: that pass is §3.2's skip, not a refusal (issue #889).
         match self.reclaim_gate {
-            ReclaimGate::Unwitnessed => self.refuse_legacy_stale_gaps(marks),
-            ReclaimGate::FsyncPending | ReclaimGate::Open => Ok(()),
+            ReclaimGate::Unwitnessed if self.on_legacy_branch() => {
+                self.refuse_legacy_stale_gaps(marks)
+            }
+            ReclaimGate::Unwitnessed | ReclaimGate::FsyncPending | ReclaimGate::Open => Ok(()),
         }
     }
 

@@ -3324,6 +3324,7 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
+ "uuid",
  "zstd",
 ]
 

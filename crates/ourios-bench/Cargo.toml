@@ -132,6 +132,9 @@ criterion = "=0.8.2"
 # uncompressed sidecar. Already in the workspace lock tree (transitive), so
 # no new vendored crate.
 flate2 = "=1.1.10"
+# Builds `WalOffset`s by hand in the reclamation harness's unit tests; the
+# same `uuid` the WAL already pulls into the lock tree.
+uuid = { version = "1", default-features = false }
 
 [[bench]]
 name = "b1"

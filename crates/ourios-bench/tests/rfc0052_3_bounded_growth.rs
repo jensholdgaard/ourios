@@ -13,7 +13,7 @@ use ourios_bench::reclaim::{
     GrowthBound, PassResult, ReclaimSample, ReclaimSoak, ReclaimSoakConfig, Tick,
 };
 use ourios_ingester::barrier::CutOutcome;
-use ourios_wal::{RetainFloor, WalOffset};
+use ourios_wal::{PassOutcome, RetainFloor, SkipReason, WalOffset};
 
 /// Segments the bounded-growth run rolls: three times the default
 /// config's bound, so a WAL that never unlinked would break it well
@@ -47,7 +47,9 @@ async fn rfc0052_3_wal_bytes_and_segments_stay_bounded_over_a_long_run() {
         .passes()
         .iter()
         .map(|pass| match pass.result {
-            PassResult::Completed { removed_segments } => removed_segments,
+            PassResult::Completed {
+                removed_segments, ..
+            } => removed_segments,
             PassResult::Failed(_) | PassResult::Panicked => 0,
         })
         .sum();
@@ -155,7 +157,8 @@ fn first_stamp(soak: &ReclaimSoak) -> u64 {
     first.synthetic_secs
 }
 
-/// Every cut stamped, every pass after the first stamp completed, and
+/// Every cut stamped, every pass before the first stamp was the
+/// no-checkpoint skip and every one after it planned, and
 /// the floor those passes derived was a minimum over every tenant — no
 /// pin — that rose over the run.
 fn assert_complete_and_advancing_floor(soak: &ReclaimSoak, witnessed: u64) {
@@ -165,10 +168,20 @@ fn assert_complete_and_advancing_floor(soak: &ReclaimSoak, witnessed: u64) {
         assert_eq!(cut.outcome, CutOutcome::Stamped, "{cut:?}");
     }
     for pass in soak.passes() {
-        assert!(
-            pass.synthetic_secs <= witnessed || matches!(pass.result, PassResult::Completed { .. }),
-            "{pass:?}"
-        );
+        match pass.result {
+            PassResult::Completed { outcome, .. } if pass.synthetic_secs > witnessed => {
+                assert_eq!(outcome, PassOutcome::Planned, "{pass:?}");
+            }
+            result => assert_eq!(
+                result,
+                PassResult::Completed {
+                    removed_segments: 0,
+                    outcome: PassOutcome::Skipped(SkipReason::NoCheckpoint),
+                },
+                "before the first stamp a pass is §3.2's skip, and after it one completes: \
+                 {pass:?}"
+            ),
+        }
     }
     let floors: Vec<WalOffset> = soak
         .samples()

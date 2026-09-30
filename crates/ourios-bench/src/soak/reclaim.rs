@@ -18,10 +18,14 @@
 //! and the batch shape say, and reclamation is never behind the clock.
 //!
 //! One predicate reads the wall clock: the WAL's segment age, from the
-//! segment's `UUIDv7` mint time. A barrier tick whose synthetic time says
-//! the last append's segment has aged out first waits until the wall
-//! clock agrees, so an idle rotation is never credited to a tick the WAL
-//! would refuse.
+//! open segment's `UUIDv7` mint time. The harness notes the instant each
+//! segment appears, and a barrier tick whose synthetic time says the open
+//! segment has aged waits until the wall clock agrees, so an idle
+//! rotation is never credited to a tick the WAL would refuse. Appends are
+//! not held that way: a rotation on append stays size-driven unless the
+//! wall clock alone ages a segment, so a run that needs age rotation
+//! between appends — a low-rate soak — is outside this harness, and
+//! [`ReclaimSoak::segments_rolled`] is how a run shows it stayed on size.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +44,7 @@ use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, ReceiveError,
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::Store;
-use ourios_wal::{ReclaimState, RetainFloor, Wal, WalConfig, WalOffset};
+use ourios_wal::{PassOutcome, ReclaimState, RetainFloor, Wal, WalConfig, WalOffset};
 use serde::Serialize;
 
 use super::{BASE_UNIX_NANOS, NANOS_PER_SEC, export_request, tenant_name, to_u64};
@@ -57,9 +61,6 @@ const RECORD_OVERHEAD_BYTES: u64 = 128;
 /// the WAL frame header. [`ReclaimSoak::largest_frame_bytes`] is what a
 /// run checks this ceiling against.
 const FRAME_OVERHEAD_BYTES: u64 = 1024;
-/// Allowance for the segment header, which no frame shares a segment
-/// with.
-const SEGMENT_HEADER_ALLOWANCE: u64 = 4096;
 const HOUR_SECS: u64 = 3_600;
 /// Past the WAL's strict `>` and the `UUIDv7`'s millisecond truncation.
 const AGE_MARGIN: Duration = Duration::from_millis(50);
@@ -132,7 +133,7 @@ impl ReclaimSoakConfig {
     pub fn fewest_frames_per_segment(&self) -> u64 {
         (self
             .segment_size_bytes
-            .saturating_sub(SEGMENT_HEADER_ALLOWANCE)
+            .saturating_sub(segment_header_bytes())
             / self.frame_ceiling_bytes().max(1))
         .max(1)
     }
@@ -247,6 +248,7 @@ pub struct CutRecord {
 pub enum PassResult {
     Completed {
         removed_segments: usize,
+        outcome: PassOutcome,
     },
     /// The pass returned an error; its `error.type`.
     Failed(&'static str),
@@ -260,9 +262,10 @@ pub struct PassRecord {
     pub result: PassResult,
 }
 
-/// The last acknowledged append.
-#[derive(Debug, Clone, Copy)]
-struct LastAppend {
+/// The open segment, and when the harness first saw it — on both clocks.
+#[derive(Debug, Clone)]
+struct OpenSegment {
+    name: String,
     synthetic_secs: u64,
     wall: Instant,
 }
@@ -353,7 +356,12 @@ impl FrameLog {
                     .largest_frame
                     .max(offset.byte.saturating_sub(last.byte));
             }
-            _ => self.segments += 1,
+            _ => {
+                self.segments += 1;
+                self.largest_frame = self
+                    .largest_frame
+                    .max(offset.byte.saturating_sub(segment_header_bytes()));
+            }
         }
         self.last = Some(offset);
     }
@@ -369,7 +377,7 @@ pub struct ReclaimSoak {
     schedule: Schedule,
     batches: u64,
     frames: FrameLog,
-    last_append: Option<LastAppend>,
+    open_segment: Option<OpenSegment>,
     samples: Vec<ReclaimSample>,
     cuts: Vec<CutRecord>,
     passes: Vec<PassRecord>,
@@ -403,7 +411,7 @@ impl ReclaimSoak {
             now_secs: 0,
             batches: 0,
             frames: FrameLog::default(),
-            last_append: None,
+            open_segment: None,
             samples: Vec::new(),
             cuts: Vec::new(),
             passes: Vec::new(),
@@ -448,10 +456,6 @@ impl ReclaimSoak {
             .acknowledged_durable()
             .ok_or(ReclaimSoakError::NoMark)?;
         self.frames.observe(offset);
-        self.last_append = Some(LastAppend {
-            synthetic_secs: self.now_secs,
-            wall: Instant::now(),
-        });
         self.batches += 1;
         self.sample(Tick::Append);
         Ok(offset)
@@ -559,6 +563,7 @@ impl ReclaimSoak {
         let result = match tick {
             HousekeepingTick::Completed(progress) => PassResult::Completed {
                 removed_segments: progress.removed_segments,
+                outcome: progress.outcome,
             },
             HousekeepingTick::Failed(e) => PassResult::Failed(e.error_type()),
             HousekeepingTick::Panicked => PassResult::Panicked,
@@ -570,23 +575,47 @@ impl ReclaimSoak {
         Ok(())
     }
 
-    /// Hold a barrier tick the synthetic clock places past the last
-    /// append's segment age until the wall clock is past it too.
+    /// Hold a barrier tick the synthetic clock places past the open
+    /// segment's age until the wall clock is past it too. The segment was
+    /// minted no later than the harness first saw it, so waiting from
+    /// that sighting never undershoots the WAL's own reading.
     async fn await_segment_age(&self) {
-        let Some(last) = self.last_append else {
+        let Some(open) = &self.open_segment else {
             return;
         };
-        let aged_at = last
+        let aged_at = open
             .synthetic_secs
             .saturating_add(self.config.segment_age_secs);
         if self.now_secs < aged_at {
             return;
         }
-        let deadline = last.wall + Duration::from_secs(self.config.segment_age_secs) + AGE_MARGIN;
+        let deadline = open.wall + Duration::from_secs(self.config.segment_age_secs) + AGE_MARGIN;
         tokio::time::sleep_until(deadline.into()).await;
     }
 
+    /// Segments are created only inside an append or a barrier tick, and
+    /// this runs after each, so a new segment is dated to the step that
+    /// made it. `UUIDv7` names sort by mint time, so the newest is open.
+    fn note_open_segment(&mut self) {
+        let Some(name) = newest_segment(&self.wal_root) else {
+            return;
+        };
+        if self
+            .open_segment
+            .as_ref()
+            .is_some_and(|open| open.name == name)
+        {
+            return;
+        }
+        self.open_segment = Some(OpenSegment {
+            name,
+            synthetic_secs: self.now_secs,
+            wall: Instant::now(),
+        });
+    }
+
     fn sample(&mut self, after: Tick) {
+        self.note_open_segment();
         let state = self.node.commits.reclaim_state();
         self.samples.push(ReclaimSample {
             synthetic_secs: self.now_secs,
@@ -705,6 +734,21 @@ fn count_objects(root: &Path) -> usize {
         .count()
 }
 
+fn segment_header_bytes() -> u64 {
+    to_u64(ourios_wal::SEGMENT_HEADER_LEN)
+}
+
+/// The newest `*.wal` segment's name.
+fn newest_segment(wal_root: &Path) -> Option<String> {
+    std::fs::read_dir(wal_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
+        .max()
+}
+
 /// The summed length of the WAL's `*.wal` segment files.
 fn segment_bytes(wal_root: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(wal_root) else {
@@ -763,6 +807,20 @@ mod tests {
                 (240, Timer::Barrier),
             ]
         );
+    }
+
+    #[test]
+    fn a_segments_first_frame_counts_toward_the_largest() {
+        let (first, second) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let at = |segment, byte| WalOffset { segment, byte };
+        let header = segment_header_bytes();
+        let mut log = FrameLog::default();
+        log.observe(at(first, header + 100));
+        log.observe(at(first, header + 150));
+        log.observe(at(second, header + 900));
+        log.observe(at(second, header + 1_000));
+        assert_eq!(log.largest_frame, 900, "the second segment's first frame");
+        assert_eq!(log.segments, 2);
     }
 
     #[test]

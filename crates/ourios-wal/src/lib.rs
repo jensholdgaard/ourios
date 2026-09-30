@@ -66,7 +66,8 @@ pub use reclaim::{
 pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
 use rotation::DirFsync;
 pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
-use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
+pub use segment::SEGMENT_HEADER_LEN;
+use segment::{SegmentHeader, write_header};
 
 // -----------------------------------------------------------
 // Public types (RFC 0008 §6.1 + §6.2.2)

@@ -30,6 +30,9 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "testing")]
+pub mod live_check;
+
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;

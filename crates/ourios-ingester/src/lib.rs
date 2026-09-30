@@ -57,6 +57,7 @@ pub mod metrics;
 pub mod publish;
 pub mod publisher;
 pub mod receiver;
+pub mod reclaim_telemetry;
 pub mod record_sink;
 pub mod recovery;
 pub mod snapshot_store;

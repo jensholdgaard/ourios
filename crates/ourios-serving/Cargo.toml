@@ -82,6 +82,11 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["std"
 # speak raw HTTP/1 over the socket, and open an h2c connection.
 rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "test-util"] }
+# The listener-event test's certificate directory.
+tempfile = "=3.27.0"
+# Self-dependency: turns `fault-injection` on for this crate's own test
+# targets only (`cargo build` does not resolve dev-dependencies).
+ourios-serving = { path = ".", features = ["fault-injection"] }
 hyper = { version = "1", default-features = false, features = ["client", "http2"] }
 
 [features]
@@ -91,6 +96,11 @@ oidc = ["dep:jsonwebtoken", "dep:reqwest", "dep:serde", "dep:serde_json"]
 # The RFC 0047 OpenFGA resolver (HTTP client + session cache). Same
 # reqwest/rustls stack as `oidc`; the config types stay in ourios-core.
 openfga = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+# `tls_serve::panic_next_reload`: makes a certificate reload unwind, the
+# reload failure no file on disk can cause. Enabled only by this crate's
+# own test targets via the dev-dependency below; not part of the stable
+# public API.
+fault-injection = []
 
 [lints]
 workspace = true

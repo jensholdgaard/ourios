@@ -628,6 +628,9 @@ pub struct JournalFaults {
     /// Housekeeping's ledger half, **after** the WAL has taken its plan:
     /// the entries are marked reclaiming and nothing commits them.
     pub panic_after_prepare: AtomicBool,
+    /// The barrier's idle rotation: the segment reads as aged and the
+    /// rotation fails once, with a plain I/O error.
+    pub fail_idle_rotation: AtomicBool,
 }
 
 /// A real `Wal` behind the journal seam, with [`JournalFaults`] armed.
@@ -682,6 +685,12 @@ impl Journal for FaultyJournal {
     }
 
     fn rotate(&mut self, kind: RotationKind) -> Result<(), ReceiveError> {
+        if self.faults.fail_idle_rotation.swap(false, Ordering::AcqRel) {
+            return Err(ReceiveError::WalAppend(ourios_wal::AppendError::Io {
+                op: "rotate",
+                source: std::io::Error::other("injected idle-rotation failure"),
+            }));
+        }
         Journal::rotate(&mut self.wal, kind)
     }
 
@@ -690,7 +699,8 @@ impl Journal for FaultyJournal {
             !self.faults.panic_on_age_check.swap(false, Ordering::AcqRel),
             "injected barrier-tick panic outside any batch guard"
         );
-        Journal::segment_age_exceeded(&self.wal)
+        self.faults.fail_idle_rotation.load(Ordering::Acquire)
+            || Journal::segment_age_exceeded(&self.wal)
     }
 
     fn owes_rotation_fsync(&self) -> bool {
@@ -699,5 +709,9 @@ impl Journal for FaultyJournal {
 
     fn reclaim_state(&self) -> ReclaimState {
         Journal::reclaim_state(&self.wal)
+    }
+
+    fn rotation_state(&self) -> ourios_wal::RotationState {
+        Journal::rotation_state(&self.wal)
     }
 }

@@ -12,14 +12,17 @@ superseded-by: —
 # RFC 0052 — WAL reclamation and quiesce recovery
 
 > **Status note.** `red` — test stubs exist and fail
-> (`docs/rfcs/README.md` §Lifecycle): every live §5 scenario has one or
-> more `#[ignore]`d `todo!` stubs, per leg where §6 separates the legs,
-> in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12, .13, .16,
-> .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's startup leg,
-> .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry.rs` (.7, its own
-> binary per RFC0028.2) and `ourios-bench/tests/rfc0052_3_bounded_growth.rs`
-> (.3). Implementation proceeds in six green slices, each un-ignoring the
-> stubs it discharges. Where a criterion's legs span slices, the mapping
+> (`docs/rfcs/README.md` §Lifecycle). Every live §5 scenario was stubbed
+> as one or more `#[ignore]`d `todo!` stubs, per leg where §6 separates
+> the legs, in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12,
+> .13, .16, .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's
+> startup leg, .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry/`
+> (.7, its own binary per RFC0028.2) and
+> `ourios-bench/tests/rfc0052_3_bounded_growth.rs` (.3). Slices A–E have
+> landed and discharged their stubs, .7 included. The stubs still
+> ignored are slice F's (.10 and .3) and .17's `PUBLISHED` row, which
+> waits on RFC 0055. Implementation proceeds in six green slices, each
+> un-ignoring the stubs it discharges. Where a criterion's legs span slices, the mapping
 > below is by leg and each stub's `#[ignore]` reason names its slice:
 > **A** reclaim record and sidecars (§3.2 `RECLAIM`, `CHECKPOINT` v2,
 > `SEGMENT_VERSION` 2, open-time reconciliation → .16, .11's open-time

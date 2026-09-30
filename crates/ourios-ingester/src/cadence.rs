@@ -25,6 +25,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::metrics::ERROR_TYPE;
+
 /// The high half's width, and the mask the low (generation) half keeps.
 const EPOCH_SHIFT: u32 = 32;
 const GENERATION_MASK: u64 = 0xFFFF_FFFF;
@@ -204,11 +206,12 @@ pub fn read_join(
     let Err(e) = joined else {
         return false;
     };
+    let class = if e.is_panic() { "panic" } else { "cancelled" };
     tracing::error!(
-        task,
-        error = %e,
-        "a cadence task did not join cleanly; read as a failed cut, so nothing is stamped \
-         and nothing is assumed drained (the WAL replays it on the next start)"
+        name: ourios_semconv::EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR,
+        { { ERROR_TYPE } = class },
+        "the {task} cadence task did not join cleanly; read as a failed cut, so nothing is \
+         stamped and nothing is assumed drained (the WAL replays it on the next start): {e}"
     );
     epochs.report(epochs.current());
     true

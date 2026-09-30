@@ -528,6 +528,9 @@ impl ReceiverHandle {
                 );
             });
         });
+        // The joins and the last cut above are the steps that can set the
+        // latch after the timer stopped observing it.
+        self.cadences.housekeeper.observe_state();
         Ok(())
     }
 }
@@ -713,12 +716,11 @@ fn spawn_barrier(
 /// [`Housekeeper::tick`] catches its own panic and counts it, and a
 /// failed pass is logged there; either way the next tick retries.
 fn spawn_housekeeping(
-    housekeeper: Housekeeper,
+    housekeeper: Arc<Housekeeper>,
     every: Duration,
     epochs: Arc<BarrierEpochs>,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
-    let housekeeper = Arc::new(housekeeper);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -827,6 +829,10 @@ struct Cadences {
     /// `housekeeping_secs`); joined with the other cadences, before the
     /// shutdown flush, so no pass holds the journal past the handle.
     housekeeping: JoinHandle<()>,
+    /// The housekeeping task's owner, kept for shutdown's last
+    /// observation: the latch its steps can set lands after the task is
+    /// joined (RFC 0052 §3.5).
+    housekeeper: Arc<Housekeeper>,
 }
 
 /// The housekeeping knobs, captured before `WalConfig` moves into
@@ -876,13 +882,14 @@ fn spawn_cadences(
         housekeeping,
     } = inputs;
     let overflow = publisher.audit().overflow_notify();
-    let housekeeper = Housekeeper::new(
+    let housekeeper = Arc::new(Housekeeper::new(
         commits,
         Arc::clone(&barrier),
         publisher.clone(),
         housekeeping.max_unlinks,
-    );
+    ));
     Cadences {
+        housekeeper: Arc::clone(&housekeeper),
         housekeeping: spawn_housekeeping(
             housekeeper,
             housekeeping.every,
@@ -1712,7 +1719,12 @@ mod tests {
         let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
         let (shutdown, shutdown_rx) = watch::channel(());
         let every = Duration::from_secs(60);
-        let task = spawn_housekeeping(housekeeper, every, Arc::clone(&epochs), shutdown_rx);
+        let task = spawn_housekeeping(
+            Arc::new(housekeeper),
+            every,
+            Arc::clone(&epochs),
+            shutdown_rx,
+        );
 
         // The first pass runs without waiting an interval, and panics.
         passes_reach(&passes, 1).await;
@@ -1755,9 +1767,14 @@ mod tests {
         let (shutdown, shutdown_rx) = watch::channel(());
         shutdown.send(()).expect("signal shutdown");
 
-        spawn_housekeeping(housekeeper, Duration::from_secs(60), epochs, shutdown_rx)
-            .await
-            .expect("the housekeeping task exits cleanly");
+        spawn_housekeeping(
+            Arc::new(housekeeper),
+            Duration::from_secs(60),
+            epochs,
+            shutdown_rx,
+        )
+        .await
+        .expect("the housekeeping task exits cleanly");
 
         assert_eq!(
             passes.load(std::sync::atomic::Ordering::Acquire),

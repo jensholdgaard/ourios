@@ -1404,6 +1404,10 @@ impl Journal for SharedWal {
     fn reclaim_state(&self) -> ourios_wal::ReclaimState {
         Journal::reclaim_state(&*lock_wal(&self.0))
     }
+
+    fn rotation_state(&self) -> ourios_wal::RotationState {
+        Journal::rotation_state(&*lock_wal(&self.0))
+    }
 }
 
 // ----------------------------------------------------------------------

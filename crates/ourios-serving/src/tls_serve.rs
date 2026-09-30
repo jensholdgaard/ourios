@@ -34,7 +34,8 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
-use crate::serve::{accept_failed, set_tcp_keepalive};
+use crate::metrics::ERROR_TYPE;
+use crate::serve::{NamedListener, accept_failed, set_tcp_keepalive};
 use crate::tls::TlsSettings;
 
 /// A [`TlsAcceptor`] whose backing config can be hot-swapped without
@@ -68,6 +69,9 @@ impl ReloadingAcceptor {
 /// `ourios.tls.reload_error` values.
 const RELOAD_UNREADABLE: &str = "unreadable";
 const RELOAD_INVALID: &str = "invalid";
+/// The reload task itself unwound — the `error.type` of the reload event
+/// only; the counter records material failures.
+const RELOAD_PANIC: &str = "panic";
 
 /// The outcome of one reload attempt (computed off the async worker in
 /// `spawn_blocking`, since it reads + parses PEM files). `Reloaded`
@@ -100,6 +104,11 @@ fn fingerprint(settings: &TlsSettings) -> Option<u64> {
 /// blocking filesystem + PEM work, so the caller runs it in
 /// `spawn_blocking`.
 fn reload_once(settings: &TlsSettings, alpn: &[Vec<u8>], last: Option<u64>) -> ReloadOutcome {
+    #[cfg(feature = "fault-injection")]
+    assert!(
+        !PANIC_NEXT_RELOAD.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "injected TLS reload panic"
+    );
     let Some(fp) = fingerprint(settings) else {
         return ReloadOutcome::Unreadable;
     };
@@ -111,6 +120,19 @@ fn reload_once(settings: &TlsSettings, alpn: &[Vec<u8>], last: Option<u64>) -> R
         Ok(acceptor) => ReloadOutcome::Reloaded(fp, Box::new(acceptor)),
         Err(e) => ReloadOutcome::Invalid(e),
     }
+}
+
+#[cfg(feature = "fault-injection")]
+static PANIC_NEXT_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Make the next certificate reload, on any listener, unwind inside its
+/// blocking task — the one reload failure no file on disk can cause.
+///
+/// Behind the `fault-injection` feature, which only this crate's own
+/// test targets enable. Not part of the stable public API.
+#[cfg(feature = "fault-injection")]
+pub fn panic_next_reload() {
+    PANIC_NEXT_RELOAD.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Build a [`ReloadingAcceptor`] for `settings` advertising `alpn`. When
@@ -136,95 +158,140 @@ pub fn reloading_acceptor(
     let acceptor = settings.acceptor(alpn)?;
     let current = Arc::new(RwLock::new(acceptor));
     if let Some(interval) = settings.reload_interval {
-        let settings = settings.clone();
-        let alpn: Vec<Vec<u8>> = alpn.iter().map(|p| p.to_vec()).collect();
-        let weak = Arc::downgrade(&current);
-        let failures = global::meter("ourios.receiver")
-            .u64_counter(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES)
-            .build();
-        // Seed with the startup material's fingerprint so the first tick
-        // only reloads if the files actually changed since startup — no
-        // needless rebuild + "reloaded" log on every listener start.
-        let initial = fingerprint(&settings);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            // Steady cadence: a long reload or a paused runtime must not
-            // make the interval "catch up" with a burst of back-to-back
-            // re-reads (mirrors the age-sweep task).
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await; // the first tick is immediate; skip it
-            let mut last = initial;
-            loop {
-                tick.tick().await;
-                // Stop once the listener drops its acceptor.
-                if weak.upgrade().is_none() {
-                    break;
-                }
-                // The read + parse + rebuild is blocking — keep it off
-                // the async worker.
-                let (s, a) = (settings.clone(), alpn.clone());
-                let outcome = match tokio::task::spawn_blocking(move || reload_once(&s, &a, last))
-                    .await
-                {
-                    Ok(outcome) => outcome,
-                    // Cancelled → the runtime is shutting down; stop.
-                    Err(e) if e.is_cancelled() => break,
-                    // A panic in the (pure) reload path is a bug, not a
-                    // shutdown — log and retry next tick rather than
-                    // silently disabling all future rotations.
-                    Err(e) => {
-                        tracing::error!(error = %e, "TLS reload task panicked; retrying next tick");
-                        continue;
-                    }
-                };
-                // Re-check the acceptor is still alive after the await.
-                let Some(current) = weak.upgrade() else { break };
-                match outcome {
-                    ReloadOutcome::Unchanged => {}
-                    ReloadOutcome::Reloaded(fp, acceptor) => {
-                        *current.write().unwrap_or_else(PoisonError::into_inner) = *acceptor;
-                        last = Some(fp);
-                        tracing::info!(
-                            cert = %settings.cert_file.display(),
-                            "reloaded the TLS certificate",
-                        );
-                    }
-                    ReloadOutcome::Unreadable => {
-                        failures.add(
-                            1,
-                            &[
-                                KeyValue::new(semconv::OURIOS_TLS_LISTENER, listener),
-                                KeyValue::new(semconv::OURIOS_TLS_RELOAD_ERROR, RELOAD_UNREADABLE),
-                            ],
-                        );
-                        tracing::warn!(
-                            cert = %settings.cert_file.display(),
-                            key = %settings.key_file.display(),
-                            ca = ?settings.client_ca_file,
-                            "TLS material unreadable on reload; keeping the last good certificate",
-                        );
-                    }
-                    ReloadOutcome::Invalid(e) => {
-                        failures.add(
-                            1,
-                            &[
-                                KeyValue::new(semconv::OURIOS_TLS_LISTENER, listener),
-                                KeyValue::new(semconv::OURIOS_TLS_RELOAD_ERROR, RELOAD_INVALID),
-                            ],
-                        );
-                        tracing::error!(
-                            error = %e,
-                            cert = %settings.cert_file.display(),
-                            key = %settings.key_file.display(),
-                            ca = ?settings.client_ca_file,
-                            "TLS reload produced an invalid config; keeping the last good certificate",
-                        );
-                    }
-                }
-            }
-        });
+        let task = ReloadTask {
+            settings: settings.clone(),
+            alpn: alpn.iter().map(|p| p.to_vec()).collect(),
+            current: Arc::downgrade(&current),
+            failures: global::meter("ourios.receiver")
+                .u64_counter(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES)
+                .build(),
+            listener,
+        };
+        // Seed with the startup material's fingerprint, taken now rather
+        // than when the task first runs, so the first tick only reloads
+        // if the files changed since the listener built its acceptor —
+        // and a change made before the task is scheduled is not missed.
+        let initial = fingerprint(settings);
+        tokio::spawn(task.run(interval, initial));
     }
     Ok(ReloadingAcceptor { current })
+}
+
+/// The certificate-reload loop behind a [`ReloadingAcceptor`].
+struct ReloadTask {
+    settings: TlsSettings,
+    alpn: Vec<Vec<u8>>,
+    current: std::sync::Weak<RwLock<TlsAcceptor>>,
+    failures: Counter<u64>,
+    listener: &'static str,
+}
+
+impl ReloadTask {
+    async fn run(self, interval: Duration, initial: Option<u64>) {
+        let mut last = initial;
+        let mut tick = tokio::time::interval(interval);
+        // Steady cadence: a long reload or a paused runtime must not
+        // make the interval "catch up" with a burst of back-to-back
+        // re-reads (mirrors the age-sweep task).
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick is immediate; skip it
+        loop {
+            tick.tick().await;
+            // Stop once the listener drops its acceptor.
+            if self.current.strong_count() == 0 {
+                break;
+            }
+            // The read + parse + rebuild is blocking — keep it off the
+            // async worker.
+            let (s, a) = (self.settings.clone(), self.alpn.clone());
+            let outcome = match tokio::task::spawn_blocking(move || reload_once(&s, &a, last)).await
+            {
+                Ok(outcome) => outcome,
+                // Cancelled → the runtime is shutting down; stop.
+                Err(e) if e.is_cancelled() => break,
+                // A panic in the (pure) reload path is a bug, not a
+                // shutdown — log and retry next tick rather than silently
+                // disabling all future rotations.
+                Err(e) => {
+                    tracing::error!(
+                        name: semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR,
+                        {
+                            { ERROR_TYPE } = RELOAD_PANIC,
+                            { semconv::OURIOS_SERVER_LISTENER_NAME } = self.listener,
+                        },
+                        "TLS reload task panicked (cert {}, key {}, client CA {:?}); retrying next \
+                         tick: {e}",
+                        self.settings.cert_file.display(),
+                        self.settings.key_file.display(),
+                        self.settings.client_ca_file,
+                    );
+                    continue;
+                }
+            };
+            // Re-check the acceptor is still alive after the await.
+            let Some(current) = self.current.upgrade() else {
+                break;
+            };
+            self.apply(outcome, &current, &mut last);
+        }
+    }
+
+    fn apply(&self, outcome: ReloadOutcome, current: &RwLock<TlsAcceptor>, last: &mut Option<u64>) {
+        let settings = &self.settings;
+        match outcome {
+            ReloadOutcome::Unchanged => {}
+            ReloadOutcome::Reloaded(fp, acceptor) => {
+                *current.write().unwrap_or_else(PoisonError::into_inner) = *acceptor;
+                *last = Some(fp);
+                tracing::info!(
+                    name: semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_COMPLETED,
+                    { { semconv::OURIOS_SERVER_LISTENER_NAME } = self.listener },
+                    "reloaded the TLS certificate from {}",
+                    settings.cert_file.display(),
+                );
+            }
+            ReloadOutcome::Unreadable => {
+                self.count_failure(RELOAD_UNREADABLE);
+                tracing::warn!(
+                    name: semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR,
+                    {
+                        { ERROR_TYPE } = RELOAD_UNREADABLE,
+                        { semconv::OURIOS_SERVER_LISTENER_NAME } = self.listener,
+                    },
+                    "TLS material unreadable on reload (cert {}, key {}, client CA {:?}); \
+                     keeping the last good certificate",
+                    settings.cert_file.display(),
+                    settings.key_file.display(),
+                    settings.client_ca_file,
+                );
+            }
+            ReloadOutcome::Invalid(e) => {
+                self.count_failure(RELOAD_INVALID);
+                tracing::error!(
+                    name: semconv::EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR,
+                    {
+                        { ERROR_TYPE } = RELOAD_INVALID,
+                        { semconv::OURIOS_SERVER_LISTENER_NAME } = self.listener,
+                    },
+                    "TLS reload produced an invalid config (cert {}, key {}, client CA {:?}); \
+                     keeping the last good certificate: {e}",
+                    settings.cert_file.display(),
+                    settings.key_file.display(),
+                    settings.client_ca_file,
+                );
+            }
+        }
+    }
+
+    fn count_failure(&self, class: &'static str) {
+        self.failures.add(
+            1,
+            &[
+                KeyValue::new(semconv::OURIOS_SERVER_LISTENER_NAME, self.listener),
+                KeyValue::new(semconv::OURIOS_TLS_RELOAD_ERROR, class),
+            ],
+        );
+    }
 }
 
 /// Per-connection handshake deadline. A handshake that has not completed
@@ -240,7 +307,7 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// backpressure, not unbounded growth.
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 256;
 
-/// `ourios.tls.listener` values.
+/// `ourios.server.listener.name` values.
 pub const LISTENER_GRPC: &str = "grpc";
 pub const LISTENER_HTTP: &str = "http";
 /// The querier HTTP listener (distinct from the receiver HTTP listener).
@@ -271,7 +338,7 @@ impl HandshakeFailures {
         self.counter.add(
             1,
             &[
-                KeyValue::new(semconv::OURIOS_TLS_LISTENER, self.listener),
+                KeyValue::new(semconv::OURIOS_SERVER_LISTENER_NAME, self.listener),
                 KeyValue::new(semconv::OURIOS_TLS_FAILURE, failure),
             ],
         );
@@ -395,7 +462,7 @@ pub struct TlsListener {
 
 impl TlsListener {
     /// Wrap a bound `TcpListener` with `acceptor`. `listener` is the
-    /// `ourios.tls.listener` label for this listener's handshake-failure
+    /// `ourios.server.listener.name` label for this listener's handshake-failure
     /// metric (e.g. `LISTENER_HTTP` for the receiver, `LISTENER_QUERIER`
     /// for the querier) — so the two HTTP listeners don't aggregate.
     #[must_use]
@@ -406,6 +473,12 @@ impl TlsListener {
             metrics: HandshakeFailures::new(listener),
             handshakes: JoinSet::new(),
         }
+    }
+}
+
+impl NamedListener for TlsListener {
+    fn name(&self) -> &'static str {
+        self.metrics.listener
     }
 }
 

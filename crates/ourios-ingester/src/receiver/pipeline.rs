@@ -28,7 +28,7 @@ use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{
     FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
-    ReclaimState, RotationKind, SnapshotHorizons, TenantBatch, Wal, WalOffset,
+    ReclaimState, RotationKind, RotationState, SnapshotHorizons, TenantBatch, Wal, WalOffset,
 };
 use prost::Message;
 use tracing::Instrument as _;
@@ -187,6 +187,12 @@ pub trait Journal: Send {
     fn reclaim_state(&self) -> ReclaimState {
         ReclaimState::default()
     }
+
+    /// §3.3's rotation state alone — cheap, because the coordinator
+    /// reads it on every guard release to emit the rotation edges.
+    fn rotation_state(&self) -> RotationState {
+        RotationState::Healthy
+    }
 }
 
 impl Journal for Wal {
@@ -240,6 +246,10 @@ impl Journal for Wal {
 
     fn reclaim_state(&self) -> ReclaimState {
         Wal::reclaim_state(self)
+    }
+
+    fn rotation_state(&self) -> RotationState {
+        Wal::rotation_state(self).clone()
     }
 }
 

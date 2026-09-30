@@ -58,7 +58,11 @@ use crate::tree::OwnedToken;
 /// from the cut's global mark to the tenant's own folded horizon — so
 /// a version-1 artefact takes the unknown-version path: one byte never
 /// carries both readings, and before production a persisted layout is
-/// broken rather than dual-read.
+/// broken rather than dual-read. The cost is paid once, on upgrade: a
+/// tenant whose frames the WAL already reclaimed past its version-1
+/// snapshot rebuilds from what remains, and re-mints the template ids
+/// of what was reclaimed (hazard #5, visible in the RFC 0010 drift
+/// query).
 pub const SNAPSHOT_VERSION: u8 = 2;
 
 /// One tenant's full snapshot payload (the bytes after the version

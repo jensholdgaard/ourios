@@ -193,9 +193,11 @@ pub fn recover(
     // method whose only callers are tests.
     wal.rebuild_ledger().map_err(RecoveryDriverError::Ledger)?;
 
+    let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
         if let Some(horizon) = horizons.get(&tenant.tenant_id) {
-            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &sink.segments_seen);
+            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &sink.segments_seen)
+                && !reclaim_explains(*horizon, reclaimed.get(&tenant.tenant_id));
         }
     }
 
@@ -272,18 +274,14 @@ pub fn write_folded_snapshots(
 }
 
 /// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
-/// below the checkpoint whose segment never surfaced during replay
-/// means frames in `(S, oldest surviving)` are gone. Internally
-/// unreachable: the §6.7 retain floor (min over tenant horizons)
-/// keeps any segment holding frames above the floor, and a lagging
-/// tenant's own `S.segment` is protected by its own membership in
-/// the min — so a hit means external mutation of `wal_root`, and the
+/// below the checkpoint whose segment never surfaced during replay may
+/// mean frames in `(S, oldest surviving)` are gone. Under per-tenant
+/// horizons (RFC 0052 §3.1) that shape is also the normal one — an idle
+/// tenant's own last segment is reclaimed once its horizon covers it —
+/// so a hit is a gap only when [`reclaim_explains`] does not account
+/// for it. What remains is external mutation of `wal_root`, and the
 /// warning names the gap rather than staying silent (hazard #5; the
-/// re-minting drift is observable via the RFC 0010 drift query). The
-/// rule has no steady-state false positive: in normal operation
-/// `S`'s segment either survives (seen during replay) or was
-/// reclaimed only after the checkpoint passed it, in which case
-/// `S ≥` every reclaimed frame and `S < checkpoint` fails.
+/// re-minting drift is observable via the RFC 0010 drift query).
 fn stale_gap(
     horizon: WalOffset,
     checkpoint: Option<WalOffset>,
@@ -293,6 +291,14 @@ fn stale_gap(
         Some(checkpoint) => horizon < checkpoint && !segments_seen.contains(&horizon.segment),
         None => false,
     }
+}
+
+/// RFC 0052 §3.2's restated witness: an absent horizon segment is
+/// explained when the `RECLAIM` record says a pass reclaimed the
+/// tenant's frames at or above `S`. Only `S` above the tenant's
+/// reclaimed-through, or no entry at all, leaves the absence unexplained.
+fn reclaim_explains(horizon: WalOffset, reclaimed_through: Option<&WalOffset>) -> bool {
+    reclaimed_through.is_some_and(|through| *through >= horizon)
 }
 
 /// Parse a snapshot's recorded high-water mark into a [`WalOffset`].
@@ -443,6 +449,15 @@ mod tests {
         let x = offset("00000000-0000-7000-8000-000000000002", 5);
         let seen = HashSet::from([x.segment]);
         assert!(stale_gap(s, Some(x), &seen));
+    }
+
+    #[test]
+    fn a_reclaim_entry_at_or_above_the_horizon_explains_its_absent_segment() {
+        let s = offset(SEGMENT, 10);
+        assert!(reclaim_explains(s, Some(&offset(SEGMENT, 10))), "at S");
+        assert!(reclaim_explains(s, Some(&offset(SEGMENT, 11))), "above S");
+        assert!(!reclaim_explains(s, Some(&offset(SEGMENT, 9))), "below S");
+        assert!(!reclaim_explains(s, None), "nothing reclaimed");
     }
 
     #[test]

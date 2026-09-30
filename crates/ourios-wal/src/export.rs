@@ -1,7 +1,12 @@
 //! RFC 0052 §3.5's export surface: the WAL state the receiver reads to
 //! publish the reclamation instruments and the rotation edges.
 
-use crate::{ReclaimState, RotationState, Wal};
+use std::collections::HashMap;
+
+use ourios_core::tenant::TenantId;
+
+use crate::reclaim::SlotState;
+use crate::{ReclaimState, RotationState, Wal, WalOffset};
 
 impl Wal {
     /// The WAL state RFC 0052 §3.5 exports.
@@ -32,6 +37,33 @@ impl Wal {
     #[must_use]
     pub fn rotation_state(&self) -> &RotationState {
         &self.rotation
+    }
+
+    /// Each tenant's reclaimed-through offset as the `RECLAIM` record
+    /// holds it (RFC 0052 §3.2): the last frame of that tenant a pass
+    /// unlinked. A tenant with nothing reclaimed is absent, as is every
+    /// tenant of a root with no record. This is the witness that
+    /// explains a snapshot horizon whose segment is gone.
+    #[must_use]
+    pub fn reclaimed_through(&self) -> HashMap<TenantId, WalOffset> {
+        let held = self.reclaim.lock();
+        let Some(store) = held.as_ref() else {
+            return HashMap::new();
+        };
+        store
+            .record()
+            .dictionary
+            .live()
+            .filter_map(|(_, slot)| match &slot.state {
+                SlotState::Live {
+                    reclaimed_through: Some(entry),
+                } => Some((slot.key.clone(), entry.offset)),
+                SlotState::Live {
+                    reclaimed_through: None,
+                }
+                | SlotState::Tombstoned => None,
+            })
+            .collect()
     }
 
     fn oldest_unreclaimed(&self) -> Option<std::time::SystemTime> {

@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.11.1] - 2026-10-01
+
+### Upgrade notes
+
+- **Fixes #892:** v0.11.0 could not restore the miner snapshots it wrote
+  itself once a tenant's template tree routed a leaf through a node's
+  `<*>` child. That happens after a node collects `max_node_children`
+  (default 100) distinct tokens. Every restart then rebuilt the miner
+  from the WAL, and templates first seen in already-reclaimed frames
+  re-minted (drift).
+- **The miner snapshot format is now version 3.** Snapshots record the
+  route each leaf took through the tree, and that field is required.
+  Every snapshot written by 0.11.0 (format 2) is **discarded once** on
+  upgrade (`ourios.receiver.snapshot.discarded`,
+  `error.type=unknown_version`, "snapshot format version 2") and rebuilt
+  from the WAL that remains. Templates first seen in frames already
+  reclaimed get new ids, which the RFC 0010 drift query shows. Snapshots
+  written from 0.11.1 on restore normally.
+- **Known limitation, by decision:** a WAL root still on the RFC 0052
+  legacy branch that restarted on 0.11.0 before its first version-2
+  checkpoint has no restorable mark for its tenants, and still refuses
+  to start (`LegacyStaleGap`). Roots that stamped a checkpoint under
+  0.11.0 are not affected.
+- **Restore equivalence:** template-id choice no longer depends on map
+  iteration order or history. Convergence lookups and similarity ties
+  pick the lowest `template_id`, so a restored miner allocates exactly
+  as the live one would have (RFC 0001 §6.9, RFC0050.6 amendments).
+- A discarded snapshot's warning now carries the restore error's detail.
+
+### Documentation
+
+- Amend rfc 0001 §6.9 with the leaf wildcard route (#894) (2ee597a)
+
+### Fixed
+
+- **BREAKING** Restore snapshots of trees routed through a wildcard child (#893) (ca237dd)
+
 ## [0.11.0] - 2026-09-30
 
 ### Security

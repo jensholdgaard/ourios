@@ -2325,9 +2325,12 @@ tenant independently; there is no cluster-wide combined artefact.
 > tenant reclaimed through `S` or beyond (RFC 0052 §3.2).
 
 > **Amendment 2026-09-30 (leaf route, #892).** Each leaf record also
-> carries **`wildcard_routed`**: the prefix-path positions, ascending,
-> at which the leaf's node was reached through RFC 0023 §3.1's
-> wildcard child `<*>` rather than a keyed branch. Under that child,
+> carries **`wildcard_routed`**: the **zero-based**, strictly
+> increasing prefix-path positions, each below the walk depth
+> `min(prefix_depth, token count)`, at which the leaf's node was
+> reached through RFC 0023 §3.1's wildcard child `<*>` rather than a
+> keyed branch. Position 0 is the leaf's first token, unlike §3.5's
+> 1-indexed token positions. Under that child,
 > lines differ at the path position, so a leaf there can widen or
 > type-expand at it, and restore cannot derive the route from the
 > template. Without the field, restore rejected such a leaf when it
@@ -2337,7 +2340,8 @@ tenant independently; there is no cluster-wide combined artefact.
 > alone is harmless; only a leaf routed through `<*>` that then widened
 > or type-expanded at that position is affected. Restore descends
 > through `<*>` at the recorded positions and rejects a list that is
-> not ascending or reaches past the walk depth. The field is additive
+> not strictly increasing or holds a position at or past the walk
+> depth. The field is additive
 > and optional (`#[serde(default)]`, an absent field reads as empty):
 > a snapshot written without it restores under the strict rule that
 > every path-position wildcard is a singleton mask-emitted type, so a
@@ -2375,8 +2379,8 @@ serialised payload. The payload captures the per-tenant state needed
 to reconstruct the miner: the tree leaves (template token sequence,
 `template_id`, `template_version`, the `(severity_number,
 scope_name)` template key of §6.1, the per-slot `slot_types`
-of §6.1, and the wildcard-routed path positions of the 2026-09-30
-amendment above), the structured-template-id map allocated in §6.2's
+of §6.1, and the zero-based, strictly increasing wildcard-routed path
+positions below the walk depth of the 2026-09-30 amendment above), the structured-template-id map allocated in §6.2's
 structured short-circuit, and the WAL high-water mark above.
 The concrete payload codec is an implementation detail *behind* the
 version byte — the version byte is what makes format evolution safe,

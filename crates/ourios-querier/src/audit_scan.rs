@@ -110,16 +110,14 @@ pub(crate) fn audit_files(
     }
 }
 
-/// One captured audit scan: the events in SCAN order — (file path
-/// lexicographic, within-file row index), the order the §3.7.1
-/// timestamp sort uses as its tiebreak via stable sorting — the bytes
-/// fetched reading them, and the **frontier** — the exact audit `*.parquet`
-/// set the events came from, as store-relative keys under the tenant's audit
-/// root, sorted lexicographically (RFC 0033 §3.2 `folded_files`). Everything
-/// derived from a single listing + read pass, so the frontier can never name
-/// a set other than the one actually folded.
-pub(crate) struct CapturedScan {
-    pub(crate) events: Vec<AuditEvent>,
+/// What one streamed audit scan observed besides its events: the bytes
+/// fetched reading them (RFC 0031 §3.6) and the **frontier** — the exact
+/// audit `*.parquet` set the events came from, as store-relative keys under
+/// the tenant's audit root, sorted lexicographically (RFC 0033 §3.2
+/// `folded_files`). Both come from the single listing + read pass that fed
+/// the visitor, so the frontier can never name a set other than the one
+/// actually folded.
+pub(crate) struct ScanSummary {
     pub(crate) bytes_read: u64,
     pub(crate) frontier: Vec<String>,
 }
@@ -201,52 +199,36 @@ impl ResolvedAuditSet<'_> {
         }
     }
 
-    /// Read every [`AuditEvent`] from this resolved set, in the §3.7.1 fold
-    /// order, applying the **row-level tenant backstop** (`CLAUDE.md` §3.7 /
-    /// RFC 0005 §3.9 row-vs-path): the listing/walk is already
-    /// tenant-scoped, so a row claiming another tenant is a corrupt or
-    /// foreign file — fail loudly rather than fold (or silently drop) it. A
-    /// local file is read with [`AuditReader::open_file`], an S3 key via
-    /// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
+    /// Stream every [`AuditEvent`] in this resolved set to `visit`, in SCAN
+    /// order — (file path lexicographic, within-file row index), the order
+    /// the §3.7.1 timestamp sort uses as its tiebreak — applying the
+    /// **row-level tenant backstop** (`CLAUDE.md` §3.7 / RFC 0005 §3.9
+    /// row-vs-path): the listing/walk is already tenant-scoped, so a row
+    /// claiming another tenant is a corrupt or foreign file — fail loudly
+    /// rather than fold (or silently drop) it. A local file is read with
+    /// [`AuditReader::open_file`], an S3 key via [`Store::get_blocking`] →
+    /// [`AuditReader::open_bytes`].
     ///
-    /// Also returns (in the [`CapturedScan`]) the **bytes fetched** reading
-    /// the set (RFC 0031 §3.6). The remote branch pays a full-object GET
-    /// per key, so the local branch counts each file's length to keep the
-    /// two backends' figures equal for identical data.
-    pub(crate) fn read_events(self, tenant: &TenantId) -> Result<CapturedScan, QueryError> {
+    /// One audit file is held at a time: its bytes and decoded events are
+    /// dropped before the next is fetched, so the scan's footprint is
+    /// bounded by the largest audit file, not the tenant's history.
+    /// What the visitor keeps is the fold's business.
+    ///
+    /// The remote branch pays a full-object GET per key, so the local
+    /// branch counts each file's length to keep the two backends'
+    /// [`ScanSummary::bytes_read`] equal for identical data.
+    pub(crate) fn for_each_event(
+        self,
+        tenant: &TenantId,
+        mut visit: impl FnMut(AuditEvent),
+    ) -> Result<ScanSummary, QueryError> {
         let mut bytes_read: u64 = 0;
-        let mut events: Vec<AuditEvent> = Vec::new();
-        let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
-            for event in read {
-                if event.tenant_id != *tenant {
-                    return Err(QueryError::Storage {
-                        detail: format!(
-                            "audit file {label} carries a row for tenant {} under tenant {}'s \
-                             partition root",
-                            event.tenant_id.as_str(),
-                            tenant.as_str(),
-                        ),
-                    });
-                }
-                events.push(event);
-            }
-            Ok(())
-        };
         let frontier = match self {
             Self::Local { paths, frontier } => {
                 for path in &paths {
-                    let len = std::fs::metadata(path)
-                        .map_err(|e| QueryError::Storage {
-                            detail: format!("audit file metadata {}: {e}", path.display()),
-                        })?
-                        .len();
+                    let (len, events) = read_local(path)?;
                     bytes_read = add_measured(bytes_read, len)?;
-                    let read = AuditReader::open_file(path)
-                        .and_then(AuditReader::read_all)
-                        .map_err(|e| QueryError::Storage {
-                            detail: format!("audit file {}: {e}", path.display()),
-                        })?;
-                    push_validated(&path.display().to_string(), read)?;
+                    visit_validated(&path.display().to_string(), events, tenant, &mut visit)?;
                 }
                 frontier
             }
@@ -256,57 +238,83 @@ impl ResolvedAuditSet<'_> {
                 frontier,
             } => {
                 for key in &keys {
-                    let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
-                        detail: format!("audit file {key}: {e}"),
-                    })?;
-                    bytes_read = add_measured(bytes_read, bytes.len() as u64)?;
-                    let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
-                        .and_then(AuditReader::read_all)
-                        .map_err(|e| QueryError::Storage {
-                            detail: format!("audit file {key}: {e}"),
-                        })?;
-                    push_validated(key, read)?;
+                    let (len, events) = read_remote(store, key)?;
+                    bytes_read = add_measured(bytes_read, len)?;
+                    visit_validated(key, events, tenant, &mut visit)?;
                 }
                 frontier
             }
         };
-        Ok(CapturedScan {
-            events,
+        Ok(ScanSummary {
             bytes_read,
             frontier,
         })
     }
 }
 
-/// Read every [`AuditEvent`] from `tenant`'s resolved audit file set (the
-/// `None`-window full history), in the §3.7.1 fold order, applying the
-/// **row-level tenant backstop** (`CLAUDE.md` §3.7 / RFC 0005 §3.9 row-vs-path):
-/// the listing/walk is already tenant-scoped, so a row claiming another tenant
-/// is a corrupt or foreign file — fail loudly rather than fold (or silently
-/// drop) it. The shared reader for the alias-map and template-registry folds; a
-/// local file is read with [`AuditReader::open_file`], an S3 key via
-/// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
-///
-/// Also returns the **bytes fetched** reading the set (RFC 0031 §3.6 — the
-/// registry component of a query's total IO). The remote branch pays a
-/// full-object GET per key, so the local branch counts each file's length to
-/// keep the two backends' figures equal for identical data.
-pub(crate) fn read_all_events(
+/// Stream every [`AuditEvent`] of `tenant`'s resolved audit file set (the
+/// `None`-window full history) to `visit` — [`resolve_audit_set`] then
+/// [`ResolvedAuditSet::for_each_event`]. The shared reader for the
+/// alias-map and template-registry folds.
+pub(crate) fn for_each_event(
     backend: StoreRef<'_>,
     tenant: &TenantId,
-) -> Result<(Vec<AuditEvent>, u64), QueryError> {
-    read_all_events_captured(backend, tenant).map(|scan| (scan.events, scan.bytes_read))
+    visit: impl FnMut(AuditEvent),
+) -> Result<ScanSummary, QueryError> {
+    resolve_audit_set(backend, tenant)?.for_each_event(tenant, visit)
 }
 
-/// [`read_all_events`] plus the frontier it folded — see [`CapturedScan`].
-/// The RFC 0033 artifact derivation consumes this so the `folded_files` it
-/// publishes and the events it folds come from the same single scan (§3.5's
-/// no-partial rule starts here).
-pub(crate) fn read_all_events_captured(
-    backend: StoreRef<'_>,
+/// One local audit file's length and decoded events.
+fn read_local(path: &Path) -> Result<(u64, Vec<AuditEvent>), QueryError> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit file metadata {}: {e}", path.display()),
+        })?
+        .len();
+    let events = AuditReader::open_file(path)
+        .and_then(AuditReader::read_all)
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit file {}: {e}", path.display()),
+        })?;
+    Ok((len, events))
+}
+
+/// One audit object's fetched byte count and decoded events.
+fn read_remote(store: &Store, key: &str) -> Result<(u64, Vec<AuditEvent>), QueryError> {
+    let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
+        detail: format!("audit file {key}: {e}"),
+    })?;
+    let len = bytes.len() as u64;
+    let events = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+        .and_then(AuditReader::read_all)
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit file {key}: {e}"),
+        })?;
+    Ok((len, events))
+}
+
+/// Hand `events` from the audit file `label` to `visit`, failing loudly on
+/// the first row that claims a tenant other than `tenant`.
+fn visit_validated(
+    label: &str,
+    events: Vec<AuditEvent>,
     tenant: &TenantId,
-) -> Result<CapturedScan, QueryError> {
-    resolve_audit_set(backend, tenant)?.read_events(tenant)
+    visit: &mut impl FnMut(AuditEvent),
+) -> Result<(), QueryError> {
+    for event in events {
+        if event.tenant_id != *tenant {
+            return Err(QueryError::Storage {
+                detail: format!(
+                    "audit file {label} carries a row for tenant {} under tenant {}'s \
+                     partition root",
+                    event.tenant_id.as_str(),
+                    tenant.as_str(),
+                ),
+            });
+        }
+        visit(event);
+    }
+    Ok(())
 }
 
 /// The canonical `audit/tenant_id=<enc>` root under `bucket_root` — the same

@@ -903,3 +903,72 @@ fn rfc0033_6_measured_tax_collapses() {
         warm.registry_bytes_read,
     );
 }
+
+/// #895 / #853 — a restart after a crash loop. The audit stream holds
+/// days of re-minted history for two live templates; the query asks for
+/// the last hour. The first query after a restart folds the history once
+/// and publishes; a second restart (a fresh `Querier`, no in-process
+/// state) loads the artifact and reads no audit object, with the answer
+/// unchanged byte for byte.
+#[test]
+fn restart_after_remint_history_loads_the_published_map() {
+    let bucket = TempDir::new().expect("temp dir");
+    let tenant = TenantId::new(TENANT);
+    let history: Vec<AuditEvent> = (0..96u64)
+        .map(|restart| widened(TENANT, 1 + restart % 2, 1, TS0 - (96 - restart) * HOUR_NS))
+        .collect();
+    write_audit(bucket.path(), &history);
+    write_all(
+        bucket.path(),
+        &[
+            simple(TENANT, 1, NOW - HOUR_NS / 2),
+            simple(TENANT, 2, NOW - HOUR_NS / 4),
+        ],
+    );
+    let audit_bytes: u64 = live_audit_set(bucket.path(), TENANT)
+        .iter()
+        .map(|rel| {
+            std::fs::metadata(audit_root(bucket.path(), TENANT).join(rel))
+                .expect("stat audit file")
+                .len()
+        })
+        .sum();
+    let last_hour = || {
+        let query =
+            ourios_querier::dsl::parse("true | range(-1h, now) | limit 100").expect("parse");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(Querier::new(bucket.path()).run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                None,
+            ))
+            .expect("last-hour query")
+    };
+
+    let cold = last_hour();
+    assert_eq!(cold.rows, 2);
+    assert_eq!(
+        cold.registry_bytes_read, audit_bytes,
+        "the cold query folds the history once"
+    );
+    let artifact = audit_root(bucket.path(), TENANT).join(TEMPLATE_MAP_FILENAME);
+    let artifact_len = std::fs::metadata(&artifact)
+        .expect("the cold fold published the map")
+        .len();
+
+    let warm = last_hour();
+    assert_eq!(warm.records, cold.records);
+    assert_eq!(
+        warm.registry_bytes_read, artifact_len,
+        "after a restart the only template-map read is the artifact",
+    );
+    let (_, bytes, outcome) =
+        load_or_derive(StoreRef::Local(bucket.path()), &tenant).expect("load");
+    assert_eq!(outcome, CacheOutcome::Hit);
+    assert_eq!(bytes, artifact_len);
+}

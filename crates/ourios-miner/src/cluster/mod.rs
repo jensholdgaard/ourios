@@ -386,6 +386,16 @@ struct Attach<'a> {
     observed: Option<&'a str>,
 }
 
+impl<'a> Attach<'a> {
+    fn new(candidate: Candidate, config: &MinerConfig, observed: Option<&'a str>) -> Self {
+        Self {
+            candidate,
+            byte_limit: config.param_byte_limit,
+            observed,
+        }
+    }
+}
+
 /// What a string line contributes to its data record whichever way it
 /// is mined: its separators and its line-ordered, byte-capped params.
 /// Owned, because each exit path moves them into exactly one record.
@@ -931,11 +941,7 @@ impl MinerCluster {
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
                         line,
                         masked_line,
-                        Attach {
-                            candidate: c,
-                            byte_limit: effective_config.param_byte_limit,
-                            observed,
-                        },
+                        Attach::new(c, &effective_config, observed),
                         parts,
                     ),
                     // Lossy: new leaf rather than force-merge

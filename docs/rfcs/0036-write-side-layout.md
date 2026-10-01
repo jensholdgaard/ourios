@@ -22,6 +22,15 @@ superseded-by: —
 > materialization-bytes win, 20 of 21 groups pruned, where the fixed
 > 32 MiB default had skipped).
 >
+> **Amended 2026-10-01 (§3.2 skip-spill budget, issue #895):** the
+> in-memory sort is gated on a **decoded-row** budget (default 64 MiB)
+> instead of ≤ 256 MiB of encoded input, and run formation spills runs
+> of whole inputs whenever that budget fills. A partition of many small,
+> well-compressed files had stayed under the encoded gate yet decoded
+> past a 1.5 GiB node's memory limit. The §3.1 order, the §3.5
+> byte-identity of both paths and RFC 0009's one-output commit are
+> unchanged.
+>
 > Reached `validated` on all five §5 scenarios green plus the comparative
 > evidence below.
 > **RFC0036.1** (footer inspection — compacted threshold,
@@ -243,7 +252,8 @@ whose initial runs are the input files themselves:
    (a stable sort; the tie-break's row ordinal is the pre-sort
    position), and spill a **sorted run** to local scratch (local
    disk is cache, not truth — `CLAUDE.md` §3.6 clean; the run
-   format, Arrow IPC vs Parquet, is §7).
+   format, Arrow IPC vs Parquet, is §7). *Amended 2026-10-01:* a run
+   now groups whole inputs up to the decoded-row budget (below).
 2. **Merge.** Stream a k-way merge over the sorted runs, holding
    **one decoded batch per run** (the `Reader` already wraps the
    streaming `ParquetRecordBatchReader`; a batched-read entry point
@@ -267,16 +277,39 @@ phases. Everything around the sort — manifest bootstrap, CAS
 commit, GC, the RFC0009.5 per-row partition validation at input
 open — is untouched.
 
-The one exception is the §7 **skip-spill** optimisation for small
-partitions: while the encoded input total stays within
-`in_memory_max_bytes` (one ingest seal target, default 256 MiB), all
-inputs are held decoded at once and sorted in place rather than
-spilled one at a time. That bound is one seal-target's worth of
-input — no larger than decoding a single worst-case input file — so
-the load-bearing claim holds *at the bound*, but the strict
-"one file at a time" residency is the spill path's, not the
-in-memory path's. RFC0036.3's memory test asserts the accurate
-bound for each path.
+> **Amended 2026-10-01 (issue #895).** This paragraph originally gated
+> the skip-spill path on the partition's **encoded** input total
+> (≤ 256 MiB), arguing that one seal-target's worth of input decodes no
+> larger than one worst-case input file. Production disproved it: small,
+> well-compressed inputs decode to many times their encoded size, so a
+> partition of ~1,500 small files (~15 MB of Parquet) stayed under the
+> gate yet decoded to more than 1.5 GiB, and the boot sweep ran a node
+> with a 1.5 GiB memory limit out of memory on its first candidate. The
+> gate is therefore measured on **decoded** rows, and run formation is
+> bounded by the same budget.
+
+The **skip-spill** optimisation for small partitions is governed by a
+**decoded-row budget**, `in_memory_max_bytes` (default **64 MiB**),
+measured as an estimate of the heap each decoded row holds (the record,
+its strings, params, separators and attribute trees), never as encoded
+input bytes. Run formation streams the inputs in sorted-basename order
+and buffers their decoded rows:
+
+- if the whole partition fits the budget, it is sorted in memory and
+  written without spilling (the skip-spill path);
+- otherwise, at the end of each input that takes the buffer over the
+  budget, the buffer is stably sorted and spilled as one sorted run.
+  A run therefore holds one or more **whole** inputs, never part of
+  one, and runs are spilled in input order.
+
+Because the buffer holds rows in (input ordinal, row ordinal) order and
+the merge breaks key ties by run ordinal, the §3.1 total order and the
+§3.5 byte-identity between the two paths hold however the inputs are
+grouped into runs. Phase-1 peak residency is the budget plus one decoded
+input, and phase 2 stays at F × one decoded batch, so neither depends on
+the partition's file count or compression ratio. Spilling changes no
+output byte, only local scratch I/O (cache, not truth — `CLAUDE.md`
+§3.6). RFC0036.3's memory test asserts the accurate bound for each path.
 
 ### 3.3 Compacted row-group threshold — adaptive (target-K)
 
@@ -511,7 +544,8 @@ published diagnostic.
 >   at `red` from a first measurement, and "keeps up" — throughput
 >   ≫ per-partition seal rate — must still hold)
 > - **And** a memory-bound test shows peak decoded-row residency of
->   the order of one input file (phase 1) and F × batch (phase 2)
+>   the decoded-row budget plus one input file (phase 1; amended
+>   2026-10-01, §3.2) and F × batch (phase 2)
 >   — compacting an N-file partition must not regress to
 >   whole-partition residency.
 
@@ -665,10 +699,12 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   cheaper encode doesn't pay for a second read path. Fan-in **F = 64**
   single-passes every realistic partition (§9.7's band-scale case held
   32 inputs) while capping worst-case phase-2 residency at F × one
-  decoded batch. Small partitions **skip spilling** entirely: while
-  total encoded input stays ≤ **256 MiB** (`SINK_TARGET_BYTES`, the
-  ingest seal target), the sort runs fully in memory — no larger than
-  phase 1's existing one-input bound.
+  decoded batch. Small partitions **skip spilling** entirely while
+  their decoded rows fit the **64 MiB decoded-row budget**, and larger
+  ones spill runs of whole inputs as the budget fills (*amended
+  2026-10-01, §3.2 — originally gated on ≤ 256 MiB of **encoded**
+  input, which let a partition of many small files decode past a
+  node's memory limit; issue #895*).
 - [x] **The H4 wording amendment** (§3.3): landed with this slice —
   `docs/hazards.md` H4 scopes the 128 MB–1 GB row-group target to
   ingest-side files and states the compacted threshold as the

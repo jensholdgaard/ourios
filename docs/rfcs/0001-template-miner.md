@@ -2330,9 +2330,12 @@ tenant independently; there is no cluster-wide combined artefact.
 > wildcard child `<*>` rather than a keyed branch. Under that child,
 > lines differ at the path position, so a leaf there can widen or
 > type-expand at it, and restore cannot derive the route from the
-> template. Without the field, restore rejected every such leaf as a
-> malformed path tag, and every snapshot of a tree that had filled a
-> prefix node was discarded on the next start (#892). Restore descends
+> template. Without the field, restore rejected such a leaf when it
+> carried a wildcard at a routed position that is not a singleton
+> mask-emitted type, reading it as a malformed path tag; a snapshot
+> containing one was discarded on the next start (#892). Filling a node
+> alone is harmless; only a leaf routed through `<*>` that then widened
+> or type-expanded at that position is affected. Restore descends
 > through `<*>` at the recorded positions and rejects a list that is
 > not ascending or reaches past the walk depth. The field is additive
 > and optional (`#[serde(default)]`, an absent field reads as empty):
@@ -2341,7 +2344,12 @@ tenant independently; there is no cluster-wide combined artefact.
 > 0.11.0-written artefact holding such a leaf is discarded once more
 > and full-replays through step (3). No `SNAPSHOT_VERSION` bump,
 > following the precedent of RFC 0037's `event_name` and RFC 0050's
-> provenance and association fields.
+> provenance and association fields. By maintainer decision there is
+> no lenient migration for such a pre-fix artefact: a root still on
+> the RFC 0052 §3.2 legacy branch that wrote one and restarted on
+> 0.11.0 before its first version-2 checkpoint fails closed with
+> `LegacyStaleGap`, because the discarded tenant has neither a
+> restored horizon nor a version-1 mark.
 >
 > Restore rebuilds the tree from the snapshot, not from the history
 > that built it, so §3.5.3's equivalence also requires every choice
@@ -2351,7 +2359,8 @@ tenant independently; there is no cluster-wide combined artefact.
 > shape it reached first in map order. Its guard index was a set, so
 > one of two leaves sharing a shape widening away hid the other. Ties
 > in both lookups now go to the lowest `template_id`, and the index
-> counts leaves per shape. The format is unchanged by these.
+> counts leaves per shape. The format is unchanged by these. RFC 0050
+> carries the matching note at RFC0050.6.
 
 *Cadence: per WAL-segment rotation.* A snapshot is taken at
 WAL-segment-rotation boundaries. The snapshot records the WAL

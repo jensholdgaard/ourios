@@ -526,6 +526,18 @@ Scenario ids `RFC0050.<n>`, RFC0050.1–.9.
 > one, and adoption emits the `CLAUDE.md` §3.1 audit event naming the
 > template and its origin.
 
+> **Amendment 2026-09-30 (convergence tie-break, #892).** Two mined
+> leaves under distinct masked paths can carry the same canonical
+> shape. The convergence lookup then takes the leaf with the lowest
+> `template_id`, never whichever leaf map iteration reaches first, and
+> the convergence guard counts the leaves carrying each shape, so one
+> of them widening away leaves the shape findable. RFC 0001 §6.2 step 4
+> similarity ties break the same way. A snapshot restore rebuilds the
+> tree but not the history or map order that built it, so these
+> choices must be functions of the tree for a restored tenant to
+> converge exactly as the live one would (RFC 0001 §3.5.3). See RFC
+> 0001 §6.9's 2026-09-30 amendment.
+
 > **RFC0050.7 — the vocabulary is the convention's.** Given any Ourios
 > telemetry that names a template string as an attribute, Then the key
 > is `log.record.template`, the name resolves in `semconv/registry/`,

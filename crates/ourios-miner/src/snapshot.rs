@@ -677,14 +677,24 @@ mod tests {
     /// is discarded rather than restored into a possibly different tree.
     #[test]
     fn a_version_2_artefact_is_discarded() {
-        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
-        bytes[0] = 2;
-
-        assert!(matches!(
-            load_snapshot(&bytes),
-            Err(SnapshotError::UnknownVersion(2))
-        ));
+        let bytes = assert_unknown_version_discarded(2);
         assert_eq!(legacy_v1_mark(&bytes), LegacyMark::NotLegacy);
+    }
+
+    /// A valid artefact with byte 0 set to `version` fails to load as
+    /// that unknown version and takes the discard path. Returns it.
+    fn assert_unknown_version_discarded(version: u8) -> Vec<u8> {
+        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
+        bytes[0] = version;
+
+        assert!(
+            matches!(load_snapshot(&bytes), Err(SnapshotError::UnknownVersion(v)) if v == version)
+        );
+        assert_eq!(
+            recover(Some(&bytes)),
+            (None, RecoveryOutcome::UnknownOrCorruptDiscarded)
+        );
+        bytes
     }
 
     #[test]
@@ -705,17 +715,7 @@ mod tests {
     /// whatever its payload, it takes the discard path.
     #[test]
     fn a_version_1_artefact_is_discarded() {
-        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
-        bytes[0] = 1;
-
-        assert!(matches!(
-            load_snapshot(&bytes),
-            Err(SnapshotError::UnknownVersion(1))
-        ));
-        assert_eq!(
-            recover(Some(&bytes)),
-            (None, RecoveryOutcome::UnknownOrCorruptDiscarded)
-        );
+        assert_unknown_version_discarded(1);
     }
 
     /// RFC 0052 §3.2: the version-1 mark is decoded for the legacy

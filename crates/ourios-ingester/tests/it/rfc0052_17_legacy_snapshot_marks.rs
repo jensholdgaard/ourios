@@ -44,7 +44,7 @@ fn a_version_1_mark_below_the_oldest_surviving_frame_refuses_startup() {
 /// surviving frame, so it boots, rebuilds the tenant from every frame,
 /// and the next write is at the current version.
 #[test]
-fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_version_2() {
+fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_the_current_version() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let [first, last] = legacy_root(tmp.path(), Reclaimed::Nothing);
     write_v1_snapshot(tmp.path(), "alpha", Some(first));

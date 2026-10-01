@@ -376,6 +376,16 @@ struct StringLine<'a> {
     raw: &'a str,
 }
 
+/// A clean-zone attach (RFC 0001 §6.2 step 5): the chosen leaf, the
+/// tenant's §6.5 param byte cap, and the record's RFC 0050 `observe`
+/// association, if it carried one.
+#[derive(Clone, Copy)]
+struct Attach<'a> {
+    candidate: Candidate,
+    byte_limit: u32,
+    observed: Option<&'a str>,
+}
+
 /// What a string line contributes to its data record whichever way it
 /// is mined: its separators and its line-ordered, byte-capped params.
 /// Owned, because each exit path moves them into exactly one record.
@@ -921,10 +931,12 @@ impl MinerCluster {
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
                         line,
                         masked_line,
-                        c,
+                        Attach {
+                            candidate: c,
+                            byte_limit: effective_config.param_byte_limit,
+                            observed,
+                        },
                         parts,
-                        effective_config.param_byte_limit,
-                        observed,
                     ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
@@ -1178,10 +1190,13 @@ impl MinerCluster {
         &mut self,
         record: &OtlpLogRecord,
         masked: MaskedLine<'_>,
-        candidate: &Candidate,
-        byte_limit: u32,
-        observed: Option<&str>,
+        attach: Attach<'_>,
     ) -> AttachPlan {
+        let Attach {
+            candidate,
+            byte_limit,
+            observed,
+        } = attach;
         let state = self
             .tenants
             .get_mut(&record.tenant_id)
@@ -1351,33 +1366,23 @@ impl MinerCluster {
         template_version: u32,
         canonical: &str,
     ) {
-        let StringLine { record, raw, .. } = line;
-        self.audit_sink.emit(AuditEvent {
-            tenant_id: record.tenant_id.clone(),
-            timestamp: self.clock.now(),
-            payload: AuditPayload::Template {
-                template_id,
-                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                change: TemplateChange::Adopted {
-                    template_version,
-                    new_template: canonical.to_string(),
-                },
+        self.emit_template_change(
+            line,
+            template_id,
+            TemplateChange::Adopted {
+                template_version,
+                new_template: canonical.to_string(),
             },
-        });
+        );
     }
 
-    /// Emit the §6.4 degenerate-widening rejection audit event —
-    /// the record of *why* the attach refused to widen (RFC 0017
-    /// §3.1 keeps the audit stream the template history of record).
-    fn emit_rejected_degenerate_audit(
+    /// Emit one template audit event for `line` (RFC 0001 §6.4; RFC
+    /// 0017 §3.1 keeps the audit stream the template history of record).
+    fn emit_template_change(
         &mut self,
         line: StringLine<'_>,
         template_id: u64,
-        version: u32,
-        current_template: String,
-        would_be_template: String,
-        would_be_positions: Vec<u16>,
+        change: TemplateChange,
     ) {
         let StringLine { record, raw, .. } = line;
         self.audit_sink.emit(AuditEvent {
@@ -1387,12 +1392,7 @@ impl MinerCluster {
                 template_id,
                 triggering_line_hash: hash_triggering_line(raw.as_bytes()),
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                change: TemplateChange::RejectedDegenerate {
-                    version,
-                    current_template,
-                    would_be_template,
-                    would_be_positions,
-                },
+                change,
             },
         });
     }
@@ -1486,7 +1486,7 @@ impl MinerCluster {
         masked: MaskedLine<'_>,
         observed: Option<&str>,
     ) -> u64 {
-        let StringLine { record, raw, .. } = line;
+        let StringLine { record, .. } = line;
         let MaskedLine {
             strs: masked_strs,
             wildcard_positions: line_wildcard_positions,
@@ -1610,18 +1610,13 @@ impl MinerCluster {
         // read-time template registry can recover the v1 tokens once the
         // originating rows age out. Same WAL-before-ack path as the widening
         // events; not a merge, so it does not bump `merges_total`.
-        self.audit_sink.emit(AuditEvent {
-            tenant_id: record.tenant_id.clone(),
-            timestamp: self.clock.now(),
-            payload: AuditPayload::Template {
-                template_id: new_id,
-                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                change: TemplateChange::Created {
-                    new_template: created_template,
-                },
+        self.emit_template_change(
+            line,
+            new_id,
+            TemplateChange::Created {
+                new_template: created_template,
             },
-        });
+        );
         new_id
     }
 
@@ -1653,15 +1648,11 @@ impl MinerCluster {
         &mut self,
         line: StringLine<'_>,
         masked: MaskedLine<'_>,
-        candidate: Candidate,
+        attach: Attach<'_>,
         parts: LineParts,
-        byte_limit: u32,
-        observed: Option<&str>,
     ) -> u64 {
         let StringLine {
-            record,
-            service,
-            raw,
+            record, service, ..
         } = line;
         // Ownership rationale: each exit path emits **one** data
         // record and never reuses `parts` after that emit. Taking it
@@ -1671,7 +1662,7 @@ impl MinerCluster {
         // Phase 1 — mutate the leaf and accumulate the audit-event
         // payloads (the helper holds the leaf borrow only over the
         // mutation); emitting through `self.audit_sink` is phase 2.
-        let plan = self.plan_attach_on_candidate(record, masked, &candidate, byte_limit, observed);
+        let plan = self.plan_attach_on_candidate(record, masked, attach);
 
         match plan {
             AttachPlan::CleanReuse {
@@ -1705,13 +1696,16 @@ impl MinerCluster {
                 would_be_template,
                 would_be_positions,
             } => {
-                self.emit_rejected_degenerate_audit(
+                // §6.4: the audit records *why* the attach refused to widen.
+                self.emit_template_change(
                     line,
                     template_id,
-                    version,
-                    current_template,
-                    would_be_template,
-                    would_be_positions,
+                    TemplateChange::RejectedDegenerate {
+                        version,
+                        current_template,
+                        would_be_template,
+                        would_be_positions,
+                    },
                 );
                 // §6.4 treats degenerate widening as a parse
                 // failure that retains body (the line-ordered
@@ -1729,16 +1723,7 @@ impl MinerCluster {
                 for change in events {
                     let counts_as_merge = change.counts_as_merge();
                     let event_type = change.event_type();
-                    self.audit_sink.emit(AuditEvent {
-                        tenant_id: record.tenant_id.clone(),
-                        timestamp: self.clock.now(),
-                        payload: AuditPayload::Template {
-                            template_id,
-                            triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                            triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                            change,
-                        },
-                    });
+                    self.emit_template_change(line, template_id, change);
                     if counts_as_merge {
                         self.merges_total.fetch_add(1, Ordering::Relaxed);
                         self.metrics.record_merge(&record.tenant_id, event_type);

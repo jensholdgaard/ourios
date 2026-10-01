@@ -25,6 +25,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::metrics::ERROR_TYPE;
+
 /// The high half's width, and the mask the low (generation) half keeps.
 const EPOCH_SHIFT: u32 = 32;
 const GENERATION_MASK: u64 = 0xFFFF_FFFF;
@@ -187,6 +189,32 @@ impl BarrierEpochs {
     fn narrow(raw: u64) -> Epoch {
         Epoch(u32::try_from(raw).unwrap_or(u32::MAX))
     }
+}
+
+/// Read a cadence task's join at shutdown (RFC 0052 §3.2).
+///
+/// Each tick catches its own unwind, so a `JoinError` here is a panic or
+/// an abort that no tick saw — and the cut that task was running may
+/// have drained batches it never settled. So it is logged and read as a
+/// failed cut: the latch takes the current epoch and every later stamp,
+/// shutdown's included, refuses. Returns whether it latched.
+pub fn read_join(
+    epochs: &BarrierEpochs,
+    task: &'static str,
+    joined: Result<(), tokio::task::JoinError>,
+) -> bool {
+    let Err(e) = joined else {
+        return false;
+    };
+    let class = if e.is_panic() { "panic" } else { "cancelled" };
+    tracing::error!(
+        name: ourios_semconv::EVENT_OURIOS_RECEIVER_CADENCE_JOIN_ERROR,
+        { { ERROR_TYPE } = class },
+        "the {task} cadence task did not join cleanly; read as a failed cut, so nothing is \
+         stamped and nothing is assumed drained (the WAL replays it on the next start): {e}"
+    );
+    epochs.report(epochs.current());
+    true
 }
 
 #[cfg(test)]

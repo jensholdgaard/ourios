@@ -7,8 +7,9 @@
 //! the crash left a witness half-written, promoted durably before
 //! anything else reads it.
 //!
-//! The one row that needs the `PUBLISHED` sidecar stays an
-//! `#[ignore]`d stub: its writer and format are RFC 0055's.
+//! The one row that needs the `PUBLISHED` sidecar moved to RFC 0055 as
+//! RFC0055.5 and stays an `#[ignore]`d stub here: its writer and format
+//! are RFC 0055's.
 
 use std::collections::HashMap;
 
@@ -543,8 +544,47 @@ fn legacy_stale_gap_fails_closed_naming_the_tenant() {
         );
     }
 }
-/// Scenario RFC0052.17 — slot ids and the `published_seeded_*` flag rows.
-/// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
+
+/// The same belt at startup, before the post-recovery write replaces
+/// the version-1 artefacts it reads. It applies to a pre-RFC root and to
+/// nothing else: a post-RFC root before its first checkpoint holds
+/// tenants with frames and no snapshot as a matter of course.
+#[test]
+fn rfc0052_17_the_startup_legacy_check_refuses_only_a_pre_rfc_root() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let legacy = tmp.path().join("legacy");
+    let frames = build_tenant_segment(&legacy, &[("alpha", b"a1")]);
+    build_tenant_segment(&legacy, &[("alpha", b"a2")]);
+    std::fs::remove_file(legacy.join(RECLAIM)).expect("a pre-RFC root has no record");
+    downgrade_segments(&legacy);
+    write_legacy_checkpoint(&legacy, frames[0]);
+    let below = WalOffset {
+        segment: uuid::Uuid::nil(),
+        byte: 0,
+    };
+    let recorded =
+        |offset| HashMap::from([(tenant_id("alpha"), TenantHorizon::RecordedOnly(offset))]);
+
+    let mut wal = open(&legacy);
+    wal.rebuild_ledger().expect("ledger");
+    wal.refuse_legacy_stale_gaps_at_open(&recorded(frames[0]))
+        .expect("a mark at the oldest surviving frame explains it");
+    let refused = wal
+        .refuse_legacy_stale_gaps_at_open(&recorded(below))
+        .expect_err("a mark below it is the stale gap");
+    assert!(format!("{refused}").contains("alpha"), "{refused}");
+
+    let fresh = tmp.path().join("fresh");
+    build_tenant_segment(&fresh, &[("alpha", b"a1")]);
+    let mut wal = open(&fresh);
+    wal.rebuild_ledger().expect("ledger");
+    wal.refuse_legacy_stale_gaps_at_open(&HashMap::new())
+        .expect("a post-RFC root is not on the legacy branch");
+}
+
+/// Scenario RFC0055.5 (moved from RFC0052.17) — slot ids and the
+/// `published_seeded_*` flag rows; see
+/// `docs/rfcs/0055-publication-frontiers.md` §5.
 ///
 /// Both legs read the `PUBLISHED` sidecar. §3.2 defines the two
 /// `published_seeded_*` header bits and says they are RFC 0053's,
@@ -555,10 +595,10 @@ fn legacy_stale_gap_fails_closed_naming_the_tenant() {
 /// writer, and inventing one would put the id space's owner in the
 /// wrong RFC.
 #[test]
-#[ignore = "RFC0052.17 stub — blocked on RFC 0055 (publication frontiers), which owns the PUBLISHED writer and format; the slice that lands it discharges this"]
-fn rfc0052_17_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve() {
+#[ignore = "RFC0055.5 stub (moved from RFC0052.17) — RFC 0055 (publication frontiers) owns the PUBLISHED writer and format; the slice that lands it discharges this"]
+fn rfc0055_5_slot_ids_survive_a_published_only_write_and_seeding_flags_resolve() {
     todo!(
-        "RFC0052.17 — a tenant introduced by a PUBLISHED-only write keeps \
+        "RFC0055.5 — a tenant introduced by a PUBLISHED-only write keeps \
          its slot id across a restart; published_seeded_armed without \
          confirmed and PUBLISHED absent leaves the next start free to \
          seed again, while the same record with PUBLISHED present is \

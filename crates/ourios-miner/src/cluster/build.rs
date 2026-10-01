@@ -66,6 +66,20 @@ impl MinerCluster {
         self
     }
 
+    /// Install `sink` as the mined-record sink on a built cluster and
+    /// return the one it replaces. Startup recovery diverts replay's
+    /// output this way, then hands the configured sink back.
+    #[must_use = "the replaced sink is the one to restore"]
+    pub fn replace_record_sink(&mut self, sink: Box<dyn RecordSink>) -> Box<dyn RecordSink> {
+        std::mem::replace(&mut self.record_sink, sink)
+    }
+
+    /// The audit-event counterpart of [`Self::replace_record_sink`].
+    #[must_use = "the replaced sink is the one to restore"]
+    pub fn replace_audit_sink(&mut self, sink: Box<dyn AuditSink>) -> Box<dyn AuditSink> {
+        std::mem::replace(&mut self.audit_sink, sink)
+    }
+
     /// Convenience for tests / tuning experiments: pre-bake a
     /// `MinerConfig` with an overridden `prefix_depth` and rebuild
     /// the cluster.

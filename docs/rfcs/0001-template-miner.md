@@ -2314,6 +2314,72 @@ deferred for that reason.
 `[§3.7]`'s per-tenant trees. Recovery loads the latest snapshot per
 tenant independently; there is no cluster-wide combined artefact.
 
+> **Amended by RFC 0052 §3.1 (snapshot format 2, #877).** The
+> recorded high-water mark is **per tenant**: the WAL offset of that
+> tenant's own last frame folded into its state, not the one mark of
+> the cut that took the snapshot. An idle tenant keeps its older
+> horizon across later snapshots. A version-1 artefact, whose mark
+> had the old global meaning, takes the unknown-version path of
+> step (3) below. The §3.5.4 stale-gap check reads an absent `S`
+> segment as explained when the WAL's `RECLAIM` record shows the
+> tenant reclaimed through `S` or beyond (RFC 0052 §3.2).
+
+> **Amendment 2026-09-30 (leaf route, snapshot format 3, #892).** Each
+> leaf record carries a **required** **`wildcard_routed`**: the
+> **zero-based**, strictly increasing prefix-path positions, each below
+> the walk depth `min(prefix_depth, token count)`, at which the leaf's
+> node was reached through RFC 0023 §3.1's wildcard child `<*>` rather
+> than a keyed branch. Position 0 is the leaf's first token, unlike
+> §3.5's 1-indexed token positions. Under that child, lines differ at
+> the path position, so a leaf there can widen or type-expand at it, and
+> restore cannot derive the route from the template. Without the field,
+> restore rejected such a leaf when it carried a wildcard at a routed
+> position that is not a singleton mask-emitted type, reading it as a
+> malformed path tag; a snapshot containing one was discarded on the
+> next start (#892). Filling a node alone triggers no rejection; the
+> #892 rejection fires only for a leaf routed through `<*>` that then
+> widened or type-expanded at that position. A routed leaf that kept a
+> fixed token there is not rejected, but it can restore
+> non-equivalently, as the next paragraph explains; that is why the
+> format moves to version 3. Restore descends through `<*>` at the recorded
+> positions and rejects a list that is not strictly increasing or holds
+> a position at or past the walk depth; every other path position keeps
+> the strict rule that a path-position wildcard is a singleton
+> mask-emitted type.
+>
+> The field cannot default when absent, so it bumps the format to
+> **version 3** rather than following the additive precedent of RFC
+> 0037's `event_name` and RFC 0050's provenance and association fields.
+> A version-2 leaf that kept a fixed token where it was reached through
+> `<*>` matches no strict-rule check, so an empty default would restore
+> it as keyed. Restore re-inserts leaves in `template_id` order, and an
+> adopted-first, mined-second convergence can give such a leaf an older
+> id than a keyed sibling, so the defaulted tree could fill the node
+> differently and route another leaf through `<*>`, silently changing
+> later ids (§3.5.3). The old route cannot be inferred. A payload
+> without the field is therefore a decode error, and every version-2
+> artefact takes the unknown-version path of step (3): it is discarded
+> once, the tenant full-replays the WAL that remains, and templates
+> first seen in frames already reclaimed re-mint (hazard #5). Only the
+> version-1 mark is still read for RFC 0052 §3.2's legacy check. By
+> maintainer decision there is no lenient migration: a root still on
+> the RFC 0052 §3.2 legacy branch that wrote a version-2 artefact and
+> restarted on 0.11.0 before its first version-2 checkpoint fails
+> closed with `LegacyStaleGap`, because the discarded tenant has
+> neither a restored horizon nor a version-1 mark.
+>
+> Restore rebuilds the tree from the snapshot, not from the history
+> that built it, so §3.5.3's equivalence also requires every choice
+> live ingest makes to be a function of the tree. Three were not. §6.2
+> step 4 candidate selection broke similarity ties by leaf-list order.
+> The RFC0050.6 convergence lookup took whichever leaf of a shared
+> convergence key `(canonical, severity_number, scope_name)` it reached
+> first in map order. Its guard index was a set, so one of two leaves
+> sharing a key widening away hid the other. Ties in both lookups now
+> go to the lowest `template_id`, and the index counts leaves per
+> key. The format is unchanged by these. RFC 0050
+> carries the matching note at RFC0050.6.
+
 *Cadence: per WAL-segment rotation.* A snapshot is taken at
 WAL-segment-rotation boundaries. The snapshot records the WAL
 **high-water mark** — the `WalOffset` (RFC 0008 §6.1) up to which
@@ -2326,8 +2392,10 @@ the snapshot format version; the remaining bytes are that version's
 serialised payload. The payload captures the per-tenant state needed
 to reconstruct the miner: the tree leaves (template token sequence,
 `template_id`, `template_version`, the `(severity_number,
-scope_name)` template key of §6.1, and the per-slot `slot_types`
-of §6.1), the structured-template-id map allocated in §6.2's
+scope_name)` template key of §6.1, the per-slot `slot_types`
+of §6.1, and, from format version 3, the zero-based, strictly
+increasing wildcard-routed path positions below the walk depth of the
+2026-09-30 amendment above), the structured-template-id map allocated in §6.2's
 structured short-circuit, and the WAL high-water mark above.
 The concrete payload codec is an implementation detail *behind* the
 version byte — the version byte is what makes format evolution safe,

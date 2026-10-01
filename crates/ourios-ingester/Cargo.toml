@@ -35,6 +35,17 @@ test = false
 bench = false
 doctest = false
 
+# Crash-under-reclamation fixture spawned (and SIGKILL'd) by
+# tests/it/rfc0052_10_no_loss.rs — extends receiver_sink_crash_fixture with the
+# RFC 0052 barrier and housekeeping pass on a short cadence, so the kill lands
+# while segments below the checkpoint are being reclaimed (RFC0052.10).
+[[bin]]
+name = "receiver_reclaim_crash_fixture"
+path = "tests/fixtures/receiver_reclaim_crash_fixture.rs"
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
 ourios-config = { path = "../ourios-config" }

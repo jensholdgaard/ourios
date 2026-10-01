@@ -66,6 +66,19 @@ impl RotationSite {
         }
     }
 
+    /// The `error.type` value a failure at this site is reported under:
+    /// the step's class, never the rendered detail.
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::CloseSync => "close_sync",
+            Self::Create => "create",
+            Self::HeaderSync => "header_sync",
+            Self::Rename => "rename",
+            Self::ParentFsync => "parent_fsync",
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             Self::CloseSync => 0,
@@ -116,6 +129,10 @@ impl Budget {
 #[derive(Debug, Clone, Default)]
 pub struct RotationFaults {
     sites: [Budget; 5],
+    /// The live segment's `sync` data sync. Not a rotation step and
+    /// never charged to the budget: it is how a test puts the sick disk
+    /// a rotation failed on under the ordinary flush path as well.
+    segment_sync: Budget,
 }
 
 impl RotationFaults {
@@ -147,6 +164,24 @@ impl RotationFaults {
                 "RFC 0052 §6 injected rotation fault at {}",
                 site.op()
             )));
+        }
+        None
+    }
+
+    /// Also fail every data sync of the live segment that `sync` makes.
+    #[must_use]
+    pub fn and_failing_segment_sync(mut self) -> Self {
+        self.segment_sync = Budget::Always;
+        self
+    }
+
+    /// The error the live segment's data sync should fail with, if it
+    /// should.
+    pub(crate) fn take_segment_sync(&mut self) -> Option<std::io::Error> {
+        if self.segment_sync.take() {
+            return Some(std::io::Error::other(
+                "RFC 0052 §6 injected fault at sync(current_segment)",
+            ));
         }
         None
     }
@@ -201,6 +236,14 @@ impl RotationFault {
     #[must_use]
     pub fn op(&self) -> &'static str {
         self.op
+    }
+
+    /// The site the first failure happened at.
+    #[must_use]
+    pub fn site(&self) -> Option<RotationSite> {
+        RotationSite::ALL
+            .into_iter()
+            .find(|site| site.op() == self.op)
     }
 
     /// The first failure's `ErrorKind`.
@@ -329,6 +372,17 @@ mod tests {
     }
 
     #[test]
+    fn every_site_is_recovered_from_its_fault_with_a_distinct_error_type() {
+        let mut classes = std::collections::BTreeSet::new();
+        for site in RotationSite::ALL {
+            let fault = RotationState::default().charge(site.op(), &io(), 3);
+            assert_eq!(fault.site(), Some(site));
+            classes.insert(site.error_type());
+        }
+        assert_eq!(classes.len(), RotationSite::ALL.len());
+    }
+
+    #[test]
     fn a_budget_of_one_makes_the_first_failure_terminal() {
         let mut state = RotationState::default();
         let fault = state.charge(RotationSite::CloseSync.op(), &io(), 1);
@@ -387,6 +441,20 @@ mod tests {
         for _ in 0..64 {
             assert!(always.take(RotationSite::ParentFsync).is_some());
         }
+    }
+
+    #[test]
+    fn the_segment_sync_fault_is_armed_apart_from_every_site() {
+        let mut faults = RotationFaults::default();
+        assert!(faults.take_segment_sync().is_none());
+
+        let mut armed =
+            RotationFaults::always(RotationSite::ParentFsync).and_failing_segment_sync();
+        for _ in 0..8 {
+            assert!(armed.take_segment_sync().is_some());
+        }
+        assert!(armed.take(RotationSite::ParentFsync).is_some());
+        assert!(armed.take(RotationSite::CloseSync).is_none());
     }
 
     #[test]

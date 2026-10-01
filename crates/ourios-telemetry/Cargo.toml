@@ -40,12 +40,16 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 # the exporter's own tonic/hyper internals), `fmt` is the human-readable
 # stderr copy.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter", "fmt"] }
+# `testing` only: the weaver live-check sample file and report.
+serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Exposes `init_in_memory` so other crates' tests (e.g. the miner's
 # §8 metric-collection test) can collect the exported metric stream
-# through an in-memory reader instead of standing up an OTLP endpoint.
-testing = ["opentelemetry_sdk/testing"]
+# through an in-memory reader instead of standing up an OTLP endpoint,
+# and `live_check`, which captures named log events and hands them to
+# `weaver registry live-check`.
+testing = ["opentelemetry_sdk/testing", "dep:serde_json"]
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "logs", "trace", "testing"] }

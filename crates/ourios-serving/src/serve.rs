@@ -33,11 +33,14 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use ourios_semconv as semconv;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Sleep;
 use tower_service::Service as _;
+
+use crate::metrics::ERROR_TYPE;
 
 /// How long an HTTP/1 connection may wait for a complete request head,
 /// its first one or the next one on a keep-alive connection. hyper's own
@@ -73,9 +76,16 @@ const LISTENER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// [`TCP_KEEPALIVE`] on the sockets they accept.
 pub async fn serve_http<L>(listener: L, router: Router, shutdown: impl Future<Output = ()>)
 where
-    L: Listener,
+    L: NamedListener,
 {
     serve_with(listener, router, shutdown, HEADER_READ_TIMEOUT).await;
+}
+
+/// A listener that knows which of the server's listeners it is, so the
+/// connections it serves can report it as `ourios.server.listener.name`.
+pub trait NamedListener: Listener {
+    /// The listener's `ourios.server.listener.name` value.
+    fn name(&self) -> &'static str;
 }
 
 async fn serve_with<L>(
@@ -84,8 +94,9 @@ async fn serve_with<L>(
     shutdown: impl Future<Output = ()>,
     header_read: Duration,
 ) where
-    L: Listener,
+    L: NamedListener,
 {
+    let name = listener.name();
     let mut builder = http1::Builder::new();
     builder
         .timer(TokioTimer::new())
@@ -105,6 +116,7 @@ async fn serve_with<L>(
             builder.clone(),
             stop_rx.clone(),
             open_rx.clone(),
+            name,
         ));
     }
     drop(listener);
@@ -119,6 +131,7 @@ async fn serve_connection<I>(
     builder: http1::Builder,
     mut stop: watch::Receiver<bool>,
     _open: watch::Receiver<()>,
+    listener: &'static str,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -140,7 +153,23 @@ async fn serve_connection<I>(
         conn.await
     };
     if let Err(e) = served {
-        tracing::debug!(error = %e, "HTTP connection ended with an error");
+        tracing::debug!(
+            name: semconv::EVENT_OURIOS_SERVER_LISTENER_CONNECTION_ERROR,
+            {
+                { ERROR_TYPE } = connection_error_type(&e),
+                { semconv::OURIOS_SERVER_LISTENER_NAME } = listener,
+            },
+            "HTTP connection ended with an error: {e}"
+        );
+    }
+}
+
+/// The `error.type` of a connection that ended badly.
+fn connection_error_type(e: &hyper::Error) -> &'static str {
+    match e {
+        e if e.is_timeout() => "timeout",
+        e if e.is_incomplete_message() => "incomplete_message",
+        _ => "_OTHER",
     }
 }
 
@@ -159,6 +188,12 @@ impl PlainListener {
     #[must_use]
     pub fn new(inner: TcpListener, listener: &'static str) -> Self {
         Self { inner, listener }
+    }
+}
+
+impl NamedListener for PlainListener {
+    fn name(&self) -> &'static str {
+        self.listener
     }
 }
 
@@ -201,26 +236,32 @@ pub(crate) async fn accept_failed(e: &io::Error, listener: &'static str) {
 /// accept), [`FD_EXHAUSTED_BACKOFF`] when the process is out of file
 /// descriptors, and [`LISTENER_ERROR_BACKOFF`] for anything else.
 fn accept_pause(e: &io::Error, listener: &'static str) -> Option<Duration> {
-    match e.kind() {
-        io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionReset => {
-            tracing::debug!(error = %e, listener, "TCP accept failed; retrying");
-            None
-        }
-        _ if fd_exhausted(e) => {
-            tracing::warn!(
-                error = %e,
-                listener,
-                "accept failed: out of file descriptors; backing off before retrying",
-            );
-            Some(FD_EXHAUSTED_BACKOFF)
-        }
-        _ => {
-            tracing::warn!(error = %e, listener, "accept failed; backing off before retrying");
-            Some(LISTENER_ERROR_BACKOFF)
-        }
+    let (class, pause) = match e.kind() {
+        io::ErrorKind::ConnectionRefused => ("connection_refused", None),
+        io::ErrorKind::ConnectionAborted => ("connection_aborted", None),
+        io::ErrorKind::ConnectionReset => ("connection_reset", None),
+        _ if fd_exhausted(e) => ("fd_exhausted", Some(FD_EXHAUSTED_BACKOFF)),
+        _ => ("_OTHER", Some(LISTENER_ERROR_BACKOFF)),
+    };
+    match pause {
+        None => tracing::debug!(
+            name: semconv::EVENT_OURIOS_SERVER_LISTENER_ACCEPT_ERROR,
+            {
+                { ERROR_TYPE } = class,
+                { semconv::OURIOS_SERVER_LISTENER_NAME } = listener,
+            },
+            "TCP accept failed; retrying: {e}"
+        ),
+        Some(pause) => tracing::warn!(
+            name: semconv::EVENT_OURIOS_SERVER_LISTENER_ACCEPT_ERROR,
+            {
+                { ERROR_TYPE } = class,
+                { semconv::OURIOS_SERVER_LISTENER_NAME } = listener,
+            },
+            "accept failed; backing off {pause:?} before retrying: {e}"
+        ),
     }
+    pause
 }
 
 #[cfg(unix)]

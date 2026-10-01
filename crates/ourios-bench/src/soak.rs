@@ -56,6 +56,8 @@ use ourios_parquet::{
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use serde::Serialize;
 
+pub mod reclaim;
+
 /// §D1 throughput bar: sustained acked lines per second per core.
 pub const D1_LINES_PER_SEC_PER_CORE: u64 = 100_000;
 /// §D1 latency bar: p99 ingest-ack latency in milliseconds.
@@ -336,9 +338,9 @@ fn validate(config: &SoakConfig) -> Result<(), SoakError> {
 
 /// The soak's WAL knobs. `macos_full_fsync: false` matches the
 /// write-path bench, and `max_unlinks_per_pass` is RFC 0052 §3.8's
-/// default rather than a tuned value: nothing here drives a
-/// housekeeping pass yet, so the knob is set for the day the soak
-/// does and the run must not be read as exercising the cadence.
+/// default rather than a tuned value: this soak drives no
+/// housekeeping pass, so the run must not be read as exercising the
+/// cadence — [`reclaim`] is the harness that does.
 fn wal_config(root: std::path::PathBuf) -> WalConfig {
     WalConfig {
         root,
@@ -1110,6 +1112,12 @@ fn build_batch_for(
             }
         })
         .collect();
+    export_request(service_name, log_records)
+}
+
+/// One OTLP export carrying `log_records` under a single resource whose
+/// `service.name` is `service_name`.
+fn export_request(service_name: String, log_records: Vec<LogRecord>) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {
@@ -1403,6 +1411,10 @@ impl Journal for SharedWal {
 
     fn reclaim_state(&self) -> ourios_wal::ReclaimState {
         Journal::reclaim_state(&*lock_wal(&self.0))
+    }
+
+    fn rotation_state(&self) -> ourios_wal::RotationState {
+        Journal::rotation_state(&*lock_wal(&self.0))
     }
 }
 

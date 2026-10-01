@@ -633,29 +633,46 @@ impl Wal {
         let SnapshotHorizons::Known(marks) = horizons else {
             return Ok(());
         };
-        if let Some(record) = record {
-            for (_, held) in record.dictionary.live() {
-                let reclaim::SlotState::Live {
-                    reclaimed_through: Some(entry),
-                } = &held.state
-                else {
-                    continue;
-                };
-                if entry.mode != reclaim::EntryMode::Known
-                    || !self.ledger.may_hold_frames(&held.key)
-                {
-                    continue;
-                }
-                let restorable = marks.get(&held.key).and_then(|h| h.restorable());
-                if restorable.is_none_or(|horizon| horizon < entry.offset) {
-                    return Err(self.unrecoverable(&held.key, entry.offset));
-                }
-            }
+        match record.and_then(|record| self.first_lost_entry(record, marks)) {
+            Some((tenant, offset)) => Err(self.unrecoverable(&tenant, offset)),
+            // A post-RFC root is unwitnessed too until its first
+            // checkpoint, and its tenants have frames and no snapshot
+            // as a matter of course: that pass is §3.2's skip.
+            None if self.on_legacy_branch() => self.refuse_legacy_stale_gaps(marks),
+            None => Ok(()),
         }
-        match self.reclaim_gate {
-            ReclaimGate::Unwitnessed => self.refuse_legacy_stale_gaps(marks),
-            ReclaimGate::FsyncPending | ReclaimGate::Open => Ok(()),
-        }
+    }
+
+    /// The first live tenant whose `Known` entry its restorable horizon
+    /// does not reach, with the entry's offset.
+    fn first_lost_entry(
+        &self,
+        record: &reclaim::ReclaimRecord,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Option<(ourios_core::tenant::TenantId, WalOffset)> {
+        record.dictionary.live().find_map(|(_, held)| {
+            self.lost_entry(held, marks)
+                .map(|offset| (held.key.clone(), offset))
+        })
+    }
+
+    /// `held`'s entry offset when it is `Known`, its tenant may still
+    /// hold frames, and no restorable horizon reaches it.
+    fn lost_entry(
+        &self,
+        held: &reclaim::DictRecord,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Option<WalOffset> {
+        let reclaim::SlotState::Live {
+            reclaimed_through: Some(entry),
+        } = &held.state
+        else {
+            return None;
+        };
+        let checked =
+            entry.mode == reclaim::EntryMode::Known && self.ledger.may_hold_frames(&held.key);
+        let restorable = marks.get(&held.key).and_then(|h| h.restorable());
+        (checked && restorable.is_none_or(|horizon| horizon < entry.offset)).then_some(entry.offset)
     }
 
     /// The legacy branch rests on "#793 means no served root ever
@@ -670,20 +687,70 @@ impl Wal {
         &self,
         marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
     ) -> Result<(), ReclaimError> {
-        for tenant in self.ledger.tenants() {
-            let Some(oldest) = self.ledger.oldest_frame(&tenant) else {
-                continue;
-            };
-            match marks.get(&tenant) {
-                Some(TenantHorizon::Restorable(_)) => {}
-                Some(TenantHorizon::RecordedOnly(recorded)) if oldest <= *recorded => {}
-                Some(TenantHorizon::RecordedOnly(recorded)) => {
-                    return Err(self.unrecoverable(&tenant, *recorded));
-                }
-                None => return Err(self.unrecoverable(&tenant, oldest)),
-            }
+        match self.first_legacy_stale_gap(marks) {
+            Some((tenant, horizon)) => Err(self.unrecoverable(&tenant, horizon)),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// The same belt, at startup and before anything replaces the
+    /// snapshots it reads (RFC 0052 §3.2): on a pre-RFC root — see
+    /// [`Self::on_legacy_branch`] — a version-1
+    /// artefact's mark is decoded for this check alone and offered as
+    /// [`TenantHorizon::RecordedOnly`]. Checked here, the evidence is
+    /// still on disk; once the post-recovery write has replaced those
+    /// artefacts at version 2, every tenant reads as restorable and the
+    /// pass-time check can no longer see a gap. Any other root is `Ok`:
+    /// a post-RFC root without its first checkpoint has tenants with
+    /// frames and no snapshot as a matter of course.
+    ///
+    /// # Errors
+    ///
+    /// [`HousekeepingError::Unrecoverable`] naming the first tenant
+    /// whose oldest surviving frame no recorded horizon explains.
+    pub fn refuse_legacy_stale_gaps_at_open(
+        &self,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Result<(), HousekeepingError> {
+        match self.first_legacy_stale_gap(marks) {
+            Some((tenant, horizon)) if self.on_legacy_branch() => {
+                Err(HousekeepingError::Unrecoverable {
+                    tenant: tenant.as_str().to_owned(),
+                    horizon,
+                })
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    /// Whether this is a pre-RFC root still on the legacy branch (RFC
+    /// 0052 §3.2): open found a version-1 `CHECKPOINT` or segment, and
+    /// no version-2 checkpoint has landed since. A record alone does not
+    /// end the branch — the root's first rotation writes one — and a
+    /// post-RFC root is never on it. Only such a root is held to the
+    /// legacy stale-gap belt, at open and on every pass.
+    #[must_use]
+    pub fn on_legacy_branch(&self) -> bool {
+        self.reclaim_gate == ReclaimGate::Unwitnessed && self.legacy_origin
+    }
+
+    /// The first tenant whose oldest surviving frame is not explained
+    /// by its horizon, with the horizon to name. A tenant with no
+    /// recorded horizon at all has nothing to compare, which is the one
+    /// direction that could replay past reclaimed data, so it counts.
+    fn first_legacy_stale_gap(
+        &self,
+        marks: &std::collections::HashMap<ourios_core::tenant::TenantId, TenantHorizon>,
+    ) -> Option<(ourios_core::tenant::TenantId, WalOffset)> {
+        self.ledger.tenants().into_iter().find_map(|tenant| {
+            let oldest = self.ledger.oldest_frame(&tenant)?;
+            match marks.get(&tenant) {
+                Some(TenantHorizon::Restorable(_)) => None,
+                Some(TenantHorizon::RecordedOnly(recorded)) if oldest <= *recorded => None,
+                Some(TenantHorizon::RecordedOnly(recorded)) => Some((tenant, *recorded)),
+                None => Some((tenant, oldest)),
+            }
+        })
     }
 
     fn unrecoverable(

@@ -1,7 +1,7 @@
 ---
 rfc: 0052
 title: WAL reclamation and quiesce recovery
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-09-12
@@ -11,15 +11,45 @@ superseded-by: —
 
 # RFC 0052 — WAL reclamation and quiesce recovery
 
-> **Status note.** `red` — test stubs exist and fail
-> (`docs/rfcs/README.md` §Lifecycle): every live §5 scenario has one or
-> more `#[ignore]`d `todo!` stubs, per leg where §6 separates the legs,
-> in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12, .13, .16,
-> .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's startup leg,
-> .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry.rs` (.7, its own
-> binary per RFC0028.2) and `ourios-bench/tests/rfc0052_3_bounded_growth.rs`
-> (.3). Implementation proceeds in six green slices, each un-ignoring the
-> stubs it discharges. Where a criterion's legs span slices, the mapping
+> **Status: `green` (2026-09-30, maintainer-approved flip).** Every live
+> §5 scenario passes. RFC0052.17's two `PUBLISHED` legs **moved to RFC
+> 0055 as RFC0055.5** before the flip, because RFC 0055 (publication
+> frontiers) owns the `PUBLISHED` writer and format. Their stub stays
+> `#[ignore]`d under that criterion, as .6, .8 and .9 moved to RFC 0053.
+> The recorded long soak run §6 requires before `validated` is still to
+> come. The history of the `red` stage follows.
+>
+> *(`red` — test stubs existed and failed
+> (`docs/rfcs/README.md` §Lifecycle).)* Every live §5 scenario was stubbed
+> as one or more `#[ignore]`d `todo!` stubs, per leg where §6 separates
+> the legs, in `ourios-wal/tests/it/rfc0052_*` (.2, .4, .5, .11, .12,
+> .13, .16, .17), `ourios-ingester/tests/it/rfc0052_*` (.1, .10, .13's
+> startup leg, .14, .15), `ourios-ingester/tests/rfc0052_7_telemetry/`
+> (.7, its own binary per RFC0028.2) and
+> `ourios-bench/tests/rfc0052_3_bounded_growth.rs` (.3). Slices A–E have
+> landed and discharged their stubs, .7 included, and slice F's first
+> half (F1) has discharged .10: a `SIGKILL` of
+> `receiver_reclaim_crash_fixture` with the barrier and housekeeping on
+> a 100 ms cadence loses no acknowledged record, and recovery now gates
+> the replayed records on `max(X, S)` and the regenerated audit events
+> on `X` (§3.7), withholding and counting the rest. The barrier still
+> retains a cut whose snapshot write failed (RFC0052.7 pins that), so
+> the `S < X` leg reconstructs that state on disk rather than reaching
+> it through a cut. Slice F2 has discharged .3 on the reclamation soak
+> harness (`ourios-bench/src/soak/reclaim.rs`), which runs the
+> receiver's barrier and housekeeping ticks on a stepped synthetic
+> clock: a capacity-balanced run over three tenants rolls twelve
+> segments under the 300 s / 60 s cadences and never holds more than
+> the bound its config derives (four segments), and an idle node
+> reclaims every closed segment one `barrier_secs` plus one
+> `housekeeping_secs` after its last append, and its last segment within
+> `segment_age_secs` more. The recorded long soak run §6 requires before
+> `validated` is still to come. The only stub still ignored is .17's
+> `PUBLISHED` row. That row is **recorded as partial at green and handed to RFC 0055**, as
+> RFC 0041 handed on its deferred rows: this RFC turns green on the
+> other rows once slice F lands, and RFC 0055's writer discharges the
+> row. Implementation proceeds in six green slices, each
+> un-ignoring the stubs it discharges. Where a criterion's legs span slices, the mapping
 > below is by leg and each stub's `#[ignore]` reason names its slice:
 > **A** reclaim record and sidecars (§3.2 `RECLAIM`, `CHECKPOINT` v2,
 > `SEGMENT_VERSION` 2, open-time reconciliation → .16, .11's open-time
@@ -46,12 +76,23 @@ superseded-by: —
 > **C** rotation (temporary name, bounded retry, terminal state, the
 > `hold/794-wedged-classification` reintroduction → .4, .5, .15, .11's
 > post-RFC rotation leg, .17's legacy-root rotation leg);
-> **D** barrier (guard-at-submit, publisher thread, epoch latch,
-> ingest exclusion → .1's cut legs, .14, .13's startup leg);
+> **D** barrier (guard-at-submit, publisher thread carrying detached
+> partitions only, epoch latch, ingest exclusion → .1's cut legs, .14,
+> .13's startup leg);
 > **E** timer and telemetry (§3.5 instruments and events → .7, .1's
 > cadence-tick panic leg);
 > **F** crash and soak (.10 on the rfc0014_5 fixture, .3 on the extended
 > soak harness). A before B; B before D and E; F last.
+> **Snapshot v2 (#877)** sits outside the six slices and has landed as
+> its own breaking change: §3.1's per-tenant folded horizon in
+> `wal_high_water` (each ingest turn and each replayed frame folds its
+> tenant's horizon, and the cut, the post-recovery and shutdown writes
+> and the ledger carry it per tenant) and `SNAPSHOT_VERSION` 1 → 2, a
+> version-1 artefact taking the unknown-version discard path. The same
+> landing restates recovery's stale-gap check on the `RECLAIM` record
+> (§3.2): an absent horizon segment is explained when the tenant's
+> reclaimed-through is at or above `S`. The §8 amendment of RFC 0001
+> §6.9's global high-water wording is live from that landing.
 > **Stage 1 of two.** Motivated by a production
 > incident (issue #791) and the defects found tracing it (#791, #793). Amends
 > RFC 0008 §6.5 and §6.7 with the *policy* those sections left to a caller
@@ -383,12 +424,22 @@ of its own; the queue carries the handle with the records.
 What the queue carries is **not** a `Drained`: that value is the audit
 buffer's own snapshot taken under the miner lock beside the records, and a
 worker holds neither — it sees `MinedRecord`s after their template events
-were already emitted into the audit sink. So the queue's item is
-`PublishItem::{ Drained(Drained), Detached { records, guard,
-audit_watermark } }`. The `Drained` arm is the age sweep's and the
-barrier's existing value, written by `write_ordered` unchanged. The
-`Detached` arm carries the **audit-sink position observed under the miner
-lock at detach time** — the count of events the sink has accepted for that
+were already emitted into the audit sink. So the queue carries **detached
+partitions only**: its item is a `Detached` partition, which holds the
+detached records with their audit watermark and a handle to the batch's
+shared completion. A `Drained` never enters it. The age sweep and the
+barrier keep writing theirs through `write_ordered`, synchronously on
+their own tasks, unchanged. The barrier must: `run_cut` needs its flush's
+outcome (`cut_ok`) before it decides whether to stamp. The sweep stays
+there so that a `write_ordered` unwind keeps happening on the sweep's own
+task, where #795's stop-on-panic (§3.2) stops it and its `JoinError`
+counts `cadence_panic`; on the publisher thread the sweep would tick on
+under the latch, and whether the sweep survives an unwind is RFC 0054's
+(publish unwind safety) decision to make, not this one's.
+An earlier revision gave the item a `Drained` arm as well; slice D shipped
+without it (#867) because no producer fitted §3.2, and #875 settled the
+question by dropping it. The item carries the **audit-sink position
+observed under the miner lock at detach time** — the count of events the sink has accepted for that
 tenant when the partition left the buffers, which is at or above every
 event the partition's records produced, since emission precedes the
 append. Before writing a detached partition the publisher requires the
@@ -473,7 +524,7 @@ First, **the slot is closed before the queue is drained**: a publisher
 about to exit marks the slot closed under the publisher-slot mutex and
 only then drains its receiver, so a worker cannot succeed at an enqueue
 into a channel that is about to be abandoned — it observes the closed
-mark, parks, and joins the restart gate below. Second, **`PublishItem`'s
+mark, parks, and joins the restart gate below. Second, **the queue item's
 destructor is the backstop**: dropping an item that never settled
 requeues its records into the buffers under the sink lock and settles its
 share of the batch's completion, so even an item lost to a drop no code
@@ -942,7 +993,9 @@ uncommitted plan is re-planned by the next `housekeeping_prepare`, which
 is exactly the case §3.7 already defines. At shutdown a `JoinError` from
 either task is logged and read as a failed cut — no stamp, nothing
 assumed drained — rather than as a clean join. The sweep keeps #795's
-stop-on-panic until RFC 0053 makes it survivable; what changes here is
+stop-on-panic until RFC 0054 (publish unwind safety) makes it
+survivable, and keeps its writes on its own task for that reason (§3.1: the publisher queue carries detached
+partitions only); what changes here is
 that stopping the sweep no longer stops reclamation or the barrier. The sweep's
 panic is the one #795 already stops the sweep on; what this RFC adds is that
 the same unwind now latches *before* the sweep's publish guard drops, so the
@@ -2477,16 +2530,25 @@ So the design is:
   the commit coordinator exists**, so there is no journal owner to checkpoint
   through. That call therefore deliberately advances no checkpoint; the first
   timer pass after the coordinator is built does it instead, from the same
-  mark or a later one. And when replay delivers **nothing** — the normal
-  shape once housekeeping has reclaimed every closed frame and the node
-  restarts idle — that post-recovery snapshot write preserves each tenant's
-  *restored* horizon rather than writing `None` over it, which would have
-  discarded the snapshots on the next restart and forced a full replay every
-  time. The mixed case needs the same care: a replay that delivered frames
-  for tenant A only must record A's progress and keep B's restored horizon,
-  which one global `max_delivered` cannot express, so `RecoveryReport`
-  returns **per-tenant delivered horizons** and the post-recovery write is
-  driven from those. §3.1's "behind the barrier and nowhere else" holds —
+  mark or a later one. The post-recovery snapshot write stamps each tenant
+  at its own **folded horizon** (§3.1), read from `MinerCluster::folded_horizon`
+  and written by `recovery::write_folded_snapshots`, the one writer the
+  shutdown point shares: restoring a snapshot sets the tenant's horizon to
+  the one it carries, and replay advances it to each frame it feeds. So when
+  replay delivers **nothing** — the normal shape once housekeeping has
+  reclaimed every closed frame and the node restarts idle — each tenant keeps
+  its *restored* horizon rather than having `None` written over it, which
+  would discard the snapshots on the next restart and force a full replay
+  every time; and a replay that delivered frames for tenant A only records
+  A's own last frame and keeps B's restored horizon, which no global
+  `max_delivered` could express. The snapshot ledger is seeded from what that
+  write installed, and **fail-closed**: a skipped or partly failed write
+  falls back to the horizons recovery restored, never to the higher ones it
+  attempted, so the ledger is never above what is on disk. Before any of
+  it — inside recovery, after the ledger rebuild — a pre-RFC root runs the
+  §3.2 legacy stale-gap check against the marks its version-1 artefacts
+  recorded, since the post-recovery write replaces those artefacts and
+  would destroy the evidence. §3.1's "behind the barrier and nowhere else" holds —
   this is a caller that has the mark but not yet the owner, not a second
   checkpoint site.
 - **Errors are fail-closed and never swallowed.** A failed `checkpoint` logs
@@ -2893,10 +2955,11 @@ memory, and nothing here claims to.
 > - **And** the mark used is the one read after the quiesce under the same
 >   exclusion, not one read before either
 > - **And** that mark is a turn's own frame offset, never the sync's reported
->   EOF, and the post-recovery seed is a delivered offset covered by a
->   successful sync — never `max_delivered` alone, so a replayed frame whose
->   group sync failed before the crash is not seeded as a mark, and a node
->   with no such offset seeds `None` and lets its first turn establish one —
+>   EOF, and nothing replay delivered is ever a mark: a restarted node has no
+>   mark until its first acknowledged turn establishes one, so a replayed
+>   frame whose group sync failed before the crash is never checkpointed
+>   across (a replayed seed, where a caller still supplies one, stays
+>   distinct from a mark; whether that seed survives is #883) —
 >   so a later frame made durable by the same flush but not yet mined
 >   (nor acknowledged) is never
 >   covered — asserted by a flush whose sync covers two turns and a barrier
@@ -3091,17 +3154,10 @@ memory, and nothing here claims to.
 >   **segments present** it is a legacy root mid migration and the record
 >   is **retained** with its arming and its mode, the root opening on the
 >   legacy branch with the upgrade retried by the next checkpoint
-> - **And** a tenant introduced by a `PUBLISHED`-only write — no
->   intervening `RECLAIM` write — keeps its slot id across a restart: the
->   table is seeded from the union of both dictionaries and `next_slot_id`
->   is the maximum of the two headers, so the id is never reissued to a
->   different tenant
-> - **And** a record carrying `published_seeded_armed` without
->   `published_seeded_confirmed` with `PUBLISHED` **absent** — the crash
->   before the accepting start's own `PUBLISHED` write — leaves the next
->   start free to seed again, while the same record with `PUBLISHED`
->   **present** is the ordinary post-write state and is promoted to
->   confirmed durably at open, never read as a fault
+> - *(The two `PUBLISHED` legs — slot ids surviving a `PUBLISHED`-only
+>   write, and the `published_seeded_*` flags resolving at open — moved
+>   to RFC 0055 as RFC0055.5, since RFC 0055 owns the `PUBLISHED` writer
+>   and format. No obligation here.)*
 > - **And** the same record beside a **present** version-2 `CHECKPOINT` —
 >   the crash after the rename and before the record's next write — opens
 >   normally and is promoted to `seen` durably at open, never read as a

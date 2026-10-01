@@ -28,7 +28,7 @@ use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{
     FrameKind, HousekeepingProgress, PassId, ReclaimError, ReclaimOutcome, ReclaimPlan,
-    ReclaimState, RotationKind, SnapshotHorizons, TenantBatch, Wal, WalOffset,
+    ReclaimState, RotationKind, RotationState, SnapshotHorizons, TenantBatch, Wal, WalOffset,
 };
 use prost::Message;
 use tracing::Instrument as _;
@@ -187,6 +187,12 @@ pub trait Journal: Send {
     fn reclaim_state(&self) -> ReclaimState {
         ReclaimState::default()
     }
+
+    /// §3.3's rotation state alone — cheap, because the coordinator
+    /// reads it on every guard release to emit the rotation edges.
+    fn rotation_state(&self) -> RotationState {
+        RotationState::Healthy
+    }
 }
 
 impl Journal for Wal {
@@ -240,6 +246,10 @@ impl Journal for Wal {
 
     fn reclaim_state(&self) -> ReclaimState {
         Wal::reclaim_state(self)
+    }
+
+    fn rotation_state(&self) -> RotationState {
+        Wal::rotation_state(self).clone()
     }
 }
 
@@ -657,34 +667,7 @@ impl IngestPipeline {
                 // Taken **before** the miner lock, and never requested
                 // while holding it.
                 let _bound = self.share_bound();
-                // §6.9 rotation cadence: a segment change since the prior
-                // (now strictly-previous) durable mark means the WAL
-                // rotated under this batch; fire the hook with the
-                // rotation-point high-water mark BEFORE this batch's
-                // records reach the miner, so a snapshot it takes reflects
-                // exactly the frames at or below that mark. In-order, so
-                // `before` is exactly the preceding seq's offset and no
-                // higher seq has ingested yet.
-                //
-                // The mark stays typed to here (RFC 0052 §3.7): the hook
-                // is a barrier capture that checkpoints at `prev`, and a
-                // replay seed is proof of *delivery*, not of a completed
-                // group sync. Rotating on one — the first acknowledged
-                // turn after a restart landing in a new segment, because
-                // the reopened one was full or had aged out — would let
-                // the WAL forget a frame no turn in this process
-                // acknowledged. The barrier's own timer covers that
-                // replayed tail at the next cut, under a mark that is one.
-                let before = *self.lock_last_durable();
-                let mined = {
-                    let mut miner = self.lock_miner();
-                    if let Some(DurableMark::Acknowledged(prev)) = before
-                        && prev.segment != now.segment
-                    {
-                        self.rotate_for_segment_change(&miner, prev);
-                    }
-                    self.mine_batch_ordered(&mut miner, &records)
-                };
+                let mined = self.fold_turn(&tenant, &records, now);
                 if let Some(pool) = &self.encode_pool {
                     // Still under the ingest gate (`_gate` drops at
                     // return): every frame ≤ this seq submits its encodes
@@ -722,6 +705,46 @@ impl IngestPipeline {
         };
         // `_gate` releases the hand-off to `seq + 1` as it drops here.
         ack
+    }
+
+    /// One acknowledged turn's miner step, under the exclusion the caller
+    /// holds: the rotation check, the mining, and the fold of this
+    /// tenant's horizon to `now`.
+    fn fold_turn(
+        &self,
+        tenant: &TenantId,
+        records: &[OtlpLogRecord],
+        now: WalOffset,
+    ) -> Vec<MinedRecord> {
+        // §6.9 rotation cadence: a segment change since the prior
+        // (now strictly-previous) durable mark means the WAL rotated
+        // under this batch; fire the hook with the rotation-point
+        // high-water mark BEFORE this batch's records reach the miner,
+        // so a snapshot it takes reflects exactly the frames at or below
+        // that mark. In-order, so `before` is exactly the preceding
+        // seq's offset and no higher seq has ingested yet.
+        //
+        // The mark stays typed to here (RFC 0052 §3.7): the hook is a
+        // barrier capture that checkpoints at `prev`, and a replay seed
+        // is proof of *delivery*, not of a completed group sync.
+        // Rotating on one — the first acknowledged turn after a restart
+        // landing in a new segment, because the reopened one was full or
+        // had aged out — would let the WAL forget a frame no turn in
+        // this process acknowledged. The barrier's own timer covers that
+        // replayed tail at the next cut, under a mark that is one.
+        let before = *self.lock_last_durable();
+        let mut miner = self.lock_miner();
+        if let Some(DurableMark::Acknowledged(prev)) = before
+            && prev.segment != now.segment
+        {
+            self.rotate_for_segment_change(&miner, prev);
+        }
+        let encodes = self.mine_batch_ordered(&mut miner, records);
+        // RFC 0052 §3.1: before `last_durable` moves and under the
+        // exclusion, so a cut never sees a horizon ahead of its mark or
+        // of the state it snapshots.
+        miner.fold_through(tenant, crate::snapshot_store::high_water(now));
+        encodes
     }
 
     /// The RFC 0035 §3.1 **ordered phase**, verbatim from the pre-split
@@ -1124,6 +1147,48 @@ mod tests {
             }
         }
 
+        /// A real WAL whose idle timer spent the budget on an owed
+        /// directory fsync, then whose flush's data sync fails on the
+        /// same disk: the flush must still classify terminal, not as
+        /// the ordinary sync failure a client should retry.
+        #[test]
+        fn a_failing_data_sync_behind_a_terminal_owed_dir_fsync_is_terminal() {
+            use ourios_wal::{FrameKind, RotationFaults, RotationKind, Wal, WalConfig};
+
+            let tmp = tempfile::TempDir::new().expect("temp");
+            let mut wal = Wal::open(WalConfig {
+                root: tmp.path().to_path_buf(),
+                batch_window_ms: 20,
+                segment_size_bytes: ourios_wal::MIN_SEGMENT_SIZE_BYTES,
+                segment_age_secs: 600,
+                housekeeping_secs: 60,
+                max_unlinks_per_pass: ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS,
+                rotation_retry_attempts: 2,
+                macos_full_fsync: false,
+            })
+            .expect("open WAL");
+            wal.append(FrameKind::OtlpBatch, b"seed").expect("seed");
+            wal.arm_rotation_faults(RotationFaults::always(RotationSite::ParentFsync));
+            wal.rotate(RotationKind::Owed)
+                .expect_err("the rotation's parent fsync fails");
+            wal.append(FrameKind::OtlpBatch, b"appended, never flushed")
+                .expect("appends land in the installed segment");
+            wal.rotate(RotationKind::Discretionary)
+                .expect_err("the timer's discharge spends the budget");
+            wal.arm_rotation_faults(
+                RotationFaults::always(RotationSite::ParentFsync).and_failing_segment_sync(),
+            );
+
+            for _ in 0..3 {
+                let error = ReceiveError::WalSync(wal.sync().expect_err("nothing is acked"));
+                assert_eq!(
+                    IngestFailure::classify(&error),
+                    IngestFailure::ServerTerminal,
+                    "{error}",
+                );
+            }
+        }
+
         #[test]
         fn other_append_and_sync_failures_stay_transient() {
             assert_eq!(
@@ -1373,6 +1438,34 @@ mod tests {
             .await
             .expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
+    }
+
+    /// RFC 0052 §3.1: every acknowledged turn folds its own tenant's
+    /// horizon to the turn's own frame, and no other tenant's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledged_turn_folds_only_its_own_tenant() {
+        use ourios_core::tenant::TenantId;
+
+        let pipeline = sequence_pipeline(
+            vec![offset(10), offset(20), offset(30)],
+            Box::new(|_, _| {}),
+        );
+        for tenant in ["idle", "busy", "busy"] {
+            pipeline
+                .ingest(request(), TenantId::new(tenant))
+                .await
+                .expect("ingest");
+        }
+
+        let folded = |tenant: &str| {
+            pipeline.with_miner(|miner| {
+                miner
+                    .folded_horizon(&TenantId::new(tenant))
+                    .and_then(crate::snapshot_store::offset_of)
+            })
+        };
+        assert_eq!(folded("idle"), Some(offset(10)));
+        assert_eq!(folded("busy"), Some(offset(30)));
     }
 
     /// RFC 0052 §3.7: a replay seed is never a checkpoint mark, and the

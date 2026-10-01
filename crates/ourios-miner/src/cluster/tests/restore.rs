@@ -137,6 +137,7 @@ fn restore_maps_pre_rfc0050_empty_provenance_to_mined() {
             provenance: vec![],
             upstream_associations: vec!["disk <*>".to_string()],
             upstream_association_overflow: 3,
+            wildcard_routed: vec![],
         }],
         structured_templates: vec![],
         wal_high_water: None,
@@ -190,6 +191,7 @@ fn restore_rejects_inconsistent_slot() {
             provenance: vec![],
             upstream_associations: vec![],
             upstream_association_overflow: 0,
+            wildcard_routed: vec![],
         }],
         structured_templates: vec![],
         wal_high_water: None,
@@ -221,6 +223,7 @@ fn restore_rejects_duplicate_template_id() {
             provenance: vec![],
             upstream_associations: vec![],
             upstream_association_overflow: 0,
+            wildcard_routed: vec![],
         }],
         structured_templates: vec![StructuredTemplateRecord {
             severity_number: 9,
@@ -304,6 +307,7 @@ fn restore_bumps_the_id_allocator() {
             provenance: vec![],
             upstream_associations: vec![],
             upstream_association_overflow: 0,
+            wildcard_routed: vec![],
         }],
         structured_templates: vec![],
         wal_high_water: None,
@@ -320,4 +324,69 @@ fn restore_bumps_the_id_allocator() {
         new_id >= 8,
         "new template must not collide with restored id 7, got {new_id}",
     );
+}
+
+fn high_water(byte: u64) -> crate::snapshot::WalHighWater {
+    crate::snapshot::WalHighWater {
+        segment: "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0".to_string(),
+        byte,
+    }
+}
+
+/// RFC 0052 §3.1: each tenant carries its own folded horizon, and
+/// recording one tenant's frame moves no other tenant's.
+#[test]
+fn fold_through_moves_only_the_folding_tenants_horizon() {
+    let (busy, idle) = (TenantId::new("busy"), TenantId::new("idle"));
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let _ = cluster.ingest(&string_record(&idle, "user 1 logged in"));
+    cluster.fold_through(&idle, high_water(10));
+
+    let _ = cluster.ingest(&string_record(&busy, "user 2 logged in"));
+    cluster.fold_through(&busy, high_water(20));
+
+    assert_eq!(cluster.folded_horizon(&idle), Some(&high_water(10)));
+    assert_eq!(cluster.folded_horizon(&busy), Some(&high_water(20)));
+    assert_eq!(
+        cluster.snapshot_state(&busy).wal_high_water,
+        None,
+        "the snapshot writer stamps the horizon, not the cluster",
+    );
+}
+
+/// A restored tenant keeps its snapshot's horizon until a later
+/// frame folds, so a restart with nothing to replay does not lose it.
+#[test]
+fn restore_carries_the_snapshot_horizon_as_the_folded_horizon() {
+    let t = TenantId::new("tenant-x");
+    let mut original = MinerCluster::new(MinerConfig::default());
+    let _ = original.ingest(&string_record(&t, "user 42 logged in"));
+    let mut state = original.snapshot_state(&t);
+    state.wal_high_water = Some(high_water(7));
+
+    let mut restored = MinerCluster::new(MinerConfig::default());
+    restored.restore_tenant(&t, &state).expect("restore");
+
+    assert_eq!(restored.folded_horizon(&t), Some(&high_water(7)));
+}
+
+/// A tenant whose records carried no body allocates no templates, but
+/// its frames were folded all the same: without state it would have no
+/// snapshot, and its frames would pin reclamation for good.
+#[test]
+fn fold_through_allocates_a_tenant_whose_records_minted_nothing() {
+    let t = TenantId::new("bodyless");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let _ = cluster.ingest(&OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: None,
+        ..Default::default()
+    });
+    assert!(cluster.tenant_ids().is_empty(), "fixture: no state yet");
+
+    cluster.fold_through(&t, high_water(3));
+
+    assert_eq!(cluster.tenant_ids(), vec![t.clone()]);
+    assert_eq!(cluster.folded_horizon(&t), Some(&high_water(3)));
+    assert_eq!(cluster.template_count(&t), 0);
 }

@@ -40,10 +40,10 @@ pub(crate) const SEGMENT_VERSION_LEGACY: u16 = 1;
 /// "reserved means reserved" rule §6.2.2 applies to frames.
 pub(crate) const SEGMENT_FLAGS_RESERVED: u16 = 0;
 
-/// Exact on-disk length of a [`SegmentHeader`] per §6.2.1
+/// Exact on-disk length of a segment header per §6.2.1
 /// (`4 + 2 + 2 + 16 = 24`). Implementations index into the
 /// segment file past this offset to find the first frame.
-pub(crate) const SEGMENT_HEADER_LEN: usize = 24;
+pub const SEGMENT_HEADER_LEN: usize = 24;
 
 /// In-memory view of the 24 B header per RFC 0008 §6.2.1.
 ///

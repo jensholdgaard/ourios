@@ -51,16 +51,20 @@ pub mod compactor;
 pub mod encode_pool;
 #[cfg(feature = "openfga")]
 pub mod graph_emitter;
+pub mod housekeeping;
 mod lane;
 pub mod metrics;
 pub mod publish;
 pub mod publisher;
 pub mod receiver;
+pub mod reclaim_telemetry;
 pub mod record_sink;
 pub mod recovery;
 pub mod snapshot_store;
 
 pub use compactor::{Compactor, IngestError, SweepReport, run_sweep, run_sweep_with_promoted};
 pub use metrics::CompactionMetrics;
-pub use recovery::{RecoveryDriverError, RecoveryReport, TenantRecovery};
+pub use recovery::{
+    DiscardReason, RecoveryDriverError, RecoveryReport, SnapshotFate, TenantRecovery,
+};
 pub use snapshot_store::SnapshotStoreError;

@@ -2,23 +2,169 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
-## [0.10.0] - 2026-09-05
+## [0.11.1] - 2026-10-01
+
+### Upgrade notes
+
+- **Fixes #892:** v0.11.0 could not restore the miner snapshots it wrote
+  itself once a tenant's template tree routed a leaf through a node's
+  `<*>` child. That happens after a node collects `max_node_children`
+  (default 100) distinct tokens. Every restart then rebuilt the miner
+  from the WAL, and templates first seen in already-reclaimed frames
+  re-minted (drift).
+- **The miner snapshot format is now version 3.** Snapshots record the
+  route each leaf took through the tree, and that field is required.
+  Every snapshot written by 0.11.0 (format 2) is **discarded once** on
+  upgrade (`ourios.receiver.snapshot.discarded`,
+  `error.type=unknown_version`, "snapshot format version 2") and rebuilt
+  from the WAL that remains. Templates first seen in frames already
+  reclaimed get new ids, which the RFC 0010 drift query shows. Snapshots
+  written from 0.11.1 on restore normally.
+- **Known limitation, by decision:** a WAL root still on the RFC 0052
+  legacy branch that restarted on 0.11.0 before its first version-2
+  checkpoint has no restorable mark for its tenants, and still refuses
+  to start (`LegacyStaleGap`). Roots that stamped a checkpoint under
+  0.11.0 are not affected.
+- **Restore equivalence:** template-id choice no longer depends on map
+  iteration order or history. Convergence lookups and similarity ties
+  pick the lowest `template_id`, so a restored miner allocates exactly
+  as the live one would have (RFC 0001 §6.9, RFC0050.6 amendments).
+- A discarded snapshot's warning now carries the restore error's detail.
+
+### Documentation
+
+- Amend rfc 0001 §6.9 with the leaf wildcard route (#894) (2ee597a)
+
+### Fixed
+
+- **BREAKING** Restore snapshots of trees routed through a wildcard child (#893) (ca237dd)
+
+## [0.11.0] - 2026-09-30
 
 ### Security
 
-- The query DSL parsers are bounded against untrusted input (#778). A short
-  nested query could previously drive `/v1/query` and the MCP surface into
-  unbounded recursion (string surface) or exponential backtracking (structured
-  surface); both now return a typed error. Anyone running 0.9.0 with the query
-  endpoint reachable should upgrade.
+- Bump rustls to 0.23.45 for **RUSTSEC-2026-0285** (#808) (8db320f)
 
 ### Breaking (summary)
 
-- **MSRV is now Rust 1.94** (DataFusion 55 / arrow 59 / parquet 59, #773).
-  Building from source on an older toolchain fails at resolution.
-- `ourios-core` no longer hosts the OIDC and OpenFGA clients; they live in the
-  new `ourios-serving` crate (#762, #763). Library consumers update imports.
-- The RFC 0051 receiver compatibility shims are deleted (#769).
+- **WAL reclamation (RFC 0052, now `green`).** The WAL now reclaims
+  segments behind a publication barrier and a checkpoint, under a
+  housekeeping timer. The on-disk layout changes: the new `RECLAIM`
+  sidecar, `CHECKPOINT` v2 and `SEGMENT_VERSION` 2 (#821), and the
+  RECLAIM slot write moved (#869). Rotation now retries up to a bound and
+  then enters a terminal state (#828). There is no migration tooling
+  (pre-production layout policy): an existing WAL root opens on the
+  legacy branch and upgrades at its first checkpoint.
+- **Miner snapshot format v2 (#882).** Snapshots record each tenant's
+  own folded horizon. Upgrading **discards every v1 snapshot**. Each
+  discard emits `ourios.receiver.snapshot.discarded` with
+  `error.type=unknown_version` (#887), and the tenant's miner is rebuilt
+  from the WAL frames that remain. If the WAL was already reclaimed past
+  a v1 snapshot, templates first seen in the reclaimed frames re-mint;
+  the RFC 0010 drift query shows the effect. The v1 snapshot's
+  high-water mark is still read, for the legacy stale-gap check only.
+  An upgraded root whose WAL has a real gap past it **refuses to start**
+  and names the tenant, rather than silently re-minting.
+- `recovery::write_snapshots` is removed; `write_folded_snapshots` is the
+  only snapshot writer (#882).
+- OTLP error responses now carry the `Status` body the spec requires
+  (#794).
+- The comparative Loki label set is machine-checked per RFC0031.10
+  (#797). This is a bench/test contract change only.
+
+### Added
+
+- Green RFC 0052 slice F2 — bounded WAL growth under reclamation (#888) (71173fb)
+- Emit an event when recovery discards a snapshot (#887) (908c585)
+- Green RFC 0052 slice F1 — crash recovery under reclamation (#886) (595112e)
+- **BREAKING** Snapshot v2 with per-tenant folded horizons (#882) (aa8be8c)
+- Green RFC 0052 slice E2 — WAL telemetry and registry-named events (#878) (d45543e)
+- Green RFC 0052 slice E1 — housekeeping timer and cadence panic policy (#875) (226d479)
+- Green RFC 0052 slice D2 — the publisher thread and its respawning lane (#867) (073d1e1)
+- Green RFC 0052 slice D — the publication barrier and its checkpoint (#831) (e333b61)
+- **BREAKING** Green RFC 0052 slice C — rotation under a bounded retry and its terminal state (#828) (2494114)
+- Green RFC 0052 slice B — the segment ledger and the capped housekeeping pass (#823) (ef321d8)
+- **BREAKING** Wire the RECLAIM sidecar in and bump three layouts (RFC 0052 slice A2) (#821) (f23615c)
+- Add the RECLAIM sidecar codec (RFC 0052 slice A1) (#820) (b3d4db4)
+
+### CI
+
+- Export each profile by name so the bob is not empty (#850) (3e6f6d9)
+- Stop exporting containerprofiles the storage API does not serve (#849) (a93b5de)
+- Add one-off Kubescape BoB capture workflow (dispatch-only) (#812) (538eede)
+- Group the opentelemetry crate family into its own PR (#818) (138acac)
+
+### Changed
+
+- Name cluster imports and move the builder into cluster/build.rs (#868) (9401fd3)
+- Move the cluster tests out of cluster/mod.rs and split them by topic (#840) (1abdc21)
+
+### Chore
+
+- Bump the registry pin to v0.2.0 (RFC 0052 names) (#874) (9f9149a)
+- Update quay.io/kubescape/host-scanner docker tag to v1.0.78 (#861) (e55aa88)
+- Update quay.io/kubescape/http-request docker tag to v0.2.23 (#862) (26307ac)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 5fc0de2 (#859) (765480f)
+- Update github-actions (#860) (ce3dea7)
+- Update cargo (minor/patch) (#815) (9d0c460)
+- Update codecov/codecov-action action to v7.1.1 (#816) (bd904e2)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 30133d6 (#813) (8c3dad9)
+- Update github-actions (#814) (1870f54)
+- Update helm/kind-action action to v1.15.0 (#805) (7464f20)
+- Add an rfc-check triage skill (#806) (57780d2)
+- Update github-actions (#804) (aa45dd5)
+- Update cargo (minor/patch) (#790) (aa9d2b9)
+- Update github-actions (#789) (afc6cc7)
+- Put an osv-scanner config beside the fuzz lockfile (#785) (e5d343a)
+
+### Documentation
+
+- Flip RFC 0052 to green, moving the PUBLISHED legs to RFC0055.5 (#891) (0bc5d29)
+- Narrow 0052's publisher queue to detached partitions only (#876) (ad15c06)
+- Amend 0038 with query-phase and object-store client spans (#864) (2e353cf)
+- Draft RFC 0058, query resource limits (#863) (bd12642)
+- Refresh stale crate-level headers (#855) (1e72757)
+- Refresh stale internal docs against code and RFC front matter (#856) (e68ead1)
+- Refresh stale user-facing docs from the 2026-09-28 audit (#854) (83a5087)
+- Draft meta RFC 0057, move CLAUDE.md to AGENTS.md (#847) (804815e)
+- Amend 0052 §3.5/§3.7 figures and record the server-terminal class in 0018 §3.2 (#838) (0e8a193)
+- Editorial follow-ups from the RFC 0053 split (#817) (76c6a08)
+- Editorial follow-ups from the RFC 0053 split (#811) (9f370f7)
+- Draft RFC 0053 — WAL backpressure, with 0054–0056 split out (#802) (87f2a02)
+- Draft RFC 0052 — WAL reclamation and quiesce recovery, stage 1 (#798) (cc8c5f8)
+- Code of conduct is about the work, and only the work (#788) (77ff550)
+
+### Fixed
+
+- Keep restored snapshot horizons across an idle restart (#881) (dc4d18f)
+- Tighten three checks and docs flagged after merge (#879) (17fc6f0)
+- Report a terminal rotation before the data sync (#880) (0bdea08)
+- Bound stalled and idle listener connections with transport deadlines (#870) (08c698f)
+- **BREAKING** Write the RECLAIM slot outside the journal guard (#869) (8b87819)
+- Allow the unit-typed tuple gather without the openfga feature (#871) (b9c821b)
+- Satisfy a churned-out tenant's reclaim entry by absence (#848) (5b58fe5)
+- Run s3 connections on the bridge runtime and cap the idle pool (#866) (53fd0b7)
+- List only the query window's partitions and resolve them off the runtime (#858) (62563f3)
+- Poll bridged store futures on the bridge runtime, not a thread per call (#857) (f87e29e)
+- Retry an unquoted etag swap and surface lost commits (#841) (24fc620)
+- Pin the client-cert verifier to the ring provider (#845) (7abbea8)
+- Keep a stranded planned row from wedging the reclaim record (#844) (d8c8208)
+- Fsync every ancestor directory prepare_root creates (#842) (5738acc)
+- Allow clippy 1.98's unused_async_trait_impl on the auth helpers (#839) (705dd9c)
+- Bump rustls to 0.23.45 for RUSTSEC-2026-0285 (#808) (8db320f)
+- **BREAKING** Carry the Status body OTLP requires on error responses (#794) (91b7792)
+- Count a cadence-sweep panic so a dead age sweep is alertable (#795) (aecbb0e)
+- Fuzz osv-scanner config is a guarded copy, not a symlink (#787) (64f7870)
+- Regenerate fuzz/Cargo.lock in the release commit (#786) (b343143)
+
+### Tests
+
+- Record which loki stream labels the comparative corpus triggers (#843) (6bbf041)
+- Red — all fourteen §5 stubs land, status specified→red (#819) (776aa30)
+- **BREAKING** Machine-check the comparative Loki label set per RFC0031.10 (#797) (6301aa6)
+- Tolerate a post-response reset when reading a raw HTTP reply (#801) (46cdce6)
+
+## [0.10.0] - 2026-09-05
 
 ### CI
 
@@ -63,6 +209,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
 - Rfc 0046 §7 — record the four resolutions (#772) (fe2b644)
 - Rfc 0051 green — all seven criteria pass (#765) (358e732)
 - Rfc 0051 — ourios-serving crate extraction (drafted) (#760) (2255b55)
+- Rfc 0051 restructured to the house template (e4165c4)
 - Auth guide names the tenant out-of-band (RFC 0046) (#744) (a5d7440)
 
 ### Fixed

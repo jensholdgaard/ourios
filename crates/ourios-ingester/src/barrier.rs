@@ -46,22 +46,27 @@
 //!   barrier began can panic *while the barrier waits on it*, and the
 //!   latch it sets lands after the first check.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
-use ourios_miner::snapshot::{SnapshotState, WalHighWater};
-use ourios_wal::{ReclaimError, WalOffset};
+use ourios_miner::snapshot::SnapshotState;
+use ourios_wal::{AppendError, ReclaimError, SnapshotHorizons, WalOffset};
 
 use crate::cadence::{BarrierEpochs, Epoch};
+use crate::metrics::{BarrierMetrics, ERROR_TYPE};
 use crate::publish::{Drained, PublishCoordinator};
 use crate::receiver::CommitCoordinator;
+use crate::receiver::ReceiveError;
 use crate::receiver::pipeline::IngestPipeline;
+use crate::reclaim_telemetry::fault_error_type;
 use crate::snapshot_store;
 
 /// One capture: the frames at or below `mark` taken out of both sinks,
-/// plus each tenant's miner state as of that instant.
+/// plus each tenant's miner state as of that instant and the horizon it
+/// folds.
 ///
 /// No public fields: a caller that could raise `mark` without owning the
 /// matching batches would checkpoint over records that are still in the
@@ -70,8 +75,30 @@ pub struct Cut {
     epoch: Epoch,
     mark: Option<WalOffset>,
     drained: Vec<Drained>,
-    snapshots: Vec<(TenantId, SnapshotState)>,
+    snapshots: Vec<(TenantId, TenantCut)>,
     bytes: usize,
+}
+
+/// One tenant's share of a cut: its miner state, and RFC 0052 §3.1's
+/// folded horizon — the offset of that tenant's own last frame the state
+/// folds, which is what its artefact and the ledger carry. Never the
+/// cut's mark: an idle tenant must keep the older horizon its state
+/// actually reflects.
+#[derive(Clone)]
+struct TenantCut {
+    horizon: WalOffset,
+    state: SnapshotState,
+}
+
+impl TenantCut {
+    /// The artefact this share installs: the state, stamped with its
+    /// own horizon.
+    fn artefact(&self) -> SnapshotState {
+        SnapshotState {
+            wal_high_water: Some(snapshot_store::high_water(self.horizon)),
+            ..self.state.clone()
+        }
+    }
 }
 
 impl Cut {
@@ -141,6 +168,18 @@ pub enum CaptureOutcome {
     Parked,
 }
 
+impl CaptureOutcome {
+    /// The `ourios.ingest.barrier.capture.outcome` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Coalesced => "coalesced",
+            Self::Parked => "parked",
+        }
+    }
+}
+
 /// What one cut's run decided.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CutOutcome {
@@ -162,6 +201,42 @@ pub enum CutOutcome {
     /// Nothing was pending.
     Idle,
 }
+
+impl CutOutcome {
+    /// The `ourios.ingest.barrier.cut.outcome` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stamped => "stamped",
+            Self::Unstamped => "unstamped",
+            Self::Retained => "retained",
+            Self::Latched => "latched",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+/// A cut's decision and what `ourios.ingest.barrier.cut.outcome` records
+/// for it. They differ in one case: a checkpoint write that failed
+/// decides [`CutOutcome::Stamped`] (RFC0052.1) but did not stamp, and the
+/// registry's `stamped` means the checkpoint advanced.
+#[derive(Clone, Copy, Debug)]
+struct Ran {
+    outcome: CutOutcome,
+    recorded: &'static str,
+}
+
+impl From<CutOutcome> for Ran {
+    fn from(outcome: CutOutcome) -> Self {
+        Self {
+            outcome,
+            recorded: outcome.as_str(),
+        }
+    }
+}
+
+/// The cut outcome recorded when the checkpoint write failed.
+const CUT_CHECKPOINT_FAILED: &str = "checkpoint_failed";
 
 /// What one cut's snapshot install did. Three states, not a `bool`: a
 /// cut whose mark is below the installed one did nothing *and* may
@@ -192,7 +267,14 @@ pub struct Barrier {
     /// and carries the highest mark installed so an older cut cannot
     /// overwrite a newer snapshot.
     install: Mutex<Option<WalOffset>>,
+    /// §3.2's snapshot ledger: each tenant's horizon as of its last
+    /// snapshot write that returned `Ok`, which is what housekeeping may
+    /// reclaim against. Never read back from the directory after
+    /// startup: a write whose rename landed but whose fsync failed is
+    /// visible there and may not survive a crash.
+    horizons: Mutex<HashMap<TenantId, WalOffset>>,
     ceiling_bytes: usize,
+    metrics: BarrierMetrics,
     /// Runs inside `capture_rotation` between the drain and the cut's
     /// epoch — the window a racing park must not land in.
     #[cfg(test)]
@@ -214,6 +296,7 @@ impl Barrier {
         ceiling_bytes: usize,
     ) -> Self {
         let epochs = publish.record().epochs();
+        let metrics = BarrierMetrics::new(&epochs);
         Self {
             publish,
             coordinator,
@@ -221,10 +304,37 @@ impl Barrier {
             epochs,
             pending: Mutex::new(None),
             install: Mutex::new(None),
+            horizons: Mutex::new(HashMap::new()),
             ceiling_bytes,
+            metrics,
             #[cfg(test)]
             window: Mutex::new(None),
         }
+    }
+
+    /// Seed the snapshot ledger with the horizons startup found durable
+    /// (§3.2: the listing is trusted only after the root's fsync, and
+    /// only before this process has reclaimed anything).
+    #[must_use]
+    pub fn with_durable_horizons(
+        self,
+        marks: impl IntoIterator<Item = (TenantId, WalOffset)>,
+    ) -> Self {
+        self.lock_horizons().extend(marks);
+        self
+    }
+
+    /// The per-tenant horizons housekeeping reclaims against. A tenant
+    /// with frames in the WAL and no entry here pins the floor at its
+    /// oldest surviving frame, which is the conservative reading of a
+    /// snapshot that never landed.
+    #[must_use]
+    pub fn snapshot_horizons(&self) -> SnapshotHorizons {
+        SnapshotHorizons::restorable(
+            self.lock_horizons()
+                .iter()
+                .map(|(tenant, mark)| (tenant.clone(), *mark)),
+        )
     }
 
     /// The cadence state this barrier decides against.
@@ -315,11 +425,18 @@ impl Barrier {
 
     /// Run the pending cut, if any — outside the exclusion.
     pub fn run_pending(&self) -> CutOutcome {
+        let ran = self.run_taken();
+        self.metrics.record_cut(ran.recorded);
+        ran.outcome
+    }
+
+    fn run_taken(&self) -> Ran {
         let Some(cut) = self.take_pending() else {
-            return CutOutcome::Idle;
+            return CutOutcome::Idle.into();
         };
         let epoch = cut.epoch;
-        let outcome = self.run_cut(cut);
+        let ran = self.run_cut(cut);
+        let outcome = ran.outcome;
         // §3.1: a pending cut captured behind a cut that did **not**
         // stamp already folds frames whose only durable copy was that
         // cut's batches, so installing or stamping it would suppress
@@ -334,7 +451,7 @@ impl Barrier {
             CutOutcome::Stamped | CutOutcome::Unstamped | CutOutcome::Idle => {}
         }
         self.publish.record().settle_cut(epoch);
-        outcome
+        ran
     }
 
     /// One barrier tick: capture, then run. A panic anywhere inside is
@@ -367,6 +484,7 @@ impl Barrier {
             // `epoch < at` — so settling against it here is what keeps
             // the list from growing for the life of the process.
             self.publish.record().settle_cut(self.epochs.current());
+            self.metrics.record_cut(CutOutcome::Latched.as_str());
             return CutOutcome::Latched;
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -382,6 +500,7 @@ impl Barrier {
         // replays them.
         self.epochs.report(epoch);
         self.invalidate_pending();
+        self.metrics.record_cut(CutOutcome::Latched.as_str());
         CutOutcome::Latched
     }
 
@@ -401,6 +520,12 @@ impl Barrier {
 
     /// Fill, coalesce into, or park against the pending slot (§3.1).
     fn offer(&self, cut: Cut) -> CaptureOutcome {
+        let outcome = self.place(cut);
+        self.metrics.record_capture(outcome.as_str());
+        outcome
+    }
+
+    fn place(&self, cut: Cut) -> CaptureOutcome {
         let mut pending = self.lock_pending();
         let Some(existing) = pending.as_mut() else {
             *pending = Some(cut);
@@ -445,6 +570,10 @@ impl Barrier {
         }
     }
 
+    fn lock_horizons(&self) -> std::sync::MutexGuard<'_, HashMap<TenantId, WalOffset>> {
+        self.horizons.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn take_pending(&self) -> Option<Cut> {
         self.lock_pending().take()
     }
@@ -460,15 +589,16 @@ impl Barrier {
     fn rotate_idle(&self) {
         if let Err(e) = self.coordinator.rotate_if_aged() {
             tracing::warn!(
-                error = %e,
-                "barrier: the idle rotation failed; the cut proceeds against the open segment"
+                name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_IDLE_ROTATION_ERROR,
+                { { ERROR_TYPE } = rotation_error_type(&e) },
+                "barrier: the idle rotation failed; the cut proceeds against the open segment: {e}"
             );
         }
     }
 
     /// The store-I/O half, outside the exclusion (§3.1's pseudocode from
     /// `cut_ok` on).
-    fn run_cut(&self, cut: Cut) -> CutOutcome {
+    fn run_cut(&self, cut: Cut) -> Ran {
         let Cut {
             epoch,
             mark,
@@ -482,7 +612,7 @@ impl Barrier {
             for batch in drained {
                 self.publish.park(batch);
             }
-            return CutOutcome::Latched;
+            return CutOutcome::Latched.into();
         }
         let mut published = true;
         for batch in drained {
@@ -506,24 +636,19 @@ impl Barrier {
         // spells the conjunction out — `ok = cut_ok and prior_ok and
         // failed_epoch > cut.epoch`.
         if self.epochs.capture().refuses(epoch) {
-            return CutOutcome::Latched;
+            return CutOutcome::Latched.into();
         }
         if !published || !outcomes.all_ok(epoch) {
-            return CutOutcome::Retained;
+            return CutOutcome::Retained.into();
         }
-        // A failed install must not be followed by a stamp. §3.1 says a
-        // snapshot write failure is not a checkpoint blocker, and adds
-        // the condition that makes that safe: recovery must gate the
-        // *Parquet* side on `max(X, S)`. `recovery::DriverSink` does not
-        // yet — that gate is RFC0052.10's — so advancing `X` over a
-        // snapshot still at `S` would republish every row in `(S, X]`
-        // on the next start. Retaining does not make the next start
-        // clean: this cut's rows are already in the store, so replay
-        // re-mines them exactly as it would after a crash between the
-        // write and the stamp. What it buys is the bound — the
-        // duplicates are this cut's, not every row since `S`.
+        // A failed install is not followed by a stamp; RFC0052.7 pins the
+        // `retained` outcome. §3.1 would allow the stamp — recovery gates
+        // the sinks on `max(X, S)` (RFC0052.10), so advancing `X` over a
+        // snapshot still at `S` republishes nothing in `(S, X]`. Retaining
+        // instead costs this cut's rows, already in the store, one
+        // republish if the node restarts before a later cut stamps.
         match self.install(&snapshots, mark) {
-            Install::Failed => CutOutcome::Retained,
+            Install::Failed => CutOutcome::Retained.into(),
             Install::Written | Install::Superseded => self.stamp(mark),
         }
     }
@@ -531,11 +656,14 @@ impl Barrier {
     /// Install this cut's snapshot bytes, serialised against every other
     /// installer and monotone in the mark.
     ///
-    /// A cut with no mark installs nothing: an artefact without a
-    /// concrete horizon is discarded at the next start, so writing one
-    /// over a tenant's only valid snapshot would trade a full replay for
-    /// a cut that had nothing to stamp anyway.
-    fn install(&self, snapshots: &[(TenantId, SnapshotState)], mark: Option<WalOffset>) -> Install {
+    /// A cut with no mark installs nothing: no turn in this process has
+    /// been acknowledged, and installs are ordered by the mark.
+    ///
+    /// Each tenant is installed at its own folded horizon, never at the
+    /// mark, and the ledger records exactly that — so an idle tenant
+    /// keeps the older horizon its state reflects, and the floor stays
+    /// the minimum over what each tenant truly folded.
+    fn install(&self, snapshots: &[(TenantId, TenantCut)], mark: Option<WalOffset>) -> Install {
         let Some(mark) = mark else {
             return Install::Superseded;
         };
@@ -543,22 +671,22 @@ impl Barrier {
         if installed.is_some_and(|previous| mark < previous) {
             return Install::Superseded;
         }
-        let high_water = WalHighWater {
-            segment: mark.segment.to_string(),
-            byte: mark.byte,
-        };
-        for (tenant, state) in snapshots {
-            let mut state = state.clone();
-            state.wal_high_water = Some(high_water.clone());
-            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &state) {
+        for (tenant, share) in snapshots {
+            if let Err(e) = snapshot_store::write(&self.snapshots_root, tenant, &share.artefact()) {
+                self.metrics
+                    .record_snapshot_write(tenant.as_str(), Some(e.error_type()));
                 tracing::warn!(
                     name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
-                    error = %e,
                     "barrier: snapshot write failed, so this cut does not stamp; the next \
-                     one retries (no acknowledged data is lost — the WAL is durable)"
+                     one retries (no acknowledged data is lost — the WAL is durable): {e}"
                 );
                 return Install::Failed;
             }
+            self.metrics.record_snapshot_write(tenant.as_str(), None);
+            // Per tenant, not per cut: the tenants written before a
+            // failure are durable at their horizons, and the rest keep
+            // their previous ones.
+            self.lock_horizons().insert(tenant.clone(), share.horizon);
         }
         *installed = Some(mark);
         Install::Written
@@ -568,50 +696,78 @@ impl Barrier {
     /// in-memory mark where it was, so nothing past the *previous* mark
     /// becomes reclaimable — segments already eligible under it still
     /// are.
-    fn stamp(&self, mark: Option<WalOffset>) -> CutOutcome {
+    fn stamp(&self, mark: Option<WalOffset>) -> Ran {
         let Some(mark) = mark else {
-            return CutOutcome::Stamped;
+            return CutOutcome::Stamped.into();
         };
-        match self.coordinator.checkpoint(mark) {
-            Ok(()) => CutOutcome::Stamped,
-            Err(ReclaimError::NoReclamationSurface) => {
+        let written = self.coordinator.checkpoint(mark);
+        self.metrics
+            .record_checkpoint_write(written.as_ref().err().map(ReclaimError::error_type));
+        match written {
+            Ok(()) => CutOutcome::Stamped.into(),
+            Err(e @ ReclaimError::NoReclamationSurface) => {
                 tracing::warn!(
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
+                    { { ERROR_TYPE } = e.error_type() },
                     "barrier: the journal exposes no reclamation surface, so no checkpoint was \
                      written and nothing is reclaimed"
                 );
-                CutOutcome::Unstamped
+                CutOutcome::Unstamped.into()
             }
             Err(e) => {
                 tracing::warn!(
-                    error = %e,
-                    "barrier: the checkpoint write failed; nothing past the previous mark is \
-                     reclaimed"
+                    name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_CHECKPOINT_ERROR,
+                    { { ERROR_TYPE } = e.error_type() },
+                    "barrier: the checkpoint write failed; a later cut retries the stamp: {e}"
                 );
-                CutOutcome::Stamped
+                Ran {
+                    outcome: CutOutcome::Stamped,
+                    recorded: CUT_CHECKPOINT_FAILED,
+                }
             }
         }
     }
 }
 
-/// Each tenant's miner state as of the cut, serialised under the miner
-/// lock so it never runs past the mark.
-fn serialise(miner: &MinerCluster) -> Vec<(TenantId, SnapshotState)> {
+/// The `error.type` of a failed idle rotation, as the registry lists it:
+/// the rotation step for a failure charged to the budget, `io` for any
+/// other I/O failure, and `_OTHER` for what a rotation cannot return.
+fn rotation_error_type(error: &ReceiveError) -> &'static str {
+    match error {
+        ReceiveError::WalAppend(
+            AppendError::RotationRetrying(fault) | AppendError::RotationTerminal(fault),
+        ) => fault_error_type(fault),
+        ReceiveError::WalAppend(AppendError::Io { .. }) => "io",
+        ReceiveError::WalAppend(AppendError::TooLarge { .. })
+        | ReceiveError::TenantDenied { .. }
+        | ReceiveError::TenantFrame(_)
+        | ReceiveError::WalSync(_) => "_OTHER",
+    }
+}
+
+/// Each tenant's miner state as of the cut and the horizon it folds,
+/// read together under the miner lock so neither runs past the other or
+/// past the mark.
+///
+/// A tenant with no folded horizon has no frame this process or its
+/// recovery folded, so it has nothing to install: an artefact without a
+/// horizon is discarded at the next start, and writing one would replace
+/// whatever valid snapshot it has.
+fn serialise(miner: &MinerCluster) -> Vec<(TenantId, TenantCut)> {
     miner
         .tenant_ids()
         .into_iter()
-        .map(|tenant| {
+        .filter_map(|tenant| {
+            let horizon = snapshot_store::offset_of(miner.folded_horizon(&tenant)?)?;
             let state = miner.snapshot_state(&tenant);
-            (tenant, state)
+            Some((tenant, TenantCut { horizon, state }))
         })
         .collect()
 }
 
 /// Latest wins per tenant; a tenant absent from the newer capture keeps
 /// the older bytes, which are still cut-consistent at its own horizon.
-fn merge_snapshots(
-    into: &mut Vec<(TenantId, SnapshotState)>,
-    newer: Vec<(TenantId, SnapshotState)>,
-) {
+fn merge_snapshots(into: &mut Vec<(TenantId, TenantCut)>, newer: Vec<(TenantId, TenantCut)>) {
     for (tenant, state) in newer {
         match into.iter_mut().find(|(existing, _)| *existing == tenant) {
             Some(slot) => slot.1 = state,
@@ -622,10 +778,7 @@ fn merge_snapshots(
 
 /// The same rule from the other side: `into` is already the later
 /// capture, so `older` only fills the tenants it has no bytes for.
-fn backfill_snapshots(
-    into: &mut Vec<(TenantId, SnapshotState)>,
-    older: Vec<(TenantId, SnapshotState)>,
-) {
+fn backfill_snapshots(into: &mut Vec<(TenantId, TenantCut)>, older: Vec<(TenantId, TenantCut)>) {
     for (tenant, state) in older {
         if !into.iter().any(|(existing, _)| *existing == tenant) {
             into.push((tenant, state));
@@ -652,7 +805,7 @@ pub fn fsync_snapshots_root(root: &Path) -> Result<(), snapshot_store::SnapshotS
 #[cfg(test)]
 mod tests {
     use ourios_core::tenant::TenantId;
-    use ourios_miner::snapshot::{SnapshotState, WalHighWater};
+    use ourios_miner::snapshot::SnapshotState;
     use ourios_wal::WalOffset;
 
     use std::sync::Arc;
@@ -667,7 +820,7 @@ mod tests {
     use ourios_miner::cluster::MinerCluster;
     use ourios_parquet::Store;
 
-    use super::{Barrier, Cut, CutOutcome};
+    use super::{Barrier, Cut, CutOutcome, TenantCut};
     use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
     use crate::cadence::{BarrierEpochs, Epoch};
     use crate::publish::PublishCoordinator;
@@ -675,15 +828,15 @@ mod tests {
     use crate::receiver::pipeline::{Journal, ReceiveError};
     use crate::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 
-    fn state(byte: u64) -> SnapshotState {
-        SnapshotState {
-            leaves: Vec::new(),
-            structured_templates: Vec::new(),
-            wal_high_water: Some(WalHighWater {
-                segment: "segment".to_owned(),
-                byte,
-            }),
-            adopted_templates: Vec::new(),
+    fn share(byte: u64) -> TenantCut {
+        TenantCut {
+            horizon: offset(byte),
+            state: SnapshotState {
+                leaves: Vec::new(),
+                structured_templates: Vec::new(),
+                wal_high_water: None,
+                adopted_templates: Vec::new(),
+            },
         }
     }
 
@@ -701,7 +854,7 @@ mod tests {
             drained: Vec::new(),
             snapshots: snapshots
                 .iter()
-                .map(|(tenant, at)| (TenantId::new(*tenant), state(*at)))
+                .map(|(tenant, at)| (TenantId::new(*tenant), share(*at)))
                 .collect(),
             bytes: 0,
         }
@@ -711,8 +864,7 @@ mod tests {
         cut.snapshots
             .iter()
             .find(|(id, _)| id.as_str() == tenant)
-            .and_then(|(_, state)| state.wal_high_water.as_ref())
-            .map(|high_water| high_water.byte)
+            .map(|(_, share)| share.horizon.byte)
     }
 
     /// §3.1's ordering rule, at the one place the two captures meet: the

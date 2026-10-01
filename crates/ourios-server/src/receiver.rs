@@ -18,16 +18,18 @@ use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_config::MinerConfig;
+use ourios_core::tenant::TenantId;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::barrier::{Barrier, CutOutcome};
-use ourios_ingester::cadence::BarrierEpochs;
+use ourios_ingester::cadence::{self, BarrierEpochs};
+use ourios_ingester::housekeeping::Housekeeper;
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
-use ourios_ingester::recovery;
+use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
@@ -235,46 +237,40 @@ fn count_step_panic(coordinator: &PublishCoordinator, join_error: &tokio::task::
 /// same store would fail anyway, and flushing it would expose a clean row
 /// before its template event is durable.
 ///
-/// Returns whether both sinks fully drained: `true` means both buffers cleared
-/// and the snapshot was *attempted* (a write failure there is a separate,
-/// logged, rebuildable-cache miss — it does not endanger no-loss, since the
-/// data is in the store); `false` means data was retained and the snapshot was
-/// skipped. Callers log via `cadence`; the value is for tests today and
-/// sink-flush metrics later (RFC 0014 §6.3).
-/// What a non-barrier cadence point may stamp, and the state it must
-/// clear first.
+/// Returns what the cadence point left on disk: [`Snapshotted::Skipped`] when
+/// data was retained and the snapshot skipped, otherwise the outcome of the
+/// write it attempted (a write failure there is a separate, logged,
+/// rebuildable-cache miss — it does not endanger no-loss, since the data is in
+/// the store). `serve` seeds the snapshot ledger from it.
+/// Which non-barrier cadence point is stamping, and so the state it must
+/// clear first. Both stamp each tenant at its own folded horizon (RFC 0052
+/// §3.1), read from the miner they snapshot, so an idle tenant keeps the
+/// older horizon its state reflects.
 ///
-/// Two variants rather than an offset beside an `Option<&_>`: only one
-/// of the two call sites can have a cadence latch at all, and a caller
-/// holding a bare offset could not tell whether it owed the check.
+/// Two variants rather than a flag: only one of the two call sites can
+/// have a cadence latch at all.
 enum Stamp {
     /// `serve`'s post-recovery point. It runs before the pipeline, its
     /// encode pool and its publish guards exist, so nothing can have
     /// latched and there is no state to consult.
-    PreFlight(Option<WalOffset>),
-    /// A running receiver's shutdown. Refused while the latch is set: a
-    /// latch means an encode or a publish unwound and dropped records
-    /// this process can no longer account for, and unlike a requeue
-    /// those records are in no buffer for the flush below to find.
-    /// Stamping over them would put the snapshot horizon above data that
-    /// reached neither the store nor a buffer, and recovery suppresses
-    /// frames at or below that horizon — silent loss.
-    Cadence(Option<WalOffset>, Arc<BarrierEpochs>),
+    PreFlight,
+    /// A running receiver's shutdown. Refused while the latch is set: a latch means an encode or a
+    /// publish unwound and dropped records this process can no longer
+    /// account for, and unlike a requeue those records are in no buffer
+    /// for the flush below to find. Stamping over them would put the
+    /// snapshot horizon above data that reached neither the store nor a
+    /// buffer, and recovery suppresses frames at or below that horizon —
+    /// silent loss.
+    Cadence(Arc<BarrierEpochs>),
 }
 
 impl Stamp {
-    fn high_water(&self) -> Option<WalOffset> {
-        match self {
-            Self::PreFlight(mark) | Self::Cadence(mark, _) => *mark,
-        }
-    }
-
     fn refused(&self) -> bool {
         match self {
-            Self::PreFlight(_) => false,
+            Self::PreFlight => false,
             // Every epoch this process has handed out is at or below
             // `current`, so a latch anywhere refuses the stamp.
-            Self::Cadence(_, epochs) => epochs.capture().refuses(epochs.current()),
+            Self::Cadence(epochs) => epochs.capture().refuses(epochs.current()),
         }
     }
 }
@@ -286,7 +282,7 @@ fn flush_then_snapshot(
     miner: &MinerCluster,
     stamp: &Stamp,
     cadence: &str,
-) -> bool {
+) -> Snapshotted {
     // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
     // caller stamps `wal_high_water` from here with exclusive access to
     // `miner` — shutdown holds the pipeline's miner lock; the
@@ -336,7 +332,7 @@ fn flush_then_snapshot(
              snapshot is skipped — the next start replays from the checkpoint and re-mines \
              those frames (no acknowledged data is lost; the WAL is durable)"
         );
-        return false;
+        return Snapshotted::Skipped;
     }
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
@@ -346,7 +342,7 @@ fn flush_then_snapshot(
              the record flush + snapshot this cycle so a clean row isn't exposed before its \
              template event is durable — no acknowledged data is lost (the WAL is durable)"
         );
-        return false;
+        return Snapshotted::Skipped;
     }
     sink.flush_all();
     let records = sink.buffered_records();
@@ -356,15 +352,38 @@ fn flush_then_snapshot(
             "{cadence}: record sink retained {records} record(s) (store unavailable?); skipping the \
              snapshot so recovery re-mines them — no acknowledged data is lost (the WAL is durable)"
         );
-        return false;
+        return Snapshotted::Skipped;
     }
-    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, stamp.high_water()) {
-        tracing::warn!(
-            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
-            "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
-        );
+    match recovery::write_folded_snapshots(snapshots_root, miner) {
+        Ok(installed) => Snapshotted::Installed(installed),
+        Err(e) => {
+            tracing::warn!(
+                name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
+                "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
+            );
+            Snapshotted::WriteFailed
+        }
     }
-    true
+}
+
+/// What [`flush_then_snapshot`] left on disk.
+#[derive(Debug)]
+enum Snapshotted {
+    /// Data was retained or the stamp refused: no artefact was touched.
+    Skipped,
+    /// Both sinks drained, but the write failed partway: the artefacts
+    /// before the failure were replaced and the rest were not.
+    WriteFailed,
+    /// Every live tenant's artefact was replaced, carrying these
+    /// horizons.
+    Installed(Vec<(TenantId, WalOffset)>),
+}
+
+#[cfg(test)]
+impl Snapshotted {
+    fn drained(&self) -> bool {
+        !matches!(self, Self::Skipped)
+    }
 }
 
 /// Where the receiver role binds, the WAL it persists to, and the object
@@ -424,13 +443,8 @@ pub struct ReceiverHandle {
     /// data sink (before it, so a row's template event is durable no later than
     /// the row), and likewise gates the shutdown snapshot.
     audit_sink: SharedParquetAuditSink,
-    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
-    /// clean exit on shutdown via the `shutdown` watch signal.
-    flush_tick: JoinHandle<()>,
-    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
-    /// joined before the shutdown flush so no cut is in flight when it
-    /// runs.
-    barrier_tick: JoinHandle<()>,
+    /// The three cadence tasks, each joined before the shutdown flush.
+    cadences: Cadences,
     /// The same barrier the task and the rotation hook hold. Shutdown
     /// runs whatever is left in its pending slot once the task is
     /// joined — the hook can fill it after the last tick, and nothing
@@ -470,19 +484,22 @@ impl ReceiverHandle {
         // holding the sink mutex, which the drain below would then wait on
         // anyway. A `JoinError` (the task panicked) is ignored — the drain
         // below still runs.
-        let _ = self.flush_tick.await;
+        let _ = self.cadences.sweep.await;
         // RFC 0052 §3.1: the receiver joins the barrier task after its
         // running cut finishes, so the flush below cannot race a cut
         // holding drained batches outside the buffers. A store failure
         // in that last cut requeues into the buffers as any cut's does,
         // and the flush covers the requeue.
-        // A `JoinError` is the barrier task panicking or being aborted
-        // outside `tick`'s own `catch_unwind`; the cut it was running
-        // may have drained batches it never settled, so latch its epoch
-        // and let the stamp below refuse rather than advance past them.
-        if self.barrier_tick.await.is_err() {
-            self.epochs.report(self.epochs.current());
-        }
+        // A `JoinError` from either task is a panic or an abort outside
+        // its tick's own `catch_unwind`; a cut it was running may have
+        // drained batches it never settled, so it is logged and latched,
+        // and the stamp below refuses rather than advance past them.
+        cadence::read_join(&self.epochs, "barrier", self.cadences.barrier.await);
+        cadence::read_join(
+            &self.epochs,
+            "housekeeping",
+            self.cadences.housekeeping.await,
+        );
         // The barrier task is gone, but the slot it fed need not be
         // empty: the rotation hook is capture-only, so an append taken
         // just before the signal can have left a cut there with nothing
@@ -505,7 +522,6 @@ impl ReceiverHandle {
         // replay (the snapshot is a rebuildable cache). `flush_then_snapshot`
         // drains the sink first and writes the snapshot only if it drained —
         // the no-loss invariant (see `serve`).
-        let last_durable = self.pipeline.last_durable();
         tokio::task::block_in_place(|| {
             // RFC 0035 §3.1 barrier at the shutdown cadence point: the
             // listeners are stopped (every acked batch has submitted its
@@ -523,11 +539,14 @@ impl ReceiverHandle {
                     &self.audit_sink,
                     &self.snapshots_root,
                     miner,
-                    &Stamp::Cadence(last_durable, Arc::clone(&self.epochs)),
+                    &Stamp::Cadence(Arc::clone(&self.epochs)),
                     "shutdown",
                 );
             });
         });
+        // The joins and the last cut above are the steps that can set the
+        // latch after the timer stopped observing it.
+        self.cadences.housekeeper.observe_state();
         Ok(())
     }
 }
@@ -606,6 +625,7 @@ fn build_barrier(
     commits: &Arc<CommitCoordinator>,
     snapshots_root: PathBuf,
     graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+    horizons: Vec<(TenantId, WalOffset)>,
 ) -> (PublishCoordinator, Arc<Barrier>) {
     let (sink, audit_sink) = sinks;
     let mut publisher = PublishCoordinator::new(sink.clone(), audit_sink.clone());
@@ -617,7 +637,8 @@ fn build_barrier(
         Arc::clone(commits),
         snapshots_root,
         SINK_CEILING_BYTES,
-    );
+    )
+    .with_durable_horizons(horizons);
     (publisher, Arc::new(barrier))
 }
 
@@ -701,6 +722,47 @@ fn spawn_barrier(
     })
 }
 
+/// RFC 0052 §3.2's housekeeping task: one capped reclamation pass every
+/// `housekeeping_secs`, separate from the barrier and the age sweep so
+/// that neither a latched barrier nor a stopped sweep (#795) stops it.
+///
+/// The first pass runs at once: the task is spawned after recovery has
+/// seeded the durable horizons, and a node restarting onto a backlog —
+/// #793's restart loop — must not wait a whole interval to shed it.
+/// [`Housekeeper::tick`] catches its own panic and counts it, and a
+/// failed pass is logged there; either way the next tick retries.
+fn spawn_housekeeping(
+    housekeeper: Arc<Housekeeper>,
+    every: Duration,
+    epochs: Arc<BarrierEpochs>,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            if shutdown.has_changed().unwrap_or(true) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = tick.tick() => {}
+            }
+            let housekeeper = Arc::clone(&housekeeper);
+            // The tick catches its own unwind, so a `JoinError` is a
+            // cancellation or an abort; §3.2 reads it as a failed cut,
+            // the same as the barrier task's.
+            let joined = tokio::task::spawn_blocking(move || housekeeper.tick())
+                .await
+                .map(drop);
+            if cadence::read_join(&epochs, "housekeeping", joined) {
+                break;
+            }
+        }
+    })
+}
+
 /// Bind both transports and start serving over one shared
 /// `IngestPipeline`. Recovery (RFC 0008 §6.6) runs to completion first,
 /// then the post-recovery snapshots are written, and only then do the
@@ -769,11 +831,41 @@ fn build_acceptors(
     Ok((grpc, http))
 }
 
-/// The two background cadences the receiver runs: RFC0014.2's age sweep
-/// and RFC 0052 §3.1's barrier.
+/// The three background cadences the receiver runs: RFC0014.2's age
+/// sweep, RFC 0052 §3.1's barrier and §3.2's housekeeping.
 struct Cadences {
-    flush_tick: JoinHandle<()>,
-    barrier_tick: JoinHandle<()>,
+    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
+    /// clean exit on shutdown via the `shutdown` watch signal.
+    sweep: JoinHandle<()>,
+    /// The RFC 0052 §3.1 barrier task (one cut per [`BARRIER_TICK`]);
+    /// joined before the shutdown flush so no cut is in flight when it
+    /// runs.
+    barrier: JoinHandle<()>,
+    /// The RFC 0052 §3.2 housekeeping task (one capped pass per
+    /// `housekeeping_secs`); joined with the other cadences, before the
+    /// shutdown flush, so no pass holds the journal past the handle.
+    housekeeping: JoinHandle<()>,
+    /// The housekeeping task's owner, kept for shutdown's last
+    /// observation: the latch its steps can set lands after the task is
+    /// joined (RFC 0052 §3.5).
+    housekeeper: Arc<Housekeeper>,
+}
+
+/// The housekeeping knobs, captured before `WalConfig` moves into
+/// `Wal::open`.
+struct HousekeepingPlan {
+    every: Duration,
+    max_unlinks: usize,
+}
+
+impl HousekeepingPlan {
+    fn of(wal: &WalConfig) -> Self {
+        Self {
+            // `interval` panics on a zero period; the config layer's floor is 1.
+            every: Duration::from_secs(wal.housekeeping_secs.max(1)),
+            max_unlinks: usize::try_from(wal.max_unlinks_per_pass).unwrap_or(usize::MAX),
+        }
+    }
 }
 
 /// What the cadences are built over. A value rather than three more
@@ -788,21 +880,77 @@ struct CadenceInputs {
     /// Built before the pipeline, because the capture-only rotation hook
     /// the pipeline installs holds it (RFC 0052 §3.1).
     barrier: Arc<Barrier>,
+    /// The journal owner housekeeping reclaims through.
+    commits: Arc<CommitCoordinator>,
+    housekeeping: HousekeepingPlan,
 }
 
-/// Start both cadences over one publish coordinator.
+/// Start the cadences over one publish coordinator.
 fn spawn_cadences(
     pipeline: &SharedPipeline,
     inputs: CadenceInputs,
     shutdown: &watch::Receiver<()>,
 ) -> Cadences {
-    let CadenceInputs { publisher, barrier } = inputs;
+    let CadenceInputs {
+        publisher,
+        barrier,
+        commits,
+        housekeeping,
+    } = inputs;
     let overflow = publisher.audit().overflow_notify();
+    let housekeeper = Arc::new(Housekeeper::new(
+        commits,
+        Arc::clone(&barrier),
+        publisher.clone(),
+        housekeeping.max_unlinks,
+    ));
     Cadences {
-        barrier_tick: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
+        housekeeper: Arc::clone(&housekeeper),
+        housekeeping: spawn_housekeeping(
+            housekeeper,
+            housekeeping.every,
+            barrier.epochs(),
+            shutdown.clone(),
+        ),
+        barrier: spawn_barrier(pipeline.clone(), barrier, shutdown.clone()),
         // The age sweep drains under the barrier exclusion and the miner
         // lock, and writes audit-ordered off both (issue #302 #1/#2).
-        flush_tick: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+        sweep: spawn_age_sweep(pipeline.clone(), publisher, overflow, shutdown.clone()),
+    }
+}
+
+/// Post-recovery cadence point (RFC 0001 §6.9): drain the replayed tail,
+/// then persist what replay rebuilt so a crash before the next cadence point
+/// doesn't redo it. `flush_then_snapshot` gates the snapshot on the drain
+/// succeeding (the no-loss invariant); `block_in_place` keeps its blocking
+/// Parquet/store I/O off a runtime worker, as at the other cadence points.
+///
+/// Each tenant is stamped at its own folded horizon (RFC 0052 §3.1): its
+/// restored horizon when replay fed it nothing, otherwise its own last
+/// replayed frame. Returns RFC 0052 §3.2's snapshot ledger — only horizons
+/// the artefacts on disk carry, or lower ones.
+fn snapshot_post_recovery(
+    (sink, audit_sink): (&SharedParquetSink, &SharedParquetAuditSink),
+    snapshots_root: &Path,
+    miner: &MinerCluster,
+    report: &RecoveryReport,
+) -> Vec<(TenantId, WalOffset)> {
+    let snapshotted = tokio::task::block_in_place(|| {
+        flush_then_snapshot(
+            sink,
+            audit_sink,
+            snapshots_root,
+            miner,
+            &Stamp::PreFlight,
+            "post-recovery",
+        )
+    });
+    // A skipped or failed write left the restored artefacts in place, and
+    // every horizon the write installs is at or above the restored one, so
+    // those are a floor under whatever did land.
+    match snapshotted {
+        Snapshotted::Installed(installed) => installed,
+        Snapshotted::Skipped | Snapshotted::WriteFailed => report.accepted_horizons(),
     }
 }
 
@@ -840,6 +988,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // into `Wal::open`: the batch window and the segment-fill early-cut.
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
     let segment_size_bytes = config.wal.segment_size_bytes;
+    let housekeeping = HousekeepingPlan::of(&config.wal);
     // RFC0052.13: a snapshot listed at startup governs reclamation only
     // once the snapshots root and its parent are durable **in this
     // process**. A failure here fails startup rather than discarding the
@@ -872,35 +1021,14 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             tenant.tenant_id.as_str(),
         );
     }
-    // Post-recovery cadence point (RFC 0001 §6.9): drain the replayed tail,
-    // then persist what replay rebuilt so a crash before the next cadence point
-    // doesn't redo it. `flush_then_snapshot` gates the snapshot on the drain
-    // succeeding (the no-loss invariant); `block_in_place` keeps its blocking
-    // Parquet/store I/O off a runtime worker, as at the other cadence points.
-    tokio::task::block_in_place(|| {
-        flush_then_snapshot(
-            &sink,
-            &audit_sink,
-            &snapshots_root,
-            &miner,
-            // The highest offset replay delivered is the right horizon
-            // for a *snapshot*: the miner state below covers exactly
-            // those frames. It is not a checkpoint mark, and the
-            // pipeline's `DurableMark::Replayed` seed keeps the barrier
-            // from mistaking it for one.
-            &Stamp::PreFlight(report.max_delivered),
-            "post-recovery",
-        );
-    });
+    let ledger = snapshot_post_recovery((&sink, &audit_sink), &snapshots_root, &miner, &report);
 
     // The group-commit coordinator owns the single-writer WAL and folds
     // concurrent appends into one fsync per `wal_batch_window_ms`
     // (RFC0008.8); the pipeline owns the miner + the rotation hook (the §6.9
-    // *primary* cadence point). `with_last_durable` seeds the durable mark from
-    // replay so a process serving zero requests still stamps its shutdown
-    // snapshots with a concrete horizon — an unstamped snapshot is discarded at
-    // the next start (RFC 0001 §6.9), which would overwrite the post-recovery
-    // artefacts with full-replay-only ones.
+    // *primary* cadence point). A process serving zero requests still stamps
+    // concrete shutdown horizons: the miner carries each tenant's folded
+    // horizon from its restore or its replay (RFC 0052 §3.1).
     let commits = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     // RFC 0052 §3.1: the barrier is built before the pipeline, because
     // the pipeline's rotation hook is now a capture into it.
@@ -909,13 +1037,17 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         &commits,
         snapshots_root.clone(),
         config.graph_emitter.clone(),
+        // RFC 0052 §3.2's snapshot ledger starts from the snapshots on
+        // disk: an artefact recovery rejected would be rejected again on
+        // the next start, so its horizon must never let housekeeping
+        // unlink the frames that start would replay.
+        ledger,
     );
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(Arc::clone(&commits), miner)
             // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
             // through the same durable audit sink as every other event.
             .with_denial_audit_sink(Box::new(audit_sink.clone()))
-            .with_last_durable(report.max_delivered)
             .with_rotation_hook(rotation_capture_hook(Arc::clone(&barrier)))
             // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
             // global commit gate; the pool emits into the same shared
@@ -939,14 +1071,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // — one word across every guard in the receiver (RFC 0052 §3.1).
     let pipeline_epochs = pipeline.epochs();
 
-    let Cadences {
-        flush_tick,
-        barrier_tick,
-    } = spawn_cadences(
+    let cadences = spawn_cadences(
         &pipeline,
         CadenceInputs {
             publisher,
             barrier: Arc::clone(&barrier),
+            commits,
+            housekeeping,
         },
         &shutdown_rx,
     );
@@ -1018,8 +1149,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         snapshots_root,
         sink,
         audit_sink,
-        flush_tick,
-        barrier_tick,
+        cadences,
         barrier,
         epochs: pipeline_epochs,
     })
@@ -1056,6 +1186,14 @@ mod tests {
         );
     }
 
+    /// One test at a time among those that increment the global sink
+    /// counter's `cadence_panic` dimension, held for the whole test: the
+    /// assertion on that count would otherwise see a sibling's increment.
+    async fn cadence_panic_serial() -> tokio::sync::MutexGuard<'static, ()> {
+        static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        SERIAL.lock().await
+    }
+
     /// #791: the sweep could not tell a cancelled step from a panicked one —
     /// it broke its loop on either, so a panic retired the flush cadence for
     /// the life of the process while the task returned `()` cleanly and
@@ -1072,7 +1210,8 @@ mod tests {
     /// binary, a different process) and no sibling asserts on metrics. It is
     /// still one installer only — which is why the two cases are one test
     /// rather than two, since siblings sharing a global meter accumulate on
-    /// the same counter.
+    /// the same counter. A sibling that *increments* the counter holds
+    /// [`cadence_panic_serial`] for the same reason.
     ///
     /// `ourios-ingester`'s `cadence_panic_metric` covers the complementary
     /// half: that the dimension distinguishes a dead sweep from an ordinary
@@ -1126,6 +1265,7 @@ mod tests {
                 AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint,
             };
 
+            let _serial = super::cadence_panic_serial().await;
             let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
             let root = tempfile::TempDir::new().expect("root");
             let join_error = tokio::spawn(async { panic!("the step blew up") })
@@ -1276,9 +1416,10 @@ mod tests {
             &audit,
             &tmp.path().join("snapshots"),
             &miner,
-            &Stamp::PreFlight(None),
+            &Stamp::PreFlight,
             "test",
-        );
+        )
+        .drained();
 
         assert!(drained, "a working store drains the sink");
         assert_eq!(sink.buffered_records(), 0, "the buffer cleared on flush");
@@ -1307,9 +1448,10 @@ mod tests {
             &audit,
             &snapshots_root,
             &miner,
-            &Stamp::PreFlight(None),
+            &Stamp::PreFlight,
             "test",
-        );
+        )
+        .drained();
 
         assert!(!drained, "an unavailable store does not drain the sink");
         assert_eq!(
@@ -1355,9 +1497,10 @@ mod tests {
             &audit,
             &snapshots_root,
             &miner,
-            &Stamp::PreFlight(None),
+            &Stamp::PreFlight,
             "test",
-        );
+        )
+        .drained();
 
         assert!(!drained, "a retained audit buffer blocks the drain");
         assert_eq!(
@@ -1537,6 +1680,542 @@ mod tests {
         // Then shutdown settles it rather than blocking on its publish guards.
         handle.shutdown().await.expect("graceful shutdown");
         !data_parquet_files(data_dir.path()).is_empty()
+    }
+
+    /// A journal whose housekeeping prepare counts its calls and unwinds
+    /// on the first — the pass the task must survive.
+    struct CountedPasses(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ourios_ingester::receiver::Journal for CountedPasses {
+        fn append_batch(
+            &mut self,
+            _payload: &[u8],
+        ) -> Result<WalOffset, ourios_ingester::receiver::ReceiveError> {
+            unreachable!("the housekeeping task appends nothing")
+        }
+
+        fn sync(&mut self) -> Result<WalOffset, ourios_ingester::receiver::ReceiveError> {
+            unreachable!("the housekeeping task syncs nothing")
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
+        }
+
+        fn housekeeping_prepare(
+            &mut self,
+            _horizons: &ourios_wal::SnapshotHorizons,
+            _max_unlinks: usize,
+        ) -> Result<ourios_wal::ReclaimPlan, ourios_wal::ReclaimError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            assert!(n != 0, "injected panic in the first housekeeping pass");
+            Err(ourios_wal::ReclaimError::NoReclamationSurface)
+        }
+    }
+
+    /// A production [`Housekeeper`] over [`CountedPasses`], and the latch
+    /// its barrier shares.
+    fn counted_housekeeper(
+        root: &Path,
+        passes: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Housekeeper, Arc<BarrierEpochs>) {
+        std::fs::create_dir_all(root.join("store")).expect("store root");
+        let (sink, audit) = build_write_sinks(
+            Store::local(root.join("store")).expect("local store"),
+            PromotedAttributes::default(),
+        );
+        let publisher = PublishCoordinator::new(sink, audit);
+        let commits = CommitCoordinator::new(
+            Box::new(CountedPasses(Arc::clone(passes))),
+            Duration::from_millis(20),
+            u64::MAX,
+        );
+        let barrier = Arc::new(Barrier::new(
+            publisher.clone(),
+            Arc::clone(&commits),
+            root.join("snapshots"),
+            SINK_CEILING_BYTES,
+        ));
+        let epochs = barrier.epochs();
+        (Housekeeper::new(commits, barrier, publisher, 8), epochs)
+    }
+
+    /// Yield until `passes` reaches `n`. Paused time does not advance
+    /// while a `spawn_blocking` pass runs, so this waits on the pass
+    /// itself rather than on the clock.
+    async fn passes_reach(passes: &std::sync::atomic::AtomicUsize, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while passes.load(std::sync::atomic::Ordering::Acquire) < n {
+            assert!(std::time::Instant::now() < deadline, "pass {n} never ran");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The production housekeeping loop: the first pass runs at once, a
+    /// pass that panics costs that tick and not the task, and shutdown
+    /// stops every later pass.
+    #[tokio::test(start_paused = true)]
+    async fn housekeeping_task_passes_at_once_survives_a_panic_and_stops_on_shutdown() {
+        let _serial = cadence_panic_serial().await;
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
+        let (shutdown, shutdown_rx) = watch::channel(());
+        let every = Duration::from_secs(60);
+        let task = spawn_housekeeping(
+            Arc::new(housekeeper),
+            every,
+            Arc::clone(&epochs),
+            shutdown_rx,
+        );
+
+        // The first pass runs without waiting an interval, and panics.
+        passes_reach(&passes, 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "one pass before the first interval elapses",
+        );
+        assert_eq!(
+            epochs.capture().failed_epoch(),
+            None,
+            "a caught housekeeping panic fails no cut",
+        );
+
+        // The next tick runs another pass: the panic did not end the task.
+        tokio::time::sleep(every).await;
+        passes_reach(&passes, 2).await;
+
+        // Shutdown ends the task cleanly, and no later tick runs a pass.
+        shutdown.send(()).expect("signal shutdown");
+        task.await.expect("the housekeeping task exits cleanly");
+        tokio::time::sleep(every * 10).await;
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "no pass after shutdown",
+        );
+        assert_eq!(epochs.capture().failed_epoch(), None);
+    }
+
+    /// The pre-check: a signal that arrived before the loop's first
+    /// iteration — the arm a signal landing during a pass also takes —
+    /// runs no pass at all.
+    #[tokio::test(start_paused = true)]
+    async fn housekeeping_task_runs_no_pass_once_shutdown_is_signalled() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (housekeeper, epochs) = counted_housekeeper(tmp.path(), &passes);
+        let (shutdown, shutdown_rx) = watch::channel(());
+        shutdown.send(()).expect("signal shutdown");
+
+        spawn_housekeeping(
+            Arc::new(housekeeper),
+            Duration::from_secs(60),
+            epochs,
+            shutdown_rx,
+        )
+        .await
+        .expect("the housekeeping task exits cleanly");
+
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "no pass ran after the shutdown signal",
+        );
+    }
+
+    /// RFC 0052 §3.2 and #793: a node that restarts onto reclaimable
+    /// segments reclaims them on its first housekeeping pass, which runs as
+    /// soon as the durable horizons are seeded, not a whole
+    /// `housekeeping_secs` later. The interval here is an hour, so only
+    /// that immediate pass can explain the removal; a restart loop shorter
+    /// than the interval would otherwise never reclaim anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_node_reclaims_on_its_first_pass_without_waiting_an_interval() {
+        use prost::Message;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let wal = WalConfig {
+            segment_age_secs: 1, // the WAL's floor; slept past below
+            housekeeping_secs: 3_600,
+            ..test_wal_config(wal_dir.path())
+        };
+        let config = || ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: wal.clone(),
+            store: Store::local(data_dir.path()).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        };
+
+        // Given a node that sealed a segment and stamped past it: the second
+        // append observes the aged-out segment and captures a cut, and
+        // shutdown runs that cut, which publishes, snapshots and checkpoints.
+        let first = serve(config()).await.expect("serve");
+        let export = export_request("checkout", &["user 1 logged in"]).encode_to_vec();
+        post_otlp_http(first.http_addr, &export).await;
+        let sealed = wal_segments(wal_dir.path());
+        assert_eq!(sealed.len(), 1, "one segment before the rotation");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let export = export_request("checkout", &["payment 9 settled"]).encode_to_vec();
+        post_otlp_http(first.http_addr, &export).await;
+        first.shutdown().await.expect("graceful shutdown");
+        assert!(
+            sealed[0].exists(),
+            "the sealed segment survives the first process: its only pass ran at start",
+        );
+
+        // When the node restarts with an hour-long housekeeping interval.
+        let second = serve(config()).await.expect("serve again");
+
+        // Then the sealed segment is reclaimed well inside that interval.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sealed[0].exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let reclaimed = !sealed[0].exists();
+        second.shutdown().await.expect("graceful shutdown");
+        assert!(
+            reclaimed,
+            "the first pass after recovery reclaimed the stamped segment",
+        );
+    }
+
+    /// RFC 0052 §3.7: once housekeeping has reclaimed every closed frame,
+    /// replay delivers nothing, and a node that restarts idle must keep
+    /// each tenant's restored horizon. Writing `None` over it made the
+    /// next start discard every snapshot with no frames left to rebuild
+    /// from, so the whole miner state was lost and templates re-minted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_restart_onto_a_reclaimed_wal_keeps_every_restored_horizon() {
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let snapshots_root = wal_dir.path().join(SNAPSHOTS_DIR);
+        let tenant = TenantId::new("checkout");
+
+        // Given a snapshot at the tenant's last frame, and a WAL whose
+        // every segment housekeeping reclaimed against that horizon.
+        let (horizon, templates) = snapshot_then_reclaim(wal_dir.path(), &tenant);
+
+        let config = || ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: test_wal_config(wal_dir.path()),
+            store: Store::local(data_dir.path()).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        };
+        let expected = Some(ourios_miner::snapshot::WalHighWater {
+            segment: horizon.segment.to_string(),
+            byte: horizon.byte,
+        });
+
+        // When the node restarts idle twice.
+        for start in ["first", "second"] {
+            let node = serve(config()).await.expect("serve");
+
+            // Then each start seeds the ledger and the durable mark from
+            // the horizon its post-recovery write installed.
+            assert_eq!(
+                snapshot_on_disk(&snapshots_root).1,
+                expected,
+                "{start} start: the post-recovery write keeps the restored horizon",
+            );
+            assert_seeded_from(&node, &tenant, horizon, start);
+            node.shutdown().await.expect("graceful shutdown");
+
+            // And the miner state and its horizon survive the shutdown.
+            let (state, high_water) = snapshot_on_disk(&snapshots_root);
+            assert_eq!(
+                high_water, expected,
+                "{start} start: the shutdown keeps it too"
+            );
+            assert_eq!(state, templates, "{start} start: the templates survive");
+        }
+    }
+
+    /// RFC 0052 §3.1: shutdown stamps each tenant at its own folded
+    /// horizon. A tenant idle since its last frame keeps that frame's
+    /// offset rather than rising to the node's last acknowledged turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_stamps_each_tenant_at_its_own_folded_horizon() {
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let node = serve(local_config(wal_dir.path(), data_dir.path()))
+            .await
+            .expect("serve");
+        let mut acknowledged = Vec::new();
+        for tenant in ["search", "checkout"] {
+            node.pipeline
+                .ingest(
+                    export_request(tenant, &["user 1 logged in"]),
+                    TenantId::new(tenant),
+                )
+                .await
+                .expect("ingest");
+            acknowledged.push(node.pipeline.last_durable());
+        }
+
+        node.shutdown().await.expect("graceful shutdown");
+
+        let snapshots_root = wal_dir.path().join(SNAPSHOTS_DIR);
+        assert_eq!(disk_high_water(&snapshots_root, "search"), acknowledged[0]);
+        assert_eq!(
+            disk_high_water(&snapshots_root, "checkout"),
+            acknowledged[1]
+        );
+        assert!(
+            acknowledged[0] < acknowledged[1],
+            "fixture: search is older"
+        );
+    }
+
+    fn local_config(wal_root: &Path, data_root: &Path) -> ReceiverConfig {
+        ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: test_wal_config(wal_root),
+            store: Store::local(data_root).expect("local store"),
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+            graph_emitter: None,
+            encode_workers: 2,
+            miner: MinerConfig::default(),
+        }
+    }
+
+    /// Append and sync one frame for `tenant`, snapshot the miner at that
+    /// frame's offset, then checkpoint, rotate and run a real housekeeping
+    /// pass that unlinks the sealed segment. Returns the horizon and the
+    /// mined state the snapshot carries.
+    fn snapshot_then_reclaim(
+        wal_root: &Path,
+        tenant: &TenantId,
+    ) -> (WalOffset, ourios_miner::snapshot::SnapshotState) {
+        use prost::Message;
+
+        let mut wal = Wal::open(test_wal_config(wal_root)).expect("open");
+        let request = export_request(tenant.as_str(), &["user 1 logged in", "user 2 logged in"]);
+        let payload = ourios_wal::TenantBatch::encode(tenant.as_str(), &request.encode_to_vec())
+            .expect("frame");
+        wal.append(ourios_wal::FrameKind::TenantOtlpBatch, &payload)
+            .expect("append");
+        let horizon = wal.sync().expect("sync");
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        for record in ourios_ingester::receiver::assign(request, tenant) {
+            miner.ingest(&record);
+        }
+        miner.fold_through(tenant, ourios_ingester::snapshot_store::high_water(horizon));
+        let snapshots_root = wal_root.join(SNAPSHOTS_DIR);
+        recovery::write_folded_snapshots(&snapshots_root, &miner).expect("snapshot");
+        wal.checkpoint(horizon).expect("checkpoint");
+        wal.rotate(ourios_wal::RotationKind::Owed).expect("rotate");
+        let cap = usize::try_from(ourios_wal::DEFAULT_MAX_UNLINKS_PER_PASS).expect("cap fits");
+        let pass = wal
+            .housekeeping_pass(
+                &ourios_wal::SnapshotHorizons::restorable([(tenant.clone(), horizon)]),
+                cap,
+            )
+            .expect("housekeeping");
+        assert_eq!(pass.removed_segments, 1, "{pass:?}");
+        (horizon, miner.snapshot_state(tenant))
+    }
+
+    /// The single artefact under `snapshots_root`, split into its miner
+    /// state and its high-water mark.
+    fn snapshot_on_disk(
+        snapshots_root: &Path,
+    ) -> (
+        ourios_miner::snapshot::SnapshotState,
+        Option<ourios_miner::snapshot::WalHighWater>,
+    ) {
+        let artefacts = ourios_ingester::snapshot_store::load_all(snapshots_root).expect("load");
+        assert_eq!(artefacts.len(), 1, "one tenant's artefact");
+        let (state, outcome) = ourios_miner::snapshot::recover(Some(&artefacts[0].1));
+        assert_eq!(outcome, ourios_miner::snapshot::RecoveryOutcome::Restored);
+        let mut state = state.expect("known-version artefact decodes");
+        let high_water = state.wal_high_water.take();
+        (state, high_water)
+    }
+
+    /// A running node's snapshot ledger carries the one horizon its
+    /// post-recovery write installed for `tenant`.
+    fn assert_seeded_from(
+        node: &ReceiverHandle,
+        tenant: &TenantId,
+        horizon: WalOffset,
+        start: &str,
+    ) {
+        assert_eq!(
+            node.barrier.snapshot_horizons(),
+            ourios_wal::SnapshotHorizons::restorable([(tenant.clone(), horizon)]),
+            "{start} start: the ledger is what the artefact carries",
+        );
+    }
+
+    /// RFC 0052 §3.2: the post-recovery seed sets the WAL reclamation
+    /// floor. When the flush is skipped, nothing replaced the restored
+    /// artefacts, so the ledger must be the restored horizons and not the
+    /// higher ones the write would have installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_skipped_post_recovery_write_seeds_the_restored_horizons() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let [restored, alpha_replayed, beta_replayed] = offsets(&tmp.path().join("wal"));
+        let report = restoring("alpha", restored, beta_replayed);
+        let sink = buffered_sink(&tmp.path().join("store"));
+        let audit_root = tmp.path().join("audit");
+        let audit = audit_sink(&audit_root);
+        audit.clone().emit(audit_event("alpha"));
+        std::fs::remove_dir_all(&audit_root).expect("remove audit dir");
+        std::fs::write(&audit_root, b"not a directory").expect("sabotage audit store");
+        let snapshots_root = tmp.path().join("snapshots");
+
+        let ledger = snapshot_post_recovery(
+            (&sink, &audit),
+            &snapshots_root,
+            &mined(&[("alpha", alpha_replayed), ("beta", beta_replayed)]),
+            &report,
+        );
+
+        assert!(
+            std::fs::read_dir(&snapshots_root).is_err(),
+            "the retained audit event skipped the write",
+        );
+        assert_eq!(
+            ledger,
+            vec![(TenantId::new("alpha"), restored)],
+            "the ledger is what the untouched artefacts carry",
+        );
+    }
+
+    /// RFC 0052 §3.2: a write that fails partway has replaced some
+    /// artefacts and not others, so the ledger falls back to the restored
+    /// horizons. Each tenant's folded horizon — the one it is written at —
+    /// is at or above its restored one, so that is never above what is
+    /// durable for any tenant. Lower is
+    /// the safe direction: a lower floor only retains more WAL, while a
+    /// horizon above the artefact on disk would let housekeeping unlink
+    /// frames the next start must replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_post_recovery_write_never_seeds_above_the_disk() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let [restored, alpha_replayed, beta_replayed] = offsets(&tmp.path().join("wal"));
+        let snapshots_root = tmp.path().join("snapshots");
+        let miner = mined(&[("alpha", alpha_replayed), ("beta", beta_replayed)]);
+        let alpha = TenantId::new("alpha");
+        let mut restored_state = miner.snapshot_state(&alpha);
+        restored_state.wal_high_water = Some(ourios_ingester::snapshot_store::high_water(restored));
+        ourios_ingester::snapshot_store::write(&snapshots_root, &alpha, &restored_state)
+            .expect("alpha's restored artefact");
+        // Beta, known to replay only, is written second; a non-empty
+        // directory cannot be replaced by a rename, so its write fails.
+        std::fs::create_dir(snapshots_root.join("beta.snap")).expect("block beta");
+        std::fs::write(snapshots_root.join("beta.snap").join("occupied"), b"x").expect("occupy");
+
+        let ledger = snapshot_post_recovery(
+            (
+                &buffered_sink(&tmp.path().join("store")),
+                &audit_sink(&tmp.path().join("audit")),
+            ),
+            &snapshots_root,
+            &miner,
+            &restoring("alpha", restored, beta_replayed),
+        );
+
+        assert_eq!(
+            disk_high_water(&snapshots_root, "alpha"),
+            Some(alpha_replayed),
+            "alpha, first, was replaced at its own replayed frame before beta failed",
+        );
+        assert_eq!(ledger, vec![(TenantId::new("alpha"), restored)]);
+        assert!(
+            restored < alpha_replayed,
+            "below alpha's artefact, never above it"
+        );
+        assert!(
+            !ledger.iter().any(|(tenant, _)| tenant.as_str() == "beta"),
+            "beta has no durable artefact, so no horizon may cover its frames",
+        );
+    }
+
+    /// Three synced offsets, in ascending order.
+    fn offsets(wal_root: &Path) -> [WalOffset; 3] {
+        let mut wal = Wal::open(test_wal_config(wal_root)).expect("open");
+        let mut sync = |payload: &[u8]| {
+            wal.append(ourios_wal::FrameKind::TenantOtlpBatch, payload)
+                .expect("append");
+            wal.sync().expect("sync")
+        };
+        [sync(b"first"), sync(b"second"), sync(b"third")]
+    }
+
+    /// A report that restored `tenant` at `restored` and replayed up to
+    /// `replayed`.
+    fn restoring(tenant: &str, restored: WalOffset, replayed: WalOffset) -> RecoveryReport {
+        RecoveryReport {
+            max_delivered: Some(replayed),
+            tenants: vec![recovery::TenantRecovery {
+                tenant_id: TenantId::new(tenant),
+                fate: recovery::SnapshotFate::Restored(restored),
+                stale_gap: false,
+            }],
+            ..RecoveryReport::default()
+        }
+    }
+
+    /// A miner holding one mined line per tenant, each folded at that
+    /// tenant's own replayed frame.
+    fn mined(tenants: &[(&str, WalOffset)]) -> MinerCluster {
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        for (tenant, frame) in tenants {
+            let tenant = TenantId::new(*tenant);
+            let request = export_request(tenant.as_str(), &["user 1 logged in"]);
+            for record in ourios_ingester::receiver::assign(request, &tenant) {
+                miner.ingest(&record);
+            }
+            miner.fold_through(&tenant, ourios_ingester::snapshot_store::high_water(*frame));
+        }
+        miner
+    }
+
+    /// The high-water mark `tenant`'s artefact carries on disk.
+    fn disk_high_water(snapshots_root: &Path, tenant: &str) -> Option<WalOffset> {
+        let bytes = std::fs::read(snapshots_root.join(format!("{tenant}.snap"))).expect("read");
+        let (state, _) = ourios_miner::snapshot::recover(Some(&bytes));
+        let high_water = state.expect("decodes").wal_high_water?;
+        let segment = high_water.segment.parse().expect("segment uuid");
+        Some(WalOffset {
+            segment,
+            byte: high_water.byte,
+        })
+    }
+
+    /// Every `*.wal` segment directly under the WAL root.
+    fn wal_segments(root: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the WAL root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        out.sort();
+        out
     }
 
     /// RFC 0047 §3.3: the graph emitter is attached to the coordinator the

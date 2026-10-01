@@ -162,13 +162,12 @@ async fn rfc0008_10_recovery_runs_before_serving_and_shutdown_snapshots_are_cohe
     let s = seed_wal(&wal_root, &[("checkout", &covered), ("billing", &tail)]);
 
     let mut snap_miner = MinerCluster::new(MinerConfig::default());
-    for record in ourios_ingester::receiver::assign(
-        covered.clone(),
-        &ourios_core::tenant::TenantId::new("checkout"),
-    ) {
+    let checkout = ourios_core::tenant::TenantId::new("checkout");
+    for record in ourios_ingester::receiver::assign(covered.clone(), &checkout) {
         snap_miner.ingest(&record);
     }
-    recovery::write_snapshots(&snapshots_root, &snap_miner, Some(s)).expect("snapshot at S");
+    snap_miner.fold_through(&checkout, snapshot_store::high_water(s));
+    recovery::write_folded_snapshots(&snapshots_root, &snap_miner).expect("snapshot at S");
 
     // Act: spawn the server (recovery runs to completion before the
     // listeners bind — the reported addresses are the proof the bind

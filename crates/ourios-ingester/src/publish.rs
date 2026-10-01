@@ -344,7 +344,8 @@ impl PublishCoordinator {
         };
         if !cleared {
             tracing::debug!(
-                trigger,
+                name: ourios_semconv::EVENT_OURIOS_RECEIVER_PUBLISH_HELD,
+                { { ourios_semconv::OURIOS_SINK_FLUSH_TRIGGER } = trigger },
                 "publish held: an earlier drain's template events are not durable yet, so the \
                  records are requeued for the drain that carries both"
             );

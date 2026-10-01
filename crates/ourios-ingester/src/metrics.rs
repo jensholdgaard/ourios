@@ -26,10 +26,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opentelemetry::metrics::{Counter, Histogram, ObservableUpDownCounter, UpDownCounter};
+use opentelemetry::metrics::{
+    Counter, Histogram, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
+};
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
+use crate::cadence::BarrierEpochs;
 use crate::compactor::{IngestError, SweepReport, to_u64};
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
@@ -354,13 +357,19 @@ pub use ourios_serving::metrics::{
 /// Deliberately **not** in the Ourios weaver registry — it is an upstream
 /// OpenTelemetry attribute used here per the "recording errors on metrics"
 /// convention, not an Ourios-coined name.
-const ERROR_TYPE: &str = "error.type";
+pub(crate) const ERROR_TYPE: &str = "error.type";
 /// The domain-specific `error.type` value for an out-of-`0..=24`
 /// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
 const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
-/// The `error.type` value for a cadence sweep step that panicked (#791).
+/// The `error.type` value for a cadence sweep step that panicked (#791),
+/// and for an RFC 0052 §3.2 housekeeping tick that panicked.
 ///
-/// One such count means the **age/cadence** flush trigger is dead for the
+/// The housekeeping case is survivable: the task takes the next tick, the
+/// checkpoint is untouched and the next pass re-plans what the failed one
+/// left uncommitted, so it is only a stall in reclamation. The panic
+/// message on stderr names which of the two it was.
+///
+/// A count from the sweep means the **age/cadence** flush trigger is dead for the
 /// life of the process: the sweep stops on a panic, because continuing would
 /// repeat #796's data-loss window every tick.
 ///
@@ -395,6 +404,168 @@ pub(crate) const CADENCE_PANIC: &str = "cadence_panic";
 impl Default for IngestMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One reading shared by two observable instruments that must agree.
+///
+/// The SDK runs one callback per instrument, each exactly once per
+/// collection, and has no multi-instrument callback, so the pair shares
+/// a slot: whichever callback runs first takes a fresh reading and parks
+/// it, and the other consumes that same reading. Each collection
+/// therefore reports one reading on both instruments, whatever order
+/// the callbacks run in.
+#[derive(Debug)]
+pub(crate) struct PairedReading<T> {
+    parked: Mutex<Option<T>>,
+}
+
+impl<T> Default for PairedReading<T> {
+    fn default() -> Self {
+        Self {
+            parked: Mutex::new(None),
+        }
+    }
+}
+
+impl<T: Copy> PairedReading<T> {
+    pub(crate) fn read(&self, fresh: impl Fn() -> T) -> T {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reading) = parked.take() {
+            return reading;
+        }
+        let reading = fresh();
+        *parked = Some(reading);
+        reading
+    }
+}
+
+/// RFC 0052 §3.1's publication-barrier instruments (#833): what each cut
+/// and capture decided, the checkpoint and snapshot writes the barrier
+/// attempts, and the epoch pair that says whether the `cadence_failed`
+/// latch is set. Built once per barrier on the global `ourios.ingest`
+/// meter.
+#[derive(Debug)]
+pub struct BarrierMetrics {
+    cuts: Counter<u64>,
+    captures: Counter<u64>,
+    checkpoint_writes: Counter<u64>,
+    snapshot_writes: Counter<u64>,
+    #[expect(dead_code, reason = "retains the observable-callback registrations")]
+    epochs: [ObservableGauge<u64>; 2],
+}
+
+impl BarrierMetrics {
+    /// Build the instruments; the epoch gauges read `epochs` at collect
+    /// time.
+    #[must_use]
+    pub fn new(epochs: &Arc<BarrierEpochs>) -> Self {
+        let meter = global::meter("ourios.ingest");
+        let cuts = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_CUTS)
+            .with_unit("{cut}")
+            .build();
+        let captures = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_CAPTURES)
+            .with_unit("{capture}")
+            .build();
+        let checkpoint_writes = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES)
+            .with_unit("{write}")
+            .build();
+        let snapshot_writes = meter
+            .u64_counter(semconv::OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES)
+            .with_unit("{write}")
+            .build();
+        // Weak, so a barrier that is gone stops reporting rather than
+        // being kept alive by the meter provider. One paired reading per
+        // collection, the latch read before the epoch it can only trail,
+        // so the pair never shows a failed epoch above the current one.
+        let reading = Arc::new(PairedReading::default());
+        let read = {
+            let epochs = Arc::downgrade(epochs);
+            move || {
+                epochs.upgrade().map(|epochs| {
+                    let failed = epochs.capture().failed_epoch();
+                    (
+                        failed.map(|f| u64::from(f.get())),
+                        u64::from(epochs.current().get()),
+                    )
+                })
+            }
+        };
+        let (paired, fresh) = (Arc::clone(&reading), read.clone());
+        let epoch = meter
+            .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_EPOCH)
+            .with_unit("{epoch}")
+            .with_callback(move |observer| {
+                if let Some((_, current)) = paired.read(&fresh) {
+                    observer.observe(current, &[]);
+                }
+            })
+            .build();
+        let failed_epoch = meter
+            .u64_observable_gauge(semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH)
+            .with_unit("{epoch}")
+            .with_callback(move |observer| {
+                if let Some((Some(failed), _)) = reading.read(&read) {
+                    observer.observe(failed, &[]);
+                }
+            })
+            .build();
+        Self {
+            cuts,
+            captures,
+            checkpoint_writes,
+            snapshot_writes,
+            epochs: [epoch, failed_epoch],
+        }
+    }
+
+    /// One cut's decision, as `ourios.ingest.barrier.cut.outcome`.
+    pub fn record_cut(&self, outcome: &'static str) {
+        self.cuts.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_INGEST_BARRIER_CUT_OUTCOME,
+                outcome,
+            )],
+        );
+    }
+
+    /// One capture's effect on the pending slot.
+    pub fn record_capture(&self, outcome: &'static str) {
+        self.captures.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_INGEST_BARRIER_CAPTURE_OUTCOME,
+                outcome,
+            )],
+        );
+    }
+
+    /// One checkpoint write: `error_type` is `None` on success.
+    pub fn record_checkpoint_write(&self, error_type: Option<&'static str>) {
+        match error_type {
+            None => self.checkpoint_writes.add(1, &[]),
+            Some(class) => self
+                .checkpoint_writes
+                .add(1, &[KeyValue::new(ERROR_TYPE, class)]),
+        }
+    }
+
+    /// One tenant's snapshot write: `error_type` is `None` on success.
+    pub fn record_snapshot_write(&self, tenant: &str, error_type: Option<&'static str>) {
+        let tenant = KeyValue::new(semconv::OURIOS_TENANT, tenant.to_owned());
+        match error_type {
+            None => self.snapshot_writes.add(1, &[tenant]),
+            Some(class) => self
+                .snapshot_writes
+                .add(1, &[tenant, KeyValue::new(ERROR_TYPE, class)]),
+        }
     }
 }
 
@@ -658,6 +829,20 @@ mod tests {
 
     use super::*;
     use crate::compactor::{CompactedFile, TenantSweep};
+
+    /// Two callbacks in one collection see one reading, whichever runs
+    /// first, even when the source moves between them; the next
+    /// collection reads afresh.
+    #[test]
+    fn a_paired_reading_is_shared_by_both_callbacks_of_a_collection() {
+        let source = std::sync::atomic::AtomicU64::new(1);
+        let fresh = || source.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let paired = PairedReading::default();
+        assert_eq!(paired.read(fresh), 1, "the first callback reads");
+        assert_eq!(paired.read(fresh), 1, "the second sees the same reading");
+        assert_eq!(paired.read(fresh), 2, "the next collection reads afresh");
+        assert_eq!(paired.read(fresh), 2);
+    }
 
     // Collected metric names across the in-memory export.
     fn collected_names(rms: &[ResourceMetrics]) -> Vec<String> {

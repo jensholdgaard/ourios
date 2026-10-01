@@ -55,6 +55,7 @@ pub use lgates::{
 };
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
+pub use soak::reclaim;
 pub use soak::{
     BacklogSample, D1Verdict, D2Verdict, LatencySummary, SoakConfig, SoakError, SoakReport,
     default_worker_threads, run_soak,

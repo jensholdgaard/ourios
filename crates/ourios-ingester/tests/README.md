@@ -17,6 +17,9 @@ one-per-binary:
 - `perf_metrics.rs` — ingest + sink instruments through the global meter.
 - `cadence_panic_metric.rs` — the sink's flush-error counter through the
   global meter, for the `error.type=cadence_panic` dimension (#791).
+- `rfc0052_1_housekeeping_panic_metric.rs` — the same counter and
+  dimension, reached through a housekeeping tick that unwinds (RFC 0052
+  §3.2).
 - `audit_sink_metrics.rs` — audit-sink instruments through the global meter.
 - `rfc0018_otlp_compliance.rs` — its `.6` telemetry arm installs the
   global in-memory provider.
@@ -24,9 +27,13 @@ one-per-binary:
   global in-memory provider.
 - `rfc0026_telemetry.rs` — the RFC0026.7 rejection-telemetry arm installs
   the global in-memory provider.
-- `rfc0052_7_telemetry.rs` — the RFC0052.7 WAL-state export arm installs
-  the global in-memory provider (red-gate stubs until slice E lands; placed
-  here so the file does not move when it goes green).
+- `rfc0052_7_telemetry/` — the RFC0052.7 WAL-state export installs the
+  global in-memory meter provider and a global `tracing` subscriber
+  bridged onto an in-memory log exporter; its legs share both and run
+  one at a time, so they stay one binary, split into four legs of a
+  module each (`instruments`, `transitions`, `live_check`, and
+  `snapshot_discard` for startup recovery's discard event) over shared
+  support modules. CI's `live-check` job reruns it with weaver configured.
 - `rfc0038_3_spawn_boundary.rs` — installs the global in-memory **tracer**;
   a global (not scoped) tracer is required to capture the `ingest logs` /
   `sweep partitions` spans across the receiver's `tokio::spawn` and the

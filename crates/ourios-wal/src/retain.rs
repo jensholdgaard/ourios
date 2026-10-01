@@ -497,6 +497,15 @@ impl SegmentLedger {
         self.floor
     }
 
+    /// The oldest surviving segment that still holds a frame. A
+    /// header-only segment is skipped: it holds nothing to age.
+    pub(crate) fn oldest_with_frames(&self) -> Option<Uuid> {
+        self.segments
+            .iter()
+            .find(|(_, segment)| segment.bytes > 0)
+            .map(|(id, _)| *id)
+    }
+
     /// Segments a received horizon has not yet been applied to, summed
     /// over tenants.
     ///

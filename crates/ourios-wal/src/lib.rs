@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use ourios_core::audit::AuditEvent;
 
 pub(crate) mod checkpoint;
+mod export;
 // `frame` is crate-internal, but the `fuzzing` feature exposes it so the
 // `fuzz/` cargo-fuzz targets can drive `read_frame` directly (RFC 0015).
 // Not part of the stable public API.
@@ -55,7 +56,8 @@ pub(crate) mod segment;
 pub use ledger::LedgerError;
 pub use pass::{
     HousekeepingProgress, PassId, PassOutcome, PlannedSegment, ReclaimError, ReclaimOutcome,
-    ReclaimPlan, SkipReason, UnlinkPermit, unlink_failure, unlink_planned, write_plan_record,
+    ReclaimPlan, ReclaimState, SkipReason, UnlinkPermit, unlink_failure, unlink_planned,
+    write_plan_record,
 };
 pub use reclaim::{
     DEFAULT_MAX_TENANTS, DEFAULT_MAX_UNLINKS_PER_PASS, MAX_TENANTS_CEILING,
@@ -64,7 +66,8 @@ pub use reclaim::{
 pub use retain::{RetainFloor, SnapshotHorizons, TenantHorizon};
 use rotation::DirFsync;
 pub use rotation::{RotationFault, RotationFaults, RotationKind, RotationSite, RotationState};
-use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
+pub use segment::SEGMENT_HEADER_LEN;
+use segment::{SegmentHeader, write_header};
 
 // -----------------------------------------------------------
 // Public types (RFC 0008 §6.1 + §6.2.2)
@@ -436,6 +439,9 @@ pub struct Wal {
     reclaim: reclaim_store::ReclaimSlot,
     /// Whether a housekeeping pass may plan segments (RFC 0052 §3.2).
     reclaim_gate: ReclaimGate,
+    /// Whether open found a pre-RFC root, which [`Self::on_legacy_branch`]
+    /// holds to the stale-gap belt until its first version-2 checkpoint.
+    legacy_origin: bool,
     /// Stale `<uuid>.wal.partial` files, seeded by
     /// [`Self::rebuild_ledger`] and popped by the housekeeping sweep.
     /// §3.3: the sweep lists nothing on the pass, so restart debris is
@@ -570,6 +576,7 @@ impl Wal {
             // `prepare_root` fsynced the root before the sidecars
             // were read, so whatever is on disk there is durable.
             reclaim_gate: witness.gate,
+            legacy_origin: witness.legacy,
             stale_partials,
             ledger,
             outstanding: None,
@@ -604,26 +611,6 @@ impl Wal {
         self.ledger = rebuilt.segments;
         self.stale_partials = rebuilt.partials;
         Ok(())
-    }
-
-    /// The WAL state RFC 0052 §3.5 exports. The retain floor with its
-    /// lag, the rotation-failure state and the age of the oldest
-    /// unreclaimed frame arrive with the slices that own them; this is
-    /// what the WAL knows once the sidecar is wired.
-    #[must_use]
-    pub fn reclaim_state(&self) -> ReclaimState {
-        let metrics = self.metrics();
-        ReclaimState {
-            unflushed_bytes: metrics.unflushed_bytes,
-            disk_bytes: metrics.disk_bytes,
-            segment_count: metrics.segment_count,
-            unreclaimed_bytes: self.unreclaimed_bytes,
-            checkpoint: self.checkpoint,
-            stale_partials: self.stale_partials.len(),
-            reclaimable: self.checkpoint_is_settled(),
-            floor: self.ledger.floor(),
-            rotation: self.rotation.clone(),
-        }
     }
 
     /// Arm RFC 0052 §6's rotation fault-injection seam.
@@ -1082,6 +1069,16 @@ impl Wal {
     ///
     /// See [`SyncError`].
     pub fn sync(&mut self) -> Result<WalOffset, SyncError> {
+        // A spent budget on the post-rename obligation means nothing in
+        // the installed segment can ever be acked, and the closing sync
+        // already covered the old one — so a data sync failing on the
+        // same disk must not mask the state as a retryable I/O error. A
+        // pre-rename terminal state never owes this fsync, and still
+        // syncs the old segment's unflushed frames below.
+        if let (Some(fault), DirFsync::PendingRotation) = (self.rotation.terminal(), self.dir_fsync)
+        {
+            return Err(SyncError::RotationTerminal(fault.clone()));
+        }
         self.sync_segment_data()?;
         self.discharge_dir_fsync()?;
         // Everything written so far is now durable; the highest
@@ -1109,9 +1106,10 @@ impl Wal {
     /// post-rename one) is outstanding.
     ///
     /// A rotation-origin discharge is the second operation §3.3's retry
-    /// budget counts, and a terminal state short-circuits it rather than
-    /// hammering a disk that has already failed the same fsync its whole
-    /// budget's worth of times. An `open`-origin failure stays an
+    /// budget counts, and a terminal state short-circuits it — at the top
+    /// of [`Self::sync`], ahead of the data sync — rather than hammering a
+    /// disk that has already failed the same fsync its whole budget's
+    /// worth of times. An `open`-origin failure stays an
     /// ordinary retryable sync error, outside the budget — which is what
     /// keeps RFC0052.15's reclassification narrow.
     fn discharge_dir_fsync(&mut self) -> Result<(), SyncError> {
@@ -1132,9 +1130,6 @@ impl Wal {
     }
 
     fn discharge_rotation_fsync(&mut self) -> Result<(), SyncError> {
-        if let Some(fault) = self.rotation.terminal() {
-            return Err(SyncError::RotationTerminal(fault.clone()));
-        }
         match self.step(RotationSite::ParentFsync, |wal| {
             sync_parent_dir(&wal.config.root)
         }) {
@@ -1149,12 +1144,14 @@ impl Wal {
 
     /// The live segment's §6.3 data sync — [`sync_file_data`] with
     /// this WAL's knob.
-    fn sync_segment_data(&self) -> Result<(), SyncError> {
-        sync_file_data(&self.current_segment, self.config.macos_full_fsync).map_err(|source| {
-            SyncError::Io {
-                op: "sync(current_segment)",
-                source,
-            }
+    fn sync_segment_data(&mut self) -> Result<(), SyncError> {
+        let outcome = match self.faults.take_segment_sync() {
+            Some(injected) => Err(injected),
+            None => sync_file_data(&self.current_segment, self.config.macos_full_fsync),
+        };
+        outcome.map_err(|source| SyncError::Io {
+            op: "sync(current_segment)",
+            source,
         })
     }
 
@@ -2407,34 +2404,6 @@ fn mark_uncertain(record: &mut reclaim::ReclaimRecord, segment: uuid::Uuid) {
             entry.uncertain = true;
         }
     }
-}
-
-/// The WAL state RFC 0052 §3.5 exports, as [`Wal::reclaim_state`]
-/// returns it. `disk_bytes` stays the best-effort diagnostic
-/// [`WalMetrics`] documents; `unreclaimed_bytes` is the exact figure,
-/// seeded from the post-recovery ledger walk.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReclaimState {
-    pub unflushed_bytes: u64,
-    pub disk_bytes: u64,
-    pub segment_count: u32,
-    pub unreclaimed_bytes: u64,
-    pub checkpoint: Option<WalOffset>,
-    /// `<uuid>.wal.partial` files awaiting the housekeeping sweep.
-    pub stale_partials: usize,
-    /// Whether a pass may plan segments: RFC 0052 §3.2's witness, a
-    /// version-2 `CHECKPOINT` beside a `RECLAIM` record.
-    pub reclaimable: bool,
-    /// The floor the WAL derived on its last pass (RFC 0052 §3.7).
-    /// Between passes that is by definition the floor governing
-    /// retention, so the export is never stale; before the first it is
-    /// [`RetainFloor::Unknown`], which is not the same claim as "no
-    /// consumer exists".
-    pub floor: RetainFloor,
-    /// RFC 0052 §3.3's rotation state — healthy, retrying with its
-    /// attempt count, or terminal. §3.5 exports the distinction because
-    /// "retrying" and "given up" need different operator responses.
-    pub rotation: RotationState,
 }
 
 /// Errors from [`Wal::replay`].

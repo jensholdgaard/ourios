@@ -40,6 +40,12 @@ pub(crate) struct RootWitness {
     /// A version-2 `CHECKPOINT` beside a record is the only shape a
     /// pass may plan segments under.
     pub(crate) gate: crate::ReclaimGate,
+    /// A pre-RFC root that has not yet taken its first version-2
+    /// checkpoint. The record cannot say so — the first rotation on
+    /// such a root creates one — so this is read from what the upgrade
+    /// alone retires: a version-1 `CHECKPOINT`, or a version-1 segment,
+    /// which nothing reclaims before the witness exists.
+    pub(crate) legacy: bool,
 }
 
 impl RootWitness {
@@ -49,14 +55,18 @@ impl RootWitness {
         Self {
             store: None,
             gate: crate::ReclaimGate::Unwitnessed,
+            legacy: true,
         }
     }
 
-    /// A record whose root still owes the version-2 upgrade.
-    fn with_record(store: reclaim_store::ReclaimStore) -> Self {
+    /// A record whose root still owes the version-2 upgrade — a legacy
+    /// root's, when `legacy`, else a post-RFC root's before its first
+    /// checkpoint.
+    fn with_record(store: reclaim_store::ReclaimStore, legacy: bool) -> Self {
         Self {
             store: Some(store),
             gate: crate::ReclaimGate::Unwitnessed,
+            legacy,
         }
     }
 
@@ -64,6 +74,7 @@ impl RootWitness {
         Self {
             store: Some(store),
             gate: crate::ReclaimGate::Open,
+            legacy: false,
         }
     }
 }
@@ -118,7 +129,7 @@ fn recorded_root(
         // the upgrade against the arming already on disk.
         (Some(checkpoint::SidecarVersion::Legacy), _) => {
             planned(&mut store, &config.root)?;
-            Ok(RootWitness::with_record(store))
+            Ok(RootWitness::with_record(store, true))
         }
         (None, true) => Err(lost_checkpoint(&config.root)),
         // Not fresh at all: the first rotation on a legacy root writes
@@ -127,11 +138,14 @@ fn recorded_root(
         // discard a mode the first pass may already have adopted.
         (None, false) if !segments.is_empty() => {
             planned(&mut store, &config.root)?;
-            Ok(RootWitness::with_record(store))
+            Ok(RootWitness::with_record(
+                store,
+                pre_rfc_segment(segments).is_some(),
+            ))
         }
         (None, false) => {
             reset_record(&mut store)?;
-            Ok(RootWitness::with_record(store))
+            Ok(RootWitness::with_record(store, false))
         }
     }
 }
@@ -302,11 +316,20 @@ fn open_without_sidecars(
 /// it as it always has, and deciding here would turn that halt into a
 /// different one at `open`.
 fn post_rfc_segment(segments: &[PathBuf]) -> Option<&PathBuf> {
+    segment_with_version(segments, |version| version == segment::SEGMENT_VERSION)
+}
+
+/// The first segment a pre-RFC build wrote, by the same reading.
+fn pre_rfc_segment(segments: &[PathBuf]) -> Option<&PathBuf> {
+    segment_with_version(segments, |version| version < segment::SEGMENT_VERSION)
+}
+
+fn segment_with_version(segments: &[PathBuf], matches: impl Fn(u16) -> bool) -> Option<&PathBuf> {
     segments.iter().find(|path| {
         File::open(path)
             .ok()
             .and_then(|mut handle| segment::read_header(&mut handle).ok())
-            .is_some_and(|header| header.version == segment::SEGMENT_VERSION)
+            .is_some_and(|header| matches(header.version))
     })
 }
 
@@ -325,7 +348,7 @@ fn seed_fresh_record(config: &WalConfig) -> Result<RootWitness, OpenError> {
         &reclaim::ReclaimRecord::default(),
         config.macos_full_fsync,
     )?;
-    Ok(RootWitness::with_record(store))
+    Ok(RootWitness::with_record(store, false))
 }
 
 fn lost_record(root: &Path) -> OpenError {

@@ -1405,3 +1405,116 @@ fn rfc0036_3_forced_spill_peak_far_below_whole_partition() {
          in-memory path ({mem_peak})",
     );
 }
+
+/// Total encoded bytes of the [`partition`]'s data files in `store`.
+fn encoded_partition_bytes(store: &Store) -> u64 {
+    store
+        .list_with_sizes_blocking(Some(&partition_data_prefix(&partition())))
+        .expect("list sizes")
+        .iter()
+        .map(|(_, size)| *size)
+        .sum()
+}
+
+/// Issue #895 — the in-memory budget bounds *decoded* residency. A
+/// partition of many small inputs whose encoded total fits the budget
+/// still decodes many times larger (small files compress well), so
+/// gating the skip-spill path on encoded bytes held the whole partition
+/// decoded and ran the node out of memory. With the budget set to exactly the
+/// encoded total, the sort must spill instead of buffering every row.
+#[test]
+fn many_small_inputs_within_the_encoded_budget_do_not_decode_at_once() {
+    const K: u64 = 120;
+    const S: u64 = 200;
+    const FAN_IN: usize = 4;
+    let total = usize::try_from(K * S).expect("fits usize");
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    build_k_file_partition(&store, K, S);
+    let encoded = encoded_partition_bytes(&store);
+
+    residency::reset();
+    let outcome = compact_sorted(
+        &store,
+        &partition(),
+        &PromotedAttributes::default(),
+        ClusterKeys::ServiceThenTime,
+        SortTuning {
+            in_memory_max_bytes: encoded,
+            fan_in: FAN_IN,
+            ..SortTuning::default()
+        },
+    )
+    .expect("compact");
+    let peak = residency::peak();
+    assert_eq!(outcome.rows, K * S, "every row carried");
+    assert!(outcome.committed.is_some(), "one pass commits");
+
+    let row_bytes = decoded_footprint(&sort_rec(Some("svc-a"), HOUR10_START, 1));
+    let budget_rows = usize::try_from(encoded / row_bytes).expect("fits usize");
+    let one_input = usize::try_from(S).expect("fits usize");
+    let bound = budget_rows + one_input + FAN_IN * SUB_BATCH_ROWS;
+    assert!(
+        peak <= bound,
+        "peak residency {peak} exceeds the decoded budget bound {bound} \
+         (budget {budget_rows} rows + one batch + F x batch)",
+    );
+    assert!(
+        peak * 3 < total,
+        "peak residency {peak} approached the whole partition ({total} rows)",
+    );
+}
+
+/// Issue #895 — a partition over the decoded budget still compacts in
+/// one pass to the same bytes the unbounded in-memory sort writes, with
+/// every row observed once and an erasure applied across spilled runs.
+#[test]
+fn over_budget_partition_matches_the_in_memory_output_with_hooks() {
+    const K: u64 = 40;
+    const S: u64 = 300;
+    let bucket_a = tempfile::tempdir().expect("temp a");
+    let bucket_b = tempfile::tempdir().expect("temp b");
+    let store_a = store_at(bucket_a.path());
+    let store_b = store_at(bucket_b.path());
+    build_k_file_partition(&store_a, K, S);
+    mirror_partition(&store_a, &store_b, &partition());
+
+    let erased = |r: &MinedRecord| r.template_id.is_multiple_of(7);
+    let run = |store: &Store, budget: u64| {
+        let mut observed = 0usize;
+        let mut observe = |rows: &[MinedRecord]| observed += rows.len();
+        let mut hooks = RowHooks {
+            observe: Some(&mut observe),
+            drop: Some(&erased),
+        };
+        let outcome = compact_sorted_hooked(
+            store,
+            &partition(),
+            &PromotedAttributes::default(),
+            ClusterKeys::ServiceThenTime,
+            SortTuning {
+                in_memory_max_bytes: budget,
+                fan_in: 3,
+                ..SortTuning::default()
+            },
+            &mut hooks,
+        )
+        .expect("compact");
+        (outcome, observed)
+    };
+    let (unbounded, observed_a) = run(&store_a, u64::MAX);
+    let (bounded, observed_b) = run(&store_b, 64 * 1024);
+
+    let total = usize::try_from(K * S).expect("fits usize");
+    assert_eq!(observed_a, total, "every row observed once (unbounded)");
+    assert_eq!(observed_b, total, "every row observed once (bounded)");
+    assert_eq!(bounded.rows_dropped, unbounded.rows_dropped);
+    assert_eq!(bounded.rows + bounded.rows_dropped, K * S);
+    let a = unbounded.committed.expect("unbounded commit");
+    let b = bounded.committed.expect("bounded commit");
+    assert_eq!(
+        consolidated_bytes(&store_a, &partition(), &a),
+        consolidated_bytes(&store_b, &partition(), &b),
+        "the bounded sort writes the unbounded sort's bytes",
+    );
+}

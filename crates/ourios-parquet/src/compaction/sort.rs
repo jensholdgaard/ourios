@@ -1,6 +1,5 @@
-//! RFC 0036 §3.2 external merge sort — phases, spill runs, k-way merge,
-//! and the test-only residency gauge. Split from the flat `compaction.rs`
-//! (epic #745 wave 1); pure code motion.
+//! RFC 0036 §3.2 external merge sort — budgeted run formation, spill
+//! runs, k-way merge, and the test-only residency gauge.
 
 // The parent scope IS this module's import surface: the split was
 // mechanical code motion, and gluing back through `super` keeps every
@@ -9,138 +8,291 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Where the RFC 0036 §3.2 sort currently holds the partition's rows:
-/// decoded in memory while the running encoded input total fits
-/// [`SortTuning::in_memory_max_bytes`], or spilled to local scratch as
-/// sorted runs once it doesn't (scratch is cache, not truth —
-/// `CLAUDE.md` §3.6; the `TempDir` tears the runs down when the
-/// compaction call ends, success or error).
-pub(super) enum SortState {
-    /// One decoded-row vec per input, in input-ordinal order.
-    Buffering(Vec<Vec<MinedRecord>>),
-    /// Sorted runs on scratch, one per input so far, in input-ordinal
-    /// order.
-    Spilling {
-        scratch: tempfile::TempDir,
-        runs: Vec<PathBuf>,
-    },
+use ourios_core::otlp::{AnyValue, KeyValue, any_value};
+use ourios_core::record::Param;
+
+/// The fixed inputs of one RFC 0036 §3.2 sort of a partition.
+#[derive(Clone, Copy)]
+pub(super) struct SortPlan<'a> {
+    pub(super) store: &'a Store,
+    pub(super) partition: &'a PartitionKey,
+    pub(super) promoted: &'a PromotedAttributes,
+    pub(super) keys: ClusterKeys,
+    pub(super) tuning: SortTuning,
 }
 
-/// Phases 1–2 of the RFC 0036 §3.2 external merge sort: decode
-/// `inputs` (already in sorted-basename order) one at a time, sort by
+/// What one sort carried: rows written, input bytes read, and rows an
+/// erasure dropped.
+#[derive(Debug, Default)]
+pub(super) struct SortTotals {
+    pub(super) rows: u64,
+    pub(super) bytes_read: u64,
+    pub(super) rows_dropped: u64,
+}
+
+/// Phases 1–2 of the RFC 0036 §3.2 external merge sort: stream
+/// `inputs` (already in sorted-basename order) batch by batch, sort by
 /// the §3.1 key, and emit every row into `writer` in that key order.
-/// Returns `(rows, input bytes read)`.
 ///
-/// Peak decoded-row residency depends on the path (see [`SortTuning`]):
-/// - **Spill path** (encoded input total > `in_memory_max_bytes`): one
-///   decoded input file during run formation (inputs are decoded
-///   strictly one at a time, then spilled), then — via [`reduce_runs`]'s
-///   fan-in cap F — F × one decoded batch during the merge. This
-///   preserves the pre-sort one-input-file bound.
-/// - **In-memory path** (encoded input total ≤ `in_memory_max_bytes`,
-///   default 256 MiB = one ingest seal target): all inputs' decoded
-///   rows are held at once to sort in place and skip spilling — bounded
-///   by one seal-target's worth of input, so no larger than decoding a
-///   single worst-case input file (the [`SortTuning`] tradeoff).
-#[allow(clippy::too_many_arguments)] // one call site; the tuple of sort inputs is the seam
+/// Decoded rows buffer until their [`decoded_footprint`] exceeds
+/// [`SortTuning::in_memory_max_bytes`]; a partition that never crosses
+/// it sorts wholly in memory, and one that does spills the buffer as a
+/// sorted run at the end of the input that filled it. Peak residency is
+/// therefore the budget plus one decoded input in phase 1 and, via
+/// [`reduce_runs`]'s fan-in cap F, F × one decoded batch in phase 2 —
+/// independent of how many inputs the partition holds or how well they
+/// compress.
 pub(super) fn sort_inputs_into(
     writer: &mut Writer,
-    store: &Store,
-    partition: &PartitionKey,
-    promoted: &PromotedAttributes,
-    keys: ClusterKeys,
-    tuning: SortTuning,
+    plan: SortPlan<'_>,
     inputs: &[String],
     hooks: &mut RowHooks<'_>,
-) -> Result<(u64, u64, u64), CompactionError> {
-    let mut row_count: u64 = 0;
-    let mut bytes_read: u64 = 0;
-    let mut rows_dropped: u64 = 0;
-    let mut state = SortState::Buffering(Vec::new());
+) -> Result<SortTotals, CompactionError> {
+    let mut formation = RunFormation::new(plan);
+    let mut totals = SortTotals::default();
     for input in inputs {
-        let bytes = store
-            .get_blocking(input)
-            .map_err(|e| store_io("get", input, e))?;
-        bytes_read = bytes_read.saturating_add(bytes.len() as u64);
-        let reader = Reader::open_partition_bytes(Bytes::from(bytes), partition.clone(), input)
-            .map_err(CompactionError::Read)?;
-        let mut records = reader.read_all().map_err(CompactionError::Read)?;
-        // RFC 0047 §3.3/§3.6: the graph feed sees every row once (before
-        // any drop); an erasure removes its rows before the sort.
-        if let Some(observe) = hooks.observe.as_deref_mut() {
-            observe(&records);
+        let mut reader = open_input(plan, input, &mut totals)?;
+        while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
+            formation.push(apply_hooks(hooks, batch, &mut totals));
         }
-        if let Some(drop) = hooks.drop {
-            let before = records.len();
-            records.retain(|record| !drop(record));
-            rows_dropped = rows_dropped
-                .saturating_add(u64::try_from(before - records.len()).unwrap_or(u64::MAX));
+        formation.end_input()?;
+    }
+    formation.finish(writer)?;
+    Ok(totals)
+}
+
+/// Fetch one input and open it under the partition, so every row is
+/// validated against the partition as it decodes (RFC 0005 §3.9 /
+/// RFC0009.5).
+fn open_input(
+    plan: SortPlan<'_>,
+    input: &str,
+    totals: &mut SortTotals,
+) -> Result<Reader, CompactionError> {
+    let bytes = plan
+        .store
+        .get_blocking(input)
+        .map_err(|e| store_io("get", input, e))?;
+    totals.bytes_read = totals.bytes_read.saturating_add(bytes.len() as u64);
+    Reader::open_partition_bytes(Bytes::from(bytes), plan.partition.clone(), input)
+        .map_err(CompactionError::Read)
+}
+
+/// RFC 0047 §3.3/§3.6: the graph feed sees every row once, before any
+/// drop; an erasure removes its rows before the sort.
+fn apply_hooks(
+    hooks: &mut RowHooks<'_>,
+    mut batch: Vec<MinedRecord>,
+    totals: &mut SortTotals,
+) -> Vec<MinedRecord> {
+    if let Some(observe) = hooks.observe.as_deref_mut() {
+        observe(&batch);
+    }
+    if let Some(drop) = hooks.drop {
+        let before = batch.len();
+        batch.retain(|record| !drop(record));
+        totals.rows_dropped = totals
+            .rows_dropped
+            .saturating_add(widen(before - batch.len()));
+    }
+    totals.rows = totals.rows.saturating_add(widen(batch.len()));
+    batch
+}
+
+/// `usize <= u64` on every supported target; saturate rather than panic
+/// on a theoretically wider one.
+fn widen(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Phase 1 of the sort: the decoded-row buffer and, once it has
+/// overflowed the budget, the sorted runs spilled to local scratch
+/// (scratch is cache, not truth — `CLAUDE.md` §3.6; the `TempDir`
+/// tears the runs down when the compaction call ends, success or
+/// error).
+///
+/// The buffer holds rows in (input ordinal, row ordinal) order and is
+/// sorted stably, and runs are spilled in buffer order, so the merge's
+/// run-ordinal tie-break realises the §3.1 total order however the
+/// rows were cut into runs.
+struct RunFormation<'a> {
+    plan: SortPlan<'a>,
+    buffer: Vec<MinedRecord>,
+    buffered_bytes: u64,
+    spill: Option<Spill>,
+}
+
+impl<'a> RunFormation<'a> {
+    fn new(plan: SortPlan<'a>) -> Self {
+        Self {
+            plan,
+            buffer: Vec::new(),
+            buffered_bytes: 0,
+            spill: None,
         }
+    }
+
+    fn push(&mut self, batch: Vec<MinedRecord>) {
         #[cfg(test)]
-        residency::add(records.len());
-        // `usize <= u64` on every supported target; saturate rather than panic
-        // on a theoretically wider one.
-        row_count = row_count.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
-        state = match state {
-            SortState::Buffering(mut buffered) if bytes_read <= tuning.in_memory_max_bytes => {
-                buffered.push(records);
-                SortState::Buffering(buffered)
-            }
-            // Crossed the in-memory bound: spill mode from here on.
-            // Flush the inputs buffered so far as sorted runs first,
-            // preserving input-ordinal order (the §3.1 tie-break).
-            SortState::Buffering(buffered) => {
-                let scratch = tempfile::tempdir().map_err(|source| CompactionError::Io {
-                    op: "create scratch",
-                    path: PathBuf::from("<scratch>"),
-                    source,
-                })?;
-                let mut runs = Vec::with_capacity(inputs.len());
-                for mut prior in buffered {
-                    sort_records(keys, &mut prior);
-                    runs.push(spill_run(scratch.path(), runs.len(), &prior, promoted)?);
-                    #[cfg(test)]
-                    residency::sub(prior.len());
-                }
-                sort_records(keys, &mut records);
-                runs.push(spill_run(scratch.path(), runs.len(), &records, promoted)?);
-                #[cfg(test)]
-                residency::sub(records.len());
-                SortState::Spilling { scratch, runs }
-            }
-            SortState::Spilling { scratch, mut runs } => {
-                sort_records(keys, &mut records);
-                runs.push(spill_run(scratch.path(), runs.len(), &records, promoted)?);
-                #[cfg(test)]
-                residency::sub(records.len());
-                SortState::Spilling { scratch, runs }
-            }
+        residency::add(batch.len());
+        let bytes: u64 = batch.iter().map(decoded_footprint).sum();
+        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.buffer.extend(batch);
+    }
+
+    /// Runs are cut only between inputs, so a run never splits one
+    /// input's rows and the budget overshoots by at most one input.
+    fn end_input(&mut self) -> Result<(), CompactionError> {
+        if self.buffered_bytes > self.plan.tuning.in_memory_max_bytes {
+            self.spill_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn spill_buffer(&mut self) -> Result<(), CompactionError> {
+        let spill = match self.spill.take() {
+            Some(spill) => spill,
+            None => Spill::new()?,
         };
+        let spill = self.spill.insert(spill);
+        sort_records(self.plan.keys, &mut self.buffer);
+        let run = spill_run(
+            spill.scratch.path(),
+            spill.runs.len(),
+            &self.buffer,
+            self.plan.promoted,
+        )?;
+        spill.runs.push(run);
+        #[cfg(test)]
+        residency::sub(self.buffer.len());
+        self.buffer.clear();
+        self.buffered_bytes = 0;
+        Ok(())
     }
-    match state {
-        // Whole partition within the one-input-file bound: sort in
-        // memory and skip spilling (§3.2 / §7). Concatenation order is
-        // (input ordinal, row ordinal), so the stable sort realises the
-        // §3.1 tie-break; the single `append_records` call sub-batches
-        // exactly as the merge path's chunked emit does (§3.5).
-        SortState::Buffering(buffered) => {
-            let mut rows: Vec<MinedRecord> = buffered.into_iter().flatten().collect();
-            sort_records(keys, &mut rows);
-            writer
-                .append_records(&rows)
-                .map_err(CompactionError::Write)?;
-            #[cfg(test)]
-            residency::sub(rows.len());
+
+    /// Emit every buffered row in §3.1 order: sorted in place when the
+    /// partition never left memory, else merged from the spilled runs.
+    /// Both drive the writer with the same [`SUB_BATCH_ROWS`] chunking,
+    /// so the output is byte-identical either way (§3.5).
+    fn finish(mut self, writer: &mut Writer) -> Result<(), CompactionError> {
+        if self.spill.is_some() && !self.buffer.is_empty() {
+            self.spill_buffer()?;
         }
-        SortState::Spilling { scratch, runs } => {
-            let runs = reduce_runs(scratch.path(), runs, tuning.fan_in, keys, promoted)?;
-            merge_runs(&runs, keys, |chunk| {
-                writer.append_records(chunk).map_err(CompactionError::Write)
-            })?;
-            drop(scratch);
+        match self.spill {
+            None => emit_in_memory(self.plan.keys, self.buffer, writer),
+            Some(spill) => spill.merge_into(writer, self.plan),
         }
     }
-    Ok((row_count, bytes_read, rows_dropped))
+}
+
+fn emit_in_memory(
+    keys: ClusterKeys,
+    mut rows: Vec<MinedRecord>,
+    writer: &mut Writer,
+) -> Result<(), CompactionError> {
+    sort_records(keys, &mut rows);
+    writer
+        .append_records(&rows)
+        .map_err(CompactionError::Write)?;
+    #[cfg(test)]
+    residency::sub(rows.len());
+    Ok(())
+}
+
+/// Sorted runs on local scratch, in spill order.
+struct Spill {
+    scratch: tempfile::TempDir,
+    runs: Vec<PathBuf>,
+}
+
+impl Spill {
+    fn new() -> Result<Self, CompactionError> {
+        let scratch = tempfile::tempdir().map_err(|source| CompactionError::Io {
+            op: "create scratch",
+            path: PathBuf::from("<scratch>"),
+            source,
+        })?;
+        Ok(Self {
+            scratch,
+            runs: Vec::new(),
+        })
+    }
+
+    fn merge_into(self, writer: &mut Writer, plan: SortPlan<'_>) -> Result<(), CompactionError> {
+        let runs = reduce_runs(
+            self.scratch.path(),
+            self.runs,
+            plan.tuning.fan_in,
+            plan.keys,
+            plan.promoted,
+        )?;
+        merge_runs(&runs, plan.keys, |chunk| {
+            writer.append_records(chunk).map_err(CompactionError::Write)
+        })
+    }
+}
+
+/// Approximate heap bytes one decoded row holds: the record itself plus
+/// its strings, params, separators and attribute trees. It sizes the
+/// sort's in-memory budget, so it tracks what decoding allocates rather
+/// than what the row costs on disk — small, well-compressed inputs
+/// decode to many times their encoded size.
+pub(super) fn decoded_footprint(record: &MinedRecord) -> u64 {
+    let strings: usize = [
+        &record.severity_text,
+        &record.scope_name,
+        &record.scope_version,
+        &record.resource_schema_url,
+        &record.scope_schema_url,
+        &record.event_name,
+        &record.body,
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::len)
+    .sum();
+    let params: usize = record
+        .params
+        .iter()
+        .map(|p| size_of::<Param>() + p.value.len())
+        .sum();
+    let separators: usize = record
+        .separators
+        .iter()
+        .map(|s| size_of::<String>() + s.len())
+        .sum();
+    let attributes: usize = [
+        &record.attributes,
+        &record.resource_attributes,
+        &record.scope_attributes,
+    ]
+    .into_iter()
+    .map(|kvs| key_values_footprint(kvs))
+    .sum();
+    let fixed = size_of::<MinedRecord>() + record.tenant_id.as_str().len();
+    widen(fixed + strings + params + separators + attributes)
+}
+
+fn key_values_footprint(kvs: &[KeyValue]) -> usize {
+    kvs.iter()
+        .map(|kv| {
+            size_of::<KeyValue>() + kv.key.len() + kv.value.as_ref().map_or(0, any_value_footprint)
+        })
+        .sum()
+}
+
+fn any_value_footprint(value: &AnyValue) -> usize {
+    match &value.value {
+        Some(any_value::Value::StringValue(s)) => s.len(),
+        Some(any_value::Value::BytesValue(b)) => b.len(),
+        Some(any_value::Value::ArrayValue(array)) => array
+            .values
+            .iter()
+            .map(|v| size_of::<AnyValue>() + any_value_footprint(v))
+            .sum(),
+        Some(any_value::Value::KvlistValue(list)) => key_values_footprint(&list.values),
+        _ => 0,
+    }
 }
 
 /// Stable §3.1 sort of one input's decoded rows: promoted

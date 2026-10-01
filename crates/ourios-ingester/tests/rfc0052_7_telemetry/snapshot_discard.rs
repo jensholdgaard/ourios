@@ -9,7 +9,7 @@ use ourios_core::tenant::TenantId;
 use ourios_ingester::receiver::tenant::assign;
 use ourios_ingester::recovery::{self, DiscardReason, SnapshotFate};
 use ourios_ingester::snapshot_store;
-use ourios_miner::cluster::MinerCluster;
+use ourios_miner::cluster::{MinerCluster, RestoreError};
 use ourios_miner::snapshot::{SNAPSHOT_VERSION, SnapshotState};
 use ourios_semconv as semconv;
 use ourios_telemetry::live_check::{self, Checked, Event, EventSpec};
@@ -114,7 +114,7 @@ async fn recovery_names_each_discarded_snapshot_once() {
             .tenants
             .iter()
             .find(|t| t.tenant_id.as_str() == tenant)
-            .map(|t| t.fate);
+            .map(|t| &t.fate);
         assert!(
             matches!(fate, Some(SnapshotFate::Discarded(reason)) if reason.error_type() == class),
             "{tenant}: {fate:?}"
@@ -134,6 +134,13 @@ async fn recovery_names_each_discarded_snapshot_once() {
     assert!(
         body.contains("will be rebuilt next") && body.contains("if the restart succeeds"),
         "replay and the legacy check still follow, and either can fail startup: {body:?}"
+    );
+    let rejected = discards_of(&events, "rejected");
+    let body = rejected[0].body.as_deref().unwrap_or_default();
+    assert!(
+        body.contains("restore_failed: inconsistent snapshot: template_id")
+            && body.contains("appears more than once"),
+        "the restore_failed discard names why the miner rejected it: {body:?}"
     );
     assert!(
         discards_of(&events, "restored").is_empty(),
@@ -159,7 +166,10 @@ fn every_discard_reason_has_its_registry_error_type() {
         (DiscardReason::Corrupt, "corrupt"),
         (DiscardReason::Empty, "empty"),
         (DiscardReason::NoHorizon, "no_horizon"),
-        (DiscardReason::RestoreFailed, "restore_failed"),
+        (
+            DiscardReason::RestoreFailed(RestoreError::TenantAlreadyLive),
+            "restore_failed",
+        ),
         (DiscardReason::Other, "_OTHER"),
     ] {
         assert_eq!(reason.error_type(), class);

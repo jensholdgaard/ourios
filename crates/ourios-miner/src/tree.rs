@@ -269,16 +269,16 @@ impl PrefixNode {
         severity_number: u8,
         scope_name: Option<&str>,
     ) -> Option<&mut Leaf> {
-        if let Some(idx) = self.leaves.iter().position(|l| {
+        let own = self.leaves.iter_mut().filter(|l| {
             l.template == template
                 && l.severity_number == severity_number
                 && l.scope_name.as_deref() == scope_name
-        }) {
-            return self.leaves.get_mut(idx);
-        }
+        });
         self.children
             .values_mut()
-            .find_map(|child| child.find_exact_mut(template, severity_number, scope_name))
+            .filter_map(|child| child.find_exact_mut(template, severity_number, scope_name))
+            .chain(own)
+            .min_by_key(|leaf| leaf.template_id)
     }
 }
 
@@ -295,7 +295,9 @@ impl Tree {
     /// leaf, RFC0050.6). Walks every node in the matching length
     /// bucket: `O(leaves of that length)`, run once per distinct
     /// canonical template under `adopt` (the cluster caches the
-    /// answer), never per record.
+    /// answer), never per record. Leaves under distinct masked paths
+    /// can share one shape; the lowest `template_id` wins, so the
+    /// choice depends on the tree alone, not on map iteration order.
     pub fn find_exact_mut(
         &mut self,
         template: &[OwnedToken],
@@ -400,6 +402,40 @@ impl Tree {
             collect_leaves_recursive(&length_node.root, &mut out);
         }
         out
+    }
+
+    /// Every [`Leaf`] with the prefix-path positions (ascending) at
+    /// which its node was reached through the RFC 0023 §3.1 wildcard
+    /// child. A leaf under that child can widen or type-expand at a path
+    /// position, so the route is not derivable from its template; a
+    /// snapshot records it. Order is not guaranteed.
+    #[must_use]
+    pub fn collect_routed_leaves(&self) -> Vec<(&Leaf, Vec<usize>)> {
+        let mut out = Vec::new();
+        for length_node in self.by_length.values() {
+            collect_routed_recursive(&length_node.root, &mut Vec::new(), &mut out);
+        }
+        out
+    }
+}
+
+fn collect_routed_recursive<'t>(
+    node: &'t PrefixNode,
+    route: &mut Vec<bool>,
+    out: &mut Vec<(&'t Leaf, Vec<usize>)>,
+) {
+    if !node.leaves.is_empty() {
+        let routed: Vec<usize> = route
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &wildcard)| wildcard.then_some(position))
+            .collect();
+        out.extend(node.leaves.iter().map(|leaf| (leaf, routed.clone())));
+    }
+    for (key, child) in &node.children {
+        route.push(key == WILDCARD_CHILD);
+        collect_routed_recursive(child, route, out);
+        route.pop();
     }
 }
 

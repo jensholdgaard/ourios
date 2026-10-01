@@ -82,6 +82,7 @@ mod confidence;
 mod emission;
 mod ingest;
 mod restore;
+mod restore_properties;
 mod structured;
 mod type_expansion;
 mod widen;

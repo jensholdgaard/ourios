@@ -42,9 +42,9 @@ fn a_version_1_mark_below_the_oldest_surviving_frame_refuses_startup() {
 
 /// The ordinary pre-RFC root: its version-1 mark explains the oldest
 /// surviving frame, so it boots, rebuilds the tenant from every frame,
-/// and the next write is version 2.
+/// and the next write is at the current version.
 #[test]
-fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_version_2() {
+fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_the_current_version() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let [first, last] = legacy_root(tmp.path(), Reclaimed::Nothing);
     write_v1_snapshot(tmp.path(), "alpha", Some(first));
@@ -57,7 +57,10 @@ fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_version_2() {
         .expect("post-recovery write");
     assert_eq!(installed, vec![(TenantId::new("alpha"), last)]);
     let bytes = std::fs::read(snapshots(tmp.path()).join("alpha.snap")).expect("artefact");
-    assert_eq!(bytes[0], SNAPSHOT_VERSION, "rewritten at version 2");
+    assert_eq!(
+        bytes[0], SNAPSHOT_VERSION,
+        "rewritten at the current version"
+    );
 }
 
 /// A version-1 artefact that does not decode even for its mark has no
@@ -141,7 +144,7 @@ fn append(wal: &mut Wal, line: &str) -> WalOffset {
 
 /// `tenant`'s artefact as the pre-RFC writer left it: format version 1,
 /// its global mark in `wal_high_water`.
-fn write_v1_snapshot(root: &Path, tenant: &str, mark: Option<WalOffset>) {
+pub(crate) fn write_v1_snapshot(root: &Path, tenant: &str, mark: Option<WalOffset>) {
     let tenant = TenantId::new(tenant);
     let mut state = MinerCluster::new(MinerConfig::default()).snapshot_state(&tenant);
     state.wal_high_water = mark.map(snapshot_store::high_water);
@@ -176,7 +179,7 @@ fn snapshots(root: &Path) -> std::path::PathBuf {
 
 /// A version-1 `CHECKPOINT`, as `ourios-wal`'s RFC 0052 test support
 /// writes it: magic, version, then the offset.
-fn write_legacy_checkpoint(root: &Path, offset: WalOffset) {
+pub(crate) fn write_legacy_checkpoint(root: &Path, offset: WalOffset) {
     let mut out = vec![0u8; 32];
     out[0..4].copy_from_slice(b"OWCK");
     out[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -187,7 +190,7 @@ fn write_legacy_checkpoint(root: &Path, offset: WalOffset) {
 
 /// Every segment header's version field back to 1: a root whose
 /// segments all predate RFC 0052.
-fn downgrade_segments(root: &Path) {
+pub(crate) fn downgrade_segments(root: &Path) {
     for entry in std::fs::read_dir(root).expect("read root") {
         let path = entry.expect("entry").path();
         if path.extension().is_some_and(|ext| ext == "wal") {

@@ -56,7 +56,7 @@
 //! [`AuditSink`]: ourios_core::audit::AuditSink
 //! [`TemplateChange`]: ourios_core::audit::TemplateChange
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_config::MinerConfig;
@@ -299,12 +299,7 @@ struct TenantState {
     /// (including one already at the ceiling) costs a hash miss per
     /// canonical instead of a tree walk. Maintained at leaf
     /// creation, on template-changing widenings, and on restore.
-    /// When two leaves ever share a canonical (distinct masked
-    /// paths converging on one shape), one widening away removes
-    /// the shared entry and later adoptions of that shape intern
-    /// separately — safe, and multi-id shapes are RFC 0007 alias
-    /// territory.
-    mined_canonicals: HashSet<(String, u8, Option<String>)>,
+    mined_canonicals: canonicals::MinedCanonicals,
     template_count: usize,
     /// Drain-tree leaves only (excludes structured-template
     /// entries) — the quantity RFC 0023 §3.1's `max_templates`
@@ -334,7 +329,7 @@ impl TenantState {
             structured_templates: HashMap::new(),
             adopted_templates: HashMap::new(),
             owned_adopted_count: 0,
-            mined_canonicals: HashSet::new(),
+            mined_canonicals: canonicals::MinedCanonicals::default(),
             template_count: 0,
             leaf_count: 0,
             config,
@@ -379,6 +374,26 @@ struct StringLine<'a> {
     record: &'a OtlpLogRecord,
     service: Option<&'a str>,
     raw: &'a str,
+}
+
+/// A clean-zone attach (RFC 0001 §6.2 step 5): the chosen leaf, the
+/// tenant's §6.5 param byte cap, and the record's RFC 0050 `observe`
+/// association, if it carried one.
+#[derive(Clone, Copy)]
+struct Attach<'a> {
+    candidate: Candidate,
+    byte_limit: u32,
+    observed: Option<&'a str>,
+}
+
+impl<'a> Attach<'a> {
+    fn new(candidate: Candidate, config: &MinerConfig, observed: Option<&'a str>) -> Self {
+        Self {
+            candidate,
+            byte_limit: config.param_byte_limit,
+            observed,
+        }
+    }
 }
 
 /// What a string line contributes to its data record whichever way it
@@ -600,6 +615,7 @@ impl MinerCluster {
 }
 
 mod build;
+mod canonicals;
 mod persist;
 mod plan;
 
@@ -925,10 +941,8 @@ impl MinerCluster {
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
                         line,
                         masked_line,
-                        c,
+                        Attach::new(c, &effective_config, observed),
                         parts,
-                        effective_config.param_byte_limit,
-                        observed,
                     ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
@@ -1182,10 +1196,13 @@ impl MinerCluster {
         &mut self,
         record: &OtlpLogRecord,
         masked: MaskedLine<'_>,
-        candidate: &Candidate,
-        byte_limit: u32,
-        observed: Option<&str>,
+        attach: Attach<'_>,
     ) -> AttachPlan {
+        let Attach {
+            candidate,
+            byte_limit,
+            observed,
+        } = attach;
         let state = self
             .tenants
             .get_mut(&record.tenant_id)
@@ -1234,16 +1251,10 @@ impl MinerCluster {
         if let Some((old_canonical, new_canonical)) = widened_move
             && let Some(state) = self.tenants.get_mut(&record.tenant_id)
         {
-            state.mined_canonicals.remove(&(
-                old_canonical,
-                record.severity_number,
-                record.scope_name.clone(),
-            ));
-            state.mined_canonicals.insert((
-                new_canonical,
-                record.severity_number,
-                record.scope_name.clone(),
-            ));
+            let key = |canonical| (canonical, record.severity_number, record.scope_name.clone());
+            state
+                .mined_canonicals
+                .replace(&key(old_canonical), key(new_canonical));
         }
     }
 
@@ -1361,33 +1372,23 @@ impl MinerCluster {
         template_version: u32,
         canonical: &str,
     ) {
-        let StringLine { record, raw, .. } = line;
-        self.audit_sink.emit(AuditEvent {
-            tenant_id: record.tenant_id.clone(),
-            timestamp: self.clock.now(),
-            payload: AuditPayload::Template {
-                template_id,
-                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                change: TemplateChange::Adopted {
-                    template_version,
-                    new_template: canonical.to_string(),
-                },
+        self.emit_template_change(
+            line,
+            template_id,
+            TemplateChange::Adopted {
+                template_version,
+                new_template: canonical.to_string(),
             },
-        });
+        );
     }
 
-    /// Emit the §6.4 degenerate-widening rejection audit event —
-    /// the record of *why* the attach refused to widen (RFC 0017
-    /// §3.1 keeps the audit stream the template history of record).
-    fn emit_rejected_degenerate_audit(
+    /// Emit one template audit event for `line` (RFC 0001 §6.4; RFC
+    /// 0017 §3.1 keeps the audit stream the template history of record).
+    fn emit_template_change(
         &mut self,
         line: StringLine<'_>,
         template_id: u64,
-        version: u32,
-        current_template: String,
-        would_be_template: String,
-        would_be_positions: Vec<u16>,
+        change: TemplateChange,
     ) {
         let StringLine { record, raw, .. } = line;
         self.audit_sink.emit(AuditEvent {
@@ -1397,12 +1398,7 @@ impl MinerCluster {
                 template_id,
                 triggering_line_hash: hash_triggering_line(raw.as_bytes()),
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                change: TemplateChange::RejectedDegenerate {
-                    version,
-                    current_template,
-                    would_be_template,
-                    would_be_positions,
-                },
+                change,
             },
         });
     }
@@ -1444,44 +1440,35 @@ impl MinerCluster {
             usize::from(state.config.max_node_children),
         )?;
 
-        let mut best: Option<Candidate> = None;
-        for (leaf_idx, leaf) in parent.leaves.iter().enumerate() {
-            // Length is structurally guaranteed by the tree's
-            // length-keyed first level (`Tree::descend` looks up
-            // `by_length[masked_strs.len()]`), so a length
-            // mismatch here would be a tree-invariant bug rather
-            // than a runtime case to handle. Debug-only assert.
-            debug_assert_eq!(
-                leaf.template.len(),
-                masked_strs.len(),
-                "tree partitions by length; every leaf under this parent must match",
-            );
-            // Filter on the non-token half of the §6.1
-            // template-key composition tuple. (Severity and
-            // scope are *not* part of the tree's keying today —
-            // we instead keep one leaf per `(severity, scope)`
-            // pair under each `(length, prefix)` bucket and
-            // filter on the leaf-list side.)
-            if leaf.severity_number != record.severity_number
-                || leaf.scope_name.as_deref() != record.scope_name.as_deref()
-            {
-                continue;
-            }
-            // Allocation-free over `&[OwnedToken]`. The borrowed
-            // `Token` view + `Vec::collect` form would allocate
-            // per leaf on every ingest call.
-            let similarity = sim_seq_owned(masked_strs, &leaf.template, line_wildcard_positions);
-            let candidate = Candidate {
-                leaf_idx,
-                similarity,
-            };
-            best = match best {
-                None => Some(candidate),
-                Some(prev) if similarity > prev.similarity => Some(candidate),
-                Some(prev) => Some(prev),
-            };
-        }
-        best
+        // Severity and scope are not part of the tree's keying: each
+        // `(length, prefix)` bucket holds one leaf per `(severity, scope)`
+        // pair and filters on the leaf-list side. A similarity tie goes to
+        // the lowest `template_id` — a property of the leaves, not of
+        // list order, which a snapshot restore does not reproduce.
+        parent
+            .leaves
+            .iter()
+            .enumerate()
+            .filter(|(_, leaf)| {
+                leaf.severity_number == record.severity_number
+                    && leaf.scope_name.as_deref() == record.scope_name.as_deref()
+            })
+            .map(|(leaf_idx, leaf)| {
+                debug_assert_eq!(leaf.template.len(), masked_strs.len());
+                let similarity =
+                    sim_seq_owned(masked_strs, &leaf.template, line_wildcard_positions);
+                (
+                    Candidate {
+                        leaf_idx,
+                        similarity,
+                    },
+                    leaf.template_id,
+                )
+            })
+            .max_by(|(a, a_id), (b, b_id)| {
+                a.similarity.total_cmp(&b.similarity).then(b_id.cmp(a_id))
+            })
+            .map(|(candidate, _)| candidate)
     }
 
     /// RFC §6.2 step 4 (fresh-leaf branch). Allocates a new
@@ -1505,7 +1492,7 @@ impl MinerCluster {
         masked: MaskedLine<'_>,
         observed: Option<&str>,
     ) -> u64 {
-        let StringLine { record, raw, .. } = line;
+        let StringLine { record, .. } = line;
         let MaskedLine {
             strs: masked_strs,
             wildcard_positions: line_wildcard_positions,
@@ -1629,18 +1616,13 @@ impl MinerCluster {
         // read-time template registry can recover the v1 tokens once the
         // originating rows age out. Same WAL-before-ack path as the widening
         // events; not a merge, so it does not bump `merges_total`.
-        self.audit_sink.emit(AuditEvent {
-            tenant_id: record.tenant_id.clone(),
-            timestamp: self.clock.now(),
-            payload: AuditPayload::Template {
-                template_id: new_id,
-                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                change: TemplateChange::Created {
-                    new_template: created_template,
-                },
+        self.emit_template_change(
+            line,
+            new_id,
+            TemplateChange::Created {
+                new_template: created_template,
             },
-        });
+        );
         new_id
     }
 
@@ -1672,15 +1654,11 @@ impl MinerCluster {
         &mut self,
         line: StringLine<'_>,
         masked: MaskedLine<'_>,
-        candidate: Candidate,
+        attach: Attach<'_>,
         parts: LineParts,
-        byte_limit: u32,
-        observed: Option<&str>,
     ) -> u64 {
         let StringLine {
-            record,
-            service,
-            raw,
+            record, service, ..
         } = line;
         // Ownership rationale: each exit path emits **one** data
         // record and never reuses `parts` after that emit. Taking it
@@ -1690,7 +1668,7 @@ impl MinerCluster {
         // Phase 1 — mutate the leaf and accumulate the audit-event
         // payloads (the helper holds the leaf borrow only over the
         // mutation); emitting through `self.audit_sink` is phase 2.
-        let plan = self.plan_attach_on_candidate(record, masked, &candidate, byte_limit, observed);
+        let plan = self.plan_attach_on_candidate(record, masked, attach);
 
         match plan {
             AttachPlan::CleanReuse {
@@ -1724,13 +1702,16 @@ impl MinerCluster {
                 would_be_template,
                 would_be_positions,
             } => {
-                self.emit_rejected_degenerate_audit(
+                // §6.4: the audit records *why* the attach refused to widen.
+                self.emit_template_change(
                     line,
                     template_id,
-                    version,
-                    current_template,
-                    would_be_template,
-                    would_be_positions,
+                    TemplateChange::RejectedDegenerate {
+                        version,
+                        current_template,
+                        would_be_template,
+                        would_be_positions,
+                    },
                 );
                 // §6.4 treats degenerate widening as a parse
                 // failure that retains body (the line-ordered
@@ -1748,16 +1729,7 @@ impl MinerCluster {
                 for change in events {
                     let counts_as_merge = change.counts_as_merge();
                     let event_type = change.event_type();
-                    self.audit_sink.emit(AuditEvent {
-                        tenant_id: record.tenant_id.clone(),
-                        timestamp: self.clock.now(),
-                        payload: AuditPayload::Template {
-                            template_id,
-                            triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                            triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                            change,
-                        },
-                    });
+                    self.emit_template_change(line, template_id, change);
                     if counts_as_merge {
                         self.merges_total.fetch_add(1, Ordering::Relaxed);
                         self.metrics.record_merge(&record.tenant_id, event_type);

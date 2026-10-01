@@ -2336,9 +2336,12 @@ tenant independently; there is no cluster-wide combined artefact.
 > restore rejected such a leaf when it carried a wildcard at a routed
 > position that is not a singleton mask-emitted type, reading it as a
 > malformed path tag; a snapshot containing one was discarded on the
-> next start (#892). Filling a node alone is harmless; only a leaf
-> routed through `<*>` that then widened or type-expanded at that
-> position is affected. Restore descends through `<*>` at the recorded
+> next start (#892). Filling a node alone triggers no rejection; the
+> #892 rejection fires only for a leaf routed through `<*>` that then
+> widened or type-expanded at that position. A routed leaf that kept a
+> fixed token there is not rejected, but it can restore
+> non-equivalently, as the next paragraph explains; that is why the
+> format moves to version 3. Restore descends through `<*>` at the recorded
 > positions and rejects a list that is not strictly increasing or holds
 > a position at or past the walk depth; every other path position keeps
 > the strict rule that a path-position wildcard is a singleton
@@ -2370,10 +2373,11 @@ tenant independently; there is no cluster-wide combined artefact.
 > live ingest makes to be a function of the tree. Three were not. §6.2
 > step 4 candidate selection broke similarity ties by leaf-list order.
 > The RFC0050.6 convergence lookup took whichever leaf of a shared
-> shape it reached first in map order. Its guard index was a set, so
-> one of two leaves sharing a shape widening away hid the other. Ties
-> in both lookups now go to the lowest `template_id`, and the index
-> counts leaves per shape. The format is unchanged by these. RFC 0050
+> convergence key `(canonical, severity_number, scope_name)` it reached
+> first in map order. Its guard index was a set, so one of two leaves
+> sharing a key widening away hid the other. Ties in both lookups now
+> go to the lowest `template_id`, and the index counts leaves per
+> key. The format is unchanged by these. RFC 0050
 > carries the matching note at RFC0050.6.
 
 *Cadence: per WAL-segment rotation.* A snapshot is taken at

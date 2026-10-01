@@ -527,11 +527,13 @@ Scenario ids `RFC0050.<n>`, RFC0050.1–.9.
 > template and its origin.
 
 > **Amendment 2026-09-30 (convergence tie-break, #892).** Two mined
-> leaves under distinct masked paths can carry the same canonical
-> shape. The convergence lookup then takes the leaf with the lowest
+> leaves under distinct masked paths can carry the same convergence key
+> `(canonical, severity_number, scope_name)` — the RFC 0001 §6.1
+> template key with the canonical shape in place of the tokens. The
+> convergence lookup then takes the leaf with that key and the lowest
 > `template_id`, never whichever leaf map iteration reaches first, and
-> the convergence guard counts the leaves carrying each shape, so one
-> of them widening away leaves the shape findable. RFC 0001 §6.2 step 4
+> the convergence guard counts the leaves carrying each key, so one of
+> them widening away leaves the key findable. RFC 0001 §6.2 step 4
 > similarity ties break the same way. A snapshot restore rebuilds the
 > tree but not the history or map order that built it, so these
 > choices must be functions of the tree for a restored tenant to

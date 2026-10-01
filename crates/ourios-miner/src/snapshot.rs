@@ -65,7 +65,14 @@ use crate::tree::OwnedToken;
 /// snapshot rebuilds from what remains, and re-mints the template ids
 /// of what was reclaimed (hazard #5, visible in the RFC 0010 drift
 /// query).
-pub const SNAPSHOT_VERSION: u8 = 2;
+///
+/// Version 3 (#892) makes every leaf record carry its
+/// [`LeafRecord::wildcard_routed`] route. A version-2 leaf without one
+/// cannot be placed faithfully: a fixed-token leaf reached through the
+/// wildcard child reads as keyed, so a default would silently build a
+/// different tree. Version-2 artefacts therefore take the
+/// unknown-version path too.
+pub const SNAPSHOT_VERSION: u8 = 3;
 
 /// One tenant's full snapshot payload (the bytes after the version
 /// byte) — the per-tenant state a restore would rebuild the miner
@@ -157,13 +164,12 @@ pub struct LeafRecord {
     pub upstream_associations: Vec<String>,
     #[serde(default)]
     pub upstream_association_overflow: u64,
-    /// Prefix-path positions (ascending) at which the leaf's node was
-    /// reached through RFC 0023 §3.1's wildcard child rather than a
-    /// keyed branch. There the leaf can hold any token, widen, or
+    /// Zero-based, strictly increasing prefix-path positions, each
+    /// below the walk depth, at which the leaf's node was reached
+    /// through RFC 0023 §3.1's wildcard child rather than a keyed
+    /// branch. There the leaf can hold any token, widen, or
     /// type-expand, so restore cannot derive the route from the
-    /// template. Absent in earlier snapshots, which restore by
-    /// derivation alone. No `SNAPSHOT_VERSION` bump (additive).
-    #[serde(default)]
+    /// template. Required: its absence is a decode error.
     pub wildcard_routed: Vec<usize>,
 }
 
@@ -603,7 +609,8 @@ mod tests {
             "template_version": 1,
             "severity_number": 0,
             "scope_name": null,
-            "slot_types": []
+            "slot_types": [],
+            "wildcard_routed": []
         }"#;
         let record: LeafRecord =
             serde_json::from_str(pre_rfc0050).expect("pre-RFC0050 record must deserialize");
@@ -664,6 +671,33 @@ mod tests {
 
         // Assert
         assert!(matches!(err, SnapshotError::UnknownVersion(0xFF)));
+    }
+
+    /// #892: a version-2 leaf carries no route, so a version-2 artefact
+    /// is discarded rather than restored into a possibly different tree.
+    #[test]
+    fn a_version_2_artefact_is_discarded() {
+        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
+        bytes[0] = 2;
+
+        assert!(matches!(
+            load_snapshot(&bytes),
+            Err(SnapshotError::UnknownVersion(2))
+        ));
+        assert_eq!(legacy_v1_mark(&bytes), LegacyMark::NotLegacy);
+    }
+
+    #[test]
+    fn a_leaf_record_without_its_route_does_not_decode() {
+        let without_route = r#"{
+            "template": [{"Fixed":"disk"}],
+            "template_id": 7,
+            "template_version": 1,
+            "severity_number": 0,
+            "scope_name": null,
+            "slot_types": []
+        }"#;
+        assert!(serde_json::from_str::<LeafRecord>(without_route).is_err());
     }
 
     /// RFC 0052 §3.1: a version-1 artefact's `wal_high_water` is the

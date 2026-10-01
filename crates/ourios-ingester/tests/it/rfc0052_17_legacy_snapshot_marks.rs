@@ -42,7 +42,7 @@ fn a_version_1_mark_below_the_oldest_surviving_frame_refuses_startup() {
 
 /// The ordinary pre-RFC root: its version-1 mark explains the oldest
 /// surviving frame, so it boots, rebuilds the tenant from every frame,
-/// and the next write is version 2.
+/// and the next write is at the current version.
 #[test]
 fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_version_2() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -57,7 +57,10 @@ fn a_version_1_mark_at_the_oldest_frame_boots_and_rewrites_at_version_2() {
         .expect("post-recovery write");
     assert_eq!(installed, vec![(TenantId::new("alpha"), last)]);
     let bytes = std::fs::read(snapshots(tmp.path()).join("alpha.snap")).expect("artefact");
-    assert_eq!(bytes[0], SNAPSHOT_VERSION, "rewritten at version 2");
+    assert_eq!(
+        bytes[0], SNAPSHOT_VERSION,
+        "rewritten at the current version"
+    );
 }
 
 /// A version-1 artefact that does not decode even for its mark has no

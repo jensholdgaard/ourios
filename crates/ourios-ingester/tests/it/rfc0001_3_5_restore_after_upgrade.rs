@@ -61,7 +61,7 @@ async fn a_barrier_installed_snapshot_restores_and_so_does_the_post_recovery_one
 }
 
 /// The issue's sequence: a version-1 root's first start discards and
-/// full-replays, writes at version 2, ingests more and writes again at
+/// full-replays, writes at the current version, ingests more and writes again at
 /// shutdown; the next start restores what that start wrote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upgraded_root_restores_what_its_first_start_wrote() {
@@ -92,6 +92,47 @@ async fn an_upgraded_root_restores_what_its_first_start_wrote() {
     drop(pipeline);
 
     let (report, _) = start(root);
+    assert_every_tenant(&report, |fate| matches!(fate, SnapshotFate::Restored(_)));
+}
+
+/// A 0.11.0 root: its version-2 artefacts carry no leaf routes, so the
+/// first start discards each once as an unknown version and full-replays,
+/// and the next start restores what that start wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_2_artefact_is_discarded_once_and_the_rewrite_restores() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = BarrierRig::new(tmp.path());
+    for round in 0..5 {
+        for tenant in TENANTS {
+            rig.pipeline
+                .ingest(workload(tenant, round), TenantId::new(tenant))
+                .await
+                .expect("the batch acks");
+        }
+    }
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    let (wal_root, snapshots_root) = (rig.wal_root.clone(), rig.snapshots_root.clone());
+    drop(rig);
+    for tenant in TENANTS {
+        let path = snapshots_root.join(format!("{tenant}.snap"));
+        let mut bytes = std::fs::read(&path).expect("artefact");
+        bytes[0] = 2;
+        std::fs::write(&path, bytes).expect("rewrite as version 2");
+    }
+
+    let (report, miner) = start(&wal_root);
+    assert_every_tenant(&report, |fate| {
+        *fate == SnapshotFate::Discarded(DiscardReason::UnknownVersion(2))
+    });
+    assert_eq!(
+        DiscardReason::UnknownVersion(2).to_string(),
+        "snapshot format version 2",
+        "the discard warning names the version it saw"
+    );
+
+    recovery::write_folded_snapshots(&snapshots_root, &miner).expect("post-recovery write");
+    drop(miner);
+    let (report, _) = start(&wal_root);
     assert_every_tenant(&report, |fate| matches!(fate, SnapshotFate::Restored(_)));
 }
 

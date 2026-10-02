@@ -138,6 +138,9 @@ impl BarrierEpochs {
     /// reports, which refuses that cut and every later one until a
     /// restart.
     pub fn open_cut(&self) -> Epoch {
+        // Rust 1.99 deprecates `fetch_update` for `try_update`, which is
+        // still unstable at the 1.94 MSRV; switch once the MSRV reaches it.
+        #[allow(deprecated)]
         let taken = self
             .next
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {

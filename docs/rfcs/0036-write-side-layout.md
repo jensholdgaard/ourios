@@ -282,8 +282,12 @@ trees — and never as encoded input bytes.
    numbered in spill order.
 2. **Skip-spill.** If no run was spilled by the last input, the whole
    partition fits `B`: sort the buffer in place and write it straight
-   to the output. Otherwise spill the remaining buffer as the final
-   run and go to step 3.
+   to the output. Otherwise, if the buffer still holds rows (inputs
+   read after the last spill that kept it at or below `B`), stably
+   sort it by the §3.1 key and spill it as the final run; an empty
+   buffer spills nothing, so no run is empty. Then go to step 3 with
+   the runs spilled so far. Every run is therefore sorted before it
+   is merged.
 3. **Merge.** Stream a k-way merge over the sorted runs, holding
    **one decoded batch per run** (the `Reader` wraps the streaming
    `ParquetRecordBatchReader`), breaking §3.1 key ties by run ordinal.
@@ -545,9 +549,11 @@ published diagnostic.
 > - **And** (reopened 2026-10-02) for **any** N-file partition —
 >   including many small inputs whose encoded total is far below the
 >   budget `B` while their decoded rows exceed it — peak decoded-row
->   residency is at most `B` plus one decoded input (phase 1) and
->   F × one decoded batch (phase 2), never whole-partition residency;
->   the gate is measured on decoded rows, not encoded bytes.
+>   residency stays within the phase-specific bounds: at most `B`
+>   plus one decoded input in phase 1, and F × one decoded batch in
+>   phase 2. Holding the whole partition is allowed only within those
+>   bounds (the skip-spill case, where it fits `B`); the gate is
+>   measured on decoded rows, not encoded bytes.
 
 > **Scenario RFC0036.4 — determinism (the harness's contract).**
 > - **Given** the same set of input files (same bytes, same names)
@@ -595,10 +601,12 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   then hold the D2 band; D3 assertions unchanged
   (`rfc0009_1_*`-style structural tests extended). Memory:
   compact an N-file partition under a decoded-row residency gauge
-  and assert the phase-1/phase-2 bounds — the test fails if the sort
-  ever holds the whole partition decoded. Reopened 2026-10-02: the
-  gauge test includes a many-small-inputs partition whose budget is set
-  to its encoded size
+  and assert residency stays within the phase-specific bounds
+  (`B` + one input in phase 1, F × one batch in phase 2); the
+  skip-spill fixture may hold the whole partition, since it fits `B`.
+  Reopened 2026-10-02: the gauge test includes a many-small-inputs
+  partition whose encoded total is well below its budget (`B` set to
+  twice the encoded total) while its decoded rows exceed that budget
   (`many_small_inputs_within_the_encoded_budget_do_not_decode_at_once`),
   which fails on the encoded-bytes gate.
 - **RFC0036.4 — a rebuild differential.** Compact the same inputs

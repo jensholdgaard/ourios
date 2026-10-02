@@ -39,7 +39,8 @@ pub(super) struct SortTotals {
 /// it sorts wholly in memory, and one that does spills the buffer as a
 /// sorted run at the end of the input that filled it. Peak residency is
 /// therefore the budget plus one decoded input in phase 1 and, via
-/// [`reduce_runs`]'s fan-in cap F, F × one decoded batch in phase 2 —
+/// [`reduce_runs`]'s fan-in cap F, (F + 1) × one decoded batch in
+/// phase 2 (one batch per open run plus the merge's output chunk) —
 /// independent of how many inputs the partition holds or how well they
 /// compress.
 pub(super) fn sort_inputs_into(
@@ -188,7 +189,7 @@ impl<'a> RunFormation<'a> {
             None => emit_in_memory(plan.keys, buffer, writer),
             Some(spill) => {
                 // `clear()` kept the phase-1 allocation; release it before
-                // the merge so phase 2 holds only F × one batch.
+                // the merge so phase 2 holds only (F + 1) × one batch.
                 drop(buffer);
                 spill.merge_into(writer, plan)
             }
@@ -435,11 +436,11 @@ pub(super) fn reduce_runs(
 /// path and the in-memory path drive the Parquet writer with an
 /// identical call sequence (§3.5).
 ///
-/// Peak memory is one decoded batch per run: each [`RunCursor`]
-/// streams its file batch-by-batch, and [`reduce_runs`] caps the run
-/// count at F, so this holds ≤ F × batch bytes no matter how many
-/// inputs the partition accrued — far below phase 1's
-/// one-decoded-input bound.
+/// Peak memory is one decoded batch per run plus the output chunk
+/// being filled: each [`RunCursor`] streams its file batch-by-batch,
+/// [`reduce_runs`] caps the run count at F, and the chunk holds at most
+/// [`SUB_BATCH_ROWS`] rows, so this holds ≤ (F + 1) × batch no matter
+/// how many inputs the partition accrued.
 pub(super) fn merge_runs<F>(
     runs: &[PathBuf],
     keys: ClusterKeys,
@@ -462,17 +463,29 @@ where
     while let Some(Reverse(entry)) = heap.pop() {
         let run = entry.run;
         out.push(entry.record);
+        #[cfg(test)]
+        residency::add(1);
         if out.len() == SUB_BATCH_ROWS {
-            emit(&out)?;
-            out.clear();
+            emit_chunk(&mut out, &mut emit)?;
         }
         if let Some(record) = cursors[run].next_record()? {
             heap.push(Reverse(MergeEntry::new(keys, run, record)));
         }
     }
     if !out.is_empty() {
-        emit(&out)?;
+        emit_chunk(&mut out, &mut emit)?;
     }
+    Ok(())
+}
+
+fn emit_chunk<F>(out: &mut Vec<MinedRecord>, emit: &mut F) -> Result<(), CompactionError>
+where
+    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+{
+    emit(out)?;
+    #[cfg(test)]
+    residency::sub(out.len());
+    out.clear();
     Ok(())
 }
 
@@ -540,10 +553,12 @@ pub(super) struct RunCursor {
     batch: std::vec::IntoIter<MinedRecord>,
     /// Rows in the batch this cursor currently holds decoded, for the
     /// RFC0036.3 residency gauge: the merge keeps ≤ one batch resident
-    /// per open run, so the gauge peaks at `F × batch`, not the whole
-    /// partition. The count is charged for the whole batch's lifetime
-    /// (a small over-count as its rows drain into the merge heap), and
-    /// released when the next batch loads or the run is exhausted.
+    /// per open run, and the merge charges its output chunk on top, so
+    /// the gauge peaks at `(F + 1) × batch`, not the whole partition.
+    /// The count is charged for the whole batch's lifetime (an
+    /// over-count while its rows drain into the heap and the output
+    /// chunk), and released when the next batch loads or the run is
+    /// exhausted.
     #[cfg(test)]
     batch_len: usize,
 }
@@ -592,7 +607,7 @@ pub(super) fn parquet_write(e: parquet::errors::ParquetError) -> CompactionError
 /// Test-only decoded-row residency gauge (RFC 0036 §3.2 / RFC0036.3).
 /// Counts the `MinedRecord`s the sort holds decoded in RAM on the
 /// current thread, exposing the peak so the forced-spill memory test
-/// can assert the one-input-plus-`F × batch` bound rather than
+/// can assert the phase bounds (one input, then `(F + 1) × batch`) rather than
 /// whole-partition residency (RFC 0036 §6, "an instrumentation counter
 /// inside `sort_inputs_into`/`merge_runs`"). Thread-local because a
 /// `compact_*` call runs entirely on its caller's thread (blocking I/O

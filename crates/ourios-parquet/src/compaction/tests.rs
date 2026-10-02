@@ -1420,8 +1420,9 @@ fn encoded_partition_bytes(store: &Store) -> u64 {
 /// partition of many small inputs whose encoded total fits the budget
 /// still decodes many times larger (small files compress well), so
 /// gating the skip-spill path on encoded bytes held the whole partition
-/// decoded and ran the node out of memory. With the budget set to exactly the
-/// encoded total, the sort must spill instead of buffering every row.
+/// decoded and ran the node out of memory. With the budget at twice the
+/// encoded total, so the partition sits well inside the old gate, the
+/// sort must spill instead of buffering every row.
 #[test]
 fn many_small_inputs_within_the_encoded_budget_do_not_decode_at_once() {
     const K: u64 = 120;
@@ -1431,7 +1432,7 @@ fn many_small_inputs_within_the_encoded_budget_do_not_decode_at_once() {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     build_k_file_partition(&store, K, S);
-    let encoded = encoded_partition_bytes(&store);
+    let budget = 2 * encoded_partition_bytes(&store);
 
     residency::reset();
     let outcome = compact_sorted(
@@ -1440,7 +1441,7 @@ fn many_small_inputs_within_the_encoded_budget_do_not_decode_at_once() {
         &PromotedAttributes::default(),
         ClusterKeys::ServiceThenTime,
         SortTuning {
-            in_memory_max_bytes: encoded,
+            in_memory_max_bytes: budget,
             fan_in: FAN_IN,
             ..SortTuning::default()
         },
@@ -1454,7 +1455,7 @@ fn many_small_inputs_within_the_encoded_budget_do_not_decode_at_once() {
     );
 
     let row_bytes = decoded_footprint(&sort_rec(Some("svc-a"), HOUR10_START, 1));
-    let budget_rows = usize::try_from(encoded / row_bytes).expect("fits usize");
+    let budget_rows = usize::try_from(budget / row_bytes).expect("fits usize");
     let one_input = usize::try_from(S).expect("fits usize");
     let bound = budget_rows + one_input + FAN_IN * SUB_BATCH_ROWS;
     assert!(
@@ -1530,4 +1531,51 @@ fn over_budget_partition_matches_the_in_memory_output_with_hooks() {
         consolidated_bytes(&store_b, &partition(), &b),
         "the bounded sort writes the unbounded sort's bytes",
     );
+}
+
+/// RFC 0036 §3.2 step 2 — after an earlier spill, inputs that leave the
+/// buffer at or below the budget form a final run, and that run must be
+/// sorted before the merge or the §3.1 order breaks. The residual rows
+/// here arrive in descending time order.
+#[test]
+fn residual_buffer_after_a_spill_is_sorted_before_the_merge() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let at = |offset: u64, id: u64| sort_rec(Some("svc-a"), HOUR10_START + offset, id);
+    let inputs: [Vec<MinedRecord>; 3] = [
+        (0..10).map(|i| at(100 - i, i)).collect(),
+        vec![at(50, 10), at(40, 11)],
+        vec![at(30, 12), at(20, 13)],
+    ];
+    for recs in &inputs {
+        write_file(&store, recs);
+        // UUIDv7 names order by millisecond, so this keeps the
+        // sorted-basename input order equal to the write order.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // The first input alone overflows the budget; the last two together
+    // stay under it and are left in the buffer when the inputs run out.
+    let budget = 5 * decoded_footprint(&at(0, 0));
+
+    let outcome = compact_sorted(
+        &store,
+        &partition(),
+        &PromotedAttributes::default(),
+        ClusterKeys::ServiceThenTime,
+        SortTuning {
+            in_memory_max_bytes: budget,
+            ..SortTuning::default()
+        },
+    )
+    .expect("compact");
+    let committed = outcome.committed.expect("committed");
+    let bytes = consolidated_bytes(&store, &partition(), &committed);
+    let rows = Reader::open_partition_bytes(Bytes::from(bytes), partition(), &committed.file)
+        .expect("open consolidated")
+        .read_all()
+        .expect("read consolidated");
+
+    let mut expected: Vec<MinedRecord> = inputs.into_iter().flatten().collect();
+    sort_records(ClusterKeys::ServiceThenTime, &mut expected);
+    assert_eq!(rows, expected, "§3.1 order holds across the residual run");
 }

@@ -127,6 +127,10 @@ ourios-testgen = { path = "../ourios-testgen" }
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
 tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "=3.27.0"
+# #895 (`tests/rfc0033_bounded_fold.rs`) — testing-mode heap profiler as the
+# global allocator, so the cold template-map derivation's peak heap is
+# asserted in bytes rather than read off wall RSS.
+dhat = "=0.3.3"
 # RFC 0033 §3.4 S3 publish arm (`template_map_publish_cas_on_s3`):
 # LocalStack via testcontainers, the same harness as ourios-parquet's
 # RFC 0013 CAS tests — `#[ignore]`d, run by the `s3-integration` CI job.

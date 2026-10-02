@@ -12,8 +12,9 @@
 //! This test installs a process-global in-memory `MeterProvider`, so it
 //! lives in its own integration binary (its own process) — the
 //! `rfc0016_6_query_metrics` precedent, applied at the querier-library
-//! surface where the RFC 0033 instruments live — and is the one
-//! RFC0028.2 process-isolation exemption in this crate.
+//! surface where the RFC 0033 instruments live — and is one of this
+//! crate's two RFC0028.2 process-isolation exemptions (the other,
+//! `rfc0033_bounded_fold.rs`, installs a global allocator).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

@@ -228,8 +228,9 @@ fn build_k_file_partition(store: &Store, k: u64, s: u64) {
 /// RFC0036.3 (memory bound) — the load-bearing §3.2 claim. On a
 /// partition of `K` inputs of `S` rows each, the forced-spill sort's
 /// peak decoded-row residency is bounded by one input (phase 1,
-/// inputs decoded strictly one at a time) plus `F × batch` (phase 2,
-/// one streamed batch per open run) — it must NOT regress to holding
+/// inputs decoded strictly one at a time), then `(F + 1) × batch`
+/// (phase 2, one streamed batch per open run plus the merge's output
+/// chunk) — it must NOT regress to holding
 /// the whole `K × S` partition decoded, which is the whole reason the
 /// external merge sort exists. The in-memory (skip-spill) path, by
 /// contrast, deliberately holds the whole partition (§7 tradeoff,
@@ -246,8 +247,9 @@ fn rfc0036_3_forced_spill_peak_far_below_whole_partition() {
     // pass — each holding one small reader batch, well under S. So the
     // peak sits at ~one input, an order of magnitude below the whole
     // partition (K × S), making a whole-partition regression
-    // unambiguous. (The F × batch term in the RFC 0036 §3.2 bound is
-    // the worst case for F saturated runs; it does not bite here.)
+    // unambiguous. (The (F + 1) × batch term in the RFC 0036 §3.2
+    // bound is the worst case for F saturated runs plus the output
+    // chunk; it does not bite here.)
     const K: u64 = 6;
     const S: u64 = 12_000;
     let total = usize::try_from(K * S).expect("fits usize");

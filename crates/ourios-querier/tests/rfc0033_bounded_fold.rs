@@ -1,12 +1,16 @@
-//! #895 / #853 — a cold template-map derivation holds O(live template
-//! state), not O(audit history).
+//! #895 / #853 — a cold template-map derivation releases each audit
+//! file's template-event payloads before reading the next file.
 //!
 //! A crash loop that re-mints templates inflates a tenant's audit stream
 //! without growing its registry: every restart re-emits creations and
-//! widenings for the same `(template_id, version)` keys. The fold result
-//! is bounded by those keys; the derivation's peak heap must be too, or a
-//! one-hour query on a cold cache reads the tenant's whole audit history
-//! into memory and OOMs the node.
+//! widenings for the same `(template_id, version)` keys. Holding every
+//! decoded template event until the fold ran made a one-hour query on a
+//! cold cache read that whole history into memory and OOM the node.
+//!
+//! Scope: the fixture carries no alias events, so this pins only the
+//! release of template-event payloads between files. It is not a bound
+//! over the whole audit history — the fold still holds every alias event
+//! and one frontier entry per audit file.
 //!
 //! The assertion is on heap bytes, measured by `dhat`'s testing-mode
 //! global allocator — deterministic, not wall RSS. Installing a global
@@ -100,15 +104,15 @@ fn peak_heap_during<T>(work: impl FnOnce() -> T) -> (T, u64) {
 }
 
 #[test]
-fn cold_derivation_peak_heap_is_bounded_by_live_templates_not_history() {
+fn template_event_payloads_are_released_between_audit_files() {
     let bucket = TempDir::new().expect("temp dir");
     let history_template_bytes = write_history(bucket.path());
     let tenant = TenantId::new(TENANT);
     let backend = StoreRef::Local(bucket.path());
 
-    // A budget a quarter of the history's template text: far above what
-    // the live state plus one audit file needs, far below holding the
-    // history.
+    // A budget a quarter of the history's template text: far above one
+    // audit file plus the per-key winners, far below holding every
+    // decoded template event.
     let budget = history_template_bytes / 4;
 
     let ((map, bytes_read), peak) =
@@ -119,8 +123,8 @@ fn cold_derivation_peak_heap_is_bounded_by_live_templates_not_history() {
     );
     assert!(
         peak < budget,
-        "the cold derivation held {peak} B at peak — O(audit history), not O(live templates) \
-         (budget {budget} B)",
+        "the cold derivation held {peak} B at peak — template-event payloads were retained \
+         across audit files (budget {budget} B)",
     );
     assert_eq!(map.registry().len() as u64, LIVE_TEMPLATES);
     for id in 1..=LIVE_TEMPLATES {

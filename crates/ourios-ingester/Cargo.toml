@@ -168,7 +168,7 @@ tempfile = "=3.27.0"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
 # threading test (pinned in lockstep with ourios-parquet's arrow stack,
 # matching ourios-querier's dev pin).
-parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
+parquet = { version = "=60.0.0", default-features = false, features = ["arrow"] }
 # Drive the axum `Router` in-process (`ServiceExt::oneshot`) for the
 # HTTP-transport acceptance tests — no real socket.
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
@@ -201,7 +201,7 @@ tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-m
 # RFC 0052 §3.1's publisher legs hold a PUT at the object-store seam
 # (`Store::wrap_backend`) — the one place the publisher's write waits with
 # no sink lock held. All four are already in the tree via ourios-parquet.
-object_store = { version = "0.13", default-features = false }
+object_store = { version = "0.14", default-features = false }
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"

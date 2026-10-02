@@ -29,7 +29,8 @@ use tempfile::TempDir;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const TENANT: &str = "crashloop";
-/// 2026-09-21T00:00:00Z — the start of the reported crash-loop window.
+/// A synthetic ordering anchor (2026-09-24T00:00:00Z); only the relative
+/// order of the re-mints matters.
 const TS0: u64 = 1_790_208_000_000_000_000;
 const MINUTE_NS: u64 = 60_000_000_000;
 /// Distinct `(template_id, version)` keys the history re-mints.

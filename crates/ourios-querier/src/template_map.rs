@@ -436,9 +436,12 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
 /// (RFC 0031 §3.6 — on a cache miss this is exactly what template-map
 /// acquisition cost).
 ///
-/// The scan holds one audit file at a time and each fold retains only its
-/// live state, so peak memory tracks the tenant's template and alias
-/// state, not its audit history. Each fold is the same streaming fold the
+/// Peak memory is one audit object and its decoded events, plus the live
+/// `(template_id, version)` winners, plus every alias event (held until
+/// the alias fold sorts them), plus one frontier entry per audit file.
+/// Template history no longer accumulates; the alias events and the
+/// frontier still grow with the audit set, as does the freshness listing
+/// of the whole audit prefix. Each fold is the same streaming fold the
 /// fresh derivation it caches runs — [`crate::derive_template_registry`] /
 /// [`crate::derive_alias_map`] (RFC0033.1 pins the equivalence by property
 /// test).

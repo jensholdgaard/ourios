@@ -37,15 +37,16 @@ use std::sync::LazyLock;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 use ourios_core::alias::AliasMap;
-use ourios_core::audit::{AuditEvent, AuditPayload};
+use ourios_core::audit::AuditPayload;
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{format_template, parse_template};
 use ourios_parquet::percent_encode_tenant;
 use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
-use crate::template_registry::TemplateRegistry;
-use crate::{QueryError, StoreRef, audit_scan, template_registry};
+use crate::alias_store::AliasFold;
+use crate::template_registry::{RegistryFold, TemplateRegistry};
+use crate::{QueryError, StoreRef, audit_scan};
 
 /// Canonical artifact key at the root of a tenant's audit subtree
 /// (`audit/tenant_id=<enc>/template_map.v2.json.zst`, RFC 0033 §3.2
@@ -429,18 +430,21 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
 }
 
 /// Fold `tenant`'s [`TemplateMap`] from its audit stream — **one**
-/// `audit_scan` listing + read pass, both folds from the captured events
-/// (RFC 0033 §3.5: the marginal cost of the second fold is CPU over
-/// in-memory events, zero extra IO), and the frontier taken from that
-/// same scan. Also returns the **bytes fetched** deriving it (RFC 0031
-/// §3.6 — on a cache miss this is exactly what template-map acquisition
-/// cost).
+/// `audit_scan` listing + read pass streamed into both folds (RFC 0033
+/// §3.5: the second fold costs CPU, zero extra IO), and the frontier taken
+/// from that same scan. Also returns the **bytes fetched** deriving it
+/// (RFC 0031 §3.6 — on a cache miss this is exactly what template-map
+/// acquisition cost).
 ///
-/// Each fold is byte-for-byte the fresh derivation it caches:
-/// the registry filter + `fold_registry` matches
-/// [`crate::derive_template_registry`], and the alias filter + stable
-/// timestamp sort + `AliasMap::from_events` matches
-/// [`crate::derive_alias_map`] (RFC0033.1 pins this by property test).
+/// Peak memory is one audit object and its decoded events, plus the live
+/// `(template_id, version)` winners, plus every alias event (held until
+/// the alias fold sorts them), plus one frontier entry per audit file.
+/// Template history no longer accumulates; the alias events and the
+/// frontier still grow with the audit set, as does the freshness listing
+/// of the whole audit prefix. Each fold is the same streaming fold the
+/// fresh derivation it caches runs — [`crate::derive_template_registry`] /
+/// [`crate::derive_alias_map`] (RFC0033.1 pins the equivalence by property
+/// test).
 ///
 /// # Errors
 ///
@@ -463,35 +467,18 @@ fn fold_template_map(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
 ) -> Result<(TemplateMap, u64), QueryError> {
-    let scan = resolved.read_events(tenant)?;
-
-    let mut alias_events: Vec<&AuditEvent> = scan
-        .events
-        .iter()
-        .filter(|e| {
-            matches!(
-                &e.payload,
-                AuditPayload::AliasAsserted { .. } | AuditPayload::AliasRetracted { .. }
-            )
-        })
-        .collect();
-    alias_events.sort_by_key(|e| e.timestamp);
-    let aliases = AliasMap::from_events(alias_events.iter().copied());
-    drop(alias_events);
-
-    let template_events: Vec<AuditEvent> = scan
-        .events
-        .into_iter()
-        .filter(|e| matches!(&e.payload, AuditPayload::Template { .. }))
-        .collect();
-    let registry = template_registry::fold_registry(template_events);
-
+    let mut registry = RegistryFold::default();
+    let mut aliases = AliasFold::default();
+    let scan = resolved.for_each_event(tenant, |event| match &event.payload {
+        AuditPayload::Template { .. } => registry.push(event),
+        _ => aliases.push(event),
+    })?;
     Ok((
         TemplateMap {
             tenant: tenant.clone(),
             folded_files: scan.frontier,
-            registry,
-            aliases,
+            registry: registry.finish(),
+            aliases: aliases.finish(),
         },
         scan.bytes_read,
     ))

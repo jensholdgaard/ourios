@@ -25,8 +25,10 @@ superseded-by: —
 > `many_small_inputs_within_the_encoded_budget_do_not_decode_at_once`
 > (`crates/ourios-parquet/src/compaction/tests.rs`, PR #900). The RFC
 > returns to `green` when #900 lands, and to `accepted` once the
-> compaction benches are re-recorded. Everything below this banner
-> records the history up to the reopen.
+> compaction benches are re-recorded. The status note immediately
+> below is the pre-reopen history (the earlier `validated`/`accepted`
+> record); the rest of this document, including the revised §3.2
+> algorithm and RFC0036.3, is the current contract.
 
 > **Status note.** **`accepted`** (2026-07-22, maintainer sign-off — the
 > terminal state), **amended 2026-07-22 with the §3.3 adaptive

@@ -555,7 +555,10 @@ published diagnostic.
 >   plus one decoded input in phase 1, and F × one decoded batch in
 >   phase 2. Holding the whole partition is allowed only within those
 >   bounds (the skip-spill case, where it fits `B`); the gate is
->   measured on decoded rows, not encoded bytes.
+>   measured on decoded rows, not encoded bytes. `B` is a byte budget
+>   over the per-row decoded-footprint estimate, so a row-counting
+>   test states the phase-1 bound in rows as `B` divided by the
+>   smallest per-row footprint in the fixture, plus one input's rows.
 
 > **Scenario RFC0036.4 — determinism (the harness's contract).**
 > - **Given** the same set of input files (same bytes, same names)
@@ -603,9 +606,12 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   then hold the D2 band; D3 assertions unchanged
   (`rfc0009_1_*`-style structural tests extended). Memory:
   compact an N-file partition under a decoded-row residency gauge
-  and assert residency stays within the phase-specific bounds
-  (`B` + one input in phase 1, F × one batch in phase 2); the
-  skip-spill fixture may hold the whole partition, since it fits `B`.
+  and assert residency stays within the phase-specific bounds, in
+  rows: phase 1 holds at most `⌊B / f⌋` rows plus one input's rows,
+  where `f` is the smallest per-row decoded-footprint estimate in the
+  fixture (the same `decoded_footprint` the sort charges against
+  `B`), and phase 2 at most F × one batch's rows. The skip-spill
+  fixture may hold the whole partition, since it fits `B`.
   Reopened 2026-10-02: the gauge test includes a many-small-inputs
   partition whose encoded total is well below its budget (`B` set to
   twice the encoded total) while its decoded rows exceed that budget

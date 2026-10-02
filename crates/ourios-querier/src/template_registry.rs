@@ -22,6 +22,7 @@ use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, Tem
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{OwnedToken, parse_template};
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 use crate::{QueryError, StoreRef, audit_scan};
 
@@ -67,66 +68,101 @@ pub(crate) fn derive_template_registry_measured(
     tenant: &TenantId,
 ) -> Result<(TemplateRegistry, u64), QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
-    // tenant backstop; keep only the template events (no window — the registry
-    // folds the tenant's whole template history).
-    let (all_events, bytes_read) = audit_scan::read_all_events(backend, tenant)?;
-    let events: Vec<AuditEvent> = all_events
-        .into_iter()
-        .filter(|e| matches!(&e.payload, AuditPayload::Template { .. }))
-        .collect();
-    Ok((fold_registry(events), bytes_read))
+    // tenant backstop; the fold keeps only the template events (no window —
+    // the registry folds the tenant's whole template history).
+    let mut fold = RegistryFold::default();
+    let scan = audit_scan::for_each_event(backend, tenant, |event| fold.push(event))?;
+    Ok((fold.finish(), scan.bytes_read))
 }
 
-/// Fold template audit `events` into the registry (RFC 0017 §3.2) — the pure
-/// core of [`derive_template_registry`], split out so the version-keying logic
-/// is unit-testable without the audit-file I/O.
-///
-/// Sorts by timestamp first: the stable sort completes the §3.7.1 total order,
-/// keeping same-timestamp events in their (file path, row index) input order.
-/// Each event keys by its version — `template_created` at
-/// [`TEMPLATE_INITIAL_VERSION`], widening / type-expansion at `new_version`,
-/// rejections contribute nothing — so distinct versions never collide and a
-/// later widening cannot clobber an earlier version's tokens.
-pub(crate) fn fold_registry(mut events: Vec<AuditEvent>) -> TemplateRegistry {
-    events.sort_by_key(|e| e.timestamp);
-
-    let mut registry = TemplateRegistry::new();
+/// Fold template audit `events`, given in SCAN order, into the registry
+/// (RFC 0017 §3.2) — the pure core of [`derive_template_registry`], split
+/// out so the version-keying logic is unit-testable without the audit-file
+/// I/O. See [`RegistryFold`] for the order it completes.
+#[cfg(test)]
+pub(crate) fn fold_registry(events: Vec<AuditEvent>) -> TemplateRegistry {
+    let mut fold = RegistryFold::default();
     for event in events {
+        fold.push(event);
+    }
+    fold.finish()
+}
+
+/// The streaming registry fold (RFC 0017 §3.2): events arrive in SCAN order
+/// — (file path, row index) — and only the per-key winner is retained, so a
+/// fold over a tenant's whole audit history holds O(live `(template_id,
+/// version)` keys), not O(events).
+///
+/// The winner per key is the event a stable timestamp sort would place
+/// last: the greatest timestamp, ties going to the later scan position.
+/// Replacing on `>=` while consuming in scan order is exactly that, so the
+/// result equals sort-then-last-insert-wins over the full event list — the
+/// §3.7.1 total order. Each event keys by its version — `template_created`
+/// at [`TEMPLATE_INITIAL_VERSION`], widening / type-expansion at
+/// `new_version`, adoption at its `template_version`; rejections and
+/// non-template events contribute nothing.
+#[derive(Default)]
+pub(crate) struct RegistryFold {
+    latest: HashMap<(u64, u32), (SystemTime, String)>,
+}
+
+impl RegistryFold {
+    pub(crate) fn push(&mut self, event: AuditEvent) {
         let AuditPayload::Template {
             template_id,
             change,
             ..
         } = event.payload
         else {
-            continue;
+            return;
         };
-        let (version, template) = match change {
-            TemplateChange::Created { new_template } => (TEMPLATE_INITIAL_VERSION, new_template),
-            TemplateChange::Widened {
-                new_version,
-                new_template,
-                ..
+        let Some((version, template)) = keyed_template(change) else {
+            return;
+        };
+        match self.latest.get_mut(&(template_id, version)) {
+            Some(held) if event.timestamp < held.0 => {}
+            Some(held) => *held = (event.timestamp, template),
+            None => {
+                self.latest
+                    .insert((template_id, version), (event.timestamp, template));
             }
-            | TemplateChange::TypeExpanded {
-                new_version,
-                new_template,
-                ..
-            } => (new_version, new_template),
-            // RFC 0050 §3.3 — adoption binds rows to
-            // `(template_id, template_version)` exactly like a
-            // creation; for an adoption riding an existing mined
-            // leaf the pair is already interned and this insert is
-            // an idempotent overwrite with the same tokens.
-            TemplateChange::Adopted {
-                template_version,
-                new_template,
-            } => (template_version, new_template),
-            // A rejection bumps no version and changes no tokens.
-            TemplateChange::RejectedDegenerate { .. } => continue,
-        };
-        registry.insert((template_id, version), parse_template(&template));
+        }
     }
-    registry
+
+    pub(crate) fn finish(self) -> TemplateRegistry {
+        self.latest
+            .into_iter()
+            .map(|(key, (_, template))| (key, parse_template(&template)))
+            .collect()
+    }
+}
+
+/// The `(version, template)` a template change binds, or `None` for a
+/// rejection, which bumps no version and changes no tokens.
+fn keyed_template(change: TemplateChange) -> Option<(u32, String)> {
+    match change {
+        TemplateChange::Created { new_template } => Some((TEMPLATE_INITIAL_VERSION, new_template)),
+        TemplateChange::Widened {
+            new_version,
+            new_template,
+            ..
+        }
+        | TemplateChange::TypeExpanded {
+            new_version,
+            new_template,
+            ..
+        } => Some((new_version, new_template)),
+        // RFC 0050 §3.3 — adoption binds rows to
+        // `(template_id, template_version)` exactly like a
+        // creation; for an adoption riding an existing mined
+        // leaf the pair is already interned and this insert is
+        // an idempotent overwrite with the same tokens.
+        TemplateChange::Adopted {
+            template_version,
+            new_template,
+        } => Some((template_version, new_template)),
+        TemplateChange::RejectedDegenerate { .. } => None,
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +323,44 @@ mod tests {
             Some(&vec![fixed("late"), OwnedToken::Wildcard]),
             "the later-timestamp event wins the (id, version) key",
         );
+    }
+
+    /// The §3.7.1 order as a materialized fold: stable sort by timestamp,
+    /// then insert every event, last insert winning.
+    fn sort_then_insert(mut events: Vec<AuditEvent>) -> super::TemplateRegistry {
+        events.sort_by_key(|e| e.timestamp);
+        let mut registry = super::TemplateRegistry::new();
+        for event in events {
+            if let AuditPayload::Template {
+                template_id,
+                change,
+                ..
+            } = event.payload
+                && let Some((version, template)) = super::keyed_template(change)
+            {
+                registry.insert((template_id, version), super::parse_template(&template));
+            }
+        }
+        registry
+    }
+
+    proptest::proptest! {
+        /// The streaming fold equals sorting the whole history and
+        /// inserting in order, same-timestamp ties included.
+        #[test]
+        fn streaming_fold_equals_sort_then_insert(
+            history in proptest::collection::vec(
+                (1u64..4, 0u64..4, 1u32..3, "[a-z]{1,3}"),
+                0..40,
+            ),
+        ) {
+            let events: Vec<AuditEvent> = history
+                .into_iter()
+                .map(|(id, secs, version, word)| {
+                    widened(id, secs, version + 1, &format!("{word} <*>"))
+                })
+                .collect();
+            proptest::prop_assert_eq!(fold_registry(events.clone()), sort_then_insert(events));
+        }
     }
 }

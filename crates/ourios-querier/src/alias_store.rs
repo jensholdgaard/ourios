@@ -22,7 +22,7 @@
 //! semantics owner and the fallback for every non-hit disposition.
 
 use ourios_core::alias::AliasMap;
-use ourios_core::audit::AuditPayload;
+use ourios_core::audit::{AuditEvent, AuditPayload};
 use ourios_core::tenant::TenantId;
 
 use crate::{QueryError, StoreRef, audit_scan};
@@ -46,21 +46,37 @@ use crate::{QueryError, StoreRef, audit_scan};
 /// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
 pub fn derive_alias_map(backend: StoreRef<'_>, tenant: &TenantId) -> Result<AliasMap, QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
-    // tenant backstop; keep only the alias events. The reader's byte
-    // accounting is unused here (RFC 0031 measures the registry derivation,
-    // not the alias fold).
-    let (all_events, _bytes_read) = audit_scan::read_all_events(backend, tenant)?;
-    let mut events: Vec<_> = all_events
-        .into_iter()
-        .filter(|e| {
-            matches!(
-                &e.payload,
-                AuditPayload::AliasAsserted { .. } | AuditPayload::AliasRetracted { .. }
-            )
-        })
-        .collect();
-    // …and the stable sort by event time completes the total order:
-    // same-timestamp events keep their (file path, row index) order.
-    events.sort_by_key(|e| e.timestamp);
-    Ok(AliasMap::from_events(&events))
+    // tenant backstop; the fold keeps only the alias events. The reader's
+    // byte accounting is unused here (RFC 0031 measures the registry
+    // derivation, not the alias fold).
+    let mut fold = AliasFold::default();
+    audit_scan::for_each_event(backend, tenant, |event| fold.push(event))?;
+    Ok(fold.finish())
+}
+
+/// The streaming alias fold: retains only `alias_asserted` /
+/// `alias_retracted` events — rare operator actions — from a scan-order
+/// event stream, so folding a tenant's whole audit history holds
+/// O(alias events), not O(events).
+#[derive(Default)]
+pub(crate) struct AliasFold {
+    events: Vec<AuditEvent>,
+}
+
+impl AliasFold {
+    pub(crate) fn push(&mut self, event: AuditEvent) {
+        if matches!(
+            &event.payload,
+            AuditPayload::AliasAsserted { .. } | AuditPayload::AliasRetracted { .. }
+        ) {
+            self.events.push(event);
+        }
+    }
+
+    /// The stable sort by event time completes the total order:
+    /// same-timestamp events keep their (file path, row index) order.
+    pub(crate) fn finish(mut self) -> AliasMap {
+        self.events.sort_by_key(|e| e.timestamp);
+        AliasMap::from_events(&self.events)
+    }
 }

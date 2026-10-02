@@ -26,7 +26,7 @@ exclude = ["fuzz"]
 # `version.workspace = true`). The excluded `fuzz/` harness is a separate
 # workspace and versions independently. The release recipe (`just release X.Y.Z`)
 # bumps this one line; the matching `vX.Y.Z` tag then drives cargo-dist + image.
-version = "0.11.1"
+version = "0.11.2"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -55,6 +55,11 @@ pedantic = { level = "warn", priority = -1 }
 # canonical form each constant is recognised by, so the lint is noise
 # here — allowed, not fought site by site.
 duration_suboptimal_units = "allow"
+# `assert_is_empty` (clippy 1.99+) flags `assert!(x.is_empty())` across
+# many test sites. Its `assert_eq!(x, [])` rewrites often need explicit
+# empty-array types, and clippy's own fixes fail to compile in several
+# crates, so it is allowed here; adopting it is a cleanup of its own.
+assert_is_empty = "allow"
 
 # The profile that 'dist' will build with
 [profile.dist]

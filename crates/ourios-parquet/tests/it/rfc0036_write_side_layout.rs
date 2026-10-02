@@ -512,9 +512,9 @@ fn is_immediate_child(key: &str, prefix: &str) -> bool {
 /// here.
 ///
 /// The other two halves live where their machinery is. The **memory
-/// bound** (forced-spill peak decoded residency = one input + F×batch,
-/// never whole-partition) is
-/// `compaction::tests::rfc0036_3_forced_spill_peak_is_one_input_not_whole_partition`,
+/// bound** (forced-spill peak decoded residency: one input in phase 1,
+/// then (F + 1) × batch in phase 2, never whole-partition) is
+/// `compaction::tests::bounded_sort::rfc0036_3_forced_spill_peak_far_below_whole_partition`,
 /// which needs the internal `SortTuning` spill seam. The **D2 throughput
 /// band** is a wall-clock measurement, recorded in the `ourios-bench`
 /// `compaction` bench and `docs/benchmarks.md` §9.25 (indicative) —

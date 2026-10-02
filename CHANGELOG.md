@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.11.2] - 2026-10-02
+
+### Upgrade notes
+
+- **Fixes the idle out-of-memory loop from #895 (part 1).** Compaction no
+  longer decodes a whole partition into memory before sorting it. The
+  in-memory sort was gated on the partition's *encoded* size (256 MiB),
+  so a partition of many small files (e.g. 1,555 files, about 15 MB of
+  Parquet) decoded past 1.5 GiB on the first sweep after every start.
+  Sort memory is now bounded by an estimate of the *decoded* size
+  (64 MiB budget): the sort spills to sorted runs and merges them. Peak
+  is the budget plus one input while reading, then (fan-in + 1) × one
+  batch while merging, whatever the file count. Output is byte-identical
+  and still one file per partition. Partitions that now spill compact
+  somewhat slower (about 26% on the 64-file bench). If you disabled
+  compaction (`OURIOS_COMPACTION_ENABLED=0`) as a workaround, re-enable
+  it; the small-file backlog drains over the next sweeps.
+- **Fixes the query out-of-memory from #895 (part 2) / #853.** Deriving the
+  template map on a cold or stale cache no longer holds the tenant's
+  whole decoded audit history. The fold streams one audit file at a time
+  and keeps only the winning event per `(template_id, version)`. Results
+  are identical. The derived map is published once a derive completes,
+  so later queries and restarts load it instead of re-deriving. Still
+  open: a stale map re-reads the full audit history from object storage
+  (memory-bounded, but I/O scales with history; #897), and alias events
+  plus the freshness listing still grow with the audit set (#853).
+- RFC 0036 (write-side layout) is **reopened at `red`**: #895 invalidated
+  its memory criterion RFC0036.3. With this release that criterion
+  passes again. The RFC returns to `accepted` once the compaction
+  benches are re-recorded.
+
+### Documentation
+
+- Reopen RFC 0036 at red with a decoded-row budget for the §3.2 sort (#899) (2cf3632)
+
+### Fixed
+
+- Bound compaction sort memory by decoded footprint (#900) (42a003c)
+- Stream the template-map fold so audit history cannot oom (#896) (7999a23)
+- Keep clippy green on rust 1.99 (#901) (6eb8642)
+
 ## [0.11.1] - 2026-10-01
 
 ### Upgrade notes

@@ -296,8 +296,9 @@ trees — and never as encoded input bytes.
    The **fan-in cap F** (64) bounds the number of **runs** merged at
    once: while more than F runs remain, merge consecutive groups of F
    runs into intermediate runs, preserving run order, and repeat.
-   Emit into the existing `Writer`, rotating row groups at the §3.3
-   threshold.
+   Merged rows collect in one output chunk of at most one batch,
+   which is emitted into the existing `Writer` (rotating row groups at
+   the §3.3 threshold) each time it fills.
 
 **Order and determinism.** The buffer holds rows in (input ordinal,
 row ordinal) order, every sort is stable, runs are contiguous in that
@@ -310,7 +311,9 @@ changes only local scratch I/O.
 **Memory bound (the load-bearing claim).** Phase 1 holds at most `B`
 plus one decoded input: the buffer is under `B` when an input starts,
 and that input is the most it can overshoot by. Phase 2 holds at most
-F × one decoded batch, whatever the run count. Neither bound depends
+(F + 1) × one decoded batch, whatever the run count: one batch per
+open run plus the output chunk. The phases do not overlap, because the
+run-formation buffer is released before the merge starts. Neither bound depends
 on the partition's file count or compression ratio. The writer's
 in-memory output accumulation (`ArrowWriter<Vec<u8>>`) is unchanged.
 Everything around the sort — manifest bootstrap, CAS commit, GC, the
@@ -552,8 +555,8 @@ published diagnostic.
 >   including many small inputs whose encoded total is far below the
 >   budget `B` while their decoded rows exceed it — peak decoded-row
 >   residency stays within the phase-specific bounds: at most `B`
->   plus one decoded input in phase 1, and F × one decoded batch in
->   phase 2. Holding the whole partition is allowed only within those
+>   plus one decoded input in phase 1, and (F + 1) × one decoded batch
+>   (F open runs plus the merge's output chunk) in phase 2. Holding the whole partition is allowed only within those
 >   bounds (the skip-spill case, where it fits `B`); the gate is
 >   measured on decoded rows, not encoded bytes. `B` is a byte budget
 >   over the per-row decoded-footprint estimate, so a row-counting
@@ -610,8 +613,10 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   rows: phase 1 holds at most `⌊B / f⌋` rows plus one input's rows,
   where `f` is the smallest per-row decoded-footprint estimate in the
   fixture (the same `decoded_footprint` the sort charges against
-  `B`), and phase 2 at most F × one batch's rows. The skip-spill
-  fixture may hold the whole partition, since it fits `B`.
+  `B`), and phase 2 at most (F + 1) × one batch's rows. The phases
+  do not overlap, so a single peak is checked against the larger of
+  the two bounds. The skip-spill fixture may hold the whole
+  partition, since it fits `B`.
   Reopened 2026-10-02: the gauge test includes a many-small-inputs
   partition whose encoded total is well below its budget (`B` set to
   twice the encoded total) while its decoded rows exceed that budget
@@ -718,7 +723,7 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   cheaper encode doesn't pay for a second read path. Fan-in **F = 64**
   counts **runs**, not inputs: it single-passes any partition of up to
   64 budgets of decoded rows while capping worst-case phase-2
-  residency at F × one decoded batch. Small partitions **skip
+  residency at (F + 1) × one decoded batch. Small partitions **skip
   spilling** entirely while their decoded rows fit the **64 MiB
   decoded-row budget**; larger ones spill runs of whole inputs as the
   budget fills (*reopened 2026-10-02, §3.2 — originally gated on

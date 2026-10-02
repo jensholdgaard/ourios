@@ -265,7 +265,8 @@ pub fn compact_partition_with_promoted(
 /// rewritten even when it holds a single file, so the erasure lands.
 #[derive(Default)]
 pub struct RowHooks<'a> {
-    /// Called once per input file with its decoded rows, before any drop.
+    /// Called once per decoded batch, before any drop, so every input
+    /// row is seen exactly once.
     pub observe: Option<&'a mut RowObserver<'a>>,
     /// Rows for which this returns `true` are not written back.
     pub drop: Option<&'a RowFilter<'a>>,
@@ -341,17 +342,20 @@ pub fn compact_partition_with_flush_threshold(
 /// the defaults.
 #[derive(Debug, Clone, Copy)]
 struct SortTuning {
-    /// Sort wholly in memory (no spill) while the partition's total
-    /// encoded input bytes stay within this bound. 256 MiB is the
-    /// ingest seal target (`SINK_TARGET_BYTES`, RFC 0014 §3): a
-    /// partition no larger than one worst-case input file costs no
-    /// more to hold decoded than phase 1's existing one-input bound.
+    /// Budget for decoded rows held in memory, in
+    /// [`decoded_footprint`] bytes: a partition within it sorts wholly
+    /// in memory, and a larger one spills a sorted run at the end of
+    /// each input that overflows it. It is measured on decoded rows,
+    /// never encoded input, because small, well-compressed inputs
+    /// decode to many times their size on disk. 64 MiB keeps phase 1
+    /// well inside a small node's memory; spilling changes no output
+    /// byte (§3.5), only scratch I/O.
     in_memory_max_bytes: u64,
     /// Fan-in cap F: more sorted runs than this merge hierarchically,
-    /// so phase-2 memory is ≤ F × one decoded batch regardless of
-    /// backlog. 64 single-passes every realistic partition (§9.7's
-    /// band-scale case held 32 input files) while capping worst-case
-    /// residency far below one decoded input file.
+    /// so phase-2 memory is ≤ (F + 1) × one decoded batch (F open runs
+    /// plus the merge's output chunk) regardless of
+    /// backlog. 64 single-passes any partition up to F budgets of
+    /// decoded rows.
     fan_in: usize,
     /// RFC 0036 §3.3 compacted row-group rotation threshold override.
     /// `None` (production) takes the adaptive default (`OURIOS_COMPACTED_RG_BYTES`
@@ -364,7 +368,7 @@ struct SortTuning {
 impl Default for SortTuning {
     fn default() -> Self {
         Self {
-            in_memory_max_bytes: 256 * 1024 * 1024,
+            in_memory_max_bytes: 64 * 1024 * 1024,
             fan_in: 64,
             compacted_flush_bytes: None,
         }
@@ -456,9 +460,10 @@ fn compact_sorted_hooked(
     let estimated_output_bytes = sum_input_sizes(store, partition, &inputs)?;
 
     // RFC 0036 §3.2 external merge sort into the consolidated file.
-    // Phase 1 decodes the inputs strictly one at a time, so its peak is
-    // one fully-decoded input — the same bound the pre-sort streaming
-    // loop had. `open_partition_bytes` validates each row's tenant +
+    // Phase 1 holds at most the `tuning` budget of decoded rows plus one
+    // input before spilling a sorted run, so its peak is independent of
+    // the partition's file count and compression ratio.
+    // `open_partition_bytes` validates each row's tenant +
     // time bucket against this partition (RFC 0005 §3.9 / RFC0009.5),
     // so a mis-partitioned input aborts the compaction instead of being
     // silently merged. Row groups rotate at the §3.3 compacted
@@ -473,16 +478,14 @@ fn compact_sorted_hooked(
         estimated_output_bytes,
     )
     .map_err(CompactionError::Write)?;
-    let (row_count, bytes_read, rows_dropped) = sort_inputs_into(
-        &mut writer,
+    let plan = SortPlan {
         store,
         partition,
         promoted,
         keys,
         tuning,
-        &inputs,
-        hooks,
-    )?;
+    };
+    let totals = sort_inputs_into(&mut writer, plan, &inputs, hooks)?;
     let written = writer.close().map_err(CompactionError::Write)?;
     let bytes_written = written.bytes_written;
     let consolidated = basename(&written.key).to_owned();
@@ -516,8 +519,8 @@ fn compact_sorted_hooked(
 
     Ok(CompactionOutcome {
         files_before: inputs.len(),
-        rows: row_count,
-        rows_dropped,
+        rows: totals.rows,
+        rows_dropped: totals.rows_dropped,
         committed: Some(Committed {
             file: consolidated,
             generation,
@@ -525,7 +528,7 @@ fn compact_sorted_hooked(
         }),
         commit_lost: false,
         gc_failures,
-        bytes_read,
+        bytes_read: totals.bytes_read,
         bytes_written,
     })
 }

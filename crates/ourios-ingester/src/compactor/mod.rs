@@ -239,7 +239,7 @@ pub fn run_sweep_with_promoted(
 /// pending erasures are recorded as errors, never silently skipped.
 #[derive(Default)]
 pub struct SweepHooks<'a> {
-    /// `(tenant, rows)` for every input file the sweep decodes.
+    /// `(tenant, rows)` for every batch of input rows the sweep decodes.
     pub observe: Option<&'a mut SweepObserver<'a>>,
     /// `(row, conversation_id)` → whether the row belongs to the conversation.
     pub erasure_match: Option<&'a ErasureMatch<'a>>,

@@ -1447,8 +1447,11 @@ fn many_small_inputs_within_the_encoded_budget_do_not_decode_at_once() {
     )
     .expect("compact");
     let peak = residency::peak();
-    assert_eq!(outcome.rows, K * S, "every row carried");
-    assert!(outcome.committed.is_some(), "one pass commits");
+    assert_eq!(
+        (outcome.rows, outcome.committed.is_some()),
+        (K * S, true),
+        "one pass commits every row",
+    );
 
     let row_bytes = decoded_footprint(&sort_rec(Some("svc-a"), HOUR10_START, 1));
     let budget_rows = usize::try_from(encoded / row_bytes).expect("fits usize");
@@ -1506,10 +1509,20 @@ fn over_budget_partition_matches_the_in_memory_output_with_hooks() {
     let (bounded, observed_b) = run(&store_b, 64 * 1024);
 
     let total = usize::try_from(K * S).expect("fits usize");
-    assert_eq!(observed_a, total, "every row observed once (unbounded)");
-    assert_eq!(observed_b, total, "every row observed once (bounded)");
-    assert_eq!(bounded.rows_dropped, unbounded.rows_dropped);
-    assert_eq!(bounded.rows + bounded.rows_dropped, K * S);
+    assert_eq!(
+        (observed_a, observed_b),
+        (total, total),
+        "every row observed once on both paths",
+    );
+    assert_eq!(
+        (
+            bounded.rows,
+            bounded.rows_dropped,
+            bounded.rows + bounded.rows_dropped
+        ),
+        (unbounded.rows, unbounded.rows_dropped, K * S),
+        "both paths keep and drop the same rows, accounting for all of them",
+    );
     let a = unbounded.committed.expect("unbounded commit");
     let b = bounded.committed.expect("bounded commit");
     assert_eq!(

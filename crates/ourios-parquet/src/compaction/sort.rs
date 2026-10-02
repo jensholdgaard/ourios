@@ -178,9 +178,20 @@ impl<'a> RunFormation<'a> {
         if self.spill.is_some() && !self.buffer.is_empty() {
             self.spill_buffer()?;
         }
-        match self.spill {
-            None => emit_in_memory(self.plan.keys, self.buffer, writer),
-            Some(spill) => spill.merge_into(writer, self.plan),
+        let Self {
+            plan,
+            buffer,
+            spill,
+            ..
+        } = self;
+        match spill {
+            None => emit_in_memory(plan.keys, buffer, writer),
+            Some(spill) => {
+                // `clear()` kept the phase-1 allocation; release it before
+                // the merge so phase 2 holds only F × one batch.
+                drop(buffer);
+                spill.merge_into(writer, plan)
+            }
         }
     }
 }

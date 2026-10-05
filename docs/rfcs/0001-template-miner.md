@@ -522,6 +522,12 @@ direction and the primary obligation lives in those other RFCs.
 >   scratch
 > - **And** no frame at or below `S` reaches the miner (no
 >   double-apply — the v1 hazard that gated restore)
+> - *(2026-10-05 amendment, #898.)* At the miner level the equality
+>   is exact. Through the ingester's recovery driver, a template
+>   **first allocated during tail replay** is drawn from above the
+>   template-id high-water (§6.9), so the equality holds up to that
+>   injective renaming of tail-minted ids. Every other field, and
+>   every id restored from the snapshot, is unchanged.
 
 > **Scenario §3.5.4 — Stale snapshot degrades loudly, not silently (2026-06-12 amendment)**
 > - **Given** a snapshot at high-water mark `S`, a Parquet
@@ -539,6 +545,39 @@ direction and the primary obligation lives in those other RFCs.
 >   `S` and the oldest surviving frame, so the possible template
 >   re-minting inside it is surfaced (hazard #5, observable via the
 >   RFC 0010 drift query) rather than silent
+
+> **Scenario §3.5.5 — A discarded or lost miner state never re-issues a published id (2026-10-05 amendment, #898)**
+> - **Given** templates minted, published and their WAL frames
+>   reclaimed, including a structured-body template (which emits no
+>   audit event)
+> - **When** the tenant's snapshot is discarded (any discard
+>   class), or the whole local root is replaced by an empty one
+>   while the object store is intact, and the node restarts and
+>   mints new and old shapes
+> - **Then** no newly allocated `template_id` equals an id any
+>   Parquet row or audit event already carries
+> - **And** a shape first seen in a reclaimed frame re-mints under
+>   a fresh id (hazard #5 drift, observable via RFC 0010), never
+>   under another template's id
+
+> **Scenario §3.5.6 — Reserved-but-unused ids are skipped, never reused (2026-10-05 amendment, #898)**
+> - **Given** a node that durably reserved ids through `N` and
+>   allocated only some of them
+> - **When** it crashes and restarts
+> - **Then** its first fresh allocation is above `N`
+> - **And** the template-id high-water object reads at least `N`
+
+> **Scenario §3.5.7 — The template-id high-water is bootstrapped once, and an unreadable one fails closed (2026-10-05 amendment, #898)**
+> - **Given** a store with published data but no high-water object
+>   (a deployment upgrading to this amendment)
+> - **When** the node starts
+> - **Then** it writes the high-water at the bootstrap floor (the
+>   audit stream's highest `template_id` or the restored snapshots'
+>   highest id, whichever is larger, plus the bootstrap margin)
+>   before allocating, and logs the bootstrap once
+> - **And** a high-water object that cannot be read or parsed, or
+>   carries an unknown format version, fails startup instead of
+>   bootstrapping over it
 
 > **Scenario §3.7.1 — Tenants' template trees never cross-pollinate**
 > - **Given** a `MinerCluster` ingesting interleaved lines from
@@ -1191,6 +1230,20 @@ are an opt-in concern and are not provided by the miner. A future
 hash over `(severity_number, scope_name, masked_body_tokens)` for
 opt-in cross-tenant use; the gate for adding it is "we have a
 concrete consumer," not "it might be useful."
+
+> **Amendment 2026-10-05 (durable uniqueness, #898).** "Never reused"
+> is a durable guarantee, not a property of one process's memory.
+> The in-memory allocator alone could not keep it: a snapshot that
+> recovery discards, reclaimed WAL frames, or a replaced local root
+> rebuilt the allocator below ids already published, and the next
+> fresh template took one of them, binding existing rows to another
+> template (`[§3.1]`). Uniqueness now rests on the **template-id
+> high-water** in object storage (§6.9 amendment of the same date):
+> no id above the durably reserved `N` is ever allocated, and every
+> start allocates only above `N`. Ids are no longer dense: a
+> reservation a crash leaves unused is skipped, and the monotonic
+> per-tenant subsequence may jump. Nothing reads density; `u64`
+> gaps are free.
 
 **Template version.** `template_version` starts at 1 when the
 template is created and increments by 1 on every widening event:
@@ -2252,6 +2305,157 @@ boundary at 1.0 (see §6.3): default buckets
 > (restore-equivalence), §3.5.4 (stale-snapshot fallback); the
 > end-to-end driver contract is RFC 0008's RFC0008.10.
 
+> **Amendment 2026-10-05 (durable template-id high-water, #898).**
+> The cluster-wide `template_id` allocator (§6.1) lived only in
+> memory. A restored snapshot moved it past the ids that snapshot
+> held, but a tenant whose snapshot was discarded, or whose
+> reclaimed frames no snapshot covered, was rebuilt from the
+> surviving frames alone, so the allocator could restart below ids
+> already published. The audit stream cannot be the floor: structured
+> templates emit no audit event, an audit write that fails
+> permanently is dropped while its records still publish, and a
+> replaced local root looks like a fresh one. The allocator is now
+> bounded by a durable object in the store.
+>
+> *The object.* One per store, at the key
+> **`miner/template_ids.v1.json`**: a top-level prefix beside
+> `data/`, `audit/`, `erasure/` and `backfill/`, kept out of `audit/`
+> so no audit scan ever lists it. The format version is in the name,
+> following RFC 0033's `template_map.v2.json.zst`, and the body is
+> JSON, following the RFC 0009 `manifest.json` and RFC 0047 marker
+> precedent: `{"reserved_through": N}`, where `N` is a `u64`
+> serialised as a JSON integer. A reader that finds the key but
+> cannot fetch it, parse it, or read a `u64` there fails closed, and
+> so does one that finds only a later version's key.
+>
+> *Write-before-allocate.* The allocator holds a reserved range
+> `(next, limit]` and never allocates above `limit`. To extend it, a
+> node reserves a block: it reads `N`, writes
+> `N' = max(N, its own floor) + BLOCK` durably, and only after that
+> write succeeds raises its `limit` to `N'`. A crash between the
+> write and use leaves `(next, N']` unused, and those ids are simply
+> skipped. `BLOCK` is a constant **1 000**. New templates are rare
+> next to lines: RFC 0023 bounds a tenant's tree at 20 000 leaves,
+> and the C2 corpora plateau in the tens, so a block lasts hours to
+> days and reservations stay far from the line rate. The most a
+> crash can waste is one block plus the refill block below, and at
+> `u64` that waste is irrelevant.
+>
+> *Off the hot path.* The miner allocates under its lock, so the
+> reservation write must not normally run there. The ingester keeps
+> the next block ready: when fewer than `BLOCK / 2` reserved ids
+> remain, it reserves the next block off the miner lock and hands it
+> to the miner. Only when the miner exhausts its range before that
+> refill lands does it reserve synchronously under the lock. That
+> needs `BLOCK / 2` new templates to arrive inside one refill write,
+> so it is rare. If even the synchronous reservation fails (the
+> store is unreachable), the line is not given an id it cannot
+> prove unique. It is treated as a parse failure, with `template_id
+> = 0` and its body retained (`[§3.3]` holds through the body), and
+> counted on the existing `parse_failures_total` with an `error.type`
+> naming the cause. The attribute value goes through the semconv
+> registry when the slice lands.
+>
+> *Every start.* Recovery reads `N` before replay and seats the
+> allocator by reserving a fresh block above
+> `max(N, highest restored snapshot id)`. The snapshot term is a
+> belt, since every restored id was allocated under some earlier
+> reservation and is therefore `≤ N`. Replay then mints from that
+> block, so nothing replay or later ingest allocates can equal an id
+> issued before the restart, whatever recovery restored, discarded
+> or never found. This replaces the discard-time audit-stream floor
+> that #898 first proposed. **An object that exists but cannot be
+> read fails startup closed.** That is the RFC 0052 / #791
+> trade-off: a restart then needs the store reachable, but a guessed
+> floor could silently bind published rows to another template.
+>
+> *Restore equivalence.* A tenant's own tail frames above its `S`
+> lie above the checkpoint `X` in the steady state (`S ≥ X`, the
+> 2026-06-12 amendment above), so they were never published, and the
+> fresh ids replay gives the templates first seen there are
+> invisible. Only a **lagging snapshot** (`S < X`) re-mints, from the
+> fresh block, templates whose rows in `(S, X]` were already
+> published under the old ids. That is drift, surfaced by RFC 0010
+> and bounded to templates first seen in that window, never a
+> collision. §3.5.3 is restated accordingly. Keeping exact id
+> continuity across a restart would mean journalling every
+> reservation as a WAL frame (an RFC 0008 format change), and is not
+> worth it for that window.
+>
+> *Bootstrap.* When the object is absent (a deployment upgrading to
+> this amendment, or a new store), the first start computes a
+> one-time floor:
+> `max(audit-stream max, highest restored snapshot id) + 1 000 000`.
+> The audit-stream max is read from each audit file's `template_id`
+> footer statistics, one object at a time, with no event decoded.
+> It then writes `reserved_through` from that floor and logs the
+> bootstrap once. The margin covers what neither source can see:
+> structured templates emit no audit event and a discarded snapshot
+> holds none, and audit events lost to a permanent write failure
+> left their ids unrecorded. Those ids were allocated from the same
+> counter as audited ones. The ones that matter are those allocated
+> after the highest audited id, and their number is bounded by the
+> structured `(severity_number, scope_name, event_name)` keys and
+> dropped audit batches minted after that point: in practice tens
+> to thousands, so `10⁶` clears it by orders of magnitude at no
+> cost. Reading data-file footers for an exact maximum was
+> rejected: that listing is the whole data prefix (#853's cost,
+> across every tenant). A new store bootstraps through the same
+> rule, from an empty audit stream, so its first id is
+> `1 000 001`. The bootstrap is created with a create-if-absent
+> write. A start that loses that race reads the winner's object
+> instead. The bootstrap log line needs an event name that does not
+> exist yet; it goes through the semconv registry (proposed:
+> `ourios.receiver.template_ids.bootstrapped`, attributes
+> `ourios.template_id.floor` and the audit maximum) before the
+> slice merges.
+>
+> *Several ingesters on one store.* The Helm chart runs the
+> receiver as a StatefulSet whose `replicas` an operator may raise,
+> each replica with its own WAL, all writing one shared store, and
+> nothing routes a tenant to a single replica. Before this
+> amendment two replicas each started their allocator at 1, so
+> ids already collided across them. The reservation is therefore a
+> compare-and-swap on the one object: read `N` with its `ETag`,
+> write `N'` with `If-Match` (or create-if-absent when there is no
+> object), and on a precondition failure re-read and retry. The
+> store's linearisable conditional write makes every node's
+> `(N, N']` disjoint, which is RFC 0013's manifest-swap primitive
+> (`Store::put_if_match`, including its unquoted-`ETag` retry) and
+> needs no per-node key. The **local backend** has no `If-Match`
+> (RFC0019.7: it commits by atomic overwrite, last writer wins), so
+> on it the high-water is written by overwrite, and **one receiver
+> per local store** is a stated constraint, the same constraint
+> under which the chart's shared local PVC is coherent at all. The
+> same template reaching two replicas still gets two ids. That is
+> hazard #5 drift across replicas, not a collision, and it is out of
+> scope here.
+>
+> *Hazards and the snapshot format.* The amendment changes no
+> snapshot payload: format 3's `wildcard_routed` and every restore
+> rule above are untouched. Restore still seats the allocator past
+> the restored ids (`allocate_past`), and the high-water only adds a
+> floor above it. Hazard #1 / `[§3.1]`: a `(template_id,
+> template_version)` can no longer name two templates through
+> re-issue. Hazard #5: re-minting old shapes under fresh ids remains
+> what it was, drift that the RFC 0010 drift query surfaces. It now
+> never lands on another template's id.
+>
+> *Tests.* §3.5.5–§3.5.7 above, built on #898's scenario harness
+> (the real barrier, housekeeping and recovery path: mint, cut,
+> reclaim, discard, restart, mint):
+> - discard of each class;
+> - a structured template surviving a discard;
+> - a replaced local root over an intact store;
+> - a crash between reservation and use;
+> - bootstrap from an absent object;
+> - an unreadable object failing closed;
+> - two allocators on one CAS store reserving disjoint ranges.
+>
+> Alongside them run the property that no allocator seated past the
+> issued ids re-issues one, and a heap-bounded bootstrap scan
+> (`dhat`).
+
 **Hot path.** The per-tenant tree lives in process memory on the
 ingester. Tree operations (descend, simSeq, attach, widen) are
 hot-path; persistence does not happen synchronously per line.
@@ -2609,6 +2813,13 @@ resolves bidirectionally between RFC and tests.
   gap while the surviving frames still fold.
   *Covers:* §3.5.3, §3.5.4 (the end-to-end driver half is
   RFC 0008's RFC0008.10).
+
+- **Template-id high-water tests (2026-10-05 amendment)**: the §6.9
+  amendment's scenario list, driven through the production barrier,
+  housekeeping and recovery path, with every newly minted id
+  checked against every id the store's Parquet rows and audit
+  events already carry.
+  *Covers:* §3.5.5, §3.5.6, §3.5.7.
 
 - **Configuration tests**: assert default values and the rejection
   of out-of-bounds settings at startup.

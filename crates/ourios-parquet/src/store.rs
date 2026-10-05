@@ -30,7 +30,8 @@ use object_store::client::SpawnedReqwestConnector;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use tokio::runtime::Runtime;
 
@@ -152,6 +153,15 @@ pub struct DelimitedListing {
     /// The immediate child common-prefixes ("directories"), without a
     /// trailing `/`.
     pub common_prefixes: Vec<String>,
+}
+
+/// The tail of an object, from [`Store::get_suffix`].
+#[derive(Debug, Clone)]
+pub struct Suffix {
+    /// Up to the requested number of the object's last bytes.
+    pub bytes: bytes::Bytes,
+    /// The whole object's size.
+    pub object_size: u64,
 }
 
 /// A handle to the object store backing a tenant store's Parquet + manifest
@@ -635,6 +645,24 @@ impl Store {
         Ok(bytes.to_vec())
     }
 
+    /// Read up to the last `len` bytes of the object at `key`, with the
+    /// object's whole size — one ranged `GET`, which is how a Parquet footer
+    /// is read without fetching the file.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if the object is missing or the read fails.
+    pub async fn get_suffix(&self, key: &str, len: u64) -> Result<Suffix, StoreError> {
+        let options = GetOptions::default().with_range(Some(GetRange::Suffix(len)));
+        let got = self
+            .inner
+            .get_opts(&self.resolve(key)?, options)
+            .await
+            .map_err(StoreError::Backend)?;
+        let object_size = got.meta.size;
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok(Suffix { bytes, object_size })
+    }
+
     /// Delete the object at `key`.
     ///
     /// # Errors
@@ -676,6 +704,17 @@ impl Store {
     pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
         block_on_off_runtime(async move { store.get(&key).await })
+    }
+
+    /// Blocking [`Self::get_suffix`] for the sync call sites. Safe to call
+    /// from inside a tokio runtime (see [`Self::get_blocking`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::get_suffix`].
+    pub fn get_suffix_blocking(&self, key: &str, len: u64) -> Result<Suffix, StoreError> {
+        let (store, key) = (self.clone(), key.to_owned());
+        block_on_off_runtime(async move { store.get_suffix(&key, len).await })
     }
 
     /// List every object key under `prefix` (store-relative), recursively, in

@@ -150,9 +150,12 @@ it in increasing order. It never allocates an id above `b`.
 restored or issued:
 
 1. Read `N` and its `ETag`.
-2. Compute `a = max(N, f)` and `b = a + BLOCK`. Fail if `b` would exceed
-   `i64::MAX`, the top of the id domain (§3.7). That failure is the same
-   controlled exhaustion error as everywhere else.
+2. Compute `a = max(N, f)` and `b = min(a + BLOCK, i64::MAX)`: the final
+   block below the top of the id domain (§3.7) is **shortened**, so no
+   id up to `i64::MAX` is stranded and `i64::MAX` itself is issuable.
+   Only `a = i64::MAX`, nothing left, fails, with the same controlled
+   exhaustion error as everywhere else. Filling the ready blocks stops
+   there without retrying. Fresh mints fail once the held ids run out.
 3. Write `N' = b` as a compare-and-swap against the `ETag` (§3.6). On a
    precondition failure, re-read and retry from step 1.
 4. Only once the write is durable does `(a, b]` become usable.
@@ -877,8 +880,12 @@ The ids are referenced from test code.
 > - **When** its ids are listed in issue order
 > - **Then** they strictly increase
 > - **And** no id above `i64::MAX` is ever issued: `i64::MAX` itself is
->   the last id, and seating past it, restoring an id above it, or a
->   block reaching past it, is the controlled exhaustion error
+>   the last id, and seating past it or restoring an id above it is the
+>   controlled exhaustion error
+> - **And** from a high-water whose distance to `i64::MAX` is not a
+>   multiple of `BLOCK`, a shortened final block ending at `i64::MAX` is
+>   reserved, every id through `i64::MAX` is issued, and only the next
+>   fresh mint fails
 > - **And** a bootstrap that finds a published id above `i64::MAX` fails
 >   startup closed, naming the file
 

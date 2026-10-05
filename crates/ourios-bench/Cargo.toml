@@ -134,7 +134,7 @@ criterion = "=0.8.2"
 flate2 = "=1.1.10"
 # Builds `WalOffset`s by hand in the reclamation harness's unit tests; the
 # same `uuid` the WAL already pulls into the lock tree.
-uuid = { version = "1", default-features = false }
+uuid = { version = "=1.26.1", default-features = false }
 
 [[bench]]
 name = "b1"

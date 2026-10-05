@@ -243,8 +243,11 @@ data file under `data/`.
 - The read goes footer only, one file at a time. One suffix-ranged
   GET of the last 64 KiB returns the footer and the object's size, and a
   second, larger one follows only when the footer is bigger than that.
-- A file with a row group lacking usable statistics comes down whole,
-  and only its id columns are decoded. The writers record the
+- The footer answers a file only when **every** id column it holds has
+  usable statistics in every row group. That is `template_id` for a data
+  file, and all three id columns for an audit file (below).
+- If any id column lacks them in any row group, the file comes down
+  whole and its id columns are decoded. The writers record the
   statistics, so a file that needs this is a pre-statistics or foreign
   file.
 - No row is ever materialised.
@@ -257,7 +260,9 @@ staging objects, `manifest.json`, and `template_map.v2.json.zst`.
 
 **`audit_max`.** The same footer read over every `audit/` file. It
 covers the `template_id` column, plus `alias_representative_id` and the
-`alias_member_ids` leaf, since alias events carry ids too.
+`alias_member_ids` leaf, since alias events carry ids too. Statistics on
+`template_id` alone do not answer an audit file: if either alias column
+lacks usable statistics, that column's data is read.
 
 **`restored_max`.** The highest id in the snapshots this start restored.
 Those can hold ids whose rows were not yet published.
@@ -369,7 +374,28 @@ DuckDB procedure finds them.
     reservations.
 - **A lost or replaced root** has no marker and no snapshots, so it
   just writes the marker.
-- **No operator step.** No replica count or upgrade order is required.
+- **Live pre-RFC receivers are a different case.** The marker covers
+  offline replicas' snapshots. It cannot cover a pre-RFC receiver that is
+  still running.
+  - A Kubernetes StatefulSet rolling update keeps old pods serving while
+    the first upgraded pod bootstraps. An old binary can publish an id
+    after the scan has passed its file and before the create lands.
+  - That id may then lie inside the bootstrapper's first block.
+- **The upgrade rule.** For the one upgrade to this RFC:
+  1. stop every pre-RFC receiver (scale `receiver.replicas` to 0);
+  2. start one upgraded replica, which bootstraps;
+  3. only then scale out.
+
+  The Helm chart states the rule beside `receiver.replicas` and in its
+  `NOTES.txt`, and the release notes carry it. A store that already has
+  the high-water needs no step.
+- **Detection is a stated limitation.** Spotting a still-running
+  pre-RFC writer would mean finding data files whose ids exceed the
+  floor yet were not allocated from a reservation. That needs
+  re-listing every data partition after the bootstrap, the whole-prefix
+  walk (#853) the bootstrap pays only once. It is not cheap enough to
+  run, so the receiver does not warn. The DuckDB procedure from #908
+  finds any collision such an upgrade left.
 - **Relation to RFC 0052.** The discard runs before RFC 0052 §3.2's
   legacy stale-gap belt. That belt still reads the discarded version-1
   artefacts' marks, so a pre-RFC 0052 root is checked exactly as
@@ -462,7 +488,7 @@ are listed exactly so that registry PR can be finalised:
 
 | Name | Kind | Attributes / members |
 |---|---|---|
-| `ourios.receiver.template_ids.bootstrapped` | event, once per store | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
+| `ourios.receiver.template_ids.bootstrapped` | event, at most once per store (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
 | `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
 | `ourios.miner.parse_failure.reason` | existing enum attribute | new member `id_reservation_failed` |
 | `ourios.receiver.snapshot.discarded` | existing event | new `error.type` value `predates_high_water` (§3.5) |
@@ -578,8 +604,9 @@ The ids are referenced from test code.
 > - **Then** the object is created with `reserved_through =
 >   max(data_max, audit_max, restored_max)`, with no margin
 > - **And** every id allocated afterwards is above it
-> - **And** `ourios.receiver.template_ids.bootstrapped` is logged exactly
->   once, with the floor and the maxima
+> - **And** `ourios.receiver.template_ids.bootstrapped` is logged at most
+>   once per store, by the start whose create landed, with the floor and
+>   the maxima (a crash between the create and the event leaves none)
 > - **And** a restart killed mid-scan leaves no object, and the next start
 >   redoes the scan and writes once
 
@@ -587,12 +614,14 @@ The ids are referenced from test code.
 > - **Given** histories of 40 and 160 data and audit files with large
 >   bodies and templates
 > - **When** the bootstrap scan runs
-> - **Then** it decodes no row and reads no data page of a file whose
->   `template_id` statistics are present
+> - **Then** it decodes no row and reads no data page of a file whose id
+>   columns all have usable statistics
 > - **And** its peak heap is below one eighth of the history's body and
->   template bytes, and grows less than 1.5× when the history grows 4×
->   across a fixed number of directories, so that it is bounded by the
->   largest directory listing plus one file, not by the file count
+>   template bytes
+> - **And** when the history grows 4× by adding directories, with the
+>   widest directory and the largest file held fixed, the peak grows
+>   less than 1.5×: it is bounded by the largest directory listing plus
+>   one file, not by the number of files or directories
 
 > **Scenario RFC0059.8 — Concurrent reservers on one store get disjoint blocks**
 > - **Given** a store with `If-Match` support and two reservers on it

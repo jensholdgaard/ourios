@@ -34,9 +34,8 @@ jobs:
           persist-credentials: false
       - name: Free runner disk space
         run: .github/scripts/free-disk-space.sh
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
-        with:
-          toolchain: stable
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run ingest_write_path + recovery benches
         run: |

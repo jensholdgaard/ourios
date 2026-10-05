@@ -13,8 +13,9 @@ superseded-by: —
 
 > **Status: `specified`.** §5 lists the acceptance criteria. This RFC
 > amends RFC 0001 §6.1 (template identity), §6.9 (persistence and
-> recovery) and scenario §3.5.3, and RFC 0023 §3.4 (the parse-failure
-> reason enum). RFC 0001 keeps the old text with a dated pointer here,
+> recovery) and scenario §3.5.3, RFC 0023 §3.4 (the parse-failure
+> reason enum), and RFC 0052 §3.7 (the audit gate, for re-minted ids).
+> RFC 0001 keeps the old text with a dated pointer here,
 > the way RFC 0023 amended it.
 
 ## 1. Summary
@@ -150,11 +151,25 @@ rebuildable cache.
     (RFC0059.18).
   - Every replica that saw a later value therefore refuses the stale
     copy at its next start.
-  - The only recovery is a quiesced, authorised re-bootstrap (§3.5):
+  - The only recovery is a quiesced, authorised re-bootstrap (§3.5),
+    the same for a rolled-back and for a deleted object (RFC0059.14):
     1. stop every receiver;
-    2. remove the object;
-    3. start one replica with `receiver.template_ids_allow_bootstrap`,
-       which recomputes the provable floor from the footers.
+    2. remove the object **and every root's seated marker**. A root that
+       keeps its marker refuses to bootstrap and fails closed with
+       `HighWaterDeleted`;
+    3. start one replica with `receiver.template_ids_allow_bootstrap`;
+    4. remove the setting, and scale out as in the upgrade.
+  - The replica in step 3 recomputes the floor from every data and audit
+    footer, plus its own restored snapshots. That is exactly the
+    upgrade's path, and the markers' `max_reserved_seen` is safe to drop:
+    - every id a root issued and published lies in the footers, so the
+      floor covers it;
+    - every root that later starts markerless discards its snapshots as
+      `predates_high_water` and re-mints its unpublished frames above
+      the new high-water (§3.5);
+    - an id a root reserved but never published binds no row, so it may
+      be re-issued safely.
+  - This needs no new configuration, and is tested (RFC0059.18).
   - §3.6 bounds what this check covers.
 
 ### 3.2 Reservation: write before allocate
@@ -309,6 +324,25 @@ RFC 0001 §6.9's 2026-06-12 amendment). They were never published, so the
 renaming is invisible. Only a lagging snapshot (`S < X`) re-mints
 templates whose rows in `(S, X]` were already published. That is
 drift, surfaced by RFC 0010, never a collision.
+
+**A re-minted id publishes its mapping.**
+- A frame at or below `X` replays for the miner's state alone, because
+  its rows and audit events were published before the crash (RFC 0052
+  §3.7's gates).
+- A template such a frame mints afresh takes an id above the
+  high-water that no published event binds. That happens when the
+  snapshot is discarded, or when `S < X`.
+- Rows ingested after startup that match the template carry that id.
+  Without its events, the querier could not render them.
+- Replay therefore **forwards every audit event of a template it minted
+  itself**: one whose `template_id` lies above the highest id seated
+  before replay. It withholds every other event at or below `X` as
+  before, and every row.
+  - Nothing is duplicated. The forwarded events bind a new id, while
+    the published originals bind the old one.
+  - The events reach the audit sink during recovery, before any
+    listener opens. The sink's audit barrier publishes them no later
+    than the first row that carries the id.
 
 ### 3.5 Bootstrap: a provable floor
 
@@ -691,7 +725,9 @@ adversary who holds delete or overwrite rights on `miner/`.
 - **Unsupported, but caught:**
   - Restoring an older copy of the object. The per-root check refuses it
     at every replica whose marker saw a later value (§3.1).
-  - Recovery is the quiesced, authorised re-bootstrap described there.
+  - Recovery is the quiesced, authorised re-bootstrap described there:
+    remove the object and every seated marker, then bootstrap one
+    replica from the provable footer floor.
 - **Out of scope:**
   - An operator with delete rights who restores stale state while some
     replica never observed the later value. That replica's marker cannot
@@ -761,6 +797,8 @@ needs.
 - **RFC 0023 §3.4**: `ourios.miner.parse_failure.reason` gains the
   member `id_reservation_failed`, checked after `template_ceiling`
   (§3.3).
+- **RFC 0052 §3.7**: the audit gate at `X` forwards the events of
+  templates replay minted afresh (§3.4). The record gate is unchanged.
 - **RFC 0001** gets only a dated pointer here, in §6.1 and §6.9.
 
 ### 3.9 Telemetry
@@ -926,6 +964,13 @@ The ids are referenced from test code.
 >   injective renaming that touches only ids first minted in the tail
 > - **And** every restored id and every other field is exactly equal
 > - **And** no renamed id equals an id issued before the restart
+> - **And** when the snapshot is discarded, or lags the checkpoint
+>   (`S < X`), every template replay mints afresh from frames at or
+>   below `X` has its audit events published before any listener
+>   opens, while those frames' rows stay withheld and no event of an
+>   older id is re-published
+> - **And** a row ingested after startup that matches such a template
+>   carries an id a published event binds
 
 > **Scenario RFC0059.10 — Ids increase per allocator across restarts**
 > - **Given** an allocator that issued ids, restarted, and issued more
@@ -1036,6 +1081,10 @@ The ids are referenced from test code.
 > - **And** when the object reappears as an older copy below the
 >   receiver's `max_reserved_seen`, a restart fails closed with an error
 >   naming a rollback of the high-water object, and writes nothing
+> - **And** after the documented recovery (every receiver stopped, the
+>   object and every seated marker removed, one replica started with
+>   `receiver.template_ids_allow_bootstrap`), that replica seats at or
+>   above every published id, and its next mint is fresh
 
 ## 6. Testing strategy
 

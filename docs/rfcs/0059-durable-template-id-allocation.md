@@ -99,12 +99,14 @@ rebuildable cache.
   {"reserved_through": 4021000}
   ```
 
-  `reserved_through` (`N`) is a `u64` written as a JSON integer. It is
-  the highest id any allocator has been allowed to issue. Readers
-  ignore unknown fields within version 1.
+  `reserved_through` (`N`) is a `u64` written as a JSON integer, at
+  most `i64::MAX` (the id domain, §3.7). It is the highest id any
+  allocator has been allowed to issue. Readers ignore unknown fields
+  within version 1.
 - **Read failures fail closed.** A reader fails when:
   - the key exists but cannot be fetched or parsed;
-  - `reserved_through` is absent or is not a `u64`;
+  - `reserved_through` is absent, is not a `u64`, or is above
+    `i64::MAX`;
   - `miner/` holds any `template_ids.v<k>.json` with `k` above the
     version the reader knows, **whether or not** its own version's key
     also exists.
@@ -149,7 +151,8 @@ restored or issued:
 
 1. Read `N` and its `ETag`.
 2. Compute `a = max(N, f)` and `b = a + BLOCK`. Fail if `b` would exceed
-   `u64::MAX - 1`, so `u64::MAX` is never issued.
+   `i64::MAX`, the top of the id domain (§3.7). That failure is the same
+   controlled exhaustion error as everywhere else.
 3. Write `N' = b` as a compare-and-swap against the `ETag` (§3.6). On a
    precondition failure, re-read and retry from step 1.
 4. Only once the write is durable does `(a, b]` become usable.
@@ -179,8 +182,8 @@ which is free.
 
 The miner allocates under its lock (RFC 0035 §3.1's ordered phase), so
 no reservation ever runs there.
-- **Holding blocks ahead.** The miner holds its current block, and up
-  to **two ready blocks** wait beside it. When the current block is used
+- **Holding blocks ahead.** The miner holds its current block, and
+  **two ready blocks** wait beside it. When the current block is used
   up, the oldest ready block becomes current. That is an in-memory pop.
 - **Why two.** Refill is asynchronous: when a ready block becomes
   current, the refiller is asked for a replacement, and that reservation
@@ -243,9 +246,11 @@ file afterwards would leave its leaves live. The order is:
    loses to another replica's also fails startup (`BootstrapRaceLost`),
    and its restart takes case 2.
 
-In every case the allocator then reserves the two ready blocks
-synchronously, before any mint. The first fresh allocation takes one of
-them as its current block, and replay mints from those blocks.
+In every case the allocator then reserves **three** blocks
+synchronously, before any listener opens: the miner takes the first as
+its current block, and the other two are its ready blocks. Startup thus
+leaves exactly the steady state of §3.3, a current block plus two ready,
+and replay mints from those blocks.
 - **Replay reserves on demand.** Replay can mint far more than two
   blocks of templates, for example a discarded snapshot's tenant
   full-replaying its WAL. While it runs, the recovery driver owns the
@@ -647,6 +652,22 @@ That is drift across replicas (hazard #5), not a collision.
 
 RFC 0001 §6.1 said `template_id` is "a cluster-wide unique monotonic
 `u64`". That is amended as follows:
+- ids lie in **`1..=i64::MAX`**. They stay `u64` in memory and in the
+  Parquet `template_id` columns, but the domain stops at `i64::MAX`, so
+  every id fits the signed 64-bit `int` that OTLP and the semconv
+  registry use for attribute values. Roughly 9.2 × 10^18 ids is
+  effectively unbounded, and the registry needs no change.
+  - Allocating past `i64::MAX` is exhaustion: the controlled
+    `IdSpaceExhausted` error, which fails fresh mints as
+    `id_reservation_failed` (§3.3).
+  - A `reserved_through` above `i64::MAX` is malformed and fails
+    startup closed (§3.1).
+  - So is a bootstrap file whose footer or decoded id column holds an
+    id above it: no allocator issued that id, so no floor is built on
+    it (§3.5).
+  - Parquet stores the column as unsigned 64-bit, and its footer
+    statistics and decode both return such an id exactly, so the scan
+    sees it rather than a truncated or negative value.
 - ids are **unique cluster-wide**;
 - ids are **strictly increasing per allocator**, across that
   allocator's restarts, because every block lies above every earlier
@@ -785,8 +806,9 @@ The ids are referenced from test code.
 >   that block, and every id below it stays unissued
 
 > **Scenario RFC0059.4 — An exhausted range fails fresh mints without blocking ingest**
-> - **Given** a miner whose current block and both ready blocks are used
->   up, and a reserver that is down
+> - **Given** a receiver whose startup left exactly a current block and
+>   two ready blocks, three reservations in all
+> - **And** all three used up, and a reserver that is down
 > - **When** lines arrive, some needing a fresh template and some matching
 >   an existing one
 > - **Then** each fresh-needing line is emitted with `template_id = 0`,
@@ -800,7 +822,8 @@ The ids are referenced from test code.
 
 > **Scenario RFC0059.5 — An unreadable high-water fails startup closed**
 > - **Given** a store whose `miner/template_ids.v1.json` does not parse,
->   lacks `reserved_through`, or holds a non-`u64` value
+>   lacks `reserved_through`, holds a non-`u64` value, or holds a value
+>   above `i64::MAX`
 > - **When** the receiver starts
 > - **Then** startup fails with an error naming the object, before any
 >   listener opens
@@ -853,8 +876,11 @@ The ids are referenced from test code.
 > - **Given** an allocator that issued ids, restarted, and issued more
 > - **When** its ids are listed in issue order
 > - **Then** they strictly increase
-> - **And** `u64::MAX` is never issued: seating past it, or a block
->   reaching it, is a controlled error
+> - **And** no id above `i64::MAX` is ever issued: `i64::MAX` itself is
+>   the last id, and seating past it, restoring an id above it, or a
+>   block reaching past it, is the controlled exhaustion error
+> - **And** a bootstrap that finds a published id above `i64::MAX` fails
+>   startup closed, naming the file
 
 > **Scenario RFC0059.11 — Any later-version high-water fails startup closed, even beside a v1**
 > - **Given** a store holding `miner/template_ids.v2.json`, both alone
@@ -888,8 +914,8 @@ The ids are referenced from test code.
 
 > **Scenario RFC0059.13 — Replay past the ready blocks reserves on demand**
 > - **Given** a seated root whose surviving WAL holds more first-seen
->   templates than the two ready blocks startup reserves, and a healthy
->   store
+>   templates than the three blocks startup reserves (a current block and
+>   two ready), and a healthy store
 > - **When** the receiver restarts and replays every frame
 > - **Then** no template fails with `id_reservation_failed` and
 >   `ourios.miner.parse_failures` stays at zero

@@ -169,13 +169,24 @@ no reservation ever runs there.
 
 ### 3.4 Every start
 
-Recovery reads `N` **before** replay, after restoring the snapshots
-(RFC 0001 §6.9):
-- **Object present.** Recovery first applies the seated-marker rule
-  (§3.5): a root that has never seated discards its snapshots. It then
-  seats the allocator above `max(N, highest restored id)`, and
-  reserves the first current block and the first ready block
-  synchronously. Replay then mints from those blocks.
+Recovery decides whether the snapshots may be restored **before** it
+restores any of them. `restore_tenant` puts a snapshot's leaves into the
+live miner, so an untrusted snapshot must never reach it: deleting the
+file afterwards would leave its leaves live. The order is:
+
+1. Check the seated marker and the object's presence, before any
+   restore.
+2. **Object present, no marker** (§3.5): discard every artefact with
+   reason `predates_high_water`, without restoring any. Remove the
+   files, then seat above `N`, then write the marker.
+3. **Object present, marker present:** restore the snapshots normally,
+   then seat above `max(N, highest restored id)`.
+4. **Object absent, the bootstrap** (§3.5): restore first, because the
+   floor needs `restored_max`. Then bootstrap the object and write the
+   marker.
+
+In every case the allocator then reserves the first current block and
+the first ready block synchronously, and replay mints from those blocks.
 - **Replay reserves on demand.** Replay can mint far more than two
   blocks of templates, for example a discarded snapshot's tenant
   full-replaying its WAL. While it runs, the recovery driver owns the
@@ -187,8 +198,6 @@ Recovery reads `N` **before** replay, after restoring the snapshots
     handed the miner to the pipeline.
   - A store failure during replay therefore fails the reservation, and
     with it startup, never a single template.
-- **Object absent** (no version of it, §3.1). Recovery bootstraps it
-  (§3.5), then proceeds as above.
 - **Read fails.** Startup fails closed. This is the same trade-off as
   RFC 0052's fail-closed checks and #791 (recovery during an
   object-store outage): a restart then needs the store reachable, but a
@@ -389,6 +398,15 @@ DuckDB procedure finds them.
   The Helm chart states the rule beside `receiver.replicas` and in its
   `NOTES.txt`, and the release notes carry it. A store that already has
   the high-water needs no step.
+- **No downgrade.** Once the high-water object exists, a receiver built
+  before this RFC must not run against the store again. It ignores the
+  high-water, so it can re-issue ids an upgraded replica already
+  reserved or issued.
+  - Direct downgrade below RFC 0059 is prohibited.
+  - A safe rollback would mean restoring the object store and every
+    receiver's WAL to their state from before the upgrade. That is not
+    a supported operation.
+  - The chart's upgrade note and the release notes say so.
 - **Detection is a stated limitation.** Spotting a still-running
   pre-RFC writer would mean finding data files whose ids exceed the
   floor yet were not allocated from a reservation. That needs
@@ -660,7 +678,10 @@ The ids are referenced from test code.
 >   bootstrapped the high-water and allocated from it
 > - **When** receiver B starts with no seated marker
 > - **Then** every one of its artefacts is discarded with reason
->   `predates_high_water`, removed, and each tenant full-replays
+>   `predates_high_water` without being restored, removed, and each
+>   tenant full-replays
+> - **And** the miner holds none of the discarded snapshots' leaves: a
+>   shape one of them held mints a fresh id above the high-water
 > - **And** no id B restores or allocates equals one A issued since the
 >   bootstrap
 > - **And** B writes its seated marker only after the artefacts are

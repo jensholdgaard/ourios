@@ -179,13 +179,19 @@ which is free.
 
 The miner allocates under its lock (RFC 0035 §3.1's ordered phase), so
 no reservation ever runs there.
-- **Holding a block ahead.** The miner holds its current block and at
-  most one **ready block**. When the current block is used up, the
-  ready block becomes current. That is an in-memory swap.
+- **Holding blocks ahead.** The miner holds its current block, and up
+  to **two ready blocks** wait beside it. When the current block is used
+  up, the oldest ready block becomes current. That is an in-memory pop.
+- **Why two.** Refill is asynchronous: when a ready block becomes
+  current, the refiller is asked for a replacement, and that reservation
+  takes a store round trip, or longer under backoff. With a single ready
+  block, a burst that spends the new current block inside that window
+  would find nothing ready. The second ready block keeps one whole block
+  (`BLOCK` fresh templates) of headroom while a refill is in flight.
 - **Background refill.** Each time a block becomes current, the
-  ingester's background refiller reserves the next ready block off the
-  lock. If the store fails, it retries with capped exponential backoff
-  (100 ms doubling to 30 s).
+  ingester's background refiller reserves blocks off the lock until two
+  are ready again. If the store fails, it retries with capped
+  exponential backoff (100 ms doubling to 30 s).
 - **A high-water deleted while live.** If a refill finds the object
   absent (`HighWaterDeleted`), the refiller stops for good and logs an
   error. It does not retry: an object that reappears, for example
@@ -196,10 +202,10 @@ no reservation ever runs there.
     attaching.
   - Only a restart gets past it, and a seated root's restart fails
     closed while the object is absent (RFC0059.14).
-- **Exhausted range.** Once the listeners are open, if both blocks are
-  used up before a refill lands, every **fresh** allocation fails
-  immediately: a new tree leaf, an adoption-interned template, or a
-  first-seen structured key. (Startup replay is different; see §3.4.)
+- **Exhausted range.** Once the listeners are open, if the current
+  block and every ready block are used up before a refill lands, every
+  **fresh** allocation fails immediately: a new tree leaf, an
+  adoption-interned template, or a first-seen structured key. (Startup replay is different; see §3.4.)
   - Each such line is emitted as a parse failure: `template_id = 0`, its
     body retained (`CLAUDE.md` §3.3 holds through the body), and
     `lossy_flag = true` for string bodies.
@@ -237,8 +243,9 @@ file afterwards would leave its leaves live. The order is:
    loses to another replica's also fails startup (`BootstrapRaceLost`),
    and its restart takes case 2.
 
-In every case the allocator then reserves the first current block and
-the first ready block synchronously, and replay mints from those blocks.
+In every case the allocator then reserves the two ready blocks
+synchronously, before any mint. The first fresh allocation takes one of
+them as its current block, and replay mints from those blocks.
 - **Replay reserves on demand.** Replay can mint far more than two
   blocks of templates, for example a discarded snapshot's tenant
   full-replaying its WAL. While it runs, the recovery driver owns the
@@ -778,8 +785,8 @@ The ids are referenced from test code.
 >   that block, and every id below it stays unissued
 
 > **Scenario RFC0059.4 — An exhausted range fails fresh mints without blocking ingest**
-> - **Given** a miner whose current and ready blocks are both used up, and
->   a reserver that is down
+> - **Given** a miner whose current block and both ready blocks are used
+>   up, and a reserver that is down
 > - **When** lines arrive, some needing a fresh template and some matching
 >   an existing one
 > - **Then** each fresh-needing line is emitted with `template_id = 0`,
@@ -881,7 +888,8 @@ The ids are referenced from test code.
 
 > **Scenario RFC0059.13 — Replay past the ready blocks reserves on demand**
 > - **Given** a seated root whose surviving WAL holds more first-seen
->   templates than the two blocks startup reserves, and a healthy store
+>   templates than the two ready blocks startup reserves, and a healthy
+>   store
 > - **When** the receiver restarts and replays every frame
 > - **Then** no template fails with `id_reservation_failed` and
 >   `ourios.miner.parse_failures` stays at zero

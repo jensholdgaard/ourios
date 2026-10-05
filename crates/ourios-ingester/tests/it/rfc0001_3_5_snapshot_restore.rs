@@ -102,8 +102,11 @@ fn assert_discarded_and_full_replayed(
 }
 
 /// Scenario §3.5.3 — Known-version restore + tail replay is
-/// equivalent to a full rebuild.
-/// See `docs/rfcs/0001-template-miner.md` §3.5.
+/// equivalent to a full rebuild, up to RFC 0059's renaming of the ids
+/// the tail replay first mints (Scenario RFC0059.9, the §3.5.3 narrowing
+/// the maintainer approved on 2026-10-05).
+/// See `docs/rfcs/0001-template-miner.md` §3.5 and
+/// `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // Arrange: ingest two batches through the live pipeline, snapshot
@@ -126,6 +129,11 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
             &["user 3 logged in", "user 3 viewed cart"],
         )]),
         request(vec![resource_logs("billing", &["charge 12 EUR accepted"])]),
+        // A shape first seen above S: the tail mints it.
+        request(vec![resource_logs(
+            "checkout",
+            &["disk sda1 is 91 percent full"],
+        )]),
     ];
 
     let pipeline = open_pipeline(root);
@@ -151,20 +159,38 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let pre_records = ingest_all(&mut control, &pre);
     let post_records = ingest_all(&mut control, &post);
 
+    // The live node reserved ahead of what it issued, as RFC 0059 §3.2
+    // requires: the store's high-water is above every id the control
+    // mints.
+    let issued = control.highest_allocated();
+    let high_water = issued + 37;
+    let ids = template_ids(root);
+    ids.store()
+        .put_blocking(
+            ourios_ingester::template_ids::HIGH_WATER_KEY,
+            format!(r#"{{"reserved_through": {high_water}}}"#).into_bytes(),
+        )
+        .expect("the live node's high-water");
+    ourios_ingester::template_ids::mark_seated(&snapshots_root, 0)
+        .expect("the live node seated before it snapshotted");
+
     // Act: recover into a fresh miner over the same WAL + snapshots.
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(
-        &mut wal,
-        &snapshots_root,
-        &mut recovered,
-        &template_ids(root),
-    )
-    .expect("recover");
+    let report =
+        recovery::recover(&mut wal, &snapshots_root, &mut recovered, &ids).expect("recover");
 
     // Assert (a): restored + tail-replayed state equals the
-    // from-scratch control, per tenant.
-    assert_equivalent(&recovered, &control);
+    // from-scratch control, per tenant, up to an injective renaming of
+    // the ids first minted in the tail, which all lie above the
+    // high-water and so collide with no id issued before the restart.
+    let renamed =
+        crate::rfc0059_support::assert_equivalent_up_to_renaming(&recovered, &control, high_water);
+    assert!(
+        !renamed.is_empty(),
+        "the tail minted templates, so the renaming is exercised"
+    );
+    assert!(renamed.iter().all(|id| *id > issued), "{renamed:?}");
 
     // Assert (b): no frame at or below S reached the miner — every
     // pre-S record was suppressed, every post-S record fed.

@@ -283,6 +283,7 @@ pub fn recover(
     } = restore_artefacts(miner, artefacts, trust);
     let template_ids = seat_root(snapshots_root, miner, ids, trust)?;
     let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
+    ids.finish_replay();
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
     // ends there rather than at `Wal::open` because open runs before
     // replay has healed a torn tail — a figure taken there would count

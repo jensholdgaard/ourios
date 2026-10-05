@@ -5,8 +5,15 @@
 //! [`READY_BLOCKS`] more, reserved by a background refiller. Taking a
 //! block is an in-memory pop. When none is ready the miner's fresh
 //! allocations fail at once and the refiller keeps retrying.
+//!
+//! Startup replay is the exception (RFC 0059 §3.4): the recovery driver
+//! owns the miner before any listener opens, so no ingest waits on it,
+//! and a replay that drains the ready blocks reserves the next one
+//! synchronously rather than failing a template a healthy store could
+//! have given an id.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -39,6 +46,7 @@ pub struct TemplateIds {
     ready: Arc<Mutex<Ready>>,
     refill: Sender<()>,
     refill_rx: Mutex<Option<Receiver<()>>>,
+    replaying: Arc<AtomicBool>,
 }
 
 impl TemplateIds {
@@ -50,7 +58,15 @@ impl TemplateIds {
             ready: Arc::new(Mutex::new(Ready::default())),
             refill,
             refill_rx: Mutex::new(Some(refill_rx)),
+            replaying: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Recovery has handed the miner to the pipeline: from now on an
+    /// exhausted range fails fresh mints instead of reserving under the
+    /// miner lock (RFC 0059 §3.3).
+    pub fn finish_replay(&self) {
+        self.replaying.store(false, Ordering::Release);
     }
 
     /// The store the high-water lives in.
@@ -64,8 +80,10 @@ impl TemplateIds {
     #[must_use]
     pub fn reserver(&self) -> Box<dyn IdReserver> {
         Box::new(StoreIdReserver {
+            store: self.store.clone(),
             ready: Arc::clone(&self.ready),
             refill: self.refill.clone(),
+            replaying: Arc::clone(&self.replaying),
         })
     }
 
@@ -132,18 +150,31 @@ fn refill_loop(store: &Store, ready: &Mutex<Ready>, requests: &Receiver<()>) {
     }
 }
 
-/// The miner's side: an in-memory pop, never a store call.
+/// The miner's side: an in-memory pop, never a store call once the
+/// listeners are open.
 struct StoreIdReserver {
+    store: Store,
     ready: Arc<Mutex<Ready>>,
     refill: Sender<()>,
+    replaying: Arc<AtomicBool>,
+}
+
+impl StoreIdReserver {
+    fn take(&self, floor: u64) -> Option<IdBlock> {
+        let mut held = lock(&self.ready);
+        std::iter::from_fn(|| held.blocks.pop_front())
+            .find_map(|block| IdBlock::new(block.after().max(floor), block.through()))
+    }
 }
 
 impl IdReserver for StoreIdReserver {
     fn reserve(&mut self, floor: u64) -> Result<IdBlock, IdReservationError> {
-        let taken = {
-            let mut held = lock(&self.ready);
-            std::iter::from_fn(|| held.blocks.pop_front())
-                .find_map(|block| IdBlock::new(block.after().max(floor), block.through()))
+        let taken = match self.take(floor) {
+            None if self.replaying.load(Ordering::Acquire) => {
+                fill(&self.store, &self.ready).map_err(IdReservationError::new)?;
+                self.take(floor)
+            }
+            taken => taken,
         };
         // A send fails only once the refiller is gone with the process.
         let _ = self.refill.send(());
@@ -185,9 +216,41 @@ mod tests {
             held.blocks.push_back(IdBlock::new(0, 10).expect("block"));
             held.blocks.push_back(IdBlock::new(10, 20).expect("block"));
         }
-        let mut reserver = StoreIdReserver { ready, refill };
+        let mut reserver = StoreIdReserver {
+            store: Store::in_memory(),
+            ready,
+            refill,
+            replaying: Arc::new(AtomicBool::new(false)),
+        };
         let block = reserver.reserve(14).expect("trimmed");
         assert_eq!((block.after(), block.through()), (14, 20));
         assert!(reserver.reserve(20).is_err(), "nothing is ready");
+    }
+
+    /// A reserver over a healthy store holding a high-water, with nothing
+    /// ready.
+    fn drained(replaying: bool) -> StoreIdReserver {
+        let store = Store::in_memory();
+        store.put_blocking(HIGH_WATER_KEY, encode(50)).expect("put");
+        let (refill, _rx) = mpsc::channel();
+        StoreIdReserver {
+            store,
+            ready: Arc::new(Mutex::new(Ready::default())),
+            refill,
+            replaying: Arc::new(AtomicBool::new(replaying)),
+        }
+    }
+
+    #[test]
+    fn after_replay_a_drained_reserver_fails_without_touching_the_store() {
+        // The store would grant a block; a reserver that asked it would
+        // not fail.
+        assert!(drained(false).reserve(50).is_err());
+    }
+
+    #[test]
+    fn during_replay_a_drained_reserver_reserves_on_demand() {
+        let block = drained(true).reserve(50).expect("reserved on demand");
+        assert_eq!((block.after(), block.through()), (50, 50 + BLOCK));
     }
 }

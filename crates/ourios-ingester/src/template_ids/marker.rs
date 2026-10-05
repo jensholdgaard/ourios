@@ -42,15 +42,18 @@ impl SnapshotTrust {
     /// [`TemplateIdsError`] when the marker cannot be checked or the
     /// high-water cannot be read; startup fails closed.
     pub fn of(snapshots_root: &Path, store: &Store) -> Result<Self, TemplateIdsError> {
-        let marker = snapshots_root.join(SEATED_MARKER);
-        let seated = marker
-            .try_exists()
-            .map_err(|source| TemplateIdsError::Marker {
-                op: "stat(seated marker)",
-                source,
-            })?;
-        if seated {
-            return Ok(Self::Seated);
+        // Only a file is a marker: anything else at its path vouches for
+        // nothing.
+        match std::fs::metadata(snapshots_root.join(SEATED_MARKER)) {
+            Ok(metadata) if metadata.is_file() => return Ok(Self::Seated),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(TemplateIdsError::Marker {
+                    op: "stat(seated marker)",
+                    source,
+                });
+            }
         }
         Ok(match read(store)? {
             Some(_) => Self::PredatesHighWater,

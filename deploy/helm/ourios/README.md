@@ -245,11 +245,27 @@ cleanly:
 | Role      | S3 actions                                            | Holds delete? |
 | --------- | ----------------------------------------------------- | ------------- |
 | querier   | `GetObject`, `ListBucket` (see cache note)            | no            |
-| receiver  | `PutObject` only                                      | no            |
+| receiver  | `PutObject`; `GetObject` + `ListBucket` on `miner/`; once, `GetObject` + `ListBucket` on `data/` and `audit/` (see below) | no |
 | compactor | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`| **only one**  |
 
-The receiver only *writes* data/audit objects — its production path never
-issues a read, list, or delete against the store. Manifest swaps (conditional
+The receiver *writes* data/audit objects and never deletes. Since RFC 0059
+(durable template-id allocation) it also keeps one small object,
+`miner/template_ids.v1.json`, so it needs:
+
+- **always:** `GetObject`, `PutObject` and `ListBucket` (prefix `miner/`) on
+  `miner/*`. The reservation writes it with `If-Match` / `If-None-Match`
+  conditional puts, which need only `PutObject`.
+- **for the one-time upgrade bootstrap only:** `ListBucket` (prefixes
+  `data/`, `audit/`) and `GetObject` on `data/*` and `audit/*`. The first
+  upgraded receiver reads every file's footer once to compute the
+  high-water. Grant these **before** the scale-to-one upgrade step, and
+  revoke them afterwards if you want the narrower policy back.
+
+A denied call fails startup with an error naming the missing action
+(`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`). Never grant a delete on
+`miner/`: the object must not be deleted (a seated receiver that finds it
+gone refuses to start), and a bucket policy or object lock protecting
+`miner/template_ids.v1.json` is recommended. Manifest swaps (conditional
 `PutObject`) belong to the compaction path, and reclaiming compacted inputs is
 the compactor's job alone; the querier only reads. With this split, a
 compromised receiver can pollute but neither read nor destroy history, a

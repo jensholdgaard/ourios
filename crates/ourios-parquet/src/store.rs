@@ -390,6 +390,19 @@ impl StoreError {
         )
     }
 
+    /// True if the backend refused the call for want of a permission (an
+    /// S3 `403`) or of credentials.
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::Backend(
+                object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+            )
+        )
+    }
+
     /// True if a create-if-absent (`If-None-Match`) failed because the object
     /// already exists (see [`Store::put_if_absent`]).
     #[must_use]

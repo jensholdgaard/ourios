@@ -141,11 +141,12 @@ async fn rfc0059_12_the_marker_is_written_only_after_the_artefacts_are_gone() {
     let (a, b) = two_pre_rfc_receivers(tmp.path()).await;
     drop(a.restart().expect("A bootstraps"));
 
-    // A directory where the marker belongs makes its rename fail: the
-    // start dies after the removal and before the marker.
+    // A directory where the marker's temp file belongs makes its write
+    // fail: the start dies after the removal and before the marker.
     let marker = b.snapshots.join(SEATED_MARKER);
-    std::fs::create_dir(&marker).expect("block the marker");
-    std::fs::write(marker.join("occupied"), b"x").expect("occupy it");
+    let marker_tmp = b.snapshots.join(format!("{SEATED_MARKER}.tmp"));
+    std::fs::create_dir(&marker_tmp).expect("block the marker");
+    std::fs::write(marker_tmp.join("occupied"), b"x").expect("occupy it");
     let Err(err) = b.restart() else {
         panic!("the marker write must fail");
     };
@@ -158,10 +159,42 @@ async fn rfc0059_12_the_marker_is_written_only_after_the_artefacts_are_gone() {
     );
     assert!(artefacts(&b).is_empty(), "removed before the marker");
 
-    std::fs::remove_dir_all(&marker).expect("unblock");
+    assert!(!marker.exists(), "no marker was written");
+    std::fs::remove_dir_all(&marker_tmp).expect("unblock");
     let restarted = b.restart().expect("the next start");
     assert!(restarted.report.tenants.is_empty(), "nothing left to trust");
     assert!(marker.is_file());
+}
+
+/// Scenario RFC0059.12 — a marker that does not parse, or claims more
+/// than the high-water holds, fails startup closed and never trusts the
+/// snapshots.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_12_an_unusable_marker_fails_startup_closed() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (a, b) = two_pre_rfc_receivers(tmp.path()).await;
+    drop(a.restart().expect("A bootstraps"));
+    let snapshots_before = artefacts(&b);
+    for body in [
+        &b""[..],
+        br#"{"version": 1, "seated_ab"#,
+        b"not json",
+        br#"{"version": 1, "seated_above": 99999999}"#,
+    ] {
+        std::fs::write(b.snapshots.join(SEATED_MARKER), body).expect("marker");
+        let Err(err) = b.restart() else {
+            panic!("{body:?} must fail startup");
+        };
+        assert!(
+            matches!(
+                err,
+                RecoveryDriverError::TemplateIds(TemplateIdsError::MarkerInvalid { .. })
+            ),
+            "{body:?}: {err}"
+        );
+        assert_eq!(artefacts(&b), snapshots_before, "nothing is touched");
+    }
 }
 
 /// Scenario RFC0059.12 — when two markerless receivers race the

@@ -93,7 +93,9 @@ storage:
 receiver:
   enabled: true
   # Upgrading from a release before RFC 0059 (durable template-id
-  # allocation): set replicas to 0 and apply, so no pre-RFC receiver is
+  # allocation): first grant the receiver's role the object-store reads the
+  # one-time bootstrap needs (README, "Per-role IAM"); then set replicas to
+  # 0 and apply, so no pre-RFC receiver is
   # running; then set it to 1 and apply, and let that one replica start
   # (it bootstraps the template-id high-water from the store once); only
   # then scale out. A pre-RFC receiver still running during that first
@@ -116,8 +118,10 @@ receiver:
   # give each role its own IAM identity — see "Per-role IAM" in the README).
   # create=false (default) uses the shared serviceAccount below. With IRSA,
   # annotate with this role's eks.amazonaws.com/role-arn — the receiver's
-  # role needs s3:PutObject ONLY (its production path never reads, lists,
-  # or deletes). `name`:
+  # role needs s3:PutObject, plus s3:GetObject and s3:ListBucket on miner/
+  # for the template-id high-water (RFC 0059); for the one-time upgrade
+  # bootstrap also s3:ListBucket and s3:GetObject on data/ and audit/,
+  # granted BEFORE the scale-to-one step. It never deletes. `name`:
   # create=true + empty name renders `<fullname>-receiver`;
   # create=true + name overrides that; create=false + name binds an
   # EXISTING ServiceAccount of that name (managed out-of-band).

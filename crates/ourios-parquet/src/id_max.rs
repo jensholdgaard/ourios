@@ -81,6 +81,14 @@ impl std::fmt::Display for IdMaxError {
     }
 }
 
+impl IdMaxError {
+    /// True if the store refused a read for want of a permission.
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, Self::Store { source, .. } if source.is_permission_denied())
+    }
+}
+
 impl std::error::Error for IdMaxError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

@@ -79,6 +79,12 @@ pub enum TemplateIdsError {
     },
     /// The snapshots directory could not be made durable.
     Snapshots(crate::snapshot_store::SnapshotStoreError),
+    /// The seated marker is malformed, or claims more than the high-water
+    /// holds: it vouches for nothing (RFC 0059 §3.5).
+    MarkerInvalid { detail: String },
+    /// A seated root found no high-water: it was deleted, and a bootstrap
+    /// could reseat below a block another receiver still holds.
+    HighWaterDeleted,
 }
 
 impl TemplateIdsError {
@@ -94,7 +100,8 @@ impl TemplateIdsError {
             Self::Scan(_) => "scan",
             Self::Exhausted(_) => "exhausted",
             Self::BootstrapRaceLost => "bootstrap_race_lost",
-            Self::Marker { .. } | Self::Snapshots(_) => "marker",
+            Self::Marker { .. } | Self::Snapshots(_) | Self::MarkerInvalid { .. } => "marker",
+            Self::HighWaterDeleted => "deleted",
             Self::Refiller(_) => "_OTHER",
         }
     }
@@ -103,6 +110,12 @@ impl TemplateIdsError {
 impl std::fmt::Display for TemplateIdsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Store { op, key, source } if source.is_permission_denied() => write!(
+                f,
+                "{op} {key}: permission denied; the receiver needs {} there \
+                 (RFC 0059 §3.6): {source}",
+                s3_action(op)
+            ),
             Self::Store { op, key, source } => write!(f, "{op} {key}: {source}"),
             Self::Malformed { key, detail } => {
                 write!(f, "{key} is not a template-id high-water: {detail}")
@@ -118,6 +131,11 @@ impl std::fmt::Display for TemplateIdsError {
                 f,
                 "{HIGH_WATER_KEY}: {MAX_CAS_ATTEMPTS} compare-and-swap attempts all lost"
             ),
+            Self::Scan(e) if e.is_permission_denied() => write!(
+                f,
+                "template-id bootstrap scan: permission denied; the receiver needs \
+                 s3:GetObject on data/ and audit/ for the bootstrap (RFC 0059 §3.6): {e}"
+            ),
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),
             Self::Refiller(e) => write!(f, "start the template-id refiller: {e}"),
@@ -128,6 +146,14 @@ impl std::fmt::Display for TemplateIdsError {
             ),
             Self::Marker { op, source } => write!(f, "{op}: {source}"),
             Self::Snapshots(e) => write!(f, "seated marker: {e}"),
+            Self::MarkerInvalid { detail } => {
+                write!(f, "{SEATED_MARKER} is not a usable seated marker: {detail}")
+            }
+            Self::HighWaterDeleted => write!(
+                f,
+                "{HIGH_WATER_KEY} is gone though this root has seated against it; it must \
+                 never be deleted (RFC 0059 §3.1)"
+            ),
         }
     }
 }
@@ -145,8 +171,19 @@ impl std::error::Error for TemplateIdsError {
             | Self::Missing
             | Self::Contended
             | Self::BootstrapRaceLost
+            | Self::MarkerInvalid { .. }
+            | Self::HighWaterDeleted
             | Self::Refiller(_) => None,
         }
+    }
+}
+
+/// The S3 action a store operation of this module needs.
+fn s3_action(op: &str) -> &'static str {
+    match op {
+        "list" => "s3:ListBucket",
+        "write" => "s3:PutObject",
+        _ => "s3:GetObject",
     }
 }
 
@@ -294,14 +331,19 @@ pub struct Seated {
 ///
 /// [`TemplateIdsError`] when the object cannot be read or bootstrapped;
 /// startup fails closed on any of them.
-pub fn seat(store: &Store, miner: &mut MinerCluster) -> Result<Seated, TemplateIdsError> {
+pub fn seat(
+    store: &Store,
+    miner: &mut MinerCluster,
+    may_bootstrap: bool,
+) -> Result<Seated, TemplateIdsError> {
     let restored = miner.highest_allocated();
     let seated = match read(store)? {
         Some(high_water) => Seated {
             high_water: high_water.reserved_through,
             bootstrapped: false,
         },
-        None => bootstrap(store, restored)?,
+        None if may_bootstrap => bootstrap(store, restored)?,
+        None => return Err(TemplateIdsError::HighWaterDeleted),
     };
     miner
         .allocate_past_issued(seated.high_water.max(restored))

@@ -95,8 +95,12 @@ impl TemplateIds {
     ///
     /// [`TemplateIdsError`] when the high-water cannot be read,
     /// bootstrapped or reserved from; startup fails closed.
-    pub fn start(&self, miner: &mut MinerCluster) -> Result<Seated, TemplateIdsError> {
-        let seated = seat(&self.store, miner)?;
+    pub fn start(
+        &self,
+        miner: &mut MinerCluster,
+        may_bootstrap: bool,
+    ) -> Result<Seated, TemplateIdsError> {
+        let seated = seat(&self.store, miner, may_bootstrap)?;
         lock(&self.ready).highest = miner.highest_allocated();
         fill(&self.store, &self.ready)?;
         let receiver = self
@@ -197,7 +201,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default());
-        let seated = ids.start(&mut miner).expect("start");
+        let seated = ids.start(&mut miner, true).expect("start");
         assert_eq!(seated.high_water, 500);
         assert_eq!(miner.highest_allocated(), 500);
         let mut reserver = ids.reserver();

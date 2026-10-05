@@ -68,6 +68,7 @@ mod rfc0052_4_timer_discharge;
 mod rfc0052_barrier_support;
 mod rfc0059_12_seated_marker;
 mod rfc0059_13_replay_reserves_on_demand;
+mod rfc0059_14_deleted_high_water;
 mod rfc0059_1_discarded_snapshot;
 mod rfc0059_2_lost_root;
 mod rfc0059_3_reserve_before_use;

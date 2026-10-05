@@ -17,8 +17,10 @@ use super::{TemplateIdsError, read};
 use crate::snapshot_store;
 
 /// The marker's file name in the snapshots root. Not a `*.snap`, so the
-/// snapshot loader never lists it.
+/// snapshot loader never lists it. Its body is JSON
+/// `{"version": 1, "seated_above": N}` (RFC 0059 §3.5).
 pub const SEATED_MARKER: &str = "TEMPLATE_IDS_SEATED";
+const MARKER_VERSION: u64 = 1;
 
 /// Whether a root's snapshot artefacts may be restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,32 +41,72 @@ impl SnapshotTrust {
     ///
     /// # Errors
     ///
-    /// [`TemplateIdsError`] when the marker cannot be checked or the
-    /// high-water cannot be read; startup fails closed.
+    /// [`TemplateIdsError`] when the high-water cannot be read, and fails
+    /// closed on a marker that is unreadable, malformed, or claims more
+    /// than the high-water holds ([`TemplateIdsError::MarkerInvalid`]), or
+    /// on a seated root whose high-water is gone
+    /// ([`TemplateIdsError::HighWaterDeleted`]): a bootstrap then would see
+    /// only published ids and could reseat below a block another receiver
+    /// still holds.
     pub fn of(snapshots_root: &Path, store: &Store) -> Result<Self, TemplateIdsError> {
-        // Only a file is a marker: anything else at its path vouches for
-        // nothing.
-        match std::fs::metadata(snapshots_root.join(SEATED_MARKER)) {
-            Ok(metadata) if metadata.is_file() => return Ok(Self::Seated),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(TemplateIdsError::Marker {
-                    op: "stat(seated marker)",
-                    source,
-                });
+        let marker = read_marker(snapshots_root)?;
+        match (marker, read(store)?) {
+            (Some(_), None) => Err(TemplateIdsError::HighWaterDeleted),
+            (Some(above), Some(high_water)) if above > high_water.reserved_through => {
+                Err(TemplateIdsError::MarkerInvalid {
+                    detail: format!(
+                        "seated above {above}, past the high-water's {}",
+                        high_water.reserved_through
+                    ),
+                })
             }
+            (Some(_), Some(_)) => Ok(Self::Seated),
+            (None, Some(_)) => Ok(Self::PredatesHighWater),
+            (None, None) => Ok(Self::Bootstrap),
         }
-        Ok(match read(store)? {
-            Some(_) => Self::PredatesHighWater,
-            None => Self::Bootstrap,
-        })
     }
 
     /// Whether the artefacts restore.
     #[must_use]
     pub fn restores(self) -> bool {
         matches!(self, Self::Seated | Self::Bootstrap)
+    }
+
+    /// Whether an absent high-water may be bootstrapped: only by a root
+    /// that never seated.
+    #[must_use]
+    pub fn may_bootstrap(self) -> bool {
+        self != Self::Seated
+    }
+}
+
+/// The marker's `seated_above`, or `None` when the root has no marker.
+fn read_marker(snapshots_root: &Path) -> Result<Option<u64>, TemplateIdsError> {
+    let bytes = match std::fs::read(snapshots_root.join(SEATED_MARKER)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(TemplateIdsError::Marker {
+                op: "read(seated marker)",
+                source,
+            });
+        }
+    };
+    let invalid = |detail: String| TemplateIdsError::MarkerInvalid { detail };
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    match (
+        body.get("version").and_then(serde_json::Value::as_u64),
+        body.get("seated_above"),
+    ) {
+        (Some(MARKER_VERSION), Some(above)) => above
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| invalid(format!("`seated_above` is {above}, not a u64"))),
+        (Some(MARKER_VERSION), None) => Err(invalid("no `seated_above`".to_owned())),
+        (version, _) => Err(invalid(format!(
+            "version {version:?}, not {MARKER_VERSION}"
+        ))),
     }
 }
 
@@ -80,7 +122,8 @@ pub fn mark_seated(snapshots_root: &Path, high_water: u64) -> Result<(), Templat
     std::fs::create_dir_all(snapshots_root).map_err(io("create_dir_all(snapshots root)"))?;
     let tmp = snapshots_root.join(format!("{SEATED_MARKER}.tmp"));
     let mut file = std::fs::File::create(&tmp).map_err(io("create(seated marker tmp)"))?;
-    file.write_all(format!("{high_water}\n").as_bytes())
+    let body = serde_json::json!({ "version": MARKER_VERSION, "seated_above": high_water });
+    file.write_all(body.to_string().as_bytes())
         .map_err(io("write(seated marker tmp)"))?;
     file.sync_all().map_err(io("fsync(seated marker tmp)"))?;
     std::fs::rename(&tmp, snapshots_root.join(SEATED_MARKER))
@@ -112,5 +155,48 @@ mod tests {
             SnapshotTrust::of(&root, &store).expect("trust"),
             SnapshotTrust::Seated
         );
+    }
+
+    #[test]
+    fn a_seated_root_whose_high_water_is_gone_fails_closed() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path().join("snapshots");
+        mark_seated(&root, 9).expect("mark");
+        let err = SnapshotTrust::of(&root, &Store::in_memory()).expect_err("deleted");
+        assert!(matches!(err, TemplateIdsError::HighWaterDeleted), "{err}");
+    }
+
+    #[test]
+    fn every_unusable_marker_fails_closed() {
+        let store = Store::in_memory();
+        store.put_blocking(HIGH_WATER_KEY, encode(9)).expect("put");
+        for body in [
+            &b""[..],
+            br#"{"version": 1, "seated_ab"#,
+            b"9\n",
+            br#"{"version": 1}"#,
+            br#"{"version": 2, "seated_above": 3}"#,
+            br#"{"version": 1, "seated_above": -3}"#,
+            br#"{"version": 1, "seated_above": 10}"#,
+        ] {
+            let tmp = tempfile::TempDir::new().expect("temp");
+            let root = tmp.path().join("snapshots");
+            std::fs::create_dir_all(&root).expect("root");
+            std::fs::write(root.join(SEATED_MARKER), body).expect("marker");
+            let err = SnapshotTrust::of(&root, &store).expect_err("never trusted");
+            assert!(
+                matches!(err, TemplateIdsError::MarkerInvalid { .. }),
+                "{body:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_at_the_marker_path_fails_closed() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path().join("snapshots");
+        std::fs::create_dir_all(root.join(SEATED_MARKER)).expect("dir");
+        let err = SnapshotTrust::of(&root, &Store::in_memory()).expect_err("unreadable");
+        assert!(matches!(err, TemplateIdsError::Marker { .. }), "{err}");
     }
 }

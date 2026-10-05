@@ -567,7 +567,9 @@ fn seat_root(
     if trust == SnapshotTrust::PredatesHighWater {
         snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
     }
-    let seated = ids.start(miner).map_err(RecoveryDriverError::TemplateIds)?;
+    let seated = ids
+        .start(miner, trust.may_bootstrap())
+        .map_err(RecoveryDriverError::TemplateIds)?;
     if trust != SnapshotTrust::Seated {
         mark_seated(snapshots_root, seated.high_water).map_err(RecoveryDriverError::TemplateIds)?;
     }

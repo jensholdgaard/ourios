@@ -441,6 +441,8 @@ fn renamed_state(state: &State, renaming: &BTreeMap<u64, u64>) -> State {
 pub struct Hooks {
     pub down: Arc<std::sync::atomic::AtomicBool>,
     pub race_the_create: Arc<std::sync::atomic::AtomicBool>,
+    /// Refuse every call as an S3 `403` would.
+    pub denied: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Hooks {
@@ -454,6 +456,12 @@ impl Hooks {
     }
 
     fn enter(&self) -> object_store::Result<()> {
+        if self.denied.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(object_store::Error::PermissionDenied {
+                path: "hooked".to_owned(),
+                source: "AccessDenied".into(),
+            });
+        }
         if self.down.load(std::sync::atomic::Ordering::Acquire) {
             return Err(object_store::Error::Generic {
                 store: "hooked",

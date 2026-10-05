@@ -2,6 +2,7 @@
 //! floor, the highest id any data row, audit event or restored snapshot
 //! carries.
 
+use ourios_miner::cluster::MAX_TEMPLATE_ID;
 use ourios_parquet::{IdColumns, Store, object_max_id};
 
 use super::{Seated, TemplateIdsError, Written, create, names, store_err};
@@ -27,13 +28,13 @@ impl BootstrapScan {
     pub fn run(store: &Store) -> Result<Self, TemplateIdsError> {
         let mut scan = Self::default();
         walk(store, "data", &mut |key| {
-            let max = object_max_id(store, key, IdColumns::Data).map_err(scan_err)?;
+            let max = in_domain(key, object_max_id(store, key, IdColumns::Data))?;
             scan.data_max = scan.data_max.max(max);
             scan.counted();
             Ok(())
         })?;
         walk(store, "audit", &mut |key| {
-            let max = object_max_id(store, key, IdColumns::Audit).map_err(scan_err)?;
+            let max = in_domain(key, object_max_id(store, key, IdColumns::Audit))?;
             scan.audit_max = scan.audit_max.max(max);
             scan.counted();
             Ok(())
@@ -63,8 +64,19 @@ impl BootstrapScan {
     }
 }
 
-fn scan_err(e: ourios_parquet::IdMaxError) -> TemplateIdsError {
-    TemplateIdsError::Scan(Box::new(e))
+/// A file's highest id, refused when it lies past the template-id
+/// domain: no allocator issued it, so no floor can be built on it.
+fn in_domain(
+    key: &str,
+    max: Result<Option<u64>, ourios_parquet::IdMaxError>,
+) -> Result<Option<u64>, TemplateIdsError> {
+    match max.map_err(|e| TemplateIdsError::Scan(Box::new(e)))? {
+        Some(id) if id > MAX_TEMPLATE_ID => Err(TemplateIdsError::Malformed {
+            key: key.to_owned(),
+            detail: format!("carries template id {id}, above the template-id domain's i64::MAX"),
+        }),
+        max => Ok(max),
+    }
 }
 
 /// Visit every `*.parquet` key under `prefix`, one delimited level at a
@@ -119,5 +131,30 @@ pub fn bootstrap(store: &Store, restored: u64) -> Result<Seated, TemplateIdsErro
             })
         }
         Written::Lost => Err(TemplateIdsError::BootstrapRaceLost),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_id_past_i64_max_fails_the_scan_closed() {
+        let err = in_domain("data/x.parquet", Ok(Some(MAX_TEMPLATE_ID + 1)))
+            .expect_err("past the domain");
+        assert!(
+            matches!(&err, TemplateIdsError::Malformed { key, .. } if key == "data/x.parquet"),
+            "{err}"
+        );
+        assert!(in_domain("data/x.parquet", Ok(Some(u64::MAX))).is_err());
+    }
+
+    #[test]
+    fn a_file_id_at_i64_max_is_a_floor() {
+        assert_eq!(
+            in_domain("data/x.parquet", Ok(Some(MAX_TEMPLATE_ID))).expect("in the domain"),
+            Some(MAX_TEMPLATE_ID)
+        );
+        assert_eq!(in_domain("data/x.parquet", Ok(None)).expect("no id"), None);
     }
 }

@@ -143,5 +143,30 @@ fn restoring_an_id_at_u64_max_is_rejected() {
     let err = MinerCluster::new(MinerConfig::default())
         .restore_tenant(&t, &state)
         .expect_err("no id is left above u64::MAX");
-    assert!(err.to_string().contains("u64::MAX"), "{err}");
+    assert!(err.to_string().contains("i64::MAX"), "{err}");
+}
+
+#[test]
+fn restoring_an_id_past_the_i64_domain_is_rejected_and_at_it_accepted() {
+    let t = TenantId::new("t");
+    let mut original = MinerCluster::new(MinerConfig::default());
+    original.ingest(&structured_record(&t, 9, None));
+    let mut state = original.snapshot_state(&t);
+    state.structured_templates[0].template_id = MAX_TEMPLATE_ID + 1;
+    assert!(
+        MinerCluster::new(MinerConfig::default())
+            .restore_tenant(&t, &state)
+            .is_err()
+    );
+    state.structured_templates[0].template_id = MAX_TEMPLATE_ID;
+    let mut restored = MinerCluster::new(MinerConfig::default());
+    restored
+        .restore_tenant(&t, &state)
+        .expect("the last id restores");
+    assert_eq!(restored.highest_allocated(), MAX_TEMPLATE_ID);
+    assert_eq!(
+        restored.ingest(&structured_record(&t, 10, None)),
+        NO_TEMPLATE,
+        "the domain is exhausted"
+    );
 }

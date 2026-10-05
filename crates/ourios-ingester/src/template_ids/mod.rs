@@ -15,7 +15,9 @@ pub use bootstrap::{BootstrapScan, bootstrap};
 pub use marker::{SEATED_MARKER, SnapshotTrust, mark_seated};
 pub use reserver::TemplateIds;
 
-use ourios_miner::cluster::{IdBlock, IdSpaceExhausted, MinerCluster};
+use ourios_miner::cluster::{
+    IdBlock, IdReservationError, IdSpaceExhausted, MAX_TEMPLATE_ID, MinerCluster,
+};
 use ourios_parquet::{IdMaxError, Store, StoreError};
 
 /// The high-water object's key (RFC 0059 §3.1).
@@ -66,6 +68,8 @@ pub enum TemplateIdsError {
     Exhausted(IdSpaceExhausted),
     /// The background refiller thread could not start.
     Refiller(String),
+    /// The miner could not take its first block from the ones reserved.
+    FirstBlock(IdReservationError),
     /// Another start created the high-water while this one, without a
     /// seated marker, had restored its own snapshots: their ids may lie in
     /// the winner's blocks, so this start must not go on (RFC 0059 §3.5).
@@ -104,7 +108,7 @@ impl TemplateIdsError {
             Self::Marker { .. } | Self::Snapshots(_) | Self::MarkerInvalid { .. } => "marker",
             Self::HighWaterDeleted => "deleted",
             Self::BootstrapNotAuthorized => "bootstrap_not_authorized",
-            Self::Refiller(_) => "_OTHER",
+            Self::Refiller(_) | Self::FirstBlock(_) => "_OTHER",
         }
     }
 }
@@ -140,6 +144,7 @@ impl std::fmt::Display for TemplateIdsError {
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),
             Self::Refiller(e) => write!(f, "start the template-id refiller: {e}"),
+            Self::FirstBlock(e) => write!(f, "take the first template-id block: {e}"),
             Self::BootstrapRaceLost => write!(
                 f,
                 "another start created {HIGH_WATER_KEY} while this one had restored \
@@ -183,6 +188,7 @@ impl std::error::Error for TemplateIdsError {
             | Self::HighWaterDeleted
             | Self::BootstrapNotAuthorized
             | Self::Refiller(_) => None,
+            Self::FirstBlock(e) => Some(e),
         }
     }
 }
@@ -242,10 +248,12 @@ fn parse(bytes: &[u8]) -> Result<u64, TemplateIdsError> {
     };
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| malformed(e.to_string()))?;
-    match value.get(FIELD) {
-        Some(n) => n
-            .as_u64()
-            .ok_or_else(|| malformed(format!("`{FIELD}` is {n}, not a u64"))),
+    match value.get(FIELD).map(|n| (n, n.as_u64())) {
+        Some((_, Some(id))) if id <= MAX_TEMPLATE_ID => Ok(id),
+        Some((n, Some(_))) => Err(malformed(format!(
+            "`{FIELD}` is {n}, above the template-id domain's i64::MAX"
+        ))),
+        Some((n, None)) => Err(malformed(format!("`{FIELD}` is {n}, not a u64"))),
         None => Err(malformed(format!("no `{FIELD}`"))),
     }
 }
@@ -323,14 +331,14 @@ fn landed(outcome: Result<(), StoreError>) -> Result<Written, TemplateIdsError> 
 /// [`TemplateIdsError::HighWaterDeleted`] when the object is gone, which
 /// a reservation never repairs; otherwise [`TemplateIdsError`] when the
 /// object is unreadable, a write fails, every attempt loses, or the block
-/// would reach `u64::MAX`.
+/// would pass [`MAX_TEMPLATE_ID`].
 pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
     for _ in 0..MAX_CAS_ATTEMPTS {
         let prior = read(store)?.ok_or(TemplateIdsError::HighWaterDeleted)?;
         let after = prior.reserved_through.max(floor);
         let block = after
             .checked_add(BLOCK)
-            .filter(|through| *through < u64::MAX)
+            .filter(|through| *through <= MAX_TEMPLATE_ID)
             .and_then(|through| IdBlock::new(after, through))
             .ok_or(TemplateIdsError::Exhausted(IdSpaceExhausted))?;
         if let Written::Landed = update(store, &prior, block.through())? {
@@ -430,6 +438,8 @@ mod tests {
             br#"{"other": 1}"#,
             br#"{"reserved_through": -1}"#,
             br#"{"reserved_through": "7"}"#,
+            br#"{"reserved_through": 9223372036854775808}"#,
+            br#"{"reserved_through": 18446744073709551615}"#,
         ] {
             let (_tmp, store) = local();
             store
@@ -487,14 +497,34 @@ mod tests {
     }
 
     #[test]
-    fn a_block_reaching_u64_max_is_refused() {
+    fn the_high_water_reads_up_to_i64_max() {
         let store = Store::in_memory();
         store
-            .put_blocking(HIGH_WATER_KEY, encode(u64::MAX - BLOCK))
+            .put_blocking(HIGH_WATER_KEY, encode(MAX_TEMPLATE_ID))
+            .expect("put");
+        let read = read(&store).expect("read").expect("present");
+        assert_eq!(read.reserved_through, MAX_TEMPLATE_ID);
+    }
+
+    #[test]
+    fn a_block_reaching_past_i64_max_is_refused() {
+        let store = Store::in_memory();
+        store
+            .put_blocking(HIGH_WATER_KEY, encode(MAX_TEMPLATE_ID - BLOCK + 1))
             .expect("put");
         assert!(matches!(
             reserve(&store, 0),
             Err(TemplateIdsError::Exhausted(_))
         ));
+    }
+
+    #[test]
+    fn a_block_ending_at_i64_max_is_reserved() {
+        let store = Store::in_memory();
+        store
+            .put_blocking(HIGH_WATER_KEY, encode(MAX_TEMPLATE_ID - BLOCK))
+            .expect("put");
+        let block = reserve(&store, 0).expect("the last block");
+        assert_eq!(block.through(), MAX_TEMPLATE_ID);
     }
 }

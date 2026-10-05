@@ -98,8 +98,9 @@ impl TemplateIds {
         })
     }
 
-    /// Seat `miner` above the high-water, reserve the first blocks
-    /// synchronously, and start the background refiller (RFC 0059 §3.4).
+    /// Seat `miner` above the high-water, reserve its current block and
+    /// [`READY_BLOCKS`] more synchronously, and start the background
+    /// refiller (RFC 0059 §3.4).
     /// Runs once, at startup, before any listener opens.
     ///
     /// # Errors
@@ -118,6 +119,10 @@ impl TemplateIds {
         };
         let seated = seat(&self.store, miner, policy)?;
         lock(&self.ready).highest = miner.highest_allocated();
+        fill(&self.store, &self.ready)?;
+        miner
+            .reserve_current_block()
+            .map_err(TemplateIdsError::FirstBlock)?;
         fill(&self.store, &self.ready)?;
         let receiver = self
             .refill_rx
@@ -239,6 +244,34 @@ mod tests {
         assert_eq!((first.after(), first.through()), (500, 500 + BLOCK));
         let second = reserver.reserve(first.through()).expect("ready");
         assert_eq!(second.after(), 500 + BLOCK);
+    }
+
+    #[test]
+    fn startup_leaves_a_current_block_and_two_ready() {
+        let store = Store::in_memory();
+        store
+            .put_blocking(HIGH_WATER_KEY, encode(500))
+            .expect("put");
+        let ids = TemplateIds::new(store.clone());
+        let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
+        ids.start(&mut miner, true).expect("start");
+        let ready: Vec<(u64, u64)> = lock(&ids.ready)
+            .blocks
+            .iter()
+            .map(|b| (b.after(), b.through()))
+            .collect();
+        assert_eq!(
+            ready,
+            [
+                (500 + BLOCK, 500 + 2 * BLOCK),
+                (500 + 2 * BLOCK, 500 + 3 * BLOCK)
+            ],
+            "the current block is in the miner, two more are ready"
+        );
+        let high_water = crate::template_ids::read(&store)
+            .expect("read")
+            .expect("present");
+        assert_eq!(high_water.reserved_through, 500 + 3 * BLOCK);
     }
 
     #[test]

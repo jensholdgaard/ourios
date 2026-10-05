@@ -7,7 +7,7 @@ use ourios_config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{
-    IdBlock, IdReservationError, IdReserver, IdSpaceExhausted, MinerCluster,
+    IdBlock, IdReservationError, IdReserver, IdSpaceExhausted, MAX_TEMPLATE_ID, MinerCluster,
 };
 
 /// A stand-in for the store's high-water: blocks of four above whatever
@@ -66,22 +66,31 @@ fn rfc0059_10_ids_strictly_increase_across_restarts() {
     assert!(issued[3] > reserved, "the restart skips the unused block");
 }
 
-/// Scenario RFC0059.10 — `u64::MAX` is never issued.
+/// Scenario RFC0059.10 — no id above `i64::MAX` is ever issued.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
-fn rfc0059_10_u64_max_is_never_issued() {
+fn rfc0059_10_no_id_above_i64_max_is_issued() {
     let tenant = TenantId::new("checkout");
     let mut cluster = MinerCluster::new(MinerConfig::default());
     assert_eq!(
         cluster.allocate_past_issued(u64::MAX),
         Err(IdSpaceExhausted)
     );
+    assert_eq!(
+        cluster.allocate_past_issued(MAX_TEMPLATE_ID + 1),
+        Err(IdSpaceExhausted)
+    );
 
     cluster
-        .allocate_past_issued(u64::MAX - 1)
-        .expect("seat at the top");
+        .allocate_past_issued(MAX_TEMPLATE_ID - 1)
+        .expect("seat below the top");
     assert_eq!(
         cluster.ingest(&line(&tenant, "alpha one")),
+        MAX_TEMPLATE_ID,
+        "the last id in the domain is issued"
+    );
+    assert_eq!(
+        cluster.ingest(&line(&tenant, "beta two three")),
         0,
         "no id is left to issue, so the mint fails parse"
     );

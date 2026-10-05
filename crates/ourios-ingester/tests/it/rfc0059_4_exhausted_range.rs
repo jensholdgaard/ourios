@@ -27,10 +27,16 @@ fn rfc0059_4_an_exhausted_range_fails_fresh_mints_and_keeps_matches_flowing() {
         .restart_over(hooks.wrap(node.store()))
         .expect("recover");
 
-    // Given the store down and both ready blocks drained.
+    // Given startup holding a current block and two ready ones.
+    assert_eq!(
+        node.high_water_bytes().as_deref(),
+        Some(format!(r#"{{"reserved_through":{}}}"#, 3 * BLOCK).as_bytes()),
+        "startup reserves the current block and two ready blocks"
+    );
+    // And the store down, with all three blocks drained.
     hooks.set_down(true);
     let first = running.mine_structured(TENANT, "event.0");
-    for i in 1..2 * BLOCK {
+    for i in 1..3 * BLOCK {
         assert_ne!(running.mine_structured(TENANT, &format!("event.{i}")), 0);
     }
     drop(running.records.drain());
@@ -57,5 +63,5 @@ fn rfc0059_4_an_exhausted_range_fails_fresh_mints_and_keeps_matches_flowing() {
             id => break id,
         }
     };
-    assert!(resumed > 2 * BLOCK, "{resumed} comes from a new block");
+    assert!(resumed > 3 * BLOCK, "{resumed} comes from a new block");
 }

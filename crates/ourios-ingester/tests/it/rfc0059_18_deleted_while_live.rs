@@ -25,14 +25,14 @@ fn rfc0059_18_a_high_water_deleted_while_live_is_never_recreated() {
     node.put(HIGH_WATER_KEY, br#"{"reserved_through": 0}"#);
     mark_seated(&node.snapshots, 0).expect("seated");
     let mut running = node.restart().expect("recover");
-    let held = 2 * BLOCK;
+    let held = 3 * BLOCK;
     assert_eq!(
         node.high_water_bytes().as_deref(),
         Some(format!(r#"{{"reserved_through":{held}}}"#).as_bytes()),
-        "startup readies two blocks"
+        "startup holds a current block and two ready blocks"
     );
 
-    // Given the object deleted while the node holds both blocks.
+    // Given the object deleted while the node holds all three blocks.
     std::fs::remove_file(node.store.join(HIGH_WATER_KEY)).expect("delete the object");
 
     // When it mints through every held id, asking the refiller each time.

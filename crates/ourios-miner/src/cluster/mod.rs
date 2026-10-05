@@ -624,6 +624,7 @@ mod structured;
 use id_alloc::IdRange;
 pub use id_alloc::{
     ID_RESERVATION_FAILED, IdBlock, IdReservationError, IdReserver, IdSpaceExhausted,
+    MAX_TEMPLATE_ID,
 };
 pub use persist::{AdoptedSnapshot, LeafSnapshot, RestoreError};
 

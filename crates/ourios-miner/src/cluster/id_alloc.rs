@@ -19,6 +19,10 @@ use super::MinerCluster;
 /// found no reserved id and the reservation itself failed.
 pub const ID_RESERVATION_FAILED: &str = "id_reservation_failed";
 
+/// The highest template id ever issued: `i64::MAX`, so every id fits the
+/// signed 64-bit integers OTLP attributes carry (RFC 0059 §3.7).
+pub const MAX_TEMPLATE_ID: u64 = i64::MAX.unsigned_abs();
+
 /// A reserved block of ids: every id `i` with `after < i <= through`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdBlock {
@@ -68,13 +72,14 @@ impl std::error::Error for IdReservationError {
     }
 }
 
-/// The `u64` id space has no id left above the one named.
+/// The id domain has no id left: every id up to [`MAX_TEMPLATE_ID`] is
+/// issued or reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdSpaceExhausted;
 
 impl fmt::Display for IdSpaceExhausted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("no template id is left above u64::MAX - 1")
+        f.write_str("no template id is left at or below i64::MAX")
     }
 }
 
@@ -99,7 +104,8 @@ struct Unreserved;
 
 impl IdReserver for Unreserved {
     fn reserve(&mut self, floor: u64) -> Result<IdBlock, IdReservationError> {
-        IdBlock::new(floor, u64::MAX - 1).ok_or_else(|| IdReservationError::new(IdSpaceExhausted))
+        IdBlock::new(floor, MAX_TEMPLATE_ID)
+            .ok_or_else(|| IdReservationError::new(IdSpaceExhausted))
     }
 }
 
@@ -116,7 +122,7 @@ impl IdRange {
     pub(super) fn new() -> Self {
         Self {
             next: 1,
-            end: u64::MAX,
+            end: MAX_TEMPLATE_ID + 1,
             reserver: Box::new(Unreserved),
         }
     }
@@ -127,8 +133,8 @@ impl IdRange {
         self.next
     }
 
-    /// Take the id [`Self::peek`] named. `next < end <= u64::MAX` after a
-    /// successful [`Self::ensure`], so this never overflows.
+    /// Take the id [`Self::peek`] named. `next < end <= MAX_TEMPLATE_ID + 1`
+    /// after a successful [`Self::ensure`], so this never overflows.
     pub(super) fn consume(&mut self) {
         self.next += 1;
     }
@@ -146,19 +152,25 @@ impl IdRange {
                 block.after, block.through
             )));
         }
-        self.end = block
-            .through
-            .checked_add(1)
-            .ok_or_else(|| IdReservationError::new(IdSpaceExhausted))?;
+        if block.through > MAX_TEMPLATE_ID {
+            return Err(IdReservationError::new(IdSpaceExhausted));
+        }
+        self.end = block.through + 1;
         self.next = block.after + 1;
         Ok(())
     }
 
-    /// Never allocate `issued` or any id below it.
+    /// Never allocate `issued` or any id below it. An id above
+    /// [`MAX_TEMPLATE_ID`] was never issued by this domain, so it is
+    /// refused rather than seated past.
     fn allocate_past(&mut self, issued: u64) -> Result<(), IdSpaceExhausted> {
-        let floor = issued.checked_add(1).ok_or(IdSpaceExhausted)?;
-        self.next = self.next.max(floor);
-        Ok(())
+        match issued {
+            issued if issued > MAX_TEMPLATE_ID => Err(IdSpaceExhausted),
+            issued => {
+                self.next = self.next.max(issued + 1);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -178,9 +190,19 @@ impl MinerCluster {
     ///
     /// # Errors
     ///
-    /// [`IdSpaceExhausted`] when `issued` is `u64::MAX`.
+    /// [`IdSpaceExhausted`] when `issued` is above [`MAX_TEMPLATE_ID`].
     pub fn allocate_past_issued(&mut self, issued: u64) -> Result<(), IdSpaceExhausted> {
         self.ids.allocate_past(issued)
+    }
+
+    /// Reserve the block the next fresh id comes from now, if none is in
+    /// hand, rather than at the first mint.
+    ///
+    /// # Errors
+    ///
+    /// [`IdReservationError`] when the reservation fails.
+    pub fn reserve_current_block(&mut self) -> Result<(), IdReservationError> {
+        self.ids.ensure()
     }
 
     /// The highest id this cluster has allocated or restored, or 0.
@@ -282,16 +304,42 @@ mod tests {
     }
 
     #[test]
-    fn seating_past_u64_max_is_a_controlled_error() {
+    fn seating_past_the_id_domain_is_a_controlled_error() {
         let mut range = IdRange::new();
         assert_eq!(range.allocate_past(u64::MAX), Err(IdSpaceExhausted));
-        assert_eq!(range.allocate_past(u64::MAX - 1), Ok(()));
-        assert!(take(&mut range).is_err(), "u64::MAX is never issued");
+        assert_eq!(
+            range.allocate_past(MAX_TEMPLATE_ID + 1),
+            Err(IdSpaceExhausted)
+        );
+        assert_eq!(range.allocate_past(MAX_TEMPLATE_ID - 1), Ok(()));
+        assert_eq!(take(&mut range).expect("the last id"), MAX_TEMPLATE_ID);
+        assert!(
+            take(&mut range).is_err(),
+            "nothing above i64::MAX is issued"
+        );
     }
 
     #[test]
     fn a_block_ending_at_u64_max_is_refused() {
         let (mut range, _) = range(vec![Ok(block(0, u64::MAX))]);
+        assert!(take(&mut range).is_err());
+    }
+
+    #[test]
+    fn a_block_reaching_past_the_id_domain_is_refused() {
+        let (mut range, _) = range(vec![
+            Ok(block(MAX_TEMPLATE_ID - 1, MAX_TEMPLATE_ID + 1)),
+            Ok(block(MAX_TEMPLATE_ID - 1, MAX_TEMPLATE_ID)),
+        ]);
+        assert!(take(&mut range).is_err());
+        assert_eq!(take(&mut range).expect("in the domain"), MAX_TEMPLATE_ID);
+    }
+
+    #[test]
+    fn the_unreserved_range_ends_at_the_id_domain() {
+        let mut range = IdRange::new();
+        range.allocate_past(MAX_TEMPLATE_ID - 1).expect("seat");
+        assert_eq!(take(&mut range).expect("the last id"), MAX_TEMPLATE_ID);
         assert!(take(&mut range).is_err());
     }
 }

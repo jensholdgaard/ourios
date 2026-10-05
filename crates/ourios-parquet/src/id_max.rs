@@ -448,6 +448,32 @@ mod tests {
         );
     }
 
+    /// Ids are stored as unsigned 64-bit: neither the footer nor a decode
+    /// may read one past `i64::MAX` as a smaller or negative value.
+    #[test]
+    fn ids_around_i64_max_read_back_exactly() {
+        let top = i64::MAX.unsigned_abs();
+        for (ids, max) in [
+            (vec![5, top], top),
+            (vec![top, top + 1, 7], top + 1),
+            (vec![u64::MAX, 3], u64::MAX),
+        ] {
+            let rows: Vec<MinedRecord> = ids.iter().map(|&id| row(id)).collect();
+            let batch = mined_records_to_batch(&rows).expect("batch");
+            let with = file(&batch, EnabledStatistics::Chunk, 8);
+            assert_eq!(
+                whole(&with, IdColumns::Data),
+                FooterMax::Known(Some(max)),
+                "{ids:?}"
+            );
+            let without = file(&batch, EnabledStatistics::None, 8);
+            assert_eq!(
+                decoded_max(without, IdColumns::Data).expect("decode"),
+                Some(max)
+            );
+        }
+    }
+
     #[test]
     fn a_file_of_events_without_ids_binds_none() {
         let quarantined = AuditEvent {

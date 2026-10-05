@@ -330,17 +330,18 @@ fn landed(outcome: Result<(), StoreError>) -> Result<Written, TemplateIdsError> 
 ///
 /// [`TemplateIdsError::HighWaterDeleted`] when the object is gone, which
 /// a reservation never repairs; otherwise [`TemplateIdsError`] when the
-/// object is unreadable, a write fails, every attempt loses, or the block
-/// would pass [`MAX_TEMPLATE_ID`].
+/// object is unreadable, a write fails, every attempt loses, or no id is
+/// left at or below [`MAX_TEMPLATE_ID`]. A block that would pass it is
+/// shortened to end there.
 pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
     for _ in 0..MAX_CAS_ATTEMPTS {
         let prior = read(store)?.ok_or(TemplateIdsError::HighWaterDeleted)?;
         let after = prior.reserved_through.max(floor);
-        let block = after
-            .checked_add(BLOCK)
-            .filter(|through| *through <= MAX_TEMPLATE_ID)
-            .and_then(|through| IdBlock::new(after, through))
-            .ok_or(TemplateIdsError::Exhausted(IdSpaceExhausted))?;
+        // The final block is shortened at the domain's top, so
+        // `MAX_TEMPLATE_ID` itself stays issuable.
+        let through = after.saturating_add(BLOCK).min(MAX_TEMPLATE_ID);
+        let block =
+            IdBlock::new(after, through).ok_or(TemplateIdsError::Exhausted(IdSpaceExhausted))?;
         if let Written::Landed = update(store, &prior, block.through())? {
             return Ok(block);
         }
@@ -507,15 +508,25 @@ mod tests {
     }
 
     #[test]
-    fn a_block_reaching_past_i64_max_is_refused() {
+    fn the_final_block_is_shortened_to_end_at_i64_max() {
         let store = Store::in_memory();
         store
-            .put_blocking(HIGH_WATER_KEY, encode(MAX_TEMPLATE_ID - BLOCK + 1))
+            .put_blocking(HIGH_WATER_KEY, encode(MAX_TEMPLATE_ID - 234))
             .expect("put");
+        let block = reserve(&store, 0).expect("the shortened final block");
+        assert_eq!(
+            (block.after(), block.through()),
+            (MAX_TEMPLATE_ID - 234, MAX_TEMPLATE_ID)
+        );
         assert!(matches!(
             reserve(&store, 0),
             Err(TemplateIdsError::Exhausted(_))
         ));
+        let read = read(&store).expect("read").expect("present");
+        assert_eq!(
+            read.reserved_through, MAX_TEMPLATE_ID,
+            "exhaustion writes nothing"
+        );
     }
 
     #[test]

@@ -120,10 +120,12 @@ impl TemplateIds {
         let seated = seat(&self.store, miner, policy)?;
         lock(&self.ready).highest = miner.highest_allocated();
         fill(&self.store, &self.ready)?;
-        miner
-            .reserve_current_block()
-            .map_err(TemplateIdsError::FirstBlock)?;
-        fill(&self.store, &self.ready)?;
+        if !lock(&self.ready).blocks.is_empty() {
+            miner
+                .reserve_current_block()
+                .map_err(TemplateIdsError::FirstBlock)?;
+            fill(&self.store, &self.ready)?;
+        }
         let receiver = self
             .refill_rx
             .lock()
@@ -140,7 +142,9 @@ impl TemplateIds {
     }
 }
 
-/// Reserve blocks until [`READY_BLOCKS`] are ready.
+/// Reserve blocks until [`READY_BLOCKS`] are ready, or until the id
+/// domain has none left: fresh mints then fail once the held ids run
+/// out, and no retry can help.
 fn fill(store: &Store, ready: &Mutex<Ready>) -> Result<(), TemplateIdsError> {
     loop {
         let floor = {
@@ -150,7 +154,11 @@ fn fill(store: &Store, ready: &Mutex<Ready>) -> Result<(), TemplateIdsError> {
             }
             held.highest
         };
-        let block = reserve(store, floor)?;
+        let block = match reserve(store, floor) {
+            Ok(block) => block,
+            Err(TemplateIdsError::Exhausted(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let mut held = lock(ready);
         held.highest = held.highest.max(block.through());
         held.blocks.push_back(block);

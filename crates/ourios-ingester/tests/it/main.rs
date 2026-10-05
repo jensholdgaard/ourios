@@ -66,6 +66,7 @@ mod rfc0052_1_unwind_policy;
 mod rfc0052_2_per_tenant_horizons;
 mod rfc0052_4_timer_discharge;
 mod rfc0052_barrier_support;
+mod rfc0059_10_last_id;
 mod rfc0059_12_seated_marker;
 mod rfc0059_13_replay_reserves_on_demand;
 mod rfc0059_14_deleted_high_water;

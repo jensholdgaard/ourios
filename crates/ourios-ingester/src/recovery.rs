@@ -35,6 +35,7 @@ use prost::Message;
 use crate::metrics::ERROR_TYPE;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
+use crate::template_ids::{Seated, TemplateIds, TemplateIdsError};
 
 /// What recovery did, for the caller to log and for the
 /// RFC0008.10 / RFC 0001 §3.5.3–.4 assertions.
@@ -62,6 +63,9 @@ pub struct RecoveryReport {
     pub max_delivered: Option<WalOffset>,
     /// Per-tenant snapshot outcome, one entry per artefact found.
     pub tenants: Vec<TenantRecovery>,
+    /// The template-id high-water this start seated the miner above
+    /// (RFC 0059 §3.4).
+    pub template_ids: Seated,
 }
 
 impl RecoveryReport {
@@ -196,6 +200,10 @@ pub enum RecoveryDriverError {
     /// tenant still has frames in the WAL: with none left, booting
     /// would silently discard the only record of its templates.
     LegacyMarkUnreadable(TenantId),
+    /// The template-id high-water could not be read, bootstrapped or
+    /// reserved from (RFC 0059 §3.4): a guessed floor could re-issue an id
+    /// published rows carry.
+    TemplateIds(TemplateIdsError),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -211,6 +219,7 @@ impl std::fmt::Display for RecoveryDriverError {
                  high-water mark cannot be read (RFC 0052 §3.2)",
                 tenant.as_str()
             ),
+            Self::TemplateIds(e) => write!(f, "recovery template-id high-water: {e}"),
         }
     }
 }
@@ -220,6 +229,7 @@ impl std::error::Error for RecoveryDriverError {
         match self {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
+            Self::TemplateIds(e) => Some(e),
             Self::LegacyStaleGap(_) | Self::LegacyMarkUnreadable(_) | Self::Replay(_) => None,
         }
     }
@@ -239,15 +249,22 @@ impl std::error::Error for RecoveryDriverError {
 /// discard emits one `ourios.receiver.snapshot.discarded` event naming
 /// the tenant and the [`DiscardReason`].
 ///
+/// Before replay mints anything, `ids` seats the miner above the store's
+/// template-id high-water (RFC 0059 §3.4), so nothing replay or later
+/// ingest allocates can equal an id issued before this start, whatever
+/// was restored, discarded or never found.
+///
 /// # Errors
 ///
 /// [`RecoveryDriverError`] on snapshot-store I/O or replay failure
 /// (including an `OtlpBatch` frame that fails protobuf decode or
-/// tenant fan-out — corruption-adjacent, surfaced loudly).
+/// tenant fan-out — corruption-adjacent, surfaced loudly), or when the
+/// template-id high-water cannot be seated.
 pub fn recover(
     wal: &mut Wal,
     snapshots_root: &Path,
     miner: &mut MinerCluster,
+    ids: &TemplateIds,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
     let artefacts =
@@ -258,6 +275,7 @@ pub fn recover(
         horizons,
         legacy,
     } = restore_artefacts(miner, artefacts);
+    let template_ids = ids.start(miner).map_err(RecoveryDriverError::TemplateIds)?;
     let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
     // ends there rather than at `Wal::open` because open runs before
@@ -288,6 +306,7 @@ pub fn recover(
         audit_events_suppressed: replay.withheld.events,
         max_delivered: replay.max_delivered,
         tenants,
+        template_ids,
     })
 }
 
@@ -1016,7 +1035,8 @@ mod tests {
         );
 
         let mut miner = MinerCluster::new(MinerConfig::default());
-        recover(&mut wal, &root.join("snapshots"), &mut miner).expect("recover");
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        recover(&mut wal, &root.join("snapshots"), &mut miner, &ids).expect("recover");
 
         let state = wal.reclaim_state();
         assert!(

@@ -20,6 +20,7 @@ use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::Wal;
@@ -95,6 +96,7 @@ fn rfc0035_2_crash_during_the_sweeps_in_flight_publish_replays_the_records() {
     // acked frames and re-mines the drained records.
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen WAL");
     let store = Store::local(&bucket_root).expect("store");
+    let ids = TemplateIds::new(store.clone());
     let sink = SharedParquetSink::new(ParquetRecordSink::new(
         store,
         FlushConfig {
@@ -107,7 +109,7 @@ fn rfc0035_2_crash_during_the_sweeps_in_flight_publish_replays_the_records() {
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let snapshots_root = wal_root.join("snapshots"); // none written → full replay
     let report =
-        recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("startup recovery");
+        recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids).expect("startup recovery");
     assert_eq!(
         report.records_fed_to_miner, 2,
         "replay re-mined both records the crash caught mid-publish"

@@ -30,6 +30,7 @@ use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
@@ -612,6 +613,23 @@ fn build_write_sinks(
     (sink, audit_sink)
 }
 
+/// The miner, wired *before* recovery to both sinks and to the store's
+/// template-id high-water: replay re-mines the un-flushed tail through
+/// `miner.ingest`, which re-emits its records into the record sink and its
+/// template events into the audit sink (RFC0014.5 — recovery rebuilds the
+/// in-memory buffers the crash dropped; the durability of record is the
+/// WAL, never the buffers), and every id it mints comes from a block
+/// reserved in the store first (RFC 0059 §3.2).
+fn build_miner(
+    config: MinerConfig,
+    (sink, audit_sink): (&SharedParquetSink, &SharedParquetAuditSink),
+    ids: &TemplateIds,
+) -> MinerCluster {
+    MinerCluster::with_audit_sink(config, Box::new(audit_sink.clone()))
+        .with_record_sink(Box::new(sink.clone()))
+        .with_id_reserver(ids.reserver())
+}
+
 /// The one publish coordinator both cadences share — two would put two
 /// owners on a single sink's in-flight accounting — and the barrier that
 /// clones it (RFC 0052 §3.1).
@@ -1000,17 +1018,10 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
+    let ids = TemplateIds::new(config.store.clone());
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
-
-    // Wire both sinks into the miner *before* recovery: replay re-mines the
-    // un-flushed tail through `miner.ingest`, which re-emits its records into
-    // the record sink and its template events into the audit sink (RFC0014.5 —
-    // recovery rebuilds the in-memory buffers the crash dropped; the durability
-    // of record is the WAL, never the buffers).
-    let mut miner = MinerCluster::with_audit_sink(config.miner, Box::new(audit_sink.clone()))
-        .with_record_sink(Box::new(sink.clone()));
-
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner)
+    let mut miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
         .map_err(|e| format!("startup recovery: {e}"))?;
     for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
         tracing::warn!(

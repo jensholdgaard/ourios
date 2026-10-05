@@ -11,7 +11,7 @@ mod bootstrap;
 mod reserver;
 
 pub use bootstrap::{BootstrapScan, bootstrap};
-pub use reserver::{StoreIdReserver, TemplateIds};
+pub use reserver::TemplateIds;
 
 use ourios_miner::cluster::{IdBlock, IdSpaceExhausted, MinerCluster};
 use ourios_parquet::{IdMaxError, Store, StoreError};
@@ -28,13 +28,15 @@ pub const BLOCK: u64 = 1_000;
 const MAX_CAS_ATTEMPTS: usize = 16;
 
 /// The telemetry names RFC 0059 §3.9 registers, in one place.
-pub mod names {
-    pub const BOOTSTRAPPED: &str = "ourios.receiver.template_ids.bootstrapped";
-    pub const BOOTSTRAP_PROGRESS: &str = "ourios.receiver.template_ids.bootstrap.progress";
-    pub const FLOOR: &str = "ourios.receiver.template_ids.floor";
-    pub const DATA_MAX: &str = "ourios.receiver.template_ids.data_max";
-    pub const AUDIT_MAX: &str = "ourios.receiver.template_ids.audit_max";
-    pub const FILES_SCANNED: &str = "ourios.receiver.template_ids.files_scanned";
+mod names {
+    pub(super) use ourios_semconv::{
+        EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAP_PROGRESS as BOOTSTRAP_PROGRESS,
+        EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAPPED as BOOTSTRAPPED,
+        OURIOS_RECEIVER_TEMPLATE_IDS_AUDIT_MAX as AUDIT_MAX,
+        OURIOS_RECEIVER_TEMPLATE_IDS_DATA_MAX as DATA_MAX,
+        OURIOS_RECEIVER_TEMPLATE_IDS_FILES_SCANNED as FILES_SCANNED,
+        OURIOS_RECEIVER_TEMPLATE_IDS_FLOOR as FLOOR,
+    };
 }
 
 /// Why the high-water could not be read, written or seated.
@@ -58,15 +60,39 @@ pub enum TemplateIdsError {
     Scan(Box<IdMaxError>),
     /// No id is left in the `u64` space.
     Exhausted(IdSpaceExhausted),
+    /// The background refiller thread could not start.
+    Refiller(String),
+}
+
+impl TemplateIdsError {
+    /// The `error.type` a failure is logged under.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Store { .. } => "store",
+            Self::Malformed { .. } => "malformed",
+            Self::LaterVersion { .. } => "later_version",
+            Self::Missing => "missing",
+            Self::Contended => "contended",
+            Self::Scan(_) => "scan",
+            Self::Exhausted(_) => "exhausted",
+            Self::Refiller(_) => "_OTHER",
+        }
+    }
 }
 
 impl std::fmt::Display for TemplateIdsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store { op, key, source } => write!(f, "{op} {key}: {source}"),
-            Self::Malformed { key, detail } => write!(f, "{key} is not a template-id high-water: {detail}"),
+            Self::Malformed { key, detail } => {
+                write!(f, "{key} is not a template-id high-water: {detail}")
+            }
             Self::LaterVersion { key } => {
-                write!(f, "{key} is a later template-id high-water format than this build reads")
+                write!(
+                    f,
+                    "{key} is a later template-id high-water format than this build reads"
+                )
             }
             Self::Missing => write!(f, "{HIGH_WATER_KEY} is gone; a reservation needs it"),
             Self::Contended => write!(
@@ -75,6 +101,7 @@ impl std::fmt::Display for TemplateIdsError {
             ),
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),
+            Self::Refiller(e) => write!(f, "start the template-id refiller: {e}"),
         }
     }
 }
@@ -85,9 +112,11 @@ impl std::error::Error for TemplateIdsError {
             Self::Store { source, .. } => Some(source.as_ref()),
             Self::Scan(e) => Some(e.as_ref()),
             Self::Exhausted(e) => Some(e),
-            Self::Malformed { .. } | Self::LaterVersion { .. } | Self::Missing | Self::Contended => {
-                None
-            }
+            Self::Malformed { .. }
+            | Self::LaterVersion { .. }
+            | Self::Missing
+            | Self::Contended
+            | Self::Refiller(_) => None,
         }
     }
 }
@@ -108,18 +137,21 @@ pub struct HighWater {
     e_tag: Option<String>,
 }
 
-/// Read the high-water, or `None` when the store has none yet.
+/// Read the high-water, or `None` when the store has none of any version.
 ///
 /// # Errors
 ///
-/// [`TemplateIdsError`] when the object cannot be fetched or parsed, or
-/// only a later format version's object exists (RFC 0059 §3.1).
+/// [`TemplateIdsError`] when the object cannot be fetched or parsed, or a
+/// later format version's object exists beside it or alone (RFC 0059
+/// §3.1): a newer binary may have moved the authoritative high-water
+/// there, so a stale v1 is never trusted.
 pub fn read(store: &Store) -> Result<Option<HighWater>, TemplateIdsError> {
+    refuse_later_version(store)?;
     let Some((bytes, e_tag)) = store
         .get_with_etag_blocking_opt(HIGH_WATER_KEY)
         .map_err(store_err("read", HIGH_WATER_KEY))?
     else {
-        return refuse_later_version(store).map(|()| None);
+        return Ok(None);
     };
     let reserved_through = parse(&bytes)?;
     Ok(Some(HighWater {
@@ -147,7 +179,10 @@ fn refuse_later_version(store: &Store) -> Result<(), TemplateIdsError> {
     let keys = store
         .list_blocking(Some(HIGH_WATER_PREFIX))
         .map_err(store_err("list", HIGH_WATER_PREFIX))?;
-    match keys.into_iter().find(|key| key.starts_with(HIGH_WATER_STEM)) {
+    let later = keys
+        .into_iter()
+        .find(|key| key.starts_with(HIGH_WATER_STEM) && key != HIGH_WATER_KEY);
+    match later {
         Some(key) => Err(TemplateIdsError::LaterVersion { key }),
         None => Ok(()),
     }
@@ -215,7 +250,7 @@ pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
 }
 
 /// What a start found and seated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Seated {
     /// The high-water read at start, or written by its bootstrap.
     pub high_water: u64,
@@ -279,13 +314,23 @@ mod tests {
     }
 
     #[test]
-    fn a_later_version_alone_is_refused() {
-        let (_tmp, store) = local();
-        store
-            .put_blocking("miner/template_ids.v2.json", b"{}".to_vec())
-            .expect("put");
-        let err = read(&store).expect_err("later version");
-        assert!(matches!(err, TemplateIdsError::LaterVersion { .. }), "{err}");
+    fn a_later_version_is_refused_alone_and_beside_v1() {
+        for beside_v1 in [false, true] {
+            let (_tmp, store) = local();
+            if beside_v1 {
+                store
+                    .put_blocking(HIGH_WATER_KEY, encode(7))
+                    .expect("put v1");
+            }
+            store
+                .put_blocking("miner/template_ids.v2.json", b"{}".to_vec())
+                .expect("put v2");
+            let err = read(&store).expect_err("later version");
+            assert!(
+                matches!(err, TemplateIdsError::LaterVersion { .. }),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -296,7 +341,8 @@ mod tests {
 
     #[test]
     fn reservations_raise_the_high_water_above_the_floor() {
-        for store in [Store::in_memory(), local().1] {
+        let (_tmp, local) = local();
+        for store in [Store::in_memory(), local] {
             store.put_blocking(HIGH_WATER_KEY, encode(10)).expect("put");
             let first = reserve(&store, 0).expect("first");
             assert_eq!((first.after(), first.through()), (10, 10 + BLOCK));

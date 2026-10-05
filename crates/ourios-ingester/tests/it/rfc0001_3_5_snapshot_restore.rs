@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ingest_support::{
-    open_pipeline, request, resource_logs, tenant_for, wal_config, write_snapshots_at,
+    open_pipeline, request, resource_logs, template_ids, tenant_for, wal_config, write_snapshots_at,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
@@ -83,8 +83,13 @@ fn assert_discarded_and_full_replayed(
 ) -> recovery::RecoveryReport {
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &root.join("snapshots"), &mut recovered).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &root.join("snapshots"),
+        &mut recovered,
+        &template_ids(root),
+    )
+    .expect("recover");
     assert_eq!(report.tenants.len(), 1);
     assert_eq!(
         report.tenants[0].outcome(),
@@ -149,7 +154,13 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // Act: recover into a fresh miner over the same WAL + snapshots.
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &template_ids(root),
+    )
+    .expect("recover");
 
     // Assert (a): restored + tail-replayed state equals the
     // from-scratch control, per tenant.
@@ -356,7 +367,13 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &template_ids(root),
+    )
+    .expect("recover");
 
     // Assert: restored + flagged, surviving frames folded, no error.
     assert_eq!(report.tenants.len(), 1);
@@ -398,8 +415,13 @@ async fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
     // Act
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
     let mut recovered = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &root.join("snapshots"), &mut recovered).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &root.join("snapshots"),
+        &mut recovered,
+        &template_ids(root),
+    )
+    .expect("recover");
 
     // Assert
     assert!(report.tenants.is_empty(), "no artefacts, no outcomes");

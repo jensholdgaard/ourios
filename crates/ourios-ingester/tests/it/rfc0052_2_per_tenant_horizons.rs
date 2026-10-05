@@ -15,7 +15,9 @@ use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
 use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::snapshot_store;
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
+use ourios_parquet::Store;
 use ourios_wal::{HousekeepingProgress, RetainFloor, SnapshotHorizons, Wal, WalConfig, WalOffset};
 
 use crate::rfc0052_barrier_support::{BarrierRig, RigSpec, wal_config};
@@ -114,6 +116,7 @@ fn housekeeping_pass(rig: &BarrierRig) -> HousekeepingProgress {
 /// Stop the rig's node and run startup recovery over what it left.
 fn restart(rig: BarrierRig) -> RecoveryReport {
     let (wal_root, snapshots_root) = (rig.wal_root.clone(), rig.snapshots_root.clone());
+    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"));
     drop(rig);
     let mut wal = Wal::open(WalConfig {
         segment_age_secs: 1,
@@ -121,7 +124,7 @@ fn restart(rig: BarrierRig) -> RecoveryReport {
     })
     .expect("reopen");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("recover")
+    recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids).expect("recover")
 }
 
 fn stale_gap(report: &RecoveryReport, tenant: &str) -> bool {

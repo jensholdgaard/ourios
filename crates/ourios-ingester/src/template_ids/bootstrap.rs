@@ -46,7 +46,7 @@ impl BootstrapScan {
         if self.files_scanned.is_multiple_of(PROGRESS_EVERY) {
             tracing::info!(
                 name: names::BOOTSTRAP_PROGRESS,
-                { names::FILES_SCANNED } = self.files_scanned,
+                { { names::FILES_SCANNED } = self.files_scanned },
                 "template-id bootstrap: {} data and audit footers read",
                 self.files_scanned,
             );
@@ -102,10 +102,12 @@ pub fn bootstrap(store: &Store, restored: u64) -> Result<Seated, TemplateIdsErro
         Written::Landed => {
             tracing::info!(
                 name: names::BOOTSTRAPPED,
-                { names::FLOOR } = floor,
-                { names::DATA_MAX } = scan.data_max,
-                { names::AUDIT_MAX } = scan.audit_max,
-                { names::FILES_SCANNED } = scan.files_scanned,
+                {
+                    { names::FLOOR } = floor,
+                    { names::DATA_MAX } = scan.data_max,
+                    { names::AUDIT_MAX } = scan.audit_max,
+                    { names::FILES_SCANNED } = scan.files_scanned,
+                },
                 "template-id high-water bootstrapped at {floor} from {} data and audit footers",
                 scan.files_scanned,
             );

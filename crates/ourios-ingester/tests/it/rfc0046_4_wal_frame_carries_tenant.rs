@@ -17,6 +17,7 @@ use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::{FrameKind, Wal};
@@ -100,10 +101,11 @@ async fn rfc0046_4_replay_lands_records_in_the_acknowledged_tenant() {
     // Recover into a fresh miner + sink and flush.
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen WAL");
     let store = Store::local(&bucket_root).expect("store");
+    let ids = TemplateIds::new(store.clone());
     let sink = SharedParquetSink::new(ParquetRecordSink::new(store, never_flush()));
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
-    let report = recovery::recover(&mut wal, &wal_root.join("snapshots"), &mut miner)
+    let report = recovery::recover(&mut wal, &wal_root.join("snapshots"), &mut miner, &ids)
         .expect("startup recovery");
     assert_eq!(report.records_fed_to_miner, 3);
     sink.flush_all();

@@ -150,9 +150,10 @@ no reservation ever runs there.
   ingester's background refiller reserves the next ready block off the
   lock. If the store fails, it retries with capped exponential backoff
   (100 ms doubling to 30 s).
-- **Exhausted range.** If both blocks are used up before a refill
-  lands, every **fresh** allocation fails immediately: a new tree leaf,
-  an adoption-interned template, or a first-seen structured key.
+- **Exhausted range.** Once the listeners are open, if both blocks are
+  used up before a refill lands, every **fresh** allocation fails
+  immediately: a new tree leaf, an adoption-interned template, or a
+  first-seen structured key. (Startup replay is different; see §3.4.)
   - Each such line is emitted as a parse failure: `template_id = 0`, its
     body retained (`CLAUDE.md` §3.3 holds through the body), and
     `lossy_flag = true` for string bodies.
@@ -172,10 +173,20 @@ Recovery reads `N` **before** replay, after restoring the snapshots
 (RFC 0001 §6.9):
 - **Object present.** Recovery first applies the seated-marker rule
   (§3.5): a root that has never seated discards its snapshots. It then
-  seats the allocator above `max(N, highest restored id)`. It reserves the first current block
-  and the first ready block synchronously, before the listeners open,
-  so startup is the one place a reservation blocks. Replay then mints
-  from that block.
+  seats the allocator above `max(N, highest restored id)`, and
+  reserves the first current block and the first ready block
+  synchronously. Replay then mints from those blocks.
+- **Replay reserves on demand.** Replay can mint far more than two
+  blocks of templates, for example a discarded snapshot's tenant
+  full-replaying its WAL. While it runs, the recovery driver owns the
+  miner exclusively, before any listener opens. There is no pipeline
+  lock yet and no ingest to stall, so a replay that drains the ready
+  blocks reserves the next block **synchronously, on demand**, rather
+  than failing a template a healthy store could have given an id.
+  - The exhausted-range rule of §3.3 applies only once recovery has
+    handed the miner to the pipeline.
+  - A store failure during replay therefore fails the reservation, and
+    with it startup, never a single template.
 - **Object absent** (no version of it, §3.1). Recovery bootstraps it
   (§3.5), then proceeds as above.
 - **Read fails.** Startup fails closed. This is the same trade-off as
@@ -629,6 +640,17 @@ The ids are referenced from test code.
 > - **And** when two markerless receivers race the bootstrap, the loser
 >   fails startup and its restart takes the discard path
 
+> **Scenario RFC0059.13 — Replay past the ready blocks reserves on demand**
+> - **Given** a seated root whose surviving WAL holds more first-seen
+>   templates than the two blocks startup reserves, and a healthy store
+> - **When** the receiver restarts and replays every frame
+> - **Then** no template fails with `id_reservation_failed` and
+>   `ourios.miner.parse_failures` stays at zero
+> - **And** the recovered state equals a from-scratch rebuild up to the
+>   renaming of RFC0059.9
+> - **And** once replay has ended, a drained reserver fails instead of
+>   calling the store
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -636,7 +658,7 @@ scenario harness: the production barrier, housekeeping and recovery
 path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
-  fixture), .5, .6, .9, .11 and .12.
+  fixture), .5, .6, .9, .11, .12 and .13.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none

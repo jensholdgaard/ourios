@@ -4,7 +4,7 @@
 
 use ourios_parquet::{IdColumns, Store, object_max_id};
 
-use super::{Seated, TemplateIdsError, Written, names, store_err, write};
+use super::{Seated, TemplateIdsError, Written, create, names, store_err};
 
 /// Files between two progress events.
 const PROGRESS_EVERY: u64 = 10_000;
@@ -100,7 +100,7 @@ fn walk(
 pub fn bootstrap(store: &Store, restored: u64) -> Result<Seated, TemplateIdsError> {
     let scan = BootstrapScan::run(store)?;
     let floor = scan.floor(restored);
-    match write(store, None, floor)? {
+    match create(store, floor)? {
         Written::Landed => {
             tracing::info!(
                 name: names::BOOTSTRAPPED,

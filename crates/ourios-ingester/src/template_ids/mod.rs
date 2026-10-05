@@ -58,8 +58,6 @@ pub enum TemplateIdsError {
     Malformed { key: String, detail: String },
     /// Only a later format version's object exists.
     LaterVersion { key: String },
-    /// A reservation needs the object, and it is gone.
-    Missing,
     /// Every compare-and-swap attempt lost a race.
     Contended,
     /// The bootstrap scan could not read a data or audit file.
@@ -82,8 +80,9 @@ pub enum TemplateIdsError {
     /// The seated marker is malformed, or claims more than the high-water
     /// holds: it vouches for nothing (RFC 0059 §3.5).
     MarkerInvalid { detail: String },
-    /// A seated root found no high-water: it was deleted, and a bootstrap
-    /// could reseat below a block another receiver still holds.
+    /// A seated root, at startup or reserving live, found no high-water:
+    /// it was deleted, and re-creating it could seat below a block another
+    /// receiver still holds.
     HighWaterDeleted,
     /// No high-water exists, the store already holds data, and this start
     /// was not authorised to bootstrap (RFC 0059 §3.5).
@@ -98,7 +97,6 @@ impl TemplateIdsError {
             Self::Store { .. } => "store",
             Self::Malformed { .. } => "malformed",
             Self::LaterVersion { .. } => "later_version",
-            Self::Missing => "missing",
             Self::Contended => "contended",
             Self::Scan(_) => "scan",
             Self::Exhausted(_) => "exhausted",
@@ -130,7 +128,6 @@ impl std::fmt::Display for TemplateIdsError {
                     "{key} is a later template-id high-water format than this build reads"
                 )
             }
-            Self::Missing => write!(f, "{HIGH_WATER_KEY} is gone; a reservation needs it"),
             Self::Contended => write!(
                 f,
                 "{HIGH_WATER_KEY}: {MAX_CAS_ATTEMPTS} compare-and-swap attempts all lost"
@@ -180,7 +177,6 @@ impl std::error::Error for TemplateIdsError {
             Self::Snapshots(e) => Some(e),
             Self::Malformed { .. }
             | Self::LaterVersion { .. }
-            | Self::Missing
             | Self::Contended
             | Self::BootstrapRaceLost
             | Self::MarkerInvalid { .. }
@@ -279,24 +275,38 @@ enum Written {
     Lost,
 }
 
-/// Write `reserved_through`: create-if-absent when there is no object,
-/// compare-and-swap against `prior` where the backend supports it, and
-/// overwrite on a backend that does not (RFC 0059 §3.6).
-fn write(
+/// Create the high-water at `reserved_through`. Only the startup
+/// bootstrap calls this (RFC 0059 §3.5): a live reservation never creates
+/// an absent object.
+fn create(store: &Store, reserved_through: u64) -> Result<Written, TemplateIdsError> {
+    landed(store.put_if_absent_blocking(HIGH_WATER_KEY, encode(reserved_through)))
+}
+
+/// Replace the high-water read as `prior` with `reserved_through`: a
+/// compare-and-swap where the backend supports one, an overwrite where it
+/// does not (RFC 0059 §3.6). A compare-and-swap against a deleted object
+/// fails rather than re-creating it.
+fn update(
     store: &Store,
-    prior: Option<&HighWater>,
+    prior: &HighWater,
     reserved_through: u64,
 ) -> Result<Written, TemplateIdsError> {
     let bytes = encode(reserved_through);
-    let outcome = match prior {
-        None => store.put_if_absent_blocking(HIGH_WATER_KEY, bytes),
-        Some(HighWater {
-            e_tag: Some(tag), ..
-        }) if store.supports_conditional_update() => {
-            store.put_if_match_blocking(HIGH_WATER_KEY, bytes, tag)
+    let outcome = match (&prior.e_tag, store.supports_conditional_update()) {
+        (Some(tag), true) => store.put_if_match_blocking(HIGH_WATER_KEY, bytes, tag),
+        (None, true) => {
+            return Err(TemplateIdsError::Malformed {
+                key: HIGH_WATER_KEY.to_owned(),
+                detail: "read without an ETag, so no compare-and-swap can guard the write"
+                    .to_owned(),
+            });
         }
-        Some(_) => store.put_blocking(HIGH_WATER_KEY, bytes),
+        (_, false) => store.put_blocking(HIGH_WATER_KEY, bytes),
     };
+    landed(outcome)
+}
+
+fn landed(outcome: Result<(), StoreError>) -> Result<Written, TemplateIdsError> {
     match outcome {
         Ok(()) => Ok(Written::Landed),
         Err(e) if e.is_already_exists() || e.is_precondition() => Ok(Written::Lost),
@@ -310,18 +320,20 @@ fn write(
 ///
 /// # Errors
 ///
-/// [`TemplateIdsError`] when the object is unreadable or gone, a write
-/// fails, every attempt loses, or the block would reach `u64::MAX`.
+/// [`TemplateIdsError::HighWaterDeleted`] when the object is gone, which
+/// a reservation never repairs; otherwise [`TemplateIdsError`] when the
+/// object is unreadable, a write fails, every attempt loses, or the block
+/// would reach `u64::MAX`.
 pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
     for _ in 0..MAX_CAS_ATTEMPTS {
-        let prior = read(store)?.ok_or(TemplateIdsError::Missing)?;
+        let prior = read(store)?.ok_or(TemplateIdsError::HighWaterDeleted)?;
         let after = prior.reserved_through.max(floor);
         let block = after
             .checked_add(BLOCK)
             .filter(|through| *through < u64::MAX)
             .and_then(|through| IdBlock::new(after, through))
             .ok_or(TemplateIdsError::Exhausted(IdSpaceExhausted))?;
-        if let Written::Landed = write(store, Some(&prior), block.through())? {
+        if let Written::Landed = update(store, &prior, block.through())? {
             return Ok(block);
         }
     }
@@ -449,9 +461,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reservation_needs_the_object() {
-        let (_tmp, store) = local();
-        assert!(matches!(reserve(&store, 0), Err(TemplateIdsError::Missing)));
+    fn a_reservation_never_creates_an_absent_object() {
+        let (_tmp, local) = local();
+        for store in [Store::in_memory(), local] {
+            assert!(matches!(
+                reserve(&store, 0),
+                Err(TemplateIdsError::HighWaterDeleted)
+            ));
+            assert!(read(&store).expect("read").is_none(), "nothing was created");
+        }
     }
 
     #[test]

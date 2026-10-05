@@ -153,15 +153,29 @@ fn fill(store: &Store, ready: &Mutex<Ready>) -> Result<(), TemplateIdsError> {
 }
 
 /// Refill on every request, retrying a failure with capped backoff until
-/// it lands or every sender is gone.
+/// it lands or every sender is gone. A deleted high-water stops the
+/// refiller for good (RFC 0059 §3.1): an object that reappears may sit
+/// below blocks other receivers hold, so only a restart, which fails
+/// closed, may decide what it is worth.
 fn refill_loop(store: &Store, ready: &Mutex<Ready>, requests: &Receiver<()>) {
     while requests.recv().is_ok() {
         let mut backoff = BACKOFF_START;
-        while let Err(error) = fill(store, ready) {
-            tracing::warn!(
-                { crate::metrics::ERROR_TYPE } = error.error_type(),
-                "template-id refill failed; fresh templates fail parse until it lands: {error}",
-            );
+        loop {
+            match fill(store, ready) {
+                Ok(()) => break,
+                Err(error @ TemplateIdsError::HighWaterDeleted) => {
+                    tracing::error!(
+                        { crate::metrics::ERROR_TYPE } = error.error_type(),
+                        "template-id refill stopped; fresh templates fail parse until a \
+                         restart: {error}",
+                    );
+                    return;
+                }
+                Err(error) => tracing::warn!(
+                    { crate::metrics::ERROR_TYPE } = error.error_type(),
+                    "template-id refill failed; fresh templates fail parse until it lands: {error}",
+                ),
+            }
             match requests.recv_timeout(backoff) {
                 Ok(()) | Err(RecvTimeoutError::Timeout) => backoff = (backoff * 2).min(BACKOFF_MAX),
                 Err(RecvTimeoutError::Disconnected) => return,

@@ -71,6 +71,7 @@ mod rfc0059_13_replay_reserves_on_demand;
 mod rfc0059_14_deleted_high_water;
 mod rfc0059_16_bootstrap_authorization;
 mod rfc0059_17_no_policy_deletes_high_water;
+mod rfc0059_18_deleted_while_live;
 mod rfc0059_1_discarded_snapshot;
 mod rfc0059_2_lost_root;
 mod rfc0059_3_reserve_before_use;

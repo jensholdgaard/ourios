@@ -34,6 +34,22 @@ The first start of an existing deployment computes the object from
 every data and audit file footer, so the floor is provable and needs no
 margin.
 
+**Invariants and hazards touched** (`docs/verification.md`), each with
+the §5 scenarios that cover it:
+
+| Touched | How | Covered by |
+|---|---|---|
+| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16 |
+| `CLAUDE.md` §3.3, bit-identical reconstruction | the registry's last-wins fold would render old rows against the wrong text; an exhausted range must keep the body | RFC0059.1, .4 |
+| `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16 |
+| `CLAUDE.md` §3.7, multi-tenancy | ids stay unique across tenants; the scenarios mint for two tenants | RFC0059.1, .8 |
+| Hazard #1, template miner correctness | allocation, restore and replay order inside the miner | RFC0059.3, .4, .10, .13 |
+| Hazard #5, template schema evolution | re-minted old shapes stay drift on fresh ids, never collisions; restore equivalence holds up to renaming | RFC0059.1, .9 |
+
+`CLAUDE.md` §3.4 (WAL-before-ack) and hazard #4 (small files) are not
+changed: the WAL format and acknowledgement path are untouched, and the
+high-water is one small object per store.
+
 ## 2. Motivation
 
 **The bug.** #898's scenario tests, run against `main` at `09e493ed`,
@@ -109,7 +125,8 @@ rebuildable cache.
   refuses to start when it sees the later key, whatever v1 holds.
 - **Absent** means no `template_ids.v<k>.json` of any version exists.
   It triggers the bootstrap (§3.5) **only on a root without a seated
-  marker**.
+  marker**, and over a store that already holds data **only with explicit
+  authorisation** (§3.5).
 - **A seated root that finds the object absent fails closed.** The
   object was deleted. A bootstrap then would scan only published ids and
   could reseat `N` below a block another receiver still holds, so the
@@ -192,9 +209,10 @@ file afterwards would leave its leaves live. The order is:
    normally, then seat above `max(N, highest restored id)`. An invalid
    marker, or a valid one whose object is absent, fails startup closed
    (§3.1, §3.5).
-4. **Object absent, the bootstrap** (§3.5): restore first, because the
-   floor needs `restored_max`. Then bootstrap the object and write the
-   marker.
+4. **Object absent, no marker, the bootstrap** (§3.5): restore first,
+   because the floor needs `restored_max`. Then bootstrap the object and
+   write the marker, provided the store holds no data yet or this start
+   is authorised. Otherwise startup fails closed.
 
 In every case the allocator then reserves the first current block and
 the first ready block synchronously, and replay mints from those blocks.
@@ -240,9 +258,28 @@ drift, surfaced by RFC 0010, never a collision.
 
 ### 3.5 Bootstrap: a provable floor
 
-**Trigger.** The object is absent. This happens on the first start of a
-deployment upgrading to this RFC, or on a new store. The first start
-computes:
+**Trigger.** The object is absent and the root has no seated marker. A
+markerless root is not proof of a first bootstrap: if the object were
+deleted while receiver A held an unused block, a replica on a replaced
+root would bootstrap from the published ids alone, below A's block. So:
+
+| High-water | Store holds data or audit objects | Authorised | Seated marker | Outcome |
+|---|---|---|---|---|
+| absent | no (a genuinely new store) | either | none | bootstrap |
+| absent | yes | no | none | fail closed, with an error explaining the upgrade step |
+| absent | yes | yes | none | bootstrap |
+| absent | either | either | valid | fail closed (RFC0059.14) |
+
+- **"Holds data"** means one delimited `LIST` of each of `data/` and
+  `audit/` returns anything at its first level. The check is
+  conservative: a tenant directory with no file still counts.
+- **Authorisation** is the receiver setting
+  `receiver.template_ids_allow_bootstrap` (config file) or
+  `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` (environment), default off. It is
+  meant for the one upgrade start only, and is removed once that
+  receiver has seated.
+
+The bootstrapping start computes:
 
 ```text
 floor = max(data_max, audit_max, restored_max)
@@ -412,9 +449,12 @@ DuckDB procedure finds them.
     after the scan has passed its file and before the create lands.
   - That id may then lie inside the bootstrapper's first block.
 - **The upgrade rule.** For the one upgrade to this RFC:
-  1. stop every pre-RFC receiver (scale `receiver.replicas` to 0);
-  2. start one upgraded replica, which bootstraps;
-  3. only then scale out.
+  1. grant the permissions of §3.6, including the bootstrap-only reads;
+  2. stop every pre-RFC receiver (scale `receiver.replicas` to 0);
+  3. start **one** upgraded replica with
+     `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true`, and let it bootstrap
+     and seat;
+  4. remove the setting, then scale out.
 
   The Helm chart states the rule beside `receiver.replicas` and in its
   `NOTES.txt`, and the release notes carry it. A store that already has
@@ -756,6 +796,21 @@ The ids are referenced from test code.
 > - **Then** startup fails with an error naming the S3 action the
 >   receiver lacks
 
+> **Scenario RFC0059.16 — Bootstrapping over existing data needs authorisation**
+> - **Given** a markerless root and a store with no high-water object
+> - **When** the receiver starts:
+>   - over a store with no data or audit object, unauthorised;
+>   - over a store that holds data, unauthorised;
+>   - over a store that holds data, authorised
+> - **Then**, respectively:
+>   - it bootstraps, and the first allocatable id is 1;
+>   - startup fails closed with an error naming
+>     `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` and the upgrade step, and
+>     writes neither the object nor the marker;
+>   - it bootstraps with a floor at or above every published id, and
+>     writes its marker
+> - **And** the setting is off unless the configuration sets it
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -763,7 +818,7 @@ scenario harness: the production barrier, housekeeping and recovery
 path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
-  fixture), .5, .6, .9, .11, .12, .13, .14 and .15.
+  fixture), .5, .6, .9, .11, .12, .13, .14, .15 and .16.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none

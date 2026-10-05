@@ -97,7 +97,10 @@ receiver:
   # running; then set it to 1 and apply, and let that one replica start
   # (it bootstraps the template-id high-water from the store once); only
   # then scale out. A pre-RFC receiver still running during that first
-  # start can publish an id the bootstrap scan never saw.
+  # start can publish an id the bootstrap scan never saw. Downgrading below
+  # RFC 0059 is not supported once the high-water exists: an older receiver
+  # ignores it and can re-issue ids already reserved or issued. Going back
+  # means restoring the store and every WAL from before the upgrade.
   replicas: 1
   service:
     type: ClusterIP

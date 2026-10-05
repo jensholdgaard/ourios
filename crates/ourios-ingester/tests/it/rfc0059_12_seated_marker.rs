@@ -36,6 +36,23 @@ async fn two_pre_rfc_receivers(tmp: &std::path::Path) -> (Node, Node) {
     (a, b)
 }
 
+/// Every template id the node's snapshot artefacts hold.
+fn snapshot_ids(node: &Node) -> BTreeSet<u64> {
+    artefacts(node)
+        .iter()
+        .flat_map(|path| {
+            let bytes = std::fs::read(path).expect("artefact");
+            let state = ourios_miner::snapshot::load_snapshot(&bytes).expect("decodes");
+            state
+                .leaves
+                .iter()
+                .map(|l| l.template_id)
+                .chain(state.structured_templates.iter().map(|s| s.template_id))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn artefacts(node: &Node) -> Vec<std::path::PathBuf> {
     std::fs::read_dir(&node.snapshots)
         .map(|entries| {
@@ -67,6 +84,8 @@ async fn rfc0059_12_a_markerless_root_over_a_seated_store_discards_its_snapshots
     .collect();
 
     // When B starts with no seated marker.
+    let b_old_ids = snapshot_ids(&b);
+    assert!(!b_old_ids.is_empty(), "B snapshotted templates");
     let mut b_running = b.restart().expect("B recovers");
 
     // Then every artefact of B's is discarded as predating the seat,
@@ -82,6 +101,22 @@ async fn rfc0059_12_a_markerless_root_over_a_seated_store_discards_its_snapshots
     }
     assert!(artefacts(&b).is_empty(), "the untrusted artefacts are gone");
     assert!(b.snapshots.join(SEATED_MARKER).exists());
+
+    // And none of the discarded snapshot's leaves is live: they were never
+    // restored, so a shape the snapshot held mints a fresh id above the
+    // high-water rather than reviving its old one.
+    let tenant = ourios_core::tenant::TenantId::new("checkout");
+    assert!(
+        b_running.miner.snapshot_state(&tenant).leaves.is_empty(),
+        "no discarded leaf is in the miner"
+    );
+    let high_water = b_running.report.template_ids.high_water;
+    let revived = b_running.mine("checkout", "disk sda1 is 91 percent full");
+    assert!(
+        revived > high_water,
+        "{revived} is fresh, above {high_water}"
+    );
+    assert!(!b_old_ids.contains(&revived), "not its pre-RFC id");
 
     // And nothing B allocates equals an id A issued since the bootstrap.
     let b_minted: BTreeSet<u64> = [

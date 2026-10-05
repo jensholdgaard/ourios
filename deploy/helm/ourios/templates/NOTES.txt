@@ -25,6 +25,9 @@ Workloads:
     first, start one upgraded replica (it bootstraps the template-id
     high-water once), and only then scale out. A rolling update that keeps
     an old receiver running during that first start can re-issue ids.
+    Downgrading below RFC 0059 afterwards is not supported: an older
+    receiver ignores the template-id high-water and can re-issue ids. Going
+    back means restoring the store and every WAL from before the upgrade.
 {{- else }}
   - receiver  disabled
 {{- end }}

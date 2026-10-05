@@ -6,9 +6,11 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use ourios_ingester::recovery::RecoveryDriverError;
-use ourios_ingester::template_ids::{BLOCK, HIGH_WATER_KEY, TemplateIdsError, mark_seated};
+use ourios_ingester::template_ids::{
+    BLOCK, HIGH_WATER_KEY, SEATED_MARKER, TemplateIdsError, mark_seated,
+};
 
-use crate::rfc0059_support::Node;
+use crate::rfc0059_support::{Node, cut_and_reclaim, publish};
 
 const TENANT: &str = "checkout";
 /// Long enough for the refiller's backoff to retry several times.
@@ -97,4 +99,47 @@ fn rfc0059_18_a_high_water_deleted_while_live_is_never_recreated() {
         Some(br#"{"reserved_through": 0}"#.as_slice()),
         "the failed restart writes nothing"
     );
+}
+
+/// Scenario RFC0059.18 — the documented recovery from a rolled-back
+/// high-water (RFC 0059 §3.1): with every receiver stopped, remove the
+/// object and every root's seated marker, then start one replica
+/// authorised to bootstrap. It seats above every published id, and every
+/// id it mints is fresh.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_18_the_documented_recovery_reseats_above_every_published_id() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let rig = Node::rig(tmp.path());
+    publish(
+        &rig,
+        TENANT,
+        &["user alice logged in", "disk sda1 is full"],
+        &[],
+    )
+    .await;
+    cut_and_reclaim(&rig).await;
+    let node = Node::stop(rig, tmp.path());
+    drop(node.restart().expect("the upgrade bootstraps and seats"));
+    let published = node.issued();
+    node.put(HIGH_WATER_KEY, br#"{"reserved_through": 0}"#);
+    assert!(node.restart().is_err(), "the stale copy is refused");
+
+    // When the operator removes the object and the marker, then starts
+    // one replica authorised to bootstrap.
+    std::fs::remove_file(node.store.join(HIGH_WATER_KEY)).expect("remove the object");
+    std::fs::remove_file(node.snapshots.join(SEATED_MARKER)).expect("remove the marker");
+    let mut restarted = node
+        .restart_with(node.store(), true)
+        .expect("the authorised re-bootstrap");
+
+    // Then it seats above every published id, and mints only fresh ones.
+    let seated = restarted.report.template_ids.high_water;
+    let highest = published.iter().max().copied().expect("ids were published");
+    assert!(
+        seated >= highest,
+        "seated at {seated}, below published {highest}"
+    );
+    let fresh = restarted.mine(TENANT, "cache warmed in 12 ms");
+    assert!(fresh > highest && !published.contains(&fresh));
 }

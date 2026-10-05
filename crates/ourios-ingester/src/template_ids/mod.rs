@@ -171,13 +171,16 @@ impl std::fmt::Display for TemplateIdsError {
                 f,
                 "{HIGH_WATER_KEY} reads {found}, below the {seen} this root already reserved: \
                  the object was rolled back to an older copy, which is unsupported. Recover \
-                 by stopping every receiver, removing the object, and starting one replica \
-                 authorised to bootstrap (RFC 0059 §3.1)"
+                 by stopping every receiver, removing the object and every root's \
+                 {SEATED_MARKER}, and starting one replica authorised to bootstrap (RFC 0059 \
+                 §3.1)"
             ),
             Self::HighWaterDeleted => write!(
                 f,
                 "{HIGH_WATER_KEY} is gone though this root has seated against it; it must \
-                 never be deleted (RFC 0059 §3.1)"
+                 never be deleted. Recover by stopping every receiver, removing every root's \
+                 {SEATED_MARKER}, and starting one replica authorised to bootstrap (RFC 0059 \
+                 §3.1)"
             ),
         }
     }

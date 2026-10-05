@@ -75,7 +75,8 @@ semconv-generate:
     cargo fmt -p ourios-semconv
 
 # Preview a release WITHOUT changing anything (no bump, no tag): the CHANGELOG.md
-# git-cliff would generate for vX.Y.Z, then the artifacts cargo-dist would build.
+# section git-cliff would prepend for vX.Y.Z, then the artifacts cargo-dist would
+# build.
 # `dist plan --tag` parses the version and rejects anything that isn't a valid
 # release tag — we don't re-validate SemVer ourselves. Requires git-cliff
 # (`brew install git-cliff`) + dist (cargo-dist). e.g. `just release-dry 0.1.0`.
@@ -98,13 +99,13 @@ release-dry version:
     echo "=== dist plan (release artifacts) ==="
     dist plan --tag "v$version" --force-tag
     echo ""
-    echo "=== CHANGELOG.md for v$version (git-cliff preview) ==="
-    git-cliff --tag "v$version"
+    echo "=== CHANGELOG.md section for v$version (git-cliff preview) ==="
+    git-cliff --unreleased --tag "v$version" --strip header
 
 # Cut a release: bump the single workspace version (every workspace member crate
 # inherits it; the excluded `fuzz/` harness is a separate workspace and is not
-# released), regenerate CHANGELOG.md from the conventional-commit history
-# (git-cliff), commit, and tag vX.Y.Z. Does NOT push — review, then fire the
+# released), prepend the new release's CHANGELOG.md section from the
+# conventional-commit history (git-cliff), commit, and tag vX.Y.Z. Does NOT push — review, then fire the
 # pipeline with `git push --follow-tags origin main` (the tag drives cargo-dist's
 # signed release + image.yml's container image). Run `just release-dry X.Y.Z`
 # first. Requires git-cliff; must run on a clean `main`. e.g. `just release 0.1.0`.
@@ -148,14 +149,14 @@ release version:
     # member crate switched to `version.workspace = true`, this is the only
     # literal `version = "..."` in the root manifest. Read it, and fail fast if
     # the requested version already matches (else the bump is a no-op and the
-    # release "commit" would carry only a regenerated changelog/lock, or nothing).
+    # release "commit" would carry only a changelog/lock update, or nothing).
     current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
     [ -n "$current" ] || { echo "error: could not read the current workspace version from Cargo.toml (expected a literal 'version = \"...\"')"; exit 1; }
     [ "$version" != "$current" ] || { echo "error: version $version is already the current workspace version"; exit 1; }
     # Capture the pristine starting commit (the clean-tree + HEAD==origin/main
     # checks above guarantee it is one) so any failure below rolls the whole
     # attempt back: a hard reset to this SHA reverts every mutation — Cargo.toml,
-    # the synced Cargo.lock, the regenerated CHANGELOG.md, and the release commit
+    # the synced Cargo.lock, the updated CHANGELOG.md, and the release commit
     # — then we drop the tag. Disarmed on success. Safer than restoring
     # individual files: a `git tag` failure after the commit would otherwise
     # leave the working tree inconsistent with an advanced HEAD.
@@ -199,9 +200,13 @@ release version:
     # deps can't churn into the release commit; it rewrites the lock for the
     # manifest version change + compile-verifies.
     cargo check --workspace
-    # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
-    # commit — cargo-dist reads it for the GitHub Release body (release.yml).
-    git-cliff --tag "v$version" --output CHANGELOG.md
+    # Add the new [X.Y.Z] section so it exists at the tagged commit — cargo-dist
+    # reads it for the GitHub Release body (release.yml). Prepend only the
+    # unreleased commits: regenerating the whole file from history deletes the
+    # hand-written sections of earlier releases (Security, Breaking (summary),
+    # Upgrade notes), as it did on v0.11.0 through v0.11.2. git-cliff strips the
+    # configured header from the old file and writes it back once on top.
+    git-cliff --unreleased --tag "v$version" --prepend CHANGELOG.md
     # THIRD-PARTY-LICENSES.md embeds every workspace crate's version, so the
     # bump above staled it and CI's `cargo about (no-diff)` gate would fail on
     # the release commit (it did for v0.5.0). Regenerate it in the same commit.

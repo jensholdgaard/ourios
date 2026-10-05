@@ -45,13 +45,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
-        with:
-          toolchain: stable
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup toolchain install
       # Pin cargo-about so the attribution is reproducible and the no-diff gate
       # can't flake on a new release changing output; bump deliberately
       # alongside any about.toml / about.hbs change.
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: cargo-about@0.9.1
       - name: Regenerate THIRD-PARTY-LICENSES.md

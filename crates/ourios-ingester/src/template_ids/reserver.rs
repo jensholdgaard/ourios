@@ -53,6 +53,12 @@ impl TemplateIds {
         }
     }
 
+    /// The store the high-water lives in.
+    #[must_use]
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// The reserver to install on the miner with
     /// [`MinerCluster::with_id_reserver`].
     #[must_use]

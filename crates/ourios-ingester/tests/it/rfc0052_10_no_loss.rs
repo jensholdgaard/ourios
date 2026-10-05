@@ -476,7 +476,6 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
         .expect("append");
     wal.sync().expect("sync");
     drop(wal);
-    let expected = reference_events(&node);
 
     let events = SharedAuditSink::new();
     let records = SharedRecordSink::new();
@@ -489,6 +488,7 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
         &node.template_ids(),
     )
     .expect("recover");
+    let expected = reference_events(&node, report.template_ids.high_water);
 
     let forwarded = events.drain();
     assert!(
@@ -635,8 +635,11 @@ struct Reference {
 }
 
 /// Mine every tenant frame above `S` from the same snapshot with the same
-/// clock, and split the events it emits at the checkpoint.
-fn reference_events(node: &Node) -> Reference {
+/// clock, seated at the template-id high-water recovery seated above, and
+/// split the events it emits at the checkpoint. The seat is the one
+/// renaming RFC 0059 §3.4 allows: ids first minted in the tail come from
+/// above the high-water.
+fn reference_events(node: &Node, high_water: u64) -> Reference {
     let artefacts = snapshot_store::load_all(&node.snapshots_root).expect("artefacts");
     let (tenant, bytes) = artefacts.into_iter().next().expect("one artefact");
     let (Some(state), _) = ourios_miner::snapshot::recover(Some(&bytes)) else {
@@ -650,6 +653,7 @@ fn reference_events(node: &Node) -> Reference {
     let events = SharedAuditSink::new();
     let mut miner = pinned_miner(&events);
     miner.restore_tenant(&tenant, &state).expect("restore");
+    miner.allocate_past_issued(high_water).expect("seat");
     let mut withheld = Vec::new();
     for (offset, records) in frames(node).into_iter().filter(|(o, _)| *o > horizon) {
         for record in &records {

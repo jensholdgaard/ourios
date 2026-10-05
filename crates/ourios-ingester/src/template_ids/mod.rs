@@ -8,9 +8,11 @@
 //! ([`bootstrap`]).
 
 mod bootstrap;
+mod marker;
 mod reserver;
 
 pub use bootstrap::{BootstrapScan, bootstrap};
+pub use marker::{SEATED_MARKER, SnapshotTrust, mark_seated};
 pub use reserver::TemplateIds;
 
 use ourios_miner::cluster::{IdBlock, IdSpaceExhausted, MinerCluster};
@@ -28,7 +30,11 @@ pub const BLOCK: u64 = 1_000;
 const MAX_CAS_ATTEMPTS: usize = 16;
 
 /// The telemetry names RFC 0059 §3.9 registers, in one place.
-mod names {
+pub(crate) mod names {
+    /// The `error.type` of a snapshot discarded because its root never
+    /// seated (RFC 0059 §3.5); registered in ourios-semconv#8.
+    pub(crate) const PREDATES_HIGH_WATER: &str = "predates_high_water";
+
     pub(super) use ourios_semconv::{
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAP_PROGRESS as BOOTSTRAP_PROGRESS,
         EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAPPED as BOOTSTRAPPED,
@@ -62,6 +68,17 @@ pub enum TemplateIdsError {
     Exhausted(IdSpaceExhausted),
     /// The background refiller thread could not start.
     Refiller(String),
+    /// Another start created the high-water while this one, without a
+    /// seated marker, had restored its own snapshots: their ids may lie in
+    /// the winner's blocks, so this start must not go on (RFC 0059 §3.5).
+    BootstrapRaceLost,
+    /// The seated marker could not be checked or written.
+    Marker {
+        op: &'static str,
+        source: std::io::Error,
+    },
+    /// The snapshots directory could not be made durable.
+    Snapshots(crate::snapshot_store::SnapshotStoreError),
 }
 
 impl TemplateIdsError {
@@ -76,6 +93,8 @@ impl TemplateIdsError {
             Self::Contended => "contended",
             Self::Scan(_) => "scan",
             Self::Exhausted(_) => "exhausted",
+            Self::BootstrapRaceLost => "bootstrap_race_lost",
+            Self::Marker { .. } | Self::Snapshots(_) => "marker",
             Self::Refiller(_) => "_OTHER",
         }
     }
@@ -102,6 +121,13 @@ impl std::fmt::Display for TemplateIdsError {
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),
             Self::Refiller(e) => write!(f, "start the template-id refiller: {e}"),
+            Self::BootstrapRaceLost => write!(
+                f,
+                "another start created {HIGH_WATER_KEY} while this one had restored \
+                 snapshots it never seated; restart to discard them"
+            ),
+            Self::Marker { op, source } => write!(f, "{op}: {source}"),
+            Self::Snapshots(e) => write!(f, "seated marker: {e}"),
         }
     }
 }
@@ -112,10 +138,13 @@ impl std::error::Error for TemplateIdsError {
             Self::Store { source, .. } => Some(source.as_ref()),
             Self::Scan(e) => Some(e.as_ref()),
             Self::Exhausted(e) => Some(e),
+            Self::Marker { source, .. } => Some(source),
+            Self::Snapshots(e) => Some(e),
             Self::Malformed { .. }
             | Self::LaterVersion { .. }
             | Self::Missing
             | Self::Contended
+            | Self::BootstrapRaceLost
             | Self::Refiller(_) => None,
         }
     }

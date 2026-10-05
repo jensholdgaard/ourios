@@ -35,7 +35,7 @@ use prost::Message;
 use crate::metrics::ERROR_TYPE;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
-use crate::template_ids::{Seated, TemplateIds, TemplateIdsError};
+use crate::template_ids::{Seated, SnapshotTrust, TemplateIds, TemplateIdsError, mark_seated};
 
 /// What recovery did, for the caller to log and for the
 /// RFC0008.10 / RFC 0001 §3.5.3–.4 assertions.
@@ -139,6 +139,9 @@ pub enum DiscardReason {
     NoHorizon,
     /// The miner rejected the decoded state, for the reason it carries.
     RestoreFailed(RestoreError),
+    /// The root never seated against the template-id high-water, so the
+    /// artefact holds ids from a pre-RFC 0059 counter (§3.5).
+    PredatesHighWater,
     /// A decode failure outside the classes above.
     Other,
 }
@@ -152,6 +155,7 @@ impl DiscardReason {
             Self::Empty => "empty",
             Self::NoHorizon => "no_horizon",
             Self::RestoreFailed(_) => "restore_failed",
+            Self::PredatesHighWater => crate::template_ids::names::PREDATES_HIGH_WATER,
             Self::Other => "_OTHER",
         }
     }
@@ -270,12 +274,14 @@ pub fn recover(
     let artefacts =
         snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
+    let trust =
+        SnapshotTrust::of(snapshots_root, ids.store()).map_err(RecoveryDriverError::TemplateIds)?;
     let Restored {
         mut tenants,
         horizons,
         legacy,
-    } = restore_artefacts(miner, artefacts);
-    let template_ids = ids.start(miner).map_err(RecoveryDriverError::TemplateIds)?;
+    } = restore_artefacts(miner, artefacts, trust);
+    let template_ids = seat_root(snapshots_root, miner, ids, trust)?;
     let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
     // ends there rather than at `Wal::open` because open runs before
@@ -513,14 +519,24 @@ impl LegacyMarks {
     }
 }
 
-fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>)>) -> Restored {
+/// Restore every artefact `trust` allows, and discard every other one as
+/// predating the root's first template-id seat.
+fn restore_artefacts(
+    miner: &mut MinerCluster,
+    artefacts: Vec<(TenantId, Vec<u8>)>,
+    trust: SnapshotTrust,
+) -> Restored {
     let mut restored = Restored {
         tenants: Vec::with_capacity(artefacts.len()),
         horizons: HashMap::new(),
         legacy: LegacyMarks::default(),
     };
     for (tenant_id, bytes) in artefacts {
-        let fate = restore_artefact(miner, &tenant_id, &bytes);
+        let fate = if trust.restores() {
+            restore_artefact(miner, &tenant_id, &bytes)
+        } else {
+            SnapshotFate::Discarded(DiscardReason::PredatesHighWater)
+        };
         match &fate {
             SnapshotFate::Restored(horizon) => {
                 restored.horizons.insert(tenant_id.clone(), *horizon);
@@ -535,6 +551,26 @@ fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>
         });
     }
     restored
+}
+
+/// Seat `miner` above the template-id high-water (RFC 0059 §3.4–§3.5).
+/// A root that never seated loses its untrusted artefacts first, and
+/// records its marker only once they are gone, so a crash at any earlier
+/// step leads the next start to the same decision.
+fn seat_root(
+    snapshots_root: &Path,
+    miner: &mut MinerCluster,
+    ids: &TemplateIds,
+    trust: SnapshotTrust,
+) -> Result<Seated, RecoveryDriverError> {
+    if trust == SnapshotTrust::PredatesHighWater {
+        snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
+    }
+    let seated = ids.start(miner).map_err(RecoveryDriverError::TemplateIds)?;
+    if trust != SnapshotTrust::Seated {
+        mark_seated(snapshots_root, seated.high_water).map_err(RecoveryDriverError::TemplateIds)?;
+    }
+    Ok(seated)
 }
 
 /// Restore one artefact into `miner`.

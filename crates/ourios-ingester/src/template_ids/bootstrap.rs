@@ -4,7 +4,7 @@
 
 use ourios_parquet::{IdColumns, Store, object_max_id};
 
-use super::{Seated, TemplateIdsError, Written, names, read, store_err, write};
+use super::{Seated, TemplateIdsError, Written, names, store_err, write};
 
 /// Files between two progress events.
 const PROGRESS_EVERY: u64 = 10_000;
@@ -89,12 +89,14 @@ fn walk(
 
 /// Bootstrap the high-water (RFC 0059 §3.5): scan, then create the object
 /// at the floor. Nothing is written until the scan completes, so a crash
-/// mid-scan leaves no object and the next start scans again. A start that
-/// loses the create to another reads the winner's object.
+/// mid-scan leaves no object and the next start scans again.
 ///
 /// # Errors
 ///
-/// [`TemplateIdsError`] when the scan or the write fails.
+/// [`TemplateIdsError`] when the scan or the write fails, and
+/// [`TemplateIdsError::BootstrapRaceLost`] when another start created the
+/// object first: this one has restored snapshots the winner's floor may
+/// not cover, and its restart discards them.
 pub fn bootstrap(store: &Store, restored: u64) -> Result<Seated, TemplateIdsError> {
     let scan = BootstrapScan::run(store)?;
     let floor = scan.floor(restored);
@@ -116,12 +118,6 @@ pub fn bootstrap(store: &Store, restored: u64) -> Result<Seated, TemplateIdsErro
                 bootstrapped: true,
             })
         }
-        Written::Lost => match read(store)? {
-            Some(winner) => Ok(Seated {
-                high_water: winner.reserved_through,
-                bootstrapped: false,
-            }),
-            None => Err(TemplateIdsError::Missing),
-        },
+        Written::Lost => Err(TemplateIdsError::BootstrapRaceLost),
     }
 }

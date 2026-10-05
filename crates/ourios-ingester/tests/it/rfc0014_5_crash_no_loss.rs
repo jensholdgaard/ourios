@@ -125,7 +125,7 @@ fn rfc0014_5_no_acknowledged_data_loss() {
     // it into the new buffer; a flush then lands them in the store.
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen WAL");
     let store = Store::local(&bucket_root).expect("store");
-    let ids = TemplateIds::new(store.clone());
+    let ids = TemplateIds::new(store.clone()).with_bootstrap_allowed(true);
     let sink = SharedParquetSink::new(ParquetRecordSink::new(store, never_flush()));
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));

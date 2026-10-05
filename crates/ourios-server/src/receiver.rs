@@ -421,6 +421,9 @@ pub struct ReceiverConfig {
     /// upstream-template dial (`miner.*`; defaults are byte-identical
     /// pre-RFC behaviour).
     pub miner: MinerConfig,
+    /// RFC 0059 §3.5 — authorise the one-time template-id bootstrap on a
+    /// store that already holds data.
+    pub template_ids_allow_bootstrap: bool,
     /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
     /// graph is configured with a bound conversation object.
     pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
@@ -1018,7 +1021,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
-    let ids = TemplateIds::new(config.store.clone());
+    let ids = TemplateIds::new(config.store.clone())
+        .with_bootstrap_allowed(config.template_ids_allow_bootstrap);
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
     let mut miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
@@ -1568,6 +1572,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -1672,6 +1677,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -1866,6 +1872,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         };
 
         // Given a node that sealed a segment and stamped past it: the second
@@ -1929,6 +1936,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         };
         let expected = Some(ourios_miner::snapshot::WalHighWater {
             segment: horizon.segment.to_string(),
@@ -2008,6 +2016,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         }
     }
 
@@ -2261,6 +2270,7 @@ mod tests {
             graph_emitter: Some(emitter),
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2447,6 +2457,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2494,6 +2505,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2668,6 +2680,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");

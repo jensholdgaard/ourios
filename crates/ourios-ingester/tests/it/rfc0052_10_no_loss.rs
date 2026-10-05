@@ -278,7 +278,8 @@ fn recover_into_stores(
         wal,
         &wal_root.join("snapshots"),
         &mut miner,
-        &TemplateIds::new(Store::local(audit_root).expect("audit store")),
+        &TemplateIds::new(Store::local(audit_root).expect("audit store"))
+            .with_bootstrap_allowed(true),
     )
     .expect("startup recovery");
     sink.flush_all();
@@ -548,6 +549,7 @@ impl Node {
     /// its audit stream to.
     fn template_ids(&self) -> TemplateIds {
         TemplateIds::new(Store::local(&self.audit_root).expect("audit store"))
+            .with_bootstrap_allowed(true)
     }
 
     fn artefact(&self) -> PathBuf {

@@ -116,7 +116,8 @@ fn housekeeping_pass(rig: &BarrierRig) -> HousekeepingProgress {
 /// Stop the rig's node and run startup recovery over what it left.
 fn restart(rig: BarrierRig) -> RecoveryReport {
     let (wal_root, snapshots_root) = (rig.wal_root.clone(), rig.snapshots_root.clone());
-    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"));
+    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"))
+        .with_bootstrap_allowed(true);
     drop(rig);
     let mut wal = Wal::open(WalConfig {
         segment_age_secs: 1,

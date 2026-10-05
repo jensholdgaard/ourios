@@ -261,6 +261,18 @@ The receiver *writes* data/audit objects and never deletes. Since RFC 0059
   high-water. Grant these **before** the scale-to-one upgrade step, and
   revoke them afterwards if you want the narrower policy back.
 
+**The upgrade to RFC 0059**, in order:
+
+1. Grant the permissions above, including the bootstrap-only reads.
+2. Scale `receiver.replicas` to `0`, so no older receiver is running.
+3. Start **one** upgraded replica with `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true`
+   in `receiver.extraEnv` (or `receiver.template_ids_allow_bootstrap: true` in
+   a config file). A store that already holds data refuses to bootstrap
+   without it.
+4. Once that replica has seated, remove the setting and scale out.
+
+Downgrading below RFC 0059 is not supported once the high-water exists.
+
 A denied call fails startup with an error naming the missing action
 (`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`). Never grant a delete on
 `miner/`: the object must not be deleted (a seated receiver that finds it

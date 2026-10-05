@@ -471,6 +471,41 @@ async fn auth_resolver(
     }
     Ok(Some(resolver))
 }
+/// Start the receiver role if enabled (RFC 0003 §9). Its RFC 0014 data
+/// write path runs on the resolved store (local or S3, RFC 0019 slice 2c),
+/// the same store the querier reads and the compactor sweeps; the WAL stays
+/// local regardless (§3.6). Reports the bound addresses on stdout.
+async fn start_receiver(
+    config: &ServerConfig,
+    store: &ourios_parquet::Store,
+    resolver: Option<ourios_serving::AuthResolver>,
+    graph_emitter: Option<std::sync::Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+) -> Result<Option<receiver::ReceiverHandle>, String> {
+    let Some(params) = &config.receiver else {
+        return Ok(None);
+    };
+    let handle = receiver::serve(receiver::ReceiverConfig {
+        grpc_addr: params.grpc_addr,
+        grpc_tls: params.grpc_tls.clone(),
+        http_addr: params.http_addr,
+        http_tls: params.http_tls.clone(),
+        wal: wal_config(&params.wal_root),
+        // The clone is a cheap shared handle; the compactor keeps the original.
+        store: store.clone(),
+        promoted: config.promoted.clone(),
+        auth: resolver.ok_or("the auth resolver is built for every enabled role")?,
+        encode_workers: params.encode_workers,
+        miner: params.miner,
+        template_ids_allow_bootstrap: params.template_ids_allow_bootstrap,
+        graph_emitter,
+    })
+    .await?;
+    println!("receiver gRPC listening on {}", handle.grpc_addr);
+    println!("receiver HTTP listening on {}", handle.http_addr);
+    std::io::stdout().flush().ok();
+    Ok(Some(handle))
+}
+
 /// Start the querier role if enabled (RFC 0016), over the same store the
 /// receiver writes and the compactor sweeps. Reports the bound address on
 /// stdout (an operator — or a test binding `:0` — learns the actual port).
@@ -569,35 +604,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    let receiver = match &config.receiver {
-        // The receiver's RFC 0014 data write path runs on the resolved store
-        // (local or S3, RFC 0019 slice 2c) — the same store the querier reads
-        // and the compactor sweeps. The WAL stays local regardless (§3.6).
-        Some(params) => {
-            let handle = receiver::serve(receiver::ReceiverConfig {
-                grpc_addr: params.grpc_addr,
-                grpc_tls: params.grpc_tls.clone(),
-                http_addr: params.http_addr,
-                http_tls: params.http_tls.clone(),
-                wal: wal_config(&params.wal_root),
-                // The data store the receiver's RFC 0014 write path lands
-                // Parquet in — the same store the compactor sweeps (cloned; the
-                // handle is cheap to share, the compactor keeps the original).
-                store: store.clone(),
-                promoted: config.promoted.clone(),
-                auth: resolver.clone().expect("resolver built for enabled roles"),
-                encode_workers: params.encode_workers,
-                miner: params.miner,
-                graph_emitter: graph_emitter.clone(),
-            })
-            .await?;
-            println!("receiver gRPC listening on {}", handle.grpc_addr);
-            println!("receiver HTTP listening on {}", handle.http_addr);
-            std::io::stdout().flush().ok();
-            Some(handle)
-        }
-        None => None,
-    };
+    let receiver = start_receiver(&config, &store, resolver.clone(), graph_emitter.clone()).await?;
 
     let querier = start_querier(&config, resolver.clone()).await?;
 

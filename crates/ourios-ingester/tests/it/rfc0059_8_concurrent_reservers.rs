@@ -1,7 +1,7 @@
 //! RFC0059.8 — Concurrent reservers on one store get disjoint blocks.
 //! See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 
-use ourios_ingester::template_ids::{self, HIGH_WATER_KEY};
+use ourios_ingester::template_ids::{self, HIGH_WATER_KEY, TemplateIdsError};
 use ourios_parquet::Store;
 
 const ROUNDS: usize = 40;
@@ -21,9 +21,17 @@ fn rfc0059_8_two_reservers_on_an_if_match_store_get_disjoint_blocks() {
         .map(|_| {
             let store = store.clone();
             std::thread::spawn(move || {
-                (0..ROUNDS)
-                    .map(|_| template_ids::reserve(&store, 0).expect("reserve"))
-                    .collect::<Vec<_>>()
+                // A reservation that loses every compare-and-swap attempt is
+                // a failed one the refiller retries; so does this reserver.
+                let mut blocks = Vec::with_capacity(ROUNDS);
+                while blocks.len() < ROUNDS {
+                    match template_ids::reserve(&store, 0) {
+                        Ok(block) => blocks.push(block),
+                        Err(TemplateIdsError::Contended) => {}
+                        Err(e) => panic!("reserve: {e}"),
+                    }
+                }
+                blocks
             })
         })
         .collect();

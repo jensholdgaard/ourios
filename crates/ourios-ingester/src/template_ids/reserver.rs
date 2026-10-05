@@ -21,7 +21,7 @@ use std::time::Duration;
 use ourios_miner::cluster::{IdBlock, IdReservationError, IdReserver, MinerCluster};
 use ourios_parquet::Store;
 
-use super::{Seated, TemplateIdsError, reserve, seat};
+use super::{BootstrapPolicy, Seated, TemplateIdsError, reserve, seat};
 
 /// Blocks kept ready beside the one the miner allocates from.
 const READY_BLOCKS: usize = 2;
@@ -47,6 +47,7 @@ pub struct TemplateIds {
     refill: Sender<()>,
     refill_rx: Mutex<Option<Receiver<()>>>,
     replaying: Arc<AtomicBool>,
+    allow_bootstrap: bool,
 }
 
 impl TemplateIds {
@@ -59,7 +60,17 @@ impl TemplateIds {
             refill,
             refill_rx: Mutex::new(Some(refill_rx)),
             replaying: Arc::new(AtomicBool::new(true)),
+            allow_bootstrap: false,
         }
+    }
+
+    /// Authorise this start to bootstrap the high-water on a store that
+    /// already holds data: the one upgraded replica of the RFC 0059 §3.5
+    /// upgrade, never a normal start.
+    #[must_use]
+    pub fn with_bootstrap_allowed(mut self, allowed: bool) -> Self {
+        self.allow_bootstrap = allowed;
+        self
     }
 
     /// Recovery has handed the miner to the pipeline: from now on an
@@ -100,7 +111,12 @@ impl TemplateIds {
         miner: &mut MinerCluster,
         may_bootstrap: bool,
     ) -> Result<Seated, TemplateIdsError> {
-        let seated = seat(&self.store, miner, may_bootstrap)?;
+        let policy = match (may_bootstrap, self.allow_bootstrap) {
+            (false, _) => BootstrapPolicy::Refuse,
+            (true, false) => BootstrapPolicy::IfStoreEmpty,
+            (true, true) => BootstrapPolicy::Authorized,
+        };
+        let seated = seat(&self.store, miner, policy)?;
         lock(&self.ready).highest = miner.highest_allocated();
         fill(&self.store, &self.ready)?;
         let receiver = self

@@ -101,7 +101,7 @@ async fn rfc0046_4_replay_lands_records_in_the_acknowledged_tenant() {
     // Recover into a fresh miner + sink and flush.
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen WAL");
     let store = Store::local(&bucket_root).expect("store");
-    let ids = TemplateIds::new(store.clone());
+    let ids = TemplateIds::new(store.clone()).with_bootstrap_allowed(true);
     let sink = SharedParquetSink::new(ParquetRecordSink::new(store, never_flush()));
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));

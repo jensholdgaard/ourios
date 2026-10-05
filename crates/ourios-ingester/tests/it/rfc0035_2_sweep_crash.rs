@@ -96,7 +96,7 @@ fn rfc0035_2_crash_during_the_sweeps_in_flight_publish_replays_the_records() {
     // acked frames and re-mines the drained records.
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen WAL");
     let store = Store::local(&bucket_root).expect("store");
-    let ids = TemplateIds::new(store.clone());
+    let ids = TemplateIds::new(store.clone()).with_bootstrap_allowed(true);
     let sink = SharedParquetSink::new(ParquetRecordSink::new(
         store,
         FlushConfig {

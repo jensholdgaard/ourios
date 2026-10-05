@@ -93,16 +93,20 @@ storage:
 receiver:
   enabled: true
   # Upgrading from a release before RFC 0059 (durable template-id
-  # allocation): first grant the receiver's role the object-store reads the
-  # one-time bootstrap needs (README, "Per-role IAM"); then set replicas to
-  # 0 and apply, so no pre-RFC receiver is
-  # running; then set it to 1 and apply, and let that one replica start
-  # (it bootstraps the template-id high-water from the store once); only
-  # then scale out. A pre-RFC receiver still running during that first
-  # start can publish an id the bootstrap scan never saw. Downgrading below
-  # RFC 0059 is not supported once the high-water exists: an older receiver
-  # ignores it and can re-issue ids already reserved or issued. Going back
-  # means restoring the store and every WAL from before the upgrade.
+  # allocation), in order:
+  #   1. grant the receiver's role the object-store permissions in the
+  #      README's "Per-role IAM";
+  #   2. set replicas to 0 and apply, so no pre-RFC receiver is running;
+  #   3. set replicas to 1 with receiver.extraEnv
+  #      OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true and apply; that one
+  #      replica bootstraps the template-id high-water from the store once;
+  #   4. once it has seated, remove that env var, then scale out.
+  # A store that already holds data refuses to bootstrap without step 3's
+  # setting. A pre-RFC receiver still running during that first start can
+  # publish an id the bootstrap scan never saw. Downgrading below RFC 0059
+  # is not supported once the high-water exists: an older receiver ignores
+  # it and can re-issue ids already reserved or issued. Going back means
+  # restoring the store and every WAL from before the upgrade.
   replicas: 1
   service:
     type: ClusterIP

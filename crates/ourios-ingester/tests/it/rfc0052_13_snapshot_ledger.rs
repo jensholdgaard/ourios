@@ -39,7 +39,8 @@ async fn a_snapshot_recovery_rejects_seeds_no_horizon_and_the_pass_keeps_its_fra
     assert_eq!(rig.barrier.tick(&rig.pipeline, true), CutOutcome::Stamped);
     let sealed = rig.wal_root.join(format!("{}.wal", mark.segment));
     let snapshots_root = rig.snapshots_root.clone();
-    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"));
+    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"))
+        .with_bootstrap_allowed(true);
     drop(rig);
 
     // And its artefact replaced by one the codec reads, horizon and all,
@@ -106,7 +107,8 @@ async fn the_ledger_holds_exactly_the_horizons_a_restart_restores() {
     let ledger = rig.barrier.snapshot_horizons();
     let wal_root = rig.wal_root.clone();
     let snapshots_root = rig.snapshots_root.clone();
-    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"));
+    let ids = TemplateIds::new(Store::local(&rig.audit_root).expect("audit store"))
+        .with_bootstrap_allowed(true);
     drop(rig);
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen");
     let mut miner = MinerCluster::new(MinerConfig::default());

@@ -383,6 +383,11 @@ pub struct ReceiverSection {
     /// (`receiver.encode_workers`; default: the host's available cores).
     #[serde(deserialize_with = "scalar_opt")]
     pub encode_workers: Option<String>,
+    /// RFC 0059 §3.5 — authorise the one-time template-id bootstrap on a
+    /// store that already holds data (`receiver.template_ids_allow_bootstrap`;
+    /// default off).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub template_ids_allow_bootstrap: Option<String>,
 }
 
 /// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
@@ -887,7 +892,8 @@ impl ReceiverSection {
         substitute(&mut self.http_addr, lookup)?;
         self.http_tls.substitute(lookup)?;
         substitute(&mut self.wal_root, lookup)?;
-        substitute(&mut self.encode_workers, lookup)
+        substitute(&mut self.encode_workers, lookup)?;
+        substitute(&mut self.template_ids_allow_bootstrap, lookup)
     }
 }
 

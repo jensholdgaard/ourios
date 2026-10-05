@@ -85,6 +85,9 @@ pub enum TemplateIdsError {
     /// A seated root found no high-water: it was deleted, and a bootstrap
     /// could reseat below a block another receiver still holds.
     HighWaterDeleted,
+    /// No high-water exists, the store already holds data, and this start
+    /// was not authorised to bootstrap (RFC 0059 §3.5).
+    BootstrapNotAuthorized,
 }
 
 impl TemplateIdsError {
@@ -102,6 +105,7 @@ impl TemplateIdsError {
             Self::BootstrapRaceLost => "bootstrap_race_lost",
             Self::Marker { .. } | Self::Snapshots(_) | Self::MarkerInvalid { .. } => "marker",
             Self::HighWaterDeleted => "deleted",
+            Self::BootstrapNotAuthorized => "bootstrap_not_authorized",
             Self::Refiller(_) => "_OTHER",
         }
     }
@@ -149,6 +153,14 @@ impl std::fmt::Display for TemplateIdsError {
             Self::MarkerInvalid { detail } => {
                 write!(f, "{SEATED_MARKER} is not a usable seated marker: {detail}")
             }
+            Self::BootstrapNotAuthorized => write!(
+                f,
+                "{HIGH_WATER_KEY} is absent but the store already holds data: bootstrapping \
+                 the template-id high-water needs explicit authorisation. For the upgrade to \
+                 RFC 0059, stop every older receiver, start one upgraded replica with \
+                 receiver.template_ids_allow_bootstrap (OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP) \
+                 set to true, and remove the setting once it has seated"
+            ),
             Self::HighWaterDeleted => write!(
                 f,
                 "{HIGH_WATER_KEY} is gone though this root has seated against it; it must \
@@ -173,6 +185,7 @@ impl std::error::Error for TemplateIdsError {
             | Self::BootstrapRaceLost
             | Self::MarkerInvalid { .. }
             | Self::HighWaterDeleted
+            | Self::BootstrapNotAuthorized
             | Self::Refiller(_) => None,
         }
     }
@@ -315,6 +328,32 @@ pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
     Err(TemplateIdsError::Contended)
 }
 
+/// Whether a start may create an absent high-water (RFC 0059 §3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapPolicy {
+    /// A seated root: absence means the object was deleted.
+    Refuse,
+    /// A markerless root without authorisation: only a store with no data
+    /// or audit file yet, a genuinely new one, bootstraps.
+    IfStoreEmpty,
+    /// A markerless root the operator authorised for the upgrade.
+    Authorized,
+}
+
+/// Whether the store holds any data or audit object: one delimited
+/// listing of each prefix's first level.
+fn store_has_data(store: &Store) -> Result<bool, TemplateIdsError> {
+    for prefix in ["data", "audit"] {
+        let listing = store
+            .list_delimited_blocking(Some(prefix))
+            .map_err(store_err("list", prefix))?;
+        if !listing.objects.is_empty() || !listing.common_prefixes.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// What a start found and seated.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Seated {
@@ -334,16 +373,21 @@ pub struct Seated {
 pub fn seat(
     store: &Store,
     miner: &mut MinerCluster,
-    may_bootstrap: bool,
+    policy: BootstrapPolicy,
 ) -> Result<Seated, TemplateIdsError> {
     let restored = miner.highest_allocated();
-    let seated = match read(store)? {
-        Some(high_water) => Seated {
+    let seated = match (read(store)?, policy) {
+        (Some(high_water), _) => Seated {
             high_water: high_water.reserved_through,
             bootstrapped: false,
         },
-        None if may_bootstrap => bootstrap(store, restored)?,
-        None => return Err(TemplateIdsError::HighWaterDeleted),
+        (None, BootstrapPolicy::Refuse) => return Err(TemplateIdsError::HighWaterDeleted),
+        (None, BootstrapPolicy::IfStoreEmpty) if store_has_data(store)? => {
+            return Err(TemplateIdsError::BootstrapNotAuthorized);
+        }
+        (None, BootstrapPolicy::IfStoreEmpty | BootstrapPolicy::Authorized) => {
+            bootstrap(store, restored)?
+        }
     };
     miner
         .allocate_past_issued(seated.high_water.max(restored))

@@ -19,7 +19,8 @@ fn rfc0059_14_a_seated_root_never_bootstraps_a_deleted_high_water() {
     drop(node.restart().expect("the root seats"));
     std::fs::remove_file(node.store.join(HIGH_WATER_KEY)).expect("delete the object");
 
-    let Err(err) = node.restart() else {
+    // Authorised or not: a seated root never bootstraps.
+    let Err(err) = node.restart_with(node.store(), true) else {
         panic!("a seated root must not bootstrap");
     };
 

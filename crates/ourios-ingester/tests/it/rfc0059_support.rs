@@ -113,7 +113,17 @@ impl Node {
     /// [`Self::restart`] over `store`, e.g. the node's store behind
     /// [`Hooks`].
     pub fn restart_over(&self, store: Store) -> Result<Restarted, RecoveryDriverError> {
-        let ids = TemplateIds::new(store);
+        self.restart_with(store, true)
+    }
+
+    /// [`Self::restart_over`], with the RFC 0059 §3.5 bootstrap
+    /// authorisation set as given.
+    pub fn restart_with(
+        &self,
+        store: Store,
+        allow_bootstrap: bool,
+    ) -> Result<Restarted, RecoveryDriverError> {
+        let ids = TemplateIds::new(store).with_bootstrap_allowed(allow_bootstrap);
         let records = SharedRecordSink::new();
         let mut miner = MinerCluster::new(MinerConfig::default())
             .with_record_sink(Box::new(records.clone()))

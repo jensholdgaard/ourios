@@ -28,10 +28,47 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 const TENANT: &str = "eq-perses";
 /// About 20 KiB of distinct text per body and per template.
 const TOKENS: usize = 2_500;
-/// 2026-09-24T00:00:00Z.
-const TS: u64 = 1_790_208_000_000_000_000;
+/// The widest any partition directory gets, in both histories: the
+/// history grows by adding directories, never by widening one.
+const WIDTH: u64 = 10;
 const HOUR_NS: u64 = 3_600_000_000_000;
-const DAY_NS: u64 = 24 * HOUR_NS;
+
+/// Nanoseconds since the epoch at `year-month-day hour:00` UTC (Howard
+/// Hinnant's `days_from_civil`).
+fn at(year: u64, month: u64, day: u64, hour: u64) -> u64 {
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (days * 24 + hour) * HOUR_NS
+}
+
+/// Data file `seq`'s instant: `WIDTH` hours a day, `WIDTH` days a month.
+fn data_at(seq: u64) -> u64 {
+    at(
+        2026,
+        1 + seq / (WIDTH * WIDTH),
+        1 + (seq / WIDTH) % WIDTH,
+        seq % WIDTH,
+    )
+}
+
+/// Audit file `seq`'s instant: `WIDTH` days a month, `WIDTH` months a
+/// year.
+fn audit_at(seq: u64) -> u64 {
+    at(
+        2026 + seq / (WIDTH * WIDTH),
+        1 + (seq / WIDTH) % WIDTH,
+        1 + seq % WIDTH,
+        0,
+    )
+}
 
 fn text(seq: u64) -> String {
     (0..TOKENS)
@@ -52,9 +89,7 @@ fn row(seq: u64) -> MinedRecord {
         scope_attributes: Vec::new(),
         resource_schema_url: None,
         scope_schema_url: None,
-        // One data file per hour partition, so directories stay small
-        // while the history grows.
-        time_unix_nano: TS + seq * HOUR_NS,
+        time_unix_nano: data_at(seq),
         observed_time_unix_nano: None,
         attributes: Vec::new(),
         dropped_attributes_count: 0,
@@ -75,8 +110,7 @@ fn row(seq: u64) -> MinedRecord {
 fn created(seq: u64) -> AuditEvent {
     AuditEvent {
         tenant_id: TenantId::new(TENANT),
-        // One audit file per day partition.
-        timestamp: UNIX_EPOCH + Duration::from_nanos(TS + seq * DAY_NS),
+        timestamp: UNIX_EPOCH + Duration::from_nanos(audit_at(seq)),
         payload: AuditPayload::Template {
             template_id: seq + 1,
             triggering_line_hash: hash_triggering_line(b"line"),
@@ -119,9 +153,10 @@ fn scan_over(files: u64) -> (BootstrapScan, u64, u64) {
     (scan, bytes, peak)
 }
 
-/// Scenario RFC0059.7 — the scan's peak heap does not grow with the
-/// history when its directories stay the same size: it is bounded by the
-/// largest directory listing plus one file.
+/// Scenario RFC0059.7 — the scan's peak heap does not grow when the
+/// history grows by directories, with the widest directory and the
+/// largest file held fixed: it is bounded by the largest directory
+/// listing plus one file.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
 fn rfc0059_7_the_bootstrap_scan_heap_does_not_grow_with_history() {

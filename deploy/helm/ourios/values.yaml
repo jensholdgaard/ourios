@@ -92,6 +92,12 @@ storage:
 # OTLP receiver role (RFC 0003): a StatefulSet, one durable WAL PVC per replica.
 receiver:
   enabled: true
+  # Upgrading from a release before RFC 0059 (durable template-id
+  # allocation): set replicas to 0 and apply, so no pre-RFC receiver is
+  # running; then set it to 1 and apply, and let that one replica start
+  # (it bootstraps the template-id high-water from the store once); only
+  # then scale out. A pre-RFC receiver still running during that first
+  # start can publish an id the bootstrap scan never saw.
   replicas: 1
   service:
     type: ClusterIP

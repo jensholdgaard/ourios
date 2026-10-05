@@ -388,6 +388,46 @@ mod tests {
         );
     }
 
+    /// RFC 0059 §3.5: the footer answers an audit file only when every id
+    /// column has usable statistics; one alias column without them makes
+    /// that column's data be read.
+    #[test]
+    fn an_alias_column_without_statistics_forces_a_decode() {
+        let events = [created(4), alias(900, 950), created(17)];
+        let batch = audit_events_to_batch(&events).expect("batch");
+        for leaf in [
+            vec![audit_columns::ALIAS_REPRESENTATIVE_ID.to_owned()],
+            vec![
+                audit_columns::ALIAS_MEMBER_IDS.to_owned(),
+                "list".to_owned(),
+                "element".to_owned(),
+            ],
+        ] {
+            let props = WriterProperties::builder()
+                .set_statistics_enabled(EnabledStatistics::Chunk)
+                .set_column_statistics_enabled(
+                    parquet::schema::types::ColumnPath::new(leaf.clone()),
+                    EnabledStatistics::None,
+                )
+                .build();
+            let mut out = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut out, batch.schema(), Some(props)).expect("w");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+            let bytes = bytes::Bytes::from(out);
+            assert_eq!(
+                whole(&bytes, IdColumns::Audit),
+                FooterMax::NeedsDecode,
+                "{leaf:?} has no statistics, so the footer cannot answer",
+            );
+            assert_eq!(
+                decoded_max(bytes, IdColumns::Audit).expect("decode"),
+                Some(950)
+            );
+        }
+    }
+
     #[test]
     fn data_files_answer_from_template_id() {
         let batch = mined_records_to_batch(&[row(3), row(41), row(0)]).expect("batch");

@@ -140,6 +140,22 @@ rebuildable cache.
   `Deny` of `s3:DeleteObject` on `miner/*`, so a later widening of a
   delete grant still cannot reach the object (§3.6, RFC0059.17). Object
   lock or retention, where the store offers it, adds a second control.
+- **Restoring an older copy is unsupported.** A stale `reserved_through`
+  would let every allocator reserve blocks it, or another replica,
+  already issued from.
+  - Each root guards against it: its seated marker records the highest
+    reservation the root has made usable (`max_reserved_seen`, §3.5).
+  - A start that reads `reserved_through` below that value fails closed,
+    with an error naming a rollback of the high-water object
+    (RFC0059.18).
+  - Every replica that saw a later value therefore refuses the stale
+    copy at its next start.
+  - The only recovery is a quiesced, authorised re-bootstrap (§3.5):
+    1. stop every receiver;
+    2. remove the object;
+    3. start one replica with `receiver.template_ids_allow_bootstrap`,
+       which recomputes the provable floor from the footers.
+  - §3.6 bounds what this check covers.
 
 ### 3.2 Reservation: write before allocate
 
@@ -442,20 +458,33 @@ DuckDB procedure finds them.
 - **The seated marker.** Each root records that its snapshots were
   written under reservations: a file
   **`<snapshots root>/TEMPLATE_IDS_SEATED`** whose body is JSON
-  `{"version": 1, "seated_above": N}`, `N` being the high-water the root
-  first seated above.
+  `{"version": 1, "seated_above": N, "max_reserved_seen": M}`:
+  - `N` is the high-water the root first seated above;
+  - `M` is the highest block end the root has made usable, with
+    `N <= M`.
   - It is written through the snapshot store's temp-file, fsync and
     rename discipline.
+  - Every start rewrites it with the blocks the start reserved.
+  - Every later reservation raises `M` durably **before** its block can
+    be taken, so `M` covers every id the root can issue. That is one
+    local fsync per block of 1,000 ids.
   - The snapshot loader ignores it, since it is not a `*.snap` artefact.
     The snapshot and WAL formats are unchanged.
-- **The marker must be valid to count.** It must parse, carry version 1
-  and a `u64` `seated_above`, and that value must not exceed the
-  object's `reserved_through`. A marker that is zero-length, truncated,
-  malformed, of another version, unreadable, or claims more than the
-  object holds fails startup closed. It never trusts the snapshots, and
-  it is never read as "absent".
-- **Marker present and valid, object present.** The root's snapshots
-  are trusted and restore normally.
+- **The marker must be valid to count.**
+  - It must parse, and carry version 1, a `u64` `seated_above` and a
+    `u64` `max_reserved_seen`, with `seated_above <= max_reserved_seen`.
+  - A marker that is zero-length, truncated, malformed, of another
+    version, unreadable, missing either field, or with
+    `seated_above > max_reserved_seen` fails startup closed. It never
+    trusts the snapshots, and it is never read as "absent".
+  - The format is new in this RFC and unpublished, so no marker without
+    `max_reserved_seen` exists in the field.
+- **Marker present and valid, object present.**
+  - If the object's `reserved_through` is below `max_reserved_seen`, the
+    object was rolled back to an older copy, and startup fails closed
+    (§3.1, RFC0059.18). A marker claiming more than the object holds is
+    the same case.
+  - Otherwise the root's snapshots are trusted and restore normally.
 - **Marker present and valid, object absent.** Startup fails closed
   (§3.1, RFC0059.14).
 - **Marker absent, high-water object absent.** This start is the
@@ -651,6 +680,27 @@ release notes carry the receiver's.
 **Out of scope.** The same template reaching two replicas gets two ids.
 That is drift across replicas (hazard #5), not a collision.
 
+**Threat model** (maintainer decision, 2026-10-06). The high-water is
+protected against accident and misconfiguration, not against an
+adversary who holds delete or overwrite rights on `miner/`.
+- **Supported:**
+  - the object is never deleted (§3.1, enforced by every documented
+    policy);
+  - a deletion fails closed at every seated start (RFC0059.14) and stops
+    live reservation (RFC0059.18).
+- **Unsupported, but caught:**
+  - Restoring an older copy of the object. The per-root check refuses it
+    at every replica whose marker saw a later value (§3.1).
+  - Recovery is the quiesced, authorised re-bootstrap described there.
+- **Out of scope:**
+  - An operator with delete rights who restores stale state while some
+    replica never observed the later value. That replica's marker cannot
+    tell the stale copy from the truth.
+  - Deleting a root's marker along with its snapshots. The root then
+    takes the markerless path.
+  - Neither is detected, and preventing them is left to the store's
+    access control, versioning and object lock.
+
 ### 3.7 Monotonicity
 
 RFC 0001 §6.1 said `template_id` is "a cluster-wide unique monotonic
@@ -729,8 +779,10 @@ Reservation failures in the background refiller log through the
 existing `tracing` warn path, with `error.type` set to the store error
 class. A deleted high-water, which stops the refiller, logs at error
 level with `error.type = deleted`, the value startup already uses for
-RFC0059.14. No new metric is added: a run of failures shows on the
-parse-failure counter as soon as it costs a template.
+RFC0059.14. A start refused over a rolled-back high-water fails with
+`error.type = rolled_back` (§3.1). No new metric is added: a run of
+failures shows on the parse-failure counter as soon as it costs a
+template.
 
 ### 3.10 What this RFC does not change
 
@@ -908,9 +960,9 @@ The ids are referenced from test code.
 > - **And** the miner holds none of the discarded snapshots' leaves: a
 >   shape one of them held mints a fresh id above the high-water
 > - **And** a marker that is zero-length, truncated, malformed, of
->   another version, or claims more than the object's
->   `reserved_through`, fails startup closed and never trusts the
->   snapshots
+>   another version, missing `seated_above` or `max_reserved_seen`, or
+>   with `seated_above` above `max_reserved_seen`, fails startup closed
+>   and never trusts the snapshots
 > - **And** no id B restores or allocates equals one A issued since the
 >   bootstrap
 > - **And** B writes its seated marker only after the artefacts are
@@ -981,6 +1033,9 @@ The ids are referenced from test code.
 >   `id_reservation_failed` while known templates attach
 > - **And** if the object then reappears, the refiller does not reserve
 >   from it
+> - **And** when the object reappears as an older copy below the
+>   receiver's `max_reserved_seen`, a restart fails closed with an error
+>   naming a rollback of the high-water object, and writes nothing
 
 ## 6. Testing strategy
 

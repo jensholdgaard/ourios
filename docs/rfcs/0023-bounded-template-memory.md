@@ -151,7 +151,8 @@ the body column preserves the line exactly), so overflow degrades to
 
 - `ourios.miner.parse_failures` (existing counter) gains a
   **`ourios.miner.parse_failure.reason`** attribute — values
-  `below_floor` | `line_too_long` | `template_ceiling` — following
+  `below_floor` | `line_too_long` | `template_ceiling` |
+  `id_reservation_failed` (added by RFC 0059, 2026-10-05) — following
   the OTel "error.type on an existing instrument" convention rather
   than minting per-cause counters.
 - `ourios.miner.template.count` (existing gauge) is the ceiling's

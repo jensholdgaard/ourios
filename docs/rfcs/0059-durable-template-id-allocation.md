@@ -98,9 +98,15 @@ rebuildable cache.
   have moved the authoritative high-water to its own key and left the v1
   object stale, so an older binary that trusted v1 could re-issue ids
   the newer one already handed out. The only safe reading of an unknown
-  version is to refuse to start (RFC0059.11). A future format change
-  therefore keeps writing v1 alongside, or ships with a migration that
-  every binary still running can read.
+  version is to refuse to start (RFC0059.11).
+- **Evolving the format.** A future change takes one of two paths:
+  - it evolves version 1 backward-compatibly, adding fields v1 readers
+    ignore and keeping `reserved_through`'s meaning;
+  - it stops every binary that reads only version 1 before any
+    later-version key is published.
+
+  Writing v1 alongside a later version is not an option: a v1-only reader
+  refuses to start when it sees the later key, whatever v1 holds.
 - **Absent** means no `template_ids.v<k>.json` of any version exists.
   That alone triggers the bootstrap (§3.5).
 
@@ -164,8 +170,9 @@ no reservation ever runs there.
 
 Recovery reads `N` **before** replay, after restoring the snapshots
 (RFC 0001 §6.9):
-- **Object present.** Recovery seats the allocator above
-  `max(N, highest restored id)`. It reserves the first current block
+- **Object present.** Recovery first applies the seated-marker rule
+  (§3.5): a root that has never seated discards its snapshots. It then
+  seats the allocator above `max(N, highest restored id)`. It reserves the first current block
   and the first ready block synchronously, before the listeners open,
   so startup is the one place a reservation blocks. Replay then mints
   from that block.
@@ -210,6 +217,12 @@ computes:
 floor = max(data_max, audit_max, restored_max)
 ```
 
+A source with no id counts as `0`, the `NO_TEMPLATE` sentinel (RFC 0001
+§6.1): a data file whose rows are all parse failures, an empty audit
+stream, or no restored snapshot. On a genuinely new store every maximum
+is absent, so `floor = 0` and the first allocatable id is `1`, as
+before this RFC.
+
 **`data_max`.** The highest `template_id` in the statistics of every
 data file under `data/`.
 - This covers every published row, structured or not, whatever the
@@ -224,6 +237,12 @@ data file under `data/`.
   statistics, so a file that needs this is a pre-statistics or foreign
   file.
 - No row is ever materialised.
+
+**Which keys are read.** Only keys ending in lowercase `.parquet`. That
+is the rule the compactor applies (`compaction/keys.rs`,
+`is_committed_parquet`) and the one RFC 0033's map key relies on to stay
+out of every audit walk (`template_map.rs`). It skips `*.parquet.tmp`
+staging objects, `manifest.json`, and `template_map.v2.json.zst`.
 
 **`audit_max`.** The same footer read over every `audit/` file. It
 covers the `template_id` column, plus `alias_representative_id` and the
@@ -266,14 +285,25 @@ This is the whole-prefix walk #853 warns about. It is paid once per
 store, at its first start under this RFC, and never again.
 
 **Memory.**
-- **Listings.** The walk is depth-first. It holds one directory's
-  listing at a time, plus the prefixes still to visit. Those are at
-  most the unvisited siblings at each level of the current path, so a
-  few hundred names, never the prefix's keys.
+- **Listings.** `list_delimited_blocking` materialises one directory's
+  listing into memory, every page of it. The walk is depth-first, so it
+  holds that one listing plus the prefixes still to visit, which are the
+  unvisited siblings at each level of the current path.
 - **Files.** Each file's footer, or a whole pre-statistics file, is
   dropped before the next one is fetched.
-- **Peak.** The scan's peak heap is one directory listing plus one
-  file, independent of the store's size (RFC0059.7).
+- **The bound.** The largest single directory listing, plus the current
+  path's pending siblings, plus one file. It does not grow with the
+  number of directories or files in the store as a whole. It does grow
+  with the widest directory. That is an hour partition's file list,
+  which compaction keeps to a handful of files (RFC 0009), or a level
+  such as `tenant_id=…`, with one name per tenant.
+- **Why not a streaming seam.** A paginated listing would bound memory
+  at one page, but only on S3. Its lexicographic `start-after` paging is
+  a guarantee there, while `object_store`'s local backend lists in an
+  unspecified order. A page-by-offset walk there would skip keys, or
+  have to sort the whole prefix first. The directory-at-a-time walk is
+  correct on both backends, and its bound is the honest one stated
+  above.
 
 **Progress.** Every 10,000 files, the bootstrap logs
 `ourios.receiver.template_ids.bootstrap.progress` (§3.9).
@@ -285,22 +315,54 @@ redoes the scan from the beginning. The write is create-if-absent
 (§3.6), reads the winner's object instead. It then proceeds as in §3.4:
 its first reservation still uses `f ≥ restored_max`.
 
-**Multi-replica upgrade.** Before this RFC, two receivers sharing a
-store each started counting at 1, so a multi-replica deployment already
-has colliding ids.
-- **Detecting them.** #908's read-only DuckDB procedure finds them.
-- **Ordering the upgrade.** The upgrade bootstraps from what the store
-  holds, plus the restoring replica's own snapshots. A replica that
-  starts later may restore snapshot ids above the bootstrap floor that
-  it minted pre-upgrade and never published, and the first replica may
-  have reserved those ids already.
-- **The rule.** Upgrade a multi-replica deployment to this RFC with
-  `receiver.replicas = 1`, then scale out.
-- **Ready-gating does not close the window.** The chart's StatefulSet
-  uses the default `OrderedReady` policy (no `podManagementPolicy` in
-  `receiver-statefulset.yaml`), so replica 0 bootstraps before replica 1
-  starts. That ordering still leaves the window above, which is why the
-  rule exists.
+**Snapshots written before the high-water existed.** Before this RFC,
+two receivers sharing a store each started counting at 1, so a
+multi-replica deployment already has colliding ids. #908's read-only
+DuckDB procedure finds them.
+- **The danger.** A replica's local snapshots hold ids from its own
+  pre-RFC counter. Once another replica has bootstrapped the high-water
+  and allocated from it, restoring those snapshots would bring back
+  leaves whose ids that replica has since issued for other templates.
+  Scaling to one replica for the upgrade only delays this until scale-out.
+- **The seated marker.** Each root records that its snapshots were
+  written under reservations: a file
+  **`<snapshots root>/TEMPLATE_IDS_SEATED`** holding the high-water it
+  first seated above. It is written through the snapshot store's
+  temp-file, fsync and rename discipline, and the snapshot loader
+  ignores it, since it is not a `*.snap` artefact. The snapshot and WAL
+  formats are unchanged.
+- **Marker present.** The root's snapshots are trusted and restore
+  normally.
+- **Marker absent, high-water object absent.** This start is the
+  bootstrap. It restores its snapshots, folds their highest id into the
+  floor (`restored_max`), creates the object, then writes the marker.
+- **Marker absent, high-water object present.** Another replica, or
+  this one before a crash, already seated the store. Every artefact
+  here predates this root's first seat and is untrusted.
+  - Recovery discards them all with reason `predates_high_water`, so
+    each tenant full-replays its surviving frames.
+  - It removes the artefact files and fsyncs the directory, seats
+    above `N`, then writes the marker.
+  - A discarded snapshot only costs drift. The WAL replays, and the
+    high-water makes every re-minted id fresh.
+- **Losing the bootstrap race.** If two replicas without markers both
+  find the object absent, both restore their own snapshots, and only
+  one create lands. The loser has already restored ids the winner's
+  floor may not cover. So the loser fails startup, and its restart takes
+  the "object present" path.
+- **Crash safety.**
+  - Every step before the marker write leaves the marker absent, so the
+    next start reruns the same decision.
+  - After the marker write, no untrusted artefact remains: they were
+    removed before it, and every later snapshot is written under
+    reservations.
+- **A lost or replaced root** has no marker and no snapshots, so it
+  just writes the marker.
+- **No operator step.** No replica count or upgrade order is required.
+- **Relation to RFC 0052.** The discard runs before RFC 0052 §3.2's
+  legacy stale-gap belt. That belt still reads the discarded version-1
+  artefacts' marks, so a pre-RFC 0052 root is checked exactly as
+  before.
 
 ### 3.6 Several receivers on one store
 
@@ -392,6 +454,7 @@ are listed exactly so that registry PR can be finalised:
 | `ourios.receiver.template_ids.bootstrapped` | event, once per store | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
 | `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
 | `ourios.miner.parse_failure.reason` | existing enum attribute | new member `id_reservation_failed` |
+| `ourios.receiver.snapshot.discarded` | existing event | new `error.type` value `predates_high_water` (§3.5) |
 
 Reservation failures in the background refiller log through the
 existing `tracing` warn path, with `error.type` set to the store error
@@ -517,6 +580,8 @@ The ids are referenced from test code.
 >   `template_id` statistics are present
 > - **And** its peak heap is below one eighth of the history's body and
 >   template bytes, and grows less than 1.5× when the history grows 4×
+>   across a fixed number of directories, so that it is bounded by the
+>   largest directory listing plus one file, not by the file count
 
 > **Scenario RFC0059.8 — Concurrent reservers on one store get disjoint blocks**
 > - **Given** a store with `If-Match` support and two reservers on it
@@ -549,6 +614,21 @@ The ids are referenced from test code.
 >   before any listener opens
 > - **And** it neither bootstraps nor writes any high-water object
 
+> **Scenario RFC0059.12 — Snapshots written before a root's first seat are never restored**
+> - **Given** two receivers on one store, each with local snapshots from
+>   its pre-RFC counter that hold ids the other also used, and receiver A
+>   bootstrapped the high-water and allocated from it
+> - **When** receiver B starts with no seated marker
+> - **Then** every one of its artefacts is discarded with reason
+>   `predates_high_water`, removed, and each tenant full-replays
+> - **And** no id B restores or allocates equals one A issued since the
+>   bootstrap
+> - **And** B writes its seated marker only after the artefacts are
+>   gone, so a kill at any point before it leads the next start to the
+>   same decision
+> - **And** when two markerless receivers race the bootstrap, the loser
+>   fails startup and its restart takes the discard path
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -556,7 +636,7 @@ scenario harness: the production barrier, housekeeping and recovery
 path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
-  fixture), .5, .6, .9 and .11.
+  fixture), .5, .6, .9, .11 and .12.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none
@@ -586,10 +666,6 @@ kept snapshot restored under that id. This covers RFC0059.1 and .9.
       stream, so it inherits the audit fold's last-wins on historical
       collisions. Repairing already-collided history is out of scope; the
       DuckDB procedure from #908 detects it.
-- [ ] **Scale-out without the upgrade rule.** The §3.5 rule (upgrade at
-      one replica) could become a checked precondition: refuse to
-      bootstrap while another replica's lease is live. That waits on a
-      lease, as RFC 0013 §7 does.
 
 ## 8. References
 

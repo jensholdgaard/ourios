@@ -420,6 +420,17 @@ impl Store {
         })
     }
 
+    /// An in-process backend with `If-Match` support, for tests and
+    /// tools that need the conditional-update path without an S3 endpoint.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            prefix: ObjectPath::default(),
+            conditional_update: true,
+        }
+    }
+
     /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
     /// S3-compatible endpoint (Hetzner, R2, …) via [`S3Config::endpoint`].
     ///

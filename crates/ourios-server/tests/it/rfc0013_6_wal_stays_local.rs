@@ -184,11 +184,15 @@ async fn rfc0013_6_wal_stays_local() {
         !data_parquet.is_empty(),
         "the shutdown drain landed at least one data Parquet object in the store; saw {store_files:?}",
     );
+    // RFC 0059 §3.1: the template-id high-water is the one other object the
+    // receiver keeps in the store.
+    let high_water = bucket_root.join(ourios_ingester::template_ids::HIGH_WATER_KEY);
     for path in &store_files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         assert!(
-            has_extension(path, "parquet") || name == "manifest.json",
-            "only Parquet/manifest objects reach the store, found {path:?}",
+            has_extension(path, "parquet") || name == "manifest.json" || *path == high_water,
+            "only Parquet/manifest objects and the template-id high-water reach the store, \
+             found {path:?}",
         );
         assert!(
             !has_extension(path, "wal"),

@@ -108,7 +108,16 @@ rebuildable cache.
   Writing v1 alongside a later version is not an option: a v1-only reader
   refuses to start when it sees the later key, whatever v1 holds.
 - **Absent** means no `template_ids.v<k>.json` of any version exists.
-  That alone triggers the bootstrap (§3.5).
+  It triggers the bootstrap (§3.5) **only on a root without a seated
+  marker**.
+- **A seated root that finds the object absent fails closed.** The
+  object was deleted. A bootstrap then would scan only published ids and
+  could reseat `N` below a block another receiver still holds, so the
+  start stops with an error naming the object instead (RFC0059.14).
+- **The object must never be deleted.** Operators should protect
+  `miner/template_ids.v1.json` from deletion, with a bucket policy that
+  denies `DeleteObject` on it, or an object lock or retention where the
+  store offers one. No Ourios role is granted a delete there (§3.6).
 
 ### 3.2 Reservation: write before allocate
 
@@ -179,8 +188,10 @@ file afterwards would leave its leaves live. The order is:
 2. **Object present, no marker** (§3.5): discard every artefact with
    reason `predates_high_water`, without restoring any. Remove the
    files, then seat above `N`, then write the marker.
-3. **Object present, marker present:** restore the snapshots normally,
-   then seat above `max(N, highest restored id)`.
+3. **Object present, marker present and valid:** restore the snapshots
+   normally, then seat above `max(N, highest restored id)`. An invalid
+   marker, or a valid one whose object is absent, fails startup closed
+   (§3.1, §3.5).
 4. **Object absent, the bootstrap** (§3.5): restore first, because the
    floor needs `restored_max`. Then bootstrap the object and write the
    marker.
@@ -351,13 +362,23 @@ DuckDB procedure finds them.
   Scaling to one replica for the upgrade only delays this until scale-out.
 - **The seated marker.** Each root records that its snapshots were
   written under reservations: a file
-  **`<snapshots root>/TEMPLATE_IDS_SEATED`** holding the high-water it
-  first seated above. It is written through the snapshot store's
-  temp-file, fsync and rename discipline, and the snapshot loader
-  ignores it, since it is not a `*.snap` artefact. The snapshot and WAL
-  formats are unchanged.
-- **Marker present.** The root's snapshots are trusted and restore
-  normally.
+  **`<snapshots root>/TEMPLATE_IDS_SEATED`** whose body is JSON
+  `{"version": 1, "seated_above": N}`, `N` being the high-water the root
+  first seated above.
+  - It is written through the snapshot store's temp-file, fsync and
+    rename discipline.
+  - The snapshot loader ignores it, since it is not a `*.snap` artefact.
+    The snapshot and WAL formats are unchanged.
+- **The marker must be valid to count.** It must parse, carry version 1
+  and a `u64` `seated_above`, and that value must not exceed the
+  object's `reserved_through`. A marker that is zero-length, truncated,
+  malformed, of another version, unreadable, or claims more than the
+  object holds fails startup closed. It never trusts the snapshots, and
+  it is never read as "absent".
+- **Marker present and valid, object present.** The root's snapshots
+  are trusted and restore normally.
+- **Marker present and valid, object absent.** Startup fails closed
+  (§3.1, RFC0059.14).
 - **Marker absent, high-water object absent.** This start is the
   bootstrap. It restores its snapshots, folds their highest id into the
   floor (`restored_max`), creates the object, then writes the marker.
@@ -449,6 +470,22 @@ disjoint, and no per-node key is needed.
   same constraint under which the chart's shared local PVC is coherent
   at all (`data-pvc.yaml`: "coherent only on one node or with a
   ReadWriteMany class").
+
+**Permissions.** The receiver's object-store role gains:
+- **always:** `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` (with
+  the `miner/` prefix) on `miner/*`. Conditional writes (`If-Match`,
+  `If-None-Match`) need nothing beyond `s3:PutObject`. No delete is
+  granted.
+- **for the one-time upgrade bootstrap:** `s3:ListBucket` (prefixes
+  `data/` and `audit/`) and `s3:GetObject` on `data/*` and `audit/*`.
+
+Before this RFC the chart documented the receiver as `PutObject` only.
+These grants must be in place **before** the scale-to-one upgrade step,
+and the migration-only reads may be revoked once the high-water exists.
+A denied call fails startup with an error naming the action it lacked
+(`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`, RFC0059.15). The
+chart's README and `values.yaml` document both sets, and the release
+notes carry them.
 
 **Out of scope.** The same template reaching two replicas gets two ids.
 That is drift across replicas (hazard #5), not a collision.
@@ -682,6 +719,10 @@ The ids are referenced from test code.
 >   tenant full-replays
 > - **And** the miner holds none of the discarded snapshots' leaves: a
 >   shape one of them held mints a fresh id above the high-water
+> - **And** a marker that is zero-length, truncated, malformed, of
+>   another version, or claims more than the object's
+>   `reserved_through`, fails startup closed and never trusts the
+>   snapshots
 > - **And** no id B restores or allocates equals one A issued since the
 >   bootstrap
 > - **And** B writes its seated marker only after the artefacts are
@@ -701,6 +742,20 @@ The ids are referenced from test code.
 > - **And** once replay has ended, a drained reserver fails instead of
 >   calling the store
 
+> **Scenario RFC0059.14 — A seated root that finds the high-water gone fails closed**
+> - **Given** a root whose seated marker is valid, and a store whose
+>   high-water object was then deleted
+> - **When** the receiver starts
+> - **Then** startup fails with an error naming the object
+> - **And** it neither bootstraps nor writes any high-water object
+
+> **Scenario RFC0059.15 — A denied store call names the missing permission**
+> - **Given** a store that refuses the receiver's calls with an
+>   access-denied error
+> - **When** the receiver starts
+> - **Then** startup fails with an error naming the S3 action the
+>   receiver lacks
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -708,7 +763,7 @@ scenario harness: the production barrier, housekeeping and recovery
 path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
-  fixture), .5, .6, .9, .11, .12 and .13.
+  fixture), .5, .6, .9, .11, .12, .13, .14 and .15.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none

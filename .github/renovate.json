@@ -117,6 +117,17 @@
       ],
       "pinDigests": false,
       "description": "Don't digest-pin the chart's default image. image.tag is deliberately empty (floating latest; the values.yaml comment tells operators to pin a released tag in production), so a point-in-time digest in the published chart's defaults contradicts that contract - and renovate writes it as a bare @sha256:... tag, which the ourios.image helper renders as an invalid repo:@sha256:... reference."
+    },
+    {
+      "matchManagers": [
+        "rust-toolchain",
+        "dockerfile"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
+      "groupName": "rust toolchain",
+      "description": "rust-toolchain.toml pins an exact Rust version (CLAUDE.md \u00a76.1) so a new release cannot break CI overnight, as Rust 1.99 did through the unpinned stable channel with a deprecation and a new clippy lint (#901). The rust-toolchain manager proposes each release as a PR instead, so its new lints are fixed there. The image builders' rust:<version>-bookworm base is grouped in because COPY . . brings the toolchain file into the build, and a mismatched base makes rustup download the pinned version mid-build. CI jobs install whatever the toolchain file names, so nothing else needs bumping."
     }
   ]
 }

@@ -39,9 +39,9 @@ the §5 scenarios that cover it:
 
 | Touched | How | Covered by |
 |---|---|---|
-| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16, .17 |
+| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16, .17, .18 |
 | `CLAUDE.md` §3.3, bit-identical reconstruction | the registry's last-wins fold would render old rows against the wrong text; an exhausted range must keep the body | RFC0059.1, .4 |
-| `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16, .17 |
+| `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16, .17, .18 |
 | `CLAUDE.md` §3.7, multi-tenancy | ids stay unique across tenants; the scenarios mint for two tenants | RFC0059.1, .8 |
 | Hazard #1, template miner correctness | allocation, restore and replay order inside the miner | RFC0059.3, .4, .10, .13 |
 | Hazard #5, template schema evolution | re-minted old shapes stay drift on fresh ids, never collisions; restore equivalence holds up to renaming | RFC0059.1, .9 |
@@ -154,6 +154,13 @@ restored or issued:
    precondition failure, re-read and retry from step 1.
 4. Only once the write is durable does `(a, b]` become usable.
 
+**A reservation never creates the object.** Only the startup bootstrap
+(§3.5) creates it. If step 1 finds it absent, the reservation fails with
+`HighWaterDeleted` (§3.1). A compare-and-swap against an object deleted
+after step 1 fails its precondition rather than re-creating it. A store
+that offers compare-and-swap but returned no `ETag` in step 1 fails the
+reservation closed instead of overwriting.
+
 **Crash semantics.** A crash between the write and the use leaves ids
 in `(a, b]` unissued, and they are skipped. Ids are `u64`, so these
 gaps cost nothing. Nothing in Ourios reads id density (§3.7).
@@ -179,6 +186,16 @@ no reservation ever runs there.
   ingester's background refiller reserves the next ready block off the
   lock. If the store fails, it retries with capped exponential backoff
   (100 ms doubling to 30 s).
+- **A high-water deleted while live.** If a refill finds the object
+  absent (`HighWaterDeleted`), the refiller stops for good and logs an
+  error. It does not retry: an object that reappears, for example
+  restored from an old copy, may sit below blocks other receivers hold.
+  - The blocks already held are spent, with no reservation overlapping
+    them.
+  - Then fresh mints fail as below, while existing templates keep
+    attaching.
+  - Only a restart gets past it, and a seated root's restart fails
+    closed while the object is absent (RFC0059.14).
 - **Exhausted range.** Once the listeners are open, if both blocks are
   used up before a refill lands, every **fresh** allocation fails
   immediately: a new tree leaf, an adoption-interned template, or a
@@ -191,7 +208,8 @@ no reservation ever runs there.
   - Lines that match an existing template keep attaching to it.
   - An adoption that would intern is not attempted. The line is mined
     instead, and either attaches or counts as above.
-  - Allocation resumes as soon as the refiller hands over a block.
+  - Allocation resumes as soon as the refiller hands over a block,
+    unless the refiller stopped on a deleted high-water.
 - **Precedence.** RFC 0023 §3.1's per-tenant ceiling is checked before
   id availability. A line at the ceiling reports `template_ceiling`,
   not `id_reservation_failed`.
@@ -215,7 +233,9 @@ file afterwards would leave its leaves live. The order is:
 4. **Object absent, no marker, the bootstrap** (§3.5): restore first,
    because the floor needs `restored_max`. Then bootstrap the object and
    write the marker, provided the store holds no data yet or this start
-   is authorised. Otherwise startup fails closed.
+   is authorised. Otherwise startup fails closed. A start whose create
+   loses to another replica's also fails startup (`BootstrapRaceLost`),
+   and its restart takes case 2.
 
 In every case the allocator then reserves the first current block and
 the first ready block synchronously, and replay mints from those blocks.
@@ -387,9 +407,13 @@ store, at its first start under this RFC, and never again.
 **Crash mid-bootstrap.** Nothing is written until the scan completes. A
 crash or restart during the scan leaves no object, so the next start
 redoes the scan from the beginning. The write is create-if-absent
-(`put_if_absent`). A start that loses that race, to a concurrent replica
-(§3.6), reads the winner's object instead. It then proceeds as in §3.4:
-its first reservation still uses `f ≥ restored_max`.
+(`put_if_absent`), and this bootstrap is the only writer that ever
+creates the object (§3.2). A start that loses that race to a concurrent
+replica (§3.6) **fails startup** with `BootstrapRaceLost`. It never
+proceeds against the winner's object: it has already restored its own
+snapshots, whose ids may lie above the winner's floor. Its restart finds
+the object present and no marker, and takes the discard path below
+(RFC0059.12).
 
 **Snapshots written before the high-water existed.** Before this RFC,
 two receivers sharing a store each started counting at 1, so a
@@ -497,8 +521,9 @@ DuckDB procedure finds them.
 the one object. This is RFC 0013's manifest-swap primitive,
 `Store::put_if_match`, including its unquoted-`ETag` retry:
 - it writes with `If-Match: <etag>`;
-- it creates with `If-None-Match: *` (`put_if_absent`) when the object
-  is absent;
+- only the startup bootstrap creates, with `If-None-Match: *`
+  (`put_if_absent`); a reservation that finds the object absent fails
+  (§3.2);
 - on a precondition failure it re-reads and retries, up to 16 attempts
   per reservation;
 - a reservation that still loses is a failed reservation (§3.3).
@@ -508,7 +533,11 @@ disjoint, and no per-node key is needed.
 
 **The local backend.**
 - It has no `If-Match` (RFC0019.7: it commits by atomic overwrite, last
-  writer wins). The reservation writes `N'` by overwrite there.
+  writer wins). The reservation writes `N'` by overwrite there. An
+  overwrite cannot be made conditional on the file still existing, so a
+  deletion racing a reservation's read and write can re-create it. That
+  is the single-receiver backend's accepted limit. A reservation that
+  reads an absent object still fails (§3.2).
 - **One receiver per local store** is a stated constraint. It is the
   same constraint under which the chart's shared local PVC is coherent
   at all (`data-pvc.yaml`: "coherent only on one node or with a
@@ -667,7 +696,9 @@ are listed exactly so that registry PR can be finalised:
 
 Reservation failures in the background refiller log through the
 existing `tracing` warn path, with `error.type` set to the store error
-class. No new metric is added: a run of failures shows on the
+class. A deleted high-water, which stops the refiller, logs at error
+level with `error.type = deleted`, the value startup already uses for
+RFC0059.14. No new metric is added: a run of failures shows on the
 parse-failure counter as soon as it costs a template.
 
 ### 3.10 What this RFC does not change
@@ -897,6 +928,19 @@ The ids are referenced from test code.
 > - **And** each policy holds an explicit `Deny` of `s3:DeleteObject`
 >   that covers it
 
+> **Scenario RFC0059.18 — A high-water deleted while live is never re-created**
+> - **Given** a running, seated receiver that holds its current and
+>   ready blocks
+> - **When** the high-water object is deleted, and fresh templates keep
+>   arriving
+> - **Then** the held ids are each issued once and none lies past the
+>   last reservation
+> - **And** no reservation re-creates the object
+> - **And** once the held blocks are spent, fresh mints fail as
+>   `id_reservation_failed` while known templates attach
+> - **And** if the object then reappears, the refiller does not reserve
+>   from it
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -905,6 +949,9 @@ path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
   fixture), .5, .6, .9, .11, .12, .13, .14, .15 and .16.
+- RFC0059.18 deletes the object under a running node and restores it
+  later, asserting no re-creation and no reservation from the restored
+  copy.
 - RFC0059.17 parses the chart README's JSON policies (`include_str!`)
   and evaluates their action and resource wildcards against the
   high-water key.

@@ -35,7 +35,7 @@ use prost::Message;
 use crate::metrics::ERROR_TYPE;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
-use crate::template_ids::{Seated, SnapshotTrust, TemplateIds, TemplateIdsError, mark_seated};
+use crate::template_ids::{Seated, SnapshotTrust, TemplateIds, TemplateIdsError};
 
 /// What recovery did, for the caller to log and for the
 /// RFC0008.10 / RFC 0001 §3.5.3–.4 assertions.
@@ -570,9 +570,8 @@ fn seat_root(
     let seated = ids
         .start(miner, trust.may_bootstrap())
         .map_err(RecoveryDriverError::TemplateIds)?;
-    if trust != SnapshotTrust::Seated {
-        mark_seated(snapshots_root, seated.high_water).map_err(RecoveryDriverError::TemplateIds)?;
-    }
+    ids.record_seat(snapshots_root, trust, seated)
+        .map_err(RecoveryDriverError::TemplateIds)?;
     Ok(seated)
 }
 

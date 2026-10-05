@@ -91,6 +91,9 @@ pub enum TemplateIdsError {
     /// No high-water exists, the store already holds data, and this start
     /// was not authorised to bootstrap (RFC 0059 §3.5).
     BootstrapNotAuthorized,
+    /// The high-water reads below a reservation this root already made
+    /// usable: an older copy was restored (RFC 0059 §3.1).
+    HighWaterRolledBack { seen: u64, found: u64 },
 }
 
 impl TemplateIdsError {
@@ -108,6 +111,7 @@ impl TemplateIdsError {
             Self::Marker { .. } | Self::Snapshots(_) | Self::MarkerInvalid { .. } => "marker",
             Self::HighWaterDeleted => "deleted",
             Self::BootstrapNotAuthorized => "bootstrap_not_authorized",
+            Self::HighWaterRolledBack { .. } => "rolled_back",
             Self::Refiller(_) | Self::FirstBlock(_) => "_OTHER",
         }
     }
@@ -163,6 +167,13 @@ impl std::fmt::Display for TemplateIdsError {
                  receiver.template_ids_allow_bootstrap (OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP) \
                  set to true, and remove the setting once it has seated"
             ),
+            Self::HighWaterRolledBack { seen, found } => write!(
+                f,
+                "{HIGH_WATER_KEY} reads {found}, below the {seen} this root already reserved: \
+                 the object was rolled back to an older copy, which is unsupported. Recover \
+                 by stopping every receiver, removing the object, and starting one replica \
+                 authorised to bootstrap (RFC 0059 §3.1)"
+            ),
             Self::HighWaterDeleted => write!(
                 f,
                 "{HIGH_WATER_KEY} is gone though this root has seated against it; it must \
@@ -187,6 +198,7 @@ impl std::error::Error for TemplateIdsError {
             | Self::MarkerInvalid { .. }
             | Self::HighWaterDeleted
             | Self::BootstrapNotAuthorized
+            | Self::HighWaterRolledBack { .. }
             | Self::Refiller(_) => None,
             Self::FirstBlock(e) => Some(e),
         }

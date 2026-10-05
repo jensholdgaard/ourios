@@ -11,8 +11,14 @@
 //! and a replay that drains the ready blocks reserves the next one
 //! synchronously rather than failing a template a healthy store could
 //! have given an id.
+//!
+//! Once the root's seated marker is written, every block's end is
+//! recorded in it before the block can be taken, so the marker's
+//! `max_reserved_seen` covers every id this root can issue (RFC 0059
+//! §3.1's rollback check).
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -21,7 +27,8 @@ use std::time::Duration;
 use ourios_miner::cluster::{IdBlock, IdReservationError, IdReserver, MinerCluster};
 use ourios_parquet::Store;
 
-use super::{BootstrapPolicy, Seated, TemplateIdsError, reserve, seat};
+use super::marker::{Marker, read_marker, write_marker};
+use super::{BootstrapPolicy, Seated, SnapshotTrust, TemplateIdsError, reserve, seat};
 
 /// Blocks kept ready beside the one the miner allocates from.
 const READY_BLOCKS: usize = 2;
@@ -35,15 +42,29 @@ struct Ready {
     highest: u64,
 }
 
-fn lock(ready: &Mutex<Ready>) -> MutexGuard<'_, Ready> {
-    ready.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The seated marker this root keeps current.
+struct Ledger {
+    root: PathBuf,
+    marker: Marker,
+}
+
+/// What the startup seat, the refiller and the miner's reserver share.
+struct Shared {
+    store: Store,
+    ready: Mutex<Ready>,
+    /// `None` until the root's marker is written; held across recording a
+    /// block and making it ready, so no block becomes takeable unrecorded.
+    ledger: Mutex<Option<Ledger>>,
 }
 
 /// One store's template-id allocation: the startup seat, and the
 /// reserver the miner draws from.
 pub struct TemplateIds {
-    store: Store,
-    ready: Arc<Mutex<Ready>>,
+    shared: Arc<Shared>,
     refill: Sender<()>,
     refill_rx: Mutex<Option<Receiver<()>>>,
     replaying: Arc<AtomicBool>,
@@ -55,8 +76,11 @@ impl TemplateIds {
     pub fn new(store: Store) -> Self {
         let (refill, refill_rx) = mpsc::channel();
         Self {
-            store,
-            ready: Arc::new(Mutex::new(Ready::default())),
+            shared: Arc::new(Shared {
+                store,
+                ready: Mutex::new(Ready::default()),
+                ledger: Mutex::new(None),
+            }),
             refill,
             refill_rx: Mutex::new(Some(refill_rx)),
             replaying: Arc::new(AtomicBool::new(true)),
@@ -83,7 +107,7 @@ impl TemplateIds {
     /// The store the high-water lives in.
     #[must_use]
     pub fn store(&self) -> &Store {
-        &self.store
+        &self.shared.store
     }
 
     /// The reserver to install on the miner with
@@ -91,8 +115,7 @@ impl TemplateIds {
     #[must_use]
     pub fn reserver(&self) -> Box<dyn IdReserver> {
         Box::new(StoreIdReserver {
-            store: self.store.clone(),
-            ready: Arc::clone(&self.ready),
+            shared: Arc::clone(&self.shared),
             refill: self.refill.clone(),
             replaying: Arc::clone(&self.replaying),
         })
@@ -117,14 +140,15 @@ impl TemplateIds {
             (true, false) => BootstrapPolicy::IfStoreEmpty,
             (true, true) => BootstrapPolicy::Authorized,
         };
-        let seated = seat(&self.store, miner, policy)?;
-        lock(&self.ready).highest = miner.highest_allocated();
-        fill(&self.store, &self.ready)?;
-        if !lock(&self.ready).blocks.is_empty() {
+        let shared = &self.shared;
+        let seated = seat(&shared.store, miner, policy)?;
+        lock(&shared.ready).highest = miner.highest_allocated();
+        fill(shared)?;
+        if !lock(&shared.ready).blocks.is_empty() {
             miner
                 .reserve_current_block()
                 .map_err(TemplateIdsError::FirstBlock)?;
-            fill(&self.store, &self.ready)?;
+            fill(shared)?;
         }
         let receiver = self
             .refill_rx
@@ -132,37 +156,95 @@ impl TemplateIds {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(receiver) = receiver {
-            let (store, ready) = (self.store.clone(), Arc::clone(&self.ready));
+            let shared = Arc::clone(&self.shared);
             std::thread::Builder::new()
                 .name("template-id-refill".to_owned())
-                .spawn(move || refill_loop(&store, &ready, &receiver))
+                .spawn(move || refill_loop(&shared, &receiver))
                 .map_err(|e| TemplateIdsError::Refiller(e.to_string()))?;
         }
         Ok(seated)
+    }
+
+    /// Write the root's seated marker after [`Self::start`], recording
+    /// every block reserved so far, and keep it current from then on. A
+    /// root that seated before keeps its `seated_above`; a new one seats
+    /// above the high-water `seated` read.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateIdsError`] when the marker cannot be read or written.
+    pub fn record_seat(
+        &self,
+        snapshots_root: &Path,
+        trust: SnapshotTrust,
+        seated: Seated,
+    ) -> Result<(), TemplateIdsError> {
+        let base = match trust {
+            SnapshotTrust::Seated => {
+                read_marker(snapshots_root)?.ok_or_else(|| TemplateIdsError::MarkerInvalid {
+                    detail: "the seated marker vanished during startup".to_owned(),
+                })?
+            }
+            SnapshotTrust::Bootstrap | SnapshotTrust::PredatesHighWater => Marker {
+                seated_above: seated.high_water,
+                max_reserved_seen: seated.high_water,
+            },
+        };
+        let mut ledger = lock(&self.shared.ledger);
+        let highest = lock(&self.shared.ready).highest;
+        let marker = Marker {
+            max_reserved_seen: base.max_reserved_seen.max(highest),
+            ..base
+        };
+        write_marker(snapshots_root, marker)?;
+        *ledger = Some(Ledger {
+            root: snapshots_root.to_path_buf(),
+            marker,
+        });
+        Ok(())
     }
 }
 
 /// Reserve blocks until [`READY_BLOCKS`] are ready, or until the id
 /// domain has none left: fresh mints then fail once the held ids run
 /// out, and no retry can help.
-fn fill(store: &Store, ready: &Mutex<Ready>) -> Result<(), TemplateIdsError> {
+fn fill(shared: &Shared) -> Result<(), TemplateIdsError> {
     loop {
         let floor = {
-            let held = lock(ready);
+            let held = lock(&shared.ready);
             if held.blocks.len() >= READY_BLOCKS {
                 return Ok(());
             }
             held.highest
         };
-        let block = match reserve(store, floor) {
+        let block = match reserve(&shared.store, floor) {
             Ok(block) => block,
             Err(TemplateIdsError::Exhausted(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let mut held = lock(ready);
+        let mut ledger = lock(&shared.ledger);
+        if let Some(ledger) = ledger.as_mut() {
+            record(ledger, block.through())?;
+        }
+        let mut held = lock(&shared.ready);
         held.highest = held.highest.max(block.through());
         held.blocks.push_back(block);
     }
+}
+
+/// Raise the marker's `max_reserved_seen` to `through`, durably, before
+/// the block ending there can be taken.
+fn record(ledger: &mut Ledger, through: u64) -> Result<(), TemplateIdsError> {
+    if through <= ledger.marker.max_reserved_seen {
+        return Ok(());
+    }
+    let marker = Marker {
+        max_reserved_seen: through,
+        ..ledger.marker
+    };
+    write_marker(&ledger.root, marker)?;
+    ledger.marker = marker;
+    Ok(())
 }
 
 /// Refill on every request, retrying a failure with capped backoff until
@@ -170,11 +252,11 @@ fn fill(store: &Store, ready: &Mutex<Ready>) -> Result<(), TemplateIdsError> {
 /// refiller for good (RFC 0059 §3.1): an object that reappears may sit
 /// below blocks other receivers hold, so only a restart, which fails
 /// closed, may decide what it is worth.
-fn refill_loop(store: &Store, ready: &Mutex<Ready>, requests: &Receiver<()>) {
+fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
     while requests.recv().is_ok() {
         let mut backoff = BACKOFF_START;
         loop {
-            match fill(store, ready) {
+            match fill(shared) {
                 Ok(()) => break,
                 Err(error @ TemplateIdsError::HighWaterDeleted) => {
                     tracing::error!(
@@ -200,15 +282,14 @@ fn refill_loop(store: &Store, ready: &Mutex<Ready>, requests: &Receiver<()>) {
 /// The miner's side: an in-memory pop, never a store call once the
 /// listeners are open.
 struct StoreIdReserver {
-    store: Store,
-    ready: Arc<Mutex<Ready>>,
+    shared: Arc<Shared>,
     refill: Sender<()>,
     replaying: Arc<AtomicBool>,
 }
 
 impl StoreIdReserver {
     fn take(&self, floor: u64) -> Option<IdBlock> {
-        let mut held = lock(&self.ready);
+        let mut held = lock(&self.shared.ready);
         std::iter::from_fn(|| held.blocks.pop_front())
             .find_map(|block| IdBlock::new(block.after().max(floor), block.through()))
     }
@@ -218,7 +299,7 @@ impl IdReserver for StoreIdReserver {
     fn reserve(&mut self, floor: u64) -> Result<IdBlock, IdReservationError> {
         let taken = match self.take(floor) {
             None if self.replaying.load(Ordering::Acquire) => {
-                fill(&self.store, &self.ready).map_err(IdReservationError::new)?;
+                fill(&self.shared).map_err(IdReservationError::new)?;
                 self.take(floor)
             }
             taken => taken,
@@ -263,7 +344,7 @@ mod tests {
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
         ids.start(&mut miner, true).expect("start");
-        let ready: Vec<(u64, u64)> = lock(&ids.ready)
+        let ready: Vec<(u64, u64)> = lock(&ids.shared.ready)
             .blocks
             .iter()
             .map(|b| (b.after(), b.through()))
@@ -282,18 +363,25 @@ mod tests {
         assert_eq!(high_water.reserved_through, 500 + 3 * BLOCK);
     }
 
+    fn shared(store: Store) -> Arc<Shared> {
+        Arc::new(Shared {
+            store,
+            ready: Mutex::new(Ready::default()),
+            ledger: Mutex::new(None),
+        })
+    }
+
     #[test]
     fn a_taken_block_never_reaches_below_the_floor() {
-        let ready = Arc::new(Mutex::new(Ready::default()));
+        let shared = shared(Store::in_memory());
         let (refill, _rx) = mpsc::channel();
         {
-            let mut held = lock(&ready);
+            let mut held = lock(&shared.ready);
             held.blocks.push_back(IdBlock::new(0, 10).expect("block"));
             held.blocks.push_back(IdBlock::new(10, 20).expect("block"));
         }
         let mut reserver = StoreIdReserver {
-            store: Store::in_memory(),
-            ready,
+            shared,
             refill,
             replaying: Arc::new(AtomicBool::new(false)),
         };
@@ -309,11 +397,41 @@ mod tests {
         store.put_blocking(HIGH_WATER_KEY, encode(50)).expect("put");
         let (refill, _rx) = mpsc::channel();
         StoreIdReserver {
-            store,
-            ready: Arc::new(Mutex::new(Ready::default())),
+            shared: shared(store),
             refill,
             replaying: Arc::new(AtomicBool::new(replaying)),
         }
+    }
+
+    #[test]
+    fn every_block_is_recorded_in_the_marker_before_it_is_ready() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store = Store::in_memory();
+        store
+            .put_blocking(HIGH_WATER_KEY, encode(500))
+            .expect("put");
+        let ids = TemplateIds::new(store);
+        let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
+        let seated = ids.start(&mut miner, true).expect("start");
+        ids.record_seat(tmp.path(), SnapshotTrust::PredatesHighWater, seated)
+            .expect("seat");
+        let marker = |root: &Path| read_marker(root).expect("read").expect("present");
+        assert_eq!(
+            marker(tmp.path()),
+            Marker {
+                seated_above: 500,
+                max_reserved_seen: 500 + 3 * BLOCK
+            },
+            "startup's three blocks are recorded"
+        );
+
+        lock(&ids.shared.ready).blocks.clear();
+        fill(&ids.shared).expect("refill");
+        assert_eq!(
+            marker(tmp.path()).max_reserved_seen,
+            500 + 5 * BLOCK,
+            "each refilled block is recorded"
+        );
     }
 
     #[test]

@@ -5,7 +5,8 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use ourios_ingester::template_ids::{BLOCK, HIGH_WATER_KEY, mark_seated};
+use ourios_ingester::recovery::RecoveryDriverError;
+use ourios_ingester::template_ids::{BLOCK, HIGH_WATER_KEY, TemplateIdsError, mark_seated};
 
 use crate::rfc0059_support::Node;
 
@@ -16,7 +17,8 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// Scenario RFC0059.18 — after the object is deleted under a running
 /// receiver, the refiller neither re-creates it nor reserves from one
 /// that reappears; the blocks already held are spent without overlap,
-/// then fresh mints fail while known templates keep attaching.
+/// then fresh mints fail while known templates keep attaching; and a
+/// restart over the stale copy fails closed as a rollback.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
 fn rfc0059_18_a_high_water_deleted_while_live_is_never_recreated() {
@@ -72,5 +74,27 @@ fn rfc0059_18_a_high_water_deleted_while_live_is_never_recreated() {
         node.high_water_bytes().as_deref(),
         Some(br#"{"reserved_through": 0}"#.as_slice()),
         "the reappeared object is left alone"
+    );
+
+    // And a restart over that stale copy fails closed, naming a rollback.
+    drop(running);
+    let Err(err) = node.restart() else {
+        panic!("a restart over a rolled-back high-water must fail");
+    };
+    assert!(
+        matches!(
+            err,
+            RecoveryDriverError::TemplateIds(TemplateIdsError::HighWaterRolledBack {
+                seen,
+                found: 0
+            }) if seen == held
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("rolled back"), "{err}");
+    assert_eq!(
+        node.high_water_bytes().as_deref(),
+        Some(br#"{"reserved_through": 0}"#.as_slice()),
+        "the failed restart writes nothing"
     );
 }

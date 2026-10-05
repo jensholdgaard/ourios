@@ -39,9 +39,9 @@ the §5 scenarios that cover it:
 
 | Touched | How | Covered by |
 |---|---|---|
-| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16 |
+| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16, .17 |
 | `CLAUDE.md` §3.3, bit-identical reconstruction | the registry's last-wins fold would render old rows against the wrong text; an exhausted range must keep the body | RFC0059.1, .4 |
-| `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16 |
+| `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16, .17 |
 | `CLAUDE.md` §3.7, multi-tenancy | ids stay unique across tenants; the scenarios mint for two tenants | RFC0059.1, .8 |
 | Hazard #1, template miner correctness | allocation, restore and replay order inside the miner | RFC0059.3, .4, .10, .13 |
 | Hazard #5, template schema evolution | re-minted old shapes stay drift on fresh ids, never collisions; restore equivalence holds up to renaming | RFC0059.1, .9 |
@@ -131,10 +131,13 @@ rebuildable cache.
   object was deleted. A bootstrap then would scan only published ids and
   could reseat `N` below a block another receiver still holds, so the
   start stops with an error naming the object instead (RFC0059.14).
-- **The object must never be deleted.** Operators should protect
-  `miner/template_ids.v1.json` from deletion, with a bucket policy that
-  denies `DeleteObject` on it, or an object lock or retention where the
-  store offers one. No Ourios role is granted a delete there (§3.6).
+- **The object must never be deleted.** No documented Ourios policy
+  grants a delete that reaches `miner/`: the only role holding
+  `s3:DeleteObject`, the compactor, has it on `data/*`, `erasure/*` and
+  `backfill/*` alone. Every documented policy also carries an explicit
+  `Deny` of `s3:DeleteObject` on `miner/*`, so a later widening of a
+  delete grant still cannot reach the object (§3.6, RFC0059.17). Object
+  lock or retention, where the store offers it, adds a second control.
 
 ### 3.2 Reservation: write before allocate
 
@@ -511,23 +514,37 @@ disjoint, and no per-node key is needed.
   at all (`data-pvc.yaml`: "coherent only on one node or with a
   ReadWriteMany class").
 
-**Permissions.** The receiver's object-store role gains:
+**Permissions.** Every key sits under one top-level prefix (behind the
+configured `storage.s3.prefix`, written `PREFIX/` below; with no prefix it
+is dropped). Each is written by these roles, as the code's writers show:
+
+| Prefix      | Receiver                     | Compactor                                        | Querier                     |
+| ----------- | ---------------------------- | ------------------------------------------------ | --------------------------- |
+| `data/`     | puts record files            | puts compacted files and manifests; deletes inputs and orphans | reads              |
+| `audit/`    | puts audit events            | puts erasure events                              | reads; template-map cache key |
+| `miner/`    | gets and puts the high-water | none                                             | none                        |
+| `erasure/`  | none                         | gets, puts and deletes erasure markers           | none                        |
+| `backfill/` | none                         | gets, puts and deletes backfill locks            | none                        |
+
+The receiver's object-store role therefore gains, beyond its existing
+`s3:PutObject` on `PREFIX/data/*` and `PREFIX/audit/*`:
 - **always:** `s3:GetObject` and `s3:PutObject` on the objects
-  `arn:aws:s3:::BUCKET/miner/*`, and `s3:ListBucket` on the bucket
-  `arn:aws:s3:::BUCKET` with an `s3:prefix` condition of `miner/*`.
+  `arn:aws:s3:::BUCKET/PREFIX/miner/*`, and `s3:ListBucket` on the bucket
+  `arn:aws:s3:::BUCKET` with an `s3:prefix` condition of `PREFIX/miner/*`.
   Conditional writes (`If-Match`, `If-None-Match`) need nothing beyond
   `s3:PutObject`. No delete is granted.
 - **for the one-time upgrade bootstrap:** `s3:GetObject` on the objects
-  `BUCKET/data/*` and `BUCKET/audit/*`, and `data/*` and `audit/*` added
-  to the `s3:prefix` condition.
+  `BUCKET/PREFIX/data/*` and `BUCKET/PREFIX/audit/*`, and
+  `PREFIX/data/*` and `PREFIX/audit/*` added to the `s3:prefix`
+  condition.
 
 `s3:ListBucket` is a bucket action. AWS evaluates it against the bucket
 ARN, so a grant on an object ARN such as `BUCKET/miner/*` never matches
 and the listing is denied. The `StringLike` condition on `s3:prefix` is
 what scopes it: the receiver may list under those prefixes only, not the
-whole bucket. The minimal policy during the upgrade, with the
-`data/*` and `audit/*` entries removed afterwards (a `storage.s3.prefix`
-goes in front of each path and each `s3:prefix` value):
+whole bucket. Object actions go on one object ARN per prefix the role
+writes, never `BUCKET/*`. The receiver's minimal policy during the
+upgrade, with the `data/*` and `audit/*` reads removed afterwards:
 
 ```json
 {
@@ -536,15 +553,19 @@ goes in front of each path and each `s3:prefix` value):
     {
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::BUCKET/*"
+      "Resource": [
+        "arn:aws:s3:::BUCKET/PREFIX/data/*",
+        "arn:aws:s3:::BUCKET/PREFIX/audit/*",
+        "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+      ]
     },
     {
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": [
-        "arn:aws:s3:::BUCKET/miner/*",
-        "arn:aws:s3:::BUCKET/data/*",
-        "arn:aws:s3:::BUCKET/audit/*"
+        "arn:aws:s3:::BUCKET/PREFIX/miner/*",
+        "arn:aws:s3:::BUCKET/PREFIX/data/*",
+        "arn:aws:s3:::BUCKET/PREFIX/audit/*"
       ]
     },
     {
@@ -552,23 +573,36 @@ goes in front of each path and each `s3:prefix` value):
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::BUCKET",
       "Condition": {
-        "StringLike": { "s3:prefix": ["miner/*", "data/*", "audit/*"] }
+        "StringLike": {
+          "s3:prefix": ["PREFIX/miner/*", "PREFIX/data/*", "PREFIX/audit/*"]
+        }
       }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/miner/*"
     }
   ]
 }
 ```
 
-`s3:PutObject` covers `BUCKET/*` because the receiver already writes
-`data/` and `audit/` objects; RFC 0059 adds only the `miner/` key to it.
+**No documented policy can delete the high-water.** The compactor's
+documented `s3:DeleteObject` is scoped to `PREFIX/data/*`,
+`PREFIX/erasure/*` and `PREFIX/backfill/*`, where it reclaims; it was
+previously documented on `PREFIX/*`, which reached `miner/`. The querier's
+optional cache grant deletes only its `audit/tenant_id=*/template_map*`
+key. Every documented policy (receiver, compactor, querier) also ends with
+the explicit `Deny` above, as belt and braces. The chart README carries
+all three policies, and a test enforces the rule on them (RFC0059.17).
 
 Before this RFC the chart documented the receiver as `PutObject` only.
 These grants must be in place **before** the scale-to-one upgrade step,
 and the migration-only reads may be revoked once the high-water exists.
 A denied call fails startup with an error naming the action it lacked
 (`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`, RFC0059.15). The
-chart's README and `values.yaml` document both sets, and the release
-notes carry them.
+chart's README and `values.yaml` document every role's set, and the
+release notes carry the receiver's.
 
 **Out of scope.** The same template reaching two replicas gets two ids.
 That is drift across replicas (hazard #5), not a collision.
@@ -851,8 +885,17 @@ The ids are referenced from test code.
 >     `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` and the upgrade step, and
 >     writes neither the object nor the marker;
 >   - it bootstraps with a floor at or above every published id, and
->     writes its marker
+>   writes its marker
 > - **And** the setting is off unless the configuration sets it
+
+> **Scenario RFC0059.17 — No documented policy can delete the high-water**
+> - **Given** every JSON IAM policy the chart README documents
+> - **When** each is evaluated for `s3:DeleteObject` on
+>   `miner/template_ids.v1.json`, with and without a `storage.s3.prefix`
+> - **Then** no `Allow` statement's actions and resources reach it
+>   (wildcards such as `s3:*` and `BUCKET/*` included)
+> - **And** each policy holds an explicit `Deny` of `s3:DeleteObject`
+>   that covers it
 
 ## 6. Testing strategy
 
@@ -862,6 +905,9 @@ path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
   fixture), .5, .6, .9, .11, .12, .13, .14, .15 and .16.
+- RFC0059.17 parses the chart README's JSON policies (`include_str!`)
+  and evaluates their action and resource wildcards against the
+  high-water key.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none

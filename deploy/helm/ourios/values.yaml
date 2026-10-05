@@ -122,10 +122,12 @@ receiver:
   # give each role its own IAM identity — see "Per-role IAM" in the README).
   # create=false (default) uses the shared serviceAccount below. With IRSA,
   # annotate with this role's eks.amazonaws.com/role-arn — the receiver's
-  # role needs s3:PutObject, plus s3:GetObject and s3:ListBucket on miner/
-  # for the template-id high-water (RFC 0059); for the one-time upgrade
-  # bootstrap also s3:ListBucket and s3:GetObject on data/ and audit/,
-  # granted BEFORE the scale-to-one step. It never deletes. `name`:
+  # role needs s3:PutObject, plus s3:GetObject on the objects miner/* for
+  # the template-id high-water (RFC 0059); for the one-time upgrade
+  # bootstrap also s3:GetObject on data/* and audit/*, granted BEFORE the
+  # scale-to-one step. s3:ListBucket goes on the bucket arn (not an object
+  # arn) with an s3:prefix condition: miner/*, plus data/* and audit/* for
+  # the bootstrap (README has the JSON policy). It never deletes. `name`:
   # create=true + empty name renders `<fullname>-receiver`;
   # create=true + name overrides that; create=false + name binds an
   # EXISTING ServiceAccount of that name (managed out-of-band).

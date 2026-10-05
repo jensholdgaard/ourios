@@ -22,8 +22,9 @@ Workloads:
 {{- if .Values.receiver.enabled }}
   - receiver  (StatefulSet, {{ .Values.receiver.replicas }} replica(s)) — OTLP gRPC :4317 + HTTP :4318; per-replica WAL PVC ({{ .Values.receiver.wal.size }}, local, never S3).
     Upgrading from a release before RFC 0059: (1) grant the receiver's role
-    the permissions in the chart README's "Per-role IAM"; (2) scale
-    receiver.replicas to 0; (3) start one upgraded replica with
+    the permissions in the chart README's "Per-role IAM" (s3:ListBucket goes
+    on the bucket arn with an s3:prefix condition, never on an object arn);
+    (2) scale receiver.replicas to 0; (3) start one upgraded replica with
     OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true in receiver.extraEnv (it
     bootstraps the template-id high-water once); (4) once it has seated,
     remove that variable and scale out. A rolling update that keeps an old

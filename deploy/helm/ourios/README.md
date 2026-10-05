@@ -245,21 +245,60 @@ cleanly:
 | Role      | S3 actions                                            | Holds delete? |
 | --------- | ----------------------------------------------------- | ------------- |
 | querier   | `GetObject`, `ListBucket` (see cache note)            | no            |
-| receiver  | `PutObject`; `GetObject` + `ListBucket` on `miner/`; once, `GetObject` + `ListBucket` on `data/` and `audit/` (see below) | no |
+| receiver  | `PutObject`; `GetObject` on `miner/*`; `ListBucket` on the bucket for prefix `miner/*`; once, also `data/` and `audit/` (see below) | no |
 | compactor | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`| **only one**  |
 
 The receiver *writes* data/audit objects and never deletes. Since RFC 0059
 (durable template-id allocation) it also keeps one small object,
 `miner/template_ids.v1.json`, so it needs:
 
-- **always:** `GetObject`, `PutObject` and `ListBucket` (prefix `miner/`) on
-  `miner/*`. The reservation writes it with `If-Match` / `If-None-Match`
-  conditional puts, which need only `PutObject`.
-- **for the one-time upgrade bootstrap only:** `ListBucket` (prefixes
-  `data/`, `audit/`) and `GetObject` on `data/*` and `audit/*`. The first
-  upgraded receiver reads every file's footer once to compute the
-  high-water. Grant these **before** the scale-to-one upgrade step, and
-  revoke them afterwards if you want the narrower policy back.
+- **always:** `GetObject` and `PutObject` on the objects `miner/*`, and
+  `ListBucket` on the bucket for the prefix `miner/*`. The reservation writes
+  with `If-Match` / `If-None-Match` conditional puts, which need only
+  `PutObject`.
+- **for the one-time upgrade bootstrap only:** `GetObject` on the objects
+  `data/*` and `audit/*`, and `ListBucket` on the bucket for the prefixes
+  `data/*` and `audit/*`. The first upgraded receiver reads every file's
+  footer once to compute the high-water. Grant these **before** the
+  scale-to-one upgrade step, and revoke them afterwards if you want the
+  narrower policy back.
+
+`ListBucket` is a bucket action: AWS checks it against the bucket arn, never
+an object arn, so it is scoped with an `s3:prefix` condition rather than a
+resource path. Without the condition it would allow listing every key in the
+bucket. The receiver's policy during the upgrade (drop the `data/*` and
+`audit/*` entries afterwards; with a `storage.s3.prefix`, put it in front of
+each path and each `s3:prefix` value):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<bucket>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::<bucket>/miner/*",
+        "arn:aws:s3:::<bucket>/data/*",
+        "arn:aws:s3:::<bucket>/audit/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["miner/*", "data/*", "audit/*"] }
+      }
+    }
+  ]
+}
+```
 
 **The upgrade to RFC 0059**, in order:
 

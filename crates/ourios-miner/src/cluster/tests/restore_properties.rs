@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::snapshot::{load_snapshot, snapshot};
 use crate::upstream::LOG_RECORD_TEMPLATE_ATTR;
@@ -191,6 +193,69 @@ proptest! {
         }
         assert_same_state(&fresh, &original)?;
     }
+
+    /// Issue #898 (property) — whichever tenants' snapshots are
+    /// discarded, and whatever replay and new traffic then mine, a
+    /// cluster seated past the highest id ever issued only hands out an
+    /// issued id when the record attaches to a template a kept snapshot
+    /// restored under that very id.
+    #[test]
+    fn a_cluster_seated_past_the_issued_ids_never_reissues_one(
+        config in config(),
+        before in prop::collection::vec(op(), 1..200),
+        kept in prop::collection::vec(any::<bool>(), 2),
+        survivors in 0usize..200,
+        after in prop::collection::vec(op(), 0..60),
+    ) {
+        let mut original = MinerCluster::new(config);
+        let issued: HashSet<u64> = before
+            .iter()
+            .map(|op| original.ingest(&record(op)))
+            .filter(|&id| id != NO_TEMPLATE)
+            .collect();
+        let mut fresh = MinerCluster::new(config);
+        let mut restored_ids = HashSet::new();
+        for (tenant, _) in tenants().iter().zip(&kept).filter(|(_, keep)| **keep) {
+            let state = original.snapshot_state(tenant);
+            restored_ids.extend(snapshot_ids(&state));
+            fresh
+                .restore_tenant(tenant, &state)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        }
+        if let Some(&highest) = issued.iter().max() {
+            fresh.allocate_past_issued(highest).map_err(|e| TestCaseError::fail(e.to_string()))?;
+        }
+
+        // A kept tenant's surviving frames are folded into its snapshot.
+        let replayed = before[before.len().saturating_sub(survivors)..]
+            .iter()
+            .filter(|op| !kept[tenant_of(op)]);
+        for op in replayed.chain(&after) {
+            let id = fresh.ingest(&record(op));
+            prop_assert!(
+                !issued.contains(&id) || restored_ids.contains(&id),
+                "{:?} took issued id {}", op, id,
+            );
+        }
+    }
+}
+
+fn tenant_of(op: &Op) -> usize {
+    match op {
+        Op::Line { tenant, .. } | Op::Annotated { tenant, .. } | Op::Event { tenant, .. } => {
+            *tenant
+        }
+    }
+}
+
+/// Every template id a snapshot state carries.
+fn snapshot_ids(state: &crate::snapshot::SnapshotState) -> impl Iterator<Item = u64> + '_ {
+    state
+        .leaves
+        .iter()
+        .map(|l| l.template_id)
+        .chain(state.structured_templates.iter().map(|s| s.template_id))
+        .chain(state.adopted_templates.iter().map(|a| a.template_id))
 }
 
 /// The #892 shape: a full node routes new first tokens through the

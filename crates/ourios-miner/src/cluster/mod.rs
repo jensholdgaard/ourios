@@ -98,8 +98,7 @@ use plan::{
 ///   line is treated as a parse failure
 ///   (`parse_failures_total` increments).
 ///
-/// Real templates always have id `>= 1` (see `next_template_id`
-/// initialisation).
+/// Real templates always have id `>= 1` (see `IdRange::new`).
 pub const NO_TEMPLATE: u64 = 0;
 
 /// A multi-tenant in-memory miner.
@@ -131,8 +130,9 @@ pub struct MinerCluster {
     // and silently violates §3.7.2. The reconciliation: the id
     // *space* is cluster-wide, but each tenant's slice of that
     // space is monotonic with respect to that tenant's allocation
-    // order — both invariants hold.
-    next_template_id: u64,
+    // order — both invariants hold. Ids come only from durably
+    // reserved blocks (`id_alloc`), so none is ever issued twice.
+    ids: IdRange,
     // Audit-event sink per RFC §6.4. Boxed trait object so the
     // WAL sink (post-`ourios-wal`) drops in by swapping the impl;
     // the trait is `Send` so the cluster stays moveable across
@@ -231,7 +231,7 @@ enum MinedCapture {
 /// the `template_id` allocated on first observation of that tuple.
 ///
 /// `template_id` allocation lives on [`MinerCluster`], not here
-/// — see the `next_template_id` comment there for why.
+/// — see the `ids` comment there for why.
 ///
 /// `template_count` is a cache of the number of templates this
 /// tenant holds (tree leaves + structured-template entries),
@@ -616,9 +616,15 @@ impl MinerCluster {
 
 mod build;
 mod canonicals;
+mod id_alloc;
 mod persist;
 mod plan;
+mod structured;
 
+use id_alloc::IdRange;
+pub use id_alloc::{
+    ID_RESERVATION_FAILED, IdBlock, IdReservationError, IdReserver, IdSpaceExhausted,
+};
 pub use persist::{AdoptedSnapshot, LeafSnapshot, RestoreError};
 
 impl MinerCluster {
@@ -922,8 +928,10 @@ impl MinerCluster {
                 // ceiling the mint diverts to the §6.3
                 // parse-failure path — body retained, counted,
                 // never force-merged.
-                if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
-                    return self.emit_string_parse_failure(line, parts, "template_ceiling");
+                if let Some(reason) =
+                    self.mint_blocked(&record.tenant_id, effective_config.max_templates)
+                {
+                    return self.emit_string_parse_failure(line, parts, reason);
                 }
                 let new_id = self.create_new_leaf(line, masked_line, observed);
                 self.emit_fresh_leaf_record(line, parts, new_id, FreshLeafZone::Clean)
@@ -957,10 +965,10 @@ impl MinerCluster {
                         // mints rather than force-merges into the
                         // too-weak candidate, so at the ceiling it
                         // must fail parse, not merge.
-                        if self
-                            .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
+                        if let Some(reason) =
+                            self.mint_blocked(&record.tenant_id, effective_config.max_templates)
                         {
-                            return self.emit_string_parse_failure(line, parts, "template_ceiling");
+                            return self.emit_string_parse_failure(line, parts, reason);
                         }
                         let new_id = self.create_new_leaf(line, masked_line, observed);
                         self.emit_fresh_leaf_record(
@@ -1107,6 +1115,11 @@ impl MinerCluster {
         let Ok(alignment) = upstream::align(&parsed, raw) else {
             return self.reject_upstream(record, service, "alignment");
         };
+        // Interning needs a fresh id. Without a reservable one the line
+        // is mined instead, which attaches or counts the failure.
+        if !self.ids_ready() {
+            return None;
+        }
 
         let owned_tokens = parsed.to_owned_tokens();
         let canonical = format_template(&owned_tokens);
@@ -1135,7 +1148,7 @@ impl MinerCluster {
                     (id, version)
                 }
                 AdoptResolution::Interned(id) => {
-                    self.next_template_id += 1;
+                    self.ids.consume();
                     self.emit_adopted_audit(line, id, 1, &canonical);
                     (id, 1)
                 }
@@ -1284,7 +1297,7 @@ impl MinerCluster {
         config: &MinerConfig,
     ) -> AdoptResolution {
         let effective_config = *config;
-        let candidate_id = self.next_template_id;
+        let candidate_id = self.ids.peek();
         let assoc_limit = usize::from(config.upstream_association_limit);
         let state = self
             .tenants
@@ -1403,19 +1416,6 @@ impl MinerCluster {
         });
     }
 
-    /// RFC 0023 §3.1 bound 2 — whether the tenant's template count
-    /// has reached the configured ceiling. The basis is Drain-tree
-    /// leaves **plus** adoption-interned templates (RFC0050.5:
-    /// adopted templates count against `max_templates`; tree-backed
-    /// adopted entries are already counted as leaves). Structured
-    /// templates stay deliberately outside the bound. An unseen
-    /// tenant is trivially below it.
-    fn at_template_ceiling(&self, tenant: &TenantId, max_templates: u32) -> bool {
-        self.tenants
-            .get(tenant)
-            .is_some_and(|s| s.leaf_count + s.owned_adopted_count >= max_templates as usize)
-    }
-
     /// RFC §6.2 step 4 — find the best-matching leaf in the
     /// `(severity, scope, length, prefix)` bucket, or `None` if
     /// the tenant is unseen, the prefix path doesn't exist, or
@@ -1506,7 +1506,7 @@ impl MinerCluster {
         // Read (don't consume) the allocator: the RFC 0050
         // adopted-first-mined-second convergence below may reuse an
         // adoption-interned id instead of minting.
-        let candidate_id = self.next_template_id;
+        let candidate_id = self.ids.peek();
 
         // Resolve effective config BEFORE the entry/get-or-insert
         // borrow on `self.tenants` — the `or_insert_with` closure
@@ -1603,7 +1603,7 @@ impl MinerCluster {
             // does not bump `template_count`: the identity already
             // counted when adoption interned it.
             if new_id == candidate_id {
-                self.next_template_id += 1;
+                self.ids.consume();
                 state.template_count += 1;
             }
             state.leaf_count += 1;
@@ -1749,46 +1749,6 @@ impl MinerCluster {
                 template_id
             }
         }
-    }
-
-    /// `Body::Structured` short-circuit per RFC 0001 §6.2 step 0 as
-    /// extended by RFC 0037 §3.1. The tree is not walked; the
-    /// per-tenant `(severity_number, scope_name, event_name) →
-    /// template_id` map is the entire lookup. First observation of a
-    /// tuple allocates; subsequent records with the same tuple reuse.
-    /// Structured records never widen and never emit audit events.
-    fn ingest_structured(&mut self, line: StructuredLine<'_>) -> u64 {
-        let template_id = self.structured_template_id(line.record);
-        self.emit_structured(line, template_id);
-        template_id
-    }
-
-    /// The structured-template id for `record`'s `(severity_number,
-    /// scope_name, event_name)` tuple, allocated on its first sight.
-    fn structured_template_id(&mut self, record: &OtlpLogRecord) -> u64 {
-        let key = (
-            record.severity_number,
-            record.scope_name.clone(),
-            record.event_name.clone(),
-        );
-        // Same pre-compute pattern as `create_new_leaf`: resolve
-        // effective config before the mutable borrow on
-        // `self.tenants`.
-        let effective_config = self.effective_config(&record.tenant_id);
-        let state = self
-            .tenants
-            .entry(record.tenant_id.clone())
-            .or_insert_with(|| TenantState::new(effective_config));
-        if let Some(&existing_id) = state.structured_templates.get(&key) {
-            return existing_id;
-        }
-        let new_id = self.next_template_id;
-        self.next_template_id += 1;
-        state.structured_templates.insert(key, new_id);
-        // Same cache invariant as create_new_leaf: one fresh
-        // allocation, one cache increment.
-        state.template_count += 1;
-        new_id
     }
 
     /// Emit a structured record's data row under `template_id`.

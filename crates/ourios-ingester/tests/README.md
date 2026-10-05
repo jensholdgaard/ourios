@@ -44,5 +44,12 @@ one-per-binary:
   `rfc0038_3` because a process holds one tracer install and that file owns
   the no-inbound-context (root) case.
 
+## Global-allocator binaries
+
+- `rfc0059_7_bootstrap_heap.rs`: RFC0059.7 asserts the template-id
+  bootstrap scan's peak heap in bytes, under `dhat`'s testing-mode global
+  allocator. A global allocator is process-wide, so it cannot share the
+  `it` binary.
+
 `fixtures/` holds the crash-fixture **`[[bin]]` targets** (SIGKILL'd by
 harness tests via `CARGO_BIN_EXE_*`), not test binaries.

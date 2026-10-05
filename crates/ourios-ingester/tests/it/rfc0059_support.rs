@@ -14,7 +14,9 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use ourios_config::MinerConfig;
-use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
+use ourios_core::audit::{
+    AuditEvent, AuditPayload, SharedAuditSink, TEMPLATE_INITIAL_VERSION, TemplateChange,
+};
 use ourios_core::record::{MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::barrier::CutOutcome;
@@ -125,9 +127,11 @@ impl Node {
     ) -> Result<Restarted, RecoveryDriverError> {
         let ids = TemplateIds::new(store).with_bootstrap_allowed(allow_bootstrap);
         let records = SharedRecordSink::new();
+        let audit = SharedAuditSink::new();
         let mut miner = MinerCluster::new(MinerConfig::default())
             .with_record_sink(Box::new(records.clone()))
             .with_id_reserver(ids.reserver());
+        drop(miner.replace_audit_sink(Box::new(audit.clone())));
         let mut wal = Wal::open(WalConfig {
             segment_age_secs: 1,
             ..wal_config(&self.wal)
@@ -138,6 +142,7 @@ impl Node {
             report,
             miner,
             records,
+            audit,
             _ids: ids,
         })
     }
@@ -174,6 +179,8 @@ pub struct Restarted {
     pub report: RecoveryReport,
     pub miner: MinerCluster,
     pub records: SharedRecordSink,
+    /// What recovery and the miner published to the audit sink.
+    pub audit: SharedAuditSink,
     _ids: TemplateIds,
 }
 
@@ -249,11 +256,17 @@ pub async fn publish(rig: &BarrierRig, tenant: &str, bodies: &[&str], events: &[
     }
 }
 
-/// Let the open segment age out, cut so the idle rotation seals it, and
-/// run one housekeeping pass that reclaims what the cut covered.
-pub async fn cut_and_reclaim(rig: &BarrierRig) {
+/// Let the open segment age out and cut, so the idle rotation seals it
+/// and the checkpoint stamps, reclaiming nothing.
+pub async fn cut(rig: &BarrierRig) {
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     assert_eq!(rig.barrier.tick(&rig.pipeline, true), CutOutcome::Stamped);
+}
+
+/// [`cut`], then one housekeeping pass that reclaims what the cut
+/// covered.
+pub async fn cut_and_reclaim(rig: &BarrierRig) {
+    cut(rig).await;
     let housekeeper = Housekeeper::new(
         Arc::clone(&rig.commits),
         Arc::clone(&rig.barrier),

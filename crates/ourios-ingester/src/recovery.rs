@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use ourios_core::audit::{AuditEvent, AuditSink};
+use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
 use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, RestoreError};
@@ -377,6 +377,9 @@ fn replay_gated(
 /// miner's state alone, its rows and events being published already; any
 /// other is mined and published. `max(X, S)` is therefore the record
 /// gate, and `X` the audit gate, since a folded frame regenerates nothing.
+/// The one exception is a template a frame at or below `X` mints afresh:
+/// its id lies above the high-water, so its events were never published
+/// (RFC 0059 §3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Folded,
@@ -445,6 +448,9 @@ struct ReplayCapture {
     record_sink: Box<dyn RecordSink>,
     audit_sink: Box<dyn AuditSink>,
     withheld: Withheld,
+    /// The highest id seated before replay: every id above it is minted
+    /// by this replay.
+    seated: u64,
 }
 
 impl ReplayCapture {
@@ -456,6 +462,7 @@ impl ReplayCapture {
             records,
             events,
             withheld: Withheld::default(),
+            seated: miner.highest_allocated(),
         }
     }
 
@@ -475,10 +482,29 @@ impl ReplayCapture {
                     self.record_sink.emit(record);
                 }
             }
-            Route::MinerOnly | Route::Folded => {
+            Route::MinerOnly => {
+                self.withheld.records += records.len() as u64;
+                for event in events {
+                    self.publish_if_reminted(event);
+                }
+            }
+            Route::Folded => {
                 self.withheld.records += records.len() as u64;
                 self.withheld.events += events.len() as u64;
             }
+        }
+    }
+
+    /// Publish an event of a template this replay minted, whose id no
+    /// published event binds yet, so rows ingested after startup resolve;
+    /// withhold every other, whose original was published before the
+    /// crash.
+    fn publish_if_reminted(&mut self, event: AuditEvent) {
+        match &event.payload {
+            AuditPayload::Template { template_id, .. } if *template_id > self.seated => {
+                self.audit_sink.emit(event);
+            }
+            _ => self.withheld.events += 1,
         }
     }
 

@@ -1,14 +1,16 @@
 # Production OCI image for the `ourios-server` binary (first shipping
 # milestone, workstream A). Multi-stage, glibc: a Debian-based Rust
-# builder pinned to the MSRV, then a distroless `cc` runtime that carries
-# only glibc + the binary. Distroless `cc-debian12` is multi-arch, so the
-# CI build cross-builds linux/amd64 + linux/arm64 from one Dockerfile.
+# builder pinned to the `rust-toolchain.toml` version, then a distroless
+# `cc` runtime that carries only glibc + the binary. Distroless
+# `cc-debian12` is multi-arch, so the CI build cross-builds linux/amd64 +
+# linux/arm64 from one Dockerfile.
 
-# Builder: at or above the workspace MSRV (Cargo.toml `rust-version = 1.88`),
-# pinned by digest for reproducibility. This rust ref carries a tag, so
-# Renovate's docker manager bumps both the tag and the digest — no directive
-# comment needed.
-FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
+# Builder: the exact version `rust-toolchain.toml` pins, pinned by digest for
+# reproducibility. The two must match: `COPY . .` brings the toolchain file
+# in, and rustup would otherwise download that version during the build.
+# This rust ref carries a tag, so Renovate's docker manager bumps both the
+# tag and the digest, grouped with the toolchain-file bump.
+FROM rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
 WORKDIR /build
 COPY . .
 # `--locked` so a stale Cargo.lock fails the build instead of being

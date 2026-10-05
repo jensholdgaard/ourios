@@ -1,5 +1,5 @@
 # Static-musl OCI image variant for the `ourios-server` binary (#263):
-# the same MSRV-pinned Debian builder as `Dockerfile`, but targeting
+# the same toolchain-pinned Debian builder as `Dockerfile`, but targeting
 # `*-unknown-linux-musl` (static by default for musl targets), with a
 # `distroless/static` runtime — no libc, no libgcc, no libssl, so the
 # OS-package vulnerability surface Trivy scans is ~empty. Published
@@ -14,7 +14,7 @@
 # so Renovate bumps tag + digest). musl-tools provides the native musl-gcc each
 # architecture leg needs — the CI legs run on native runners, so this is
 # a native musl build, not a cross-compile.
-FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
+FROM rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
 # ca-certificates is installed explicitly rather than assumed from the
 # base image — the scratch runtime stage COPYs the bundle out of here.
 RUN apt-get update \

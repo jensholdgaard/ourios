@@ -3,7 +3,7 @@
 Thanks for your interest! ourios is design-first and pre-release.
 
 ## Dev setup
-- Install Rust via `rust-toolchain.toml`, which selects the stable channel (the
+- Install Rust via `rust-toolchain.toml`, which pins an exact stable release (the
   MSRV is 1.94, set as `rust-version` in `Cargo.toml`).
 - Install [`just`](https://github.com/casey/just) and run `just --list` to see tasks.
 

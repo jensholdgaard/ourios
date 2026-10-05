@@ -242,11 +242,34 @@ privileges — a compromised querier could then delete data it never needed to
 touch. The roles' object-store needs are strictly narrower, and they split
 cleanly:
 
-| Role      | S3 actions                                            | Holds delete? |
-| --------- | ----------------------------------------------------- | ------------- |
-| querier   | `GetObject`, `ListBucket` (see cache note)            | no            |
-| receiver  | `PutObject`; `GetObject` on `miner/*`; `ListBucket` on the bucket for prefix `miner/*`; once, also `data/` and `audit/` (see below) | no |
-| compactor | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`| **only one**  |
+| Role      | S3 actions (keys under `storage.s3.prefix`)                                                                 | Holds delete? |
+| --------- | ----------------------------------------------------------------------------------------------------------- | ------------- |
+| querier   | `GetObject` on `data/*`, `audit/*`; `ListBucket` for `data/*`, `audit/*` (see cache note)                    | no            |
+| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; once, reads on `data/` and `audit/` (see below) | no |
+| compactor | `GetObject`, `PutObject`, `DeleteObject` on `data/*`, `erasure/*`, `backfill/*`; `PutObject` on `audit/*`; `ListBucket` for `data/*`, `erasure/*`, `backfill/*` | **only one** |
+
+Every key lives under one of five top-level prefixes, each written by one
+role:
+
+- `data/`: record files and partition manifests. The receiver writes new
+  files; the compactor writes compacted files and manifests and deletes
+  compacted inputs, orphans and erased rows' files.
+- `audit/`: audit events. The receiver writes them, and the compactor writes
+  the erasure events. The querier's template-map cache sits here too.
+- `miner/`: the template-id high-water (RFC 0059). Only the receiver writes it,
+  and **nothing may delete it**.
+- `erasure/` and `backfill/`: the RFC 0048 erasure markers and backfill locks.
+  The compactor's sweep advances and removes them; the `graph erase` and
+  `graph backfill` verbs create them, so run those with the compactor's
+  credentials.
+
+`ListBucket` is a bucket action: AWS checks it against the bucket arn, never
+an object arn, so it is scoped with an `s3:prefix` condition rather than a
+resource path. Without the condition it would allow listing every key in the
+bucket. Object actions go on object arns, one per prefix, so no role can
+write or delete outside its own prefixes. Every policy below also carries an
+explicit `Deny` of `s3:DeleteObject` on `miner/*`, so the high-water stays
+undeletable even if a later grant widens a delete.
 
 The receiver *writes* data/audit objects and never deletes. Since RFC 0059
 (durable template-id allocation) it also keeps one small object,
@@ -263,12 +286,10 @@ The receiver *writes* data/audit objects and never deletes. Since RFC 0059
   scale-to-one upgrade step, and revoke them afterwards if you want the
   narrower policy back.
 
-`ListBucket` is a bucket action: AWS checks it against the bucket arn, never
-an object arn, so it is scoped with an `s3:prefix` condition rather than a
-resource path. Without the condition it would allow listing every key in the
-bucket. The receiver's policy during the upgrade (drop the `data/*` and
-`audit/*` entries afterwards; with a `storage.s3.prefix`, put it in front of
-each path and each `s3:prefix` value):
+The policies use `<prefix>/` for `storage.s3.prefix`; with no prefix, drop
+`<prefix>/` from every resource and every `s3:prefix` value. The
+receiver's policy during the upgrade (drop the `data/*` and `audit/*` reads
+afterwards):
 
 ```json
 {
@@ -277,15 +298,19 @@ each path and each `s3:prefix` value):
     {
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::<bucket>/*"
+      "Resource": [
+        "arn:aws:s3:::<bucket>/<prefix>/data/*",
+        "arn:aws:s3:::<bucket>/<prefix>/audit/*",
+        "arn:aws:s3:::<bucket>/<prefix>/miner/*"
+      ]
     },
     {
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": [
-        "arn:aws:s3:::<bucket>/miner/*",
-        "arn:aws:s3:::<bucket>/data/*",
-        "arn:aws:s3:::<bucket>/audit/*"
+        "arn:aws:s3:::<bucket>/<prefix>/miner/*",
+        "arn:aws:s3:::<bucket>/<prefix>/data/*",
+        "arn:aws:s3:::<bucket>/<prefix>/audit/*"
       ]
     },
     {
@@ -293,8 +318,15 @@ each path and each `s3:prefix` value):
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::<bucket>",
       "Condition": {
-        "StringLike": { "s3:prefix": ["miner/*", "data/*", "audit/*"] }
+        "StringLike": {
+          "s3:prefix": ["<prefix>/miner/*", "<prefix>/data/*", "<prefix>/audit/*"]
+        }
       }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/miner/*"
     }
   ]
 }
@@ -325,14 +357,15 @@ singleton compactor can delete data.
 
 **Querier cache note (RFC 0033):** after a cache miss the querier attempts a
 *best-effort* write-through of its template-map cache artifact (and cleanup of
-the stale v1 key). Under the read-only policy above this publish simply fails —
+the stale v1 key). Without that grant this publish simply fails —
 **by contract that never fails a query** (it is a telemetry-only outcome), but
 the cache never populates, so every query re-pays the audit fold. To keep the
 cache warm without widening the read path, grant the querier `PutObject` +
 `DeleteObject` scoped to the one cache key it writes:
 `arn:aws:s3:::<bucket>/audit/tenant_id=*/template_map*` (with a
-`storage.s3.prefix`, `arn:aws:s3:::<bucket>/<prefix>/audit/tenant_id=*/template_map*`)
-— the querier still cannot touch data objects.
+`storage.s3.prefix`, `arn:aws:s3:::<bucket>/<prefix>/audit/tenant_id=*/template_map*`;
+the querier policy below includes it) — the querier still cannot touch data
+objects.
 
 Each role opts into its own ServiceAccount (falling back to the shared
 `serviceAccount` otherwise), carrying its own IRSA role:
@@ -359,9 +392,8 @@ role's trust policy federates to its ServiceAccount
 rendered name with `helm template`, since the chart's fullname collapses
 to the release name when it already contains "ourios"); `eksctl create
 iamserviceaccount` or the Terraform `iam-role-for-service-accounts` module wires
-this in one step. The permission policy per role (swap the `Action` list per the
-table; the example shows the `storage.s3.prefix`-scoped form — with no
-prefix, drop the `Condition` and use `<bucket>/*` on the object arn):
+this in one step. The compactor's permission policy, the only one holding a
+delete, scoped to the prefixes it deletes in and never `miner/`:
 
 ```json
 {
@@ -370,21 +402,75 @@ prefix, drop the `Condition` and use `<bucket>/*` on the object arn):
     {
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::<bucket>/<prefix>/*"
+      "Resource": [
+        "arn:aws:s3:::<bucket>/<prefix>/data/*",
+        "arn:aws:s3:::<bucket>/<prefix>/erasure/*",
+        "arn:aws:s3:::<bucket>/<prefix>/backfill/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/audit/*"
     },
     {
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::<bucket>",
-      "Condition": { "StringLike": { "s3:prefix": "<prefix>/*" } }
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["<prefix>/data/*", "<prefix>/erasure/*", "<prefix>/backfill/*"]
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/miner/*"
     }
   ]
 }
 ```
 
-(Without the `s3:prefix` condition, `ListBucket` on the bucket arn allows
-listing **every** key in the bucket — object access would be scoped but
-listing would not.)
+The querier's, with the optional template-map cache grant:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::<bucket>/<prefix>/data/*",
+        "arn:aws:s3:::<bucket>/<prefix>/audit/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/audit/tenant_id=*/template_map*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["<prefix>/data/*", "<prefix>/audit/*"] }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/miner/*"
+    }
+  ]
+}
+```
+
+A test (RFC0059.17) parses every JSON policy in this README and fails if any
+allowed delete could reach `miner/template_ids.v1.json` or a policy lacks the
+`Deny`.
 
 Two hardening notes:
 

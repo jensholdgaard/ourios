@@ -512,12 +512,55 @@ disjoint, and no per-node key is needed.
   ReadWriteMany class").
 
 **Permissions.** The receiver's object-store role gains:
-- **always:** `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` (with
-  the `miner/` prefix) on `miner/*`. Conditional writes (`If-Match`,
-  `If-None-Match`) need nothing beyond `s3:PutObject`. No delete is
-  granted.
-- **for the one-time upgrade bootstrap:** `s3:ListBucket` (prefixes
-  `data/` and `audit/`) and `s3:GetObject` on `data/*` and `audit/*`.
+- **always:** `s3:GetObject` and `s3:PutObject` on the objects
+  `arn:aws:s3:::BUCKET/miner/*`, and `s3:ListBucket` on the bucket
+  `arn:aws:s3:::BUCKET` with an `s3:prefix` condition of `miner/*`.
+  Conditional writes (`If-Match`, `If-None-Match`) need nothing beyond
+  `s3:PutObject`. No delete is granted.
+- **for the one-time upgrade bootstrap:** `s3:GetObject` on the objects
+  `BUCKET/data/*` and `BUCKET/audit/*`, and `data/*` and `audit/*` added
+  to the `s3:prefix` condition.
+
+`s3:ListBucket` is a bucket action. AWS evaluates it against the bucket
+ARN, so a grant on an object ARN such as `BUCKET/miner/*` never matches
+and the listing is denied. The `StringLike` condition on `s3:prefix` is
+what scopes it: the receiver may list under those prefixes only, not the
+whole bucket. The minimal policy during the upgrade, with the
+`data/*` and `audit/*` entries removed afterwards (a `storage.s3.prefix`
+goes in front of each path and each `s3:prefix` value):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::BUCKET/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::BUCKET/miner/*",
+        "arn:aws:s3:::BUCKET/data/*",
+        "arn:aws:s3:::BUCKET/audit/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["miner/*", "data/*", "audit/*"] }
+      }
+    }
+  ]
+}
+```
+
+`s3:PutObject` covers `BUCKET/*` because the receiver already writes
+`data/` and `audit/` objects; RFC 0059 adds only the `miner/` key to it.
 
 Before this RFC the chart documented the receiver as `PutObject` only.
 These grants must be in place **before** the scale-to-one upgrade step,

@@ -44,5 +44,11 @@ one-per-binary:
   `rfc0038_3` because a process holds one tracer install and that file owns
   the no-inbound-context (root) case.
 
+## Global-allocator binaries
+
+- `issued_ids_bounded.rs` — installs `dhat`'s testing-mode global allocator
+  to assert the startup template-id floor's peak heap in bytes (#898). A
+  global allocator is process-wide, so it cannot share the `it` binary.
+
 `fixtures/` holds the crash-fixture **`[[bin]]` targets** (SIGKILL'd by
 harness tests via `CARGO_BIN_EXE_*`), not test binaries.

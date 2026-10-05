@@ -29,6 +29,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod audit_max_id;
 pub mod audit_reader;
 pub mod audit_record_batch;
 pub mod audit_sink;
@@ -44,6 +45,7 @@ pub mod record_batch;
 pub mod store;
 pub mod writer;
 
+pub use audit_max_id::max_template_id;
 pub use audit_reader::{AuditReader, AuditReaderError};
 pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_sink::ParquetAuditSink;

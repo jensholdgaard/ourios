@@ -12,8 +12,7 @@
 //! row is durable, so the stream's highest id bounds every id a row can
 //! carry.
 
-use ourios_core::audit::{AuditEvent, AuditPayload};
-use ourios_parquet::{AuditReader, AuditReaderError, Store, StoreError};
+use ourios_parquet::{AuditReaderError, Store, StoreError, max_template_id};
 
 /// The audit stream's top-level prefix in the store (RFC 0005 §3.4).
 const AUDIT_PREFIX: &str = "audit";
@@ -57,8 +56,11 @@ impl std::error::Error for IssuedIdsError {
 }
 
 /// The highest `template_id` any template event in `store`'s audit stream
-/// binds, over every tenant, or `None` when the stream holds none. One
-/// audit file is held at a time.
+/// binds, over every tenant, or `None` when the stream holds none.
+///
+/// The stream can run to gigabytes, so one audit object is held at a time
+/// and dropped before the next is fetched, and each is answered from its
+/// footer's `template_id` statistics; no audit event is decoded.
 ///
 /// # Errors
 ///
@@ -71,42 +73,29 @@ pub fn highest_issued_template_id(store: &Store) -> Result<Option<u64>, IssuedId
         .map_err(|e| IssuedIdsError::List(Box::new(e)))?;
     let mut highest = None;
     for key in keys.iter().filter(|key| key.ends_with(".parquet")) {
-        let file_highest = highest_in(&read_events(store, key)?);
-        highest = highest.max(file_highest);
+        highest = highest.max(highest_in(store, key)?);
     }
     Ok(highest)
 }
 
-fn read_events(store: &Store, key: &str) -> Result<Vec<AuditEvent>, IssuedIdsError> {
+fn highest_in(store: &Store, key: &str) -> Result<Option<u64>, IssuedIdsError> {
     let bytes = store
         .get_blocking(key)
         .map_err(|source| IssuedIdsError::Fetch {
             key: key.to_owned(),
             source: Box::new(source),
         })?;
-    AuditReader::open_bytes(bytes::Bytes::from(bytes))
-        .and_then(AuditReader::read_all)
-        .map_err(|source| IssuedIdsError::Decode {
-            key: key.to_owned(),
-            source: Box::new(source),
-        })
-}
-
-fn highest_in(events: &[AuditEvent]) -> Option<u64> {
-    events
-        .iter()
-        .filter_map(|event| match event.payload {
-            AuditPayload::Template { template_id, .. } => Some(template_id),
-            _ => None,
-        })
-        .max()
+    max_template_id(bytes::Bytes::from(bytes)).map_err(|source| IssuedIdsError::Decode {
+        key: key.to_owned(),
+        source: Box::new(source),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
 
-    use ourios_core::audit::{AuditPayload, TemplateChange};
+    use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange};
     use ourios_core::tenant::TenantId;
     use ourios_parquet::{AuditWriter, derive_audit_partition};
 

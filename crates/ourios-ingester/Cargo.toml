@@ -168,6 +168,9 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "cr
 # metadata → interceptor → extension → handler handoff is covered end to end.
 tonic = { version = "=0.14.6", default-features = false, features = ["transport", "router", "channel", "tls-ring", "tls-connect-info"] }
 tempfile = "=3.27.0"
+# #898 (`tests/issued_ids_bounded.rs`): testing-mode heap profiler as the
+# global allocator, so the template-id floor's peak heap is asserted in bytes.
+dhat = "=0.3.3"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
 # threading test (pinned in lockstep with ourios-parquet's arrow stack,
 # matching ourios-querier's dev pin).

@@ -145,6 +145,10 @@ the body column preserves the line exactly), so overflow degrades to
 
 ### 3.4 Telemetry (weaver registry, per the standing discipline)
 
+> **Amended by RFC 0059 (2026-10-05).** `ourios.miner.parse_failure.reason`
+> gains `id_reservation_failed`: a fresh mint with no durably reserved
+> template id. It is checked after `template_ceiling`.
+
 - `ourios.miner.parse_failures` (existing counter) gains a
   **`ourios.miner.parse_failure.reason`** attribute — values
   `below_floor` | `line_too_long` | `template_ceiling` — following

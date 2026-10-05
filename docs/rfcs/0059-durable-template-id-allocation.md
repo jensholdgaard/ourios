@@ -89,8 +89,20 @@ rebuildable cache.
 - **Read failures fail closed.** A reader fails when:
   - the key exists but cannot be fetched or parsed;
   - `reserved_through` is absent or is not a `u64`;
-  - `miner/` holds a `template_ids.v<k>.json` for some `k > 1` and no
-    version-1 key.
+  - `miner/` holds any `template_ids.v<k>.json` with `k` above the
+    version the reader knows, **whether or not** its own version's key
+    also exists.
+- **Why every later version is refused.** RFC 0033's map is a cache: a
+  reader that skips an unknown version just rebuilds. This object is
+  the reverse, the one record that keeps ids unique. A later version may
+  have moved the authoritative high-water to its own key and left the v1
+  object stale, so an older binary that trusted v1 could re-issue ids
+  the newer one already handed out. The only safe reading of an unknown
+  version is to refuse to start (RFC0059.11). A future format change
+  therefore keeps writing v1 alongside, or ships with a migration that
+  every binary still running can read.
+- **Absent** means no `template_ids.v<k>.json` of any version exists.
+  That alone triggers the bootstrap (§3.5).
 
 ### 3.2 Reservation: write before allocate
 
@@ -157,8 +169,8 @@ Recovery reads `N` **before** replay, after restoring the snapshots
   and the first ready block synchronously, before the listeners open,
   so startup is the one place a reservation blocks. Replay then mints
   from that block.
-- **Object absent.** Recovery bootstraps it (§3.5), then proceeds as
-  above.
+- **Object absent** (no version of it, §3.1). Recovery bootstraps it
+  (§3.5), then proceeds as above.
 - **Read fails.** Startup fails closed. This is the same trade-off as
   RFC 0052's fail-closed checks and #791 (recovery during an
   object-store outage): a restart then needs the store reachable, but a
@@ -204,11 +216,13 @@ data file under `data/`.
   audit stream holds. The data writer enables page-level statistics on
   every column (RFC 0005 §3.6, `writer.rs`), and those include chunk
   min/max for `template_id`.
-- The read goes footer only, one file at a time. The listing supplies
-  each object's size, and a ranged GET of the tail returns the footer
-  (a second ranged GET when the footer is larger than the first read).
-- For a row group without usable `template_id` statistics, a ranged
-  GET fetches that column chunk alone and decodes only that column.
+- The read goes footer only, one file at a time. One suffix-ranged
+  GET of the last 64 KiB returns the footer and the object's size, and a
+  second, larger one follows only when the footer is bigger than that.
+- A file with a row group lacking usable statistics comes down whole,
+  and only its id columns are decoded. The writers record the
+  statistics, so a file that needs this is a pre-statistics or foreign
+  file.
 - No row is ever materialised.
 
 **`audit_max`.** The same footer read over every `audit/` file. It
@@ -227,15 +241,39 @@ Those can hold ids whose rows were not yet published.
 - `reserved_through = floor`, and the allocator starts at `floor + 1`
   by construction.
 
-**Listing cost.** The bootstrap walks the data prefix once, partition by
-partition, holding one partition's listing at a time:
-- one delimited `LIST` per tenant for its partitions;
-- one `LIST` per hour partition for its files.
+**Listing cost.** The store's listing seam returns one `/`-delimited
+level per call (`Store::list_delimited_blocking`: the objects directly
+under a prefix plus its immediate child prefixes). Data partitions nest
+`data/tenant_id=…/year=…/month=…/day=…/hour=…/`, so the walk issues one
+delimited `LIST` at every directory of every level:
 
-This is the whole-prefix listing #853 warns about, paid once per store,
-at its first start under this RFC, and never again. The same walk
-covers `audit/` (day partitions). On the reporter's node that is about
-620,000 data footers.
+```text
+LISTs = 1 (data/) + tenants + tenant-years + tenant-months
+      + tenant-days + tenant-hours
+```
+
+That is dominated by the hour partitions. A backend pages a large
+directory, at 1,000 keys per page on S3, and each page is one more
+request. `audit/` adds the same walk over its
+`tenant_id=…/year=…/month=…/day=…/` levels.
+
+On top of the listings, every file costs one suffix GET (two when its
+footer exceeds 64 KiB). On the reporter's node that is about 620,000
+footer reads and, for two tenants with a year of hourly partitions,
+about 17,500 hour-level `LIST`s.
+
+This is the whole-prefix walk #853 warns about. It is paid once per
+store, at its first start under this RFC, and never again.
+
+**Memory.**
+- **Listings.** The walk is depth-first. It holds one directory's
+  listing at a time, plus the prefixes still to visit. Those are at
+  most the unvisited siblings at each level of the current path, so a
+  few hundred names, never the prefix's keys.
+- **Files.** Each file's footer, or a whole pre-statistics file, is
+  dropped before the next one is fetched.
+- **Peak.** The scan's peak heap is one directory listing plus one
+  file, independent of the store's size (RFC0059.7).
 
 **Progress.** Every 10,000 files, the bootstrap logs
 `ourios.receiver.template_ids.bootstrap.progress` (§3.9).
@@ -452,8 +490,7 @@ The ids are referenced from test code.
 
 > **Scenario RFC0059.5 — An unreadable high-water fails startup closed**
 > - **Given** a store whose `miner/template_ids.v1.json` does not parse,
->   lacks `reserved_through`, holds a non-`u64` value, or is shadowed by
->   only a later-version key
+>   lacks `reserved_through`, or holds a non-`u64` value
 > - **When** the receiver starts
 > - **Then** startup fails with an error naming the object, before any
 >   listener opens
@@ -504,6 +541,14 @@ The ids are referenced from test code.
 > - **And** `u64::MAX` is never issued: seating past it, or a block
 >   reaching it, is a controlled error
 
+> **Scenario RFC0059.11 — Any later-version high-water fails startup closed, even beside a v1**
+> - **Given** a store holding `miner/template_ids.v2.json`, both alone
+>   and beside a readable `miner/template_ids.v1.json`
+> - **When** a binary that knows only version 1 starts
+> - **Then** startup fails with an error naming the later-version key,
+>   before any listener opens
+> - **And** it neither bootstraps nor writes any high-water object
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -511,7 +556,7 @@ scenario harness: the production barrier, housekeeping and recovery
 path, with the store's data rows and audit events compared against
 every newly minted id.
 - RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
-  fixture), .5, .6 and .9.
+  fixture), .5, .6, .9 and .11.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none

@@ -19,7 +19,7 @@ use ourios_miner::snapshot::SNAPSHOT_VERSION;
 use ourios_wal::{FrameKind, RotationKind, TenantBatch, Wal, WalOffset};
 use prost::Message;
 
-use crate::ingest_support::{request, resource_logs, wal_config};
+use crate::ingest_support::{empty_audit_store, request, resource_logs, wal_config};
 
 /// A pre-RFC root reclaimed past its version-1 snapshot fails closed,
 /// naming the tenant.
@@ -169,7 +169,12 @@ fn write_undecodable_v1(root: &Path, tenant: &str) {
 fn recover(root: &Path) -> Result<(recovery::RecoveryReport, MinerCluster), RecoveryDriverError> {
     let mut wal = Wal::open(wal_config(root)).expect("reopen the legacy root");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots(root), &mut miner)?;
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots(root),
+        &mut miner,
+        &empty_audit_store(root),
+    )?;
     Ok((report, miner))
 }
 

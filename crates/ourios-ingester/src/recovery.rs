@@ -26,12 +26,14 @@ use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, RestoreError};
 use ourios_miner::snapshot::{LegacyMark, RecoveryOutcome, SnapshotError, WalHighWater};
+use ourios_parquet::Store;
 use ourios_wal::{
     FrameKind, FrameSink, HousekeepingError, LedgerError, RecoveryError, TenantBatch,
     TenantHorizon, Wal, WalOffset,
 };
 use prost::Message;
 
+use crate::issued_ids::{self, IssuedIdsError};
 use crate::metrics::ERROR_TYPE;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
@@ -62,6 +64,10 @@ pub struct RecoveryReport {
     pub max_delivered: Option<WalOffset>,
     /// Per-tenant snapshot outcome, one entry per artefact found.
     pub tenants: Vec<TenantRecovery>,
+    /// The audit stream's highest template id, read when replay alone
+    /// could not rebuild every id ever issued; the miner allocates
+    /// above it. `None` when no read was needed or the stream is empty.
+    pub issued_template_id_floor: Option<u64>,
 }
 
 impl RecoveryReport {
@@ -196,6 +202,9 @@ pub enum RecoveryDriverError {
     /// tenant still has frames in the WAL: with none left, booting
     /// would silently discard the only record of its templates.
     LegacyMarkUnreadable(TenantId),
+    /// The audit stream's highest template id could not be read, so the
+    /// miner cannot be kept from re-issuing an id rows already carry.
+    IssuedIds(IssuedIdsError),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -211,6 +220,7 @@ impl std::fmt::Display for RecoveryDriverError {
                  high-water mark cannot be read (RFC 0052 §3.2)",
                 tenant.as_str()
             ),
+            Self::IssuedIds(e) => write!(f, "recovery template-id floor: {e}"),
         }
     }
 }
@@ -220,6 +230,7 @@ impl std::error::Error for RecoveryDriverError {
         match self {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
+            Self::IssuedIds(e) => Some(e),
             Self::LegacyStaleGap(_) | Self::LegacyMarkUnreadable(_) | Self::Replay(_) => None,
         }
     }
@@ -239,15 +250,23 @@ impl std::error::Error for RecoveryDriverError {
 /// discard emits one `ourios.receiver.snapshot.discarded` event naming
 /// the tenant and the [`DiscardReason`].
 ///
+/// Whenever replay cannot rebuild every template id ever issued — a
+/// discarded snapshot, or reclaimed frames no restored snapshot covers —
+/// the miner's allocator is first seated above the highest id `audit`'s
+/// stream carries, so no fresh template takes an id published rows
+/// already carry (issue #898).
+///
 /// # Errors
 ///
 /// [`RecoveryDriverError`] on snapshot-store I/O or replay failure
 /// (including an `OtlpBatch` frame that fails protobuf decode or
-/// tenant fan-out — corruption-adjacent, surfaced loudly).
+/// tenant fan-out — corruption-adjacent, surfaced loudly), or when that
+/// audit read fails.
 pub fn recover(
     wal: &mut Wal,
     snapshots_root: &Path,
     miner: &mut MinerCluster,
+    audit: &Store,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
     let artefacts =
@@ -258,6 +277,11 @@ pub fn recover(
         horizons,
         legacy,
     } = restore_artefacts(miner, artefacts);
+    let issued_template_id_floor = if replay_rebuilds_every_id(wal, &tenants, &horizons) {
+        None
+    } else {
+        floor_issued_ids(miner, audit)?
+    };
     let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
     // ends there rather than at `Wal::open` because open runs before
@@ -288,7 +312,36 @@ pub fn recover(
         audit_events_suppressed: replay.withheld.events,
         max_delivered: replay.max_delivered,
         tenants,
+        issued_template_id_floor,
     })
+}
+
+/// Whether replaying the surviving frames over the restored snapshots
+/// re-mints no id below one already issued: every artefact restored, and
+/// no tenant's reclaimed frames lie above what its snapshot folded.
+fn replay_rebuilds_every_id(
+    wal: &Wal,
+    tenants: &[TenantRecovery],
+    horizons: &HashMap<TenantId, WalOffset>,
+) -> bool {
+    tenants.iter().all(|tenant| tenant.horizon().is_some())
+        && wal
+            .reclaimed_through()
+            .iter()
+            .all(|(tenant, reclaimed)| horizons.get(tenant).is_some_and(|s| s >= reclaimed))
+}
+
+/// Seat `miner`'s allocator above the audit stream's highest template id.
+fn floor_issued_ids(
+    miner: &mut MinerCluster,
+    audit: &Store,
+) -> Result<Option<u64>, RecoveryDriverError> {
+    let highest =
+        issued_ids::highest_issued_template_id(audit).map_err(RecoveryDriverError::IssuedIds)?;
+    if let Some(issued) = highest {
+        miner.allocate_past_issued(issued);
+    }
+    Ok(highest)
 }
 
 /// What one replay pass saw and withheld.
@@ -1016,7 +1069,8 @@ mod tests {
         );
 
         let mut miner = MinerCluster::new(MinerConfig::default());
-        recover(&mut wal, &root.join("snapshots"), &mut miner).expect("recover");
+        let audit = Store::local(root).expect("audit store");
+        recover(&mut wal, &root.join("snapshots"), &mut miner, &audit).expect("recover");
 
         let state = wal.reclaim_state();
         assert!(

@@ -273,8 +273,13 @@ fn recover_into_stores(
     ));
     let mut miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
         .with_record_sink(Box::new(sink.clone()));
-    let report =
-        recovery::recover(wal, &wal_root.join("snapshots"), &mut miner).expect("startup recovery");
+    let report = recovery::recover(
+        wal,
+        &wal_root.join("snapshots"),
+        &mut miner,
+        &Store::local(audit_root).expect("audit store"),
+    )
+    .expect("startup recovery");
     sink.flush_all();
     assert!(audit.flush(), "the regenerated audit events land");
     report
@@ -366,7 +371,7 @@ async fn rfc0052_10_a_replayed_record_is_never_durable_before_its_template_event
 
     // When recovery replays it, with no flush afterwards.
     let mut wal = Wal::open(node.wal()).expect("reopen");
-    recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+    recovery::recover(&mut wal, &node.snapshots_root, &mut miner, &node.audit()).expect("recover");
 
     // Then the record reached the store inline, and its template event is
     // durable beside it.
@@ -470,7 +475,8 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
     let records = SharedRecordSink::new();
     let mut miner = pinned_miner(&events).with_record_sink(Box::new(records.clone()));
     let mut wal = Wal::open(node.wal()).expect("reopen");
-    let report = recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+    let report = recovery::recover(&mut wal, &node.snapshots_root, &mut miner, &node.audit())
+        .expect("recover");
 
     let forwarded = events.drain();
     assert!(
@@ -503,6 +509,7 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
 struct Node {
     wal_root: PathBuf,
     data_root: PathBuf,
+    audit_root: PathBuf,
     snapshots_root: PathBuf,
     checkpoint: WalOffset,
 }
@@ -513,6 +520,7 @@ impl Node {
         let node = Self {
             wal_root: rig.wal_root.clone(),
             data_root: rig.data_root.clone(),
+            audit_root: rig.audit_root.clone(),
             snapshots_root: rig.snapshots_root.clone(),
             checkpoint,
         };
@@ -522,6 +530,11 @@ impl Node {
 
     fn wal(&self) -> WalConfig {
         wal_config(&self.wal_root)
+    }
+
+    /// The audit store the stopped node published to.
+    fn audit(&self) -> Store {
+        Store::local(&self.audit_root).expect("audit store")
     }
 
     fn artefact(&self) -> PathBuf {
@@ -584,7 +597,8 @@ fn recover_into_store(node: &Node) -> RecoveryReport {
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let mut wal = Wal::open(node.wal()).expect("reopen");
-    let report = recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+    let report = recovery::recover(&mut wal, &node.snapshots_root, &mut miner, &node.audit())
+        .expect("recover");
     sink.flush_all();
     report
 }

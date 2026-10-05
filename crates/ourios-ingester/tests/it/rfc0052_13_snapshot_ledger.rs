@@ -38,6 +38,7 @@ async fn a_snapshot_recovery_rejects_seeds_no_horizon_and_the_pass_keeps_its_fra
     assert_eq!(rig.barrier.tick(&rig.pipeline, true), CutOutcome::Stamped);
     let sealed = rig.wal_root.join(format!("{}.wal", mark.segment));
     let snapshots_root = rig.snapshots_root.clone();
+    let audit = Store::local(&rig.audit_root).expect("audit store");
     drop(rig);
 
     // And its artefact replaced by one the codec reads, horizon and all,
@@ -56,7 +57,7 @@ async fn a_snapshot_recovery_rejects_seeds_no_horizon_and_the_pass_keeps_its_fra
     // When the node restarts and seeds the ledger from recovery.
     let mut wal = Wal::open(aging_wal(tmp.path())).expect("reopen");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("recover");
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &audit).expect("recover");
     assert_eq!(
         report.tenants[0].outcome(),
         RecoveryOutcome::UnknownOrCorruptDiscarded,
@@ -104,10 +105,11 @@ async fn the_ledger_holds_exactly_the_horizons_a_restart_restores() {
     let ledger = rig.barrier.snapshot_horizons();
     let wal_root = rig.wal_root.clone();
     let snapshots_root = rig.snapshots_root.clone();
+    let audit = Store::local(&rig.audit_root).expect("audit store");
     drop(rig);
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("recover");
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &audit).expect("recover");
 
     // Then both name the same horizon for every tenant.
     assert_eq!(report.accepted_horizons().len(), 2, "both tenants restore");

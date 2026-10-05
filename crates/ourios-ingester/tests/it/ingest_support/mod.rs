@@ -34,6 +34,15 @@ pub fn write_snapshots_at(root: &Path, miner: &MinerCluster, high_water: Option<
     }
 }
 
+/// An object store under `root` that holds no audit events, for a
+/// recovery whose node published nothing: its template-id floor read
+/// (#898) finds no id.
+pub fn empty_audit_store(root: &Path) -> Store {
+    let dir = root.join("empty-audit-store");
+    std::fs::create_dir_all(&dir).expect("empty audit store root");
+    Store::local(dir).expect("empty audit store")
+}
+
 pub fn wal_config(root: &Path) -> WalConfig {
     WalConfig {
         root: root.to_path_buf(),

@@ -19,7 +19,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::ingest_support::{coordinator, request, resource_logs, wal_config, write_snapshots_at};
+use crate::ingest_support::{
+    coordinator, empty_audit_store, request, resource_logs, wal_config, write_snapshots_at,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 use ourios_ingester::encode_pool::EncodePool;
@@ -185,7 +187,13 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
         ..wal_config(&wal_root)
     })
     .expect("reopen WAL");
-    recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
+    recovery::recover(
+        &mut wal,
+        &snapshots_root,
+        &mut recovered,
+        &empty_audit_store(&wal_root),
+    )
+    .expect("recover");
     drop(wal);
 
     let mut control = MinerCluster::new(MinerConfig::default());

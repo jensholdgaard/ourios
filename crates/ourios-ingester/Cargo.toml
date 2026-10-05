@@ -108,6 +108,9 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 # `DecodeError::source` returns `prost::DecodeError` as `&dyn
 # std::error::Error`, which only impls `Error` under prost's `std`.
 prost = { version = "0.14", default-features = false, features = ["std"] }
+# `AuditReader::open_bytes` takes `Bytes`: startup recovery reads the audit
+# stream's highest template id (#898). Already in the tree via ourios-parquet.
+bytes = "1"
 # OTLP/JSON decode (RFC0003.6) via the proto types' `with-serde`
 # `Deserialize` impls — the `application/json` transport body is an
 # `ExportLogsServiceRequest` in the proto3-JSON mapping.
@@ -200,11 +203,11 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 # RFC 0052 §3.1's publisher legs hold a PUT at the object-store seam
 # (`Store::wrap_backend`) — the one place the publisher's write waits with
-# no sink lock held. All four are already in the tree via ourios-parquet.
+# no sink lock held. All three are already in the tree via ourios-parquet
+# (`bytes`, the fourth, is a normal dependency).
 object_store = { version = "0.13", default-features = false }
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-bytes = "1"
 
 [lints]
 workspace = true

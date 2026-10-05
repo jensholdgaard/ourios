@@ -1000,6 +1000,9 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
+    // Recovery seats the template-id allocator from this store's audit
+    // stream when replay alone cannot rebuild every issued id.
+    let store = config.store.clone();
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
 
     // Wire both sinks into the miner *before* recovery: replay re-mines the
@@ -1010,7 +1013,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut miner = MinerCluster::with_audit_sink(config.miner, Box::new(audit_sink.clone()))
         .with_record_sink(Box::new(sink.clone()));
 
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner)
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &store)
         .map_err(|e| format!("startup recovery: {e}"))?;
     for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
         tracing::warn!(

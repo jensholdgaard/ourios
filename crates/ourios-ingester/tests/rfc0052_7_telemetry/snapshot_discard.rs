@@ -16,7 +16,7 @@ use ourios_telemetry::live_check::{self, Checked, Event, EventSpec};
 use ourios_wal::{Wal, WalOffset};
 
 use crate::harness::{harness, serial};
-use crate::ingest_support::{request, resource_logs, wal_config};
+use crate::ingest_support::{empty_audit_store, request, resource_logs, wal_config};
 
 const DISCARDED: EventSpec = EventSpec {
     name: semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_DISCARDED,
@@ -103,7 +103,13 @@ async fn recovery_names_each_discarded_snapshot_once() {
 
     let mut wal = Wal::open(wal_config(&tmp.path().join("wal"))).expect("open");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots, &mut miner).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &snapshots,
+        &mut miner,
+        &empty_audit_store(tmp.path()),
+    )
+    .expect("recover");
     let events = harness().events();
 
     for (tenant, class) in DISCARDS {

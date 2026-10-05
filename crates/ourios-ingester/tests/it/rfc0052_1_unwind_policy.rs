@@ -241,9 +241,11 @@ fn assert_nothing_reached_durability(rig: &BarrierRig) {
 fn restart_and_recover(rig: BarrierRig) -> ourios_ingester::recovery::RecoveryReport {
     let wal_root = rig.wal_root.clone();
     let snapshots_root = rig.snapshots_root.clone();
+    let audit_root = rig.audit_root.clone();
     drop(rig);
     let mut wal = ourios_wal::Wal::open(wal_config(&wal_root)).expect("reopen");
     let mut miner = ourios_miner::cluster::MinerCluster::new(ourios_config::MinerConfig::default());
-    ourios_ingester::recovery::recover(&mut wal, &snapshots_root, &mut miner)
+    let audit = ourios_parquet::Store::local(&audit_root).expect("audit store");
+    ourios_ingester::recovery::recover(&mut wal, &snapshots_root, &mut miner, &audit)
         .expect("recovery completes")
 }

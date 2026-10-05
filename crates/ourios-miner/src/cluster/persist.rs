@@ -377,8 +377,18 @@ impl MinerCluster {
             .chain(state.adopted_templates.iter().map(|a| a.template_id))
             .max();
         if let Some(max_restored) = max_restored {
-            self.next_template_id = self.next_template_id.max(max_restored + 1);
+            self.allocate_past_issued(max_restored);
         }
+    }
+
+    /// Never allocate `issued` or any id below it again. Startup recovery
+    /// calls this with the highest `template_id` the durable audit stream
+    /// carries when replay alone cannot rebuild every id ever issued — a
+    /// discarded snapshot or reclaimed frames — since an id the rebuilt
+    /// allocator re-issued would bind existing rows to a different
+    /// template (`CLAUDE.md` §3.1).
+    pub fn allocate_past_issued(&mut self, issued: u64) {
+        self.next_template_id = self.next_template_id.max(issued.saturating_add(1));
     }
 }
 

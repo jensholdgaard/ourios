@@ -65,3 +65,49 @@ fn rfc0059_4_an_exhausted_range_fails_fresh_mints_and_keeps_matches_flowing() {
     };
     assert!(resumed > 3 * BLOCK, "{resumed} comes from a new block");
 }
+
+/// Scenario RFC0059.4 — while the store is down, the refiller retries on
+/// its own backoff however many fresh mints fail and ask it to refill:
+/// the requests coalesce and never cut a backoff short.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[test]
+fn rfc0059_4_failed_mints_never_bypass_the_refill_backoff() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let node = Node::empty(tmp.path());
+    node.put(HIGH_WATER_KEY, br#"{"reserved_through": 0}"#);
+    mark_seated(&node.snapshots, 0).expect("seated");
+    let hooks = Hooks::default();
+    let mut running = node
+        .restart_over(hooks.wrap(node.store()))
+        .expect("recover");
+    hooks.set_down(true);
+    for i in 0..3 * BLOCK {
+        assert_ne!(running.mine_structured(TENANT, &format!("event.{i}")), 0);
+    }
+
+    let reads = || {
+        hooks
+            .high_water_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+    };
+    let before = reads();
+    let window = Instant::now() + Duration::from_millis(800);
+    let mut failed = 0;
+    while Instant::now() < window {
+        assert_eq!(
+            running.mine_structured(TENANT, &format!("fresh.{failed}")),
+            0
+        );
+        failed += 1;
+    }
+
+    assert!(
+        failed > 100,
+        "{failed} failed mints each asked for a refill"
+    );
+    let retried = reads() - before;
+    assert!(
+        retried <= 6,
+        "{retried} reservation attempts in 800 ms: the backoff was bypassed"
+    );
+}

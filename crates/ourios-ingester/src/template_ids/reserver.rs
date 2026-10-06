@@ -22,15 +22,15 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ourios_miner::cluster::{IdBlock, IdReservationError, IdReserver, MinerCluster};
 use ourios_parquet::Store;
 
 use super::marker::{Marker, read_marker, write_marker};
-use super::{BootstrapPolicy, Seated, SnapshotTrust, TemplateIdsError, reserve, seat};
+use super::{BootstrapPolicy, Seated, SnapshotTrust, TemplateIdsError, names, reserve, seat};
 
 /// Blocks kept ready beside the one the miner allocates from.
 const READY_BLOCKS: usize = 2;
@@ -67,7 +67,7 @@ struct Shared {
 /// reserver the miner draws from.
 pub struct TemplateIds {
     shared: Arc<Shared>,
-    refill: Sender<()>,
+    refill: SyncSender<()>,
     refill_rx: Mutex<Option<Receiver<()>>>,
     replaying: Arc<AtomicBool>,
     allow_bootstrap: bool,
@@ -76,7 +76,8 @@ pub struct TemplateIds {
 impl TemplateIds {
     #[must_use]
     pub fn new(store: Store) -> Self {
-        let (refill, refill_rx) = mpsc::channel();
+        // One slot: a request while one is pending coalesces into it.
+        let (refill, refill_rx) = mpsc::sync_channel(1);
         Self {
             shared: Arc::new(Shared {
                 store,
@@ -116,7 +117,7 @@ impl TemplateIds {
                 .name("template-id-refill".to_owned())
                 .spawn(move || refill_loop(&shared, &receiver))
                 .map_err(|e| TemplateIdsError::Refiller(e.to_string()))?;
-            let _ = self.refill.send(());
+            request_refill(&self.refill);
         }
         Ok(())
     }
@@ -254,11 +255,21 @@ fn record(ledger: &mut Ledger, through: u64) -> Result<(), TemplateIdsError> {
     Ok(())
 }
 
+/// Ask the refiller to top the ready blocks up, without blocking: a
+/// request already pending covers this one.
+fn request_refill(refill: &SyncSender<()>) {
+    // Full means a request is pending; disconnected means the refiller is
+    // gone with the process.
+    let _ = refill.try_send(());
+}
+
 /// Refill on every request, retrying a failure with capped backoff until
-/// it lands or every sender is gone. A deleted high-water stops the
-/// refiller for good (RFC 0059 §3.1): an object that reappears may sit
-/// below blocks other receivers hold, so only a restart, which fails
-/// closed, may decide what it is worth.
+/// it lands or every sender is gone. Requests arriving during a backoff do
+/// not cut it short. A deleted high-water stops the refiller for good
+/// (RFC 0059 §3.1): an object that reappears may sit below blocks other
+/// receivers hold, so only a restart, which fails closed, may decide what
+/// it is worth. An exhausted id domain is no failure (`fill` returns
+/// `Ok`): it surfaces only as `id_reservation_failed` parse failures.
 fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
     while requests.recv().is_ok() {
         let mut backoff = BACKOFF_START;
@@ -267,21 +278,39 @@ fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
                 Ok(()) => break,
                 Err(error @ TemplateIdsError::HighWaterDeleted) => {
                     tracing::error!(
-                        { crate::metrics::ERROR_TYPE } = error.error_type(),
-                        "template-id refill stopped; fresh templates fail parse until a \
-                         restart: {error}",
+                        name: names::REFILL_STOPPED,
+                        { { crate::metrics::ERROR_TYPE } = error.error_type() },
+                        "template-id refill stopped; fresh templates fail parse once the \
+                         held blocks are spent, until a restart: {error}",
                     );
                     return;
                 }
                 Err(error) => tracing::warn!(
-                    { crate::metrics::ERROR_TYPE } = error.error_type(),
-                    "template-id refill failed; fresh templates fail parse until it lands: {error}",
+                    name: names::REFILL_FAILED,
+                    { { crate::metrics::ERROR_TYPE } = error.error_type() },
+                    "template-id refill failed; retrying with backoff while the held blocks \
+                     last: {error}",
                 ),
             }
-            match requests.recv_timeout(backoff) {
-                Ok(()) | Err(RecvTimeoutError::Timeout) => backoff = (backoff * 2).min(BACKOFF_MAX),
-                Err(RecvTimeoutError::Disconnected) => return,
+            if !wait_out(requests, Instant::now() + backoff) {
+                return;
             }
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+        }
+    }
+}
+
+/// Wait until `deadline` whatever requests arrive meanwhile; `false` once
+/// every sender is gone.
+fn wait_out(requests: &Receiver<()>, deadline: Instant) -> bool {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        match requests.recv_timeout(left) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
         }
     }
 }
@@ -290,7 +319,7 @@ fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
 /// listeners are open.
 struct StoreIdReserver {
     shared: Arc<Shared>,
-    refill: Sender<()>,
+    refill: SyncSender<()>,
     replaying: Arc<AtomicBool>,
 }
 
@@ -311,8 +340,7 @@ impl IdReserver for StoreIdReserver {
             }
             taken => taken,
         };
-        // A send fails only once the refiller is gone with the process.
-        let _ = self.refill.send(());
+        request_refill(&self.refill);
         taken.ok_or_else(|| IdReservationError::new("no reserved template-id block is ready"))
     }
 }
@@ -433,7 +461,7 @@ mod tests {
     #[test]
     fn a_taken_block_never_reaches_below_the_floor() {
         let shared = shared(Store::in_memory());
-        let (refill, _rx) = mpsc::channel();
+        let (refill, _rx) = mpsc::sync_channel(1);
         {
             let mut held = lock(&shared.ready);
             held.blocks.push_back(IdBlock::new(0, 10).expect("block"));
@@ -449,12 +477,29 @@ mod tests {
         assert!(reserver.reserve(20).is_err(), "nothing is ready");
     }
 
+    /// Running out of ids is no refill failure: `fill` returns `Ok`, so
+    /// the refiller logs nothing and fresh mints fail as
+    /// `id_reservation_failed` once the held blocks are spent.
+    #[test]
+    fn exhausting_the_id_domain_is_not_a_refill_failure() {
+        let store = Store::in_memory();
+        store
+            .put_blocking(
+                HIGH_WATER_KEY,
+                encode(ourios_miner::cluster::MAX_TEMPLATE_ID),
+            )
+            .expect("put");
+        let shared = shared(store);
+        fill(&shared).expect("exhaustion is not an error");
+        assert!(lock(&shared.ready).blocks.is_empty());
+    }
+
     /// A reserver over a healthy store holding a high-water, with nothing
     /// ready.
     fn drained(replaying: bool) -> StoreIdReserver {
         let store = Store::in_memory();
         store.put_blocking(HIGH_WATER_KEY, encode(50)).expect("put");
-        let (refill, _rx) = mpsc::channel();
+        let (refill, _rx) = mpsc::sync_channel(1);
         StoreIdReserver {
             shared: shared(store),
             refill,

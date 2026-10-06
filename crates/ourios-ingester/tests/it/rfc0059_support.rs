@@ -470,6 +470,8 @@ pub struct Hooks {
     pub create_after_absent_read: Arc<std::sync::atomic::AtomicBool>,
     /// Refuse every call as an S3 `403` would.
     pub denied: Arc<std::sync::atomic::AtomicBool>,
+    /// Reads of the high-water attempted, whether or not they succeed.
+    pub high_water_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What another writer leaves in the high-water when it wins a race.
@@ -571,6 +573,11 @@ impl object_store::ObjectStore for HookedStore {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if is_high_water(location) {
+            self.hooks
+                .high_water_reads
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         self.hooks.enter()?;
         let got = self.inner.get_opts(location, options).await;
         let absent = matches!(got, Err(object_store::Error::NotFound { .. }));

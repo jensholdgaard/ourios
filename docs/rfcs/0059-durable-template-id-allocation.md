@@ -840,12 +840,16 @@ needs.
   - RFC 0052's own RFC0052.10 carries the matching dated And-clause, so
     the two green gates agree.
   - The maintainer approved the change on 2026-10-06.
-- **RFC 0001** gets only a dated pointer here, in §6.1 and §6.9.
+- **RFC 0001** gets only a dated pointer here, in §6.1 and §6.9. The
+  §6.1 pointer states the reuse boundary:
+  - an id still bound by stored data or audit is never reissued;
+  - an id whose data and audit retention or erasure removed may be
+    reissued after an authorised re-bootstrap (§3.7, RFC0059.19).
 
 ### 3.9 Telemetry
 
-All names go through the shared semconv registry (ourios-semconv). They
-are listed exactly so that registry PR can be finalised:
+All names go through the shared semconv registry (ourios-semconv), where
+they are final as of v0.3.7:
 
 | Name | Kind | Attributes / members |
 |---|---|---|
@@ -856,8 +860,8 @@ are listed exactly so that registry PR can be finalised:
 
 The registry's brief and note for `ourios.receiver.template_ids.bootstrapped`
 say the same, "at most once per successful creation of the high-water"
-(ourios-semconv#9). #911 pins the semconv patch release that carries
-it, v0.3.7, once that change merges.
+(ourios-semconv#9). The semconv patch release v0.3.7 (`ead0337`)
+carries this finalized event contract, and the code pins it.
 
 Reservation failures in the background refiller log through the
 existing `tracing` warn path, with `error.type` set to the store error
@@ -1207,8 +1211,9 @@ kept snapshot restored under that id. This covers RFC0059.1 and .9.
 
 ## 7. Open questions
 
-- [ ] **Semconv names.** §3.9's names are final once the shared registry
-      PR (ourios-semconv#7) lands with them. The code pins that tag.
+- [x] **Semconv names.** §3.9's names and the bootstrapped event's
+      contract are final in the shared registry's v0.3.7 (`ead0337`),
+      which the code pins.
 - [ ] **Template-map artefacts.** RFC 0033's map is derived from the audit
       stream, so it inherits the audit fold's last-wins on historical
       collisions. Repairing already-collided history is out of scope; the

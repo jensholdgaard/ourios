@@ -1199,6 +1199,13 @@ concrete consumer," not "it might be useful."
 > durable guarantee backed by a template-id high-water in object
 > storage. Ids are monotonic per allocator only, not dense, and not
 > monotonic across receiver replicas.
+>
+> **Amended by RFC 0059 (2026-10-06).** "Never reused or reassigned"
+> now has a boundary:
+> - an id still bound by stored data or audit is never reissued;
+> - an id whose data and audit retention or erasure removed may be
+>   reissued after an authorised re-bootstrap (RFC 0059 §3.7,
+>   RFC0059.19). Nothing stored binds it, so that is harmless.
 
 **Template version.** `template_version` starts at 1 when the
 template is created and increments by 1 on every widening event:

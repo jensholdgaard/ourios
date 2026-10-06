@@ -196,7 +196,9 @@ restored or issued:
    precondition failure, re-read and retry from step 1.
 4. Only once the write is durable does `(a, b]` become usable. On the
    local backend, whose put renames a file into place without fsync,
-   that means fsyncing the object and its directory first.
+   that means fsyncing the object and then every directory from its own
+   up to the store root, so a newly created `miner/` entry is durable
+   too.
 
 **A reservation never creates the object.** Only the startup bootstrap
 (§3.5) creates it. If step 1 finds it absent, the reservation fails with
@@ -605,13 +607,15 @@ DuckDB procedure finds them.
     after the scan has passed its file and before the create lands.
   - That id may then lie inside the bootstrapper's first block.
 - **The upgrade rule.** For the one upgrade to this RFC:
-  1. grant the permissions of §3.6, including the bootstrap-only reads;
+  1. grant the permissions of §3.6, including the bootstrap-only listing
+     and reads;
   2. stop every pre-RFC receiver (scale `receiver.replicas` to 0);
   3. start **one** upgraded replica with the bootstrap authorised
      (chart value `receiver.templateIdsAllowBootstrap=true`; config key
      `receiver.template_ids_allow_bootstrap`), and let it bootstrap and
      seat;
-  4. remove the setting, then scale out.
+  4. remove the setting, revoke the bootstrap-only listing and reads
+     (§3.6), then scale out.
 
   The Helm chart states the rule beside `receiver.replicas` and in its
   `NOTES.txt`, and the release notes carry it. A store that already has
@@ -700,18 +704,26 @@ The receiver's object-store role therefore gains, beyond its existing
   `arn:aws:s3:::BUCKET` with an `s3:prefix` condition of `PREFIX/miner/*`.
   Conditional writes (`If-Match`, `If-None-Match`) need nothing beyond
   `s3:PutObject`. No delete is granted.
-- **for the one-time upgrade bootstrap:** `s3:GetObject` on the objects
-  `BUCKET/PREFIX/data/*` and `BUCKET/PREFIX/audit/*`, and
-  `PREFIX/data/*` and `PREFIX/audit/*` added to the `s3:prefix`
-  condition.
+- **for a bootstrap only** (the first start against a store, and a
+  quiesced re-bootstrap, §3.1):
+  - `PREFIX/data/*` and `PREFIX/audit/*` added to the `s3:prefix`
+    condition. **Every** first bootstrap lists both prefixes, an empty
+    store included: that listing is how it tells a new store from one
+    already holding data (§3.5).
+  - `s3:GetObject` on the objects `BUCKET/PREFIX/data/*` and
+    `BUCKET/PREFIX/audit/*`, which the scan needs to read footers when
+    the store holds files: the upgrade, or a re-bootstrap.
+  - Once the high-water exists, revoking both is a **required** step.
+    No ordinary start lists or reads `data/` or `audit/`, so the
+    receiver's steady-state policy carries neither.
 
 `s3:ListBucket` is a bucket action. AWS evaluates it against the bucket
 ARN, so a grant on an object ARN such as `BUCKET/miner/*` never matches
 and the listing is denied. The `StringLike` condition on `s3:prefix` is
 what scopes it: the receiver may list under those prefixes only, not the
 whole bucket. Object actions go on one object ARN per prefix the role
-writes, never `BUCKET/*`. The receiver's minimal policy during the
-upgrade, with the `data/*` and `audit/*` reads removed afterwards:
+writes, never `BUCKET/*`. The receiver's minimal policy during a
+bootstrap:
 
 ```json
 {
@@ -754,6 +766,43 @@ upgrade, with the `data/*` and `audit/*` reads removed afterwards:
 }
 ```
 
+And its steady-state policy, once the high-water exists:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::BUCKET/PREFIX/data/*",
+        "arn:aws:s3:::BUCKET/PREFIX/audit/*",
+        "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["PREFIX/miner/*"] }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+    }
+  ]
+}
+```
+
 **No documented policy can delete the high-water.** The compactor's
 documented `s3:DeleteObject` is scoped to `PREFIX/data/*`,
 `PREFIX/erasure/*` and `PREFIX/backfill/*`, where it reclaims; it was
@@ -765,7 +814,8 @@ all three policies, and a test enforces the rule on them (RFC0059.17).
 
 Before this RFC the chart documented the receiver as `PutObject` only.
 These grants must be in place **before** the scale-to-one upgrade step,
-and the migration-only reads may be revoked once the high-water exists.
+and the bootstrap-only listing and reads **must** be revoked once the
+high-water exists (re-granted only for a quiesced re-bootstrap).
 A denied call fails startup with an error naming the action it lacked
 (`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`, RFC0059.15). The
 chart's README and `values.yaml` document every role's set, and the

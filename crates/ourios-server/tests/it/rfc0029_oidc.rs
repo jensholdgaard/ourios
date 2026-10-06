@@ -519,6 +519,10 @@ pub(crate) mod claim_binding {
 
     /// [`spawn_with_auth`] with extra `storage:` keys (e.g. a
     /// `promoted_attributes` block, indented two spaces) after `local`.
+    /// The RFC 0047/0048 fixtures seed Parquet straight into the store
+    /// before the first start, which is RFC 0059's upgrade case (data
+    /// predating the template-id high-water), so the receiver is
+    /// authorised to bootstrap.
     pub(crate) async fn spawn_with_auth_and_storage(
         tmp: &tempfile::TempDir,
         storage_yaml: &str,
@@ -533,6 +537,7 @@ pub(crate) mod claim_binding {
             file,
             "storage:\n  local:\n    bucket_root: {}\n{storage_yaml}\
              receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
+             \x20 template_ids_allow_bootstrap: true\n\
              querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n  mcp:\n    enabled: true\n\
              {auth_yaml}",
             tmp.path().display(),

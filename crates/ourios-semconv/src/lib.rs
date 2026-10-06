@@ -403,6 +403,14 @@ pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAP_PROGRESS: &str =
 pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAPPED: &str =
     "ourios.receiver.template_ids.bootstrapped";
 
+/// `ourios.receiver.template_ids.refill.failed` log event name.
+pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_FAILED: &str =
+    "ourios.receiver.template_ids.refill.failed";
+
+/// `ourios.receiver.template_ids.refill.stopped` log event name.
+pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_STOPPED: &str =
+    "ourios.receiver.template_ids.refill.stopped";
+
 /// `ourios.receiver.tenant.divergence` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE: &str = "ourios.receiver.tenant.divergence";
 

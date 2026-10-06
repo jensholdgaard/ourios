@@ -97,10 +97,10 @@ receiver:
   #   1. grant the receiver's role the object-store permissions in the
   #      README's "Per-role IAM";
   #   2. set replicas to 0 and apply, so no pre-RFC receiver is running;
-  #   3. set replicas to 1 with receiver.extraEnv
-  #      OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true and apply; that one
-  #      replica bootstraps the template-id high-water from the store once;
-  #   4. once it has seated, remove that env var, then scale out.
+  #   3. set replicas to 1 with templateIdsAllowBootstrap: true and apply;
+  #      that one replica bootstraps the template-id high-water from the
+  #      store once;
+  #   4. once it has seated, set it back to false, then scale out.
   # A store that already holds data refuses to bootstrap without step 3's
   # setting. A pre-RFC receiver still running during that first start can
   # publish an id the bootstrap scan never saw. Downgrading below RFC 0059
@@ -108,6 +108,12 @@ receiver:
   # it and can re-issue ids already reserved or issued. Going back means
   # restoring the store and every WAL from before the upgrade.
   replicas: 1
+  # RFC 0059 §3.5: authorise the one-time template-id bootstrap over a
+  # store that already holds data (receiver.template_ids_allow_bootstrap in
+  # the rendered config). For step 3 above only; leave false otherwise.
+  # The chart runs the binary with --config, which reads no bare
+  # OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP env var, so extraEnv cannot set it.
+  templateIdsAllowBootstrap: false
   service:
     type: ClusterIP
   # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never

@@ -336,9 +336,10 @@ afterwards):
 
 1. Grant the permissions above, including the bootstrap-only reads.
 2. Scale `receiver.replicas` to `0`, so no older receiver is running.
-3. Start **one** upgraded replica with `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true`
-   in `receiver.extraEnv` (or `receiver.template_ids_allow_bootstrap: true` in
-   a config file). A store that already holds data refuses to bootstrap
+3. Start **one** upgraded replica with `receiver.templateIdsAllowBootstrap=true`
+   (rendered as `receiver.template_ids_allow_bootstrap: true` in the config
+   file the chart mounts; the chart runs the binary with `--config`, which
+   reads no bare `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` env var). A store that already holds data refuses to bootstrap
    without it.
 4. Once that replica has seated, remove the setting and scale out.
 

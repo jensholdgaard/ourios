@@ -25,9 +25,9 @@ Workloads:
     the permissions in the chart README's "Per-role IAM" (s3:ListBucket goes
     on the bucket arn with an s3:prefix condition, never on an object arn);
     (2) scale receiver.replicas to 0; (3) start one upgraded replica with
-    OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true in receiver.extraEnv (it
-    bootstraps the template-id high-water once); (4) once it has seated,
-    remove that variable and scale out. A rolling update that keeps an old
+    receiver.templateIdsAllowBootstrap=true (it bootstraps the template-id
+    high-water once); (4) once it has seated, set it back to false and
+    scale out. A rolling update that keeps an old
     receiver running during that first start can re-issue ids.
     Downgrading below RFC 0059 afterwards is not supported: an older
     receiver ignores the template-id high-water and can re-issue ids. Going

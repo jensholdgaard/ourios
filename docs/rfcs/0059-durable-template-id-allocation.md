@@ -849,13 +849,13 @@ are listed exactly so that registry PR can be finalised:
 
 | Name | Kind | Attributes / members |
 |---|---|---|
-| `ourios.receiver.template_ids.bootstrapped` | event, once per successful creation of the high-water: the upgrade bootstrap and each authorised re-bootstrap (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
+| `ourios.receiver.template_ids.bootstrapped` | event, at most once per successful creation of the high-water: the upgrade bootstrap and each authorised re-bootstrap (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
 | `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
 | `ourios.miner.parse_failure.reason` | existing enum attribute | new member `id_reservation_failed` |
 | `ourios.receiver.snapshot.discarded` | existing event | new `error.type` value `predates_high_water` (§3.5) |
 
 The registry's brief and note for `ourios.receiver.template_ids.bootstrapped`
-say the same, "once per successful creation of the high-water"
+say the same, "at most once per successful creation of the high-water"
 (ourios-semconv#9). #911 pins the semconv patch release that carries
 it, v0.3.7, once that change merges.
 

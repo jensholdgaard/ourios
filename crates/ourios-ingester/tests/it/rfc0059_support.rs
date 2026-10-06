@@ -377,6 +377,20 @@ pub fn assert_equivalent_up_to_renaming(
     renamed
 }
 
+/// Every template id `cluster` holds, per tenant.
+pub fn ids_per_tenant(cluster: &MinerCluster) -> BTreeMap<String, BTreeSet<u64>> {
+    cluster
+        .tenant_ids()
+        .into_iter()
+        .map(|tenant| {
+            let ids = ids_by_content(&cluster.snapshot_state(&tenant))
+                .into_values()
+                .collect();
+            (tenant.as_str().to_owned(), ids)
+        })
+        .collect()
+}
+
 type State = ourios_miner::snapshot::SnapshotState;
 
 /// Each template of `state`, keyed by its content.

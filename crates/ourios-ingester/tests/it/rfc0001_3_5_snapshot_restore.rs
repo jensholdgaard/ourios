@@ -166,7 +166,10 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let s = pipeline
         .last_durable()
         .expect("a synced batch yields the durable mark");
-    pipeline.with_miner(|m| write_snapshots_at(&snapshots_root, m, Some(s)));
+    let ids_at_s = pipeline.with_miner(|m| {
+        write_snapshots_at(&snapshots_root, m, Some(s));
+        crate::rfc0059_support::ids_per_tenant(m)
+    });
     for r in &post {
         pipeline
             .ingest(r.clone(), tenant_for(r))
@@ -203,6 +206,18 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
         "the tail minted templates, so the renaming is exercised"
     );
     assert!(renamed.iter().all(|id| *id > issued), "{renamed:?}");
+    // Only the tail's ids may move: every id the snapshot at S restored
+    // keeps its identity.
+    let recovered_ids = crate::rfc0059_support::ids_per_tenant(&recovered);
+    for (tenant, restored) in &ids_at_s {
+        assert!(
+            restored.is_subset(&recovered_ids[tenant]),
+            "{tenant}: an id restored at S was renamed ({restored:?} vs {:?})",
+            recovered_ids[tenant],
+        );
+        assert!(restored.is_disjoint(&renamed), "{tenant}: {renamed:?}");
+    }
+    assert_eq!(ids_at_s.len(), 2, "both tenants snapshotted at S");
 
     // Assert (b): no frame at or below S reached the miner — every
     // pre-S record was suppressed, every post-S record fed.

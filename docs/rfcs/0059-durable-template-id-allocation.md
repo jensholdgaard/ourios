@@ -257,7 +257,10 @@ no reservation ever runs there.
     bounded, since such a write fails its `If-Match`.
 - **A high-water deleted while live.** If a refill finds the object
   absent (`HighWaterDeleted`), the refiller stops for good and logs an
-  error. It does not retry: an object that reappears, for example
+  error. The object counts as absent whether the refill's read finds it
+  gone or its write does: a compare-and-swap answered not-found, or, on
+  a backend without one, an overwrite that first finds the object gone
+  and so never re-creates it. It does not retry: an object that reappears, for example
   restored from an old copy, may sit below blocks other receivers hold.
   - The blocks already held are spent, with no reservation overlapping
     them.

@@ -14,10 +14,8 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use ourios_config::MinerConfig;
-use ourios_core::audit::{
-    AuditEvent, AuditPayload, SharedAuditSink, TEMPLATE_INITIAL_VERSION, TemplateChange,
-};
-use ourios_core::record::{MinedRecord, SharedRecordSink};
+use ourios_core::audit::{AuditPayload, SharedAuditSink, TEMPLATE_INITIAL_VERSION, TemplateChange};
+use ourios_core::record::SharedRecordSink;
 use ourios_core::tenant::TenantId;
 use ourios_ingester::barrier::CutOutcome;
 use ourios_ingester::housekeeping::{Housekeeper, HousekeepingTick};
@@ -25,11 +23,12 @@ use ourios_ingester::receiver::tenant::assign;
 use ourios_ingester::recovery::{self, RecoveryDriverError, RecoveryReport};
 use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::{AuditReader, Reader, Store};
+use ourios_parquet::Store;
 use ourios_wal::{Wal, WalConfig};
 
 use crate::ingest_support::{request, resource_logs};
-use crate::rfc0052_barrier_support::{BarrierRig, RigSpec, parquet_files, wal_config};
+use crate::rfc0052_barrier_support::{BarrierRig, RigSpec, wal_config};
+pub use crate::rfc0052_barrier_support::{audit_events, rows};
 
 /// A receiver's roots: its WAL (and snapshots beneath it), and the one
 /// store its data and audit streams publish to.
@@ -187,26 +186,22 @@ pub struct Restarted {
 impl Restarted {
     /// Mine one string line for `tenant`, returning its template id.
     pub fn mine(&mut self, tenant: &str, body: &str) -> u64 {
-        let tenant = TenantId::new(tenant);
-        let records = assign(
-            request(vec![resource_logs(tenant.as_str(), &[body])]),
-            &tenant,
-        );
-        records
-            .iter()
-            .map(|record| self.miner.ingest(record))
-            .last()
-            .expect("one record")
+        self.mine_logs(tenant, resource_logs(tenant, &[body]))
     }
 
     /// Mine one structured record for `tenant`, keyed by `event`.
     pub fn mine_structured(&mut self, tenant: &str, event: &str) -> u64 {
+        self.mine_logs(tenant, structured_logs(tenant, event))
+    }
+
+    /// Mine `logs` for `tenant`, returning its last record's template id.
+    fn mine_logs(
+        &mut self,
+        tenant: &str,
+        logs: opentelemetry_proto::tonic::logs::v1::ResourceLogs,
+    ) -> u64 {
         let tenant = TenantId::new(tenant);
-        let records = assign(
-            request(vec![structured_logs(tenant.as_str(), event)]),
-            &tenant,
-        );
-        records
+        assign(request(vec![logs]), &tenant)
             .iter()
             .map(|record| self.miner.ingest(record))
             .last()
@@ -277,32 +272,6 @@ pub async fn cut_and_reclaim(rig: &BarrierRig) {
         panic!("the pass runs");
     };
     assert!(pass.removed_segments > 0, "the pass reclaimed: {pass:?}");
-}
-
-/// Every mined row in the Parquet files under `root`.
-pub fn rows(root: &Path) -> Vec<MinedRecord> {
-    parquet_files(root)
-        .iter()
-        .flat_map(|path| {
-            Reader::open_file(path)
-                .expect("open_file")
-                .read_all()
-                .expect("read_all")
-        })
-        .collect()
-}
-
-/// Every audit event in the Parquet files under `root`.
-pub fn audit_events(root: &Path) -> Vec<AuditEvent> {
-    parquet_files(root)
-        .iter()
-        .flat_map(|path| {
-            AuditReader::open_file(path)
-                .expect("open audit file")
-                .read_all()
-                .expect("read audit file")
-        })
-        .collect()
 }
 
 /// Every `(template_id, version)` the audit events under `root` bind, with
@@ -502,20 +471,16 @@ impl Hooks {
     /// down to.
     fn count_down_put(&self) -> object_store::Result<()> {
         let left = &self.high_water_puts_until_failure;
-        let fails = match left.load(std::sync::atomic::Ordering::Acquire) {
-            0 => false,
-            1 => true,
-            n => {
-                left.store(n - 1, std::sync::atomic::Ordering::Release);
-                false
-            }
-        };
-        match fails {
-            true => Err(object_store::Error::Generic {
+        match left.load(std::sync::atomic::Ordering::Acquire) {
+            0 => Ok(()),
+            1 => Err(object_store::Error::Generic {
                 store: "hooked",
                 source: "the high-water write fails".into(),
             }),
-            false => Ok(()),
+            n => {
+                left.store(n - 1, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
         }
     }
 

@@ -33,9 +33,24 @@ const TOKENS: usize = 2_500;
 const WIDTH: u64 = 10;
 const HOUR_NS: u64 = 3_600_000_000_000;
 
-/// Nanoseconds since the epoch at `year-month-day hour:00` UTC (Howard
-/// Hinnant's `days_from_civil`).
-fn at(year: u64, month: u64, day: u64, hour: u64) -> u64 {
+/// A UTC hour on the civil calendar.
+#[derive(Clone, Copy)]
+struct Civil {
+    year: u64,
+    month: u64,
+    day: u64,
+    hour: u64,
+}
+
+/// Nanoseconds since the epoch at `when` (Howard Hinnant's
+/// `days_from_civil`).
+fn at(when: Civil) -> u64 {
+    let Civil {
+        year,
+        month,
+        day,
+        hour,
+    } = when;
     let (y, m) = if month <= 2 {
         (year - 1, month + 9)
     } else {
@@ -51,23 +66,23 @@ fn at(year: u64, month: u64, day: u64, hour: u64) -> u64 {
 
 /// Data file `seq`'s instant: `WIDTH` hours a day, `WIDTH` days a month.
 fn data_at(seq: u64) -> u64 {
-    at(
-        2026,
-        1 + seq / (WIDTH * WIDTH),
-        1 + (seq / WIDTH) % WIDTH,
-        seq % WIDTH,
-    )
+    at(Civil {
+        year: 2026,
+        month: 1 + seq / (WIDTH * WIDTH),
+        day: 1 + (seq / WIDTH) % WIDTH,
+        hour: seq % WIDTH,
+    })
 }
 
 /// Audit file `seq`'s instant: `WIDTH` days a month, `WIDTH` months a
 /// year.
 fn audit_at(seq: u64) -> u64 {
-    at(
-        2026 + seq / (WIDTH * WIDTH),
-        1 + (seq / WIDTH) % WIDTH,
-        1 + seq % WIDTH,
-        0,
-    )
+    at(Civil {
+        year: 2026 + seq / (WIDTH * WIDTH),
+        month: 1 + (seq / WIDTH) % WIDTH,
+        day: 1 + seq % WIDTH,
+        hour: 0,
+    })
 }
 
 fn text(seq: u64) -> String {
@@ -141,16 +156,23 @@ fn write_history(bucket: &Path, files: u64) -> u64 {
     bytes
 }
 
-/// The scan over a fresh history of `files` data and audit files: what it
-/// read, the history's bytes, and its peak heap.
-fn scan_over(files: u64) -> (BootstrapScan, u64, u64) {
+/// One scan over a fresh history: what it read, the history's bytes, and
+/// its peak heap.
+struct Scanned {
+    scan: BootstrapScan,
+    bytes: u64,
+    peak: u64,
+}
+
+/// The scan over a fresh history of `files` data and audit files.
+fn scan_over(files: u64) -> Scanned {
     let bucket = TempDir::new().expect("temp dir");
     let bytes = write_history(bucket.path(), files);
     let store = Store::local(bucket.path()).expect("store");
     let _profiler = dhat::Profiler::builder().testing().build();
     let scan = BootstrapScan::run(&store).expect("scan");
     let peak = dhat::HeapStats::get().max_bytes as u64;
-    (scan, bytes, peak)
+    Scanned { scan, bytes, peak }
 }
 
 /// Scenario RFC0059.7 — the scan's peak heap does not grow when the
@@ -160,10 +182,18 @@ fn scan_over(files: u64) -> (BootstrapScan, u64, u64) {
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
 fn rfc0059_7_the_bootstrap_scan_heap_does_not_grow_with_history() {
-    let (scan, small_bytes, small_peak) = scan_over(40);
+    let Scanned {
+        scan,
+        bytes: small_bytes,
+        peak: small_peak,
+    } = scan_over(40);
     assert_eq!((scan.data_max, scan.audit_max), (Some(40), Some(40)));
     assert_eq!(scan.files_scanned, 80);
-    let (scan, large_bytes, large_peak) = scan_over(160);
+    let Scanned {
+        scan,
+        bytes: large_bytes,
+        peak: large_peak,
+    } = scan_over(160);
     assert_eq!((scan.data_max, scan.audit_max), (Some(160), Some(160)));
     eprintln!(
         "RFC0059.7 bootstrap scan: 80 files ({small_bytes} B) peak {small_peak} B; \

@@ -18,6 +18,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 
 use ourios_ingester::recovery;
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::RecoveryOutcome;
 use ourios_wal::{FrameKind, Wal, WalOffset};
@@ -101,6 +102,49 @@ fn assert_discarded_and_full_replayed(
     report
 }
 
+/// The §3.5.3 batches the live node ingests at or below its snapshot's
+/// mark `S`.
+fn batches_below_s() -> [ExportLogsServiceRequest; 3] {
+    [
+        request(vec![resource_logs(
+            "checkout",
+            &["user 1 logged in", "user 2 logged in"],
+        )]),
+        request(vec![resource_logs("billing", &["charge 9 EUR accepted"])]),
+        request(vec![resource_logs("checkout", &["user 1 logged out"])]),
+    ]
+}
+
+/// The §3.5.3 batches above `S`, one of them a shape the tail mints.
+fn batches_above_s() -> [ExportLogsServiceRequest; 3] {
+    [
+        request(vec![resource_logs(
+            "checkout",
+            &["user 3 logged in", "user 3 viewed cart"],
+        )]),
+        request(vec![resource_logs("billing", &["charge 12 EUR accepted"])]),
+        request(vec![resource_logs(
+            "checkout",
+            &["disk sda1 is 91 percent full"],
+        )]),
+    ]
+}
+
+/// The live node's template-id state: a high-water at `high_water`, and
+/// a root that seated before it snapshotted.
+fn seated_live_node(root: &Path, snapshots_root: &Path, high_water: u64) -> TemplateIds {
+    let ids = template_ids(root);
+    ids.store()
+        .put_blocking(
+            ourios_ingester::template_ids::HIGH_WATER_KEY,
+            format!(r#"{{"reserved_through": {high_water}}}"#).into_bytes(),
+        )
+        .expect("the live node's high-water");
+    ourios_ingester::template_ids::mark_seated(snapshots_root, 0)
+        .expect("the live node seated before it snapshotted");
+    ids
+}
+
 /// Scenario §3.5.3 — Known-version restore + tail replay is
 /// equivalent to a full rebuild, up to RFC 0059's renaming of the ids
 /// the tail replay first mints (Scenario RFC0059.9, the §3.5.3 narrowing
@@ -114,27 +158,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
     let snapshots_root = root.join("snapshots");
-
-    let pre = [
-        request(vec![resource_logs(
-            "checkout",
-            &["user 1 logged in", "user 2 logged in"],
-        )]),
-        request(vec![resource_logs("billing", &["charge 9 EUR accepted"])]),
-        request(vec![resource_logs("checkout", &["user 1 logged out"])]),
-    ];
-    let post = [
-        request(vec![resource_logs(
-            "checkout",
-            &["user 3 logged in", "user 3 viewed cart"],
-        )]),
-        request(vec![resource_logs("billing", &["charge 12 EUR accepted"])]),
-        // A shape first seen above S: the tail mints it.
-        request(vec![resource_logs(
-            "checkout",
-            &["disk sda1 is 91 percent full"],
-        )]),
-    ];
+    let (pre, post) = (batches_below_s(), batches_above_s());
 
     let pipeline = open_pipeline(root);
     for r in &pre {
@@ -164,15 +188,7 @@ async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // mints.
     let issued = control.highest_allocated();
     let high_water = issued + 37;
-    let ids = template_ids(root);
-    ids.store()
-        .put_blocking(
-            ourios_ingester::template_ids::HIGH_WATER_KEY,
-            format!(r#"{{"reserved_through": {high_water}}}"#).into_bytes(),
-        )
-        .expect("the live node's high-water");
-    ourios_ingester::template_ids::mark_seated(&snapshots_root, 0)
-        .expect("the live node seated before it snapshotted");
+    let ids = seated_live_node(root, &snapshots_root, high_water);
 
     // Act: recover into a fresh miner over the same WAL + snapshots.
     let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");

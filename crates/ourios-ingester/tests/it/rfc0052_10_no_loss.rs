@@ -34,12 +34,12 @@ use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::snapshot_store;
 use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::{AuditReader, Reader, Store};
+use ourios_parquet::Store;
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, TenantBatch, Wal, WalConfig, WalOffset};
 use prost::Message;
 
 use crate::ingest_support::{request, resource_logs};
-use crate::rfc0052_barrier_support::{BarrierRig, never_flush, wal_config};
+use crate::rfc0052_barrier_support::{BarrierRig, audit_events, never_flush, rows, wal_config};
 
 const TENANT: &str = "checkout";
 
@@ -406,19 +406,6 @@ async fn rfc0052_10_a_replayed_record_is_never_durable_before_its_template_event
     );
 }
 
-/// Every audit event in the Parquet files under `root`.
-fn audit_events(root: &Path) -> Vec<AuditEvent> {
-    crate::rfc0052_barrier_support::parquet_files(root)
-        .iter()
-        .flat_map(|path| {
-            AuditReader::open_file(path)
-                .expect("open audit file")
-                .read_all()
-                .expect("read audit file")
-        })
-        .collect()
-}
-
 /// Scenario RFC0052.10 — the `S > X` shape: the snapshot landed and the
 /// checkpoint write then failed, so nothing in `(X, S]` is republished.
 /// See `docs/rfcs/0052-wal-reclamation-and-quiesce-recovery.md` §5.
@@ -639,13 +626,7 @@ async fn ingest_frame(rig: &BarrierRig, n: u64, bodies: &[&str]) -> WalOffset {
 /// Ingest one record stamped `n` (its `time_unix_nano`, the identity the
 /// assertions read back) and return its frame's offset.
 async fn ingest(rig: &BarrierRig, n: u64, body: &str) -> WalOffset {
-    let mut logs = resource_logs(TENANT, &[body]);
-    logs.scope_logs[0].log_records[0].time_unix_nano = n;
-    rig.pipeline
-        .ingest(request(vec![logs]), TenantId::new(TENANT))
-        .await
-        .expect("the batch acks");
-    rig.pipeline.last_durable().expect("a durable mark")
+    ingest_frame(rig, n, &[body]).await
 }
 
 /// Restart over `node` with the record sink on its store, as `serve`
@@ -758,19 +739,6 @@ fn frames(node: &Node) -> Vec<(WalOffset, Vec<OtlpLogRecord>)> {
     let mut collect = Collect(Vec::new());
     wal.replay(&mut collect).expect("replay");
     collect.0
-}
-
-/// Every mined row in the Parquet files under `root`.
-fn rows(root: &Path) -> Vec<MinedRecord> {
-    crate::rfc0052_barrier_support::parquet_files(root)
-        .iter()
-        .flat_map(|path| {
-            Reader::open_file(path)
-                .expect("open_file")
-                .read_all()
-                .expect("read_all")
-        })
-        .collect()
 }
 
 /// Each record's stamp, sorted.

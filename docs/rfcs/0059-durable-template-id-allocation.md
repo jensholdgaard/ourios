@@ -564,7 +564,9 @@ DuckDB procedure finds them.
   - If the object's `reserved_through` is below `max_reserved_seen`, the
     object was rolled back to an older copy, and startup fails closed
     (§3.1, RFC0059.18). A marker claiming more than the object holds is
-    the same case.
+    the same case. Seating re-reads the object, and holds that read to
+    `max_reserved_seen` as well, before it reserves any block: a rollback
+    between the trust decision and seating fails closed the same way.
   - Otherwise the root's snapshots are trusted and restore normally.
 - **Marker present and valid, object absent.** Startup fails closed
   (§3.1, RFC0059.14).

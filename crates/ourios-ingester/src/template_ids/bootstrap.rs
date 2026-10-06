@@ -3,9 +3,9 @@
 //! carries.
 
 use ourios_miner::cluster::MAX_TEMPLATE_ID;
-use ourios_parquet::{IdColumns, Store, object_max_id};
+use ourios_parquet::{IdColumns, IdMaxError, Store, object_max_id};
 
-use super::{Seated, TemplateIdsError, Written, create, names, store_err};
+use super::{Seated, TemplateIdsError, Written, create, names};
 
 /// Files between two progress events.
 const PROGRESS_EVERY: u64 = 10_000;
@@ -23,8 +23,9 @@ impl BootstrapScan {
     ///
     /// # Errors
     ///
-    /// [`TemplateIdsError`] when a listing or a file read fails: a floor
-    /// over a partial scan proves nothing.
+    /// [`TemplateIdsError::Scan`] when any step fails (a listing, a
+    /// ranged read, a footer parse, the full-file fallback, or an id
+    /// column's decode): a floor over a partial scan proves nothing.
     pub fn run(store: &Store) -> Result<Self, TemplateIdsError> {
         let mut scan = Self::default();
         walk(store, "data", &mut |key| {
@@ -68,7 +69,7 @@ impl BootstrapScan {
 /// domain: no allocator issued it, so no floor can be built on it.
 fn in_domain(
     key: &str,
-    max: Result<Option<u64>, ourios_parquet::IdMaxError>,
+    max: Result<Option<u64>, IdMaxError>,
 ) -> Result<Option<u64>, TemplateIdsError> {
     match max.map_err(|e| TemplateIdsError::Scan(Box::new(e)))? {
         Some(id) if id > MAX_TEMPLATE_ID => Err(TemplateIdsError::Malformed {
@@ -90,7 +91,12 @@ fn walk(
     while let Some(dir) = pending.pop() {
         let listing = store
             .list_delimited_blocking(Some(&dir))
-            .map_err(store_err("list", &dir))?;
+            .map_err(|source| {
+                TemplateIdsError::Scan(Box::new(IdMaxError::Store {
+                    key: dir.clone(),
+                    source: Box::new(source),
+                }))
+            })?;
         for key in listing.objects.iter().filter(|k| k.ends_with(".parquet")) {
             visit(key)?;
         }

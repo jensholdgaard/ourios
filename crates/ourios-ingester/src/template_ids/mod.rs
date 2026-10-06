@@ -143,7 +143,8 @@ impl std::fmt::Display for TemplateIdsError {
             Self::Scan(e) if e.is_permission_denied() => write!(
                 f,
                 "template-id bootstrap scan: permission denied; the receiver needs \
-                 s3:GetObject on data/ and audit/ for the bootstrap (RFC 0059 §3.6): {e}"
+                 s3:ListBucket and s3:GetObject on data/ and audit/ for the bootstrap \
+                 (RFC 0059 §3.6): {e}"
             ),
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),

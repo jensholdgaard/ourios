@@ -2,7 +2,7 @@
 //! See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 
 use ourios_ingester::recovery::RecoveryDriverError;
-use ourios_ingester::template_ids::TemplateIdsError;
+use ourios_ingester::template_ids::{SEATED_MARKER, TemplateIdsError};
 
 use crate::rfc0059_support::{Node, audit_bindings, cut_and_reclaim, publish, rows};
 
@@ -107,10 +107,53 @@ async fn rfc0059_6_a_kill_mid_scan_writes_nothing_and_the_next_start_redoes_it()
         ),
         "{err}"
     );
+    assert!(err.to_string().contains("bootstrap scan"), "{err}");
     assert_eq!(node.high_water_bytes(), None, "nothing is written mid-scan");
+    assert!(
+        !node.snapshots.join(SEATED_MARKER).exists(),
+        "nor the marker"
+    );
 
     std::fs::remove_file(&torn).expect("the next start can read it");
     let restarted = node.restart().expect("recover");
     assert!(restarted.report.template_ids.bootstrapped);
     assert_eq!(restarted.report.template_ids.high_water, data_max);
+}
+
+/// Scenario RFC0059.6 — a listing the scan cannot complete fails startup
+/// closed as a scan failure, and writes neither the object nor the
+/// marker.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_6_a_failed_listing_fails_the_scan_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (node, _, _) = store_only_rows_can_bound(tmp.path()).await;
+    let partition = node.store.join("data").join("tenant_id=search");
+    let set = |mode| {
+        std::fs::set_permissions(&partition, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    set(0o000);
+
+    let result = node.restart();
+    set(0o755);
+
+    let Err(err) = result else {
+        panic!("an unlistable partition must fail the scan");
+    };
+    assert!(
+        matches!(
+            &err,
+            RecoveryDriverError::TemplateIds(e @ TemplateIdsError::Scan(_))
+                if e.error_type() == "scan"
+        ),
+        "{err}"
+    );
+    assert_eq!(node.high_water_bytes(), None, "no object is written");
+    assert!(
+        !node.snapshots.join(SEATED_MARKER).exists(),
+        "nor the marker"
+    );
 }

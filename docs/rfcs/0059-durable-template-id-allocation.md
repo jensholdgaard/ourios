@@ -13,8 +13,10 @@ superseded-by: —
 
 > **Status: `specified`.** §5 lists the acceptance criteria. This RFC
 > amends RFC 0001 §6.1 (template identity), §6.9 (persistence and
-> recovery) and scenario §3.5.3, RFC 0023 §3.4 (the parse-failure
-> reason enum), and RFC 0052 §3.7 (the audit gate, for re-minted ids).
+> recovery) and scenario §3.5.3, and RFC 0023 §3.4 (the parse-failure
+> reason enum). It coordinates with RFC 0052 §3.7 (the audit gate, for
+> re-minted ids): RFC 0052 is `green`, not `accepted`, so the overlap is
+> recorded on both sides rather than as an amendment (§3.8).
 > RFC 0001 keeps the old text with a dated pointer here,
 > the way RFC 0023 amended it.
 
@@ -469,6 +471,14 @@ store, at its first start under this RFC, and never again.
 **Progress.** Every 10,000 files, the bootstrap logs
 `ourios.receiver.template_ids.bootstrap.progress` (§3.9).
 
+**A failed scan fails closed.** Every step of the scan can fail: a
+listing, a ranged footer read, a footer parse, the full-file fallback,
+or an id column's decode.
+- Any such failure aborts startup with `error.type = scan`.
+- The receiver writes neither the high-water object nor the seated
+  marker. A floor over a partial scan proves nothing.
+- The next start redoes the scan (RFC0059.6).
+
 **Crash mid-bootstrap.** Nothing is written until the scan completes. A
 crash or restart during the scan leaves no object, so the next start
 redoes the scan from the beginning. The write is create-if-absent
@@ -785,7 +795,7 @@ allocator, ids increase with creation order across restarts, which is
 all the restore-order equivalence of RFC 0001's 2026-09-30 amendment
 needs.
 
-### 3.8 Amendments to earlier RFCs
+### 3.8 Amendments to earlier RFCs, and coordination
 
 - **RFC 0001 §6.1** (*Template identity*): uniqueness is a durable
   guarantee (§3.4), and monotonicity is per allocator (§3.7).
@@ -797,8 +807,12 @@ needs.
 - **RFC 0023 §3.4**: `ourios.miner.parse_failure.reason` gains the
   member `id_reservation_failed`, checked after `template_ceiling`
   (§3.3).
-- **RFC 0052 §3.7**: the audit gate at `X` forwards the events of
-  templates replay minted afresh (§3.4). The record gate is unchanged.
+- **Coordination with RFC 0052 §3.7** (not an amendment: RFC 0052 is
+  `green`, not `accepted`). The audit gate at `X` forwards the events of
+  templates replay minted afresh (§3.4); the record gate is unchanged.
+  - RFC 0052's own RFC0052.10 carries the matching dated And-clause, so
+    the two green gates agree.
+  - The maintainer approved the change on 2026-10-06.
 - **RFC 0001** gets only a dated pointer here, in §6.1 and §6.9.
 
 ### 3.9 Telemetry
@@ -935,6 +949,10 @@ The ids are referenced from test code.
 >   the maxima (a crash between the create and the event leaves none)
 > - **And** a restart killed mid-scan leaves no object, and the next start
 >   redoes the scan and writes once
+> - **And** when any scan step fails (a listing, a ranged read, a footer
+>   parse, the full-file fallback, or an id column's decode), startup
+>   aborts with `error.type = scan` and writes neither the object nor the
+>   seated marker
 
 > **Scenario RFC0059.7 — The bootstrap reads footers in bounded memory**
 > - **Given** histories of 40 and 160 data and audit files with large
@@ -1100,6 +1118,20 @@ every newly minted id.
 - RFC0059.17 parses the chart README's JSON policies (`include_str!`)
   and evaluates their action and resource wildcards against the
   high-water key.
+- **RFC0052.10's transition.** Its audit-gate test
+  (`rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_frame_order`)
+  changes its contract with this RFC. The maintainer approved this on
+  2026-10-06.
+  - Before: the forwarded events equal the reference's `(X, tail]`
+    events.
+  - After: the forwarded events equal the reference's `(X, tail]`
+    events plus the `(S, X]` events whose id lies above the seated
+    high-water, in frame order. `audit_events_suppressed` counts every
+    other `(S, X]` event.
+  - The assertions stay exact. A recovery unit test keeps the withheld
+    branch covered.
+  - RFC0059.9's `rfc0059_9_a_reminted_replay_id_publishes_its_mapping`
+    covers the discarded-snapshot and `S < X` cases end to end.
 
 **Miner unit tests**, with a scripted `IdReserver`:
 - RFC0059.4: the reserver records every call; the test asserts none

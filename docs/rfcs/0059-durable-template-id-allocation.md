@@ -42,7 +42,7 @@ the §5 scenarios that cover it:
 
 | Touched | How | Covered by |
 |---|---|---|
-| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16, .17, .18 |
+| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16, .17, .18, .19 |
 | `CLAUDE.md` §3.3, bit-identical reconstruction | the registry's last-wins fold would render old rows against the wrong text; an exhausted range must keep the body | RFC0059.1, .4 |
 | `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16, .17, .18 |
 | `CLAUDE.md` §3.7, multi-tenancy | ids stay unique across tenants; the scenarios mint for two tenants | RFC0059.1, .8 |
@@ -623,9 +623,17 @@ disjoint, and no per-node key is needed.
 - It has no `If-Match` (RFC0019.7: it commits by atomic overwrite, last
   writer wins). The reservation writes `N'` by overwrite there. An
   overwrite cannot be made conditional on the file still existing, so a
-  deletion racing a reservation's read and write can re-create it. That
-  is the single-receiver backend's accepted limit. A reservation that
-  reads an absent object still fails (§3.2).
+  deletion that lands between a reservation's read and its write can
+  re-create the object.
+  - That is the local backend's accepted limit, for single-node
+    development only. The re-created value is still above every block
+    this one receiver reserved, so no id is re-issued.
+  - RFC0059.18's "no reservation re-creates the object" is therefore
+    scoped to stores with conditional writes.
+  - A deletion that does not race a write is still caught on the local
+    backend: the next reservation fails with `HighWaterDeleted` and
+    stops the refiller, and the next restart fails closed (RFC0059.14,
+    whose test runs on the local backend).
 - **One receiver per local store** is a stated constraint. It is the
   same constraint under which the chart's shared local PVC is coherent
   at all (`data-pvc.yaml`: "coherent only on one node or with a
@@ -767,10 +775,19 @@ RFC 0001 §6.1 said `template_id` is "a cluster-wide unique monotonic
   - Parquet stores the column as unsigned 64-bit, and its footer
     statistics and decode both return such an id exactly, so the scan
     sees it rather than a truncated or negative value.
-- ids are **unique cluster-wide**;
+- ids are **unique cluster-wide against every id still bound by stored
+  data or audit**. This is narrowed by the maintainer's 2026-10-06
+  decision:
+  - the upgrade bootstrap and the quiesced re-bootstrap (§3.1) seat
+    above the footers of the data and audit that exist at the time;
+  - an id whose data and audit retention or erasure has already removed
+    may be issued again after such a re-bootstrap. That is harmless,
+    because nothing stored binds it (RFC0059.19);
+  - between re-bootstraps, no id is ever issued twice;
 - ids are **strictly increasing per allocator**, across that
   allocator's restarts, because every block lies above every earlier
-  one;
+  one. A re-bootstrap may restart the sequence lower, but never at or
+  below an id stored data or audit still binds;
 - ids are **not dense**;
 - ids are **not monotonic across replicas**: two replicas interleave
   disjoint blocks.
@@ -797,8 +814,13 @@ needs.
 
 ### 3.8 Amendments to earlier RFCs, and coordination
 
-- **RFC 0001 §6.1** (*Template identity*): uniqueness is a durable
-  guarantee (§3.4), and monotonicity is per allocator (§3.7).
+- **RFC 0001 §6.1** (*Template identity*; RFC 0001 is `accepted`, so
+  this is an amendment). Uniqueness is a durable guarantee (§3.4),
+  monotonicity is per allocator (§3.7), and uniqueness holds against
+  every id still bound by stored data or audit. After the upgrade
+  bootstrap or a quiesced re-bootstrap, an id whose data and audit
+  retention or erasure removed may be reissued. This narrowing was
+  approved by the maintainer on 2026-10-06.
 - **RFC 0001 §6.9**: every start reads the high-water and allocates
   above it (§3.4), and the first start bootstraps it (§3.5).
 - **RFC 0001 scenario §3.5.3**: restore equivalence holds up to the
@@ -991,7 +1013,8 @@ The ids are referenced from test code.
 >   carries an id a published event binds
 
 > **Scenario RFC0059.10 — Ids increase per allocator across restarts**
-> - **Given** an allocator that issued ids, restarted, and issued more
+> - **Given** an allocator that issued ids, restarted, and issued more,
+>   with no re-bootstrap in between
 > - **When** its ids are listed in issue order
 > - **Then** they strictly increase
 > - **And** no id above `i64::MAX` is ever issued: `i64::MAX` itself is
@@ -1091,7 +1114,10 @@ The ids are referenced from test code.
 >   arriving
 > - **Then** the held ids are each issued once and none lies past the
 >   last reservation
-> - **And** no reservation re-creates the object
+> - **And** on a store with conditional writes, no reservation re-creates
+>   the object (on the local backend a deletion racing a write may
+>   re-create it, §3.6, and one that does not race is caught at the next
+>   reservation and fails the next restart closed, RFC0059.14)
 > - **And** once the held blocks are spent, fresh mints fail as
 >   `id_reservation_failed` while known templates attach
 > - **And** if the object then reappears, the refiller does not reserve
@@ -1104,6 +1130,17 @@ The ids are referenced from test code.
 >   `receiver.template_ids_allow_bootstrap`), that replica seats at or
 >   above every published id, and its next mint is fresh
 
+> **Scenario RFC0059.19 — Retention or erasure followed by re-bootstrap never reissues a bound id**
+> - **Given** a seated store from which retention or erasure removed one
+>   tenant's data and audit, including its highest ids
+> - **When** the documented re-bootstrap runs (every receiver stopped,
+>   the object and every seated marker removed, one replica started with
+>   `receiver.template_ids_allow_bootstrap`)
+> - **Then** the new floor is at or above every id still bound by stored
+>   data or audit
+> - **And** no id minted afterwards equals an id still bound by stored
+>   data or audit; ids only the removed files bound may be reissued
+
 ## 6. Testing strategy
 
 **Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
@@ -1114,7 +1151,11 @@ every newly minted id.
   fixture), .5, .6, .9, .11, .12, .13, .14, .15 and .16.
 - RFC0059.18 deletes the object under a running node and restores it
   later, asserting no re-creation and no reservation from the restored
-  copy.
+  copy. Its deletion does not race a write, so it holds on the local
+  backend too.
+- RFC0059.19 removes one tenant's data and audit directories, as
+  retention would, runs the documented re-bootstrap, and asserts no new
+  id equals one still bound.
 - RFC0059.17 parses the chart README's JSON policies (`include_str!`)
   and evaluates their action and resource wildcards against the
   high-water key.

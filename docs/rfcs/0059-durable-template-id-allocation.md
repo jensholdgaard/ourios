@@ -248,6 +248,13 @@ no reservation ever runs there.
     drive one store call each.
   - Running out of ids is not a refill failure: it surfaces only as the
     parse failures below.
+  - A receiver stops its refiller and waits for any reservation in
+    flight before it releases its roots, at shutdown and on a failed
+    start, so no stale write can land under the next receiver over
+    them. After the stop no block is recorded in the marker or made
+    ready. The wait is unbounded on a backend without compare-and-swap,
+    where a stale write could lower the high-water. Elsewhere it is
+    bounded, since such a write fails its `If-Match`.
 - **A high-water deleted while live.** If a refill finds the object
   absent (`HighWaterDeleted`), the refiller stops for good and logs an
   error. It does not retry: an object that reappears, for example

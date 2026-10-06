@@ -26,6 +26,11 @@ pub struct Hooks {
     pub high_water_puts_until_failure: Arc<std::sync::atomic::AtomicUsize>,
     /// Parks the high-water's writes while armed.
     pub high_water_put_gate: Arc<PutGate>,
+    /// Delete the high-water just before its next write, which then fails
+    /// not-found, as a backend answering a compare-and-swap on a missing
+    /// key with `404` does: the window between a reservation's read and
+    /// its write.
+    pub delete_before_next_put: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Hooks {

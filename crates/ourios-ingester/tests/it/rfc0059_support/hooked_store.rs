@@ -33,6 +33,23 @@ impl std::fmt::Display for HookedStore {
 }
 
 impl HookedStore {
+    /// Another actor deletes the high-water, once, if `flag` is armed, and
+    /// the write in flight fails not-found.
+    async fn delete_if(
+        &self,
+        flag: &std::sync::atomic::AtomicBool,
+        location: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        if !take(flag) {
+            return Ok(());
+        }
+        object_store::ObjectStoreExt::delete(self.inner.as_ref(), location).await?;
+        Err(object_store::Error::NotFound {
+            path: location.to_string(),
+            source: "deleted between the read and the write".into(),
+        })
+    }
+
     /// Another writer creates the high-water, once, if `flag` is armed.
     async fn win_if(
         &self,
@@ -65,6 +82,8 @@ impl object_store::ObjectStore for HookedStore {
         if is_high_water(location) {
             self.hooks.count_down_put()?;
             self.hooks.high_water_put_gate.pass();
+            self.delete_if(&self.hooks.delete_before_next_put, location)
+                .await?;
         }
         let creating = matches!(opts.mode, object_store::PutMode::Create);
         if creating && is_high_water(location) {

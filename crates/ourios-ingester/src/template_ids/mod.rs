@@ -313,8 +313,10 @@ fn create(store: &Store, reserved_through: u64) -> Result<Written, TemplateIdsEr
 
 /// Replace the high-water read as `prior` with `reserved_through`: a
 /// compare-and-swap where the backend supports one, an overwrite where it
-/// does not (RFC 0059 §3.6). A compare-and-swap against a deleted object
-/// fails rather than re-creating it.
+/// does not (RFC 0059 §3.6). An object deleted since the read is
+/// [`TemplateIdsError::HighWaterDeleted`], never re-created: a backend
+/// that answers the compare-and-swap with not-found says so, and the
+/// overwrite first checks the object is still there.
 fn update(
     store: &Store,
     prior: &HighWater,
@@ -330,9 +332,13 @@ fn update(
                     .to_owned(),
             });
         }
+        (_, false) if read(store)?.is_none() => return Err(TemplateIdsError::HighWaterDeleted),
         (_, false) => store.put_blocking(HIGH_WATER_KEY, bytes),
     };
-    landed(store, outcome)
+    match outcome {
+        Err(e) if e.is_not_found() => Err(TemplateIdsError::HighWaterDeleted),
+        outcome => landed(store, outcome),
+    }
 }
 
 /// A write counts as landed only once it is durable: the local backend's
@@ -514,6 +520,19 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn an_overwrite_never_re_creates_an_object_deleted_since_the_read() {
+        let (_tmp, store) = local();
+        store.put_blocking(HIGH_WATER_KEY, encode(7)).expect("put");
+        let prior = read(&store).expect("read").expect("present");
+        store.delete_blocking(HIGH_WATER_KEY).expect("delete");
+
+        let err = update(&store, &prior, 1_007).err().expect("deleted");
+
+        assert!(matches!(err, TemplateIdsError::HighWaterDeleted), "{err}");
+        assert_eq!(read(&store).expect("read"), None, "not re-created");
     }
 
     #[test]

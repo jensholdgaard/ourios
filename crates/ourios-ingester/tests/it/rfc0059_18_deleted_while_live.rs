@@ -143,3 +143,77 @@ async fn rfc0059_18_the_documented_recovery_reseats_above_every_published_id() {
     let fresh = restarted.mine(TENANT, "cache warmed in 12 ms");
     assert!(fresh > highest && !published.contains(&fresh));
 }
+
+/// Scenario RFC0059.18 — a high-water deleted between a reservation's read
+/// and its compare-and-swap, on a backend that answers that write
+/// not-found, stops the refiller for good: an older copy restored during
+/// what would have been its backoff is never read or reserved from, and no
+/// block is handed out once the held ones are gone.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[test]
+fn rfc0059_18_a_deletion_between_read_and_write_stops_the_refiller() {
+    use std::sync::atomic::Ordering;
+
+    use ourios_config::MinerConfig;
+    use ourios_ingester::template_ids::{self, SnapshotTrust, TemplateIds};
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_parquet::Store;
+
+    use crate::rfc0059_support::Hooks;
+
+    // Given a running receiver whose refiller is about to reserve.
+    let backend = Store::in_memory();
+    backend
+        .put_blocking(HIGH_WATER_KEY, br#"{"reserved_through": 5000}"#.to_vec())
+        .expect("seed");
+    let hooks = Hooks::default();
+    let ids = TemplateIds::new(hooks.wrap(backend.clone()));
+    let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
+    ids.start(
+        &mut miner,
+        SnapshotTrust::Seated {
+            max_reserved_seen: 0,
+        },
+    )
+    .expect("start");
+    ids.finish_replay().expect("the refiller");
+    let present = || template_ids::read(&backend).expect("read").is_some();
+    let mut reserver = ids.reserver();
+
+    // When the object is deleted between the refill's read and its write.
+    hooks.delete_before_next_put.store(true, Ordering::Release);
+    let held = reserver.reserve(0).expect("a held block");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while present() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!present(), "the refill reached its write");
+
+    // And an older copy is restored inside the first backoff.
+    backend
+        .put_blocking(HIGH_WATER_KEY, br#"{"reserved_through": 1000}"#.to_vec())
+        .expect("restore a stale copy");
+    let reads = || hooks.high_water_reads.load(Ordering::Acquire);
+    let reads_after_restore = reads();
+    let last = reserver
+        .reserve(held.through())
+        .expect("the other held block");
+    std::thread::sleep(SETTLE);
+
+    // Then the refiller never read or wrote the restored object again,
+    // and no further block is handed out.
+    assert_eq!(reads(), reads_after_restore, "the refiller stopped");
+    assert_eq!(
+        template_ids::read(&backend)
+            .expect("read")
+            .expect("restored")
+            .reserved_through,
+        1000,
+        "nothing reserved from the stale copy"
+    );
+    assert!(held.after() >= 5000 && last.after() >= 5000);
+    assert!(
+        reserver.reserve(last.through()).is_err(),
+        "no block below another replica's comes from the stale copy"
+    );
+}

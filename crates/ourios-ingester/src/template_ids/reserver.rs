@@ -133,12 +133,14 @@ impl TemplateIds {
     pub fn start(
         &self,
         miner: &mut MinerCluster,
-        may_bootstrap: bool,
+        trust: SnapshotTrust,
     ) -> Result<Seated, TemplateIdsError> {
-        let policy = match (may_bootstrap, self.allow_bootstrap) {
-            (false, _) => BootstrapPolicy::Refuse,
-            (true, false) => BootstrapPolicy::IfStoreEmpty,
-            (true, true) => BootstrapPolicy::Authorized,
+        let policy = match (trust, self.allow_bootstrap) {
+            (SnapshotTrust::Seated | SnapshotTrust::PredatesHighWater, _) => {
+                BootstrapPolicy::Refuse
+            }
+            (SnapshotTrust::Bootstrap, false) => BootstrapPolicy::IfStoreEmpty,
+            (SnapshotTrust::Bootstrap, true) => BootstrapPolicy::Authorized,
         };
         let shared = &self.shared;
         let seated = seat(&shared.store, miner, policy)?;
@@ -325,7 +327,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default());
-        let seated = ids.start(&mut miner, true).expect("start");
+        let seated = ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
         assert_eq!(seated.high_water, 500);
         assert_eq!(miner.highest_allocated(), 500);
         let mut reserver = ids.reserver();
@@ -343,7 +345,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
-        ids.start(&mut miner, true).expect("start");
+        ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
         let ready: Vec<(u64, u64)> = lock(&ids.shared.ready)
             .blocks
             .iter()
@@ -412,7 +414,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store);
         let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
-        let seated = ids.start(&mut miner, true).expect("start");
+        let seated = ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
         ids.record_seat(tmp.path(), SnapshotTrust::PredatesHighWater, seated)
             .expect("seat");
         let marker = |root: &Path| read_marker(root).expect("read").expect("present");

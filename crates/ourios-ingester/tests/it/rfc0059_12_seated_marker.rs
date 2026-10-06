@@ -4,8 +4,12 @@
 
 use std::collections::BTreeSet;
 
+use ourios_config::MinerConfig;
 use ourios_ingester::recovery::{RecoveryDriverError, SnapshotFate};
-use ourios_ingester::template_ids::{SEATED_MARKER, TemplateIdsError};
+use ourios_ingester::template_ids::{
+    HIGH_WATER_KEY, SEATED_MARKER, SnapshotTrust, TemplateIds, TemplateIdsError,
+};
+use ourios_miner::cluster::MinerCluster;
 
 use crate::rfc0059_support::{Hooks, Node, cut_and_reclaim, publish};
 
@@ -231,4 +235,66 @@ async fn rfc0059_12_the_loser_of_the_bootstrap_race_fails_and_its_restart_discar
         "{:?}",
         restarted.report.tenants
     );
+}
+
+/// Scenario RFC0059.12 — a start that saw no high-water, restored its
+/// snapshots, and then finds that another start created the object before
+/// its seat, fails startup: it certifies nothing and writes no marker, and
+/// its restart takes the discard path.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_12_a_high_water_created_after_the_trust_read_fails_the_start() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (_, b) = two_pre_rfc_receivers(tmp.path()).await;
+    let snapshots_before = artefacts(&b);
+    let hooks = Hooks::default();
+    hooks
+        .create_after_absent_read
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let Err(err) = b.restart_over(hooks.wrap(b.store())) else {
+        panic!("a start whose trust read is stale must fail");
+    };
+    assert!(
+        matches!(
+            err,
+            RecoveryDriverError::TemplateIds(TemplateIdsError::BootstrapRaceLost)
+        ),
+        "{err}"
+    );
+    assert!(!b.snapshots.join(SEATED_MARKER).exists(), "no marker");
+    assert_eq!(artefacts(&b), snapshots_before, "nothing is removed");
+
+    let restarted = b.restart().expect("the restart");
+    assert!(
+        restarted
+            .report
+            .tenants
+            .iter()
+            .all(|t| matches!(&t.fate, SnapshotFate::Discarded(r) if r.error_type() == "predates_high_water")),
+        "{:?}",
+        restarted.report.tenants
+    );
+}
+
+/// Scenario RFC0059.12 — a markerless start that saw the high-water, and
+/// so discards its snapshots, never bootstraps if the object then
+/// vanishes: it fails closed with nothing written.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_12_a_start_that_saw_the_high_water_never_bootstraps() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (a, b) = two_pre_rfc_receivers(tmp.path()).await;
+    drop(a.restart().expect("A bootstraps"));
+    let trust = SnapshotTrust::of(&b.snapshots, &b.store()).expect("trust");
+    assert_eq!(trust, SnapshotTrust::PredatesHighWater);
+    std::fs::remove_file(b.store.join(HIGH_WATER_KEY)).expect("the object vanishes");
+
+    let ids = TemplateIds::new(b.store()).with_bootstrap_allowed(true);
+    let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
+    let Err(err) = ids.start(&mut miner, trust) else {
+        panic!("a start that saw the object must not bootstrap");
+    };
+    assert!(matches!(err, TemplateIdsError::HighWaterDeleted), "{err}");
+    assert_eq!(b.high_water_bytes(), None, "nothing is created");
 }

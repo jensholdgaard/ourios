@@ -464,8 +464,23 @@ fn renamed_state(state: &State, renaming: &BTreeMap<u64, u64>) -> State {
 pub struct Hooks {
     pub down: Arc<std::sync::atomic::AtomicBool>,
     pub race_the_create: Arc<std::sync::atomic::AtomicBool>,
+    /// Let another writer create the high-water right after the next read
+    /// that finds it absent: the window between a start's trust decision
+    /// and its seat.
+    pub create_after_absent_read: Arc<std::sync::atomic::AtomicBool>,
     /// Refuse every call as an S3 `403` would.
     pub denied: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What another writer leaves in the high-water when it wins a race.
+const WINNER: &[u8] = br#"{"reserved_through": 1}"#;
+
+fn is_high_water(location: &object_store::path::Path) -> bool {
+    location.as_ref() == ourios_ingester::template_ids::HIGH_WATER_KEY
+}
+
+fn take(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.swap(false, std::sync::atomic::Ordering::AcqRel)
 }
 
 impl Hooks {
@@ -512,6 +527,20 @@ impl std::fmt::Display for HookedStore {
     }
 }
 
+impl HookedStore {
+    /// Another writer creates the high-water.
+    async fn win(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+        self.inner
+            .put_opts(
+                location,
+                WINNER.to_vec().into(),
+                object_store::PutOptions::default(),
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
 #[async_trait::async_trait]
 impl object_store::ObjectStore for HookedStore {
     async fn put_opts(
@@ -522,17 +551,8 @@ impl object_store::ObjectStore for HookedStore {
     ) -> object_store::Result<object_store::PutResult> {
         self.hooks.enter()?;
         let creating = matches!(opts.mode, object_store::PutMode::Create);
-        if creating
-            && location.as_ref() == ourios_ingester::template_ids::HIGH_WATER_KEY
-            && self
-                .hooks
-                .race_the_create
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            let winner = br#"{"reserved_through": 1}"#.to_vec();
-            self.inner
-                .put_opts(location, winner.into(), object_store::PutOptions::default())
-                .await?;
+        if creating && is_high_water(location) && take(&self.hooks.race_the_create) {
+            self.win(location).await?;
         }
         self.inner.put_opts(location, payload, opts).await
     }
@@ -552,7 +572,12 @@ impl object_store::ObjectStore for HookedStore {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         self.hooks.enter()?;
-        self.inner.get_opts(location, options).await
+        let got = self.inner.get_opts(location, options).await;
+        let absent = matches!(got, Err(object_store::Error::NotFound { .. }));
+        if absent && is_high_water(location) && take(&self.hooks.create_after_absent_read) {
+            self.win(location).await?;
+        }
+        got
     }
 
     async fn get_ranges(

@@ -78,13 +78,6 @@ impl SnapshotTrust {
     pub fn restores(self) -> bool {
         matches!(self, Self::Seated | Self::Bootstrap)
     }
-
-    /// Whether an absent high-water may be bootstrapped: only by a root
-    /// that never seated.
-    #[must_use]
-    pub fn may_bootstrap(self) -> bool {
-        self != Self::Seated
-    }
 }
 
 /// A root's seated marker.

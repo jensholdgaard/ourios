@@ -365,15 +365,19 @@ pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
     Err(TemplateIdsError::Contended)
 }
 
-/// Whether a start may create an absent high-water (RFC 0059 §3.5).
+/// What a start expects of the high-water it read when deciding whether
+/// to trust its snapshots (RFC 0059 §3.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapPolicy {
-    /// A seated root: absence means the object was deleted.
+    /// The start saw the object (a seated root, or a markerless one that
+    /// discards its snapshots): absence now means it was deleted.
     Refuse,
-    /// A markerless root without authorisation: only a store with no data
-    /// or audit file yet, a genuinely new one, bootstraps.
+    /// The start saw no object and restored its snapshots on that basis,
+    /// so it must create the object itself. Only a store with no data or
+    /// audit file yet, a genuinely new one, bootstraps unauthorised.
     IfStoreEmpty,
-    /// A markerless root the operator authorised for the upgrade.
+    /// As [`Self::IfStoreEmpty`], authorised by the operator for the
+    /// upgrade.
     Authorized,
 }
 
@@ -414,10 +418,15 @@ pub fn seat(
 ) -> Result<Seated, TemplateIdsError> {
     let restored = miner.highest_allocated();
     let seated = match (read(store)?, policy) {
-        (Some(high_water), _) => Seated {
+        (Some(high_water), BootstrapPolicy::Refuse) => Seated {
             high_water: high_water.reserved_through,
             bootstrapped: false,
         },
+        // Another start created the object after this one saw it absent
+        // and restored its snapshots: their ids may lie above its floor.
+        (Some(_), BootstrapPolicy::IfStoreEmpty | BootstrapPolicy::Authorized) => {
+            return Err(TemplateIdsError::BootstrapRaceLost);
+        }
         (None, BootstrapPolicy::Refuse) => return Err(TemplateIdsError::HighWaterDeleted),
         (None, BootstrapPolicy::IfStoreEmpty) if store_has_data(store)? => {
             return Err(TemplateIdsError::BootstrapNotAuthorized);

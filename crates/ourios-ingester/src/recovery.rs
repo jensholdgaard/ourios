@@ -594,7 +594,7 @@ fn seat_root(
         snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
     }
     let seated = ids
-        .start(miner, trust.may_bootstrap())
+        .start(miner, trust)
         .map_err(RecoveryDriverError::TemplateIds)?;
     ids.record_seat(snapshots_root, trust, seated)
         .map_err(RecoveryDriverError::TemplateIds)?;

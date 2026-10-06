@@ -602,7 +602,7 @@ fn seat_root(
     let seated = ids
         .start(miner, trust)
         .map_err(RecoveryDriverError::TemplateIds)?;
-    if trust == SnapshotTrust::Seated {
+    if matches!(trust, SnapshotTrust::Seated { .. }) {
         ids.record_seat(snapshots_root, trust, seated)
             .map_err(RecoveryDriverError::TemplateIds)?;
     }
@@ -621,7 +621,7 @@ fn seal_root(
     seated: Seated,
 ) -> Result<(), RecoveryDriverError> {
     match trust {
-        SnapshotTrust::Seated => return Ok(()),
+        SnapshotTrust::Seated { .. } => return Ok(()),
         SnapshotTrust::PredatesHighWater => {
             snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
         }

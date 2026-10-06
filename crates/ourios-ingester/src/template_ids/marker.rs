@@ -32,8 +32,9 @@ const MARKER_VERSION: u64 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotTrust {
     /// The root has seated before: every artefact was written under
-    /// reservations.
-    Seated,
+    /// reservations, and the high-water read at decision time was at
+    /// least `max_reserved_seen`, which seating holds it to.
+    Seated { max_reserved_seen: u64 },
     /// No high-water exists yet: this start bootstraps it and folds the
     /// restored ids into the floor.
     Bootstrap,
@@ -67,7 +68,9 @@ impl SnapshotTrust {
                     found: high_water.reserved_through,
                 })
             }
-            (Some(_), Some(_)) => Ok(Self::Seated),
+            (Some(marker), Some(_)) => Ok(Self::Seated {
+                max_reserved_seen: marker.max_reserved_seen,
+            }),
             (None, Some(_)) => Ok(Self::PredatesHighWater),
             (None, None) => Ok(Self::Bootstrap),
         }
@@ -76,7 +79,7 @@ impl SnapshotTrust {
     /// Whether the artefacts restore.
     #[must_use]
     pub fn restores(self) -> bool {
-        matches!(self, Self::Seated | Self::Bootstrap)
+        matches!(self, Self::Seated { .. } | Self::Bootstrap)
     }
 }
 
@@ -193,7 +196,9 @@ mod tests {
         mark_seated(&root, 9).expect("mark");
         assert_eq!(
             SnapshotTrust::of(&root, &store).expect("trust"),
-            SnapshotTrust::Seated
+            SnapshotTrust::Seated {
+                max_reserved_seen: 9
+            }
         );
     }
 
@@ -252,7 +257,9 @@ mod tests {
         .expect("mark");
         assert_eq!(
             SnapshotTrust::of(&root, &store).expect("current"),
-            SnapshotTrust::Seated
+            SnapshotTrust::Seated {
+                max_reserved_seen: 3_000
+            }
         );
         store
             .put_blocking(HIGH_WATER_KEY, encode(2_999))

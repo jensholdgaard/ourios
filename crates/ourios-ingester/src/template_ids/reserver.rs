@@ -165,9 +165,10 @@ impl TemplateIds {
         trust: SnapshotTrust,
     ) -> Result<Seated, TemplateIdsError> {
         let policy = match (trust, self.allow_bootstrap) {
-            (SnapshotTrust::Seated | SnapshotTrust::PredatesHighWater, _) => {
-                BootstrapPolicy::Refuse
-            }
+            (SnapshotTrust::Seated { max_reserved_seen }, _) => BootstrapPolicy::Refuse {
+                floor: max_reserved_seen,
+            },
+            (SnapshotTrust::PredatesHighWater, _) => BootstrapPolicy::Refuse { floor: 0 },
             (SnapshotTrust::Bootstrap, false) => BootstrapPolicy::IfStoreEmpty,
             (SnapshotTrust::Bootstrap, true) => BootstrapPolicy::Authorized,
         };
@@ -199,7 +200,7 @@ impl TemplateIds {
         seated: Seated,
     ) -> Result<(), TemplateIdsError> {
         let base = match trust {
-            SnapshotTrust::Seated => {
+            SnapshotTrust::Seated { .. } => {
                 read_marker(snapshots_root)?.ok_or_else(|| TemplateIdsError::MarkerInvalid {
                     detail: "the seated marker vanished during startup".to_owned(),
                 })?
@@ -367,6 +368,55 @@ mod tests {
     use super::*;
     use crate::template_ids::{BLOCK, HIGH_WATER_KEY, encode};
 
+    /// A seated root whose marker holds no reservation above the store's.
+    const SEATED: SnapshotTrust = SnapshotTrust::Seated {
+        max_reserved_seen: 0,
+    };
+
+    /// A high-water rolled back after the trust decision read it, and
+    /// before seating reads it again, fails startup closed before any
+    /// block is reserved: seating holds the object to the marker's
+    /// `max_reserved_seen`, not only the first read.
+    #[test]
+    fn a_rollback_between_the_trust_decision_and_seating_fails_closed() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let root = tmp.path().join("snapshots");
+        let store = Store::in_memory();
+        store
+            .put_blocking(HIGH_WATER_KEY, encode(8_000))
+            .expect("put");
+        crate::template_ids::mark_seated(&root, 8_000).expect("mark");
+        let trust = SnapshotTrust::of(&root, &store).expect("current");
+
+        store
+            .put_blocking(HIGH_WATER_KEY, encode(0))
+            .expect("stale copy");
+        let ids = TemplateIds::new(store.clone());
+        let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
+        let err = ids.start(&mut miner, trust).expect_err("rolled back");
+
+        assert!(
+            matches!(
+                err,
+                TemplateIdsError::HighWaterRolledBack {
+                    seen: 8_000,
+                    found: 0
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            crate::template_ids::read(&store)
+                .expect("read")
+                .expect("present")
+                .reserved_through,
+            0,
+            "no block was reserved over the stale copy"
+        );
+        assert!(lock(&ids.shared.ready).blocks.is_empty());
+        assert_eq!(miner.highest_allocated(), 0);
+    }
+
     #[test]
     fn startup_seats_above_the_high_water_and_readies_two_blocks() {
         let store = Store::in_memory();
@@ -375,7 +425,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default());
-        let seated = ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
+        let seated = ids.start(&mut miner, SEATED).expect("start");
         assert_eq!(seated.high_water, 500);
         assert_eq!(miner.highest_allocated(), 500);
         let mut reserver = ids.reserver();
@@ -395,7 +445,7 @@ mod tests {
         store.put_blocking(HIGH_WATER_KEY, encode(0)).expect("put");
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
-        ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
+        ids.start(&mut miner, SEATED).expect("start");
         let high_water = || {
             crate::template_ids::read(&store)
                 .expect("read")
@@ -445,7 +495,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store.clone());
         let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
-        ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
+        ids.start(&mut miner, SEATED).expect("start");
         let ready: Vec<(u64, u64)> = lock(&ids.shared.ready)
             .blocks
             .iter()
@@ -532,7 +582,7 @@ mod tests {
             .expect("put");
         let ids = TemplateIds::new(store);
         let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
-        let seated = ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
+        let seated = ids.start(&mut miner, SEATED).expect("start");
         ids.record_seat(tmp.path(), SnapshotTrust::PredatesHighWater, seated)
             .expect("seat");
         let marker = |root: &Path| read_marker(root).expect("read").expect("present");

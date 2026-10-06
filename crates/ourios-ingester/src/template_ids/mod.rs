@@ -380,8 +380,10 @@ pub fn reserve(store: &Store, floor: u64) -> Result<IdBlock, TemplateIdsError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapPolicy {
     /// The start saw the object (a seated root, or a markerless one that
-    /// discards its snapshots): absence now means it was deleted.
-    Refuse,
+    /// discards its snapshots): absence now means it was deleted, and a
+    /// high-water below `floor`, the highest reservation the root has
+    /// seen, means it was rolled back since.
+    Refuse { floor: u64 },
     /// The start saw no object and restored its snapshots on that basis,
     /// so it must create the object itself. Only a store with no data or
     /// audit file yet, a genuinely new one, bootstraps unauthorised.
@@ -428,7 +430,15 @@ pub fn seat(
 ) -> Result<Seated, TemplateIdsError> {
     let restored = miner.highest_allocated();
     let seated = match (read(store)?, policy) {
-        (Some(high_water), BootstrapPolicy::Refuse) => Seated {
+        (Some(high_water), BootstrapPolicy::Refuse { floor })
+            if high_water.reserved_through < floor =>
+        {
+            return Err(TemplateIdsError::HighWaterRolledBack {
+                seen: floor,
+                found: high_water.reserved_through,
+            });
+        }
+        (Some(high_water), BootstrapPolicy::Refuse { .. }) => Seated {
             high_water: high_water.reserved_through,
             bootstrapped: false,
         },
@@ -437,7 +447,7 @@ pub fn seat(
         (Some(_), BootstrapPolicy::IfStoreEmpty | BootstrapPolicy::Authorized) => {
             return Err(TemplateIdsError::BootstrapRaceLost);
         }
-        (None, BootstrapPolicy::Refuse) => return Err(TemplateIdsError::HighWaterDeleted),
+        (None, BootstrapPolicy::Refuse { .. }) => return Err(TemplateIdsError::HighWaterDeleted),
         (None, BootstrapPolicy::IfStoreEmpty) if store_has_data(store)? => {
             return Err(TemplateIdsError::BootstrapNotAuthorized);
         }

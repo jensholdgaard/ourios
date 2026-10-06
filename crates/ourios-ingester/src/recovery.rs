@@ -295,6 +295,7 @@ pub fn recover(
     // Before the caller's post-recovery write replaces the version-1
     // artefacts whose marks this check reads.
     refuse_legacy_stale_gaps(wal, &horizons, legacy)?;
+    seal_root(snapshots_root, ids, trust, template_ids)?;
 
     let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
@@ -580,25 +581,45 @@ fn restore_artefacts(
     restored
 }
 
-/// Seat `miner` above the template-id high-water (RFC 0059 §3.4–§3.5).
-/// A root that never seated loses its untrusted artefacts first, and
-/// records its marker only once they are gone, so a crash at any earlier
-/// step leads the next start to the same decision.
+/// Seat `miner` above the template-id high-water (RFC 0059 §3.4–§3.5). A
+/// seated root keeps its marker current from here on; a root that never
+/// seated writes its marker only in [`seal_root`].
 fn seat_root(
     snapshots_root: &Path,
     miner: &mut MinerCluster,
     ids: &TemplateIds,
     trust: SnapshotTrust,
 ) -> Result<Seated, RecoveryDriverError> {
-    if trust == SnapshotTrust::PredatesHighWater {
-        snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
-    }
     let seated = ids
         .start(miner, trust)
         .map_err(RecoveryDriverError::TemplateIds)?;
-    ids.record_seat(snapshots_root, trust, seated)
-        .map_err(RecoveryDriverError::TemplateIds)?;
+    if trust == SnapshotTrust::Seated {
+        ids.record_seat(snapshots_root, trust, seated)
+            .map_err(RecoveryDriverError::TemplateIds)?;
+    }
     Ok(seated)
+}
+
+/// Once every startup check has passed, a root that never seated removes
+/// its untrusted artefacts and only then writes its marker. A refusal or a
+/// crash at any earlier step keeps the artefacts, whose version-1 marks are
+/// RFC 0052 §3.2's evidence, and leads the next start to the same decision
+/// (RFC 0059 §3.5).
+fn seal_root(
+    snapshots_root: &Path,
+    ids: &TemplateIds,
+    trust: SnapshotTrust,
+    seated: Seated,
+) -> Result<(), RecoveryDriverError> {
+    match trust {
+        SnapshotTrust::Seated => return Ok(()),
+        SnapshotTrust::PredatesHighWater => {
+            snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
+        }
+        SnapshotTrust::Bootstrap => {}
+    }
+    ids.record_seat(snapshots_root, trust, seated)
+        .map_err(RecoveryDriverError::TemplateIds)
 }
 
 /// Restore one artefact into `miner`.

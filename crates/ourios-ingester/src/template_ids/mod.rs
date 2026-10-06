@@ -303,7 +303,10 @@ enum Written {
 /// bootstrap calls this (RFC 0059 §3.5): a live reservation never creates
 /// an absent object.
 fn create(store: &Store, reserved_through: u64) -> Result<Written, TemplateIdsError> {
-    landed(store.put_if_absent_blocking(HIGH_WATER_KEY, encode(reserved_through)))
+    landed(
+        store,
+        store.put_if_absent_blocking(HIGH_WATER_KEY, encode(reserved_through)),
+    )
 }
 
 /// Replace the high-water read as `prior` with `reserved_through`: a
@@ -327,12 +330,17 @@ fn update(
         }
         (_, false) => store.put_blocking(HIGH_WATER_KEY, bytes),
     };
-    landed(outcome)
+    landed(store, outcome)
 }
 
-fn landed(outcome: Result<(), StoreError>) -> Result<Written, TemplateIdsError> {
+/// A write counts as landed only once it is durable: the local backend's
+/// rename is fsynced first (RFC 0059 §3.2's write-before-allocate).
+fn landed(store: &Store, outcome: Result<(), StoreError>) -> Result<Written, TemplateIdsError> {
     match outcome {
-        Ok(()) => Ok(Written::Landed),
+        Ok(()) => store
+            .sync_local_blocking(HIGH_WATER_KEY)
+            .map(|()| Written::Landed)
+            .map_err(store_err("write", HIGH_WATER_KEY)),
         Err(e) if e.is_already_exists() || e.is_precondition() => Ok(Written::Lost),
         Err(e) => Err(store_err("write", HIGH_WATER_KEY)(e)),
     }

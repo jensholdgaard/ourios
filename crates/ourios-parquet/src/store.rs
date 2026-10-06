@@ -183,6 +183,9 @@ pub struct Store {
     /// commits with on S3. `false` for `LocalFileSystem`, which rejects
     /// `PutMode::Update` (see [`Self::supports_conditional_update`]).
     conditional_update: bool,
+    /// The directory a local backend writes under, for
+    /// [`Self::sync_local_blocking`]; `None` on every other backend.
+    local_root: Option<std::path::PathBuf>,
 }
 
 /// Addressing for the S3 / S3-compatible backend (RFC0013.7) — bucket,
@@ -423,13 +426,14 @@ impl Store {
     /// [`StoreError::Backend`] if `root` cannot be opened as an
     /// `object_store` `LocalFileSystem` (e.g. it does not exist).
     pub fn local(root: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
-        let fs = LocalFileSystem::new_with_prefix(root).map_err(StoreError::Backend)?;
+        let fs = LocalFileSystem::new_with_prefix(root.as_ref()).map_err(StoreError::Backend)?;
         Ok(Self {
             inner: Arc::new(fs),
             prefix: ObjectPath::default(),
             // `LocalFileSystem` rejects `PutMode::Update`, so it has no `If-Match`
             // CAS; the compactor commits the manifest with an atomic overwrite here.
             conditional_update: false,
+            local_root: Some(root.as_ref().to_path_buf()),
         })
     }
 
@@ -441,6 +445,7 @@ impl Store {
             inner: Arc::new(object_store::memory::InMemory::new()),
             prefix: ObjectPath::default(),
             conditional_update: true,
+            local_root: None,
         }
     }
 
@@ -574,6 +579,7 @@ impl Store {
             // The backend keeps object_store's default `S3ConditionalPut::ETagMatch`,
             // so the `If-Match` CAS the manifest generation-swap needs is available.
             conditional_update: true,
+            local_root: None,
         })
     }
 
@@ -616,6 +622,32 @@ impl Store {
     #[must_use]
     pub fn prefix(&self) -> &ObjectPath {
         &self.prefix
+    }
+
+    /// Make an object the local backend just wrote durable: fsync the
+    /// file, then its directory. `LocalFileSystem` renames a written file
+    /// into place without either, so a crash could lose a put that had
+    /// returned. A no-op on every other backend, whose puts are durable
+    /// once they return.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] when the file or its directory cannot be
+    /// synced.
+    pub fn sync_local_blocking(&self, key: &str) -> Result<(), StoreError> {
+        let Some(root) = &self.local_root else {
+            return Ok(());
+        };
+        let path = root.join(self.resolve(key)?.as_ref());
+        let sync = |p: &std::path::Path| std::fs::File::open(p).and_then(|f| f.sync_all());
+        sync(&path)
+            .and_then(|()| path.parent().map_or(Ok(()), sync))
+            .map_err(|source| {
+                StoreError::Backend(object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                })
+            })
     }
 
     /// Resolve a `/`-delimited `key` to an absolute object path under the
@@ -1091,6 +1123,23 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_local_write_syncs_and_other_backends_need_nothing() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let local = super::Store::local(tmp.path()).expect("local");
+        local
+            .put_blocking("miner/key.json", b"{}".to_vec())
+            .expect("put");
+        local.sync_local_blocking("miner/key.json").expect("synced");
+        assert!(
+            local.sync_local_blocking("miner/absent.json").is_err(),
+            "an object the put never wrote cannot be made durable"
+        );
+        super::Store::in_memory()
+            .sync_local_blocking("miner/absent.json")
+            .expect("nothing to sync off the local backend");
+    }
+
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::thread::ThreadId;

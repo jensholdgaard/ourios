@@ -4,7 +4,7 @@
 use ourios_ingester::recovery::RecoveryDriverError;
 use ourios_ingester::template_ids::{SEATED_MARKER, TemplateIdsError};
 
-use crate::rfc0059_support::{Node, audit_bindings, cut_and_reclaim, publish, rows};
+use crate::rfc0059_support::{Fixture, Node, audit_bindings, cut_and_reclaim, publish, rows};
 
 /// A published store whose highest ids are structured templates, which
 /// emit no audit event, with one tenant's audit stream lost entirely,
@@ -115,6 +115,39 @@ async fn rfc0059_6_a_kill_mid_scan_writes_nothing_and_the_next_start_redoes_it()
     );
 
     std::fs::remove_file(&torn).expect("the next start can read it");
+    let restarted = node.restart().expect("recover");
+    assert!(restarted.report.template_ids.bootstrapped);
+    assert_eq!(restarted.report.template_ids.high_water, data_max);
+}
+
+/// Scenario RFC0059.6 — a receiver process killed by `SIGKILL` mid-scan leaves
+/// neither the object nor the marker, and the next start redoes the scan
+/// and writes once.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_6_a_sigkill_mid_scan_writes_nothing_and_the_next_start_redoes_it() {
+    // Given a receiver process parked inside the bootstrap scan, in a
+    // data file's footer read.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (node, data_max, _) = store_only_rows_can_bound(tmp.path()).await;
+    let mut fixture = Fixture::spawn("scan", &node);
+    let scanning = fixture.reached("SCANNING");
+
+    // When it is SIGKILLed there.
+    fixture.kill();
+
+    // Then nothing was written.
+    assert_eq!(
+        node.high_water_bytes(),
+        None,
+        "no object after a kill at {scanning:?}"
+    );
+    assert!(
+        !node.snapshots.join(SEATED_MARKER).exists(),
+        "nor the marker"
+    );
+
+    // And the next start redoes the scan and writes once.
     let restarted = node.restart().expect("recover");
     assert!(restarted.report.template_ids.bootstrapped);
     assert_eq!(restarted.report.template_ids.high_water, data_max);

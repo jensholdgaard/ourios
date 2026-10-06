@@ -3,7 +3,7 @@
 
 use ourios_ingester::template_ids::{self, HIGH_WATER_KEY};
 
-use crate::rfc0059_support::Node;
+use crate::rfc0059_support::{Fixture, Node};
 
 const N: u64 = 100;
 
@@ -63,5 +63,40 @@ fn rfc0059_3_a_kill_after_reservation_skips_the_block() {
     assert!(
         id > reserved,
         "{id} skips the unused block below {reserved}"
+    );
+}
+
+/// Scenario RFC0059.3 — a SIGKILL after a reservation and before any use
+/// of its block only skips that block: the restarted receiver's first
+/// allocation is above it, and no id below it is ever issued.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[test]
+fn rfc0059_3_a_sigkill_after_reservation_skips_the_block() {
+    // Given a receiver process that started, reserved its blocks and
+    // minted nothing.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let node = seeded(tmp.path());
+    let mut fixture = Fixture::spawn("reserve", &node);
+    fixture.reached("STARTED");
+
+    // When it is SIGKILLed, and the node restarts and allocates.
+    fixture.kill();
+    let reserved = high_water(&node);
+    assert!(reserved > N, "the killed start reserved ahead");
+    let mut restarted = node.restart().expect("recover");
+    let first = restarted.mine("checkout", "user alice logged in");
+    restarted.mine("checkout", "disk sda1 is 91 percent full");
+    restarted.mine_structured("checkout", "checkout.paid");
+
+    // Then the first id is above the killed start's blocks, and every id
+    // below them stays unissued.
+    assert!(
+        first > reserved,
+        "{first} skips the unused block below {reserved}"
+    );
+    let emitted = restarted.emitted();
+    assert!(
+        emitted.iter().all(|id| *id > reserved),
+        "{emitted:?} reaches into the killed start's blocks below {reserved}"
     );
 }

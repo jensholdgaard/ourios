@@ -61,6 +61,8 @@ struct Shared {
     /// `None` until the root's marker is written; held across recording a
     /// block and making it ready, so no block becomes takeable unrecorded.
     ledger: Mutex<Option<Ledger>>,
+    /// A reservation replay could not make, for recovery to fail with.
+    replay_failure: Mutex<Option<TemplateIdsError>>,
 }
 
 /// One store's template-id allocation: the startup seat, and the
@@ -83,6 +85,7 @@ impl TemplateIds {
                 store,
                 ready: Mutex::new(Ready::default()),
                 ledger: Mutex::new(None),
+                replay_failure: Mutex::new(None),
             }),
             refill,
             refill_rx: Mutex::new(Some(refill_rx)),
@@ -120,6 +123,14 @@ impl TemplateIds {
             request_refill(&self.refill);
         }
         Ok(())
+    }
+
+    /// The reservation replay could not make, if any. The miner turns it
+    /// into a parse failure, which replay must not settle for: recovery
+    /// fails with it instead (RFC 0059 §3.4).
+    #[must_use]
+    pub fn take_replay_failure(&self) -> Option<TemplateIdsError> {
+        lock(&self.shared.replay_failure).take()
     }
 
     /// The store the high-water lives in.
@@ -335,7 +346,11 @@ impl IdReserver for StoreIdReserver {
     fn reserve(&mut self, floor: u64) -> Result<IdBlock, IdReservationError> {
         let taken = match self.take(floor) {
             None if self.replaying.load(Ordering::Acquire) => {
-                fill(&self.shared).map_err(IdReservationError::new)?;
+                if let Err(failure) = fill(&self.shared) {
+                    let detail = failure.to_string();
+                    *lock(&self.shared.replay_failure) = Some(failure);
+                    return Err(IdReservationError::new(detail));
+                }
                 self.take(floor)
             }
             taken => taken,
@@ -455,6 +470,7 @@ mod tests {
             store,
             ready: Mutex::new(Ready::default()),
             ledger: Mutex::new(None),
+            replay_failure: Mutex::new(None),
         })
     }
 

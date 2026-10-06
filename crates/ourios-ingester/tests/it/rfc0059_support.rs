@@ -472,6 +472,9 @@ pub struct Hooks {
     pub denied: Arc<std::sync::atomic::AtomicBool>,
     /// Reads of the high-water attempted, whether or not they succeed.
     pub high_water_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set to `n`, the high-water's `n`th write from now fails, and
+    /// every later one with it; 0 (the default) never fails one.
+    pub high_water_puts_until_failure: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What another writer leaves in the high-water when it wins a race.
@@ -493,6 +496,27 @@ impl Hooks {
 
     pub fn set_down(&self, down: bool) {
         self.down.store(down, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Fail the high-water write `high_water_puts_until_failure` counts
+    /// down to.
+    fn count_down_put(&self) -> object_store::Result<()> {
+        let left = &self.high_water_puts_until_failure;
+        let fails = match left.load(std::sync::atomic::Ordering::Acquire) {
+            0 => false,
+            1 => true,
+            n => {
+                left.store(n - 1, std::sync::atomic::Ordering::Release);
+                false
+            }
+        };
+        match fails {
+            true => Err(object_store::Error::Generic {
+                store: "hooked",
+                source: "the high-water write fails".into(),
+            }),
+            false => Ok(()),
+        }
     }
 
     fn enter(&self) -> object_store::Result<()> {
@@ -552,6 +576,9 @@ impl object_store::ObjectStore for HookedStore {
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
         self.hooks.enter()?;
+        if is_high_water(location) {
+            self.hooks.count_down_put()?;
+        }
         let creating = matches!(opts.mode, object_store::PutMode::Create);
         if creating && is_high_water(location) && take(&self.hooks.race_the_create) {
             self.win(location).await?;

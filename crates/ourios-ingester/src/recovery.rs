@@ -282,7 +282,12 @@ pub fn recover(
         legacy,
     } = restore_artefacts(miner, artefacts, trust);
     let template_ids = seat_root(snapshots_root, miner, ids, trust)?;
-    let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
+    let gates = Gates {
+        horizons: &horizons,
+        checkpoint: parquet_horizon,
+        ids,
+    };
+    let replay = replay_gated(wal, miner, gates)?;
     ids.finish_replay()
         .map_err(RecoveryDriverError::TemplateIds)?;
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
@@ -336,14 +341,13 @@ struct Replayed {
 fn replay_gated(
     wal: &mut Wal,
     miner: &mut MinerCluster,
-    horizons: &HashMap<TenantId, WalOffset>,
-    checkpoint: Option<WalOffset>,
+    gates: Gates<'_>,
 ) -> Result<Replayed, RecoveryDriverError> {
     let capture = ReplayCapture::install(miner);
     let mut sink = DriverSink {
         miner,
-        horizons,
-        checkpoint,
+        gates,
+        failure: None,
         capture,
         frames_delivered: 0,
         records_fed: 0,
@@ -360,9 +364,13 @@ fn replay_gated(
         records_suppressed,
         segments_seen,
         max_delivered,
+        failure,
         ..
     } = sink;
     let withheld = capture.restore(miner);
+    if let Some(failure) = failure {
+        return Err(RecoveryDriverError::TemplateIds(failure));
+    }
     replayed.map_err(RecoveryDriverError::Replay)?;
     Ok(Replayed {
         frames_delivered,
@@ -757,10 +765,19 @@ fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
 /// prefix then the export (RFC 0046 §3.3) → [`assign`] every record to that
 /// tenant → feed each to the miner iff the frame offset is above the
 /// tenant's horizon.
-struct DriverSink<'a> {
-    miner: &'a mut MinerCluster,
+/// What decides each replayed frame's fate: the restored horizons, the
+/// checkpoint, and the template-id allocation replay reserves from.
+struct Gates<'a> {
     horizons: &'a HashMap<TenantId, WalOffset>,
     checkpoint: Option<WalOffset>,
+    ids: &'a TemplateIds,
+}
+
+struct DriverSink<'a> {
+    miner: &'a mut MinerCluster,
+    gates: Gates<'a>,
+    /// A reservation replay could not make: recovery fails with it.
+    failure: Option<TemplateIdsError>,
     capture: ReplayCapture,
     frames_delivered: u64,
     records_fed: u64,
@@ -820,11 +837,23 @@ impl DriverSink<'_> {
             .map_err(|e| reject(kind, offset, &e))?;
         let records = assign(request, &tenant);
         let count = records.len() as u64;
-        match route(offset, self.horizons.get(&tenant), self.checkpoint) {
+        match route(
+            offset,
+            self.gates.horizons.get(&tenant),
+            self.gates.checkpoint,
+        ) {
             Route::Folded => self.records_suppressed += count,
             mined => {
                 for record in &records {
                     self.miner.ingest(record);
+                }
+                // A template the store could have given an id must not
+                // replay as a parse failure: stop before this frame is
+                // folded or published (RFC 0059 §3.4).
+                if let Some(failure) = self.gates.ids.take_replay_failure() {
+                    let detail = failure.to_string();
+                    self.failure = Some(failure);
+                    return Err(reject(kind, offset, &detail));
                 }
                 self.records_fed += count;
                 self.miner
@@ -991,12 +1020,17 @@ mod tests {
     fn sink<'a>(
         miner: &'a mut MinerCluster,
         horizons: &'a HashMap<TenantId, WalOffset>,
+        ids: &'a TemplateIds,
     ) -> DriverSink<'a> {
         let capture = ReplayCapture::install(miner);
         DriverSink {
             miner,
-            horizons,
-            checkpoint: None,
+            gates: Gates {
+                horizons,
+                checkpoint: None,
+                ids,
+            },
+            failure: None,
             capture,
             frames_delivered: 0,
             records_fed: 0,
@@ -1017,7 +1051,8 @@ mod tests {
     fn sink_rejects_a_malformed_payload_naming_the_offset() {
         let mut miner = MinerCluster::new(MinerConfig::default());
         let horizons = HashMap::new();
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
 
         // A valid tenant prefix followed by a truncated varint key that
         // cannot decode as a protobuf message.
@@ -1038,7 +1073,8 @@ mod tests {
     fn sink_rejects_malformed_tenant_prefixes() {
         let mut miner = MinerCluster::new(MinerConfig::default());
         let horizons = HashMap::new();
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
         for (payload, needle) in [
             (vec![7u8], "length prefix"),
             (vec![0, 0, 1], "zero"),
@@ -1089,7 +1125,8 @@ mod tests {
         state.wal_high_water = Some(snapshot_store::high_water(restored_at));
         miner.restore_tenant(&idle, &state).expect("restore");
         let horizons = HashMap::from([(idle.clone(), restored_at)]);
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
 
         for (tenant, byte) in [("idle", 40), ("busy", 60), ("busy", 80)] {
             sink.consume(
@@ -1116,7 +1153,8 @@ mod tests {
     fn sink_refuses_legacy_otlp_batch_frames() {
         let mut miner = MinerCluster::new(MinerConfig::default());
         let horizons = HashMap::new();
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
         let detail = sink_rejected(
             sink.consume(offset(SEGMENT, 32), FrameKind::OtlpBatch, b"anything")
                 .expect_err("legacy frame is refused"),

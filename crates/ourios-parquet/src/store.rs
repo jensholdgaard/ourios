@@ -164,6 +164,20 @@ pub struct Suffix {
     pub object_size: u64,
 }
 
+/// What [`Store::sync_local_blocking`] fsyncs for `path` under `root`, in
+/// order: the object, then each directory from its own up to and
+/// including `root`.
+fn local_sync_targets<'p>(
+    root: &'p std::path::Path,
+    path: &'p std::path::Path,
+) -> impl Iterator<Item = &'p std::path::Path> {
+    std::iter::once(path).chain(
+        path.ancestors()
+            .skip(1)
+            .take_while(move |dir| dir.starts_with(root)),
+    )
+}
+
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
 /// same code path targets `LocalFileSystem` or `AmazonS3` / S3-compatible.
@@ -625,10 +639,12 @@ impl Store {
     }
 
     /// Make an object the local backend just wrote durable: fsync the
-    /// file, then its directory. `LocalFileSystem` renames a written file
-    /// into place without either, so a crash could lose a put that had
-    /// returned. A no-op on every other backend, whose puts are durable
-    /// once they return.
+    /// file, then every directory from its own up to the store root, so a
+    /// directory the put newly created (e.g. `miner/`) is durable in its
+    /// parent too. `LocalFileSystem` creates directories and renames a
+    /// written file into place without any fsync, so a crash could lose a
+    /// put that had returned. A no-op on every other backend, whose puts
+    /// are durable once they return.
     ///
     /// # Errors
     ///
@@ -639,9 +655,8 @@ impl Store {
             return Ok(());
         };
         let path = root.join(self.resolve(key)?.as_ref());
-        let sync = |p: &std::path::Path| std::fs::File::open(p).and_then(|f| f.sync_all());
-        sync(&path)
-            .and_then(|()| path.parent().map_or(Ok(()), sync))
+        local_sync_targets(root, &path)
+            .try_for_each(|p| std::fs::File::open(p).and_then(|f| f.sync_all()))
             .map_err(|source| {
                 StoreError::Backend(object_store::Error::Generic {
                     store: "LocalFileSystem",
@@ -1123,6 +1138,18 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_local_sync_covers_every_directory_up_to_the_store_root() {
+        let root = std::path::Path::new("/store");
+        let object = root.join("miner").join("template_ids.v1.json");
+        let targets: Vec<&std::path::Path> = super::local_sync_targets(root, &object).collect();
+        assert_eq!(
+            targets,
+            [object.as_path(), &root.join("miner"), root],
+            "the object, its new directory, and the root holding that directory's entry"
+        );
+    }
+
     #[test]
     fn a_local_write_syncs_and_other_backends_need_nothing() {
         let tmp = tempfile::TempDir::new().expect("temp");

@@ -127,16 +127,20 @@ impl IdRange {
         }
     }
 
-    /// The id the next allocation takes. Meaningful only once
-    /// [`Self::ensure`] has succeeded.
-    pub(super) fn peek(&self) -> u64 {
-        self.next
-    }
-
-    /// Take the id [`Self::peek`] named. `next < end <= MAX_TEMPLATE_ID + 1`
-    /// after a successful [`Self::ensure`], so this never overflows.
-    pub(super) fn consume(&mut self) {
+    /// Take the next id, reserving a block first when the range in hand
+    /// is used up. This is the only way an id leaves the range, so no id
+    /// outside a reserved block is ever handed out.
+    ///
+    /// # Errors
+    ///
+    /// [`IdReservationError`] when no reservable id is left.
+    pub(super) fn take(&mut self) -> Result<u64, IdReservationError> {
+        self.ensure()?;
+        let id = self.next;
+        // `next < end <= MAX_TEMPLATE_ID + 1` after `ensure`, so this
+        // never overflows.
         self.next += 1;
+        Ok(id)
     }
 
     /// Make at least one reserved id available.
@@ -211,30 +215,12 @@ impl MinerCluster {
         self.ids.next - 1
     }
 
-    /// Whether a fresh id can be allocated now, reserving a block first
-    /// when the range in hand is used up.
-    pub(super) fn ids_ready(&mut self) -> bool {
-        self.ids.ensure().is_ok()
-    }
-
-    /// Why a fresh template cannot be minted for `tenant`, if it cannot:
-    /// the RFC 0023 §3.1 per-tenant ceiling, or, when the template is a
-    /// genuinely new identity (`needs_id`), no reservable id.
-    pub(super) fn mint_blocked(
-        &mut self,
-        tenant: &TenantId,
-        max_templates: u32,
-        needs_id: bool,
-    ) -> Option<&'static str> {
-        let at_ceiling = self
-            .tenants
+    /// Whether `tenant` is at the RFC 0023 §3.1 per-tenant ceiling, which
+    /// is checked before id availability.
+    pub(super) fn at_ceiling(&self, tenant: &TenantId, max_templates: u32) -> bool {
+        self.tenants
             .get(tenant)
-            .is_some_and(|s| s.leaf_count + s.owned_adopted_count >= max_templates as usize);
-        match at_ceiling {
-            true => Some("template_ceiling"),
-            false if needs_id && !self.ids_ready() => Some(ID_RESERVATION_FAILED),
-            false => None,
-        }
+            .is_some_and(|s| s.leaf_count + s.owned_adopted_count >= max_templates as usize)
     }
 }
 
@@ -273,10 +259,7 @@ mod tests {
     }
 
     fn take(range: &mut IdRange) -> Result<u64, IdReservationError> {
-        range.ensure()?;
-        let id = range.peek();
-        range.consume();
-        Ok(id)
+        range.take()
     }
 
     #[test]

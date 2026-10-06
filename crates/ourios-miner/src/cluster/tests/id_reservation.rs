@@ -233,3 +233,43 @@ fn a_mined_line_converging_on_an_adoption_resolves_on_an_exhausted_range() {
         "the mined leaf takes over the adopted identity without a fresh id",
     );
 }
+
+/// A mined leaf whose literal token is `<*>` renders the same canonical as
+/// an upstream template's wildcard, but is a different shape. Adopting the
+/// upstream template on an exhausted range must not intern it under an id
+/// outside every reserved block.
+#[test]
+fn a_literal_wildcard_leaf_never_lets_an_adoption_skip_the_id_check() {
+    let switch = Switch::new();
+    let (mut cluster, _) = reserving_cluster(&switch);
+    let t = TenantId::new("t");
+    let literal = cluster.ingest(&string_record(&t, "user <*> logged in"));
+    assert_ne!(literal, NO_TEMPLATE);
+    assert_ne!(
+        cluster.ingest(&string_record(&t, "alpha one two")),
+        NO_TEMPLATE
+    );
+    switch.set_up(false);
+    assert_eq!(
+        cluster.ingest(&string_record(&t, "beta three four five")),
+        NO_TEMPLATE,
+        "the range is exhausted"
+    );
+    let highest = cluster.highest_allocated();
+
+    let id = cluster.ingest(&adopted_record(
+        &t,
+        "user 7 logged in",
+        "user <*> logged in",
+    ));
+
+    assert!(
+        id == NO_TEMPLATE || id == literal,
+        "{id} is neither a parse failure nor the existing leaf"
+    );
+    assert_eq!(
+        cluster.highest_allocated(),
+        highest,
+        "no id was taken outside a reserved block"
+    );
+}

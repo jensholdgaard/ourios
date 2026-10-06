@@ -42,11 +42,9 @@ impl MinerCluster {
         {
             return existing_id;
         }
-        if !self.ids_ready() {
+        let Ok(new_id) = self.ids.take() else {
             return NO_TEMPLATE;
-        }
-        let new_id = self.ids.peek();
-        self.ids.consume();
+        };
         let state = self
             .tenants
             .entry(record.tenant_id.clone())

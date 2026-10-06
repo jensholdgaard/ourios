@@ -469,7 +469,7 @@ async fn rfc0052_10_a_snapshot_ahead_of_a_failed_checkpoint_republishes_nothing_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_frame_order() {
     let tmp = tempfile::TempDir::new().expect("temp");
-    let node = lagging_snapshot_node(tmp.path(), Leftover::Lagging).await;
+    let node = audit_gate_node(tmp.path()).await;
     // A stored AuditEvent frame above X: regeneration is the only source,
     // so it must not surface.
     let mut wal = Wal::open(node.wal()).expect("reopen");
@@ -493,10 +493,17 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
 
     let forwarded = events.drain();
     assert!(
-        expected.at_or_below_x > 0 && expected.forwarded.len() > expected.at_or_below_x,
+        !expected.withheld.is_empty() && !expected.forwarded.is_empty(),
         "both sides of X regenerate events, so the gate is exercised: {} / {}",
-        expected.at_or_below_x,
+        expected.withheld.len(),
         expected.forwarded.len(),
+    );
+    assert!(
+        expected.at_or_below_x > expected.withheld.len(),
+        "an (S, X] event also re-mints and is forwarded, so both of RFC 0059 §3.4's \
+         branches are exercised: {} regenerated, {} withheld",
+        expected.at_or_below_x,
+        expected.withheld.len(),
     );
     assert_eq!(
         forwarded, expected.forwarded,
@@ -591,6 +598,42 @@ async fn lagging_snapshot_node(tmp: &Path, leftover: Leftover) -> Node {
     };
     std::fs::write(node.artefact(), bytes).expect("the leftover artefact");
     node
+}
+
+/// [`lagging_snapshot_node`]'s shape for the audit gate. Its `(S, X]` frame
+/// both widens the template the snapshot holds, an event on a seated id
+/// that replay withholds, and first sees a new one, which replay re-mints
+/// and forwards (RFC 0059 §3.4).
+async fn audit_gate_node(tmp: &Path) -> Node {
+    let rig = BarrierRig::new(tmp);
+    ingest_frame(&rig, 1, &["user 42 logged in from 10.0.0.1"]).await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    let lagging = std::fs::read(rig.snapshots_root.join(format!("{TENANT}.snap"))).expect("S");
+    let second = ingest_frame(
+        &rig,
+        2,
+        &["user 42 logged out from 10.0.0.1", "user bob logged in"],
+    )
+    .await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    assert_eq!(rig.commits.last_checkpoint(), Some(second), "X is frame 2");
+    ingest_frame(&rig, 3, &["order 3 shipped"]).await;
+    let node = Node::stop(rig, second);
+    std::fs::write(node.artefact(), lagging).expect("the lagging artefact");
+    node
+}
+
+/// Ingest one frame of records stamped `n` and return its offset.
+async fn ingest_frame(rig: &BarrierRig, n: u64, bodies: &[&str]) -> WalOffset {
+    let mut logs = resource_logs(TENANT, bodies);
+    for record in &mut logs.scope_logs[0].log_records {
+        record.time_unix_nano = n;
+    }
+    rig.pipeline
+        .ingest(request(vec![logs]), TenantId::new(TENANT))
+        .await
+        .expect("the batch acks");
+    rig.pipeline.last_durable().expect("a durable mark")
 }
 
 /// Ingest one record stamped `n` (its `time_unix_nano`, the identity the

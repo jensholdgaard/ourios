@@ -102,32 +102,28 @@ fn assert_discarded_and_full_replayed(
     report
 }
 
+/// One batch per `(tenant, lines)`.
+fn batches(spec: [(&str, &[&str]); 3]) -> [ExportLogsServiceRequest; 3] {
+    spec.map(|(tenant, lines)| request(vec![resource_logs(tenant, lines)]))
+}
+
 /// The §3.5.3 batches the live node ingests at or below its snapshot's
 /// mark `S`.
 fn batches_below_s() -> [ExportLogsServiceRequest; 3] {
-    [
-        request(vec![resource_logs(
-            "checkout",
-            &["user 1 logged in", "user 2 logged in"],
-        )]),
-        request(vec![resource_logs("billing", &["charge 9 EUR accepted"])]),
-        request(vec![resource_logs("checkout", &["user 1 logged out"])]),
-    ]
+    batches([
+        ("checkout", &["user 1 logged in", "user 2 logged in"]),
+        ("billing", &["charge 9 EUR accepted"]),
+        ("checkout", &["user 1 logged out"]),
+    ])
 }
 
-/// The §3.5.3 batches above `S`, one of them a shape the tail mints.
+/// The §3.5.3 batches above `S`, the last a shape the tail mints.
 fn batches_above_s() -> [ExportLogsServiceRequest; 3] {
-    [
-        request(vec![resource_logs(
-            "checkout",
-            &["user 3 logged in", "user 3 viewed cart"],
-        )]),
-        request(vec![resource_logs("billing", &["charge 12 EUR accepted"])]),
-        request(vec![resource_logs(
-            "checkout",
-            &["disk sda1 is 91 percent full"],
-        )]),
-    ]
+    batches([
+        ("checkout", &["user 3 logged in", "user 3 viewed cart"]),
+        ("billing", &["charge 12 EUR accepted"]),
+        ("checkout", &["disk sda1 is 91 percent full"]),
+    ])
 }
 
 /// The live node's template-id state: a high-water at `high_water`, and

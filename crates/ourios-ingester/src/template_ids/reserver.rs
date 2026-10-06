@@ -10,7 +10,9 @@
 //! owns the miner before any listener opens, so no ingest waits on it,
 //! and a replay that drains the ready blocks reserves the next one
 //! synchronously rather than failing a template a healthy store could
-//! have given an id.
+//! have given an id. The refiller starts only once replay ends, so the
+//! two never reserve at once: on the local backend's unconditional
+//! overwrite, two concurrent reservations could hand out the same block.
 //!
 //! Once the root's seated marker is written, every block's end is
 //! recorded in it before the block can be taken, so the marker's
@@ -99,9 +101,24 @@ impl TemplateIds {
 
     /// Recovery has handed the miner to the pipeline: from now on an
     /// exhausted range fails fresh mints instead of reserving under the
-    /// miner lock (RFC 0059 §3.3).
-    pub fn finish_replay(&self) {
+    /// miner lock (RFC 0059 §3.3), and the background refiller starts,
+    /// the only reserver from here on.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateIdsError::Refiller`] when its thread cannot start.
+    pub fn finish_replay(&self) -> Result<(), TemplateIdsError> {
         self.replaying.store(false, Ordering::Release);
+        let receiver = lock(&self.refill_rx).take();
+        if let Some(receiver) = receiver {
+            let shared = Arc::clone(&self.shared);
+            std::thread::Builder::new()
+                .name("template-id-refill".to_owned())
+                .spawn(move || refill_loop(&shared, &receiver))
+                .map_err(|e| TemplateIdsError::Refiller(e.to_string()))?;
+            let _ = self.refill.send(());
+        }
+        Ok(())
     }
 
     /// The store the high-water lives in.
@@ -121,10 +138,10 @@ impl TemplateIds {
         })
     }
 
-    /// Seat `miner` above the high-water, reserve its current block and
-    /// two more synchronously, and start the background
-    /// refiller (RFC 0059 §3.4).
-    /// Runs once, at startup, before any listener opens.
+    /// Seat `miner` above the high-water and reserve its current block and
+    /// two more synchronously (RFC 0059 §3.4). Runs once, at startup,
+    /// before any listener opens; the refiller starts at
+    /// [`Self::finish_replay`].
     ///
     /// # Errors
     ///
@@ -151,18 +168,6 @@ impl TemplateIds {
                 .reserve_current_block()
                 .map_err(TemplateIdsError::FirstBlock)?;
             fill(shared)?;
-        }
-        let receiver = self
-            .refill_rx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(receiver) = receiver {
-            let shared = Arc::clone(&self.shared);
-            std::thread::Builder::new()
-                .name("template-id-refill".to_owned())
-                .spawn(move || refill_loop(&shared, &receiver))
-                .map_err(|e| TemplateIdsError::Refiller(e.to_string()))?;
         }
         Ok(seated)
     }
@@ -335,6 +340,58 @@ mod tests {
         assert_eq!((first.after(), first.through()), (500, 500 + BLOCK));
         let second = reserver.reserve(first.through()).expect("ready");
         assert_eq!(second.after(), 500 + BLOCK);
+    }
+
+    /// Before replay ends only replay's synchronous fill reserves: no
+    /// refiller races it, which on the local backend's unconditional
+    /// overwrite could hand the same block out twice.
+    #[test]
+    fn nothing_reserves_in_the_background_until_replay_ends() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(tmp.path()).expect("local");
+        store.put_blocking(HIGH_WATER_KEY, encode(0)).expect("put");
+        let ids = TemplateIds::new(store.clone());
+        let mut miner = MinerCluster::new(MinerConfig::default()).with_id_reserver(ids.reserver());
+        ids.start(&mut miner, SnapshotTrust::Seated).expect("start");
+        let high_water = || {
+            crate::template_ids::read(&store)
+                .expect("read")
+                .expect("present")
+                .reserved_through
+        };
+        let ready = || lock(&ids.shared.ready).blocks.len();
+
+        let mut reserver = ids.reserver();
+        let taken: Vec<(u64, u64)> = [BLOCK, 2 * BLOCK, 3 * BLOCK]
+            .into_iter()
+            .map(|floor| {
+                let block = reserver.reserve(floor).expect("a block");
+                (block.after(), block.through())
+            })
+            .collect();
+        assert_eq!(
+            taken,
+            [
+                (BLOCK, 2 * BLOCK),
+                (2 * BLOCK, 3 * BLOCK),
+                (3 * BLOCK, 4 * BLOCK)
+            ]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            high_water(),
+            5 * BLOCK,
+            "only the synchronous fill reserved"
+        );
+        assert_eq!(ready(), 1, "nothing topped the ready blocks up");
+
+        ids.finish_replay().expect("refiller");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ready() < READY_BLOCKS && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(ready(), READY_BLOCKS, "the refiller runs once replay ends");
+        assert_eq!(high_water(), 6 * BLOCK);
     }
 
     #[test]

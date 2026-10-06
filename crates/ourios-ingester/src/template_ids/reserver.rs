@@ -122,7 +122,7 @@ impl TemplateIds {
     }
 
     /// Seat `miner` above the high-water, reserve its current block and
-    /// [`READY_BLOCKS`] more synchronously, and start the background
+    /// two more synchronously, and start the background
     /// refiller (RFC 0059 §3.4).
     /// Runs once, at startup, before any listener opens.
     ///

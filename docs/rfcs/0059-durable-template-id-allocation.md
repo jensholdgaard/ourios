@@ -1,0 +1,1241 @@
+---
+rfc: 0059
+title: Durable template-id allocation (RFC 0001 amendment)
+status: red
+author: Jens Holdgaard Pedersen <jens@holdgaard.org>
+drafting-assistance: Claude
+created: 2026-10-05
+supersedes: —
+superseded-by: —
+---
+
+# RFC 0059 — Durable template-id allocation (RFC 0001 amendment)
+
+> **Status: `red`.** Every §5 scenario, RFC0059.1 to RFC0059.19, has an
+> `#[ignore]`d `todo!` stub naming the slice that discharges it. This RFC
+> amends RFC 0001 §6.1 (template identity), §6.9 (persistence and
+> recovery) and scenario §3.5.3, and RFC 0023 §3.4 (the parse-failure
+> reason enum). It coordinates with RFC 0052 §3.7 (the audit gate, for
+> re-minted ids): RFC 0052 is `green`, not `accepted`, so the overlap is
+> recorded on both sides rather than as an amendment (§3.8).
+> RFC 0001 keeps the old text with a dated pointer here,
+> the way RFC 0023 amended it.
+
+## 1. Summary
+
+`template_id` is allocated by one in-memory counter per process. A
+restart rebuilds that counter from what recovery restores and replays,
+so a discarded snapshot, reclaimed WAL frames, or a replaced local root
+can restart it below ids that Parquet rows and audit events already
+carry, and the next new template takes one of them (#898). This RFC makes
+uniqueness durable:
+- one small object in the store records the highest id reserved since
+  it was created;
+- the allocator draws only from blocks it has reserved there, before
+  using them;
+- every start allocates above it.
+
+The first start of an existing deployment computes the object from
+every data and audit file footer, so the floor is provable and needs no
+margin.
+
+**Invariants and hazards touched** (`docs/verification.md`), each with
+the §5 scenarios that cover it:
+
+| Touched | How | Covered by |
+|---|---|---|
+| `CLAUDE.md` §3.1, no silent template merges | a re-issued id binds existing rows to another template | RFC0059.1, .2, .9, .12, .14, .16, .17, .18, .19 |
+| `CLAUDE.md` §3.3, bit-identical reconstruction | the registry's last-wins fold would render old rows against the wrong text; an exhausted range must keep the body | RFC0059.1, .4 |
+| `CLAUDE.md` §3.6, object storage is the truth | the high-water lives in the store; local snapshots are trusted only under a valid seated marker | RFC0059.5, .6, .11, .12, .14, .15, .16, .17, .18 |
+| `CLAUDE.md` §3.7, multi-tenancy | ids stay unique across tenants; the scenarios mint for two tenants | RFC0059.1, .8 |
+| Hazard #1, template miner correctness | allocation, restore and replay order inside the miner | RFC0059.3, .4, .10, .13 |
+| Hazard #5, template schema evolution | re-minted old shapes stay drift on fresh ids, never collisions; restore equivalence holds up to renaming | RFC0059.1, .9 |
+
+`CLAUDE.md` §3.4 (WAL-before-ack) and hazard #4 (small files) are not
+changed: the WAL format and acknowledgement path are untouched, and the
+high-water is one small object per store.
+
+## 2. Motivation
+
+**The bug.** #898's scenario tests, run against `main` at `09e493ed`,
+show both outcomes:
+- a new shape after a discarded snapshot took id 1, which the audit
+  stream already binds to `user alice logged in`;
+- re-minting that old shape took id 2, which belongs to another
+  template.
+
+The querier's registry fold is last-wins per `(template_id, version)`,
+so existing rows then render against the wrong text. That breaks
+`CLAUDE.md` §3.1 (no silent merges) and §3.3 (bit-identical
+reconstruction).
+
+**Why the audit stream cannot be the floor.** #908 first seeded the
+counter from the audit stream's highest id. Review showed three holes:
+- structured templates emit no audit event (RFC 0001 §6.2 step 0);
+- an audit write that fails permanently is dropped while its records
+  still publish (RFC 0056);
+- a replaced local root looks like a fresh node, so nothing triggered
+  the read at all.
+
+**Why it is reachable today.** The 0.10.0 → 0.11.0 → 0.11.1 upgrade
+discarded every version-1 and version-2 snapshot (RFC 0052 §3.1, RFC
+0001 §6.9's 2026-09-30 amendment). It did so on a node whose WAL
+reclamation had already removed the frames below those snapshots.
+
+**Why at this layer.** Object storage is the source of truth (`CLAUDE.md`
+§3.6). A counter that must outlive any local state belongs there, not in
+a local snapshot that is, by RFC 0001 §6.9's own definition, a
+rebuildable cache.
+
+## 3. Proposed design
+
+### 3.1 The high-water object
+
+- **Key.** One object per store, at **`miner/template_ids.v1.json`**.
+  - `miner/` is a new top-level prefix beside `data/`, `audit/`,
+    `erasure/` and `backfill/`.
+  - No audit or data scan lists it, since both scope their listings to
+    their own prefixes.
+- **Format.** The version is in the filename, following RFC 0033's
+  `template_map.v2.json.zst`. The body is JSON, following the RFC 0009
+  `manifest.json` and the RFC 0047 erasure markers:
+
+  ```json
+  {"reserved_through": 4021000}
+  ```
+
+  `reserved_through` (`N`) is a `u64` written as a JSON integer, at
+  most `i64::MAX` (the id domain, §3.7). It is the highest id any
+  allocator has been allowed to issue. Readers ignore unknown fields
+  within version 1.
+- **Read failures fail closed.** A reader fails when:
+  - the key exists but cannot be fetched or parsed;
+  - `reserved_through` is absent, is not a `u64`, or is above
+    `i64::MAX`;
+  - `miner/` holds any `template_ids.v<k>.json` with `k` above the
+    version the reader knows, **whether or not** its own version's key
+    also exists.
+- **Why every later version is refused.** RFC 0033's map is a cache: a
+  reader that skips an unknown version just rebuilds. This object is
+  the reverse, the one record that keeps ids unique. A later version may
+  have moved the authoritative high-water to its own key and left the v1
+  object stale, so an older binary that trusted v1 could re-issue ids
+  the newer one already handed out. The only safe reading of an unknown
+  version is to refuse to start (RFC0059.11).
+- **Evolving the format.** A future change takes one of two paths:
+  - it evolves version 1 backward-compatibly, adding fields v1 readers
+    ignore and keeping `reserved_through`'s meaning;
+  - it stops every binary that reads only version 1 before any
+    later-version key is published.
+
+  Writing v1 alongside a later version is not an option: a v1-only reader
+  refuses to start when it sees the later key, whatever v1 holds.
+- **Absent** means no `template_ids.v<k>.json` of any version exists.
+  It triggers the bootstrap (§3.5) **only on a root without a seated
+  marker**, and over a store that already holds data **only with explicit
+  authorisation** (§3.5).
+- **A seated root that finds the object absent fails closed.** The
+  object was deleted. A bootstrap then would scan only published ids and
+  could reseat `N` below a block another receiver still holds, so the
+  start stops with an error naming the object instead (RFC0059.14).
+- **The object must never be deleted.** No documented Ourios policy
+  grants a delete that reaches `miner/`: the only role holding
+  `s3:DeleteObject`, the compactor, has it on `data/*`, `erasure/*` and
+  `backfill/*` alone. Every documented policy also carries an explicit
+  `Deny` of `s3:DeleteObject` on `miner/*`, so a later widening of a
+  delete grant still cannot reach the object (§3.6, RFC0059.17). Object
+  lock or retention, where the store offers it, adds a second control.
+- **Restoring an older copy is unsupported.** A stale `reserved_through`
+  would let every allocator reserve blocks it, or another replica,
+  already issued from.
+  - Each root guards against it: its seated marker records the highest
+    reservation the root has made usable (`max_reserved_seen`, §3.5).
+  - A start that reads `reserved_through` below that value fails closed,
+    with an error naming a rollback of the high-water object
+    (RFC0059.18).
+  - Every replica that saw a later value therefore refuses the stale
+    copy at its next start.
+  - The only recovery is a quiesced, authorised re-bootstrap (§3.5),
+    the same for a rolled-back and for a deleted object (RFC0059.14):
+    1. stop every receiver;
+    2. remove the object **and every root's seated marker**. A root that
+       keeps its marker refuses to bootstrap and fails closed with
+       `HighWaterDeleted`;
+    3. start one replica with `receiver.template_ids_allow_bootstrap`;
+    4. remove the setting, and scale out as in the upgrade.
+  - The replica in step 3 recomputes the floor from every data and audit
+    footer, plus its own restored snapshots. That is exactly the
+    upgrade's path, and the markers' `max_reserved_seen` is safe to drop:
+    - every id a root issued and published lies in the footers, so the
+      floor covers it;
+    - every root that later starts markerless discards its snapshots as
+      `predates_high_water` and re-mints its unpublished frames above
+      the new high-water (§3.5);
+    - an id a root reserved but never published binds no row, so it may
+      be re-issued safely.
+  - This needs no new configuration, and is tested (RFC0059.18).
+  - §3.6 bounds what this check covers.
+
+### 3.2 Reservation: write before allocate
+
+An allocator holds a **current block** `(a, b]` and allocates ids from
+it in increasing order. It never allocates an id above `b`.
+
+**Reserving a block**, given `f`, the highest id this allocator has
+restored or issued:
+
+1. Read `N` and its `ETag`.
+2. Compute `a = max(N, f)` and `b = min(a + BLOCK, i64::MAX)`: the final
+   block below the top of the id domain (§3.7) is **shortened**, so no
+   id up to `i64::MAX` is stranded and `i64::MAX` itself is issuable.
+   Only `a = i64::MAX`, nothing left, fails, with the same controlled
+   exhaustion error as everywhere else. Filling the ready blocks stops
+   there without retrying. Fresh mints fail once the held ids run out.
+3. Write `N' = b` as a compare-and-swap against the `ETag` (§3.6). On a
+   precondition failure, re-read and retry from step 1.
+4. Only once the write is durable does `(a, b]` become usable.
+
+**A reservation never creates the object.** Only the startup bootstrap
+(§3.5) creates it. If step 1 finds it absent, the reservation fails with
+`HighWaterDeleted` (§3.1). A compare-and-swap against an object deleted
+after step 1 fails its precondition rather than re-creating it. A store
+that offers compare-and-swap but returned no `ETag` in step 1 fails the
+reservation closed instead of overwriting.
+
+**Crash semantics.** A crash between the write and the use leaves ids
+in `(a, b]` unissued, and they are skipped. Ids are `u64`, so these
+gaps cost nothing. Nothing in Ourios reads id density (§3.7).
+
+**`BLOCK = 1000`, a constant.** New templates are rare next to lines:
+- RFC 0023 bounds a tenant at 20,000 tree templates;
+- the C2 gate corpora plateau in the tens of templates (RFC 0001
+  `benchmarks.md` §9.5).
+
+So a block lasts hours to days, and reservation runs at a negligible
+rate. A smaller block raises the refill rate and the chance of an empty
+range under a burst (§3.3). A larger one only wastes more ids per crash,
+which is free.
+
+### 3.3 No object-store I/O under the miner lock
+
+The miner allocates under its lock (RFC 0035 §3.1's ordered phase), so
+no reservation ever runs there.
+- **Holding blocks ahead.** The miner holds its current block, and
+  **two ready blocks** wait beside it. When the current block is used
+  up, the oldest ready block becomes current. That is an in-memory pop.
+- **Why two.** Refill is asynchronous: when a ready block becomes
+  current, the refiller is asked for a replacement, and that reservation
+  takes a store round trip, or longer under backoff. With a single ready
+  block, a burst that spends the new current block inside that window
+  would find nothing ready. The second ready block keeps one whole block
+  (`BLOCK` fresh templates) of headroom while a refill is in flight.
+- **Background refill.** Each time a block becomes current, the
+  ingester's background refiller reserves blocks off the lock until two
+  are ready again. If the store fails, it retries with capped
+  exponential backoff (100 ms doubling to 30 s).
+- **A high-water deleted while live.** If a refill finds the object
+  absent (`HighWaterDeleted`), the refiller stops for good and logs an
+  error. It does not retry: an object that reappears, for example
+  restored from an old copy, may sit below blocks other receivers hold.
+  - The blocks already held are spent, with no reservation overlapping
+    them.
+  - Then fresh mints fail as below, while existing templates keep
+    attaching.
+  - Only a restart gets past it, and a seated root's restart fails
+    closed while the object is absent (RFC0059.14).
+- **Exhausted range.** Once the listeners are open, if the current
+  block and every ready block are used up before a refill lands, every
+  **fresh** allocation fails immediately: a new tree leaf, an
+  adoption-interned template, or a first-seen structured key. (Startup replay is different; see §3.4.)
+  - Each such line is emitted as a parse failure: `template_id = 0`, its
+    body retained (`CLAUDE.md` §3.3 holds through the body), and
+    `lossy_flag = true` for string bodies.
+  - It is counted on the existing `ourios.miner.parse_failures` counter
+    under `ourios.miner.parse_failure.reason = id_reservation_failed`.
+  - Lines that match an existing template keep attaching to it.
+  - An adoption that would intern is not attempted. The line is mined
+    instead, and either attaches or counts as above.
+  - Allocation resumes as soon as the refiller hands over a block,
+    unless the refiller stopped on a deleted high-water.
+- **Precedence.** RFC 0023 §3.1's per-tenant ceiling is checked before
+  id availability. A line at the ceiling reports `template_ceiling`,
+  not `id_reservation_failed`.
+
+### 3.4 Every start
+
+Recovery decides whether the snapshots may be restored **before** it
+restores any of them. `restore_tenant` puts a snapshot's leaves into the
+live miner, so an untrusted snapshot must never reach it: deleting the
+file afterwards would leave its leaves live. The order is:
+
+1. Check the seated marker and the object's presence, before any
+   restore.
+2. **Object present, no marker** (§3.5): discard every artefact with
+   reason `predates_high_water`, without restoring any. Remove the
+   files, then seat above `N`, then write the marker.
+3. **Object present, marker present and valid:** restore the snapshots
+   normally, then seat above `max(N, highest restored id)`. An invalid
+   marker, or a valid one whose object is absent, fails startup closed
+   (§3.1, §3.5).
+4. **Object absent, no marker, the bootstrap** (§3.5): restore first,
+   because the floor needs `restored_max`. Then bootstrap the object and
+   write the marker, provided the store holds no data yet or this start
+   is authorised. Otherwise startup fails closed. A start whose create
+   loses to another replica's also fails startup (`BootstrapRaceLost`),
+   and its restart takes case 2.
+
+In every case the allocator then reserves **three** blocks
+synchronously, before any listener opens: the miner takes the first as
+its current block, and the other two are its ready blocks. Startup thus
+leaves exactly the steady state of §3.3, a current block plus two ready,
+and replay mints from those blocks.
+- **Replay reserves on demand.** Replay can mint far more than two
+  blocks of templates, for example a discarded snapshot's tenant
+  full-replaying its WAL. While it runs, the recovery driver owns the
+  miner exclusively, before any listener opens. There is no pipeline
+  lock yet and no ingest to stall, so a replay that drains the ready
+  blocks reserves the next block **synchronously, on demand**, rather
+  than failing a template a healthy store could have given an id.
+  - The exhausted-range rule of §3.3 applies only once recovery has
+    handed the miner to the pipeline.
+  - A store failure during replay therefore fails the reservation, and
+    with it startup, never a single template.
+- **Read fails.** Startup fails closed. This is the same trade-off as
+  RFC 0052's fail-closed checks and #791 (recovery during an
+  object-store outage): a restart then needs the store reachable, but a
+  guessed floor could silently bind published rows to another template.
+
+**The guarantee.** Within one high-water generation (between
+re-bootstraps, §3.1), write-before-allocate makes every id issued at
+most `N`, and every start allocates only above `N`. So nothing replay or
+later ingest mints can equal an id issued before the restart, whatever
+recovery restored, discarded, or never found. A replaced local root is
+covered too: it has no snapshots and no WAL, but `N` is in the store.
+Across a re-bootstrap the guarantee covers every id still bound by
+stored data or audit (§3.7, RFC0059.19).
+
+**Restore equivalence** (amends RFC 0001 scenario §3.5.3, approved by
+the maintainer on 2026-10-05):
+- A template **first allocated during tail replay** now takes an id
+  from the fresh block, not the one the uninterrupted process would
+  have issued.
+- Restore plus tail replay therefore equals a full rebuild only up to
+  an **injective renaming of the ids first minted in tail replay**.
+- Restored ids, versions, slot types, routes, the structured map, and
+  every other field remain exactly equal.
+- No renamed id equals an id issued before the restart.
+
+**When the renaming is observable.** In the steady state a tenant's
+frames above its horizon `S` also lie above the checkpoint `X` (`S ≥ X`,
+RFC 0001 §6.9's 2026-06-12 amendment). They were never published, so the
+renaming is invisible. Only a lagging snapshot (`S < X`) re-mints
+templates whose rows in `(S, X]` were already published. That is
+drift, surfaced by RFC 0010, never a collision.
+
+**A re-minted id publishes its mapping.**
+- A frame at or below `X` replays for the miner's state alone, because
+  its rows and audit events were published before the crash (RFC 0052
+  §3.7's gates).
+- A template such a frame mints afresh takes an id above the
+  high-water that no published event binds. That happens when the
+  snapshot is discarded, or when `S < X`.
+- Rows ingested after startup that match the template carry that id.
+  Without its events, the querier could not render them.
+- Replay therefore **forwards every audit event of a template it minted
+  itself**: one whose `template_id` lies above the highest id seated
+  before replay. It withholds every other event at or below `X` as
+  before, and every row.
+  - Nothing is duplicated. The forwarded events bind a new id, while
+    the published originals bind the old one.
+  - The events reach the audit sink during recovery, before any
+    listener opens. The sink's audit barrier publishes them no later
+    than the first row that carries the id.
+
+### 3.5 Bootstrap: a provable floor
+
+**Trigger.** The object is absent and the root has no seated marker. A
+markerless root is not proof of a first bootstrap: if the object were
+deleted while receiver A held an unused block, a replica on a replaced
+root would bootstrap from the published ids alone, below A's block. So:
+
+| High-water | Store holds data or audit objects | Authorised | Seated marker | Outcome |
+|---|---|---|---|---|
+| absent | no (a genuinely new store) | either | none | bootstrap |
+| absent | yes | no | none | fail closed, with an error explaining the upgrade step |
+| absent | yes | yes | none | bootstrap |
+| absent | either | either | valid | fail closed (RFC0059.14) |
+
+- **"Holds data"** means one delimited `LIST` of each of `data/` and
+  `audit/` returns anything at its first level. The check is
+  conservative: a tenant directory with no file still counts.
+- **Authorisation** is the receiver setting
+  `receiver.template_ids_allow_bootstrap` (config file) or
+  `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` (environment), default off. It is
+  meant for the one upgrade start only, and is removed once that
+  receiver has seated.
+
+The bootstrapping start computes:
+
+```text
+floor = max(data_max, audit_max, restored_max)
+```
+
+A source with no id counts as `0`, the `NO_TEMPLATE` sentinel (RFC 0001
+§6.1): a data file whose rows are all parse failures, an empty audit
+stream, or no restored snapshot. On a genuinely new store every maximum
+is absent, so `floor = 0` and the first allocatable id is `1`, as
+before this RFC.
+
+**`data_max`.** The highest `template_id` in the statistics of every
+data file under `data/`.
+- This covers every published row, structured or not, whatever the
+  audit stream holds. The data writer enables page-level statistics on
+  every column (RFC 0005 §3.6, `writer.rs`), and those include chunk
+  min/max for `template_id`.
+- The read goes footer only, one file at a time. One suffix-ranged
+  GET of the last 64 KiB returns the footer and the object's size, and a
+  second, larger one follows only when the footer is bigger than that.
+- The footer answers a file only when **every** id column it holds has
+  usable statistics in every row group. That is `template_id` for a data
+  file, and all three id columns for an audit file (below).
+- If any id column lacks them in any row group, the file comes down
+  whole and its id columns are decoded. The writers record the
+  statistics, so a file that needs this is a pre-statistics or foreign
+  file.
+- No row is ever materialised.
+
+**Which keys are read.** Only keys ending in lowercase `.parquet`. That
+is the rule the compactor applies (`compaction/keys.rs`,
+`is_committed_parquet`) and the one RFC 0033's map key relies on to stay
+out of every audit walk (`template_map.rs`). It skips `*.parquet.tmp`
+staging objects, `manifest.json`, and `template_map.v2.json.zst`.
+
+**`audit_max`.** The same footer read over every `audit/` file. It
+covers the `template_id` column, plus `alias_representative_id` and the
+`alias_member_ids` leaf, since alias events carry ids too. Statistics on
+`template_id` alone do not answer an audit file: if either alias column
+lacks usable statistics, that column's data is read.
+
+**`restored_max`.** The highest id in the snapshots this start restored.
+Those can hold ids whose rows were not yet published.
+
+**Why no margin is needed.**
+- An id that no surviving data row, audit event or restored snapshot
+  carries binds nothing durable. If it is re-issued, no existing
+  artefact mis-renders. Quarantined records (RFC 0025) persist no id.
+- Rows whose ids were erased (RFC 0047) or aged out are gone, so their
+  ids bind nothing either.
+- `reserved_through = floor`, and the allocator starts at `floor + 1`
+  by construction.
+
+**Listing cost.** The store's listing seam returns one `/`-delimited
+level per call (`Store::list_delimited_blocking`: the objects directly
+under a prefix plus its immediate child prefixes). Data partitions nest
+`data/tenant_id=…/year=…/month=…/day=…/hour=…/`, so the walk issues one
+delimited `LIST` at every directory of every level:
+
+```text
+LISTs = 1 (data/) + tenants + tenant-years + tenant-months
+      + tenant-days + tenant-hours
+```
+
+That is dominated by the hour partitions. A backend pages a large
+directory, at 1,000 keys per page on S3, and each page is one more
+request. `audit/` adds the same walk over its
+`tenant_id=…/year=…/month=…/day=…/` levels.
+
+On top of the listings, every file costs one suffix GET (two when its
+footer exceeds 64 KiB). On the reporter's node that is about 620,000
+footer reads and, for two tenants with a year of hourly partitions,
+about 17,500 hour-level `LIST`s.
+
+This is the whole-prefix walk #853 warns about. It runs at a store's
+first start under this RFC and again at each authorised re-bootstrap
+(§3.1). Ordinary starts between re-bootstraps never scan.
+
+**Memory.**
+- **Listings.** `list_delimited_blocking` materialises one directory's
+  listing into memory, every page of it. The walk is depth-first, so it
+  holds that one listing plus the prefixes still to visit, which are the
+  unvisited siblings at each level of the current path.
+- **Files.** Each file's footer, or a whole pre-statistics file, is
+  dropped before the next one is fetched.
+- **The bound.** The largest single directory listing, plus the current
+  path's pending siblings, plus one file. It does not grow with the
+  number of directories or files in the store as a whole. It does grow
+  with the widest directory. That is an hour partition's file list,
+  which compaction keeps to a handful of files (RFC 0009), or a level
+  such as `tenant_id=…`, with one name per tenant.
+- **Why not a streaming seam.** A paginated listing would bound memory
+  at one page, but only on S3. Its lexicographic `start-after` paging is
+  a guarantee there, while `object_store`'s local backend lists in an
+  unspecified order. A page-by-offset walk there would skip keys, or
+  have to sort the whole prefix first. The directory-at-a-time walk is
+  correct on both backends, and its bound is the honest one stated
+  above.
+
+**Progress.** Every 10,000 files, the bootstrap logs
+`ourios.receiver.template_ids.bootstrap.progress` (§3.9).
+
+**A failed scan fails closed.** Every step of the scan can fail: a
+listing, a ranged footer read, a footer parse, the full-file fallback,
+or an id column's decode.
+- Any such failure aborts startup with `error.type = scan`.
+- The receiver writes neither the high-water object nor the seated
+  marker. A floor over a partial scan proves nothing.
+- The next start redoes the scan (RFC0059.6).
+
+**Crash mid-bootstrap.** Nothing is written until the scan completes. A
+crash or restart during the scan leaves no object, so the next start
+redoes the scan from the beginning. The write is create-if-absent
+(`put_if_absent`), and this bootstrap is the only writer that ever
+creates the object (§3.2). A start that loses that race to a concurrent
+replica (§3.6) **fails startup** with `BootstrapRaceLost`. It never
+proceeds against the winner's object: it has already restored its own
+snapshots, whose ids may lie above the winner's floor. Its restart finds
+the object present and no marker, and takes the discard path below
+(RFC0059.12).
+
+**Snapshots written before the high-water existed.** Before this RFC,
+two receivers sharing a store each started counting at 1, so a
+multi-replica deployment already has colliding ids. #908's read-only
+DuckDB procedure finds them.
+- **The danger.** A replica's local snapshots hold ids from its own
+  pre-RFC counter. Once another replica has bootstrapped the high-water
+  and allocated from it, restoring those snapshots would bring back
+  leaves whose ids that replica has since issued for other templates.
+  Scaling to one replica for the upgrade only delays this until scale-out.
+- **The seated marker.** Each root records that its snapshots were
+  written under reservations: a file
+  **`<snapshots root>/TEMPLATE_IDS_SEATED`** whose body is JSON
+  `{"version": 1, "seated_above": N, "max_reserved_seen": M}`:
+  - `N` is the high-water the root first seated above;
+  - `M` is the highest block end the root has made usable, with
+    `N <= M`.
+  - It is written through the snapshot store's temp-file, fsync and
+    rename discipline.
+  - Every start rewrites it with the blocks the start reserved.
+  - Every later reservation raises `M` durably **before** its block can
+    be taken, so `M` covers every id the root can issue. That is one
+    local fsync per block of 1,000 ids.
+  - The snapshot loader ignores it, since it is not a `*.snap` artefact.
+    The snapshot and WAL formats are unchanged.
+- **The marker must be valid to count.**
+  - It must parse, and carry version 1, a `u64` `seated_above` and a
+    `u64` `max_reserved_seen`, with `seated_above <= max_reserved_seen`.
+  - A marker that is zero-length, truncated, malformed, of another
+    version, unreadable, missing either field, or with
+    `seated_above > max_reserved_seen` fails startup closed. It never
+    trusts the snapshots, and it is never read as "absent".
+  - The format is new in this RFC and unpublished, so no marker without
+    `max_reserved_seen` exists in the field.
+- **Marker present and valid, object present.**
+  - If the object's `reserved_through` is below `max_reserved_seen`, the
+    object was rolled back to an older copy, and startup fails closed
+    (§3.1, RFC0059.18). A marker claiming more than the object holds is
+    the same case.
+  - Otherwise the root's snapshots are trusted and restore normally.
+- **Marker present and valid, object absent.** Startup fails closed
+  (§3.1, RFC0059.14).
+- **Marker absent, high-water object absent.** This start is the
+  bootstrap. It restores its snapshots, folds their highest id into the
+  floor (`restored_max`), creates the object, then writes the marker.
+- **Marker absent, high-water object present.** Another replica, or
+  this one before a crash, already seated the store. Every artefact
+  here predates this root's first seat and is untrusted.
+  - Recovery discards them all with reason `predates_high_water`, so
+    each tenant full-replays its surviving frames.
+  - It removes the artefact files and fsyncs the directory, seats
+    above `N`, then writes the marker.
+  - A discarded snapshot only costs drift. The WAL replays, and the
+    high-water makes every re-minted id fresh.
+- **Losing the bootstrap race.** If two replicas without markers both
+  find the object absent, both restore their own snapshots, and only
+  one create lands. The loser has already restored ids the winner's
+  floor may not cover. So the loser fails startup, and its restart takes
+  the "object present" path.
+- **Crash safety.**
+  - Every step before the marker write leaves the marker absent, so the
+    next start reruns the same decision.
+  - After the marker write, no untrusted artefact remains: they were
+    removed before it, and every later snapshot is written under
+    reservations.
+- **A lost or replaced root** has no marker and no snapshots, so it
+  just writes the marker.
+- **Live pre-RFC receivers are a different case.** The marker covers
+  offline replicas' snapshots. It cannot cover a pre-RFC receiver that is
+  still running.
+  - A Kubernetes StatefulSet rolling update keeps old pods serving while
+    the first upgraded pod bootstraps. An old binary can publish an id
+    after the scan has passed its file and before the create lands.
+  - That id may then lie inside the bootstrapper's first block.
+- **The upgrade rule.** For the one upgrade to this RFC:
+  1. grant the permissions of §3.6, including the bootstrap-only reads;
+  2. stop every pre-RFC receiver (scale `receiver.replicas` to 0);
+  3. start **one** upgraded replica with
+     `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true`, and let it bootstrap
+     and seat;
+  4. remove the setting, then scale out.
+
+  The Helm chart states the rule beside `receiver.replicas` and in its
+  `NOTES.txt`, and the release notes carry it. A store that already has
+  the high-water needs no step.
+- **No downgrade.** Once the high-water object exists, a receiver built
+  before this RFC must not run against the store again. It ignores the
+  high-water, so it can re-issue ids an upgraded replica already
+  reserved or issued.
+  - Direct downgrade below RFC 0059 is prohibited.
+  - A safe rollback would mean restoring the object store and every
+    receiver's WAL to their state from before the upgrade. That is not
+    a supported operation.
+  - The chart's upgrade note and the release notes say so.
+- **Detection is a stated limitation.** Spotting a still-running
+  pre-RFC writer would mean finding data files whose ids exceed the
+  floor yet were not allocated from a reservation. That needs
+  re-listing every data partition after the bootstrap, the whole-prefix
+  walk (#853) that runs only at a bootstrap. It is not cheap enough to
+  run, so the receiver does not warn. The DuckDB procedure from #908
+  finds any collision such an upgrade left.
+- **Relation to RFC 0052.** The discard runs before RFC 0052 §3.2's
+  legacy stale-gap belt. That belt still reads the discarded version-1
+  artefacts' marks, so a pre-RFC 0052 root is checked exactly as
+  before.
+
+### 3.6 Several receivers on one store
+
+**What the chart allows.**
+- The Helm chart runs the receiver as a StatefulSet whose
+  `receiver.replicas` an operator may raise (`values.yaml`, default 1).
+- Each replica has its own WAL PVC, and all of them write one shared
+  store.
+- The receiver Service load-balances, and nothing routes a tenant to
+  one replica.
+
+**S3-compatible stores.** Reservation is therefore a compare-and-swap on
+the one object. This is RFC 0013's manifest-swap primitive,
+`Store::put_if_match`, including its unquoted-`ETag` retry:
+- it writes with `If-Match: <etag>`;
+- only the startup bootstrap creates, with `If-None-Match: *`
+  (`put_if_absent`); a reservation that finds the object absent fails
+  (§3.2);
+- on a precondition failure it re-reads and retries, up to 16 attempts
+  per reservation;
+- a reservation that still loses is a failed reservation (§3.3).
+
+The store linearises conditional writes, so every replica's blocks are
+disjoint, and no per-node key is needed.
+
+**The local backend.**
+- It has no `If-Match` (RFC0019.7: it commits by atomic overwrite, last
+  writer wins). The reservation writes `N'` by overwrite there. An
+  overwrite cannot be made conditional on the file still existing, so a
+  deletion that lands between a reservation's read and its write can
+  re-create the object.
+  - That is the local backend's accepted limit, for single-node
+    development only. The re-created value is still above every block
+    this one receiver reserved, so no id is re-issued.
+  - RFC0059.18's "no reservation re-creates the object" is therefore
+    scoped to stores with conditional writes.
+  - A deletion that does not race a write is still caught on the local
+    backend: the next reservation fails with `HighWaterDeleted` and
+    stops the refiller, and the next restart fails closed (RFC0059.14,
+    whose test runs on the local backend).
+- **One receiver per local store** is a stated constraint. It is the
+  same constraint under which the chart's shared local PVC is coherent
+  at all (`data-pvc.yaml`: "coherent only on one node or with a
+  ReadWriteMany class").
+
+**Permissions.** Every key sits under one top-level prefix (behind the
+configured `storage.s3.prefix`, written `PREFIX/` below; with no prefix it
+is dropped). Each is written by these roles, as the code's writers show:
+
+| Prefix      | Receiver                     | Compactor                                        | Querier                     |
+| ----------- | ---------------------------- | ------------------------------------------------ | --------------------------- |
+| `data/`     | puts record files            | puts compacted files and manifests; deletes inputs and orphans | reads              |
+| `audit/`    | puts audit events            | puts erasure events                              | reads; template-map cache key |
+| `miner/`    | gets and puts the high-water | none                                             | none                        |
+| `erasure/`  | none                         | gets, puts and deletes erasure markers           | none                        |
+| `backfill/` | none                         | gets, puts and deletes backfill locks            | none                        |
+
+The receiver's object-store role therefore gains, beyond its existing
+`s3:PutObject` on `PREFIX/data/*` and `PREFIX/audit/*`:
+- **always:** `s3:GetObject` and `s3:PutObject` on the objects
+  `arn:aws:s3:::BUCKET/PREFIX/miner/*`, and `s3:ListBucket` on the bucket
+  `arn:aws:s3:::BUCKET` with an `s3:prefix` condition of `PREFIX/miner/*`.
+  Conditional writes (`If-Match`, `If-None-Match`) need nothing beyond
+  `s3:PutObject`. No delete is granted.
+- **for the one-time upgrade bootstrap:** `s3:GetObject` on the objects
+  `BUCKET/PREFIX/data/*` and `BUCKET/PREFIX/audit/*`, and
+  `PREFIX/data/*` and `PREFIX/audit/*` added to the `s3:prefix`
+  condition.
+
+`s3:ListBucket` is a bucket action. AWS evaluates it against the bucket
+ARN, so a grant on an object ARN such as `BUCKET/miner/*` never matches
+and the listing is denied. The `StringLike` condition on `s3:prefix` is
+what scopes it: the receiver may list under those prefixes only, not the
+whole bucket. Object actions go on one object ARN per prefix the role
+writes, never `BUCKET/*`. The receiver's minimal policy during the
+upgrade, with the `data/*` and `audit/*` reads removed afterwards:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::BUCKET/PREFIX/data/*",
+        "arn:aws:s3:::BUCKET/PREFIX/audit/*",
+        "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::BUCKET/PREFIX/miner/*",
+        "arn:aws:s3:::BUCKET/PREFIX/data/*",
+        "arn:aws:s3:::BUCKET/PREFIX/audit/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["PREFIX/miner/*", "PREFIX/data/*", "PREFIX/audit/*"]
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+    }
+  ]
+}
+```
+
+**No documented policy can delete the high-water.** The compactor's
+documented `s3:DeleteObject` is scoped to `PREFIX/data/*`,
+`PREFIX/erasure/*` and `PREFIX/backfill/*`, where it reclaims; it was
+previously documented on `PREFIX/*`, which reached `miner/`. The querier's
+optional cache grant deletes only its `audit/tenant_id=*/template_map*`
+key. Every documented policy (receiver, compactor, querier) also ends with
+the explicit `Deny` above, as belt and braces. The chart README carries
+all three policies, and a test enforces the rule on them (RFC0059.17).
+
+Before this RFC the chart documented the receiver as `PutObject` only.
+These grants must be in place **before** the scale-to-one upgrade step,
+and the migration-only reads may be revoked once the high-water exists.
+A denied call fails startup with an error naming the action it lacked
+(`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`, RFC0059.15). The
+chart's README and `values.yaml` document every role's set, and the
+release notes carry the receiver's.
+
+**Out of scope.** The same template reaching two replicas gets two ids.
+That is drift across replicas (hazard #5), not a collision.
+
+**Threat model** (maintainer decision, 2026-10-06). The high-water is
+protected against accident and misconfiguration, not against an
+adversary who holds delete or overwrite rights on `miner/`.
+- **Supported:**
+  - the object is never deleted (§3.1, enforced by every documented
+    policy);
+  - a deletion fails closed at every seated start (RFC0059.14) and stops
+    live reservation (RFC0059.18).
+- **Unsupported, but caught:**
+  - Restoring an older copy of the object. The per-root check refuses it
+    at every replica whose marker saw a later value (§3.1).
+  - Recovery is the quiesced, authorised re-bootstrap described there:
+    remove the object and every seated marker, then bootstrap one
+    replica from the provable footer floor.
+- **Out of scope:**
+  - An operator with delete rights who restores stale state while some
+    replica never observed the later value. That replica's marker cannot
+    tell the stale copy from the truth.
+  - Deleting a root's marker along with its snapshots. The root then
+    takes the markerless path.
+  - Neither is detected, and preventing them is left to the store's
+    access control, versioning and object lock.
+
+### 3.7 Monotonicity
+
+RFC 0001 §6.1 said `template_id` is "a cluster-wide unique monotonic
+`u64`". That is amended as follows:
+- ids lie in **`1..=i64::MAX`**. They stay `u64` in memory and in the
+  Parquet `template_id` columns, but the domain stops at `i64::MAX`, so
+  every id fits the signed 64-bit `int` that OTLP and the semconv
+  registry use for attribute values. Roughly 9.2 × 10^18 ids is
+  effectively unbounded, and the registry needs no change.
+  - Allocating past `i64::MAX` is exhaustion: the controlled
+    `IdSpaceExhausted` error, which fails fresh mints as
+    `id_reservation_failed` (§3.3).
+  - A `reserved_through` above `i64::MAX` is malformed and fails
+    startup closed (§3.1).
+  - So is a bootstrap file whose footer or decoded id column holds an
+    id above it: no allocator issued that id, so no floor is built on
+    it (§3.5).
+  - Parquet stores the column as unsigned 64-bit, and its footer
+    statistics and decode both return such an id exactly, so the scan
+    sees it rather than a truncated or negative value.
+- ids are **unique cluster-wide against every id still bound by stored
+  data or audit**. This is narrowed by the maintainer's 2026-10-06
+  decision:
+  - the upgrade bootstrap and the quiesced re-bootstrap (§3.1) seat
+    above the footers of the data and audit that exist at the time;
+  - an id whose data and audit retention or erasure has already removed
+    may be issued again after such a re-bootstrap. That is harmless,
+    because nothing stored binds it (RFC0059.19);
+  - between re-bootstraps, no id is ever issued twice;
+- ids are **strictly increasing per allocator**, across that
+  allocator's restarts, because every block lies above every earlier
+  one. A re-bootstrap may restart the sequence lower, but never at or
+  below an id stored data or audit still binds;
+- ids are **not dense**;
+- ids are **not monotonic across replicas**: two replicas interleave
+  disjoint blocks.
+
+Nothing relies on cross-replica order. Each place that orders or compares
+ids:
+
+| Where | What it does with id order | Effect |
+|---|---|---|
+| Querier registry fold `template_registry.rs:110`, `RegistryFold::push` | Keys by `(template_id, version)` and orders by `(timestamp, file path, row)` (RFC 0005 §3.7.1) | No id order involved |
+| Template map `template_map.rs:605` | Sorts entries by `(template_id, version)` | Serialisation determinism only |
+| Drift query `drift.rs:155–161` | `ORDER BY widening_count DESC, template_id ASC` | Display tiebreak |
+| Alias store `alias.rs:14` and `:350` | Canonical representative is `min(members)` | Documented there as a display convenience that is not part of the contract |
+| Compaction `writer.rs:744–790` | Sorts by time and promoted service columns | Never `template_id` |
+| Miner `tree.rs:281` | Convergence ties go to the lowest id | Within one tenant tree, which only one allocator ever mints into |
+| Miner `persist.rs:156`, `:418` | Snapshots sort records by id, and restore re-inserts leaves in id order | Within one tenant tree, which only one allocator ever mints into |
+| C2 gate counter `ourios-bench/src/c2.rs:156` | Counts a template as created when its id exceeds the running maximum | Correct per allocator: the bench drives one in-process miner |
+| DSL comparisons on `template_id` (`plan/predicate.rs:354`) | Answer correctly | "Newer templates have higher ids" holds only within one allocator; the query cookbook will say so when the RFC reaches `green` |
+
+The miner rows follow from the per-allocator guarantee: within one
+allocator, ids increase with creation order across restarts, which is
+all the restore-order equivalence of RFC 0001's 2026-09-30 amendment
+needs.
+
+### 3.8 Amendments to earlier RFCs, and coordination
+
+- **RFC 0001 §6.1** (*Template identity*; RFC 0001 is `accepted`, so
+  this is an amendment). Uniqueness is a durable guarantee (§3.4),
+  monotonicity is per allocator (§3.7), and uniqueness holds against
+  every id still bound by stored data or audit. After the upgrade
+  bootstrap or a quiesced re-bootstrap, an id whose data and audit
+  retention or erasure removed may be reissued. This narrowing was
+  approved by the maintainer on 2026-10-06.
+- **RFC 0001 §6.9**: every start reads the high-water and allocates
+  above it (§3.4), and the first start bootstraps it (§3.5).
+- **RFC 0001 scenario §3.5.3**: restore equivalence holds up to the
+  injective renaming of tail-minted ids (§3.4), and RFC 0001 §8's
+  restore-equivalence test asserts exactly that.
+- **RFC 0023 §3.4**: `ourios.miner.parse_failure.reason` gains the
+  member `id_reservation_failed`, checked after `template_ceiling`
+  (§3.3).
+- **Coordination with RFC 0052 §3.7** (not an amendment: RFC 0052 is
+  `green`, not `accepted`). The audit gate at `X` forwards the events of
+  templates replay minted afresh (§3.4); the record gate is unchanged.
+  - RFC 0052's own RFC0052.10 carries the matching dated And-clause, so
+    the two green gates agree.
+  - The maintainer approved the change on 2026-10-06.
+- **RFC 0001** gets only a dated pointer here, in §6.1 and §6.9. The
+  §6.1 pointer states the reuse boundary:
+  - an id still bound by stored data or audit is never reissued;
+  - an id whose data and audit retention or erasure removed may be
+    reissued after an authorised re-bootstrap (§3.7, RFC0059.19).
+
+### 3.9 Telemetry
+
+All names go through the shared semconv registry (ourios-semconv), where
+they are final as of v0.3.7:
+
+| Name | Kind | Attributes / members |
+|---|---|---|
+| `ourios.receiver.template_ids.bootstrapped` | event, at most once per successful creation of the high-water: the upgrade bootstrap and each authorised re-bootstrap (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
+| `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
+| `ourios.miner.parse_failure.reason` | existing enum attribute | new member `id_reservation_failed` |
+| `ourios.receiver.snapshot.discarded` | existing event | new `error.type` value `predates_high_water` (§3.5) |
+
+The registry's brief and note for `ourios.receiver.template_ids.bootstrapped`
+say the same, "at most once per successful creation of the high-water"
+(ourios-semconv#9). The semconv patch release v0.3.7 (`ead0337`)
+carries this finalized event contract, and the code pins it.
+
+Reservation failures in the background refiller log through the
+existing `tracing` warn path, with `error.type` set to the store error
+class. A deleted high-water, which stops the refiller, logs at error
+level with `error.type = deleted`, the value startup already uses for
+RFC0059.14. A start refused over a rolled-back high-water fails with
+`error.type = rolled_back` (§3.1). No new metric is added: a run of
+failures shows on the parse-failure counter as soon as it costs a
+template.
+
+### 3.10 What this RFC does not change
+
+- The snapshot payload (format 3, including `wildcard_routed`).
+- The WAL format.
+- The Parquet and audit schemas.
+- The RFC 0052 recovery horizons.
+
+Restore still seats the allocator past the restored ids; the high-water
+only adds a floor above that.
+
+## 4. Alternatives considered
+
+**Floor from the audit stream only (#908).** It cannot see structured
+templates, dropped audit writes, or a lost root (§2). That makes it
+unsound, not just imprecise.
+
+**Bootstrap with a fixed margin instead of the data scan.** Cheaper at
+the one-time bootstrap, but the margin is a guess: nothing bounds
+structured keys or dropped audit batches above the audit maximum. The
+maintainer chose the provable floor (2026-10-05).
+
+**Journal reservations as WAL frames.** This would keep exact id
+continuity across restarts, so §3.5.3 would need no renaming. But it is
+an RFC 0008 format change, and it still needs the store object for a
+lost root. The renaming it avoids is unobservable in the steady state
+(§3.4).
+
+**A per-node key with static disjoint ranges.** For example,
+`node k` issues ids `≡ k (mod R)`. It needs a stable node identity and a
+fixed `R`, and it breaks on scale-out. The compare-and-swap needs
+neither.
+
+**Synchronous reservation under the miner lock as a fallback.** It puts
+store latency, and store outages, on the ingest path for every line in
+the batch. Failing only fresh allocations (§3.3) bounds the damage to
+lines that need a new template.
+
+**A content hash as the id.** RFC 0001 §6.1 already rejects this: it
+leaks identity across tenants and makes versioning collapse into
+aliasing.
+
+## 5. Acceptance criteria
+
+The ids are referenced from test code.
+
+> **Scenario RFC0059.1 — A discarded snapshot never re-issues a published id**
+> - **Given** a receiver that minted string and structured templates for
+>   two tenants, published them through a barrier cut, and reclaimed
+>   their WAL frames
+> - **When** one tenant's snapshot is discarded (each of
+>   `unknown_version`, `corrupt`, `empty`, `no_horizon`,
+>   `restore_failed`) and the receiver restarts and mints new shapes and
+>   the old ones
+> - **Then** no newly allocated `template_id` equals any `template_id` a
+>   data row or audit event in the store already carries
+> - **And** no `(template_id, version)` in the audit stream is bound to two
+>   template texts
+> - **And** an old shape first seen in a reclaimed frame re-mints under a
+>   fresh id (hazard #5 drift), never another template's
+
+> **Scenario RFC0059.2 — A replaced local root never re-issues a published id**
+> - **Given** RFC0059.1's published store
+> - **When** the receiver restarts on an empty WAL root (no snapshots, no
+>   frames) over the same store
+> - **Then** its first allocation is above the high-water `N`
+> - **And** no newly allocated id equals any id the store carries
+
+> **Scenario RFC0059.3 — Ids are reserved before they are used; a crash only skips**
+> - **Given** a receiver whose high-water reads `N`
+> - **When** it allocates its first id
+> - **Then** the object already reads at least that id when the allocation
+>   happens
+> - **And** after a SIGKILL that follows a reservation but precedes any
+>   use of its block, the restarted receiver's first allocation is above
+>   that block, and every id below it stays unissued
+
+> **Scenario RFC0059.4 — An exhausted range fails fresh mints without blocking ingest**
+> - **Given** a receiver whose startup left exactly a current block and
+>   two ready blocks, three reservations in all
+> - **And** all three used up, and a reserver that is down
+> - **When** lines arrive, some needing a fresh template and some matching
+>   an existing one
+> - **Then** each fresh-needing line is emitted with `template_id = 0`,
+>   its body retained, and counted on `ourios.miner.parse_failures` with
+>   `ourios.miner.parse_failure.reason = id_reservation_failed`
+> - **And** each matching line attaches to its existing template as
+>   before
+> - **And** no store call is made while the miner lock is held
+> - **And** once the reserver recovers, the next fresh line is allocated
+>   from the new block
+
+> **Scenario RFC0059.5 — An unreadable high-water fails startup closed**
+> - **Given** a store whose `miner/template_ids.v1.json` does not parse,
+>   lacks `reserved_through`, holds a non-`u64` value, or holds a value
+>   above `i64::MAX`
+> - **When** the receiver starts
+> - **Then** startup fails with an error naming the object, before any
+>   listener opens
+> - **And** the object is not rewritten
+
+> **Scenario RFC0059.6 — The bootstrap floor is provable and written once**
+> - **Given** a store with published data and audit files but no
+>   high-water object, including a structured template that has no audit
+>   event and a data row whose audit event was dropped
+> - **When** the receiver starts
+> - **Then** the object is created with `reserved_through =
+>   max(data_max, audit_max, restored_max)`, with no margin
+> - **And** every id allocated afterwards is above it
+> - **And** `ourios.receiver.template_ids.bootstrapped` is logged at most
+>   once per successful creation of the high-water, by the start whose
+>   create landed, with the floor and the maxima (a crash between the
+>   create and the event leaves none)
+> - **And** a restart killed mid-scan leaves no object, and the next start
+>   redoes the scan and writes once
+> - **And** when any scan step fails (a listing, a ranged read, a footer
+>   parse, the full-file fallback, or an id column's decode), startup
+>   aborts with `error.type = scan` and writes neither the object nor the
+>   seated marker
+
+> **Scenario RFC0059.7 — The bootstrap reads footers in bounded memory**
+> - **Given** histories of 40 and 160 data and audit files with large
+>   bodies and templates
+> - **When** the bootstrap scan runs
+> - **Then** it decodes no row and reads no data page of a file whose id
+>   columns all have usable statistics
+> - **And** its peak heap is below one eighth of the history's body and
+>   template bytes
+> - **And** when the history grows 4× by adding directories, with the
+>   widest directory and the largest file held fixed, the peak grows
+>   less than 1.5×: it is bounded by the largest directory listing plus
+>   one file, not by the number of files or directories
+
+> **Scenario RFC0059.8 — Concurrent reservers on one store get disjoint blocks**
+> - **Given** a store with `If-Match` support and two reservers on it
+> - **When** both reserve blocks concurrently, many times
+> - **Then** every block either reserver received is disjoint from every
+>   other
+> - **And** the high-water reads the highest block end
+
+> **Scenario RFC0059.9 — Restore equivalence holds up to renaming tail-minted ids**
+> - **Given** a tenant snapshotted at `S`, frames above `S` that mint
+>   new templates, and a high-water above every id issued
+> - **When** recovery restores the snapshot and replays the tail
+> - **Then** the recovered state equals a from-scratch control under an
+>   injective renaming that touches only ids first minted in the tail
+> - **And** every restored id and every other field is exactly equal
+> - **And** no renamed id equals an id issued before the restart
+> - **And** when the snapshot is discarded, or lags the checkpoint
+>   (`S < X`), every template replay mints afresh from frames at or
+>   below `X` has its audit events published before any listener
+>   opens, while those frames' rows stay withheld and no event of an
+>   older id is re-published
+> - **And** a row ingested after startup that matches such a template
+>   carries an id a published event binds
+
+> **Scenario RFC0059.10 — Ids increase per allocator across restarts**
+> - **Given** an allocator that issued ids, restarted, and issued more,
+>   with no re-bootstrap in between
+> - **When** its ids are listed in issue order
+> - **Then** they strictly increase
+> - **And** no id above `i64::MAX` is ever issued: `i64::MAX` itself is
+>   the last id, and seating past it or restoring an id above it is the
+>   controlled exhaustion error
+> - **And** from a high-water whose distance to `i64::MAX` is not a
+>   multiple of `BLOCK`, a shortened final block ending at `i64::MAX` is
+>   reserved, every id through `i64::MAX` is issued, and only the next
+>   fresh mint fails
+> - **And** a bootstrap that finds a published id above `i64::MAX` fails
+>   startup closed, naming the file
+
+> **Scenario RFC0059.11 — Any later-version high-water fails startup closed, even beside a v1**
+> - **Given** a store holding `miner/template_ids.v2.json`, both alone
+>   and beside a readable `miner/template_ids.v1.json`
+> - **When** a binary that knows only version 1 starts
+> - **Then** startup fails with an error naming the later-version key,
+>   before any listener opens
+> - **And** it neither bootstraps nor writes any high-water object
+
+> **Scenario RFC0059.12 — Snapshots written before a root's first seat are never restored**
+> - **Given** two receivers on one store, each with local snapshots from
+>   its pre-RFC counter that hold ids the other also used, and receiver A
+>   bootstrapped the high-water and allocated from it
+> - **When** receiver B starts with no seated marker
+> - **Then** every one of its artefacts is discarded with reason
+>   `predates_high_water` without being restored, removed, and each
+>   tenant full-replays
+> - **And** the miner holds none of the discarded snapshots' leaves: a
+>   shape one of them held mints a fresh id above the high-water
+> - **And** a marker that is zero-length, truncated, malformed, of
+>   another version, missing `seated_above` or `max_reserved_seen`, or
+>   with `seated_above` above `max_reserved_seen`, fails startup closed
+>   and never trusts the snapshots
+> - **And** no id B restores or allocates equals one A issued since the
+>   bootstrap
+> - **And** B writes its seated marker only after the artefacts are
+>   gone, so a kill at any point before it leads the next start to the
+>   same decision
+> - **And** when two markerless receivers race the bootstrap, the loser
+>   fails startup and its restart takes the discard path
+
+> **Scenario RFC0059.13 — Replay past the ready blocks reserves on demand**
+> - **Given** a seated root whose surviving WAL holds more first-seen
+>   templates than the three blocks startup reserves (a current block and
+>   two ready), and a healthy store
+> - **When** the receiver restarts and replays every frame
+> - **Then** no template fails with `id_reservation_failed` and
+>   `ourios.miner.parse_failures` stays at zero
+> - **And** the recovered state equals a from-scratch rebuild up to the
+>   renaming of RFC0059.9
+> - **And** once replay has ended, a drained reserver fails instead of
+>   calling the store
+
+> **Scenario RFC0059.14 — A seated root that finds the high-water gone fails closed**
+> - **Given** a root whose seated marker is valid, and a store whose
+>   high-water object was then deleted
+> - **When** the receiver starts
+> - **Then** startup fails with an error naming the object
+> - **And** it neither bootstraps nor writes any high-water object
+
+> **Scenario RFC0059.15 — A denied store call names the missing permission**
+> - **Given** a store that refuses the receiver's calls with an
+>   access-denied error
+> - **When** the receiver starts
+> - **Then** startup fails with an error naming the S3 action the
+>   receiver lacks
+
+> **Scenario RFC0059.16 — Bootstrapping over existing data needs authorisation**
+> - **Given** a markerless root and a store with no high-water object
+> - **When** the receiver starts:
+>   - over a store with no data or audit object, unauthorised;
+>   - over a store that holds data, unauthorised;
+>   - over a store that holds data, authorised
+> - **Then**, respectively:
+>   - it bootstraps, and the first allocatable id is 1;
+>   - startup fails closed with an error naming
+>     `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` and the upgrade step, and
+>     writes neither the object nor the marker;
+>   - it bootstraps with a floor at or above every published id, and
+>   writes its marker
+> - **And** the setting is off unless the configuration sets it
+
+> **Scenario RFC0059.17 — No documented policy can delete the high-water**
+> - **Given** every JSON IAM policy the chart README documents
+> - **When** each is evaluated for `s3:DeleteObject` on
+>   `miner/template_ids.v1.json`, with and without a `storage.s3.prefix`
+> - **Then** no `Allow` statement's actions and resources reach it
+>   (wildcards such as `s3:*` and `BUCKET/*` included)
+> - **And** each policy holds an explicit `Deny` of `s3:DeleteObject`
+>   that covers it
+
+> **Scenario RFC0059.18 — A high-water deleted while live is never re-created**
+> - **Given** a running, seated receiver that holds its current and
+>   ready blocks
+> - **When** the high-water object is deleted, and fresh templates keep
+>   arriving
+> - **Then** the held ids are each issued once and none lies past the
+>   last reservation
+> - **And** on a store with conditional writes, no reservation re-creates
+>   the object (on the local backend a deletion racing a write may
+>   re-create it, §3.6, and one that does not race is caught at the next
+>   reservation and fails the next restart closed, RFC0059.14)
+> - **And** once the held blocks are spent, fresh mints fail as
+>   `id_reservation_failed` while known templates attach
+> - **And** if the object then reappears, the refiller does not reserve
+>   from it
+> - **And** when the object reappears as an older copy below the
+>   receiver's `max_reserved_seen`, a restart fails closed with an error
+>   naming a rollback of the high-water object, and writes nothing
+> - **And** after the documented recovery (every receiver stopped, the
+>   object and every seated marker removed, one replica started with
+>   `receiver.template_ids_allow_bootstrap`), that replica seats at or
+>   above every published id, and its next mint is fresh
+
+> **Scenario RFC0059.19 — Retention or erasure followed by re-bootstrap never reissues a bound id**
+> - **Given** a seated store from which retention or erasure removed one
+>   tenant's data and audit, including its highest ids
+> - **When** the documented re-bootstrap runs (every receiver stopped,
+>   the object and every seated marker removed, one replica started with
+>   `receiver.template_ids_allow_bootstrap`)
+> - **Then** the new floor is at or above every id still bound by stored
+>   data or audit
+> - **And** no id minted afterwards equals an id still bound by stored
+>   data or audit; ids only the removed files bound may be reissued
+
+## 6. Testing strategy
+
+**Integration tests (`ourios-ingester` `tests/it`).** These run on #898's
+scenario harness: the production barrier, housekeeping and recovery
+path, with the store's data rows and audit events compared against
+every newly minted id.
+- RFC0059.1, .2, .3 (the SIGKILL arm reuses the RFC 0052 crash
+  fixture), .5, .6, .9, .11, .12, .13, .14, .15 and .16.
+- RFC0059.18 deletes the object under a running node and restores it
+  later, asserting no re-creation and no reservation from the restored
+  copy. Its deletion does not race a write, so it holds on the local
+  backend too.
+- RFC0059.19 removes one tenant's data and audit directories, as
+  retention would, runs the documented re-bootstrap, and asserts no new
+  id equals one still bound.
+- RFC0059.17 parses the chart README's JSON policies (`include_str!`)
+  and evaluates their action and resource wildcards against the
+  high-water key.
+- **RFC0052.10's transition.** Its audit-gate test
+  (`rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_frame_order`)
+  changes its contract with this RFC. The maintainer approved this on
+  2026-10-06.
+  - Before: the forwarded events equal the reference's `(X, tail]`
+    events.
+  - After: the forwarded events equal the reference's `(X, tail]`
+    events plus the `(S, X]` events whose id lies above the seated
+    high-water, in frame order. `audit_events_suppressed` counts every
+    other `(S, X]` event.
+  - The assertions stay exact. A recovery unit test keeps the withheld
+    branch covered.
+  - RFC0059.9's `rfc0059_9_a_reminted_replay_id_publishes_its_mapping`
+    covers the discarded-snapshot and `S < X` cases end to end.
+
+**Miner unit tests**, with a scripted `IdReserver`:
+- RFC0059.4: the reserver records every call; the test asserts none
+  happens while the miner holds its lock;
+- RFC0059.10.
+
+**Property test (`proptest`).** Over any reachable miner state, any
+subset of discarded tenants, surviving replay and new traffic: a miner
+seated past the issued ids only hands out an issued id for a template a
+kept snapshot restored under that id. This covers RFC0059.1 and .9.
+
+**Concurrency test (RFC0059.8).** Two reservers on an in-memory
+`If-Match` store, plus an `#[ignore]`d LocalStack arm run by the
+`s3-integration` job.
+
+**Heap test (RFC0059.7).** `dhat` in its own binary, in the style of
+#896's `rfc0033_bounded_fold.rs`.
+
+**Red gate.** One `#[ignore]`d `todo!` stub per scenario, registered in
+`tests/it/main.rs` (#819's convention), flips this RFC to `red`.
+
+## 7. Open questions
+
+- [x] **Semconv names.** §3.9's names and the bootstrapped event's
+      contract are final in the shared registry's v0.3.7 (`ead0337`),
+      which the code pins.
+- [ ] **Template-map artefacts.** RFC 0033's map is derived from the audit
+      stream, so it inherits the audit fold's last-wins on historical
+      collisions. Repairing already-collided history is out of scope; the
+      DuckDB procedure from #908 detects it.
+
+## 8. References
+
+- Issue #898 and PR #908 (the investigation, the scenario tests, the
+  DuckDB collision check); #909 (the review this RFC answers).
+- RFC 0001 §6.1, §6.2 step 0, §6.9, scenario §3.5.3.
+- RFC 0005 §3.6 (data-file statistics) and §3.7.1 (audit fold order).
+- RFC 0010 (drift).
+- RFC 0013 (`put_if_match` and the manifest compare-and-swap).
+- RFC 0019 (RFC0019.7, the local backend).
+- RFC 0023 §3.1 and §3.4.
+- RFC 0025 (quarantine).
+- RFC 0033 (the map artefact precedent).
+- RFC 0035 §3.1 (the ordered phase).
+- RFC 0047 (erasure).
+- RFC 0052 (reclamation and recovery horizons).
+- RFC 0056 (audit durability).
+- #791 (object-store outage recovery); #853 (listing cost); #896 (the
+  bounded audit fold).
+- `CLAUDE.md` §3.1, §3.3, §3.6, §3.7; hazards #1 and #5.

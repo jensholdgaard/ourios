@@ -218,11 +218,13 @@ impl MinerCluster {
     }
 
     /// Why a fresh template cannot be minted for `tenant`, if it cannot:
-    /// the RFC 0023 §3.1 per-tenant ceiling, or no reservable id.
+    /// the RFC 0023 §3.1 per-tenant ceiling, or, when the template is a
+    /// genuinely new identity (`needs_id`), no reservable id.
     pub(super) fn mint_blocked(
         &mut self,
         tenant: &TenantId,
         max_templates: u32,
+        needs_id: bool,
     ) -> Option<&'static str> {
         let at_ceiling = self
             .tenants
@@ -230,7 +232,7 @@ impl MinerCluster {
             .is_some_and(|s| s.leaf_count + s.owned_adopted_count >= max_templates as usize);
         match at_ceiling {
             true => Some("template_ceiling"),
-            false if !self.ids_ready() => Some(ID_RESERVATION_FAILED),
+            false if needs_id && !self.ids_ready() => Some(ID_RESERVATION_FAILED),
             false => None,
         }
     }

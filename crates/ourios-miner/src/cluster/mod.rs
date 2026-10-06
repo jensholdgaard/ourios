@@ -81,7 +81,7 @@ use crate::tree::{Leaf, OwnedToken, Tree, UpstreamAssociations, format_template}
 use crate::upstream;
 
 use plan::{
-    AttachPlan, Candidate, param_type_for_line_position, params_from_mask, plan_attach,
+    AttachPlan, Candidate, adopted_row_parts, leaf_template, params_from_mask, plan_attach,
     separators_to_owned, upstream_template_of,
 };
 
@@ -279,6 +279,29 @@ enum AdoptResolution {
     Interned(u64),
     /// The RFC 0023/0050 ceiling refused the intern.
     Ceiling,
+    /// Interning needs a fresh id and none is reservable: the line is
+    /// mined instead, which attaches or counts the failure.
+    NoId,
+}
+
+/// One adopted canonical to resolve: what [`MinerCluster::resolve_adoption`]
+/// reads, and whether a fresh id is in hand should it have to intern.
+struct AdoptQuery<'a> {
+    upstream: &'a str,
+    owned_tokens: &'a [OwnedToken],
+    key: (String, u8, Option<String>),
+    config: &'a MinerConfig,
+    id_ready: bool,
+}
+
+/// A fresh leaf to mint for a string line: its masked form, the owned
+/// parts its record carries, the RFC 0050 `observe` string, and its
+/// §6.3 zone.
+struct FreshLeaf<'a> {
+    masked: MaskedLine<'a>,
+    parts: LineParts,
+    observed: Option<&'a str>,
+    zone: FreshLeafZone,
 }
 
 struct TenantState {
@@ -924,19 +947,16 @@ impl MinerCluster {
             // by definition: there was no weaker match to drop
             // into the lossy zone against, and no template to
             // declare a parse failure against.
-            None => {
-                // RFC 0023 §3.1 bound 2: at the per-tenant leaf
-                // ceiling the mint diverts to the §6.3
-                // parse-failure path — body retained, counted,
-                // never force-merged.
-                if let Some(reason) =
-                    self.mint_blocked(&record.tenant_id, effective_config.max_templates)
-                {
-                    return self.emit_string_parse_failure(line, parts, reason);
-                }
-                let new_id = self.create_new_leaf(line, masked_line, observed);
-                self.emit_fresh_leaf_record(line, parts, new_id, FreshLeafZone::Clean)
-            }
+            None => self.mint_fresh_leaf(
+                line,
+                FreshLeaf {
+                    masked: masked_line,
+                    parts,
+                    observed,
+                    zone: FreshLeafZone::Clean,
+                },
+                effective_config.max_templates,
+            ),
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
                     // Clean: attach to candidate, optionally
@@ -960,27 +980,21 @@ impl MinerCluster {
                     // (RFC 0017 §3.1). The retention counter bumps
                     // here; `record_parse_failure` covers the
                     // parse-failure-zone path separately.
-                    ConfidenceZone::Lossy => {
-                        // RFC 0023 §3.1 bound 2 — same divert as
-                        // the no-candidate arm: the §6.3 lossy zone
-                        // mints rather than force-merges into the
-                        // too-weak candidate, so at the ceiling it
-                        // must fail parse, not merge.
-                        if let Some(reason) =
-                            self.mint_blocked(&record.tenant_id, effective_config.max_templates)
-                        {
-                            return self.emit_string_parse_failure(line, parts, reason);
-                        }
-                        let new_id = self.create_new_leaf(line, masked_line, observed);
-                        self.emit_fresh_leaf_record(
-                            line,
+                    // The §6.3 lossy zone mints rather than
+                    // force-merges into the too-weak candidate, so at
+                    // the ceiling it must fail parse, not merge.
+                    ConfidenceZone::Lossy => self.mint_fresh_leaf(
+                        line,
+                        FreshLeaf {
+                            masked: masked_line,
                             parts,
-                            new_id,
-                            FreshLeafZone::Lossy {
+                            observed,
+                            zone: FreshLeafZone::Lossy {
                                 confidence: c.similarity / threshold,
                             },
-                        )
-                    }
+                        },
+                        effective_config.max_templates,
+                    ),
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
                     ConfidenceZone::ParseFailure => {
@@ -1116,12 +1130,6 @@ impl MinerCluster {
         let Ok(alignment) = upstream::align(&parsed, raw) else {
             return self.reject_upstream(record, service, "alignment");
         };
-        // Interning needs a fresh id. Without a reservable one the line
-        // is mined instead, which attaches or counts the failure.
-        if !self.ids_ready() {
-            return None;
-        }
-
         let owned_tokens = parsed.to_owned_tokens();
         let canonical = format_template(&owned_tokens);
         let key = (
@@ -1129,65 +1137,46 @@ impl MinerCluster {
             record.severity_number,
             record.scope_name.clone(),
         );
+        // Only a genuinely new identity needs a fresh id: a known
+        // canonical, or one converging onto a mined leaf, resolves
+        // however exhausted the range is.
+        let id_ready =
+            self.adoption_resolves_without_id(&record.tenant_id, &key) || self.ids_ready();
+        let query = AdoptQuery {
+            upstream,
+            owned_tokens: &owned_tokens,
+            key,
+            config,
+            id_ready,
+        };
 
-        let (template_id, template_version) =
-            match self.resolve_adoption(record, upstream, &owned_tokens, key, config) {
-                AdoptResolution::Ceiling => {
-                    // RFC0050.5: at the ceiling, adoption stops
-                    // interning and the documented fallback is mining
-                    // (which will divert to parse-failure at the same
-                    // ceiling).
-                    return self.reject_upstream(record, service, "template_ceiling");
-                }
-                AdoptResolution::Existing(id, version) => (id, version),
-                AdoptResolution::FirstOnLeaf(id, version) => {
-                    // First adoption of this canonical — a provenance
-                    // transition, audited once (§3.3 / CLAUDE.md §3.1:
-                    // a clustering decision made elsewhere is audited
-                    // like a merge).
-                    self.emit_adopted_audit(line, id, version, &canonical);
-                    (id, version)
-                }
-                AdoptResolution::Interned(id) => {
-                    self.ids.consume();
-                    self.emit_adopted_audit(line, id, 1, &canonical);
-                    (id, 1)
-                }
-            };
+        let (template_id, template_version) = match self.resolve_adoption(record, query) {
+            AdoptResolution::Ceiling => {
+                // RFC0050.5: at the ceiling, adoption stops
+                // interning and the documented fallback is mining
+                // (which will divert to parse-failure at the same
+                // ceiling).
+                return self.reject_upstream(record, service, "template_ceiling");
+            }
+            AdoptResolution::NoId => return None,
+            AdoptResolution::Existing(id, version) => (id, version),
+            AdoptResolution::FirstOnLeaf(id, version) => {
+                // First adoption of this canonical — a provenance
+                // transition, audited once (§3.3 / CLAUDE.md §3.1:
+                // a clustering decision made elsewhere is audited
+                // like a merge).
+                self.emit_adopted_audit(line, id, version, &canonical);
+                (id, version)
+            }
+            AdoptResolution::Interned(id) => {
+                self.ids.consume();
+                self.emit_adopted_audit(line, id, 1, &canonical);
+                (id, 1)
+            }
+        };
 
-        // Row assembly: params in template order, each wildcard
-        // capturing exactly one body token. Classification comes
-        // from `mask()`'s authoritative read of the body (§6.2) —
-        // `Str` where mask saw nothing — and every value passes
-        // the §6.5 byte cap with overflow spilling to the body.
-        let wildcard_body_positions: Vec<usize> = parsed
-            .tokens()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                matches!(t, crate::upstream::UpstreamToken::Wildcard { .. }).then_some(i)
-            })
-            .collect();
-        debug_assert_eq!(wildcard_body_positions.len(), alignment.params.len());
-        let params: Vec<Param> = alignment
-            .params
-            .iter()
-            .zip(&wildcard_body_positions)
-            .map(|(p, &pos)| {
-                let ty = param_type_for_line_position(
-                    pos,
-                    masked.wildcard_positions,
-                    masked.typed_params,
-                );
-                crate::overflow::cap_param_value(ty, p.value.to_string(), config.param_byte_limit)
-            })
-            .collect();
-        let separators: Vec<String> = alignment
-            .separators
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-
+        let (params, separators) =
+            adopted_row_parts(&parsed, &alignment, masked, config.param_byte_limit);
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.template_id = template_id;
         rec.template_version = template_version;
@@ -1292,11 +1281,15 @@ impl MinerCluster {
     fn resolve_adoption(
         &mut self,
         record: &OtlpLogRecord,
-        upstream: &str,
-        owned_tokens: &[OwnedToken],
-        key: (String, u8, Option<String>),
-        config: &MinerConfig,
+        query: AdoptQuery<'_>,
     ) -> AdoptResolution {
+        let AdoptQuery {
+            upstream,
+            owned_tokens,
+            key,
+            config,
+            id_ready,
+        } = query;
         let effective_config = *config;
         let candidate_id = self.ids.peek();
         let assoc_limit = usize::from(config.upstream_association_limit);
@@ -1359,6 +1352,8 @@ impl MinerCluster {
                     >= config.max_templates as usize
                 {
                     AdoptResolution::Ceiling
+                } else if !id_ready {
+                    AdoptResolution::NoId
                 } else {
                     let mut associations = UpstreamAssociations::default();
                     let _ = associations.observe(upstream, assoc_limit);
@@ -1376,6 +1371,62 @@ impl MinerCluster {
                 }
             }
         }
+    }
+
+    /// Whether adopting `key` for `tenant` resolves to an identity that
+    /// already exists, an adopted entry or a mined leaf of that exact
+    /// shape, so needs no fresh id.
+    fn adoption_resolves_without_id(
+        &self,
+        tenant: &TenantId,
+        key: &(String, u8, Option<String>),
+    ) -> bool {
+        self.tenants.get(tenant).is_some_and(|state| {
+            state.adopted_templates.contains_key(key) || state.mined_canonicals.contains(key)
+        })
+    }
+
+    /// Mint a fresh leaf for `line`, or divert it to the §6.3
+    /// parse-failure path: at the RFC 0023 §3.1 per-tenant ceiling, or
+    /// without a reservable id for a genuinely new identity. A line
+    /// whose shape an adopted entry already owns converges onto that
+    /// entry's id (RFC0050.6) and needs no fresh one.
+    fn mint_fresh_leaf(
+        &mut self,
+        line: StringLine<'_>,
+        fresh: FreshLeaf<'_>,
+        max_templates: u32,
+    ) -> u64 {
+        let FreshLeaf {
+            masked,
+            parts,
+            observed,
+            zone,
+        } = fresh;
+        let needs_id = !self.converges_on_adoption(line.record, masked);
+        if let Some(reason) = self.mint_blocked(&line.record.tenant_id, max_templates, needs_id) {
+            return self.emit_string_parse_failure(line, parts, reason);
+        }
+        let new_id = self.create_new_leaf(line, masked, observed);
+        self.emit_fresh_leaf_record(line, parts, new_id, zone)
+    }
+
+    /// Whether a fresh leaf for `masked` would take over an owned
+    /// adopted entry's identity (RFC0050.6, "adopted first, mined
+    /// second").
+    fn converges_on_adoption(&self, record: &OtlpLogRecord, masked: MaskedLine<'_>) -> bool {
+        let Some(state) = self.tenants.get(&record.tenant_id) else {
+            return false;
+        };
+        let key = (
+            format_template(&leaf_template(masked)),
+            record.severity_number,
+            record.scope_name.clone(),
+        );
+        matches!(
+            state.adopted_templates.get(&key),
+            Some(AdoptedEntry::Owned(_))
+        )
     }
 
     /// Emit the RFC 0050 §3.3 `template_adopted` audit event.
@@ -1527,20 +1578,7 @@ impl MinerCluster {
             // ascending (single forward pass over the tokens) so we
             // can walk both arrays in lockstep without allocating a
             // membership set.
-            let mut new_template = Vec::with_capacity(masked_strs.len());
-            let mut wp_iter = line_wildcard_positions.iter().copied().peekable();
-            for (p, s) in masked_strs.iter().enumerate() {
-                if wp_iter.peek().copied() == Some(p) {
-                    new_template.push(OwnedToken::Wildcard);
-                    wp_iter.next();
-                } else {
-                    new_template.push(OwnedToken::Fixed((*s).to_string()));
-                }
-            }
-            debug_assert!(
-                wp_iter.peek().is_none(),
-                "every wildcard_position must land within masked_strs.len()",
-            );
+            let new_template = leaf_template(masked);
             let slot_types: Vec<SlotTypes> = line_typed_params
                 .iter()
                 .map(|tp| SlotTypes::singleton(tp.type_tag))

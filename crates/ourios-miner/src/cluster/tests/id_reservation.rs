@@ -170,3 +170,75 @@ fn restoring_an_id_past_the_i64_domain_is_rejected_and_at_it_accepted() {
         "the domain is exhausted"
     );
 }
+
+/// `line` carrying the upstream template `template`.
+fn adopted_record(t: &TenantId, line: &str, template: &str) -> OtlpLogRecord {
+    let mut rec = string_record(t, line);
+    rec.attributes.push(ourios_core::otlp::KeyValue {
+        key: LOG_RECORD_TEMPLATE_ATTR.to_string(),
+        value: Some(AnyValue {
+            value: Some(AvValue::StringValue(template.to_string())),
+        }),
+        ..Default::default()
+    });
+    rec
+}
+
+/// A cluster that adopted `user <*> logged in` and then spent every id
+/// it held, with the reserver down: the next genuinely new identity has
+/// no id. Returns the adopted id.
+fn exhausted_after_adopting(switch: &Switch, cluster: &mut MinerCluster, t: &TenantId) -> u64 {
+    let adopted = cluster.ingest(&adopted_record(t, "user 7 logged in", "user <*> logged in"));
+    assert_ne!(
+        cluster.ingest(&string_record(t, "alpha one two")),
+        NO_TEMPLATE
+    );
+    switch.set_up(false);
+    assert_eq!(
+        cluster.ingest(&string_record(t, "beta three four five")),
+        NO_TEMPLATE,
+        "the range is exhausted"
+    );
+    adopted
+}
+
+#[test]
+fn a_known_adoption_resolves_on_an_exhausted_range() {
+    let switch = Switch::new();
+    let (mut cluster, _) = reserving_cluster(&switch);
+    let t = TenantId::new("t");
+    let adopted = exhausted_after_adopting(&switch, &mut cluster, &t);
+
+    let again = cluster.ingest(&adopted_record(
+        &t,
+        "user 9 logged in",
+        "user <*> logged in",
+    ));
+
+    assert_eq!(again, adopted, "a known identity needs no fresh id");
+    assert_eq!(
+        cluster.parse_failures_total(),
+        1,
+        "only the new identity failed"
+    );
+}
+
+#[test]
+fn a_mined_line_converging_on_an_adoption_resolves_on_an_exhausted_range() {
+    let switch = Switch::new();
+    let (mut cluster, _) = reserving_cluster(&switch);
+    let t = TenantId::new("t");
+    let adopted = exhausted_after_adopting(&switch, &mut cluster, &t);
+
+    let converged = cluster.ingest(&string_record(&t, "user 8 logged in"));
+
+    assert_eq!(
+        converged, adopted,
+        "the mined leaf takes over the adopted identity without a fresh id"
+    );
+    assert_eq!(
+        cluster.parse_failures_total(),
+        1,
+        "only the new identity failed"
+    );
+}

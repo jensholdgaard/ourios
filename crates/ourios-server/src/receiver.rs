@@ -633,6 +633,20 @@ fn build_miner(
         .with_id_reserver(ids.reserver())
 }
 
+/// Name every tenant whose WAL was truncated past its snapshot's
+/// high-water mark by an external mutation.
+fn warn_stale_gaps(report: &RecoveryReport) {
+    for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,
+            "WAL truncated past tenant {:?}'s snapshot high-water mark (external mutation); \
+             templates first seen in the gap may re-mint — drift is observable via the \
+             RFC 0010 drift query",
+            tenant.tenant_id.as_str(),
+        );
+    }
+}
+
 /// The one publish coordinator both cadences share — two would put two
 /// owners on a single sink's in-flight accounting — and the barrier that
 /// clones it (RFC 0052 §3.1).
@@ -1027,15 +1041,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
         .map_err(|e| format!("startup recovery: {e}"))?;
-    for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
-        tracing::warn!(
-            name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,
-            "WAL truncated past tenant {:?}'s snapshot high-water mark (external mutation); \
-             templates first seen in the gap may re-mint — drift is observable via the \
-             RFC 0010 drift query",
-            tenant.tenant_id.as_str(),
-        );
-    }
+    warn_stale_gaps(&report);
     let ledger = snapshot_post_recovery((&sink, &audit_sink), &snapshots_root, &miner, &report);
 
     // The group-commit coordinator owns the single-writer WAL and folds
@@ -2657,6 +2663,41 @@ mod tests {
         out
     }
 
+    /// Every data row under `root`, rendered from its template, each
+    /// asserted faithful. The walk is scoped to `data/` so the audit
+    /// Parquet (a different schema, under `audit/`) isn't read as data.
+    fn faithfully_rendered(
+        root: &std::path::Path,
+        registry: &ourios_querier::TemplateRegistry,
+    ) -> Vec<String> {
+        let mut rendered = Vec::new();
+        for file in data_parquet_files(&root.join("data")) {
+            let records = ourios_parquet::Reader::open_file(&file)
+                .expect("open data file")
+                .read_all()
+                .expect("read records");
+            for record in records {
+                let ourios_querier::LogBody::Rendered {
+                    line,
+                    reconstruction,
+                } = ourios_querier::render_log_body(&record, registry)
+                else {
+                    panic!("a string body renders to a line");
+                };
+                assert!(
+                    matches!(
+                        reconstruction,
+                        ourios_miner::reconstruct::Reconstruction::Faithful
+                    ),
+                    "a clean row reconstructs faithfully from its template, not the empty \
+                     retained body (issue #302)",
+                );
+                rendered.push(String::from_utf8(line).expect("utf8 line"));
+            }
+        }
+        rendered
+    }
+
     /// issue #302: the receiver wires the miner's audit sink, so its
     /// `template_created` / `template_widened` events reach the audit stream and
     /// the read-time registry (RFC 0017 `derive_template_registry`) can render a
@@ -2712,33 +2753,7 @@ mod tests {
         );
 
         // Every stored data record reconstructs its original line bit-for-bit.
-        // Scope the walk to the `data/` subtree so the audit Parquet (a
-        // different schema, under `audit/`) isn't read as a data file.
-        let mut rendered = Vec::new();
-        for file in data_parquet_files(&data_dir.path().join("data")) {
-            let records = ourios_parquet::Reader::open_file(&file)
-                .expect("open data file")
-                .read_all()
-                .expect("read records");
-            for record in records {
-                let ourios_querier::LogBody::Rendered {
-                    line,
-                    reconstruction,
-                } = ourios_querier::render_log_body(&record, &registry)
-                else {
-                    panic!("a string body renders to a line");
-                };
-                assert!(
-                    matches!(
-                        reconstruction,
-                        ourios_miner::reconstruct::Reconstruction::Faithful
-                    ),
-                    "a clean row reconstructs faithfully from its template, not the empty \
-                     retained body (issue #302)",
-                );
-                rendered.push(String::from_utf8(line).expect("utf8 line"));
-            }
-        }
+        let mut rendered = faithfully_rendered(data_dir.path(), &registry);
         rendered.sort();
         let mut want: Vec<String> = bodies.iter().map(|s| (*s).to_owned()).collect();
         want.sort();

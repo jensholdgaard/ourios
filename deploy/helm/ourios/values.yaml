@@ -100,7 +100,9 @@ receiver:
   #   3. set replicas to 1 with templateIdsAllowBootstrap: true and apply;
   #      that one replica bootstraps the template-id high-water from the
   #      store once;
-  #   4. once it has seated, set it back to false, then scale out.
+  #   4. once it has seated, set it back to false, revoke the
+  #      bootstrap-only grants (README's steady-state policy), then scale
+  #      out.
   # A store that already holds data refuses to bootstrap without step 3's
   # setting. A pre-RFC receiver still running during that first start can
   # publish an id the bootstrap scan never saw. Downgrading below RFC 0059
@@ -130,11 +132,13 @@ receiver:
   # annotate with this role's eks.amazonaws.com/role-arn — the receiver's
   # role needs s3:PutObject on data/*, audit/* and miner/* (under
   # storage.s3.prefix), plus s3:GetObject on the objects miner/* for
-  # the template-id high-water (RFC 0059); for the one-time upgrade
-  # bootstrap also s3:GetObject on data/* and audit/*, granted BEFORE the
-  # scale-to-one step. s3:ListBucket goes on the bucket arn (not an object
-  # arn) with an s3:prefix condition: miner/*, plus data/* and audit/* for
-  # the bootstrap (README has the JSON policy). It never deletes. `name`:
+  # the template-id high-water (RFC 0059). s3:ListBucket goes on the
+  # bucket arn (not an object arn) with an s3:prefix condition for miner/*.
+  # Every first start, a fresh install included, bootstraps: it also needs
+  # s3:ListBucket for data/* and audit/*, and (over a store holding data)
+  # s3:GetObject on them, granted before it. Revoking those once the
+  # high-water exists is required (README has both JSON policies). It
+  # never deletes. `name`:
   # create=true + empty name renders `<fullname>-receiver`;
   # create=true + name overrides that; create=false + name binds an
   # EXISTING ServiceAccount of that name (managed out-of-band).

@@ -245,7 +245,7 @@ cleanly:
 | Role      | S3 actions (keys under `storage.s3.prefix`)                                                                 | Holds delete? |
 | --------- | ----------------------------------------------------------------------------------------------------------- | ------------- |
 | querier   | `GetObject` on `data/*`, `audit/*`; `ListBucket` for `data/*`, `audit/*` (see cache note)                    | no            |
-| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; once, reads on `data/` and `audit/` (see below) | no |
+| receiver  | `PutObject` on `data/*`, `audit/*`, `miner/*`; `GetObject` on `miner/*`; `ListBucket` for `miner/*`; for a bootstrap only, `ListBucket` and reads on `data/` and `audit/` (see below) | no |
 | compactor | `GetObject`, `PutObject`, `DeleteObject` on `data/*`, `erasure/*`, `backfill/*`; `PutObject` on `audit/*`; `ListBucket` for `data/*`, `erasure/*`, `backfill/*` | **only one** |
 
 Every key lives under one of five top-level prefixes, each written by one
@@ -279,17 +279,24 @@ The receiver *writes* data/audit objects and never deletes. Since RFC 0059
   `ListBucket` on the bucket for the prefix `miner/*`. The reservation writes
   with `If-Match` / `If-None-Match` conditional puts, which need only
   `PutObject`.
-- **for the one-time upgrade bootstrap only:** `GetObject` on the objects
-  `data/*` and `audit/*`, and `ListBucket` on the bucket for the prefixes
-  `data/*` and `audit/*`. The first upgraded receiver reads every file's
-  footer once to compute the high-water. Grant these **before** the
-  scale-to-one upgrade step, and revoke them afterwards if you want the
-  narrower policy back.
+- **for a bootstrap only** (the first start against a store, and a
+  quiesced re-bootstrap):
+  - `ListBucket` on the bucket for the prefixes `data/*` and `audit/*`.
+    **Every** first start needs it, a fresh install over an empty store
+    included: listing both prefixes is how the receiver tells an empty
+    store from one that already holds data.
+  - `GetObject` on the objects `data/*` and `audit/*`. When the store
+    already holds files (the upgrade), the receiver reads every file's
+    footer once to compute the high-water.
+
+  Grant these **before** the first start (for the upgrade, before the
+  scale-to-one step). Once the high-water exists, revoking them is a
+  **required** step: no later start lists or reads `data/` or `audit/`, so
+  the steady-state policy below carries neither.
 
 The policies use `<prefix>/` for `storage.s3.prefix`; with no prefix, drop
 `<prefix>/` from every resource and every `s3:prefix` value. The
-receiver's policy during the upgrade (drop the `data/*` and `audit/*` reads
-afterwards):
+receiver's policy for a bootstrap:
 
 ```json
 {
@@ -332,16 +339,57 @@ afterwards):
 }
 ```
 
+And its steady-state policy, once the high-water exists:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::<bucket>/<prefix>/data/*",
+        "arn:aws:s3:::<bucket>/<prefix>/audit/*",
+        "arn:aws:s3:::<bucket>/<prefix>/miner/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/miner/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["<prefix>/miner/*"]
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/miner/*"
+    }
+  ]
+}
+```
+
 **The upgrade to RFC 0059**, in order:
 
-1. Grant the permissions above, including the bootstrap-only reads.
+1. Grant the bootstrap policy above, including the bootstrap-only listing
+   and reads.
 2. Scale `receiver.replicas` to `0`, so no older receiver is running.
 3. Start **one** upgraded replica with `receiver.templateIdsAllowBootstrap=true`
    (rendered as `receiver.template_ids_allow_bootstrap: true` in the config
    file the chart mounts; the chart runs the binary with `--config`, which
    reads no bare `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` env var). A store that already holds data refuses to bootstrap
    without it.
-4. Once that replica has seated, remove the setting and scale out.
+4. Once that replica has seated, remove the setting, replace the
+   bootstrap policy with the steady-state one, and scale out.
 
 Downgrading below RFC 0059 is not supported once the high-water exists.
 

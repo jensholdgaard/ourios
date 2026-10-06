@@ -6,7 +6,7 @@ use serde_json::Value;
 
 const CHART_README: &str = include_str!("../../../../deploy/helm/ourios/README.md");
 const PREFIX: &str = "<prefix>/";
-const DOCUMENTED_POLICIES: usize = 3;
+const DOCUMENTED_POLICIES: usize = 4;
 
 /// The README's fenced `json` blocks that are IAM policies.
 fn policies(markdown: &str) -> Vec<String> {

@@ -61,8 +61,8 @@ async fn rfc0059_6_the_floor_is_the_max_over_data_audit_and_snapshots() {
     assert!(fresh > data_max, "{fresh} is above the floor {data_max}");
 }
 
-/// Scenario RFC0059.6 — the bootstrap happens once: a later start reads
-/// the object it wrote.
+/// Scenario RFC0059.6 — the bootstrap happens once per creation of the
+/// high-water: a later start reads the object it wrote.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rfc0059_6_the_bootstrap_is_logged_once() {

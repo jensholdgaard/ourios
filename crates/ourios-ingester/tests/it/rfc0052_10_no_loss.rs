@@ -493,19 +493,20 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
 
     let forwarded = events.drain();
     assert!(
-        !expected.withheld.is_empty() && !expected.forwarded.is_empty(),
+        expected.at_or_below_x > 0 && expected.forwarded.len() > expected.at_or_below_x,
         "both sides of X regenerate events, so the gate is exercised: {} / {}",
-        expected.withheld.len(),
+        expected.at_or_below_x,
         expected.forwarded.len(),
     );
     assert_eq!(
         forwarded, expected.forwarded,
-        "the forwarded events are exactly the reference's for (X, tail], in frame order",
+        "the forwarded events are exactly the reference's for (X, tail], plus the (S, X] \
+         events binding a fresh id, in frame order",
     );
     assert_eq!(
         report.audit_events_suppressed,
         expected.withheld.len() as u64,
-        "the (S, X] events were regenerated, withheld and counted",
+        "every other (S, X] event was regenerated, withheld and counted",
     );
     assert_eq!(
         report.frames_delivered, 4,
@@ -630,17 +631,21 @@ fn pinned_miner(events: &SharedAuditSink) -> MinerCluster {
         .with_clock(Box::new(TestClock::new(SystemTime::UNIX_EPOCH)))
 }
 
-/// The reference mine's events, split at X.
+/// The reference mine's events, split by what recovery publishes.
 struct Reference {
     withheld: Vec<AuditEvent>,
     forwarded: Vec<AuditEvent>,
+    /// Events the `(S, X]` frames regenerated, withheld or not.
+    at_or_below_x: usize,
 }
 
 /// Mine every tenant frame above `S` from the same snapshot with the same
 /// clock, seated at the template-id high-water recovery seated above, and
-/// split the events it emits at the checkpoint. The seat is the one
-/// renaming RFC 0059 §3.4 allows: ids first minted in the tail come from
-/// above the high-water.
+/// split the events it emits: those of frames above the checkpoint, and
+/// those of `(S, X]` frames that bind an id the seat made fresh, are
+/// forwarded in frame order; every other `(S, X]` event is withheld
+/// (RFC 0059 §3.4). The seat is the one renaming RFC 0059 §3.4 allows:
+/// ids first minted in the tail come from above the high-water.
 fn reference_events(node: &Node, high_water: u64) -> Reference {
     let artefacts = snapshot_store::load_all(&node.snapshots_root).expect("artefacts");
     let (tenant, bytes) = artefacts.into_iter().next().expect("one artefact");
@@ -656,19 +661,35 @@ fn reference_events(node: &Node, high_water: u64) -> Reference {
     let mut miner = pinned_miner(&events);
     miner.restore_tenant(&tenant, &state).expect("restore");
     miner.allocate_past_issued(high_water).expect("seat");
-    let mut withheld = Vec::new();
+    let seated = miner.highest_allocated();
+    let (mut withheld, mut forwarded, mut at_or_below_x) = (Vec::new(), Vec::new(), 0);
     for (offset, records) in frames(node).into_iter().filter(|(o, _)| *o > horizon) {
         for record in &records {
             miner.ingest(record);
         }
         if offset <= node.checkpoint {
-            withheld.extend(events.drain());
+            let regenerated = events.drain();
+            at_or_below_x += regenerated.len();
+            let (fresh, old): (Vec<_>, Vec<_>) = regenerated
+                .into_iter()
+                .partition(|event| binds_fresh_id(event, seated));
+            forwarded.extend(fresh);
+            withheld.extend(old);
         }
     }
+    forwarded.extend(events.drain());
     Reference {
         withheld,
-        forwarded: events.drain(),
+        forwarded,
+        at_or_below_x,
     }
+}
+
+fn binds_fresh_id(event: &AuditEvent, seated: u64) -> bool {
+    matches!(
+        event.payload,
+        AuditPayload::Template { template_id, .. } if template_id > seated
+    )
 }
 
 /// Every tenant frame in the WAL, in order, fanned out to its records.

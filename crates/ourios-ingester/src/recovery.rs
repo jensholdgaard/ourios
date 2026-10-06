@@ -931,6 +931,41 @@ mod tests {
         );
     }
 
+    fn created(template_id: u64) -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            payload: AuditPayload::Template {
+                template_id,
+                triggering_line_hash: [0; 16],
+                triggering_line_sample: None,
+                change: ourios_core::audit::TemplateChange::Created {
+                    new_template: format!("line {template_id}"),
+                },
+            },
+        }
+    }
+
+    /// RFC 0059 §3.4: a frame at or below `X` forwards only the events of
+    /// ids the replay minted, and withholds the rest and every row.
+    #[test]
+    fn a_frame_at_or_below_x_forwards_only_events_of_reminted_ids() {
+        let published = ourios_core::audit::SharedAuditSink::new();
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        drop(miner.replace_audit_sink(Box::new(published.clone())));
+        miner.allocate_past_issued(10).expect("seat");
+        let mut capture = ReplayCapture::install(&mut miner);
+        for id in [9, 10, 11, 12] {
+            capture.events.push(created(id));
+        }
+        capture.settle(Route::MinerOnly);
+        let withheld = capture.restore(&mut miner);
+
+        let forwarded: Vec<AuditEvent> = published.drain();
+        assert_eq!(forwarded, [created(11), created(12)]);
+        assert_eq!(withheld.events, 2, "the events of seated ids stay withheld");
+    }
+
     fn sink<'a>(
         miner: &'a mut MinerCluster,
         horizons: &'a HashMap<TenantId, WalOffset>,

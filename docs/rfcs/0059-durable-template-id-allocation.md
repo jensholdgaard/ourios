@@ -936,7 +936,7 @@ needs.
 ### 3.9 Telemetry
 
 All names go through the shared semconv registry (ourios-semconv), where
-they are final as of v0.3.7:
+they are final as of v0.3.8:
 
 | Name | Kind | Attributes / members |
 |---|---|---|
@@ -947,15 +947,16 @@ they are final as of v0.3.7:
 
 The registry's brief and note for `ourios.receiver.template_ids.bootstrapped`
 say the same, "at most once per successful creation of the high-water"
-(ourios-semconv#9). The semconv patch release v0.3.7 (`ead0337`)
-carries this finalized event contract, and the code pins it.
+(ourios-semconv#9). That contract was first released in semconv v0.3.7
+(`ead0337`). The code pins v0.3.8 (`bb19221`), which adds the two
+refill events below.
 
 Reservation failures in the background refiller log the event
 `ourios.receiver.template_ids.refill.failed` (WARN) with `error.type`
 set to the store error class. A deleted high-water, which stops the
 refiller, logs `ourios.receiver.template_ids.refill.stopped` (ERROR) with
 `error.type = deleted`, the value startup already uses for RFC0059.14.
-Both are in the registry from semconv v0.3.8. A start refused over a rolled-back high-water fails with
+Both are in the registry from semconv v0.3.8 (`bb19221`). A start refused over a rolled-back high-water fails with
 `error.type = rolled_back` (§3.1). No new metric is added: a run of
 failures shows on the parse-failure counter as soon as it costs a
 template.
@@ -1299,9 +1300,10 @@ kept snapshot restored under that id. This covers RFC0059.1 and .9.
 
 ## 7. Open questions
 
-- [x] **Semconv names.** §3.9's names and the bootstrapped event's
-      contract are final in the shared registry's v0.3.7 (`ead0337`),
-      which the code pins.
+- [x] **Semconv names.** The bootstrapped event's contract was first
+      released in the shared registry's v0.3.7 (`ead0337`). The code pins
+      v0.3.8 (`bb19221`), which adds `refill.failed` and `refill.stopped`;
+      §3.9's names are all final there.
 - [ ] **Template-map artefacts.** RFC 0033's map is derived from the audit
       stream, so it inherits the audit fold's last-wins on historical
       collisions. Repairing already-collided history is out of scope; the

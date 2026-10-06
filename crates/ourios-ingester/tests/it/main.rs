@@ -82,3 +82,5 @@ mod rfc0059_5_unreadable_high_water;
 mod rfc0059_6_bootstrap;
 mod rfc0059_8_concurrent_reservers;
 mod rfc0059_9_reminted_mapping;
+mod rfc0059_refiller_shutdown;
+mod rfc0059_support;

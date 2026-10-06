@@ -3224,6 +3224,12 @@ memory, and nothing here claims to.
 >   ignored as a source; the test mines the same frames from the same
 >   snapshot with the same injected clock as a reference and asserts the
 >   forwarded set equals the reference's events for `(X, tail]`
+> - **And** (2026-10-06, coordinating with RFC 0059 §3.4, maintainer-approved)
+>   the one exception is an event at or below `X` of a template replay
+>   minted afresh: its id lies above RFC 0059's template-id high-water, so
+>   no published event binds it, and it is forwarded once, in frame order;
+>   the test's reference forwards the `(X, tail]` events plus those `(S, X]`
+>   events, and `audit_events_suppressed` counts every other `(S, X]` event
 
 ## 6. Testing strategy
 

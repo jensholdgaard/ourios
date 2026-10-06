@@ -19,7 +19,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::ingest_support::{coordinator, request, resource_logs, wal_config, write_snapshots_at};
+use crate::ingest_support::{
+    coordinator, request, resource_logs, template_ids, wal_config, write_snapshots_at,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_config::MinerConfig;
 use ourios_ingester::encode_pool::EncodePool;
@@ -179,14 +181,7 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
     // coherent — snapshot at the mark + tail replay == full rebuild.
     pipeline.quiesce_encodes();
     drop(pipeline);
-    let mut recovered = MinerCluster::new(MinerConfig::default());
-    let mut wal = Wal::open(WalConfig {
-        segment_age_secs: 1,
-        ..wal_config(&wal_root)
-    })
-    .expect("reopen WAL");
-    recovery::recover(&mut wal, &snapshots_root, &mut recovered).expect("recover");
-    drop(wal);
+    let recovered = recover_from(&wal_root, &snapshots_root);
 
     let mut control = MinerCluster::new(MinerConfig::default());
     for (kind, payload) in crate::ingest_support::replay_frames(&wal_root) {
@@ -206,4 +201,23 @@ async fn rfc0035_2_high_water_is_stamped_only_after_drain_and_flush() {
             "restore + tail replay equals the full rebuild — no loss at the mark",
         );
     }
+}
+
+/// Startup recovery over `wal_root` into a fresh miner, the WAL released
+/// before it returns.
+fn recover_from(wal_root: &Path, snapshots_root: &Path) -> MinerCluster {
+    let mut recovered = MinerCluster::new(MinerConfig::default());
+    let mut wal = Wal::open(WalConfig {
+        segment_age_secs: 1,
+        ..wal_config(wal_root)
+    })
+    .expect("reopen WAL");
+    recovery::recover(
+        &mut wal,
+        snapshots_root,
+        &mut recovered,
+        &template_ids(wal_root),
+    )
+    .expect("recover");
+    recovered
 }

@@ -35,6 +35,7 @@ pub mod audit_sink;
 pub mod audit_writer;
 pub mod compaction;
 mod decode;
+pub mod id_max;
 pub mod manifest;
 mod parquet_io;
 pub mod partition;
@@ -53,6 +54,7 @@ pub use compaction::{
     compact_partition, compact_partition_hooked, compact_partition_with_flush_threshold,
     compact_partition_with_promoted, gc_orphans, hour_partitions, plan_candidates,
 };
+pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 pub use partition::{
     PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
@@ -61,7 +63,7 @@ pub use partition::{
 pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_KEY};
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
 pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
-pub use store::{DelimitedListing, S3Config, Store, StoreConfig, StoreError};
+pub use store::{DelimitedListing, S3Config, Store, StoreConfig, StoreError, Suffix};
 pub use writer::{
     COMPACTED_RG_BYTES_ENV, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, MIN_COMPACTED_RG_BYTES,
     ROW_GROUP_FLUSH_BYTES, SUB_BATCH_ROWS, TARGET_COMPACTED_ROW_GROUPS, Writer, WriterError,

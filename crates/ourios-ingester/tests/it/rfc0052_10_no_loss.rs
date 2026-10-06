@@ -32,13 +32,14 @@ use ourios_ingester::receiver::tenant::assign;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::snapshot_store;
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::{AuditReader, Reader, Store};
+use ourios_parquet::Store;
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, TenantBatch, Wal, WalConfig, WalOffset};
 use prost::Message;
 
 use crate::ingest_support::{request, resource_logs};
-use crate::rfc0052_barrier_support::{BarrierRig, never_flush, wal_config};
+use crate::rfc0052_barrier_support::{BarrierRig, audit_events, never_flush, rows, wal_config};
 
 const TENANT: &str = "checkout";
 
@@ -273,8 +274,14 @@ fn recover_into_stores(
     ));
     let mut miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
         .with_record_sink(Box::new(sink.clone()));
-    let report =
-        recovery::recover(wal, &wal_root.join("snapshots"), &mut miner).expect("startup recovery");
+    let report = recovery::recover(
+        wal,
+        &wal_root.join("snapshots"),
+        &mut miner,
+        &TemplateIds::new(Store::local(audit_root).expect("audit store"))
+            .with_bootstrap_allowed(true),
+    )
+    .expect("startup recovery");
     sink.flush_all();
     assert!(audit.flush(), "the regenerated audit events land");
     report
@@ -366,7 +373,13 @@ async fn rfc0052_10_a_replayed_record_is_never_durable_before_its_template_event
 
     // When recovery replays it, with no flush afterwards.
     let mut wal = Wal::open(node.wal()).expect("reopen");
-    recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+    recovery::recover(
+        &mut wal,
+        &node.snapshots_root,
+        &mut miner,
+        &node.template_ids(),
+    )
+    .expect("recover");
 
     // Then the record reached the store inline, and its template event is
     // durable beside it.
@@ -391,19 +404,6 @@ async fn rfc0052_10_a_replayed_record_is_never_durable_before_its_template_event
         "the template event for record 3 must be durable no later than the record \
          (durable templates: {durable_templates:?})",
     );
-}
-
-/// Every audit event in the Parquet files under `root`.
-fn audit_events(root: &Path) -> Vec<AuditEvent> {
-    crate::rfc0052_barrier_support::parquet_files(root)
-        .iter()
-        .flat_map(|path| {
-            AuditReader::open_file(path)
-                .expect("open audit file")
-                .read_all()
-                .expect("read audit file")
-        })
-        .collect()
 }
 
 /// Scenario RFC0052.10 — the `S > X` shape: the snapshot landed and the
@@ -456,7 +456,7 @@ async fn rfc0052_10_a_snapshot_ahead_of_a_failed_checkpoint_republishes_nothing_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_frame_order() {
     let tmp = tempfile::TempDir::new().expect("temp");
-    let node = lagging_snapshot_node(tmp.path(), Leftover::Lagging).await;
+    let node = audit_gate_node(tmp.path()).await;
     // A stored AuditEvent frame above X: regeneration is the only source,
     // so it must not surface.
     let mut wal = Wal::open(node.wal()).expect("reopen");
@@ -464,13 +464,19 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
         .expect("append");
     wal.sync().expect("sync");
     drop(wal);
-    let expected = reference_events(&node);
 
     let events = SharedAuditSink::new();
     let records = SharedRecordSink::new();
     let mut miner = pinned_miner(&events).with_record_sink(Box::new(records.clone()));
     let mut wal = Wal::open(node.wal()).expect("reopen");
-    let report = recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &node.snapshots_root,
+        &mut miner,
+        &node.template_ids(),
+    )
+    .expect("recover");
+    let expected = reference_events(&node, report.template_ids.high_water);
 
     let forwarded = events.drain();
     assert!(
@@ -479,14 +485,22 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
         expected.withheld.len(),
         expected.forwarded.len(),
     );
+    assert!(
+        expected.at_or_below_x > expected.withheld.len(),
+        "an (S, X] event also re-mints and is forwarded, so both of RFC 0059 §3.4's \
+         branches are exercised: {} regenerated, {} withheld",
+        expected.at_or_below_x,
+        expected.withheld.len(),
+    );
     assert_eq!(
         forwarded, expected.forwarded,
-        "the forwarded events are exactly the reference's for (X, tail], in frame order",
+        "the forwarded events are exactly the reference's for (X, tail], plus the (S, X] \
+         events binding a fresh id, in frame order",
     );
     assert_eq!(
         report.audit_events_suppressed,
         expected.withheld.len() as u64,
-        "the (S, X] events were regenerated, withheld and counted",
+        "every other (S, X] event was regenerated, withheld and counted",
     );
     assert_eq!(
         report.frames_delivered, 4,
@@ -503,6 +517,7 @@ async fn rfc0052_10_audit_events_above_the_mark_are_forwarded_exactly_once_in_fr
 struct Node {
     wal_root: PathBuf,
     data_root: PathBuf,
+    audit_root: PathBuf,
     snapshots_root: PathBuf,
     checkpoint: WalOffset,
 }
@@ -513,6 +528,7 @@ impl Node {
         let node = Self {
             wal_root: rig.wal_root.clone(),
             data_root: rig.data_root.clone(),
+            audit_root: rig.audit_root.clone(),
             snapshots_root: rig.snapshots_root.clone(),
             checkpoint,
         };
@@ -522,6 +538,13 @@ impl Node {
 
     fn wal(&self) -> WalConfig {
         wal_config(&self.wal_root)
+    }
+
+    /// Template-id allocation over the store the stopped node published
+    /// its audit stream to.
+    fn template_ids(&self) -> TemplateIds {
+        TemplateIds::new(Store::local(&self.audit_root).expect("audit store"))
+            .with_bootstrap_allowed(true)
     }
 
     fn artefact(&self) -> PathBuf {
@@ -564,16 +587,46 @@ async fn lagging_snapshot_node(tmp: &Path, leftover: Leftover) -> Node {
     node
 }
 
-/// Ingest one record stamped `n` (its `time_unix_nano`, the identity the
-/// assertions read back) and return its frame's offset.
-async fn ingest(rig: &BarrierRig, n: u64, body: &str) -> WalOffset {
-    let mut logs = resource_logs(TENANT, &[body]);
-    logs.scope_logs[0].log_records[0].time_unix_nano = n;
+/// [`lagging_snapshot_node`]'s shape for the audit gate. Its `(S, X]` frame
+/// both widens the template the snapshot holds, an event on a seated id
+/// that replay withholds, and first sees a new one, which replay re-mints
+/// and forwards (RFC 0059 §3.4).
+async fn audit_gate_node(tmp: &Path) -> Node {
+    let rig = BarrierRig::new(tmp);
+    ingest_frame(&rig, 1, &["user 42 logged in from 10.0.0.1"]).await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    let lagging = std::fs::read(rig.snapshots_root.join(format!("{TENANT}.snap"))).expect("S");
+    let second = ingest_frame(
+        &rig,
+        2,
+        &["user 42 logged out from 10.0.0.1", "user bob logged in"],
+    )
+    .await;
+    assert_eq!(rig.barrier.tick(&rig.pipeline, false), CutOutcome::Stamped);
+    assert_eq!(rig.commits.last_checkpoint(), Some(second), "X is frame 2");
+    ingest_frame(&rig, 3, &["order 3 shipped"]).await;
+    let node = Node::stop(rig, second);
+    std::fs::write(node.artefact(), lagging).expect("the lagging artefact");
+    node
+}
+
+/// Ingest one frame of records stamped `n` and return its offset.
+async fn ingest_frame(rig: &BarrierRig, n: u64, bodies: &[&str]) -> WalOffset {
+    let mut logs = resource_logs(TENANT, bodies);
+    for record in &mut logs.scope_logs[0].log_records {
+        record.time_unix_nano = n;
+    }
     rig.pipeline
         .ingest(request(vec![logs]), TenantId::new(TENANT))
         .await
         .expect("the batch acks");
     rig.pipeline.last_durable().expect("a durable mark")
+}
+
+/// Ingest one record stamped `n` (its `time_unix_nano`, the identity the
+/// assertions read back) and return its frame's offset.
+async fn ingest(rig: &BarrierRig, n: u64, body: &str) -> WalOffset {
+    ingest_frame(rig, n, &[body]).await
 }
 
 /// Restart over `node` with the record sink on its store, as `serve`
@@ -584,7 +637,13 @@ fn recover_into_store(node: &Node) -> RecoveryReport {
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let mut wal = Wal::open(node.wal()).expect("reopen");
-    let report = recovery::recover(&mut wal, &node.snapshots_root, &mut miner).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &node.snapshots_root,
+        &mut miner,
+        &node.template_ids(),
+    )
+    .expect("recover");
     sink.flush_all();
     report
 }
@@ -596,15 +655,22 @@ fn pinned_miner(events: &SharedAuditSink) -> MinerCluster {
         .with_clock(Box::new(TestClock::new(SystemTime::UNIX_EPOCH)))
 }
 
-/// The reference mine's events, split at X.
+/// The reference mine's events, split by what recovery publishes.
 struct Reference {
     withheld: Vec<AuditEvent>,
     forwarded: Vec<AuditEvent>,
+    /// Events the `(S, X]` frames regenerated, withheld or not.
+    at_or_below_x: usize,
 }
 
 /// Mine every tenant frame above `S` from the same snapshot with the same
-/// clock, and split the events it emits at the checkpoint.
-fn reference_events(node: &Node) -> Reference {
+/// clock, seated at the template-id high-water recovery seated above, and
+/// split the events it emits: those of frames above the checkpoint, and
+/// those of `(S, X]` frames that bind an id the seat made fresh, are
+/// forwarded in frame order; every other `(S, X]` event is withheld
+/// (RFC 0059 §3.4). The seat is the one renaming RFC 0059 §3.4 allows:
+/// ids first minted in the tail come from above the high-water.
+fn reference_events(node: &Node, high_water: u64) -> Reference {
     let artefacts = snapshot_store::load_all(&node.snapshots_root).expect("artefacts");
     let (tenant, bytes) = artefacts.into_iter().next().expect("one artefact");
     let (Some(state), _) = ourios_miner::snapshot::recover(Some(&bytes)) else {
@@ -618,19 +684,36 @@ fn reference_events(node: &Node) -> Reference {
     let events = SharedAuditSink::new();
     let mut miner = pinned_miner(&events);
     miner.restore_tenant(&tenant, &state).expect("restore");
-    let mut withheld = Vec::new();
+    miner.allocate_past_issued(high_water).expect("seat");
+    let seated = miner.highest_allocated();
+    let (mut withheld, mut forwarded, mut at_or_below_x) = (Vec::new(), Vec::new(), 0);
     for (offset, records) in frames(node).into_iter().filter(|(o, _)| *o > horizon) {
         for record in &records {
             miner.ingest(record);
         }
         if offset <= node.checkpoint {
-            withheld.extend(events.drain());
+            let regenerated = events.drain();
+            at_or_below_x += regenerated.len();
+            let (fresh, old): (Vec<_>, Vec<_>) = regenerated
+                .into_iter()
+                .partition(|event| binds_fresh_id(event, seated));
+            forwarded.extend(fresh);
+            withheld.extend(old);
         }
     }
+    forwarded.extend(events.drain());
     Reference {
         withheld,
-        forwarded: events.drain(),
+        forwarded,
+        at_or_below_x,
     }
+}
+
+fn binds_fresh_id(event: &AuditEvent, seated: u64) -> bool {
+    matches!(
+        event.payload,
+        AuditPayload::Template { template_id, .. } if template_id > seated
+    )
 }
 
 /// Every tenant frame in the WAL, in order, fanned out to its records.
@@ -656,19 +739,6 @@ fn frames(node: &Node) -> Vec<(WalOffset, Vec<OtlpLogRecord>)> {
     let mut collect = Collect(Vec::new());
     wal.replay(&mut collect).expect("replay");
     collect.0
-}
-
-/// Every mined row in the Parquet files under `root`.
-fn rows(root: &Path) -> Vec<MinedRecord> {
-    crate::rfc0052_barrier_support::parquet_files(root)
-        .iter()
-        .flat_map(|path| {
-            Reader::open_file(path)
-                .expect("open_file")
-                .read_all()
-                .expect("read_all")
-        })
-        .collect()
 }
 
 /// Each record's stamp, sorted.

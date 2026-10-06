@@ -21,6 +21,18 @@ Storage backend: {{ .Values.storage.backend }}
 Workloads:
 {{- if .Values.receiver.enabled }}
   - receiver  (StatefulSet, {{ .Values.receiver.replicas }} replica(s)) — OTLP gRPC :4317 + HTTP :4318; per-replica WAL PVC ({{ .Values.receiver.wal.size }}, local, never S3).
+    Upgrading from a release before RFC 0059: (1) grant the receiver's role
+    the permissions in the chart README's "Per-role IAM" (s3:ListBucket goes
+    on the bucket arn with an s3:prefix condition, never on an object arn);
+    (2) scale receiver.replicas to 0; (3) start one upgraded replica with
+    receiver.templateIdsAllowBootstrap=true (it bootstraps the template-id
+    high-water once); (4) once it has seated, set it back to false,
+    revoke the bootstrap-only grants (the README's steady-state policy)
+    and scale out. A rolling update that keeps an old
+    receiver running during that first start can re-issue ids.
+    Downgrading below RFC 0059 afterwards is not supported: an older
+    receiver ignores the template-id high-water and can re-issue ids. Going
+    back means restoring the store and every WAL from before the upgrade.
 {{- else }}
   - receiver  disabled
 {{- end }}

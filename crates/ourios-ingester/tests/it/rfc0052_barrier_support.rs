@@ -440,6 +440,30 @@ impl HeldEncode {
     }
 }
 
+/// Every mined row in the Parquet files under `root`.
+pub fn rows(root: &Path) -> Vec<ourios_core::record::MinedRecord> {
+    read_each(root, |path| {
+        ourios_parquet::Reader::open_file(path)
+            .expect("open_file")
+            .read_all()
+            .expect("read_all")
+    })
+}
+
+/// Every audit event in the Parquet files under `root`.
+pub fn audit_events(root: &Path) -> Vec<ourios_core::audit::AuditEvent> {
+    read_each(root, |path| {
+        ourios_parquet::AuditReader::open_file(path)
+            .expect("open audit file")
+            .read_all()
+            .expect("read audit file")
+    })
+}
+
+fn read_each<T>(root: &Path, read: impl Fn(&Path) -> Vec<T>) -> Vec<T> {
+    parquet_files(root).iter().flat_map(|p| read(p)).collect()
+}
+
 pub fn parquet_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];

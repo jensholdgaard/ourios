@@ -30,6 +30,7 @@ use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
@@ -420,6 +421,9 @@ pub struct ReceiverConfig {
     /// upstream-template dial (`miner.*`; defaults are byte-identical
     /// pre-RFC behaviour).
     pub miner: MinerConfig,
+    /// RFC 0059 §3.5 — authorise the one-time template-id bootstrap on a
+    /// store that already holds data.
+    pub template_ids_allow_bootstrap: bool,
     /// The RFC 0047 §3.3 graph emitter, fed on the flush cadence, when the
     /// graph is configured with a bound conversation object.
     pub graph_emitter: Option<Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
@@ -454,6 +458,9 @@ pub struct ReceiverHandle {
     /// shutdown stamp consults it: it is the one stamping path left
     /// outside [`Barrier::run_cut`]'s own checks.
     epochs: Arc<BarrierEpochs>,
+    /// The template-id allocation (RFC 0059), whose refiller is stopped
+    /// and joined before the roots are released.
+    ids: TemplateIds,
 }
 
 impl ReceiverHandle {
@@ -547,7 +554,10 @@ impl ReceiverHandle {
         // The joins and the last cut above are the steps that can set the
         // latch after the timer stopped observing it.
         self.cadences.housekeeper.observe_state();
-        Ok(())
+        // RFC 0059 §3.3: no reservation may still be in flight once the
+        // roots are free for the next receiver.
+        tokio::task::block_in_place(|| self.ids.shutdown())
+            .map_err(|e| format!("template-id refiller: {e}"))
     }
 }
 
@@ -610,6 +620,37 @@ fn build_write_sinks(
             .with_audit_sink(Box::new(quarantine_audit)),
     );
     (sink, audit_sink)
+}
+
+/// The miner, wired *before* recovery to both sinks and to the store's
+/// template-id high-water: replay re-mines the un-flushed tail through
+/// `miner.ingest`, which re-emits its records into the record sink and its
+/// template events into the audit sink (RFC0014.5 — recovery rebuilds the
+/// in-memory buffers the crash dropped; the durability of record is the
+/// WAL, never the buffers), and every id it mints comes from a block
+/// reserved in the store first (RFC 0059 §3.2).
+fn build_miner(
+    config: MinerConfig,
+    (sink, audit_sink): (&SharedParquetSink, &SharedParquetAuditSink),
+    ids: &TemplateIds,
+) -> MinerCluster {
+    MinerCluster::with_audit_sink(config, Box::new(audit_sink.clone()))
+        .with_record_sink(Box::new(sink.clone()))
+        .with_id_reserver(ids.reserver())
+}
+
+/// Name every tenant whose WAL was truncated past its snapshot's
+/// high-water mark by an external mutation.
+fn warn_stale_gaps(report: &RecoveryReport) {
+    for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,
+            "WAL truncated past tenant {:?}'s snapshot high-water mark (external mutation); \
+             templates first seen in the gap may re-mint — drift is observable via the \
+             RFC 0010 drift query",
+            tenant.tenant_id.as_str(),
+        );
+    }
 }
 
 /// The one publish coordinator both cadences share — two would put two
@@ -1000,27 +1041,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
+    let ids = TemplateIds::new(config.store.clone())
+        .with_bootstrap_allowed(config.template_ids_allow_bootstrap);
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
-
-    // Wire both sinks into the miner *before* recovery: replay re-mines the
-    // un-flushed tail through `miner.ingest`, which re-emits its records into
-    // the record sink and its template events into the audit sink (RFC0014.5 —
-    // recovery rebuilds the in-memory buffers the crash dropped; the durability
-    // of record is the WAL, never the buffers).
-    let mut miner = MinerCluster::with_audit_sink(config.miner, Box::new(audit_sink.clone()))
-        .with_record_sink(Box::new(sink.clone()));
-
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner)
+    let mut miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
+    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
         .map_err(|e| format!("startup recovery: {e}"))?;
-    for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
-        tracing::warn!(
-            name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,
-            "WAL truncated past tenant {:?}'s snapshot high-water mark (external mutation); \
-             templates first seen in the gap may re-mint — drift is observable via the \
-             RFC 0010 drift query",
-            tenant.tenant_id.as_str(),
-        );
-    }
+    warn_stale_gaps(&report);
     let ledger = snapshot_post_recovery((&sink, &audit_sink), &snapshots_root, &miner, &report);
 
     // The group-commit coordinator owns the single-writer WAL and folds
@@ -1152,6 +1179,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         cadences,
         barrier,
         epochs: pipeline_epochs,
+        ids,
     })
 }
 
@@ -1557,6 +1585,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -1661,6 +1690,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -1855,6 +1885,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         };
 
         // Given a node that sealed a segment and stamped past it: the second
@@ -1918,6 +1949,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         };
         let expected = Some(ourios_miner::snapshot::WalHighWater {
             segment: horizon.segment.to_string(),
@@ -1997,6 +2029,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         }
     }
 
@@ -2250,6 +2283,7 @@ mod tests {
             graph_emitter: Some(emitter),
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2436,6 +2470,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2483,6 +2518,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2634,6 +2670,41 @@ mod tests {
         out
     }
 
+    /// Every data row under `root`, rendered from its template, each
+    /// asserted faithful. The walk is scoped to `data/` so the audit
+    /// Parquet (a different schema, under `audit/`) isn't read as data.
+    fn faithfully_rendered(
+        root: &std::path::Path,
+        registry: &ourios_querier::TemplateRegistry,
+    ) -> Vec<String> {
+        let mut rendered = Vec::new();
+        for file in data_parquet_files(&root.join("data")) {
+            let records = ourios_parquet::Reader::open_file(&file)
+                .expect("open data file")
+                .read_all()
+                .expect("read records");
+            for record in records {
+                let ourios_querier::LogBody::Rendered {
+                    line,
+                    reconstruction,
+                } = ourios_querier::render_log_body(&record, registry)
+                else {
+                    panic!("a string body renders to a line");
+                };
+                assert!(
+                    matches!(
+                        reconstruction,
+                        ourios_miner::reconstruct::Reconstruction::Faithful
+                    ),
+                    "a clean row reconstructs faithfully from its template, not the empty \
+                     retained body (issue #302)",
+                );
+                rendered.push(String::from_utf8(line).expect("utf8 line"));
+            }
+        }
+        rendered
+    }
+
     /// issue #302: the receiver wires the miner's audit sink, so its
     /// `template_created` / `template_widened` events reach the audit stream and
     /// the read-time registry (RFC 0017 `derive_template_registry`) can render a
@@ -2657,6 +2728,7 @@ mod tests {
             graph_emitter: None,
             encode_workers: 2,
             miner: MinerConfig::default(),
+            template_ids_allow_bootstrap: false,
         })
         .await
         .expect("serve");
@@ -2688,33 +2760,7 @@ mod tests {
         );
 
         // Every stored data record reconstructs its original line bit-for-bit.
-        // Scope the walk to the `data/` subtree so the audit Parquet (a
-        // different schema, under `audit/`) isn't read as a data file.
-        let mut rendered = Vec::new();
-        for file in data_parquet_files(&data_dir.path().join("data")) {
-            let records = ourios_parquet::Reader::open_file(&file)
-                .expect("open data file")
-                .read_all()
-                .expect("read records");
-            for record in records {
-                let ourios_querier::LogBody::Rendered {
-                    line,
-                    reconstruction,
-                } = ourios_querier::render_log_body(&record, &registry)
-                else {
-                    panic!("a string body renders to a line");
-                };
-                assert!(
-                    matches!(
-                        reconstruction,
-                        ourios_miner::reconstruct::Reconstruction::Faithful
-                    ),
-                    "a clean row reconstructs faithfully from its template, not the empty \
-                     retained body (issue #302)",
-                );
-                rendered.push(String::from_utf8(line).expect("utf8 line"));
-            }
-        }
+        let mut rendered = faithfully_rendered(data_dir.path(), &registry);
         rendered.sort();
         let mut want: Vec<String> = bodies.iter().map(|s| (*s).to_owned()).collect();
         want.sort();

@@ -1,29 +1,81 @@
 //! RFC0059.5 — An unreadable high-water fails startup closed.
+//! RFC0059.11 — Any later-version high-water fails startup closed, even
+//! beside a v1.
 //! See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
-//!
-//! Stubs are `#[ignore]`d so the default run stays green while the
-//! RFC is red; each names the slice that discharges it.
 
-/// Scenario RFC0059.5 — An unreadable high-water fails startup closed.
+use ourios_ingester::recovery::RecoveryDriverError;
+use ourios_ingester::template_ids::{HIGH_WATER_KEY, SEATED_MARKER, TemplateIdsError};
+
+use crate::rfc0059_support::Node;
+
+const LATER: &str = "miner/template_ids.v2.json";
+
+/// Scenario RFC0059.5 — each unreadable object fails startup, naming the
+/// object, and is not rewritten.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
-#[ignore = "RFC0059.5 stub — implemented in the startup seat slice of #898's implementation"]
-fn rfc0059_5_an_unreadable_high_water_fails_startup_closed() {
-    todo!(
-        "RFC0059.5 — a high-water that does not parse, lacks \
-         reserved_through, holds a non-u64 value or one above i64::MAX \
-         fails startup before any listener opens, naming the object, and is \
-         not rewritten"
-    );
+fn rfc0059_5_each_unreadable_object_fails_startup_before_any_listener() {
+    for body in [
+        &b"not json"[..],
+        br#"{"other": 1}"#,
+        br#"{"reserved_through": -1}"#,
+        br#"{"reserved_through": "7"}"#,
+    ] {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let node = Node::empty(tmp.path());
+        node.put(HIGH_WATER_KEY, body);
+
+        let Err(err) = node.restart() else {
+            panic!("{body:?} must fail startup");
+        };
+
+        assert!(
+            matches!(
+                err,
+                RecoveryDriverError::TemplateIds(TemplateIdsError::Malformed { .. })
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains(HIGH_WATER_KEY), "{err}");
+        assert_eq!(
+            node.high_water_bytes().as_deref(),
+            Some(body),
+            "not rewritten"
+        );
+    }
 }
 
-/// Scenario RFC0059.11 — Any later-version high-water fails startup closed, even beside a v1.
+/// Scenario RFC0059.11 — a later-version key fails startup alone and
+/// beside a readable v1, and nothing is written.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
-#[ignore = "RFC0059.11 stub — implemented in the startup seat slice of #898's implementation"]
-fn rfc0059_11_a_later_version_fails_startup_closed_even_beside_v1() {
-    todo!(
-        "RFC0059.11 — a later template_ids.v<k>.json, alone or beside a v1, \
-         fails startup closed and nothing is rewritten"
-    );
+fn rfc0059_11_a_later_version_fails_startup_alone_and_beside_v1() {
+    for beside_v1 in [false, true] {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let node = Node::empty(tmp.path());
+        let v1 = br#"{"reserved_through": 40}"#;
+        if beside_v1 {
+            node.put(HIGH_WATER_KEY, v1);
+        }
+        node.put(LATER, br#"{"reserved_through": 9000}"#);
+
+        let Err(err) = node.restart() else {
+            panic!("a later version must fail startup");
+        };
+
+        assert!(
+            matches!(
+                err,
+                RecoveryDriverError::TemplateIds(TemplateIdsError::LaterVersion { .. })
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains(LATER), "{err}");
+        let expected_v1 = beside_v1.then_some(&v1[..]);
+        assert_eq!(node.high_water_bytes().as_deref(), expected_v1, "no write");
+        assert!(
+            !node.snapshots.join(SEATED_MARKER).exists(),
+            "no marker is written"
+        );
+    }
 }

@@ -294,6 +294,19 @@ pub const OURIOS_QUERY_ROW_GROUP_STATE: &str = "ourios.query.row_group.state";
 /// `ourios.query.visibility.branch` attribute key.
 pub const OURIOS_QUERY_VISIBILITY_BRANCH: &str = "ourios.query.visibility.branch";
 
+/// `ourios.receiver.template_ids.audit_max` attribute key.
+pub const OURIOS_RECEIVER_TEMPLATE_IDS_AUDIT_MAX: &str = "ourios.receiver.template_ids.audit_max";
+
+/// `ourios.receiver.template_ids.data_max` attribute key.
+pub const OURIOS_RECEIVER_TEMPLATE_IDS_DATA_MAX: &str = "ourios.receiver.template_ids.data_max";
+
+/// `ourios.receiver.template_ids.files_scanned` attribute key.
+pub const OURIOS_RECEIVER_TEMPLATE_IDS_FILES_SCANNED: &str =
+    "ourios.receiver.template_ids.files_scanned";
+
+/// `ourios.receiver.template_ids.floor` attribute key.
+pub const OURIOS_RECEIVER_TEMPLATE_IDS_FLOOR: &str = "ourios.receiver.template_ids.floor";
+
 /// `ourios.server.listener.name` attribute key.
 pub const OURIOS_SERVER_LISTENER_NAME: &str = "ourios.server.listener.name";
 
@@ -381,6 +394,22 @@ pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_DISCARDED: &str = "ourios.receiver.snap
 
 /// `ourios.receiver.snapshot.error` log event name.
 pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR: &str = "ourios.receiver.snapshot.error";
+
+/// `ourios.receiver.template_ids.bootstrap.progress` log event name.
+pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAP_PROGRESS: &str =
+    "ourios.receiver.template_ids.bootstrap.progress";
+
+/// `ourios.receiver.template_ids.bootstrapped` log event name.
+pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_BOOTSTRAPPED: &str =
+    "ourios.receiver.template_ids.bootstrapped";
+
+/// `ourios.receiver.template_ids.refill.failed` log event name.
+pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_FAILED: &str =
+    "ourios.receiver.template_ids.refill.failed";
+
+/// `ourios.receiver.template_ids.refill.stopped` log event name.
+pub const EVENT_OURIOS_RECEIVER_TEMPLATE_IDS_REFILL_STOPPED: &str =
+    "ourios.receiver.template_ids.refill.stopped";
 
 /// `ourios.receiver.tenant.divergence` log event name.
 pub const EVENT_OURIOS_RECEIVER_TENANT_DIVERGENCE: &str = "ourios.receiver.tenant.divergence";

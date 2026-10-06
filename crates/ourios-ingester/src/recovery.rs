@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use ourios_core::audit::{AuditEvent, AuditSink};
+use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
 use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, RestoreError};
@@ -35,6 +35,7 @@ use prost::Message;
 use crate::metrics::ERROR_TYPE;
 use crate::receiver::tenant::assign;
 use crate::snapshot_store::{self, SnapshotStoreError};
+use crate::template_ids::{Seated, SnapshotTrust, TemplateIds, TemplateIdsError};
 
 /// What recovery did, for the caller to log and for the
 /// RFC0008.10 / RFC 0001 §3.5.3–.4 assertions.
@@ -62,6 +63,9 @@ pub struct RecoveryReport {
     pub max_delivered: Option<WalOffset>,
     /// Per-tenant snapshot outcome, one entry per artefact found.
     pub tenants: Vec<TenantRecovery>,
+    /// The template-id high-water this start seated the miner above
+    /// (RFC 0059 §3.4).
+    pub template_ids: Seated,
 }
 
 impl RecoveryReport {
@@ -135,6 +139,9 @@ pub enum DiscardReason {
     NoHorizon,
     /// The miner rejected the decoded state, for the reason it carries.
     RestoreFailed(RestoreError),
+    /// The root never seated against the template-id high-water, so the
+    /// artefact holds ids from a pre-RFC 0059 counter (§3.5).
+    PredatesHighWater,
     /// A decode failure outside the classes above.
     Other,
 }
@@ -148,6 +155,7 @@ impl DiscardReason {
             Self::Empty => "empty",
             Self::NoHorizon => "no_horizon",
             Self::RestoreFailed(_) => "restore_failed",
+            Self::PredatesHighWater => crate::template_ids::names::PREDATES_HIGH_WATER,
             Self::Other => "_OTHER",
         }
     }
@@ -196,6 +204,10 @@ pub enum RecoveryDriverError {
     /// tenant still has frames in the WAL: with none left, booting
     /// would silently discard the only record of its templates.
     LegacyMarkUnreadable(TenantId),
+    /// The template-id high-water could not be read, bootstrapped or
+    /// reserved from (RFC 0059 §3.4): a guessed floor could re-issue an id
+    /// published rows carry.
+    TemplateIds(TemplateIdsError),
 }
 
 impl std::fmt::Display for RecoveryDriverError {
@@ -211,6 +223,7 @@ impl std::fmt::Display for RecoveryDriverError {
                  high-water mark cannot be read (RFC 0052 §3.2)",
                 tenant.as_str()
             ),
+            Self::TemplateIds(e) => write!(f, "recovery template-id high-water: {e}"),
         }
     }
 }
@@ -220,6 +233,7 @@ impl std::error::Error for RecoveryDriverError {
         match self {
             Self::Store(e) => Some(e),
             Self::Ledger(e) => Some(e),
+            Self::TemplateIds(e) => Some(e),
             Self::LegacyStaleGap(_) | Self::LegacyMarkUnreadable(_) | Self::Replay(_) => None,
         }
     }
@@ -239,26 +253,43 @@ impl std::error::Error for RecoveryDriverError {
 /// discard emits one `ourios.receiver.snapshot.discarded` event naming
 /// the tenant and the [`DiscardReason`].
 ///
+/// Before replay mints anything, `ids` seats the miner above the store's
+/// template-id high-water (RFC 0059 §3.4), so nothing replay or later
+/// ingest allocates can equal an id issued before this start, whatever
+/// was restored, discarded or never found.
+///
 /// # Errors
 ///
 /// [`RecoveryDriverError`] on snapshot-store I/O or replay failure
 /// (including an `OtlpBatch` frame that fails protobuf decode or
-/// tenant fan-out — corruption-adjacent, surfaced loudly).
+/// tenant fan-out — corruption-adjacent, surfaced loudly), or when the
+/// template-id high-water cannot be seated.
 pub fn recover(
     wal: &mut Wal,
     snapshots_root: &Path,
     miner: &mut MinerCluster,
+    ids: &TemplateIds,
 ) -> Result<RecoveryReport, RecoveryDriverError> {
     let parquet_horizon = wal.last_checkpoint();
     let artefacts =
         snapshot_store::load_all_durable(snapshots_root).map_err(RecoveryDriverError::Store)?;
 
+    let trust =
+        SnapshotTrust::of(snapshots_root, ids.store()).map_err(RecoveryDriverError::TemplateIds)?;
     let Restored {
         mut tenants,
         horizons,
         legacy,
-    } = restore_artefacts(miner, artefacts);
-    let replay = replay_gated(wal, miner, &horizons, parquet_horizon)?;
+    } = restore_artefacts(miner, artefacts, trust);
+    let template_ids = seat_root(snapshots_root, miner, ids, trust)?;
+    let gates = Gates {
+        horizons: &horizons,
+        checkpoint: parquet_horizon,
+        ids,
+    };
+    let replay = replay_gated(wal, miner, gates)?;
+    ids.finish_replay()
+        .map_err(RecoveryDriverError::TemplateIds)?;
     // RFC 0052 §3.7: recovery ends by rebuilding the ledger, and it
     // ends there rather than at `Wal::open` because open runs before
     // replay has healed a torn tail — a figure taken there would count
@@ -270,6 +301,7 @@ pub fn recover(
     // Before the caller's post-recovery write replaces the version-1
     // artefacts whose marks this check reads.
     refuse_legacy_stale_gaps(wal, &horizons, legacy)?;
+    seal_root(snapshots_root, ids, trust, template_ids)?;
 
     let reclaimed = wal.reclaimed_through();
     for tenant in &mut tenants {
@@ -288,6 +320,7 @@ pub fn recover(
         audit_events_suppressed: replay.withheld.events,
         max_delivered: replay.max_delivered,
         tenants,
+        template_ids,
     })
 }
 
@@ -308,14 +341,13 @@ struct Replayed {
 fn replay_gated(
     wal: &mut Wal,
     miner: &mut MinerCluster,
-    horizons: &HashMap<TenantId, WalOffset>,
-    checkpoint: Option<WalOffset>,
+    gates: Gates<'_>,
 ) -> Result<Replayed, RecoveryDriverError> {
     let capture = ReplayCapture::install(miner);
     let mut sink = DriverSink {
         miner,
-        horizons,
-        checkpoint,
+        gates,
+        failure: None,
         capture,
         frames_delivered: 0,
         records_fed: 0,
@@ -332,9 +364,13 @@ fn replay_gated(
         records_suppressed,
         segments_seen,
         max_delivered,
+        failure,
         ..
     } = sink;
     let withheld = capture.restore(miner);
+    if let Some(failure) = failure {
+        return Err(RecoveryDriverError::TemplateIds(failure));
+    }
     replayed.map_err(RecoveryDriverError::Replay)?;
     Ok(Replayed {
         frames_delivered,
@@ -351,6 +387,9 @@ fn replay_gated(
 /// miner's state alone, its rows and events being published already; any
 /// other is mined and published. `max(X, S)` is therefore the record
 /// gate, and `X` the audit gate, since a folded frame regenerates nothing.
+/// The one exception is a template a frame at or below `X` mints afresh:
+/// its id lies above the high-water, so its events were never published
+/// (RFC 0059 §3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Folded,
@@ -419,6 +458,9 @@ struct ReplayCapture {
     record_sink: Box<dyn RecordSink>,
     audit_sink: Box<dyn AuditSink>,
     withheld: Withheld,
+    /// The highest id seated before replay: every id above it is minted
+    /// by this replay.
+    seated: u64,
 }
 
 impl ReplayCapture {
@@ -430,6 +472,7 @@ impl ReplayCapture {
             records,
             events,
             withheld: Withheld::default(),
+            seated: miner.highest_allocated(),
         }
     }
 
@@ -449,10 +492,29 @@ impl ReplayCapture {
                     self.record_sink.emit(record);
                 }
             }
-            Route::MinerOnly | Route::Folded => {
+            Route::MinerOnly => {
+                self.withheld.records += records.len() as u64;
+                for event in events {
+                    self.publish_if_reminted(event);
+                }
+            }
+            Route::Folded => {
                 self.withheld.records += records.len() as u64;
                 self.withheld.events += events.len() as u64;
             }
+        }
+    }
+
+    /// Publish an event of a template this replay minted, whose id no
+    /// published event binds yet, so rows ingested after startup resolve;
+    /// withhold every other, whose original was published before the
+    /// crash.
+    fn publish_if_reminted(&mut self, event: AuditEvent) {
+        match &event.payload {
+            AuditPayload::Template { template_id, .. } if *template_id > self.seated => {
+                self.audit_sink.emit(event);
+            }
+            _ => self.withheld.events += 1,
         }
     }
 
@@ -494,14 +556,24 @@ impl LegacyMarks {
     }
 }
 
-fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>)>) -> Restored {
+/// Restore every artefact `trust` allows, and discard every other one as
+/// predating the root's first template-id seat.
+fn restore_artefacts(
+    miner: &mut MinerCluster,
+    artefacts: Vec<(TenantId, Vec<u8>)>,
+    trust: SnapshotTrust,
+) -> Restored {
     let mut restored = Restored {
         tenants: Vec::with_capacity(artefacts.len()),
         horizons: HashMap::new(),
         legacy: LegacyMarks::default(),
     };
     for (tenant_id, bytes) in artefacts {
-        let fate = restore_artefact(miner, &tenant_id, &bytes);
+        let fate = if trust.restores() {
+            restore_artefact(miner, &tenant_id, &bytes)
+        } else {
+            SnapshotFate::Discarded(DiscardReason::PredatesHighWater)
+        };
         match &fate {
             SnapshotFate::Restored(horizon) => {
                 restored.horizons.insert(tenant_id.clone(), *horizon);
@@ -516,6 +588,47 @@ fn restore_artefacts(miner: &mut MinerCluster, artefacts: Vec<(TenantId, Vec<u8>
         });
     }
     restored
+}
+
+/// Seat `miner` above the template-id high-water (RFC 0059 §3.4–§3.5). A
+/// seated root keeps its marker current from here on; a root that never
+/// seated writes its marker only in [`seal_root`].
+fn seat_root(
+    snapshots_root: &Path,
+    miner: &mut MinerCluster,
+    ids: &TemplateIds,
+    trust: SnapshotTrust,
+) -> Result<Seated, RecoveryDriverError> {
+    let seated = ids
+        .start(miner, trust)
+        .map_err(RecoveryDriverError::TemplateIds)?;
+    if matches!(trust, SnapshotTrust::Seated { .. }) {
+        ids.record_seat(snapshots_root, trust, seated)
+            .map_err(RecoveryDriverError::TemplateIds)?;
+    }
+    Ok(seated)
+}
+
+/// Once every startup check has passed, a root that never seated removes
+/// its untrusted artefacts and only then writes its marker. A refusal or a
+/// crash at any earlier step keeps the artefacts, whose version-1 marks are
+/// RFC 0052 §3.2's evidence, and leads the next start to the same decision
+/// (RFC 0059 §3.5).
+fn seal_root(
+    snapshots_root: &Path,
+    ids: &TemplateIds,
+    trust: SnapshotTrust,
+    seated: Seated,
+) -> Result<(), RecoveryDriverError> {
+    match trust {
+        SnapshotTrust::Seated { .. } => return Ok(()),
+        SnapshotTrust::PredatesHighWater => {
+            snapshot_store::remove_all(snapshots_root).map_err(RecoveryDriverError::Store)?;
+        }
+        SnapshotTrust::Bootstrap => {}
+    }
+    ids.record_seat(snapshots_root, trust, seated)
+        .map_err(RecoveryDriverError::TemplateIds)
 }
 
 /// Restore one artefact into `miner`.
@@ -652,10 +765,19 @@ fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
 /// prefix then the export (RFC 0046 §3.3) → [`assign`] every record to that
 /// tenant → feed each to the miner iff the frame offset is above the
 /// tenant's horizon.
-struct DriverSink<'a> {
-    miner: &'a mut MinerCluster,
+/// What decides each replayed frame's fate: the restored horizons, the
+/// checkpoint, and the template-id allocation replay reserves from.
+struct Gates<'a> {
     horizons: &'a HashMap<TenantId, WalOffset>,
     checkpoint: Option<WalOffset>,
+    ids: &'a TemplateIds,
+}
+
+struct DriverSink<'a> {
+    miner: &'a mut MinerCluster,
+    gates: Gates<'a>,
+    /// A reservation replay could not make: recovery fails with it.
+    failure: Option<TemplateIdsError>,
     capture: ReplayCapture,
     frames_delivered: u64,
     records_fed: u64,
@@ -715,11 +837,23 @@ impl DriverSink<'_> {
             .map_err(|e| reject(kind, offset, &e))?;
         let records = assign(request, &tenant);
         let count = records.len() as u64;
-        match route(offset, self.horizons.get(&tenant), self.checkpoint) {
+        match route(
+            offset,
+            self.gates.horizons.get(&tenant),
+            self.gates.checkpoint,
+        ) {
             Route::Folded => self.records_suppressed += count,
             mined => {
                 for record in &records {
                     self.miner.ingest(record);
+                }
+                // A template the store could have given an id must not
+                // replay as a parse failure: stop before this frame is
+                // folded or published (RFC 0059 §3.4).
+                if let Some(failure) = self.gates.ids.take_replay_failure() {
+                    let detail = failure.to_string();
+                    self.failure = Some(failure);
+                    return Err(reject(kind, offset, &detail));
                 }
                 self.records_fed += count;
                 self.miner
@@ -848,15 +982,55 @@ mod tests {
         );
     }
 
+    fn created(template_id: u64) -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            payload: AuditPayload::Template {
+                template_id,
+                triggering_line_hash: [0; 16],
+                triggering_line_sample: None,
+                change: ourios_core::audit::TemplateChange::Created {
+                    new_template: format!("line {template_id}"),
+                },
+            },
+        }
+    }
+
+    /// RFC 0059 §3.4: a frame at or below `X` forwards only the events of
+    /// ids the replay minted, and withholds the rest and every row.
+    #[test]
+    fn a_frame_at_or_below_x_forwards_only_events_of_reminted_ids() {
+        let published = ourios_core::audit::SharedAuditSink::new();
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        drop(miner.replace_audit_sink(Box::new(published.clone())));
+        miner.allocate_past_issued(10).expect("seat");
+        let mut capture = ReplayCapture::install(&mut miner);
+        for id in [9, 10, 11, 12] {
+            capture.events.push(created(id));
+        }
+        capture.settle(Route::MinerOnly);
+        let withheld = capture.restore(&mut miner);
+
+        let forwarded: Vec<AuditEvent> = published.drain();
+        assert_eq!(forwarded, [created(11), created(12)]);
+        assert_eq!(withheld.events, 2, "the events of seated ids stay withheld");
+    }
+
     fn sink<'a>(
         miner: &'a mut MinerCluster,
         horizons: &'a HashMap<TenantId, WalOffset>,
+        ids: &'a TemplateIds,
     ) -> DriverSink<'a> {
         let capture = ReplayCapture::install(miner);
         DriverSink {
             miner,
-            horizons,
-            checkpoint: None,
+            gates: Gates {
+                horizons,
+                checkpoint: None,
+                ids,
+            },
+            failure: None,
             capture,
             frames_delivered: 0,
             records_fed: 0,
@@ -877,7 +1051,8 @@ mod tests {
     fn sink_rejects_a_malformed_payload_naming_the_offset() {
         let mut miner = MinerCluster::new(MinerConfig::default());
         let horizons = HashMap::new();
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
 
         // A valid tenant prefix followed by a truncated varint key that
         // cannot decode as a protobuf message.
@@ -898,7 +1073,8 @@ mod tests {
     fn sink_rejects_malformed_tenant_prefixes() {
         let mut miner = MinerCluster::new(MinerConfig::default());
         let horizons = HashMap::new();
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
         for (payload, needle) in [
             (vec![7u8], "length prefix"),
             (vec![0, 0, 1], "zero"),
@@ -949,7 +1125,8 @@ mod tests {
         state.wal_high_water = Some(snapshot_store::high_water(restored_at));
         miner.restore_tenant(&idle, &state).expect("restore");
         let horizons = HashMap::from([(idle.clone(), restored_at)]);
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
 
         for (tenant, byte) in [("idle", 40), ("busy", 60), ("busy", 80)] {
             sink.consume(
@@ -976,7 +1153,8 @@ mod tests {
     fn sink_refuses_legacy_otlp_batch_frames() {
         let mut miner = MinerCluster::new(MinerConfig::default());
         let horizons = HashMap::new();
-        let mut sink = sink(&mut miner, &horizons);
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        let mut sink = sink(&mut miner, &horizons, &ids);
         let detail = sink_rejected(
             sink.consume(offset(SEGMENT, 32), FrameKind::OtlpBatch, b"anything")
                 .expect_err("legacy frame is refused"),
@@ -1016,7 +1194,8 @@ mod tests {
         );
 
         let mut miner = MinerCluster::new(MinerConfig::default());
-        recover(&mut wal, &root.join("snapshots"), &mut miner).expect("recover");
+        let ids = TemplateIds::new(ourios_parquet::Store::in_memory());
+        recover(&mut wal, &root.join("snapshots"), &mut miner, &ids).expect("recover");
 
         let state = wal.reclaim_state();
         assert!(

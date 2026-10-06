@@ -92,6 +92,63 @@ pub(super) fn param_type_for_line_position(
     }
 }
 
+/// A fresh leaf's template for `masked`: `Wildcard` at every
+/// mask-emitted position, `Fixed` at every other.
+pub(super) fn leaf_template(masked: super::MaskedLine<'_>) -> Vec<OwnedToken> {
+    // `wildcard_positions` is ascending (one forward pass over the
+    // tokens), so both arrays are walked in lockstep.
+    let mut wildcards = masked.wildcard_positions.iter().copied().peekable();
+    let template = masked
+        .strs
+        .iter()
+        .enumerate()
+        .map(|(p, s)| match wildcards.next_if_eq(&p) {
+            Some(_) => OwnedToken::Wildcard,
+            None => OwnedToken::Fixed((*s).to_string()),
+        })
+        .collect();
+    debug_assert!(
+        wildcards.peek().is_none(),
+        "every wildcard_position must land within masked.strs.len()",
+    );
+    template
+}
+
+/// An adopted row's params and separators. Params come in template
+/// order, each wildcard capturing exactly one body token, classified by
+/// `mask()`'s authoritative read of the body (§6.2), `Str` where mask
+/// saw nothing, and every value passes the §6.5 byte cap with overflow
+/// spilling to the body.
+pub(super) fn adopted_row_parts(
+    parsed: &crate::upstream::UpstreamTemplate<'_>,
+    alignment: &crate::upstream::Alignment<'_, '_>,
+    masked: super::MaskedLine<'_>,
+    param_byte_limit: u32,
+) -> (Vec<Param>, Vec<String>) {
+    let wildcard_body_positions = parsed.tokens().iter().enumerate().filter_map(|(i, t)| {
+        matches!(t, crate::upstream::UpstreamToken::Wildcard { .. }).then_some(i)
+    });
+    debug_assert_eq!(
+        parsed
+            .tokens()
+            .iter()
+            .filter(|t| matches!(t, crate::upstream::UpstreamToken::Wildcard { .. }))
+            .count(),
+        alignment.params.len()
+    );
+    let params = alignment
+        .params
+        .iter()
+        .zip(wildcard_body_positions)
+        .map(|(p, pos)| {
+            let ty =
+                param_type_for_line_position(pos, masked.wildcard_positions, masked.typed_params);
+            crate::overflow::cap_param_value(ty, p.value.to_string(), param_byte_limit)
+        })
+        .collect();
+    (params, separators_to_owned(&alignment.separators))
+}
+
 /// On widening, seed [`Leaf::slot_types`] for each newly-introduced
 /// `Wildcard` position. The initial type set captures both
 /// observations the widening witnessed:

@@ -92,7 +92,30 @@ storage:
 # OTLP receiver role (RFC 0003): a StatefulSet, one durable WAL PVC per replica.
 receiver:
   enabled: true
+  # Upgrading from a release before RFC 0059 (durable template-id
+  # allocation), in order:
+  #   1. grant the receiver's role the object-store permissions in the
+  #      README's "Per-role IAM";
+  #   2. set replicas to 0 and apply, so no pre-RFC receiver is running;
+  #   3. set replicas to 1 with templateIdsAllowBootstrap: true and apply;
+  #      that one replica bootstraps the template-id high-water from the
+  #      store once;
+  #   4. once it has seated, set it back to false, revoke the
+  #      bootstrap-only grants (README's steady-state policy), then scale
+  #      out.
+  # A store that already holds data refuses to bootstrap without step 3's
+  # setting. A pre-RFC receiver still running during that first start can
+  # publish an id the bootstrap scan never saw. Downgrading below RFC 0059
+  # is not supported once the high-water exists: an older receiver ignores
+  # it and can re-issue ids already reserved or issued. Going back means
+  # restoring the store and every WAL from before the upgrade.
   replicas: 1
+  # RFC 0059 §3.5: authorise the one-time template-id bootstrap over a
+  # store that already holds data (receiver.template_ids_allow_bootstrap in
+  # the rendered config). For step 3 above only; leave false otherwise.
+  # The chart runs the binary with --config, which reads no bare
+  # OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP env var, so extraEnv cannot set it.
+  templateIdsAllowBootstrap: false
   service:
     type: ClusterIP
   # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never
@@ -107,8 +130,15 @@ receiver:
   # give each role its own IAM identity — see "Per-role IAM" in the README).
   # create=false (default) uses the shared serviceAccount below. With IRSA,
   # annotate with this role's eks.amazonaws.com/role-arn — the receiver's
-  # role needs s3:PutObject ONLY (its production path never reads, lists,
-  # or deletes). `name`:
+  # role needs s3:PutObject on data/*, audit/* and miner/* (under
+  # storage.s3.prefix), plus s3:GetObject on the objects miner/* for
+  # the template-id high-water (RFC 0059). s3:ListBucket goes on the
+  # bucket arn (not an object arn) with an s3:prefix condition for miner/*.
+  # Every first start, a fresh install included, bootstraps: it also needs
+  # s3:ListBucket for data/* and audit/*, and (over a store holding data)
+  # s3:GetObject on them, granted before it. Revoking those once the
+  # high-water exists is required (README has both JSON policies). It
+  # never deletes. `name`:
   # create=true + empty name renders `<fullname>-receiver`;
   # create=true + name overrides that; create=false + name binds an
   # EXISTING ServiceAccount of that name (managed out-of-band).
@@ -165,7 +195,9 @@ compactor:
   # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS), used only by this compactor.
   intervalSecs: 300
   # Optional role-scoped ServiceAccount (see receiver.serviceAccount). The
-  # compactor is the only role whose IAM role holds s3:DeleteObject.
+  # compactor is the only role whose IAM role holds s3:DeleteObject, scoped
+  # to data/*, erasure/* and backfill/*: never miner/*, which every role's
+  # policy also denies explicitly (README "Per-role IAM").
   serviceAccount:
     create: false
     annotations: {}

@@ -458,6 +458,9 @@ pub struct ReceiverHandle {
     /// shutdown stamp consults it: it is the one stamping path left
     /// outside [`Barrier::run_cut`]'s own checks.
     epochs: Arc<BarrierEpochs>,
+    /// The template-id allocation (RFC 0059), whose refiller is stopped
+    /// and joined before the roots are released.
+    ids: TemplateIds,
 }
 
 impl ReceiverHandle {
@@ -551,7 +554,10 @@ impl ReceiverHandle {
         // The joins and the last cut above are the steps that can set the
         // latch after the timer stopped observing it.
         self.cadences.housekeeper.observe_state();
-        Ok(())
+        // RFC 0059 §3.3: no reservation may still be in flight once the
+        // roots are free for the next receiver.
+        tokio::task::block_in_place(|| self.ids.shutdown())
+            .map_err(|e| format!("template-id refiller: {e}"))
     }
 }
 
@@ -1173,6 +1179,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         cadences,
         barrier,
         epochs: pipeline_epochs,
+        ids,
     })
 }
 

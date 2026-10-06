@@ -523,6 +523,65 @@ pub struct Hooks {
     /// When set to `n`, the high-water's `n`th write from now fails, and
     /// every later one with it; 0 (the default) never fails one.
     pub high_water_puts_until_failure: Arc<std::sync::atomic::AtomicUsize>,
+    /// Parks the high-water's writes while armed.
+    pub high_water_put_gate: Arc<PutGate>,
+}
+
+/// Holds every high-water write while armed, so a test can act while a
+/// reservation is in flight between its read and its write.
+#[derive(Default)]
+pub struct PutGate {
+    state: std::sync::Mutex<GateState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    armed: bool,
+    parked: usize,
+}
+
+impl PutGate {
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn arm(&self) {
+        self.state().armed = true;
+    }
+
+    /// Wait until a write is parked at the gate.
+    pub fn wait_parked(&self) {
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(self.state(), Duration::from_secs(30), |s| s.parked == 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !timeout.timed_out() && state.parked > 0,
+            "no high-water write reached the gate"
+        );
+    }
+
+    pub fn release(&self) {
+        self.state().armed = false;
+        self.changed.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut state = self.state();
+        if !state.armed {
+            return;
+        }
+        state.parked += 1;
+        self.changed.notify_all();
+        drop(
+            self.changed
+                .wait_while(state, |s| s.armed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
 }
 
 /// What another writer leaves in the high-water when it wins a race.
@@ -629,6 +688,7 @@ impl object_store::ObjectStore for HookedStore {
         self.hooks.enter()?;
         if is_high_water(location) {
             self.hooks.count_down_put()?;
+            self.hooks.high_water_put_gate.pass();
         }
         let creating = matches!(opts.mode, object_store::PutMode::Create);
         if creating && is_high_water(location) {

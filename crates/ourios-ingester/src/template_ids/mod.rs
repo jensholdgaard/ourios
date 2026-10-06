@@ -13,7 +13,7 @@ mod reserver;
 
 pub use bootstrap::{BootstrapScan, bootstrap};
 pub use marker::{SEATED_MARKER, SnapshotTrust, mark_seated};
-pub use reserver::TemplateIds;
+pub use reserver::{RefillerStillRunning, TemplateIds};
 
 use ourios_miner::cluster::{
     IdBlock, IdReservationError, IdSpaceExhausted, MAX_TEMPLATE_ID, MinerCluster,

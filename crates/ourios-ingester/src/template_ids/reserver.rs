@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ourios_miner::cluster::{IdBlock, IdReservationError, IdReserver, MinerCluster};
@@ -36,6 +37,9 @@ use super::{BootstrapPolicy, Seated, SnapshotTrust, TemplateIdsError, names, res
 const READY_BLOCKS: usize = 2;
 const BACKOFF_START: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long [`TemplateIds::shutdown`] waits for an in-flight reservation on
+/// a store whose writes are compare-and-swaps.
+const STOP_WITHIN: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct Ready {
@@ -63,7 +67,42 @@ struct Shared {
     ledger: Mutex<Option<Ledger>>,
     /// A reservation replay could not make, for recovery to fail with.
     replay_failure: Mutex<Option<TemplateIdsError>>,
+    /// Set once, under the ledger lock, by [`TemplateIds::shutdown`]: no
+    /// reservation starts and no block is recorded or made ready after.
+    stopped: AtomicBool,
 }
+
+impl Shared {
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
+/// The running refiller: its thread, and a channel that disconnects when
+/// the thread exits, so a wait for it can be bounded.
+struct Refiller {
+    thread: JoinHandle<()>,
+    exited: Receiver<()>,
+}
+
+/// [`TemplateIds::shutdown`] gave up waiting for a reservation in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefillerStillRunning {
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for RefillerStillRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the template-id refiller was still reserving after {:?}; its compare-and-swap \
+             write cannot lower the high-water, and it records nothing more",
+            self.waited
+        )
+    }
+}
+
+impl std::error::Error for RefillerStillRunning {}
 
 /// One store's template-id allocation: the startup seat, and the
 /// reserver the miner draws from.
@@ -71,6 +110,7 @@ pub struct TemplateIds {
     shared: Arc<Shared>,
     refill: SyncSender<()>,
     refill_rx: Mutex<Option<Receiver<()>>>,
+    refiller: Mutex<Option<Refiller>>,
     replaying: Arc<AtomicBool>,
     allow_bootstrap: bool,
 }
@@ -86,9 +126,11 @@ impl TemplateIds {
                 ready: Mutex::new(Ready::default()),
                 ledger: Mutex::new(None),
                 replay_failure: Mutex::new(None),
+                stopped: AtomicBool::new(false),
             }),
             refill,
             refill_rx: Mutex::new(Some(refill_rx)),
+            refiller: Mutex::new(None),
             replaying: Arc::new(AtomicBool::new(true)),
             allow_bootstrap: false,
         }
@@ -116,12 +158,56 @@ impl TemplateIds {
         let receiver = lock(&self.refill_rx).take();
         if let Some(receiver) = receiver {
             let shared = Arc::clone(&self.shared);
-            std::thread::Builder::new()
+            let (exiting, exited) = mpsc::channel();
+            let thread = std::thread::Builder::new()
                 .name("template-id-refill".to_owned())
-                .spawn(move || refill_loop(&shared, &receiver))
+                .spawn(move || {
+                    let _exiting = exiting;
+                    refill_loop(&shared, &receiver);
+                })
                 .map_err(|e| TemplateIdsError::Refiller(e.to_string()))?;
+            *lock(&self.refiller) = Some(Refiller { thread, exited });
             request_refill(&self.refill);
         }
+        Ok(())
+    }
+
+    /// Stop the refiller and wait for it, before the receiver releases its
+    /// roots: a reservation still in flight once another receiver starts
+    /// over them could otherwise overwrite the high-water and the marker
+    /// below what that receiver reserved. After this returns no block is
+    /// recorded or made ready. Idempotent; dropping `self` does the same.
+    ///
+    /// On a store without compare-and-swap (the local backend) the wait is
+    /// unbounded, since a stale unconditional write could lower the
+    /// high-water; its calls are local filesystem calls. Elsewhere a stale
+    /// write fails its `If-Match`, so the wait is bounded by
+    /// ten seconds.
+    ///
+    /// # Errors
+    ///
+    /// [`RefillerStillRunning`] when the bounded wait ran out.
+    pub fn shutdown(&self) -> Result<(), RefillerStillRunning> {
+        {
+            let _ledger = lock(&self.shared.ledger);
+            self.shared.stopped.store(true, Ordering::Release);
+        }
+        request_refill(&self.refill);
+        let Some(Refiller { thread, exited }) = lock(&self.refiller).take() else {
+            return Ok(());
+        };
+        if self.shared.store.supports_conditional_update() {
+            match exited.recv_timeout(STOP_WITHIN) {
+                Err(RecvTimeoutError::Disconnected) => {}
+                Ok(()) | Err(RecvTimeoutError::Timeout) => {
+                    return Err(RefillerStillRunning {
+                        waited: STOP_WITHIN,
+                    });
+                }
+            }
+        }
+        // A panic in the refiller has already been reported by the hook.
+        drop(thread.join());
         Ok(())
     }
 
@@ -230,6 +316,9 @@ impl TemplateIds {
 /// out, and no retry can help.
 fn fill(shared: &Shared) -> Result<(), TemplateIdsError> {
     loop {
+        if shared.stopped() {
+            return Ok(());
+        }
         let floor = {
             let held = lock(&shared.ready);
             if held.blocks.len() >= READY_BLOCKS {
@@ -243,6 +332,9 @@ fn fill(shared: &Shared) -> Result<(), TemplateIdsError> {
             Err(error) => return Err(error),
         };
         let mut ledger = lock(&shared.ledger);
+        if shared.stopped() {
+            return Ok(());
+        }
         if let Some(ledger) = ledger.as_mut() {
             record(ledger, block.through())?;
         }
@@ -283,7 +375,7 @@ fn request_refill(refill: &SyncSender<()>) {
 /// it is worth. An exhausted id domain is no failure (`fill` returns
 /// `Ok`): it surfaces only as `id_reservation_failed` parse failures.
 fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
-    while requests.recv().is_ok() {
+    while requests.recv().is_ok() && !shared.stopped() {
         let mut backoff = BACKOFF_START;
         loop {
             match fill(shared) {
@@ -304,7 +396,7 @@ fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
                      last: {error}",
                 ),
             }
-            if !wait_out(requests, Instant::now() + backoff) {
+            if !wait_out(shared, requests, Instant::now() + backoff) {
                 return;
             }
             backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -313,9 +405,12 @@ fn refill_loop(shared: &Shared, requests: &Receiver<()>) {
 }
 
 /// Wait until `deadline` whatever requests arrive meanwhile; `false` once
-/// every sender is gone.
-fn wait_out(requests: &Receiver<()>, deadline: Instant) -> bool {
+/// every sender is gone, or once a shutdown's request arrives.
+fn wait_out(shared: &Shared, requests: &Receiver<()>, deadline: Instant) -> bool {
     loop {
+        if shared.stopped() {
+            return false;
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
@@ -324,6 +419,14 @@ fn wait_out(requests: &Receiver<()>, deadline: Instant) -> bool {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return false,
         }
+    }
+}
+
+impl Drop for TemplateIds {
+    fn drop(&mut self) {
+        // A startup that fails after replay drops these without a
+        // shutdown; the bounded case has nothing left to do.
+        let _ = self.shutdown();
     }
 }
 
@@ -521,6 +624,7 @@ mod tests {
             ready: Mutex::new(Ready::default()),
             ledger: Mutex::new(None),
             replay_failure: Mutex::new(None),
+            stopped: AtomicBool::new(false),
         })
     }
 

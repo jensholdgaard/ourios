@@ -164,7 +164,8 @@ rebuildable cache.
     2. remove the object **and every root's seated marker**. A root that
        keeps its marker refuses to bootstrap and fails closed with
        `HighWaterDeleted`;
-    3. start one replica with `receiver.template_ids_allow_bootstrap`;
+    3. start one replica with `receiver.template_ids_allow_bootstrap`
+       (chart value `receiver.templateIdsAllowBootstrap`);
     4. remove the setting, and scale out as in the upgrade.
   - The replica in step 3 recomputes the floor from every data and audit
     footer, plus its own restored snapshots. That is exactly the
@@ -196,7 +197,11 @@ restored or issued:
    there without retrying. Fresh mints fail once the held ids run out.
 3. Write `N' = b` as a compare-and-swap against the `ETag` (§3.6). On a
    precondition failure, re-read and retry from step 1.
-4. Only once the write is durable does `(a, b]` become usable.
+4. Only once the write is durable does `(a, b]` become usable. On the
+   local backend, whose put renames a file into place without fsync,
+   that means fsyncing the object and then every directory from its own
+   up to the store root, so a newly created `miner/` entry is durable
+   too.
 
 **A reservation never creates the object.** Only the startup bootstrap
 (§3.5) creates it. If step 1 finds it absent, the reservation fails with
@@ -234,11 +239,31 @@ no reservation ever runs there.
   (`BLOCK` fresh templates) of headroom while a refill is in flight.
 - **Background refill.** Each time a block becomes current, the
   ingester's background refiller reserves blocks off the lock until two
-  are ready again. If the store fails, it retries with capped
-  exponential backoff (100 ms doubling to 30 s).
+  are ready again. The refiller starts only once replay ends (§3.4), so
+  it never reserves at the same time as replay's synchronous fill. On
+  the local backend's unconditional overwrite, two concurrent
+  reservations could hand out the same block.
+  - Requests to refill coalesce: one pending request covers every later
+    one, and asking never blocks the miner.
+  - If the store fails, the refiller retries with capped exponential
+    backoff (100 ms doubling to 30 s), and waits out each backoff in full
+    whatever requests arrive meanwhile. Failed mints therefore cannot
+    drive one store call each.
+  - Running out of ids is not a refill failure: it surfaces only as the
+    parse failures below.
+  - A receiver stops its refiller and waits for any reservation in
+    flight before it releases its roots, at shutdown and on a failed
+    start, so no stale write can land under the next receiver over
+    them. After the stop no block is recorded in the marker or made
+    ready. The wait is unbounded on a backend without compare-and-swap,
+    where a stale write could lower the high-water. Elsewhere it is
+    bounded, since such a write fails its `If-Match`.
 - **A high-water deleted while live.** If a refill finds the object
   absent (`HighWaterDeleted`), the refiller stops for good and logs an
-  error. It does not retry: an object that reappears, for example
+  error. The object counts as absent whether the refill's read finds it
+  gone or its write does: a compare-and-swap answered not-found, or, on
+  a backend without one, an overwrite that first finds the object gone
+  and so never re-creates it. It does not retry: an object that reappears, for example
   restored from an old copy, may sit below blocks other receivers hold.
   - The blocks already held are spent, with no reservation overlapping
     them.
@@ -274,18 +299,27 @@ file afterwards would leave its leaves live. The order is:
 1. Check the seated marker and the object's presence, before any
    restore.
 2. **Object present, no marker** (§3.5): discard every artefact with
-   reason `predates_high_water`, without restoring any. Remove the
-   files, then seat above `N`, then write the marker.
+   reason `predates_high_water`, without restoring any, then seat above
+   `N`. Only after replay and RFC 0052 §3.2's legacy stale-gap check pass
+   are the files removed and the marker written. The object must still
+   be there at the seat; if it is gone, startup fails closed
+   (`HighWaterDeleted`).
 3. **Object present, marker present and valid:** restore the snapshots
    normally, then seat above `max(N, highest restored id)`. An invalid
    marker, or a valid one whose object is absent, fails startup closed
    (§3.1, §3.5).
 4. **Object absent, no marker, the bootstrap** (§3.5): restore first,
-   because the floor needs `restored_max`. Then bootstrap the object and
-   write the marker, provided the store holds no data yet or this start
-   is authorised. Otherwise startup fails closed. A start whose create
-   loses to another replica's also fails startup (`BootstrapRaceLost`),
-   and its restart takes case 2.
+   because the floor needs `restored_max`. Then bootstrap the object,
+   provided the store holds no data yet or this start is authorised;
+   otherwise startup fails closed. The marker is written after replay and
+   the legacy check, as in case 2. This start must create the object
+   itself: finding it already present at the seat, because another
+   replica created it after the trust read, or losing the create, fails
+   startup (`BootstrapRaceLost`) before any marker or replay. Its restart
+   takes case 2.
+
+A seated root (case 3) records its marker at the seat and keeps it
+current while replay reserves.
 
 In every case the allocator then reserves **three** blocks
 synchronously, before any listener opens: the miner takes the first as
@@ -300,9 +334,14 @@ and replay mints from those blocks.
   blocks reserves the next block **synchronously, on demand**, rather
   than failing a template a healthy store could have given an id.
   - The exhausted-range rule of §3.3 applies only once recovery has
-    handed the miner to the pipeline.
-  - A store failure during replay therefore fails the reservation, and
-    with it startup, never a single template.
+    handed the miner to the pipeline. The background refiller starts at
+    that point too, so during replay this synchronous fill is the only
+    reserver.
+  - A store failure during replay fails the reservation, and with it
+    startup, never a single template. The failure is latched where the
+    miner would otherwise count a parse failure. Recovery checks it after
+    mining each frame, and fails before that frame is folded or
+    published.
 - **Read fails.** Startup fails closed. This is the same trade-off as
   RFC 0052's fail-closed checks and #791 (recovery during an
   object-store outage): a restart then needs the store reachable, but a
@@ -372,8 +411,10 @@ root would bootstrap from the published ids alone, below A's block. So:
   `audit/` returns anything at its first level. The check is
   conservative: a tenant directory with no file still counts.
 - **Authorisation** is the receiver setting
-  `receiver.template_ids_allow_bootstrap` (config file) or
-  `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` (environment), default off. It is
+  `receiver.template_ids_allow_bootstrap` (config file), the chart value
+  `receiver.templateIdsAllowBootstrap` that renders it, or
+  `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` (environment, read only when no
+  config file is given), default off. It is
   meant for the one upgrade start only, and is removed once that
   receiver has seated.
 
@@ -536,7 +577,9 @@ DuckDB procedure finds them.
   - If the object's `reserved_through` is below `max_reserved_seen`, the
     object was rolled back to an older copy, and startup fails closed
     (§3.1, RFC0059.18). A marker claiming more than the object holds is
-    the same case.
+    the same case. Seating re-reads the object, and holds that read to
+    `max_reserved_seen` as well, before it reserves any block: a rollback
+    between the trust decision and seating fails closed the same way.
   - Otherwise the root's snapshots are trusted and restore normally.
 - **Marker present and valid, object absent.** Startup fails closed
   (§3.1, RFC0059.14).
@@ -548,20 +591,26 @@ DuckDB procedure finds them.
   here predates this root's first seat and is untrusted.
   - Recovery discards them all with reason `predates_high_water`, so
     each tenant full-replays its surviving frames.
-  - It removes the artefact files and fsyncs the directory, seats
-    above `N`, then writes the marker.
+  - It seats above `N` and replays. Only once replay and RFC 0052 §3.2's
+    legacy stale-gap check pass does it remove the artefact files, fsync
+    the directory, and write the marker. A refusal or crash before then
+    keeps the artefacts, whose version-1 marks are that check's evidence.
   - A discarded snapshot only costs drift. The WAL replays, and the
     high-water makes every re-minted id fresh.
 - **Losing the bootstrap race.** If two replicas without markers both
   find the object absent, both restore their own snapshots, and only
   one create lands. The loser has already restored ids the winner's
   floor may not cover. So the loser fails startup, and its restart takes
-  the "object present" path.
+  the "object present" path. The same holds when the winner's object
+  appears between this start's trust read and its seat: a start that
+  saw no object must create it itself (`BootstrapRaceLost`). Conversely,
+  a start that saw the object never bootstraps if it then vanishes
+  (`HighWaterDeleted`).
 - **Crash safety.**
   - Every step before the marker write leaves the marker absent, so the
     next start reruns the same decision.
   - After the marker write, no untrusted artefact remains: they were
-    removed before it, and every later snapshot is written under
+    removed just before it, and every later snapshot is written under
     reservations.
 - **A lost or replaced root** has no marker and no snapshots, so it
   just writes the marker.
@@ -573,12 +622,15 @@ DuckDB procedure finds them.
     after the scan has passed its file and before the create lands.
   - That id may then lie inside the bootstrapper's first block.
 - **The upgrade rule.** For the one upgrade to this RFC:
-  1. grant the permissions of §3.6, including the bootstrap-only reads;
+  1. grant the permissions of §3.6, including the bootstrap-only listing
+     and reads;
   2. stop every pre-RFC receiver (scale `receiver.replicas` to 0);
-  3. start **one** upgraded replica with
-     `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP=true`, and let it bootstrap
-     and seat;
-  4. remove the setting, then scale out.
+  3. start **one** upgraded replica with the bootstrap authorised
+     (chart value `receiver.templateIdsAllowBootstrap=true`; config key
+     `receiver.template_ids_allow_bootstrap`), and let it bootstrap and
+     seat;
+  4. remove the setting, revoke the bootstrap-only listing and reads
+     (§3.6), then scale out.
 
   The Helm chart states the rule beside `receiver.replicas` and in its
   `NOTES.txt`, and the release notes carry it. A store that already has
@@ -667,18 +719,26 @@ The receiver's object-store role therefore gains, beyond its existing
   `arn:aws:s3:::BUCKET` with an `s3:prefix` condition of `PREFIX/miner/*`.
   Conditional writes (`If-Match`, `If-None-Match`) need nothing beyond
   `s3:PutObject`. No delete is granted.
-- **for the one-time upgrade bootstrap:** `s3:GetObject` on the objects
-  `BUCKET/PREFIX/data/*` and `BUCKET/PREFIX/audit/*`, and
-  `PREFIX/data/*` and `PREFIX/audit/*` added to the `s3:prefix`
-  condition.
+- **for a bootstrap only** (the first start against a store, and a
+  quiesced re-bootstrap, §3.1):
+  - `PREFIX/data/*` and `PREFIX/audit/*` added to the `s3:prefix`
+    condition. **Every** first bootstrap lists both prefixes, an empty
+    store included: that listing is how it tells a new store from one
+    already holding data (§3.5).
+  - `s3:GetObject` on the objects `BUCKET/PREFIX/data/*` and
+    `BUCKET/PREFIX/audit/*`, which the scan needs to read footers when
+    the store holds files: the upgrade, or a re-bootstrap.
+  - Once the high-water exists, revoking both is a **required** step.
+    No ordinary start lists or reads `data/` or `audit/`, so the
+    receiver's steady-state policy carries neither.
 
 `s3:ListBucket` is a bucket action. AWS evaluates it against the bucket
 ARN, so a grant on an object ARN such as `BUCKET/miner/*` never matches
 and the listing is denied. The `StringLike` condition on `s3:prefix` is
 what scopes it: the receiver may list under those prefixes only, not the
 whole bucket. Object actions go on one object ARN per prefix the role
-writes, never `BUCKET/*`. The receiver's minimal policy during the
-upgrade, with the `data/*` and `audit/*` reads removed afterwards:
+writes, never `BUCKET/*`. The receiver's minimal policy during a
+bootstrap:
 
 ```json
 {
@@ -721,6 +781,43 @@ upgrade, with the `data/*` and `audit/*` reads removed afterwards:
 }
 ```
 
+And its steady-state policy, once the high-water exists:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::BUCKET/PREFIX/data/*",
+        "arn:aws:s3:::BUCKET/PREFIX/audit/*",
+        "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["PREFIX/miner/*"] }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::BUCKET/PREFIX/miner/*"
+    }
+  ]
+}
+```
+
 **No documented policy can delete the high-water.** The compactor's
 documented `s3:DeleteObject` is scoped to `PREFIX/data/*`,
 `PREFIX/erasure/*` and `PREFIX/backfill/*`, where it reclaims; it was
@@ -732,7 +829,8 @@ all three policies, and a test enforces the rule on them (RFC0059.17).
 
 Before this RFC the chart documented the receiver as `PutObject` only.
 These grants must be in place **before** the scale-to-one upgrade step,
-and the migration-only reads may be revoked once the high-water exists.
+and the bootstrap-only listing and reads **must** be revoked once the
+high-water exists (re-granted only for a quiesced re-bootstrap).
 A denied call fails startup with an error naming the action it lacked
 (`s3:GetObject`, `s3:ListBucket` or `s3:PutObject`, RFC0059.15). The
 chart's README and `values.yaml` document every role's set, and the
@@ -853,7 +951,7 @@ needs.
 ### 3.9 Telemetry
 
 All names go through the shared semconv registry (ourios-semconv), where
-they are final as of v0.3.7:
+they are final as of v0.3.8:
 
 | Name | Kind | Attributes / members |
 |---|---|---|
@@ -864,14 +962,16 @@ they are final as of v0.3.7:
 
 The registry's brief and note for `ourios.receiver.template_ids.bootstrapped`
 say the same, "at most once per successful creation of the high-water"
-(ourios-semconv#9). The semconv patch release v0.3.7 (`ead0337`)
-carries this finalized event contract, and the code pins it.
+(ourios-semconv#9). That contract was first released in semconv v0.3.7
+(`ead0337`). The code pins v0.3.8 (`bb19221`), which adds the two
+refill events below.
 
-Reservation failures in the background refiller log through the
-existing `tracing` warn path, with `error.type` set to the store error
-class. A deleted high-water, which stops the refiller, logs at error
-level with `error.type = deleted`, the value startup already uses for
-RFC0059.14. A start refused over a rolled-back high-water fails with
+Reservation failures in the background refiller log the event
+`ourios.receiver.template_ids.refill.failed` (WARN) with `error.type`
+set to the store error class. A deleted high-water, which stops the
+refiller, logs `ourios.receiver.template_ids.refill.stopped` (ERROR) with
+`error.type = deleted`, the value startup already uses for RFC0059.14.
+Both are in the registry from semconv v0.3.8 (`bb19221`). A start refused over a rolled-back high-water fails with
 `error.type = rolled_back` (§3.1). No new metric is added: a run of
 failures shows on the parse-failure counter as soon as it costs a
 template.
@@ -1215,9 +1315,10 @@ kept snapshot restored under that id. This covers RFC0059.1 and .9.
 
 ## 7. Open questions
 
-- [x] **Semconv names.** §3.9's names and the bootstrapped event's
-      contract are final in the shared registry's v0.3.7 (`ead0337`),
-      which the code pins.
+- [x] **Semconv names.** The bootstrapped event's contract was first
+      released in the shared registry's v0.3.7 (`ead0337`). The code pins
+      v0.3.8 (`bb19221`), which adds `refill.failed` and `refill.stopped`;
+      §3.9's names are all final there.
 - [ ] **Template-map artefacts.** RFC 0033's map is derived from the audit
       stream, so it inherits the audit fold's last-wins on historical
       collisions. Repairing already-collided history is out of scope; the

@@ -519,8 +519,15 @@ impl std::fmt::Display for HookedStore {
 }
 
 impl HookedStore {
-    /// Another writer creates the high-water.
-    async fn win(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+    /// Another writer creates the high-water, once, if `flag` is armed.
+    async fn win_if(
+        &self,
+        flag: &std::sync::atomic::AtomicBool,
+        location: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        if !take(flag) {
+            return Ok(());
+        }
         self.inner
             .put_opts(
                 location,
@@ -545,8 +552,8 @@ impl object_store::ObjectStore for HookedStore {
             self.hooks.count_down_put()?;
         }
         let creating = matches!(opts.mode, object_store::PutMode::Create);
-        if creating && is_high_water(location) && take(&self.hooks.race_the_create) {
-            self.win(location).await?;
+        if creating && is_high_water(location) {
+            self.win_if(&self.hooks.race_the_create, location).await?;
         }
         self.inner.put_opts(location, payload, opts).await
     }
@@ -573,8 +580,9 @@ impl object_store::ObjectStore for HookedStore {
         self.hooks.enter()?;
         let got = self.inner.get_opts(location, options).await;
         let absent = matches!(got, Err(object_store::Error::NotFound { .. }));
-        if absent && is_high_water(location) && take(&self.hooks.create_after_absent_read) {
-            self.win(location).await?;
+        if absent && is_high_water(location) {
+            self.win_if(&self.hooks.create_after_absent_read, location)
+                .await?;
         }
         got
     }

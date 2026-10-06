@@ -213,6 +213,14 @@ async fn rfc0059_12_the_loser_of_the_bootstrap_race_fails_and_its_restart_discar
         .race_the_create
         .store(true, std::sync::atomic::Ordering::Release);
 
+    assert_race_lost_then_discarded(&b, &hooks);
+}
+
+/// `b`'s start over `hooks` loses the bootstrap race: it fails startup,
+/// writes no marker and removes no artefact, and its restart discards
+/// every snapshot as `predates_high_water`.
+fn assert_race_lost_then_discarded(b: &Node, hooks: &Hooks) {
+    let snapshots_before = artefacts(b);
     let Err(err) = b.restart_over(hooks.wrap(b.store())) else {
         panic!("the loser must fail startup");
     };
@@ -223,7 +231,8 @@ async fn rfc0059_12_the_loser_of_the_bootstrap_race_fails_and_its_restart_discar
         ),
         "{err}"
     );
-    assert!(!b.snapshots.join(SEATED_MARKER).exists());
+    assert!(!b.snapshots.join(SEATED_MARKER).exists(), "no marker");
+    assert_eq!(artefacts(b), snapshots_before, "nothing is removed");
 
     let restarted = b.restart().expect("the restart");
     assert!(
@@ -246,35 +255,12 @@ async fn rfc0059_12_the_loser_of_the_bootstrap_race_fails_and_its_restart_discar
 async fn rfc0059_12_a_high_water_created_after_the_trust_read_fails_the_start() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let (_, b) = two_pre_rfc_receivers(tmp.path()).await;
-    let snapshots_before = artefacts(&b);
     let hooks = Hooks::default();
     hooks
         .create_after_absent_read
         .store(true, std::sync::atomic::Ordering::Release);
 
-    let Err(err) = b.restart_over(hooks.wrap(b.store())) else {
-        panic!("a start whose trust read is stale must fail");
-    };
-    assert!(
-        matches!(
-            err,
-            RecoveryDriverError::TemplateIds(TemplateIdsError::BootstrapRaceLost)
-        ),
-        "{err}"
-    );
-    assert!(!b.snapshots.join(SEATED_MARKER).exists(), "no marker");
-    assert_eq!(artefacts(&b), snapshots_before, "nothing is removed");
-
-    let restarted = b.restart().expect("the restart");
-    assert!(
-        restarted
-            .report
-            .tenants
-            .iter()
-            .all(|t| matches!(&t.fate, SnapshotFate::Discarded(r) if r.error_type() == "predates_high_water")),
-        "{:?}",
-        restarted.report.tenants
-    );
+    assert_race_lost_then_discarded(&b, &hooks);
 }
 
 /// Scenario RFC0059.12 — a markerless start that saw the high-water, and

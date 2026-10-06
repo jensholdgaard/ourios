@@ -202,20 +202,15 @@ fn exhausted_after_adopting(switch: &Switch, cluster: &mut MinerCluster, t: &Ten
     adopted
 }
 
-#[test]
-fn a_known_adoption_resolves_on_an_exhausted_range() {
+/// On an exhausted range, `record` resolves to the adopted identity:
+/// it is not a new one, so it needs no fresh id.
+fn assert_resolves_to_the_adoption(record: impl Fn(&TenantId) -> OtlpLogRecord, why: &str) {
     let switch = Switch::new();
     let (mut cluster, _) = reserving_cluster(&switch);
     let t = TenantId::new("t");
     let adopted = exhausted_after_adopting(&switch, &mut cluster, &t);
 
-    let again = cluster.ingest(&adopted_record(
-        &t,
-        "user 9 logged in",
-        "user <*> logged in",
-    ));
-
-    assert_eq!(again, adopted, "a known identity needs no fresh id");
+    assert_eq!(cluster.ingest(&record(&t)), adopted, "{why}");
     assert_eq!(
         cluster.parse_failures_total(),
         1,
@@ -224,21 +219,17 @@ fn a_known_adoption_resolves_on_an_exhausted_range() {
 }
 
 #[test]
-fn a_mined_line_converging_on_an_adoption_resolves_on_an_exhausted_range() {
-    let switch = Switch::new();
-    let (mut cluster, _) = reserving_cluster(&switch);
-    let t = TenantId::new("t");
-    let adopted = exhausted_after_adopting(&switch, &mut cluster, &t);
-
-    let converged = cluster.ingest(&string_record(&t, "user 8 logged in"));
-
-    assert_eq!(
-        converged, adopted,
-        "the mined leaf takes over the adopted identity without a fresh id"
+fn a_known_adoption_resolves_on_an_exhausted_range() {
+    assert_resolves_to_the_adoption(
+        |t| adopted_record(t, "user 9 logged in", "user <*> logged in"),
+        "a known identity needs no fresh id",
     );
-    assert_eq!(
-        cluster.parse_failures_total(),
-        1,
-        "only the new identity failed"
+}
+
+#[test]
+fn a_mined_line_converging_on_an_adoption_resolves_on_an_exhausted_range() {
+    assert_resolves_to_the_adoption(
+        |t| string_record(t, "user 8 logged in"),
+        "the mined leaf takes over the adopted identity without a fresh id",
     );
 }

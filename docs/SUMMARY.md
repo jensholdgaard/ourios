@@ -86,6 +86,7 @@
 - [RFC 0056 — Audit-sink durability on permanent write failure](./rfcs/0056-audit-durability.md)
 - [RFC 0057 — meta: move CLAUDE.md to AGENTS.md](./rfcs/0057-agents-md.md)
 - [RFC 0058 — Query resource limits](./rfcs/0058-query-resource-limits.md)
+- [RFC 0059 — Durable template-id allocation](./rfcs/0059-durable-template-id-allocation.md)
 
 # Talks
 

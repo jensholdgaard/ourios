@@ -522,6 +522,9 @@ direction and the primary obligation lives in those other RFCs.
 >   scratch
 > - **And** no frame at or below `S` reaches the miner (no
 >   double-apply — the v1 hazard that gated restore)
+> - *Amended by RFC 0059 (2026-10-05).* Through the recovery driver,
+>   the equality holds up to an injective renaming of ids first minted
+>   in tail replay (RFC0059.9).
 
 > **Scenario §3.5.4 — Stale snapshot degrades loudly, not silently (2026-06-12 amendment)**
 > - **Given** a snapshot at high-water mark `S`, a Parquet
@@ -1191,6 +1194,18 @@ are an opt-in concern and are not provided by the miner. A future
 hash over `(severity_number, scope_name, masked_body_tokens)` for
 opt-in cross-tenant use; the gate for adding it is "we have a
 concrete consumer," not "it might be useful."
+
+> **Amended by RFC 0059 (2026-10-05, #898).** Uniqueness is now a
+> durable guarantee backed by a template-id high-water in object
+> storage. Ids are monotonic per allocator only, not dense, and not
+> monotonic across receiver replicas.
+>
+> **Amended by RFC 0059 (2026-10-06).** "Never reused or reassigned"
+> now has a boundary:
+> - an id still bound by stored data or audit is never reissued;
+> - an id whose data and audit retention or erasure removed may be
+>   reissued after an authorised re-bootstrap (RFC 0059 §3.7,
+>   RFC0059.19). Nothing stored binds it, so that is harmless.
 
 **Template version.** `template_version` starts at 1 when the
 template is created and increments by 1 on every widening event:
@@ -2251,6 +2266,12 @@ boundary at 1.0 (see §6.3): default buckets
 > not silent). New acceptance criteria: §3.5.3
 > (restore-equivalence), §3.5.4 (stale-snapshot fallback); the
 > end-to-end driver contract is RFC 0008's RFC0008.10.
+
+> **Amended by RFC 0059 (2026-10-05, #898).** The `template_id`
+> allocator draws only from blocks reserved in a durable
+> template-id high-water in object storage. Every start reads that
+> high-water before replay and allocates above it, and the first start
+> bootstraps it from the data and audit footers.
 
 **Hot path.** The per-tenant tree lives in process memory on the
 ingester. Tree operations (descend, simSeq, attach, widen) are

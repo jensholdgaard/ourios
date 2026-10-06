@@ -23,7 +23,7 @@ use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, TenantBatch, Wal, WalOffset};
 use prost::Message;
 
-use crate::ingest_support::{coordinator, string_value, wal_config};
+use crate::ingest_support::{coordinator, string_value, template_ids, wal_config};
 use crate::rfc0052_17_legacy_snapshot_marks::{
     downgrade_segments, write_legacy_checkpoint, write_v1_snapshot,
 };
@@ -140,8 +140,13 @@ async fn a_version_2_artefact_is_discarded_once_and_the_rewrite_restores() {
 fn start(wal_root: &Path) -> (RecoveryReport, MinerCluster) {
     let mut wal = Wal::open(wal_config(wal_root)).expect("open WAL");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    let report =
-        recovery::recover(&mut wal, &wal_root.join("snapshots"), &mut miner).expect("recover");
+    let report = recovery::recover(
+        &mut wal,
+        &wal_root.join("snapshots"),
+        &mut miner,
+        &template_ids(wal_root),
+    )
+    .expect("recover");
     (report, miner)
 }
 

@@ -114,6 +114,21 @@ check "s3 existingSecret envFrom is untouched" \
       --set 'receiver.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
       --set 'receiver.extraEnv[0].value=x=y')"
 
+# --- RFC 0059 template-id bootstrap ------------------------------------------
+
+# The chart runs the binary with --config, which reads no bare env var, so
+# the authorisation must reach the receiver's rendered config.
+receiver_config() {
+  helm template t "$CHART" --show-only templates/configmap.yaml "$@" \
+    | sed -n '/receiver:/,/compaction:/p'
+}
+check "bootstrap authorisation is off by default" "" \
+  "$(receiver_config | grep 'template_ids_allow_bootstrap' || true)"
+check "templateIdsAllowBootstrap renders into the receiver config" \
+  "template_ids_allow_bootstrap: true" \
+  "$(receiver_config --set receiver.templateIdsAllowBootstrap=true \
+      | grep -o 'template_ids_allow_bootstrap: true')"
+
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2
   exit 1

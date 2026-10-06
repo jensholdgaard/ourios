@@ -197,6 +197,10 @@ async fn rfc0016_7_receiver_and_querier_compose_in_one_binary() {
         .env("OURIOS_WAL_ROOT", &wal_root)
         .env("OURIOS_QUERIER_ENABLED", "1")
         .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
+        // The seeded row predates the receiver's first start: the start that
+        // bootstraps the template-id high-water over it is authorised
+        // (RFC 0059 §3.5).
+        .env("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP", "true")
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()

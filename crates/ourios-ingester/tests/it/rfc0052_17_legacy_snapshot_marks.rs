@@ -14,12 +14,13 @@ use ourios_config::MinerConfig;
 use ourios_core::tenant::TenantId;
 use ourios_ingester::recovery::{self, RecoveryDriverError};
 use ourios_ingester::snapshot_store;
+use ourios_ingester::template_ids::{HIGH_WATER_KEY, SEATED_MARKER};
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::snapshot::SNAPSHOT_VERSION;
 use ourios_wal::{FrameKind, RotationKind, TenantBatch, Wal, WalOffset};
 use prost::Message;
 
-use crate::ingest_support::{request, resource_logs, wal_config};
+use crate::ingest_support::{request, resource_logs, template_ids, wal_config};
 
 /// A pre-RFC root reclaimed past its version-1 snapshot fails closed,
 /// naming the tenant.
@@ -107,6 +108,41 @@ fn a_version_1_mark_for_a_tenant_without_any_frame_boots() {
     recover(tmp.path()).expect("the root boots");
 }
 
+/// A markerless root over a store that already has the template-id
+/// high-water discards its artefacts (RFC 0059 §3.5), but keeps them
+/// until the legacy check passes: a refused start leaves the version-1
+/// evidence and no marker, so the next start refuses again instead of
+/// booting past the gap.
+#[test]
+fn a_refused_legacy_check_keeps_the_evidence_for_the_next_start() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let [first, _] = legacy_root(tmp.path(), Reclaimed::Nothing);
+    write_v1_snapshot(tmp.path(), "alpha", Some(first));
+    write_undecodable_v1(tmp.path(), "beta");
+    let ids = template_ids(tmp.path());
+    ids.store()
+        .put_blocking(HIGH_WATER_KEY, br#"{"reserved_through": 0}"#.to_vec())
+        .expect("a seated store");
+
+    for start in ["first", "second"] {
+        let refused = recover(tmp.path())
+            .err()
+            .unwrap_or_else(|| panic!("the {start} start must refuse"));
+        assert!(
+            matches!(&refused, RecoveryDriverError::LegacyMarkUnreadable(t) if t.as_str() == "beta"),
+            "{start}: {refused}"
+        );
+        assert!(
+            snapshots(tmp.path()).join("beta.snap").exists(),
+            "{start}: the evidence stays"
+        );
+        assert!(
+            !snapshots(tmp.path()).join(SEATED_MARKER).exists(),
+            "{start}: no marker"
+        );
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reclaimed {
     Nothing,
@@ -169,7 +205,7 @@ fn write_undecodable_v1(root: &Path, tenant: &str) {
 fn recover(root: &Path) -> Result<(recovery::RecoveryReport, MinerCluster), RecoveryDriverError> {
     let mut wal = Wal::open(wal_config(root)).expect("reopen the legacy root");
     let mut miner = MinerCluster::new(MinerConfig::default());
-    let report = recovery::recover(&mut wal, &snapshots(root), &mut miner)?;
+    let report = recovery::recover(&mut wal, &snapshots(root), &mut miner, &template_ids(root))?;
     Ok((report, miner))
 }
 

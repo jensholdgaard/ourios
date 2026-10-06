@@ -100,6 +100,24 @@ fn has_extension(path: &Path, ext: &str) -> bool {
     path.extension().is_some_and(|e| e == ext)
 }
 
+/// SIGTERM the server so its graceful-shutdown drain flushes the sink,
+/// and assert it exits cleanly.
+async fn terminate_cleanly(child: &mut tokio::process::Child) {
+    let pid = child.id().expect("server pid");
+    let kill_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .expect("run kill -TERM");
+    assert!(kill_status.success(), "kill -TERM, got {kill_status:?}");
+    let status = timeout(Duration::from_secs(15), child.wait())
+        .await
+        .expect("server exits before timeout")
+        .expect("await server exit");
+    assert!(status.success(), "clean exit, got {status:?}");
+}
+
 /// Scenario RFC0013.6 — with an object-storage backend, only data/audit/manifest
 /// objects reach the store; the WAL stays on local disk (`CLAUDE.md` §3.4).
 /// See `docs/rfcs/0013-object-storage.md` §5.
@@ -154,19 +172,7 @@ async fn rfc0013_6_wal_stays_local() {
         response.lines().next(),
     );
 
-    let pid = child.id().expect("server pid");
-    let kill_status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .await
-        .expect("run kill -TERM");
-    assert!(kill_status.success(), "kill -TERM, got {kill_status:?}");
-    let status = timeout(Duration::from_secs(15), child.wait())
-        .await
-        .expect("server exits before timeout")
-        .expect("await server exit");
-    assert!(status.success(), "clean exit, got {status:?}");
+    terminate_cleanly(&mut child).await;
 
     // Assert: the store holds the Parquet data and nothing WAL-ish; the WAL
     // segments stayed under the local WAL root.
@@ -184,11 +190,15 @@ async fn rfc0013_6_wal_stays_local() {
         !data_parquet.is_empty(),
         "the shutdown drain landed at least one data Parquet object in the store; saw {store_files:?}",
     );
+    // RFC 0059 §3.1: the template-id high-water is the one other object the
+    // receiver keeps in the store.
+    let high_water = bucket_root.join(ourios_ingester::template_ids::HIGH_WATER_KEY);
     for path in &store_files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         assert!(
-            has_extension(path, "parquet") || name == "manifest.json",
-            "only Parquet/manifest objects reach the store, found {path:?}",
+            has_extension(path, "parquet") || name == "manifest.json" || *path == high_water,
+            "only Parquet/manifest objects and the template-id high-water reach the store, \
+             found {path:?}",
         );
         assert!(
             !has_extension(path, "wal"),

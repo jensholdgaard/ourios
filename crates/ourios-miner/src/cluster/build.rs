@@ -10,7 +10,7 @@ use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::record::{NoOpRecordSink, RecordSink};
 use ourios_core::tenant::TenantId;
 
-use super::{MinedCapture, MinerCluster};
+use super::{IdRange, MinedCapture, MinerCluster};
 use crate::metrics::MinerMetrics;
 
 impl MinerCluster {
@@ -39,9 +39,7 @@ impl MinerCluster {
             config,
             tenant_overrides: HashMap::new(),
             tenants: HashMap::new(),
-            // Start at 1 so 0 stays available as the [`NO_TEMPLATE`]
-            // sentinel.
-            next_template_id: 1,
+            ids: IdRange::new(),
             audit_sink: sink,
             record_sink: Box::new(NoOpRecordSink::new()),
             merges_total: AtomicU64::new(0),

@@ -125,6 +125,7 @@ auth:
 | `OURIOS_RECEIVER_ENABLED` / `OURIOS_RECEIVER_GRPC_ADDR` / `OURIOS_RECEIVER_HTTP_ADDR` | receiver role |
 | `OURIOS_WAL_ROOT` | WAL directory (receiver) |
 | `OURIOS_RECEIVER_ENCODE_WORKERS` | concurrent encode pool size (RFC 0035; default: all cores) |
+| `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` / `receiver.template_ids_allow_bootstrap` | authorise the one-time template-id bootstrap over existing data, for the upgrade to RFC 0059 only (default off) |
 | `OURIOS_QUERIER_ENABLED` / `OURIOS_QUERIER_HTTP_ADDR` / `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` | querier role |
 | `OURIOS_QUERIER_MCP_ENABLED` | the `/mcp` agent surface (RFC 0027) |
 | `OURIOS_COMPACTION_ENABLED` / `OURIOS_COMPACTION_INTERVAL_SECS` | background compactor |

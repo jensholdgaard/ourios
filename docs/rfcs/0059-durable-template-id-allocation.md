@@ -1,7 +1,7 @@
 ---
 rfc: 0059
 title: Durable template-id allocation (RFC 0001 amendment)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-05
@@ -11,8 +11,11 @@ superseded-by: —
 
 # RFC 0059 — Durable template-id allocation (RFC 0001 amendment)
 
-> **Status: `red`.** Every §5 scenario, RFC0059.1 to RFC0059.19, has an
-> `#[ignore]`d `todo!` stub naming the slice that discharges it. This RFC
+> **Status: `green` (2026-10-06).** Every §5 scenario, RFC0059.1 to
+> RFC0059.19, passes. The implementation (#911) replaced each `red`-stage
+> stub with its test, and no RFC0059 stub stays `#[ignore]`d.
+>
+> *(`red`: an `#[ignore]`d `todo!` stub per scenario, #912.)* This RFC
 > amends RFC 0001 §6.1 (template identity), §6.9 (persistence and
 > recovery) and scenario §3.5.3, and RFC 0023 §3.4 (the parse-failure
 > reason enum). It coordinates with RFC 0052 §3.7 (the audit gate, for

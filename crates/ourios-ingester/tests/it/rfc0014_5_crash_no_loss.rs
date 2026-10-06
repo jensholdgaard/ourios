@@ -24,6 +24,7 @@ use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
+use ourios_ingester::template_ids::TemplateIds;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{Reader, Store};
 use ourios_wal::{Wal, WalConfig};
@@ -124,12 +125,13 @@ fn rfc0014_5_no_acknowledged_data_loss() {
     // it into the new buffer; a flush then lands them in the store.
     let mut wal = Wal::open(wal_config(&wal_root)).expect("reopen WAL");
     let store = Store::local(&bucket_root).expect("store");
+    let ids = TemplateIds::new(store.clone()).with_bootstrap_allowed(true);
     let sink = SharedParquetSink::new(ParquetRecordSink::new(store, never_flush()));
     let mut miner =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let snapshots_root = wal_root.join("snapshots"); // the fixture wrote none → full replay
     let report =
-        recovery::recover(&mut wal, &snapshots_root, &mut miner).expect("startup recovery");
+        recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids).expect("startup recovery");
     assert_eq!(
         report.records_fed_to_miner, 2,
         "replay re-mined both records"

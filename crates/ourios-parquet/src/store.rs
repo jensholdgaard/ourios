@@ -30,7 +30,8 @@ use object_store::client::SpawnedReqwestConnector;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use tokio::runtime::Runtime;
 
@@ -154,6 +155,29 @@ pub struct DelimitedListing {
     pub common_prefixes: Vec<String>,
 }
 
+/// The tail of an object, from [`Store::get_suffix`].
+#[derive(Debug, Clone)]
+pub struct Suffix {
+    /// Up to the requested number of the object's last bytes.
+    pub bytes: bytes::Bytes,
+    /// The whole object's size.
+    pub object_size: u64,
+}
+
+/// What [`Store::sync_local_blocking`] fsyncs for `path` under `root`, in
+/// order: the object, then each directory from its own up to and
+/// including `root`.
+fn local_sync_targets<'p>(
+    root: &'p std::path::Path,
+    path: &'p std::path::Path,
+) -> impl Iterator<Item = &'p std::path::Path> {
+    std::iter::once(path).chain(
+        path.ancestors()
+            .skip(1)
+            .take_while(move |dir| dir.starts_with(root)),
+    )
+}
+
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
 /// same code path targets `LocalFileSystem` or `AmazonS3` / S3-compatible.
@@ -173,6 +197,9 @@ pub struct Store {
     /// commits with on S3. `false` for `LocalFileSystem`, which rejects
     /// `PutMode::Update` (see [`Self::supports_conditional_update`]).
     conditional_update: bool,
+    /// The directory a local backend writes under, for
+    /// [`Self::sync_local_blocking`]; `None` on every other backend.
+    local_root: Option<std::path::PathBuf>,
 }
 
 /// Addressing for the S3 / S3-compatible backend (RFC0013.7) — bucket,
@@ -380,6 +407,19 @@ impl StoreError {
         )
     }
 
+    /// True if the backend refused the call for want of a permission (an
+    /// S3 `403`) or of credentials.
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::Backend(
+                object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+            )
+        )
+    }
+
     /// True if a create-if-absent (`If-None-Match`) failed because the object
     /// already exists (see [`Store::put_if_absent`]).
     #[must_use]
@@ -400,14 +440,27 @@ impl Store {
     /// [`StoreError::Backend`] if `root` cannot be opened as an
     /// `object_store` `LocalFileSystem` (e.g. it does not exist).
     pub fn local(root: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
-        let fs = LocalFileSystem::new_with_prefix(root).map_err(StoreError::Backend)?;
+        let fs = LocalFileSystem::new_with_prefix(root.as_ref()).map_err(StoreError::Backend)?;
         Ok(Self {
             inner: Arc::new(fs),
             prefix: ObjectPath::default(),
             // `LocalFileSystem` rejects `PutMode::Update`, so it has no `If-Match`
             // CAS; the compactor commits the manifest with an atomic overwrite here.
             conditional_update: false,
+            local_root: Some(root.as_ref().to_path_buf()),
         })
+    }
+
+    /// An in-process backend with `If-Match` support, for tests and
+    /// tools that need the conditional-update path without an S3 endpoint.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            prefix: ObjectPath::default(),
+            conditional_update: true,
+            local_root: None,
+        }
     }
 
     /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
@@ -540,6 +593,7 @@ impl Store {
             // The backend keeps object_store's default `S3ConditionalPut::ETagMatch`,
             // so the `If-Match` CAS the manifest generation-swap needs is available.
             conditional_update: true,
+            local_root: None,
         })
     }
 
@@ -582,6 +636,33 @@ impl Store {
     #[must_use]
     pub fn prefix(&self) -> &ObjectPath {
         &self.prefix
+    }
+
+    /// Make an object the local backend just wrote durable: fsync the
+    /// file, then every directory from its own up to the store root, so a
+    /// directory the put newly created (e.g. `miner/`) is durable in its
+    /// parent too. `LocalFileSystem` creates directories and renames a
+    /// written file into place without any fsync, so a crash could lose a
+    /// put that had returned. A no-op on every other backend, whose puts
+    /// are durable once they return.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] when the file or its directory cannot be
+    /// synced.
+    pub fn sync_local_blocking(&self, key: &str) -> Result<(), StoreError> {
+        let Some(root) = &self.local_root else {
+            return Ok(());
+        };
+        let path = root.join(self.resolve(key)?.as_ref());
+        local_sync_targets(root, &path)
+            .try_for_each(|p| std::fs::File::open(p).and_then(|f| f.sync_all()))
+            .map_err(|source| {
+                StoreError::Backend(object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                })
+            })
     }
 
     /// Resolve a `/`-delimited `key` to an absolute object path under the
@@ -635,6 +716,24 @@ impl Store {
         Ok(bytes.to_vec())
     }
 
+    /// Read up to the last `len` bytes of the object at `key`, with the
+    /// object's whole size — one ranged `GET`, which is how a Parquet footer
+    /// is read without fetching the file.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if the object is missing or the read fails.
+    pub async fn get_suffix(&self, key: &str, len: u64) -> Result<Suffix, StoreError> {
+        let options = GetOptions::default().with_range(Some(GetRange::Suffix(len)));
+        let got = self
+            .inner
+            .get_opts(&self.resolve(key)?, options)
+            .await
+            .map_err(StoreError::Backend)?;
+        let object_size = got.meta.size;
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok(Suffix { bytes, object_size })
+    }
+
     /// Delete the object at `key`.
     ///
     /// # Errors
@@ -676,6 +775,17 @@ impl Store {
     pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
         block_on_off_runtime(async move { store.get(&key).await })
+    }
+
+    /// Blocking [`Self::get_suffix`] for the sync call sites. Safe to call
+    /// from inside a tokio runtime (see [`Self::get_blocking`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::get_suffix`].
+    pub fn get_suffix_blocking(&self, key: &str, len: u64) -> Result<Suffix, StoreError> {
+        let (store, key) = (self.clone(), key.to_owned());
+        block_on_off_runtime(async move { store.get_suffix(&key, len).await })
     }
 
     /// List every object key under `prefix` (store-relative), recursively, in
@@ -1028,6 +1138,35 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_local_sync_covers_every_directory_up_to_the_store_root() {
+        let root = std::path::Path::new("/store");
+        let object = root.join("miner").join("template_ids.v1.json");
+        let targets: Vec<&std::path::Path> = super::local_sync_targets(root, &object).collect();
+        assert_eq!(
+            targets,
+            [object.as_path(), &root.join("miner"), root],
+            "the object, its new directory, and the root holding that directory's entry"
+        );
+    }
+
+    #[test]
+    fn a_local_write_syncs_and_other_backends_need_nothing() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let local = super::Store::local(tmp.path()).expect("local");
+        local
+            .put_blocking("miner/key.json", b"{}".to_vec())
+            .expect("put");
+        local.sync_local_blocking("miner/key.json").expect("synced");
+        assert!(
+            local.sync_local_blocking("miner/absent.json").is_err(),
+            "an object the put never wrote cannot be made durable"
+        );
+        super::Store::in_memory()
+            .sync_local_blocking("miner/absent.json")
+            .expect("nothing to sync off the local backend");
+    }
+
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::thread::ThreadId;

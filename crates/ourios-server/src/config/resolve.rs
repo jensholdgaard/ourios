@@ -97,6 +97,11 @@ pub struct ReceiverParams {
     /// config-file only; the env path always gets the defaults, whose
     /// `ignore` mode is byte-identical pre-RFC behaviour).
     pub miner: MinerConfig,
+    /// RFC 0059 §3.5 — whether this start may bootstrap the template-id
+    /// high-water on a store that already holds data
+    /// (`receiver.template_ids_allow_bootstrap` /
+    /// `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP`; default off).
+    pub template_ids_allow_bootstrap: bool,
 }
 
 /// Raw inputs for [`build_store_config`]. Named fields so the env and
@@ -159,6 +164,10 @@ pub struct ReceiverInputs<'a> {
     pub http_tls: Option<&'a TlsSection>,
     /// `miner.*` (config-file only, RFC 0050 §3.2).
     pub miner: MinerInputs<'a>,
+    /// `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` /
+    /// `receiver.template_ids_allow_bootstrap` (`1`/`true`/`yes`
+    /// authorises; default off — RFC 0059 §3.5).
+    pub template_ids_allow_bootstrap: Option<&'a str>,
 }
 
 /// Raw inputs for [`build_querier_config`].
@@ -248,6 +257,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
     let grpc_addr = std::env::var("OURIOS_RECEIVER_GRPC_ADDR").ok();
     let http_addr = std::env::var("OURIOS_RECEIVER_HTTP_ADDR").ok();
     let encode_workers = std::env::var("OURIOS_RECEIVER_ENCODE_WORKERS").ok();
+    let allow_bootstrap = std::env::var("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP").ok();
     // TLS and the miner dial are config-file only (RFC 0030 §3.1 /
     // RFC 0050 §3.2): the env path takes the defaults (plaintext,
     // `ignore` mode).
@@ -257,6 +267,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         http_addr: http_addr.as_deref(),
         wal_root: std::env::var_os("OURIOS_WAL_ROOT").map(PathBuf::from),
         encode_workers: encode_workers.as_deref(),
+        template_ids_allow_bootstrap: allow_bootstrap.as_deref(),
         ..ReceiverInputs::default()
     })?;
     let querier_enabled = std::env::var("OURIOS_QUERIER_ENABLED").ok();
@@ -348,6 +359,7 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
             upstream_template_byte_limit: file.miner.upstream_template_byte_limit.as_deref(),
             upstream_association_limit: file.miner.upstream_association_limit.as_deref(),
         },
+        template_ids_allow_bootstrap: file.receiver.template_ids_allow_bootstrap.as_deref(),
     })?;
     let querier = build_querier_config(QuerierInputs {
         enabled: file.querier.enabled.as_deref(),
@@ -536,6 +548,10 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         None => None,
     };
     let miner = build_miner_config(inputs.miner)?;
+    let template_ids_allow_bootstrap = matches!(
+        inputs.template_ids_allow_bootstrap.map(str::trim),
+        Some("1" | "true" | "yes")
+    );
     Ok(Some(ReceiverParams {
         grpc_addr,
         grpc_tls,
@@ -544,6 +560,7 @@ pub fn build_receiver_config(inputs: ReceiverInputs<'_>) -> Result<Option<Receiv
         wal_root,
         encode_workers,
         miner,
+        template_ids_allow_bootstrap,
     }))
 }
 
@@ -1038,6 +1055,31 @@ querier:
             1800 * NANOS_PER_SEC,
             "the file value wins; the bare env var is ignored",
         );
+    }
+
+    /// RFC 0059 §3.5 — the bootstrap authorisation is off unless the
+    /// file says so, and it rides `${env:…}` like any other value.
+    #[test]
+    fn rfc0059_the_template_id_bootstrap_is_authorised_only_explicitly() {
+        let resolve = |extra: &str| {
+            server_config(&format!(
+                "\
+storage:
+  local:
+    bucket_root: /store
+receiver:
+  enabled: true
+  wal_root: /wal
+{extra}"
+            ))
+            .expect("valid")
+            .receiver
+            .expect("enabled")
+            .template_ids_allow_bootstrap
+        };
+        assert!(!resolve(""), "off by default");
+        assert!(resolve("  template_ids_allow_bootstrap: true\n"));
+        assert!(!resolve("  template_ids_allow_bootstrap: false\n"));
     }
 
     /// RFC 0050 §3.2 — the `miner.*` section resolves onto the

@@ -441,11 +441,15 @@ async fn rfc0019_2_wal_stays_local_under_s3() {
     );
     for key in &keys {
         // The store only ever holds data/audit objects (manifests live under
-        // `data/<partition>/manifest.json`); a WAL segment would surface as a
-        // `wal/...` key, which this prefix check positively excludes.
+        // `data/<partition>/manifest.json`), plus RFC 0059 §3.1's template-id
+        // high-water; a WAL segment would surface as a `wal/...` key, which
+        // this check positively excludes.
         assert!(
-            key.starts_with("data/") || key.starts_with("audit/"),
-            "only data/audit objects reach the object store, found {key:?}",
+            key.starts_with("data/")
+                || key.starts_with("audit/")
+                || *key == ourios_ingester::template_ids::HIGH_WATER_KEY,
+            "only data/audit objects and the template-id high-water reach the object \
+             store, found {key:?}",
         );
     }
 

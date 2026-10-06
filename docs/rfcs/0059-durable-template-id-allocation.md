@@ -28,7 +28,8 @@ so a discarded snapshot, reclaimed WAL frames, or a replaced local root
 can restart it below ids that Parquet rows and audit events already
 carry, and the next new template takes one of them (#898). This RFC makes
 uniqueness durable:
-- one small object in the store records the highest id ever reserved;
+- one small object in the store records the highest id reserved since
+  it was created;
 - the allocator draws only from blocks it has reserved there, before
   using them;
 - every start allocates above it.
@@ -303,11 +304,14 @@ and replay mints from those blocks.
   object-store outage): a restart then needs the store reachable, but a
   guessed floor could silently bind published rows to another template.
 
-**The guarantee.** Write-before-allocate makes every id ever issued at
-most `N`. Every start allocates only above `N`. So nothing replay or
+**The guarantee.** Within one high-water generation (between
+re-bootstraps, §3.1), write-before-allocate makes every id issued at
+most `N`, and every start allocates only above `N`. So nothing replay or
 later ingest mints can equal an id issued before the restart, whatever
 recovery restored, discarded, or never found. A replaced local root is
 covered too: it has no snapshots and no WAL, but `N` is in the store.
+Across a re-bootstrap the guarantee covers every id still bound by
+stored data or audit (§3.7, RFC0059.19).
 
 **Restore equivalence** (amends RFC 0001 scenario §3.5.3, approved by
 the maintainer on 2026-10-05):
@@ -444,8 +448,9 @@ footer exceeds 64 KiB). On the reporter's node that is about 620,000
 footer reads and, for two tenants with a year of hourly partitions,
 about 17,500 hour-level `LIST`s.
 
-This is the whole-prefix walk #853 warns about. It is paid once per
-store, at its first start under this RFC, and never again.
+This is the whole-prefix walk #853 warns about. It runs at a store's
+first start under this RFC and again at each authorised re-bootstrap
+(§3.1). Ordinary starts between re-bootstraps never scan.
 
 **Memory.**
 - **Listings.** `list_delimited_blocking` materialises one directory's
@@ -587,7 +592,7 @@ DuckDB procedure finds them.
   pre-RFC writer would mean finding data files whose ids exceed the
   floor yet were not allocated from a reservation. That needs
   re-listing every data partition after the bootstrap, the whole-prefix
-  walk (#853) the bootstrap pays only once. It is not cheap enough to
+  walk (#853) that runs only at a bootstrap. It is not cheap enough to
   run, so the receiver does not warn. The DuckDB procedure from #908
   finds any collision such an upgrade left.
 - **Relation to RFC 0052.** The discard runs before RFC 0052 §3.2's
@@ -844,10 +849,15 @@ are listed exactly so that registry PR can be finalised:
 
 | Name | Kind | Attributes / members |
 |---|---|---|
-| `ourios.receiver.template_ids.bootstrapped` | event, at most once per store (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
+| `ourios.receiver.template_ids.bootstrapped` | event, once per successful creation of the high-water: the upgrade bootstrap and each authorised re-bootstrap (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
 | `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
 | `ourios.miner.parse_failure.reason` | existing enum attribute | new member `id_reservation_failed` |
 | `ourios.receiver.snapshot.discarded` | existing event | new `error.type` value `predates_high_water` (§3.5) |
+
+The registry's brief and note for `ourios.receiver.template_ids.bootstrapped`
+say the same, "once per successful creation of the high-water"
+(ourios-semconv#9). #911 pins the semconv patch release that carries
+it, v0.3.7, once that change merges.
 
 Reservation failures in the background refiller log through the
 existing `tracing` warn path, with `error.type` set to the store error
@@ -967,8 +977,9 @@ The ids are referenced from test code.
 >   max(data_max, audit_max, restored_max)`, with no margin
 > - **And** every id allocated afterwards is above it
 > - **And** `ourios.receiver.template_ids.bootstrapped` is logged at most
->   once per store, by the start whose create landed, with the floor and
->   the maxima (a crash between the create and the event leaves none)
+>   once per successful creation of the high-water, by the start whose
+>   create landed, with the floor and the maxima (a crash between the
+>   create and the event leaves none)
 > - **And** a restart killed mid-scan leaves no object, and the next start
 >   redoes the scan and writes once
 > - **And** when any scan step fails (a listing, a ranged read, a footer

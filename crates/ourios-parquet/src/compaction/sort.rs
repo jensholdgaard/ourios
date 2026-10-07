@@ -38,11 +38,12 @@ pub(super) struct SortTotals {
 /// [`SortTuning::in_memory_max_bytes`]; a partition that never crosses
 /// it sorts wholly in memory, and one that does spills the buffer as a
 /// sorted run at the end of the input that filled it. Peak residency is
-/// therefore the budget plus one decoded input in phase 1 and, via
-/// [`reduce_runs`]'s fan-in cap F, (F + 1) × one decoded batch in
-/// phase 2 (one batch per open run plus the merge's output chunk) —
-/// independent of how many inputs the partition holds or how well they
-/// compress.
+/// therefore the budget plus one decoded input in phase 1 and, in
+/// phase 2, one decoded batch per open run — sized so the open runs
+/// together hold at most the budget, whatever the row width (see
+/// [`cursor_batch_rows`]) — plus the merge's [`SUB_BATCH_ROWS`] output
+/// chunk; independent of how many inputs the partition holds or how
+/// well they compress.
 pub(super) fn sort_inputs_into(
     writer: &mut Writer,
     plan: SortPlan<'_>,
@@ -120,6 +121,9 @@ struct RunFormation<'a> {
     plan: SortPlan<'a>,
     buffer: Vec<MinedRecord>,
     buffered_bytes: u64,
+    /// The widest buffered row's [`decoded_footprint`], carried onto the
+    /// run the buffer spills as.
+    widest_row: u64,
     spill: Option<Spill>,
 }
 
@@ -129,6 +133,7 @@ impl<'a> RunFormation<'a> {
             plan,
             buffer: Vec::new(),
             buffered_bytes: 0,
+            widest_row: 0,
             spill: None,
         }
     }
@@ -136,7 +141,14 @@ impl<'a> RunFormation<'a> {
     fn push(&mut self, batch: Vec<MinedRecord>) {
         #[cfg(test)]
         residency::add(batch.len());
-        let bytes: u64 = batch.iter().map(decoded_footprint).sum();
+        let mut bytes = 0_u64;
+        for record in &batch {
+            let footprint = decoded_footprint(record);
+            bytes = bytes.saturating_add(footprint);
+            self.widest_row = self.widest_row.max(footprint);
+        }
+        #[cfg(test)]
+        residency::add_bytes(bytes);
         self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
         self.buffer.extend(batch);
     }
@@ -157,17 +169,24 @@ impl<'a> RunFormation<'a> {
         };
         let spill = self.spill.insert(spill);
         sort_records(self.plan.keys, &mut self.buffer);
-        let run = spill_run(
+        let path = spill_run(
             spill.scratch.path(),
             spill.runs.len(),
             &self.buffer,
             self.plan.promoted,
         )?;
-        spill.runs.push(run);
+        spill.runs.push(Run {
+            path,
+            widest_row: self.widest_row,
+        });
         #[cfg(test)]
-        residency::sub(self.buffer.len());
+        {
+            residency::sub(self.buffer.len());
+            residency::sub_bytes(self.buffered_bytes);
+        }
         self.buffer.clear();
         self.buffered_bytes = 0;
+        self.widest_row = 0;
         Ok(())
     }
 
@@ -207,14 +226,37 @@ fn emit_in_memory(
         .append_records(&rows)
         .map_err(CompactionError::Write)?;
     #[cfg(test)]
-    residency::sub(rows.len());
+    {
+        residency::sub(rows.len());
+        residency::sub_bytes(rows.iter().map(decoded_footprint).sum());
+    }
     Ok(())
 }
 
 /// Sorted runs on local scratch, in spill order.
 struct Spill {
     scratch: tempfile::TempDir,
-    runs: Vec<PathBuf>,
+    runs: Vec<Run>,
+}
+
+/// A sorted run on local scratch and the widest decoded row it holds —
+/// what sizes its reader's batches in the merge.
+pub(super) struct Run {
+    pub(super) path: PathBuf,
+    pub(super) widest_row: u64,
+}
+
+/// Rows per decoded batch for each of `open_runs` cursors, so the cursors
+/// together hold at most `budget` [`decoded_footprint`] bytes: the budget's
+/// (F + 1)-th share per run, divided by the run's widest row. At least one
+/// row, so a row wider than its share still merges; at most
+/// [`SUB_BATCH_ROWS`], the batch narrow rows have always used.
+pub(super) fn cursor_batch_rows(budget: u64, open_runs: usize, widest_row: u64) -> usize {
+    let share = budget / widen(open_runs.saturating_add(1));
+    let rows = share / widest_row.max(1);
+    usize::try_from(rows)
+        .unwrap_or(usize::MAX)
+        .clamp(1, SUB_BATCH_ROWS)
 }
 
 impl Spill {
@@ -231,14 +273,16 @@ impl Spill {
     }
 
     fn merge_into(self, writer: &mut Writer, plan: SortPlan<'_>) -> Result<(), CompactionError> {
+        let budget = plan.tuning.in_memory_max_bytes;
         let runs = reduce_runs(
             self.scratch.path(),
             self.runs,
             plan.tuning.fan_in,
+            budget,
             plan.keys,
             plan.promoted,
         )?;
-        merge_runs(&runs, plan.keys, |chunk| {
+        merge_runs(&runs, plan.keys, budget, |chunk| {
             writer.append_records(chunk).map_err(CompactionError::Write)
         })
     }
@@ -396,33 +440,39 @@ pub(super) fn spill_run(
 /// Collapse `runs` hierarchically until at most `fan_in` remain
 /// (RFC 0036 §3.2's cap F): each pass merges consecutive groups of
 /// `fan_in` runs into one intermediate run, preserving run order so
-/// the §3.1 tie-break (input ordinal) survives every level.
+/// the §3.1 tie-break (input ordinal) survives every level. Each merge
+/// reads its runs within `budget` (see [`merge_runs`]).
 pub(super) fn reduce_runs(
     scratch: &Path,
-    mut runs: Vec<PathBuf>,
+    mut runs: Vec<Run>,
     fan_in: usize,
+    budget: u64,
     keys: ClusterKeys,
     promoted: &PromotedAttributes,
-) -> Result<Vec<PathBuf>, CompactionError> {
+) -> Result<Vec<Run>, CompactionError> {
     let fan_in = fan_in.max(2);
     let mut next_index = runs.len();
     while runs.len() > fan_in {
         let mut merged = Vec::with_capacity(runs.len().div_ceil(fan_in));
         for group in runs.chunks(fan_in) {
             if let [single] = group {
-                merged.push(single.clone());
+                merged.push(Run {
+                    path: single.path.clone(),
+                    widest_row: single.widest_row,
+                });
                 continue;
             }
             let path = scratch.join(format!("run-{next_index:06}.parquet"));
             next_index += 1;
             let mut out = RunWriter::create(&path, promoted)?;
-            merge_runs(group, keys, |chunk| out.append(chunk))?;
+            merge_runs(group, keys, budget, |chunk| out.append(chunk))?;
             out.finish()?;
-            merged.push(path);
+            let widest_row = group.iter().map(|run| run.widest_row).max().unwrap_or(0);
+            merged.push(Run { path, widest_row });
             for consumed in group {
                 // Best-effort: the TempDir reclaims scratch either way;
                 // early removal just bounds peak scratch-disk use.
-                let _ = std::fs::remove_file(consumed);
+                let _ = std::fs::remove_file(&consumed.path);
             }
         }
         runs = merged;
@@ -437,21 +487,24 @@ pub(super) fn reduce_runs(
 /// identical call sequence (§3.5).
 ///
 /// Peak memory is one decoded batch per run plus the output chunk
-/// being filled: each [`RunCursor`] streams its file batch-by-batch,
-/// [`reduce_runs`] caps the run count at F, and the chunk holds at most
-/// [`SUB_BATCH_ROWS`] rows, so this holds ≤ (F + 1) × batch no matter
-/// how many inputs the partition accrued.
+/// being filled: each [`RunCursor`] streams its file in batches
+/// [`cursor_batch_rows`] sizes so the open runs hold at most `budget`
+/// bytes together however wide their rows, and the chunk holds at most
+/// [`SUB_BATCH_ROWS`] rows — no matter how many inputs the partition
+/// accrued.
 pub(super) fn merge_runs<F>(
-    runs: &[PathBuf],
+    runs: &[Run],
     keys: ClusterKeys,
+    budget: u64,
     mut emit: F,
 ) -> Result<(), CompactionError>
 where
     F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
 {
     let mut cursors = Vec::with_capacity(runs.len());
-    for path in runs {
-        cursors.push(RunCursor::open(path)?);
+    for run in runs {
+        let batch_rows = cursor_batch_rows(budget, runs.len(), run.widest_row);
+        cursors.push(RunCursor::open(&run.path, batch_rows)?);
     }
     let mut heap = BinaryHeap::with_capacity(cursors.len());
     for (run, cursor) in cursors.iter_mut().enumerate() {
@@ -462,9 +515,12 @@ where
     let mut out: Vec<MinedRecord> = Vec::with_capacity(SUB_BATCH_ROWS);
     while let Some(Reverse(entry)) = heap.pop() {
         let run = entry.run;
-        out.push(entry.record);
         #[cfg(test)]
-        residency::add(1);
+        {
+            residency::add(1);
+            residency::add_bytes(decoded_footprint(&entry.record));
+        }
+        out.push(entry.record);
         if out.len() == SUB_BATCH_ROWS {
             emit_chunk(&mut out, &mut emit)?;
         }
@@ -484,7 +540,10 @@ where
 {
     emit(out)?;
     #[cfg(test)]
-    residency::sub(out.len());
+    {
+        residency::sub(out.len());
+        residency::sub_bytes(out.iter().map(decoded_footprint).sum());
+    }
     out.clear();
     Ok(())
 }
@@ -561,15 +620,20 @@ pub(super) struct RunCursor {
     /// exhausted.
     #[cfg(test)]
     batch_len: usize,
+    /// The same batch's [`decoded_footprint`] bytes, for the byte gauge.
+    #[cfg(test)]
+    batch_bytes: u64,
 }
 
 impl RunCursor {
-    fn open(path: &Path) -> Result<Self, CompactionError> {
+    fn open(path: &Path, batch_rows: usize) -> Result<Self, CompactionError> {
         Ok(Self {
-            reader: Reader::open_streaming_file(path).map_err(CompactionError::Read)?,
+            reader: Reader::open_streaming_file(path, batch_rows).map_err(CompactionError::Read)?,
             batch: Vec::new().into_iter(),
             #[cfg(test)]
             batch_len: 0,
+            #[cfg(test)]
+            batch_bytes: 0,
         })
     }
 
@@ -584,6 +648,9 @@ impl RunCursor {
                     residency::sub(self.batch_len);
                     residency::add(batch.len());
                     self.batch_len = batch.len();
+                    residency::sub_bytes(self.batch_bytes);
+                    self.batch_bytes = batch.iter().map(decoded_footprint).sum();
+                    residency::add_bytes(self.batch_bytes);
                 }
                 self.batch = batch.into_iter();
             } else {
@@ -591,6 +658,8 @@ impl RunCursor {
                 {
                     residency::sub(self.batch_len);
                     self.batch_len = 0;
+                    residency::sub_bytes(self.batch_bytes);
+                    self.batch_bytes = 0;
                 }
                 return Ok(None);
             }
@@ -621,13 +690,49 @@ pub(in crate::compaction) mod residency {
     thread_local! {
         static CURRENT: Cell<usize> = const { Cell::new(0) };
         static PEAK: Cell<usize> = const { Cell::new(0) };
+        static CURRENT_BYTES: Cell<u64> = const { Cell::new(0) };
+        static PEAK_BYTES: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Zero both the running count and the high-water mark before a
+    /// Zero both the running counts and the high-water marks before a
     /// measured compaction.
     pub(in crate::compaction) fn reset() {
         CURRENT.with(|c| c.set(0));
         PEAK.with(|p| p.set(0));
+        CURRENT_BYTES.with(|c| c.set(0));
+        PEAK_BYTES.with(|p| p.set(0));
+    }
+
+    /// The peak concurrently-live decoded bytes ([`super::decoded_footprint`])
+    /// since the last [`reset`] — the same residency as [`peak`], weighed
+    /// by row width.
+    pub(in crate::compaction) fn peak_bytes() -> u64 {
+        PEAK_BYTES.with(Cell::get)
+    }
+
+    /// `n` decoded bytes entered residency.
+    pub(in crate::compaction) fn add_bytes(n: u64) {
+        let now = CURRENT_BYTES.with(|c| {
+            let now = c.get() + n;
+            c.set(now);
+            now
+        });
+        PEAK_BYTES.with(|p| {
+            if now > p.get() {
+                p.set(now);
+            }
+        });
+    }
+
+    /// `n` decoded bytes left residency; underflow panics, as [`sub`].
+    pub(in crate::compaction) fn sub_bytes(n: u64) {
+        CURRENT_BYTES.with(|c| {
+            let now = c
+                .get()
+                .checked_sub(n)
+                .expect("residency byte gauge underflow: unbalanced add/sub");
+            c.set(now);
+        });
     }
 
     /// The peak concurrently-live decoded-row count since the last

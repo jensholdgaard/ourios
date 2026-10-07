@@ -40,8 +40,9 @@ pub(super) struct SortTotals {
 /// sorted run at the end of the input that filled it. Peak residency is
 /// therefore the budget plus one decoded input in phase 1 and, in
 /// phase 2, one decoded batch per open run — sized so the open runs
-/// together hold at most the budget, whatever the row width (see
-/// [`cursor_batch_rows`]) — plus the merge's [`SUB_BATCH_ROWS`] output
+/// together hold at most the budget, or one row each when a row is wider
+/// than its share (see [`cursor_batch_rows`]) — plus the merge's
+/// [`SUB_BATCH_ROWS`] output
 /// chunk; independent of how many inputs the partition holds or how
 /// well they compress.
 pub(super) fn sort_inputs_into(
@@ -246,11 +247,14 @@ pub(super) struct Run {
     pub(super) widest_row: u64,
 }
 
-/// Rows per decoded batch for each of `open_runs` cursors, so the cursors
-/// together hold at most `budget` [`decoded_footprint`] bytes: the budget's
-/// (F + 1)-th share per run, divided by the run's widest row. At least one
-/// row, so a row wider than its share still merges; at most
-/// [`SUB_BATCH_ROWS`], the batch narrow rows have always used.
+/// Rows per decoded batch for each of `open_runs` cursors: the budget's
+/// (F + 1)-th share per run, divided by the run's widest row, so the
+/// cursors together hold at most `budget` [`decoded_footprint`] bytes. At
+/// most [`SUB_BATCH_ROWS`], the batch narrow rows have always used. At
+/// least one row, because a merge cannot advance a run without its head
+/// row: a run whose widest row exceeds its share holds that one row, so
+/// the cursors' bound is the larger of `budget` and one widest row per
+/// open run.
 pub(super) fn cursor_batch_rows(budget: u64, open_runs: usize, widest_row: u64) -> usize {
     let share = budget / widen(open_runs.saturating_add(1));
     let rows = share / widest_row.max(1);
@@ -489,7 +493,8 @@ pub(super) fn reduce_runs(
 /// Peak memory is one decoded batch per run plus the output chunk
 /// being filled: each [`RunCursor`] streams its file in batches
 /// [`cursor_batch_rows`] sizes so the open runs hold at most `budget`
-/// bytes together however wide their rows, and the chunk holds at most
+/// bytes together (or one row each, when a row is wider than its share),
+/// and the chunk holds at most
 /// [`SUB_BATCH_ROWS`] rows — no matter how many inputs the partition
 /// accrued.
 pub(super) fn merge_runs<F>(

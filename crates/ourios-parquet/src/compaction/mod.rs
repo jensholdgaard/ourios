@@ -353,7 +353,8 @@ struct SortTuning {
     in_memory_max_bytes: u64,
     /// Fan-in cap F: more sorted runs than this merge hierarchically,
     /// so phase 2 opens at most F runs, whose decoded batches together
-    /// hold at most `in_memory_max_bytes`, plus the merge's output chunk,
+    /// hold at most `in_memory_max_bytes` (or one row per run, for rows
+    /// wider than a run's share), plus the merge's output chunk,
     /// regardless of backlog. 64 single-passes any partition up to F budgets of
     /// decoded rows.
     fan_in: usize,

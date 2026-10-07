@@ -575,12 +575,15 @@ fn wide_rows_merge_within_the_byte_budget() {
     let widest = row + row / 50;
     let chunk = u64::try_from(SUB_BATCH_ROWS).expect("fits u64");
     let phase1 = budget + S * widest;
-    let phase2 = budget + chunk * widest;
+    // The cursors hold the budget, or one widest row per open run when a
+    // row exceeds its share (the merge needs each run's head row).
+    let cursors = budget.max(u64::try_from(FAN_IN).expect("fits u64") * widest);
+    let phase2 = cursors + chunk * widest;
     let bound = phase1.max(phase2);
     assert!(
         peak <= bound,
         "peak decoded bytes {peak} exceed the larger phase bound {bound} \
-         (phase 1: budget + one input = {phase1}; phase 2: budget + output chunk = {phase2})",
+         (phase 1: budget + one input = {phase1}; phase 2: cursors + output chunk = {phase2})",
     );
 }
 

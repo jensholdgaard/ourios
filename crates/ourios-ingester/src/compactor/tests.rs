@@ -4,6 +4,11 @@
 
 use std::path::Path;
 
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry_sdk::metrics::data::{
+    AggregatedMetrics, MetricData, ResourceMetrics, SumDataPoint,
+};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
@@ -547,52 +552,46 @@ async fn a_sweep_dying_mid_backlog_has_emitted_every_committed_partitions_event(
     }
 }
 
+/// Reads `partitions` and `files` through a fresh collection at every
+/// event the sweep emits.
+struct ReadingSink {
+    provider: SdkMeterProvider,
+    exporter: InMemoryMetricExporter,
+    readings: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+fn u64_sum(rms: &[ResourceMetrics], name: &str) -> u64 {
+    rms.iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|m| m.name() == name)
+        .map(|m| match m.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                sum.data_points().map(SumDataPoint::value).sum()
+            }
+            other => panic!("{name} is not a u64 sum: {other:?}"),
+        })
+        .last()
+        .unwrap_or(0)
+}
+
+impl AuditSink for ReadingSink {
+    fn emit(&mut self, _: AuditEvent) {
+        self.exporter.reset();
+        self.provider.force_flush().expect("flush");
+        let rms = self.exporter.get_finished_metrics().expect("collect");
+        self.readings.lock().expect("readings").push((
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_PARTITIONS),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_FILES),
+        ));
+    }
+}
+
 /// The partition counters rise as each partition commits, not once the
 /// sweep ends: a sweep over a backlog of hourly partitions runs for hours,
 /// and `ourios.compaction.partitions` must show its progress meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
-    use opentelemetry::metrics::MeterProvider as _;
-    use opentelemetry_sdk::metrics::data::{
-        AggregatedMetrics, MetricData, ResourceMetrics, SumDataPoint,
-    };
-    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
-
-    /// Reads `partitions` and `files` through a fresh collection at every
-    /// event the sweep emits.
-    struct ReadingSink {
-        provider: SdkMeterProvider,
-        exporter: InMemoryMetricExporter,
-        readings: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
-    }
-
-    fn u64_sum(rms: &[ResourceMetrics], name: &str) -> u64 {
-        rms.iter()
-            .flat_map(ResourceMetrics::scope_metrics)
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-            .filter(|m| m.name() == name)
-            .map(|m| match m.data() {
-                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
-                    sum.data_points().map(SumDataPoint::value).sum()
-                }
-                other => panic!("{name} is not a u64 sum: {other:?}"),
-            })
-            .last()
-            .unwrap_or(0)
-    }
-
-    impl AuditSink for ReadingSink {
-        fn emit(&mut self, _: AuditEvent) {
-            self.exporter.reset();
-            self.provider.force_flush().expect("flush");
-            let rms = self.exporter.get_finished_metrics().expect("collect");
-            self.readings.lock().expect("readings").push((
-                u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_PARTITIONS),
-                u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_FILES),
-            ));
-        }
-    }
-
     // Arrange
     const PARTITIONS: u64 = 4;
     let bucket = tempfile::tempdir().expect("temp");

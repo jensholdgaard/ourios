@@ -679,8 +679,11 @@ pub(crate) async fn sweep_recorded(
     .expect("compaction sweep task should not panic");
 
     #[cfg(feature = "openfga")]
-    if let (Ok(report), Some(emitter)) = (&mut result, emitter.as_ref()) {
-        graph_phase(&store, emitter, report, &mut audit_sink, tuples).await;
+    if let Some(emitter) = emitter.as_ref() {
+        match &mut result {
+            Ok(report) => graph_phase(&store, emitter, report, &mut audit_sink, tuples).await,
+            Err(e) => emit_after_failed_sweep(emitter, &tuples, e).await,
+        }
     }
     #[cfg(not(feature = "openfga"))]
     let GraphTuples = tuples;
@@ -749,6 +752,23 @@ impl GraphFlush {
             report.errors.extend(self.errors);
         }
         (result, remaining)
+    }
+}
+
+/// Write the tuples no commit flushed when the sweep itself failed: the
+/// partitions it committed before failing are no longer candidates, so no
+/// later sweep derives their tuples again.
+#[cfg(feature = "openfga")]
+async fn emit_after_failed_sweep(
+    emitter: &GraphEmitter,
+    tuples: &GraphTuples,
+    sweep: &IngestError,
+) {
+    if tuples.is_empty() {
+        return;
+    }
+    if let Err(e) = emitter.emit(tuples).await {
+        tracing::warn!("graph emit after a failed sweep ({sweep}): {e}");
     }
 }
 
@@ -1024,22 +1044,21 @@ mod graph_tests {
     use crate::graph_emitter::GraphEmitter;
 
     /// A fake `OpenFGA` store: `/write` applies writes/deletes (asserting the
-    /// ≤ 100 chunk), `/read` answers by object.
+    /// ≤ 100 chunk), `/read` answers by object. With `fail_next_write` set,
+    /// the next `/write` answers `503` instead.
     #[derive(Clone, Default)]
     struct Fake {
         tuples: Arc<Mutex<Vec<TupleKey>>>,
         writes: Arc<Mutex<Vec<usize>>>,
+        fail_next_write: Arc<std::sync::atomic::AtomicBool>,
     }
 
     fn json(value: &serde_json::Value) -> ([(&'static str, &'static str); 1], String) {
         ([("content-type", "application/json")], value.to_string())
     }
 
-    async fn write(
-        State(fake): State<Fake>,
-        body: axum::body::Bytes,
-    ) -> ([(&'static str, &'static str); 1], String) {
-        let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    fn write(fake: &Fake, body: &[u8]) -> ([(&'static str, &'static str); 1], String) {
+        let request: serde_json::Value = serde_json::from_slice(body).expect("json");
         let mut tuples = fake.tuples.lock().expect("lock");
         if let Some(keys) = request["writes"]["tuple_keys"].as_array() {
             assert!(keys.len() <= 100, "RFC 0047 §3.3: ≤ 100 tuples per Write");
@@ -1063,6 +1082,20 @@ mod graph_tests {
         json(&json!({}))
     }
 
+    async fn flaky_write(
+        State(fake): State<Fake>,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if fake
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+        }
+        write(&fake, &body).into_response()
+    }
+
     async fn read(
         State(fake): State<Fake>,
         body: axum::body::Bytes,
@@ -1080,7 +1113,7 @@ mod graph_tests {
 
     async fn serve(fake: Fake) -> String {
         let app = Router::new()
-            .route("/stores/{store}/write", post(write))
+            .route("/stores/{store}/write", post(flaky_write))
             .route("/stores/{store}/read", post(read))
             .with_state(fake);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1310,6 +1343,50 @@ mod graph_tests {
         assert!(
             !objects.iter().any(|o| o == "conversation:acme/c-2"),
             "{objects:?}"
+        );
+    }
+
+    /// A sweep that commits a partition, fails to write its tuples, then
+    /// fails fatally (the erasure markers cannot be listed) still writes
+    /// those tuples: the partition is consolidated, so no later sweep
+    /// derives them again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_sweep_still_writes_its_committed_partitions_tuples() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Arrange
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        write_rows(&store, "c-1", "alice", None, 1);
+        write_rows(&store, "c-1", "alice", None, 1);
+        let markers = bucket.path().join("erasure");
+        std::fs::create_dir(&markers).expect("erasure dir");
+        std::fs::set_permissions(&markers, std::fs::Permissions::from_mode(0o000))
+            .expect("unlistable");
+        fake.fail_next_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Act
+        let (result, _, _) = sweep_once(
+            store,
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(SharedAuditSink::new()),
+            Some(emitter(&url)),
+        )
+        .await;
+        std::fs::set_permissions(&markers, std::fs::Permissions::from_mode(0o755))
+            .expect("restore");
+
+        // Assert
+        assert!(result.is_err(), "the sweep failed fatally: {result:?}");
+        let tuples = fake.tuples.lock().expect("lock").clone();
+        assert!(
+            tuples.iter().any(|t| t.object == "conversation:acme/c-1"),
+            "{tuples:?}"
         );
     }
 

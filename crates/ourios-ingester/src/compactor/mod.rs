@@ -317,67 +317,21 @@ pub fn run_sweep_committing(
     hooks: &mut SweepHooks<'_>,
     on_commit: &mut CommitObserver<'_>,
 ) -> Result<SweepReport, IngestError> {
-    let mut report = SweepReport::default();
+    let mut sweep = Sweep {
+        store,
+        now_unix_nanos,
+        promoted,
+        report: SweepReport::default(),
+        on_commit,
+    };
     for tenant in tenants(store)? {
-        report.tenants_scanned += 1;
-        let candidates = match plan_candidates(store, &tenant, now_unix_nanos, policy) {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                report.errors.push(format!("plan tenant {tenant:?}: {e}"));
-                continue;
-            }
-        };
-        let candidates_found = candidates.len();
-        let mut compacted_here = 0usize;
-        for partition in candidates {
-            // Reclaim orphans a prior crashed compaction of this partition
-            // left (RFC0009.4). Manifest-authoritative, so it never touches
-            // a live file; a scan error is recorded, not fatal.
-            match gc_orphans(store, &partition) {
-                Ok(gc) => report.orphans_reclaimed += gc.reclaimed,
-                Err(e) => report.errors.push(format!(
-                    "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
-                    partition.year, partition.month, partition.day, partition.hour,
-                )),
-            }
-            let tenant_name = tenant.as_str();
-            let mut observe = hooks
-                .observe
-                .as_deref_mut()
-                .map(|observe| move |rows: &[MinedRecord]| observe(tenant_name, rows));
-            let mut row_hooks = RowHooks {
-                observe: observe
-                    .as_mut()
-                    .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
-                drop: None,
-            };
-            match compact_candidate(store, &partition, promoted, &mut row_hooks) {
-                Ok(outcome) => {
-                    if let Some(committed) = &outcome.committed {
-                        compacted_here += 1;
-                        let event = compaction_audit_event(
-                            &tenant,
-                            now_unix_nanos,
-                            &partition,
-                            committed,
-                            outcome.rows,
-                        );
-                        record_commit(&mut report, &tenant, &outcome, event, on_commit);
-                    }
-                    report.gc_failures += outcome.gc_failures;
-                }
-                Err(e) => e.record(
-                    &mut report,
-                    &format!("compact {tenant:?} {}", hour_label(&partition)),
-                ),
-            }
-        }
-        report.per_tenant.push(TenantSweep {
-            tenant,
-            candidates_found,
-            partitions_compacted: compacted_here,
-        });
+        sweep.tenant(&tenant, policy, hooks.observe.as_deref_mut());
     }
+    let Sweep {
+        mut report,
+        on_commit,
+        ..
+    } = sweep;
     erase_pending(
         store,
         now_unix_nanos,
@@ -387,6 +341,100 @@ pub fn run_sweep_committing(
         on_commit,
     )?;
     Ok(report)
+}
+
+/// One consolidation pass in progress: its fixed inputs, the report it
+/// accumulates, and the commit callback each committed partition reaches.
+struct Sweep<'s, 'c> {
+    store: &'s Store,
+    now_unix_nanos: u64,
+    promoted: &'s PromotedAttributes,
+    report: SweepReport,
+    on_commit: &'s mut CommitObserver<'c>,
+}
+
+impl Sweep<'_, '_> {
+    /// Plan and consolidate `tenant`'s sealed candidates. A planning
+    /// failure is recorded and the tenant skipped.
+    fn tenant(
+        &mut self,
+        tenant: &str,
+        policy: &CompactionPolicy,
+        mut observe: Option<&mut SweepObserver<'_>>,
+    ) {
+        self.report.tenants_scanned += 1;
+        let candidates = match plan_candidates(self.store, tenant, self.now_unix_nanos, policy) {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                self.report
+                    .errors
+                    .push(format!("plan tenant {tenant:?}: {e}"));
+                return;
+            }
+        };
+        let mut compacted_here = 0usize;
+        for partition in &candidates {
+            if self.partition(tenant, partition, observe.as_deref_mut()) {
+                compacted_here += 1;
+            }
+        }
+        self.report.per_tenant.push(TenantSweep {
+            tenant: tenant.to_string(),
+            candidates_found: candidates.len(),
+            partitions_compacted: compacted_here,
+        });
+    }
+
+    /// Reclaim `partition`'s orphans, then consolidate it; whether it
+    /// committed.
+    fn partition(
+        &mut self,
+        tenant: &str,
+        partition: &PartitionKey,
+        observe: Option<&mut SweepObserver<'_>>,
+    ) -> bool {
+        // Reclaim orphans a prior crashed compaction of this partition
+        // left (RFC0009.4). Manifest-authoritative, so it never touches
+        // a live file; a scan error is recorded, not fatal.
+        match gc_orphans(self.store, partition) {
+            Ok(gc) => self.report.orphans_reclaimed += gc.reclaimed,
+            Err(e) => self.report.errors.push(format!(
+                "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
+                partition.year, partition.month, partition.day, partition.hour,
+            )),
+        }
+        let mut observe = observe.map(|observe| move |rows: &[MinedRecord]| observe(tenant, rows));
+        let mut row_hooks = RowHooks {
+            observe: observe
+                .as_mut()
+                .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
+            drop: None,
+        };
+        let outcome = match compact_candidate(self.store, partition, self.promoted, &mut row_hooks)
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                e.record(
+                    &mut self.report,
+                    &format!("compact {tenant:?} {}", hour_label(partition)),
+                );
+                return false;
+            }
+        };
+        self.report.gc_failures += outcome.gc_failures;
+        let Some(committed) = &outcome.committed else {
+            return false;
+        };
+        let event = compaction_audit_event(
+            tenant,
+            self.now_unix_nanos,
+            partition,
+            committed,
+            outcome.rows,
+        );
+        record_commit(&mut self.report, tenant, &outcome, event, self.on_commit);
+        true
+    }
 }
 
 /// Raw tenant ids present in the store, decoded from the immediate
@@ -1057,8 +1105,11 @@ mod graph_tests {
         ([("content-type", "application/json")], value.to_string())
     }
 
-    fn write(fake: &Fake, body: &[u8]) -> ([(&'static str, &'static str); 1], String) {
-        let request: serde_json::Value = serde_json::from_slice(body).expect("json");
+    async fn write(
+        State(fake): State<Fake>,
+        body: axum::body::Bytes,
+    ) -> ([(&'static str, &'static str); 1], String) {
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
         let mut tuples = fake.tuples.lock().expect("lock");
         if let Some(keys) = request["writes"]["tuple_keys"].as_array() {
             assert!(keys.len() <= 100, "RFC 0047 §3.3: ≤ 100 tuples per Write");
@@ -1082,9 +1133,11 @@ mod graph_tests {
         json(&json!({}))
     }
 
-    async fn flaky_write(
+    /// Answers the next `/write` with `503` once `fail_next_write` is set.
+    async fn fail_gate(
         State(fake): State<Fake>,
-        body: axum::body::Bytes,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
         if fake
@@ -1093,7 +1146,7 @@ mod graph_tests {
         {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
         }
-        write(&fake, &body).into_response()
+        next.run(request).await
     }
 
     async fn read(
@@ -1113,7 +1166,13 @@ mod graph_tests {
 
     async fn serve(fake: Fake) -> String {
         let app = Router::new()
-            .route("/stores/{store}/write", post(flaky_write))
+            .route(
+                "/stores/{store}/write",
+                post(write).layer(axum::middleware::from_fn_with_state(
+                    fake.clone(),
+                    fail_gate,
+                )),
+            )
             .route("/stores/{store}/read", post(read))
             .with_state(fake);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

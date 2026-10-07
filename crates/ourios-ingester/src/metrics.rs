@@ -7,7 +7,8 @@
 //! is installed the global meter is a no-op, so constructing and
 //! recording is always safe.
 //!
-//! Records the per-sweep counters and histograms of RFC 0009 §3.6:
+//! Records the counters and histograms of RFC 0009 §3.6 — per committed
+//! partition where the measurement is a partition's, per sweep otherwise:
 //! sweeps, partitions, files, rows, orphan files, sweep duration,
 //! `ourios.compaction.io` (bytes read / written), and the
 //! `ourios.storage.parquet.file.size` H4 detector (a per-tenant
@@ -18,7 +19,7 @@
 //! sealed-but-uncompacted lag — is an **observable** (async)
 //! `UpDownCounter`: its callback reports each tenant's *absolute*
 //! current backlog at collect time (OpenTelemetry additive-non-monotonic
-//! guidance), which `record_sweep` keeps current from the per-tenant
+//! guidance), which `record_sweep_outcome` keeps current from the per-tenant
 //! candidate/compacted breakdown. This completes the §3.6 metric set.
 
 use std::collections::HashMap;
@@ -27,22 +28,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use opentelemetry::metrics::{
-    Counter, Histogram, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
+    Counter, Histogram, Meter, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
 };
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
 use crate::cadence::BarrierEpochs;
-use crate::compactor::{IngestError, SweepReport, to_u64};
+use crate::compactor::{IngestError, PartitionCommitted, SweepReport, to_u64};
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
-/// shared between [`CompactionMetrics::record_sweep`], which writes the
+/// shared between [`CompactionMetrics::record_sweep_outcome`], which writes the
 /// absolute value after each sweep, and the `ourios.compaction.backlog`
 /// observable callback, which reads it at collection time.
 type BacklogState = Arc<Mutex<HashMap<String, i64>>>;
 
 /// The compaction metric instruments (RFC 0009 §3.6). Build one per
-/// process and call [`CompactionMetrics::record_sweep`] once per sweep.
+/// process; call [`CompactionMetrics::record_partition`] as each partition
+/// commits and [`CompactionMetrics::record_sweep_outcome`] once per sweep.
 #[derive(Debug)]
 pub struct CompactionMetrics {
     sweeps: Counter<u64>,
@@ -53,7 +55,7 @@ pub struct CompactionMetrics {
     duration: Histogram<f64>,
     io: Counter<u64>,
     file_size: Histogram<u64>,
-    /// Current per-tenant backlog `record_sweep` keeps up to date; the
+    /// Current per-tenant backlog `record_sweep_outcome` keeps up to date; the
     /// observable counter's callback reads it.
     backlog_state: BacklogState,
     /// Held to keep the observable callback registered with the meter
@@ -77,7 +79,11 @@ impl CompactionMetrics {
     /// surface on the first sweep with a real `result`.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.compaction");
+        Self::from_meter(&global::meter("ourios.compaction"))
+    }
+
+    /// [`Self::new`] on `meter` rather than the global one.
+    pub(crate) fn from_meter(meter: &Meter) -> Self {
         let sweeps = meter
             .u64_counter(semconv::OURIOS_COMPACTION_SWEEPS)
             .with_unit("{sweep}")
@@ -116,7 +122,7 @@ impl CompactionMetrics {
         // collect time (OTel additive-non-monotonic guidance). Reporting
         // an absolute value — not a per-sweep delta — is what keeps it
         // from drifting when a candidate errors one sweep and clears the
-        // next. `record_sweep` keeps `backlog_state` current; the
+        // next. `record_sweep_outcome` keeps `backlog_state` current; the
         // callback only reads it.
         let backlog_state: BacklogState = Arc::new(Mutex::new(HashMap::new()));
         let callback_state = Arc::clone(&backlog_state);
@@ -161,12 +167,28 @@ impl CompactionMetrics {
         }
     }
 
-    /// Record one sweep's outcome and wall-clock `elapsed`. The
-    /// `ourios.compaction.result` attribute classifies the sweep:
-    /// `error` if any tenant/partition failed (or the sweep itself
-    /// failed to scan the store), else `committed` if anything was
-    /// consolidated, else `noop`.
-    pub fn record_sweep(&self, result: &Result<SweepReport, IngestError>, elapsed: Duration) {
+    /// Record one committed partition rewrite, the moment its manifest
+    /// commits: `partitions`, `files`, `rows`, both `io` directions, and
+    /// the H4 `file.size` sample. Recorded per partition, not per sweep, so
+    /// a sweep working through a large backlog shows its progress while it
+    /// runs.
+    pub fn record_partition(&self, commit: &PartitionCommitted<'_>) {
+        self.partitions.add(1, &[]);
+        self.files.add(commit.files, &[]);
+        self.rows.add(commit.rows, &[]);
+        self.record_io(commit.bytes_read, commit.bytes_written);
+        self.record_file_size(commit.tenant, commit.bytes_written);
+    }
+
+    /// Record one sweep's outcome and wall-clock `elapsed`, for a sweep
+    /// whose committed partitions were each recorded through
+    /// [`Self::record_partition`]: `sweeps`, `duration`, `orphan.files`,
+    /// and the backlog.
+    pub fn record_sweep_outcome(
+        &self,
+        result: &Result<SweepReport, IngestError>,
+        elapsed: Duration,
+    ) {
         let outcome = match result {
             Ok(report) if !report.errors.is_empty() => "error",
             Ok(report) if report.partitions_compacted > 0 => "committed",
@@ -177,6 +199,8 @@ impl CompactionMetrics {
 
         self.sweeps.add(1, &attrs);
         self.duration.record(elapsed.as_secs_f64(), &attrs);
+        // Both directions surface on every sweep, a no-op one included.
+        self.record_io(0, 0);
 
         // A fatal sweep error (couldn't even scan the store) yields no
         // per-tenant data, so the backlog map is deliberately left as-is:
@@ -184,40 +208,7 @@ impl CompactionMetrics {
         // partitions didn't compact, so the backlog hasn't shrunk), and
         // the failure itself surfaces via `sweeps{result="error"}`.
         if let Ok(report) = result {
-            self.partitions
-                .add(to_u64(report.partitions_compacted), &[]);
-            self.files.add(report.files_compacted, &[]);
-            self.rows.add(report.rows_compacted, &[]);
             self.orphan_files.add(to_u64(report.gc_failures), &[]);
-
-            // Bytes moved this sweep, split by direction; the write
-            // volume is the sum of the consolidated output sizes
-            // (saturating, matching `run_sweep`'s read accumulation).
-            let bytes_written = report
-                .compacted_files
-                .iter()
-                .fold(0_u64, |acc, f| acc.saturating_add(f.bytes));
-            self.io.add(
-                report.bytes_read,
-                &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "read")],
-            );
-            self.io.add(
-                bytes_written,
-                &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "write")],
-            );
-
-            // The H4 detector: one per-tenant sample per consolidated
-            // file, so the "> 5 % of files < 128 MiB" rule is a derived
-            // alert over this distribution (RFC 0009 §3.6). A `0` size is
-            // a best-effort `stat` failure (`file_len`), not a real
-            // file — skip it so the small-file distribution isn't skewed
-            // by a bogus zero-byte sample.
-            for file in report.compacted_files.iter().filter(|f| f.bytes > 0) {
-                self.file_size.record(
-                    file.bytes,
-                    &[KeyValue::new(semconv::OURIOS_TENANT, file.tenant.clone())],
-                );
-            }
 
             // Rebuild each tenant's *absolute* backlog (candidates the
             // sweep found minus those it compacted) for the observable
@@ -240,6 +231,54 @@ impl CompactionMetrics {
                     .unwrap_or(i64::MAX);
                 backlog.insert(t.tenant.clone(), lag);
             }
+        }
+    }
+
+    /// Record one whole sweep from its final report: the per-partition
+    /// counters as the report's totals, then [`Self::record_sweep_outcome`].
+    /// For a caller that did not record the sweep's partitions as they
+    /// committed.
+    pub fn record_sweep(&self, result: &Result<SweepReport, IngestError>, elapsed: Duration) {
+        if let Ok(report) = result {
+            self.partitions
+                .add(to_u64(report.partitions_compacted), &[]);
+            self.files.add(report.files_compacted, &[]);
+            self.rows.add(report.rows_compacted, &[]);
+            // The write volume is the sum of the consolidated output sizes
+            // (saturating, matching `run_sweep`'s read accumulation).
+            let bytes_written = report
+                .compacted_files
+                .iter()
+                .fold(0_u64, |acc, f| acc.saturating_add(f.bytes));
+            self.record_io(report.bytes_read, bytes_written);
+            for file in &report.compacted_files {
+                self.record_file_size(&file.tenant, file.bytes);
+            }
+        }
+        self.record_sweep_outcome(result, elapsed);
+    }
+
+    /// Bytes moved, split by direction.
+    fn record_io(&self, read: u64, written: u64) {
+        self.io
+            .add(read, &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "read")]);
+        self.io.add(
+            written,
+            &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "write")],
+        );
+    }
+
+    /// The H4 detector: one per-tenant sample per consolidated file, so
+    /// the "> 5 % of files < 128 MiB" rule is a derived alert over this
+    /// distribution (RFC 0009 §3.6). A `0` size is a best-effort `stat`
+    /// failure (`file_len`), not a real file — skipped so the small-file
+    /// distribution isn't skewed by a bogus zero-byte sample.
+    fn record_file_size(&self, tenant: &str, bytes: u64) {
+        if bytes > 0 {
+            self.file_size.record(
+                bytes,
+                &[KeyValue::new(semconv::OURIOS_TENANT, tenant.to_string())],
+            );
         }
     }
 }

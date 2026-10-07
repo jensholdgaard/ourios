@@ -182,6 +182,7 @@ pub(super) fn erase_pending(
     promoted: &PromotedAttributes,
     erasure_match: Option<&ErasureMatch<'_>>,
     report: &mut SweepReport,
+    on_commit: &mut CommitObserver<'_>,
 ) -> Result<(), IngestError> {
     for request in pending_erasures(store)? {
         // RFC 0048 §3.4: backfill and erasure exclude each other — a
@@ -246,21 +247,14 @@ pub(super) fn erase_pending(
                             // other for the sweep's IO accounting and audit
                             // trail (RFC 0009 §3.6): it reads and writes the
                             // partition and commits a generation.
-                            report.partitions_compacted += 1;
-                            report.files_compacted += to_u64(o.files_before);
-                            report.rows_compacted += o.rows;
-                            report.bytes_read = report.bytes_read.saturating_add(o.bytes_read);
-                            report.compacted_files.push(CompactedFile {
-                                tenant: request.tenant.clone(),
-                                bytes: o.bytes_written,
-                            });
-                            report.compaction_events.push(compaction_audit_event(
+                            let event = compaction_audit_event(
                                 &request.tenant,
                                 now_unix_nanos,
                                 &partition,
                                 committed,
                                 o.rows,
-                            ));
+                            );
+                            record_commit(report, &request.tenant, &o, event, on_commit);
                             report.gc_failures += o.gc_failures;
                         }
                     }

@@ -19,7 +19,7 @@ pub(super) fn store_at(bucket: &Path) -> Store {
 
 /// 2026-04-02T10:58:00 UTC (hour 10).
 pub(super) const TS0: u64 = 1_775_127_480_000_000_000;
-const HOUR: u64 = 3_600_000_000_000;
+pub(super) const HOUR: u64 = 3_600_000_000_000;
 /// Well past hour 10's end + grace.
 const NOW_SEALED: u64 = TS0 + 2 * HOUR;
 
@@ -456,4 +456,181 @@ fn run_executes_sweeps_until_cancelled() {
 
     // Assert — the loop ran a sweep that compacted the candidate.
     assert_eq!(compacted.expect("sweep ok"), 1);
+}
+
+/// `count` sealed candidates for tenant `a`, one per consecutive hour from
+/// `TS0`'s, two files each.
+fn write_sealed_hours(store: &Store, count: u64) {
+    for hour in 0..count {
+        write_file(store, "a", 1, TS0 + hour * HOUR);
+        write_file(store, "a", 2, TS0 + hour * HOUR + 1_000_000);
+    }
+}
+
+/// The partition a compaction audit event names.
+fn event_partition(event: &AuditEvent) -> String {
+    match &event.payload {
+        AuditPayload::Compaction { partition, .. } => partition.clone(),
+        other => panic!("not a compaction event: {other:?}"),
+    }
+}
+
+/// An audit sink that hands every event on, then stands in for the process
+/// dying once it has emitted `crash_after` of them.
+pub(super) struct CrashingSink {
+    inner: ourios_core::audit::SharedAuditSink,
+    crash_after: usize,
+    emitted: usize,
+}
+
+impl CrashingSink {
+    pub(super) fn new(inner: &ourios_core::audit::SharedAuditSink, crash_after: usize) -> Self {
+        Self {
+            inner: inner.clone(),
+            crash_after,
+            emitted: 0,
+        }
+    }
+}
+
+impl AuditSink for CrashingSink {
+    fn emit(&mut self, event: AuditEvent) {
+        self.inner.emit(event);
+        self.emitted += 1;
+        assert!(self.emitted < self.crash_after, "the process dies here");
+    }
+}
+
+/// A sweep that dies after its `k`th committed partition has already
+/// emitted the audit events of partitions 1..=k — each right after its
+/// manifest commit, not at sweep end — and left the rest uncompacted for
+/// the next sweep (RFC 0009 §3.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_dying_mid_backlog_has_emitted_every_committed_partitions_event() {
+    // Arrange
+    const PARTITIONS: u64 = 5;
+    const K: usize = 2;
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, PARTITIONS);
+    let audit = ourios_core::audit::SharedAuditSink::new();
+    let sink = CrashingSink::new(&audit, K);
+
+    // Act
+    let sweep = tokio::spawn(sweep_once(
+        store.clone(),
+        CompactionPolicy::default(),
+        PromotedAttributes::default(),
+        Box::new(sink),
+        #[cfg(feature = "openfga")]
+        None,
+    ))
+    .await;
+
+    // Assert
+    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+    let emitted: Vec<String> = audit.drain().iter().map(event_partition).collect();
+    assert_eq!(emitted.len(), K, "{emitted:?}");
+    let left =
+        plan_candidates(&store, "a", now_unix_nanos(), &CompactionPolicy::default()).expect("plan");
+    assert_eq!(
+        left.len(),
+        usize::try_from(PARTITIONS).expect("small") - K,
+        "the sweep stopped at the crash: {left:?}"
+    );
+    for partition in &left {
+        let key = format!(
+            "year={:04}/month={:02}/day={:02}/hour={:02}",
+            partition.year, partition.month, partition.day, partition.hour
+        );
+        assert!(!emitted.contains(&key), "{key} uncompacted yet audited");
+    }
+}
+
+/// The partition counters rise as each partition commits, not once the
+/// sweep ends: a sweep over a backlog of hourly partitions runs for hours,
+/// and `ourios.compaction.partitions` must show its progress meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, SumDataPoint,
+    };
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+
+    /// Reads `partitions` and `files` through a fresh collection at every
+    /// event the sweep emits.
+    struct ReadingSink {
+        provider: SdkMeterProvider,
+        exporter: InMemoryMetricExporter,
+        readings: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+
+    fn u64_sum(rms: &[ResourceMetrics], name: &str) -> u64 {
+        rms.iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .filter(|m| m.name() == name)
+            .map(|m| match m.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    sum.data_points().map(SumDataPoint::value).sum()
+                }
+                other => panic!("{name} is not a u64 sum: {other:?}"),
+            })
+            .last()
+            .unwrap_or(0)
+    }
+
+    impl AuditSink for ReadingSink {
+        fn emit(&mut self, _: AuditEvent) {
+            self.exporter.reset();
+            self.provider.force_flush().expect("flush");
+            let rms = self.exporter.get_finished_metrics().expect("collect");
+            self.readings.lock().expect("readings").push((
+                u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_PARTITIONS),
+                u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_FILES),
+            ));
+        }
+    }
+
+    // Arrange
+    const PARTITIONS: u64 = 4;
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, PARTITIONS);
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter("ourios.compaction"),
+    ));
+    let readings = Arc::default();
+    let sink = ReadingSink {
+        provider: provider.clone(),
+        exporter,
+        readings: Arc::clone(&readings),
+    };
+
+    // Act
+    let (result, _, _) = sweep_recorded(
+        store,
+        CompactionPolicy::default(),
+        PromotedAttributes::default(),
+        Box::new(sink),
+        #[cfg(feature = "openfga")]
+        None,
+        Some(metrics),
+    )
+    .await;
+
+    // Assert
+    let report = result.expect("sweep");
+    assert_eq!(report.partitions_compacted, 4, "{report:?}");
+    let readings = readings.lock().expect("readings").clone();
+    assert_eq!(
+        readings,
+        vec![(1, 2), (2, 4), (3, 6), (4, 8)],
+        "one partition and its two files counted at each commit"
+    );
 }

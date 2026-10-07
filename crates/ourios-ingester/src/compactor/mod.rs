@@ -5,14 +5,13 @@
 //! synchronous (blocking filesystem + Parquet work) and deterministic,
 //! so it's the unit the tests exercise. [`Compactor::run`] is the thin
 //! daemon: it calls `run_sweep` on a fixed cadence via `spawn_blocking`,
-//! records the RFC 0009 §3.6 metrics for each sweep
-//! ([`crate::metrics::CompactionMetrics`]), and hands each result to a
-//! caller-supplied observer for logging.
+//! records the RFC 0009 §3.6 metrics and audit events as each partition
+//! commits ([`crate::metrics::CompactionMetrics`]), and hands each sweep's
+//! result to a caller-supplied observer for logging.
 
 #[cfg(feature = "openfga")]
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-#[cfg(feature = "openfga")]
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -110,8 +109,8 @@ pub struct SweepReport {
     /// daemon just retries the same sweep next tick).
     pub errors: Vec<String>,
     /// One [`AuditPayload::Compaction`] audit event per committed
-    /// compaction (RFC 0009 §3.6 / RFC 0005 §3.7). Built here;
-    /// [`Compactor::run`] emits them through its [`AuditSink`].
+    /// compaction (RFC 0009 §3.6 / RFC 0005 §3.7). [`sweep_once`] emits
+    /// each through its [`AuditSink`] as its partition commits.
     pub compaction_events: Vec<AuditEvent>,
     /// Total input bytes read across the compacted partitions — the
     /// read volume for `ourios.compaction.io` (RFC 0009 §3.6).
@@ -260,6 +259,48 @@ pub type ErasureMatch<'a> = dyn Fn(&MinedRecord, &str) -> bool + 'a;
 /// # Errors
 ///
 /// As [`run_sweep`].
+pub fn run_sweep_hooked(
+    store: &Store,
+    now_unix_nanos: u64,
+    policy: &CompactionPolicy,
+    promoted: &PromotedAttributes,
+    hooks: &mut SweepHooks<'_>,
+) -> Result<SweepReport, IngestError> {
+    run_sweep_committing(store, now_unix_nanos, policy, promoted, hooks, &mut |_| {})
+}
+
+/// One partition rewrite whose manifest just committed, handed to the
+/// sweep's commit callback before the sweep moves on (RFC 0009 §3.6): the
+/// counters it adds and the audit event it carries are the ones the
+/// [`SweepReport`] accumulates, delivered while the sweep is still running.
+#[derive(Debug)]
+pub struct PartitionCommitted<'a> {
+    /// Tenant whose partition was rewritten.
+    pub tenant: &'a str,
+    /// Input files merged away.
+    pub files: u64,
+    /// Rows rewritten.
+    pub rows: u64,
+    /// Input bytes read.
+    pub bytes_read: u64,
+    /// Size of the consolidated output file.
+    pub bytes_written: u64,
+    /// The partition's [`AuditPayload::Compaction`] event.
+    pub event: &'a AuditEvent,
+}
+
+/// The commit callback of [`run_sweep_committing`].
+pub type CommitObserver<'a> = dyn FnMut(&PartitionCommitted<'_>) + 'a;
+
+/// [`run_sweep_hooked`], calling `on_commit` for every partition rewrite
+/// (consolidation or erasure) right after its manifest commits, so the
+/// caller can record and emit per partition rather than at sweep end — a
+/// sweep over a large backlog runs for hours, and a restart mid-sweep must
+/// not lose what the committed partitions already did.
+///
+/// # Errors
+///
+/// As [`run_sweep`].
 // RFC 0038: one span per compaction sweep — coarse and periodic. Opened inside
 // the callee (the tick `spawn_blocking`s this), and the per-tenant / per-file
 // loops below stay span-free.
@@ -268,12 +309,13 @@ pub type ErasureMatch<'a> = dyn Fn(&MinedRecord, &str) -> bool + 'a;
     name = "sweep partitions",
     fields(otel.kind = "internal")
 )]
-pub fn run_sweep_hooked(
+pub fn run_sweep_committing(
     store: &Store,
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
     promoted: &PromotedAttributes,
     hooks: &mut SweepHooks<'_>,
+    on_commit: &mut CommitObserver<'_>,
 ) -> Result<SweepReport, IngestError> {
     let mut report = SweepReport::default();
     for tenant in tenants(store)? {
@@ -312,22 +354,15 @@ pub fn run_sweep_hooked(
             match compact_candidate(store, &partition, promoted, &mut row_hooks) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
-                        report.partitions_compacted += 1;
                         compacted_here += 1;
-                        report.files_compacted += to_u64(outcome.files_before);
-                        report.rows_compacted += outcome.rows;
-                        report.bytes_read = report.bytes_read.saturating_add(outcome.bytes_read);
-                        report.compacted_files.push(CompactedFile {
-                            tenant: tenant.clone(),
-                            bytes: outcome.bytes_written,
-                        });
-                        report.compaction_events.push(compaction_audit_event(
+                        let event = compaction_audit_event(
                             &tenant,
                             now_unix_nanos,
                             &partition,
                             committed,
                             outcome.rows,
-                        ));
+                        );
+                        record_commit(&mut report, &tenant, &outcome, event, on_commit);
                     }
                     report.gc_failures += outcome.gc_failures;
                 }
@@ -349,6 +384,7 @@ pub fn run_sweep_hooked(
         promoted,
         hooks.erasure_match,
         &mut report,
+        on_commit,
     )?;
     Ok(report)
 }
@@ -465,9 +501,10 @@ impl Compactor {
     /// wall clock; its [`SweepReport`]/[`IngestError`] result is handed
     /// to `on_sweep` for logging — so one failing sweep is observed,
     /// not fatal, and the loop keeps ticking. RFC 0009 §3.6 metrics are
-    /// recorded for every sweep via the `ourios.compaction` meter
-    /// (instruments built and seeded once here, before the loop). Does
-    /// not return.
+    /// recorded via the `ourios.compaction` meter (instruments built and
+    /// seeded once here, before the loop): the partition, file, row and IO
+    /// counters as each partition commits, the sweep outcome and backlog
+    /// once the sweep ends. Does not return.
     ///
     /// # Panics
     ///
@@ -489,7 +526,7 @@ impl Compactor {
         } = self;
         // Built (and zero-seeded) once, before the loop, so the metric
         // set is visible to the exporter even before the first sweep.
-        let metrics = CompactionMetrics::new();
+        let metrics = Arc::new(CompactionMetrics::new());
         let mut ticker = tokio::time::interval(interval);
         // A maintenance sweep that overruns `interval` must not make
         // the next ticks fire back-to-back (the default `Burst`) —
@@ -498,30 +535,32 @@ impl Compactor {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let (result, elapsed, sink) = sweep_once(
+            let (result, elapsed, sink) = sweep_recorded(
                 store.clone(),
                 policy,
                 promoted.clone(),
                 audit_sink,
                 #[cfg(feature = "openfga")]
                 emitter.clone(),
+                Some(Arc::clone(&metrics)),
             )
             .await;
             audit_sink = sink;
-            metrics.record_sweep(&result, elapsed);
+            metrics.record_sweep_outcome(&result, elapsed);
             on_sweep(result);
         }
     }
 }
 
 /// One full sweep as the daemon runs it: the blocking pass (consolidation,
-/// erasure rewrites, compaction audit events) on the blocking pool, then
-/// — with an emitter — the async graph phase (write the tuples the pass
-/// derived; delete the tuples of every erasure whose rows are gone; then,
-/// back on the blocking pool, the `conversation_erased` audit event and
-/// the marker removal). Returns the report, the wall-clock spent, and the
-/// audit sink handed back. Runs the same way whether called by
-/// [`Compactor::run`] or a test.
+/// erasure rewrites) on the blocking pool — each committed partition's
+/// compaction audit event, and with an emitter its graph tuples, written
+/// right after its manifest commit — then, with an emitter, the async graph
+/// phase (write the tuples no commit flushed; delete the tuples of every
+/// erasure whose rows are gone; then, back on the blocking pool, the
+/// `conversation_erased` audit event and the marker removal). Returns the
+/// report, the wall-clock spent, and the audit sink handed back. Runs the
+/// same way whether called by [`Compactor::run`] or a test.
 ///
 /// # Panics
 ///
@@ -539,9 +578,39 @@ pub async fn sweep_once(
     Duration,
     Box<dyn AuditSink>,
 ) {
+    sweep_recorded(
+        store,
+        policy,
+        promoted,
+        audit_sink,
+        #[cfg(feature = "openfga")]
+        emitter,
+        None,
+    )
+    .await
+}
+
+/// [`sweep_once`], recording each committed partition into `metrics` as it
+/// commits.
+pub(crate) async fn sweep_recorded(
+    store: Store,
+    policy: CompactionPolicy,
+    promoted: PromotedAttributes,
+    audit_sink: Box<dyn AuditSink>,
+    #[cfg(feature = "openfga")] emitter: Option<Arc<GraphEmitter>>,
+    metrics: Option<Arc<CompactionMetrics>>,
+) -> (
+    Result<SweepReport, IngestError>,
+    Duration,
+    Box<dyn AuditSink>,
+) {
     let start = Instant::now();
     #[cfg(feature = "openfga")]
     let blocking_emitter = emitter.clone();
+    // The per-commit graph flush drives the emitter's async client from the
+    // blocking thread.
+    #[cfg(feature = "openfga")]
+    let runtime = tokio::runtime::Handle::current();
     let blocking_store = store.clone();
     // `Store` is a cheap `Arc` handle; clone it into the blocking task
     // (compaction is blocking I/O). `policy` is `Copy`. The audit sink moves
@@ -552,6 +621,8 @@ pub async fn sweep_once(
     let (mut result, mut audit_sink, tuples) = tokio::task::spawn_blocking(move || {
         let mut audit_sink = audit_sink;
         let tuples: std::cell::RefCell<GraphTuples> = std::cell::RefCell::default();
+        #[cfg(feature = "openfga")]
+        let mut flushed = GraphFlush::default();
         let result = {
             #[cfg(feature = "openfga")]
             let tuples_ref = &tuples;
@@ -579,20 +650,30 @@ pub async fn sweep_once(
                 #[cfg(not(feature = "openfga"))]
                 erasure_match: None,
             };
-            run_sweep_hooked(
+            let mut on_commit = |commit: &PartitionCommitted<'_>| {
+                if let Some(metrics) = &metrics {
+                    metrics.record_partition(commit);
+                }
+                audit_sink.emit(commit.event.clone());
+                #[cfg(feature = "openfga")]
+                if let Some(emitter) = &blocking_emitter {
+                    flushed.flush(&runtime, emitter, &tuples);
+                }
+            };
+            run_sweep_committing(
                 &blocking_store,
                 now_unix_nanos(),
                 &policy,
                 &promoted,
                 &mut hooks,
+                &mut on_commit,
             )
         };
-        if let Ok(report) = &result {
-            for event in &report.compaction_events {
-                audit_sink.emit(event.clone());
-            }
-        }
-        (result, audit_sink, tuples.into_inner())
+        #[cfg(feature = "openfga")]
+        let (result, tuples) = flushed.settle(result, tuples.into_inner());
+        #[cfg(not(feature = "openfga"))]
+        let tuples = tuples.into_inner();
+        (result, audit_sink, tuples)
     })
     .await
     .expect("compaction sweep task should not panic");
@@ -606,6 +687,71 @@ pub async fn sweep_once(
     (result, start.elapsed(), audit_sink)
 }
 
+/// The graph tuples a sweep has written so far, flushed at each partition
+/// commit (RFC 0047 §3.3) so a restart mid-sweep loses none of a committed
+/// partition's tuples.
+#[cfg(feature = "openfga")]
+#[derive(Default)]
+struct GraphFlush {
+    /// Every tuple written this sweep, so a tuple derived again from a later
+    /// partition (a tenant's tool tuples, a conversation spanning hours) is
+    /// sent once.
+    sent: GraphTuples,
+    emitted: usize,
+    errors: Vec<String>,
+    /// A write failed this sweep: the rest wait for the end-of-sweep graph
+    /// phase, so an unreachable graph costs one timeout per sweep, not one
+    /// per partition.
+    failed: bool,
+}
+
+#[cfg(feature = "openfga")]
+impl GraphFlush {
+    /// Write the derived tuples not yet sent. A failed write puts them back
+    /// for the end-of-sweep graph phase to retry.
+    fn flush(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        emitter: &GraphEmitter,
+        tuples: &std::cell::RefCell<GraphTuples>,
+    ) {
+        if self.failed {
+            return;
+        }
+        let mut fresh = std::mem::take(&mut *tuples.borrow_mut());
+        fresh.retain(|tuple| !self.sent.contains(tuple));
+        if fresh.is_empty() {
+            return;
+        }
+        match runtime.block_on(emitter.emit(&fresh)) {
+            Ok(written) => {
+                self.emitted += written.tuples;
+                self.sent.append(&mut fresh);
+            }
+            Err(e) => {
+                self.errors.push(format!("graph emit: {e}"));
+                self.failed = true;
+                tuples.borrow_mut().append(&mut fresh);
+            }
+        }
+    }
+
+    /// Fold the per-commit flushes into the sweep's report, returning the
+    /// derived tuples still unsent for the graph phase.
+    fn settle(
+        self,
+        mut result: Result<SweepReport, IngestError>,
+        mut remaining: GraphTuples,
+    ) -> (Result<SweepReport, IngestError>, GraphTuples) {
+        remaining.retain(|tuple| !self.sent.contains(tuple));
+        if let Ok(report) = &mut result {
+            report.graph_tuples_emitted += self.emitted;
+            report.errors.extend(self.errors);
+        }
+        (result, remaining)
+    }
+}
+
 /// The async graph phase of a sweep (RFC 0047 §3.3 / §3.6).
 #[cfg(feature = "openfga")]
 async fn graph_phase(
@@ -617,7 +763,7 @@ async fn graph_phase(
 ) {
     if !tuples.is_empty() {
         match emitter.emit(&tuples).await {
-            Ok(written) => report.graph_tuples_emitted = written.tuples,
+            Ok(written) => report.graph_tuples_emitted += written.tuples,
             Err(e) => report.errors.push(format!("graph emit: {e}")),
         }
     }
@@ -817,6 +963,35 @@ fn compaction_audit_event(
     }
 }
 
+/// Account one committed rewrite in `report`, handing it to `on_commit`
+/// first — the moment its manifest commit is durable.
+fn record_commit(
+    report: &mut SweepReport,
+    tenant: &str,
+    outcome: &CompactionOutcome,
+    event: AuditEvent,
+    on_commit: &mut CommitObserver<'_>,
+) {
+    let files = to_u64(outcome.files_before);
+    on_commit(&PartitionCommitted {
+        tenant,
+        files,
+        rows: outcome.rows,
+        bytes_read: outcome.bytes_read,
+        bytes_written: outcome.bytes_written,
+        event: &event,
+    });
+    report.partitions_compacted += 1;
+    report.files_compacted += files;
+    report.rows_compacted += outcome.rows;
+    report.bytes_read = report.bytes_read.saturating_add(outcome.bytes_read);
+    report.compacted_files.push(CompactedFile {
+        tenant: tenant.to_string(),
+        bytes: outcome.bytes_written,
+    });
+    report.compaction_events.push(event);
+}
+
 /// `SystemTime::now()` as Unix nanoseconds (`0` if the clock is before
 /// the epoch; saturated at `u64::MAX` past year 2554 — neither is
 /// reachable in practice).
@@ -964,9 +1139,21 @@ mod graph_tests {
     /// One file per call, in the sealed hour partition, `rows` records with
     /// `conversation`/`user` attributes.
     fn write_rows(store: &Store, conversation: &str, user: &str, agent: Option<&str>, n: u64) {
+        write_rows_at(store, super::tests::TS0, conversation, user, agent, n);
+    }
+
+    /// [`write_rows`], its rows from `ts0` on.
+    fn write_rows_at(
+        store: &Store,
+        ts0: u64,
+        conversation: &str,
+        user: &str,
+        agent: Option<&str>,
+        n: u64,
+    ) {
         let rows: Vec<MinedRecord> = (0..n)
             .map(|i| {
-                let mut r = super::tests::rec("acme", 1, super::tests::TS0 + i * 1_000);
+                let mut r = super::tests::rec("acme", 1, ts0 + i * 1_000);
                 r.attributes = vec![
                     kv("gen_ai.conversation.id", conversation),
                     kv("user.hash", user),
@@ -1077,6 +1264,53 @@ mod graph_tests {
             "nothing new"
         );
         assert_eq!(fake.tuples.lock().expect("lock").len(), tuples.len());
+    }
+
+    /// A committed partition's tuples are written right after its commit,
+    /// not at sweep end: a sweep dying in its second partition has already
+    /// fed the graph the first partition's conversation, and not yet the
+    /// second's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_committed_partitions_tuples_survive_a_sweep_dying_after_it() {
+        // Arrange
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = super::tests::store_at(bucket.path());
+        for (hour, conversation) in [(0, "c-1"), (1, "c-2")] {
+            let ts0 = super::tests::TS0 + hour * super::tests::HOUR;
+            write_rows_at(&store, ts0, conversation, "alice", None, 1);
+            write_rows_at(&store, ts0 + 1_000_000, conversation, "alice", None, 1);
+        }
+        let sink = super::tests::CrashingSink::new(&SharedAuditSink::new(), 2);
+
+        // Act
+        let sweep = tokio::spawn(sweep_once(
+            store,
+            CompactionPolicy::default(),
+            promoted(),
+            Box::new(sink),
+            Some(emitter(&url)),
+        ))
+        .await;
+
+        // Assert
+        assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+        let objects: Vec<String> = fake
+            .tuples
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|t| t.object.clone())
+            .collect();
+        assert!(
+            objects.iter().any(|o| o == "conversation:acme/c-1"),
+            "{objects:?}"
+        );
+        assert!(
+            !objects.iter().any(|o| o == "conversation:acme/c-2"),
+            "{objects:?}"
+        );
     }
 
     /// Scenario RFC0047.11 — erasure removes tuples after rows: a requested

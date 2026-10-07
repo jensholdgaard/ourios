@@ -330,7 +330,22 @@ pub fn load_or_derive(
     backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
-    let resolved = audit_scan::resolve_audit_set(backend, tenant)?;
+    load_or_derive_resolved(
+        backend,
+        tenant,
+        audit_scan::resolve_audit_set(backend, tenant)?,
+    )
+}
+
+/// [`load_or_derive`] against a listing the caller already took — the
+/// querier's in-process cache lists once, compares the frontier against
+/// its held map, and hands that same listing here on a miss, so the
+/// §3.3 one-listing rule holds across both layers.
+pub(crate) fn load_or_derive_resolved(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
     let (fetched_bytes, expected, outcome) = match fetch_artifact(backend, tenant) {
         FetchedArtifact::Absent => (
             0,

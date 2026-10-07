@@ -47,6 +47,7 @@ mod body_match;
 mod drift;
 pub mod dsl;
 mod log_row;
+mod map_cache;
 mod plan;
 mod schema_adapt;
 mod template_map;
@@ -274,6 +275,9 @@ pub struct Querier {
     /// Defaults to the implicit-`service.name`-only set, under which
     /// the scan stays purely schema-driven (the RFC 0022 behaviour).
     promoted: ourios_parquet::PromotedAttributes,
+    /// The in-process template-map layer (#853): per-tenant single-flight
+    /// plus the latest derived map per tenant, shared by every clone.
+    template_maps: Arc<map_cache::TemplateMapCache>,
 }
 
 /// The object-store URL scheme/authority the S3 scan registers its
@@ -329,7 +333,7 @@ impl Terminal {
 /// render — so the alias map and the registry can never come from
 /// different frontiers within one query (§3.1's one-artifact rationale).
 struct AcquiredTemplateMap {
-    map: TemplateMap,
+    map: Arc<TemplateMap>,
     acquisition_bytes: u64,
 }
 
@@ -349,6 +353,7 @@ impl Querier {
         Self {
             backend: Backend::Local(bucket_root.into()),
             promoted: ourios_parquet::PromotedAttributes::default(),
+            template_maps: Arc::default(),
         }
     }
 
@@ -390,6 +395,7 @@ impl Querier {
         Ok(Self {
             backend,
             promoted: ourios_parquet::PromotedAttributes::default(),
+            template_maps: Arc::default(),
         })
     }
 
@@ -506,22 +512,18 @@ impl Querier {
         }
         // A `body ==`/`!=` needs the RFC 0017 registry for the RFC 0044
         // template arm; the `resolves_to` alias fold needs the alias map.
-        // Both ride the one RFC 0033 cached-map acquisition (artifact hit or
-        // fresh fold + write-through), so the two needs share one map (and
-        // one frontier) per query — and the acquisition is skipped entirely
-        // when neither is in the predicate. The blocking IO (S3 GETs / local
-        // `std::fs`) offloads off the runtime worker, mirroring `run_drift`.
+        // Both ride the one RFC 0033 cached-map acquisition (in-process hit,
+        // artifact hit, or fresh fold + write-through — single-flighted per
+        // tenant), so the two needs share one map (and one frontier) per
+        // query — and the acquisition is skipped entirely when neither is in
+        // the predicate. The blocking IO (S3 GETs / local `std::fs`) offloads
+        // off the runtime worker, mirroring `run_drift`.
         let needs_registry = plan::uses_body_equality(&query.predicate);
         let needs_alias_fold = alias_map.is_none() && plan::uses_resolves_to(&query.predicate);
         let mut acquired: Option<AcquiredTemplateMap> = None;
         if needs_alias_fold || needs_registry {
-            let (template_map, acquisition_bytes, _outcome) = self
-                .spawn_blocking_io({
-                    let backend = self.backend.clone();
-                    let tenant = tenant.clone();
-                    move || template_map::load_or_derive(backend.store_ref(), &tenant)
-                })
-                .await?;
+            let (template_map, acquisition_bytes) =
+                self.template_maps.acquire(&self.backend, tenant).await?;
             acquired = Some(AcquiredTemplateMap {
                 map: template_map,
                 acquisition_bytes,
@@ -924,21 +926,15 @@ impl Querier {
         // The single per-query template-map acquisition, measured
         // (RFC 0031 §3.6 / RFC 0033): reuse the compile-time alias fold's
         // map when the query already acquired one, else resolve through
-        // the cached read path — the same blocking-pool offload as
-        // [`Self::template_registry`].
+        // the querier's template-map cache (`map_cache`).
         let AcquiredTemplateMap {
             map,
             acquisition_bytes,
         } = if let Some(acquired) = acquired {
             acquired
         } else {
-            let (map, acquisition_bytes, _outcome) = self
-                .spawn_blocking_io({
-                    let backend = self.backend.clone();
-                    let tenant = tenant.clone();
-                    move || template_map::load_or_derive(backend.store_ref(), &tenant)
-                })
-                .await?;
+            let (map, acquisition_bytes) =
+                self.template_maps.acquire(&self.backend, tenant).await?;
             AcquiredTemplateMap {
                 map,
                 acquisition_bytes,
@@ -1232,6 +1228,7 @@ mod tests {
             let querier = Querier {
                 backend: Backend::Remote(store),
                 promoted: ourios_parquet::PromotedAttributes::default(),
+                template_maps: Arc::default(),
             };
             (querier, counter.expect("wrapped"))
         }

@@ -169,7 +169,10 @@ pub struct QueryResult {
     /// the `template_map.v2.json.zst` artifact GET on a cache hit. One
     /// per-query acquisition serves both the registry and, for
     /// `resolves_to` queries, the alias map. `0` when no rows were
-    /// rendered. Same additive contract as `materialize_bytes_read`
+    /// rendered, and `0` when the querier process already held the map
+    /// at the listed frontier (nothing fetched). A query that waited on
+    /// another query's in-flight derivation of the same frontier reports
+    /// that derivation's bytes. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
 }
@@ -214,7 +217,7 @@ pub struct AggregateGroup {
 /// add failure modes (parse/validation/auth) — matching the
 /// `TokenizeError` / `BenchError` convention so downstream
 /// matches don't break when variants land.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum QueryError {
     /// The query referenced no tenant (cross-tenant scans are

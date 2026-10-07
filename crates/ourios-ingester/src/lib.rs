@@ -61,6 +61,7 @@ pub mod reclaim_telemetry;
 pub mod record_sink;
 pub mod recovery;
 pub mod snapshot_store;
+pub mod template_ids;
 
 pub use compactor::{Compactor, IngestError, SweepReport, run_sweep, run_sweep_with_promoted};
 pub use metrics::CompactionMetrics;

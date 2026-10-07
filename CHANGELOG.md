@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.12.0] - 2026-10-06
+
+### CI
+
+- Pin the rust toolchain to 1.99.0 and let renovate bump it (#906) (09e493e)
+
+### Chore
+
+- Pin dependencies (#902) (3945d51)
+- Update quay.io/kubescape/kubescape docker tag to v3.0.48 (#905) (93b6bcf)
+- Update taiki-e/install-action digest to e407f7b (#904) (e1ec838)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 4129299 (#903) (f548852)
+
+### Documentation
+
+- Sync RFC 0059 with the implementation's gate round (#913) (18a6942)
+- Add rfc 0059, durable template-id allocation (#910) (6d4f986)
+
+### Fixed
+
+- **BREAKING** Allocate template ids from a durable high-water (rfc 0059) (#911) (b2f8a38)
+- Prepend the new changelog section instead of regenerating the file (#907) (03c6873)
+
+### Tests
+
+- Red, all nineteen §5 stubs land, status specified→red (#912) (78fdaa3)
+
 ## [0.11.2] - 2026-10-02
 
 ### Upgrade notes

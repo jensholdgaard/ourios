@@ -131,6 +131,29 @@ fn write_and_install(
     Ok(())
 }
 
+/// Remove every `*.snap` artefact under `root` and make the removal
+/// durable: the snapshots a root wrote before it seated against the
+/// template-id high-water are never restored (RFC 0059 §3.5).
+///
+/// # Errors
+///
+/// [`SnapshotStoreError::Io`] on any filesystem failure.
+pub fn remove_all(root: &Path) -> Result<(), SnapshotStoreError> {
+    let io = |op: &'static str| move |source| SnapshotStoreError::Io { op, source };
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io("read_dir(snapshots root)")(e)),
+    };
+    for entry in entries {
+        let path = entry.map_err(io("read_dir(snapshots root)"))?.path();
+        if path.extension().is_some_and(|e| e == EXTENSION) && path.is_file() {
+            std::fs::remove_file(&path).map_err(io("remove(snapshot)"))?;
+        }
+    }
+    fsync_root(root)
+}
+
 /// Fsync the snapshots root **and its parent** (RFC0052.13).
 ///
 /// Startup calls this before any listed artefact is read as a horizon.

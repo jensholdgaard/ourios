@@ -80,6 +80,7 @@ fn cluster_with_observable_sinks() -> (MinerCluster, SharedAuditSink, SharedReco
 mod adoption;
 mod confidence;
 mod emission;
+mod id_reservation;
 mod ingest;
 mod restore;
 mod restore_properties;

@@ -21,6 +21,7 @@ use ourios_wal::{
 
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, Journal, ReceiveError};
 use ourios_ingester::snapshot_store;
+use ourios_ingester::template_ids::TemplateIds;
 
 /// Every tenant's artefact at one explicit horizon, the fixture shape for
 /// a snapshot whose tenants' frames all sit at or below `high_water` (or
@@ -32,6 +33,15 @@ pub fn write_snapshots_at(root: &Path, miner: &MinerCluster, high_water: Option<
         state.wal_high_water = high_water.map(snapshot_store::high_water);
         snapshot_store::write(root, &tenant, &state).expect("snapshot write");
     }
+}
+
+/// Template-id allocation (RFC 0059) over an empty local store under
+/// `root`: a node that published nothing, whose bootstrap floor is what its
+/// snapshots restore.
+pub fn template_ids(root: &Path) -> TemplateIds {
+    let dir = root.join("template-id-store");
+    std::fs::create_dir_all(&dir).expect("template-id store root");
+    TemplateIds::new(ourios_parquet::Store::local(dir).expect("template-id store"))
 }
 
 pub fn wal_config(root: &Path) -> WalConfig {

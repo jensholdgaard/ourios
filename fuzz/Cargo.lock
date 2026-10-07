@@ -321,13 +321,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.92"
+version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2391,11 +2391,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.11.2"
+version = "0.12.0"
 
 [[package]]
 name = "ourios-core"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "opentelemetry",
@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "datafusion",
  "opentelemetry",
@@ -2430,12 +2430,14 @@ dependencies = [
 
 [[package]]
 name = "ourios-ingester"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
+ "async-trait",
  "axum",
  "flate2",
  "futures-core",
  "http",
+ "object_store",
  "opentelemetry",
  "opentelemetry-proto",
  "ourios-config",
@@ -2461,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "opentelemetry",
  "ourios-config",
@@ -2474,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2493,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2515,11 +2517,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.11.2"
+version = "0.12.0"
 
 [[package]]
 name = "ourios-serving"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "axum",
  "futures-core",
@@ -2542,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "crc32c",
  "ourios-core",

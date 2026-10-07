@@ -151,6 +151,9 @@ receiver:
   grpc_addr: "0.0.0.0:4317"
   http_addr: "0.0.0.0:4318"
   wal_root: {{ $.Values.receiver.wal.mountPath | quote }}
+  {{- if $.Values.receiver.templateIdsAllowBootstrap }}
+  template_ids_allow_bootstrap: true
+  {{- end }}
 compaction:
   enabled: false
 {{- else if eq $role "querier" }}

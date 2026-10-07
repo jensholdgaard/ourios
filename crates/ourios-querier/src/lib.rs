@@ -1291,7 +1291,9 @@ mod tests {
             assert_eq!(first.records.len(), 3);
             counter.reset();
 
-            let hit = querier.run(windowed(7)).await.expect("hit");
+            // A fresh querier (a restart, another replica) holds no map in
+            // memory, so its acquisition goes through the artifact.
+            let hit = fresh_querier(&querier).run(windowed(7)).await.expect("hit");
 
             assert_eq!(hit.records.len(), 3);
             let calls = audit_calls(&counter);
@@ -1314,6 +1316,39 @@ mod tests {
                 audit_keys >= 5,
                 "every day's audit file is listed: {audit_keys}"
             );
+        }
+
+        /// A repeat on the same querier at an unchanged frontier is served
+        /// from the in-process map: the freshness LIST still runs, but no
+        /// GET at all — not even the artifact.
+        #[tokio::test]
+        async fn a_repeat_on_the_same_querier_lists_once_and_reads_nothing() {
+            let tmp = tempfile::tempdir().expect("temp");
+            let (querier, counter) = seeded(tmp.path());
+            let first = querier
+                .run(windowed(7))
+                .await
+                .expect("miss: fold + publish");
+            counter.reset();
+
+            let repeat = querier.run(windowed(7)).await.expect("in-process hit");
+
+            assert_eq!(repeat.records, first.records);
+            assert_eq!(repeat.registry_bytes_read, 0, "nothing fetched");
+            let calls = audit_calls(&counter);
+            assert_eq!(
+                calls,
+                vec![Call::List("audit/tenant_id=acme".to_string())],
+                "one LIST, zero GETs",
+            );
+        }
+
+        fn fresh_querier(querier: &Querier) -> Querier {
+            Querier {
+                backend: querier.backend.clone(),
+                promoted: ourios_parquet::PromotedAttributes::default(),
+                template_maps: Arc::default(),
+            }
         }
     }
 }

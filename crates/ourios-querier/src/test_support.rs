@@ -4,7 +4,9 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -142,6 +144,104 @@ impl ObjectStore for CountingStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.record(Call::ListDelimited(prefix_str(prefix)));
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Delays (and optionally fails) whole-object GETs per key, recording how
+/// many were in flight at once — for tests that need out-of-order
+/// completion and failed reads on the remote audit scan.
+#[derive(Clone)]
+pub(crate) struct SlowStore {
+    inner: Arc<dyn ObjectStore>,
+    delay: fn(&str) -> Duration,
+    fail: Option<String>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+}
+
+impl SlowStore {
+    pub(crate) fn new(
+        inner: Arc<dyn ObjectStore>,
+        delay: fn(&str) -> Duration,
+        fail: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            delay,
+            fail,
+            in_flight: Arc::default(),
+            max_in_flight: Arc::default(),
+        }
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+}
+
+impl fmt::Debug for SlowStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SlowStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for SlowStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SlowStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for SlowStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        let key = location.to_string();
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep((self.delay)(&key)).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if self.fail.as_deref() == Some(key.as_str()) {
+            return Err(object_store::Error::Generic {
+                store: "SlowStore",
+                source: format!("injected GET failure for {key}").into(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 

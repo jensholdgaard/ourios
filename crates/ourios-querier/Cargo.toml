@@ -125,7 +125,8 @@ ourios-testgen = { path = "../ourios-testgen" }
 # (ourios-parquet, a normal dep) lays down fixture Parquet, and
 # tempfile gives each test a scratch bucket. `rt-multi-thread` for the
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
-tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros"] }
+# `time` for the delayed-GET store wrapper (`test_support::SlowStore`).
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile = "=3.27.0"
 # #895 (`tests/rfc0033_bounded_fold.rs`) — testing-mode heap profiler as the
 # global allocator, so the cold template-map derivation's peak heap is

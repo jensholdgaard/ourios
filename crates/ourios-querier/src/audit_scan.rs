@@ -39,6 +39,7 @@ use ourios_core::audit::AuditEvent;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditReader, Store, percent_encode_tenant};
 
+use crate::audit_fetch::{FetchLimits, fetch_in_order};
 use crate::{Backend, QueryError};
 
 /// Borrowed audit-scan backend selector (RFC 0019 §3.3): either a local
@@ -117,6 +118,7 @@ pub(crate) fn audit_files(
 /// `folded_files`). Both come from the single listing + read pass that fed
 /// the visitor, so the frontier can never name a set other than the one
 /// actually folded.
+#[derive(Debug)]
 pub(crate) struct ScanSummary {
     pub(crate) bytes_read: u64,
     pub(crate) frontier: Vec<String>,
@@ -137,8 +139,10 @@ pub(crate) enum ResolvedAuditSet<'a> {
     },
     Remote {
         store: &'a Store,
-        /// Store-relative object keys (lexicographically sorted, unique).
-        keys: Vec<String>,
+        /// Store-relative object keys (lexicographically sorted, unique),
+        /// each with its listed size — the concurrent fetch's byte budget
+        /// is charged from the listing, before the GET.
+        objects: Vec<(String, u64)>,
         frontier: Vec<String>,
     },
 }
@@ -170,19 +174,19 @@ pub(crate) fn resolve_audit_set<'a>(
         StoreRef::Remote(store) => {
             let enc = percent_encode_tenant(tenant.as_str());
             let prefix = format!("audit/tenant_id={enc}/");
-            let keys = remote_audit_files(store, tenant, None)?;
+            let objects = remote_audit_objects(store, tenant, None)?;
             // The listing is prefix-scoped, so the strip always applies;
             // keeping the full key on a (can't-happen) miss stays
             // consistent for set-equality as long as both sides use this
             // same rule.
-            let mut frontier: Vec<String> = keys
+            let mut frontier: Vec<String> = objects
                 .iter()
-                .map(|key| key.strip_prefix(&prefix).unwrap_or(key).to_owned())
+                .map(|(key, _)| key.strip_prefix(&prefix).unwrap_or(key).to_owned())
                 .collect();
             frontier.sort_unstable();
             Ok(ResolvedAuditSet::Remote {
                 store,
-                keys,
+                objects,
                 frontier,
             })
         }
@@ -209,16 +213,30 @@ impl ResolvedAuditSet<'_> {
     /// [`AuditReader::open_file`], an S3 key via [`Store::get_blocking`] →
     /// [`AuditReader::open_bytes`].
     ///
-    /// One audit file is held at a time: its bytes and decoded events are
-    /// dropped before the next is fetched, so the scan's footprint is
-    /// bounded by the largest audit file, not the tenant's history.
-    /// What the visitor keeps is the fold's business.
+    /// One audit file is decoded at a time: its decoded events are dropped
+    /// before the next file is decoded. Locally the files are also read one
+    /// at a time. Remote GETs run concurrently under [`FetchLimits`] — at
+    /// most `requests` in flight and `bytes` of listed object size fetched
+    /// ahead of the fold — and are still visited in key order, so the
+    /// footprint is bounded by that budget plus the largest decoded file,
+    /// not the tenant's history. What the visitor keeps is the fold's
+    /// business.
     ///
     /// The remote branch pays a full-object GET per key, so the local
     /// branch counts each file's length to keep the two backends'
     /// [`ScanSummary::bytes_read`] equal for identical data.
     pub(crate) fn for_each_event(
         self,
+        tenant: &TenantId,
+        visit: impl FnMut(AuditEvent),
+    ) -> Result<ScanSummary, QueryError> {
+        self.for_each_event_with(FetchLimits::default(), tenant, visit)
+    }
+
+    /// [`Self::for_each_event`] under explicit remote [`FetchLimits`].
+    pub(crate) fn for_each_event_with(
+        self,
+        limits: FetchLimits,
         tenant: &TenantId,
         mut visit: impl FnMut(AuditEvent),
     ) -> Result<ScanSummary, QueryError> {
@@ -234,14 +252,24 @@ impl ResolvedAuditSet<'_> {
             }
             Self::Remote {
                 store,
-                keys,
+                objects,
                 frontier,
             } => {
-                for key in &keys {
-                    let (len, events) = read_remote(store, key)?;
-                    bytes_read = add_measured(bytes_read, len)?;
-                    visit_validated(key, events, tenant, &mut visit)?;
-                }
+                fetch_in_order(
+                    &objects,
+                    limits,
+                    |key| {
+                        store.get_blocking(key).map_err(|e| QueryError::Storage {
+                            detail: format!("audit file {key}: {e}"),
+                        })
+                    },
+                    |index, bytes| {
+                        let key = &objects[index].0;
+                        let (len, events) = decode_remote(key, bytes)?;
+                        bytes_read = add_measured(bytes_read, len)?;
+                        visit_validated(key, events, tenant, &mut visit)
+                    },
+                )?;
                 frontier
             }
         };
@@ -279,11 +307,8 @@ fn read_local(path: &Path) -> Result<(u64, Vec<AuditEvent>), QueryError> {
     Ok((len, events))
 }
 
-/// One audit object's fetched byte count and decoded events.
-fn read_remote(store: &Store, key: &str) -> Result<(u64, Vec<AuditEvent>), QueryError> {
-    let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
-        detail: format!("audit file {key}: {e}"),
-    })?;
+/// One fetched audit object's byte count and decoded events.
+fn decode_remote(key: &str, bytes: Vec<u8>) -> Result<(u64, Vec<AuditEvent>), QueryError> {
     let len = bytes.len() as u64;
     let events = AuditReader::open_bytes(bytes::Bytes::from(bytes))
         .and_then(AuditReader::read_all)
@@ -484,24 +509,38 @@ fn remote_audit_files(
     tenant: &TenantId,
     window: Option<(u64, u64)>,
 ) -> Result<Vec<String>, QueryError> {
+    Ok(remote_audit_objects(store, tenant, window)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect())
+}
+
+/// [`remote_audit_files`] with each key's listed size — the same single
+/// listing request; the size rides along in the listing response.
+fn remote_audit_objects(
+    store: &Store,
+    tenant: &TenantId,
+    window: Option<(u64, u64)>,
+) -> Result<Vec<(String, u64)>, QueryError> {
     let enc = percent_encode_tenant(tenant.as_str());
     let prefix = format!("audit/tenant_id={enc}");
-    let keys = store
-        .list_blocking(Some(&prefix))
-        .map_err(|e| QueryError::Storage {
-            detail: format!("list audit prefix {prefix}: {e}"),
-        })?;
-    let files = keys
+    let entries =
+        store
+            .list_with_sizes_blocking(Some(&prefix))
+            .map_err(|e| QueryError::Storage {
+                detail: format!("list audit prefix {prefix}: {e}"),
+            })?;
+    let files = entries
         .into_iter()
         // `*.parquet.tmp` does not end in `.parquet`, so an uncommitted /
         // crashed writer's temp object contributes nothing.
-        .filter(|key| key.ends_with(".parquet"))
+        .filter(|(key, _)| key.ends_with(".parquet"))
         // Day-granularity partition prune (RFC 0005 §3.4 / RFC 0010
         // §6.5): a key whose `year/month/day` segments fall out of the
         // window is dropped before it is read. `day_key_in_window` is
         // conservative — a key whose segments don't parse is never
         // pruned — so an unrecognised layout never drops in-window data.
-        .filter(|key| window.is_none_or(|(start, end)| day_key_in_window(key, start, end)))
+        .filter(|(key, _)| window.is_none_or(|(start, end)| day_key_in_window(key, start, end)))
         .collect();
     Ok(files)
 }
@@ -704,5 +743,185 @@ mod tests {
             DAY_START - 7_200_000_000_000,
             DAY_START - 3_600_000_000_000,
         ));
+    }
+
+    /// The remote scan's concurrent GETs fold exactly what the serial
+    /// local scan folds, in the same order.
+    mod concurrent_fetch {
+        use std::sync::Arc;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use ourios_core::audit::{AuditPayload, AuditSink as _, TemplateChange};
+
+        use super::*;
+        use crate::test_support::SlowStore;
+        use crate::{derive_template_map, template_map::TemplateMap};
+
+        const TENANT: &str = "acme";
+        const FILES: u64 = 80;
+
+        /// One audit file per event (the production sink's per-emit
+        /// flush). Every event shares one timestamp and re-mints one of a
+        /// few `(template_id, 1)` keys with a distinct template, so which
+        /// template wins depends on the scan's file order alone.
+        fn seeded() -> tempfile::TempDir {
+            let bucket = tempfile::tempdir().expect("temp");
+            let mut sink =
+                ourios_parquet::ParquetAuditSink::new(Store::local(bucket.path()).expect("store"));
+            for seq in 0..FILES {
+                sink.emit(AuditEvent {
+                    tenant_id: TenantId::new(TENANT),
+                    timestamp: UNIX_EPOCH + Duration::from_nanos(DAY_START),
+                    payload: AuditPayload::Template {
+                        template_id: seq % 5 + 1,
+                        triggering_line_hash: ourios_core::audit::hash_triggering_line(b"l"),
+                        triggering_line_sample: None,
+                        change: TemplateChange::Created {
+                            new_template: format!("t{seq} <*>"),
+                        },
+                    },
+                });
+            }
+            assert_eq!(sink.write_failures(), 0);
+            bucket
+        }
+
+        /// Spread completions out of listing order: the delay depends on a
+        /// key byte, not on the key's position.
+        fn scrambled(key: &str) -> Duration {
+            let byte = key.bytes().rev().nth(9).unwrap_or(0);
+            Duration::from_millis(u64::from(byte % 13))
+        }
+
+        fn slow_store(bucket: &Path, fail: Option<String>) -> (Store, SlowStore) {
+            let mut slow = None;
+            let store = Store::local(bucket).expect("store").wrap_backend(|inner| {
+                let wrapped = SlowStore::new(inner, scrambled, fail);
+                slow = Some(wrapped.clone());
+                Arc::new(wrapped)
+            });
+            (store, slow.expect("wrapped"))
+        }
+
+        fn scan(
+            backend: StoreRef<'_>,
+            limits: FetchLimits,
+        ) -> Result<(Vec<AuditEvent>, ScanSummary), QueryError> {
+            let tenant = TenantId::new(TENANT);
+            let mut events = Vec::new();
+            let summary = resolve_audit_set(backend, &tenant)?.for_each_event_with(
+                limits,
+                &tenant,
+                |event| events.push(event),
+            )?;
+            Ok((events, summary))
+        }
+
+        fn assert_same_map(left: &TemplateMap, right: &TemplateMap) {
+            assert_eq!(left.folded_files(), right.folded_files());
+            assert_eq!(left.registry(), right.registry());
+            let tenant = TenantId::new(TENANT);
+            assert_eq!(
+                left.alias_map().classes(&tenant),
+                right.alias_map().classes(&tenant),
+            );
+        }
+
+        #[test]
+        fn concurrent_remote_scan_equals_the_serial_scan() {
+            let bucket = seeded();
+            let (serial, serial_summary) =
+                scan(StoreRef::Local(bucket.path()), FetchLimits::default()).expect("serial");
+            assert_eq!(serial.len() as u64, FILES);
+            let (store, slow) = slow_store(bucket.path(), None);
+            let limits = FetchLimits {
+                requests: 8,
+                bytes: u64::MAX,
+            };
+
+            let (concurrent, summary) = scan(StoreRef::Remote(&store), limits).expect("concurrent");
+
+            assert_eq!(concurrent, serial, "same events, same order");
+            assert_eq!(summary.frontier, serial_summary.frontier);
+            assert_eq!(summary.bytes_read, serial_summary.bytes_read);
+            assert!(slow.max_in_flight() > 1, "the GETs overlapped");
+            assert!(slow.max_in_flight() <= limits.requests);
+
+            let tenant = TenantId::new(TENANT);
+            let (local, _) =
+                derive_template_map(StoreRef::Local(bucket.path()), &tenant).expect("local fold");
+            let (remote, _) =
+                derive_template_map(StoreRef::Remote(&store), &tenant).expect("remote fold");
+            assert_same_map(&remote, &local);
+        }
+
+        #[test]
+        fn one_request_at_a_time_is_the_serial_scan() {
+            let bucket = seeded();
+            let (store, slow) = slow_store(bucket.path(), None);
+            let (serial, _) = scan(
+                StoreRef::Remote(&store),
+                FetchLimits {
+                    requests: 1,
+                    bytes: u64::MAX,
+                },
+            )
+            .expect("one at a time");
+            assert_eq!(slow.max_in_flight(), 1);
+            let (concurrent, _) =
+                scan(StoreRef::Remote(&store), FetchLimits::default()).expect("concurrent");
+            assert_eq!(concurrent, serial);
+        }
+
+        #[test]
+        fn a_failed_get_fails_the_remote_scan() {
+            let bucket = seeded();
+            let keys = Store::local(bucket.path())
+                .expect("store")
+                .list_blocking(Some("audit/"))
+                .expect("list");
+            let victim = keys[keys.len() / 2].clone();
+            let (store, _) = slow_store(bucket.path(), Some(victim.clone()));
+
+            let err = scan(StoreRef::Remote(&store), FetchLimits::default())
+                .expect_err("a failed GET fails the scan");
+
+            assert!(
+                matches!(&err, QueryError::Storage { detail } if detail.contains(&victim)),
+                "{err:?}",
+            );
+            let tenant = TenantId::new(TENANT);
+            assert!(derive_template_map(StoreRef::Remote(&store), &tenant).is_err());
+        }
+
+        #[test]
+        fn the_byte_budget_bounds_overlap() {
+            let bucket = seeded();
+            let (store, slow) = slow_store(bucket.path(), None);
+            let largest = Store::local(bucket.path())
+                .expect("store")
+                .list_with_sizes_blocking(Some("audit/"))
+                .expect("list")
+                .into_iter()
+                .map(|(_, size)| size)
+                .max()
+                .expect("files");
+
+            let (events, _) = scan(
+                StoreRef::Remote(&store),
+                FetchLimits {
+                    requests: 16,
+                    bytes: largest,
+                },
+            )
+            .expect("scan");
+
+            assert_eq!(events.len() as u64, FILES);
+            assert_eq!(
+                slow.max_in_flight(),
+                1,
+                "a budget of one object admits one GET at a time",
+            );
+        }
     }
 }

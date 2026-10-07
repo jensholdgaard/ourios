@@ -199,10 +199,20 @@ where
                 Err(_) => break,
             }
         }
-        let outcome = consume_in_order(&shared, &sizes, &mut consume);
-        shared.stop();
-        outcome
+        let _stop = StopOnDrop(&shared);
+        consume_in_order(&shared, &sizes, &mut consume)
     })
+}
+
+/// Stops dispatch when the consumer leaves — normally or by unwinding — so
+/// workers parked on the byte budget wake and exit, and the scope's join
+/// cannot hang behind them.
+struct StopOnDrop<'a>(&'a Shared);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 fn consume_in_order<C>(shared: &Shared, sizes: &[u64], consume: &mut C) -> Result<(), QueryError>
@@ -211,6 +221,11 @@ where
 {
     for (index, size) in sizes.iter().enumerate() {
         let outcome = shared.take(index).and_then(|body| consume(index, body));
+        // Stop before releasing: the release wakes budget-blocked workers,
+        // which must see the failure instead of claiming another GET.
+        if outcome.is_err() {
+            shared.stop();
+        }
         shared.release(*size);
         outcome?;
     }
@@ -331,6 +346,81 @@ mod tests {
             fetched.load(Ordering::SeqCst) < objects.len(),
             "dispatch stops after the failure",
         );
+    }
+
+    #[test]
+    fn a_panicking_consume_propagates_instead_of_hanging() {
+        // One object's worth of budget: while the consumer holds index 0,
+        // every other worker is parked on the byte window.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let objects = objects(&[10; 32]);
+            let outcome = std::panic::catch_unwind(|| {
+                fetch_in_order(
+                    &objects,
+                    FetchLimits {
+                        requests: 4,
+                        bytes: 10,
+                    },
+                    |key| Ok(body(key)),
+                    |_, _| -> Result<(), QueryError> { panic!("consume panics") },
+                )
+            });
+            let _ = tx.send(outcome.is_err());
+        });
+
+        let panicked = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("fetch_in_order hung after a consume panic");
+        assert!(panicked, "the consume panic propagates");
+    }
+
+    /// Counts GET starts across a pass whose first object fails, under a
+    /// budget of two objects: exactly indices 0 and 1 are dispatched before
+    /// the failure, and nothing may start after it.
+    fn gets_started_after_first_failure(fail_get: bool) -> usize {
+        let objects = objects(&[10; 64]);
+        let started = AtomicUsize::new(0);
+        let err = fetch_in_order(
+            &objects,
+            FetchLimits {
+                requests: 8,
+                bytes: 20,
+            },
+            |key| {
+                started.fetch_add(1, Ordering::SeqCst);
+                match key {
+                    "k0000" if fail_get => Err(QueryError::Storage {
+                        detail: "GET".to_owned(),
+                    }),
+                    _ => Ok(body(key)),
+                }
+            },
+            |index, _| match index {
+                0 => Err(QueryError::Storage {
+                    detail: "consume".to_owned(),
+                }),
+                _ => Ok(()),
+            },
+        );
+        assert!(err.is_err());
+        started.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn no_get_starts_after_a_failure() {
+        for _ in 0..50 {
+            assert_eq!(
+                gets_started_after_first_failure(true),
+                2,
+                "after a failed GET"
+            );
+            assert_eq!(
+                gets_started_after_first_failure(false),
+                2,
+                "after a failed consume"
+            );
+        }
     }
 
     #[test]

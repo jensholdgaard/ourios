@@ -413,6 +413,7 @@ fn over_budget_partition_matches_the_in_memory_output_with_hooks() {
         let mut hooks = RowHooks {
             observe: Some(&mut observe),
             drop: Some(&erased),
+            on_commit: None,
         };
         let outcome = compact_sorted_hooked(
             store,

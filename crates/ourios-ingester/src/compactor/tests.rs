@@ -463,6 +463,15 @@ fn run_executes_sweeps_until_cancelled() {
     assert_eq!(compacted.expect("sweep ok"), 1);
 }
 
+/// A graph-less sweep of `store` under the default policy and promoted set.
+fn target(store: &Store) -> SweepTarget {
+    SweepTarget::new(
+        store.clone(),
+        CompactionPolicy::default(),
+        PromotedAttributes::default(),
+    )
+}
+
 /// `count` sealed candidates for tenant `a`, one per consecutive hour from
 /// `TS0`'s, two files each.
 fn write_sealed_hours(store: &Store, count: u64) {
@@ -522,15 +531,7 @@ async fn a_sweep_dying_mid_backlog_has_emitted_every_committed_partitions_event(
     let sink = CrashingSink::new(&audit, K);
 
     // Act
-    let sweep = tokio::spawn(sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        PromotedAttributes::default(),
-        Box::new(sink),
-        #[cfg(feature = "openfga")]
-        None,
-    ))
-    .await;
+    let sweep = tokio::spawn(sweep_once(target(&store), Box::new(sink))).await;
 
     // Assert
     assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
@@ -612,16 +613,7 @@ async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
     };
 
     // Act
-    let (result, _, _) = sweep_recorded(
-        store,
-        CompactionPolicy::default(),
-        PromotedAttributes::default(),
-        Box::new(sink),
-        #[cfg(feature = "openfga")]
-        None,
-        Some(metrics),
-    )
-    .await;
+    let (result, _, _) = sweep_recorded(target(&store), Box::new(sink), Some(metrics)).await;
 
     // Assert
     let report = result.expect("sweep");
@@ -631,5 +623,130 @@ async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
         readings,
         vec![(1, 2), (2, 4), (3, 6), (4, 8)],
         "one partition and its two files counted at each commit"
+    );
+}
+
+/// A store backend that dies (panics) on the first delete of a data file:
+/// the cleanup of a compaction's superseded inputs, after its commit.
+#[derive(Debug)]
+struct DiesInCleanup(Arc<dyn object_store::ObjectStore>);
+
+impl std::fmt::Display for DiesInCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DiesInCleanup({})", self.0)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DiesInCleanup {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.0.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.0.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        use futures::StreamExt as _;
+        let dying = locations.inspect(|location| {
+            if let Ok(path) = location {
+                let path = path.as_ref();
+                assert!(
+                    !(path.starts_with("data/") && path.ends_with(".parquet")),
+                    "the process dies cleaning up {path}"
+                );
+            }
+        });
+        self.0.delete_stream(dying.boxed())
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(from, to, options).await
+    }
+}
+
+/// A sweep dying in the cleanup after a partition's commit — the
+/// superseded inputs' deletes — has already recorded that partition: its
+/// counters and its audit event come from the commit itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_dying_in_post_commit_cleanup_has_recorded_the_partition() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, 2);
+    let store = store.wrap_backend(|inner| Arc::new(DiesInCleanup(inner)));
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter("ourios.compaction"),
+    ));
+    let audit = ourios_core::audit::SharedAuditSink::new();
+
+    // Act
+    let sweep = tokio::spawn(sweep_recorded(
+        target(&store),
+        Box::new(audit.clone()),
+        Some(metrics),
+    ))
+    .await;
+
+    // Assert
+    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+    provider.force_flush().expect("flush");
+    let rms = exporter.get_finished_metrics().expect("collect");
+    let events: Vec<String> = audit.drain().iter().map(event_partition).collect();
+    assert_eq!(
+        (
+            events.len(),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_PARTITIONS),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_FILES),
+        ),
+        (1, 1, 2),
+        "the committed partition's event and counters: {events:?}"
     );
 }

@@ -13,7 +13,8 @@ use ourios_core::auth::openfga::{
     OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
 };
 use ourios_ingester::compactor::{
-    acquire_backfill_lock, backfill_locks, pending_erasures, release_backfill_lock, sweep_once,
+    SweepTarget, acquire_backfill_lock, backfill_locks, pending_erasures, release_backfill_lock,
+    sweep_once,
 };
 use ourios_ingester::graph_emitter::GraphEmitter;
 use ourios_parquet::{CompactionPolicy, Store};
@@ -294,11 +295,9 @@ async fn rfc0048_5_8_backfill_and_fence_end_to_end() {
     );
     let audit = SharedAuditSink::new();
     let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
+        SweepTarget::new(store.clone(), CompactionPolicy::default(), promoted())
+            .with_emitter(Arc::clone(&emitter)),
         Box::new(audit.clone()),
-        Some(Arc::clone(&emitter)),
     )
     .await;
     let report = result.expect("sweep");
@@ -312,11 +311,9 @@ async fn rfc0048_5_8_backfill_and_fence_end_to_end() {
     );
     release_backfill_lock(&store, "acme").expect("release");
     let (result, _, _) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
+        SweepTarget::new(store.clone(), CompactionPolicy::default(), promoted())
+            .with_emitter(emitter),
         sink,
-        Some(emitter),
     )
     .await;
     let report = result.expect("sweep");

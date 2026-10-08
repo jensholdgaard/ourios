@@ -20,8 +20,8 @@ use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, PartitionKey,
-    PromotedAttributes, RowHooks, Store, compact_partition_hooked, gc_orphans, hour_partitions,
-    percent_decode_tenant, percent_encode_tenant, plan_candidates,
+    PromotedAttributes, RowFilter, RowHooks, RowObserver, Store, compact_partition_hooked,
+    gc_orphans, hour_partitions, percent_decode_tenant, percent_encode_tenant, plan_candidates,
 };
 
 #[cfg(feature = "openfga")]
@@ -140,6 +140,8 @@ pub struct SweepReport {
 mod backfill;
 mod daemon;
 mod erasure;
+#[cfg(feature = "openfga")]
+mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
 mod graph_tests;
 #[cfg(test)]
@@ -154,6 +156,8 @@ pub use backfill::*;
 pub use daemon::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
 pub use erasure::*;
+#[cfg(feature = "openfga")]
+use graph_phase::GraphPhase;
 
 fn store_error(op: &'static str, key: &str, e: &ourios_parquet::StoreError) -> IngestError {
     IngestError::Io {
@@ -207,32 +211,11 @@ pub fn run_sweep(
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
 ) -> Result<SweepReport, IngestError> {
-    run_sweep_with_promoted(
-        store,
-        now_unix_nanos,
-        policy,
-        &PromotedAttributes::default(),
-    )
-}
-
-/// Like [`run_sweep`] but consolidating under an explicit RFC 0022 promoted
-/// attribute set (§3.4: rewrites re-project with the *current* set). The bare
-/// [`run_sweep`] delegates with the default (`service.name`-only) set.
-///
-/// # Errors
-///
-/// See [`run_sweep`].
-pub fn run_sweep_with_promoted(
-    store: &Store,
-    now_unix_nanos: u64,
-    policy: &CompactionPolicy,
-    promoted: &PromotedAttributes,
-) -> Result<SweepReport, IngestError> {
     run_sweep_hooked(
         store,
         now_unix_nanos,
         policy,
-        promoted,
+        &PromotedAttributes::default(),
         &mut SweepHooks::default(),
     )
 }
@@ -254,7 +237,9 @@ pub type SweepObserver<'a> = dyn FnMut(&str, &[MinedRecord]) + 'a;
 /// A [`SweepHooks::erasure_match`] predicate.
 pub type ErasureMatch<'a> = dyn Fn(&MinedRecord, &str) -> bool + 'a;
 
-/// [`run_sweep_with_promoted`] with [`SweepHooks`]: the consolidation
+/// [`run_sweep`] under an explicit RFC 0022 promoted attribute set
+/// (§3.4: rewrites re-project with the *current* set), with
+/// [`SweepHooks`]: the consolidation
 /// pass, then the RFC 0047 §3.6 erasure pass — every pending request in
 /// the `Rows` phase rewrites each of its tenant's partitions with the
 /// conversation's rows dropped; once every partition rewrote cleanly the
@@ -274,8 +259,9 @@ pub fn run_sweep_hooked(
     run_sweep_committing(store, now_unix_nanos, policy, promoted, hooks, &mut |_| {})
 }
 
-/// One partition rewrite whose manifest just committed, handed to the
-/// sweep's commit callback before the sweep moves on (RFC 0009 §3.6): the
+/// One partition rewrite whose manifest commit was just won, handed to the
+/// sweep's commit callback before the superseded inputs are cleaned up
+/// (RFC 0009 §3.6): the
 /// counters it adds and the audit event it carries are the ones the
 /// [`SweepReport`] accumulates, delivered while the sweep is still running.
 #[derive(Debug)]
@@ -332,30 +318,25 @@ pub fn run_sweep_committing(
     for tenant in tenants(store)? {
         sweep.tenant(&tenant, policy, hooks.observe.as_deref_mut());
     }
-    let Sweep {
-        mut report,
-        on_commit,
-        ..
-    } = sweep;
-    erase_pending(
-        store,
-        now_unix_nanos,
-        promoted,
-        hooks.erasure_match,
-        &mut report,
-        on_commit,
-    )?;
-    Ok(report)
+    erase_pending(&mut sweep, hooks.erasure_match)?;
+    Ok(sweep.report)
 }
 
-/// One consolidation pass in progress: its fixed inputs, the report it
-/// accumulates, and the commit callback each committed partition reaches.
+/// One sweep in progress: its fixed inputs, the report it accumulates, and
+/// the commit callback each committed partition reaches.
 struct Sweep<'s, 'c> {
     store: &'s Store,
     now_unix_nanos: u64,
     promoted: &'s PromotedAttributes,
     report: SweepReport,
     on_commit: &'s mut CommitObserver<'c>,
+}
+
+/// One partition of one tenant.
+#[derive(Clone, Copy)]
+struct Target<'p> {
+    tenant: &'p str,
+    partition: &'p PartitionKey,
 }
 
 impl Sweep<'_, '_> {
@@ -379,7 +360,8 @@ impl Sweep<'_, '_> {
         };
         let mut compacted_here = 0usize;
         for partition in &candidates {
-            if self.partition(tenant, partition, observe.as_deref_mut()) {
+            let target = Target { tenant, partition };
+            if self.consolidate(target, observe.as_deref_mut()) {
                 compacted_here += 1;
             }
         }
@@ -390,14 +372,10 @@ impl Sweep<'_, '_> {
         });
     }
 
-    /// Reclaim `partition`'s orphans, then consolidate it; whether it
+    /// Reclaim the partition's orphans, then consolidate it; whether it
     /// committed.
-    fn partition(
-        &mut self,
-        tenant: &str,
-        partition: &PartitionKey,
-        observe: Option<&mut SweepObserver<'_>>,
-    ) -> bool {
+    fn consolidate(&mut self, target: Target<'_>, observe: Option<&mut SweepObserver<'_>>) -> bool {
+        let Target { tenant, partition } = target;
         // Reclaim orphans a prior crashed compaction of this partition
         // left (RFC0009.4). Manifest-authoritative, so it never touches
         // a live file; a scan error is recorded, not fatal.
@@ -409,36 +387,57 @@ impl Sweep<'_, '_> {
             )),
         }
         let mut observe = observe.map(|observe| move |rows: &[MinedRecord]| observe(tenant, rows));
-        let mut row_hooks = RowHooks {
-            observe: observe
-                .as_mut()
-                .map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
-            drop: None,
-        };
-        let outcome = match compact_candidate(self.store, partition, self.promoted, &mut row_hooks)
-        {
-            Ok(outcome) => outcome,
+        let observe = observe
+            .as_mut()
+            .map(|observe| observe as &mut dyn FnMut(&[MinedRecord]));
+        match self.rewrite(target, observe, None) {
+            Ok(outcome) => {
+                self.report.gc_failures += outcome.gc_failures;
+                outcome.committed.is_some()
+            }
             Err(e) => {
-                e.record(
-                    &mut self.report,
-                    &format!("compact {tenant:?} {}", hour_label(partition)),
+                let context = format!("compact {tenant:?} {}", hour_label(partition));
+                e.record(&mut self.report, &context);
+                false
+            }
+        }
+    }
+
+    /// Rewrite the partition ([`compact_candidate`]), recording its commit
+    /// — report, audit event, commit callback — the moment the manifest
+    /// commit is won, before the superseded inputs are cleaned up: a crash
+    /// in that cleanup leaves the partition committed, and recorded.
+    fn rewrite(
+        &mut self,
+        target: Target<'_>,
+        observe: Option<&mut RowObserver<'_>>,
+        drop: Option<&RowFilter<'_>>,
+    ) -> Result<CompactionOutcome, Uncommitted> {
+        let Self {
+            store,
+            now_unix_nanos,
+            promoted,
+            report,
+            on_commit,
+        } = self;
+        let mut record = |outcome: &CompactionOutcome| {
+            if let Some(committed) = &outcome.committed {
+                let event = compaction_audit_event(
+                    target.tenant,
+                    *now_unix_nanos,
+                    target.partition,
+                    committed,
+                    outcome.rows,
                 );
-                return false;
+                record_commit(report, target.tenant, outcome, event, &mut **on_commit);
             }
         };
-        self.report.gc_failures += outcome.gc_failures;
-        let Some(committed) = &outcome.committed else {
-            return false;
+        let mut hooks = RowHooks {
+            observe: observe.map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
+            drop: drop.map(|drop| drop as &dyn Fn(&MinedRecord) -> bool),
+            on_commit: Some(&mut record),
         };
-        let event = compaction_audit_event(
-            tenant,
-            self.now_unix_nanos,
-            partition,
-            committed,
-            outcome.rows,
-        );
-        record_commit(&mut self.report, tenant, &outcome, event, self.on_commit);
-        true
+        compact_candidate(store, target.partition, promoted, &mut hooks)
     }
 }
 

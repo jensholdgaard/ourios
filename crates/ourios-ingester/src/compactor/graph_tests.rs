@@ -1,13 +1,12 @@
 //! The compaction sweep against a fake `OpenFGA` store: the RFC 0047
-//! graph feed, erasure, and the per-commit tuple flush.
+//! graph feed and erasure.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
-use ourios_core::audit::{AuditPayload, SharedAuditSink};
+use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, SharedAuditSink};
 use ourios_core::auth::openfga::{OpenFgaSpec, build_openfga_config};
 use ourios_core::otlp::any_value::Value;
 use ourios_core::otlp::{AnyValue, KeyValue};
@@ -18,21 +17,35 @@ use ourios_parquet::{
 use ourios_serving::openfga::TupleKey;
 use serde_json::json;
 
-use super::{ErasurePhase, pending_erasures, request_erasure, sweep_once};
+use super::{
+    ErasureOutcome, ErasurePhase, IngestError, SweepReport, SweepTarget, pending_erasures,
+    request_erasure, sweep_once,
+};
 use crate::graph_emitter::GraphEmitter;
 
 /// A fake `OpenFGA` store: `/write` applies writes/deletes (asserting the
-/// ≤ 100 chunk), `/read` answers by object. With `fail_next_write` set,
-/// the next `/write` answers `503` instead.
+/// ≤ 100 chunk), `/read` answers by object.
 #[derive(Clone, Default)]
 struct Fake {
     tuples: Arc<Mutex<Vec<TupleKey>>>,
     writes: Arc<Mutex<Vec<usize>>>,
-    fail_next_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn json(value: &serde_json::Value) -> ([(&'static str, &'static str); 1], String) {
     ([("content-type", "application/json")], value.to_string())
+}
+
+/// The tuple keys of a `Write` request's `section` (`writes` / `deletes`),
+/// asserting the ≤ 100 chunk and the idempotency `flag` the section carries.
+fn section_keys(request: &serde_json::Value, section: &str, flag: &str) -> Vec<TupleKey> {
+    let Some(keys) = request[section]["tuple_keys"].as_array() else {
+        return Vec::new();
+    };
+    assert!(keys.len() <= 100, "RFC 0047 §3.3: ≤ 100 tuples per Write");
+    assert_eq!(request[section][flag], "ignore");
+    keys.iter()
+        .map(|key| serde_json::from_value(key.clone()).expect("tuple"))
+        .collect()
 }
 
 async fn write(
@@ -41,42 +54,19 @@ async fn write(
 ) -> ([(&'static str, &'static str); 1], String) {
     let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let mut tuples = fake.tuples.lock().expect("lock");
-    if let Some(keys) = request["writes"]["tuple_keys"].as_array() {
-        assert!(keys.len() <= 100, "RFC 0047 §3.3: ≤ 100 tuples per Write");
-        assert_eq!(request["writes"]["on_duplicate"], "ignore");
-        fake.writes.lock().expect("lock").push(keys.len());
-        for key in keys {
-            let key: TupleKey = serde_json::from_value(key.clone()).expect("tuple");
+    if request["writes"]["tuple_keys"].is_array() {
+        let writes = section_keys(&request, "writes", "on_duplicate");
+        fake.writes.lock().expect("lock").push(writes.len());
+        for key in writes {
             if !tuples.contains(&key) {
                 tuples.push(key);
             }
         }
     }
-    if let Some(keys) = request["deletes"]["tuple_keys"].as_array() {
-        assert!(keys.len() <= 100);
-        assert_eq!(request["deletes"]["on_missing"], "ignore");
-        for key in keys {
-            let key: TupleKey = serde_json::from_value(key.clone()).expect("tuple");
-            tuples.retain(|t| *t != key);
-        }
+    for key in section_keys(&request, "deletes", "on_missing") {
+        tuples.retain(|t| *t != key);
     }
     json(&json!({}))
-}
-
-/// Answers the next `/write` with `503` once `fail_next_write` is set.
-async fn fail_gate(
-    State(fake): State<Fake>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if fake
-        .fail_next_write
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
-    }
-    next.run(request).await
 }
 
 async fn read(
@@ -96,13 +86,7 @@ async fn read(
 
 async fn serve(fake: Fake) -> String {
     let app = Router::new()
-        .route(
-            "/stores/{store}/write",
-            post(write).layer(axum::middleware::from_fn_with_state(
-                fake.clone(),
-                fail_gate,
-            )),
-        )
+        .route("/stores/{store}/write", post(write))
         .route("/stores/{store}/read", post(read))
         .with_state(fake);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -158,58 +142,109 @@ fn promoted() -> PromotedAttributes {
     )
 }
 
-/// One file per call, in the sealed hour partition, `rows` records with
-/// `conversation`/`user` attributes.
-fn write_rows(store: &Store, conversation: &str, user: &str, agent: Option<&str>, n: u64) {
-    write_rows_at(store, super::tests::TS0, conversation, user, agent, n);
-}
-
-/// [`write_rows`], its rows from `ts0` on.
-fn write_rows_at(
-    store: &Store,
-    ts0: u64,
-    conversation: &str,
-    user: &str,
-    agent: Option<&str>,
+/// `n` rows of one conversation by `user` (and `agent`), as one file in the
+/// sealed hour partition.
+struct Rows<'a> {
+    conversation: &'a str,
+    user: &'a str,
+    agent: Option<&'a str>,
     n: u64,
-) {
-    let rows: Vec<MinedRecord> = (0..n)
-        .map(|i| {
-            let mut r = super::tests::rec("acme", 1, ts0 + i * 1_000);
-            r.attributes = vec![
-                kv("gen_ai.conversation.id", conversation),
-                kv("user.hash", user),
-            ];
-            if let Some(agent) = agent {
-                r.attributes.push(kv("gen_ai.agent.id", agent));
-            }
-            r
-        })
-        .collect();
-    let partition = PartitionKey::derive(&rows[0]).expect("derive");
-    let mut w = Writer::open_in_with_promoted(
-        store,
-        partition,
-        ourios_parquet::DEFAULT_ZSTD_LEVEL,
-        promoted(),
-    )
-    .expect("open writer");
-    w.append_records(&rows).expect("append");
-    w.close().expect("close");
 }
 
-fn live_rows(store: &Store, bucket: &Path) -> Vec<MinedRecord> {
-    let mut rows = Vec::new();
-    for key in store.list_blocking(Some("data/")).expect("list") {
-        if !key.ends_with(".parquet") {
-            continue;
+impl Rows<'_> {
+    fn of<'a>(conversation: &'a str, user: &'a str, n: u64) -> Rows<'a> {
+        Rows {
+            conversation,
+            user,
+            agent: None,
+            n,
         }
-        let bytes = store.get_blocking(&key).expect("get");
-        let reader = Reader::open_bytes(bytes.into()).expect("open");
-        rows.extend(reader.read_all().expect("read"));
     }
-    let _ = bucket;
-    rows
+
+    fn record(&self, i: u64) -> MinedRecord {
+        let mut r = super::tests::rec("acme", 1, super::tests::TS0 + i * 1_000);
+        r.attributes = vec![
+            kv("gen_ai.conversation.id", self.conversation),
+            kv("user.hash", self.user),
+        ];
+        if let Some(agent) = self.agent {
+            r.attributes.push(kv("gen_ai.agent.id", agent));
+        }
+        r
+    }
+
+    fn write(&self, store: &Store) {
+        let rows: Vec<MinedRecord> = (0..self.n).map(|i| self.record(i)).collect();
+        let partition = PartitionKey::derive(&rows[0]).expect("derive");
+        let mut w = Writer::open_in_with_promoted(
+            store,
+            partition,
+            ourios_parquet::DEFAULT_ZSTD_LEVEL,
+            promoted(),
+        )
+        .expect("open writer");
+        w.append_records(&rows).expect("append");
+        w.close().expect("close");
+    }
+}
+
+/// A store, a fake graph, and an emitter wired to it.
+struct Graph {
+    fake: Fake,
+    emitter: Arc<GraphEmitter>,
+    store: Store,
+    bucket: tempfile::TempDir,
+}
+
+impl Graph {
+    async fn new() -> Self {
+        let fake = Fake::default();
+        let url = serve(fake.clone()).await;
+        let bucket = tempfile::TempDir::new().expect("temp");
+        Self {
+            fake,
+            emitter: emitter(&url),
+            store: super::tests::store_at(bucket.path()),
+            bucket,
+        }
+    }
+
+    fn target(&self) -> SweepTarget {
+        SweepTarget::new(self.store.clone(), CompactionPolicy::default(), promoted())
+            .with_emitter(Arc::clone(&self.emitter))
+    }
+
+    async fn sweep(
+        &self,
+        sink: Box<dyn AuditSink>,
+    ) -> (Result<SweepReport, IngestError>, Box<dyn AuditSink>) {
+        let (result, _, sink) = sweep_once(self.target(), sink).await;
+        (result, sink)
+    }
+
+    fn tuples(&self) -> Vec<TupleKey> {
+        self.fake.tuples.lock().expect("lock").clone()
+    }
+
+    fn writes(&self) -> Vec<usize> {
+        self.fake.writes.lock().expect("lock").clone()
+    }
+
+    fn has_object(&self, object: &str) -> bool {
+        self.tuples().iter().any(|t| t.object == object)
+    }
+
+    fn live_rows(&self) -> Vec<MinedRecord> {
+        let mut rows = Vec::new();
+        for key in self.store.list_blocking(Some("data/")).expect("list") {
+            if key.ends_with(".parquet") {
+                let bytes = self.store.get_blocking(&key).expect("get");
+                let reader = Reader::open_bytes(bytes.into()).expect("open");
+                rows.extend(reader.read_all().expect("read"));
+            }
+        }
+        rows
+    }
 }
 
 /// Scenario RFC0047.10 — the sweep feeds the graph: after a sweep the
@@ -219,29 +254,22 @@ fn live_rows(store: &Store, bucket: &Path) -> Vec<MinedRecord> {
 /// ≤ 100 tuples. See `docs/rfcs/0047-rebac-resolver-and-graph-visibility.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0047_10_sweep_emits_tuples_idempotently() {
-    let fake = Fake::default();
-    let url = serve(fake.clone()).await;
-    let bucket = tempfile::TempDir::new().expect("temp");
-    let store = super::tests::store_at(bucket.path());
+    let graph = Graph::new().await;
     // Two files → a sealed candidate; 130 distinct conversations so the
     // tuple set spans more than one chunk.
-    write_rows(&store, "c-1", "alice", Some("bot"), 3);
-    for i in 0..130 {
-        write_rows(&store, &format!("c-{}", i + 10), "bob", None, 1);
+    Rows {
+        agent: Some("bot"),
+        ..Rows::of("c-1", "alice", 3)
     }
-    let emitter = emitter(&url);
-    let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        Box::new(SharedAuditSink::new()),
-        Some(Arc::clone(&emitter)),
-    )
-    .await;
+    .write(&graph.store);
+    for i in 0..130 {
+        Rows::of(&format!("c-{}", i + 10), "bob", 1).write(&graph.store);
+    }
+    let (result, sink) = graph.sweep(Box::new(SharedAuditSink::new())).await;
     let report = result.expect("sweep");
     assert_eq!(report.partitions_compacted, 1, "{report:?}");
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    let tuples = fake.tuples.lock().expect("lock").clone();
+    let tuples = graph.tuples();
     let t = |u: &str, r: &str, o: &str| TupleKey::new(u, r, o);
     for tuple in [
         t("tenant:acme", "parent", "conversation:acme/c-1"),
@@ -261,135 +289,175 @@ async fn rfc0047_10_sweep_emits_tuples_idempotently() {
         tuples.len(),
         "every tuple sent once"
     );
-    let writes = fake.writes.lock().expect("lock").clone();
+    let writes = graph.writes();
     assert!(
         writes.len() >= 2 && writes.iter().all(|n| *n <= 100),
         "{writes:?}"
     );
 
     // Second sweep: nothing to consolidate, nothing rewritten, nothing sent.
-    let before = fake.writes.lock().expect("lock").len();
-    let (result, _, _) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        sink,
-        Some(emitter),
-    )
-    .await;
+    let (result, _) = graph.sweep(sink).await;
     let report = result.expect("sweep");
-    assert_eq!(report.partitions_compacted, 0);
-    assert_eq!(report.graph_tuples_emitted, 0);
     assert_eq!(
-        fake.writes.lock().expect("lock").len(),
-        before,
+        (report.partitions_compacted, report.graph_tuples_emitted),
+        (0, 0)
+    );
+    assert_eq!(
+        (graph.writes().len(), graph.tuples().len()),
+        (writes.len(), tuples.len()),
         "nothing new"
     );
-    assert_eq!(fake.tuples.lock().expect("lock").len(), tuples.len());
 }
 
-/// A committed partition's tuples are written right after its commit,
-/// not at sweep end: a sweep dying in its second partition has already
-/// fed the graph the first partition's conversation, and not yet the
-/// second's.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_committed_partitions_tuples_survive_a_sweep_dying_after_it() {
-    // Arrange
-    let fake = Fake::default();
-    let url = serve(fake.clone()).await;
-    let bucket = tempfile::TempDir::new().expect("temp");
-    let store = super::tests::store_at(bucket.path());
-    for (hour, conversation) in [(0, "c-1"), (1, "c-2")] {
-        let ts0 = super::tests::TS0 + hour * super::tests::HOUR;
-        write_rows_at(&store, ts0, conversation, "alice", None, 1);
-        write_rows_at(&store, ts0 + 1_000_000, conversation, "alice", None, 1);
+/// Makes a directory unlistable, and listable again when dropped, so a
+/// failing assertion or panic still leaves the temp dir removable.
+#[cfg(unix)]
+struct Unlistable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Unlistable {
+    fn new(dir: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("unlistable");
+        Self(dir)
     }
-    let sink = super::tests::CrashingSink::new(&SharedAuditSink::new(), 2);
-
-    // Act
-    let sweep = tokio::spawn(sweep_once(
-        store,
-        CompactionPolicy::default(),
-        promoted(),
-        Box::new(sink),
-        Some(emitter(&url)),
-    ))
-    .await;
-
-    // Assert
-    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
-    let objects: Vec<String> = fake
-        .tuples
-        .lock()
-        .expect("lock")
-        .iter()
-        .map(|t| t.object.clone())
-        .collect();
-    assert!(
-        objects.iter().any(|o| o == "conversation:acme/c-1"),
-        "{objects:?}"
-    );
-    assert!(
-        !objects.iter().any(|o| o == "conversation:acme/c-2"),
-        "{objects:?}"
-    );
 }
 
-/// A sweep that commits a partition, fails to write its tuples, then
-/// fails fatally (the erasure markers cannot be listed) still writes
-/// those tuples: the partition is consolidated, so no later sweep
-/// derives them again.
+#[cfg(unix)]
+impl Drop for Unlistable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A sweep that commits a partition and then fails fatally (the erasure
+/// markers cannot be listed) still writes that partition's tuples after
+/// the pass: the partition is consolidated, so no later sweep derives
+/// them again.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_sweep_still_writes_its_committed_partitions_tuples() {
-    use std::os::unix::fs::PermissionsExt;
-
-    /// Makes a directory unlistable, and listable again when dropped, so a
-    /// failing assertion or panic still leaves the temp dir removable.
-    struct Unlistable(std::path::PathBuf);
-    impl Unlistable {
-        fn new(dir: std::path::PathBuf) -> Self {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
-                .expect("unlistable");
-            Self(dir)
-        }
-    }
-    impl Drop for Unlistable {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-
     // Arrange
-    let fake = Fake::default();
-    let url = serve(fake.clone()).await;
-    let bucket = tempfile::TempDir::new().expect("temp");
-    let store = super::tests::store_at(bucket.path());
-    write_rows(&store, "c-1", "alice", None, 1);
-    write_rows(&store, "c-1", "alice", None, 1);
-    let markers = bucket.path().join("erasure");
+    let graph = Graph::new().await;
+    Rows::of("c-1", "alice", 1).write(&graph.store);
+    Rows::of("c-1", "alice", 1).write(&graph.store);
+    let markers = graph.bucket.path().join("erasure");
     std::fs::create_dir(&markers).expect("erasure dir");
     let unlistable = Unlistable::new(markers);
-    fake.fail_next_write
-        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Act
-    let (result, _, _) = sweep_once(
-        store,
-        CompactionPolicy::default(),
-        promoted(),
-        Box::new(SharedAuditSink::new()),
-        Some(emitter(&url)),
-    )
-    .await;
+    let (result, _) = graph.sweep(Box::new(SharedAuditSink::new())).await;
     drop(unlistable);
 
     // Assert
     assert!(result.is_err(), "the sweep failed fatally: {result:?}");
-    let tuples = fake.tuples.lock().expect("lock").clone();
     assert!(
-        tuples.iter().any(|t| t.object == "conversation:acme/c-1"),
-        "{tuples:?}"
+        graph.has_object("conversation:acme/c-1"),
+        "{:?}",
+        graph.tuples()
+    );
+}
+
+/// RFC0047.11's setup: a repeated request is a no-op (create-if-absent)
+/// that never resets a marker's phase, whether the marker is the
+/// sweep-written one or hand-written in the `tuples` phase.
+fn request_c1_erasure(store: &Store) {
+    request_erasure(store, "acme", "c-1").expect("request");
+    request_erasure(store, "acme", "c-1").expect("repeat");
+    assert_eq!(pending_erasures(store).expect("pending").len(), 1);
+    let c9 = super::erasure_marker_key("acme", "c-9");
+    store
+        .put_blocking(&c9, b" { \"phase\" : \"tuples\" }\n".to_vec())
+        .expect("hand-written marker");
+    request_erasure(store, "acme", "c-9").expect("repeat");
+    let phases: Vec<_> = pending_erasures(store)
+        .expect("pending")
+        .into_iter()
+        .map(|r| (r.conversation_id, r.phase))
+        .collect();
+    assert!(
+        phases.contains(&("c-9".to_string(), ErasurePhase::Tuples)),
+        "{phases:?}"
+    );
+    store.delete_blocking(&c9).expect("cleanup");
+}
+
+/// RFC0047.11's outcome: c-1's three rows dropped from one partition, its
+/// three tuples (parent + participant + actor) deleted, the erasure done.
+fn assert_c1_erased(outcome: &ErasureOutcome) {
+    assert_eq!(
+        (
+            outcome.request.conversation_id.as_str(),
+            outcome.rows_dropped,
+            outcome.partitions_rewritten,
+            outcome.phase,
+        ),
+        ("c-1", 3, 1, ErasurePhase::Tuples)
+    );
+    assert_eq!(
+        (outcome.tuples_deleted, outcome.finished),
+        (Some(3), true),
+        "parent + participant + actor"
+    );
+}
+
+/// Only c-2's rows remain, and in the graph no tuple on c-1 remains while
+/// c-2's and the tenant-scoped binding tuples stay.
+fn assert_only_c2_left(graph: &Graph) {
+    let rows = graph.live_rows();
+    assert_eq!(rows.len(), 2, "c-1's three rows are gone");
+    let c2 = Some(Value::StringValue("c-2".to_string()));
+    assert!(rows.iter().all(|r| {
+        r.attributes.iter().any(|kv| {
+            kv.key == "gen_ai.conversation.id"
+                && kv.value.as_ref().and_then(|v| v.value.clone()) == c2
+        })
+    }));
+    let binding = TupleKey::new("user:alice", "scoped_reader", "tenant:acme");
+    assert_eq!(
+        (
+            graph.has_object("conversation:acme/c-1"),
+            graph.has_object("conversation:acme/c-2"),
+            graph.tuples().contains(&binding),
+        ),
+        (false, true, true)
+    );
+}
+
+/// The erasure's audit trail: the rewrite is audited as a compaction, and
+/// the `conversation_erased` event, carrying the counts, is the sweep's
+/// last.
+fn assert_erasure_audited(events: &[AuditEvent]) {
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.payload, AuditPayload::Compaction { .. })),
+        "the erasure rewrite is audited as a compaction: {events:?}"
+    );
+    let erased = events
+        .iter()
+        .position(|e| matches!(e.payload, AuditPayload::ConversationErased { .. }))
+        .expect("conversation_erased event");
+    assert_eq!(erased, events.len() - 1, "last event of the sweep");
+    let AuditPayload::ConversationErased {
+        conversation_id,
+        partitions_rewritten,
+        rows_dropped,
+        tuples_deleted,
+    } = &events[erased].payload
+    else {
+        unreachable!("matched above");
+    };
+    assert_eq!(
+        (
+            conversation_id.as_str(),
+            *partitions_rewritten,
+            *rows_dropped,
+            *tuples_deleted,
+            events[erased].tenant_id.as_str(),
+        ),
+        ("c-1", 1, 3, 3, "acme")
     );
 }
 
@@ -400,135 +468,37 @@ async fn a_failed_sweep_still_writes_its_committed_partitions_tuples() {
 /// object is unlisted (no tuple on it remains) and other conversations'
 /// tuples are untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::too_many_lines)] // one store, one graph: rows → tuples → audit → marker in sequence
 async fn rfc0047_11_erasure_removes_tuples_after_rows() {
-    let fake = Fake::default();
-    let url = serve(fake.clone()).await;
-    let bucket = tempfile::TempDir::new().expect("temp");
-    let store = super::tests::store_at(bucket.path());
-    write_rows(&store, "c-1", "alice", Some("bot"), 3);
-    write_rows(&store, "c-2", "bob", None, 2);
-    let emitter = emitter(&url);
+    let graph = Graph::new().await;
+    Rows {
+        agent: Some("bot"),
+        ..Rows::of("c-1", "alice", 3)
+    }
+    .write(&graph.store);
+    Rows::of("c-2", "bob", 2).write(&graph.store);
     let audit = SharedAuditSink::new();
     // Sweep 1: consolidate + feed the graph.
-    let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        Box::new(audit.clone()),
-        Some(Arc::clone(&emitter)),
-    )
-    .await;
+    let (result, sink) = graph.sweep(Box::new(audit.clone())).await;
     result.expect("sweep");
-    assert!(
-        fake.tuples
-            .lock()
-            .expect("lock")
-            .iter()
-            .any(|t| t.object == "conversation:acme/c-1")
-    );
+    assert!(graph.has_object("conversation:acme/c-1"));
     let _ = audit.drain();
 
-    // Request the erasure of c-1; sweep 2 performs it. A repeated request
-    // is a no-op (create-if-absent) — it never resets a marker's phase.
-    request_erasure(&store, "acme", "c-1").expect("request");
-    request_erasure(&store, "acme", "c-1").expect("repeat");
-    assert_eq!(pending_erasures(&store).expect("pending").len(), 1);
-    store
-        .put_blocking(
-            &super::erasure_marker_key("acme", "c-9"),
-            b" { \"phase\" : \"tuples\" }\n".to_vec(),
-        )
-        .expect("hand-written marker");
-    request_erasure(&store, "acme", "c-9").expect("repeat");
-    let phases: Vec<_> = pending_erasures(&store)
-        .expect("pending")
-        .into_iter()
-        .map(|r| (r.conversation_id, r.phase))
-        .collect();
-    assert!(
-        phases.contains(&("c-9".to_string(), ErasurePhase::Tuples)),
-        "{phases:?}"
-    );
-    store
-        .delete_blocking(&super::erasure_marker_key("acme", "c-9"))
-        .expect("cleanup");
-    let (result, _, _) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        sink,
-        Some(Arc::clone(&emitter)),
-    )
-    .await;
+    // Request the erasure of c-1; sweep 2 performs it.
+    request_c1_erasure(&graph.store);
+    let (result, _) = graph.sweep(sink).await;
     let report = result.expect("sweep");
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.erasures.len(), 1, "{report:?}");
-    let outcome = &report.erasures[0];
-    assert_eq!(outcome.request.conversation_id, "c-1");
-    assert_eq!(outcome.rows_dropped, 3);
-    assert_eq!(outcome.partitions_rewritten, 1);
-    assert_eq!(outcome.phase, ErasurePhase::Tuples);
-    assert_eq!(
-        outcome.tuples_deleted,
-        Some(3),
-        "parent + participant + actor"
-    );
-    assert!(outcome.finished);
-
-    // Rows: only c-2's remain.
-    let rows = live_rows(&store, bucket.path());
-    assert_eq!(rows.len(), 2, "c-1's three rows are gone");
-    assert!(rows.iter().all(|r| {
-        r.attributes.iter().any(|kv| {
-            kv.key == "gen_ai.conversation.id"
-                && kv.value.as_ref().and_then(|v| v.value.as_ref())
-                    == Some(&Value::StringValue("c-2".to_string()))
-        })
-    }));
-    // Tuples: no tuple on the object remains; c-2's untouched; the
-    // binding tuples (tenant-scoped, not object-scoped) stay.
-    let tuples = fake.tuples.lock().expect("lock").clone();
-    assert!(!tuples.iter().any(|t| t.object == "conversation:acme/c-1"));
-    assert!(tuples.iter().any(|t| t.object == "conversation:acme/c-2"));
-    assert!(tuples.contains(&TupleKey::new("user:alice", "scoped_reader", "tenant:acme")));
+    assert_c1_erased(&report.erasures[0]);
+    assert_only_c2_left(&graph);
     // Marker gone; nothing pending.
-    assert!(pending_erasures(&store).expect("pending").is_empty());
-    // Audit order: the erasure event comes after every compaction
-    // event of the sweep (the rewrite is itself audited and counted as
-    // a compaction), carrying the counts.
-    let events = audit.drain();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.payload, AuditPayload::Compaction { .. })),
-        "the erasure rewrite is audited as a compaction: {events:?}"
-    );
+    assert!(pending_erasures(&graph.store).expect("pending").is_empty());
+    assert_erasure_audited(&audit.drain());
     assert_eq!(
         report.partitions_compacted, 1,
         "and counted in the sweep's IO accounting"
     );
     assert!(report.bytes_read > 0);
-    let erased = events
-        .iter()
-        .position(|e| matches!(e.payload, AuditPayload::ConversationErased { .. }))
-        .expect("conversation_erased event");
-    assert_eq!(erased, events.len() - 1, "last event of the sweep");
-    match &events[erased].payload {
-        AuditPayload::ConversationErased {
-            conversation_id,
-            partitions_rewritten,
-            rows_dropped,
-            tuples_deleted,
-        } => {
-            assert_eq!(conversation_id, "c-1");
-            assert_eq!(*partitions_rewritten, 1);
-            assert_eq!(*rows_dropped, 3);
-            assert_eq!(*tuples_deleted, 3);
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(events[erased].tenant_id.as_str(), "acme");
 }
 
 /// RFC0047.11 (raw ids): a conversation whose id can never be a graph
@@ -536,48 +506,29 @@ async fn rfc0047_11_erasure_removes_tuples_after_rows() {
 /// stored value — with zero tuples to delete and an honest audit event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0047_11_erasure_matches_raw_ids() {
-    let fake = Fake::default();
-    let url = serve(fake.clone()).await;
-    let bucket = tempfile::TempDir::new().expect("temp");
-    let store = super::tests::store_at(bucket.path());
-    write_rows(&store, "odd id", "alice", None, 2);
-    write_rows(&store, "c-2", "bob", None, 1);
-    let emitter = emitter(&url);
-    let audit = SharedAuditSink::new();
-    let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        Box::new(audit.clone()),
-        Some(Arc::clone(&emitter)),
-    )
-    .await;
+    let graph = Graph::new().await;
+    Rows::of("odd id", "alice", 2).write(&graph.store);
+    Rows::of("c-2", "bob", 1).write(&graph.store);
+    let (result, sink) = graph.sweep(Box::new(SharedAuditSink::new())).await;
     result.expect("sweep");
     assert!(
-        !fake
-            .tuples
-            .lock()
-            .expect("lock")
-            .iter()
-            .any(|t| t.object.contains("odd")),
+        !graph.tuples().iter().any(|t| t.object.contains("odd")),
         "no tuple was ever minted for a non-object-id conversation"
     );
-    request_erasure(&store, "acme", "odd id").expect("request");
-    let (result, _, _) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        sink,
-        Some(emitter),
-    )
-    .await;
+    request_erasure(&graph.store, "acme", "odd id").expect("request");
+    let (result, _) = graph.sweep(sink).await;
     let report = result.expect("sweep");
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let outcome = &report.erasures[0];
     assert_eq!(outcome.rows_dropped, 2, "rows matched on the raw value");
-    assert_eq!(outcome.tuples_deleted, Some(0));
-    assert!(outcome.finished);
-    assert_eq!(live_rows(&store, bucket.path()).len(), 1);
+    assert_eq!(
+        (
+            outcome.tuples_deleted,
+            outcome.finished,
+            graph.live_rows().len()
+        ),
+        (Some(0), true, 1)
+    );
 }
 
 /// RFC0048.4 — the completion event: its **registry-backed name** is
@@ -588,37 +539,18 @@ async fn rfc0047_11_erasure_matches_raw_ids() {
 /// cannot migrate to another worker.
 #[tokio::test]
 async fn rfc0048_4_completion_event_carries_the_registry_name() {
-    let fake = Fake::default();
-    let url = serve(fake.clone()).await;
-    let bucket = tempfile::TempDir::new().expect("temp");
-    let store = super::tests::store_at(bucket.path());
-    write_rows(&store, "c-1", "alice", None, 2);
-    let emitter = emitter(&url);
-    let audit = SharedAuditSink::new();
-    let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        Box::new(audit),
-        Some(Arc::clone(&emitter)),
-    )
-    .await;
+    let graph = Graph::new().await;
+    Rows::of("c-1", "alice", 2).write(&graph.store);
+    let (result, sink) = graph.sweep(Box::new(SharedAuditSink::new())).await;
     result.expect("sweep");
-    request_erasure(&store, "acme", "c-1").expect("request");
+    request_erasure(&graph.store, "acme", "c-1").expect("request");
     let events: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
     let subscriber = {
         use tracing_subscriber::prelude::*;
         tracing_subscriber::registry().with(CaptureEvents(Arc::clone(&events)))
     };
     let guard = tracing::subscriber::set_default(subscriber);
-    let (result, _, _) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
-        sink,
-        Some(emitter),
-    )
-    .await;
+    let (result, _) = graph.sweep(sink).await;
     drop(guard);
     let report = result.expect("sweep");
     assert!(report.erasures[0].finished, "{report:?}");

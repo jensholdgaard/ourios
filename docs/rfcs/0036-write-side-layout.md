@@ -21,13 +21,16 @@ superseded-by: —
 > memory limit out of memory on every boot sweep. The reopened contract
 > is the corrected §3.2 algorithm (one decoded-row budget governing the
 > skip-spill decision and run formation) and the rewritten RFC0036.3
-> memory clause. The failing test on `main` is
+> memory clause. The test that reopened it is
 > `many_small_inputs_within_the_encoded_budget_do_not_decode_at_once`
-> (`crates/ourios-parquet/src/compaction/tests.rs`, PR #900). RFC0036.3
+> (`crates/ourios-parquet/src/compaction/tests/bounded_sort.rs`, PR #900). RFC0036.3
 > now has two memory clauses: the decoded-row budget (#900) and the
 > byte-bounded phase-2 merge (#916). The RFC returns to `green` once
-> both have landed and every §5 criterion passes on `main`, and to
-> `accepted` once the compaction benches are re-recorded. The status note immediately
+> both have landed and every §5 criterion passes on `main`; to
+> `validated` once the compaction benches are re-recorded and the
+> `docs/benchmarks.md` §7 thesis-gates pass on representative corpora;
+> and to `accepted` only on the maintainer's sign-off
+> (`docs/rfcs/README.md` lifecycle). The status note immediately
 > below is the pre-reopen history (the earlier `validated`/`accepted`
 > record); the rest of this document, including the revised §3.2
 > algorithm and RFC0036.3, is the current contract.

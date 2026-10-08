@@ -9,6 +9,10 @@
 //! the weaver-generated `ourios-semconv` constants (the registry half of
 //! the scenario is the CI semconv no-diff gate).
 //!
+//! With the `testing` feature (CI runs `--all-features`), two concurrent
+//! same-frontier queries on one querier also drive a shared acquisition:
+//! the acquirer records its own outcome and the waiter records `joined`.
+//!
 //! This test installs a process-global in-memory `MeterProvider`, so it
 //! lives in its own integration binary (its own process) — the
 //! `rfc0016_6_query_metrics` precedent, applied at the querier-library
@@ -143,6 +147,71 @@ fn try_body_query(bucket: &Path) -> Result<QueryResult, ourios_querier::QueryErr
     ))
 }
 
+/// Two concurrent body-rendering queries on one querier at an unchanged
+/// frontier. The first to list acquires; a gate holds that acquisition
+/// until the other has found it in flight and parked on it, so the second
+/// deterministically joins (one lookup outcome each: the acquirer's own,
+/// and `joined`).
+#[cfg(feature = "testing")]
+fn shared_acquisition(bucket: &Path) {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let querier = Arc::new(Querier::new(bucket));
+    let weak = Arc::downgrade(&querier);
+    querier.set_template_map_acquire_gate(Some(Arc::new(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Some(querier) = weak.upgrade()
+            && querier.template_map_waits() < 1
+        {
+            assert!(Instant::now() < deadline, "the second query never joined");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("runtime");
+    let rows = runtime.block_on(async {
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let querier = Arc::clone(&querier);
+                tokio::spawn(async move {
+                    let query =
+                        ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
+                    querier
+                        .run_query(&query, &TenantId::new(TENANT), NOW, DEFAULT_WINDOW_NS, None)
+                        .await
+                        .expect("shared acquisition answers both queries")
+                        .rows
+                })
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for task in tasks {
+            rows.push(task.await.expect("query task"));
+        }
+        rows
+    });
+    querier.set_template_map_acquire_gate(None);
+    assert_eq!(rows, vec![1, 1]);
+    assert_eq!(querier.template_map_waits(), 1, "exactly one query waited");
+}
+
+/// The lookup outcomes the acts below drive, once each — plus, with the
+/// `testing` feature, the shared acquisition's acquirer (a second `hit`)
+/// and its waiter (`joined`).
+#[cfg(not(feature = "testing"))]
+const EXPECTED_LOOKUPS: &[(&str, u64)] = &[("miss", 1), ("hit", 1), ("stale", 1), ("torn", 1)];
+#[cfg(feature = "testing")]
+const EXPECTED_LOOKUPS: &[(&str, u64)] = &[
+    ("miss", 1),
+    ("hit", 2),
+    ("stale", 1),
+    ("torn", 1),
+    ("joined", 1),
+];
+
 /// Every file under `dir`, recursively — the audit stream is
 /// date-partitioned, so new files land in nested directories.
 fn walk_files(dir: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
@@ -237,6 +306,10 @@ fn rfc0033_7_observable_outcomes() {
     std::fs::write(&artifact, &good[..good.len() / 2]).expect("tear artifact");
     assert_eq!(body_query(bucket.path()).rows, 1);
     let size_after_torn = artifact_len();
+    // 4b. Two concurrent queries at that frontier share one acquisition (an
+    //     artifact hit, no publish): the waiter records `joined`.
+    #[cfg(feature = "testing")]
+    shared_acquisition(bucket.path());
     // 5. A failing fold records nothing: a frontier-changing audit file
     //    that is itself unreadable errors the query, so no outcome is
     //    counted — a counted outcome is always one that answered.
@@ -261,9 +334,9 @@ fn rfc0033_7_observable_outcomes() {
         semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
         semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
     );
-    let expected: BTreeMap<String, u64> = [("miss", 1), ("hit", 1), ("stale", 1), ("torn", 1)]
-        .into_iter()
-        .map(|(outcome, n)| (outcome.to_string(), n))
+    let expected: BTreeMap<String, u64> = EXPECTED_LOOKUPS
+        .iter()
+        .map(|(outcome, n)| ((*outcome).to_string(), *n))
         .collect();
     assert_eq!(
         lookups, expected,

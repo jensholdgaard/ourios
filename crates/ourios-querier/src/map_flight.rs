@@ -4,10 +4,11 @@
 //! Every query still LISTs the tenant's audit prefix and acquires the map
 //! through [`template_map::load_or_derive_resolved`]: an artifact GET, or on
 //! a miss the fold and write-through. What this adds is that at most one
-//! acquisition runs per tenant at a time. A query whose listing equals the
-//! running acquisition's waits for its result, success or error alike, and
-//! reports its bytes; a query whose listing differs waits for it to finish
-//! and then lists again, so it is never handed a map of another frontier.
+//! acquisition runs per tenant at a time. A query whose listed frontier
+//! equals the running acquisition's frontier waits for its result, success
+//! or error alike, and reports its bytes; a query whose frontier differs
+//! waits for it to finish and then lists again, so it is never handed a map
+//! of another frontier.
 //!
 //! The acquisition runs to completion on the blocking pool even when the
 //! query that started it is dropped (a client timeout); a retry arriving
@@ -34,8 +35,8 @@ pub(crate) type Acquired = Result<(Arc<TemplateMap>, u64), QueryError>;
 #[derive(Default)]
 pub(crate) struct TemplateMapFlights {
     flights: Mutex<HashMap<TenantId, Flight>>,
-    #[cfg(test)]
-    hooks: tests::Hooks,
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) hooks: hooks::Hooks,
 }
 
 impl fmt::Debug for TemplateMapFlights {
@@ -107,7 +108,7 @@ impl TemplateMapFlights {
                         // failed acquisition records nothing for anyone.
                         if acquired.is_ok() {
                             template_map::record_joined_lookup();
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "testing"))]
                             self.hooks.joined();
                         }
                         return acquired;
@@ -124,7 +125,7 @@ impl TemplateMapFlights {
         let guard = {
             let mut flights = self.lock();
             if let Some(flight) = flights.get(tenant) {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 self.hooks.waited();
                 return Ok(Step::Wait {
                     done: flight.done.clone(),
@@ -145,7 +146,7 @@ impl TemplateMapFlights {
                 tx: Some(tx),
             }
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         self.hooks.before_acquire();
         let acquired = template_map::load_or_derive_resolved(backend, tenant, resolved)
             .map(|(map, bytes, _)| (Arc::new(map), bytes));
@@ -193,6 +194,48 @@ impl Drop for FlightGuard<'_> {
     }
 }
 
+/// Test seams (unit tests, and integration tests through the `testing`
+/// feature): acquisitions started, acquisitions that waited on a flight,
+/// `joined` lookups recorded, and a gate the acquiring thread runs just
+/// before it acquires.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) mod hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    #[derive(Default)]
+    pub(crate) struct Hooks {
+        pub(crate) acquisitions: AtomicUsize,
+        pub(crate) waits: AtomicUsize,
+        pub(crate) joins: AtomicUsize,
+        pub(crate) before_acquire: Mutex<Option<Hook>>,
+    }
+
+    impl Hooks {
+        pub(crate) fn waited(&self) {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+        }
+
+        pub(crate) fn joined(&self) {
+            self.joins.fetch_add(1, Ordering::SeqCst);
+        }
+
+        pub(crate) fn before_acquire(&self) {
+            self.acquisitions.fetch_add(1, Ordering::SeqCst);
+            let hook = self
+                .before_acquire
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -205,40 +248,7 @@ mod tests {
 
     use super::*;
 
-    type Hook = Arc<dyn Fn() + Send + Sync>;
-
-    /// Test-only instrumentation: acquisitions started, acquisitions that
-    /// waited on a flight, `joined` lookups recorded, and a callback run by
-    /// the acquiring thread just before it acquires.
-    #[derive(Default)]
-    pub(super) struct Hooks {
-        acquisitions: AtomicUsize,
-        waits: AtomicUsize,
-        joins: AtomicUsize,
-        before_acquire: Mutex<Option<Hook>>,
-    }
-
-    impl Hooks {
-        pub(super) fn waited(&self) {
-            self.waits.fetch_add(1, Ordering::SeqCst);
-        }
-
-        pub(super) fn joined(&self) {
-            self.joins.fetch_add(1, Ordering::SeqCst);
-        }
-
-        pub(super) fn before_acquire(&self) {
-            self.acquisitions.fetch_add(1, Ordering::SeqCst);
-            let hook = self
-                .before_acquire
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
-    }
+    use super::hooks::Hook;
 
     const TENANT: &str = "acme";
     /// 2026-04-02T10:58:00 UTC.

@@ -1012,6 +1012,35 @@ impl Querier {
     }
 }
 
+/// Test seams over the per-tenant template-map single-flight, for
+/// integration tests that must steer it deterministically (RFC0033.7's
+/// `joined` outcome). Not part of the query surface.
+#[cfg(feature = "testing")]
+impl Querier {
+    /// Run `gate` on the acquiring thread just before each template-map
+    /// acquisition this querier starts; `None` removes it.
+    #[doc(hidden)]
+    pub fn set_template_map_acquire_gate(&self, gate: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .template_maps
+            .hooks
+            .before_acquire
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
+
+    /// How many queries have so far found an acquisition in flight and
+    /// waited on it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn template_map_waits(&self) -> usize {
+        self.template_maps
+            .hooks
+            .waits
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
 /// the local backend, store keys on S3 (their URLs need the query's
 /// `SessionContext`, which stays on the async side).

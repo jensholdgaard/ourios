@@ -352,9 +352,10 @@ pub fn load_or_derive(
 }
 
 /// [`load_or_derive`] against a listing the caller already took — the
-/// querier's in-process cache lists once, compares the frontier against
-/// its held map, and hands that same listing here on a miss, so the
-/// §3.3 one-listing rule holds across both layers.
+/// querier's per-tenant single-flight (`map_flight`) lists once, keys the
+/// flight by that listing's frontier, and acquires against the same
+/// listing, so the §3.3 one-listing rule holds. No map is retained once
+/// the acquisition completes.
 pub(crate) fn load_or_derive_resolved(
     backend: StoreRef<'_>,
     tenant: &TenantId,

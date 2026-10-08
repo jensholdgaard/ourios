@@ -352,9 +352,10 @@ struct SortTuning {
     /// byte (§3.5), only scratch I/O.
     in_memory_max_bytes: u64,
     /// Fan-in cap F: more sorted runs than this merge hierarchically,
-    /// so phase-2 memory is ≤ (F + 1) × one decoded batch (F open runs
-    /// plus the merge's output chunk) regardless of
-    /// backlog. 64 single-passes any partition up to F budgets of
+    /// so phase 2 opens at most F runs, whose decoded batches together
+    /// hold at most `in_memory_max_bytes` (or one row per run, for rows
+    /// wider than a run's share), plus the merge's output chunk,
+    /// regardless of backlog. 64 single-passes any partition up to F budgets of
     /// decoded rows.
     fan_in: usize,
     /// RFC 0036 §3.3 compacted row-group rotation threshold override.

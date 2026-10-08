@@ -320,10 +320,10 @@ changes only local scratch I/O.
 plus one decoded input: the buffer is under `B` when an input starts,
 and that input is the most it can overshoot by. Phase 2 holds, whatever
 the run count, the open runs' reader batches plus the output chunk. The
-reader batches together hold at most `B` decoded bytes. The documented
-overshoot: when a run's widest row is wider than its `⌊B / (k + 1)⌋`
-share, that run holds its one head row, so the readers hold at most
-`max(B, k × widest row)`. The output chunk holds at most 1,024 rows, a
+reader batches together hold at most `max(B, k × widest row)` decoded
+bytes for k open runs. That is `B`, plus at most one row per run whose
+widest row is wider than its `⌊B / (k + 1)⌋` share: such a run holds
+its one head row, the documented overshoot. The output chunk holds at most 1,024 rows, a
 fixed term the writer's sub-batch contract sets. In rows, phase 2 still
 holds at most (F + 1) × 1,024. The phases do not overlap, because the
 run-formation buffer is released before the merge starts. Neither bound depends

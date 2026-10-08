@@ -169,10 +169,9 @@ pub struct QueryResult {
     /// the `template_map.v2.json.zst` artifact GET on a cache hit. One
     /// per-query acquisition serves both the registry and, for
     /// `resolves_to` queries, the alias map. `0` when no rows were
-    /// rendered, and `0` when the querier process already held the map
-    /// at the listed frontier (nothing fetched). A query that waited on
-    /// another query's in-flight derivation of the same frontier reports
-    /// that derivation's bytes. Same additive contract as `materialize_bytes_read`
+    /// rendered. A query that waited on another query's in-flight
+    /// acquisition of the same frontier reports that acquisition's bytes —
+    /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
 }

@@ -47,7 +47,7 @@ mod body_match;
 mod drift;
 pub mod dsl;
 mod log_row;
-mod map_cache;
+mod map_flight;
 mod plan;
 mod schema_adapt;
 mod template_map;
@@ -275,9 +275,10 @@ pub struct Querier {
     /// Defaults to the implicit-`service.name`-only set, under which
     /// the scan stays purely schema-driven (the RFC 0022 behaviour).
     promoted: ourios_parquet::PromotedAttributes,
-    /// The in-process template-map layer (#853): per-tenant single-flight
-    /// plus the latest derived map per tenant, shared by every clone.
-    template_maps: Arc<map_cache::TemplateMapCache>,
+    /// The per-tenant single-flight over the template-map acquisition,
+    /// shared by every clone: concurrent queries at one frontier wait on one
+    /// acquisition instead of each running their own.
+    template_maps: Arc<map_flight::TemplateMapFlights>,
 }
 
 /// The object-store URL scheme/authority the S3 scan registers its
@@ -512,12 +513,12 @@ impl Querier {
         }
         // A `body ==`/`!=` needs the RFC 0017 registry for the RFC 0044
         // template arm; the `resolves_to` alias fold needs the alias map.
-        // Both ride the one RFC 0033 cached-map acquisition (in-process hit,
-        // artifact hit, or fresh fold + write-through — single-flighted per
-        // tenant), so the two needs share one map (and one frontier) per
-        // query — and the acquisition is skipped entirely when neither is in
-        // the predicate. The blocking IO (S3 GETs / local `std::fs`) offloads
-        // off the runtime worker, mirroring `run_drift`.
+        // Both ride the one RFC 0033 cached-map acquisition (artifact hit or
+        // fresh fold + write-through, single-flighted per tenant), so the two
+        // needs share one map (and one frontier) per query — and the
+        // acquisition is skipped entirely when neither is in the predicate.
+        // The blocking IO (S3 GETs / local `std::fs`) offloads off the
+        // runtime worker, mirroring `run_drift`.
         let needs_registry = plan::uses_body_equality(&query.predicate);
         let needs_alias_fold = alias_map.is_none() && plan::uses_resolves_to(&query.predicate);
         let mut acquired: Option<AcquiredTemplateMap> = None;
@@ -926,7 +927,7 @@ impl Querier {
         // The single per-query template-map acquisition, measured
         // (RFC 0031 §3.6 / RFC 0033): reuse the compile-time alias fold's
         // map when the query already acquired one, else resolve through
-        // the querier's template-map cache (`map_cache`).
+        // the per-tenant single-flight (`map_flight`).
         let AcquiredTemplateMap {
             map,
             acquisition_bytes,
@@ -1291,9 +1292,7 @@ mod tests {
             assert_eq!(first.records.len(), 3);
             counter.reset();
 
-            // A fresh querier (a restart, another replica) holds no map in
-            // memory, so its acquisition goes through the artifact.
-            let hit = fresh_querier(&querier).run(windowed(7)).await.expect("hit");
+            let hit = querier.run(windowed(7)).await.expect("hit");
 
             assert_eq!(hit.records.len(), 3);
             let calls = audit_calls(&counter);
@@ -1316,39 +1315,6 @@ mod tests {
                 audit_keys >= 5,
                 "every day's audit file is listed: {audit_keys}"
             );
-        }
-
-        /// A repeat on the same querier at an unchanged frontier is served
-        /// from the in-process map: the freshness LIST still runs, but no
-        /// GET at all — not even the artifact.
-        #[tokio::test]
-        async fn a_repeat_on_the_same_querier_lists_once_and_reads_nothing() {
-            let tmp = tempfile::tempdir().expect("temp");
-            let (querier, counter) = seeded(tmp.path());
-            let first = querier
-                .run(windowed(7))
-                .await
-                .expect("miss: fold + publish");
-            counter.reset();
-
-            let repeat = querier.run(windowed(7)).await.expect("in-process hit");
-
-            assert_eq!(repeat.records, first.records);
-            assert_eq!(repeat.registry_bytes_read, 0, "nothing fetched");
-            let calls = audit_calls(&counter);
-            assert_eq!(
-                calls,
-                vec![Call::List("audit/tenant_id=acme".to_string())],
-                "one LIST, zero GETs",
-            );
-        }
-
-        fn fresh_querier(querier: &Querier) -> Querier {
-            Querier {
-                backend: querier.backend.clone(),
-                promoted: ourios_parquet::PromotedAttributes::default(),
-                template_maps: Arc::default(),
-            }
         }
     }
 }

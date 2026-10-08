@@ -112,6 +112,9 @@ const LOOKUP_OUTCOME_MISS: &str = "miss";
 const LOOKUP_OUTCOME_STALE: &str = "stale";
 const LOOKUP_OUTCOME_TORN: &str = "torn";
 const LOOKUP_OUTCOME_UNKNOWN_VERSION: &str = "unknown_version";
+/// A query served by another query's in-flight acquisition at the same
+/// frontier (`crate::map_flight`) — semconv v0.3.9.
+const LOOKUP_OUTCOME_JOINED: &str = "joined";
 /// `ourios.template_map.publish.outcome` attribute values (RFC 0033 §3.7).
 const PUBLISH_OUTCOME_PUBLISHED: &str = "published";
 const PUBLISH_OUTCOME_LOST_RACE: &str = "lost_race";
@@ -167,6 +170,10 @@ impl TemplateMapMetrics {
             } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
             CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
         };
+        self.record_lookup_value(value);
+    }
+
+    fn record_lookup_value(&self, value: &'static str) {
         self.lookups.add(
             1,
             &[KeyValue::new(
@@ -185,6 +192,13 @@ impl TemplateMapMetrics {
             )],
         );
     }
+}
+
+/// Record a `joined` lookup: this query was served the map another query
+/// acquired at the same frontier. Only for a successful shared acquisition —
+/// the acquirer records its own outcome, and a failure records nothing.
+pub(crate) fn record_joined_lookup() {
+    METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED);
 }
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):

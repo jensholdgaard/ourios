@@ -816,7 +816,13 @@ async fn emit_after_failed_sweep(
         return;
     }
     if let Err(e) = emitter.emit(tuples).await {
-        tracing::warn!("graph emit after a failed sweep ({sweep}): {e}");
+        // The failed sweep's own report never reaches the daemon's logging, so
+        // this per-item error is logged here, under the event the daemon uses
+        // for a sweep's per-item errors.
+        tracing::error!(
+            name: ourios_semconv::EVENT_OURIOS_COMPACTION_SWEEP_ERROR,
+            "compaction sweep error: graph emit after a failed sweep ({sweep}): {e}"
+        );
     }
 }
 

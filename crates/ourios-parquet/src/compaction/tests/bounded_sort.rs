@@ -502,3 +502,139 @@ fn residual_buffer_after_a_spill_is_sorted_before_the_merge() {
     sort_records(ClusterKeys::ServiceThenTime, &mut expected);
     assert_eq!(rows, expected, "§3.1 order holds across the residual run");
 }
+
+/// A wide row: [`sort_rec`] plus 40 attributes of 250-byte values, the
+/// shape of the #853 node's structured events.
+fn wide_rec(id: u64) -> MinedRecord {
+    let svc = ["svc-a", "svc-b", "svc-c"][usize::try_from(id % 3).expect("mod 3")];
+    let pad = "x".repeat(250);
+    MinedRecord {
+        attributes: (0..40)
+            .map(|a| ourios_core::otlp::KeyValue {
+                key: format!("attr.{a}"),
+                value: Some(ourios_core::otlp::AnyValue {
+                    value: Some(ourios_core::otlp::any_value::Value::StringValue(format!(
+                        "{pad}{}",
+                        id % 97 + a
+                    ))),
+                }),
+                ..Default::default()
+            })
+            .collect(),
+        ..sort_rec(Some(svc), HOUR10_START + (id * 7_919) % 1_000_000, id)
+    }
+}
+
+/// `k` inputs of `s` [`wide_rec`] rows.
+fn build_wide_partition(store: &Store, k: u64, s: u64) {
+    let mut id = 0;
+    for _ in 0..k {
+        let recs: Vec<MinedRecord> = (0..s)
+            .map(|_| {
+                id += 1;
+                wide_rec(id)
+            })
+            .collect();
+        write_file(store, &recs);
+    }
+}
+
+/// Issue #853 — the merge is bounded in bytes, not rows: wide rows over a
+/// small budget, hierarchically merged, never hold more decoded bytes than
+/// the larger phase bound — phase 1's budget plus one input, or phase 2's
+/// budget across the open runs plus the [`SUB_BATCH_ROWS`] output chunk.
+/// Batches of [`SUB_BATCH_ROWS`] rows per open run held F × 1024 wide rows.
+#[test]
+fn wide_rows_merge_within_the_byte_budget() {
+    const K: u64 = 16;
+    const S: u64 = 300;
+    const FAN_IN: usize = 4;
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    build_wide_partition(&store, K, S);
+    let row = decoded_footprint(&wide_rec(1));
+    let budget = 8 * row;
+
+    residency::reset();
+    let outcome = compact_sorted(
+        &store,
+        &partition(),
+        &PromotedAttributes::default(),
+        ClusterKeys::ServiceThenTime,
+        SortTuning {
+            in_memory_max_bytes: budget,
+            fan_in: FAN_IN,
+            ..SortTuning::default()
+        },
+    )
+    .expect("compact");
+    let peak = residency::peak_bytes();
+
+    assert_eq!(outcome.rows, K * S, "every row carried");
+    // Rows vary by a few bytes of suffix; a 2 % allowance covers it.
+    let widest = row + row / 50;
+    let chunk = u64::try_from(SUB_BATCH_ROWS).expect("fits u64");
+    let phase1 = budget + S * widest;
+    // The cursors hold the budget, or one widest row per open run when a
+    // row exceeds its share (the merge needs each run's head row).
+    let cursors = budget.max(u64::try_from(FAN_IN).expect("fits u64") * widest);
+    let phase2 = cursors + chunk * widest;
+    let bound = phase1.max(phase2);
+    assert!(
+        peak <= bound,
+        "peak decoded bytes {peak} exceed the larger phase bound {bound} \
+         (phase 1: budget + one input = {phase1}; phase 2: cursors + output chunk = {phase2})",
+    );
+}
+
+/// Issue #853 — byte-sized merge batches change no output byte: wide rows
+/// forced through the spill path, with merge batches down to one row, write
+/// exactly the in-memory sort's file (whose bytes the merge has always
+/// matched, RFC 0036 §3.5).
+#[test]
+fn byte_sized_merge_batches_write_the_in_memory_bytes() {
+    const K: u64 = 9;
+    const S: u64 = 200;
+    let bucket_a = tempfile::tempdir().expect("temp a");
+    let bucket_b = tempfile::tempdir().expect("temp b");
+    let store_a = store_at(bucket_a.path());
+    let store_b = store_at(bucket_b.path());
+    build_wide_partition(&store_a, K, S);
+    mirror_partition(&store_a, &store_b, &partition());
+    let run = |store: &Store, budget: u64| {
+        compact_sorted(
+            store,
+            &partition(),
+            &PromotedAttributes::default(),
+            ClusterKeys::ServiceThenTime,
+            SortTuning {
+                in_memory_max_bytes: budget,
+                fan_in: 3,
+                ..SortTuning::default()
+            },
+        )
+        .expect("compact")
+        .committed
+        .expect("committed")
+    };
+
+    let in_memory = run(&store_a, u64::MAX);
+    let spilled = run(&store_b, 4 * decoded_footprint(&wide_rec(1)));
+
+    assert_eq!(
+        consolidated_bytes(&store_a, &partition(), &in_memory),
+        consolidated_bytes(&store_b, &partition(), &spilled),
+        "the byte-bounded merge writes the in-memory sort's bytes",
+    );
+}
+
+/// The cursor batch is the budget's (open runs + 1)-th share over the
+/// widest row, at least one row and at most [`SUB_BATCH_ROWS`].
+#[test]
+fn cursor_batches_are_sized_from_the_byte_budget() {
+    assert_eq!(cursor_batch_rows(64 << 20, 64, 10_000), 103);
+    assert_eq!(cursor_batch_rows(64 << 20, 64, 100), SUB_BATCH_ROWS);
+    assert_eq!(cursor_batch_rows(0, 4, 10_000), 1, "floor of one row");
+    assert_eq!(cursor_batch_rows(1 << 20, 3, u64::MAX), 1);
+    assert_eq!(cursor_batch_rows(1 << 20, 3, 0), SUB_BATCH_ROWS);
+}

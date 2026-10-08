@@ -164,10 +164,11 @@ impl Reader {
     /// Open a reader that streams batches from a local file handle
     /// instead of fully-resident bytes — the compaction merge's
     /// per-run reader (RFC 0036 §3.2): holding F sorted runs open
-    /// costs F × one decoded batch, not F × file bytes. Same §3.9
-    /// baseline-column check as [`Self::open_file`]; no row-vs-path
-    /// validation (runs hold rows already validated at input decode).
-    pub(crate) fn open_streaming_file(path: &Path) -> Result<Self, ReaderError> {
+    /// costs F × one decoded batch of `batch_rows` rows, not F × file
+    /// bytes. Same §3.9 baseline-column check as [`Self::open_file`]; no
+    /// row-vs-path validation (runs hold rows already validated at input
+    /// decode).
+    pub(crate) fn open_streaming_file(path: &Path, batch_rows: usize) -> Result<Self, ReaderError> {
         let file = std::fs::File::open(path).map_err(|source| ReaderError::Io {
             op: "open",
             path: path.to_path_buf(),
@@ -176,7 +177,10 @@ impl Reader {
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(file).map_err(ReaderError::Parquet)?;
         require_baseline_columns(builder.schema(), &crate::data_schema())?;
-        let inner = builder.build().map_err(ReaderError::Parquet)?;
+        let inner = builder
+            .with_batch_size(batch_rows)
+            .build()
+            .map_err(ReaderError::Parquet)?;
         Ok(Self {
             inner,
             partition: None,

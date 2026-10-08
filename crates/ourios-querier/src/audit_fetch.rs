@@ -65,8 +65,17 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Publish one fetch's result. A failed fetch also stops dispatch here,
+    /// at once: the pass will fail when the consumer reaches it, so GETs
+    /// started in the meantime would be wasted. The error itself is still
+    /// delivered in listing order.
     fn complete(&self, index: usize, result: Result<Vec<u8>, QueryError>) {
-        self.lock().ready.insert(index, result);
+        let mut window = self.lock();
+        if result.is_err() {
+            window.stopped = true;
+        }
+        window.ready.insert(index, result);
+        drop(window);
         self.changed.notify_all();
     }
 
@@ -375,9 +384,23 @@ mod tests {
         assert!(panicked, "the consume panic propagates");
     }
 
+    /// Spin until `counter` reaches `target` (bounded, so a bug fails the
+    /// test instead of hanging it).
+    fn await_count(counter: &AtomicUsize, target: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while counter.load(Ordering::SeqCst) < target {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached {target}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// Counts GET starts across a pass whose first object fails, under a
-    /// budget of two objects: exactly indices 0 and 1 are dispatched before
-    /// the failure, and nothing may start after it.
+    /// budget of two objects. The failure is held back until both budgeted
+    /// GETs (indices 0 and 1) have started, so exactly two start before it;
+    /// a third would be one started after the failure.
     fn gets_started_after_first_failure(fail_get: bool) -> usize {
         let objects = objects(&[10; 64]);
         let started = AtomicUsize::new(0);
@@ -390,21 +413,77 @@ mod tests {
             |key| {
                 started.fetch_add(1, Ordering::SeqCst);
                 match key {
-                    "k0000" if fail_get => Err(QueryError::Storage {
-                        detail: "GET".to_owned(),
-                    }),
+                    "k0000" if fail_get => {
+                        await_count(&started, 2);
+                        Err(QueryError::Storage {
+                            detail: "GET".to_owned(),
+                        })
+                    }
                     _ => Ok(body(key)),
                 }
             },
             |index, _| match index {
-                0 => Err(QueryError::Storage {
-                    detail: "consume".to_owned(),
-                }),
+                0 => {
+                    await_count(&started, 2);
+                    Err(QueryError::Storage {
+                        detail: "consume".to_owned(),
+                    })
+                }
                 _ => Ok(()),
             },
         );
         assert!(err.is_err());
         started.load(Ordering::SeqCst)
+    }
+
+    /// One worker and an unlimited byte budget: only the producer can stop
+    /// dispatch in time. Object 1's GET fails (or panics) while the consumer
+    /// is still slow on object 0; the worker must not go on to object 2.
+    fn gets_started_after_producer_failure(panic: bool) -> usize {
+        let objects = objects(&[10; 64]);
+        let started = AtomicUsize::new(0);
+        let pass = || {
+            fetch_in_order(
+                &objects,
+                FetchLimits {
+                    requests: 1,
+                    bytes: u64::MAX,
+                },
+                |key| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    match key {
+                        "k0001" if panic => panic!("GET panics"),
+                        "k0001" => Err(QueryError::Storage {
+                            detail: "GET".to_owned(),
+                        }),
+                        _ => Ok(body(key)),
+                    }
+                },
+                |_, _| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(())
+                },
+            )
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
+            Ok(outcome) => assert!(outcome.is_err()),
+            Err(_) => assert!(panic, "only the panicking GET may unwind"),
+        }
+        started.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_failed_fetch_stops_dispatch_before_the_consumer_reaches_it() {
+        assert_eq!(
+            gets_started_after_producer_failure(false),
+            2,
+            "after an Err"
+        );
+        assert_eq!(
+            gets_started_after_producer_failure(true),
+            2,
+            "after a panic"
+        );
     }
 
     #[test]

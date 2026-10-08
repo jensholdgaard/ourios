@@ -34,12 +34,13 @@
 //! window — it folds the tenant's whole alias history.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ourios_core::audit::AuditEvent;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditReader, Store, percent_encode_tenant};
 
-use crate::audit_fetch::{FetchLimits, fetch_in_order};
+use crate::audit_fetch::{FetchPool, fetch_in_order};
 use crate::{Backend, QueryError};
 
 /// Borrowed audit-scan backend selector (RFC 0019 §3.3): either a local
@@ -142,7 +143,7 @@ pub(crate) enum ResolvedAuditSet<'a> {
         /// Store-relative object keys (lexicographically sorted, unique),
         /// each with its listed size — the concurrent fetch's byte budget
         /// is charged from the listing, before the GET.
-        objects: Vec<(String, u64)>,
+        objects: Arc<[(String, u64)]>,
         frontier: Vec<String>,
     },
 }
@@ -186,7 +187,7 @@ pub(crate) fn resolve_audit_set<'a>(
             frontier.sort_unstable();
             Ok(ResolvedAuditSet::Remote {
                 store,
-                objects,
+                objects: objects.into(),
                 frontier,
             })
         }
@@ -215,12 +216,12 @@ impl ResolvedAuditSet<'_> {
     ///
     /// One audit file is decoded at a time: its decoded events are dropped
     /// before the next file is decoded. Locally the files are also read one
-    /// at a time. Remote GETs run concurrently under [`FetchLimits`] — at
-    /// most `requests` in flight and `bytes` of listed object size fetched
-    /// ahead of the fold — and are still visited in key order, so the
-    /// footprint is bounded by that budget plus the largest decoded file,
-    /// not the tenant's history. What the visitor keeps is the fold's
-    /// business.
+    /// at a time. Remote GETs run concurrently through the process-wide
+    /// [`FetchPool`] — its worker and read-ahead byte limits are shared by
+    /// every fold in the process — and are still visited in key order, so a
+    /// fold's footprint is bounded by that shared budget plus the largest
+    /// decoded file, not the tenant's history. What the visitor keeps is the
+    /// fold's business.
     ///
     /// The remote branch pays a full-object GET per key, so the local
     /// branch counts each file's length to keep the two backends'
@@ -230,13 +231,13 @@ impl ResolvedAuditSet<'_> {
         tenant: &TenantId,
         visit: impl FnMut(AuditEvent),
     ) -> Result<ScanSummary, QueryError> {
-        self.for_each_event_with(FetchLimits::default(), tenant, visit)
+        self.for_each_event_in(FetchPool::shared(), tenant, visit)
     }
 
-    /// [`Self::for_each_event`] under explicit remote [`FetchLimits`].
-    pub(crate) fn for_each_event_with(
+    /// [`Self::for_each_event`] fetching remote objects through `pool`.
+    pub(crate) fn for_each_event_in(
         self,
-        limits: FetchLimits,
+        pool: &Arc<FetchPool>,
         tenant: &TenantId,
         mut visit: impl FnMut(AuditEvent),
     ) -> Result<ScanSummary, QueryError> {
@@ -255,14 +256,15 @@ impl ResolvedAuditSet<'_> {
                 objects,
                 frontier,
             } => {
+                let store = store.clone();
                 fetch_in_order(
-                    &objects,
-                    limits,
-                    |key| {
+                    pool,
+                    Arc::clone(&objects),
+                    Arc::new(move |key: &str| {
                         store.get_blocking(key).map_err(|e| QueryError::Storage {
                             detail: format!("audit file {key}: {e}"),
                         })
-                    },
+                    }),
                     |index, bytes| {
                         let key = &objects[index].0;
                         let (len, events) = decode_remote(key, bytes)?;
@@ -748,12 +750,12 @@ mod tests {
     /// The remote scan's concurrent GETs fold exactly what the serial
     /// local scan folds, in the same order.
     mod concurrent_fetch {
-        use std::sync::Arc;
         use std::time::{Duration, UNIX_EPOCH};
 
         use ourios_core::audit::{AuditPayload, AuditSink as _, TemplateChange};
 
         use super::*;
+        use crate::audit_fetch::FetchLimits;
         use crate::test_support::SlowStore;
         use crate::{derive_template_map, template_map::TemplateMap};
 
@@ -809,8 +811,8 @@ mod tests {
         ) -> Result<(Vec<AuditEvent>, ScanSummary), QueryError> {
             let tenant = TenantId::new(TENANT);
             let mut events = Vec::new();
-            let summary = resolve_audit_set(backend, &tenant)?.for_each_event_with(
-                limits,
+            let summary = resolve_audit_set(backend, &tenant)?.for_each_event_in(
+                &FetchPool::new(limits),
                 &tenant,
                 |event| events.push(event),
             )?;

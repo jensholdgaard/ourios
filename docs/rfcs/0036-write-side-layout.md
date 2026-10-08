@@ -23,9 +23,11 @@ superseded-by: —
 > skip-spill decision and run formation) and the rewritten RFC0036.3
 > memory clause. The failing test on `main` is
 > `many_small_inputs_within_the_encoded_budget_do_not_decode_at_once`
-> (`crates/ourios-parquet/src/compaction/tests.rs`, PR #900). The RFC
-> returns to `green` when #900 lands, and to `accepted` once the
-> compaction benches are re-recorded. The status note immediately
+> (`crates/ourios-parquet/src/compaction/tests.rs`, PR #900). RFC0036.3
+> now has two memory clauses: the decoded-row budget (#900) and the
+> byte-bounded phase-2 merge (#916). The RFC returns to `green` once
+> both have landed and every §5 criterion passes on `main`, and to
+> `accepted` once the compaction benches are re-recorded. The status note immediately
 > below is the pre-reopen history (the earlier `validated`/`accepted`
 > record); the rest of this document, including the revised §3.2
 > algorithm and RFC0036.3, is the current contract.

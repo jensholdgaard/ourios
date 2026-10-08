@@ -296,9 +296,17 @@ trees — and never as encoded input bytes.
    The **fan-in cap F** (64) bounds the number of **runs** merged at
    once: while more than F runs remain, merge consecutive groups of F
    runs into intermediate runs, preserving run order, and repeat.
-   Merged rows collect in one output chunk of at most one batch,
-   which is emitted into the existing `Writer` (rotating row groups at
-   the §3.3 threshold) each time it fills.
+   Each run's reader batch is sized in **bytes**, not rows: every run
+   records the largest per-row decoded footprint it holds (its widest
+   row, measured as it is formed, or the maximum over the runs a
+   hierarchical merge combines). A merge of k runs gives each reader
+   `⌊B / (k + 1)⌋` bytes, divides that share by the run's widest row,
+   and clamps the result to [1, 1024] rows. The 1,024-row cap is the
+   batch narrow rows always used. The one-row floor exists because a
+   merge cannot advance a run without holding its head row (#853).
+   Merged rows collect in one output chunk of 1,024 rows (the writer's
+   sub-batch), which is emitted into the existing `Writer` (rotating row
+   groups at the §3.3 threshold) each time it fills.
 
 **Order and determinism.** The buffer holds rows in (input ordinal,
 row ordinal) order, every sort is stable, runs are contiguous in that
@@ -310,9 +318,14 @@ changes only local scratch I/O.
 
 **Memory bound (the load-bearing claim).** Phase 1 holds at most `B`
 plus one decoded input: the buffer is under `B` when an input starts,
-and that input is the most it can overshoot by. Phase 2 holds at most
-(F + 1) × one decoded batch, whatever the run count: one batch per
-open run plus the output chunk. The phases do not overlap, because the
+and that input is the most it can overshoot by. Phase 2 holds, whatever
+the run count, the open runs' reader batches plus the output chunk. The
+reader batches together hold at most `B` decoded bytes. The documented
+overshoot: when a run's widest row is wider than its `⌊B / (k + 1)⌋`
+share, that run holds its one head row, so the readers hold at most
+`max(B, k × widest row)`. The output chunk holds at most 1,024 rows, a
+fixed term the writer's sub-batch contract sets. In rows, phase 2 still
+holds at most (F + 1) × 1,024. The phases do not overlap, because the
 run-formation buffer is released before the merge starts. Neither bound depends
 on the partition's file count or compression ratio. The writer's
 in-memory output accumulation (`ArrowWriter<Vec<u8>>`) is unchanged.
@@ -556,7 +569,12 @@ published diagnostic.
 >   budget `B` while their decoded rows exceed it — peak decoded-row
 >   residency stays within the phase-specific bounds: at most `B`
 >   plus one decoded input in phase 1, and (F + 1) × one decoded batch
->   (F open runs plus the merge's output chunk) in phase 2. Holding the whole partition is allowed only within those
+>   (F open runs plus the merge's output chunk) in phase 2. Phase 2 is
+>   also bounded in **decoded bytes**, whatever the row width: the open
+>   runs' reader batches hold at most `max(B, k × widest row)` for k
+>   open runs (`B`, overshot by at most one row per run whose widest row
+>   exceeds its `⌊B / (k + 1)⌋` share), plus the 1,024-row output chunk
+>   (#853). Holding the whole partition is allowed only within those
 >   bounds (the skip-spill case, where it fits `B`); the gate is
 >   measured on decoded rows, not encoded bytes. `B` is a byte budget
 >   over the per-row decoded-footprint estimate, so a row-counting
@@ -622,6 +640,18 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   twice the encoded total) while its decoded rows exceed that budget
   (`many_small_inputs_within_the_encoded_budget_do_not_decode_at_once`),
   which fails on the encoded-bytes gate.
+  Bytes (#853): the same gauge also counts decoded-footprint bytes.
+  `wide_rows_merge_within_the_byte_budget` compacts a hierarchically
+  merged partition of wide rows (40 attributes × 250 B) under a small
+  `B` and asserts that peak decoded bytes stay within the larger of the
+  phase-1 bound (`B` plus one input) and the phase-2 bound
+  (`max(B, F × widest row)` plus 1,024 widest rows for the output
+  chunk). It fails when reader batches are sized in rows.
+  `cursor_batches_are_sized_from_the_byte_budget` pins the sizing,
+  including the one-row floor and the 1,024-row cap, and
+  `byte_sized_merge_batches_write_the_in_memory_bytes` pins §3.5 byte
+  identity under one-row merge batches. All three are in
+  `crates/ourios-parquet/src/compaction/tests/bounded_sort.rs` (#916).
 - **RFC0036.4 — a rebuild differential.** Compact the same inputs
   twice — second run with a shuffled listing order (store fake) —
   and assert byte equality of the outputs (a file hash **is**
@@ -723,7 +753,8 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   cheaper encode doesn't pay for a second read path. Fan-in **F = 64**
   counts **runs**, not inputs: it single-passes any partition of up to
   64 budgets of decoded rows while capping worst-case phase-2
-  residency at (F + 1) × one decoded batch. Small partitions **skip
+  residency at (F + 1) × one decoded batch, with each reader's batch
+  sized from its share of `B` in bytes (§3.2, #853). Small partitions **skip
   spilling** entirely while their decoded rows fit the **64 MiB
   decoded-row budget**; larger ones spill runs of whole inputs as the
   budget fills (*reopened 2026-10-02, §3.2 — originally gated on

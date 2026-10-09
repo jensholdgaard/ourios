@@ -7,11 +7,13 @@ rows and audit events already bind to a different template. v0.12.0
 (RFC 0059) stops this from happening again, but it does not repair a
 store where it already happened.
 
-Run this check once on any store that ran a release before v0.12.0 and
-saw a snapshot discard. A discard shows up in the logs as the
-`ourios.receiver.snapshot.discarded` event, for example
-`unknown_version` on an upgrade or `restore_failed`. The check is
-read-only.
+Run this check once on **every store written by a release before
+v0.12.0**. A logged snapshot discard (the
+`ourios.receiver.snapshot.discarded` event, e.g. `unknown_version` on an
+upgrade or `restore_failed`) is the most visible trigger. A missing
+snapshot after WAL frames were reclaimed, or a replaced local root, can
+cause the same collision without logging a discard, so the absence of
+that event is not evidence of a clean store. The check is read-only.
 
 No Ourios query surface shows these collisions. The template map and
 `list_templates` keep the last binding per `(template_id, version)`,
@@ -113,6 +115,10 @@ discarded tenant re-minting after its WAL was reclaimed:
   from the leaf's.
 - The `data/**` glob in query 3 can include files that compaction has
   replaced but not yet removed, so a row may be counted twice.
-- The audit and data globs read the whole history. On large stores,
-  narrow the glob to the tenant prefixes or day partitions you care
-  about.
+- The audit scans in queries 1 and 2 (and query 3's `bound` CTE) must
+  cover a tenant's **whole** audit history: the two bindings of one id
+  can be days apart, and a day-narrowed glob would see only one of them
+  and report no collision. You may narrow the audit glob to a single
+  tenant's prefix (`audit/tenant_id=<tenant>/**`), never by day. Only the
+  `data/**` glob in query 3 may be narrowed to the days query 1 reported
+  (`first_bound` to `last_bound` and later).

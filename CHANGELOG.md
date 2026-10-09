@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.12.1] - 2026-10-09
+
+### Documentation
+
+- Add a read-only check for pre-0.12 template-id collisions (#922) (7988a98)
+- Bound RFC 0036 phase-2 merge memory in bytes (#918) (176ca75)
+
+### Fixed
+
+- Record progress and emit events per committed partition (#914) (2a8fbe2)
+- Single-flight the template-map acquisition per tenant (#917) (fb987f6)
+- Bound the merge by bytes, not rows (#916) (05e26a4)
+
+### Performance
+
+- Read audit files concurrently in the template-map fold (#915) (8a33796)
+
 ## [0.12.0] - 2026-10-06
 
 ### CI

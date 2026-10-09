@@ -212,6 +212,19 @@ const EXPECTED_LOOKUPS: &[(&str, u64)] = &[
     ("joined", 1),
 ];
 
+/// Append one new audit file under `audit_dir` and tear it in place, so
+/// the frontier changes and the fold over it fails.
+fn append_torn_audit_file(bucket: &Path, audit_dir: &Path) {
+    let before = walk_files(audit_dir);
+    write_audit(bucket, &[widened(1, 4, TS0 + 2 * HOUR_NS)]);
+    let new_audit = walk_files(audit_dir)
+        .into_iter()
+        .find(|p| !before.contains(p))
+        .expect("act 5 wrote a new audit file");
+    let bytes = std::fs::read(&new_audit).expect("read new audit file");
+    std::fs::write(&new_audit, &bytes[..bytes.len() / 2]).expect("tear new audit file");
+}
+
 /// Every file under `dir`, recursively — the audit stream is
 /// date-partitioned, so new files land in nested directories.
 fn walk_files(dir: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
@@ -313,15 +326,7 @@ fn rfc0033_7_observable_outcomes() {
     // 5. A failing fold records nothing: a frontier-changing audit file
     //    that is itself unreadable errors the query, so no outcome is
     //    counted — a counted outcome is always one that answered.
-    let audit_dir = artifact.parent().expect("audit tenant dir").to_path_buf();
-    let before = walk_files(&audit_dir);
-    write_audit(bucket.path(), &[widened(1, 4, TS0 + 2 * HOUR_NS)]);
-    let new_audit = walk_files(&audit_dir)
-        .into_iter()
-        .find(|p| !before.contains(p))
-        .expect("act 5 wrote a new audit file");
-    let bytes = std::fs::read(&new_audit).expect("read new audit file");
-    std::fs::write(&new_audit, &bytes[..bytes.len() / 2]).expect("tear new audit file");
+    append_torn_audit_file(bucket.path(), artifact.parent().expect("audit tenant dir"));
     try_body_query(bucket.path()).expect_err("an unreadable audit stream must fail the query");
 
     // Assert — the exported stream carries the §3.7 instruments, every

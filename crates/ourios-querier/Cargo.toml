@@ -102,8 +102,8 @@ zstd = "0.13"
 [features]
 # Test seams for integration tests that need to steer the template-map
 # single-flight (RFC0033.7's `joined` outcome): a gate run before each
-# acquisition and a count of queries waiting on one. Enabled by
-# `--all-features` (CI); never by a release build.
+# acquisition and a count of queries waiting on one. Disabled by default;
+# test-only hooks, which CI's `--all-features` runs turn on.
 testing = []
 
 [dev-dependencies]

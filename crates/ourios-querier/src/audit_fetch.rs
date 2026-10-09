@@ -24,6 +24,9 @@
 //! starved by a stream of small ones. That wait always ends: every reserved
 //! byte belongs to an object already being fetched or already fetched, and
 //! each fold's consumer only waits on objects it has already been granted.
+//! A fold that fails or is dropped releases its fetched bodies at once, but
+//! its GETs still in flight keep their bytes until they finish, so the
+//! budget bounds every body actually held, not just those of live folds.
 //!
 //! The consumer decodes one object at a time, as the serial scan did, so the
 //! decoded-events footprint is unchanged.
@@ -90,8 +93,12 @@ struct Fold {
     /// The next object index to dispatch; every index below it is
     /// dispatched, so the consumer's next object always is.
     next: usize,
-    /// This fold's share of [`PoolState::reserved`].
+    /// This fold's share of [`PoolState::reserved`]: its GETs in flight
+    /// plus its fetched objects not yet consumed.
     reserved: u64,
+    /// The in-flight part of `reserved`. A deregistered fold's in-flight
+    /// GETs stay charged until their workers finish them.
+    in_flight: u64,
     ready: BTreeMap<usize, Outcome>,
     /// A fetch or the consumer failed: dispatch nothing more.
     stopped: bool,
@@ -100,6 +107,7 @@ struct Fold {
 struct Job {
     fold: u64,
     index: usize,
+    size: u64,
     key: String,
     fetch: Fetch,
     span: tracing::Span,
@@ -124,12 +132,14 @@ impl PoolState {
             let job = Job {
                 fold: id,
                 index: fold.next,
+                size: *size,
                 key: key.clone(),
                 fetch: Arc::clone(&fold.fetch),
                 span: fold.span.clone(),
             };
             fold.next += 1;
             fold.reserved = fold.reserved.saturating_add(*size);
+            fold.in_flight = fold.in_flight.saturating_add(*size);
             self.reserved = self.reserved.saturating_add(*size);
             self.rotation.rotate_left(1);
             return Some(job);
@@ -141,12 +151,21 @@ impl PoolState {
     /// dispatch at once: the pass will fail when the consumer reaches it, so
     /// GETs started in the meantime would be wasted. The error itself is
     /// still delivered in listing order.
-    fn publish(&mut self, fold: u64, index: usize, outcome: Outcome) {
-        if let Some(fold) = self.folds.get_mut(&fold) {
+    ///
+    /// The object's bytes stay charged while its body waits to be consumed.
+    /// If the fold is gone — it failed or was dropped while this GET was in
+    /// flight — nobody will consume it, so the charge is released here, only
+    /// now that the body has been dropped.
+    fn publish(&mut self, job: &Job, outcome: Outcome) {
+        if let Some(fold) = self.folds.get_mut(&job.fold) {
+            fold.in_flight = fold.in_flight.saturating_sub(job.size);
             if !matches!(outcome, Ok(Ok(_))) {
                 fold.stopped = true;
             }
-            fold.ready.insert(index, outcome);
+            fold.ready.insert(job.index, outcome);
+        } else {
+            drop(outcome);
+            self.reserved = self.reserved.saturating_sub(job.size);
         }
     }
 }
@@ -194,6 +213,7 @@ impl FetchPool {
                 span: tracing::Span::current(),
                 next: 0,
                 reserved: 0,
+                in_flight: 0,
                 ready: BTreeMap::new(),
                 stopped: false,
             },
@@ -231,7 +251,7 @@ impl FetchPool {
                     .span
                     .in_scope(|| catch_unwind(AssertUnwindSafe(|| (job.fetch)(&job.key))));
                 state = self.lock();
-                state.publish(job.fold, job.index, outcome);
+                state.publish(&job, outcome);
                 self.changed.notify_all();
                 continue;
             }
@@ -279,13 +299,16 @@ impl FetchPool {
         self.changed.notify_all();
     }
 
-    /// Remove a fold — normally or while unwinding — returning its
-    /// outstanding reservation to the budget. Its in-flight GETs finish and
-    /// publish into nothing.
+    /// Remove a fold — normally or while unwinding. Its fetched but
+    /// unconsumed bodies are dropped and their bytes released now; its GETs
+    /// still in flight keep their bytes charged until their workers finish,
+    /// so a detached GET can never allocate against budget another fold has
+    /// already reused.
     fn deregister(&self, fold: u64) {
         let mut state = self.lock();
         if let Some(window) = state.folds.remove(&fold) {
-            state.reserved = state.reserved.saturating_sub(window.reserved);
+            let fetched = window.reserved.saturating_sub(window.in_flight);
+            state.reserved = state.reserved.saturating_sub(fetched);
         }
         drop(state);
         self.changed.notify_all();
@@ -294,6 +317,11 @@ impl FetchPool {
     #[cfg(test)]
     fn workers(&self) -> usize {
         self.lock().workers
+    }
+
+    #[cfg(test)]
+    fn reserved(&self) -> u64 {
+        self.lock().reserved
     }
 }
 
@@ -767,6 +795,95 @@ mod tests {
             pool.workers() <= limits.requests,
             "worker threads stay bounded"
         );
+    }
+
+    /// A failed fold's GETs still in flight stay charged until they finish:
+    /// another fold cannot reuse their bytes and push the bodies actually
+    /// held past the budget. Its fetched-but-unconsumed bodies are released
+    /// at once.
+    #[test]
+    fn a_departed_folds_in_flight_gets_stay_charged_until_they_finish() {
+        let pool = pool(4, 300);
+        let started = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Fold A, 100 B objects under a 300 B budget: 0, 1 and 2 dispatch.
+        // GET 0 fails once all three have started; GET 1 completes (fetched,
+        // never consumed); GET 2 is held in flight until released.
+        let err = fetch_in_order(
+            &pool,
+            objects(&[100; 10]),
+            fetcher({
+                let (started, released) = (Arc::clone(&started), Arc::clone(&released));
+                move |key| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    match key {
+                        "k0000" => {
+                            await_count(&started, 3);
+                            Err(QueryError::Storage {
+                                detail: "GET".to_owned(),
+                            })
+                        }
+                        "k0002" => {
+                            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                            while !released.load(Ordering::SeqCst) {
+                                assert!(std::time::Instant::now() < deadline, "never released");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Ok(body(key))
+                        }
+                        _ => Ok(body(key)),
+                    }
+                }
+            }),
+            |_, _| Ok(()),
+        );
+        assert!(err.is_err());
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+
+        // A is gone. GET 1's body (fetched, or published to nothing once it
+        // finishes) is released; GET 2, still in flight, stays charged.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while pool.reserved() != 100 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reserved {}",
+                pool.reserved()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Fold B runs while GET 2 is held: the outstanding total, B's GETs
+        // plus A's detached one, never exceeds the budget.
+        let max_reserved = Arc::new(AtomicU64::new(0));
+        fetch_in_order(
+            &pool,
+            objects(&[100; 8]),
+            fetcher({
+                let (pool, max_reserved) = (Arc::clone(&pool), Arc::clone(&max_reserved));
+                move |key| {
+                    max_reserved.fetch_max(pool.reserved(), Ordering::SeqCst);
+                    Ok(body(key))
+                }
+            }),
+            |_, _| Ok(()),
+        )
+        .expect("fold B");
+        let max_reserved = max_reserved.load(Ordering::SeqCst);
+        assert!(max_reserved <= 300, "{max_reserved} B outstanding");
+        assert!(max_reserved >= 200, "B's GETs ran beside A's held one");
+        assert_eq!(pool.reserved(), 100, "A's held GET is still charged");
+
+        // Once the held GET finishes, everything is released.
+        released.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while pool.reserved() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reserved {}",
+                pool.reserved()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

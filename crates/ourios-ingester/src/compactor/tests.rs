@@ -4,6 +4,11 @@
 
 use std::path::Path;
 
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry_sdk::metrics::data::{
+    AggregatedMetrics, MetricData, ResourceMetrics, SumDataPoint,
+};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
@@ -19,7 +24,7 @@ pub(super) fn store_at(bucket: &Path) -> Store {
 
 /// 2026-04-02T10:58:00 UTC (hour 10).
 pub(super) const TS0: u64 = 1_775_127_480_000_000_000;
-const HOUR: u64 = 3_600_000_000_000;
+pub(super) const HOUR: u64 = 3_600_000_000_000;
 /// Well past hour 10's end + grace.
 const NOW_SEALED: u64 = TS0 + 2 * HOUR;
 
@@ -456,4 +461,454 @@ fn run_executes_sweeps_until_cancelled() {
 
     // Assert — the loop ran a sweep that compacted the candidate.
     assert_eq!(compacted.expect("sweep ok"), 1);
+}
+
+/// A graph-less sweep of `store` under the default policy and promoted set.
+fn target(store: &Store) -> SweepTarget {
+    SweepTarget::new(
+        store.clone(),
+        CompactionPolicy::default(),
+        PromotedAttributes::default(),
+    )
+}
+
+/// `count` sealed candidates for tenant `a`, one per consecutive hour from
+/// `TS0`'s, two files each.
+fn write_sealed_hours(store: &Store, count: u64) {
+    for hour in 0..count {
+        write_file(store, "a", 1, TS0 + hour * HOUR);
+        write_file(store, "a", 2, TS0 + hour * HOUR + 1_000_000);
+    }
+}
+
+/// The partition a compaction audit event names.
+fn event_partition(event: &AuditEvent) -> String {
+    match &event.payload {
+        AuditPayload::Compaction { partition, .. } => partition.clone(),
+        other => panic!("not a compaction event: {other:?}"),
+    }
+}
+
+/// An audit sink that hands every event on, then stands in for the process
+/// dying once it has emitted `crash_after` of them.
+pub(super) struct CrashingSink {
+    inner: ourios_core::audit::SharedAuditSink,
+    crash_after: usize,
+    emitted: usize,
+}
+
+impl CrashingSink {
+    pub(super) fn new(inner: &ourios_core::audit::SharedAuditSink, crash_after: usize) -> Self {
+        Self {
+            inner: inner.clone(),
+            crash_after,
+            emitted: 0,
+        }
+    }
+}
+
+impl AuditSink for CrashingSink {
+    fn emit(&mut self, event: AuditEvent) {
+        self.inner.emit(event);
+        self.emitted += 1;
+        assert!(self.emitted < self.crash_after, "the process dies here");
+    }
+}
+
+/// A sweep that dies after its `k`th committed partition has already
+/// emitted the audit events of partitions 1..=k — each right after its
+/// manifest commit, not at sweep end — and left the rest uncompacted for
+/// the next sweep (RFC 0009 §3.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_dying_mid_backlog_has_emitted_the_events_committed_before_it() {
+    // Arrange
+    const PARTITIONS: u64 = 5;
+    const K: usize = 2;
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, PARTITIONS);
+    let audit = ourios_core::audit::SharedAuditSink::new();
+    let sink = CrashingSink::new(&audit, K);
+
+    // Act
+    let sweep = tokio::spawn(sweep_once(target(&store), Box::new(sink))).await;
+
+    // Assert
+    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+    let emitted: Vec<String> = audit.drain().iter().map(event_partition).collect();
+    assert_eq!(emitted.len(), K, "{emitted:?}");
+    let left =
+        plan_candidates(&store, "a", now_unix_nanos(), &CompactionPolicy::default()).expect("plan");
+    assert_eq!(
+        left.len(),
+        usize::try_from(PARTITIONS).expect("small") - K,
+        "the sweep stopped at the crash: {left:?}"
+    );
+    for partition in &left {
+        let key = format!(
+            "year={:04}/month={:02}/day={:02}/hour={:02}",
+            partition.year, partition.month, partition.day, partition.hour
+        );
+        assert!(!emitted.contains(&key), "{key} uncompacted yet audited");
+    }
+}
+
+/// Reads `partitions` and `files` through a fresh collection at every
+/// event the sweep emits.
+struct ReadingSink {
+    provider: SdkMeterProvider,
+    exporter: InMemoryMetricExporter,
+    readings: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+fn u64_sum(rms: &[ResourceMetrics], name: &str) -> u64 {
+    rms.iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|m| m.name() == name)
+        .map(|m| match m.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                sum.data_points().map(SumDataPoint::value).sum()
+            }
+            other => panic!("{name} is not a u64 sum: {other:?}"),
+        })
+        .last()
+        .unwrap_or(0)
+}
+
+impl AuditSink for ReadingSink {
+    fn emit(&mut self, _: AuditEvent) {
+        self.exporter.reset();
+        self.provider.force_flush().expect("flush");
+        let rms = self.exporter.get_finished_metrics().expect("collect");
+        self.readings.lock().expect("readings").push((
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_PARTITIONS),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_FILES),
+        ));
+    }
+}
+
+/// The partition counters rise as each partition commits, not once the
+/// sweep ends: a sweep over a backlog of hourly partitions runs for hours,
+/// and `ourios.compaction.partitions` must show its progress meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
+    // Arrange
+    const PARTITIONS: u64 = 4;
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, PARTITIONS);
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter("ourios.compaction"),
+    ));
+    let readings = Arc::default();
+    let sink = ReadingSink {
+        provider: provider.clone(),
+        exporter,
+        readings: Arc::clone(&readings),
+    };
+
+    // Act
+    let (result, _, _) = sweep_recorded(target(&store), Box::new(sink), Some(metrics)).await;
+
+    // Assert
+    let report = result.expect("sweep");
+    assert_eq!(report.partitions_compacted, 4, "{report:?}");
+    let readings = readings.lock().expect("readings").clone();
+    assert_eq!(
+        readings,
+        vec![(1, 2), (2, 4), (3, 6), (4, 8)],
+        "one partition and its two files counted at each commit"
+    );
+}
+
+/// A store backend whose deletes of data files — the cleanup of a
+/// compaction's superseded inputs, after its commit — fail: with `dies`,
+/// the process dies (panics) on the first; otherwise each delete errors.
+#[derive(Debug)]
+struct BrokenCleanup {
+    inner: Arc<dyn object_store::ObjectStore>,
+    dies: bool,
+}
+
+impl std::fmt::Display for BrokenCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BrokenCleanup({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for BrokenCleanup {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        use futures::StreamExt as _;
+        let dies = self.dies;
+        let broken = locations.map(move |location| {
+            let path = location?;
+            let data = path.as_ref().starts_with("data/") && path.as_ref().ends_with(".parquet");
+            assert!(!(dies && data), "the process dies cleaning up {path}");
+            if data {
+                return Err(object_store::Error::Generic {
+                    store: "broken-cleanup",
+                    source: format!("cannot delete {path}").into(),
+                });
+            }
+            Ok(path)
+        });
+        self.inner.delete_stream(broken.boxed())
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A sweep dying in the cleanup after a partition's commit — the
+/// superseded inputs' deletes — has already recorded that partition: its
+/// counters and its audit event come from the commit itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_dying_in_post_commit_cleanup_has_recorded_the_partition() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, 2);
+    let store = store.wrap_backend(|inner| Arc::new(BrokenCleanup { inner, dies: true }));
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter("ourios.compaction"),
+    ));
+    let audit = ourios_core::audit::SharedAuditSink::new();
+
+    // Act
+    let sweep = tokio::spawn(sweep_recorded(
+        target(&store),
+        Box::new(audit.clone()),
+        Some(metrics),
+    ))
+    .await;
+
+    // Assert
+    assert!(matches!(&sweep, Err(e) if e.is_panic()), "the sweep died");
+    provider.force_flush().expect("flush");
+    let rms = exporter.get_finished_metrics().expect("collect");
+    let events: Vec<String> = audit.drain().iter().map(event_partition).collect();
+    assert_eq!(
+        (
+            events.len(),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_PARTITIONS),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_FILES),
+        ),
+        (1, 1, 2),
+        "the committed partition's event and counters: {events:?}"
+    );
+}
+
+/// A clock that advances by an hour on every read, starting a day after
+/// `NOW_SEALED`.
+fn advancing_clock() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(NOW_SEALED + 24 * HOUR);
+    NEXT.fetch_add(HOUR, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Each commit's audit event is stamped from the clock as it is emitted
+/// (RFC 0005 §3.7), not with the sweep's start: two commits read an
+/// advancing clock and carry distinct, increasing timestamps after the
+/// sweep's start. Candidates are still sealed against the start: hour 12,
+/// open at `NOW_SEALED` but long closed by the advanced clock, is left
+/// alone.
+#[test]
+fn audit_events_carry_the_clock_at_emit_while_sealing_uses_the_sweep_start() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_sealed_candidate(&store, "b");
+    write_file(&store, "a", 3, NOW_SEALED);
+    write_file(&store, "a", 4, NOW_SEALED + 1_000_000);
+    let clock = SweepClock {
+        sealed_at: NOW_SEALED,
+        now: advancing_clock,
+    };
+    let mut stamps = Vec::new();
+
+    // Act
+    let report = run_sweep_committing(
+        &store,
+        clock,
+        &CompactionPolicy::default(),
+        &PromotedAttributes::default(),
+        &mut SweepHooks::default(),
+        &mut |commit| stamps.push(commit.event.timestamp),
+    )
+    .expect("sweep");
+
+    // Assert
+    let start = SystemTime::UNIX_EPOCH + Duration::from_nanos(NOW_SEALED);
+    assert_eq!(
+        report.partitions_compacted, 2,
+        "hour 12 is not sealed: {report:?}"
+    );
+    assert!(
+        matches!(stamps.as_slice(), [first, second] if start < *first && first < second),
+        "{stamps:?}"
+    );
+}
+
+/// The backlog the in-memory exporter last collected, per tenant.
+fn backlog(rms: &[ResourceMetrics]) -> Vec<(String, i64)> {
+    rms.iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|m| m.name() == ourios_semconv::OURIOS_COMPACTION_BACKLOG)
+        .flat_map(|m| match m.data() {
+            AggregatedMetrics::I64(MetricData::Sum(sum)) => sum
+                .data_points()
+                .map(|dp| {
+                    let tenant = dp
+                        .attributes()
+                        .find(|kv| kv.key.as_str() == ourios_semconv::OURIOS_TENANT)
+                        .map(|kv| kv.value.as_str().to_string())
+                        .unwrap_or_default();
+                    (tenant, dp.value())
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("backlog is not an i64 sum: {other:?}"),
+        })
+        .collect()
+}
+
+/// Takes every permission off a path, and restores its mode when dropped,
+/// so a failing assertion or panic still leaves the temp dir removable.
+#[cfg(unix)]
+pub(super) struct Unreadable {
+    path: std::path::PathBuf,
+    mode: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Unreadable {
+    pub(super) fn new(path: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("metadata").permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable");
+        Self { path, mode }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.path, self.mode.clone());
+    }
+}
+
+/// A sweep that commits and then fails fatally still records what it
+/// did: the backlog gauge is rebuilt from its partial report (tenant `a`'s
+/// candidate was compacted, so its lag is 0) and the inputs its cleanup
+/// could not delete count as orphan files.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fatally_failed_sweep_records_its_partial_backlog_and_gc_failures() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, 1);
+    let store = store.wrap_backend(|inner| Arc::new(BrokenCleanup { inner, dies: false }));
+    let markers = bucket.path().join("erasure");
+    std::fs::create_dir(&markers).expect("erasure dir");
+    let unlistable = Unreadable::new(markers);
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter("ourios.compaction"),
+    ));
+
+    // Act
+    let (result, elapsed, _) = sweep_recorded(
+        target(&store),
+        Box::new(ourios_core::audit::SharedAuditSink::new()),
+        Some(Arc::clone(&metrics)),
+    )
+    .await;
+    metrics.record_sweep_outcome(&result, elapsed);
+    drop(unlistable);
+
+    // Assert
+    let failed = result.expect_err("the erasure listing fails the sweep");
+    let partial = failed.partial.as_deref().expect("a partial report");
+    assert_eq!(
+        (partial.partitions_compacted, partial.gc_failures),
+        (1, 2),
+        "{partial:?}"
+    );
+    provider.force_flush().expect("flush");
+    let rms = exporter.get_finished_metrics().expect("collect");
+    assert_eq!(
+        (
+            backlog(&rms),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_ORPHAN_FILES),
+        ),
+        (vec![("a".to_string(), 0)], 2),
+        "the partial report's backlog and gc failures"
+    );
 }

@@ -63,7 +63,7 @@ pub mod recovery;
 pub mod snapshot_store;
 pub mod template_ids;
 
-pub use compactor::{Compactor, IngestError, SweepReport, run_sweep, run_sweep_with_promoted};
+pub use compactor::{Compactor, IngestError, SweepReport, SweepTarget, run_sweep};
 pub use metrics::CompactionMetrics;
 pub use recovery::{
     DiscardReason, RecoveryDriverError, RecoveryReport, SnapshotFate, TenantRecovery,

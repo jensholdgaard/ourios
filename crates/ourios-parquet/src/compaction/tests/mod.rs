@@ -65,6 +65,60 @@ fn write_file(store: &Store, recs: &[MinedRecord]) {
     w.close().expect("close");
 }
 
+/// The commit hook runs once, after the manifest commit is won and before
+/// the superseded inputs are deleted, so a caller that records commits
+/// through it has the partition recorded even when the process dies
+/// during that cleanup.
+#[test]
+fn the_commit_hook_runs_between_the_commit_and_the_cleanup() {
+    // Arrange
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let store = store_at(bucket.path());
+    write_file(&store, &[rec(1, TS0)]);
+    write_file(&store, &[rec(2, TS0 + 1_000)]);
+    let parquet_files = || {
+        store
+            .list_blocking(Some(&partition_data_prefix(&partition())))
+            .expect("list")
+            .into_iter()
+            .filter(|key| key.ends_with(".parquet"))
+            .count()
+    };
+    let mut seen = Vec::new();
+    let mut on_commit = |outcome: &CompactionOutcome| {
+        let (manifest, _) = Manifest::read_with_etag(&store, &manifest_key(&partition()))
+            .expect("read manifest")
+            .expect("manifest");
+        let file = outcome.committed.as_ref().map(|c| c.file.clone());
+        seen.push(((file, outcome.gc_failures), manifest.files, parquet_files()));
+    };
+    let mut hooks = RowHooks {
+        on_commit: Some(&mut on_commit),
+        ..RowHooks::default()
+    };
+
+    // Act
+    let outcome = compact_partition_hooked(
+        &store,
+        &partition(),
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("compact");
+
+    // Assert
+    let file = outcome.committed.expect("committed").file;
+    let [(at_commit, manifest_files, files_on_disk)] = seen.as_slice() else {
+        panic!("one call, got {}", seen.len());
+    };
+    assert_eq!(
+        (at_commit, manifest_files, *files_on_disk),
+        (&(Some(file.clone()), 0), &vec![file], 3),
+        "at the hook: the commit is in the manifest, and both inputs are still on disk"
+    );
+    assert_eq!(parquet_files(), 1, "the cleanup ran after the hook");
+}
+
 /// RFC 0048 §3.4 — `visit_partition_rows` reads a partition's live
 /// rows without rewriting: every row of every input file is delivered
 /// in batches (glob fallback before any manifest exists), the

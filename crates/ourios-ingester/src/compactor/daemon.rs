@@ -161,7 +161,9 @@ impl Compactor {
 
 /// One full sweep as the daemon runs it: the blocking pass (consolidation,
 /// erasure rewrites) on the blocking pool, emitting each committed
-/// partition's compaction audit event as its manifest commits; then, with
+/// partition's compaction audit event at commit time — best-effort: a
+/// crash between a commit and its emit, or a sink that suppresses an
+/// error, can still drop that one event; then, with
 /// an emitter, the async graph phase (RFC 0047 §3.3: write the tuples the
 /// pass derived; delete the tuples of every erasure whose rows are gone;
 /// then, back on the blocking pool, the `conversation_erased` audit event
@@ -226,7 +228,11 @@ pub(crate) async fn sweep_recorded(
 }
 
 /// The sweep's blocking pass: records each committed partition into
-/// `metrics` and emits its audit event the moment its manifest commits.
+/// `metrics` and emits its audit event at commit time, so a crash later in
+/// the sweep loses no event for a partition committed before it. The emit
+/// is best-effort: a crash inside its own window, between the commit and
+/// the sink's write, or a sink that suppresses an error, can still drop
+/// that one event.
 fn blocking_pass(
     target: &SweepTarget,
     mut audit_sink: Box<dyn AuditSink>,
@@ -272,7 +278,7 @@ fn sweep_deriving(
     };
     let result = run_sweep_committing(
         &target.store,
-        now_unix_nanos(),
+        SweepClock::sealed_at(now_unix_nanos()),
         &target.policy,
         &target.promoted,
         &mut hooks,
@@ -290,7 +296,7 @@ fn sweep_deriving(
 ) -> (Result<SweepReport, IngestError>, GraphTuples) {
     let result = run_sweep_committing(
         &target.store,
-        now_unix_nanos(),
+        SweepClock::sealed_at(now_unix_nanos()),
         &target.policy,
         &target.promoted,
         &mut SweepHooks::default(),

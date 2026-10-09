@@ -239,42 +239,61 @@ fn erase_rows(sweep: &mut Sweep<'_, '_>, matches: &ErasureMatch<'_>, outcome: &m
     let drop = |record: &MinedRecord| matches(record, id);
     let mut clean = true;
     for partition in &partitions {
-        let target = Target {
-            tenant: &request.tenant,
-            partition,
-        };
-        // An erasure rewrite is a compaction like any other for the
-        // sweep's IO accounting and audit trail (RFC 0009 §3.6): it reads
-        // and writes the partition and commits a generation, so `rewrite`
-        // records its commit as the consolidation pass does.
-        match sweep.rewrite(target, None, Some(&drop)) {
-            Ok(o) if o.committed.is_some() => {
+        clean &= erase_partition(sweep, partition, &drop, outcome);
+    }
+    if clean {
+        advance_marker(sweep, outcome);
+    }
+}
+
+/// Rewrite one partition of the request's tenant without the rows `drop`
+/// matches; whether it rewrote cleanly. An erasure rewrite is a compaction
+/// like any other for the sweep's IO accounting and audit trail (RFC 0009
+/// §3.6): it reads and writes the partition and commits a generation, so
+/// `rewrite` records its commit as the consolidation pass does.
+fn erase_partition(
+    sweep: &mut Sweep<'_, '_>,
+    partition: &PartitionKey,
+    drop: &RowFilter<'_>,
+    outcome: &mut ErasureOutcome,
+) -> bool {
+    let request = &outcome.request;
+    let target = Target {
+        tenant: &request.tenant,
+        partition,
+    };
+    match sweep.rewrite(target, None, Some(drop)) {
+        Ok(o) => {
+            if o.committed.is_some() {
                 outcome.partitions_rewritten += 1;
                 outcome.rows_dropped += o.rows_dropped;
                 sweep.report.gc_failures += o.gc_failures;
             }
-            Ok(_) => {}
-            Err(e) => {
-                clean = false;
-                let hour = hour_label(partition);
-                let (tenant, id) = (&request.tenant, &request.conversation_id);
-                e.record(
-                    &mut sweep.report,
-                    &format!("erase {tenant:?} {id:?} {hour}"),
-                );
-            }
+            true
+        }
+        Err(e) => {
+            let hour = hour_label(partition);
+            let (tenant, id) = (&request.tenant, &request.conversation_id);
+            e.record(
+                &mut sweep.report,
+                &format!("erase {tenant:?} {id:?} {hour}"),
+            );
+            false
         }
     }
-    if clean {
-        match sweep
-            .store
-            .put_blocking(&request.marker, ERASURE_PHASE_TUPLES.to_vec())
-        {
-            Ok(()) => outcome.phase = ErasurePhase::Tuples,
-            Err(e) => sweep.report.errors.push(format!(
-                "erase {:?} {:?}: advance marker: {e}",
-                request.tenant, request.conversation_id
-            )),
-        }
+}
+
+/// Move the request's marker to the `Tuples` phase: its rows are gone.
+fn advance_marker(sweep: &mut Sweep<'_, '_>, outcome: &mut ErasureOutcome) {
+    let request = &outcome.request;
+    match sweep
+        .store
+        .put_blocking(&request.marker, ERASURE_PHASE_TUPLES.to_vec())
+    {
+        Ok(()) => outcome.phase = ErasurePhase::Tuples,
+        Err(e) => sweep.report.errors.push(format!(
+            "erase {:?} {:?}: advance marker: {e}",
+            request.tenant, request.conversation_id
+        )),
     }
 }

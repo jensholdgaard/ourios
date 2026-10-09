@@ -520,7 +520,7 @@ impl AuditSink for CrashingSink {
 /// manifest commit, not at sweep end — and left the rest uncompacted for
 /// the next sweep (RFC 0009 §3.6).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sweep_dying_mid_backlog_has_emitted_every_committed_partitions_event() {
+async fn a_sweep_dying_mid_backlog_has_emitted_the_events_committed_before_it() {
     // Arrange
     const PARTITIONS: u64 = 5;
     const K: usize = 2;
@@ -748,5 +748,57 @@ async fn a_sweep_dying_in_post_commit_cleanup_has_recorded_the_partition() {
         ),
         (1, 1, 2),
         "the committed partition's event and counters: {events:?}"
+    );
+}
+
+/// A clock that advances by an hour on every read, starting a day after
+/// `NOW_SEALED`.
+fn advancing_clock() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(NOW_SEALED + 24 * HOUR);
+    NEXT.fetch_add(HOUR, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Each commit's audit event is stamped from the clock as it is emitted
+/// (RFC 0005 §3.7), not with the sweep's start: two commits read an
+/// advancing clock and carry distinct, increasing timestamps after the
+/// sweep's start. Candidates are still sealed against the start: hour 12,
+/// open at `NOW_SEALED` but long closed by the advanced clock, is left
+/// alone.
+#[test]
+fn audit_events_carry_the_clock_at_emit_while_sealing_uses_the_sweep_start() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_candidate(&store, "a");
+    write_sealed_candidate(&store, "b");
+    write_file(&store, "a", 3, NOW_SEALED);
+    write_file(&store, "a", 4, NOW_SEALED + 1_000_000);
+    let clock = SweepClock {
+        sealed_at: NOW_SEALED,
+        now: advancing_clock,
+    };
+    let mut stamps = Vec::new();
+
+    // Act
+    let report = run_sweep_committing(
+        &store,
+        clock,
+        &CompactionPolicy::default(),
+        &PromotedAttributes::default(),
+        &mut SweepHooks::default(),
+        &mut |commit| stamps.push(commit.event.timestamp),
+    )
+    .expect("sweep");
+
+    // Assert
+    let start = SystemTime::UNIX_EPOCH + Duration::from_nanos(NOW_SEALED);
+    assert_eq!(
+        report.partitions_compacted, 2,
+        "hour 12 is not sealed: {report:?}"
+    );
+    assert!(
+        matches!(stamps.as_slice(), [first, second] if start < *first && first < second),
+        "{stamps:?}"
     );
 }

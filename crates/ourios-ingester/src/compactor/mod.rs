@@ -256,7 +256,37 @@ pub fn run_sweep_hooked(
     promoted: &PromotedAttributes,
     hooks: &mut SweepHooks<'_>,
 ) -> Result<SweepReport, IngestError> {
-    run_sweep_committing(store, now_unix_nanos, policy, promoted, hooks, &mut |_| {})
+    run_sweep_committing(
+        store,
+        SweepClock::sealed_at(now_unix_nanos),
+        policy,
+        promoted,
+        hooks,
+        &mut |_| {},
+    )
+}
+
+/// A sweep's two times: the instant its candidates are sealed against,
+/// fixed for the whole sweep, and the clock each committed partition's
+/// audit event is stamped from as it is emitted (RFC 0005 §3.7: the
+/// cluster clock at emit time).
+#[derive(Debug, Clone, Copy)]
+pub struct SweepClock {
+    /// Unix nanoseconds the candidates are planned and sealed against.
+    pub sealed_at: u64,
+    /// Unix nanoseconds now, read once per committed partition.
+    pub now: fn() -> u64,
+}
+
+impl SweepClock {
+    /// Seal against `sealed_at`; stamp audit events with the wall clock.
+    #[must_use]
+    pub fn sealed_at(sealed_at: u64) -> Self {
+        Self {
+            sealed_at,
+            now: now_unix_nanos,
+        }
+    }
 }
 
 /// One partition rewrite whose manifest commit was just won, handed to the
@@ -284,10 +314,14 @@ pub struct PartitionCommitted<'a> {
 pub type CommitObserver<'a> = dyn FnMut(&PartitionCommitted<'_>) + 'a;
 
 /// [`run_sweep_hooked`], calling `on_commit` for every partition rewrite
-/// (consolidation or erasure) right after its manifest commits, so the
-/// caller can record and emit per partition rather than at sweep end — a
-/// sweep over a large backlog runs for hours, and a restart mid-sweep must
-/// not lose what the committed partitions already did.
+/// (consolidation or erasure) as its manifest commit is won, so the caller
+/// can record and emit per partition rather than at sweep end: a sweep
+/// over a large backlog runs for hours, and a restart mid-sweep no longer
+/// loses what the partitions committed before it already did. The
+/// callback's own work is best-effort — a crash inside it, or a sink that
+/// suppresses an error, can still drop that one partition's record.
+/// Candidates are sealed against `clock.sealed_at`; each audit event is
+/// stamped from `clock.now` as it is built.
 ///
 /// # Errors
 ///
@@ -302,7 +336,7 @@ pub type CommitObserver<'a> = dyn FnMut(&PartitionCommitted<'_>) + 'a;
 )]
 pub fn run_sweep_committing(
     store: &Store,
-    now_unix_nanos: u64,
+    clock: SweepClock,
     policy: &CompactionPolicy,
     promoted: &PromotedAttributes,
     hooks: &mut SweepHooks<'_>,
@@ -310,7 +344,7 @@ pub fn run_sweep_committing(
 ) -> Result<SweepReport, IngestError> {
     let mut sweep = Sweep {
         store,
-        now_unix_nanos,
+        clock,
         promoted,
         report: SweepReport::default(),
         on_commit,
@@ -326,7 +360,7 @@ pub fn run_sweep_committing(
 /// the commit callback each committed partition reaches.
 struct Sweep<'s, 'c> {
     store: &'s Store,
-    now_unix_nanos: u64,
+    clock: SweepClock,
     promoted: &'s PromotedAttributes,
     report: SweepReport,
     on_commit: &'s mut CommitObserver<'c>,
@@ -349,7 +383,7 @@ impl Sweep<'_, '_> {
         mut observe: Option<&mut SweepObserver<'_>>,
     ) {
         self.report.tenants_scanned += 1;
-        let candidates = match plan_candidates(self.store, tenant, self.now_unix_nanos, policy) {
+        let candidates = match plan_candidates(self.store, tenant, self.clock.sealed_at, policy) {
             Ok(candidates) => candidates,
             Err(e) => {
                 self.report
@@ -415,7 +449,7 @@ impl Sweep<'_, '_> {
     ) -> Result<CompactionOutcome, Uncommitted> {
         let Self {
             store,
-            now_unix_nanos,
+            clock,
             promoted,
             report,
             on_commit,
@@ -424,7 +458,7 @@ impl Sweep<'_, '_> {
             if let Some(committed) = &outcome.committed {
                 let event = compaction_audit_event(
                     target.tenant,
-                    *now_unix_nanos,
+                    (clock.now)(),
                     target.partition,
                     committed,
                     outcome.rows,
@@ -543,23 +577,23 @@ fn check_committed(
 }
 
 /// Build the RFC 0009 §3.6 audit event for a committed compaction
-/// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
-/// the sweep's wall clock; the partition is the canonical
+/// (RFC 0005 §3.7 `AuditPayload::Compaction`), stamped `emitted_at` —
+/// the cluster clock as the event is built; the partition is the canonical
 /// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
 fn compaction_audit_event(
     tenant: &str,
-    now_unix_nanos: u64,
+    emitted_at: u64,
     partition: &PartitionKey,
     committed: &Committed,
     rows: u64,
 ) -> AuditEvent {
     AuditEvent {
         tenant_id: TenantId::new(tenant),
-        // `checked_add` so a saturated `now_unix_nanos` (year ~2554,
+        // `checked_add` so a saturated `emitted_at` (year ~2554,
         // unreachable in practice — see `now_unix_nanos`) can't panic;
         // falls back to the epoch rather than aborting a sweep.
         timestamp: SystemTime::UNIX_EPOCH
-            .checked_add(Duration::from_nanos(now_unix_nanos))
+            .checked_add(Duration::from_nanos(emitted_at))
             .unwrap_or(SystemTime::UNIX_EPOCH),
         payload: AuditPayload::Compaction {
             partition: format!(

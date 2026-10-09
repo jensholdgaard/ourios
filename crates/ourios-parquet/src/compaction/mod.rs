@@ -518,20 +518,42 @@ fn compact_sorted_hooked(
         Published::Lost => return Ok(lost_commit_outcome(store, &written.key, inputs.len())),
     }
 
-    let mut outcome = CompactionOutcome {
+    let committed = Committed {
+        file: consolidated,
+        generation,
+        input_files,
+    };
+    let outcome = committed_outcome(&inputs, &totals, committed, bytes_written);
+    Ok(announce_and_clean_up(store, &inputs, hooks, outcome))
+}
+
+/// The outcome of a won commit of `inputs`, before their cleanup.
+fn committed_outcome(
+    inputs: &[String],
+    totals: &SortTotals,
+    committed: Committed,
+    bytes_written: u64,
+) -> CompactionOutcome {
+    CompactionOutcome {
         files_before: inputs.len(),
         rows: totals.rows,
         rows_dropped: totals.rows_dropped,
-        committed: Some(Committed {
-            file: consolidated,
-            generation,
-            input_files,
-        }),
+        committed: Some(committed),
         commit_lost: false,
         gc_failures: 0,
         bytes_read: totals.bytes_read,
         bytes_written,
-    };
+    }
+}
+
+/// Tell [`RowHooks::on_commit`] of the won commit, then delete the
+/// superseded `inputs`, counting the deletes that failed.
+fn announce_and_clean_up(
+    store: &Store,
+    inputs: &[String],
+    hooks: &mut RowHooks<'_>,
+    mut outcome: CompactionOutcome,
+) -> CompactionOutcome {
     if let Some(on_commit) = hooks.on_commit.as_deref_mut() {
         on_commit(&outcome);
     }
@@ -541,6 +563,6 @@ fn compact_sorted_hooked(
     // failure. Count such failures and continue; a not-found is
     // already-reclaimed (S3 DELETE is idempotent; the local backend reports
     // not-found — the GC treats both alike).
-    outcome.gc_failures = delete_non_live(store, &inputs);
-    Ok(outcome)
+    outcome.gc_failures = delete_non_live(store, inputs);
+    outcome
 }

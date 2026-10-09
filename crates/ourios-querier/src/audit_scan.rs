@@ -263,9 +263,11 @@ impl ResolvedAuditSet<'_> {
                     pool,
                     Arc::clone(&objects),
                     Arc::new(move |key: &str| {
-                        store.get_blocking(key).map_err(|e| QueryError::Storage {
-                            detail: format!("audit file {key}: {e}"),
-                        })
+                        store
+                            .get_bytes_blocking(key)
+                            .map_err(|e| QueryError::Storage {
+                                detail: format!("audit file {key}: {e}"),
+                            })
                     }),
                     |index, bytes| {
                         let key = &objects[index].0;
@@ -312,9 +314,9 @@ fn read_local(path: &Path) -> Result<(u64, Vec<AuditEvent>), QueryError> {
 }
 
 /// One fetched audit object's byte count and decoded events.
-fn decode_remote(key: &str, bytes: Vec<u8>) -> Result<(u64, Vec<AuditEvent>), QueryError> {
+fn decode_remote(key: &str, bytes: bytes::Bytes) -> Result<(u64, Vec<AuditEvent>), QueryError> {
     let len = bytes.len() as u64;
-    let events = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+    let events = AuditReader::open_bytes(bytes)
         .and_then(AuditReader::read_all)
         .map_err(|e| QueryError::Storage {
             detail: format!("audit file {key}: {e}"),

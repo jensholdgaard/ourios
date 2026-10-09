@@ -36,6 +36,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::QueryError;
 
 /// The process-wide fetch limits of a [`FetchPool`].
@@ -57,11 +59,11 @@ impl Default for FetchLimits {
 }
 
 /// One GET: the store call a fold's objects are fetched with.
-pub(crate) type Fetch = Arc<dyn Fn(&str) -> Result<Vec<u8>, QueryError> + Send + Sync>;
+pub(crate) type Fetch = Arc<dyn Fn(&str) -> Result<Bytes, QueryError> + Send + Sync>;
 
 /// A fetched body, a fetch error, or the payload of a panicking fetch (re-
 /// raised on the consumer's thread when it reaches that object).
-type Outcome = std::thread::Result<Result<Vec<u8>, QueryError>>;
+type Outcome = std::thread::Result<Result<Bytes, QueryError>>;
 
 /// How long an idle worker of the shared pool waits for work before it
 /// exits.
@@ -401,7 +403,7 @@ pub(crate) fn fetch_in_order<C>(
     mut consume: C,
 ) -> Result<(), QueryError>
 where
-    C: FnMut(usize, Vec<u8>) -> Result<(), QueryError>,
+    C: FnMut(usize, Bytes) -> Result<(), QueryError>,
 {
     if objects.is_empty() {
         return Ok(());
@@ -444,14 +446,14 @@ mod tests {
         FetchPool::for_test(FetchLimits { requests, bytes })
     }
 
-    fn fetcher(f: impl Fn(&str) -> Result<Vec<u8>, QueryError> + Send + Sync + 'static) -> Fetch {
+    fn fetcher(f: impl Fn(&str) -> Result<Bytes, QueryError> + Send + Sync + 'static) -> Fetch {
         Arc::new(f)
     }
 
     /// A body that names its key, so the consumer can check it got the
     /// right object at the right index.
-    fn body(key: &str) -> Vec<u8> {
-        key.as_bytes().to_vec()
+    fn body(key: &str) -> Bytes {
+        Bytes::copy_from_slice(key.as_bytes())
     }
 
     fn index_of(key: &str) -> usize {

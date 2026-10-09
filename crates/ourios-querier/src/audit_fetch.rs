@@ -80,6 +80,9 @@ pub(crate) struct FetchPool {
     idle: Duration,
     state: Mutex<PoolState>,
     changed: Condvar,
+    /// Test hook: make every worker spawn fail.
+    #[cfg(test)]
+    fail_spawns: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -197,6 +200,8 @@ impl FetchPool {
             idle,
             state: Mutex::new(PoolState::default()),
             changed: Condvar::new(),
+            #[cfg(test)]
+            fail_spawns: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -215,12 +220,28 @@ impl FetchPool {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Register a fold for dispatch. Workers are topped up *before* the fold
+    /// is added, so a pool that cannot start any worker returns the error
+    /// with nothing registered — no fold, no rotation entry to leak.
     fn register(
         self: &Arc<Self>,
         objects: Arc<[(String, u64)]>,
         fetch: Fetch,
     ) -> Result<u64, QueryError> {
         let mut state = self.lock();
+        while state.workers < self.limits.requests {
+            match self.spawn_worker() {
+                Ok(()) => state.workers += 1,
+                Err(e) if state.workers == 0 => {
+                    return Err(QueryError::Storage {
+                        detail: format!("start audit fetch worker: {e}"),
+                    });
+                }
+                // Fewer workers only lowers the concurrency; one is enough
+                // to make progress.
+                Err(_) => break,
+            }
+        }
         let id = state.next_id;
         state.next_id += 1;
         state.folds.insert(
@@ -237,27 +258,21 @@ impl FetchPool {
             },
         );
         state.rotation.push_back(id);
-        while state.workers < self.limits.requests {
-            let pool = Arc::clone(self);
-            match std::thread::Builder::new()
-                .name("ourios-audit-fetch".to_owned())
-                .spawn(move || pool.work())
-            {
-                Ok(_) => state.workers += 1,
-                Err(e) if state.workers == 0 => {
-                    state.folds.remove(&id);
-                    return Err(QueryError::Storage {
-                        detail: format!("start audit fetch worker: {e}"),
-                    });
-                }
-                // Fewer workers only lowers the concurrency; one is enough
-                // to make progress.
-                Err(_) => break,
-            }
-        }
         drop(state);
         self.changed.notify_all();
         Ok(id)
+    }
+
+    fn spawn_worker(self: &Arc<Self>) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_spawns.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected spawn failure"));
+        }
+        let pool = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("ourios-audit-fetch".to_owned())
+            .spawn(move || pool.work())
+            .map(drop)
     }
 
     fn work(self: Arc<Self>) {
@@ -340,6 +355,13 @@ impl FetchPool {
     #[cfg(test)]
     fn reserved(&self) -> u64 {
         self.lock().reserved
+    }
+
+    /// Folds registered and rotation entries queued, for leak checks.
+    #[cfg(test)]
+    fn registered(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.folds.len(), state.rotation.len())
     }
 }
 
@@ -902,6 +924,42 @@ mod tests {
         // Once the held GET finishes, everything is released.
         released.store(true, Ordering::SeqCst);
         await_reserved(&pool, 0);
+    }
+
+    /// A pool that cannot start any worker fails the fold with nothing left
+    /// registered — no fold, no rotation entry — however often it happens,
+    /// and serves the next fold normally once spawning works again.
+    #[test]
+    fn a_failed_worker_spawn_leaves_nothing_registered() {
+        let pool = pool(4, u64::MAX);
+        pool.fail_spawns.store(true, Ordering::SeqCst);
+        for _ in 0..5 {
+            let err = fetch_in_order(
+                &pool,
+                objects(&[10; 8]),
+                fetcher(|key| Ok(body(key))),
+                |_, _| Ok(()),
+            )
+            .expect_err("no worker could start");
+            assert!(matches!(err, QueryError::Storage { .. }));
+            assert_eq!(pool.registered(), (0, 0), "nothing left registered");
+            assert_eq!(pool.workers(), 0);
+        }
+
+        pool.fail_spawns.store(false, Ordering::SeqCst);
+        let mut seen = Vec::new();
+        fetch_in_order(
+            &pool,
+            objects(&[10; 8]),
+            fetcher(|key| Ok(body(key))),
+            |index, _| {
+                seen.push(index);
+                Ok(())
+            },
+        )
+        .expect("a later fold works");
+        assert_eq!(seen, (0..8).collect::<Vec<_>>());
+        assert_eq!(pool.registered(), (0, 0), "the finished fold deregistered");
     }
 
     /// A test-built pool's workers exit soon after its last fold, dropping

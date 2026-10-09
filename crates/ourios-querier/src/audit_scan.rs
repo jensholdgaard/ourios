@@ -812,7 +812,7 @@ mod tests {
             let tenant = TenantId::new(TENANT);
             let mut events = Vec::new();
             let summary = resolve_audit_set(backend, &tenant)?.for_each_event_in(
-                &FetchPool::new(limits),
+                &FetchPool::for_test(limits),
                 &tenant,
                 |event| events.push(event),
             )?;

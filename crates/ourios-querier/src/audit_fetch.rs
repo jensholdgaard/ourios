@@ -63,14 +63,21 @@ pub(crate) type Fetch = Arc<dyn Fn(&str) -> Result<Vec<u8>, QueryError> + Send +
 /// raised on the consumer's thread when it reaches that object).
 type Outcome = std::thread::Result<Result<Vec<u8>, QueryError>>;
 
-/// How long an idle worker waits for work before it exits.
+/// How long an idle worker of the shared pool waits for work before it
+/// exits.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// Test-built pools' idle lifetime: short, so a test's workers exit soon
+/// after its folds finish instead of piling up across tests.
+#[cfg(test)]
+const TEST_IDLE: Duration = Duration::from_millis(20);
 
 static SHARED: LazyLock<Arc<FetchPool>> = LazyLock::new(|| FetchPool::new(FetchLimits::default()));
 
 /// The process-wide worker pool and byte budget every fold fetches through.
 pub(crate) struct FetchPool {
     limits: FetchLimits,
+    idle: Duration,
     state: Mutex<PoolState>,
     changed: Condvar,
 }
@@ -171,12 +178,23 @@ impl PoolState {
 }
 
 impl FetchPool {
-    pub(crate) fn new(limits: FetchLimits) -> Arc<Self> {
+    fn new(limits: FetchLimits) -> Arc<Self> {
+        Self::with_idle(limits, IDLE)
+    }
+
+    /// A pool for tests: its own limits, and a short idle lifetime.
+    #[cfg(test)]
+    pub(crate) fn for_test(limits: FetchLimits) -> Arc<Self> {
+        Self::with_idle(limits, TEST_IDLE)
+    }
+
+    fn with_idle(limits: FetchLimits, idle: Duration) -> Arc<Self> {
         Arc::new(Self {
             limits: FetchLimits {
                 requests: limits.requests.max(1),
                 bytes: limits.bytes,
             },
+            idle,
             state: Mutex::new(PoolState::default()),
             changed: Condvar::new(),
         })
@@ -257,7 +275,7 @@ impl FetchPool {
             }
             let (next, idle) = self
                 .changed
-                .wait_timeout(state, IDLE)
+                .wait_timeout(state, self.idle)
                 .unwrap_or_else(PoisonError::into_inner);
             state = next;
             if idle.timed_out() && state.rotation.is_empty() {
@@ -401,7 +419,7 @@ mod tests {
     }
 
     fn pool(requests: usize, bytes: u64) -> Arc<FetchPool> {
-        FetchPool::new(FetchLimits { requests, bytes })
+        FetchPool::for_test(FetchLimits { requests, bytes })
     }
 
     fn fetcher(f: impl Fn(&str) -> Result<Vec<u8>, QueryError> + Send + Sync + 'static) -> Fetch {
@@ -707,7 +725,7 @@ mod tests {
 
     fn bounded_pass(sizes: &[u64], limits: FetchLimits) -> Gauge {
         let gauge = Arc::new(Gauge::default());
-        gauged_pass(&FetchPool::new(limits), sizes, &gauge);
+        gauged_pass(&FetchPool::for_test(limits), sizes, &gauge);
         Arc::into_inner(gauge).expect("no other gauge holders")
     }
 
@@ -772,7 +790,7 @@ mod tests {
             requests: 4,
             bytes: 5_000,
         };
-        let pool = FetchPool::new(limits);
+        let pool = FetchPool::for_test(limits);
         let gauge = Arc::new(Gauge::default());
         let folds: Vec<Vec<u64>> = (0..3)
             .map(|f| (0..60).map(|i| 1_000 + (i * 37 + f * 101) % 900).collect())
@@ -797,86 +815,10 @@ mod tests {
         );
     }
 
-    /// A failed fold's GETs still in flight stay charged until they finish:
-    /// another fold cannot reuse their bytes and push the bodies actually
-    /// held past the budget. Its fetched-but-unconsumed bodies are released
-    /// at once.
-    #[test]
-    fn a_departed_folds_in_flight_gets_stay_charged_until_they_finish() {
-        let pool = pool(4, 300);
-        let started = Arc::new(AtomicUsize::new(0));
-        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Fold A, 100 B objects under a 300 B budget: 0, 1 and 2 dispatch.
-        // GET 0 fails once all three have started; GET 1 completes (fetched,
-        // never consumed); GET 2 is held in flight until released.
-        let err = fetch_in_order(
-            &pool,
-            objects(&[100; 10]),
-            fetcher({
-                let (started, released) = (Arc::clone(&started), Arc::clone(&released));
-                move |key| {
-                    started.fetch_add(1, Ordering::SeqCst);
-                    match key {
-                        "k0000" => {
-                            await_count(&started, 3);
-                            Err(QueryError::Storage {
-                                detail: "GET".to_owned(),
-                            })
-                        }
-                        "k0002" => {
-                            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                            while !released.load(Ordering::SeqCst) {
-                                assert!(std::time::Instant::now() < deadline, "never released");
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Ok(body(key))
-                        }
-                        _ => Ok(body(key)),
-                    }
-                }
-            }),
-            |_, _| Ok(()),
-        );
-        assert!(err.is_err());
-        assert_eq!(started.load(Ordering::SeqCst), 3);
-
-        // A is gone. GET 1's body (fetched, or published to nothing once it
-        // finishes) is released; GET 2, still in flight, stays charged.
+    /// Spin until `pool`'s reservation is exactly `bytes` (bounded).
+    fn await_reserved(pool: &FetchPool, bytes: u64) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while pool.reserved() != 100 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "reserved {}",
-                pool.reserved()
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        // Fold B runs while GET 2 is held: the outstanding total, B's GETs
-        // plus A's detached one, never exceeds the budget.
-        let max_reserved = Arc::new(AtomicU64::new(0));
-        fetch_in_order(
-            &pool,
-            objects(&[100; 8]),
-            fetcher({
-                let (pool, max_reserved) = (Arc::clone(&pool), Arc::clone(&max_reserved));
-                move |key| {
-                    max_reserved.fetch_max(pool.reserved(), Ordering::SeqCst);
-                    Ok(body(key))
-                }
-            }),
-            |_, _| Ok(()),
-        )
-        .expect("fold B");
-        let max_reserved = max_reserved.load(Ordering::SeqCst);
-        assert!(max_reserved <= 300, "{max_reserved} B outstanding");
-        assert!(max_reserved >= 200, "B's GETs ran beside A's held one");
-        assert_eq!(pool.reserved(), 100, "A's held GET is still charged");
-
-        // Once the held GET finishes, everything is released.
-        released.store(true, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while pool.reserved() != 0 {
+        while pool.reserved() != bytes {
             assert!(
                 std::time::Instant::now() < deadline,
                 "reserved {}",
@@ -886,12 +828,113 @@ mod tests {
         }
     }
 
+    /// Fold A, 100 B objects under a 300 B budget: 0, 1 and 2 dispatch.
+    /// GET 0 fails once all three have started; GET 1 completes (fetched,
+    /// never consumed); GET 2 is held in flight until `released` is set.
+    fn fail_with_held_get(
+        pool: &Arc<FetchPool>,
+        started: &Arc<AtomicUsize>,
+        released: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), QueryError> {
+        let (started, released) = (Arc::clone(started), Arc::clone(released));
+        let fetch = fetcher(move |key| {
+            started.fetch_add(1, Ordering::SeqCst);
+            match key {
+                "k0000" => {
+                    await_count(&started, 3);
+                    Err(QueryError::Storage {
+                        detail: "GET".to_owned(),
+                    })
+                }
+                "k0002" => {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while !released.load(Ordering::SeqCst) {
+                        assert!(std::time::Instant::now() < deadline, "never released");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(body(key))
+                }
+                _ => Ok(body(key)),
+            }
+        });
+        fetch_in_order(pool, objects(&[100; 10]), fetch, |_, _| Ok(()))
+    }
+
+    /// One 8-object fold through `pool`, returning the highest reservation
+    /// any of its GETs saw when it started.
+    fn max_reserved_during_pass(pool: &Arc<FetchPool>) -> u64 {
+        let max_reserved = Arc::new(AtomicU64::new(0));
+        let fetch = fetcher({
+            let (pool, max_reserved) = (Arc::clone(pool), Arc::clone(&max_reserved));
+            move |key| {
+                max_reserved.fetch_max(pool.reserved(), Ordering::SeqCst);
+                Ok(body(key))
+            }
+        });
+        fetch_in_order(pool, objects(&[100; 8]), fetch, |_, _| Ok(())).expect("fold B");
+        max_reserved.load(Ordering::SeqCst)
+    }
+
+    /// A failed fold's GETs still in flight stay charged until they finish:
+    /// another fold cannot reuse their bytes and push the bodies actually
+    /// held past the budget. Its fetched-but-unconsumed bodies are released
+    /// at once.
+    #[test]
+    fn a_departed_folds_in_flight_gets_stay_charged_until_they_finish() {
+        let pool = pool(4, 300);
+        let started = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = fail_with_held_get(&pool, &started, &released);
+        assert!(err.is_err());
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+
+        // A is gone. GET 1's body (fetched, or published to nothing once it
+        // finishes) is released; GET 2, still in flight, stays charged.
+        await_reserved(&pool, 100);
+
+        // Fold B runs while GET 2 is held: the outstanding total, B's GETs
+        // plus A's detached one, never exceeds the budget.
+        let max_reserved = max_reserved_during_pass(&pool);
+        assert!(max_reserved <= 300, "{max_reserved} B outstanding");
+        assert!(max_reserved >= 200, "B's GETs ran beside A's held one");
+        assert_eq!(pool.reserved(), 100, "A's held GET is still charged");
+
+        // Once the held GET finishes, everything is released.
+        released.store(true, Ordering::SeqCst);
+        await_reserved(&pool, 0);
+    }
+
+    /// A test-built pool's workers exit soon after its last fold, dropping
+    /// their hold on the pool, so tests do not accumulate idle threads.
+    #[test]
+    fn a_test_pools_workers_exit_once_idle() {
+        let pool = pool(8, u64::MAX);
+        fetch_in_order(
+            &pool,
+            objects(&[10; 32]),
+            fetcher(|key| Ok(body(key))),
+            |_, _| Ok(()),
+        )
+        .expect("fetch");
+        assert!(pool.workers() > 0, "the pass started workers");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while pool.workers() != 0 || Arc::strong_count(&pool) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} workers still alive",
+                pool.workers()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn concurrent_folds_with_oversize_objects_all_complete() {
         // Every fold carries objects larger than the whole budget, which are
         // admitted only alone: the folds must take turns, not deadlock or
         // starve one another.
-        let pool = FetchPool::new(FetchLimits {
+        let pool = FetchPool::for_test(FetchLimits {
             requests: 2,
             bytes: 1_000,
         });

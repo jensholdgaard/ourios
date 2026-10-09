@@ -211,7 +211,7 @@ impl ResolvedAuditSet<'_> {
     /// row-vs-path): the listing/walk is already tenant-scoped, so a row
     /// claiming another tenant is a corrupt or foreign file — fail loudly
     /// rather than fold (or silently drop) it. A local file is read with
-    /// [`AuditReader::open_file`], an S3 key via [`Store::get_blocking`] →
+    /// [`AuditReader::open_file`], an S3 key via [`Store::get_bytes_blocking`] →
     /// [`AuditReader::open_bytes`].
     ///
     /// One audit file is decoded at a time: its decoded events are dropped

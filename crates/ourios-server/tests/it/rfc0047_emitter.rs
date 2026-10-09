@@ -15,7 +15,7 @@ use ourios_core::audit::{AuditPayload, SharedAuditSink};
 use ourios_core::auth::openfga::{
     OpenFgaSpec, VisibilityObjectSpec, VisibilitySpec, build_openfga_config,
 };
-use ourios_ingester::compactor::{pending_erasures, request_erasure, sweep_once};
+use ourios_ingester::compactor::{SweepTarget, pending_erasures, request_erasure, sweep_once};
 use ourios_ingester::graph_emitter::GraphEmitter;
 use ourios_parquet::{CompactionPolicy, Store};
 use ourios_serving::openfga::{ContextualTuples, OpenFgaClient, TupleKey};
@@ -108,11 +108,9 @@ async fn rfc0047_10_11_emitter_and_erasure_end_to_end() {
 
     // --- RFC0047.10: the sweep feeds the graph -----------------------------
     let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
+        SweepTarget::new(store.clone(), CompactionPolicy::default(), promoted())
+            .with_emitter(Arc::clone(&emitter)),
         Box::new(audit.clone()),
-        Some(Arc::clone(&emitter)),
     )
     .await;
     let report = result.expect("sweep");
@@ -141,11 +139,9 @@ async fn rfc0047_10_11_emitter_and_erasure_end_to_end() {
     };
     let c1_before = count("conversation:acme/c-1").await;
     let (result, _, sink) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
+        SweepTarget::new(store.clone(), CompactionPolicy::default(), promoted())
+            .with_emitter(Arc::clone(&emitter)),
         sink,
-        Some(Arc::clone(&emitter)),
     )
     .await;
     let report = result.expect("sweep");
@@ -194,11 +190,9 @@ async fn rfc0047_10_11_emitter_and_erasure_end_to_end() {
     let _ = audit.drain();
     request_erasure(&store, "acme", "c-1").expect("request");
     let (result, _, _) = sweep_once(
-        store.clone(),
-        CompactionPolicy::default(),
-        promoted(),
+        SweepTarget::new(store.clone(), CompactionPolicy::default(), promoted())
+            .with_emitter(Arc::clone(&emitter)),
         sink,
-        Some(Arc::clone(&emitter)),
     )
     .await;
     let report = result.expect("sweep");

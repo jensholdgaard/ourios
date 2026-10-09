@@ -177,13 +177,10 @@ pub(super) fn pending_erasures_under(
 
 /// The RFC 0047 §3.6 erasure pass (rows phase).
 pub(super) fn erase_pending(
-    store: &Store,
-    now_unix_nanos: u64,
-    promoted: &PromotedAttributes,
+    sweep: &mut Sweep<'_, '_>,
     erasure_match: Option<&ErasureMatch<'_>>,
-    report: &mut SweepReport,
 ) -> Result<(), IngestError> {
-    for request in pending_erasures(store)? {
+    for request in pending_erasures(sweep.store)? {
         // RFC 0048 §3.4: backfill and erasure exclude each other — a
         // partition read before this erasure and written after it would
         // recreate the tuples. The lock is read **per request**, right
@@ -192,8 +189,8 @@ pub(super) fn erase_pending(
         // covered — a backfill that acquired before this read is seen
         // here (defer), and one that acquires after it sees this marker
         // under its own lock (refuse + release).
-        if backfill_lock_held(store, &request.tenant)? {
-            report.erasures_deferred.push(request.marker.clone());
+        if backfill_lock_held(sweep.store, &request.tenant)? {
+            sweep.report.erasures_deferred.push(request.marker.clone());
             tracing::info!(
                 "erasure of tenant {:?} conversation {:?} deferred: backfill in progress",
                 request.tenant,
@@ -210,79 +207,93 @@ pub(super) fn erase_pending(
             finished: false,
         };
         if request.phase == ErasurePhase::Rows {
-            let Some(matches) = erasure_match else {
-                report.errors.push(format!(
+            match erasure_match {
+                Some(matches) => erase_rows(sweep, matches, &mut outcome),
+                None => sweep.report.errors.push(format!(
                     "erase {:?} {:?}: no conversation column configured \
                      (auth.openfga.visibility.objects) — request left pending",
                     request.tenant, request.conversation_id
-                ));
-                report.erasures.push(outcome);
-                continue;
-            };
-            let id = request.conversation_id.as_str();
-            let drop = |record: &MinedRecord| matches(record, id);
-            let mut clean = true;
-            let partitions = match hour_partitions(store, &request.tenant) {
-                Ok(partitions) => partitions,
-                Err(e) => {
-                    report
-                        .errors
-                        .push(format!("erase {:?}: list partitions: {e}", request.tenant));
-                    report.erasures.push(outcome);
-                    continue;
-                }
-            };
-            for partition in partitions {
-                let mut row_hooks = RowHooks {
-                    observe: None,
-                    drop: Some(&drop),
-                };
-                match compact_candidate(store, &partition, promoted, &mut row_hooks) {
-                    Ok(o) => {
-                        if let Some(committed) = &o.committed {
-                            outcome.partitions_rewritten += 1;
-                            outcome.rows_dropped += o.rows_dropped;
-                            // An erasure rewrite is a compaction like any
-                            // other for the sweep's IO accounting and audit
-                            // trail (RFC 0009 §3.6): it reads and writes the
-                            // partition and commits a generation.
-                            report.partitions_compacted += 1;
-                            report.files_compacted += to_u64(o.files_before);
-                            report.rows_compacted += o.rows;
-                            report.bytes_read = report.bytes_read.saturating_add(o.bytes_read);
-                            report.compacted_files.push(CompactedFile {
-                                tenant: request.tenant.clone(),
-                                bytes: o.bytes_written,
-                            });
-                            report.compaction_events.push(compaction_audit_event(
-                                &request.tenant,
-                                now_unix_nanos,
-                                &partition,
-                                committed,
-                                o.rows,
-                            ));
-                            report.gc_failures += o.gc_failures;
-                        }
-                    }
-                    Err(e) => {
-                        clean = false;
-                        let hour = hour_label(&partition);
-                        let (tenant, id) = (&request.tenant, &request.conversation_id);
-                        e.record(report, &format!("erase {tenant:?} {id:?} {hour}"));
-                    }
-                }
-            }
-            if clean {
-                match store.put_blocking(&request.marker, ERASURE_PHASE_TUPLES.to_vec()) {
-                    Ok(()) => outcome.phase = ErasurePhase::Tuples,
-                    Err(e) => report.errors.push(format!(
-                        "erase {:?} {:?}: advance marker: {e}",
-                        request.tenant, request.conversation_id
-                    )),
-                }
+                )),
             }
         }
-        report.erasures.push(outcome);
+        sweep.report.erasures.push(outcome);
     }
     Ok(())
+}
+
+/// Rewrite every partition of the request's tenant with the conversation's
+/// rows dropped; once all rewrote cleanly, advance the marker to `Tuples`.
+fn erase_rows(sweep: &mut Sweep<'_, '_>, matches: &ErasureMatch<'_>, outcome: &mut ErasureOutcome) {
+    let request = outcome.request.clone();
+    let partitions = match hour_partitions(sweep.store, &request.tenant) {
+        Ok(partitions) => partitions,
+        Err(e) => {
+            sweep
+                .report
+                .errors
+                .push(format!("erase {:?}: list partitions: {e}", request.tenant));
+            return;
+        }
+    };
+    let id = request.conversation_id.as_str();
+    let drop = |record: &MinedRecord| matches(record, id);
+    let mut clean = true;
+    for partition in &partitions {
+        clean &= erase_partition(sweep, partition, &drop, outcome);
+    }
+    if clean {
+        advance_marker(sweep, outcome);
+    }
+}
+
+/// Rewrite one partition of the request's tenant without the rows `drop`
+/// matches; whether it rewrote cleanly. An erasure rewrite is a compaction
+/// like any other for the sweep's IO accounting and audit trail (RFC 0009
+/// §3.6): it reads and writes the partition and commits a generation, so
+/// `rewrite` records its commit as the consolidation pass does.
+fn erase_partition(
+    sweep: &mut Sweep<'_, '_>,
+    partition: &PartitionKey,
+    drop: &RowFilter<'_>,
+    outcome: &mut ErasureOutcome,
+) -> bool {
+    let request = &outcome.request;
+    let target = Target {
+        tenant: &request.tenant,
+        partition,
+    };
+    match sweep.rewrite(target, None, Some(drop)) {
+        Ok(o) => {
+            if o.committed.is_some() {
+                outcome.partitions_rewritten += 1;
+                outcome.rows_dropped += o.rows_dropped;
+                sweep.report.gc_failures += o.gc_failures;
+            }
+            true
+        }
+        Err(e) => {
+            let hour = hour_label(partition);
+            let (tenant, id) = (&request.tenant, &request.conversation_id);
+            e.record(
+                &mut sweep.report,
+                &format!("erase {tenant:?} {id:?} {hour}"),
+            );
+            false
+        }
+    }
+}
+
+/// Move the request's marker to the `Tuples` phase: its rows are gone.
+fn advance_marker(sweep: &mut Sweep<'_, '_>, outcome: &mut ErasureOutcome) {
+    let request = &outcome.request;
+    match sweep
+        .store
+        .put_blocking(&request.marker, ERASURE_PHASE_TUPLES.to_vec())
+    {
+        Ok(()) => outcome.phase = ErasurePhase::Tuples,
+        Err(e) => sweep.report.errors.push(format!(
+            "erase {:?} {:?}: advance marker: {e}",
+            request.tenant, request.conversation_id
+        )),
+    }
 }

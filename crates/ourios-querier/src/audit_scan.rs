@@ -218,10 +218,12 @@ impl ResolvedAuditSet<'_> {
     /// before the next file is decoded. Locally the files are also read one
     /// at a time. Remote GETs run concurrently through the process-wide
     /// [`FetchPool`] — its worker and read-ahead byte limits are shared by
-    /// every fold in the process — and are still visited in key order, so a
-    /// fold's footprint is bounded by that shared budget plus the largest
-    /// decoded file, not the tenant's history. What the visitor keeps is the
-    /// fold's business.
+    /// every fold in the process — and are still visited in key order. A
+    /// fold's raw read-ahead is bounded by that shared budget (all
+    /// concurrent folds together stay within it), or by one object larger
+    /// than the whole budget, which is fetched alone; on top of that it
+    /// holds one decoded file. Neither grows with the tenant's history. What
+    /// the visitor keeps is the fold's business.
     ///
     /// The remote branch pays a full-object GET per key, so the local
     /// branch counts each file's length to keep the two backends'

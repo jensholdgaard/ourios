@@ -309,42 +309,20 @@ async fn rfc0047_10_sweep_emits_tuples_idempotently() {
     );
 }
 
-/// Makes a directory unlistable, and listable again when dropped, so a
-/// failing assertion or panic still leaves the temp dir removable.
-#[cfg(unix)]
-struct Unlistable(std::path::PathBuf);
-
-#[cfg(unix)]
-impl Unlistable {
-    fn new(dir: std::path::PathBuf) -> Self {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("unlistable");
-        Self(dir)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Unlistable {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
-}
-
 /// A sweep that commits a partition and then fails fatally (the erasure
-/// markers cannot be listed) still writes that partition's tuples after
-/// the pass: the partition is consolidated, so no later sweep derives
-/// them again.
+/// markers cannot be listed) writes no graph tuples, as on `main`: what a
+/// failed sweep derived is not trusted to be erasure-safe, and recovering
+/// it is #921's job.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_sweep_still_writes_its_committed_partitions_tuples() {
+async fn a_failed_sweep_writes_no_graph_tuples() {
     // Arrange
     let graph = Graph::new().await;
     Rows::of("c-1", "alice", 1).write(&graph.store);
     Rows::of("c-1", "alice", 1).write(&graph.store);
     let markers = graph.bucket.path().join("erasure");
     std::fs::create_dir(&markers).expect("erasure dir");
-    let unlistable = Unlistable::new(markers);
+    let unlistable = super::tests::Unreadable::new(markers);
 
     // Act
     let (result, _) = graph.sweep(Box::new(SharedAuditSink::new())).await;
@@ -352,9 +330,55 @@ async fn a_failed_sweep_still_writes_its_committed_partitions_tuples() {
 
     // Assert
     assert!(result.is_err(), "the sweep failed fatally: {result:?}");
+    assert_eq!(
+        (result.ok(), graph.tuples()),
+        (None, Vec::new()),
+        "no tuple written"
+    );
+}
+
+/// RFC0047.11 — rows before tuples, across a fatal failure: one sweep
+/// consolidates c-1's rows (deriving its tuples), erases c-1 (rows
+/// dropped, marker advanced to `tuples`), then fails reading another
+/// tenant's backfill lock. The graph phase that would delete c-1's tuples
+/// never runs, so writing what the pass derived would bring them back for
+/// a conversation whose rows are gone; none are written.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_failing_after_an_erasure_writes_no_tuples_for_it() {
+    // Arrange
+    let graph = Graph::new().await;
+    Rows::of("c-1", "alice", 1).write(&graph.store);
+    Rows::of("c-1", "alice", 1).write(&graph.store);
+    request_erasure(&graph.store, "acme", "c-1").expect("request");
+    request_erasure(&graph.store, "zeta", "z-1").expect("request");
+    let lock = super::backfill_lock_key("zeta");
+    graph
+        .store
+        .put_blocking(&lock, b"{}".to_vec())
+        .expect("lock");
+    let unreadable = super::tests::Unreadable::new(graph.bucket.path().join(&lock));
+
+    // Act
+    let (result, _) = graph.sweep(Box::new(SharedAuditSink::new())).await;
+    drop(unreadable);
+
+    // Assert
+    let error = result.expect_err("the zeta lock read fails the sweep");
+    assert!(error.to_string().contains("backfill lock"), "{error}");
+    let phases: Vec<_> = pending_erasures(&graph.store)
+        .expect("pending")
+        .into_iter()
+        .map(|r| (r.conversation_id, r.phase))
+        .collect();
     assert!(
-        graph.has_object("conversation:acme/c-1"),
-        "{:?}",
+        phases.contains(&("c-1".to_string(), ErasurePhase::Tuples)),
+        "c-1's rows were erased: {phases:?}"
+    );
+    assert!(graph.live_rows().is_empty(), "c-1's rows are gone");
+    assert!(
+        !graph.has_object("conversation:acme/c-1"),
+        "no tuple brought back for erased c-1: {:?}",
         graph.tuples()
     );
 }

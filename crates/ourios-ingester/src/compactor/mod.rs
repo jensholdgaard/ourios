@@ -264,6 +264,19 @@ pub fn run_sweep_hooked(
         hooks,
         &mut |_| {},
     )
+    .map_err(|failed| failed.error)
+}
+
+/// A sweep cut short by a fatal error, with the report of what it did
+/// before the error when there is one: a failure listing the store's
+/// tenants leaves none, while a failure in the erasure pass comes after
+/// the whole consolidation pass, whose partitions are committed.
+#[derive(Debug)]
+pub struct FailedSweep {
+    /// The fatal error.
+    pub error: IngestError,
+    /// What the sweep did before it.
+    pub partial: Option<Box<SweepReport>>,
 }
 
 /// A sweep's two times: the instant its candidates are sealed against,
@@ -325,7 +338,8 @@ pub type CommitObserver<'a> = dyn FnMut(&PartitionCommitted<'_>) + 'a;
 ///
 /// # Errors
 ///
-/// As [`run_sweep`].
+/// As [`run_sweep`], with the report of what the sweep did before the
+/// error ([`FailedSweep`]).
 // RFC 0038: one span per compaction sweep — coarse and periodic. Opened inside
 // the callee (the tick `spawn_blocking`s this), and the per-tenant / per-file
 // loops below stay span-free.
@@ -341,7 +355,11 @@ pub fn run_sweep_committing(
     promoted: &PromotedAttributes,
     hooks: &mut SweepHooks<'_>,
     on_commit: &mut CommitObserver<'_>,
-) -> Result<SweepReport, IngestError> {
+) -> Result<SweepReport, FailedSweep> {
+    let tenants = tenants(store).map_err(|error| FailedSweep {
+        error,
+        partial: None,
+    })?;
     let mut sweep = Sweep {
         store,
         clock,
@@ -349,11 +367,16 @@ pub fn run_sweep_committing(
         report: SweepReport::default(),
         on_commit,
     };
-    for tenant in tenants(store)? {
-        sweep.tenant(&tenant, policy, hooks.observe.as_deref_mut());
+    for tenant in &tenants {
+        sweep.tenant(tenant, policy, hooks.observe.as_deref_mut());
     }
-    erase_pending(&mut sweep, hooks.erasure_match)?;
-    Ok(sweep.report)
+    match erase_pending(&mut sweep, hooks.erasure_match) {
+        Ok(()) => Ok(sweep.report),
+        Err(error) => Err(FailedSweep {
+            error,
+            partial: Some(Box::new(sweep.report)),
+        }),
+    }
 }
 
 /// One sweep in progress: its fixed inputs, the report it accumulates, and

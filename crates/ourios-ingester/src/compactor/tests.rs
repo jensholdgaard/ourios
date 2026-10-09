@@ -626,26 +626,30 @@ async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
     );
 }
 
-/// A store backend that dies (panics) on the first delete of a data file:
-/// the cleanup of a compaction's superseded inputs, after its commit.
+/// A store backend whose deletes of data files — the cleanup of a
+/// compaction's superseded inputs, after its commit — fail: with `dies`,
+/// the process dies (panics) on the first; otherwise each delete errors.
 #[derive(Debug)]
-struct DiesInCleanup(Arc<dyn object_store::ObjectStore>);
+struct BrokenCleanup {
+    inner: Arc<dyn object_store::ObjectStore>,
+    dies: bool,
+}
 
-impl std::fmt::Display for DiesInCleanup {
+impl std::fmt::Display for BrokenCleanup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DiesInCleanup({})", self.0)
+        write!(f, "BrokenCleanup({})", self.inner)
     }
 }
 
 #[async_trait::async_trait]
-impl object_store::ObjectStore for DiesInCleanup {
+impl object_store::ObjectStore for BrokenCleanup {
     async fn put_opts(
         &self,
         location: &object_store::path::Path,
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        self.0.put_opts(location, payload, opts).await
+        self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
@@ -653,7 +657,7 @@ impl object_store::ObjectStore for DiesInCleanup {
         location: &object_store::path::Path,
         opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.0.put_multipart_opts(location, opts).await
+        self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
@@ -661,7 +665,7 @@ impl object_store::ObjectStore for DiesInCleanup {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
-        self.0.get_opts(location, options).await
+        self.inner.get_opts(location, options).await
     }
 
     fn delete_stream(
@@ -672,30 +676,34 @@ impl object_store::ObjectStore for DiesInCleanup {
         >,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
         use futures::StreamExt as _;
-        let dying = locations.inspect(|location| {
-            if let Ok(path) = location {
-                let path = path.as_ref();
-                assert!(
-                    !(path.starts_with("data/") && path.ends_with(".parquet")),
-                    "the process dies cleaning up {path}"
-                );
+        let dies = self.dies;
+        let broken = locations.map(move |location| {
+            let path = location?;
+            let data = path.as_ref().starts_with("data/") && path.as_ref().ends_with(".parquet");
+            assert!(!(dies && data), "the process dies cleaning up {path}");
+            if data {
+                return Err(object_store::Error::Generic {
+                    store: "broken-cleanup",
+                    source: format!("cannot delete {path}").into(),
+                });
             }
+            Ok(path)
         });
-        self.0.delete_stream(dying.boxed())
+        self.inner.delete_stream(broken.boxed())
     }
 
     fn list(
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.0.list(prefix)
+        self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> object_store::Result<object_store::ListResult> {
-        self.0.list_with_delimiter(prefix).await
+        self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(
@@ -704,7 +712,7 @@ impl object_store::ObjectStore for DiesInCleanup {
         to: &object_store::path::Path,
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
-        self.0.copy_opts(from, to, options).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -717,7 +725,7 @@ async fn a_sweep_dying_in_post_commit_cleanup_has_recorded_the_partition() {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     write_sealed_hours(&store, 2);
-    let store = store.wrap_backend(|inner| Arc::new(DiesInCleanup(inner)));
+    let store = store.wrap_backend(|inner| Arc::new(BrokenCleanup { inner, dies: true }));
     let exporter = InMemoryMetricExporter::default();
     let provider = SdkMeterProvider::builder()
         .with_periodic_exporter(exporter.clone())
@@ -800,5 +808,107 @@ fn audit_events_carry_the_clock_at_emit_while_sealing_uses_the_sweep_start() {
     assert!(
         matches!(stamps.as_slice(), [first, second] if start < *first && first < second),
         "{stamps:?}"
+    );
+}
+
+/// The backlog the in-memory exporter last collected, per tenant.
+fn backlog(rms: &[ResourceMetrics]) -> Vec<(String, i64)> {
+    rms.iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|m| m.name() == ourios_semconv::OURIOS_COMPACTION_BACKLOG)
+        .flat_map(|m| match m.data() {
+            AggregatedMetrics::I64(MetricData::Sum(sum)) => sum
+                .data_points()
+                .map(|dp| {
+                    let tenant = dp
+                        .attributes()
+                        .find(|kv| kv.key.as_str() == ourios_semconv::OURIOS_TENANT)
+                        .map(|kv| kv.value.as_str().to_string())
+                        .unwrap_or_default();
+                    (tenant, dp.value())
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("backlog is not an i64 sum: {other:?}"),
+        })
+        .collect()
+}
+
+/// Takes every permission off a path, and restores its mode when dropped,
+/// so a failing assertion or panic still leaves the temp dir removable.
+#[cfg(unix)]
+pub(super) struct Unreadable {
+    path: std::path::PathBuf,
+    mode: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Unreadable {
+    pub(super) fn new(path: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("metadata").permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable");
+        Self { path, mode }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.path, self.mode.clone());
+    }
+}
+
+/// A sweep that commits and then fails fatally still records what it
+/// did: the backlog gauge is rebuilt from its partial report (tenant `a`'s
+/// candidate was compacted, so its lag is 0) and the inputs its cleanup
+/// could not delete count as orphan files.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fatally_failed_sweep_records_its_partial_backlog_and_gc_failures() {
+    // Arrange
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, 1);
+    let store = store.wrap_backend(|inner| Arc::new(BrokenCleanup { inner, dies: false }));
+    let markers = bucket.path().join("erasure");
+    std::fs::create_dir(&markers).expect("erasure dir");
+    let unlistable = Unreadable::new(markers);
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let metrics = Arc::new(CompactionMetrics::from_meter(
+        &provider.meter("ourios.compaction"),
+    ));
+
+    // Act
+    let (result, elapsed, _) = sweep_recorded(
+        target(&store),
+        Box::new(ourios_core::audit::SharedAuditSink::new()),
+        Some(Arc::clone(&metrics)),
+    )
+    .await;
+    metrics.record_sweep_outcome(&result, elapsed);
+    drop(unlistable);
+
+    // Assert
+    let failed = result.expect_err("the erasure listing fails the sweep");
+    let partial = failed.partial.as_deref().expect("a partial report");
+    assert_eq!(
+        (partial.partitions_compacted, partial.gc_failures),
+        (1, 2),
+        "{partial:?}"
+    );
+    provider.force_flush().expect("flush");
+    let rms = exporter.get_finished_metrics().expect("collect");
+    assert_eq!(
+        (
+            backlog(&rms),
+            u64_sum(&rms, ourios_semconv::OURIOS_COMPACTION_ORPHAN_FILES),
+        ),
+        (vec![("a".to_string(), 0)], 2),
+        "the partial report's backlog and gc failures"
     );
 }

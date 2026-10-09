@@ -41,24 +41,6 @@ impl GraphPhase<'_> {
         }
     }
 
-    /// Write the derived tuples when the sweep itself failed: the
-    /// partitions it committed before failing are no longer candidates, so
-    /// no later sweep derives their tuples again.
-    pub(super) async fn after_failed_sweep(&self, tuples: &GraphTuples, sweep: &IngestError) {
-        if tuples.is_empty() {
-            return;
-        }
-        if let Err(e) = self.emitter.emit(tuples).await {
-            // The failed sweep's own report never reaches the daemon's
-            // logging, so this per-item error is logged here, under the
-            // event the daemon uses for a sweep's per-item errors.
-            tracing::error!(
-                name: ourios_semconv::EVENT_OURIOS_COMPACTION_SWEEP_ERROR,
-                "compaction sweep error: graph emit after a failed sweep ({sweep}): {e}"
-            );
-        }
-    }
-
     /// Delete the tuples of every erasure whose rows are gone; the
     /// erasures whose deletion succeeded.
     async fn erase_tuples(&self, report: &mut SweepReport) -> Vec<Completion> {

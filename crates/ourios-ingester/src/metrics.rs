@@ -34,7 +34,7 @@ use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
 use crate::cadence::BarrierEpochs;
-use crate::compactor::{IngestError, PartitionCommitted, SweepReport, to_u64};
+use crate::compactor::{FailedSweep, IngestError, PartitionCommitted, SweepReport, to_u64};
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
 /// shared between [`CompactionMetrics::record_sweep_outcome`], which writes the
@@ -183,17 +183,30 @@ impl CompactionMetrics {
     /// Record one sweep's outcome and wall-clock `elapsed`, for a sweep
     /// whose committed partitions were each recorded through
     /// [`Self::record_partition`]: `sweeps`, `duration`, `orphan.files`,
-    /// and the backlog.
+    /// and the backlog. A sweep cut short by a fatal error still records
+    /// what its partial report holds.
     pub fn record_sweep_outcome(
         &self,
-        result: &Result<SweepReport, IngestError>,
+        result: &Result<SweepReport, FailedSweep>,
         elapsed: Duration,
     ) {
-        let outcome = match result {
-            Ok(report) if !report.errors.is_empty() => "error",
-            Ok(report) if report.partitions_compacted > 0 => "committed",
-            Ok(_) => "noop",
-            Err(_) => "error",
+        match result {
+            Ok(report) => self.record_end(false, Some(report), elapsed),
+            Err(failed) => self.record_end(true, failed.partial.as_deref(), elapsed),
+        }
+    }
+
+    /// `sweeps`, `duration`, `orphan.files` and the backlog for a sweep that
+    /// `failed` fatally or not, from its `report` when it has one. The
+    /// `ourios.compaction.result` attribute classifies the sweep: `error`
+    /// if it failed or any tenant/partition failed, else `committed` if
+    /// anything was consolidated, else `noop`.
+    fn record_end(&self, failed: bool, report: Option<&SweepReport>, elapsed: Duration) {
+        let outcome = match report {
+            _ if failed => "error",
+            Some(report) if !report.errors.is_empty() => "error",
+            Some(report) if report.partitions_compacted > 0 => "committed",
+            _ => "noop",
         };
         let attrs = [KeyValue::new(semconv::OURIOS_COMPACTION_RESULT, outcome)];
 
@@ -202,35 +215,37 @@ impl CompactionMetrics {
         // Both directions surface on every sweep, a no-op one included.
         self.record_io(0, 0);
 
-        // A fatal sweep error (couldn't even scan the store) yields no
+        // A sweep that failed before scanning the store yields no
         // per-tenant data, so the backlog map is deliberately left as-is:
         // the last-known lag is more honest than clearing to nothing (the
         // partitions didn't compact, so the backlog hasn't shrunk), and
         // the failure itself surfaces via `sweeps{result="error"}`.
-        if let Ok(report) = result {
+        if let Some(report) = report {
             self.orphan_files.add(to_u64(report.gc_failures), &[]);
+            self.record_backlog(report);
+        }
+    }
 
-            // Rebuild each tenant's *absolute* backlog (candidates the
-            // sweep found minus those it compacted) for the observable
-            // counter's callback. Absolute (not a delta), so a tenant
-            // that clears its lag reports 0 next sweep rather than the
-            // value drifting up over time. A full `clear()` first means a
-            // tenant that no longer appears (data removed, or planning
-            // errored this sweep) stops being reported rather than
-            // emitting a stale value forever; `run_sweep` scans every
-            // tenant each pass, so the surviving set is current.
-            let mut backlog = self
-                .backlog_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            backlog.clear();
-            for t in &report.per_tenant {
-                // candidates_found ≥ partitions_compacted (you can't
-                // compact more than you found), so the lag is non-negative.
-                let lag = i64::try_from(t.candidates_found.saturating_sub(t.partitions_compacted))
-                    .unwrap_or(i64::MAX);
-                backlog.insert(t.tenant.clone(), lag);
-            }
+    /// Rebuild each tenant's *absolute* backlog (candidates the sweep found
+    /// minus those it compacted) for the observable counter's callback.
+    /// Absolute (not a delta), so a tenant that clears its lag reports 0
+    /// next sweep rather than the value drifting up over time. A full
+    /// `clear()` first means a tenant that no longer appears (data removed,
+    /// or planning errored this sweep) stops being reported rather than
+    /// emitting a stale value forever; `run_sweep` scans every tenant each
+    /// pass, so the surviving set is current.
+    fn record_backlog(&self, report: &SweepReport) {
+        let mut backlog = self
+            .backlog_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        backlog.clear();
+        for t in &report.per_tenant {
+            // candidates_found ≥ partitions_compacted (you can't compact
+            // more than you found), so the lag is non-negative.
+            let lag = i64::try_from(t.candidates_found.saturating_sub(t.partitions_compacted))
+                .unwrap_or(i64::MAX);
+            backlog.insert(t.tenant.clone(), lag);
         }
     }
 
@@ -255,7 +270,7 @@ impl CompactionMetrics {
                 self.record_file_size(&file.tenant, file.bytes);
             }
         }
-        self.record_sweep_outcome(result, elapsed);
+        self.record_end(result.is_err(), result.as_ref().ok(), elapsed);
     }
 
     /// Bytes moved, split by direction.

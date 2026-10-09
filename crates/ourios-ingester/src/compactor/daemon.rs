@@ -154,7 +154,7 @@ impl Compactor {
                 sweep_recorded(target.clone(), audit_sink, Some(Arc::clone(&metrics))).await;
             audit_sink = sink;
             metrics.record_sweep_outcome(&result, elapsed);
-            on_sweep(result);
+            on_sweep(result.map_err(|failed| failed.error));
         }
     }
 }
@@ -167,8 +167,11 @@ impl Compactor {
 /// an emitter, the async graph phase (RFC 0047 §3.3: write the tuples the
 /// pass derived; delete the tuples of every erasure whose rows are gone;
 /// then, back on the blocking pool, the `conversation_erased` audit event
-/// and the marker removal). Returns the report, the wall-clock spent, and
-/// the audit sink handed back. Runs the same way whether called by
+/// and the marker removal). A sweep that fails fatally writes no graph
+/// tuples: an erasure it advanced may not have had its tuples deleted yet,
+/// and writing what the pass derived could bring them back (RFC0047.11).
+/// Returns the report, the wall-clock spent, and the audit sink handed
+/// back. Runs the same way whether called by
 /// [`Compactor::run`] or a test.
 ///
 /// # Panics
@@ -184,17 +187,18 @@ pub async fn sweep_once(
     Duration,
     Box<dyn AuditSink>,
 ) {
-    sweep_recorded(target, audit_sink, None).await
+    let (result, elapsed, audit_sink) = sweep_recorded(target, audit_sink, None).await;
+    (result.map_err(|failed| failed.error), elapsed, audit_sink)
 }
 
 /// [`sweep_once`], recording each committed partition into `metrics` as it
-/// commits.
+/// commits, and keeping a fatally failed sweep's partial report.
 pub(crate) async fn sweep_recorded(
     target: SweepTarget,
     audit_sink: Box<dyn AuditSink>,
     metrics: Option<Arc<CompactionMetrics>>,
 ) -> (
-    Result<SweepReport, IngestError>,
+    Result<SweepReport, FailedSweep>,
     Duration,
     Box<dyn AuditSink>,
 ) {
@@ -212,15 +216,12 @@ pub(crate) async fn sweep_recorded(
     .expect("compaction sweep task should not panic");
 
     #[cfg(feature = "openfga")]
-    if let Some(emitter) = &target.emitter {
+    if let (Ok(report), Some(emitter)) = (&mut result, &target.emitter) {
         let graph = GraphPhase {
             store: &target.store,
             emitter,
         };
-        match &mut result {
-            Ok(report) => graph.run(report, &mut audit_sink, tuples).await,
-            Err(e) => graph.after_failed_sweep(&tuples, e).await,
-        }
+        graph.run(report, &mut audit_sink, tuples).await;
     }
     #[cfg(not(feature = "openfga"))]
     let GraphTuples = tuples;
@@ -238,7 +239,7 @@ fn blocking_pass(
     mut audit_sink: Box<dyn AuditSink>,
     metrics: Option<&CompactionMetrics>,
 ) -> (
-    Result<SweepReport, IngestError>,
+    Result<SweepReport, FailedSweep>,
     Box<dyn AuditSink>,
     GraphTuples,
 ) {
@@ -259,7 +260,7 @@ fn blocking_pass(
 fn sweep_deriving(
     target: &SweepTarget,
     on_commit: &mut CommitObserver<'_>,
-) -> (Result<SweepReport, IngestError>, GraphTuples) {
+) -> (Result<SweepReport, FailedSweep>, GraphTuples) {
     let mut tuples = GraphTuples::default();
     let emitter = target.emitter.as_deref();
     let mut observe = emitter.map(|emitter| {
@@ -293,7 +294,7 @@ fn sweep_deriving(
 fn sweep_deriving(
     target: &SweepTarget,
     on_commit: &mut CommitObserver<'_>,
-) -> (Result<SweepReport, IngestError>, GraphTuples) {
+) -> (Result<SweepReport, FailedSweep>, GraphTuples) {
     let result = run_sweep_committing(
         &target.store,
         SweepClock::sealed_at(now_unix_nanos()),

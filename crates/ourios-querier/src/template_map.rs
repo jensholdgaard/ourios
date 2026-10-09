@@ -466,8 +466,12 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
 /// (RFC 0031 §3.6 — on a cache miss this is exactly what template-map
 /// acquisition cost).
 ///
-/// Peak memory is one audit object and its decoded events, plus the live
-/// `(template_id, version)` winners, plus every alias event (held until
+/// Peak memory is one decoded audit file's events, plus the raw read-ahead
+/// — on the local backend one file's bytes; on the remote backend the
+/// fetched-but-unfolded objects, capped by the process-wide
+/// `audit_fetch::FetchPool` byte budget (32 MiB) or a single object larger
+/// than it, a cap shared by every concurrent fold in the process rather
+/// than granted to each — plus the live `(template_id, version)` winners, plus every alias event (held until
 /// the alias fold sorts them), plus one frontier entry per audit file.
 /// Template history no longer accumulates; the alias events and the
 /// frontier still grow with the audit set, as does the freshness listing

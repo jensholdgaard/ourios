@@ -707,13 +707,22 @@ impl Store {
     /// # Errors
     /// [`StoreError::Backend`] if the object is missing or the read fails.
     pub async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        Ok(self.get_bytes(key).await?.to_vec())
+    }
+
+    /// Read the whole object at `key` as the backend's own buffer — no copy,
+    /// unlike [`Self::get`]'s `Vec`, so a caller that budgets the bytes it
+    /// holds holds each body once.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if the object is missing or the read fails.
+    pub async fn get_bytes(&self, key: &str) -> Result<bytes::Bytes, StoreError> {
         let got = self
             .inner
             .get(&self.resolve(key)?)
             .await
             .map_err(StoreError::Backend)?;
-        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
-        Ok(bytes.to_vec())
+        got.bytes().await.map_err(StoreError::Backend)
     }
 
     /// Read up to the last `len` bytes of the object at `key`, with the
@@ -775,6 +784,17 @@ impl Store {
     pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
         block_on_off_runtime(async move { store.get(&key).await })
+    }
+
+    /// Blocking [`Self::get_bytes`]. Safe to call from inside a tokio
+    /// runtime (see [`Self::get_blocking`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::get_bytes`].
+    pub fn get_bytes_blocking(&self, key: &str) -> Result<bytes::Bytes, StoreError> {
+        let (store, key) = (self.clone(), key.to_owned());
+        block_on_off_runtime(async move { store.get_bytes(&key).await })
     }
 
     /// Blocking [`Self::get_suffix`] for the sync call sites. Safe to call
@@ -1138,6 +1158,28 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    /// `get_bytes` hands back the backend's own buffer: on the in-memory
+    /// store two reads share one allocation, which they could not if
+    /// either were a copy — and the length is the object's size.
+    #[test]
+    fn get_bytes_returns_the_backend_buffer_without_copying() {
+        let store = super::Store::in_memory();
+        let body = vec![7u8; 4096];
+        store.put_blocking("a/b", body.clone()).expect("put");
+
+        let first = store.get_bytes_blocking("a/b").expect("get_bytes");
+        let second = store.get_bytes_blocking("a/b").expect("get_bytes");
+
+        assert_eq!(first.len(), body.len());
+        assert_eq!(first.as_ref(), body.as_slice());
+        assert_eq!(
+            first.as_ptr(),
+            second.as_ptr(),
+            "both reads share the stored allocation"
+        );
+        assert_eq!(store.get_blocking("a/b").expect("get"), body);
+    }
+
     #[test]
     fn a_local_sync_covers_every_directory_up_to_the_store_root() {
         let root = std::path::Path::new("/store");

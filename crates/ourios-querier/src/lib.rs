@@ -42,6 +42,7 @@
 #![deny(unsafe_code)]
 
 mod alias_store;
+mod audit_fetch;
 mod audit_scan;
 mod body_match;
 mod drift;

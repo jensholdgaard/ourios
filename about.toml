@@ -34,3 +34,9 @@ ignore-dev-dependencies = true
 # rather than allowed globally.
 [webpki-roots]
 accepted = ["CDLA-Permissive-2.0"]
+
+# The same Mozilla CA-certificate data as DER certificates for
+# rustls-platform-verifier (reqwest 0.13, via object_store 0.14), mirroring
+# the matching deny.toml exception.
+[webpki-root-certs]
+accepted = ["CDLA-Permissive-2.0"]

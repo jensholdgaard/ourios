@@ -78,7 +78,7 @@ futures-core = { version = "0.3", default-features = false }
 # publisher legs hold a PUT there, and template_ids_crash_fixture parks its
 # bootstrap scan there. A [[bin]] fixture cannot use dev-dependencies; both
 # are already in the tree via ourios-parquet.
-object_store = { version = "=0.13.2", default-features = false }
+object_store = { version = "=0.14.2", default-features = false }
 async-trait = "=0.1.89"
 # `.next()` on the incoming stream inside the gRPC TLS adapter.
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
@@ -189,7 +189,7 @@ dhat = "=0.3.3"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
 # threading test (pinned in lockstep with ourios-parquet's arrow stack,
 # matching ourios-querier's dev pin).
-parquet = { version = "=59.3.0", default-features = false, features = ["arrow"] }
+parquet = { version = "=60.0.0", default-features = false, features = ["arrow"] }
 # Drive the axum `Router` in-process (`ServiceExt::oneshot`) for the
 # HTTP-transport acceptance tests — no real socket.
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }

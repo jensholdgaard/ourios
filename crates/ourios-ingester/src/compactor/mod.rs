@@ -262,32 +262,75 @@ impl SweepGauges {
 
 /// Counts a sweep's consolidation candidates down as they are processed,
 /// and back to zero when dropped, however the pass ends.
-struct Countdown<'a>(Option<&'a AtomicU64>);
+///
+/// The total comes from a counting pass that keeps one number per tenant,
+/// never the candidates themselves: each tenant's candidate list is held
+/// only while that tenant compacts. When a tenant is planned for real, the
+/// difference from its counted candidates is folded in.
+struct Countdown<'a> {
+    remaining: Option<&'a AtomicU64>,
+    counted: std::vec::IntoIter<usize>,
+}
 
 impl<'a> Countdown<'a> {
-    fn start(gauges: Option<&'a SweepGauges>, candidates: usize) -> Self {
+    /// Without `gauges` nothing is counted, so a sweep nobody measures
+    /// lists each tenant once, as before.
+    fn start(gauges: Option<&'a SweepGauges>, count: impl FnOnce() -> Vec<usize>) -> Self {
         let remaining = gauges.map(|gauges| &gauges.remaining);
+        let counted = if remaining.is_some() {
+            count()
+        } else {
+            Vec::new()
+        };
         if let Some(remaining) = remaining {
-            remaining.store(to_u64(candidates), Ordering::Relaxed);
+            remaining.store(to_u64(counted.iter().sum()), Ordering::Relaxed);
         }
-        Self(remaining)
+        Self {
+            remaining,
+            counted: counted.into_iter(),
+        }
+    }
+
+    /// The next tenant planned `planned` candidates.
+    fn begin_tenant(&mut self, planned: usize) {
+        let counted = self.counted.next().unwrap_or(0);
+        self.store(|left| {
+            left.saturating_sub(to_u64(counted))
+                .saturating_add(to_u64(planned))
+        });
     }
 
     fn tick(&self) {
-        if let Some(remaining) = self.0 {
+        self.store(|left| left.saturating_sub(1));
+    }
+
+    fn store(&self, update: impl FnOnce(u64) -> u64) {
+        if let Some(remaining) = self.remaining {
             // The sweep is the only writer.
-            let left = remaining.load(Ordering::Relaxed).saturating_sub(1);
-            remaining.store(left, Ordering::Relaxed);
+            remaining.store(update(remaining.load(Ordering::Relaxed)), Ordering::Relaxed);
         }
     }
 }
 
 impl Drop for Countdown<'_> {
     fn drop(&mut self) {
-        if let Some(remaining) = self.0 {
-            remaining.store(0, Ordering::Relaxed);
-        }
+        self.store(|_| 0);
     }
+}
+
+/// How many candidates each of `tenants` has, keeping only the counts; a
+/// tenant whose planning fails counts none (its error is recorded when it
+/// is planned again to compact).
+fn count_candidates(
+    store: &Store,
+    tenants: &[String],
+    sealed_at: u64,
+    policy: &CompactionPolicy,
+) -> Vec<usize> {
+    tenants
+        .iter()
+        .map(|tenant| plan_candidates(store, tenant, sealed_at, policy).map_or(0, |c| c.len()))
+        .collect()
 }
 
 /// A [`SweepHooks::observe`] callback.
@@ -457,37 +500,36 @@ struct Target<'p> {
 }
 
 impl Sweep<'_, '_> {
-    /// The consolidation pass over every tenant. Every tenant is planned
-    /// before any compacts, so the sweep knows from its start how many
-    /// candidates remain.
+    /// The consolidation pass over every tenant, one tenant planned at a
+    /// time, counting its candidates down ([`Countdown`]).
     fn consolidate_all(
         &mut self,
         tenants: &[String],
         policy: &CompactionPolicy,
         hooks: &mut SweepHooks<'_>,
     ) {
-        let planned: Vec<_> = tenants
-            .iter()
-            .map(|tenant| plan_candidates(self.store, tenant, self.clock.sealed_at, policy))
-            .collect();
-        let candidates = planned.iter().flatten().map(Vec::len).sum();
-        let countdown = Countdown::start(hooks.gauges, candidates);
-        for (tenant, planned) in tenants.iter().zip(planned) {
+        let sealed_at = self.clock.sealed_at;
+        let mut countdown = Countdown::start(hooks.gauges, || {
+            count_candidates(self.store, tenants, sealed_at, policy)
+        });
+        for tenant in tenants {
             let observe = hooks.observe.as_deref_mut();
-            self.tenant(tenant, planned, observe, &countdown);
+            self.tenant(tenant, policy, observe, &mut countdown);
         }
     }
 
-    /// Consolidate `tenant`'s `planned` sealed candidates, counting each
+    /// Plan and consolidate `tenant`'s sealed candidates, counting each
     /// down. A planning failure is recorded and the tenant skipped.
     fn tenant(
         &mut self,
         tenant: &str,
-        planned: Result<Vec<PartitionKey>, CompactionError>,
+        policy: &CompactionPolicy,
         mut observe: Option<&mut SweepObserver<'_>>,
-        countdown: &Countdown<'_>,
+        countdown: &mut Countdown<'_>,
     ) {
         self.report.tenants_scanned += 1;
+        let planned = plan_candidates(self.store, tenant, self.clock.sealed_at, policy);
+        countdown.begin_tenant(planned.as_ref().map_or(0, Vec::len));
         let candidates = match planned {
             Ok(candidates) => candidates,
             Err(e) => {

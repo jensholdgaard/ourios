@@ -1058,3 +1058,62 @@ async fn sweep_remaining_counts_down_and_each_partition_records_its_input() {
         "a partition within the budget never spills",
     );
 }
+
+/// #925 — the counting pass keeps one number per tenant, never the
+/// candidates: tenant `a` has three sealed candidates, `b` one, and a
+/// tenant with no data none.
+#[test]
+fn the_counting_pass_keeps_only_per_tenant_counts() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    write_sealed_hours(&store, 3);
+    write_sealed_candidate(&store, "b");
+    let tenants = ["a", "b", "none"].map(str::to_string);
+
+    let counts: Vec<usize> = count_candidates(
+        &store,
+        &tenants,
+        now_unix_nanos(),
+        &CompactionPolicy::default(),
+    );
+
+    assert_eq!(counts, vec![3, 1, 0]);
+}
+
+/// The countdown starts at the counted total, folds in a tenant whose
+/// planning found a different number than counted, ticks down per
+/// candidate, and is zero once dropped.
+#[test]
+fn the_countdown_folds_in_each_tenants_replanned_candidates() {
+    let gauges = SweepGauges::default();
+    let mut readings = Vec::new();
+
+    {
+        let mut countdown = Countdown::start(Some(&gauges), || vec![2, 1]);
+        readings.push(gauges.remaining());
+        countdown.begin_tenant(2);
+        countdown.tick();
+        readings.push(gauges.remaining());
+        countdown.tick();
+        countdown.begin_tenant(3);
+        readings.push(gauges.remaining());
+        countdown.tick();
+        readings.push(gauges.remaining());
+    }
+    readings.push(gauges.remaining());
+
+    assert_eq!(readings, vec![3, 2, 3, 2, 0]);
+}
+
+/// Without gauges the counting pass never runs.
+#[test]
+fn an_unmeasured_sweep_skips_the_counting_pass() {
+    let mut counted = false;
+
+    let _countdown = Countdown::start(None, || {
+        counted = true;
+        Vec::new()
+    });
+
+    assert!(!counted);
+}

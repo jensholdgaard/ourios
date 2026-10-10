@@ -323,5 +323,6 @@ querier:
 With an `auth` section configured, any listener left without a `*_tls`
 block gets one startup warning naming it (bearer credentials over
 plaintext) — not an error, because TLS may terminate at a fronting
-proxy. The Helm chart cannot set these keys yet
-([#852](https://github.com/jensholdgaard/ourios/issues/852)).
+proxy. On Kubernetes, the Helm chart sets these keys, and the `auth`
+section above, from Secret references; see the chart README's
+[Authentication and TLS](https://github.com/jensholdgaard/ourios/tree/main/deploy/helm/ourios#authentication-and-tls).

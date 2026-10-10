@@ -1,0 +1,467 @@
+---
+# Source: ourios/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: t-ourios
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: true
+---
+# Source: ourios/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: t-ourios-config
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+data:
+  receiver.yaml: |
+    storage:
+      backend: "local"
+      local:
+        bucket_root: "/var/lib/ourios/data"
+    receiver:
+      enabled: true
+      grpc_addr: "0.0.0.0:4317"
+      http_addr: "0.0.0.0:4318"
+      wal_root: "/var/lib/ourios/wal"
+    compaction:
+      enabled: false
+  querier.yaml: |
+    storage:
+      backend: "local"
+      local:
+        bucket_root: "/var/lib/ourios/data"
+    querier:
+      enabled: true
+      http_addr: "0.0.0.0:4319"
+      default_window_secs: 3600
+    compaction:
+      enabled: false
+  compactor.yaml: |
+    storage:
+      backend: "local"
+      local:
+        bucket_root: "/var/lib/ourios/data"
+    compaction:
+      enabled: true
+      interval_secs: 300
+---
+# Source: ourios/templates/data-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: t-ourios-data
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: "10Gi"
+---
+# Source: ourios/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: t-ourios-receiver-headless
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: receiver
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/component: receiver
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+---
+# Source: ourios/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: t-ourios-receiver
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: receiver
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/component: receiver
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+---
+# Source: ourios/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: t-ourios-querier
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: querier
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/component: querier
+  ports:
+    - name: query-http
+      port: 4319
+      targetPort: query-http
+      protocol: TCP
+---
+# Source: ourios/templates/compactor-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t-ourios-compactor
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: compactor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ourios
+      app.kubernetes.io/instance: t
+      app.kubernetes.io/component: compactor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ourios
+        app.kubernetes.io/instance: t
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: compactor
+      annotations:
+        # Roll the pods when the mounted RFC 0020 config changes.
+        checksum/config: 8b84c64cda7c71a470bb913609a48f0b69423efbabf401a014bbeca497e5816b
+    spec:
+      serviceAccountName: t-ourios
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: ourios-server
+          image: ghcr.io/jensholdgaard/ourios:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          args:
+            - --config
+            - /etc/ourios/config.yaml
+          
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ourios
+              readOnly: true
+            
+            - name: data
+              mountPath: /var/lib/ourios/data
+            # readOnlyRootFilesystem is on, so give the process a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: t-ourios-config
+            items:
+              - key: compactor.yaml
+                path: config.yaml
+        - name: tmp
+          emptyDir: {}
+        
+        - name: data
+          persistentVolumeClaim:
+            claimName: t-ourios-data
+---
+# Source: ourios/templates/querier-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t-ourios-querier
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: querier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ourios
+      app.kubernetes.io/instance: t
+      app.kubernetes.io/component: querier
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ourios
+        app.kubernetes.io/instance: t
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: querier
+      annotations:
+        # Roll the pods when the mounted RFC 0020 config changes.
+        checksum/config: 1e0a725ad4e60bd1f317bdb9f61f7a6d1f6a5d14e9d07ce3391b30bd77ef7893
+    spec:
+      serviceAccountName: t-ourios
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: ourios-server
+          image: ghcr.io/jensholdgaard/ourios:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          args:
+            - --config
+            - /etc/ourios/config.yaml
+          
+          ports:
+            - name: query-http
+              containerPort: 4319
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: query-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: query-http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ourios
+              readOnly: true
+            
+            - name: data
+              mountPath: /var/lib/ourios/data
+            # readOnlyRootFilesystem is on, so give the process a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: t-ourios-config
+            items:
+              - key: querier.yaml
+                path: config.yaml
+        - name: tmp
+          emptyDir: {}
+        
+        - name: data
+          persistentVolumeClaim:
+            claimName: t-ourios-data
+---
+# Source: ourios/templates/receiver-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: t-ourios-receiver
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: receiver
+spec:
+  replicas: 1
+  serviceName: t-ourios-receiver-headless
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ourios
+      app.kubernetes.io/instance: t
+      app.kubernetes.io/component: receiver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ourios
+        app.kubernetes.io/instance: t
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: receiver
+      annotations:
+        # Roll the pods when the mounted RFC 0020 config changes.
+        checksum/config: 02d4aaf1397b0b48862d658ab2d96cafe4efa0eccf6f3e4721ac5f41d83da856
+    spec:
+      serviceAccountName: t-ourios
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: ourios-server
+          image: ghcr.io/jensholdgaard/ourios:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          args:
+            - --config
+            - /etc/ourios/config.yaml
+          
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: otlp-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: otlp-http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ourios
+              readOnly: true
+            - name: wal
+              mountPath: /var/lib/ourios/wal
+            
+            - name: data
+              mountPath: /var/lib/ourios/data
+            # readOnlyRootFilesystem is on, so give the process a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: t-ourios-config
+            items:
+              - key: receiver.yaml
+                path: config.yaml
+        - name: tmp
+          emptyDir: {}
+        
+        - name: data
+          persistentVolumeClaim:
+            claimName: t-ourios-data
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+        labels:
+          app.kubernetes.io/name: ourios
+          app.kubernetes.io/instance: t
+          app.kubernetes.io/managed-by: Helm
+          app.kubernetes.io/component: receiver
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "2Gi"
+---
+# Source: ourios/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "t-ourios-test-connection"
+  labels:
+    app.kubernetes.io/name: ourios
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": test
+    # Clean the test pod up on success and before re-running, so repeated
+    # `helm test` runs don't collide on the pod name or leave clutter.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  # Cap the whole test so a stuck DNS lookup / TCP connect fails `helm test`
+  # deterministically instead of hanging and accumulating pods.
+  activeDeadlineSeconds: 60
+  # One container per enabled role, so a split-topology install (both roles
+  # enabled — the default) verifies BOTH the querier and the receiver: the test
+  # Pod succeeds only when every container exits 0.
+  containers:
+    # Post a trivial DSL query to the querier service. `curl -f` exits non-zero
+    # on any HTTP >= 400, so the test fails on a non-2xx. (BusyBox wget lacks
+    # --post-data, hence a real curl image; args are exec-form, not shell-split.)
+    - name: query
+      image: curlimages/curl:8.11.1
+      command:
+        - curl
+      args:
+        - -fsS
+        # Fail fast rather than hang if the Service exists but never responds.
+        - --connect-timeout
+        - "5"
+        - --max-time
+        - "15"
+        - -o
+        - /dev/null
+        - -w
+        - "%{http_code}\n"
+        - -X
+        - POST
+        - -H
+        - "X-Ourios-Tenant: helm-test"
+        - -H
+        - "Content-Type: text/plain"
+        - --data
+        - "template_id == 0"
+        - "http://t-ourios-querier:4319/v1/query"
+    # Confirm the receiver's OTLP HTTP port accepts a connection. Pinned to a
+    # specific BusyBox version (a floating tag could change `nc` behaviour and
+    # break `helm test` unexpectedly).
+    - name: otlp-http
+      image: busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - "nc -z -w5 t-ourios-receiver 4318"

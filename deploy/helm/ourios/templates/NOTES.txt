@@ -47,12 +47,47 @@ Workloads:
   - compactor DISABLED. With a receiver or querier enabled the chart refuses to render (a deployment with no sweeper — hazard #4); with all roles disabled, nothing runs.
 {{- end }}
 
+{{- $authOn := include "ourios.authEnabled" . }}
+{{- if or .Values.receiver.enabled .Values.querier.enabled }}
+{{- if not $authOn }}
+
+WARNING: authentication is OFF (RFC 0026 open mode). Any client that can
+reach the receiver or querier Services can write and read EVERY tenant, over
+plaintext unless listener TLS is set. Keep both Services inside a trusted
+network boundary, or configure auth.tokens and/or auth.oidc (and
+receiver.tls / querier.tls); see the chart README's "Authentication and TLS".
+{{- else }}
+
+{{- $auth := .Values.auth }}
+{{- $halves := list }}
+{{- if $auth.tokens }}{{ $halves = append $halves "static tokens" }}{{ end }}
+{{- if dig "oidc" "enabled" false $auth }}{{ $halves = append $halves "OIDC" }}{{ end }}
+Authentication is ON ({{ join " + " $halves }}{{ if dig "openfga" "enabled" false $auth }}; tenants bound by OpenFGA{{ end }}).
+{{- $plain := list }}
+{{- if and .Values.receiver.enabled (not (dig "tls" "grpc" "existingSecret" "" .Values.receiver)) }}{{ $plain = append $plain "receiver gRPC :4317" }}{{ end }}
+{{- if and .Values.receiver.enabled (not (dig "tls" "http" "existingSecret" "" .Values.receiver)) }}{{ $plain = append $plain "receiver HTTP :4318" }}{{ end }}
+{{- if and .Values.querier.enabled (not (dig "tls" "http" "existingSecret" "" .Values.querier)) }}{{ $plain = append $plain "querier HTTP :4319" }}{{ end }}
+{{- with $plain }}
+  These listeners carry bearer credentials in plaintext:
+    {{ join ", " . }}.
+  Fine behind a TLS-terminating proxy or mesh; otherwise set the listener's
+  <role>.tls.<listener>.existingSecret.
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.querier.enabled }}
 
 Query the logs DSL (port-forward from your workstation):
   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }}-querier 4319:4319
   curl -s -H 'X-Ourios-Tenant: my-tenant' -H 'Content-Type: text/plain' \
+{{- if $authOn }}
+    -H "Authorization: Bearer $TOKEN" \
+{{- end }}
+{{- if include "ourios.tlsEnabled" (dict "root" . "role" "querier") }}
+    --data 'template_id == 0' https://127.0.0.1:4319/v1/query
+{{- else }}
     --data 'template_id == 0' http://127.0.0.1:4319/v1/query
+{{- end }}
 {{- end }}
 {{- if .Values.receiver.enabled }}
 

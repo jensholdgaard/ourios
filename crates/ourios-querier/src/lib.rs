@@ -680,6 +680,7 @@ impl Querier {
         if urls.is_empty() {
             return Ok(empty_result(terminal.aggregate()));
         }
+        let files_opened = urls.len() as u64;
 
         // Union schema + promoted no-coercion adapter — the rationale
         // lives on `SchemaMode::Union` (epic #745 wave 2).
@@ -695,9 +696,11 @@ impl Querier {
         // count/materialize passes below never run for it.
         let (row_limit, query_options) = match terminal {
             Terminal::Aggregate(agg) => {
-                return self
+                let mut result = self
                     .execute_aggregate(df, &agg, tenant, ctx.task_ctx())
-                    .await;
+                    .await?;
+                result.stats.files_opened = files_opened;
+                return Ok(result);
             }
             Terminal::Rows { limit, options } => (limit, options),
         };
@@ -729,6 +732,7 @@ impl Querier {
                     rows: records.len() as u64,
                     stats: QueryStats {
                         bytes_read: 0,
+                        files_opened,
                         ..collected.scan
                     },
                     records,
@@ -751,7 +755,8 @@ impl Querier {
             .clone()
             .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
             .map_err(storage_err)?;
-        let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
+        let (batches, mut stats) = execute_plan(counted, ctx.task_ctx()).await?;
+        stats.files_opened = files_opened;
         let rows = count_value(&batches)?;
 
         // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the

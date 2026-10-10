@@ -161,6 +161,7 @@ pub(crate) async fn run_drift(
         .map_err(storage_err)?;
 
     let (batches, mut stats) = crate::execute_plan(sorted, ctx.task_ctx()).await?;
+    stats.files_opened = files.len() as u64;
     let mut rows = decode_drift_rows(&batches)?;
 
     // RFC 0050 §3.3 — grow the provenance set to `{mined,
@@ -177,6 +178,7 @@ pub(crate) async fn run_drift(
         stats.row_groups_scanned += adoption_stats.row_groups_scanned;
         stats.row_groups_pruned += adoption_stats.row_groups_pruned;
         stats.bytes_read += adoption_stats.bytes_read;
+        stats.files_opened += adoption_stats.files_opened;
         // Always zero from a plain scan today; folded so the
         // accounting stays complete if it ever isn't.
         stats.rows_excluded += adoption_stats.rows_excluded;
@@ -261,7 +263,8 @@ async fn adopted_template_ids(
     let grouped = filtered
         .aggregate(vec![col(audit_columns::TEMPLATE_ID)], vec![])
         .map_err(storage_err)?;
-    let (batches, stats) = crate::execute_plan(grouped, ctx.task_ctx()).await?;
+    let (batches, mut stats) = crate::execute_plan(grouped, ctx.task_ctx()).await?;
+    stats.files_opened = files.len() as u64;
     let out = decode_adopted_ids(&batches)?;
     Ok((out, stats))
 }

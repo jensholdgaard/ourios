@@ -73,6 +73,10 @@ pub struct QueryStats {
     /// keeps the exclusion observable, not silent. Always `0` for a
     /// non-aggregation query.
     pub rows_excluded: u64,
+    /// Parquet files the query's scans opened: the live files handed to
+    /// the scan (each one's footer is read even when every row group is
+    /// pruned). A drift query counts the audit files of each of its scans.
+    pub files_opened: u64,
 }
 
 /// Additive execution options for [`Querier::run_query_with`]. The
@@ -174,6 +178,18 @@ pub struct QueryResult {
     /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
+}
+
+impl QueryResult {
+    /// The query's total storage IO (RFC 0031 §3.6): the count scan, the
+    /// row materialization and the template-map acquisition.
+    #[must_use]
+    pub fn total_bytes_read(&self) -> u64 {
+        self.stats
+            .bytes_read
+            .saturating_add(self.materialize_bytes_read)
+            .saturating_add(self.registry_bytes_read)
+    }
 }
 
 /// One group of an executed `count [by …]` stage (RFC 0002 §6.3/§6.5

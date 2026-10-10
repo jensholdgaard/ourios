@@ -88,6 +88,13 @@ impl AuditFiles {
             Self::Remote(keys) => keys.is_empty(),
         }
     }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Local(paths) => paths.len(),
+            Self::Remote(keys) => keys.len(),
+        }
+    }
 }
 
 /// Resolve `tenant`'s live audit `*.parquet` file set, optionally pruned to the

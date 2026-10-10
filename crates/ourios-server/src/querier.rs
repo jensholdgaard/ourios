@@ -137,6 +137,24 @@ const QUERY_KIND_REJECTED: &str = "rejected";
 /// `ourios.query.row_group.state` attribute values.
 const ROW_GROUP_SCANNED: &str = "scanned";
 const ROW_GROUP_PRUNED: &str = "pruned";
+/// Bucket boundaries for `ourios.query.files`. The SDK defaults are shaped
+/// for milliseconds; a wide window opens thousands of files.
+const QUERY_FILES_BUCKETS: [f64; 11] = [
+    0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1_000.0, 5_000.0,
+];
+/// Bucket boundaries (bytes) for `ourios.query.read.size`. The SDK defaults
+/// top out near 10 kB.
+const QUERY_READ_SIZE_BUCKETS: [f64; 9] = [
+    65_536.0,        // 64 KiB
+    262_144.0,       // 256 KiB
+    1_048_576.0,     // 1 MiB
+    4_194_304.0,     // 4 MiB
+    16_777_216.0,    // 16 MiB
+    67_108_864.0,    // 64 MiB
+    268_435_456.0,   // 256 MiB
+    1_073_741_824.0, // 1 GiB
+    4_294_967_296.0, // 4 GiB
+];
 /// The upstream OpenTelemetry `error.type` attribute key — a failed query is
 /// recorded on the duration metric with this set, not as a bespoke error metric
 /// (the "recording errors on metrics" convention).
@@ -149,6 +167,10 @@ const ERROR_TYPE: &str = "error.type";
 pub(crate) struct QuerierMetrics {
     duration: Histogram<f64>,
     row_groups: Counter<u64>,
+    /// `ourios.query.files`: Parquet files one query opened.
+    files: Histogram<u64>,
+    /// `ourios.query.read.size`: bytes one query fetched from storage.
+    read_size: Histogram<u64>,
     /// `ourios.query.visibility` (RFC 0047 §3.4): queries by two-step branch.
     visibility: Counter<u64>,
 }
@@ -163,6 +185,16 @@ impl QuerierMetrics {
         let row_groups = meter
             .u64_counter(semconv::OURIOS_QUERY_ROW_GROUPS)
             .with_unit("{row_group}")
+            .build();
+        let files = meter
+            .u64_histogram(semconv::OURIOS_QUERY_FILES)
+            .with_unit("{file}")
+            .with_boundaries(QUERY_FILES_BUCKETS.to_vec())
+            .build();
+        let read_size = meter
+            .u64_histogram(semconv::OURIOS_QUERY_READ_SIZE)
+            .with_unit("By")
+            .with_boundaries(QUERY_READ_SIZE_BUCKETS.to_vec())
             .build();
         // Seed each pruning state with a zero so both series are visible before
         // the first query. The `state` attribute is required (there is no
@@ -184,6 +216,8 @@ impl QuerierMetrics {
         Self {
             duration,
             row_groups,
+            files,
+            read_size,
             visibility,
         }
     }
@@ -204,14 +238,21 @@ impl QuerierMetrics {
         [KeyValue::new(semconv::OURIOS_QUERY_ROW_GROUP_STATE, state)]
     }
 
-    /// Record a successful query: its wall-clock duration (by kind) and the
+    /// Record a successful query: its wall-clock duration (by kind), the
     /// scanned/pruned row-group split (the two states partition the candidates,
-    /// so the B1 pruned fraction is derivable in the backend).
-    pub(crate) fn record_ok(&self, kind: &'static str, elapsed: Duration, stats: &QueryStats) {
-        self.duration.record(
-            elapsed.as_secs_f64(),
-            &[KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)],
-        );
+    /// so the B1 pruned fraction is derivable in the backend), the files it
+    /// opened, and `bytes_read`, its total storage IO.
+    pub(crate) fn record_ok(
+        &self,
+        kind: &'static str,
+        elapsed: Duration,
+        stats: &QueryStats,
+        bytes_read: u64,
+    ) {
+        let kind = [KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)];
+        self.duration.record(elapsed.as_secs_f64(), &kind);
+        self.files.record(stats.files_opened, &kind);
+        self.read_size.record(bytes_read, &kind);
         self.row_groups.add(
             stats.row_groups_scanned,
             &Self::state_attrs(ROW_GROUP_SCANNED),
@@ -575,9 +616,12 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
             let elapsed = started.elapsed();
             match result {
                 Ok(result) => {
-                    state
-                        .metrics
-                        .record_ok(QUERY_KIND_DRIFT, elapsed, &result.stats);
+                    state.metrics.record_ok(
+                        QUERY_KIND_DRIFT,
+                        elapsed,
+                        &result.stats,
+                        result.stats.bytes_read,
+                    );
                     json_ok(&DriftResponse::from(&result))
                 }
                 Err(e) => {
@@ -1058,9 +1102,12 @@ async fn run_logs_query(
     let elapsed = started.elapsed();
     match result {
         Ok(result) => {
-            state
-                .metrics
-                .record_ok(QUERY_KIND_LOGS, elapsed, &result.stats);
+            state.metrics.record_ok(
+                QUERY_KIND_LOGS,
+                elapsed,
+                &result.stats,
+                result.total_bytes_read(),
+            );
             json_ok(&LogQueryResponse::from(&result))
         }
         Err(e) => {

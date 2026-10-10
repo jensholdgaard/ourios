@@ -33,6 +33,7 @@
 
 use std::path::Path;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
@@ -114,22 +115,56 @@ const LOOKUP_OUTCOME_TORN: &str = "torn";
 const LOOKUP_OUTCOME_UNKNOWN_VERSION: &str = "unknown_version";
 /// A query served by another query's in-flight acquisition at the same
 /// frontier (`crate::map_flight`) — semconv v0.3.9.
-const LOOKUP_OUTCOME_JOINED: &str = "joined";
+pub(crate) const LOOKUP_OUTCOME_JOINED: &str = "joined";
 /// `ourios.template_map.lookup.anomaly` value: the fold behind the lookup
 /// found a `(template_id, version)` bound to two different templates.
 const LOOKUP_ANOMALY_BINDING_CONFLICT: &str = "binding_conflict";
+/// `ourios.template_map.derive.reason` attribute values: the non-hit §3.3
+/// disposition that sent the lookup to the fold.
+const DERIVE_REASON_MISS: &str = "miss";
+const DERIVE_REASON_STALE: &str = "stale";
+const DERIVE_REASON_TORN: &str = "torn";
+const DERIVE_REASON_UNKNOWN_VERSION: &str = "unknown_version";
+/// The upstream `error.type` attribute key a failed derive carries.
+const ERROR_TYPE: &str = "error.type";
 /// `ourios.template_map.publish.outcome` attribute values (RFC 0033 §3.7).
 const PUBLISH_OUTCOME_PUBLISHED: &str = "published";
 const PUBLISH_OUTCOME_LOST_RACE: &str = "lost_race";
 const PUBLISH_OUTCOME_ERROR: &str = "error";
 
+/// Bucket boundaries (seconds) for the derive and acquire-wait durations.
+/// The SDK defaults are millisecond-shaped; a cold derive over a large
+/// audit set runs for minutes.
+const DURATION_BUCKETS_S: [f64; 12] = [
+    0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
+
+/// Bucket boundaries (bytes) for the derive's audit size. The SDK defaults
+/// top out near 10 kB; audit sets reach hundreds of MiB.
+const AUDIT_SIZE_BUCKETS: [f64; 9] = [
+    65_536.0,        // 64 KiB
+    262_144.0,       // 256 KiB
+    1_048_576.0,     // 1 MiB
+    4_194_304.0,     // 4 MiB
+    16_777_216.0,    // 16 MiB
+    67_108_864.0,    // 64 MiB
+    268_435_456.0,   // 256 MiB
+    1_073_741_824.0, // 1 GiB
+    4_294_967_296.0, // 4 GiB
+];
+
 /// The RFC 0033 §3.7 instruments: lookups by outcome, publishes by
-/// outcome, and the artifact byte size at publish. Names come from the
-/// weaver-generated [`ourios_semconv`] constants.
+/// outcome, the artifact byte size at publish, what each derive cost, and
+/// how long joiners waited on another query's acquisition. Names come
+/// from the weaver-generated [`ourios_semconv`] constants.
 struct TemplateMapMetrics {
     lookups: Counter<u64>,
     publishes: Counter<u64>,
     artifact_size: Histogram<u64>,
+    derive_duration: Histogram<f64>,
+    derive_audit_files: Histogram<u64>,
+    derive_audit_size: Histogram<u64>,
+    acquire_wait: Histogram<f64>,
 }
 
 /// Resolved once, on the first lookup or publish, through the
@@ -155,25 +190,34 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
             .with_unit("By")
             .build(),
+        derive_duration: meter
+            .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
+            .with_unit("s")
+            .with_boundaries(DURATION_BUCKETS_S.to_vec())
+            .build(),
+        derive_audit_files: meter
+            .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES)
+            .with_unit("{file}")
+            .build(),
+        derive_audit_size: meter
+            .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE)
+            .with_unit("By")
+            .with_boundaries(AUDIT_SIZE_BUCKETS.to_vec())
+            .build(),
+        acquire_wait: meter
+            .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION)
+            .with_unit("s")
+            .with_boundaries(DURATION_BUCKETS_S.to_vec())
+            .build(),
     }
 });
 
 impl TemplateMapMetrics {
     fn record_lookup(&self, outcome: CacheOutcome, binding_conflict: bool) {
-        let value = match outcome {
-            CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
-            CacheOutcome::Miss {
-                reason: MissReason::Absent,
-            } => LOOKUP_OUTCOME_MISS,
-            CacheOutcome::Miss {
-                reason: MissReason::Torn,
-            } => LOOKUP_OUTCOME_TORN,
-            CacheOutcome::Miss {
-                reason: MissReason::UnknownVersion,
-            } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
-            CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
-        };
-        let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
+        let outcome = KeyValue::new(
+            semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
+            lookup_outcome(outcome),
+        );
         if binding_conflict {
             self.lookups.add(
                 1,
@@ -198,6 +242,29 @@ impl TemplateMapMetrics {
                 value,
             )],
         );
+    }
+
+    /// One fold's cost: its duration always (with `error.type` when it
+    /// failed), and the audit files and bytes it read when it completed.
+    fn record_derive(
+        &self,
+        reason: &'static str,
+        elapsed: Duration,
+        folded: Result<(u64, u64), &'static str>,
+    ) {
+        let reason = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON, reason);
+        match folded {
+            Ok((files, bytes)) => {
+                let attrs = [reason];
+                self.derive_duration.record(elapsed.as_secs_f64(), &attrs);
+                self.derive_audit_files.record(files, &attrs);
+                self.derive_audit_size.record(bytes, &attrs);
+            }
+            Err(error_type) => self.derive_duration.record(
+                elapsed.as_secs_f64(),
+                &[reason, KeyValue::new(ERROR_TYPE, error_type)],
+            ),
+        }
     }
 
     fn record_publish(&self, outcome: &'static str) {
@@ -235,8 +302,56 @@ fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)]) {
 /// Record a `joined` lookup: this query was served the map another query
 /// acquired at the same frontier. Only for a successful shared acquisition —
 /// the acquirer records its own outcome, and a failure records nothing.
-pub(crate) fn record_joined_lookup() {
+pub(crate) fn record_joined_lookup(waited: Duration) {
     METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED);
+    METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
+}
+
+/// The `ourios.template_map.lookup.outcome` value of a lookup this query
+/// performed itself.
+pub(crate) fn lookup_outcome(outcome: CacheOutcome) -> &'static str {
+    match outcome {
+        CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
+        CacheOutcome::Miss {
+            reason: MissReason::Absent,
+        } => LOOKUP_OUTCOME_MISS,
+        CacheOutcome::Miss {
+            reason: MissReason::Torn,
+        } => LOOKUP_OUTCOME_TORN,
+        CacheOutcome::Miss {
+            reason: MissReason::UnknownVersion,
+        } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
+        CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
+    }
+}
+
+/// The `ourios.template_map.derive.reason` for an outcome that folds;
+/// `None` for a hit, which never derives.
+fn derive_reason(outcome: CacheOutcome) -> Option<&'static str> {
+    match outcome {
+        CacheOutcome::Hit => None,
+        CacheOutcome::Miss {
+            reason: MissReason::Absent,
+        } => Some(DERIVE_REASON_MISS),
+        CacheOutcome::Miss {
+            reason: MissReason::Torn,
+        } => Some(DERIVE_REASON_TORN),
+        CacheOutcome::Miss {
+            reason: MissReason::UnknownVersion,
+        } => Some(DERIVE_REASON_UNKNOWN_VERSION),
+        CacheOutcome::StaleRefreshed => Some(DERIVE_REASON_STALE),
+    }
+}
+
+/// The `error.type` a failed derive carries: the classes the query
+/// surface reports for the same [`QueryError`].
+fn derive_error_type(error: &QueryError) -> &'static str {
+    match error {
+        QueryError::Storage { .. } => "storage",
+        QueryError::TenantRequired => "tenant_required",
+        QueryError::InvalidQuery { .. } => "invalid_query",
+        QueryError::Forbidden { .. } => "permission_denied",
+    }
 }
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):
@@ -439,7 +554,19 @@ pub(crate) fn load_or_derive_resolved(
             }
         }
     };
-    let (map, fold_bytes, conflicts) = fold_template_map(resolved, tenant)?;
+    let started = Instant::now();
+    let folded = fold_template_map(resolved, tenant);
+    if let Some(reason) = derive_reason(outcome) {
+        METRICS.record_derive(
+            reason,
+            started.elapsed(),
+            match &folded {
+                Ok((map, bytes, _)) => Ok((map.folded_files().len() as u64, *bytes)),
+                Err(e) => Err(derive_error_type(e)),
+            },
+        );
+    }
+    let (map, fold_bytes, conflicts) = folded?;
     let acquisition_bytes =
         fold_bytes
             .checked_add(fetched_bytes)

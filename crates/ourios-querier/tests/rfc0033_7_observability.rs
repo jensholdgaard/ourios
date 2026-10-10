@@ -13,6 +13,12 @@
 //! same-frontier queries on one querier also drive a shared acquisition:
 //! the acquirer records its own outcome and the waiter records `joined`.
 //!
+//! The same acts pin the derive-cost instruments (#924): one
+//! `derive.duration` sample per fold keyed by `derive.reason` (none for a
+//! hit, `error.type` on the failed fold), audit files and size per
+//! completed fold — the cold one exactly the fixture's audit set — and one
+//! `acquire.wait.duration` sample, the joiner's.
+//!
 //! This test installs a process-global in-memory `MeterProvider`, so it
 //! lives in its own integration binary (its own process) — the
 //! `rfc0016_6_query_metrics` precedent, applied at the querier-library
@@ -301,6 +307,133 @@ fn outcome_counts(rms: &[ResourceMetrics], metric: &str, attr_key: &str) -> BTre
     counts
 }
 
+/// A histogram's data points as `sorted "key=value" attributes → (count,
+/// sum)`, for either number type.
+fn histogram_points(rms: &[ResourceMetrics], metric: &str) -> BTreeMap<Vec<String>, (u64, f64)> {
+    fn key<'a>(attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> Vec<String> {
+        let mut key: Vec<String> = attrs
+            .map(|kv| format!("{}={}", kv.key.as_str(), kv.value.as_str()))
+            .collect();
+        key.sort();
+        key
+    }
+    let mut points = BTreeMap::new();
+    match metric_data(rms, metric) {
+        AggregatedMetrics::F64(MetricData::Histogram(hist)) => {
+            for dp in hist.data_points() {
+                points.insert(key(dp.attributes()), (dp.count(), dp.sum()));
+            }
+        }
+        AggregatedMetrics::U64(MetricData::Histogram(hist)) => {
+            for dp in hist.data_points() {
+                #[allow(clippy::cast_precision_loss)] // fixture-sized sums
+                points.insert(key(dp.attributes()), (dp.count(), dp.sum() as f64));
+            }
+        }
+        _ => panic!("{metric} should be a histogram"),
+    }
+    points
+}
+
+/// The tenant's audit `*.parquet` files and their total bytes: what a
+/// derive over the whole audit set reads.
+fn audit_set(audit_dir: &Path) -> (u64, u64) {
+    walk_files(audit_dir)
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .fold((0, 0), |(n, bytes), p| {
+            (
+                n + 1,
+                bytes + std::fs::metadata(p).expect("stat audit file").len(),
+            )
+        })
+}
+
+/// #924 — what each derive cost. Acts 1–5 fold four times: `miss`,
+/// `stale`, `torn`, and act 5's failing `stale` fold, which records its
+/// duration with `error.type` and no audit files or size. The hits (act
+/// 2, and act 4b's acquirer) never derive, and act 4b's joiner records
+/// the only acquire-wait sample.
+fn assert_derive_metrics(rms: &[ResourceMetrics], cold_audit_set: (u64, u64)) {
+    let reason = |r: &str| format!("{}={r}", semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON);
+    let counts = |metric: &str| -> BTreeMap<Vec<String>, u64> {
+        histogram_points(rms, metric)
+            .into_iter()
+            .map(|(k, (count, _))| (k, count))
+            .collect()
+    };
+    let expected: BTreeMap<Vec<String>, u64> = [
+        (vec![reason("miss")], 1),
+        (vec![reason("stale")], 1),
+        (vec![reason("torn")], 1),
+        (vec!["error.type=storage".to_string(), reason("stale")], 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        counts(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION),
+        expected,
+        "one duration sample per fold and none for a hit; the failed fold carries error.type",
+    );
+    let completed: BTreeMap<Vec<String>, u64> = [
+        (vec![reason("miss")], 1),
+        (vec![reason("stale")], 1),
+        (vec![reason("torn")], 1),
+    ]
+    .into_iter()
+    .collect();
+    for metric in [
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
+    ] {
+        assert_eq!(
+            counts(metric),
+            completed,
+            "{metric}: one sample per completed fold"
+        );
+    }
+    let (files, bytes) = cold_audit_set;
+    assert!(files > 0 && bytes > 0, "the fixture has an audit set");
+    let miss = vec![reason("miss")];
+    #[allow(clippy::cast_precision_loss)] // fixture-sized values
+    let expected_cold = [(files as f64), (bytes as f64)];
+    let observed_cold = [
+        histogram_points(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES)[&miss].1,
+        histogram_points(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE)[&miss].1,
+    ];
+    assert_eq!(
+        observed_cold, expected_cold,
+        "the cold derive read exactly the fixture's audit files and bytes",
+    );
+
+    #[cfg(feature = "testing")]
+    {
+        let waits = histogram_points(rms, semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION);
+        let expected: BTreeMap<Vec<String>, u64> = [(Vec::new(), 1)].into_iter().collect();
+        assert_eq!(
+            waits
+                .into_iter()
+                .map(|(k, (c, _))| (k, c))
+                .collect::<BTreeMap<_, _>>(),
+            expected,
+            "the joiner records one attribute-free wait sample; the acquirer none",
+        );
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        let names: Vec<_> = rms
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .map(opentelemetry_sdk::metrics::data::Metric::name)
+            .collect();
+        assert!(
+            !names.contains(&semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION),
+            "no query joined, so no wait was recorded",
+        );
+    }
+}
+
 const BINDING_CONFLICTED: EventSpec = EventSpec {
     name: semconv::EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED,
     required: &[
@@ -431,6 +564,7 @@ fn rfc0033_7_observable_outcomes() {
         .join(format!("tenant_id={TENANT}"))
         .join(TEMPLATE_MAP_FILENAME);
     let artifact_len = || std::fs::metadata(&artifact).expect("stat artifact").len();
+    let cold_audit_set = audit_set(artifact.parent().expect("audit tenant dir"));
 
     // Act — queries drive the four §5.7 outcomes in turn. Every answer
     // is identical (the cache is advisory); only the telemetry differs.
@@ -507,5 +641,6 @@ fn rfc0033_7_observable_outcomes() {
         size_after_miss + size_after_stale + size_after_torn,
         "each sample is the published artifact's byte size",
     );
+    assert_derive_metrics(&rms, cold_audit_set);
     binding_conflict_act(&guard, &exporter, &rms);
 }

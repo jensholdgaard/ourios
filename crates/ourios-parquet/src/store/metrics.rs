@@ -14,9 +14,10 @@
 //!
 //! `object_store`'s retry loop exposes no retry count, so retries are
 //! counted at the transport: inside one logical operation, an HTTP request
-//! repeating an earlier one (same method and URI) is a retry of it, and the
-//! earlier attempt's outcome is what triggered it. Pagination and multipart
-//! parts change the URI, so they are not mistaken for retries.
+//! repeating an earlier one (same method, URI and `Range`) is a retry of it,
+//! and the earlier attempt's outcome is what triggered it. Pagination,
+//! multipart parts and the ranges of one `get_ranges` differ in URI or
+//! `Range`, so they are not mistaken for retries.
 
 use std::borrow::Cow;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -201,24 +202,14 @@ impl StoreMetrics {
         }
     }
 
-    fn record_operation(&self, op: Operation, caller: Caller, took: Duration, error: Option<&str>) {
-        let base = [
-            KeyValue::new(semconv::OURIOS_STORAGE_OPERATION, op.as_str()),
-            KeyValue::new(semconv::OURIOS_STORAGE_CALLER, caller.as_str()),
-        ];
+    fn record_operation(&self, labels: Labels, took: Duration, error: Option<&'static str>) {
         let took = took.as_secs_f64();
         match error {
-            None => self.operation_duration.record(took, &base),
+            None => self.operation_duration.record(took, &labels.attributes()),
             Some(class) => {
-                let [operation, caller] = base;
-                self.operation_duration.record(
-                    took,
-                    &[
-                        operation,
-                        caller,
-                        KeyValue::new(ERROR_TYPE, class.to_owned()),
-                    ],
-                );
+                let [operation, caller] = labels.attributes();
+                self.operation_duration
+                    .record(took, &[operation, caller, KeyValue::new(ERROR_TYPE, class)]);
             }
         }
     }
@@ -343,11 +334,28 @@ fn http_error_kind(kind: HttpErrorKind) -> &'static str {
     }
 }
 
+/// The attributes every sample of one logical call carries.
+#[derive(Clone, Copy, Debug)]
+struct Labels {
+    op: Operation,
+    caller: Caller,
+}
+
+impl Labels {
+    fn attributes(self) -> [KeyValue; 2] {
+        [
+            KeyValue::new(semconv::OURIOS_STORAGE_OPERATION, self.op.as_str()),
+            KeyValue::new(semconv::OURIOS_STORAGE_CALLER, self.caller.as_str()),
+        ]
+    }
+}
+
 /// How one HTTP attempt failed: its `error.type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
     Status(u16),
     Transport(&'static str),
+    Cancelled,
 }
 
 impl Failure {
@@ -355,6 +363,7 @@ impl Failure {
         match self {
             Self::Status(code) => Cow::Owned(code.to_string()),
             Self::Transport(kind) => Cow::Borrowed(kind),
+            Self::Cancelled => Cow::Borrowed(CANCELLED),
         }
     }
 }
@@ -368,8 +377,7 @@ tokio::task_local! {
 /// how the latest attempt of each ended (`None`: it got a response under 400).
 struct Attempts {
     metrics: Metrics,
-    op: Operation,
-    caller: Caller,
+    labels: Labels,
     seen: Mutex<Vec<(u64, Option<Failure>)>>,
 }
 
@@ -381,17 +389,14 @@ impl Attempts {
         let Some((_, earlier)) = seen.iter().find(|(id, _)| *id == identity) else {
             return;
         };
-        // An attempt that got a response can still be retried when its body
-        // fails mid-stream, which the transport never sees.
+        // The earlier attempt got a response under 400, so what failed it is
+        // not visible here.
         let class = earlier.map_or(Cow::Borrowed(OTHER), Failure::error_type);
-        self.metrics.get().retries.add(
-            1,
-            &[
-                KeyValue::new(semconv::OURIOS_STORAGE_OPERATION, self.op.as_str()),
-                KeyValue::new(semconv::OURIOS_STORAGE_CALLER, self.caller.as_str()),
-                KeyValue::new(ERROR_TYPE, class),
-            ],
-        );
+        let [operation, caller] = self.labels.attributes();
+        self.metrics
+            .get()
+            .retries
+            .add(1, &[operation, caller, KeyValue::new(ERROR_TYPE, class)]);
     }
 
     fn ended(&self, identity: u64, failure: Option<Failure>) {
@@ -407,8 +412,7 @@ impl Attempts {
 /// it records as cancelled.
 pub(super) struct Call {
     metrics: Metrics,
-    op: Operation,
-    caller: Caller,
+    labels: Labels,
     started: Instant,
     attempts: Option<Arc<Attempts>>,
     /// Objects listed so far, for a LIST.
@@ -420,18 +424,17 @@ impl Call {
     /// Start a call; `http` when its backend is reached over HTTP, whose
     /// attempts are then tracked for retries.
     pub(super) fn start(metrics: &Metrics, op: Operation, caller: Caller, http: bool) -> Self {
+        let labels = Labels { op, caller };
         let attempts = http.then(|| {
             Arc::new(Attempts {
                 metrics: metrics.clone(),
-                op,
-                caller,
+                labels,
                 seen: Mutex::new(Vec::new()),
             })
         });
         Self {
             metrics: metrics.clone(),
-            op,
-            caller,
+            labels,
             started: Instant::now(),
             attempts,
             listed: matches!(op, Operation::List | Operation::ListDelimited).then_some(0),
@@ -464,9 +467,9 @@ impl Call {
             return;
         }
         let metrics = self.metrics.get();
-        metrics.record_operation(self.op, self.caller, self.started.elapsed(), error);
+        metrics.record_operation(self.labels, self.started.elapsed(), error);
         if let (None, Some(listed)) = (error, self.listed) {
-            metrics.record_listing(self.caller, listed);
+            metrics.record_listing(self.labels.caller, listed);
         }
     }
 }
@@ -553,43 +556,85 @@ struct MeteredHttp {
 #[async_trait]
 impl HttpService for MeteredHttp {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
-        let attempts = OPERATION.try_with(Arc::clone).ok();
-        let identity = request_identity(&req);
-        if let Some(attempts) = &attempts {
+        let scope = OPERATION.try_with(Arc::clone).ok().map(|attempts| {
+            let identity = request_identity(&req);
             attempts.attempt(identity);
-        }
-        let mut attributes = request_attributes(&req);
-        let started = Instant::now();
+            (attempts, identity)
+        });
+        let mut attempt = Attempt {
+            metrics: self.metrics.clone(),
+            attributes: request_attributes(&req),
+            started: Instant::now(),
+            scope,
+            done: false,
+        };
         let response = self.inner.execute(req).await;
-        let took = started.elapsed().as_secs_f64();
-        let failure = match &response {
+        match &response {
             Ok(response) => {
                 let status = response.status().as_u16();
-                attributes.push(KeyValue::new(
-                    "http.response.status_code",
-                    i64::from(status),
-                ));
-                (status >= 400).then_some(Failure::Status(status))
+                attempt.finish(
+                    Some(status),
+                    (status >= 400).then_some(Failure::Status(status)),
+                );
             }
-            Err(e) => Some(Failure::Transport(http_error_kind(e.kind()))),
-        };
-        if let Some(failure) = failure {
-            attributes.push(KeyValue::new(ERROR_TYPE, failure.error_type()));
-        }
-        self.metrics.get().http_duration.record(took, &attributes);
-        if let Some(attempts) = &attempts {
-            attempts.ended(identity, failure);
+            Err(e) => attempt.finish(None, Some(Failure::Transport(http_error_kind(e.kind())))),
         }
         response
     }
 }
 
-/// What makes two requests the same request: method and URI. Headers are
-/// left out, since a retry re-signs and a body retry adds a `Range`.
+/// One HTTP attempt, recorded when it ends. Dropped before a response, as
+/// when its caller gives up on the request, it records as cancelled.
+struct Attempt {
+    metrics: Metrics,
+    attributes: Vec<KeyValue>,
+    started: Instant,
+    /// The logical operation it belongs to, and its request identity.
+    scope: Option<(Arc<Attempts>, u64)>,
+    done: bool,
+}
+
+impl Attempt {
+    fn finish(&mut self, status: Option<u16>, failure: Option<Failure>) {
+        if std::mem::replace(&mut self.done, true) {
+            return;
+        }
+        let took = self.started.elapsed().as_secs_f64();
+        let mut attributes = std::mem::take(&mut self.attributes);
+        if let Some(status) = status {
+            attributes.push(KeyValue::new(
+                "http.response.status_code",
+                i64::from(status),
+            ));
+        }
+        if let Some(failure) = failure {
+            attributes.push(KeyValue::new(ERROR_TYPE, failure.error_type()));
+        }
+        self.metrics.get().http_duration.record(took, &attributes);
+        if let Some((attempts, identity)) = &self.scope {
+            attempts.ended(*identity, failure);
+        }
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        self.finish(None, Some(Failure::Cancelled));
+    }
+}
+
+/// What makes two requests the same request: method, URI and `Range`, so
+/// the parallel ranged GETs of one `get_ranges` stay distinct. Other headers
+/// are left out, since a retry re-signs. A body retry resumes with a
+/// narrower `Range`, so it is not counted.
 fn request_identity(req: &HttpRequest) -> u64 {
     let mut hasher = DefaultHasher::new();
     req.method().hash(&mut hasher);
     req.uri().hash(&mut hasher);
+    req.headers()
+        .get("range")
+        .map(object_store::HeaderValue::as_bytes)
+        .hash(&mut hasher);
     hasher.finish()
 }
 
@@ -934,10 +979,22 @@ mod tests {
     /// A fake S3 endpoint answering each request on its own connection with
     /// the next of `responses`. Returns its port.
     fn fake_s3(responses: Vec<&'static str>) -> u16 {
+        let count = responses.len();
+        let mut responses = responses.into_iter();
+        serve(count, move |_| responses.next().map(str::to_owned))
+    }
+
+    /// A fake S3 endpoint serving `connections` connections, one request
+    /// each, answered by `respond` from the request head. `None` leaves the
+    /// request unanswered until the client hangs up. Returns its port.
+    fn serve(
+        connections: usize,
+        mut respond: impl FnMut(&str) -> Option<String> + Send + 'static,
+    ) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
-            for response in responses {
+            for _ in 0..connections {
                 let (mut conn, _) = listener.accept().expect("accept");
                 let mut request = Vec::new();
                 let mut buf = [0_u8; 1024];
@@ -946,10 +1003,24 @@ mod tests {
                     assert!(n > 0, "request ended early");
                     request.extend_from_slice(&buf[..n]);
                 }
-                conn.write_all(response.as_bytes()).expect("write");
+                match respond(&String::from_utf8_lossy(&request)) {
+                    Some(response) => conn.write_all(response.as_bytes()).expect("write"),
+                    None => while conn.read(&mut buf).is_ok_and(|n| n > 0) {},
+                }
             }
         });
         port
+    }
+
+    fn s3_store(harness: &Harness, port: u16, caller: Caller) -> Store {
+        let cfg = S3Config::new("bucket")
+            .with_endpoint(format!("http://127.0.0.1:{port}"))
+            .with_region("us-east-1")
+            .with_access_key_id("key")
+            .with_secret_access_key("secret");
+        Store::s3_with(cfg, harness.metrics.clone())
+            .expect("s3")
+            .with_caller(caller)
     }
 
     #[test]
@@ -960,14 +1031,7 @@ mod tests {
              Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\nhello",
         ]);
         let harness = Harness::new();
-        let cfg = S3Config::new("bucket")
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_region("us-east-1")
-            .with_access_key_id("key")
-            .with_secret_access_key("secret");
-        let store = Store::s3_with(cfg, harness.metrics.clone())
-            .expect("s3")
-            .with_caller(Caller::TemplateMap);
+        let store = s3_store(&harness, port, Caller::TemplateMap);
 
         assert_eq!(store.get_blocking("k").expect("get"), b"hello");
 
@@ -1008,6 +1072,109 @@ mod tests {
                 (Some("500".to_owned()), (1, Some("500".to_owned()))),
                 (None, (1, Some("200".to_owned()))),
             ])
+        );
+    }
+
+    /// The size of the object the ranged-GET fake serves.
+    const RANGED_SIZE: u64 = 40_000_000;
+
+    /// A 206 for the `Range` in `request`, cut from an object of
+    /// [`RANGED_SIZE`] bytes.
+    fn partial_content(request: &str) -> Option<String> {
+        let range = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("range")
+                .then(|| value.trim().strip_prefix("bytes=").map(str::to_owned))
+                .flatten()
+        })?;
+        let (first, last) = range.split_once('-')?;
+        let (first, last): (u64, u64) = (first.parse().ok()?, last.parse().ok()?);
+        let length = last - first + 1;
+        Some(format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\n\
+             Content-Range: bytes {first}-{last}/{RANGED_SIZE}\r\nETag: \"abc\"\r\n\
+             Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\n{}",
+            "x".repeat(usize::try_from(length).ok()?)
+        ))
+    }
+
+    /// More ranges than `get_ranges` fetches at once.
+    const RANGES: usize = 12;
+
+    /// Ranges too far apart to coalesce are GETs of one URI, the later ones
+    /// starting as earlier ones end, and none is a retry of another.
+    #[test]
+    fn the_parallel_gets_of_one_multi_range_read_are_not_retries() {
+        let port = serve(RANGES, partial_content);
+        let harness = Harness::new();
+        let store = s3_store(&harness, port, Caller::Querier);
+        let backend = store.object_store();
+        let path = object_store::path::Path::from("k");
+        let ranges: Vec<std::ops::Range<u64>> = (0..RANGES as u64)
+            .map(|i| i * 3_000_000..i * 3_000_000 + 10)
+            .collect();
+        let got = store
+            .bridge(Operation::GetRange, async move {
+                backend
+                    .get_ranges(&path, &ranges)
+                    .await
+                    .map_err(StoreError::Backend)
+            })
+            .expect("get_ranges");
+        assert_eq!(
+            got.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
+            [10; RANGES]
+        );
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([(key("get_range", "querier", None), 1)])
+        );
+        assert!(
+            harness
+                .points(semconv::OURIOS_STORAGE_OPERATION_RETRIES)
+                .is_empty()
+        );
+        let attempts = harness.points("http.client.request.duration");
+        assert!(
+            matches!(
+                attempts.as_slice(),
+                [p] if p.count == RANGES as u64
+                    && p.attribute("http.response.status_code") == Some("206")
+                    && p.attribute("error.type").is_none()
+            ),
+            "{attempts:?}"
+        );
+    }
+
+    /// A request its caller gives up on before the response still records
+    /// its attempt, as cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_abandoned_s3_request_records_a_cancelled_attempt() {
+        use object_store::ObjectStoreExt as _;
+
+        let port = serve(1, |_| None);
+        let harness = Harness::new();
+        let store = s3_store(&harness, port, Caller::Querier);
+        let backend = store.object_store();
+        let path = object_store::path::Path::from("k");
+        let abandoned = tokio::time::timeout(Duration::from_millis(300), backend.get(&path)).await;
+        assert!(abandoned.is_err(), "the fake never answers");
+
+        assert_eq!(
+            harness.operations(),
+            BTreeMap::from([(key("get", "querier", Some("cancelled")), 1)])
+        );
+        let attempts = harness.points("http.client.request.duration");
+        assert!(
+            matches!(
+                attempts.as_slice(),
+                [p] if p.count == 1
+                    && p.attribute("error.type") == Some("cancelled")
+                    && p.attribute("http.response.status_code").is_none()
+                    && p.attribute("http.request.method") == Some("GET")
+            ),
+            "{attempts:?}"
         );
     }
 }

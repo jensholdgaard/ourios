@@ -146,6 +146,10 @@ jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["rus
 # writer rather than to repeated literals. Already in the tree via
 # ourios-parquet — no new compilation unit versions.
 parquet = { version = "=60.0.0", default-features = false, features = ["arrow", "zstd"] }
+# The RFC0059.6 SIGTERM leg writes a statistics-less data file the bootstrap
+# scan must download and decode whole, so the scan is still running when
+# the signal lands. Already in the tree via ourios-parquet.
+arrow-array = { version = "=60.0.0", default-features = false }
 bytes = { version = "=1.12.1", default-features = false }
 # The RFC0029.7 Dex arm mints real tokens (form POST to the container's
 # token endpoint) and polls readiness — same crate + TLS stack as the

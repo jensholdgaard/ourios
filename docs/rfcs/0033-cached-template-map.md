@@ -487,6 +487,29 @@ meaning, no separate channel; the comparative harness needs no code
 change, and the alternative (a separate artifact-bytes field with
 the old field pinned to audit-stream-only) is recorded in §4.
 
+> **Amendment (2026-10-10, #927, maintainer-approved): binding
+> conflicts.** Within one `(template_id, version)` the template never
+> legitimately changes, because widening and type expansion bump the
+> version. The registry fold therefore checks every key it already
+> holds against each incoming binding. A semantically different
+> template (different parsed tokens) is a binding conflict, i.e. a
+> template-id collision (CLAUDE.md §3.1). Each fold-backed acquisition
+> reports every conflicting key once:
+>
+> - the `ourios.template_map.binding.conflicted` log event (WARN),
+>   carrying `ourios.tenant`, `ourios.template.id` and
+>   `ourios.template.version`. The template texts are never attached,
+>   because they can contain user data;
+> - `ourios.template_map.lookup.anomaly = binding_conflict` on that
+>   acquisition's lookup data point.
+>
+> The served map is unchanged and stays last-wins. An identical
+> re-emit is not a conflict. Neither is a widening (a new version) or
+> an adoption riding an existing leaf, which restates the leaf's text
+> exactly. A cache hit runs no fold, so it doesn't re-report a
+> conflict; persisting conflicts in the artifact is #928. The status
+> stays `accepted`. Scenario RFC0033.8 is the criterion.
+
 ## 4. Alternatives considered
 
 **Two artifacts (registry and alias map separately).** Independent
@@ -671,6 +694,21 @@ ambiguity cannot recur.
 > - **And** the instrument names exist in the semconv registry
 >   (weaver-generated constants, no hand-written flat names).
 
+> **Scenario RFC0033.8 — Binding conflicts are reported, never
+> served differently** (amendment 2026-10-10, #927)
+> - **Given** a tenant's audit stream that binds two semantically
+>   different templates to one `(template_id, version)`
+> - **When** a query acquires the template map by folding that
+>   stream
+> - **Then** exactly one conflict is reported, as one
+>   `ourios.template_map.binding.conflicted` event carrying the
+>   tenant, template id and version and no template text, plus
+>   `ourios.template_map.lookup.anomaly = binding_conflict` on that
+>   lookup
+> - **And** the served map is unchanged (last-wins)
+> - **And** an identical re-emit, a widening (same id, new version)
+>   and an adoption onto an existing leaf report no conflict.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -689,6 +727,13 @@ Mapped to `CLAUDE.md` §6.2:
   is the gate, the absolute numbers are recorded.
 - **RFC0033.7** — the RFC 0016 metrics-pipeline test shape
   (in-memory exporter), plus the semconv no-diff CI gate.
+- **RFC0033.8** — unit tests on the registry fold in
+  `crates/ourios-querier/src/template_registry.rs`: one conflict
+  with the map unchanged, re-emit, widening, a real-miner adoption,
+  and a property test that the conflicts are exactly the
+  multiply-bound keys. Act 6 of `tests/rfc0033_7_observability.rs`
+  asserts the event and the lookup anomaly through the in-memory
+  log and metric exporters.
 
 > **Amendment (2026-07-13).** §6 is structurally unchanged by the
 > compressed encoding: the same tests exercise the v2 artifact

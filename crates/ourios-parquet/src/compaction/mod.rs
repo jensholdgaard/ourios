@@ -263,6 +263,7 @@ pub fn compact_partition_with_promoted(
 /// emitter's feed); `drop` removes rows from the consolidated output (a
 /// conversation-scoped erasure) — with a `drop` filter the partition is
 /// rewritten even when it holds a single file, so the erasure lands.
+/// `on_commit` hears of the rewrite the moment its manifest commit is won.
 #[derive(Default)]
 pub struct RowHooks<'a> {
     /// Called once per decoded batch, before any drop, so every input
@@ -270,12 +271,19 @@ pub struct RowHooks<'a> {
     pub observe: Option<&'a mut RowObserver<'a>>,
     /// Rows for which this returns `true` are not written back.
     pub drop: Option<&'a RowFilter<'a>>,
+    /// Called once the commit is won, before the superseded inputs are
+    /// deleted, with the outcome as it stands then (`gc_failures` is 0).
+    /// A crash during that cleanup leaves the partition committed, so a
+    /// caller recording commits records it here rather than on return.
+    pub on_commit: Option<&'a mut CommitHook<'a>>,
 }
 
 /// A [`RowHooks::observe`] callback.
 pub type RowObserver<'a> = dyn FnMut(&[MinedRecord]) + 'a;
 /// A [`RowHooks::drop`] predicate.
 pub type RowFilter<'a> = dyn Fn(&MinedRecord) -> bool + 'a;
+/// A [`RowHooks::on_commit`] callback.
+pub type CommitHook<'a> = dyn FnMut(&CompactionOutcome) + 'a;
 
 /// [`compact_partition_with_promoted`] with [`RowHooks`].
 ///
@@ -352,9 +360,10 @@ struct SortTuning {
     /// byte (§3.5), only scratch I/O.
     in_memory_max_bytes: u64,
     /// Fan-in cap F: more sorted runs than this merge hierarchically,
-    /// so phase-2 memory is ≤ (F + 1) × one decoded batch (F open runs
-    /// plus the merge's output chunk) regardless of
-    /// backlog. 64 single-passes any partition up to F budgets of
+    /// so phase 2 opens at most F runs, whose decoded batches together
+    /// hold at most `in_memory_max_bytes` (or one row per run, for rows
+    /// wider than a run's share), plus the merge's output chunk,
+    /// regardless of backlog. 64 single-passes any partition up to F budgets of
     /// decoded rows.
     fan_in: usize,
     /// RFC 0036 §3.3 compacted row-group rotation threshold override.
@@ -509,26 +518,51 @@ fn compact_sorted_hooked(
         Published::Lost => return Ok(lost_commit_outcome(store, &written.key, inputs.len())),
     }
 
+    let committed = Committed {
+        file: consolidated,
+        generation,
+        input_files,
+    };
+    let outcome = committed_outcome(&inputs, &totals, committed, bytes_written);
+    Ok(announce_and_clean_up(store, &inputs, hooks, outcome))
+}
+
+/// The outcome of a won commit of `inputs`, before their cleanup.
+fn committed_outcome(
+    inputs: &[String],
+    totals: &SortTotals,
+    committed: Committed,
+    bytes_written: u64,
+) -> CompactionOutcome {
+    CompactionOutcome {
+        files_before: inputs.len(),
+        rows: totals.rows,
+        rows_dropped: totals.rows_dropped,
+        committed: Some(committed),
+        commit_lost: false,
+        gc_failures: 0,
+        bytes_read: totals.bytes_read,
+        bytes_written,
+    }
+}
+
+/// Tell [`RowHooks::on_commit`] of the won commit, then delete the
+/// superseded `inputs`, counting the deletes that failed.
+fn announce_and_clean_up(
+    store: &Store,
+    inputs: &[String],
+    hooks: &mut RowHooks<'_>,
+    mut outcome: CompactionOutcome,
+) -> CompactionOutcome {
+    if let Some(on_commit) = hooks.on_commit.as_deref_mut() {
+        on_commit(&outcome);
+    }
     // GC the now-superseded inputs. The commit already succeeded, so a delete
     // failure only leaves a non-live orphan (the manifest excludes it) for a
     // later sweep — it must NOT turn a committed compaction into a reported
     // failure. Count such failures and continue; a not-found is
     // already-reclaimed (S3 DELETE is idempotent; the local backend reports
     // not-found — the GC treats both alike).
-    let gc_failures = delete_non_live(store, &inputs);
-
-    Ok(CompactionOutcome {
-        files_before: inputs.len(),
-        rows: totals.rows,
-        rows_dropped: totals.rows_dropped,
-        committed: Some(Committed {
-            file: consolidated,
-            generation,
-            input_files,
-        }),
-        commit_lost: false,
-        gc_failures,
-        bytes_read: totals.bytes_read,
-        bytes_written,
-    })
+    outcome.gc_failures = delete_non_live(store, inputs);
+    outcome
 }

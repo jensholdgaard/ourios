@@ -88,7 +88,9 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # / the `std::fs` walk) via `spawn_blocking` so it doesn't tie up a runtime worker
 # on the async query path. `rt` is the blocking-pool half only; the runtime itself
 # is the caller's (the server / `#[tokio::test]`).
-tokio = { version = "1", default-features = false, features = ["rt"] }
+# `sync` carries the per-tenant template-map single-flight's result
+# (`map_flight`).
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 # RFC 0033 §3.2 (2026-07-13 amendment) — the template-map artifact ships
 # as one zstd frame. `zstd` is the ergonomic safe wrapper over
 # `zstd-safe`; both bind the same bundled C library and `parquet`'s
@@ -96,6 +98,13 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # ourios-bench binds it directly as the A1 reference codec), so this
 # adds no new transitive crate and the version is pinned by `Cargo.lock`.
 zstd = "0.13"
+
+[features]
+# Test seams for integration tests that need to steer the template-map
+# single-flight (RFC0033.7's `joined` outcome): a gate run before each
+# acquisition and a count of queries waiting on one. Disabled by default;
+# test-only hooks, which CI's `--all-features` runs turn on.
+testing = []
 
 [dev-dependencies]
 # #853 — the request-counting `ObjectStore` wrapper (`src/test_support.rs`)
@@ -125,7 +134,8 @@ ourios-testgen = { path = "../ourios-testgen" }
 # (ourios-parquet, a normal dep) lays down fixture Parquet, and
 # tempfile gives each test a scratch bucket. `rt-multi-thread` for the
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
-tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros"] }
+# `time` for the delayed-GET store wrapper (`test_support::SlowStore`).
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile = "=3.27.0"
 # #895 (`tests/rfc0033_bounded_fold.rs`) — testing-mode heap profiler as the
 # global allocator, so the cold template-map derivation's peak heap is

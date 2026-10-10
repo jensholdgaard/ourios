@@ -31,7 +31,9 @@ use ourios_miner::cluster::{IdBlock, IdReservationError, IdReserver, MinerCluste
 use ourios_parquet::Store;
 
 use super::marker::{Marker, read_marker, write_marker};
-use super::{BootstrapPolicy, Seated, SnapshotTrust, TemplateIdsError, names, reserve, seat};
+use super::{
+    BootstrapPolicy, ScanOptions, Seated, SnapshotTrust, TemplateIdsError, names, reserve, seat,
+};
 
 /// Blocks kept ready beside the one the miner allocates from.
 const READY_BLOCKS: usize = 2;
@@ -113,6 +115,7 @@ pub struct TemplateIds {
     refiller: Mutex<Option<Refiller>>,
     replaying: Arc<AtomicBool>,
     allow_bootstrap: bool,
+    scan: ScanOptions,
 }
 
 impl TemplateIds {
@@ -133,6 +136,7 @@ impl TemplateIds {
             refiller: Mutex::new(None),
             replaying: Arc::new(AtomicBool::new(true)),
             allow_bootstrap: false,
+            scan: ScanOptions::default(),
         }
     }
 
@@ -142,6 +146,14 @@ impl TemplateIds {
     #[must_use]
     pub fn with_bootstrap_allowed(mut self, allowed: bool) -> Self {
         self.allow_bootstrap = allowed;
+        self
+    }
+
+    /// Stop a bootstrap scan in progress once `shutdown` is set: it fails
+    /// with [`TemplateIdsError::Interrupted`] and writes nothing.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
+        self.scan.shutdown = shutdown;
         self
     }
 
@@ -259,7 +271,7 @@ impl TemplateIds {
             (SnapshotTrust::Bootstrap, true) => BootstrapPolicy::Authorized,
         };
         let shared = &self.shared;
-        let seated = seat(&shared.store, miner, policy)?;
+        let seated = seat(&shared.store, miner, policy, &self.scan)?;
         lock(&shared.ready).highest = miner.highest_allocated();
         fill(shared)?;
         if !lock(&shared.ready).blocks.is_empty() {

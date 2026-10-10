@@ -109,7 +109,11 @@ impl Node {
         store: Store,
         allow_bootstrap: bool,
     ) -> Result<Restarted, RecoveryDriverError> {
-        let ids = TemplateIds::new(store).with_bootstrap_allowed(allow_bootstrap);
+        self.restart_ids(TemplateIds::new(store).with_bootstrap_allowed(allow_bootstrap))
+    }
+
+    /// [`Self::restart`] with `ids` as the template-id allocation.
+    pub fn restart_ids(&self, ids: TemplateIds) -> Result<Restarted, RecoveryDriverError> {
         let records = SharedRecordSink::new();
         let audit = SharedAuditSink::new();
         let mut miner = MinerCluster::new(MinerConfig::default())

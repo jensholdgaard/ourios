@@ -45,7 +45,7 @@ use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasFold;
-use crate::template_registry::{RegistryFold, TemplateRegistry};
+use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
 use crate::{QueryError, StoreRef, audit_scan};
 
 /// Canonical artifact key at the root of a tenant's audit subtree
@@ -112,6 +112,12 @@ const LOOKUP_OUTCOME_MISS: &str = "miss";
 const LOOKUP_OUTCOME_STALE: &str = "stale";
 const LOOKUP_OUTCOME_TORN: &str = "torn";
 const LOOKUP_OUTCOME_UNKNOWN_VERSION: &str = "unknown_version";
+/// A query served by another query's in-flight acquisition at the same
+/// frontier (`crate::map_flight`) — semconv v0.3.9.
+const LOOKUP_OUTCOME_JOINED: &str = "joined";
+/// `ourios.template_map.lookup.anomaly` value: the fold behind the lookup
+/// found a `(template_id, version)` bound to two different templates.
+const LOOKUP_ANOMALY_BINDING_CONFLICT: &str = "binding_conflict";
 /// `ourios.template_map.publish.outcome` attribute values (RFC 0033 §3.7).
 const PUBLISH_OUTCOME_PUBLISHED: &str = "published";
 const PUBLISH_OUTCOME_LOST_RACE: &str = "lost_race";
@@ -153,7 +159,7 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
 });
 
 impl TemplateMapMetrics {
-    fn record_lookup(&self, outcome: CacheOutcome) {
+    fn record_lookup(&self, outcome: CacheOutcome, binding_conflict: bool) {
         let value = match outcome {
             CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
             CacheOutcome::Miss {
@@ -167,6 +173,24 @@ impl TemplateMapMetrics {
             } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
             CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
         };
+        let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
+        if binding_conflict {
+            self.lookups.add(
+                1,
+                &[
+                    outcome,
+                    KeyValue::new(
+                        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY,
+                        LOOKUP_ANOMALY_BINDING_CONFLICT,
+                    ),
+                ],
+            );
+        } else {
+            self.lookups.add(1, &[outcome]);
+        }
+    }
+
+    fn record_lookup_value(&self, value: &'static str) {
         self.lookups.add(
             1,
             &[KeyValue::new(
@@ -185,6 +209,34 @@ impl TemplateMapMetrics {
             )],
         );
     }
+}
+
+/// Name every binding conflict a fold found, once per acquisition. The
+/// event carries the key, never the template texts — they can hold user
+/// data. Rendering for the key stays last-wins; the event is the signal
+/// that rows carrying it may render against the wrong template.
+fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)]) {
+    for &(template_id, version) in conflicts {
+        tracing::warn!(
+            name: semconv::EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED,
+            {
+                { semconv::OURIOS_TENANT } = tenant.as_str(),
+                { semconv::OURIOS_TEMPLATE_ID } = template_id,
+                { semconv::OURIOS_TEMPLATE_VERSION } = version,
+            },
+            "tenant {:?}'s audit stream binds template {template_id} version {version} to more \
+             than one template; rows carrying it render against the last binding, which may \
+             be the wrong one — see docs/guides/template-id-collisions.md",
+            tenant.as_str(),
+        );
+    }
+}
+
+/// Record a `joined` lookup: this query was served the map another query
+/// acquired at the same frontier. Only for a successful shared acquisition —
+/// the acquirer records its own outcome, and a failure records nothing.
+pub(crate) fn record_joined_lookup() {
+    METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED);
 }
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):
@@ -330,7 +382,23 @@ pub fn load_or_derive(
     backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
-    let resolved = audit_scan::resolve_audit_set(backend, tenant)?;
+    load_or_derive_resolved(
+        backend,
+        tenant,
+        audit_scan::resolve_audit_set(backend, tenant)?,
+    )
+}
+
+/// [`load_or_derive`] against a listing the caller already took — the
+/// querier's per-tenant single-flight (`map_flight`) lists once, keys the
+/// flight by that listing's frontier, and acquires against the same
+/// listing, so the §3.3 one-listing rule holds. No map is retained once
+/// the acquisition completes.
+pub(crate) fn load_or_derive_resolved(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
     let (fetched_bytes, expected, outcome) = match fetch_artifact(backend, tenant) {
         FetchedArtifact::Absent => (
             0,
@@ -350,7 +418,7 @@ pub fn load_or_derive(
             let len = bytes.len() as u64;
             match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
-                    METRICS.record_lookup(CacheOutcome::Hit);
+                    METRICS.record_lookup(CacheOutcome::Hit, false);
                     return Ok((map, len, CacheOutcome::Hit));
                 }
                 ArtifactRead::Valid(_) => (len, e_tag, CacheOutcome::StaleRefreshed),
@@ -371,7 +439,7 @@ pub fn load_or_derive(
             }
         }
     };
-    let (map, fold_bytes) = fold_template_map(resolved, tenant)?;
+    let (map, fold_bytes, conflicts) = fold_template_map(resolved, tenant)?;
     let acquisition_bytes =
         fold_bytes
             .checked_add(fetched_bytes)
@@ -383,7 +451,8 @@ pub fn load_or_derive(
             })?;
     // Recorded only after every fallible step — a counted outcome is
     // always one that answered, mirroring the hit arm's record-at-return.
-    METRICS.record_lookup(outcome);
+    announce_binding_conflicts(tenant, &conflicts);
+    METRICS.record_lookup(outcome, !conflicts.is_empty());
     map.write_through(backend, expected.as_deref(), fold_bytes);
     Ok((map, acquisition_bytes, outcome))
 }
@@ -436,8 +505,12 @@ fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
 /// (RFC 0031 §3.6 — on a cache miss this is exactly what template-map
 /// acquisition cost).
 ///
-/// Peak memory is one audit object and its decoded events, plus the live
-/// `(template_id, version)` winners, plus every alias event (held until
+/// Peak memory is one decoded audit file's events, plus the raw read-ahead
+/// — on the local backend one file's bytes; on the remote backend the
+/// fetched-but-unfolded objects, capped by the process-wide
+/// `audit_fetch::FetchPool` byte budget (32 MiB) or a single object larger
+/// than it, a cap shared by every concurrent fold in the process rather
+/// than granted to each — plus the live `(template_id, version)` winners, plus every alias event (held until
 /// the alias fold sorts them), plus one frontier entry per audit file.
 /// Template history no longer accumulates; the alias events and the
 /// frontier still grow with the audit set, as does the freshness listing
@@ -457,30 +530,34 @@ pub fn derive_template_map(
     tenant: &TenantId,
 ) -> Result<(TemplateMap, u64), QueryError> {
     fold_template_map(audit_scan::resolve_audit_set(backend, tenant)?, tenant)
+        .map(|(map, bytes, _conflicts)| (map, bytes))
 }
 
 /// [`derive_template_map`] from a pre-resolved audit set — the fallback
 /// arm of [`load_or_derive`], which must fold the **same** listing its
 /// freshness comparison used (RFC 0033 §3.3: one listing, taken once,
-/// for both).
+/// for both). Also returns the registry fold's binding conflicts, for the
+/// caller to report once per acquisition.
 fn fold_template_map(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
-) -> Result<(TemplateMap, u64), QueryError> {
+) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
     let mut registry = RegistryFold::default();
     let mut aliases = AliasFold::default();
     let scan = resolved.for_each_event(tenant, |event| match &event.payload {
         AuditPayload::Template { .. } => registry.push(event),
         _ => aliases.push(event),
     })?;
+    let (registry, conflicts) = registry.finish_checked();
     Ok((
         TemplateMap {
             tenant: tenant.clone(),
             folded_files: scan.frontier,
-            registry: registry.finish(),
+            registry,
             aliases: aliases.finish(),
         },
         scan.bytes_read,
+        conflicts,
     ))
 }
 

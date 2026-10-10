@@ -112,6 +112,11 @@ impl object_store::ObjectStore for HookedStore {
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.hooks.enter()?;
+        if location.as_ref().starts_with("data/")
+            && let Some(flag) = self.hooks.raise_on_data_read.get()
+        {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         let got = self.inner.get_opts(location, options).await;
         let absent = matches!(got, Err(object_store::Error::NotFound { .. }));
         if absent && is_high_water(location) {

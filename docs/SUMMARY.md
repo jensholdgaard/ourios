@@ -11,6 +11,7 @@
 - [Authentication](./guides/authentication.md)
 - [Query DSL by example](./guides/query-cookbook.md)
 - [Observe your coding agent](./guides/agent-telemetry.md)
+- [Check a store for template-id collisions](./guides/template-id-collisions.md)
 
 # Architecture
 

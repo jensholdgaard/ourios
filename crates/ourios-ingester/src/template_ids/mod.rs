@@ -11,7 +11,7 @@ mod bootstrap;
 mod marker;
 mod reserver;
 
-pub use bootstrap::{BootstrapScan, bootstrap};
+pub use bootstrap::{BootstrapScan, DEFAULT_SCAN_CONCURRENCY, ScanOptions, bootstrap};
 pub use marker::{SEATED_MARKER, SnapshotTrust, mark_seated};
 pub use reserver::{RefillerStillRunning, TemplateIds};
 
@@ -66,6 +66,11 @@ pub enum TemplateIdsError {
     Contended,
     /// The bootstrap scan could not read a data or audit file.
     Scan(Box<IdMaxError>),
+    /// The bootstrap scan could not start a thread.
+    ScanThread(std::io::Error),
+    /// A shutdown stopped the bootstrap scan before it read every file:
+    /// nothing was written, and the next start scans again.
+    Interrupted { files_scanned: u64 },
     /// No id is left in the `u64` space.
     Exhausted(IdSpaceExhausted),
     /// The background refiller thread could not start.
@@ -108,13 +113,14 @@ impl TemplateIdsError {
             Self::LaterVersion { .. } => "later_version",
             Self::Contended => "contended",
             Self::Scan(_) => "scan",
+            Self::Interrupted { .. } => "interrupted",
             Self::Exhausted(_) => "exhausted",
             Self::BootstrapRaceLost => "bootstrap_race_lost",
             Self::Marker { .. } | Self::Snapshots(_) | Self::MarkerInvalid { .. } => "marker",
             Self::HighWaterDeleted => "deleted",
             Self::BootstrapNotAuthorized => "bootstrap_not_authorized",
             Self::HighWaterRolledBack { .. } => "rolled_back",
-            Self::Refiller(_) | Self::FirstBlock(_) => "_OTHER",
+            Self::Refiller(_) | Self::FirstBlock(_) | Self::ScanThread(_) => "_OTHER",
         }
     }
 }
@@ -149,6 +155,8 @@ impl std::fmt::Display for TemplateIdsError {
                  (RFC 0059 §3.6): {e}"
             ),
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
+            Self::ScanThread(e) => write!(f, "start a template-id bootstrap scan thread: {e}"),
+            Self::Interrupted { files_scanned } => interrupted(f, *files_scanned),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),
             Self::Refiller(e) => write!(f, "start the template-id refiller: {e}"),
             Self::FirstBlock(e) => write!(f, "take the first template-id block: {e}"),
@@ -162,31 +170,56 @@ impl std::fmt::Display for TemplateIdsError {
             Self::MarkerInvalid { detail } => {
                 write!(f, "{SEATED_MARKER} is not a usable seated marker: {detail}")
             }
-            Self::BootstrapNotAuthorized => write!(
-                f,
-                "{HIGH_WATER_KEY} is absent but the store already holds data: bootstrapping \
-                 the template-id high-water needs explicit authorisation. For the upgrade to \
-                 RFC 0059, stop every older receiver, start one upgraded replica with \
-                 receiver.template_ids_allow_bootstrap (OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP) \
-                 set to true, and remove the setting once it has seated"
-            ),
-            Self::HighWaterRolledBack { seen, found } => write!(
-                f,
-                "{HIGH_WATER_KEY} reads {found}, below the {seen} this root already reserved: \
-                 the object was rolled back to an older copy, which is unsupported. Recover \
-                 by stopping every receiver, removing the object and every root's \
-                 {SEATED_MARKER}, and starting one replica authorised to bootstrap (RFC 0059 \
-                 §3.1)"
-            ),
-            Self::HighWaterDeleted => write!(
-                f,
-                "{HIGH_WATER_KEY} is gone though this root has seated against it; it must \
-                 never be deleted. Recover by stopping every receiver, removing every root's \
-                 {SEATED_MARKER}, and starting one replica authorised to bootstrap (RFC 0059 \
-                 §3.1)"
-            ),
+            Self::BootstrapNotAuthorized => bootstrap_not_authorized(f),
+            Self::HighWaterRolledBack { seen, found } => rolled_back(f, *seen, *found),
+            Self::HighWaterDeleted => deleted(f),
         }
     }
+}
+
+fn interrupted(f: &mut std::fmt::Formatter<'_>, files_scanned: u64) -> std::fmt::Result {
+    write!(
+        f,
+        "template-id bootstrap scan interrupted by shutdown after {files_scanned} footers; \
+         nothing was written, and the next start authorised to bootstrap scans again from \
+         the beginning"
+    )
+}
+
+/// What an operator does for the upgrade to RFC 0059 (§3.5).
+fn bootstrap_not_authorized(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+        f,
+        "{HIGH_WATER_KEY} is absent but the store already holds data: bootstrapping the \
+         template-id high-water needs explicit authorisation. For the upgrade to RFC 0059, \
+         stop every older receiver, start one upgraded replica with \
+         receiver.template_ids_allow_bootstrap (OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP) set to \
+         true. That start reads every data and audit footer before its listeners open, so \
+         it is offline for about the store's file count divided by the scan's read rate; \
+         compact the store first if it holds many small files. Remove the setting only once \
+         it has logged {BOOTSTRAPPED} or written {SEATED_MARKER} under its snapshots root. A \
+         shutdown during the scan writes nothing, and the next start scans again",
+        BOOTSTRAPPED = names::BOOTSTRAPPED,
+    )
+}
+
+fn rolled_back(f: &mut std::fmt::Formatter<'_>, seen: u64, found: u64) -> std::fmt::Result {
+    write!(
+        f,
+        "{HIGH_WATER_KEY} reads {found}, below the {seen} this root already reserved: the \
+         object was rolled back to an older copy, which is unsupported. Recover by stopping \
+         every receiver, removing the object and every root's {SEATED_MARKER}, and starting \
+         one replica authorised to bootstrap (RFC 0059 §3.1)"
+    )
+}
+
+fn deleted(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+        f,
+        "{HIGH_WATER_KEY} is gone though this root has seated against it; it must never be \
+         deleted. Recover by stopping every receiver, removing every root's {SEATED_MARKER}, \
+         and starting one replica authorised to bootstrap (RFC 0059 §3.1)"
+    )
 }
 
 impl std::error::Error for TemplateIdsError {
@@ -194,6 +227,7 @@ impl std::error::Error for TemplateIdsError {
         match self {
             Self::Store { source, .. } => Some(source.as_ref()),
             Self::Scan(e) => Some(e.as_ref()),
+            Self::ScanThread(e) => Some(e),
             Self::Exhausted(e) => Some(e),
             Self::Marker { source, .. } => Some(source),
             Self::Snapshots(e) => Some(e),
@@ -205,6 +239,7 @@ impl std::error::Error for TemplateIdsError {
             | Self::HighWaterDeleted
             | Self::BootstrapNotAuthorized
             | Self::HighWaterRolledBack { .. }
+            | Self::Interrupted { .. }
             | Self::Refiller(_) => None,
             Self::FirstBlock(e) => Some(e),
         }
@@ -433,6 +468,7 @@ pub fn seat(
     store: &Store,
     miner: &mut MinerCluster,
     policy: BootstrapPolicy,
+    scan: &ScanOptions,
 ) -> Result<Seated, TemplateIdsError> {
     let restored = miner.highest_allocated();
     let seated = match (read(store)?, policy) {
@@ -458,7 +494,7 @@ pub fn seat(
             return Err(TemplateIdsError::BootstrapNotAuthorized);
         }
         (None, BootstrapPolicy::IfStoreEmpty | BootstrapPolicy::Authorized) => {
-            bootstrap(store, restored)?
+            bootstrap(store, restored, scan)?
         }
     };
     miner

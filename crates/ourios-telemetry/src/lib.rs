@@ -36,6 +36,7 @@
 #[cfg(feature = "testing")]
 pub mod live_check;
 mod process;
+mod runtime;
 
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider as _;
@@ -368,6 +369,10 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
             .with_resource(resource.clone())
             .build();
         process::register(&provider.meter(process::SCOPE));
+        // The runtime `init` runs on is the binary's main runtime.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime::register(&provider.meter(runtime::SCOPE), &runtime);
+        }
         Some(provider)
     } else {
         None

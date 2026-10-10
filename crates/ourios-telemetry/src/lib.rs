@@ -8,6 +8,9 @@
 //! OTLP **push** `MeterProvider` (periodic-reader export), installs it
 //! as the process-global provider, and hands back a [`TelemetryGuard`]
 //! whose [`TelemetryGuard::shutdown`] flushes pending telemetry on exit.
+//! The same provider carries the upstream `OTel` process metrics
+//! (`process.memory.usage`, `process.cpu.time`, …), so memory and CPU
+//! pressure show up in Ourios's own telemetry before the kernel acts on it.
 //!
 //! **Logs are dogfooded** (CLAUDE.md §6.3): [`init`] also builds an OTLP
 //! `SdkLoggerProvider` and installs a `tracing` subscriber whose
@@ -32,8 +35,10 @@
 
 #[cfg(feature = "testing")]
 pub mod live_check;
+mod process;
 
 use opentelemetry::global;
+use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
@@ -355,12 +360,12 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         }
         let exporter = builder.build()?;
         let reader = PeriodicReader::builder(exporter).build();
-        Some(
-            SdkMeterProvider::builder()
-                .with_reader(reader)
-                .with_resource(resource.clone())
-                .build(),
-        )
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource.clone())
+            .build();
+        process::register(&provider.meter(process::SCOPE));
+        Some(provider)
     } else {
         None
     };
@@ -538,7 +543,6 @@ pub fn init_in_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
 

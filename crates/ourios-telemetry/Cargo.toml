@@ -51,6 +51,13 @@ serde_json = { version = "1", default-features = false, features = ["std"], opti
 # `weaver registry live-check`.
 testing = ["opentelemetry_sdk/testing", "dep:serde_json"]
 
+# `process.cpu.time` converts `/proc/self/stat`'s clock ticks to seconds at
+# the kernel's tick rate, which only the auxiliary vector reports; rustix
+# reads it safely (the workspace denies `unsafe_code`). Already in the tree
+# via tempfile.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.5", default-features = false, features = ["param", "std"] }
+
 [dev-dependencies]
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "logs", "trace", "testing"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }

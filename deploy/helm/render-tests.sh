@@ -387,6 +387,39 @@ check "upgrade path: auth, tls and mcp maps absent" "" \
       --set querier.tls=null --set querier.mcp=null \
       | grep -E '^auth:|_tls:|mcp:' || true)"
 
+# A pre-0.5 release upgraded with --reuse-values has none of the new keys,
+# so values.yaml defaults (clientCA.key: ca.crt) never merge in: turning on
+# mTLS with only the two existingSecret names must still render.
+check "upgrade path: mTLS with only existingSecret names takes the ca.crt default" \
+  'client_ca_file: "/etc/ourios-tls/http-client-ca/ca.crt"' \
+  "$(role_config querier --set auth=null --set receiver.tls=null --set querier.mcp=null \
+      --set querier.tls.http.clientCA.key=null \
+      --set querier.tls.http.minVersion=null \
+      --set querier.tls.http.reloadIntervalSecs=null \
+      --set querier.tls.http.existingSecret=q-tls \
+      --set querier.tls.http.clientCA.existingSecret=q-ca \
+      | grep 'client_ca_file' | sed 's/^ *//')"
+
+# A YAML 0 or false where a Secret name or key belongs is a typo, not
+# "unset": it must fail rather than silently leave TLS or a token off.
+check_fails "existingSecret: 0 is refused, not read as plaintext" \
+  "querier.tls.http.existingSecret must be a Secret name or key" \
+  --set querier.tls.http.existingSecret=0
+check_fails "existingSecret: false is refused, not read as plaintext" \
+  "receiver.tls.grpc.existingSecret must be a Secret name or key" \
+  --set receiver.tls.grpc.existingSecret=false
+check_fails "clientCA.existingSecret: false is refused, not read as no mTLS" \
+  "receiver.tls.http.clientCA.existingSecret must be a Secret name or key" \
+  --set receiver.tls.http.existingSecret=t --set receiver.tls.http.clientCA.existingSecret=false
+check_fails "a token secretKeyRef.name of 0 is refused" \
+  "auth.tokens[0].secretKeyRef.name must be a Secret name or key" \
+  --set 'auth.tokens[0].name=e' --set 'auth.tokens[0].tenants[0]=a' \
+  --set 'auth.tokens[0].secretKeyRef.name=0' --set 'auth.tokens[0].secretKeyRef.key=k'
+check_fails "an OpenFGA apiToken key of false is refused" \
+  "auth.openfga.apiToken.secretKeyRef.key must be a Secret name or key" \
+  "${fga_args[@]}" --set auth.openfga.apiToken.secretKeyRef.name=n \
+  --set auth.openfga.apiToken.secretKeyRef.key=false
+
 check "helm test: an authenticated querier is probed over TCP, not an anonymous query" \
   "nc -z -w5 t-ourios-querier 4319" \
   "$(helm template t "$CHART" --show-only templates/tests/test-connection.yaml "${secure_args[@]}" \

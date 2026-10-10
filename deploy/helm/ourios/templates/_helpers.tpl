@@ -201,6 +201,57 @@ The TLS listeners a role serves (RFC 0030): the value keys under
 {{- end }}
 
 {{/*
+A Secret coordinate (a Secret name or key) as a string; pass (dict "path"
+"<values path>" "value" <v>). Absent or "" renders nothing; any other
+non-string (a YAML 0, false, a map) fails the render, so a typo can never
+read as "unset" and silently turn TLS or a token off.
+*/}}
+{{- define "ourios.secretRef" -}}
+{{- if and (not (kindIs "invalid" .value)) (ne (toString .value) "") }}
+{{- if not (kindIs "string" .value) }}
+{{- fail (printf "%s must be a Secret name or key (a non-empty string), got %v" .path .value) }}
+{{- end }}
+{{- .value }}
+{{- end }}
+{{- end }}
+
+{{/*
+One listener's validated TLS settings as JSON (read back with fromJson);
+pass (dict "root" $ "role" "<role>" "listener" "<listener>"). Every TLS
+helper and NOTES.txt reads this one result. Defaults live here rather than
+in values.yaml, so `helm upgrade --reuse-values` from a release without
+these keys gets them too. `secret` is empty when the listener is
+plaintext.
+*/}}
+{{- define "ourios.tlsListener" -}}
+{{- $role := .role -}}
+{{- $l := .listener -}}
+{{- $p := printf "%s.tls.%s" $role $l -}}
+{{- $t := dig "tls" $l (dict) (index .root.Values $role | default dict) -}}
+{{- $ca := $t.clientCA | default dict -}}
+{{- $secret := include "ourios.secretRef" (dict "path" (printf "%s.existingSecret" $p) "value" $t.existingSecret) -}}
+{{- $caSecret := include "ourios.secretRef" (dict "path" (printf "%s.clientCA.existingSecret" $p) "value" $ca.existingSecret) -}}
+{{- $caKey := include "ourios.secretRef" (dict "path" (printf "%s.clientCA.key" $p) "value" $ca.key) | default "ca.crt" -}}
+{{- $minVersion := include "ourios.setValue" $t.minVersion -}}
+{{- $reload := include "ourios.setValue" $t.reloadIntervalSecs -}}
+{{- if $secret }}
+{{- if and $minVersion (not (has $minVersion (list "1.2" "1.3"))) }}
+{{- fail (printf "%s.minVersion must be \"1.2\" or \"1.3\", got %v" $p $t.minVersion) }}
+{{- end }}
+{{- if and $reload (not (regexMatch "^[1-9][0-9]*$" $reload)) }}
+{{- fail (printf "%s.reloadIntervalSecs must be a positive integer (seconds), got %v" $p $t.reloadIntervalSecs) }}
+{{- end }}
+{{- else if $caSecret }}
+{{- fail (printf "%s.clientCA.existingSecret needs %s.existingSecret: mTLS requires the listener's own certificate" $p $p) }}
+{{- else if $minVersion }}
+{{- fail (printf "%s.minVersion needs %s.existingSecret: without a certificate the listener stays plaintext (RFC 0030 §3.1)" $p $p) }}
+{{- else if $reload }}
+{{- fail (printf "%s.reloadIntervalSecs needs %s.existingSecret: without a certificate the listener stays plaintext (RFC 0030 §3.1)" $p $p) }}
+{{- end }}
+{{- toJson (dict "secret" $secret "caSecret" $caSecret "caKey" $caKey "minVersion" $minVersion "reload" $reload) }}
+{{- end }}
+
+{{/*
 One `<listener>_tls` config block per listener with a Secret configured; pass
 (dict "root" $ "role" "<role>"). The paths point at the read-only Secret
 mounts from ourios.tlsVolumes, outside /etc/ourios (the ConfigMap mount).
@@ -208,38 +259,23 @@ Mounted without subPath, so a rotated Secret reaches the files and
 reloadIntervalSecs picks it up.
 */}}
 {{- define "ourios.tlsConfig" -}}
+{{- $root := .root -}}
 {{- $role := .role -}}
-{{- $roleValues := index .root.Values $role | default dict -}}
 {{- range $l := splitList " " (include "ourios.tlsListeners" $role) }}
-{{- $t := dig "tls" $l (dict) $roleValues }}
-{{- $ca := $t.clientCA | default dict }}
-{{- $minVersion := include "ourios.setValue" $t.minVersion }}
-{{- $reload := include "ourios.setValue" $t.reloadIntervalSecs }}
-{{- if $t.existingSecret }}
-{{- if and $minVersion (not (has $minVersion (list "1.2" "1.3"))) }}
-{{- fail (printf "%s.tls.%s.minVersion must be \"1.2\" or \"1.3\", got %v" $role $l $t.minVersion) }}
-{{- end }}
-{{- if and $reload (not (regexMatch "^[1-9][0-9]*$" $reload)) }}
-{{- fail (printf "%s.tls.%s.reloadIntervalSecs must be a positive integer (seconds), got %v" $role $l $t.reloadIntervalSecs) }}
-{{- end }}
+{{- $v := include "ourios.tlsListener" (dict "root" $root "role" $role "listener" $l) | fromJson }}
+{{- if $v.secret }}
 {{ $l }}_tls:
   cert_file: "/etc/ourios-tls/{{ $l }}/tls.crt"
   key_file: "/etc/ourios-tls/{{ $l }}/tls.key"
-{{- with $ca.existingSecret }}
-  client_ca_file: "/etc/ourios-tls/{{ $l }}-client-ca/{{ required (printf "%s.tls.%s.clientCA.key is required with clientCA.existingSecret" $role $l) $ca.key }}"
+{{- if $v.caSecret }}
+  client_ca_file: "/etc/ourios-tls/{{ $l }}-client-ca/{{ $v.caKey }}"
 {{- end }}
-{{- with $minVersion }}
+{{- with $v.minVersion }}
   min_version: {{ . | quote }}
 {{- end }}
-{{- with $reload }}
+{{- with $v.reload }}
   reload_interval_secs: {{ . }}
 {{- end }}
-{{- else if $ca.existingSecret }}
-{{- fail (printf "%s.tls.%s.clientCA.existingSecret needs %s.tls.%s.existingSecret: mTLS requires the listener's own certificate" $role $l $role $l) }}
-{{- else if $minVersion }}
-{{- fail (printf "%s.tls.%s.minVersion needs %s.tls.%s.existingSecret: without a certificate the listener stays plaintext (RFC 0030 §3.1)" $role $l $role $l) }}
-{{- else if $reload }}
-{{- fail (printf "%s.tls.%s.reloadIntervalSecs needs %s.tls.%s.existingSecret: without a certificate the listener stays plaintext (RFC 0030 §3.1)" $role $l $role $l) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -249,15 +285,16 @@ The read-only Secret volumes behind ourios.tlsConfig; pass (dict "root" $
 "role" "<role>"). Renders empty when no listener has TLS.
 */}}
 {{- define "ourios.tlsVolumes" -}}
-{{- $roleValues := index .root.Values .role | default dict -}}
-{{- range $l := splitList " " (include "ourios.tlsListeners" .role) }}
-{{- $t := dig "tls" $l (dict) $roleValues }}
-{{- with $t.existingSecret }}
+{{- $root := .root -}}
+{{- $role := .role -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" $role) }}
+{{- $v := include "ourios.tlsListener" (dict "root" $root "role" $role "listener" $l) | fromJson }}
+{{- with $v.secret }}
 - name: tls-{{ $l }}
   secret:
     secretName: {{ . | quote }}
 {{- end }}
-{{- with ($t.clientCA | default dict).existingSecret }}
+{{- with $v.caSecret }}
 - name: tls-{{ $l }}-client-ca
   secret:
     secretName: {{ . | quote }}
@@ -266,15 +303,16 @@ The read-only Secret volumes behind ourios.tlsConfig; pass (dict "root" $
 {{- end }}
 
 {{- define "ourios.tlsVolumeMounts" -}}
-{{- $roleValues := index .root.Values .role | default dict -}}
-{{- range $l := splitList " " (include "ourios.tlsListeners" .role) }}
-{{- $t := dig "tls" $l (dict) $roleValues }}
-{{- if $t.existingSecret }}
+{{- $root := .root -}}
+{{- $role := .role -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" $role) }}
+{{- $v := include "ourios.tlsListener" (dict "root" $root "role" $role "listener" $l) | fromJson }}
+{{- if $v.secret }}
 - name: tls-{{ $l }}
   mountPath: /etc/ourios-tls/{{ $l }}
   readOnly: true
 {{- end }}
-{{- if ($t.clientCA | default dict).existingSecret }}
+{{- if $v.caSecret }}
 - name: tls-{{ $l }}-client-ca
   mountPath: /etc/ourios-tls/{{ $l }}-client-ca
   readOnly: true
@@ -296,9 +334,10 @@ Whether a role's listeners serve TLS; pass (dict "root" $ "role" "<role>").
 Renders "true" or nothing.
 */}}
 {{- define "ourios.tlsEnabled" -}}
-{{- $roleValues := index .root.Values .role | default dict -}}
-{{- range $l := splitList " " (include "ourios.tlsListeners" .role) }}
-{{- if dig "tls" $l "existingSecret" "" $roleValues }}true{{- end }}
+{{- $root := .root -}}
+{{- $role := .role -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" $role) }}
+{{- if (include "ourios.tlsListener" (dict "root" $root "role" $role "listener" $l) | fromJson).secret }}true{{- end }}
 {{- end }}
 {{- end }}
 
@@ -320,6 +359,25 @@ empty value; 0 still renders.
 {{- if and (not (kindIs "invalid" .value)) (ne (toString .value) "") }}
 {{ repeat 4 " " }}{{ .key }}: {{ toString .value | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+A validated secretKeyRef as JSON {name, key} (read back with fromJson);
+pass (dict "path" "<values path>" "ref" <map>). Each half goes through
+ourios.secretRef, so a non-string fails the render.
+*/}}
+{{- define "ourios.secretKeyRef" -}}
+{{- $ref := .ref | default dict -}}
+{{- toJson (dict
+  "name" (include "ourios.secretRef" (dict "path" (printf "%s.name" .path) "value" $ref.name))
+  "key" (include "ourios.secretRef" (dict "path" (printf "%s.key" .path) "value" $ref.key))) }}
+{{- end }}
+
+{{/*
+The OpenFGA API token's validated secretKeyRef; pass the auth.openfga map.
+*/}}
+{{- define "ourios.openfgaTokenRef" -}}
+{{- include "ourios.secretKeyRef" (dict "path" "auth.openfga.apiToken.secretKeyRef" "ref" (dig "apiToken" "secretKeyRef" (dict) (. | default dict))) }}
 {{- end }}
 
 {{/*
@@ -345,7 +403,7 @@ auth:
 {{- if hasKey $t "token" }}
 {{- fail (printf "auth.tokens[%d].token is not accepted: put the token in a Secret and reference it with auth.tokens[%d].secretKeyRef (name, key)" $i $i) }}
 {{- end }}
-{{- $ref := $t.secretKeyRef | default dict }}
+{{- $ref := include "ourios.secretKeyRef" (dict "path" (printf "auth.tokens[%d].secretKeyRef" $i) "ref" $t.secretKeyRef) | fromJson }}
 {{- if not (and $ref.name $ref.key) }}
 {{- fail (printf "auth.tokens[%d].secretKeyRef.name and .key are required: the token value comes only from a Secret" $i) }}
 {{- end }}
@@ -379,7 +437,7 @@ auth:
     api_url: {{ required "auth.openfga.apiUrl is required with auth.openfga.enabled" $fga.apiUrl | quote }}
     store_id: {{ required "auth.openfga.storeId is required with auth.openfga.enabled" $fga.storeId | quote }}
 {{- include "ourios.optScalar" (dict "key" "authorization_model_id" "value" $fga.authorizationModelId) }}
-{{- $ref := dig "apiToken" "secretKeyRef" (dict) $fga }}
+{{- $ref := include "ourios.openfgaTokenRef" $fga | fromJson }}
 {{- if and (or $ref.name $ref.key) (not (and $ref.name $ref.key)) }}
 {{- fail "auth.openfga.apiToken.secretKeyRef needs both name and key, or neither (no API token)" }}
 {{- end }}
@@ -406,11 +464,12 @@ when auth is off. Only the receiver and querier take it.
 - name: OURIOS_AUTH_TOKEN_{{ $i }}
   valueFrom:
     secretKeyRef:
-      name: {{ $t.secretKeyRef.name | quote }}
-      key: {{ $t.secretKeyRef.key | quote }}
+      {{- $ref := include "ourios.secretKeyRef" (dict "path" (printf "auth.tokens[%d].secretKeyRef" $i) "ref" $t.secretKeyRef) | fromJson }}
+      name: {{ $ref.name | quote }}
+      key: {{ $ref.key | quote }}
 {{- end }}
 {{- $fga := $auth.openfga | default dict }}
-{{- $ref := dig "apiToken" "secretKeyRef" (dict) $fga }}
+{{- $ref := include "ourios.openfgaTokenRef" $fga | fromJson }}
 {{- if and $fga.enabled $ref.name }}
 - name: OURIOS_OPENFGA_API_TOKEN
   valueFrom:

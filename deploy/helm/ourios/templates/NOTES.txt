@@ -64,9 +64,12 @@ receiver.tls / querier.tls); see the chart README's "Authentication and TLS".
 {{- if dig "oidc" "enabled" false $auth }}{{ $halves = append $halves "OIDC" }}{{ end }}
 Authentication is ON ({{ join " + " $halves }}{{ if dig "openfga" "enabled" false $auth }}; tenants bound by OpenFGA{{ end }}).
 {{- $plain := list }}
-{{- if and .Values.receiver.enabled (not (dig "tls" "grpc" "existingSecret" "" .Values.receiver)) }}{{ $plain = append $plain "receiver gRPC :4317" }}{{ end }}
-{{- if and .Values.receiver.enabled (not (dig "tls" "http" "existingSecret" "" .Values.receiver)) }}{{ $plain = append $plain "receiver HTTP :4318" }}{{ end }}
-{{- if and .Values.querier.enabled (not (dig "tls" "http" "existingSecret" "" .Values.querier)) }}{{ $plain = append $plain "querier HTTP :4319" }}{{ end }}
+{{- range $listener := list (list "receiver" "grpc" "receiver gRPC :4317") (list "receiver" "http" "receiver HTTP :4318") (list "querier" "http" "querier HTTP :4319") }}
+{{- $role := index $listener 0 }}
+{{- if and (index $.Values $role).enabled (not (include "ourios.tlsListener" (dict "root" $ "role" $role "listener" (index $listener 1)) | fromJson).secret) }}
+{{- $plain = append $plain (index $listener 2) }}
+{{- end }}
+{{- end }}
 {{- with $plain }}
   These listeners carry bearer credentials in plaintext:
     {{ join ", " . }}.
@@ -85,14 +88,15 @@ Query the logs DSL (port-forward from your workstation):
 {{- end }}
 {{- if include "ourios.tlsEnabled" (dict "root" . "role" "querier") }}
 {{- $host := printf "%s-querier.%s.svc" (include "ourios.fullname" .) .Release.Namespace }}
+{{- $mtls := (include "ourios.tlsListener" (dict "root" . "role" "querier" "listener" "http") | fromJson).caSecret }}
     --cacert ca.crt --resolve {{ $host }}:4319:127.0.0.1 \
-{{- if dig "tls" "http" "clientCA" "existingSecret" "" .Values.querier }}
+{{- if $mtls }}
     --cert client.crt --key client.key \
 {{- end }}
     --data 'template_id == 0' https://{{ $host }}:4319/v1/query
   (ca.crt: the CA that issued the querier certificate. Replace the host with
   a DNS name the certificate carries.
-{{- if dig "tls" "http" "clientCA" "existingSecret" "" .Values.querier }}
+{{- if $mtls }}
   mTLS is on: client.crt/client.key must chain to the configured client CA.
 {{- end }})
 {{- else }}

@@ -1108,9 +1108,13 @@ The ids are referenced from test code.
 > - **And** its peak heap is below one eighth of the history's body and
 >   template bytes
 > - **And** when the history grows 4× by adding directories, with the
->   widest directory and the largest file held fixed, the peak grows
->   less than 1.5×: it is bounded by the largest directory listing plus
->   one file, not by the number of files or directories
+>   widest directory and the largest file held fixed, the peak of a scan
+>   reading one footer at a time grows less than 1.5×: it is bounded by
+>   the largest directory listing plus one file, not by the number of
+>   files or directories
+> - **And** at the default concurrency of 16 the peak stays below that
+>   one-at-a-time peak plus 15 more reads, each of at most three times
+>   the largest file, and below one eighth of the history's bytes
 
 > **Scenario RFC0059.8 — Concurrent reservers on one store get disjoint blocks**
 > - **Given** a store with `If-Match` support and two reservers on it

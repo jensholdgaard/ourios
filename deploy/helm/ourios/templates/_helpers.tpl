@@ -236,6 +236,10 @@ reloadIntervalSecs picks it up.
 {{- end }}
 {{- else if $ca.existingSecret }}
 {{- fail (printf "%s.tls.%s.clientCA.existingSecret needs %s.tls.%s.existingSecret: mTLS requires the listener's own certificate" $role $l $role $l) }}
+{{- else if $minVersion }}
+{{- fail (printf "%s.tls.%s.minVersion needs %s.tls.%s.existingSecret: without a certificate the listener stays plaintext (RFC 0030 §3.1)" $role $l $role $l) }}
+{{- else if $reload }}
+{{- fail (printf "%s.tls.%s.reloadIntervalSecs needs %s.tls.%s.existingSecret: without a certificate the listener stays plaintext (RFC 0030 §3.1)" $role $l $role $l) }}
 {{- end }}
 {{- end }}
 {{- end }}

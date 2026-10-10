@@ -319,6 +319,17 @@ enabled: true" \
       | sed -n '/^  mcp:/,/^  [a-z_]*:$/p' | sed 's/^ *//' | head -2)"
 check "MCP off by default" "" "$(role_config querier | grep 'mcp:' || true)"
 
+# TLS-only settings without the listener's certificate would leave it on
+# plaintext while looking configured: refuse them on every listener.
+for listener in receiver.tls.grpc receiver.tls.http querier.tls.http; do
+  check_fails "$listener.minVersion without existingSecret is refused" \
+    "$listener.minVersion needs $listener.existingSecret" \
+    --set-string "$listener.minVersion=1.3"
+  check_fails "$listener.reloadIntervalSecs without existingSecret is refused" \
+    "$listener.reloadIntervalSecs needs $listener.existingSecret" \
+    --set "$listener.reloadIntervalSecs=60"
+done
+
 # Explicit invalid values must fail the render, typed zeros included: the
 # empty-value shortcuts (`default`, `with`) would otherwise drop them.
 check_fails "a numeric minVersion 0 is refused, not dropped" "minVersion must be" \

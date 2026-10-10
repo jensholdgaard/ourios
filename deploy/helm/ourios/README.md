@@ -125,8 +125,12 @@ server-side behaviour is documented in
 value. Each token names an existing Secret and key; the chart injects it as
 an env var with `secretKeyRef` and the config file holds only the
 `${env:…}` reference (the server refuses an inline token). TLS material is
-mounted read-only from existing Secrets. No secret value, Secret name or key
-appears in the rendered ConfigMap, and the chart renders no Secret object.
+mounted read-only from existing Secrets. The token and OpenFGA Secret names
+and keys appear only in the Pod spec, never in the rendered ConfigMap, and
+no secret value appears anywhere in the chart's output; the chart renders no
+Secret object. The ConfigMap does hold the TLS file paths, which include the
+client CA's key name (`client_ca_file: /etc/ourios-tls/<listener>-client-ca/<key>`):
+that path is not secret.
 Rotating a token Secret needs `kubectl rollout restart` of the receiver and
 querier; rotated TLS Secrets are picked up in place when
 `reloadIntervalSecs` is set.

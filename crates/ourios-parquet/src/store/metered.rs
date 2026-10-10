@@ -14,7 +14,75 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 
+use super::Store;
 use super::metrics::{Call, Caller, Metrics, Observed, Operation};
+
+/// What a [`Store`] constructor resolved, for [`Store::assemble`].
+pub(super) struct Backend {
+    pub(super) store: Arc<dyn ObjectStore>,
+    pub(super) http: bool,
+    pub(super) prefix: Path,
+    pub(super) conditional_update: bool,
+    pub(super) local_root: Option<std::path::PathBuf>,
+    pub(super) metrics: Metrics,
+}
+
+impl Store {
+    pub(super) fn assemble(backend: Backend) -> Self {
+        let Backend {
+            store,
+            http,
+            prefix,
+            conditional_update,
+            local_root,
+            metrics,
+        } = backend;
+        Self {
+            inner: Arc::clone(&store),
+            backend: store,
+            http,
+            caller: Caller::default(),
+            metrics,
+            prefix,
+            conditional_update,
+            local_root,
+        }
+        .metered()
+    }
+
+    /// Rebuild [`Self::inner`] over the backend, for the current caller and
+    /// metrics.
+    pub(super) fn metered(self) -> Self {
+        Self {
+            inner: Arc::new(Metered {
+                inner: Arc::clone(&self.backend),
+                caller: self.caller,
+                metrics: self.metrics.clone(),
+                http: self.http,
+            }),
+            ..self
+        }
+    }
+
+    /// This handle, with its calls attributed to `caller` in the storage
+    /// metrics. A subsystem sets it where it takes its handle; the backend
+    /// is shared, so the handle stays as cheap to make as a clone.
+    #[must_use]
+    pub fn with_caller(self, caller: Caller) -> Self {
+        Self { caller, ..self }.metered()
+    }
+
+    /// The subsystem this handle's calls are attributed to.
+    #[must_use]
+    pub fn caller(&self) -> Caller {
+        self.caller
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_metrics(self, metrics: Metrics) -> Self {
+        Self { metrics, ..self }.metered()
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Metered {

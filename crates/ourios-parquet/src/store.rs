@@ -19,75 +19,27 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use std::panic::AssertUnwindSafe;
-
-use futures::{FutureExt, TryStreamExt};
-use object_store::ClientConfigKey;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-use object_store::client::SpawnedReqwestConnector;
+use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
     UpdateVersion,
 };
-use tokio::runtime::Runtime;
 
+mod bridge;
 mod metered;
 mod metrics;
+mod s3;
 
+#[cfg(test)]
+use bridge::MAX_BRIDGE_WORKERS;
+use bridge::block_on_off_runtime;
+use metered::Backend;
 pub use metrics::Caller;
-use metrics::{MeteredConnector, Metrics, Operation};
-
-/// The process-wide runtime that drives the async `object_store` calls behind
-/// the sync storage API. Built once, lazily, via `get_or_init` so there is no
-/// init-race that could drop a surplus runtime on a caller's thread (an
-/// earlier manual `get`/`set` did, panicking when the loser was inside a tokio
-/// runtime). The runtime lives for the process and is never dropped, so the
-/// "drop a runtime in async context" hazard can't arise.
-///
-/// Its workers are the long-lived threads every bridged future is polled on
-/// (see [`block_on_off_runtime`]), so they are sized to the host but capped at
-/// [`MAX_BRIDGE_WORKERS`]: the work is object-store I/O, and the local backend
-/// moves its file I/O onto tokio's blocking pool anyway. The S3 backend's
-/// HTTP connections also live here, whichever runtime issues the request
-/// (see [`Store::s3`]).
-fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
-    static RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
-    match RT.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .min(MAX_BRIDGE_WORKERS);
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .thread_name("ourios-store-bridge")
-            .on_thread_start(metrics::bridge_thread_started)
-            // `enable_all` so the runtime carries the IO + time drivers the
-            // `AmazonS3` backend's HTTP client (reqwest/hyper) needs; the local
-            // backend ignores them.
-            .enable_all()
-            .build()
-    }) {
-        Ok(rt) => Ok(rt),
-        // Build failure is cached (a permanent resource exhaustion); rebuild a
-        // fresh `io::Error` since it isn't `Clone`.
-        Err(e) => Err(StoreError::Runtime(std::io::Error::new(
-            e.kind(),
-            e.to_string(),
-        ))),
-    }
-}
-
-/// Upper bound on the bridge runtime's worker threads.
-const MAX_BRIDGE_WORKERS: usize = 4;
-
-/// Idle connections the S3 client keeps per host once a burst of concurrent
-/// requests is over; the rest close instead of holding a descriptor each.
-/// When credentials come from the chain, an `AWS_POOL_MAX_IDLE_PER_HOST` in
-/// the environment takes precedence (explicit credentials read no `AWS_*`).
-const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
+use metrics::{Metrics, Operation};
 
 /// Whether `tag` (an `ETag` without its quotes) is safe to send unquoted in
 /// `If-Match`: non-empty ASCII letters, digits and hyphens, the shape of S3
@@ -96,77 +48,6 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
 /// become a wildcard matching any existing object, and a comma a list.
 fn is_plain_opaque_tag(tag: &str) -> bool {
     !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-/// Drive `fut` to completion synchronously — the bridge from the **sync**
-/// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
-/// `object_store` (compaction must reach S3 per RFC0013.3, so a local-only
-/// `std::fs` shortcut won't do).
-///
-/// `fut` is spawned onto the shared [`bridge_runtime`] and the caller blocks
-/// on a plain `std` channel for its result. Nothing here enters or drives a
-/// tokio runtime on the caller's thread, so it is safe from any call site —
-/// a plain thread, a `spawn_blocking` closure, or *inside* a runtime (the
-/// querier resolving manifests on its async task, a `#[tokio::test]`), where
-/// `Handle::block_on` would panic. A current-thread caller blocked here does
-/// not stall `fut`, which runs on the bridge runtime's own workers.
-///
-/// The future is polled on those long-lived workers, never on a thread made
-/// for the call: an earlier design spawned a scoped OS thread per call, and a
-/// query making thousands of store calls churned thousands of threads (and
-/// their allocator arenas, which glibc does not hand back). The cost is that
-/// `fut` must be `'static`; the `*_blocking` methods clone the cheap `Store`
-/// handle and own their keys to satisfy that.
-///
-/// `fut` already yields a [`StoreError`] result, returned directly; the extra
-/// error mode is building the bridge runtime ([`StoreError::Runtime`]). A
-/// panic *inside* `fut` is not swallowed — it is re-raised on the caller's
-/// thread via [`std::panic::resume_unwind`].
-fn block_on_off_runtime<T>(
-    metrics: &Metrics,
-    op: Operation,
-    fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
-) -> Result<T, StoreError>
-where
-    T: Send + 'static,
-{
-    let call = metrics.get().bridge_call(op);
-    match bridge(fut) {
-        Ok(result) => {
-            call.end(result.as_ref().err().map(metrics::store_error_type));
-            result
-        }
-        Err(payload) => {
-            call.end(Some("_OTHER"));
-            std::panic::resume_unwind(payload)
-        }
-    }
-}
-
-/// [`block_on_off_runtime`]'s bridge, with a panic in `fut` returned
-/// rather than re-raised.
-fn bridge<T>(
-    fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
-) -> std::thread::Result<Result<T, StoreError>>
-where
-    T: Send + 'static,
-{
-    let rt = match bridge_runtime() {
-        Ok(rt) => rt,
-        Err(e) => return Ok(Err(e)),
-    };
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    // The task, not a `JoinHandle`, carries the outcome back: awaiting a
-    // `JoinHandle` needs an executor, and the caller may be inside a runtime.
-    rt.spawn(async move {
-        // The receiver outlives the send — the caller blocks on it below.
-        let _ = tx.send(AssertUnwindSafe(fut).catch_unwind().await);
-    });
-    rx.recv().unwrap_or_else(|std::sync::mpsc::RecvError| {
-        Ok(Err(StoreError::Runtime(std::io::Error::other(
-            "store bridge task dropped before completing",
-        ))))
-    })
 }
 
 /// Object bytes paired with the backend's `ETag` (the compare-and-swap token),
@@ -246,7 +127,7 @@ pub struct Store {
 /// endpoint, region, and key prefix — plus optional explicit S3 credentials
 /// (RFC 0019 §3.4). When the credential fields are set, [`Store::s3`] applies them
 /// to the builder; when they are unset, credentials fall back to the standard
-/// chain ([`AmazonS3Builder::from_env`] — static `AWS_*` keys, a shared profile,
+/// chain ([`AmazonS3Builder::from_env`](object_store::aws::AmazonS3Builder::from_env) — static `AWS_*` keys, a shared profile,
 /// IRSA, or instance metadata).
 ///
 /// `Default` yields an **empty `bucket`**, which is not valid; [`Store::s3`]
@@ -471,16 +352,6 @@ impl StoreError {
     }
 }
 
-/// What a [`Store`] constructor resolved, for [`Store::assemble`].
-struct Backend {
-    store: Arc<dyn ObjectStore>,
-    http: bool,
-    prefix: ObjectPath,
-    conditional_update: bool,
-    local_root: Option<std::path::PathBuf>,
-    metrics: Metrics,
-}
-
 impl Store {
     /// Local-filesystem backend rooted at `root` (dev / test / CI). Preserves
     /// today's on-disk layout — the RFC 0005 Hive keys become paths under
@@ -524,7 +395,7 @@ impl Store {
     /// `cfg.access_key_id` / `cfg.secret_access_key` (and optionally
     /// `cfg.session_token`) are set they build a **clean** `AmazonS3Builder` (so
     /// no ambient chain credential bleeds in); otherwise credentials fall back to
-    /// the standard chain ([`AmazonS3Builder::from_env`] — static `AWS_*` env,
+    /// the standard chain ([`AmazonS3Builder::from_env`](object_store::aws::AmazonS3Builder::from_env) — static `AWS_*` env,
     /// shared profile, IRSA, or instance metadata). Blank credential values are
     /// trimmed and treated as unset. The static access key and secret are a pair:
     /// setting one without the other, or a session token without that pair, is
@@ -546,171 +417,17 @@ impl Store {
     }
 
     fn s3_with(cfg: S3Config, metrics: Metrics) -> Result<Self, StoreError> {
-        let S3Config {
-            bucket,
-            endpoint,
-            region,
-            prefix,
-            access_key_id,
-            secret_access_key,
-            session_token,
-        } = cfg;
-        // Trim once and use the trimmed value for both the check and the
-        // builder, so a whitespace-padded bucket can't pass validation and then
-        // fail opaquely at request time.
-        let bucket = bucket.trim().to_owned();
-        if bucket.is_empty() {
-            return Err(StoreError::Config(
-                "S3 bucket name must not be empty".to_string(),
-            ));
-        }
-        // Normalize the explicit credential fields: trim and treat an empty or
-        // whitespace-only value as unset, so a blank reads consistently across
-        // every caller of `S3Config` (matching the server's env parsing) and
-        // can't spuriously trip the partial-set check below (RFC 0019 §3.4).
-        let normalize =
-            |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        let access_key_id = normalize(access_key_id);
-        let secret_access_key = normalize(secret_access_key);
-        let session_token = normalize(session_token);
-        // The static access key and its secret are a pair; a session token is
-        // meaningless without them. Reject a partial set rather than silently
-        // falling back to the chain on an operator typo. The message names only
-        // the offending key, never a value (RFC 0019 §3.4).
-        match (&access_key_id, &secret_access_key) {
-            (Some(_), None) => {
-                return Err(StoreError::Config(
-                    "OURIOS_S3_SECRET_ACCESS_KEY must be set (the static access key and secret access key are required together)".to_string(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(StoreError::Config(
-                    "OURIOS_S3_ACCESS_KEY_ID must be set (the static access key and secret access key are required together)".to_string(),
-                ));
-            }
-            (None, None) if session_token.is_some() => {
-                return Err(StoreError::Config(
-                    "OURIOS_S3_SESSION_TOKEN requires the static access key and secret access key (a session token is valid only with the static key pair)".to_string(),
-                ));
-            }
-            _ => {}
-        }
-        // Explicit credentials build from a **clean** builder so no ambient
-        // chain credential (e.g. an `AWS_SESSION_TOKEN` `from_env` would pick up)
-        // bleeds into the explicit static-key pair — the `with_*` setters do not
-        // clear an inherited token. `from_env()` (the standard chain: static
-        // `AWS_*`, shared profile, IRSA, instance metadata) is used only as the
-        // fallback when no explicit pair is given (RFC 0019 §3.4).
-        let mut builder = match (access_key_id, secret_access_key) {
-            (Some(access_key_id), Some(secret_access_key)) => {
-                let mut explicit = AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .with_access_key_id(access_key_id)
-                    .with_secret_access_key(secret_access_key);
-                if let Some(session_token) = session_token {
-                    explicit = explicit.with_token(session_token);
-                }
-                explicit
-            }
-            // The validation above guarantees the remaining case is "no explicit
-            // credentials" (a lone key, lone secret, or lone token is rejected).
-            _ => AmazonS3Builder::from_env().with_bucket_name(bucket),
-        };
-        if let Some(endpoint) = endpoint {
-            // S3-compatible dev endpoints are often plain HTTP; object_store
-            // refuses HTTP unless explicitly allowed.
-            let allow_http = endpoint.starts_with("http://");
-            builder = builder.with_endpoint(endpoint);
-            if allow_http {
-                builder = builder.with_allow_http(true);
-            }
-        }
-        if let Some(region) = region {
-            builder = builder.with_region(region);
-        }
-        let pool_cap = AmazonS3ConfigKey::Client(ClientConfigKey::PoolMaxIdlePerHost);
-        if builder.get_config_value(&pool_cap).is_none() {
-            builder = builder.with_config(pool_cap, MAX_IDLE_CONNECTIONS_PER_HOST.to_string());
-        }
-        // reqwest runs each pooled connection on the runtime that issued the
-        // request, and a connection only notices the store closing it while
-        // that runtime polls it. Callers' runtimes stall (a current-thread
-        // caller between requests, busy `DataFusion` workers), which left
-        // connections in `CLOSE_WAIT` and handed them to later requests
-        // (#791). The bridge runtime is never a caller's, so it always does.
-        let s3 = builder
-            .with_http_connector(MeteredConnector {
-                inner: SpawnedReqwestConnector::new(bridge_runtime()?.handle().clone()),
-                metrics: metrics.clone(),
-            })
-            .build()
-            .map_err(StoreError::Backend)?;
-        let prefix = prefix.map_or_else(ObjectPath::default, ObjectPath::from);
+        let (s3, prefix) = s3::client(cfg, &metrics)?;
         Ok(Self::assemble(Backend {
             store: Arc::new(s3),
             http: true,
-            prefix,
+            prefix: prefix.map_or_else(ObjectPath::default, ObjectPath::from),
             // The backend keeps object_store's default `S3ConditionalPut::ETagMatch`,
             // so the `If-Match` CAS the manifest generation-swap needs is available.
             conditional_update: true,
             local_root: None,
             metrics,
         }))
-    }
-
-    fn assemble(backend: Backend) -> Self {
-        let Backend {
-            store,
-            http,
-            prefix,
-            conditional_update,
-            local_root,
-            metrics,
-        } = backend;
-        Self {
-            inner: Arc::clone(&store),
-            backend: store,
-            http,
-            caller: Caller::default(),
-            metrics,
-            prefix,
-            conditional_update,
-            local_root,
-        }
-        .metered()
-    }
-
-    /// Rebuild [`Self::inner`] over the backend, for the current caller and
-    /// metrics.
-    fn metered(self) -> Self {
-        Self {
-            inner: Arc::new(metered::Metered {
-                inner: Arc::clone(&self.backend),
-                caller: self.caller,
-                metrics: self.metrics.clone(),
-                http: self.http,
-            }),
-            ..self
-        }
-    }
-
-    /// This handle, with its calls attributed to `caller` in the storage
-    /// metrics. A subsystem sets it where it takes its handle; the backend
-    /// is shared, so the handle stays as cheap to make as a clone.
-    #[must_use]
-    pub fn with_caller(self, caller: Caller) -> Self {
-        Self { caller, ..self }.metered()
-    }
-
-    /// The subsystem this handle's calls are attributed to.
-    #[must_use]
-    pub fn caller(&self) -> Caller {
-        self.caller
-    }
-
-    #[cfg(test)]
-    fn with_metrics(self, metrics: Metrics) -> Self {
-        Self { metrics, ..self }.metered()
     }
 
     /// Whether this backend supports a conditional update (`If-Match` CAS) — the

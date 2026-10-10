@@ -369,6 +369,7 @@ mod tests {
         );
     }
 
+    /// Scenario RFC0033.8 — binding conflicts.
     #[test]
     fn two_templates_under_one_key_are_one_conflict_and_last_still_wins() {
         let events = vec![
@@ -390,6 +391,7 @@ mod tests {
         );
     }
 
+    /// Scenario RFC0033.8 — binding conflicts.
     #[test]
     fn re_emitted_binding_is_not_a_conflict() {
         let (_, conflicts) = fold_registry_checked(vec![
@@ -400,6 +402,7 @@ mod tests {
         assert!(conflicts.is_empty(), "{conflicts:?}");
     }
 
+    /// Scenario RFC0033.8 — binding conflicts.
     #[test]
     fn widening_to_a_new_version_is_not_a_conflict() {
         let (registry, conflicts) = fold_registry_checked(vec![
@@ -411,10 +414,11 @@ mod tests {
         assert_eq!(registry.len(), 3);
     }
 
-    /// An adoption riding an existing mined leaf, through the real miner:
-    /// its canonical is `format_template` over tokens the convergence
-    /// lookup required equal to the leaf's, so it restates the leaf's
-    /// text exactly — even when the upstream spelling names its masks.
+    /// Scenario RFC0033.8 — an adoption riding an existing mined leaf,
+    /// through the real miner: its canonical is `format_template` over
+    /// tokens the convergence lookup required equal to the leaf's, so it
+    /// restates the leaf's text exactly — even when the upstream spelling
+    /// names its masks.
     #[test]
     fn adoption_onto_an_existing_leaf_is_not_a_conflict() {
         use ourios_config::{MinerConfig, UpstreamTemplates};
@@ -497,8 +501,8 @@ mod tests {
             proptest::prop_assert_eq!(fold_registry(events.clone()), sort_then_insert(events));
         }
 
-        /// A key is in conflict exactly when its history binds more than
-        /// one distinct template.
+        /// Scenario RFC0033.8 — a key is in conflict exactly when its
+        /// history binds more than one distinct template.
         #[test]
         fn conflicts_are_exactly_the_multiply_bound_keys(
             history in proptest::collection::vec(

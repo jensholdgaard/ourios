@@ -335,10 +335,10 @@ fn anomaly_counts(rms: &[ResourceMetrics]) -> BTreeMap<(String, String), u64> {
     counts
 }
 
-/// #927 — a store whose audit stream binds two different templates to
-/// one `(template_id, version)` reports it once per fold-backed
-/// acquisition: one named event carrying the key and no template text,
-/// and the anomaly on that lookup. A same-binding re-emit and a widening
+/// Scenario RFC0033.8 (#927) — a store whose audit stream binds two
+/// different templates to one `(template_id, version)` reports it once
+/// per fold-backed acquisition: one named event carrying the key and no
+/// template text, and the anomaly on that lookup. A same-binding re-emit and a widening
 /// stay silent, and a cache hit (no fold) reports nothing.
 ///
 /// Act 6 of RFC0033.7, run last: its lookups share the process-global

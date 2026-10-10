@@ -171,7 +171,7 @@ querier:
   enabled: true
   http_addr: "0.0.0.0:4319"
   default_window_secs: {{ $.Values.querier.defaultWindowSecs }}
-  {{- if dig "mcp" "enabled" false $.Values.querier }}
+  {{- if include "ourios.bool" (dict "path" "querier.mcp.enabled" "value" (dig "mcp" "enabled" nil $.Values.querier)) }}
   mcp:
     enabled: true
   {{- end }}
@@ -342,12 +342,47 @@ Renders "true" or nothing.
 {{- end }}
 
 {{/*
+A boolean switch; pass (dict "path" "<values path>" "value" <v>). Renders
+"true" or nothing. Absent is false and a real bool is used as is; anything
+else fails the render, so a quoted "false" can never read as on (a
+non-empty string is truthy in a template).
+*/}}
+{{- define "ourios.bool" -}}
+{{- if not (kindIs "invalid" .value) }}
+{{- if not (kindIs "bool" .value) }}
+{{- fail (printf "%s must be a boolean (true or false, unquoted), got %q" .path (toString .value)) }}
+{{- end }}
+{{- if .value }}true{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The validated auth switches; pass the root context. Each renders "true" or
+nothing. auth.tokens must be a list when present: a non-list would
+otherwise read as "no tokens" and leave the install in open mode.
+*/}}
+{{- define "ourios.oidcEnabled" -}}
+{{- include "ourios.bool" (dict "path" "auth.oidc.enabled" "value" (dig "oidc" "enabled" nil (.Values.auth | default dict))) }}
+{{- end }}
+
+{{- define "ourios.openfgaEnabled" -}}
+{{- include "ourios.bool" (dict "path" "auth.openfga.enabled" "value" (dig "openfga" "enabled" nil (.Values.auth | default dict))) }}
+{{- end }}
+
+{{- define "ourios.tokensConfigured" -}}
+{{- $tokens := (.Values.auth | default dict).tokens }}
+{{- if and (not (kindIs "invalid" $tokens)) (not (kindIs "slice" $tokens)) }}
+{{- fail (printf "auth.tokens must be a list of token entries, got %v" $tokens) }}
+{{- end }}
+{{- if $tokens }}true{{- end }}
+{{- end }}
+
+{{/*
 Whether an `auth` section renders (tokens or oidc configured). Renders "true"
 or nothing. OpenFGA alone authenticates nothing, so it does not count.
 */}}
 {{- define "ourios.authEnabled" -}}
-{{- $auth := .Values.auth | default dict -}}
-{{- if or ($auth.tokens | default list) (dig "enabled" false ($auth.oidc | default dict)) }}true{{- end }}
+{{- if or (include "ourios.tokensConfigured" .) (include "ourios.oidcEnabled" .) }}true{{- end }}
 {{- end }}
 
 {{/*
@@ -389,10 +424,12 @@ secret value reaches the ConfigMap.
 */}}
 {{- define "ourios.authConfig" -}}
 {{- $auth := .Values.auth | default dict -}}
-{{- $tokens := $auth.tokens | default list -}}
+{{- $tokens := ternary $auth.tokens list (eq (include "ourios.tokensConfigured" .) "true") -}}
 {{- $oidc := $auth.oidc | default dict -}}
 {{- $fga := $auth.openfga | default dict -}}
-{{- if and $fga.enabled (not (include "ourios.authEnabled" .)) }}
+{{- $oidcOn := include "ourios.oidcEnabled" . -}}
+{{- $fgaOn := include "ourios.openfgaEnabled" . -}}
+{{- if and $fgaOn (not (include "ourios.authEnabled" .)) }}
 {{- fail "auth.openfga.enabled needs auth.tokens or auth.oidc.enabled: OpenFGA binds the tenants of what they authenticate and never authenticates on its own (RFC 0047 §3.1)" }}
 {{- end }}
 {{- if include "ourios.authEnabled" . }}
@@ -407,7 +444,7 @@ auth:
 {{- if not (and $ref.name $ref.key) }}
 {{- fail (printf "auth.tokens[%d].secretKeyRef.name and .key are required: the token value comes only from a Secret" $i) }}
 {{- end }}
-{{- if not $t.tenants }}
+{{- if not (and (kindIs "slice" $t.tenants) $t.tenants) }}
 {{- fail (printf "auth.tokens[%d].tenants must list at least one tenant, or \"*\" for all (RFC 0026 §3.1)" $i) }}
 {{- end }}
     - name: {{ required (printf "auth.tokens[%d].name is required" $i) $t.name | quote }}
@@ -418,11 +455,11 @@ auth:
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if $oidc.enabled }}
+{{- if $oidcOn }}
   oidc:
     issuer: {{ required "auth.oidc.issuer is required with auth.oidc.enabled" $oidc.issuer | quote }}
     audience: {{ required "auth.oidc.audience is required with auth.oidc.enabled" $oidc.audience | quote }}
-{{- if $fga.enabled }}
+{{- if $fgaOn }}
 {{- include "ourios.optScalar" (dict "key" "tenant_claim" "value" $oidc.tenantClaim) }}
 {{- else }}
     tenant_claim: {{ required "auth.oidc.tenantClaim is required with auth.oidc.enabled unless auth.openfga binds the tenants (RFC 0029 §3.1)" $oidc.tenantClaim | quote }}
@@ -432,7 +469,7 @@ auth:
 {{- include "ourios.optScalar" (dict "key" "agent_claim" "value" $oidc.agentClaim) }}
 {{- include "ourios.optScalar" (dict "key" "groups_claim" "value" $oidc.groupsClaim) }}
 {{- end }}
-{{- if $fga.enabled }}
+{{- if $fgaOn }}
   openfga:
     api_url: {{ required "auth.openfga.apiUrl is required with auth.openfga.enabled" $fga.apiUrl | quote }}
     store_id: {{ required "auth.openfga.storeId is required with auth.openfga.enabled" $fga.storeId | quote }}
@@ -460,7 +497,7 @@ when auth is off. Only the receiver and querier take it.
 {{- define "ourios.authEnv" -}}
 {{- if include "ourios.authEnabled" . }}
 {{- $auth := .Values.auth | default dict -}}
-{{- range $i, $t := $auth.tokens | default list }}
+{{- range $i, $t := ternary $auth.tokens list (eq (include "ourios.tokensConfigured" .) "true") }}
 - name: OURIOS_AUTH_TOKEN_{{ $i }}
   valueFrom:
     secretKeyRef:
@@ -470,7 +507,7 @@ when auth is off. Only the receiver and querier take it.
 {{- end }}
 {{- $fga := $auth.openfga | default dict }}
 {{- $ref := include "ourios.openfgaTokenRef" $fga | fromJson }}
-{{- if and $fga.enabled $ref.name }}
+{{- if and (include "ourios.openfgaEnabled" .) $ref.name }}
 - name: OURIOS_OPENFGA_API_TOKEN
   valueFrom:
     secretKeyRef:

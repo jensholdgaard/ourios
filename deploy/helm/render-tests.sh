@@ -420,6 +420,32 @@ check_fails "an OpenFGA apiToken key of false is refused" \
   "${fga_args[@]}" --set auth.openfga.apiToken.secretKeyRef.name=n \
   --set auth.openfga.apiToken.secretKeyRef.key=false
 
+# Boolean switches take real booleans only: a quoted "false" is a non-empty
+# string, which a template reads as true, so it would turn the surface ON.
+for flag in querier.mcp.enabled auth.oidc.enabled auth.openfga.enabled; do
+  for word in false true; do
+    check_fails "$flag: the string \"$word\" is refused" \
+      "$flag must be a boolean (true or false, unquoted)" \
+      "${fga_args[@]}" --set auth.openfga.enabled=false --set-string "$flag=$word"
+  done
+done
+check "a real querier.mcp.enabled=false renders no mcp section" "" \
+  "$(role_config querier --set querier.mcp.enabled=false | grep 'mcp:' || true)"
+check "a real auth.oidc.enabled=false renders no oidc half" "" \
+  "$(role_config querier "${fga_args[@]}" --set auth.openfga.enabled=false \
+      --set auth.oidc.enabled=false | grep 'oidc:' || true)"
+check "a real auth.openfga.enabled=false renders no openfga half" "" \
+  "$(role_config querier "${fga_args[@]}" --set auth.openfga.enabled=false \
+      | grep 'openfga:' || true)"
+check "a real auth.oidc.enabled=true renders the oidc half" "oidc:" \
+  "$(role_config querier --set auth.oidc.enabled=true --set auth.oidc.issuer=https://i \
+      --set auth.oidc.audience=a --set auth.oidc.tenantClaim=t | grep -o '^  oidc:' | sed 's/^ *//')"
+check_fails "auth.tokens that is not a list is refused" "auth.tokens must be a list" \
+  --set-string auth.tokens=edge
+check_fails "a token whose tenants is not a list is refused" "must list at least one tenant" \
+  --set 'auth.tokens[0].name=e' --set-string 'auth.tokens[0].tenants=a' \
+  --set 'auth.tokens[0].secretKeyRef.name=s' --set 'auth.tokens[0].secretKeyRef.key=k'
+
 check "helm test: an authenticated querier is probed over TCP, not an anonymous query" \
   "nc -z -w5 t-ourios-querier 4319" \
   "$(helm template t "$CHART" --show-only templates/tests/test-connection.yaml "${secure_args[@]}" \

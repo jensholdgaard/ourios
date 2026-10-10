@@ -58,11 +58,10 @@ network boundary, or configure auth.tokens and/or auth.oidc (and
 receiver.tls / querier.tls); see the chart README's "Authentication and TLS".
 {{- else }}
 
-{{- $auth := .Values.auth }}
 {{- $halves := list }}
-{{- if $auth.tokens }}{{ $halves = append $halves "static tokens" }}{{ end }}
-{{- if dig "oidc" "enabled" false $auth }}{{ $halves = append $halves "OIDC" }}{{ end }}
-Authentication is ON ({{ join " + " $halves }}{{ if dig "openfga" "enabled" false $auth }}; tenants bound by OpenFGA{{ end }}).
+{{- if include "ourios.tokensConfigured" . }}{{ $halves = append $halves "static tokens" }}{{ end }}
+{{- if include "ourios.oidcEnabled" . }}{{ $halves = append $halves "OIDC" }}{{ end }}
+Authentication is ON ({{ join " + " $halves }}{{ if include "ourios.openfgaEnabled" . }}; tenants bound by OpenFGA{{ end }}).
 {{- $plain := list }}
 {{- range $listener := list (list "receiver" "grpc" "receiver gRPC :4317") (list "receiver" "http" "receiver HTTP :4318") (list "querier" "http" "querier HTTP :4319") }}
 {{- $role := index $listener 0 }}

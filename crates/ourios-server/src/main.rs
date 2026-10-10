@@ -503,7 +503,7 @@ async fn start_receiver(
     resolver: Option<ourios_serving::AuthResolver>,
     graph_emitter: Option<std::sync::Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<Option<receiver::ReceiverHandle>, String> {
+) -> Result<Option<receiver::ReceiverHandle>, receiver::StartError> {
     let Some(params) = &config.receiver else {
         return Ok(None);
     };
@@ -516,7 +516,11 @@ async fn start_receiver(
         // The clone is a cheap shared handle; the compactor keeps the original.
         store: store.clone(),
         promoted: config.promoted.clone(),
-        auth: resolver.ok_or("the auth resolver is built for every enabled role")?,
+        auth: resolver.ok_or_else(|| {
+            receiver::StartError::Failed(
+                "the auth resolver is built for every enabled role".to_owned(),
+            )
+        })?,
         encode_workers: params.encode_workers,
         miner: params.miner,
         template_ids_allow_bootstrap: params.template_ids_allow_bootstrap,
@@ -598,17 +602,23 @@ fn listen_for_shutdown(
     (stopping, signalled)
 }
 
-/// A receiver startup that failed because a signal stopped its recovery
-/// is a requested shutdown, not a failure: nothing was served, so flush
-/// telemetry and exit cleanly. Any other failure stays one.
+/// What a failed receiver startup means for the process: a bootstrap scan
+/// a signal interrupted is a requested stop, `Ok` with its message; any
+/// other failure, even one that raced a signal, fails the process.
+fn startup_exit(error: receiver::StartError) -> Result<String, String> {
+    match error {
+        receiver::StartError::Interrupted(message) => Ok(message),
+        receiver::StartError::Failed(message) => Err(message),
+    }
+}
+
+/// End the process after a failed receiver startup: nothing was served,
+/// so a requested stop flushes telemetry and exits cleanly.
 fn stopped_or_failed(
-    error: String,
-    stopping: &std::sync::atomic::AtomicBool,
+    error: receiver::StartError,
     telemetry: &ourios_telemetry::TelemetryGuard,
 ) -> Result<(), Box<dyn Error>> {
-    if !stopping.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(error.into());
-    }
+    let error = startup_exit(error)?;
     eprintln!("shutdown requested during receiver startup: {error}");
     if let Err(e) = telemetry.shutdown() {
         eprintln!("telemetry shutdown error: {e}");
@@ -714,7 +724,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await
     {
         Ok(receiver) => receiver,
-        Err(e) => return stopped_or_failed(e, &stopping, &telemetry),
+        Err(e) => return stopped_or_failed(e, &telemetry),
     };
 
     let querier = start_querier(&config, resolver.clone()).await?;
@@ -923,6 +933,23 @@ mod tests {
         assert!(parse(&["ourios-server", "--config", "/c.yaml", "--extra"]).is_err());
         assert!(parse(&["ourios-server", "--config=/c.yaml", "x"]).is_err());
         assert!(parse(&["ourios-server", "--nope"]).is_err());
+    }
+
+    /// Only an interrupted bootstrap ends a failed receiver startup with
+    /// exit 0; a startup failure fails the process even when the shutdown
+    /// flag was set, which this decision never consults.
+    #[test]
+    fn only_an_interrupted_startup_exits_cleanly() {
+        assert_eq!(
+            startup_exit(receiver::StartError::Interrupted("stopped".to_owned())),
+            Ok("stopped".to_owned())
+        );
+        assert_eq!(
+            startup_exit(receiver::StartError::Failed(
+                "template-id bootstrap scan: read data/x.parquet".to_owned()
+            )),
+            Err("template-id bootstrap scan: read data/x.parquet".to_owned())
+        );
     }
 
     /// RFC0048.3 — the promoted-set check is per identity list: a partial

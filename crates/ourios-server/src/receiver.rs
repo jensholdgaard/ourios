@@ -31,7 +31,7 @@ use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery::{self, RecoveryReport};
-use ourios_ingester::template_ids::TemplateIds;
+use ourios_ingester::template_ids::{TemplateIds, TemplateIdsError};
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::{PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
@@ -1022,7 +1022,47 @@ async fn bind_listeners(
 /// [`serve_until`] with no shutdown flag, for tests that never signal one.
 #[cfg(test)]
 pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
-    serve_until(config, Arc::new(AtomicBool::new(false))).await
+    serve_until(config, Arc::new(AtomicBool::new(false)))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Why the receiver did not start.
+#[derive(Debug)]
+pub enum StartError {
+    /// A shutdown stopped the RFC 0059 §3.5 bootstrap scan before it read
+    /// every file: nothing was written, so the process stops cleanly.
+    Interrupted(String),
+    /// Any other failure, which fails the process.
+    Failed(String),
+}
+
+impl From<String> for StartError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// A failed startup recovery as a [`StartError`]: only an interrupted
+/// bootstrap scan is a requested stop. A scan that failed while a shutdown
+/// was also requested reports its failure (the scan ranks it first), and
+/// that stays fail-closed.
+fn recovery_failed(error: &recovery::RecoveryDriverError) -> StartError {
+    let message = format!("startup recovery: {error}");
+    match error {
+        recovery::RecoveryDriverError::TemplateIds(TemplateIdsError::Interrupted { .. }) => {
+            StartError::Interrupted(message)
+        }
+        _ => StartError::Failed(message),
+    }
 }
 
 /// What startup recovery hands the rest of the receiver.
@@ -1042,7 +1082,7 @@ async fn recover_off_runtime(
     snapshots_root: PathBuf,
     mut miner: MinerCluster,
     ids: TemplateIds,
-) -> Result<Recovered, String> {
+) -> Result<Recovered, StartError> {
     tokio::task::spawn_blocking(move || {
         recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
             .map(|report| Recovered {
@@ -1051,10 +1091,10 @@ async fn recover_off_runtime(
                 ids,
                 report,
             })
-            .map_err(|e| format!("startup recovery: {e}"))
+            .map_err(|e| recovery_failed(&e))
     })
     .await
-    .map_err(|e| format!("startup recovery: {e}"))?
+    .map_err(|e| StartError::Failed(format!("startup recovery: {e}")))?
 }
 
 /// Serve OTLP/gRPC on `incoming`, over TLS when `acceptor` is set, until
@@ -1107,7 +1147,7 @@ fn spawn_grpc(
 pub async fn serve_until(
     config: ReceiverConfig,
     stopping: Arc<AtomicBool>,
-) -> Result<ReceiverHandle, String> {
+) -> Result<ReceiverHandle, StartError> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
     // The §3.4 group-commit knobs, captured before `config.wal` is moved
     // into `Wal::open`: the batch window and the segment-fill early-cut.
@@ -3273,7 +3313,10 @@ mod tests {
         };
 
         stopper.await.expect("the stopper ran");
-        assert!(err.contains("interrupted by shutdown"), "{err}");
+        assert!(
+            matches!(&err, StartError::Interrupted(message) if message.contains("interrupted by shutdown")),
+            "{err}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "stopped after {:?}",
@@ -3285,5 +3328,28 @@ mod tests {
                 .exists(),
             "no high-water object is written"
         );
+    }
+
+    /// Only an interrupted bootstrap scan is a requested stop; a scan
+    /// failure stays a failure, even when it raced a shutdown, since the
+    /// scan ranks its failure above the interruption.
+    #[test]
+    fn only_an_interrupted_scan_is_a_requested_stop() {
+        use ourios_ingester::recovery::RecoveryDriverError;
+
+        let interrupted =
+            RecoveryDriverError::TemplateIds(TemplateIdsError::Interrupted { files_scanned: 3 });
+        assert!(matches!(
+            recovery_failed(&interrupted),
+            StartError::Interrupted(message) if message.contains("interrupted by shutdown")
+        ));
+        let failed = RecoveryDriverError::TemplateIds(TemplateIdsError::Malformed {
+            key: "data/x.parquet".to_owned(),
+            detail: "carries template id 9223372036854775808".to_owned(),
+        });
+        assert!(matches!(
+            recovery_failed(&failed),
+            StartError::Failed(message) if message.contains("data/x.parquet")
+        ));
     }
 }

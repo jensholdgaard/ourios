@@ -510,6 +510,24 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > conflict; persisting conflicts in the artifact is #928. The status
 > stays `accepted`. Scenario RFC0033.8 is the criterion.
 
+> **Amendment (2026-10-11, #924, maintainer-approved): what an
+> acquisition costs.** The lookup counter says a derive happened, not
+> what it cost. Each fold behind a non-hit lookup also records:
+>
+> - `ourios.template_map.derive.duration` (s), keyed by
+>   `ourios.template_map.derive.reason` (`miss` / `stale` / `torn` /
+>   `unknown_version`). The reason is known before the fold, so a
+>   failed fold records its duration too, with `error.type`;
+> - `ourios.template_map.derive.audit.files` ({file}) and
+>   `ourios.template_map.derive.audit.size` (By), the audit set a
+>   completed fold read, by the same reason.
+>
+> A hit records none of them. A query that joins another query's
+> in-flight acquisition records
+> `ourios.template_map.acquire.wait.duration` (s, no attributes): the
+> time it waited. The acquirer records no wait. The status stays
+> `accepted`. Scenario RFC0033.9 is the criterion.
+
 ## 4. Alternatives considered
 
 **Two artifacts (registry and alias map separately).** Independent
@@ -709,6 +727,21 @@ ambiguity cannot recur.
 > - **And** an identical re-emit, a widening (same id, new version)
 >   and an adoption onto an existing leaf report no conflict.
 
+> **Scenario RFC0033.9 — Derive cost is observable** (amendment
+> 2026-10-11, #924)
+> - **Given** the RFC0033.7 fixture and acts
+> - **When** they drive a miss, a hit, a staleness, a torn artifact,
+>   a shared acquisition and a failing fold
+> - **Then** `ourios.template_map.derive.duration` has exactly one
+>   sample per fold, keyed by its `ourios.template_map.derive.reason`,
+>   and none for a hit; the failing fold's sample also carries
+>   `error.type`
+> - **And** `derive.audit.files` / `derive.audit.size` have one
+>   sample per completed fold, the cold miss's equal to the fixture's
+>   audit file count and bytes
+> - **And** `ourios.template_map.acquire.wait.duration` has exactly
+>   one sample, the joiner's.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -734,6 +767,11 @@ Mapped to `CLAUDE.md` §6.2:
   multiply-bound keys. Act 6 of `tests/rfc0033_7_observability.rs`
   asserts the event and the lookup anomaly through the in-memory
   log and metric exporters.
+- **RFC0033.9** — `tests/rfc0033_7_observability.rs`: the RFC0033.7
+  acts, asserted through the in-memory metric exporter. The
+  acquire-wait sample needs the shared acquisition, which runs under
+  the `testing` feature (CI runs `--all-features`); without it the
+  test asserts no wait was recorded.
 
 > **Amendment (2026-07-13).** §6 is structurally unchanged by the
 > compressed encoding: the same tests exercise the v2 artifact

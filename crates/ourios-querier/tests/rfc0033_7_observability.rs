@@ -349,7 +349,10 @@ fn audit_set(audit_dir: &Path) -> (u64, u64) {
         })
 }
 
-/// #924 — what each derive cost. Acts 1–5 fold four times: `miss`,
+/// Scenario RFC0033.9 (#924) — derive cost is observable.
+/// See `docs/rfcs/0033-cached-template-map.md` §5.
+///
+/// Acts 1–5 fold four times: `miss`,
 /// `stale`, `torn`, and act 5's failing `stale` fold, which records its
 /// duration with `error.type` and no audit files or size. The hits (act
 /// 2, and act 4b's acquirer) never derive, and act 4b's joiner records
@@ -548,6 +551,7 @@ fn binding_conflict_act(
 }
 
 /// Scenario RFC0033.7 — observable outcomes.
+/// Scenario RFC0033.9 — derive cost is observable (`assert_derive_metrics`).
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
 #[test]
 fn rfc0033_7_observable_outcomes() {

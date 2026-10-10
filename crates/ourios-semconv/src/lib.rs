@@ -322,6 +322,9 @@ pub const OURIOS_TEMPLATE_ID: &str = "ourios.template.id";
 /// `ourios.template.version` attribute key.
 pub const OURIOS_TEMPLATE_VERSION: &str = "ourios.template.version";
 
+/// `ourios.template_map.lookup.anomaly` attribute key.
+pub const OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY: &str = "ourios.template_map.lookup.anomaly";
+
 /// `ourios.template_map.lookup.outcome` attribute key.
 pub const OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME: &str = "ourios.template_map.lookup.outcome";
 
@@ -480,3 +483,7 @@ pub const EVENT_OURIOS_SERVER_TLS_RELOAD_COMPLETED: &str = "ourios.server.tls.re
 
 /// `ourios.server.tls.reload.error` log event name.
 pub const EVENT_OURIOS_SERVER_TLS_RELOAD_ERROR: &str = "ourios.server.tls.reload.error";
+
+/// `ourios.template_map.binding.conflicted` log event name.
+pub const EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED: &str =
+    "ourios.template_map.binding.conflicted";

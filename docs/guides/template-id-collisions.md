@@ -15,11 +15,43 @@ snapshot after WAL frames were reclaimed, or a replaced local root, can
 cause the same collision without logging a discard, so the absence of
 that event is not evidence of a clean store. The check is read-only.
 
-No Ourios query surface shows these collisions. The template map and
-`list_templates` keep the last binding per `(template_id, version)`,
-which hides the earlier one, and the drift query never shows template
-text. So the check reads the Parquet files directly with
-[DuckDB](https://duckdb.org/).
+## The continuous signal
+
+The querier also reports collisions itself. Each time it folds
+a tenant's audit stream into the template map, it checks whether one
+`(template_id, version)` is bound to two different templates. For every
+such pair it finds, it emits:
+
+- the `ourios.template_map.binding.conflicted` log event (WARN),
+  carrying `ourios.tenant`, `ourios.template.id` and
+  `ourios.template.version`. The event never carries the template texts,
+  because they can contain user data.
+- the `ourios.template_map.lookup.anomaly = binding_conflict` attribute
+  on that acquisition's `ourios.template_map.lookups` data point. Alert
+  on any increase of that series.
+
+Two identical bindings, such as a re-emitted event, are not a conflict.
+Neither is a widened template (same id, new version), and neither is an
+adoption riding an existing leaf, because it restates the leaf's
+template exactly. Detection changes nothing about what is served: rows
+still render against the last binding.
+
+The check runs only when the querier folds the audit stream. A query
+answered from a fresh cached template map (lookup outcome `hit`) does
+not fold, so a tenant whose audit stream stops changing goes quiet once
+its map is cached (#928). The next audit file the tenant writes triggers a
+fold and the signal again.
+
+The signal names the colliding pairs. It does not list the rows that
+render ambiguously, and it does not show the texts. For that, and for
+stores written before v0.12.0, use the queries below.
+
+## Historical damage assessment
+
+The template map and `list_templates` keep the last binding per
+`(template_id, version)`, which hides the earlier one, and the drift
+query never shows template text. So the check reads the Parquet files
+directly with [DuckDB](https://duckdb.org/).
 
 ## Setup
 
@@ -110,9 +142,11 @@ discarded tenant re-minting after its WAL was reclaimed:
 
 ## Caveats
 
-- An adoption that reuses an existing leaf can show up as a false
-  positive in query 1, if its canonical text is formatted differently
-  from the leaf's.
+- An adoption that reuses an existing leaf restates the leaf's
+  template text byte for byte. The miner adopts onto a leaf only when
+  the upstream template's tokens equal the leaf's, and both texts are
+  written from the same tokens. So an adoption is not a false positive
+  in query 1.
 - The `data/**` glob in query 3 can include files that compaction has
   replaced but not yet removed, so a row may be counted twice.
 - The audit scans in queries 1 and 2 (and query 3's `bound` CTE) must

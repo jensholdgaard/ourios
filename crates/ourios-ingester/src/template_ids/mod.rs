@@ -156,12 +156,7 @@ impl std::fmt::Display for TemplateIdsError {
             ),
             Self::Scan(e) => write!(f, "template-id bootstrap scan: {e}"),
             Self::ScanThread(e) => write!(f, "start a template-id bootstrap scan thread: {e}"),
-            Self::Interrupted { files_scanned } => write!(
-                f,
-                "template-id bootstrap scan interrupted by shutdown after {files_scanned} \
-                 footers; nothing was written, and the next start authorised to bootstrap \
-                 scans again from the beginning"
-            ),
+            Self::Interrupted { files_scanned } => interrupted(f, *files_scanned),
             Self::Exhausted(e) => write!(f, "template-id high-water: {e}"),
             Self::Refiller(e) => write!(f, "start the template-id refiller: {e}"),
             Self::FirstBlock(e) => write!(f, "take the first template-id block: {e}"),
@@ -175,37 +170,56 @@ impl std::fmt::Display for TemplateIdsError {
             Self::MarkerInvalid { detail } => {
                 write!(f, "{SEATED_MARKER} is not a usable seated marker: {detail}")
             }
-            Self::BootstrapNotAuthorized => write!(
-                f,
-                "{HIGH_WATER_KEY} is absent but the store already holds data: bootstrapping \
-                 the template-id high-water needs explicit authorisation. For the upgrade to \
-                 RFC 0059, stop every older receiver, start one upgraded replica with \
-                 receiver.template_ids_allow_bootstrap (OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP) \
-                 set to true. That start reads every data and audit footer before its \
-                 listeners open, so it is offline for about the store's file count divided \
-                 by the scan's read rate; compact the store first if it holds many small \
-                 files. Remove the setting only once it has logged {BOOTSTRAPPED} or written \
-                 {SEATED_MARKER} under its snapshots root. A shutdown during the scan writes \
-                 nothing, and the next start scans again",
-                BOOTSTRAPPED = names::BOOTSTRAPPED,
-            ),
-            Self::HighWaterRolledBack { seen, found } => write!(
-                f,
-                "{HIGH_WATER_KEY} reads {found}, below the {seen} this root already reserved: \
-                 the object was rolled back to an older copy, which is unsupported. Recover \
-                 by stopping every receiver, removing the object and every root's \
-                 {SEATED_MARKER}, and starting one replica authorised to bootstrap (RFC 0059 \
-                 §3.1)"
-            ),
-            Self::HighWaterDeleted => write!(
-                f,
-                "{HIGH_WATER_KEY} is gone though this root has seated against it; it must \
-                 never be deleted. Recover by stopping every receiver, removing every root's \
-                 {SEATED_MARKER}, and starting one replica authorised to bootstrap (RFC 0059 \
-                 §3.1)"
-            ),
+            Self::BootstrapNotAuthorized => bootstrap_not_authorized(f),
+            Self::HighWaterRolledBack { seen, found } => rolled_back(f, *seen, *found),
+            Self::HighWaterDeleted => deleted(f),
         }
     }
+}
+
+fn interrupted(f: &mut std::fmt::Formatter<'_>, files_scanned: u64) -> std::fmt::Result {
+    write!(
+        f,
+        "template-id bootstrap scan interrupted by shutdown after {files_scanned} footers; \
+         nothing was written, and the next start authorised to bootstrap scans again from \
+         the beginning"
+    )
+}
+
+/// What an operator does for the upgrade to RFC 0059 (§3.5).
+fn bootstrap_not_authorized(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+        f,
+        "{HIGH_WATER_KEY} is absent but the store already holds data: bootstrapping the \
+         template-id high-water needs explicit authorisation. For the upgrade to RFC 0059, \
+         stop every older receiver, start one upgraded replica with \
+         receiver.template_ids_allow_bootstrap (OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP) set to \
+         true. That start reads every data and audit footer before its listeners open, so \
+         it is offline for about the store's file count divided by the scan's read rate; \
+         compact the store first if it holds many small files. Remove the setting only once \
+         it has logged {BOOTSTRAPPED} or written {SEATED_MARKER} under its snapshots root. A \
+         shutdown during the scan writes nothing, and the next start scans again",
+        BOOTSTRAPPED = names::BOOTSTRAPPED,
+    )
+}
+
+fn rolled_back(f: &mut std::fmt::Formatter<'_>, seen: u64, found: u64) -> std::fmt::Result {
+    write!(
+        f,
+        "{HIGH_WATER_KEY} reads {found}, below the {seen} this root already reserved: the \
+         object was rolled back to an older copy, which is unsupported. Recover by stopping \
+         every receiver, removing the object and every root's {SEATED_MARKER}, and starting \
+         one replica authorised to bootstrap (RFC 0059 §3.1)"
+    )
+}
+
+fn deleted(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+        f,
+        "{HIGH_WATER_KEY} is gone though this root has seated against it; it must never be \
+         deleted. Recover by stopping every receiver, removing every root's {SEATED_MARKER}, \
+         and starting one replica authorised to bootstrap (RFC 0059 §3.1)"
+    )
 }
 
 impl std::error::Error for TemplateIdsError {

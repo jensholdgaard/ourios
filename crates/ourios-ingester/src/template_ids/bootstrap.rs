@@ -24,8 +24,6 @@ const PROGRESS_EVERY: u64 = 10_000;
 pub const DEFAULT_SCAN_CONCURRENCY: usize = 16;
 /// The longest gap between two progress events, by default.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
-/// How often the scan's own thread wakes to check whether progress is due.
-const PROGRESS_TICK: Duration = Duration::from_secs(1);
 
 /// The prefixes the scan walks, and the id columns their files hold.
 const PREFIXES: [(&str, IdColumns); 2] = [("data", IdColumns::Data), ("audit", IdColumns::Audit)];
@@ -151,7 +149,8 @@ impl Tally {
         self.failed.store(true, Ordering::Release);
     }
 
-    fn record(&self, columns: IdColumns, max: Option<u64>) {
+    /// Count a read file; returns the files read so far.
+    fn record(&self, columns: IdColumns, max: Option<u64>) -> u64 {
         let slot = match columns {
             IdColumns::Data => &self.data_max,
             IdColumns::Audit => &self.audit_max,
@@ -159,7 +158,7 @@ impl Tally {
         if let Some(id) = max {
             slot.fetch_max(id + 1, Ordering::AcqRel);
         }
-        self.files_read.fetch_add(1, Ordering::AcqRel);
+        self.files_read.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     fn files_read(&self) -> u64 {
@@ -192,9 +191,9 @@ impl Tally {
 
 type Keys = Mutex<Receiver<(String, IdColumns)>>;
 
-/// The scan itself; `progress` is called with the files read so far at
-/// least every `options.progress_interval`, and as each multiple of
-/// [`PROGRESS_EVERY`] is passed.
+/// The scan itself; `progress` is called with each multiple of
+/// [`PROGRESS_EVERY`] files read, and with the files read so far whenever
+/// `options.progress_interval` passes without a call.
 fn scan(
     store: &Store,
     options: &ScanOptions,
@@ -205,17 +204,17 @@ fn scan(
     let tally = Tally::default();
     let (keys_tx, keys_rx) = mpsc::sync_channel(readers);
     let keys: Keys = Mutex::new(keys_rx);
-    // Never sent on: it disconnects once every scan thread has exited.
-    let (running, finished) = mpsc::channel::<()>();
+    // Readers send each multiple of PROGRESS_EVERY they complete; the
+    // channel disconnects once every scan thread has exited.
+    let (milestones, reached) = mpsc::channel::<u64>();
     std::thread::scope(|scope| {
         let mut started = 0;
         for _ in 0..readers {
-            let (running, tally, keys) = (running.clone(), &tally, &keys);
+            let (milestones, tally, keys) = (milestones.clone(), &tally, &keys);
             let reader = std::thread::Builder::new()
                 .name("template-id-scan".to_owned())
                 .spawn_scoped(scope, move || {
-                    let _running = running;
-                    read_footers(store, tally, shutdown, keys);
+                    read_footers(store, tally, shutdown, keys, &milestones);
                 });
             match reader {
                 Ok(_) => started += 1,
@@ -226,7 +225,7 @@ fn scan(
         }
         // Readers first: a lister with no reader would block on a full
         // channel forever.
-        let (lister_running, lister_tally) = (running.clone(), &tally);
+        let (lister_running, lister_tally) = (milestones.clone(), &tally);
         let lister = std::thread::Builder::new()
             .name("template-id-list".to_owned())
             .spawn_scoped(scope, move || {
@@ -236,8 +235,8 @@ fn scan(
         if let Err(e) = lister {
             return tally.fail(TemplateIdsError::ScanThread(e));
         }
-        drop(running);
-        watch(&tally, options.progress_interval, &finished, progress);
+        drop(milestones);
+        watch(&tally, options.progress_interval, &reached, progress);
     });
     tally.outcome()
 }
@@ -270,7 +269,13 @@ fn list_keys(
 /// Read footers from `keys` until the lister hangs up. Once the scan stops,
 /// keys are still taken but no longer read, so a lister blocked on a full
 /// channel always gets to see the stop.
-fn read_footers(store: &Store, tally: &Tally, shutdown: &AtomicBool, keys: &Keys) {
+fn read_footers(
+    store: &Store,
+    tally: &Tally,
+    shutdown: &AtomicBool,
+    keys: &Keys,
+    milestones: &mpsc::Sender<u64>,
+) {
     loop {
         let next = keys.lock().unwrap_or_else(PoisonError::into_inner).recv();
         let Ok((key, columns)) = next else {
@@ -280,31 +285,37 @@ fn read_footers(store: &Store, tally: &Tally, shutdown: &AtomicBool, keys: &Keys
             continue;
         }
         match in_domain(&key, object_max_id(store, &key, columns)) {
-            Ok(max) => tally.record(columns, max),
+            Ok(max) => {
+                let files = tally.record(columns, max);
+                if files.is_multiple_of(PROGRESS_EVERY) {
+                    // The receiver outlives every reader: it is dropped only
+                    // after the scope joins them.
+                    let _ = milestones.send(files);
+                }
+            }
             Err(e) => tally.fail(e),
         }
     }
 }
 
-/// Report progress from the calling thread until every scan thread exits.
+/// Report progress from the calling thread until every scan thread exits:
+/// each multiple of [`PROGRESS_EVERY`] a reader completes, and the files
+/// read so far whenever `interval` passes without a report.
 fn watch(
     tally: &Tally,
     interval: Duration,
-    finished: &Receiver<()>,
+    milestones: &Receiver<u64>,
     progress: &mut dyn FnMut(u64),
 ) {
-    let tick = interval.min(PROGRESS_TICK);
-    let (mut reported_at, mut reported) = (Instant::now(), 0);
+    let mut reported_at = Instant::now();
     loop {
-        match finished.recv_timeout(tick) {
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-        }
-        let files = tally.files_read();
-        if reported_at.elapsed() >= interval || files / PROGRESS_EVERY > reported / PROGRESS_EVERY {
-            progress(files);
-            (reported_at, reported) = (Instant::now(), files);
-        }
+        let files = match milestones.recv_timeout(interval.saturating_sub(reported_at.elapsed())) {
+            Ok(files) => files,
+            Err(RecvTimeoutError::Timeout) => tally.files_read(),
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        progress(files);
+        reported_at = Instant::now();
     }
 }
 

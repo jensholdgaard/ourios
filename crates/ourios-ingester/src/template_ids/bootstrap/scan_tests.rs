@@ -286,15 +286,14 @@ fn latency(min_ms: u64, spread_ms: u64, seed: u64) -> Plan {
 const DATA_IDS: [u64; 4] = [3, 41, 17, 29];
 const AUDIT_IDS: [u64; 3] = [52, 8, 44];
 
-/// The sequential scan cannot finish before the sum of its reads'
-/// latencies, so that sum is a floor under its wall time. The concurrent
-/// scan over the same latencies finishes in under a tenth of it, with the
-/// identical result.
-#[test]
-fn concurrent_reads_are_ten_times_faster_than_sequential_with_the_same_floor() {
-    let base = history(400, 10, &DATA_IDS, &AUDIT_IDS);
+/// Scan `files` files spread `width` wide behind `plan`'s latencies at the
+/// default concurrency, and assert it matches the sequential scan's result
+/// in under a tenth of the sequential scan's wall time. That wall time is
+/// at least the sum of its reads' latencies, so the sum stands in for it
+/// without spending it.
+fn assert_ten_times_faster_than_sequential(files: usize, width: usize, plan: Plan) {
+    let base = history(files, width, &DATA_IDS, &AUDIT_IDS);
     let sequential = BootstrapScan::run_with(&base, &options(1)).expect("sequential");
-    let plan = latency(20, 60, 7);
     let sequential_floor_ns: u128 = base
         .list_blocking(None)
         .expect("list")
@@ -315,7 +314,7 @@ fn concurrent_reads_are_ten_times_faster_than_sequential_with_the_same_floor() {
             concurrent.audit_max,
             concurrent.files_scanned
         ),
-        (Some(41), Some(52), 400)
+        (Some(41), Some(52), files as u64)
     );
     assert!(
         elapsed.as_nanos() * 10 <= sequential_floor_ns,
@@ -326,6 +325,22 @@ fn concurrent_reads_are_ten_times_faster_than_sequential_with_the_same_floor() {
         seen.max_in_flight.load(Ordering::Acquire) <= DEFAULT_SCAN_CONCURRENCY,
         "reads in flight stay bounded"
     );
+}
+
+#[test]
+fn concurrent_reads_are_ten_times_faster_than_sequential_with_the_same_floor() {
+    assert_ten_times_faster_than_sequential(400, 10, latency(20, 60, 7));
+}
+
+/// The #932 acceptance benchmark: 30,000 files, where listing and channel
+/// overhead would show, at 5–15 ms a read: at 1–5 ms, a debug build's own
+/// per-file cost (about 0.1 ms) is no longer small against the injected
+/// latency. About 25 s, so it is not run by default:
+/// `cargo test -p ourios-ingester --lib -- --ignored thirty_thousand_files`.
+#[test]
+#[ignore = "the 30,000-file benchmark takes about 25 s"]
+fn thirty_thousand_files_read_ten_times_faster_than_sequential() {
+    assert_ten_times_faster_than_sequential(30_000, 30, latency(5, 10, 11));
 }
 
 /// Reads complete out of listing order under shuffled latencies, and
@@ -432,4 +447,22 @@ fn progress_is_reported_by_time() {
     assert_eq!(scan.files_scanned, 120);
     assert!(reports.len() >= 5, "{reports:?}");
     assert!(reports.windows(2).all(|w| w[0] <= w[1]), "{reports:?}");
+}
+
+/// Every 10,000-file mark is reported, however fast the scan runs, and
+/// nothing else is when the time interval never passes.
+#[test]
+fn every_ten_thousand_file_mark_is_reported() {
+    let base = history(25_000, 25, &DATA_IDS, &AUDIT_IDS);
+    let options = ScanOptions {
+        progress_interval: Duration::from_secs(3_600),
+        ..ScanOptions::default()
+    };
+    let mut reports = Vec::new();
+
+    let scan = scan(&base, &options, &mut |files| reports.push(files)).expect("scan");
+
+    assert_eq!(scan.files_scanned, 25_000);
+    reports.sort_unstable();
+    assert_eq!(reports, [10_000, 20_000]);
 }

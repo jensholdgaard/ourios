@@ -40,6 +40,9 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 # the exporter's own tonic/hyper internals), `fmt` is the human-readable
 # stderr copy.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter", "fmt"] }
+# `process.creation.time` on the resource is ISO 8601; same pin as
+# ourios-df-otel.
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 # `testing` only: the weaver live-check sample file and report.
 serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
 

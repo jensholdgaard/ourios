@@ -224,9 +224,12 @@ impl Drop for TelemetryGuard {
     }
 }
 
+/// The resource every signal shares: the service, and the `process` entity
+/// that the process metrics describe.
 fn resource(service_name: &str) -> Resource {
     Resource::builder()
         .with_service_name(service_name.to_owned())
+        .with_attributes(process::identity())
         .build()
 }
 
@@ -623,6 +626,27 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "ourios.compaction.sweeps"),
             "collected stream should contain the recorded instrument, got {names:?}",
+        );
+
+        // The `process` entity's identity rides on the resource, so replicas
+        // and restarts export distinguishable series.
+        let resource = resource_metrics[0].resource();
+        assert_eq!(
+            resource.get(&"process.pid".into()),
+            Some(opentelemetry::Value::I64(i64::from(std::process::id()))),
+        );
+        let created = resource
+            .get(&"process.creation.time".into())
+            .expect("process.creation.time on the resource")
+            .as_str()
+            .into_owned();
+        let created = chrono::DateTime::parse_from_rfc3339(&created)
+            .unwrap_or_else(|e| panic!("{created:?} is not ISO 8601: {e}"));
+        assert!(
+            created.timestamp_millis()
+                <= chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+                    .timestamp_millis(),
+            "the process was created in the past, got {created}",
         );
     }
 

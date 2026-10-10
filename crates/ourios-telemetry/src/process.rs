@@ -1,6 +1,6 @@
 //! The upstream `OTel` process metrics (semantic conventions
 //! `process.*`), observed when the reader collects rather than sampled on a
-//! timer of our own.
+//! timer of our own, and the `process` entity's identifying attributes.
 //!
 //! Linux, the production target, reads `/proc/self` and emits all five:
 //! `process.memory.usage` (resident set size), `process.cpu.time` by
@@ -12,27 +12,67 @@
 //! A source that cannot be read at collection time observes nothing for
 //! that interval; a missing data point is the honest report, a zero is not.
 
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime};
 
+use chrono::{DateTime, SecondsFormat, Utc};
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::Meter;
 
 /// The instrumentation scope the process metrics are recorded under.
 pub(crate) const SCOPE: &str = "ourios.process";
 
+/// When this process started. The monotonic clock carries the precision;
+/// the kernel's record of the start (Linux) adds the time the process ran
+/// before telemetry first asked.
+struct Start {
+    observed: Instant,
+    observed_wall: SystemTime,
+    ran_before: Duration,
+}
+
+impl Start {
+    fn get() -> &'static Self {
+        static START: OnceLock<Start> = OnceLock::new();
+        START.get_or_init(|| Self {
+            observed: Instant::now(),
+            observed_wall: SystemTime::now(),
+            ran_before: ran_before_now().unwrap_or_default(),
+        })
+    }
+
+    fn uptime(&self) -> Duration {
+        self.ran_before + self.observed.elapsed()
+    }
+
+    fn created(&self) -> SystemTime {
+        self.observed_wall
+            .checked_sub(self.ran_before)
+            .unwrap_or(self.observed_wall)
+    }
+}
+
+/// The `process` entity's identifying attributes, `process.pid` and
+/// `process.creation.time` (ISO 8601, UTC), for the telemetry resource:
+/// together they tell replicas, and restarts of one replica, apart.
+pub(crate) fn identity() -> [KeyValue; 2] {
+    let created =
+        DateTime::<Utc>::from(Start::get().created()).to_rfc3339_opts(SecondsFormat::Millis, true);
+    [
+        KeyValue::new("process.pid", i64::from(std::process::id())),
+        KeyValue::new("process.creation.time", created),
+    ]
+}
+
 /// Register the process metrics on `meter`. The callbacks live as long as
 /// the meter provider does, so the returned instruments need not be kept.
 pub(crate) fn register(meter: &Meter) {
-    // The monotonic clock carries the precision; the kernel's record of when
-    // the process started (Linux) adds the time spent before this call.
-    let registered = Instant::now();
-    let ran_before = ran_before_registration().unwrap_or(0.0);
+    let start = Start::get();
     meter
         .f64_observable_gauge("process.uptime")
         .with_unit("s")
         .with_description("The time the process has been running.")
-        .with_callback(move |observer| {
-            observer.observe(ran_before + registered.elapsed().as_secs_f64(), &[]);
-        })
+        .with_callback(move |observer| observer.observe(start.uptime().as_secs_f64(), &[]))
         .build();
 
     #[cfg(unix)]
@@ -51,16 +91,19 @@ pub(crate) fn register(meter: &Meter) {
     linux::register(meter);
 }
 
-/// Seconds between the process starting and now, from `/proc`.
+/// How long the process ran before now, from `/proc`.
 #[cfg(target_os = "linux")]
-fn ran_before_registration() -> Option<f64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+fn ran_before_now() -> Option<Duration> {
     let since_boot = std::fs::read_to_string("/proc/uptime").ok()?;
-    procfs::seconds_since_start(&stat, &since_boot, rustix::param::clock_ticks_per_second())
+    let ran = linux::stat()?.ran_for(
+        procfs::uptime(&since_boot)?,
+        rustix::param::clock_ticks_per_second(),
+    );
+    Duration::try_from_secs_f64(ran).ok()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ran_before_registration() -> Option<f64> {
+fn ran_before_now() -> Option<Duration> {
     None
 }
 
@@ -82,16 +125,15 @@ mod linux {
     use opentelemetry::KeyValue;
     use opentelemetry::metrics::Meter;
 
+    use super::procfs::{Stat, Status, ticks_to_seconds};
+
     pub(super) fn register(meter: &Meter) {
         meter
             .i64_observable_up_down_counter("process.memory.usage")
             .with_unit("By")
             .with_description("The amount of physical memory in use.")
             .with_callback(|observer| {
-                if let Some(bytes) = status_field("VmRSS:")
-                    .as_deref()
-                    .and_then(super::procfs::kib_to_bytes)
-                {
+                if let Some(bytes) = status().and_then(|status| status.rss_bytes) {
                     observer.observe(bytes, &[]);
                 }
             })
@@ -102,7 +144,7 @@ mod linux {
             .with_unit("{thread}")
             .with_description("Process threads count.")
             .with_callback(|observer| {
-                if let Some(threads) = status_field("Threads:").and_then(|v| v.parse().ok()) {
+                if let Some(threads) = status().and_then(|status| status.threads) {
                     observer.observe(threads, &[]);
                 }
             })
@@ -116,22 +158,22 @@ mod linux {
             .with_unit("s")
             .with_description("Total CPU seconds broken down by different CPU modes.")
             .with_callback(move |observer| {
-                let Some(cpu) = std::fs::read_to_string("/proc/self/stat")
-                    .ok()
-                    .and_then(|stat| super::procfs::cpu_ticks(&stat))
-                else {
-                    return;
-                };
-                observer.observe(super::procfs::ticks_to_seconds(cpu.user, ticks), &user);
-                observer.observe(super::procfs::ticks_to_seconds(cpu.system, ticks), &system);
+                if let Some(stat) = stat() {
+                    observer.observe(ticks_to_seconds(stat.user, ticks), &user);
+                    observer.observe(ticks_to_seconds(stat.system, ticks), &system);
+                }
             })
             .build();
     }
 
-    /// The value of one `/proc/self/status` line, e.g. `VmRSS:` → `"1234 kB"`.
-    fn status_field(key: &str) -> Option<String> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        super::procfs::field(&status, key).map(str::to_owned)
+    fn status() -> Option<Status> {
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        Some(Status::parse(&text))
+    }
+
+    pub(super) fn stat() -> Option<Stat> {
+        let text = std::fs::read_to_string("/proc/self/stat").ok()?;
+        Stat::parse(&text)
     }
 }
 
@@ -139,36 +181,70 @@ mod linux {
 /// plain functions over text, so their tests run on every host.
 #[cfg(any(target_os = "linux", test))]
 mod procfs {
-    /// The value after `key` on the first line that starts with it.
-    pub(super) fn field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .map(str::trim)
+    /// The fields Ourios reads from `/proc/<pid>/status`.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct Status {
+        /// `VmRSS`, in bytes.
+        pub(super) rss_bytes: Option<i64>,
+        /// `Threads`.
+        pub(super) threads: Option<i64>,
     }
 
-    /// `"1234 kB"`, as `/proc` reports sizes, in bytes.
-    pub(super) fn kib_to_bytes(value: &str) -> Option<i64> {
-        let kib: i64 = value.strip_suffix("kB")?.trim().parse().ok()?;
-        kib.checked_mul(1024)
+    impl Status {
+        pub(super) fn parse(text: &str) -> Self {
+            let mut status = Self::default();
+            for (key, value) in text.lines().filter_map(|line| line.split_once(':')) {
+                let value = value.trim();
+                match key {
+                    "VmRSS" => {
+                        status.rss_bytes = value
+                            .strip_suffix("kB")
+                            .and_then(|kib| kib.trim().parse::<i64>().ok())
+                            .and_then(|kib| kib.checked_mul(1024));
+                    }
+                    "Threads" => status.threads = value.parse().ok(),
+                    _ => {}
+                }
+            }
+            status
+        }
     }
 
+    /// The fields Ourios reads from `/proc/<pid>/stat`, all in clock ticks.
     #[derive(Debug, PartialEq, Eq)]
-    pub(super) struct CpuTicks {
+    pub(super) struct Stat {
+        /// `utime`, field 14.
         pub(super) user: u64,
+        /// `stime`, field 15.
         pub(super) system: u64,
+        /// `starttime`, field 22: ticks from boot to the process starting.
+        pub(super) start: u64,
     }
 
-    /// `utime` and `stime` from a `/proc/<pid>/stat` line. The command name
-    /// in field 2 is parenthesised and may itself contain spaces and `)`, so
-    /// the fields are counted from the last `)`.
-    pub(super) fn cpu_ticks(stat: &str) -> Option<CpuTicks> {
-        let (_, rest) = stat.rsplit_once(')')?;
-        // `rest` starts at field 3 (`state`); `utime` and `stime` are 14 and 15.
-        let mut fields = rest.split_whitespace().skip(11);
-        let user = fields.next()?.parse().ok()?;
-        let system = fields.next()?.parse().ok()?;
-        Some(CpuTicks { user, system })
+    impl Stat {
+        /// The command name in field 2 is parenthesised and may itself
+        /// contain spaces and `)`, so the fields are counted from the last
+        /// `)`: what follows it starts at field 3.
+        pub(super) fn parse(text: &str) -> Option<Self> {
+            let (_, rest) = text.rsplit_once(')')?;
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            let ticks = |field: usize| fields.get(field - 3)?.parse().ok();
+            Some(Self {
+                user: ticks(14)?,
+                system: ticks(15)?,
+                start: ticks(22)?,
+            })
+        }
+
+        /// Seconds the process has run, given the system uptime.
+        pub(super) fn ran_for(&self, since_boot: f64, per_second: u64) -> f64 {
+            (since_boot - ticks_to_seconds(self.start, per_second)).max(0.0)
+        }
+    }
+
+    /// The system uptime in seconds, the first field of `/proc/uptime`.
+    pub(super) fn uptime(text: &str) -> Option<f64> {
+        text.split_whitespace().next()?.parse().ok()
     }
 
     // Tick counts stay far below 2^52, where an f64 would start to round.
@@ -177,45 +253,40 @@ mod procfs {
         ticks as f64 / per_second.max(1) as f64
     }
 
-    /// How long the process has run: the system uptime (`/proc/uptime`)
-    /// less the process's `starttime` (field 22 of its `stat`, in ticks
-    /// since boot).
-    pub(super) fn seconds_since_start(stat: &str, uptime: &str, per_second: u64) -> Option<f64> {
-        let (_, rest) = stat.rsplit_once(')')?;
-        let start_ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-        let since_boot: f64 = uptime.split_whitespace().next()?.parse().ok()?;
-        Some((since_boot - ticks_to_seconds(start_ticks, per_second)).max(0.0))
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        const STAT: &str = "4242 (ourios (x) y) S 1 4242 4242 0 -1 4194560 1043 0 0 0 \
+                            731 214 0 0 20 0 9 0 12345 1000 200 18446744073709551615";
+
         #[test]
-        fn cpu_ticks_count_fields_from_the_last_parenthesis() {
-            let stat = "4242 (ourios (x) y) S 1 4242 4242 0 -1 4194560 1043 0 0 0 \
-                        731 214 0 0 20 0 9 0 12345 1000 200 18446744073709551615";
+        fn stat_counts_fields_from_the_last_parenthesis() {
             assert_eq!(
-                cpu_ticks(stat),
-                Some(CpuTicks {
+                Stat::parse(STAT),
+                Some(Stat {
                     user: 731,
-                    system: 214
+                    system: 214,
+                    start: 12345,
                 })
             );
-            assert_eq!(cpu_ticks("4242 (truncated) S 1"), None);
+            assert_eq!(Stat::parse("4242 (truncated) S 1"), None);
         }
 
         #[test]
-        fn status_fields_parse_rss_and_threads() {
-            let status =
-                "Name:\tourios-server\nVmHWM:\t  9000 kB\nVmRSS:\t   4096 kB\nThreads:\t17\n";
-            assert_eq!(
-                field(status, "VmRSS:").and_then(kib_to_bytes),
-                Some(4096 * 1024)
+        fn status_parses_rss_and_threads() {
+            let status = Status::parse(
+                "Name:\tourios-server\nVmHWM:\t  9000 kB\nVmRSS:\t   4096 kB\nThreads:\t17\n",
             );
-            assert_eq!(field(status, "Threads:"), Some("17"));
-            assert_eq!(field(status, "VmSwap:"), None);
-            assert_eq!(kib_to_bytes("12 MB"), None);
+            assert_eq!(
+                status,
+                Status {
+                    rss_bytes: Some(4096 * 1024),
+                    threads: Some(17),
+                }
+            );
+            assert_eq!(Status::parse("VmSwap:\t0 kB\n"), Status::default());
+            assert_eq!(Status::parse("VmRSS:\t12 MB\n").rss_bytes, None);
         }
 
         #[test]
@@ -225,12 +296,12 @@ mod procfs {
 
         #[test]
         fn uptime_is_system_uptime_less_the_start_tick() {
-            let stat = "4242 (ourios (x) y) S 1 4242 4242 0 -1 4194560 1043 0 0 0 \
-                        731 214 0 0 20 0 9 0 12345 1000 200 18446744073709551615";
-            let ran = seconds_since_start(stat, "223.45 880.10\n", 100).expect("parses");
+            let stat = Stat::parse(STAT).expect("parses");
+            let since_boot = uptime("223.45 880.10\n").expect("parses");
+            let ran = stat.ran_for(since_boot, 100);
             assert!((ran - 100.0).abs() < 1e-9, "got {ran}");
-            assert_eq!(seconds_since_start(stat, "", 100), None);
-            assert_eq!(seconds_since_start("1 (x) S 1", "5.0 1.0", 100), None);
+            assert_eq!(uptime(""), None);
+            assert_eq!(Stat::parse("1 (x) S 1"), None);
         }
     }
 }

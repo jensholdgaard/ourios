@@ -3656,6 +3656,7 @@ dependencies = [
 name = "ourios-telemetry"
 version = "0.12.1"
 dependencies = [
+ "chrono",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",

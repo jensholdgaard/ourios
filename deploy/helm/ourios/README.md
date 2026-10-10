@@ -142,8 +142,9 @@ Ourios is a telemetry backend, so it is instrumented as one (`CLAUDE.md` §6.3).
 
 The metrics include the upstream OpenTelemetry
 [process metrics](https://opentelemetry.io/docs/specs/semconv/system/process-metrics/),
-under their upstream names and on the same `service.name` resource, read when
-the SDK collects:
+under their upstream names and read when the SDK collects. Every signal's resource
+carries `process.pid` and `process.creation.time` beside `service.name`, so
+replicas and restarts stay apart:
 
 | Metric | Instrument | Unit |
 |---|---|---|

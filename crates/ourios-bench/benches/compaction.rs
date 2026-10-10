@@ -19,6 +19,10 @@
 //!   representative backlog and print the D3 distribution: live files
 //!   before → after (N → 1) and rows conserved.
 //!
+//! - `compaction/spill` — one compaction of the D2 backlog under a small
+//!   RFC 0036 §3.2 decoded-row budget, so it spills; it asserts the #925
+//!   spill and per-phase memory measurements and prints them.
+//!
 //! **Scale caveat (`ci-runner`).** D3's absolute target — output files in
 //! the 256 MiB–2 GiB band, < 5% under 128 MiB (`docs/benchmarks.md` D3) —
 //! needs real corpus *volume* and the `baseline-8vcpu-32gib` host; a
@@ -35,7 +39,11 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{PartitionKey, Store, Writer, compact_partition};
+use ourios_parquet::{
+    CompactionOutcome, CompactionStats, MemoryPhase, PartitionKey, PromotedAttributes, RowHooks,
+    SUB_BATCH_ROWS, Store, Writer, compact_partition, compact_partition_hooked,
+    compact_partition_with_sort_budget,
+};
 use ourios_querier::{Querier, QueryRequest};
 
 /// Anchored in 2026 so the derived partition path is stable; all records
@@ -52,6 +60,12 @@ const D2_BACKLOGS: [u64; 2] = [8, 32];
 const D3_FILES: u64 = 64;
 /// Small-file count for the B2-post-compaction query comparison.
 const B2_POST_FILES: u64 = 32;
+/// Decoded-row budget for the spill workload: far below the D2 backlog's
+/// decoded size, so it spills and merges hierarchically, yet cheap in CI.
+const SPILL_BUDGET: u64 = 256 * 1024;
+/// The merge's default fan-in cap (RFC 0036 §3.2 F): at most this many
+/// runs are open at once, each holding at least one row.
+const MERGE_FAN_IN: u64 = 64;
 /// Bytes per MiB, for the D3 integer-byte size-band classification.
 const MIB: u64 = 1 << 20;
 
@@ -250,6 +264,82 @@ fn small_file_collapse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Print the #925 measurements a compaction left in `stats`: spills, and
+/// each phase's peak usage against its budget.
+fn report_memory(label: &str, stats: &CompactionStats) {
+    eprintln!(
+        "{label}: spilled {} runs, {} B",
+        stats.spill_runs(),
+        stats.spill_bytes()
+    );
+    for phase in MemoryPhase::ALL {
+        let limit = stats
+            .limit(phase)
+            .map_or_else(|| "none".to_string(), |l| format!("{l} B"));
+        eprintln!(
+            "{label}: {} peak {} B, limit {limit}",
+            phase.as_str(),
+            stats.peak(phase)
+        );
+    }
+}
+
+/// The #925 acceptance bound: each budgeted phase's peak usage stays within
+/// its limit plus the allowance `MemoryPhase` documents — one input's
+/// decoded rows for sort, one widest row per open run plus one output
+/// chunk for merge, one sub-batch for write. Rows here are near-identical,
+/// so the mean decoded row (plus a margin) stands in for the widest.
+fn assert_phase_bounds(stats: &CompactionStats, outcome: &CompactionOutcome) {
+    let widest = outcome.decoded_bytes_estimate / outcome.rows.max(1) * 11 / 10 + 1;
+    let chunk = u64::try_from(SUB_BATCH_ROWS).expect("fits u64") * widest;
+    let allowances = [
+        (MemoryPhase::Sort, ROWS_PER_FILE * widest),
+        (MemoryPhase::Merge, MERGE_FAN_IN * widest + chunk),
+        (MemoryPhase::Write, chunk),
+    ];
+    for (phase, allowance) in allowances {
+        let limit = stats.limit(phase).expect("a budgeted phase");
+        let peak = stats.peak(phase);
+        assert!(
+            0 < peak && peak <= limit + allowance,
+            "{} peak {peak} B exceeds limit {limit} B + allowance {allowance} B",
+            phase.as_str(),
+        );
+    }
+}
+
+/// `compaction/spill`: compact the larger D2 backlog under
+/// [`SPILL_BUDGET`] once, assert it spilled and stayed within every phase
+/// bound, and print the measurements. One untimed run keeps CI cheap.
+fn spill_metrics(_c: &mut Criterion) {
+    if baseline_params().is_some() {
+        return; // band-scale baseline mode reports its own spills
+    }
+    let num_files = D2_BACKLOGS[D2_BACKLOGS.len() - 1];
+    let dir = tempfile::TempDir::new().expect("temp bucket");
+    let part = build_backlog(dir.path(), num_files);
+    let store = Store::local(dir.path()).expect("store");
+    let stats = CompactionStats::new();
+    let mut hooks = RowHooks {
+        stats: Some(&stats),
+        ..RowHooks::default()
+    };
+    let outcome = compact_partition_with_sort_budget(&store, &part, SPILL_BUDGET, &mut hooks)
+        .expect("compact");
+    assert_eq!(
+        outcome.rows,
+        num_files * ROWS_PER_FILE,
+        "every row conserved"
+    );
+    assert!(
+        stats.spill_runs() > 0 && stats.spill_bytes() > 0,
+        "a {SPILL_BUDGET} B budget over {} decoded bytes must spill",
+        outcome.decoded_bytes_estimate,
+    );
+    assert_phase_bounds(&stats, &outcome);
+    report_memory("compaction/spill", &stats);
+}
+
 /// Band-scale baseline parameters, read from the environment. Returns
 /// `Some((files, rows_per_file, body_bytes))` when `OURIOS_COMPACTION_BASELINE`
 /// is set — the authoritative `baseline-8vcpu-32gib` run sets these to a
@@ -316,9 +406,16 @@ fn baseline(_c: &mut Criterion) {
     );
     let part = build_backlog_sized(dir.path(), files, rows, body);
 
+    let stats = CompactionStats::new();
+    let mut hooks = RowHooks {
+        stats: Some(&stats),
+        ..RowHooks::default()
+    };
     let t0 = Instant::now();
     let store = Store::local(dir.path()).expect("store");
-    let outcome = compact_partition(&store, &part).expect("compact");
+    let outcome =
+        compact_partition_hooked(&store, &part, &PromotedAttributes::default(), &mut hooks)
+            .expect("compact");
     // Clamp so a sub-microsecond run can't print an infinite/NaN MiB/s.
     let secs = t0.elapsed().as_secs_f64().max(1e-9);
 
@@ -364,6 +461,7 @@ fn baseline(_c: &mut Criterion) {
          {} the 256 MiB–2 GiB band; {pct_under_128:.0}% of live files under 128 MiB after compaction",
         if in_band { "IN" } else { "OUTSIDE" },
     );
+    report_memory("compaction/baseline", &stats);
 }
 
 fn template_exact(tenant: &str, template_id: u64) -> QueryRequest {
@@ -457,6 +555,7 @@ criterion_group!(
     benches,
     compaction_throughput,
     small_file_collapse,
+    spill_metrics,
     b2_post_compaction,
     baseline
 );

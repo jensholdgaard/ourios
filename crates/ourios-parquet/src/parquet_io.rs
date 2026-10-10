@@ -97,15 +97,21 @@ impl<E: WriteError> ChunkError<E> {
 /// sub-batch that pushes the buffer past the threshold seals the next
 /// time around — bounded overshoot is intentional; unbounded overshoot
 /// is what the RFC prohibits. A final post-write check keeps the next
-/// call from inheriting an over-threshold buffer.
+/// call from inheriting an over-threshold buffer. `on_sub_batch` hears
+/// the in-progress row group's size after every sub-batch and after
+/// that final check.
 pub(crate) fn write_chunked<R, E>(
     inner: &mut ArrowWriter<Vec<u8>>,
     rows: &[R],
-    sub_batch_rows: usize,
-    flush_bytes: usize,
+    sizing: ChunkSizing,
     num_rows: &mut i64,
     encode: impl Fn(&[R]) -> Result<RecordBatch, E>,
+    on_sub_batch: &mut dyn FnMut(usize),
 ) -> Result<(), ChunkError<E>> {
+    let ChunkSizing {
+        sub_batch_rows,
+        flush_bytes,
+    } = sizing;
     for chunk in rows.chunks(sub_batch_rows) {
         if inner.in_progress_size() >= flush_bytes {
             inner.flush().map_err(ChunkError::Parquet)?;
@@ -120,11 +126,22 @@ pub(crate) fn write_chunked<R, E>(
         #[allow(clippy::cast_possible_wrap)]
         let written = chunk.len() as i64;
         *num_rows += written;
+        on_sub_batch(inner.in_progress_size());
     }
     if inner.in_progress_size() >= flush_bytes {
         inner.flush().map_err(ChunkError::Parquet)?;
     }
+    on_sub_batch(inner.in_progress_size());
     Ok(())
+}
+
+/// How [`write_chunked`] cuts rows and seals row groups.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChunkSizing {
+    /// Rows per sub-batch.
+    pub(crate) sub_batch_rows: usize,
+    /// In-progress bytes at which a row group seals.
+    pub(crate) flush_bytes: usize,
 }
 
 /// Result of a successful [`BufferedParquetWriter::close`]: the raw
@@ -215,11 +232,6 @@ impl BufferedParquetWriter {
         &self.final_path
     }
 
-    /// The encoded size the in-progress row group is estimated at.
-    pub(crate) fn in_progress_size(&self) -> usize {
-        self.inner.as_ref().map_or(0, ArrowWriter::in_progress_size)
-    }
-
     /// In-progress bytes at which a row group seals.
     pub(crate) fn flush_bytes(&self) -> usize {
         self.flush_bytes
@@ -256,18 +268,34 @@ impl BufferedParquetWriter {
         sub_batch_rows: usize,
         encode: impl Fn(&[R]) -> Result<RecordBatch, E>,
     ) -> Result<(), E> {
+        self.append_observed(rows, sub_batch_rows, encode, &mut |_| {})
+    }
+
+    /// [`Self::append`], telling `on_sub_batch` the in-progress row
+    /// group's size as each sub-batch lands ([`write_chunked`]).
+    pub(crate) fn append_observed<R, E: WriteError>(
+        &mut self,
+        rows: &[R],
+        sub_batch_rows: usize,
+        encode: impl Fn(&[R]) -> Result<RecordBatch, E>,
+        on_sub_batch: &mut dyn FnMut(usize),
+    ) -> Result<(), E> {
         self.ensure_unpoisoned::<E>()?;
         let inner = self
             .inner
             .as_mut()
             .expect("inner ArrowWriter is Some until close is called");
+        let sizing = ChunkSizing {
+            sub_batch_rows,
+            flush_bytes: self.flush_bytes,
+        };
         match write_chunked(
             inner,
             rows,
-            sub_batch_rows,
-            self.flush_bytes,
+            sizing,
             &mut self.num_rows,
             encode,
+            on_sub_batch,
         ) {
             Ok(()) => Ok(()),
             Err(e) => {

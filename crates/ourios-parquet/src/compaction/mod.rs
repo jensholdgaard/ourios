@@ -354,6 +354,32 @@ pub fn compact_partition_with_flush_threshold(
     )
 }
 
+/// [`compact_partition_hooked`] with an explicit RFC 0036 §3.2 decoded-row
+/// budget instead of the 64 MiB default: the deterministic seam a benchmark
+/// uses to drive the spill and hierarchical-merge paths without the volume
+/// they need at the default. Like the row-group threshold of
+/// [`compact_partition_with_flush_threshold`], the budget is a
+/// physical-execution knob: spilling changes no output byte (§3.5), only
+/// scratch I/O and peak memory.
+///
+/// # Errors
+///
+/// See [`compact_partition`].
+pub fn compact_partition_with_sort_budget(
+    store: &Store,
+    partition: &PartitionKey,
+    budget_bytes: u64,
+    hooks: &mut RowHooks<'_>,
+) -> Result<CompactionOutcome, CompactionError> {
+    let promoted = PromotedAttributes::default();
+    let tuning = SortTuning {
+        in_memory_max_bytes: budget_bytes,
+        ..SortTuning::default()
+    };
+    let keys = ClusterKeys::for_promoted(&promoted);
+    compact_sorted_hooked(store, partition, &promoted, keys, tuning, hooks)
+}
+
 /// RFC 0036 §3.2 sort tuning: the in-memory short-circuit bound and
 /// the merge fan-in cap F. Internal so unit tests can force the spill
 /// and hierarchical-merge paths at unit scale; production always runs

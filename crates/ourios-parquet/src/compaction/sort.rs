@@ -271,18 +271,18 @@ fn emit_in_memory(
     Ok(())
 }
 
-/// Append `rows` to the consolidated `writer`, then charge its in-progress
-/// row group to the write phase.
+/// Append `rows` to the consolidated `writer`, charging its in-progress
+/// row group to the write phase as each sub-batch lands.
 fn write_rows(
     writer: &mut Writer,
     rows: &[MinedRecord],
     gauges: Gauges<'_>,
 ) -> Result<(), CompactionError> {
     writer
-        .append_records(rows)
-        .map_err(CompactionError::Write)?;
-    gauges.set(MemoryPhase::Write, widen(writer.in_progress_size()));
-    Ok(())
+        .append_records_observed(rows, &mut |in_progress| {
+            gauges.set(MemoryPhase::Write, widen(in_progress));
+        })
+        .map_err(CompactionError::Write)
 }
 
 /// Sorted runs on local scratch, in spill order.
@@ -573,6 +573,7 @@ where
             residency::add_bytes(decoded_footprint(&entry.record));
         }
         out.push(entry.record);
+        charge.fill(out.len());
         if out.len() == SUB_BATCH_ROWS {
             emit_chunk(&mut out, &mut emit, &charge)?;
         }
@@ -594,9 +595,11 @@ fn emit_chunk<F>(
 where
     F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
 {
-    charge.chunk(out.len());
+    charge.fill(out.len());
+    charge.publish();
     emit(out)?;
-    charge.chunk(0);
+    charge.fill(0);
+    charge.publish();
     #[cfg(test)]
     {
         residency::sub(out.len());
@@ -665,12 +668,15 @@ impl Eq for MergeEntry {}
 
 /// The merge's charge against its budget, published as the merge phase's
 /// usage: each open cursor's batch at its run's widest row — the width
-/// [`cursor_batch_rows`] sizes the batch by — plus the output chunk, at
-/// the widest row of any run, while it is emitted.
+/// [`cursor_batch_rows`] sizes the batch by — plus the output chunk at the
+/// widest row of any run. The chunk's fill is noted per row in a plain
+/// cell and published with every cursor batch load and chunk emit, so
+/// the gauge follows the chunk as it fills without a per-row atomic.
 pub(super) struct MergeCharge<'a> {
     gauges: Gauges<'a>,
     widest_row: u64,
     cursors: Cell<u64>,
+    chunk_rows: Cell<usize>,
 }
 
 impl<'a> MergeCharge<'a> {
@@ -679,6 +685,7 @@ impl<'a> MergeCharge<'a> {
             gauges,
             widest_row: runs.iter().map(|run| run.widest_row).max().unwrap_or(0),
             cursors: Cell::new(0),
+            chunk_rows: Cell::new(0),
         }
     }
 
@@ -686,12 +693,16 @@ impl<'a> MergeCharge<'a> {
     fn swap(&self, old: u64, new: u64) {
         let cursors = self.cursors.get().saturating_sub(old).saturating_add(new);
         self.cursors.set(cursors);
-        self.gauges.set(MemoryPhase::Merge, cursors);
+        self.publish();
     }
 
-    /// The output chunk holds `rows` rows.
-    fn chunk(&self, rows: usize) {
-        let chunk = widen(rows).saturating_mul(self.widest_row);
+    /// The output chunk now holds `rows` rows; seen at the next publish.
+    fn fill(&self, rows: usize) {
+        self.chunk_rows.set(rows);
+    }
+
+    fn publish(&self) {
+        let chunk = widen(self.chunk_rows.get()).saturating_mul(self.widest_row);
         self.gauges
             .set(MemoryPhase::Merge, self.cursors.get().saturating_add(chunk));
     }

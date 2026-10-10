@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// |---|---|---|---|
 /// | `Read` | encoded bytes of the input object held while it decodes | none | — |
 /// | `Sort` | decoded-row buffer of RFC 0036 §3.2 phase 1 | the decoded-row budget | one input's decoded rows |
-/// | `Merge` | open runs' decoded batches, each row charged at its run's widest row, plus the output chunk while it is emitted | the decoded-row budget | one widest row per open run, plus one output chunk |
-/// | `Write` | the consolidated writer's in-progress row group (encoded estimate) | the row-group rotation threshold | one sub-batch |
+/// | `Merge` | open runs' decoded batches, each row charged at its run's widest row, plus the output chunk as it fills | the decoded-row budget | one widest row per open run, plus one output chunk |
+/// | `Write` | the consolidated writer's in-progress row group (encoded estimate), after each sub-batch | the row-group rotation threshold | one sub-batch |
 ///
 /// The read phase has no budget: an input object is fetched whole.
 /// Neither does the encoded output the consolidated writer buffers until

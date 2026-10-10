@@ -53,7 +53,8 @@ pub use compaction::{
     CommitHook, Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats,
     MemoryPhase, OrphanGc, RowFilter, RowHooks, RowObserver, compact_partition,
     compact_partition_hooked, compact_partition_with_flush_threshold,
-    compact_partition_with_promoted, gc_orphans, hour_partitions, plan_candidates,
+    compact_partition_with_promoted, compact_partition_with_sort_budget, gc_orphans,
+    hour_partitions, plan_candidates,
 };
 pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};

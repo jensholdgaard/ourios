@@ -641,25 +641,33 @@ fn cursor_batches_are_sized_from_the_byte_budget() {
     assert_eq!(cursor_batch_rows(1 << 20, 3, 0), SUB_BATCH_ROWS);
 }
 
-/// Issue #925 — a forced-spill compaction reports its spills, its budgets,
-/// and per-phase usage that never exceeds a phase's budget by more than
-/// the allowance [`MemoryPhase`] documents, with every phase back at zero
-/// once it ends. The high-water marks see every update; the `observe`
-/// hook also samples the live gauges as the inputs decode.
-#[test]
-fn forced_spill_reports_spills_and_usage_within_each_phase_budget() {
-    const K: u64 = 16;
-    const S: u64 = 300;
-    const FAN_IN: usize = 4;
+/// The #925 forced-spill fixture: `SPILL_K` inputs of `SPILL_S` wide rows,
+/// merged at fan-in `SPILL_FAN_IN` under an eight-row budget.
+const SPILL_K: u64 = 16;
+const SPILL_S: u64 = 300;
+const SPILL_FAN_IN: usize = 4;
+
+/// The fixture's decoded-row budget and its widest row (rows vary by a few
+/// bytes of suffix; a 2 % allowance covers it).
+fn spill_budget() -> (u64, u64) {
+    let row = decoded_footprint(&wide_rec(1));
+    (8 * row, row + row / 50)
+}
+
+/// One forced-spill compaction measured through `stats`: its outcome, the
+/// partition's encoded size before it, and the `(read, sort)` usage the
+/// `observe` hook sampled as each batch decoded.
+struct SpillRun {
+    outcome: CompactionOutcome,
+    encoded: u64,
+    sampled: Vec<(u64, u64)>,
+}
+
+fn run_forced_spill(stats: &CompactionStats) -> SpillRun {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
-    build_wide_partition(&store, K, S);
+    build_wide_partition(&store, SPILL_K, SPILL_S);
     let encoded = encoded_partition_bytes(&store);
-    let row = decoded_footprint(&wide_rec(1));
-    let budget = 8 * row;
-    let widest = row + row / 50;
-    let one_input = S * widest;
-    let stats = CompactionStats::new();
     let mut sampled = Vec::new();
     let mut observe = |_: &[MinedRecord]| {
         sampled.push((
@@ -669,31 +677,33 @@ fn forced_spill_reports_spills_and_usage_within_each_phase_budget() {
     };
     let mut hooks = RowHooks {
         observe: Some(&mut observe),
-        stats: Some(&stats),
+        stats: Some(stats),
         ..RowHooks::default()
     };
-
+    let tuning = SortTuning {
+        in_memory_max_bytes: spill_budget().0,
+        fan_in: SPILL_FAN_IN,
+        ..SortTuning::default()
+    };
     let outcome = compact_sorted_hooked(
         &store,
         &partition(),
         &PromotedAttributes::default(),
         ClusterKeys::ServiceThenTime,
-        SortTuning {
-            in_memory_max_bytes: budget,
-            fan_in: FAN_IN,
-            ..SortTuning::default()
-        },
+        tuning,
         &mut hooks,
     )
     .expect("compact");
+    SpillRun {
+        outcome,
+        encoded,
+        sampled,
+    }
+}
 
-    assert_eq!(outcome.rows, K * S, "every row carried");
-    assert!(
-        stats.spill_runs() > 0 && stats.spill_bytes() > 0,
-        "spilled {} runs of {} bytes",
-        stats.spill_runs(),
-        stats.spill_bytes(),
-    );
+/// The read phase has no budget; sort and merge run under the decoded-row
+/// budget, and write under the row-group threshold.
+fn assert_phase_limits(stats: &CompactionStats, budget: u64) {
     assert_eq!(
         MemoryPhase::ALL.map(|phase| stats.limit(phase).is_some()),
         [false, true, true, true],
@@ -706,8 +716,14 @@ fn forced_spill_reports_spills_and_usage_within_each_phase_budget() {
         ),
         (Some(budget), Some(budget)),
     );
+}
+
+/// Each budgeted phase peaked above zero and within its limit plus the
+/// allowance [`MemoryPhase`] documents.
+fn assert_phase_peaks(stats: &CompactionStats, budget: u64, widest: u64) {
+    let one_input = SPILL_S * widest;
     let chunk = u64::try_from(SUB_BATCH_ROWS).expect("fits u64") * widest;
-    let cursors = budget.max(u64::try_from(FAN_IN).expect("fits u64") * widest);
+    let cursors = budget.max(u64::try_from(SPILL_FAN_IN).expect("fits u64") * widest);
     let write_limit = stats.limit(MemoryPhase::Write).expect("write budget");
     let bounds = [
         (MemoryPhase::Sort, budget + one_input),
@@ -722,22 +738,50 @@ fn forced_spill_reports_spills_and_usage_within_each_phase_budget() {
             phase.as_str(),
         );
     }
+}
+
+/// Issue #925 — a forced-spill compaction reports its spills, its budgets,
+/// and per-phase usage that never exceeds a phase's budget by more than
+/// the allowance [`MemoryPhase`] documents, with every phase back at zero
+/// once it ends. The high-water marks see every update; the `observe`
+/// hook also samples the live gauges as the inputs decode.
+#[test]
+fn forced_spill_reports_spills_and_usage_within_each_phase_budget() {
+    let stats = CompactionStats::new();
+    let (budget, widest) = spill_budget();
+
+    let run = run_forced_spill(&stats);
+
+    assert_eq!(run.outcome.rows, SPILL_K * SPILL_S, "every row carried");
     assert!(
-        sampled.len() >= usize::try_from(K).expect("fits usize")
-            && sampled
+        stats.spill_runs() > 0 && stats.spill_bytes() > 0,
+        "spilled {} runs of {} bytes",
+        stats.spill_runs(),
+        stats.spill_bytes(),
+    );
+    assert_phase_limits(&stats, budget);
+    assert_phase_peaks(&stats, budget, widest);
+    let sort_bound = budget + SPILL_S * widest;
+    assert!(
+        run.sampled.len() >= usize::try_from(SPILL_K).expect("fits usize")
+            && run
+                .sampled
                 .iter()
-                .all(|&(read, sort)| read > 0 && sort <= budget + one_input),
-        "{sampled:?}",
+                .all(|&(read, sort)| read > 0 && sort <= sort_bound),
+        "{:?}",
+        run.sampled,
     );
     assert_eq!(
         MemoryPhase::ALL.map(|phase| stats.usage(phase)),
         [0; 4],
         "no usage outlives the compaction",
     );
-    let decoded: u64 = (1..=K * S).map(|id| decoded_footprint(&wide_rec(id))).sum();
+    let decoded: u64 = (1..=SPILL_K * SPILL_S)
+        .map(|id| decoded_footprint(&wide_rec(id)))
+        .sum();
     assert_eq!(
-        (outcome.bytes_read, outcome.decoded_bytes_estimate),
-        (encoded, decoded),
+        (run.outcome.bytes_read, run.outcome.decoded_bytes_estimate),
+        (run.encoded, decoded),
         "the partition's encoded and estimated decoded input sizes",
     );
 }

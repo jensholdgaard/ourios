@@ -51,7 +51,8 @@ use uuid::Uuid;
 
 use crate::data_schema_with_promoted;
 use crate::parquet_io::{
-    BufferedParquetWriter, ChunkError, WriteError, object_key, open_local_store, write_chunked,
+    BufferedParquetWriter, ChunkError, ChunkSizing, WriteError, object_key, open_local_store,
+    write_chunked,
 };
 use crate::partition::PartitionKey;
 use crate::promoted::PromotedAttributes;
@@ -504,6 +505,17 @@ impl Writer {
     /// takes ownership of `self`; `append_records` borrows
     /// `&mut self` and therefore cannot run after `close`.
     pub fn append_records(&mut self, records: &[MinedRecord]) -> Result<(), WriterError> {
+        self.append_records_observed(records, &mut |_| {})
+    }
+
+    /// [`Self::append_records`], telling `on_sub_batch` the in-progress
+    /// row group's estimated encoded size as each sub-batch lands — what
+    /// the rotation threshold ([`Self::flush_bytes`]) is checked against.
+    pub(crate) fn append_records_observed(
+        &mut self,
+        records: &[MinedRecord],
+        on_sub_batch: &mut dyn FnMut(usize),
+    ) -> Result<(), WriterError> {
         // Poisoned fail-fast comes before validation so a doomed
         // writer surfaces `Poisoned` (not `PartitionMismatch`) — the
         // caller should stop driving it, whatever the rows look like.
@@ -530,16 +542,14 @@ impl Writer {
         // follow-up `append_records` is safe — the contract is
         // "writer remains usable", not "no rows persisted".
         let promoted = &self.promoted;
-        self.core.append(records, SUB_BATCH_ROWS, |chunk| {
-            mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)
-        })
-    }
-
-    /// The in-progress row group's estimated encoded size: what the
-    /// row-group rotation threshold ([`Self::flush_bytes`]) is checked
-    /// against before each sub-batch.
-    pub(crate) fn in_progress_size(&self) -> usize {
-        self.core.in_progress_size()
+        self.core.append_observed(
+            records,
+            SUB_BATCH_ROWS,
+            |chunk| {
+                mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)
+            },
+            on_sub_batch,
+        )
     }
 
     /// The row-group rotation threshold this writer was opened with.
@@ -830,13 +840,17 @@ pub fn encode_records_to_parquet_with_promoted(
     // guard as `Writer::append_records`); the row count is unused —
     // the one-shot API reports bytes, not rows.
     let mut num_rows = 0i64;
+    let sizing = ChunkSizing {
+        sub_batch_rows: SUB_BATCH_ROWS,
+        flush_bytes: ROW_GROUP_FLUSH_BYTES,
+    };
     write_chunked(
         &mut writer,
         records,
-        SUB_BATCH_ROWS,
-        ROW_GROUP_FLUSH_BYTES,
+        sizing,
         &mut num_rows,
         |chunk| mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch),
+        &mut |_| {},
     )
     .map_err(ChunkError::into_write_error)?;
     // `into_inner` flushes the final row group, writes the footer, and

@@ -404,6 +404,28 @@ async fn terminate_signal(#[cfg(unix)] sigterm: Option<tokio::signal::unix::Sign
     std::future::pending::<()>().await;
 }
 
+/// Resolve on SIGINT or SIGTERM, setting `stopping` first so a startup
+/// still running before the listeners (the RFC 0059 §3.5 bootstrap scan)
+/// stops between reads. A SIGINT handler that cannot be installed resolves
+/// with its error and leaves `stopping` unset: that is a startup failure,
+/// not a shutdown request.
+async fn shutdown_signal(
+    #[cfg(unix)] sigterm: Option<tokio::signal::unix::Signal>,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    let signal = tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal,
+        () = terminate_signal(
+            #[cfg(unix)]
+            sigterm,
+        ) => Ok(()),
+    };
+    if signal.is_ok() {
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+    }
+    signal
+}
+
 /// The pre-readiness startup guards: the RFC 0026 open-mode warning and
 /// the SIGTERM registration — both must precede any role announcing
 /// readiness (see `install_terminate_signal` for the signal race).
@@ -480,11 +502,12 @@ async fn start_receiver(
     store: &ourios_parquet::Store,
     resolver: Option<ourios_serving::AuthResolver>,
     graph_emitter: Option<std::sync::Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<receiver::ReceiverHandle>, String> {
     let Some(params) = &config.receiver else {
         return Ok(None);
     };
-    let handle = receiver::serve(receiver::ReceiverConfig {
+    let receiver_config = receiver::ReceiverConfig {
         grpc_addr: params.grpc_addr,
         grpc_tls: params.grpc_tls.clone(),
         http_addr: params.http_addr,
@@ -498,8 +521,8 @@ async fn start_receiver(
         miner: params.miner,
         template_ids_allow_bootstrap: params.template_ids_allow_bootstrap,
         graph_emitter,
-    })
-    .await?;
+    };
+    let handle = receiver::serve_until(receiver_config, stopping).await?;
     println!("receiver gRPC listening on {}", handle.grpc_addr);
     println!("receiver HTTP listening on {}", handle.http_addr);
     std::io::stdout().flush().ok();
@@ -586,6 +609,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sigterm = startup_guards(&config);
     #[cfg(not(unix))]
     startup_guards(&config);
+    // Listened for from here on, not only once the roles are up: the
+    // receiver's startup recovery can run for minutes before its listeners
+    // open (the RFC 0059 §3.5 bootstrap scan), and must stop on a signal.
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut signalled = tokio::spawn(shutdown_signal(
+        #[cfg(unix)]
+        sigterm,
+        std::sync::Arc::clone(&stopping),
+    ));
 
     // Start the OTLP receiver role if enabled (RFC 0003 §9). Report the
     // bound addresses on stdout so an operator — or a test binding `:0` —
@@ -604,7 +636,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    let receiver = start_receiver(&config, &store, resolver.clone(), graph_emitter.clone()).await?;
+    let receiver = match start_receiver(
+        &config,
+        &store,
+        resolver.clone(),
+        graph_emitter.clone(),
+        std::sync::Arc::clone(&stopping),
+    )
+    .await
+    {
+        Ok(receiver) => receiver,
+        // A signal during startup recovery stops it before anything is
+        // served: a requested shutdown, not a failure.
+        Err(e) if stopping.load(std::sync::atomic::Ordering::Acquire) => {
+            eprintln!("shutdown requested during receiver startup: {e}");
+            if let Err(e) = telemetry.shutdown() {
+                eprintln!("telemetry shutdown error: {e}");
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let querier = start_querier(&config, resolver.clone()).await?;
 
@@ -656,11 +708,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let shutdown = tokio::select! {
         () = compaction => Ok(()),
-        signal = tokio::signal::ctrl_c() => signal,
-        () = terminate_signal(
-            #[cfg(unix)]
-            sigterm,
-        ) => Ok(()),
+        signal = &mut signalled => signal.unwrap_or_else(|e| Err(std::io::Error::other(e))),
     };
 
     // Drain the listeners gracefully (the receiver release frees the single

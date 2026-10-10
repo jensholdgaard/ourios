@@ -14,6 +14,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
@@ -1018,12 +1019,24 @@ async fn bind_listeners(
     Ok((grpc_incoming, grpc_addr, http_listener, http_addr))
 }
 
+/// [`serve_until`] with no shutdown flag, for tests that never signal one.
+#[cfg(test)]
+pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
+    serve_until(config, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Start the receiver role: startup recovery, then both listeners. Once
+/// `stopping` is set, a bootstrap scan still in progress (RFC 0059 §3.5)
+/// stops between reads with nothing written, and so does this.
 // Straight-line orchestration: recovery, sink/pipeline assembly, the
 // cadence sweep, and the two listener spawns. The RFC 0030 TLS branches
 // pushed it past the line cap; splitting it would scatter the shared
 // setup across helpers with long capture lists for no clarity gain.
 #[allow(clippy::too_many_lines)]
-pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
+pub async fn serve_until(
+    config: ReceiverConfig,
+    stopping: Arc<AtomicBool>,
+) -> Result<ReceiverHandle, String> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
     // The §3.4 group-commit knobs, captured before `config.wal` is moved
     // into `Wal::open`: the batch window and the segment-fill early-cut.
@@ -1042,7 +1055,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
     let ids = TemplateIds::new(config.store.clone())
-        .with_bootstrap_allowed(config.template_ids_allow_bootstrap);
+        .with_bootstrap_allowed(config.template_ids_allow_bootstrap)
+        .with_shutdown(stopping);
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
     let mut miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)

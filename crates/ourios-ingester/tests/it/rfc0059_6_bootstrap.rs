@@ -1,10 +1,15 @@
 //! RFC0059.6 — The bootstrap floor is provable and written once.
 //! See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 
-use ourios_ingester::recovery::RecoveryDriverError;
-use ourios_ingester::template_ids::{SEATED_MARKER, TemplateIdsError};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use crate::rfc0059_support::{Fixture, Node, audit_bindings, cut_and_reclaim, publish, rows};
+use ourios_ingester::recovery::RecoveryDriverError;
+use ourios_ingester::template_ids::{SEATED_MARKER, TemplateIds, TemplateIdsError};
+
+use crate::rfc0059_support::{
+    Fixture, Hooks, Node, audit_bindings, cut_and_reclaim, publish, rows,
+};
 
 /// A published store whose highest ids are structured templates, which
 /// emit no audit event, with one tenant's audit stream lost entirely,
@@ -189,4 +194,50 @@ async fn rfc0059_6_a_failed_listing_fails_the_scan_closed() {
         !node.snapshots.join(SEATED_MARKER).exists(),
         "nor the marker"
     );
+}
+
+/// Scenario RFC0059.6 — a shutdown signalled mid-scan stops the start with
+/// neither the object nor the marker written, and the next start redoes
+/// the scan and writes once.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc0059_6_a_shutdown_mid_scan_writes_nothing_and_the_next_start_redoes_it() {
+    // Given a start whose shutdown is signalled at its first data footer
+    // read.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (node, data_max, _) = store_only_rows_can_bound(tmp.path()).await;
+    let hooks = Hooks::default();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    hooks
+        .raise_on_data_read
+        .set(Arc::clone(&shutdown))
+        .expect("armed once");
+    let ids = TemplateIds::new(hooks.wrap(node.store()))
+        .with_bootstrap_allowed(true)
+        .with_shutdown(shutdown);
+
+    // When it runs.
+    let Err(err) = node.restart_ids(ids) else {
+        panic!("the scan must stop");
+    };
+
+    // Then it stopped as interrupted, and nothing was written.
+    assert!(
+        matches!(
+            &err,
+            RecoveryDriverError::TemplateIds(e @ TemplateIdsError::Interrupted { .. })
+                if e.error_type() == "interrupted"
+        ),
+        "{err}"
+    );
+    assert_eq!(node.high_water_bytes(), None, "no object is written");
+    assert!(
+        !node.snapshots.join(SEATED_MARKER).exists(),
+        "nor the marker"
+    );
+
+    // And the next start redoes the scan and writes once.
+    let restarted = node.restart().expect("recover");
+    assert!(restarted.report.template_ids.bootstrapped);
+    assert_eq!(restarted.report.template_ids.high_water, data_max);
 }

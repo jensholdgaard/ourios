@@ -105,16 +105,102 @@ helm test ourios
 > tag via `image.tag` in production (the chart's `appVersion` names the
 > release it was published alongside).
 
-> **Warning: a default install runs unauthenticated and over plaintext.** The chart
-> renders the config file itself and has no values for `auth`, listener TLS
-> (`grpc_tls` / `http_tls`), `querier.mcp` or `openfga`, and no hook to merge
-> extra config into the file; because it passes `--config`, `OURIOS_*`
-> environment variables cannot fill the gap either. Every chart install
-> therefore runs in RFC 0026 **open mode**: any client that can reach the
-> receiver or querier Services can write or read any tenant. Keep those
-> Services inside a trusted network boundary until the chart can configure
-> the security surface
-> ([#852](https://github.com/jensholdgaard/ourios/issues/852)).
+> **Warning: a default install runs unauthenticated and over plaintext.**
+> Authentication and listener TLS are opt-in, so with no `auth` values the
+> install runs in RFC 0026 **open mode**: any client that can reach the
+> receiver or querier Services can write or read any tenant. The install
+> notes repeat this warning. Turn them on as described in
+> [Authentication and TLS](#authentication-and-tls), or keep both Services
+> inside a trusted network boundary.
+
+## Authentication and TLS
+
+The chart renders the server's `auth` section (static tokens, OIDC, OpenFGA),
+the listener TLS blocks and the MCP switch into the receiver and querier
+config files. The compactor binds no listener and gets none of it. The
+server-side behaviour is documented in
+[the authentication guide](https://github.com/jensholdgaard/ourios/blob/main/docs/guides/authentication.md).
+
+**Secrets only through Secret references.** The chart never takes a secret
+value. Each token names an existing Secret and key; the chart injects it as
+an env var with `secretKeyRef` and the config file holds only the
+`${env:…}` reference (the server refuses an inline token). TLS material is
+mounted read-only from existing Secrets. The token and OpenFGA Secret names
+and keys appear only in the Pod spec, never in the rendered ConfigMap, and
+no secret value appears anywhere in the chart's output; the chart renders no
+Secret object. The ConfigMap does hold the TLS file paths, which include the
+client CA's key name (`client_ca_file: /etc/ourios-tls/<listener>-client-ca/<key>`):
+that path is not secret.
+Rotating a token Secret needs `kubectl rollout restart` of the receiver and
+querier; rotated TLS Secrets are picked up in place when
+`reloadIntervalSecs` is set.
+
+Static tokens and OIDC (either or both):
+
+```yaml
+auth:
+  tokens:
+    - name: edge-collector          # audit/metric label, never secret
+      tenants: [checkout, payments] # or ["*"]
+      secretKeyRef:
+        name: ourios-tokens         # kubectl create secret generic ourios-tokens \
+        key: edge-collector         #   --from-literal=edge-collector=<token>
+  oidc:
+    enabled: true
+    issuer: https://dex.example.com
+    audience: ourios
+    tenantClaim: groups             # optional once openfga binds the tenants
+```
+
+OpenFGA binds the tenants of whatever tokens or OIDC authenticate, so it
+needs one of them. Only the tenant-binding layer is exposed: layer-2
+visibility needs promoted attribute columns the chart does not render.
+
+```yaml
+auth:
+  openfga:
+    enabled: true
+    apiUrl: http://openfga.openfga.svc:8080
+    storeId: 01M07RYMXRDW4ND5M7XQV04W8R
+    authorizationModelId: ""        # empty = the store's latest model
+    apiToken:
+      secretKeyRef: {name: openfga-token, key: token}
+```
+
+Listener TLS, per listener, from a `kubernetes.io/tls` Secret (`tls.crt`,
+`tls.key`; cert-manager issues these). A client CA turns on mTLS:
+
+```yaml
+receiver:
+  tls:
+    grpc:                           # OTLP/gRPC :4317
+      existingSecret: ourios-receiver-tls
+      clientCA:
+        existingSecret: ourios-client-ca
+        key: ca.crt
+      reloadIntervalSecs: 300
+    http:                           # OTLP/HTTP :4318
+      existingSecret: ourios-receiver-tls
+querier:
+  mcp:
+    enabled: true                   # /mcp on :4319, behind the same auth
+  tls:
+    http:                           # query API and /mcp :4319
+      existingSecret: ourios-querier-tls
+```
+
+Each Secret mounts at `/etc/ourios-tls/<listener>/` (client CAs at
+`/etc/ourios-tls/<listener>-client-ca/`), without `subPath`, so the
+kubelet refreshes the files when the Secret changes.
+
+With auth on, `helm test` only checks that the querier port accepts a
+connection, because an anonymous query is refused by design. The TCP
+probes keep working with TLS and mTLS.
+
+The default stays open mode so that existing installs upgrade without
+change. Outbound HTTPS from the server (the OIDC issuer, an `https://`
+OpenFGA URL) is verified against the public web PKI roots, so an issuer
+behind a private CA cannot be reached.
 
 ## Configuration
 
@@ -575,10 +661,9 @@ Two hardening notes:
 For mTLS identity rotation (SPIRE, cert-manager): the binary hot-reloads its TLS
 listener certificates (RFC 0030), so a sidecar like `spiffe-helper` writing
 rotating certs to a shared volume would integrate without restarts. The chart
-cannot turn listener TLS on yet: it renders the config file itself and exposes
-no TLS values or extra-config hook, so a chart install serves plaintext (see the
-warning under [Install](#install) and
-[#852](https://github.com/jensholdgaard/ourios/issues/852)).
+mounts listener certificates from Secrets (see
+[Authentication and TLS](#authentication-and-tls)); with cert-manager, a
+rotated Secret plus `reloadIntervalSecs` covers rotation without a sidecar.
 
 ## Compactor topology
 
@@ -625,6 +710,14 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `otel.exporterEndpoint` | `""` | `OTEL_EXPORTER_OTLP_ENDPOINT` — where Ourios exports **all three** of its own signals (metrics, logs, traces). The only OTel knob the chart models; SDK behaviour is configured through the standard `OTEL_*` variables in `extraEnv` — see [Self-telemetry](#self-telemetry). |
 | `extraEnv` | `[]` | Env vars appended verbatim to every container (the place for `OTEL_*`). No plaintext creds. |
 | `<role>.extraEnv` | `[]` | Role-only env, appended after the global `extraEnv` (a duplicate name resolves to the role's value) — e.g. per-role `OTEL_RESOURCE_ATTRIBUTES`. |
+| `auth.tokens` | `[]` | Static bearer tokens: `name`, `tenants`, `secretKeyRef` (`name`, `key`). An inline `token` fails render. |
+| `auth.oidc.enabled` | `false` | OIDC bearer JWTs; needs `issuer`, `audience`, and `tenantClaim` unless OpenFGA is on. |
+| `auth.openfga.enabled` | `false` | OpenFGA tenant binding; needs `apiUrl`, `storeId`, and tokens or OIDC. API token via `apiToken.secretKeyRef`. |
+| `receiver.tls.{grpc,http}.existingSecret` | `""` | `kubernetes.io/tls` Secret for that listener; empty = plaintext. |
+| `querier.tls.http.existingSecret` | `""` | `kubernetes.io/tls` Secret for the query API and `/mcp`; empty = plaintext. |
+| `<listener>.clientCA.existingSecret` / `.key` | `""` / `ca.crt` | Client CA for mTLS on that listener. |
+| `<listener>.minVersion` / `.reloadIntervalSecs` | `""` | `"1.2"` or `"1.3"`; re-read the mounted files every N seconds. |
+| `querier.mcp.enabled` | `false` | Serve the RFC 0027 MCP surface at `/mcp`. |
 
 The image runs as nonroot (uid 65532) with a read-only root filesystem; the
 chart sets `fsGroup` so the process can write the WAL PVC.

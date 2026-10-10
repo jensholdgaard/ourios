@@ -166,9 +166,9 @@ impl Tally {
     }
 
     /// The scan's result once every thread has exited: a failure, or a
-    /// floor only when the whole listing was walked and every listed file
-    /// read.
-    fn outcome(self) -> Result<BootstrapScan, TemplateIdsError> {
+    /// floor only when the whole listing was walked, every listed file was
+    /// read, and no shutdown arrived meanwhile, even during the last read.
+    fn outcome(self, shutdown: &AtomicBool) -> Result<BootstrapScan, TemplateIdsError> {
         if let Some(error) = self
             .failure
             .into_inner()
@@ -177,7 +177,10 @@ impl Tally {
             return Err(error);
         }
         let files_scanned = self.files_read.into_inner();
-        if !self.listing_complete.into_inner() || files_scanned != self.files_listed.into_inner() {
+        if shutdown.load(Ordering::Acquire)
+            || !self.listing_complete.into_inner()
+            || files_scanned != self.files_listed.into_inner()
+        {
             return Err(TemplateIdsError::Interrupted { files_scanned });
         }
         let max = |slot: AtomicU64| slot.into_inner().checked_sub(1);
@@ -190,6 +193,14 @@ impl Tally {
 }
 
 type Keys = Mutex<Receiver<(String, IdColumns)>>;
+
+/// What every reader thread works from.
+struct Reading<'a> {
+    store: &'a Store,
+    tally: &'a Tally,
+    shutdown: &'a AtomicBool,
+    keys: &'a Keys,
+}
 
 /// The scan itself; `progress` is called with each multiple of
 /// [`PROGRESS_EVERY`] files read, and with the files read so far whenever
@@ -210,12 +221,16 @@ fn scan(
     std::thread::scope(|scope| {
         let mut started = 0;
         for _ in 0..readers {
-            let (milestones, tally, keys) = (milestones.clone(), &tally, &keys);
+            let milestones = milestones.clone();
+            let reading = Reading {
+                store,
+                tally: &tally,
+                shutdown,
+                keys: &keys,
+            };
             let reader = std::thread::Builder::new()
                 .name("template-id-scan".to_owned())
-                .spawn_scoped(scope, move || {
-                    read_footers(store, tally, shutdown, keys, &milestones);
-                });
+                .spawn_scoped(scope, move || read_footers(&reading, &milestones));
             match reader {
                 Ok(_) => started += 1,
                 // Fewer readers only lowers the concurrency.
@@ -238,7 +253,7 @@ fn scan(
         drop(milestones);
         watch(&tally, options.progress_interval, &reached, progress);
     });
-    tally.outcome()
+    tally.outcome(shutdown)
 }
 
 /// Feed every `*.parquet` key under each prefix to the readers, until the
@@ -269,13 +284,13 @@ fn list_keys(
 /// Read footers from `keys` until the lister hangs up. Once the scan stops,
 /// keys are still taken but no longer read, so a lister blocked on a full
 /// channel always gets to see the stop.
-fn read_footers(
-    store: &Store,
-    tally: &Tally,
-    shutdown: &AtomicBool,
-    keys: &Keys,
-    milestones: &mpsc::Sender<u64>,
-) {
+fn read_footers(reading: &Reading<'_>, milestones: &mpsc::Sender<u64>) {
+    let Reading {
+        store,
+        tally,
+        shutdown,
+        keys,
+    } = *reading;
     loop {
         let next = keys.lock().unwrap_or_else(PoisonError::into_inner).recv();
         let Ok((key, columns)) = next else {
@@ -378,6 +393,12 @@ pub fn bootstrap(
     options: &ScanOptions,
 ) -> Result<Seated, TemplateIdsError> {
     let scan = BootstrapScan::run_with(store, options)?;
+    // A shutdown after the scan's last check still writes nothing.
+    if options.shutdown.load(Ordering::Acquire) {
+        return Err(TemplateIdsError::Interrupted {
+            files_scanned: scan.files_scanned,
+        });
+    }
     let floor = scan.floor(restored);
     match create(store, floor)? {
         Written::Landed => {

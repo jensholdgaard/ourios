@@ -466,3 +466,75 @@ fn every_ten_thousand_file_mark_is_reported() {
     reports.sort_unstable();
     assert_eq!(reports, [10_000, 20_000]);
 }
+
+/// A shutdown that arrives while the scan's last reads are in flight, the
+/// listing already complete, still stops the bootstrap with nothing
+/// written: for a one-file store during its only read, and for a larger
+/// one during its final read.
+#[test]
+fn a_shutdown_during_the_last_read_writes_nothing() {
+    for (files, stop_at) in [(1, 1), (40, 40)] {
+        let base = history(files, 6, &DATA_IDS, &AUDIT_IDS);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (store, seen) = behind(
+            &base,
+            Plan {
+                stop_after: Some((stop_at, Arc::clone(&shutdown))),
+                ..latency(20, 0, 0)
+            },
+        );
+        let options = ScanOptions {
+            concurrency: 1,
+            shutdown,
+            ..ScanOptions::default()
+        };
+
+        let err = bootstrap(&store, 0, &options).expect_err("interrupted");
+
+        assert_eq!(
+            seen.started.load(Ordering::Acquire),
+            files,
+            "every file was read"
+        );
+        assert!(
+            matches!(err, TemplateIdsError::Interrupted { files_scanned } if files_scanned == files as u64),
+            "{files} files: {err}"
+        );
+        assert_eq!(
+            read(&base).expect("read"),
+            None,
+            "{files} files: nothing is written"
+        );
+    }
+}
+
+/// A read that fails still fails the scan as a scan failure when a
+/// shutdown also arrived.
+#[test]
+fn a_failed_read_outranks_a_shutdown() {
+    let base = history(1, 6, &DATA_IDS, &AUDIT_IDS);
+    let failing = base
+        .list_blocking(Some("data"))
+        .expect("list")
+        .into_iter()
+        .find(|key| key.ends_with(".parquet"))
+        .expect("the one file");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (store, _) = behind(
+        &base,
+        Plan {
+            failing: Some(failing),
+            stop_after: Some((1, Arc::clone(&shutdown))),
+            ..Plan::default()
+        },
+    );
+    let options = ScanOptions {
+        shutdown,
+        ..ScanOptions::default()
+    };
+
+    let err = bootstrap(&store, 0, &options).expect_err("fails");
+
+    assert!(matches!(err, TemplateIdsError::Scan(_)), "{err}");
+    assert_eq!(read(&base).expect("read"), None, "nothing is written");
+}

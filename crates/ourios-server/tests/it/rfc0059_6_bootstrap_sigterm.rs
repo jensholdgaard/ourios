@@ -13,7 +13,7 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,8 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::{PartitionKey, Writer};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::time::timeout;
 
 /// Small files, read first: past the 10,000-file progress mark.
@@ -107,22 +107,16 @@ fn store(bucket: &Path) {
     links(bucket, &slow, "data/tenant_id=aa", SLOW_FILES - 1);
 }
 
-/// Scenario RFC0059.6 — a SIGTERM mid-scan stops the process cleanly with
-/// nothing written, whatever the logs exporter and on one runtime worker.
-/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
-#[tokio::test]
-async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
-    let tmp = tempfile::TempDir::new().expect("temp");
-    let bucket = tmp.path().join("store");
-    let wal_root = tmp.path().join("wal");
-    store(&bucket);
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
-        .env("OURIOS_BUCKET_ROOT", &bucket)
+/// The server over `bucket` and `wal_root`, its receiver authorised to
+/// bootstrap, on one runtime worker, with every exporter off and
+/// `RUST_LOG=off`, so its stderr carries only the scan's own lines.
+fn spawn_server(bucket: &Path, wal_root: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .env("OURIOS_BUCKET_ROOT", bucket)
         .env("OURIOS_RECEIVER_ENABLED", "1")
         .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")
         .env("OURIOS_RECEIVER_HTTP_ADDR", "127.0.0.1:0")
-        .env("OURIOS_WAL_ROOT", &wal_root)
+        .env("OURIOS_WAL_ROOT", wal_root)
         .env("OURIOS_COMPACTION_ENABLED", "false")
         .env("OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP", "true")
         .env("OTEL_LOGS_EXPORTER", "none")
@@ -134,11 +128,12 @@ async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn ourios-server");
+        .expect("spawn ourios-server")
+}
 
-    // RUST_LOG=off silences the tracing copy, so these are the scan's own
-    // stderr lines.
-    let mut stderr = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
+/// Read stderr up to the scan's 10,000-file progress line, asserting that
+/// it and the start line appear.
+async fn await_progress(stderr: &mut Lines<BufReader<ChildStderr>>) {
     let mut seen = Vec::new();
     let progressed = timeout(Duration::from_secs(60), async {
         while let Some(line) = stderr.next_line().await.expect("read stderr") {
@@ -160,7 +155,18 @@ async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
             .any(|line| line.starts_with("template-id bootstrap: reading every data")),
         "no start line on stderr: {seen:?}"
     );
+}
 
+/// How the server ended after a SIGTERM.
+struct Stopped {
+    status: ExitStatus,
+    took: Duration,
+    stderr: String,
+    stdout: String,
+}
+
+/// SIGTERM `child`, reap it, and collect the rest of its output.
+async fn terminate(mut child: Child, stderr: Lines<BufReader<ChildStderr>>) -> Stopped {
     let pid = child.id().expect("server pid");
     let signalled = Instant::now();
     let kill = Command::new("kill")
@@ -174,8 +180,7 @@ async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
         .await
         .expect("the server exits promptly after SIGTERM")
         .expect("reap the server");
-    let stopped_in = signalled.elapsed();
-
+    let took = signalled.elapsed();
     let mut rest = String::new();
     stderr
         .into_inner()
@@ -190,6 +195,33 @@ async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
         .read_to_string(&mut stdout)
         .await
         .expect("drain stdout");
+    Stopped {
+        status,
+        took,
+        stderr: rest,
+        stdout,
+    }
+}
+
+/// Scenario RFC0059.6 — a SIGTERM mid-scan stops the process cleanly with
+/// nothing written, whatever the logs exporter and on one runtime worker.
+/// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
+#[tokio::test]
+async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let bucket = tmp.path().join("store");
+    let wal_root = tmp.path().join("wal");
+    store(&bucket);
+    let mut child = spawn_server(&bucket, &wal_root);
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
+
+    await_progress(&mut stderr).await;
+    let Stopped {
+        status,
+        took,
+        stderr: rest,
+        stdout,
+    } = terminate(child, stderr).await;
 
     assert!(
         status.success(),
@@ -200,8 +232,8 @@ async fn rfc0059_6_sigterm_mid_scan_exits_cleanly_and_writes_nothing() {
         "the scan stopped interrupted, not complete: {rest}"
     );
     assert!(
-        stopped_in < Duration::from_secs(5),
-        "stopped {stopped_in:?} after SIGTERM"
+        took < Duration::from_secs(5),
+        "stopped {took:?} after SIGTERM"
     );
     assert!(
         !stdout.contains("listening on"),

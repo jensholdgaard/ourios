@@ -29,7 +29,8 @@ Workloads:
     high-water once, reading every data and audit footer before its
     listeners open: about the store's file count divided by 16 concurrent
     reads, so let compaction catch up first; a restart mid-scan starts it
-    over); (4) once it has seated (it logs
+    over; the receiver's startup probe allows it and WAL replay {{ mul (.Values.receiver.startupProbe | default dict).periodSeconds (.Values.receiver.startupProbe | default dict).failureThreshold | default 3600 }}s,
+    receiver.startupProbe, before the kubelet restarts it); (4) once it has seated (it logs
     ourios.receiver.template_ids.bootstrapped and writes
     snapshots/TEMPLATE_IDS_SEATED under its WAL root), set it back to false,
     revoke the bootstrap-only grants (the README's steady-state policy)

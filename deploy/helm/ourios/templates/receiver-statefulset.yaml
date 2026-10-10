@@ -75,8 +75,18 @@ spec:
               protocol: TCP
           {{- /*
           No HTTP health route exists yet (the endpoints are POST-only), so
-          probe the listening OTLP/HTTP port over TCP.
+          probe the listening OTLP/HTTP port over TCP. The port opens only once
+          startup recovery (WAL replay, and the RFC 0059 template-id bootstrap
+          scan on an upgrade) has finished, so the startup probe holds off the
+          other two until then. `default` keeps a --reuse-values upgrade from a
+          release without the key rendering.
           */}}
+          {{- $startup := .Values.receiver.startupProbe | default dict }}
+          startupProbe:
+            tcpSocket:
+              port: otlp-http
+            periodSeconds: {{ $startup.periodSeconds | default 10 }}
+            failureThreshold: {{ $startup.failureThreshold | default 360 }}
           readinessProbe:
             tcpSocket:
               port: otlp-http

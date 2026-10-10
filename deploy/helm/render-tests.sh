@@ -129,6 +129,32 @@ check "templateIdsAllowBootstrap renders into the receiver config" \
   "$(receiver_config --set receiver.templateIdsAllowBootstrap=true \
       | grep -o 'template_ids_allow_bootstrap: true')"
 
+# --- receiver startup probe --------------------------------------------------
+
+# Startup recovery (WAL replay, the RFC 0059 bootstrap scan) runs before the
+# OTLP port opens; the startup probe must hold the liveness probe off.
+receiver_startup_probe() {
+  helm template t "$CHART" --show-only templates/receiver-statefulset.yaml "$@" \
+    | sed -n '/startupProbe:/,/readinessProbe:/p' \
+    | sed -nE 's/^ *(port|periodSeconds|failureThreshold): (.*)$/\1=\2/p'
+}
+check "receiver startup probe defaults to one hour on the OTLP/HTTP port" \
+  "port=otlp-http
+periodSeconds=10
+failureThreshold=360" \
+  "$(receiver_startup_probe)"
+check "receiver startup probe budget is configurable" \
+  "port=otlp-http
+periodSeconds=30
+failureThreshold=720" \
+  "$(receiver_startup_probe --set receiver.startupProbe.periodSeconds=30 \
+      --set receiver.startupProbe.failureThreshold=720)"
+check "upgrade path: startupProbe map absent" \
+  "port=otlp-http
+periodSeconds=10
+failureThreshold=360" \
+  "$(receiver_startup_probe --set receiver.startupProbe=null)"
+
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2
   exit 1

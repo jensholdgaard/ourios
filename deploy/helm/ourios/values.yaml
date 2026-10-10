@@ -119,6 +119,15 @@ receiver:
   # The chart runs the binary with --config, which reads no bare
   # OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP env var, so extraEnv cannot set it.
   templateIdsAllowBootstrap: false
+  # How long the receiver may take to start before the kubelet restarts it:
+  # periodSeconds x failureThreshold (default 1 h). Its OTLP port opens
+  # only after startup recovery, which replays the WAL and, on the RFC 0059
+  # upgrade, reads every data and audit footer; the liveness and readiness
+  # probes start only once this one passes. Raise failureThreshold for a
+  # bootstrap over a store larger than about 700,000 files.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
   service:
     type: ClusterIP
   # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never

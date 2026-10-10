@@ -169,26 +169,26 @@ impl Tally {
     /// floor only when the whole listing was walked, every listed file was
     /// read, and no shutdown arrived meanwhile, even during the last read.
     fn outcome(self, shutdown: &AtomicBool) -> Result<BootstrapScan, TemplateIdsError> {
-        if let Some(error) = self
+        let files_scanned = self.files_read.into_inner();
+        let every_file_read =
+            self.listing_complete.into_inner() && files_scanned == self.files_listed.into_inner();
+        let stopped = shutdown.load(Ordering::Acquire) || !every_file_read;
+        let failure = self
             .failure
             .into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
-        {
-            return Err(error);
+            .unwrap_or_else(PoisonError::into_inner);
+        match failure {
+            Some(error) => Err(error),
+            None if stopped => Err(TemplateIdsError::Interrupted { files_scanned }),
+            None => {
+                let max = |slot: AtomicU64| slot.into_inner().checked_sub(1);
+                Ok(BootstrapScan {
+                    data_max: max(self.data_max),
+                    audit_max: max(self.audit_max),
+                    files_scanned,
+                })
+            }
         }
-        let files_scanned = self.files_read.into_inner();
-        if shutdown.load(Ordering::Acquire)
-            || !self.listing_complete.into_inner()
-            || files_scanned != self.files_listed.into_inner()
-        {
-            return Err(TemplateIdsError::Interrupted { files_scanned });
-        }
-        let max = |slot: AtomicU64| slot.into_inner().checked_sub(1);
-        Ok(BootstrapScan {
-            data_max: max(self.data_max),
-            audit_max: max(self.audit_max),
-            files_scanned,
-        })
     }
 }
 

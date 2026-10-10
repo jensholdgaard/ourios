@@ -575,6 +575,96 @@ fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
+/// Watch for SIGINT and SIGTERM from here on, not only once the roles are
+/// up: the receiver's startup recovery can run for minutes before its
+/// listeners open (the RFC 0059 §3.5 bootstrap scan), and must stop on a
+/// signal. Returns the flag a signal sets and the task that resolves on it.
+fn listen_for_shutdown(
+    config: &ServerConfig,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    #[cfg(unix)]
+    let sigterm = startup_guards(config);
+    #[cfg(not(unix))]
+    startup_guards(config);
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signalled = tokio::spawn(shutdown_signal(
+        #[cfg(unix)]
+        sigterm,
+        std::sync::Arc::clone(&stopping),
+    ));
+    (stopping, signalled)
+}
+
+/// A receiver startup that failed because a signal stopped its recovery
+/// is a requested shutdown, not a failure: nothing was served, so flush
+/// telemetry and exit cleanly. Any other failure stays one.
+fn stopped_or_failed(
+    error: String,
+    stopping: &std::sync::atomic::AtomicBool,
+    telemetry: &ourios_telemetry::TelemetryGuard,
+) -> Result<(), Box<dyn Error>> {
+    if !stopping.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(error.into());
+    }
+    eprintln!("shutdown requested during receiver startup: {error}");
+    if let Err(e) = telemetry.shutdown() {
+        eprintln!("telemetry shutdown error: {e}");
+    }
+    Ok(())
+}
+
+/// RFC 0047 §3.3: the graph emitter — built for every role that stores or
+/// rewrites rows (receiver flush cadence, compaction sweep) when the graph
+/// binds a conversation object; no startup round-trip.
+fn graph_emitter(
+    config: &ServerConfig,
+) -> Result<Option<std::sync::Arc<ourios_ingester::graph_emitter::GraphEmitter>>, String> {
+    let Some(openfga) = config.auth.as_ref().and_then(|auth| auth.openfga.as_ref()) else {
+        return Ok(None);
+    };
+    validate_graph_columns(openfga, &config.promoted)?;
+    Ok(
+        ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?
+            .map(std::sync::Arc::new),
+    )
+}
+
+/// The background compactor, when compaction is enabled for this process.
+fn build_compactor(
+    config: &ServerConfig,
+    store: ourios_parquet::Store,
+    graph_emitter: Option<std::sync::Arc<ourios_ingester::graph_emitter::GraphEmitter>>,
+) -> Option<Compactor> {
+    // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
+    // opened in the preflight above so a store failure never leaks a live role,
+    // and writes durable compaction audit events through the same `Store` via
+    // the `ParquetAuditSink` (RFC 0009 §3.6 → RFC 0005 §3.7, slice 2d). Built
+    // only when compaction is enabled (RFC 0009 §3.2) — a deployment disables it
+    // on receiver/querier pods so a single dedicated compactor sweeps. When
+    // disabled, neither the store clone nor the audit sink is constructed, and
+    // the disabled state is logged so it's visible in a multi-pod rollout.
+    if config.compaction_enabled {
+        let audit_store = store.clone();
+        let mut compactor = Compactor::new(
+            store,
+            CompactionPolicy::default(),
+            config.compaction_interval,
+        )
+        .with_promoted_attributes(config.promoted.clone())
+        .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store)));
+        if let Some(emitter) = graph_emitter {
+            compactor = compactor.with_graph_emitter(emitter);
+        }
+        Some(compactor)
+    } else {
+        tracing::info!(name: ourios_semconv::EVENT_OURIOS_SERVER_COMPACTION_DISABLED, "compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
@@ -605,36 +695,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // — so there is no bespoke Ourios telemetry config to map here.
     let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
 
-    #[cfg(unix)]
-    let sigterm = startup_guards(&config);
-    #[cfg(not(unix))]
-    startup_guards(&config);
-    // Listened for from here on, not only once the roles are up: the
-    // receiver's startup recovery can run for minutes before its listeners
-    // open (the RFC 0059 §3.5 bootstrap scan), and must stop on a signal.
-    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut signalled = tokio::spawn(shutdown_signal(
-        #[cfg(unix)]
-        sigterm,
-        std::sync::Arc::clone(&stopping),
-    ));
+    let (stopping, mut signalled) = listen_for_shutdown(&config);
 
     // Start the OTLP receiver role if enabled (RFC 0003 §9). Report the
     // bound addresses on stdout so an operator — or a test binding `:0` —
     // learns the actual ports.
     // One resolver, built once, shared by every enabled network role.
     let resolver = auth_resolver(&config).await?;
-    // RFC 0047 §3.3: the graph emitter — built for every role that stores or
-    // rewrites rows (receiver flush cadence, compaction sweep) when the graph
-    // binds a conversation object; no startup round-trip.
-    let graph_emitter = match config.auth.as_ref().and_then(|auth| auth.openfga.as_ref()) {
-        Some(openfga) => {
-            validate_graph_columns(openfga, &config.promoted)?;
-            ourios_ingester::graph_emitter::GraphEmitter::from_config(openfga)?
-                .map(std::sync::Arc::new)
-        }
-        None => None,
-    };
+    let graph_emitter = graph_emitter(&config)?;
 
     let receiver = match start_receiver(
         &config,
@@ -646,45 +714,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await
     {
         Ok(receiver) => receiver,
-        // A signal during startup recovery stops it before anything is
-        // served: a requested shutdown, not a failure.
-        Err(e) if stopping.load(std::sync::atomic::Ordering::Acquire) => {
-            eprintln!("shutdown requested during receiver startup: {e}");
-            if let Err(e) = telemetry.shutdown() {
-                eprintln!("telemetry shutdown error: {e}");
-            }
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
+        Err(e) => return stopped_or_failed(e, &stopping, &telemetry),
     };
 
     let querier = start_querier(&config, resolver.clone()).await?;
 
-    // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
-    // opened in the preflight above so a store failure never leaks a live role,
-    // and writes durable compaction audit events through the same `Store` via
-    // the `ParquetAuditSink` (RFC 0009 §3.6 → RFC 0005 §3.7, slice 2d). Built
-    // only when compaction is enabled (RFC 0009 §3.2) — a deployment disables it
-    // on receiver/querier pods so a single dedicated compactor sweeps. When
-    // disabled, neither the store clone nor the audit sink is constructed, and
-    // the disabled state is logged so it's visible in a multi-pod rollout.
-    let compactor = if config.compaction_enabled {
-        let audit_store = store.clone();
-        let mut compactor = Compactor::new(
-            store,
-            CompactionPolicy::default(),
-            config.compaction_interval,
-        )
-        .with_promoted_attributes(config.promoted.clone())
-        .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store)));
-        if let Some(emitter) = graph_emitter.clone() {
-            compactor = compactor.with_graph_emitter(emitter);
-        }
-        Some(compactor)
-    } else {
-        tracing::info!(name: ourios_semconv::EVENT_OURIOS_SERVER_COMPACTION_DISABLED, "compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
-        None
-    };
+    let compactor = build_compactor(&config, store, graph_emitter);
 
     // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM). The
     // compaction loop never returns on its own (it sweeps forever, or just

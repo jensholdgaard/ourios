@@ -1025,14 +1025,85 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     serve_until(config, Arc::new(AtomicBool::new(false))).await
 }
 
+/// What startup recovery hands the rest of the receiver.
+struct Recovered {
+    wal: Wal,
+    miner: MinerCluster,
+    ids: TemplateIds,
+    report: RecoveryReport,
+}
+
+/// Run startup recovery on the blocking pool. It can take minutes (WAL
+/// replay, the RFC 0059 §3.5 bootstrap scan), and holding a runtime worker
+/// that long would starve every task on it, the shutdown-signal listener
+/// among them.
+async fn recover_off_runtime(
+    mut wal: Wal,
+    snapshots_root: PathBuf,
+    mut miner: MinerCluster,
+    ids: TemplateIds,
+) -> Result<Recovered, String> {
+    tokio::task::spawn_blocking(move || {
+        recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
+            .map(|report| Recovered {
+                wal,
+                miner,
+                ids,
+                report,
+            })
+            .map_err(|e| format!("startup recovery: {e}"))
+    })
+    .await
+    .map_err(|e| format!("startup recovery: {e}"))?
+}
+
+/// Serve OTLP/gRPC on `incoming`, over TLS when `acceptor` is set, until
+/// `shutdown` fires.
+// `tokio::spawn` heap-allocates the task, so tonic's large serve future
+// never sits on the caller's stack — the lint's concern.
+#[allow(clippy::large_futures)]
+fn spawn_grpc(
+    incoming: TcpIncoming,
+    acceptor: Option<ReloadingAcceptor>,
+    auth: AuthResolver,
+    pipeline: SharedPipeline,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<Result<(), tonic::transport::Error>> {
+    // The OTel Collector's OTLP exporter gzip-compresses by default, so the
+    // receiver must accept gzip to interoperate with a stock Collector
+    // (tests/it/collector_interop.rs). Identity stays accepted; this is
+    // additive.
+    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline))
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    let auth_layer = AuthLayer::new(auth);
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = shutdown.changed().await;
+        };
+        let server = Server::builder()
+            .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
+            .layer(auth_layer)
+            .add_service(grpc_service);
+        let incoming = accept_backoff(incoming, LISTENER_GRPC);
+        match acceptor {
+            Some(acceptor) => {
+                server
+                    .serve_with_incoming_shutdown(tls_incoming(incoming, acceptor), shutdown)
+                    .await
+            }
+            None => {
+                server
+                    .serve_with_incoming_shutdown(incoming, shutdown)
+                    .await
+            }
+        }
+    })
+}
+
 /// Start the receiver role: startup recovery, then both listeners. Once
 /// `stopping` is set, a bootstrap scan still in progress (RFC 0059 §3.5)
 /// stops between reads with nothing written, and so does this.
-// Straight-line orchestration: recovery, sink/pipeline assembly, the
-// cadence sweep, and the two listener spawns. The RFC 0030 TLS branches
-// pushed it past the line cap; splitting it would scatter the shared
-// setup across helpers with long capture lists for no clarity gain.
-#[allow(clippy::too_many_lines)]
 pub async fn serve_until(
     config: ReceiverConfig,
     stopping: Arc<AtomicBool>,
@@ -1052,15 +1123,19 @@ pub async fn serve_until(
     // nothing else can rebuild.
     ourios_ingester::barrier::fsync_snapshots_root(&snapshots_root)
         .map_err(|e| format!("fsync snapshots root: {e}"))?;
-    let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
+    let wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
     let ids = TemplateIds::new(config.store.clone())
         .with_bootstrap_allowed(config.template_ids_allow_bootstrap)
         .with_shutdown(stopping);
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
-    let mut miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
-    let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &ids)
-        .map_err(|e| format!("startup recovery: {e}"))?;
+    let miner = build_miner(config.miner, (&sink, &audit_sink), &ids);
+    let Recovered {
+        wal,
+        miner,
+        ids,
+        report,
+    } = recover_off_runtime(wal, snapshots_root.clone(), miner, ids).await?;
     warn_stale_gaps(&report);
     let ledger = snapshot_post_recovery((&sink, &audit_sink), &snapshots_root, &miner, &report);
 
@@ -1131,45 +1206,13 @@ pub async fn serve_until(
     let (grpc_acceptor, http_acceptor) =
         build_acceptors(config.grpc_tls.as_ref(), config.http_tls.as_ref())?;
 
-    // The OTel Collector's OTLP exporter gzip-compresses by default, so the
-    // receiver must accept gzip to interoperate with a stock Collector
-    // (tests/it/collector_interop.rs). Identity stays accepted; this is
-    // additive.
-    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()))
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-    let auth_layer = AuthLayer::new(config.auth.clone());
-    let grpc = tokio::spawn({
-        let mut rx = shutdown_rx.clone();
-        // `tokio::spawn` heap-allocates the task, so tonic's large serve
-        // future never sits on the caller's stack — the lint's concern.
-        #[allow(clippy::large_futures)]
-        async move {
-            let shutdown = async move {
-                let _ = rx.changed().await;
-            };
-            let server = Server::builder()
-                .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
-                .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
-                .layer(auth_layer)
-                .add_service(grpc_service);
-            let grpc_incoming = accept_backoff(grpc_incoming, LISTENER_GRPC);
-            match grpc_acceptor {
-                Some(acceptor) => {
-                    server
-                        .serve_with_incoming_shutdown(
-                            tls_incoming(grpc_incoming, acceptor),
-                            shutdown,
-                        )
-                        .await
-                }
-                None => {
-                    server
-                        .serve_with_incoming_shutdown(grpc_incoming, shutdown)
-                        .await
-                }
-            }
-        }
-    });
+    let grpc = spawn_grpc(
+        grpc_incoming,
+        grpc_acceptor,
+        config.auth.clone(),
+        pipeline.clone(),
+        shutdown_rx.clone(),
+    );
 
     let http_router = router(
         pipeline.clone(),
@@ -3175,6 +3218,72 @@ mod tests {
         assert_no_snapshot_yet(
             &snapshots_root,
             "the stamp is skipped while a record ≤ the mark reached no Parquet object",
+        );
+    }
+
+    /// A data file whose `template_id` column has no statistics, so the
+    /// bootstrap scan downloads and decodes it whole, linked `copies` times.
+    fn slow_store(root: &Path, copies: usize) {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        let dir = root.join("data/tenant_id=acme");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let ids = arrow_array::UInt64Array::from_iter_values(0..500_000);
+        let batch = arrow_array::RecordBatch::try_from_iter([("template_id", Arc::new(ids) as _)])
+            .expect("batch");
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let original = dir.join("f0.parquet");
+        let file = std::fs::File::create(&original).expect("create");
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        for copy in 1..copies {
+            std::fs::hard_link(&original, dir.join(format!("f{copy}.parquet"))).expect("link");
+        }
+    }
+
+    /// The bootstrap scan runs off the runtime: on a current-thread runtime,
+    /// where a scan holding the only thread would keep every task from
+    /// running, a task still sets the stop flag mid-scan, and startup fails
+    /// interrupted with nothing written (#932).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_set_by_a_task_interrupts_the_bootstrap_on_one_thread() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let data_root = tmp.path().join("store");
+        slow_store(&data_root, 2_000);
+        let config = ReceiverConfig {
+            template_ids_allow_bootstrap: true,
+            ..local_config(&tmp.path().join("wal"), &data_root)
+        };
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stopper = tokio::spawn({
+            let stopping = Arc::clone(&stopping);
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                stopping.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let Err(err) = serve_until(config, stopping).await else {
+            panic!("the bootstrap must stop");
+        };
+
+        stopper.await.expect("the stopper ran");
+        assert!(err.contains("interrupted by shutdown"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stopped after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !data_root
+                .join(ourios_ingester::template_ids::HIGH_WATER_KEY)
+                .exists(),
+            "no high-water object is written"
         );
     }
 }

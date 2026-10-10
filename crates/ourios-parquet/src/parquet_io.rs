@@ -215,6 +215,16 @@ impl BufferedParquetWriter {
         &self.final_path
     }
 
+    /// The encoded size the in-progress row group is estimated at.
+    pub(crate) fn in_progress_size(&self) -> usize {
+        self.inner.as_ref().map_or(0, ArrowWriter::in_progress_size)
+    }
+
+    /// In-progress bytes at which a row group seals.
+    pub(crate) fn flush_bytes(&self) -> usize {
+        self.flush_bytes
+    }
+
     /// Fail fast when a prior append poisoned the writer — touching
     /// `inner` after a Parquet error would call into an `ArrowWriter`
     /// whose buffer state is undefined. `close()` refuses to publish

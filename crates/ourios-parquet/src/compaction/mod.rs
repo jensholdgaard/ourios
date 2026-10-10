@@ -55,6 +55,7 @@ mod commit;
 mod keys;
 mod plan;
 mod sort;
+mod stats;
 #[cfg(test)]
 mod tests;
 
@@ -76,6 +77,8 @@ use plan::*;
 pub use plan::{hour_partitions, plan_candidates, visit_partition_rows};
 #[allow(unused_imports, clippy::wildcard_imports)]
 use sort::*;
+pub use stats::{CompactionStats, MemoryPhase};
+use stats::{Gauges, UsageReset};
 
 /// What a [`compact_partition`] call did.
 #[derive(Debug, Clone)]
@@ -120,6 +123,9 @@ pub struct CompactionOutcome {
     /// ([`crate::WrittenFile::bytes_written`]), not a `stat` of a path —
     /// a store-backed (S3) output can't be `stat`-ed.
     pub bytes_written: u64,
+    /// The rewritten rows' decoded size as the RFC 0036 §3.2 budget
+    /// estimates it; `0` on a no-op.
+    pub decoded_bytes_estimate: u64,
 }
 
 /// The committed result of a compaction.
@@ -264,6 +270,7 @@ pub fn compact_partition_with_promoted(
 /// conversation-scoped erasure) — with a `drop` filter the partition is
 /// rewritten even when it holds a single file, so the erasure lands.
 /// `on_commit` hears of the rewrite the moment its manifest commit is won.
+/// `stats` receives the rewrite's live memory and spill measurements.
 #[derive(Default)]
 pub struct RowHooks<'a> {
     /// Called once per decoded batch, before any drop, so every input
@@ -276,6 +283,9 @@ pub struct RowHooks<'a> {
     /// A crash during that cleanup leaves the partition committed, so a
     /// caller recording commits records it here rather than on return.
     pub on_commit: Option<&'a mut CommitHook<'a>>,
+    /// Kept current with the bytes each phase tracks against its budget,
+    /// the budgets, and the runs spilled to local scratch.
+    pub stats: Option<&'a CompactionStats>,
 }
 
 /// A [`RowHooks::observe`] callback.
@@ -477,7 +487,7 @@ fn compact_sorted_hooked(
     // so a mis-partitioned input aborts the compaction instead of being
     // silently merged. Row groups rotate at the §3.3 compacted
     // threshold and the file declares the §3.4 `sorting_columns`.
-    let mut writer = Writer::open_in_compacted(
+    let writer = Writer::open_in_compacted(
         store,
         partition.clone(),
         DEFAULT_ZSTD_LEVEL,
@@ -493,9 +503,9 @@ fn compact_sorted_hooked(
         promoted,
         keys,
         tuning,
+        gauges: Gauges(hooks.stats),
     };
-    let totals = sort_inputs_into(&mut writer, plan, &inputs, hooks)?;
-    let written = writer.close().map_err(CompactionError::Write)?;
+    let (totals, written) = sort_and_close(writer, plan, &inputs, hooks)?;
     let bytes_written = written.bytes_written;
     let consolidated = basename(&written.key).to_owned();
 
@@ -527,6 +537,20 @@ fn compact_sorted_hooked(
     Ok(announce_and_clean_up(store, &inputs, hooks, outcome))
 }
 
+/// Sort `inputs` into `writer` and close it, leaving no phase's memory
+/// usage behind however it ends.
+fn sort_and_close(
+    mut writer: Writer,
+    plan: SortPlan<'_>,
+    inputs: &[String],
+    hooks: &mut RowHooks<'_>,
+) -> Result<(SortTotals, crate::WrittenFile), CompactionError> {
+    let _reset = UsageReset(plan.gauges);
+    let totals = sort_inputs_into(&mut writer, plan, inputs, hooks)?;
+    let written = writer.close().map_err(CompactionError::Write)?;
+    Ok((totals, written))
+}
+
 /// The outcome of a won commit of `inputs`, before their cleanup.
 fn committed_outcome(
     inputs: &[String],
@@ -543,6 +567,7 @@ fn committed_outcome(
         gc_failures: 0,
         bytes_read: totals.bytes_read,
         bytes_written,
+        decoded_bytes_estimate: totals.decoded_bytes,
     }
 }
 

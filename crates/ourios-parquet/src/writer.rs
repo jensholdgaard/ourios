@@ -535,6 +535,18 @@ impl Writer {
         })
     }
 
+    /// The in-progress row group's estimated encoded size: what the
+    /// row-group rotation threshold ([`Self::flush_bytes`]) is checked
+    /// against before each sub-batch.
+    pub(crate) fn in_progress_size(&self) -> usize {
+        self.core.in_progress_size()
+    }
+
+    /// The row-group rotation threshold this writer was opened with.
+    pub(crate) fn flush_bytes(&self) -> usize {
+        self.core.flush_bytes()
+    }
+
     /// Close the writer, finalising the Parquet footer in the
     /// in-memory buffer and publishing the bytes to the object store
     /// under the partition's key. Must be called for the file to be

@@ -414,6 +414,7 @@ fn over_budget_partition_matches_the_in_memory_output_with_hooks() {
             observe: Some(&mut observe),
             drop: Some(&erased),
             on_commit: None,
+            stats: None,
         };
         let outcome = compact_sorted_hooked(
             store,
@@ -638,4 +639,137 @@ fn cursor_batches_are_sized_from_the_byte_budget() {
     assert_eq!(cursor_batch_rows(0, 4, 10_000), 1, "floor of one row");
     assert_eq!(cursor_batch_rows(1 << 20, 3, u64::MAX), 1);
     assert_eq!(cursor_batch_rows(1 << 20, 3, 0), SUB_BATCH_ROWS);
+}
+
+/// Issue #925 — a forced-spill compaction reports its spills, its budgets,
+/// and per-phase usage that never exceeds a phase's budget by more than
+/// the allowance [`MemoryPhase`] documents, with every phase back at zero
+/// once it ends. The high-water marks see every update; the `observe`
+/// hook also samples the live gauges as the inputs decode.
+#[test]
+fn forced_spill_reports_spills_and_usage_within_each_phase_budget() {
+    const K: u64 = 16;
+    const S: u64 = 300;
+    const FAN_IN: usize = 4;
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    build_wide_partition(&store, K, S);
+    let encoded = encoded_partition_bytes(&store);
+    let row = decoded_footprint(&wide_rec(1));
+    let budget = 8 * row;
+    let widest = row + row / 50;
+    let one_input = S * widest;
+    let stats = CompactionStats::new();
+    let mut sampled = Vec::new();
+    let mut observe = |_: &[MinedRecord]| {
+        sampled.push((
+            stats.usage(MemoryPhase::Read),
+            stats.usage(MemoryPhase::Sort),
+        ));
+    };
+    let mut hooks = RowHooks {
+        observe: Some(&mut observe),
+        stats: Some(&stats),
+        ..RowHooks::default()
+    };
+
+    let outcome = compact_sorted_hooked(
+        &store,
+        &partition(),
+        &PromotedAttributes::default(),
+        ClusterKeys::ServiceThenTime,
+        SortTuning {
+            in_memory_max_bytes: budget,
+            fan_in: FAN_IN,
+            ..SortTuning::default()
+        },
+        &mut hooks,
+    )
+    .expect("compact");
+
+    assert_eq!(outcome.rows, K * S, "every row carried");
+    assert!(
+        stats.spill_runs() > 0 && stats.spill_bytes() > 0,
+        "spilled {} runs of {} bytes",
+        stats.spill_runs(),
+        stats.spill_bytes(),
+    );
+    assert_eq!(
+        MemoryPhase::ALL.map(|phase| stats.limit(phase).is_some()),
+        [false, true, true, true],
+        "the read phase has no budget; the others do",
+    );
+    assert_eq!(
+        (
+            stats.limit(MemoryPhase::Sort),
+            stats.limit(MemoryPhase::Merge)
+        ),
+        (Some(budget), Some(budget)),
+    );
+    let chunk = u64::try_from(SUB_BATCH_ROWS).expect("fits u64") * widest;
+    let cursors = budget.max(u64::try_from(FAN_IN).expect("fits u64") * widest);
+    let write_limit = stats.limit(MemoryPhase::Write).expect("write budget");
+    let bounds = [
+        (MemoryPhase::Sort, budget + one_input),
+        (MemoryPhase::Merge, cursors + chunk),
+        (MemoryPhase::Write, write_limit + chunk),
+    ];
+    for (phase, bound) in bounds {
+        let peak = stats.peak(phase);
+        assert!(
+            0 < peak && peak <= bound,
+            "{} peak {peak} outside (0, {bound}]",
+            phase.as_str(),
+        );
+    }
+    assert!(
+        sampled.len() >= usize::try_from(K).expect("fits usize")
+            && sampled
+                .iter()
+                .all(|&(read, sort)| read > 0 && sort <= budget + one_input),
+        "{sampled:?}",
+    );
+    assert_eq!(
+        MemoryPhase::ALL.map(|phase| stats.usage(phase)),
+        [0; 4],
+        "no usage outlives the compaction",
+    );
+    let decoded: u64 = (1..=K * S).map(|id| decoded_footprint(&wide_rec(id))).sum();
+    assert_eq!(
+        (outcome.bytes_read, outcome.decoded_bytes_estimate),
+        (encoded, decoded),
+        "the partition's encoded and estimated decoded input sizes",
+    );
+}
+
+/// Without a spill there is nothing to count, and the in-memory path
+/// still reports its sort-phase usage.
+#[test]
+fn in_memory_compaction_reports_no_spill() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    build_wide_partition(&store, 3, 20);
+    let stats = CompactionStats::new();
+    let mut hooks = RowHooks {
+        stats: Some(&stats),
+        ..RowHooks::default()
+    };
+
+    compact_partition_hooked(
+        &store,
+        &partition(),
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("compact");
+
+    assert_eq!(
+        (
+            stats.spill_runs(),
+            stats.spill_bytes(),
+            stats.peak(MemoryPhase::Merge),
+            stats.peak(MemoryPhase::Sort) > 0,
+        ),
+        (0, 0, 0, true),
+    );
 }

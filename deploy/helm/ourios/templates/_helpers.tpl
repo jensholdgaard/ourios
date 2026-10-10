@@ -213,9 +213,14 @@ reloadIntervalSecs picks it up.
 {{- range $l := splitList " " (include "ourios.tlsListeners" $role) }}
 {{- $t := dig "tls" $l (dict) $roleValues }}
 {{- $ca := $t.clientCA | default dict }}
+{{- $minVersion := include "ourios.setValue" $t.minVersion }}
+{{- $reload := include "ourios.setValue" $t.reloadIntervalSecs }}
 {{- if $t.existingSecret }}
-{{- if not (has (toString ($t.minVersion | default "")) (list "" "1.2" "1.3")) }}
+{{- if and $minVersion (not (has $minVersion (list "1.2" "1.3"))) }}
 {{- fail (printf "%s.tls.%s.minVersion must be \"1.2\" or \"1.3\", got %v" $role $l $t.minVersion) }}
+{{- end }}
+{{- if and $reload (not (regexMatch "^[1-9][0-9]*$" $reload)) }}
+{{- fail (printf "%s.tls.%s.reloadIntervalSecs must be a positive integer (seconds), got %v" $role $l $t.reloadIntervalSecs) }}
 {{- end }}
 {{ $l }}_tls:
   cert_file: "/etc/ourios-tls/{{ $l }}/tls.crt"
@@ -223,14 +228,11 @@ reloadIntervalSecs picks it up.
 {{- with $ca.existingSecret }}
   client_ca_file: "/etc/ourios-tls/{{ $l }}-client-ca/{{ required (printf "%s.tls.%s.clientCA.key is required with clientCA.existingSecret" $role $l) $ca.key }}"
 {{- end }}
-{{- with $t.minVersion }}
-  min_version: {{ toString . | quote }}
+{{- with $minVersion }}
+  min_version: {{ . | quote }}
 {{- end }}
-{{- with $t.reloadIntervalSecs }}
-{{- if le (int .) 0 }}
-{{- fail (printf "%s.tls.%s.reloadIntervalSecs must be a positive integer (seconds), got %v" $role $l .) }}
-{{- end }}
-  reload_interval_secs: {{ int . }}
+{{- with $reload }}
+  reload_interval_secs: {{ . }}
 {{- end }}
 {{- else if $ca.existingSecret }}
 {{- fail (printf "%s.tls.%s.clientCA.existingSecret needs %s.tls.%s.existingSecret: mTLS requires the listener's own certificate" $role $l $role $l) }}
@@ -274,6 +276,15 @@ The read-only Secret volumes behind ourios.tlsConfig; pass (dict "root" $
   readOnly: true
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+A scalar value as a string, or nothing when it is absent or empty. A typed
+zero renders "0", so it reaches validation instead of being dropped as
+empty the way `default` and `with` would drop it.
+*/}}
+{{- define "ourios.setValue" -}}
+{{- if and (not (kindIs "invalid" .)) (ne (toString .) "") }}{{ toString . }}{{- end }}
 {{- end }}
 
 {{/*
@@ -365,6 +376,9 @@ auth:
     store_id: {{ required "auth.openfga.storeId is required with auth.openfga.enabled" $fga.storeId | quote }}
 {{- include "ourios.optScalar" (dict "key" "authorization_model_id" "value" $fga.authorizationModelId) }}
 {{- $ref := dig "apiToken" "secretKeyRef" (dict) $fga }}
+{{- if and (or $ref.name $ref.key) (not (and $ref.name $ref.key)) }}
+{{- fail "auth.openfga.apiToken.secretKeyRef needs both name and key, or neither (no API token)" }}
+{{- end }}
 {{- if $ref.name }}
     api_token: "${env:OURIOS_OPENFGA_API_TOKEN}"
 {{- end }}
@@ -398,7 +412,7 @@ when auth is off. Only the receiver and querier take it.
   valueFrom:
     secretKeyRef:
       name: {{ $ref.name | quote }}
-      key: {{ required "auth.openfga.apiToken.secretKeyRef.key is required with its name" $ref.key | quote }}
+      key: {{ $ref.key | quote }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -439,13 +453,23 @@ OTEL_RESOURCE_ATTRIBUTES) and a duplicate resolves to the role's entry —
 Kubernetes takes the last occurrence.
 */}}
 {{- define "ourios.workloadEnv" -}}
+{{- $roleEnv := dig "extraEnv" (list) (index .root.Values .role | default (dict)) }}
+{{- /* The auth env names are reserved: an extraEnv entry with one of them
+would replace the Secret-sourced token (Kubernetes keeps the last). */}}
+{{- range $source, $list := dict "extraEnv" (.root.Values.extraEnv | default list) (printf "%s.extraEnv" .role) $roleEnv }}
+{{- range $list }}
+{{- if regexMatch "^OURIOS_(AUTH_TOKEN_[0-9]+|OPENFGA_API_TOKEN)$" (toString .name) }}
+{{- fail (printf "%s sets %s, a name the chart reserves for a Secret-sourced auth token: set the token through auth.tokens[].secretKeyRef or auth.openfga.apiToken.secretKeyRef instead" $source .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if or (eq .role "receiver") (eq .role "querier") }}
 {{- include "ourios.authEnv" .root }}
 {{- end }}
 {{- include "ourios.commonEnv" .root }}
 {{- /* index-then-dig: dig cannot traverse the typed .Values root, and the
 role key may be absent under `helm upgrade --reuse-values`. */}}
-{{- with dig "extraEnv" (list) (index .root.Values .role | default (dict)) }}
+{{- with $roleEnv }}
 {{ toYaml . }}
 {{- end }}
 {{- end }}

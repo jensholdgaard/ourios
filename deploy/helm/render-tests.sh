@@ -319,6 +319,55 @@ enabled: true" \
       | sed -n '/^  mcp:/,/^  [a-z_]*:$/p' | sed 's/^ *//' | head -2)"
 check "MCP off by default" "" "$(role_config querier | grep 'mcp:' || true)"
 
+# Explicit invalid values must fail the render, typed zeros included: the
+# empty-value shortcuts (`default`, `with`) would otherwise drop them.
+check_fails "a numeric minVersion 0 is refused, not dropped" "minVersion must be" \
+  --set receiver.tls.http.existingSecret=t --set receiver.tls.http.minVersion=0
+check_fails "reloadIntervalSecs 0 is refused, not dropped" \
+  "reloadIntervalSecs must be a positive integer" \
+  --set querier.tls.http.existingSecret=t --set querier.tls.http.reloadIntervalSecs=0
+check_fails "a non-integer reloadIntervalSecs is refused" \
+  "reloadIntervalSecs must be a positive integer" \
+  --set querier.tls.http.existingSecret=t --set-string querier.tls.http.reloadIntervalSecs=1m
+fga_args=(
+  --set 'auth.tokens[0].name=e' --set 'auth.tokens[0].tenants[0]=a'
+  --set 'auth.tokens[0].secretKeyRef.name=s' --set 'auth.tokens[0].secretKeyRef.key=k'
+  --set auth.openfga.enabled=true --set auth.openfga.apiUrl=http://f
+  --set auth.openfga.storeId=s
+)
+check_fails "an OpenFGA apiToken secretKeyRef with a key but no name is refused" \
+  "needs both name and key" "${fga_args[@]}" --set auth.openfga.apiToken.secretKeyRef.key=k
+check_fails "an OpenFGA apiToken secretKeyRef with a name but no key is refused" \
+  "needs both name and key" "${fga_args[@]}" --set auth.openfga.apiToken.secretKeyRef.name=n
+check "OpenFGA without an apiToken renders no api_token" "" \
+  "$(role_config querier "${fga_args[@]}" | grep 'api_token' || true)"
+check_fails "a reserved token env name in global extraEnv is refused" \
+  "extraEnv sets OURIOS_AUTH_TOKEN_0" \
+  "${fga_args[@]}" --set 'extraEnv[0].name=OURIOS_AUTH_TOKEN_0' --set 'extraEnv[0].value=x'
+check_fails "a reserved token env name in a role's extraEnv is refused" \
+  "querier.extraEnv sets OURIOS_OPENFGA_API_TOKEN" \
+  --set 'querier.extraEnv[0].name=OURIOS_OPENFGA_API_TOKEN' --set 'querier.extraEnv[0].value=x'
+
+# NOTES.txt is not part of `helm template`; a client-only dry-run renders it
+# without a cluster.
+install_notes() {
+  helm install --dry-run=client -n demo t "$CHART" "$@" | sed -n '/^NOTES:/,$p'
+}
+check "NOTES: auth off warns about open mode" "WARNING: authentication is OFF (RFC 0026 open mode). Any client that can" \
+  "$(install_notes | grep 'WARNING: authentication is OFF')"
+check "NOTES: querier TLS gives a CA- and name-aware curl" \
+  "--cacert ca.crt --resolve t-ourios-querier.demo.svc:4319:127.0.0.1 \\
+--data 'template_id == 0' https://t-ourios-querier.demo.svc:4319/v1/query" \
+  "$(install_notes --set querier.tls.http.existingSecret=q \
+      | grep -E -e '--cacert|--cert|https://' | sed 's/^ *//')"
+check "NOTES: querier mTLS adds the client certificate" \
+  "--cacert ca.crt --resolve t-ourios-querier.demo.svc:4319:127.0.0.1 \\
+--cert client.crt --key client.key \\
+--data 'template_id == 0' https://t-ourios-querier.demo.svc:4319/v1/query" \
+  "$(install_notes --set querier.tls.http.existingSecret=q \
+      --set querier.tls.http.clientCA.existingSecret=q \
+      | grep -E -e '--cacert|--cert|https://' | sed 's/^ *//')"
+
 # `helm upgrade --reuse-values` from a release before these keys existed
 # carries no auth / tls / mcp maps at all (cf. #644): the render must not
 # nil-pointer and must stay open mode.

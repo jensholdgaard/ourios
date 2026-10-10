@@ -84,7 +84,17 @@ Query the logs DSL (port-forward from your workstation):
     -H "Authorization: Bearer $TOKEN" \
 {{- end }}
 {{- if include "ourios.tlsEnabled" (dict "root" . "role" "querier") }}
-    --data 'template_id == 0' https://127.0.0.1:4319/v1/query
+{{- $host := printf "%s-querier.%s.svc" (include "ourios.fullname" .) .Release.Namespace }}
+    --cacert ca.crt --resolve {{ $host }}:4319:127.0.0.1 \
+{{- if dig "tls" "http" "clientCA" "existingSecret" "" .Values.querier }}
+    --cert client.crt --key client.key \
+{{- end }}
+    --data 'template_id == 0' https://{{ $host }}:4319/v1/query
+  (ca.crt: the CA that issued the querier certificate. Replace the host with
+  a DNS name the certificate carries.
+{{- if dig "tls" "http" "clientCA" "existingSecret" "" .Values.querier }}
+  mTLS is on: client.crt/client.key must chain to the configured client CA.
+{{- end }})
 {{- else }}
     --data 'template_id == 0' http://127.0.0.1:4319/v1/query
 {{- end }}

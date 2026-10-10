@@ -35,6 +35,7 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::{ParquetAuditSink, PartitionKey, Store, Writer};
 use ourios_querier::{Querier, QueryResult, TEMPLATE_MAP_FILENAME};
 use ourios_semconv as semconv;
+use ourios_telemetry::live_check::{self, Checked, EventSpec};
 
 const TENANT: &str = "acme";
 /// 2026-04-02T10:58:00 UTC — the shared fixture instant of the querier
@@ -110,6 +111,23 @@ fn widened(template_id: u64, old_version: u32, ts_ns: u64) -> AuditEvent {
                 old_template: "user <*>".to_string(),
                 new_template: "user <*> <*>".to_string(),
                 positions_widened: vec![1],
+            },
+        },
+    }
+}
+
+/// A `template_created` audit event binding `template_id` v1 to
+/// `template` at `ts_ns`.
+fn created(template_id: u64, template: &str, ts_ns: u64) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(TENANT),
+        timestamp: UNIX_EPOCH + Duration::from_nanos(ts_ns),
+        payload: AuditPayload::Template {
+            template_id,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Created {
+                new_template: template.to_string(),
             },
         },
     }
@@ -283,6 +301,109 @@ fn outcome_counts(rms: &[ResourceMetrics], metric: &str, attr_key: &str) -> BTre
     counts
 }
 
+const BINDING_CONFLICTED: EventSpec = EventSpec {
+    name: semconv::EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED,
+    required: &[
+        semconv::OURIOS_TENANT,
+        semconv::OURIOS_TEMPLATE_ID,
+        semconv::OURIOS_TEMPLATE_VERSION,
+    ],
+    optional: &[],
+};
+
+/// The lookups counter's data points that carry the anomaly attribute,
+/// as `(outcome, anomaly) → count`.
+fn anomaly_counts(rms: &[ResourceMetrics]) -> BTreeMap<(String, String), u64> {
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) =
+        metric_data(rms, semconv::OURIOS_TEMPLATE_MAP_LOOKUPS)
+    else {
+        panic!("lookups should be a u64 sum (counter)");
+    };
+    let mut counts = BTreeMap::new();
+    for dp in sum.data_points() {
+        let attr = |key: &str| {
+            dp.attributes()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        if let Some(anomaly) = attr(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY) {
+            let outcome = attr(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME)
+                .expect("an anomalous lookup still carries its outcome");
+            counts.insert((outcome, anomaly), dp.value());
+        }
+    }
+    counts
+}
+
+/// #927 — a store whose audit stream binds two different templates to
+/// one `(template_id, version)` reports it once per fold-backed
+/// acquisition: one named event carrying the key and no template text,
+/// and the anomaly on that lookup. A same-binding re-emit and a widening
+/// stay silent, and a cache hit (no fold) reports nothing.
+fn binding_conflict_act(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
+    let capture = live_check::event_capture().expect("the only subscriber this binary installs");
+    capture.reset();
+    let bucket = tempfile::tempdir().expect("temp dir");
+    write_audit(
+        bucket.path(),
+        &[
+            created(1, "alpha <*>", TS0),
+            created(1, "omega <*>", TS0 + 1),
+            created(2, "same <*>", TS0),
+            created(2, "same <*>", TS0 + 2),
+            widened(2, 1, TS0 + 3),
+        ],
+    );
+    write_records(bucket.path(), &[mined(1, TS0 + 4)]);
+
+    assert_eq!(
+        body_query(bucket.path()).rows,
+        1,
+        "a conflict never fails the query"
+    );
+    assert_eq!(body_query(bucket.path()).rows, 1);
+
+    let events: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| e.name == BINDING_CONFLICTED.name)
+        .collect();
+    let [event] = events.as_slice() else {
+        panic!("one conflict, reported once by the folding acquisition: {events:#?}");
+    };
+    let attr = |key: &str| event.attributes.get(key).map(String::as_str);
+    assert_eq!(attr(semconv::OURIOS_TENANT), Some(TENANT));
+    assert_eq!(attr(semconv::OURIOS_TEMPLATE_ID), Some("1"));
+    assert_eq!(attr(semconv::OURIOS_TEMPLATE_VERSION), Some("1"));
+    let body = event.body.as_deref().unwrap_or_default();
+    for text in ["alpha", "omega"] {
+        assert!(
+            !body.contains(text) && event.attributes.values().all(|v| !v.contains(text)),
+            "the event must not carry template text: {event:#?}",
+        );
+    }
+    let checked = live_check::live_check(&events, &[BINDING_CONFLICTED])
+        .expect("the conflict event is registry-conformant");
+    if checked == Checked::SpecOnly {
+        eprintln!("#927: weaver is not configured here; checked the event against its spec only");
+    }
+
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let expected: BTreeMap<(String, String), u64> =
+        [(("miss".to_string(), "binding_conflict".to_string()), 1)]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        anomaly_counts(&rms),
+        expected,
+        "the folding miss carries the anomaly; the hit after it does not",
+    );
+}
+
 /// Scenario RFC0033.7 — observable outcomes.
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
 #[test]
@@ -376,4 +497,13 @@ fn rfc0033_7_observable_outcomes() {
         size_after_miss + size_after_stale + size_after_torn,
         "each sample is the published artifact's byte size",
     );
+    assert!(
+        anomaly_counts(&rms).is_empty(),
+        "a conflict-free store records no lookup anomaly",
+    );
+
+    // 6. Runs after the assertions above: its lookups share this
+    //    process's global counter.
+    exporter.reset();
+    binding_conflict_act(&guard, &exporter);
 }

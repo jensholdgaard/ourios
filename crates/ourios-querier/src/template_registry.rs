@@ -21,7 +21,7 @@
 use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{OwnedToken, parse_template};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::{QueryError, StoreRef, audit_scan};
@@ -88,6 +88,18 @@ pub(crate) fn fold_registry(events: Vec<AuditEvent>) -> TemplateRegistry {
     fold.finish()
 }
 
+/// [`fold_registry`] plus the binding conflicts the fold found (#927).
+#[cfg(test)]
+pub(crate) fn fold_registry_checked(
+    events: Vec<AuditEvent>,
+) -> (TemplateRegistry, BindingConflicts) {
+    let mut fold = RegistryFold::default();
+    for event in events {
+        fold.push(event);
+    }
+    fold.finish_checked()
+}
+
 /// The streaming registry fold (RFC 0017 §3.2): events arrive in SCAN order
 /// — (file path, row index) — and only the per-key winner is retained, so a
 /// fold over a tenant's whole audit history holds O(live `(template_id,
@@ -101,10 +113,21 @@ pub(crate) fn fold_registry(events: Vec<AuditEvent>) -> TemplateRegistry {
 /// at [`TEMPLATE_INITIAL_VERSION`], widening / type-expansion at
 /// `new_version`, adoption at its `template_version`; rejections and
 /// non-template events contribute nothing.
+///
+/// Within one `(template_id, version)` the template never legitimately
+/// changes — widening and type expansion bump the version — so a key seen
+/// bound to two semantically different templates is a template-id
+/// collision (#927). The fold records the key and still keeps the
+/// last-wins binding: detection never changes what is served.
 #[derive(Default)]
 pub(crate) struct RegistryFold {
     latest: HashMap<(u64, u32), (SystemTime, String)>,
+    conflicts: BTreeSet<(u64, u32)>,
 }
+
+/// The `(template_id, version)` keys a fold saw bound to more than one
+/// semantically different template, ascending.
+pub(crate) type BindingConflicts = Vec<(u64, u32)>;
 
 impl RegistryFold {
     pub(crate) fn push(&mut self, event: AuditEvent) {
@@ -119,22 +142,43 @@ impl RegistryFold {
         let Some((version, template)) = keyed_template(change) else {
             return;
         };
-        match self.latest.get_mut(&(template_id, version)) {
-            Some(held) if event.timestamp < held.0 => {}
-            Some(held) => *held = (event.timestamp, template),
+        let key = (template_id, version);
+        match self.latest.get_mut(&key) {
+            Some(held) => {
+                if !same_tokens(&held.1, &template) {
+                    self.conflicts.insert(key);
+                }
+                if event.timestamp >= held.0 {
+                    *held = (event.timestamp, template);
+                }
+            }
             None => {
-                self.latest
-                    .insert((template_id, version), (event.timestamp, template));
+                self.latest.insert(key, (event.timestamp, template));
             }
         }
     }
 
     pub(crate) fn finish(self) -> TemplateRegistry {
-        self.latest
+        self.finish_checked().0
+    }
+
+    /// [`Self::finish`] plus the keys the fold saw in conflict.
+    pub(crate) fn finish_checked(self) -> (TemplateRegistry, BindingConflicts) {
+        let registry = self
+            .latest
             .into_iter()
             .map(|(key, (_, template))| (key, parse_template(&template)))
-            .collect()
+            .collect();
+        (registry, self.conflicts.into_iter().collect())
     }
+}
+
+/// Whether two stored templates bind the same token sequence — the
+/// registry's semantics, so a spelling the parse treats as equal is not a
+/// conflict. Equal strings short-circuit: re-emits of one binding are the
+/// common case and need no parse.
+fn same_tokens(held: &str, incoming: &str) -> bool {
+    held == incoming || parse_template(held) == parse_template(incoming)
 }
 
 /// The `(version, template)` a template change binds, or `None` for a
@@ -173,7 +217,7 @@ mod tests {
 
     use super::{
         AuditEvent, AuditPayload, OwnedToken, TEMPLATE_INITIAL_VERSION, TemplateChange, TenantId,
-        fold_registry,
+        fold_registry, fold_registry_checked,
     };
 
     fn event(template_id: u64, secs: u64, change: TemplateChange) -> AuditEvent {
@@ -325,6 +369,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_templates_under_one_key_are_one_conflict_and_last_still_wins() {
+        let events = vec![
+            widened(7, 30, 2, "late <*>"),
+            widened(7, 20, 2, "early <*>"),
+            widened(7, 40, 2, "later <*>"),
+            widened(8, 10, 2, "other <*>"),
+        ];
+        let (registry, conflicts) = fold_registry_checked(events.clone());
+        assert_eq!(conflicts, vec![(7, 2)], "one entry per conflicting key");
+        assert_eq!(
+            registry,
+            fold_registry(events),
+            "detection never changes the map"
+        );
+        assert_eq!(
+            registry.get(&(7, 2)),
+            Some(&vec![fixed("later"), OwnedToken::Wildcard]),
+        );
+    }
+
+    #[test]
+    fn re_emitted_binding_is_not_a_conflict() {
+        let (_, conflicts) = fold_registry_checked(vec![
+            created(3, 10, "user <*>"),
+            created(3, 20, "user <*>"),
+            created(3, 5, "user <*>"),
+        ]);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
+    #[test]
+    fn widening_to_a_new_version_is_not_a_conflict() {
+        let (registry, conflicts) = fold_registry_checked(vec![
+            created(1, 10, "user <*>"),
+            widened(1, 20, 2, "user <*> <*>"),
+            widened(1, 30, 3, "<*> <*> <*>"),
+        ]);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(registry.len(), 3);
+    }
+
+    /// An adoption riding an existing mined leaf, through the real miner:
+    /// its canonical is `format_template` over tokens the convergence
+    /// lookup required equal to the leaf's, so it restates the leaf's
+    /// text exactly — even when the upstream spelling names its masks.
+    #[test]
+    fn adoption_onto_an_existing_leaf_is_not_a_conflict() {
+        use ourios_config::{MinerConfig, UpstreamTemplates};
+        use ourios_core::audit::SharedAuditSink;
+        use ourios_core::otlp::{AnyValue, Body, KeyValue, OtlpLogRecord, any_value};
+        use ourios_miner::cluster::MinerCluster;
+
+        let tenant = TenantId::new("t");
+        let record = |body: &str| OtlpLogRecord {
+            tenant_id: tenant.clone(),
+            severity_number: 9,
+            body: Some(Body::String(body.to_owned())),
+            ..Default::default()
+        };
+        let audit = SharedAuditSink::new();
+        let mut miner = MinerCluster::with_audit_sink(
+            MinerConfig::default().with_upstream_templates(UpstreamTemplates::Adopt),
+            Box::new(audit.clone()),
+        );
+        let leaf_id = miner.ingest(&record("user 42 logged in"));
+        let mut annotated = record("user 43 logged in");
+        annotated.attributes.push(KeyValue {
+            key: "log.record.template".to_owned(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(
+                    "user <user_id> logged in".to_owned(),
+                )),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            miner.ingest(&annotated),
+            leaf_id,
+            "the adoption rides the mined leaf"
+        );
+
+        let events = audit.drain();
+        let kinds: Vec<&str> = events.iter().map(|e| e.payload.event_type()).collect();
+        assert_eq!(kinds, ["template_created", "template_adopted"]);
+        let (registry, conflicts) = fold_registry_checked(events);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(registry.len(), 1);
+    }
+
     /// The §3.7.1 order as a materialized fold: stable sort by timestamp,
     /// then insert every event, last insert winning.
     fn sort_then_insert(mut events: Vec<AuditEvent>) -> super::TemplateRegistry {
@@ -361,6 +495,33 @@ mod tests {
                 })
                 .collect();
             proptest::prop_assert_eq!(fold_registry(events.clone()), sort_then_insert(events));
+        }
+
+        /// A key is in conflict exactly when its history binds more than
+        /// one distinct template.
+        #[test]
+        fn conflicts_are_exactly_the_multiply_bound_keys(
+            history in proptest::collection::vec(
+                (1u64..4, 0u64..4, 1u32..3, "[a-b]{1}"),
+                0..40,
+            ),
+        ) {
+            let mut texts: std::collections::BTreeMap<(u64, u32), std::collections::BTreeSet<String>> =
+                std::collections::BTreeMap::new();
+            let events: Vec<AuditEvent> = history
+                .into_iter()
+                .map(|(id, secs, version, word)| {
+                    let template = format!("{word} <*>");
+                    texts.entry((id, version + 1)).or_default().insert(template.clone());
+                    widened(id, secs, version + 1, &template)
+                })
+                .collect();
+            let expected: Vec<(u64, u32)> = texts
+                .into_iter()
+                .filter(|(_, t)| t.len() > 1)
+                .map(|(key, _)| key)
+                .collect();
+            proptest::prop_assert_eq!(fold_registry_checked(events).1, expected);
         }
     }
 }

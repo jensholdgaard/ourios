@@ -155,6 +155,21 @@ periodSeconds=10
 failureThreshold=360" \
   "$(receiver_startup_probe --set receiver.startupProbe=null)"
 
+# NOTES states the budget the probe renders, defaulting each field the
+# same way, so a map carrying only one key (a --reuse-values upgrade that
+# set one) reports the real product.
+startup_budget_note() {
+  helm install t "$CHART" --dry-run=client "$@" \
+    | sed -n 's/.*startup probe allows it and WAL replay \([0-9]*s\),.*/\1/p'
+}
+check "NOTES states the default startup budget" "3600s" "$(startup_budget_note)"
+check "NOTES budget with only failureThreshold set" "7200s" \
+  "$(startup_budget_note --set receiver.startupProbe.periodSeconds=null \
+      --set receiver.startupProbe.failureThreshold=720)"
+check "NOTES budget with only periodSeconds set" "10800s" \
+  "$(startup_budget_note --set receiver.startupProbe.failureThreshold=null \
+      --set receiver.startupProbe.periodSeconds=30)"
+
 # --- default render is pinned -------------------------------------------------
 
 # The security surface is opt-in: a default install must render exactly what

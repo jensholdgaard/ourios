@@ -48,12 +48,18 @@ In-cluster, point Collectors at the receiver Service
 fronted by whatever ingress/TLS termination your cluster standardises
 on.
 
-> **Warning:** a chart install runs **unauthenticated and over
-> plaintext** (RFC 0026 open mode). The chart renders the config file
-> itself and cannot yet set `auth`, listener TLS, `querier.mcp` or
-> `openfga`, and `OURIOS_*` variables cannot override a `--config`
-> file, so [authentication](./authentication.md) cannot be turned on
-> through the chart today
-> ([#852](https://github.com/jensholdgaard/ourios/issues/852)). Keep
-> both Services inside a trusted network boundary; do not expose
-> either beyond the cluster until that lands.
+> **Warning:** by default a chart install runs **unauthenticated and
+> over plaintext** (RFC 0026 open mode), and its install notes say so.
+> Keep both Services inside a trusted network boundary until you turn
+> on authentication.
+
+The chart's `auth` values render [authentication](./authentication.md)
+into the receiver and querier config: static tokens, OIDC, and the
+OpenFGA tenant binding. `receiver.tls` and `querier.tls` turn on
+listener TLS and mTLS, and `querier.mcp.enabled` serves `/mcp`. Token
+values and the OpenFGA API token come only from existing Secrets
+(`secretKeyRef`, injected as env and referenced as `${env:…}`), and
+certificates mount read-only from `kubernetes.io/tls` Secrets, so no
+secret reaches the rendered ConfigMap. The chart
+[README](https://github.com/jensholdgaard/ourios/tree/main/deploy/helm/ourios#authentication-and-tls)
+has the values and examples.

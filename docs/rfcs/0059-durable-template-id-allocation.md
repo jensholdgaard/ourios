@@ -436,7 +436,9 @@ data file under `data/`.
   audit stream holds. The data writer enables page-level statistics on
   every column (RFC 0005 §3.6, `writer.rs`), and those include chunk
   min/max for `template_id`.
-- The read goes footer only, one file at a time. One suffix-ranged
+- The read goes footer only, up to 16 files at a time (a fixed pool
+  fed by the listing walk; the floor is a maximum, so completion order
+  does not matter, and any failed read still fails the scan). One suffix-ranged
   GET of the last 64 KiB returns the footer and the object's size, and a
   second, larger one follows only when the footer is bigger than that.
 - The footer answers a file only when **every** id column it holds has
@@ -502,10 +504,10 @@ first start under this RFC and again at each authorised re-bootstrap
   listing into memory, every page of it. The walk is depth-first, so it
   holds that one listing plus the prefixes still to visit, which are the
   unvisited siblings at each level of the current path.
-- **Files.** Each file's footer, or a whole pre-statistics file, is
-  dropped before the next one is fetched.
+- **Files.** Each reader drops a file's footer, or a whole
+  pre-statistics file, before it fetches its next one.
 - **The bound.** The largest single directory listing, plus the current
-  path's pending siblings, plus one file. It does not grow with the
+  path's pending siblings, plus one file per concurrent read. It does not grow with the
   number of directories or files in the store as a whole. It does grow
   with the widest directory. That is an hour partition's file list,
   which compaction keeps to a handful of files (RFC 0009), or a level
@@ -518,8 +520,10 @@ first start under this RFC and again at each authorised re-bootstrap
   correct on both backends, and its bound is the honest one stated
   above.
 
-**Progress.** Every 10,000 files, the bootstrap logs
-`ourios.receiver.template_ids.bootstrap.progress` (§3.9).
+**Progress.** Every 10,000 files, and at least every 30 seconds, the
+bootstrap logs `ourios.receiver.template_ids.bootstrap.progress` (§3.9),
+and prints its start, progress and end on stderr. A shutdown signal
+stops the scan between reads with nothing written, as a crash would.
 
 **A failed scan fails closed.** Every step of the scan can fail: a
 listing, a ranged footer read, a footer parse, the full-file fallback,
@@ -956,7 +960,7 @@ they are final as of v0.3.8:
 | Name | Kind | Attributes / members |
 |---|---|---|
 | `ourios.receiver.template_ids.bootstrapped` | event, at most once per successful creation of the high-water: the upgrade bootstrap and each authorised re-bootstrap (a crash after the create but before the event leaves none) | `ourios.receiver.template_ids.floor` (int, required); `ourios.receiver.template_ids.data_max` (int, conditionally required when any data file carries an id); `ourios.receiver.template_ids.audit_max` (int, conditionally required when any audit file carries an id); `ourios.receiver.template_ids.files_scanned` (int, required) |
-| `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
+| `ourios.receiver.template_ids.bootstrap.progress` | event, every 10,000 files and at least every 30 s | `ourios.receiver.template_ids.files_scanned` (int, required); the progress-event shape of `ourios.graph.backfill.progress` |
 | `ourios.miner.parse_failure.reason` | existing enum attribute | new member `id_reservation_failed` |
 | `ourios.receiver.snapshot.discarded` | existing event | new `error.type` value `predates_high_water` (§3.5) |
 

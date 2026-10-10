@@ -99,8 +99,11 @@ receiver:
   #   2. set replicas to 0 and apply, so no pre-RFC receiver is running;
   #   3. set replicas to 1 with templateIdsAllowBootstrap: true and apply;
   #      that one replica bootstraps the template-id high-water from the
-  #      store once;
-  #   4. once it has seated, set it back to false, revoke the
+  #      store once, reading every data and audit footer before its
+  #      listeners open (about the file count divided by 16 concurrent
+  #      reads; let compaction catch up first, and see the README);
+  #   4. once it has seated (it writes snapshots/TEMPLATE_IDS_SEATED under
+  #      its WAL root), set it back to false, revoke the
   #      bootstrap-only grants (README's steady-state policy), then scale
   #      out.
   # A store that already holds data refuses to bootstrap without step 3's

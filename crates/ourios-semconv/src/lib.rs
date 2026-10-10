@@ -57,14 +57,35 @@ pub const OURIOS_COMPACTION_FILES: &str = "ourios.compaction.files";
 /// `ourios.compaction.io` (counter, unit `By`).
 pub const OURIOS_COMPACTION_IO: &str = "ourios.compaction.io";
 
+/// `ourios.compaction.memory.limit` (updowncounter, unit `By`).
+pub const OURIOS_COMPACTION_MEMORY_LIMIT: &str = "ourios.compaction.memory.limit";
+
+/// `ourios.compaction.memory.usage` (updowncounter, unit `By`).
+pub const OURIOS_COMPACTION_MEMORY_USAGE: &str = "ourios.compaction.memory.usage";
+
 /// `ourios.compaction.orphan.files` (counter, unit `{file}`).
 pub const OURIOS_COMPACTION_ORPHAN_FILES: &str = "ourios.compaction.orphan.files";
+
+/// `ourios.compaction.partition.input.files` (histogram, unit `{file}`).
+pub const OURIOS_COMPACTION_PARTITION_INPUT_FILES: &str = "ourios.compaction.partition.input.files";
+
+/// `ourios.compaction.partition.input.size` (histogram, unit `By`).
+pub const OURIOS_COMPACTION_PARTITION_INPUT_SIZE: &str = "ourios.compaction.partition.input.size";
 
 /// `ourios.compaction.partitions` (counter, unit `{partition}`).
 pub const OURIOS_COMPACTION_PARTITIONS: &str = "ourios.compaction.partitions";
 
 /// `ourios.compaction.rows` (counter, unit `{row}`).
 pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
+
+/// `ourios.compaction.spill.runs` (counter, unit `{run}`).
+pub const OURIOS_COMPACTION_SPILL_RUNS: &str = "ourios.compaction.spill.runs";
+
+/// `ourios.compaction.spill.size` (counter, unit `By`).
+pub const OURIOS_COMPACTION_SPILL_SIZE: &str = "ourios.compaction.spill.size";
+
+/// `ourios.compaction.sweep.remaining` (updowncounter, unit `{partition}`).
+pub const OURIOS_COMPACTION_SWEEP_REMAINING: &str = "ourios.compaction.sweep.remaining";
 
 /// `ourios.compaction.sweeps` (counter, unit `{sweep}`).
 pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
@@ -149,6 +170,12 @@ pub const OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED: &str =
 /// `ourios.query.duration` (histogram, unit `s`).
 pub const OURIOS_QUERY_DURATION: &str = "ourios.query.duration";
 
+/// `ourios.query.files` (histogram, unit `{file}`).
+pub const OURIOS_QUERY_FILES: &str = "ourios.query.files";
+
+/// `ourios.query.read.size` (histogram, unit `By`).
+pub const OURIOS_QUERY_READ_SIZE: &str = "ourios.query.read.size";
+
 /// `ourios.query.row_groups` (counter, unit `{row_group}`).
 pub const OURIOS_QUERY_ROW_GROUPS: &str = "ourios.query.row_groups";
 
@@ -163,6 +190,15 @@ pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES: &str = "ourios.receiver.tls.ha
 
 /// `ourios.receiver.tls.reload_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_RELOAD_FAILURES: &str = "ourios.receiver.tls.reload_failures";
+
+/// `ourios.runtime.global_queue.size` (updowncounter, unit `{task}`).
+pub const OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE: &str = "ourios.runtime.global_queue.size";
+
+/// `ourios.runtime.task.count` (updowncounter, unit `{task}`).
+pub const OURIOS_RUNTIME_TASK_COUNT: &str = "ourios.runtime.task.count";
+
+/// `ourios.runtime.worker.count` (updowncounter, unit `{worker}`).
+pub const OURIOS_RUNTIME_WORKER_COUNT: &str = "ourios.runtime.worker.count";
 
 /// `ourios.sink.buffer.usage` (updowncounter, unit `By`).
 pub const OURIOS_SINK_BUFFER_USAGE: &str = "ourios.sink.buffer.usage";
@@ -179,11 +215,42 @@ pub const OURIOS_SINK_FLUSH_ERRORS: &str = "ourios.sink.flush.errors";
 /// `ourios.sink.flush.records` (counter, unit `{record}`).
 pub const OURIOS_SINK_FLUSH_RECORDS: &str = "ourios.sink.flush.records";
 
+/// `ourios.storage.bridge.call.active` (updowncounter, unit `{call}`).
+pub const OURIOS_STORAGE_BRIDGE_CALL_ACTIVE: &str = "ourios.storage.bridge.call.active";
+
+/// `ourios.storage.bridge.duration` (histogram, unit `s`).
+pub const OURIOS_STORAGE_BRIDGE_DURATION: &str = "ourios.storage.bridge.duration";
+
+/// `ourios.storage.bridge.thread.created` (counter, unit `{thread}`).
+pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED: &str = "ourios.storage.bridge.thread.created";
+
+/// `ourios.storage.list.objects` (histogram, unit `{object}`).
+pub const OURIOS_STORAGE_LIST_OBJECTS: &str = "ourios.storage.list.objects";
+
+/// `ourios.storage.operation.duration` (histogram, unit `s`).
+pub const OURIOS_STORAGE_OPERATION_DURATION: &str = "ourios.storage.operation.duration";
+
+/// `ourios.storage.operation.retries` (counter, unit `{retry}`).
+pub const OURIOS_STORAGE_OPERATION_RETRIES: &str = "ourios.storage.operation.retries";
+
 /// `ourios.storage.parquet.file.size` (histogram, unit `By`).
 pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.size";
 
+/// `ourios.template_map.acquire.wait.duration` (histogram, unit `s`).
+pub const OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION: &str =
+    "ourios.template_map.acquire.wait.duration";
+
 /// `ourios.template_map.artifact.size` (histogram, unit `By`).
 pub const OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE: &str = "ourios.template_map.artifact.size";
+
+/// `ourios.template_map.derive.audit.files` (histogram, unit `{file}`).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES: &str = "ourios.template_map.derive.audit.files";
+
+/// `ourios.template_map.derive.audit.size` (histogram, unit `By`).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE: &str = "ourios.template_map.derive.audit.size";
+
+/// `ourios.template_map.derive.duration` (histogram, unit `s`).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_DURATION: &str = "ourios.template_map.derive.duration";
 
 /// `ourios.template_map.lookups` (counter, unit `{lookup}`).
 pub const OURIOS_TEMPLATE_MAP_LOOKUPS: &str = "ourios.template_map.lookups";
@@ -261,8 +328,14 @@ pub const LOG_RECORD_TEMPLATE: &str = "log.record.template";
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
 
+/// `ourios.compaction.phase` attribute key.
+pub const OURIOS_COMPACTION_PHASE: &str = "ourios.compaction.phase";
+
 /// `ourios.compaction.result` attribute key.
 pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
+
+/// `ourios.compaction.size.kind` attribute key.
+pub const OURIOS_COMPACTION_SIZE_KIND: &str = "ourios.compaction.size.kind";
 
 /// `ourios.graph.tuple.operation` attribute key.
 pub const OURIOS_GRAPH_TUPLE_OPERATION: &str = "ourios.graph.tuple.operation";
@@ -316,11 +389,20 @@ pub const OURIOS_SERVICE: &str = "ourios.service";
 /// `ourios.sink.flush.trigger` attribute key.
 pub const OURIOS_SINK_FLUSH_TRIGGER: &str = "ourios.sink.flush.trigger";
 
+/// `ourios.storage.caller` attribute key.
+pub const OURIOS_STORAGE_CALLER: &str = "ourios.storage.caller";
+
+/// `ourios.storage.operation` attribute key.
+pub const OURIOS_STORAGE_OPERATION: &str = "ourios.storage.operation";
+
 /// `ourios.template.id` attribute key.
 pub const OURIOS_TEMPLATE_ID: &str = "ourios.template.id";
 
 /// `ourios.template.version` attribute key.
 pub const OURIOS_TEMPLATE_VERSION: &str = "ourios.template.version";
+
+/// `ourios.template_map.derive.reason` attribute key.
+pub const OURIOS_TEMPLATE_MAP_DERIVE_REASON: &str = "ourios.template_map.derive.reason";
 
 /// `ourios.template_map.lookup.anomaly` attribute key.
 pub const OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY: &str = "ourios.template_map.lookup.anomaly";

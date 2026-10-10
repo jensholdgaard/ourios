@@ -40,6 +40,9 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 # the exporter's own tonic/hyper internals), `fmt` is the human-readable
 # stderr copy.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter", "fmt"] }
+# `process.creation.time` on the resource is ISO 8601; same pin as
+# ourios-df-otel.
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 # `testing` only: the weaver live-check sample file and report.
 serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
 
@@ -50,6 +53,13 @@ serde_json = { version = "1", default-features = false, features = ["std"], opti
 # and `live_check`, which captures named log events and hands them to
 # `weaver registry live-check`.
 testing = ["opentelemetry_sdk/testing", "dep:serde_json"]
+
+# `process.cpu.time` converts `/proc/self/stat`'s clock ticks to seconds at
+# the kernel's tick rate, which only the auxiliary vector reports; rustix
+# reads it safely (the workspace denies `unsafe_code`). Already in the tree
+# via tempfile.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.5", default-features = false, features = ["param", "std"] }
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "logs", "trace", "testing"] }

@@ -136,9 +136,31 @@ Ourios is a telemetry backend, so it is instrumented as one (`CLAUDE.md` §6.3).
 
 | Signal | What it carries |
 |---|---|
-| Metrics | the per-subsystem meters — miner counters, ingest/query latency, pruning |
+| Metrics | the per-subsystem meters — miner counters, ingest/query latency, pruning — plus the process metrics below |
 | Logs | Ourios's own structured logs, bridged to OTLP |
 | Traces | request-scoped spans on ingest, query, `/mcp` and sweep (RFC 0038), continuing an inbound caller's trace (RFC 0039), with a DataFusion operator span tree under a query (RFC 0040) |
+
+The metrics include the upstream OpenTelemetry
+[process metrics](https://opentelemetry.io/docs/specs/semconv/system/process-metrics/),
+under their upstream names and read when the SDK collects. Every signal's resource
+carries `process.pid` and `process.creation.time` beside `service.name`, so
+replicas and restarts stay apart:
+
+| Metric | Instrument | Unit |
+|---|---|---|
+| `process.memory.usage` | UpDownCounter | `By` (resident set size) |
+| `process.cpu.time` | Counter, by `cpu.mode` (`user`, `system`) | `s` |
+| `process.thread.count` | UpDownCounter | `{thread}` |
+| `process.unix.file_descriptor.count` | UpDownCounter | `{file_descriptor}` |
+| `process.uptime` | Gauge | `s` |
+
+`process.memory.usage` is the signal to alert on before the kernel's OOM
+killer acts: compare it with the pod's memory limit, which is deployment
+configuration rather than a process metric. CPU utilisation is not emitted;
+derive it from the rate of `process.cpu.time`, as the OTel CPU guidance
+recommends. All five come from `/proc/self` on Linux; on macOS only the
+descriptor count and the uptime are emitted. A Collector's `hostmetrics`
+receiver (`process` scraper) can report the same process from outside instead.
 
 The endpoint is the **only** OTel knob the chart models — it is deployment
 topology, which the chart owns. Everything about how the SDK *behaves* is the

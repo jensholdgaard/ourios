@@ -340,10 +340,20 @@ fn anomaly_counts(rms: &[ResourceMetrics]) -> BTreeMap<(String, String), u64> {
 /// acquisition: one named event carrying the key and no template text,
 /// and the anomaly on that lookup. A same-binding re-emit and a widening
 /// stay silent, and a cache hit (no fold) reports nothing.
+///
+/// Act 6 of RFC0033.7, run last: its lookups share the process-global
+/// counter, so it first checks `conflict_free` (the collection from acts
+/// 1–5) carries no anomaly, then resets the exporter.
 fn binding_conflict_act(
     guard: &ourios_telemetry::TelemetryGuard,
     exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+    conflict_free: &[ResourceMetrics],
 ) {
+    assert!(
+        anomaly_counts(conflict_free).is_empty(),
+        "a conflict-free store records no lookup anomaly",
+    );
+    exporter.reset();
     let capture = live_check::event_capture().expect("the only subscriber this binary installs");
     capture.reset();
     let bucket = tempfile::tempdir().expect("temp dir");
@@ -497,13 +507,5 @@ fn rfc0033_7_observable_outcomes() {
         size_after_miss + size_after_stale + size_after_torn,
         "each sample is the published artifact's byte size",
     );
-    assert!(
-        anomaly_counts(&rms).is_empty(),
-        "a conflict-free store records no lookup anomaly",
-    );
-
-    // 6. Runs after the assertions above: its lookups share this
-    //    process's global counter.
-    exporter.reset();
-    binding_conflict_act(&guard, &exporter);
+    binding_conflict_act(&guard, &exporter, &rms);
 }

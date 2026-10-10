@@ -35,6 +35,12 @@ use object_store::{
 };
 use tokio::runtime::Runtime;
 
+mod metered;
+mod metrics;
+
+pub use metrics::Caller;
+use metrics::{MeteredConnector, Metrics, Operation};
+
 /// The process-wide runtime that drives the async `object_store` calls behind
 /// the sync storage API. Built once, lazily, via `get_or_init` so there is no
 /// init-race that could drop a surplus runtime on a caller's thread (an
@@ -57,6 +63,7 @@ fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .thread_name("ourios-store-bridge")
+            .on_thread_start(metrics::bridge_thread_started)
             // `enable_all` so the runtime carries the IO + time drivers the
             // `AmazonS3` backend's HTTP client (reqwest/hyper) needs; the local
             // backend ignores them.
@@ -116,12 +123,38 @@ fn is_plain_opaque_tag(tag: &str) -> bool {
 /// panic *inside* `fut` is not swallowed — it is re-raised on the caller's
 /// thread via [`std::panic::resume_unwind`].
 fn block_on_off_runtime<T>(
+    metrics: &Metrics,
+    op: Operation,
     fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
 ) -> Result<T, StoreError>
 where
     T: Send + 'static,
 {
-    let rt = bridge_runtime()?;
+    let call = metrics.get().bridge_call(op);
+    match bridge(fut) {
+        Ok(result) => {
+            call.end(result.as_ref().err().map(metrics::store_error_type));
+            result
+        }
+        Err(payload) => {
+            call.end(Some("_OTHER"));
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+/// [`block_on_off_runtime`]'s bridge, with a panic in `fut` returned
+/// rather than re-raised.
+fn bridge<T>(
+    fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
+) -> std::thread::Result<Result<T, StoreError>>
+where
+    T: Send + 'static,
+{
+    let rt = match bridge_runtime() {
+        Ok(rt) => rt,
+        Err(e) => return Ok(Err(e)),
+    };
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     // The task, not a `JoinHandle`, carries the outcome back: awaiting a
     // `JoinHandle` needs an executor, and the caller may be inside a runtime.
@@ -129,13 +162,11 @@ where
         // The receiver outlives the send — the caller blocks on it below.
         let _ = tx.send(AssertUnwindSafe(fut).catch_unwind().await);
     });
-    match rx.recv() {
-        Ok(Ok(result)) => result,
-        Ok(Err(payload)) => std::panic::resume_unwind(payload),
-        Err(std::sync::mpsc::RecvError) => Err(StoreError::Runtime(std::io::Error::other(
+    rx.recv().unwrap_or_else(|std::sync::mpsc::RecvError| {
+        Ok(Err(StoreError::Runtime(std::io::Error::other(
             "store bridge task dropped before completing",
-        ))),
-    }
+        ))))
+    })
 }
 
 /// Object bytes paired with the backend's `ETag` (the compare-and-swap token),
@@ -188,7 +219,16 @@ fn local_sync_targets<'p>(
 /// do **not** assume this type enforces isolation yet.
 #[derive(Clone, Debug)]
 pub struct Store {
+    /// [`Self::backend`] behind the metering wrapper; every call goes
+    /// through this.
     inner: Arc<dyn ObjectStore>,
+    /// The backend itself.
+    backend: Arc<dyn ObjectStore>,
+    /// Whether the backend is reached over HTTP (S3).
+    http: bool,
+    /// The subsystem this handle's calls are attributed to.
+    caller: Caller,
+    metrics: Metrics,
     /// Reserved key prefix (the store root). Always empty at `red`; honoured
     /// once the consumers migrate onto [`Store`] at `green`.
     prefix: ObjectPath,
@@ -431,6 +471,16 @@ impl StoreError {
     }
 }
 
+/// What a [`Store`] constructor resolved, for [`Store::assemble`].
+struct Backend {
+    store: Arc<dyn ObjectStore>,
+    http: bool,
+    prefix: ObjectPath,
+    conditional_update: bool,
+    local_root: Option<std::path::PathBuf>,
+    metrics: Metrics,
+}
+
 impl Store {
     /// Local-filesystem backend rooted at `root` (dev / test / CI). Preserves
     /// today's on-disk layout — the RFC 0005 Hive keys become paths under
@@ -441,26 +491,30 @@ impl Store {
     /// `object_store` `LocalFileSystem` (e.g. it does not exist).
     pub fn local(root: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let fs = LocalFileSystem::new_with_prefix(root.as_ref()).map_err(StoreError::Backend)?;
-        Ok(Self {
-            inner: Arc::new(fs),
+        Ok(Self::assemble(Backend {
+            store: Arc::new(fs),
+            http: false,
             prefix: ObjectPath::default(),
             // `LocalFileSystem` rejects `PutMode::Update`, so it has no `If-Match`
             // CAS; the compactor commits the manifest with an atomic overwrite here.
             conditional_update: false,
             local_root: Some(root.as_ref().to_path_buf()),
-        })
+            metrics: Metrics::Global,
+        }))
     }
 
     /// An in-process backend with `If-Match` support, for tests and
     /// tools that need the conditional-update path without an S3 endpoint.
     #[must_use]
     pub fn in_memory() -> Self {
-        Self {
-            inner: Arc::new(object_store::memory::InMemory::new()),
+        Self::assemble(Backend {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            http: false,
             prefix: ObjectPath::default(),
             conditional_update: true,
             local_root: None,
-        }
+            metrics: Metrics::Global,
+        })
     }
 
     /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
@@ -488,6 +542,10 @@ impl Store {
     /// `AmazonS3` backend cannot be built from `cfg`; [`StoreError::Runtime`]
     /// if the bridge runtime its connections run on cannot be built.
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
+        Self::s3_with(cfg, Metrics::Global)
+    }
+
+    fn s3_with(cfg: S3Config, metrics: Metrics) -> Result<Self, StoreError> {
         let S3Config {
             bucket,
             endpoint,
@@ -581,20 +639,78 @@ impl Store {
         // connections in `CLOSE_WAIT` and handed them to later requests
         // (#791). The bridge runtime is never a caller's, so it always does.
         let s3 = builder
-            .with_http_connector(SpawnedReqwestConnector::new(
-                bridge_runtime()?.handle().clone(),
-            ))
+            .with_http_connector(MeteredConnector {
+                inner: SpawnedReqwestConnector::new(bridge_runtime()?.handle().clone()),
+                metrics: metrics.clone(),
+            })
             .build()
             .map_err(StoreError::Backend)?;
         let prefix = prefix.map_or_else(ObjectPath::default, ObjectPath::from);
-        Ok(Self {
-            inner: Arc::new(s3),
+        Ok(Self::assemble(Backend {
+            store: Arc::new(s3),
+            http: true,
             prefix,
             // The backend keeps object_store's default `S3ConditionalPut::ETagMatch`,
             // so the `If-Match` CAS the manifest generation-swap needs is available.
             conditional_update: true,
             local_root: None,
-        })
+            metrics,
+        }))
+    }
+
+    fn assemble(backend: Backend) -> Self {
+        let Backend {
+            store,
+            http,
+            prefix,
+            conditional_update,
+            local_root,
+            metrics,
+        } = backend;
+        Self {
+            inner: Arc::clone(&store),
+            backend: store,
+            http,
+            caller: Caller::default(),
+            metrics,
+            prefix,
+            conditional_update,
+            local_root,
+        }
+        .metered()
+    }
+
+    /// Rebuild [`Self::inner`] over the backend, for the current caller and
+    /// metrics.
+    fn metered(self) -> Self {
+        Self {
+            inner: Arc::new(metered::Metered {
+                inner: Arc::clone(&self.backend),
+                caller: self.caller,
+                metrics: self.metrics.clone(),
+                http: self.http,
+            }),
+            ..self
+        }
+    }
+
+    /// This handle, with its calls attributed to `caller` in the storage
+    /// metrics. A subsystem sets it where it takes its handle; the backend
+    /// is shared, so the handle stays as cheap to make as a clone.
+    #[must_use]
+    pub fn with_caller(self, caller: Caller) -> Self {
+        Self { caller, ..self }.metered()
+    }
+
+    /// The subsystem this handle's calls are attributed to.
+    #[must_use]
+    pub fn caller(&self) -> Caller {
+        self.caller
+    }
+
+    #[cfg(test)]
+    fn with_metrics(self, metrics: Metrics) -> Self {
+        Self { metrics, ..self }.metered()
     }
 
     /// Whether this backend supports a conditional update (`If-Match` CAS) — the
@@ -611,7 +727,8 @@ impl Store {
 
     /// The underlying [`ObjectStore`], for handing to `DataFusion`'s table
     /// providers on the read path (RFC 0013 §2.2 — the querier registers the
-    /// same store rather than local file paths).
+    /// same store rather than local file paths). Its calls are recorded in
+    /// the storage metrics under this handle's caller.
     #[must_use]
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
@@ -620,16 +737,18 @@ impl Store {
     /// This store with its backend replaced by `wrap(backend)` — for layering
     /// an instrumenting or fault-injecting [`ObjectStore`] over the real one.
     /// The prefix and the conditional-update capability are kept, so the
-    /// wrapper must forward every call it does not mean to change.
+    /// wrapper must forward every call it does not mean to change. It sits
+    /// under the storage metrics, which see what it returns.
     #[must_use]
     pub fn wrap_backend(
         self,
         wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
     ) -> Self {
         Self {
-            inner: wrap(self.inner),
+            backend: wrap(Arc::clone(&self.backend)),
             ..self
         }
+        .metered()
     }
 
     /// The store's root key prefix.
@@ -663,6 +782,15 @@ impl Store {
                     source: Box::new(source),
                 })
             })
+    }
+
+    /// Run `fut` on the bridge (see [`block_on_off_runtime`]) as an `op` call.
+    fn bridge<T: Send + 'static>(
+        &self,
+        op: Operation,
+        fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        block_on_off_runtime(&self.metrics, op, fut)
     }
 
     /// Resolve a `/`-delimited `key` to an absolute object path under the
@@ -771,7 +899,7 @@ impl Store {
     /// otherwise as [`Self::delete`] (and see the missing-key note above).
     pub fn delete_blocking(&self, key: &str) -> Result<(), StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.delete(&key).await })
+        self.bridge(Operation::Delete, async move { store.delete(&key).await })
     }
 
     /// Blocking [`Self::get`] for the **sync** storage call sites (`Reader`,
@@ -783,7 +911,7 @@ impl Store {
     /// otherwise as [`Self::get`].
     pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.get(&key).await })
+        self.bridge(Operation::Get, async move { store.get(&key).await })
     }
 
     /// Blocking [`Self::get_bytes`]. Safe to call from inside a tokio
@@ -794,7 +922,7 @@ impl Store {
     /// otherwise as [`Self::get_bytes`].
     pub fn get_bytes_blocking(&self, key: &str) -> Result<bytes::Bytes, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.get_bytes(&key).await })
+        self.bridge(Operation::Get, async move { store.get_bytes(&key).await })
     }
 
     /// Blocking [`Self::get_suffix`] for the sync call sites. Safe to call
@@ -805,7 +933,9 @@ impl Store {
     /// otherwise as [`Self::get_suffix`].
     pub fn get_suffix_blocking(&self, key: &str, len: u64) -> Result<Suffix, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.get_suffix(&key, len).await })
+        self.bridge(Operation::GetRange, async move {
+            store.get_suffix(&key, len).await
+        })
     }
 
     /// List every object key under `prefix` (store-relative), recursively, in
@@ -883,7 +1013,9 @@ impl Store {
     /// [`StoreError::Backend`] on a listing failure.
     pub fn list_blocking(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list(prefix.as_deref()).await })
+        self.bridge(Operation::List, async move {
+            store.list(prefix.as_deref()).await
+        })
     }
 
     /// Blocking `(key, size)` listing for the **sync** storage call sites — the
@@ -899,7 +1031,9 @@ impl Store {
         prefix: Option<&str>,
     ) -> Result<Vec<(String, u64)>, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list_entries(prefix.as_deref()).await })
+        self.bridge(Operation::List, async move {
+            store.list_entries(prefix.as_deref()).await
+        })
     }
 
     /// List the **immediate child common-prefixes** under `prefix` (the
@@ -983,7 +1117,9 @@ impl Store {
         prefix: Option<&str>,
     ) -> Result<DelimitedListing, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list_delimited(prefix.as_deref()).await })
+        self.bridge(Operation::ListDelimited, async move {
+            store.list_delimited(prefix.as_deref()).await
+        })
     }
 
     /// Blocking immediate-child common-prefix listing for the **sync** storage
@@ -1000,7 +1136,9 @@ impl Store {
         prefix: Option<&str>,
     ) -> Result<Vec<String>, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list_common_prefixes(prefix.as_deref()).await })
+        self.bridge(Operation::ListDelimited, async move {
+            store.list_common_prefixes(prefix.as_deref()).await
+        })
     }
 
     /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
@@ -1012,7 +1150,7 @@ impl Store {
     /// otherwise as [`Self::put`].
     pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.put(&key, bytes).await })
+        self.bridge(Operation::Put, async move { store.put(&key, bytes).await })
     }
 
     /// Write `bytes` to `key` only if no object exists there
@@ -1056,7 +1194,9 @@ impl Store {
     /// runtime can't be built.
     pub fn put_if_absent_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.put_if_absent(&key, bytes).await })
+        self.bridge(Operation::Put, async move {
+            store.put_if_absent(&key, bytes).await
+        })
     }
 
     /// Read the object at `key` together with its current `ETag` (the
@@ -1133,7 +1273,10 @@ impl Store {
         key: &str,
     ) -> Result<Option<EtaggedBytes>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        match block_on_off_runtime(async move { store.get_with_etag(&key).await }) {
+        match self.bridge(
+            Operation::Get,
+            async move { store.get_with_etag(&key).await },
+        ) {
             Ok(pair) => Ok(Some(pair)),
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e),
@@ -1152,7 +1295,9 @@ impl Store {
         e_tag: &str,
     ) -> Result<(), StoreError> {
         let (store, key, e_tag) = (self.clone(), key.to_owned(), e_tag.to_owned());
-        block_on_off_runtime(async move { store.put_if_match(&key, bytes, &e_tag).await })
+        self.bridge(Operation::Put, async move {
+            store.put_if_match(&key, bytes, &e_tag).await
+        })
     }
 }
 
@@ -1213,7 +1358,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::ThreadId;
 
-    use super::{MAX_BRIDGE_WORKERS, S3Config, Store, StoreError, block_on_off_runtime};
+    use super::{
+        MAX_BRIDGE_WORKERS, Metrics, Operation, S3Config, Store, StoreError, block_on_off_runtime,
+    };
+
+    fn bridged<T: Send + 'static>(
+        fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        block_on_off_runtime(&Metrics::Global, Operation::Get, fut)
+    }
 
     /// `Store::s3` builds an `AmazonS3` backend from addressing config without
     /// contacting the endpoint (creds/connectivity resolve on first request),
@@ -1707,7 +1860,7 @@ mod tests {
     /// Run one bridged call that records the thread its future is polled on.
     fn bridged_call_records_thread(seen: &Arc<Mutex<HashSet<ThreadId>>>) {
         let seen = Arc::clone(seen);
-        let got = block_on_off_runtime(async move {
+        let got = bridged(async move {
             seen.lock()
                 .expect("thread-id set")
                 .insert(std::thread::current().id());
@@ -1812,7 +1965,7 @@ mod tests {
     fn a_panic_in_the_bridged_future_propagates_to_the_caller() {
         let fail = true;
         let caught = std::panic::catch_unwind(|| {
-            block_on_off_runtime(async move {
+            bridged(async move {
                 assert!(!fail, "bridged future panicked");
                 Ok(())
             })
@@ -1824,9 +1977,6 @@ mod tests {
             .or_else(|| caught.downcast_ref::<&str>().copied())
             .unwrap_or_default();
         assert!(msg.contains("bridged future panicked"), "payload: {msg:?}");
-        assert_eq!(
-            block_on_off_runtime(async { Ok(1_u8) }).expect("after panic"),
-            1
-        );
+        assert_eq!(bridged(async { Ok(1_u8) }).expect("after panic"), 1);
     }
 }

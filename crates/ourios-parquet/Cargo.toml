@@ -73,8 +73,18 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # local disk for the duration of one compaction call (cache, not truth —
 # CLAUDE.md §3.6; the drop guard reclaims them on success and error alike).
 tempfile = "=3.27.0"
+# Object-store and bridge metrics (#923/#926) through the OTel API only; the
+# SDK and exporter live in ourios-telemetry (the RFC 0001 §6.8 API/SDK
+# split). Names come from the weaver-generated ourios-semconv constants.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+ourios-semconv = { path = "../ourios-semconv" }
+# `object_store`'s `HttpService` and `ObjectStore` traits are
+# `#[async_trait]`; the metering wrappers implement them.
+async-trait = "=0.1.89"
 
 [dev-dependencies]
+# In-memory metric export for the store and bridge metric tests.
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
 ourios-config = { path = "../ourios-config" }
 # RFC 0024 §5 P1 round-trip (`tests/rfc0024_properties.rs`): generated
@@ -92,7 +102,7 @@ proptest = "=1.11.0"
 # async via `object_store`). `rt-multi-thread` so the S3 integration tests'
 # `#[tokio::test(flavor = "multi_thread")]` is self-contained rather than
 # relying on the main dependency's feature set. Already in the workspace tree.
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 # RFC 0013 S3 integration tests: spin LocalStack (S3-compatible, Apache-2.0)
 # via testcontainers and point `Store::s3` at it through the endpoint override.
 # The S3 tests are `#[ignore]`d (run only by the `s3-integration` CI job via

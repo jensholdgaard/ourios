@@ -28,13 +28,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use opentelemetry::metrics::{
-    Counter, Histogram, Meter, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
+    Counter, Histogram, Meter, ObservableCounter, ObservableGauge, ObservableUpDownCounter,
+    UpDownCounter,
 };
 use opentelemetry::{KeyValue, global};
+use ourios_parquet::MemoryPhase;
 use ourios_semconv as semconv;
 
 use crate::cadence::BarrierEpochs;
-use crate::compactor::{FailedSweep, IngestError, PartitionCommitted, SweepReport, to_u64};
+use crate::compactor::{
+    FailedSweep, IngestError, PartitionCommitted, SweepGauges, SweepReport, to_u64,
+};
 
 /// Per-tenant current backlog (sealed-but-uncompacted partition count)
 /// shared between [`CompactionMetrics::record_sweep_outcome`], which writes the
@@ -63,6 +67,92 @@ pub struct CompactionMetrics {
     /// — the SDK invokes its callback on collect).
     #[expect(dead_code, reason = "retains the observable-callback registration")]
     backlog: ObservableUpDownCounter<i64>,
+    /// `ourios.compaction.partition.input.files`, one sample per partition.
+    input_files: Histogram<u64>,
+    /// `ourios.compaction.partition.input.size`, both size kinds per partition.
+    input_size: Histogram<u64>,
+    /// What the running sweep keeps current; the live instruments read it.
+    gauges: Arc<SweepGauges>,
+    #[expect(dead_code, reason = "retains the observable-callback registrations")]
+    live: LiveInstruments,
+}
+
+/// The observable instruments over [`SweepGauges`] (#925).
+#[derive(Debug)]
+#[expect(dead_code, reason = "retains the observable-callback registrations")]
+struct LiveInstruments {
+    spill_runs: ObservableCounter<u64>,
+    spill_size: ObservableCounter<u64>,
+    memory_usage: ObservableUpDownCounter<i64>,
+    memory_limit: ObservableUpDownCounter<i64>,
+    sweep_remaining: ObservableUpDownCounter<i64>,
+}
+
+impl LiveInstruments {
+    /// Register the live instruments on `meter`, each reading `gauges` at
+    /// collect time. `memory.limit` reports only the phases with a budget
+    /// (see [`MemoryPhase`]), once a compaction has published it.
+    fn register(meter: &Meter, gauges: &Arc<SweepGauges>) -> Self {
+        let read = Arc::clone(gauges);
+        let spill_runs = meter
+            .u64_observable_counter(semconv::OURIOS_COMPACTION_SPILL_RUNS)
+            .with_unit("{run}")
+            .with_callback(move |observer| observer.observe(read.compaction().spill_runs(), &[]))
+            .build();
+        let read = Arc::clone(gauges);
+        let spill_size = meter
+            .u64_observable_counter(semconv::OURIOS_COMPACTION_SPILL_SIZE)
+            .with_unit("By")
+            .with_callback(move |observer| observer.observe(read.compaction().spill_bytes(), &[]))
+            .build();
+        let read = Arc::clone(gauges);
+        let memory_usage = meter
+            .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_MEMORY_USAGE)
+            .with_unit("By")
+            .with_callback(move |observer| {
+                for phase in MemoryPhase::ALL {
+                    let usage = read.compaction().usage(phase);
+                    observer.observe(saturating_i64(usage), &phase_attribute(phase));
+                }
+            })
+            .build();
+        let read = Arc::clone(gauges);
+        let memory_limit = meter
+            .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_MEMORY_LIMIT)
+            .with_unit("By")
+            .with_callback(move |observer| {
+                for phase in MemoryPhase::ALL {
+                    if let Some(limit) = read.compaction().limit(phase) {
+                        observer.observe(saturating_i64(limit), &phase_attribute(phase));
+                    }
+                }
+            })
+            .build();
+        let read = Arc::clone(gauges);
+        let sweep_remaining = meter
+            .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_SWEEP_REMAINING)
+            .with_unit("{partition}")
+            .with_callback(move |observer| observer.observe(saturating_i64(read.remaining()), &[]))
+            .build();
+        Self {
+            spill_runs,
+            spill_size,
+            memory_usage,
+            memory_limit,
+            sweep_remaining,
+        }
+    }
+}
+
+fn phase_attribute(phase: MemoryPhase) -> [KeyValue; 1] {
+    [KeyValue::new(
+        semconv::OURIOS_COMPACTION_PHASE,
+        phase.as_str(),
+    )]
+}
+
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 impl CompactionMetrics {
@@ -152,6 +242,8 @@ impl CompactionMetrics {
         for counter in [&partitions, &files, &rows, &orphan_files] {
             counter.add(0, &[]);
         }
+        let gauges = Arc::new(SweepGauges::default());
+        let live = LiveInstruments::register(meter, &gauges);
 
         Self {
             sweeps,
@@ -164,7 +256,23 @@ impl CompactionMetrics {
             file_size,
             backlog_state,
             backlog,
+            input_files: meter
+                .u64_histogram(semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES)
+                .with_unit("{file}")
+                .build(),
+            input_size: meter
+                .u64_histogram(semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE)
+                .with_unit("By")
+                .build(),
+            gauges,
+            live,
         }
+    }
+
+    /// What a sweep keeps current for the live instruments to read.
+    #[must_use]
+    pub fn gauges(&self) -> &SweepGauges {
+        &self.gauges
     }
 
     /// Record one committed partition rewrite, the moment its manifest
@@ -178,6 +286,22 @@ impl CompactionMetrics {
         self.rows.add(commit.rows, &[]);
         self.record_io(commit.bytes_read, commit.bytes_written);
         self.record_file_size(commit.tenant, commit.bytes_written);
+        self.record_input(commit);
+    }
+
+    /// The partition's input shape: its file count, and its size both as
+    /// stored and as the RFC 0036 §3.2 budget estimates it decoded.
+    fn record_input(&self, commit: &PartitionCommitted<'_>) {
+        self.input_files.record(commit.files, &[]);
+        for (kind, bytes) in [
+            ("encoded", commit.bytes_read),
+            ("decoded_estimate", commit.decoded_bytes_estimate),
+        ] {
+            self.input_size.record(
+                bytes,
+                &[KeyValue::new(semconv::OURIOS_COMPACTION_SIZE_KIND, kind)],
+            );
+        }
     }
 
     /// Record one sweep's outcome and wall-clock `elapsed`, for a sweep

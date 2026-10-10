@@ -249,7 +249,8 @@ fn blocking_pass(
         }
         audit_sink.emit(commit.event.clone());
     };
-    let (result, tuples) = sweep_deriving(target, &mut on_commit);
+    let gauges = metrics.map(CompactionMetrics::gauges);
+    let (result, tuples) = sweep_deriving(target, gauges, &mut on_commit);
     (result, audit_sink, tuples)
 }
 
@@ -259,6 +260,7 @@ fn blocking_pass(
 #[cfg(feature = "openfga")]
 fn sweep_deriving(
     target: &SweepTarget,
+    gauges: Option<&SweepGauges>,
     on_commit: &mut CommitObserver<'_>,
 ) -> (Result<SweepReport, FailedSweep>, GraphTuples) {
     let mut tuples = GraphTuples::default();
@@ -276,6 +278,7 @@ fn sweep_deriving(
     let mut hooks = SweepHooks {
         observe: observe.as_mut().map(|f| f as &mut SweepObserver<'_>),
         erasure_match: erasure_match.as_ref().map(|f| f as &ErasureMatch<'_>),
+        gauges,
     };
     let result = run_sweep_committing(
         &target.store,
@@ -293,6 +296,7 @@ fn sweep_deriving(
 #[cfg(not(feature = "openfga"))]
 fn sweep_deriving(
     target: &SweepTarget,
+    gauges: Option<&SweepGauges>,
     on_commit: &mut CommitObserver<'_>,
 ) -> (Result<SweepReport, FailedSweep>, GraphTuples) {
     let result = run_sweep_committing(
@@ -300,7 +304,10 @@ fn sweep_deriving(
         SweepClock::sealed_at(now_unix_nanos()),
         &target.policy,
         &target.promoted,
-        &mut SweepHooks::default(),
+        &mut SweepHooks {
+            gauges,
+            ..SweepHooks::default()
+        },
         on_commit,
     );
     (result, GraphTuples)

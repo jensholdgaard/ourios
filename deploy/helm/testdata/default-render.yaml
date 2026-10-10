@@ -356,6 +356,11 @@ spec:
             - name: otlp-http
               containerPort: 4318
               protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: otlp-http
+            periodSeconds: 10
+            failureThreshold: 360
           readinessProbe:
             tcpSocket:
               port: otlp-http

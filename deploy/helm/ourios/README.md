@@ -496,8 +496,25 @@ And its steady-state policy, once the high-water exists:
    file the chart mounts; the chart runs the binary with `--config`, which
    reads no bare `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` env var). A store that already holds data refuses to bootstrap
    without it.
-4. Once that replica has seated, remove the setting, replace the
-   bootstrap policy with the steady-state one, and scale out.
+4. Wait for it to seat: it logs `ourios.receiver.template_ids.bootstrapped`
+   and writes `snapshots/TEMPLATE_IDS_SEATED` under its WAL root. Then remove
+   the setting, replace the bootstrap policy with the steady-state one, and
+   scale out.
+
+**How long step 3 takes.** The bootstrap runs during startup recovery,
+before the receiver's listeners open, so the replica accepts no logs until
+it ends. It reads one footer per data and audit file, 16 at a time, so it
+takes about the store's `*.parquet` file count divided by that concurrent
+read rate: with footer reads answered in 80 ms, about 200 files a second, or
+a few minutes for 30,000 files. Let compaction catch up first on a store with
+many small files, since every file is one more read. The replica prints its
+start, its progress at least every 30 seconds, and its end on stderr whatever
+the logs exporter. A SIGTERM during the scan stops it between reads with
+nothing written, and the next start scans again from the beginning, so a
+restart mid-scan loses the work done. The OTLP/HTTP port stays closed while
+the replica scans; the receiver's startup probe (see [Probes](#probes)) gives
+it an hour by default before the kubelet restarts it. Raise
+`receiver.startupProbe.failureThreshold` first if the scan needs longer.
 
 Downgrading below RFC 0059 is not supported once the high-water exists.
 
@@ -712,3 +729,12 @@ POST-only), so the chart uses **TCP socket probes** on the bound role ports
 (receiver `:4318`, querier `:4319`). The compactor has no listening port and
 no probe; it is supervised by the process. Swap these for HTTP probes once a
 `/healthz` endpoint lands.
+
+The receiver opens its port only once startup recovery has finished: it
+replays its WAL and, on the upgrade to RFC 0059, reads every data and audit
+footer in the store (see "How long step 3 takes" above). Either can take
+minutes. So the receiver also has a **startup probe** on the same port, and
+its liveness and readiness probes start only once it passes. The budget is
+`receiver.startupProbe.periodSeconds` x `receiver.startupProbe.failureThreshold`,
+10 s x 360 = one hour by default. The querier has no such phase: it binds its
+port right after reading its configuration, so it keeps only the two probes.

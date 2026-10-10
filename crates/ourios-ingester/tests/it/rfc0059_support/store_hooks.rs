@@ -31,6 +31,9 @@ pub struct Hooks {
     /// key with `404` does: the window between a reservation's read and
     /// its write.
     pub delete_before_next_put: Arc<std::sync::atomic::AtomicBool>,
+    /// Raised by every read of a data file, as a shutdown signal arriving
+    /// mid-scan would raise it.
+    pub raise_on_data_read: Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Hooks {

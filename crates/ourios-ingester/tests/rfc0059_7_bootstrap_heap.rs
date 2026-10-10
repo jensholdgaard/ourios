@@ -18,7 +18,7 @@ use ourios_core::audit::{
 };
 use ourios_core::record::{BodyKind, MinedRecord};
 use ourios_core::tenant::TenantId;
-use ourios_ingester::template_ids::BootstrapScan;
+use ourios_ingester::template_ids::{BootstrapScan, DEFAULT_SCAN_CONCURRENCY, ScanOptions};
 use ourios_parquet::{ParquetAuditSink, PartitionKey, Store, Writer};
 use tempfile::TempDir;
 
@@ -32,6 +32,12 @@ const TOKENS: usize = 2_500;
 /// history grows by adding directories, never by widening one.
 const WIDTH: u64 = 10;
 const HOUR_NS: u64 = 3_600_000_000_000;
+/// What one more read in flight may hold, in multiples of the largest
+/// file: its fetched tail (at most the whole file, as every file here is
+/// under the 64 KiB prefetch), the footer metadata it decodes, and the
+/// read path's transient buffers. Measured at under 2x; 3x is headroom
+/// for timing, not slack for a read that holds more than one file.
+const PER_READ_FILES: u64 = 3;
 
 /// A UTC hour on the civil calendar.
 #[derive(Clone, Copy)]
@@ -156,45 +162,62 @@ fn write_history(bucket: &Path, files: u64) -> u64 {
     bytes
 }
 
-/// One scan over a fresh history: what it read, the history's bytes, and
-/// its peak heap.
-struct Scanned {
-    scan: BootstrapScan,
+/// A fresh history of `files` data and audit files: its bucket, its body
+/// and template bytes, and its largest object's size.
+struct History {
+    bucket: TempDir,
     bytes: u64,
-    peak: u64,
+    largest_file: u64,
 }
 
-/// The scan over a fresh history of `files` data and audit files.
-fn scan_over(files: u64) -> Scanned {
+fn history(files: u64) -> History {
     let bucket = TempDir::new().expect("temp dir");
     let bytes = write_history(bucket.path(), files);
     let store = Store::local(bucket.path()).expect("store");
-    let _profiler = dhat::Profiler::builder().testing().build();
-    let scan = BootstrapScan::run(&store).expect("scan");
-    let peak = dhat::HeapStats::get().max_bytes as u64;
-    Scanned { scan, bytes, peak }
+    let largest_file = store
+        .list_with_sizes_blocking(None)
+        .expect("list")
+        .into_iter()
+        .map(|(_, size)| size)
+        .max()
+        .expect("files");
+    History {
+        bucket,
+        bytes,
+        largest_file,
+    }
 }
 
-/// Scenario RFC0059.7 — the scan's peak heap does not grow when the
-/// history grows by directories, with the widest directory and the
-/// largest file held fixed: it is bounded by the largest directory
-/// listing plus one file.
+/// One scan over `history` with `concurrency` footer reads in flight:
+/// what it read, and its peak heap.
+fn scan_over(history: &History, concurrency: usize) -> (BootstrapScan, u64) {
+    let store = Store::local(history.bucket.path()).expect("store");
+    let options = ScanOptions {
+        concurrency,
+        ..ScanOptions::default()
+    };
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let scan = BootstrapScan::run_with(&store, &options).expect("scan");
+    let peak = dhat::HeapStats::get().max_bytes as u64;
+    (scan, peak)
+}
+
+/// Scenario RFC0059.7 — one footer read at a time, the scan's peak heap
+/// does not grow when the history grows by directories, with the widest
+/// directory and the largest file held fixed: it is bounded by the
+/// largest directory listing plus one file. At the default concurrency it
+/// is bounded by the same listing plus one file per read in flight.
 /// See `docs/rfcs/0059-durable-template-id-allocation.md` §5.
 #[test]
 fn rfc0059_7_the_bootstrap_scan_heap_does_not_grow_with_history() {
-    let Scanned {
-        scan,
-        bytes: small_bytes,
-        peak: small_peak,
-    } = scan_over(40);
+    let small = history(40);
+    let (scan, small_peak) = scan_over(&small, 1);
     assert_eq!((scan.data_max, scan.audit_max), (Some(40), Some(40)));
     assert_eq!(scan.files_scanned, 80);
-    let Scanned {
-        scan,
-        bytes: large_bytes,
-        peak: large_peak,
-    } = scan_over(160);
+    let large = history(160);
+    let (scan, large_peak) = scan_over(&large, 1);
     assert_eq!((scan.data_max, scan.audit_max), (Some(160), Some(160)));
+    let (small_bytes, large_bytes) = (small.bytes, large.bytes);
     eprintln!(
         "RFC0059.7 bootstrap scan: 80 files ({small_bytes} B) peak {small_peak} B; \
          320 files ({large_bytes} B) peak {large_peak} B",
@@ -208,5 +231,26 @@ fn rfc0059_7_the_bootstrap_scan_heap_does_not_grow_with_history() {
         large_peak < small_peak + small_peak / 2,
         "peak heap grew with the history: {small_peak} B over 80 files, {large_peak} B \
          over 320",
+    );
+
+    let (scan, concurrent_peak) = scan_over(&large, DEFAULT_SCAN_CONCURRENCY);
+    assert_eq!((scan.data_max, scan.audit_max), (Some(160), Some(160)));
+    let extra_reads = DEFAULT_SCAN_CONCURRENCY as u64 - 1;
+    let bound = large_peak + extra_reads * PER_READ_FILES * large.largest_file;
+    eprintln!(
+        "RFC0059.7 bootstrap scan: {DEFAULT_SCAN_CONCURRENCY} at a time over 320 files \
+         peak {concurrent_peak} B; largest file {} B; bound {bound} B",
+        large.largest_file,
+    );
+    assert!(
+        concurrent_peak < bound,
+        "{DEFAULT_SCAN_CONCURRENCY} reads in flight held {concurrent_peak} B at peak, above \
+         the one-at-a-time {large_peak} B plus {extra_reads} more reads of at most \
+         {PER_READ_FILES} x {} B",
+        large.largest_file,
+    );
+    assert!(
+        concurrent_peak < large_bytes / 8,
+        "the concurrent scan held {concurrent_peak} B at peak over {large_bytes} B of history",
     );
 }

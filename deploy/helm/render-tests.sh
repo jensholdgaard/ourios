@@ -129,6 +129,47 @@ check "templateIdsAllowBootstrap renders into the receiver config" \
   "$(receiver_config --set receiver.templateIdsAllowBootstrap=true \
       | grep -o 'template_ids_allow_bootstrap: true')"
 
+# --- receiver startup probe --------------------------------------------------
+
+# Startup recovery (WAL replay, the RFC 0059 bootstrap scan) runs before the
+# OTLP port opens; the startup probe must hold the liveness probe off.
+receiver_startup_probe() {
+  helm template t "$CHART" --show-only templates/receiver-statefulset.yaml "$@" \
+    | sed -n '/startupProbe:/,/readinessProbe:/p' \
+    | sed -nE 's/^ *(port|periodSeconds|failureThreshold): (.*)$/\1=\2/p'
+}
+check "receiver startup probe defaults to one hour on the OTLP/HTTP port" \
+  "port=otlp-http
+periodSeconds=10
+failureThreshold=360" \
+  "$(receiver_startup_probe)"
+check "receiver startup probe budget is configurable" \
+  "port=otlp-http
+periodSeconds=30
+failureThreshold=720" \
+  "$(receiver_startup_probe --set receiver.startupProbe.periodSeconds=30 \
+      --set receiver.startupProbe.failureThreshold=720)"
+check "upgrade path: startupProbe map absent" \
+  "port=otlp-http
+periodSeconds=10
+failureThreshold=360" \
+  "$(receiver_startup_probe --set receiver.startupProbe=null)"
+
+# NOTES states the budget the probe renders, defaulting each field the
+# same way, so a map carrying only one key (a --reuse-values upgrade that
+# set one) reports the real product.
+startup_budget_note() {
+  helm install t "$CHART" --dry-run=client "$@" \
+    | sed -n 's/.*startup probe allows it and WAL replay \([0-9]*s\),.*/\1/p'
+}
+check "NOTES states the default startup budget" "3600s" "$(startup_budget_note)"
+check "NOTES budget with only failureThreshold set" "7200s" \
+  "$(startup_budget_note --set receiver.startupProbe.periodSeconds=null \
+      --set receiver.startupProbe.failureThreshold=720)"
+check "NOTES budget with only periodSeconds set" "10800s" \
+  "$(startup_budget_note --set receiver.startupProbe.failureThreshold=null \
+      --set receiver.startupProbe.periodSeconds=30)"
+
 # --- default render is pinned -------------------------------------------------
 
 # The security surface is opt-in: a default install must render exactly what

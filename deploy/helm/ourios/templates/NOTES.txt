@@ -26,7 +26,13 @@ Workloads:
     on the bucket arn with an s3:prefix condition, never on an object arn);
     (2) scale receiver.replicas to 0; (3) start one upgraded replica with
     receiver.templateIdsAllowBootstrap=true (it bootstraps the template-id
-    high-water once); (4) once it has seated, set it back to false,
+    high-water once, reading every data and audit footer before its
+    listeners open: about the store's file count divided by 16 concurrent
+    reads, so let compaction catch up first; a restart mid-scan starts it
+    over; the receiver's startup probe allows it and WAL replay {{ $startup := .Values.receiver.startupProbe | default dict }}{{ mul ($startup.periodSeconds | default 10) ($startup.failureThreshold | default 360) }}s,
+    receiver.startupProbe, before the kubelet restarts it); (4) once it has seated (it logs
+    ourios.receiver.template_ids.bootstrapped and writes
+    snapshots/TEMPLATE_IDS_SEATED under its WAL root), set it back to false,
     revoke the bootstrap-only grants (the README's steady-state policy)
     and scale out. A rolling update that keeps an old
     receiver running during that first start can re-issue ids.

@@ -99,8 +99,11 @@ receiver:
   #   2. set replicas to 0 and apply, so no pre-RFC receiver is running;
   #   3. set replicas to 1 with templateIdsAllowBootstrap: true and apply;
   #      that one replica bootstraps the template-id high-water from the
-  #      store once;
-  #   4. once it has seated, set it back to false, revoke the
+  #      store once, reading every data and audit footer before its
+  #      listeners open (about the file count divided by 16 concurrent
+  #      reads; let compaction catch up first, and see the README);
+  #   4. once it has seated (it writes snapshots/TEMPLATE_IDS_SEATED under
+  #      its WAL root), set it back to false, revoke the
   #      bootstrap-only grants (README's steady-state policy), then scale
   #      out.
   # A store that already holds data refuses to bootstrap without step 3's
@@ -116,6 +119,15 @@ receiver:
   # The chart runs the binary with --config, which reads no bare
   # OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP env var, so extraEnv cannot set it.
   templateIdsAllowBootstrap: false
+  # How long the receiver may take to start before the kubelet restarts it:
+  # periodSeconds x failureThreshold (default 1 h). Its OTLP port opens
+  # only after startup recovery, which replays the WAL and, on the RFC 0059
+  # upgrade, reads every data and audit footer; the liveness and readiness
+  # probes start only once this one passes. Raise failureThreshold for a
+  # bootstrap over a store larger than about 700,000 files.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
   # Listener TLS (RFC 0030), per listener: `grpc` is OTLP/gRPC :4317, `http`
   # is OTLP/HTTP :4318. Empty existingSecret = plaintext (the default). See
   # querier.tls.http for the keys.

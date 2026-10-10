@@ -125,7 +125,7 @@ auth:
 | `OURIOS_RECEIVER_ENABLED` / `OURIOS_RECEIVER_GRPC_ADDR` / `OURIOS_RECEIVER_HTTP_ADDR` | receiver role |
 | `OURIOS_WAL_ROOT` | WAL directory (receiver) |
 | `OURIOS_RECEIVER_ENCODE_WORKERS` | concurrent encode pool size (RFC 0035; default: all cores) |
-| `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` / `receiver.template_ids_allow_bootstrap` | authorise the one-time template-id bootstrap over existing data, for the upgrade to RFC 0059 only (default off) |
+| `OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP` / `receiver.template_ids_allow_bootstrap` | authorise the one-time template-id bootstrap over existing data, for the upgrade to RFC 0059 only (default off); see [the bootstrap's cost](#the-template-id-bootstrap) |
 | `OURIOS_QUERIER_ENABLED` / `OURIOS_QUERIER_HTTP_ADDR` / `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` | querier role |
 | `OURIOS_QUERIER_MCP_ENABLED` | the `/mcp` agent surface (RFC 0027) |
 | `OURIOS_COMPACTION_ENABLED` / `OURIOS_COMPACTION_INTERVAL_SECS` | background compactor |
@@ -133,6 +133,29 @@ auth:
 Auth configuration is **file-only** — there are deliberately no
 `OURIOS_AUTH_*` variables; token values reach the file through
 `${env:…}` references.
+
+## The template-id bootstrap
+
+The upgrade to [RFC 0059](../rfcs/0059-durable-template-id-allocation.md)
+starts one receiver with `receiver.template_ids_allow_bootstrap` set. That
+start reads the footer of every data and audit `*.parquet` file during
+startup recovery, before the receiver's listeners open (and, in a process
+that also runs the querier, before the querier's), so it accepts no logs
+until it ends:
+
+- **Cost.** One footer read per file, 16 at a time, so about the store's
+  file count divided by that concurrent read rate. Let compaction catch up
+  first on a store with many small files.
+- **Progress.** The start, progress at least every 30 seconds, and the end
+  are printed on stderr whatever the logs exporter, and logged as
+  `ourios.receiver.template_ids.bootstrap.progress` and
+  `ourios.receiver.template_ids.bootstrapped`.
+- **Interruptions.** SIGTERM or SIGINT during the scan stops it between
+  reads and exits cleanly with nothing written. The next start scans again
+  from the beginning.
+- **Done.** Remove the setting only once the receiver has logged
+  `ourios.receiver.template_ids.bootstrapped` or written
+  `snapshots/TEMPLATE_IDS_SEATED` under its WAL root.
 
 ## Listener TLS
 

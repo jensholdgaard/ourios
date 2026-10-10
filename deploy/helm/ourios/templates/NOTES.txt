@@ -47,12 +47,60 @@ Workloads:
   - compactor DISABLED. With a receiver or querier enabled the chart refuses to render (a deployment with no sweeper — hazard #4); with all roles disabled, nothing runs.
 {{- end }}
 
+{{- $authOn := include "ourios.authEnabled" . }}
+{{- if or .Values.receiver.enabled .Values.querier.enabled }}
+{{- if not $authOn }}
+
+WARNING: authentication is OFF (RFC 0026 open mode). Any client that can
+reach the receiver or querier Services can write and read EVERY tenant, over
+plaintext unless listener TLS is set. Keep both Services inside a trusted
+network boundary, or configure auth.tokens and/or auth.oidc (and
+receiver.tls / querier.tls); see the chart README's "Authentication and TLS".
+{{- else }}
+
+{{- $halves := list }}
+{{- if include "ourios.tokensConfigured" . }}{{ $halves = append $halves "static tokens" }}{{ end }}
+{{- if include "ourios.oidcEnabled" . }}{{ $halves = append $halves "OIDC" }}{{ end }}
+Authentication is ON ({{ join " + " $halves }}{{ if include "ourios.openfgaEnabled" . }}; tenants bound by OpenFGA{{ end }}).
+{{- $plain := list }}
+{{- range $listener := list (list "receiver" "grpc" "receiver gRPC :4317") (list "receiver" "http" "receiver HTTP :4318") (list "querier" "http" "querier HTTP :4319") }}
+{{- $role := index $listener 0 }}
+{{- if and (index $.Values $role).enabled (not (include "ourios.tlsListener" (dict "root" $ "role" $role "listener" (index $listener 1)) | fromJson).secret) }}
+{{- $plain = append $plain (index $listener 2) }}
+{{- end }}
+{{- end }}
+{{- with $plain }}
+  These listeners carry bearer credentials in plaintext:
+    {{ join ", " . }}.
+  Fine behind a TLS-terminating proxy or mesh; otherwise set the listener's
+  <role>.tls.<listener>.existingSecret.
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.querier.enabled }}
 
 Query the logs DSL (port-forward from your workstation):
   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }}-querier 4319:4319
   curl -s -H 'X-Ourios-Tenant: my-tenant' -H 'Content-Type: text/plain' \
+{{- if $authOn }}
+    -H "Authorization: Bearer $TOKEN" \
+{{- end }}
+{{- if include "ourios.tlsEnabled" (dict "root" . "role" "querier") }}
+{{- $host := printf "%s-querier.%s.svc" (include "ourios.fullname" .) .Release.Namespace }}
+{{- $mtls := (include "ourios.tlsListener" (dict "root" . "role" "querier" "listener" "http") | fromJson).caSecret }}
+    --cacert ca.crt --resolve {{ $host }}:4319:127.0.0.1 \
+{{- if $mtls }}
+    --cert client.crt --key client.key \
+{{- end }}
+    --data 'template_id == 0' https://{{ $host }}:4319/v1/query
+  (ca.crt: the CA that issued the querier certificate. Replace the host with
+  a DNS name the certificate carries.
+{{- if $mtls }}
+  mTLS is on: client.crt/client.key must chain to the configured client CA.
+{{- end }})
+{{- else }}
     --data 'template_id == 0' http://127.0.0.1:4319/v1/query
+{{- end }}
 {{- end }}
 {{- if .Values.receiver.enabled }}
 

@@ -8,6 +8,9 @@
 //! OTLP **push** `MeterProvider` (periodic-reader export), installs it
 //! as the process-global provider, and hands back a [`TelemetryGuard`]
 //! whose [`TelemetryGuard::shutdown`] flushes pending telemetry on exit.
+//! The same provider carries the upstream `OTel` process metrics
+//! (`process.memory.usage`, `process.cpu.time`, …), so memory and CPU
+//! pressure show up in Ourios's own telemetry before the kernel acts on it.
 //!
 //! **Logs are dogfooded** (CLAUDE.md §6.3): [`init`] also builds an OTLP
 //! `SdkLoggerProvider` and installs a `tracing` subscriber whose
@@ -32,8 +35,10 @@
 
 #[cfg(feature = "testing")]
 pub mod live_check;
+mod process;
 
 use opentelemetry::global;
+use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
@@ -219,9 +224,12 @@ impl Drop for TelemetryGuard {
     }
 }
 
+/// The resource every signal shares: the service, and the `process` entity
+/// that the process metrics describe.
 fn resource(service_name: &str) -> Resource {
     Resource::builder()
         .with_service_name(service_name.to_owned())
+        .with_attributes(process::identity())
         .build()
 }
 
@@ -355,12 +363,12 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         }
         let exporter = builder.build()?;
         let reader = PeriodicReader::builder(exporter).build();
-        Some(
-            SdkMeterProvider::builder()
-                .with_reader(reader)
-                .with_resource(resource.clone())
-                .build(),
-        )
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource.clone())
+            .build();
+        process::register(&provider.meter(process::SCOPE));
+        Some(provider)
     } else {
         None
     };
@@ -538,7 +546,6 @@ pub fn init_in_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
 
@@ -619,6 +626,27 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "ourios.compaction.sweeps"),
             "collected stream should contain the recorded instrument, got {names:?}",
+        );
+
+        // The `process` entity's identity rides on the resource, so replicas
+        // and restarts export distinguishable series.
+        let resource = resource_metrics[0].resource();
+        assert_eq!(
+            resource.get(&"process.pid".into()),
+            Some(opentelemetry::Value::I64(i64::from(std::process::id()))),
+        );
+        let created = resource
+            .get(&"process.creation.time".into())
+            .expect("process.creation.time on the resource")
+            .as_str()
+            .into_owned();
+        let created = chrono::DateTime::parse_from_rfc3339(&created)
+            .unwrap_or_else(|e| panic!("{created:?} is not ISO 8601: {e}"));
+        assert!(
+            created.timestamp_millis()
+                <= chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+                    .timestamp_millis(),
+            "the process was created in the past, got {created}",
         );
     }
 

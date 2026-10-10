@@ -21,8 +21,8 @@
 # file — the `OURIOS_*` names in parentheses are the equivalent config keys.
 # Object-store credentials are the exception: they are `${env:…}` references
 # resolved from a Secret via envFrom, never written into the file (see
-# storage.s3.existingSecret). OTEL_* and AWS_* stay plain env, read by their own
-# SDKs (RFC 0020 §3.8).
+# storage.s3.existingSecret), and so are auth tokens (see auth below). OTEL_*
+# and AWS_* stay plain env, read by their own SDKs (RFC 0020 §3.8).
 
 image:
   repository: ghcr.io/jensholdgaard/ourios
@@ -116,6 +116,24 @@ receiver:
   # The chart runs the binary with --config, which reads no bare
   # OURIOS_TEMPLATE_IDS_ALLOW_BOOTSTRAP env var, so extraEnv cannot set it.
   templateIdsAllowBootstrap: false
+  # Listener TLS (RFC 0030), per listener: `grpc` is OTLP/gRPC :4317, `http`
+  # is OTLP/HTTP :4318. Empty existingSecret = plaintext (the default). See
+  # querier.tls.http for the keys.
+  tls:
+    grpc:
+      existingSecret: ""
+      clientCA:
+        existingSecret: ""
+        key: ca.crt
+      minVersion: ""
+      reloadIntervalSecs: ""
+    http:
+      existingSecret: ""
+      clientCA:
+        existingSecret: ""
+        key: ca.crt
+      minVersion: ""
+      reloadIntervalSecs: ""
   service:
     type: ClusterIP
   # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never
@@ -168,6 +186,29 @@ querier:
   # Default look-back for a query with no range(...) stage, in seconds
   # (OURIOS_QUERIER_DEFAULT_WINDOW_SECS; RFC 0016 §7). Must be non-zero.
   defaultWindowSecs: 3600
+  # The RFC 0027 MCP agent surface at /mcp on the querier port
+  # (querier.mcp.enabled). It runs behind the same auth as the query API, so
+  # enable it together with `auth` below.
+  mcp:
+    enabled: false
+  # Listener TLS (RFC 0030) for the query API and /mcp on :4319.
+  tls:
+    http:
+      # Name of an existing kubernetes.io/tls Secret (keys tls.crt and tls.key,
+      # e.g. issued by cert-manager), mounted read-only at
+      # /etc/ourios-tls/http/. Empty = plaintext (the default).
+      existingSecret: ""
+      # Optional client CA for mTLS: a handshake without a client certificate
+      # chaining to it is refused. Can name the same Secret as above when it
+      # carries a ca.crt key.
+      clientCA:
+        existingSecret: ""
+        key: ca.crt
+      # "1.2" (the server default) or "1.3".
+      minVersion: ""
+      # Re-read the mounted files on this cadence (seconds), so a rotated
+      # Secret is picked up without a restart. Empty = never reload.
+      reloadIntervalSecs: ""
   # Optional role-scoped ServiceAccount (see receiver.serviceAccount). The
   # querier's IAM role is read-only: Get/List, no writes, no deletes.
   serviceAccount:
@@ -237,6 +278,68 @@ compactor:
 otel:
   # OTEL_EXPORTER_OTLP_ENDPOINT — all three signals. Empty leaves it unset.
   exporterEndpoint: ""
+
+# Authentication and tenant binding for the receiver and querier (the `auth`
+# section of their config file). With none of tokens / oidc configured the
+# install runs in RFC 0026 open mode: any client that reaches a listener can
+# write and read every tenant. See docs/guides/authentication.md.
+#
+# Secrets never enter values or the rendered ConfigMap: each secret is read
+# from an existing Kubernetes Secret into an env var through secretKeyRef,
+# and the config file holds only the `${env:…}` reference to it (the server
+# rejects an inline token). Rotating a referenced Secret needs a rollout
+# restart of the receiver and querier.
+auth:
+  # Static bearer tokens (RFC 0026). Each entry:
+  #   name          the audit/metric label (never secret)
+  #   tenants       the allowed tenants, or ["*"] for all
+  #   secretKeyRef  the Secret and key holding the token value
+  tokens: []
+    # - name: edge-collector
+    #   tenants: [checkout, payments]
+    #   secretKeyRef:
+    #     name: ourios-tokens
+    #     key: edge-collector
+  # OIDC bearer JWTs (RFC 0029). The issuer is contacted at startup; an
+  # unreachable issuer fails startup.
+  oidc:
+    enabled: false
+    # The OIDC discovery root, e.g. https://dex.example.com. Required.
+    issuer: ""
+    # The required `aud` value (your client id). Required.
+    audience: ""
+    # The claim carrying the tenant list. Required unless openfga binds the
+    # tenants.
+    tenantClaim: ""
+    # Optional; empty takes the server default (`sub`, 60 s skew, unset).
+    nameClaim: ""
+    clockSkewSecs: ""
+    # `<claim>=<value>` marking an agent principal (RFC 0047).
+    agentClaim: ""
+    groupsClaim: ""
+  # OpenFGA (RFC 0047) binds the tenants of whatever tokens / oidc
+  # authenticate; it never authenticates on its own, so it needs one of them.
+  # Only the tenant-binding layer is exposed here: the layer-2 visibility
+  # section needs promoted attribute columns the chart does not render.
+  openfga:
+    enabled: false
+    # The OpenFGA HTTP API root, e.g. http://openfga.openfga.svc:8080. Required.
+    apiUrl: ""
+    # The store id. Required.
+    storeId: ""
+    # The pinned authorization model id. Empty = the store's latest.
+    authorizationModelId: ""
+    # The API bearer token, from an existing Secret. Empty name = no token.
+    apiToken:
+      secretKeyRef:
+        name: ""
+        key: ""
+    # Optional; empty takes the server default (60 s, minimize_latency, 5 s,
+    # 3000 ms).
+    sessionTtlSecs: ""
+    consistency: ""
+    requestTimeoutSecs: ""
+    serverListObjectsDeadlineMs: ""
 
 # Extra environment variables appended verbatim to every container. Entries
 # are Kubernetes EnvVar objects, so valueFrom works too. Per-role additions go

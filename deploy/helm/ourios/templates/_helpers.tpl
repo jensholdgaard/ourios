@@ -136,8 +136,9 @@ storage:
 
 {{/*
 The full RFC 0020 config file for one role. Pass
-(dict "root" $ "role" "receiver"|"querier"|"compactor"): the shared storage block
-plus that role's flags; the roles it does not run are absent (disabled). The
+(dict "root" $ "role" "receiver"|"querier"|"compactor"): the shared storage block,
+the auth section for the two listening roles, plus that role's flags and
+listener TLS; the roles it does not run are absent (disabled). The
 receiver/querier disable compaction so only the dedicated compactor sweeps
 (RFC 0009 §3.2). Data-plane only — OTEL_* / AWS_* stay env (RFC 0020 §3.8).
 */}}
@@ -145,6 +146,9 @@ receiver/querier disable compaction so only the dedicated compactor sweeps
 {{- $ := .root -}}
 {{- $role := .role -}}
 {{- include "ourios.storageConfig" $ }}
+{{- if or (eq $role "receiver") (eq $role "querier") }}
+{{- include "ourios.authConfig" $ }}
+{{- end }}
 {{- if eq $role "receiver" }}
 receiver:
   enabled: true
@@ -153,6 +157,9 @@ receiver:
   wal_root: {{ $.Values.receiver.wal.mountPath | quote }}
   {{- if $.Values.receiver.templateIdsAllowBootstrap }}
   template_ids_allow_bootstrap: true
+  {{- end }}
+  {{- with include "ourios.tlsConfig" . }}
+  {{- . | trim | nindent 2 }}
   {{- end }}
 compaction:
   enabled: false
@@ -164,6 +171,13 @@ querier:
   enabled: true
   http_addr: "0.0.0.0:4319"
   default_window_secs: {{ $.Values.querier.defaultWindowSecs }}
+  {{- if dig "mcp" "enabled" false $.Values.querier }}
+  mcp:
+    enabled: true
+  {{- end }}
+  {{- with include "ourios.tlsConfig" . }}
+  {{- . | trim | nindent 2 }}
+  {{- end }}
 compaction:
   enabled: false
 {{- else if eq $role "compactor" }}
@@ -175,6 +189,217 @@ compaction:
   interval_secs: {{ $.Values.compactor.intervalSecs }}
 {{- else }}
 {{- fail (printf "ourios.config: unknown role %q" $role) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The TLS listeners a role serves (RFC 0030): the value keys under
+<role>.tls, which are also the config keys' `<listener>_tls` prefix.
+*/}}
+{{- define "ourios.tlsListeners" -}}
+{{- if eq . "receiver" }}grpc http{{- else if eq . "querier" }}http{{- end }}
+{{- end }}
+
+{{/*
+One `<listener>_tls` config block per listener with a Secret configured; pass
+(dict "root" $ "role" "<role>"). The paths point at the read-only Secret
+mounts from ourios.tlsVolumes, outside /etc/ourios (the ConfigMap mount).
+Mounted without subPath, so a rotated Secret reaches the files and
+reloadIntervalSecs picks it up.
+*/}}
+{{- define "ourios.tlsConfig" -}}
+{{- $role := .role -}}
+{{- $roleValues := index .root.Values $role | default dict -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" $role) }}
+{{- $t := dig "tls" $l (dict) $roleValues }}
+{{- $ca := $t.clientCA | default dict }}
+{{- if $t.existingSecret }}
+{{- if not (has (toString ($t.minVersion | default "")) (list "" "1.2" "1.3")) }}
+{{- fail (printf "%s.tls.%s.minVersion must be \"1.2\" or \"1.3\", got %v" $role $l $t.minVersion) }}
+{{- end }}
+{{ $l }}_tls:
+  cert_file: "/etc/ourios-tls/{{ $l }}/tls.crt"
+  key_file: "/etc/ourios-tls/{{ $l }}/tls.key"
+{{- with $ca.existingSecret }}
+  client_ca_file: "/etc/ourios-tls/{{ $l }}-client-ca/{{ required (printf "%s.tls.%s.clientCA.key is required with clientCA.existingSecret" $role $l) $ca.key }}"
+{{- end }}
+{{- with $t.minVersion }}
+  min_version: {{ toString . | quote }}
+{{- end }}
+{{- with $t.reloadIntervalSecs }}
+{{- if le (int .) 0 }}
+{{- fail (printf "%s.tls.%s.reloadIntervalSecs must be a positive integer (seconds), got %v" $role $l .) }}
+{{- end }}
+  reload_interval_secs: {{ int . }}
+{{- end }}
+{{- else if $ca.existingSecret }}
+{{- fail (printf "%s.tls.%s.clientCA.existingSecret needs %s.tls.%s.existingSecret: mTLS requires the listener's own certificate" $role $l $role $l) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The read-only Secret volumes behind ourios.tlsConfig; pass (dict "root" $
+"role" "<role>"). Renders empty when no listener has TLS.
+*/}}
+{{- define "ourios.tlsVolumes" -}}
+{{- $roleValues := index .root.Values .role | default dict -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" .role) }}
+{{- $t := dig "tls" $l (dict) $roleValues }}
+{{- with $t.existingSecret }}
+- name: tls-{{ $l }}
+  secret:
+    secretName: {{ . | quote }}
+{{- end }}
+{{- with ($t.clientCA | default dict).existingSecret }}
+- name: tls-{{ $l }}-client-ca
+  secret:
+    secretName: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- define "ourios.tlsVolumeMounts" -}}
+{{- $roleValues := index .root.Values .role | default dict -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" .role) }}
+{{- $t := dig "tls" $l (dict) $roleValues }}
+{{- if $t.existingSecret }}
+- name: tls-{{ $l }}
+  mountPath: /etc/ourios-tls/{{ $l }}
+  readOnly: true
+{{- end }}
+{{- if ($t.clientCA | default dict).existingSecret }}
+- name: tls-{{ $l }}-client-ca
+  mountPath: /etc/ourios-tls/{{ $l }}-client-ca
+  readOnly: true
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether a role's listeners serve TLS; pass (dict "root" $ "role" "<role>").
+Renders "true" or nothing.
+*/}}
+{{- define "ourios.tlsEnabled" -}}
+{{- $roleValues := index .root.Values .role | default dict -}}
+{{- range $l := splitList " " (include "ourios.tlsListeners" .role) }}
+{{- if dig "tls" $l "existingSecret" "" $roleValues }}true{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether an `auth` section renders (tokens or oidc configured). Renders "true"
+or nothing. OpenFGA alone authenticates nothing, so it does not count.
+*/}}
+{{- define "ourios.authEnabled" -}}
+{{- $auth := .Values.auth | default dict -}}
+{{- if or ($auth.tokens | default list) (dig "enabled" false ($auth.oidc | default dict)) }}true{{- end }}
+{{- end }}
+
+{{/*
+One optional scalar leaf of an auth subsection (4-space indent); pass
+(dict "key" "<yaml key>" "value" <v>). Renders nothing for an absent or
+empty value; 0 still renders.
+*/}}
+{{- define "ourios.optScalar" -}}
+{{- if and (not (kindIs "invalid" .value)) (ne (toString .value) "") }}
+{{ repeat 4 " " }}{{ .key }}: {{ toString .value | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+The `auth` config section (RFC 0026 tokens, RFC 0029 oidc, RFC 0047 openfga)
+for the receiver and querier. Absent unless tokens or oidc are configured,
+which keeps open mode the default. Every secret leaf is an ${env:…}
+reference to a variable ourios.authEnv fills from a secretKeyRef, so no
+secret value reaches the ConfigMap.
+*/}}
+{{- define "ourios.authConfig" -}}
+{{- $auth := .Values.auth | default dict -}}
+{{- $tokens := $auth.tokens | default list -}}
+{{- $oidc := $auth.oidc | default dict -}}
+{{- $fga := $auth.openfga | default dict -}}
+{{- if and $fga.enabled (not (include "ourios.authEnabled" .)) }}
+{{- fail "auth.openfga.enabled needs auth.tokens or auth.oidc.enabled: OpenFGA binds the tenants of what they authenticate and never authenticates on its own (RFC 0047 §3.1)" }}
+{{- end }}
+{{- if include "ourios.authEnabled" . }}
+auth:
+{{- with $tokens }}
+  tokens:
+{{- range $i, $t := . }}
+{{- if hasKey $t "token" }}
+{{- fail (printf "auth.tokens[%d].token is not accepted: put the token in a Secret and reference it with auth.tokens[%d].secretKeyRef (name, key)" $i $i) }}
+{{- end }}
+{{- $ref := $t.secretKeyRef | default dict }}
+{{- if not (and $ref.name $ref.key) }}
+{{- fail (printf "auth.tokens[%d].secretKeyRef.name and .key are required: the token value comes only from a Secret" $i) }}
+{{- end }}
+{{- if not $t.tenants }}
+{{- fail (printf "auth.tokens[%d].tenants must list at least one tenant, or \"*\" for all (RFC 0026 §3.1)" $i) }}
+{{- end }}
+    - name: {{ required (printf "auth.tokens[%d].name is required" $i) $t.name | quote }}
+      token: "${env:OURIOS_AUTH_TOKEN_{{ $i }}}"
+      tenants:
+{{- range $t.tenants }}
+        - {{ toString . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $oidc.enabled }}
+  oidc:
+    issuer: {{ required "auth.oidc.issuer is required with auth.oidc.enabled" $oidc.issuer | quote }}
+    audience: {{ required "auth.oidc.audience is required with auth.oidc.enabled" $oidc.audience | quote }}
+{{- if $fga.enabled }}
+{{- include "ourios.optScalar" (dict "key" "tenant_claim" "value" $oidc.tenantClaim) }}
+{{- else }}
+    tenant_claim: {{ required "auth.oidc.tenantClaim is required with auth.oidc.enabled unless auth.openfga binds the tenants (RFC 0029 §3.1)" $oidc.tenantClaim | quote }}
+{{- end }}
+{{- include "ourios.optScalar" (dict "key" "name_claim" "value" $oidc.nameClaim) }}
+{{- include "ourios.optScalar" (dict "key" "clock_skew_secs" "value" $oidc.clockSkewSecs) }}
+{{- include "ourios.optScalar" (dict "key" "agent_claim" "value" $oidc.agentClaim) }}
+{{- include "ourios.optScalar" (dict "key" "groups_claim" "value" $oidc.groupsClaim) }}
+{{- end }}
+{{- if $fga.enabled }}
+  openfga:
+    api_url: {{ required "auth.openfga.apiUrl is required with auth.openfga.enabled" $fga.apiUrl | quote }}
+    store_id: {{ required "auth.openfga.storeId is required with auth.openfga.enabled" $fga.storeId | quote }}
+{{- include "ourios.optScalar" (dict "key" "authorization_model_id" "value" $fga.authorizationModelId) }}
+{{- $ref := dig "apiToken" "secretKeyRef" (dict) $fga }}
+{{- if $ref.name }}
+    api_token: "${env:OURIOS_OPENFGA_API_TOKEN}"
+{{- end }}
+{{- include "ourios.optScalar" (dict "key" "session_ttl_secs" "value" $fga.sessionTtlSecs) }}
+{{- include "ourios.optScalar" (dict "key" "consistency" "value" $fga.consistency) }}
+{{- include "ourios.optScalar" (dict "key" "request_timeout_secs" "value" $fga.requestTimeoutSecs) }}
+{{- include "ourios.optScalar" (dict "key" "server_list_objects_deadline_ms" "value" $fga.serverListObjectsDeadlineMs) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The env behind ourios.authConfig's ${env:…} references: each token and the
+OpenFGA API token, read from the referenced Secret with secretKeyRef. Empty
+when auth is off. Only the receiver and querier take it.
+*/}}
+{{- define "ourios.authEnv" -}}
+{{- if include "ourios.authEnabled" . }}
+{{- $auth := .Values.auth | default dict -}}
+{{- range $i, $t := $auth.tokens | default list }}
+- name: OURIOS_AUTH_TOKEN_{{ $i }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $t.secretKeyRef.name | quote }}
+      key: {{ $t.secretKeyRef.key | quote }}
+{{- end }}
+{{- $fga := $auth.openfga | default dict }}
+{{- $ref := dig "apiToken" "secretKeyRef" (dict) $fga }}
+{{- if and $fga.enabled $ref.name }}
+- name: OURIOS_OPENFGA_API_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ $ref.name | quote }}
+      key: {{ required "auth.openfga.apiToken.secretKeyRef.key is required with its name" $ref.key | quote }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -214,6 +439,9 @@ OTEL_RESOURCE_ATTRIBUTES) and a duplicate resolves to the role's entry —
 Kubernetes takes the last occurrence.
 */}}
 {{- define "ourios.workloadEnv" -}}
+{{- if or (eq .role "receiver") (eq .role "querier") }}
+{{- include "ourios.authEnv" .root }}
+{{- end }}
 {{- include "ourios.commonEnv" .root }}
 {{- /* index-then-dig: dig cannot traverse the typed .Values root, and the
 role key may be absent under `helm upgrade --reuse-values`. */}}

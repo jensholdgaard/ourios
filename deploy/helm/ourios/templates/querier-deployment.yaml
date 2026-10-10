@@ -91,11 +91,17 @@ spec:
             # readOnlyRootFilesystem is on, so give the process a writable /tmp.
             - name: tmp
               mountPath: /tmp
+            {{- with include "ourios.tlsVolumeMounts" (dict "root" . "role" "querier") }}
+            {{- . | trim | nindent 12 }}
+            {{- end }}
       volumes:
         {{- include "ourios.configVolume" (dict "root" . "role" "querier") | nindent 8 }}
         - name: tmp
           emptyDir: {}
         {{- include "ourios.dataVolume" . | nindent 8 }}
+        {{- with include "ourios.tlsVolumes" (dict "root" . "role" "querier") }}
+        {{- . | trim | nindent 8 }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

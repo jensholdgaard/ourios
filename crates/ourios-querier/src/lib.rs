@@ -89,6 +89,7 @@ use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
 mod api;
 mod decode;
 mod exec;
+mod fetch_count;
 mod file_set;
 mod stats;
 #[cfg(test)]
@@ -310,6 +311,9 @@ struct CollectedRecords {
     /// stats ([`QueryOptions::elide_count_scan`]).
     scan: QueryStats,
     registry_bytes_read: u64,
+    /// Template-map bytes this pass fetched itself acquiring lazily; `0`
+    /// when it reused a compile-time acquisition or joined another query's.
+    map_fetched: u64,
 }
 
 /// How [`Querier::execute`] terminates the filtered scan (RFC 0002 §6.5):
@@ -333,18 +337,6 @@ impl Terminal {
             Self::Rows { .. } => None,
         }
     }
-}
-
-/// One per-query template-map acquisition (RFC 0033): the artifact-or-fold
-/// [`TemplateMap`] plus the bytes fetched acquiring it
-/// ([`QueryResult::registry_bytes_read`]). Acquired at most once per query
-/// — at compile time when the DSL uses `resolves_to` (the alias fold),
-/// otherwise lazily by [`Querier::collect_records`] when there are rows to
-/// render — so the alias map and the registry can never come from
-/// different frontiers within one query (§3.1's one-artifact rationale).
-struct AcquiredTemplateMap {
-    map: Arc<TemplateMap>,
-    acquisition_bytes: u64,
 }
 
 impl Querier {
@@ -530,14 +522,13 @@ impl Querier {
         // runtime worker, mirroring `run_drift`.
         let needs_registry = plan::uses_body_equality(&query.predicate);
         let needs_alias_fold = alias_map.is_none() && plan::uses_resolves_to(&query.predicate);
-        let mut acquired: Option<AcquiredTemplateMap> = None;
+        let mut acquired: Option<map_flight::MapAcquisition> = None;
         if needs_alias_fold || needs_registry {
-            let (template_map, acquisition_bytes) =
-                self.template_maps.acquire(&self.backend, tenant).await?;
-            acquired = Some(AcquiredTemplateMap {
-                map: template_map,
-                acquisition_bytes,
-            });
+            let acquisition = self
+                .template_maps
+                .acquire_fetched(&self.backend, tenant)
+                .await?;
+            acquired = Some(acquisition);
         }
         let derived;
         let map = match (alias_map, &acquired) {
@@ -659,7 +650,7 @@ impl Querier {
         // `resolves_to` alias fold, RFC 0033) — handed to the row-rendering
         // pass so one acquisition serves both folds. `None` ⇒ rendering
         // acquires lazily.
-        mut acquired: Option<AcquiredTemplateMap>,
+        acquired: Option<map_flight::MapAcquisition>,
         build_filter: F,
     ) -> Result<QueryResult, QueryError>
     where
@@ -674,6 +665,7 @@ impl Querier {
         let data_prefix = format!("data/tenant_id={enc}");
 
         let ctx = crate::exec::session();
+        let compile_fetched = acquired.as_ref().map_or(0, |a| a.fetched);
         // Resolve the live file set under the tenant's `data/` prefix,
         // honouring the RFC 0009 §3.4 manifest (glob-fallback when absent),
         // and produce the per-file table URLs (local absolute path, or
@@ -686,18 +678,46 @@ impl Querier {
             .resolve_data_urls(&ctx, &data_prefix, partition_window)
             .await?;
         if urls.is_empty() {
-            return Ok(empty_result(terminal.aggregate()));
+            let result = empty_result(terminal.aggregate());
+            return Ok(crate::fetch_count::with_fetched(
+                result,
+                &ctx,
+                compile_fetched,
+            ));
         }
+        let files_opened = urls.len() as u64;
 
         // Union schema + promoted no-coercion adapter — the rationale
         // lives on `SchemaMode::Union` (epic #745 wave 2).
         let base =
             register_listing_table(&ctx, "logs", urls, SchemaMode::Union(&self.promoted)).await?;
-        // A provably-empty filter (absent OPTIONAL column) ⇒ no scan.
-        let Some(df) = build_filter(base)? else {
-            return Ok(empty_result(terminal.aggregate()));
+        let mut result = match build_filter(base)? {
+            // A provably-empty filter (absent OPTIONAL column) ⇒ no scan. The
+            // files were still opened: schema inference read every footer.
+            None => empty_result(terminal.aggregate()),
+            Some(df) => {
+                self.run_terminal(&ctx, df, tenant, terminal, acquired)
+                    .await?
+            }
         };
+        result.stats.files_opened = files_opened;
+        Ok(crate::fetch_count::with_fetched(
+            result,
+            &ctx,
+            compile_fetched,
+        ))
+    }
 
+    /// Run `terminal` over the filtered frame `df` (see [`Self::execute`],
+    /// which sets the result's `files_opened` and `bytes_fetched`).
+    async fn run_terminal(
+        &self,
+        ctx: &SessionContext,
+        df: datafusion::dataframe::DataFrame,
+        tenant: &TenantId,
+        terminal: Terminal,
+        mut acquired: Option<map_flight::MapAcquisition>,
+    ) -> Result<QueryResult, QueryError> {
         // An aggregation query terminates in its own grouped-count scan
         // (RFC 0002 §6.5 amendment): the map is the result, so the
         // count/materialize passes below never run for it.
@@ -743,24 +763,15 @@ impl Querier {
                     aggregate: None,
                     materialize_bytes_read: collected.scan.bytes_read,
                     registry_bytes_read: collected.registry_bytes_read,
+                    bytes_fetched: collected.map_fetched,
                 });
             }
             early = Some(collected);
         }
 
-        // Count via an aggregate so the heavy `attributes` /
-        // `params` / `body` columns are never materialised
-        // (projection pushdown). We build + execute the physical
-        // plan ourselves (rather than `df.count()`) so we can read
-        // the scan's pruning metrics off the retained plan. Clone
-        // `df` first so the (RFC 0017) row collection below reads the
-        // same filtered frame.
-        let counted = df
-            .clone()
-            .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
-            .map_err(storage_err)?;
-        let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
-        let rows = count_value(&batches)?;
+        // Clone `df` so the (RFC 0017) row collection below reads the same
+        // filtered frame.
+        let (rows, stats) = count_scan(df.clone(), ctx).await?;
 
         // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the
         // matching rows (the same filtered frame, capped at the limit), decode
@@ -787,6 +798,7 @@ impl Querier {
             aggregate: None,
             materialize_bytes_read: collected.scan.bytes_read,
             registry_bytes_read: collected.registry_bytes_read,
+            bytes_fetched: collected.map_fetched,
         })
     }
 
@@ -836,6 +848,7 @@ impl Querier {
             aggregate: Some(decoded.groups),
             materialize_bytes_read: 0,
             registry_bytes_read: 0,
+            bytes_fetched: 0,
         })
     }
 
@@ -854,7 +867,7 @@ impl Querier {
         limit: usize,
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
-        acquired: Option<AcquiredTemplateMap>,
+        acquired: Option<map_flight::MapAcquisition>,
     ) -> Result<CollectedRecords, QueryError> {
         // Filter pushdown ("late materialization", off by default in
         // DataFusion 54): the scan evaluates the predicate during Parquet
@@ -937,26 +950,25 @@ impl Querier {
         // (RFC 0031 §3.6 / RFC 0033): reuse the compile-time alias fold's
         // map when the query already acquired one, else resolve through
         // the per-tenant single-flight (`map_flight`).
-        let AcquiredTemplateMap {
-            map,
-            acquisition_bytes,
-        } = if let Some(acquired) = acquired {
-            acquired
+        // A reused compile-time acquisition was already counted by `execute`.
+        let (acquired, map_fetched) = if let Some(acquired) = acquired {
+            (acquired, 0)
         } else {
-            let (map, acquisition_bytes) =
-                self.template_maps.acquire(&self.backend, tenant).await?;
-            AcquiredTemplateMap {
-                map,
-                acquisition_bytes,
-            }
+            let acquired = self
+                .template_maps
+                .acquire_fetched(&self.backend, tenant)
+                .await?;
+            let fetched = acquired.fetched;
+            (acquired, fetched)
         };
         Ok(CollectedRecords {
             // The batch constructor memoises per-(id, version) work —
             // one lookup + one formatted string per distinct template,
             // not per row.
-            records: LogRow::from_records(&mined, map.registry()),
+            records: LogRow::from_records(&mined, acquired.map.registry()),
             scan,
-            registry_bytes_read: acquisition_bytes,
+            registry_bytes_read: acquired.bytes,
+            map_fetched,
         })
     }
 
@@ -1002,11 +1014,13 @@ impl Querier {
         prefix: &str,
         window: Option<(u64, u64)>,
     ) -> Result<Vec<ListingTableUrl>, QueryError> {
+        // The manifest reads count toward the session's fetched bytes.
+        let fetched = fetch_count::counter(ctx).unwrap_or_default();
         let resolved = self
             .spawn_blocking_io({
                 let backend = self.backend.clone();
                 let prefix = prefix.to_owned();
-                move || resolve_live_set(&backend, &prefix, window)
+                move || resolve_live_set(&backend, &prefix, window, &fetched)
             })
             .await?;
         match (resolved, &self.backend) {
@@ -1047,31 +1061,6 @@ impl Querier {
             .hooks
             .waits
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
-/// the local backend, store keys on S3 (their URLs need the query's
-/// `SessionContext`, which stays on the async side).
-enum LiveSet {
-    Urls(Vec<ListingTableUrl>),
-    Keys(Vec<String>),
-}
-
-/// Resolve the tenant's live data files for [`Querier::resolve_data_urls`] —
-/// blocking IO, run on the blocking pool.
-fn resolve_live_set(
-    backend: &Backend,
-    prefix: &str,
-    window: Option<(u64, u64)>,
-) -> Result<LiveSet, QueryError> {
-    match backend {
-        Backend::Local(root) => {
-            let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window)?;
-            local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
-        }
-        Backend::Remote(store) => resolve_live_keys(store, prefix, window).map(LiveSet::Keys),
     }
 }
 

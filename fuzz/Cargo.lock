@@ -2393,9 +2393,11 @@ dependencies = [
 name = "ourios-querier"
 version = "0.12.1"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "datafusion",
+ "futures",
  "opentelemetry",
  "ourios-core",
  "ourios-df-otel",

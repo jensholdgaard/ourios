@@ -73,6 +73,10 @@ pub struct QueryStats {
     /// keeps the exclusion observable, not silent. Always `0` for a
     /// non-aggregation query.
     pub rows_excluded: u64,
+    /// Parquet files the query's scans opened: the live files handed to
+    /// the scan (each one's footer is read even when every row group is
+    /// pruned). A drift query counts the audit files of each of its scans.
+    pub files_opened: u64,
 }
 
 /// Additive execution options for [`Querier::run_query_with`]. The
@@ -95,10 +99,11 @@ pub struct QueryOptions {
     /// predicate over the same file set, and a limit that was never reached
     /// cannot stop the scan early, so the counts are the ones the count
     /// scan would have reported), but `stats.bytes_read` is `0` — the count
-    /// scan genuinely read nothing. The three-component sum with
-    /// [`QueryResult::materialize_bytes_read`] /
-    /// [`QueryResult::registry_bytes_read`] therefore remains the honest
-    /// total IO. Callers needing the pinned "a limited query's `stats`
+    /// scan genuinely read nothing. `stats.bytes_read` and
+    /// [`QueryResult::materialize_bytes_read`] stay the scan-specific
+    /// components (and [`QueryResult::registry_bytes_read`] the RFC 0033
+    /// diagnostic); the query's total IO, under elision or not, is
+    /// [`QueryResult::total_bytes_read`]. Callers needing the pinned "a limited query's `stats`
     /// equal a count-only query's" shape (RFC 0017 §3.4) keep the default.
     pub elide_count_scan: bool,
     /// RFC 0047 §3.4 layer-2 visibility: `None` = no rewrite (open mode,
@@ -149,8 +154,9 @@ pub struct QueryResult {
     /// the ≤ `limit` returned `records` (RFC 0031 §3.6). `0` for a
     /// count-only query. Additive to `stats.bytes_read`, which keeps its
     /// count/pruning-scan-only meaning (B1/B2 gates and the RFC 0016
-    /// metrics depend on that semantics) — a caller wanting the honest
-    /// total IO for one query sums the three components.
+    /// metrics depend on that semantics). Both are scan-specific
+    /// components; the query's total IO, footer and manifest reads
+    /// included, is [`Self::total_bytes_read`].
     pub materialize_bytes_read: u64,
     /// The executed aggregation's grouped-count map (RFC 0002 §6.5
     /// amendment 2026-07-15) — `Some` iff the query carried a `count [by …]`
@@ -171,9 +177,33 @@ pub struct QueryResult {
     /// `resolves_to` queries, the alias map. `0` when no rows were
     /// rendered. A query that waited on another query's in-flight
     /// acquisition of the same frontier reports that acquisition's bytes —
-    /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
-    /// (RFC 0031 §3.6).
+    /// the artifact's size on a hit, the fold's on a miss.
+    ///
+    /// This is RFC 0033 diagnostic accounting of what the map behind the
+    /// rows cost, reported to every query that rendered with it, joiners
+    /// included. It is therefore **not** a component of
+    /// [`Self::total_bytes_read`]: summed over concurrent queries it would
+    /// count one shared fold once per joiner. The bytes this query fetched
+    /// itself for the map are in [`Self::bytes_fetched`].
     pub registry_bytes_read: u64,
+    /// Every byte this query itself fetched from storage: the partition
+    /// manifests file-set resolution read, the footers schema inference
+    /// read, the count scan, the row materialization, and the template-map
+    /// acquisition when this query ran it (rendered or not). Unlike
+    /// `stats.bytes_read` + `materialize_bytes_read` it includes the reads
+    /// made before a plan exists. Unlike [`Self::registry_bytes_read`] it
+    /// counts a shared acquisition only for the query that ran it, never
+    /// for a query that joined it, so summing it over queries counts each
+    /// fetch once.
+    pub bytes_fetched: u64,
+}
+
+impl QueryResult {
+    /// Every byte this query fetched from storage ([`Self::bytes_fetched`]).
+    #[must_use]
+    pub fn total_bytes_read(&self) -> u64 {
+        self.bytes_fetched
+    }
 }
 
 /// One group of an executed `count [by …]` stage (RFC 0002 §6.3/§6.5

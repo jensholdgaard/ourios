@@ -197,4 +197,73 @@ async fn rfc0016_6_pruning_is_observable() {
         "the pruned-state counter matches the response's row_groups_pruned",
     );
     assert!(scanned_metric >= 1, "at least one row group was scanned");
+    assert_query_reads(&rms, bucket.path(), &json);
+}
+
+/// #924 — what the query read. Every live data file of the fixture was
+/// opened (pruned files still have their footer read). The bytes are
+/// schema inference's footer reads, the count scan's (the response's
+/// `bytes_read`) and the row materialization's under the endpoint's default
+/// limit; the fixture has no audit stream, so the template-map acquisition
+/// adds nothing. Each of the three passes reads at most every data file
+/// once.
+fn assert_query_reads(rms: &[ResourceMetrics], bucket: &Path, json: &serde_json::Value) {
+    let (files, file_bytes) = data_files(bucket);
+    let count_scan = json["stats"]["bytes_read"]
+        .as_u64()
+        .expect("bytes_read is a number");
+    assert!(count_scan > 0, "the count scan read data");
+    assert_eq!(
+        logs_histogram(rms, semconv::OURIOS_QUERY_FILES),
+        (1, files),
+        "one query.files sample: the fixture's file count",
+    );
+    let (samples, read) = logs_histogram(rms, semconv::OURIOS_QUERY_READ_SIZE);
+    assert_eq!(samples, 1, "one query.read.size sample");
+    assert!(
+        read > count_scan && read <= 3 * file_bytes,
+        "read.size {read} covers the count scan ({count_scan}), the inference \
+         footers and the row materialization, within three passes over the \
+         {file_bytes} fixture bytes",
+    );
+}
+
+/// The fixture's data `*.parquet` files and their total bytes.
+fn data_files(bucket: &Path) -> (u64, u64) {
+    let mut stack = vec![bucket.join("data")];
+    let (mut files, mut bytes) = (0, 0);
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("list data dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                files += 1;
+                bytes += std::fs::metadata(&path).expect("stat data file").len();
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// A u64 histogram's `(count, sum)`, which must be a single series
+/// carrying `ourios.query.kind = logs`.
+fn logs_histogram(rms: &[ResourceMetrics], name: &str) -> (u64, u64) {
+    let AggregatedMetrics::U64(MetricData::Histogram(hist)) = metric_data(rms, name) else {
+        panic!("{name} should be a u64 histogram");
+    };
+    let points: Vec<_> = hist.data_points().collect();
+    let [dp] = points.as_slice() else {
+        panic!("{name} should have one series, got {}", points.len());
+    };
+    let attrs: Vec<_> = dp
+        .attributes()
+        .map(|kv| (kv.key.as_str().to_owned(), kv.value.as_str().into_owned()))
+        .collect();
+    assert_eq!(
+        attrs,
+        vec![(semconv::OURIOS_QUERY_KIND.to_owned(), "logs".to_owned())],
+        "{name} is keyed by query kind only",
+    );
+    (dp.count(), dp.sum())
 }

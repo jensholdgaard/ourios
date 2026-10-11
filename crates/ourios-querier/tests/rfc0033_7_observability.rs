@@ -13,6 +13,14 @@
 //! same-frontier queries on one querier also drive a shared acquisition:
 //! the acquirer records its own outcome and the waiter records `joined`.
 //!
+//! The same acts pin the derive-cost instruments (RFC0033.9, #924): one
+//! `derive.duration` sample per fold keyed by `derive.reason` (none for a
+//! hit, `error.type` on a failed fold), audit files and size per
+//! completed fold — the cold one exactly the fixture's audit set — and an
+//! `acquire.wait.duration` sample per joiner, whether the shared
+//! acquisition succeeded or failed. A last act covers `unknown_version`
+//! and a failure before classification, which records no derive sample.
+//!
 //! This test installs a process-global in-memory `MeterProvider`, so it
 //! lives in its own integration binary (its own process) — the
 //! `rfc0016_6_query_metrics` precedent, applied at the querier-library
@@ -172,6 +180,29 @@ fn try_body_query(bucket: &Path) -> Result<QueryResult, ourios_querier::QueryErr
 /// and `joined`).
 #[cfg(feature = "testing")]
 fn shared_acquisition(bucket: &Path) {
+    let rows: Vec<u64> = run_shared(bucket)
+        .into_iter()
+        .map(|r| r.expect("shared acquisition answers both queries"))
+        .collect();
+    assert_eq!(rows, vec![1, 1]);
+}
+
+/// Act 5b: the shared acquisition at act 5's unreadable frontier. The
+/// acquirer's fold fails, and the waiter gets the same error — and still
+/// records how long it waited (RFC0033.9), though no lookup outcome.
+#[cfg(feature = "testing")]
+fn shared_failing_acquisition(bucket: &Path) {
+    let results = run_shared(bucket);
+    assert!(
+        results.iter().all(Result::is_err),
+        "a failed shared acquisition fails both queries: {results:?}",
+    );
+}
+
+/// Run two concurrent body-rendering queries on one querier with the
+/// acquirer gated until the other has joined; each query's row count.
+#[cfg(feature = "testing")]
+fn run_shared(bucket: &Path) -> Vec<Result<u64, ourios_querier::QueryError>> {
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -190,7 +221,7 @@ fn shared_acquisition(bucket: &Path) {
         .worker_threads(2)
         .build()
         .expect("runtime");
-    let rows = runtime.block_on(async {
+    let results = runtime.block_on(async {
         let tasks: Vec<_> = (0..2)
             .map(|_| {
                 let querier = Arc::clone(&querier);
@@ -200,20 +231,19 @@ fn shared_acquisition(bucket: &Path) {
                     querier
                         .run_query(&query, &TenantId::new(TENANT), NOW, DEFAULT_WINDOW_NS, None)
                         .await
-                        .expect("shared acquisition answers both queries")
-                        .rows
+                        .map(|result| result.rows)
                 })
             })
             .collect();
-        let mut rows = Vec::new();
+        let mut results = Vec::new();
         for task in tasks {
-            rows.push(task.await.expect("query task"));
+            results.push(task.await.expect("query task"));
         }
-        rows
+        results
     });
     querier.set_template_map_acquire_gate(None);
-    assert_eq!(rows, vec![1, 1]);
     assert_eq!(querier.template_map_waits(), 1, "exactly one query waited");
+    results
 }
 
 /// The lookup outcomes the acts below drive, once each — plus, with the
@@ -299,6 +329,219 @@ fn outcome_counts(rms: &[ResourceMetrics], metric: &str, attr_key: &str) -> BTre
         );
     }
     counts
+}
+
+/// A histogram's data points as `sorted "key=value" attributes → (count,
+/// sum)`, for either number type.
+fn histogram_points(rms: &[ResourceMetrics], metric: &str) -> BTreeMap<Vec<String>, (u64, f64)> {
+    fn key<'a>(attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> Vec<String> {
+        let mut key: Vec<String> = attrs
+            .map(|kv| format!("{}={}", kv.key.as_str(), kv.value.as_str()))
+            .collect();
+        key.sort();
+        key
+    }
+    let mut points = BTreeMap::new();
+    match metric_data(rms, metric) {
+        AggregatedMetrics::F64(MetricData::Histogram(hist)) => {
+            for dp in hist.data_points() {
+                points.insert(key(dp.attributes()), (dp.count(), dp.sum()));
+            }
+        }
+        AggregatedMetrics::U64(MetricData::Histogram(hist)) => {
+            for dp in hist.data_points() {
+                #[allow(clippy::cast_precision_loss)] // fixture-sized sums
+                points.insert(key(dp.attributes()), (dp.count(), dp.sum() as f64));
+            }
+        }
+        _ => panic!("{metric} should be a histogram"),
+    }
+    points
+}
+
+/// The tenant's audit `*.parquet` files and their total bytes: what a
+/// derive over the whole audit set reads.
+fn audit_set(audit_dir: &Path) -> (u64, u64) {
+    walk_files(audit_dir)
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .fold((0, 0), |(n, bytes), p| {
+            (
+                n + 1,
+                bytes + std::fs::metadata(p).expect("stat audit file").len(),
+            )
+        })
+}
+
+/// The `ourios.template_map.derive.reason` attribute as a
+/// [`histogram_points`] key entry.
+fn reason(r: &str) -> String {
+    format!("{}={r}", semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON)
+}
+
+/// A histogram's sample count per attribute set.
+fn sample_counts(rms: &[ResourceMetrics], metric: &str) -> BTreeMap<Vec<String>, u64> {
+    histogram_points(rms, metric)
+        .into_iter()
+        .map(|(k, (count, _))| (k, count))
+        .collect()
+}
+
+/// Failed `stale` folds: act 5's, plus act 5b's acquirer with `testing`.
+#[cfg(not(feature = "testing"))]
+const FAILED_STALE_FOLDS: u64 = 1;
+#[cfg(feature = "testing")]
+const FAILED_STALE_FOLDS: u64 = 2;
+
+/// Scenario RFC0033.9 (#924) — derive cost is observable.
+/// See `docs/rfcs/0033-cached-template-map.md` §5.
+///
+/// Acts 1–5 fold `miss`, `stale` and `torn`, then fail a `stale` fold
+/// (act 5, and act 5b's acquirer with `testing`), which records its
+/// duration with `error.type` and no audit files or size. The hits (act
+/// 2, and act 4b's acquirer) never derive. The `unknown_version` reason
+/// is [`unknown_version_act`]'s.
+fn assert_derive_metrics(rms: &[ResourceMetrics], cold_audit_set: (u64, u64)) {
+    let expected: BTreeMap<Vec<String>, u64> = [
+        (vec![reason("miss")], 1),
+        (vec![reason("stale")], 1),
+        (vec![reason("torn")], 1),
+        (
+            vec!["error.type=storage".to_string(), reason("stale")],
+            FAILED_STALE_FOLDS,
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        sample_counts(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION),
+        expected,
+        "one duration sample per fold and none for a hit; a failed fold carries error.type",
+    );
+    let completed: BTreeMap<Vec<String>, u64> = [
+        (vec![reason("miss")], 1),
+        (vec![reason("stale")], 1),
+        (vec![reason("torn")], 1),
+    ]
+    .into_iter()
+    .collect();
+    for metric in [
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
+    ] {
+        assert_eq!(
+            sample_counts(rms, metric),
+            completed,
+            "{metric}: one sample per completed fold"
+        );
+    }
+    assert_audit_read(rms, "miss", cold_audit_set);
+    assert_acquire_waits(rms);
+}
+
+/// The `reason` derive's single files and size samples equal `audit_set`,
+/// the fixture's audit file count and bytes.
+fn assert_audit_read(rms: &[ResourceMetrics], derive_reason: &str, audit_set: (u64, u64)) {
+    let (files, bytes) = audit_set;
+    assert!(files > 0 && bytes > 0, "the fixture has an audit set");
+    let key = vec![reason(derive_reason)];
+    #[allow(clippy::cast_precision_loss)] // fixture-sized values
+    let expected = [(1, files as f64), (1, bytes as f64)];
+    let observed = [
+        histogram_points(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES)[&key],
+        histogram_points(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE)[&key],
+    ];
+    assert_eq!(
+        observed, expected,
+        "the {derive_reason} derive read exactly the fixture's audit files and bytes",
+    );
+}
+
+/// Joiners alone record waits: act 4b's after a successful shared
+/// acquisition, act 5b's after a failed one. Neither acquirer does.
+#[cfg(feature = "testing")]
+fn assert_acquire_waits(rms: &[ResourceMetrics]) {
+    let expected: BTreeMap<Vec<String>, u64> = [(Vec::new(), 2)].into_iter().collect();
+    assert_eq!(
+        sample_counts(rms, semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION),
+        expected,
+        "each joiner records one attribute-free wait sample; the acquirers none",
+    );
+}
+
+#[cfg(not(feature = "testing"))]
+fn assert_acquire_waits(rms: &[ResourceMetrics]) {
+    let names: Vec<_> = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(ScopeMetrics::metrics)
+        .map(opentelemetry_sdk::metrics::data::Metric::name)
+        .collect();
+    assert!(
+        !names.contains(&semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION),
+        "no query joined, so no wait was recorded",
+    );
+}
+
+/// Rewrite the published artifact at `path` in place, editing its JSON
+/// body.
+fn rewrite_artifact(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let compressed = std::fs::read(path).expect("read artifact");
+    let json = zstd::decode_all(compressed.as_slice()).expect("decompress artifact");
+    let mut value: serde_json::Value = serde_json::from_slice(&json).expect("artifact json");
+    edit(&mut value);
+    let json = serde_json::to_vec(&value).expect("serialize artifact");
+    let compressed = zstd::encode_all(json.as_slice(), 3).expect("compress artifact");
+    std::fs::write(path, compressed).expect("write artifact");
+}
+
+/// Scenario RFC0033.9 (#924), the `unknown_version` reason and a failure
+/// before classification, on a store of their own. Run last: the
+/// cumulative collection still holds the earlier acts' series, but none
+/// of them carries `unknown_version`.
+///
+/// A future writer's artifact folds once under `unknown_version`, reading
+/// the whole audit set. An artifact naming another tenant fails the query
+/// before any fold runs, so it records no derive sample.
+fn unknown_version_act(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
+    let bucket = tempfile::tempdir().expect("temp dir");
+    write_audit(bucket.path(), &[widened(1, 1, TS0), widened(1, 2, TS0 + 1)]);
+    write_records(bucket.path(), &[mined(1, TS0 + 2)]);
+    let audit_dir = bucket
+        .path()
+        .join("audit")
+        .join(format!("tenant_id={TENANT}"));
+    let artifact = audit_dir.join(TEMPLATE_MAP_FILENAME);
+    assert_eq!(body_query(bucket.path()).rows, 1, "the miss publishes");
+    rewrite_artifact(&artifact, |json| json["format_version"] = 3.into());
+    assert_eq!(body_query(bucket.path()).rows, 1);
+
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let rms = std::slice::from_ref(rms.last().expect("a collection"));
+    assert_eq!(
+        sample_counts(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
+            .get(&vec![reason("unknown_version")]),
+        Some(&1),
+        "one duration sample for the unknown-version fold",
+    );
+    assert_audit_read(rms, "unknown_version", audit_set(&audit_dir));
+    let folds = |rms: &[ResourceMetrics]| -> u64 {
+        sample_counts(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
+            .values()
+            .sum()
+    };
+    let before = folds(rms);
+
+    rewrite_artifact(&artifact, |json| json["tenant_id"] = "intruder".into());
+    try_body_query(bucket.path()).expect_err("an artifact naming another tenant fails the query");
+    guard.force_flush().expect("force_flush");
+    let after = exporter.get_finished_metrics().expect("metrics exported");
+    let after = std::slice::from_ref(after.last().expect("a collection"));
+    assert_eq!(folds(after), before, "no fold ran, so no derive sample");
 }
 
 const BINDING_CONFLICTED: EventSpec = EventSpec {
@@ -414,7 +657,28 @@ fn binding_conflict_act(
     );
 }
 
+/// The publish-size histogram recorded each published artifact's byte
+/// size (the number RFC0033.6 gates on): one sample per publish.
+fn assert_artifact_sizes(rms: &[ResourceMetrics], published: [u64; 3]) {
+    let AggregatedMetrics::U64(MetricData::Histogram(hist)) =
+        metric_data(rms, semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
+    else {
+        panic!("artifact.size should be a u64 histogram");
+    };
+    let (count, sum) = hist
+        .data_points()
+        .map(|dp| (dp.count(), dp.sum()))
+        .fold((0, 0), |(c, s), (dc, ds)| (c + dc, s + ds));
+    assert_eq!(count, 3, "one size sample per publish");
+    assert_eq!(
+        sum,
+        published.iter().sum::<u64>(),
+        "each sample is the published artifact's byte size",
+    );
+}
+
 /// Scenario RFC0033.7 — observable outcomes.
+/// Scenario RFC0033.9 — derive cost is observable (`assert_derive_metrics`).
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
 #[test]
 fn rfc0033_7_observable_outcomes() {
@@ -431,6 +695,7 @@ fn rfc0033_7_observable_outcomes() {
         .join(format!("tenant_id={TENANT}"))
         .join(TEMPLATE_MAP_FILENAME);
     let artifact_len = || std::fs::metadata(&artifact).expect("stat artifact").len();
+    let cold_audit_set = audit_set(artifact.parent().expect("audit tenant dir"));
 
     // Act — queries drive the four §5.7 outcomes in turn. Every answer
     // is identical (the cache is advisory); only the telemetry differs.
@@ -459,6 +724,10 @@ fn rfc0033_7_observable_outcomes() {
     //    counted — a counted outcome is always one that answered.
     append_torn_audit_file(bucket.path(), artifact.parent().expect("audit tenant dir"));
     try_body_query(bucket.path()).expect_err("an unreadable audit stream must fail the query");
+    // 5b. The same failure under a shared acquisition: its waiter fails too,
+    //     and records its wait but no lookup outcome.
+    #[cfg(feature = "testing")]
+    shared_failing_acquisition(bucket.path());
 
     // Assert — the exported stream carries the §3.7 instruments, every
     // driven outcome recorded once under its registry attribute value.
@@ -490,22 +759,8 @@ fn rfc0033_7_observable_outcomes() {
     let expected: BTreeMap<String, u64> = [("published".to_string(), 3)].into_iter().collect();
     assert_eq!(publishes, expected, "three write-through publishes");
 
-    // The publish-size histogram recorded each published artifact's
-    // byte size (the number RFC0033.6 gates on).
-    let AggregatedMetrics::U64(MetricData::Histogram(hist)) =
-        metric_data(&rms, semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
-    else {
-        panic!("artifact.size should be a u64 histogram");
-    };
-    let (count, sum) = hist
-        .data_points()
-        .map(|dp| (dp.count(), dp.sum()))
-        .fold((0, 0), |(c, s), (dc, ds)| (c + dc, s + ds));
-    assert_eq!(count, 3, "one size sample per publish");
-    assert_eq!(
-        sum,
-        size_after_miss + size_after_stale + size_after_torn,
-        "each sample is the published artifact's byte size",
-    );
+    assert_artifact_sizes(&rms, [size_after_miss, size_after_stale, size_after_torn]);
+    assert_derive_metrics(&rms, cold_audit_set);
     binding_conflict_act(&guard, &exporter, &rms);
+    unknown_version_act(&guard, &exporter);
 }

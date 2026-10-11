@@ -3498,6 +3498,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,63 @@
+# libFuzzer dictionary for the otlp_json target: the proto3-JSON keys and
+# value shapes of ExportLogsServiceRequest, so mutations reach past the JSON
+# syntax error into the deserialiser. Format: one quoted token per line
+# (https://llvm.org/docs/LibFuzzer.html#dictionaries). Pass with -dict=.
+
+# envelope
+"resourceLogs"
+"resource"
+"schemaUrl"
+"scopeLogs"
+"scope"
+"name"
+"version"
+"logRecords"
+"droppedAttributesCount"
+
+# LogRecord
+"timeUnixNano"
+"observedTimeUnixNano"
+"severityNumber"
+"severityText"
+"body"
+"attributes"
+"flags"
+"traceId"
+"spanId"
+"eventName"
+
+# AnyValue / KeyValue
+"key"
+"value"
+"stringValue"
+"boolValue"
+"intValue"
+"doubleValue"
+"arrayValue"
+"kvlistValue"
+"bytesValue"
+"values"
+
+# value shapes
+"SEVERITY_NUMBER_INFO"
+"SEVERITY_NUMBER_ERROR"
+"SEVERITY_NUMBER_UNSPECIFIED"
+"1700000000000000000"
+"\"1700000000000000000\""
+"5B8EFFF798038103D269B633813FC60C"
+"EEE19B7EC3C1B174"
+"AQID"
+"-0.0"
+"1e308"
+"NaN"
+"null"
+"true"
+"false"
+"{}"
+"[]"
+"{\"stringValue\":\"\"}"
+"{\"kvlistValue\":{\"values\":[]}}"
+"{\"arrayValue\":{\"values\":[]}}"
+"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{}]}]}]}"
+"\\u0000"
+"\\ud83d\\ude00"

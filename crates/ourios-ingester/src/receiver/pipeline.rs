@@ -574,9 +574,32 @@ impl IngestPipeline {
     #[tracing::instrument(
         skip_all,
         name = "ingest logs",
-        fields(otel.kind = "server")
+        fields(
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        )
     )]
     pub async fn ingest_bound(
+        &self,
+        request: ExportLogsServiceRequest,
+        tenant: TenantId,
+        binding: Option<&AuthBinding>,
+        lenient_json: bool,
+    ) -> Result<usize, ReceiveError> {
+        let outcome = self
+            .ingest_batch(request, tenant, binding, lenient_json)
+            .await;
+        if let Err(error) = &outcome
+            && let Some(error_type) = IngestFailure::classify(error).span_error_type()
+        {
+            ourios_core::telemetry::record_span_error(&tracing::Span::current(), error_type);
+        }
+        outcome
+    }
+
+    /// [`Self::ingest_bound`]'s work, inside its span.
+    async fn ingest_batch(
         &self,
         request: ExportLogsServiceRequest,
         tenant: TenantId,
@@ -1014,6 +1037,21 @@ impl IngestFailure {
             ReceiveError::TenantFrame(_) => Self::Internal,
         }
     }
+
+    /// The `error.type` the batch span fails with, or `None` for a
+    /// rejection that is the client's fault: an `ingest logs` span is a
+    /// server span, which semconv leaves unset on a 4xx / client-error
+    /// status (HTTP 403 / 413, gRPC `PERMISSION_DENIED` /
+    /// `INVALID_ARGUMENT`).
+    #[must_use]
+    pub(super) fn span_error_type(self) -> Option<&'static str> {
+        match self {
+            Self::Denied | Self::TooLarge => None,
+            Self::Unavailable => Some("unavailable"),
+            Self::ServerTerminal => Some("server_terminal"),
+            Self::Internal => Some("internal"),
+        }
+    }
 }
 
 impl std::fmt::Display for ReceiveError {
@@ -1145,6 +1183,23 @@ mod tests {
             ] {
                 assert_eq!(IngestFailure::classify(&error), IngestFailure::Unavailable);
             }
+        }
+
+        /// The batch span is a server span: the server's own failures
+        /// mark it `Error`, a client-fault rejection leaves it unset.
+        #[test]
+        fn only_server_faults_fail_the_batch_span() {
+            assert_eq!(IngestFailure::Denied.span_error_type(), None);
+            assert_eq!(IngestFailure::TooLarge.span_error_type(), None);
+            assert_eq!(
+                IngestFailure::Unavailable.span_error_type(),
+                Some("unavailable")
+            );
+            assert_eq!(
+                IngestFailure::ServerTerminal.span_error_type(),
+                Some("server_terminal")
+            );
+            assert_eq!(IngestFailure::Internal.span_error_type(), Some("internal"));
         }
 
         /// A real WAL whose idle timer spent the budget on an owed

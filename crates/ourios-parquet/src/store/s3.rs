@@ -5,8 +5,9 @@ use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::client::SpawnedReqwestConnector;
 
 use super::bridge::bridge_runtime;
-use super::client_span::S3Target;
-use super::metrics::{MeteredConnector, Metrics};
+use super::client_span::{S3Target, Tracing};
+use super::metrics::Metrics;
+use super::transport::MeteredConnector;
 use super::{S3Config, StoreError};
 
 /// Idle connections the S3 client keeps per host once a burst of concurrent
@@ -26,6 +27,7 @@ struct Credentials {
 pub(super) fn client(
     cfg: S3Config,
     metrics: &Metrics,
+    tracing: Tracing,
 ) -> Result<(AmazonS3, Option<String>), StoreError> {
     let S3Config {
         bucket,
@@ -39,6 +41,8 @@ pub(super) fn client(
     let target = S3Target {
         bucket: bucket.trim().to_owned(),
         region: region.clone(),
+        path_prefix: endpoint_path(endpoint.as_deref()),
+        tracing,
     };
     let builder = authenticated(
         &bucket,
@@ -63,6 +67,22 @@ pub(super) fn client(
         .build()
         .map_err(StoreError::Backend)?;
     Ok((s3, prefix))
+}
+
+/// The path an endpoint override sits below (`/prefix`), without a trailing
+/// slash; empty for no endpoint or one at the host root.
+fn endpoint_path(endpoint: Option<&str>) -> String {
+    let Some(endpoint) = endpoint else {
+        return String::new();
+    };
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    after_scheme
+        .find('/')
+        .map_or("", |slash| &after_scheme[slash..])
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 /// A builder for `bucket` carrying the credentials, explicit or from the
@@ -156,4 +176,18 @@ fn addressed(
         builder = builder.with_config(pool_cap, MAX_IDLE_CONNECTIONS_PER_HOST.to_string());
     }
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_path;
+
+    #[test]
+    fn the_endpoint_path_is_what_sits_below_the_host() {
+        assert_eq!(endpoint_path(None), "");
+        assert_eq!(endpoint_path(Some("http://h:9000")), "");
+        assert_eq!(endpoint_path(Some("http://h:9000/")), "");
+        assert_eq!(endpoint_path(Some("https://h/s3/")), "/s3");
+        assert_eq!(endpoint_path(Some("https://h/a/b")), "/a/b");
+    }
 }

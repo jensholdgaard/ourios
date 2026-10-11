@@ -1,16 +1,23 @@
 //! Object-store `CLIENT` spans (RFC 0038 §3.7.3): one `S3.{Operation}` span
 //! per HTTP request the S3 backend makes inside a query phase.
 //!
-//! A span opens only when the request's `OTel` context carries both a sampled
-//! parent span and the [`QueryPhase`] marker, so ingest, compaction and the
-//! `DataFusion` scan's own reads stay span-free and no span is ever a root.
-//! Attributes are the upstream AWS SDK / S3 client-span conventions; the
-//! status follows *Recording errors* (a `>= 400` response or a transport
+//! A span opens only when the request's `OTel` context carries both a valid,
+//! sampled parent span and the [`QueryPhase`] marker, so ingest, compaction
+//! and the `DataFusion` scan's own reads stay span-free and no span is ever
+//! a root. Attributes are the upstream AWS SDK / S3 client-span conventions;
+//! the status follows *Recording errors* (a `>= 400` response or a transport
 //! failure is `Error`, a request its caller abandoned is left unset).
 
+use std::borrow::Cow;
+use std::fmt;
+use std::sync::Arc;
+
 use object_store::client::{HttpRequest, HttpResponse};
-use opentelemetry::trace::{Span as _, SpanKind, Status, TraceContextExt as _, Tracer as _};
-use opentelemetry::{Context, KeyValue, global::BoxedSpan};
+use opentelemetry::global::{BoxedSpan, BoxedTracer};
+use opentelemetry::trace::{
+    Span as _, SpanBuilder, SpanKind, Status, TraceContextExt as _, Tracer as _,
+};
+use opentelemetry::{Context, KeyValue};
 
 use super::metrics::Failure;
 
@@ -20,11 +27,47 @@ use super::metrics::Failure;
 #[derive(Clone, Copy, Debug)]
 pub struct QueryPhase;
 
-/// The configured bucket the S3 client addresses.
+/// Where `CLIENT` spans are recorded: the process-global tracer provider,
+/// resolved per span so a handle opened before telemetry starts still
+/// traces once it has, or a tracer of its own (tests).
+#[derive(Clone, Default)]
+pub(crate) enum Tracing {
+    #[default]
+    Global,
+    #[cfg_attr(not(test), allow(dead_code))] // only tests own a tracer today
+    Owned(Arc<BoxedTracer>),
+}
+
+impl fmt::Debug for Tracing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Global => "Tracing::Global",
+            Self::Owned(_) => "Tracing::Owned",
+        })
+    }
+}
+
+impl Tracing {
+    fn start(&self, builder: SpanBuilder, parent: &Context) -> BoxedSpan {
+        match self {
+            Self::Global => {
+                ourios_core::telemetry::tracer("ourios.storage").build_with_context(builder, parent)
+            }
+            Self::Owned(tracer) => tracer.build_with_context(builder, parent),
+        }
+    }
+}
+
+/// The configured bucket the S3 client addresses, and where its spans go.
 #[derive(Clone, Debug)]
 pub(super) struct S3Target {
     pub(super) bucket: String,
     pub(super) region: Option<String>,
+    /// The configured endpoint's path (`/prefix`), empty for none: an
+    /// endpoint override may sit below a path, and path-style requests then
+    /// start with it.
+    pub(super) path_prefix: String,
+    pub(super) tracing: Tracing,
 }
 
 /// One request's `CLIENT` span, ended by [`Self::end`] or on drop.
@@ -40,32 +83,15 @@ impl ClientSpan {
         request_attributes: &[KeyValue],
     ) -> Option<Self> {
         let cx = Context::current();
-        if cx.get::<QueryPhase>().is_none() || !cx.span().span_context().is_sampled() {
+        if !in_traced_phase(&cx) {
             return None;
         }
-        let key = object_key(req, &target.bucket)?;
+        let key = object_key(req, target)?;
         let operation = S3Operation::of(req);
-        let mut attributes = Vec::with_capacity(request_attributes.len() + 6);
-        attributes.extend_from_slice(request_attributes);
-        attributes.push(KeyValue::new("rpc.system", "aws-api"));
-        attributes.push(KeyValue::new("rpc.service", "S3"));
-        attributes.push(KeyValue::new("aws.s3.bucket", target.bucket.clone()));
-        if let Some(method) = operation.method() {
-            attributes.push(KeyValue::new("rpc.method", method));
-        }
-        if operation.on_object() && !key.is_empty() {
-            attributes.push(KeyValue::new("aws.s3.key", key.to_owned()));
-        }
-        if let Some(region) = &target.region {
-            attributes.push(KeyValue::new("cloud.region", region.clone()));
-        }
-        let tracer = ourios_core::telemetry::tracer("ourios.storage");
-        let span = tracer
-            .span_builder(operation.span_name())
+        let builder = SpanBuilder::from_name(operation.span_name())
             .with_kind(SpanKind::Client)
-            .with_attributes(attributes)
-            .start_with_context(&tracer, &cx);
-        Some(Self(span))
+            .with_attributes(attributes(operation, key, target, request_attributes));
+        Some(Self(target.tracing.start(builder, &cx)))
     }
 
     /// Record what the response says: its status code and request ids.
@@ -103,24 +129,67 @@ impl ClientSpan {
     }
 }
 
-/// The object key `req` addresses in `bucket`, path-style (`/bucket/key`)
-/// or virtual-hosted (`bucket.host/key`); empty for a bucket-level request,
-/// `None` for a request to anything but the bucket.
-fn object_key<'r>(req: &'r HttpRequest, bucket: &str) -> Option<&'r str> {
-    let path = req.uri().path();
+/// Whether `cx` is a query phase under a valid, sampled parent span. A
+/// context can carry the sampled flag on an invalid span context; a span
+/// started under that would be a root, which §3.7.3 rules out.
+fn in_traced_phase(cx: &Context) -> bool {
+    let span = cx.span();
+    let parent = span.span_context();
+    cx.get::<QueryPhase>().is_some() && parent.is_valid() && parent.is_sampled()
+}
+
+/// The span's attributes: the HTTP client ones known up front, then the
+/// AWS SDK / S3 ones.
+fn attributes(
+    operation: S3Operation,
+    key: &str,
+    target: &S3Target,
+    request_attributes: &[KeyValue],
+) -> Vec<KeyValue> {
+    let mut attributes = Vec::with_capacity(request_attributes.len() + 6);
+    attributes.extend_from_slice(request_attributes);
+    attributes.push(KeyValue::new("rpc.system", "aws-api"));
+    attributes.push(KeyValue::new("rpc.service", "S3"));
+    attributes.push(KeyValue::new("aws.s3.bucket", target.bucket.clone()));
+    if let Some(method) = operation.method() {
+        attributes.push(KeyValue::new("rpc.method", method));
+    }
+    if operation.on_object() && !key.is_empty() {
+        attributes.push(KeyValue::new("aws.s3.key", key.to_owned()));
+    }
+    if let Some(region) = &target.region {
+        attributes.push(KeyValue::new("cloud.region", region.clone()));
+    }
+    attributes
+}
+
+/// The object key `req` addresses in the target's bucket, path-style
+/// (`[/prefix]/bucket/key`) or virtual-hosted (`bucket.host[/prefix]/key`);
+/// empty for a bucket-level request, `None` for a request to anything but
+/// the bucket.
+fn object_key<'r>(req: &'r HttpRequest, target: &S3Target) -> Option<&'r str> {
+    let path = below_prefix(req.uri().path(), &target.path_prefix)?;
+    let bucket = target.bucket.as_str();
     let virtual_hosted = req
         .uri()
         .host()
         .and_then(|host| host.strip_prefix(bucket))
         .is_some_and(|rest| rest.starts_with('.'));
-    let path_style = path
-        .strip_prefix('/')
-        .and_then(|p| p.strip_prefix(bucket))
-        .and_then(|rest| match rest {
-            "" => Some(rest),
-            _ => rest.strip_prefix('/'),
-        });
+    let path_style = below_prefix(path, &format!("/{bucket}"))
+        .map(|rest| rest.strip_prefix('/').unwrap_or(rest));
     path_style.or_else(|| virtual_hosted.then(|| path.trim_start_matches('/')))
+}
+
+/// `path` with `prefix` removed, where `prefix` ends at a path-segment
+/// boundary; `None` when `path` does not start with it.
+fn below_prefix<'p>(path: &'p str, prefix: &str) -> Option<&'p str> {
+    let rest = path.strip_prefix(prefix)?;
+    match rest {
+        _ if prefix.is_empty() => Some(rest),
+        "" => Some(rest),
+        _ if rest.starts_with('/') => Some(rest),
+        _ => None,
+    }
 }
 
 /// The S3 API operation a request performs (RFC 0038 §3.7.3's table).
@@ -140,27 +209,64 @@ enum S3Operation {
     Unknown,
 }
 
+/// A request's query string, read for the parameter names that pick the
+/// operation.
+#[derive(Clone, Copy)]
+struct Query<'q>(&'q str);
+
+impl Query<'_> {
+    fn has(self, name: &str) -> bool {
+        self.0
+            .split('&')
+            .any(|pair| pair.split('=').next() == Some(name))
+    }
+}
+
 impl S3Operation {
     fn of(req: &HttpRequest) -> Self {
-        let query = req.uri().query().unwrap_or_default();
-        let has = |name: &str| {
-            query
-                .split('&')
-                .any(|pair| pair.split('=').next() == Some(name))
-        };
+        let query = Query(req.uri().query().unwrap_or_default());
         match req.method().as_str() {
-            "GET" if has("list-type") => Self::ListObjectsV2,
-            "GET" => Self::GetObject,
+            "GET" => Self::get(query),
             "HEAD" => Self::HeadObject,
-            "PUT" if req.headers().contains_key("x-amz-copy-source") => Self::CopyObject,
-            "PUT" if has("partNumber") => Self::UploadPart,
-            "PUT" => Self::PutObject,
-            "POST" if has("uploads") => Self::CreateMultipartUpload,
-            "POST" if has("uploadId") => Self::CompleteMultipartUpload,
-            "POST" if has("delete") => Self::DeleteObjects,
-            "DELETE" if has("uploadId") => Self::AbortMultipartUpload,
-            "DELETE" => Self::DeleteObject,
+            "PUT" => Self::put(req.headers().contains_key("x-amz-copy-source"), query),
+            "POST" => Self::post(query),
+            "DELETE" => Self::delete(query),
             _ => Self::Unknown,
+        }
+    }
+
+    fn get(query: Query<'_>) -> Self {
+        if query.has("list-type") {
+            Self::ListObjectsV2
+        } else {
+            Self::GetObject
+        }
+    }
+
+    fn put(copy: bool, query: Query<'_>) -> Self {
+        match (copy, query.has("partNumber")) {
+            (true, _) => Self::CopyObject,
+            (false, true) => Self::UploadPart,
+            (false, false) => Self::PutObject,
+        }
+    }
+
+    fn post(query: Query<'_>) -> Self {
+        [
+            ("uploads", Self::CreateMultipartUpload),
+            ("uploadId", Self::CompleteMultipartUpload),
+            ("delete", Self::DeleteObjects),
+        ]
+        .into_iter()
+        .find(|(name, _)| query.has(name))
+        .map_or(Self::Unknown, |(_, operation)| operation)
+    }
+
+    fn delete(query: Query<'_>) -> Self {
+        if query.has("uploadId") {
+            Self::AbortMultipartUpload
+        } else {
+            Self::DeleteObject
         }
     }
 
@@ -183,21 +289,10 @@ impl S3Operation {
     }
 
     /// `Service.Operation`, or the service alone when no operation matches.
-    fn span_name(self) -> &'static str {
-        match self {
-            Self::ListObjectsV2 => "S3.ListObjectsV2",
-            Self::GetObject => "S3.GetObject",
-            Self::HeadObject => "S3.HeadObject",
-            Self::CopyObject => "S3.CopyObject",
-            Self::UploadPart => "S3.UploadPart",
-            Self::PutObject => "S3.PutObject",
-            Self::CreateMultipartUpload => "S3.CreateMultipartUpload",
-            Self::CompleteMultipartUpload => "S3.CompleteMultipartUpload",
-            Self::DeleteObjects => "S3.DeleteObjects",
-            Self::AbortMultipartUpload => "S3.AbortMultipartUpload",
-            Self::DeleteObject => "S3.DeleteObject",
-            Self::Unknown => "S3",
-        }
+    fn span_name(self) -> Cow<'static, str> {
+        self.method().map_or(Cow::Borrowed("S3"), |method| {
+            Cow::Owned(format!("S3.{method}"))
+        })
     }
 
     /// Whether the operation names one object, so `aws.s3.key` applies.
@@ -210,261 +305,4 @@ impl S3Operation {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::OnceLock;
-
-    use object_store::client::{HttpRequest, HttpRequestBody};
-    use opentelemetry::trace::{
-        Span as _, SpanKind, Status, TraceContextExt as _, TraceId, Tracer as _,
-        TracerProvider as _,
-    };
-    use opentelemetry::{Context, Value};
-    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
-
-    use super::{QueryPhase, S3Operation, object_key};
-    use crate::store::Caller;
-    use crate::store::metrics::tests::{Harness, fake_s3, s3_store, serve};
-
-    fn request(method: &str, uri: &str, header: Option<&'static str>) -> HttpRequest {
-        let mut req = HttpRequest::new(HttpRequestBody::empty());
-        *req.method_mut() = method.parse().expect("method");
-        *req.uri_mut() = uri.parse().expect("uri");
-        if let Some(name) = header {
-            req.headers_mut()
-                .insert(name, object_store::HeaderValue::from_static("bucket/src"));
-        }
-        req
-    }
-
-    #[test]
-    fn each_request_shape_names_its_s3_operation() {
-        let cases = [
-            (
-                "GET",
-                "http://h/b?list-type=2&prefix=p",
-                None,
-                "S3.ListObjectsV2",
-            ),
-            ("GET", "http://h/b/k", None, "S3.GetObject"),
-            ("HEAD", "http://h/b/k", None, "S3.HeadObject"),
-            (
-                "PUT",
-                "http://h/b/k",
-                Some("x-amz-copy-source"),
-                "S3.CopyObject",
-            ),
-            (
-                "PUT",
-                "http://h/b/k?partNumber=1&uploadId=u",
-                None,
-                "S3.UploadPart",
-            ),
-            ("PUT", "http://h/b/k", None, "S3.PutObject"),
-            (
-                "POST",
-                "http://h/b/k?uploads",
-                None,
-                "S3.CreateMultipartUpload",
-            ),
-            (
-                "POST",
-                "http://h/b/k?uploadId=u",
-                None,
-                "S3.CompleteMultipartUpload",
-            ),
-            ("POST", "http://h/b?delete", None, "S3.DeleteObjects"),
-            (
-                "DELETE",
-                "http://h/b/k?uploadId=u",
-                None,
-                "S3.AbortMultipartUpload",
-            ),
-            ("DELETE", "http://h/b/k", None, "S3.DeleteObject"),
-            ("PATCH", "http://h/b/k", None, "S3"),
-        ];
-        for (method, uri, header, name) in cases {
-            let operation = S3Operation::of(&request(method, uri, header));
-            assert_eq!(operation.span_name(), name, "{method} {uri}");
-        }
-    }
-
-    #[test]
-    fn the_key_is_read_path_style_or_virtual_hosted_and_only_for_the_bucket() {
-        let key = |uri| object_key(&request("GET", uri, None), "bucket").map(str::to_owned);
-        assert_eq!(
-            key("http://h/bucket/data/a.parquet"),
-            Some("data/a.parquet".into())
-        );
-        assert_eq!(key("http://h/bucket?list-type=2"), Some(String::new()));
-        assert_eq!(
-            key("http://bucket.h/data/a.parquet"),
-            Some("data/a.parquet".into())
-        );
-        assert_eq!(key("http://h/bucket2/k"), None);
-        assert_eq!(key("http://169.254.169.254/latest/api/token"), None);
-    }
-
-    /// The process-global tracer provider the `CLIENT` spans resolve, over
-    /// one in-memory exporter. Shared because the global is per process;
-    /// each test reads only its own trace.
-    fn exporter() -> &'static InMemorySpanExporter {
-        static EXPORTER: OnceLock<InMemorySpanExporter> = OnceLock::new();
-        EXPORTER.get_or_init(|| {
-            let exporter = InMemorySpanExporter::default();
-            let provider = SdkTracerProvider::builder()
-                .with_simple_exporter(exporter.clone())
-                .build();
-            opentelemetry::global::set_tracer_provider(provider);
-            exporter
-        })
-    }
-
-    /// Run `work` under a fresh sampled parent span, the phase marker
-    /// attached when `in_phase`; the `CLIENT` spans of its trace.
-    fn client_spans_of(in_phase: bool, work: impl FnOnce()) -> (TraceId, Vec<SpanData>) {
-        let (trace_id, cx) = parent_context(in_phase);
-        {
-            let _attached = cx.attach();
-            work();
-        }
-        (trace_id, client_spans(trace_id))
-    }
-
-    /// A fresh sampled parent span's context, with the phase marker when
-    /// `in_phase`, and its trace id.
-    fn parent_context(in_phase: bool) -> (TraceId, Context) {
-        exporter();
-        let tracer = opentelemetry::global::tracer_provider()
-            .tracer_with_scope(ourios_core::telemetry::scope("test"));
-        let parent = tracer.start("load template_map");
-        let trace_id = parent.span_context().trace_id();
-        let cx = Context::current_with_span(parent);
-        let cx = if in_phase {
-            cx.with_value(QueryPhase)
-        } else {
-            cx
-        };
-        (trace_id, cx)
-    }
-
-    /// The exported `CLIENT` spans of `trace_id`.
-    fn client_spans(trace_id: TraceId) -> Vec<SpanData> {
-        exporter()
-            .get_finished_spans()
-            .expect("spans")
-            .into_iter()
-            .filter(|s| s.span_context.trace_id() == trace_id && s.span_kind == SpanKind::Client)
-            .collect()
-    }
-
-    fn attribute(span: &SpanData, key: &str) -> Option<Value> {
-        span.attributes
-            .iter()
-            .find(|kv| kv.key.as_str() == key)
-            .map(|kv| kv.value.clone())
-    }
-
-    #[test]
-    fn a_failed_request_in_a_query_phase_is_an_error_client_span() {
-        let port = fake_s3(vec![
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nx-amz-request-id: R1\r\n\
-             Connection: close\r\n\r\n",
-        ]);
-        let harness = Harness::new();
-        let store = s3_store(&harness, port, Caller::TemplateMap);
-        let (_, spans) = client_spans_of(true, || {
-            let err = store.get_blocking("data/a.parquet").expect_err("404");
-            assert!(err.is_not_found(), "{err:?}");
-        });
-
-        let [span] = spans.as_slice() else {
-            panic!("one CLIENT span, got {spans:?}");
-        };
-        assert_eq!(span.name.as_ref(), "S3.GetObject");
-        assert!(
-            matches!(span.status, Status::Error { .. }),
-            "{:?}",
-            span.status
-        );
-        let text = |key| attribute(span, key).map(|v| v.as_str().into_owned());
-        assert_eq!(text("error.type").as_deref(), Some("404"));
-        assert_eq!(text("rpc.system").as_deref(), Some("aws-api"));
-        assert_eq!(text("rpc.service").as_deref(), Some("S3"));
-        assert_eq!(text("rpc.method").as_deref(), Some("GetObject"));
-        assert_eq!(text("aws.s3.bucket").as_deref(), Some("bucket"));
-        assert_eq!(text("aws.s3.key").as_deref(), Some("data/a.parquet"));
-        assert_eq!(text("aws.request_id").as_deref(), Some("R1"));
-        assert_eq!(text("cloud.region").as_deref(), Some("us-east-1"));
-        assert_eq!(text("server.address").as_deref(), Some("127.0.0.1"));
-        assert_eq!(text("http.request.method").as_deref(), Some("GET"));
-        assert_eq!(
-            attribute(span, "server.port"),
-            Some(Value::I64(i64::from(port)))
-        );
-        assert_eq!(
-            attribute(span, "http.response.status_code"),
-            Some(Value::I64(404))
-        );
-    }
-
-    #[test]
-    fn a_successful_request_leaves_its_client_span_unset() {
-        let port = fake_s3(vec![
-            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"abc\"\r\n\
-             Last-Modified: Wed, 07 Oct 2026 11:00:00 GMT\r\nConnection: close\r\n\r\nhello",
-        ]);
-        let harness = Harness::new();
-        let store = s3_store(&harness, port, Caller::TemplateMap);
-        let (_, spans) = client_spans_of(true, || {
-            assert_eq!(store.get_blocking("k").expect("get"), b"hello");
-        });
-        let [span] = spans.as_slice() else {
-            panic!("one CLIENT span, got {spans:?}");
-        };
-        assert_eq!(span.status, Status::Unset);
-        assert_eq!(attribute(span, "error.type"), None);
-    }
-
-    #[test]
-    fn a_request_outside_a_query_phase_opens_no_client_span() {
-        let port = fake_s3(vec![
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        ]);
-        let harness = Harness::new();
-        let store = s3_store(&harness, port, Caller::Sink);
-        let (_, spans) = client_spans_of(false, || {
-            store.get_blocking("k").expect_err("404");
-        });
-        assert!(spans.is_empty(), "{spans:?}");
-    }
-
-    /// A request its caller abandons before the response ends its span
-    /// `Unset`, with no `error.type`: semconv does not count an
-    /// intentional cancellation as an error.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn an_abandoned_request_leaves_its_client_span_unset() {
-        use object_store::ObjectStoreExt as _;
-        use opentelemetry::context::FutureExt as _;
-
-        let port = serve(1, |_| None);
-        let harness = Harness::new();
-        let store = s3_store(&harness, port, Caller::TemplateMap);
-        let backend = store.object_store();
-        let (trace_id, cx) = parent_context(true);
-        let request = async move { backend.get(&object_store::path::Path::from("k")).await };
-        let abandoned = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            request.with_context(cx),
-        )
-        .await;
-        assert!(abandoned.is_err(), "the fake never answers");
-
-        let spans = client_spans(trace_id);
-        let [span] = spans.as_slice() else {
-            panic!("one CLIENT span, got {spans:?}");
-        };
-        assert_eq!(span.name.as_ref(), "S3.GetObject");
-        assert_eq!(span.status, Status::Unset);
-        assert_eq!(attribute(span, "error.type"), None);
-    }
-}
+mod tests;

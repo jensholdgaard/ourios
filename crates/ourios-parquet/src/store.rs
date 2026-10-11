@@ -34,11 +34,15 @@ mod client_span;
 mod metered;
 mod metrics;
 mod s3;
+#[cfg(test)]
+mod test_support;
+mod transport;
 
 #[cfg(test)]
 use bridge::MAX_BRIDGE_WORKERS;
 use bridge::block_on_off_runtime;
 pub use client_span::QueryPhase;
+use client_span::Tracing;
 use metered::Backend;
 pub use metrics::Caller;
 use metrics::{Metrics, Operation};
@@ -415,11 +419,11 @@ impl Store {
     /// `AmazonS3` backend cannot be built from `cfg`; [`StoreError::Runtime`]
     /// if the bridge runtime its connections run on cannot be built.
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
-        Self::s3_with(cfg, Metrics::Global)
+        Self::s3_with(cfg, Metrics::Global, Tracing::Global)
     }
 
-    fn s3_with(cfg: S3Config, metrics: Metrics) -> Result<Self, StoreError> {
-        let (s3, prefix) = s3::client(cfg, &metrics)?;
+    fn s3_with(cfg: S3Config, metrics: Metrics, tracing: Tracing) -> Result<Self, StoreError> {
+        let (s3, prefix) = s3::client(cfg, &metrics, tracing)?;
         Ok(Self::assemble(Backend {
             store: Arc::new(s3),
             http: true,

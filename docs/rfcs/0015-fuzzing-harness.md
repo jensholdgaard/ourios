@@ -66,10 +66,7 @@ A single new workspace member at the repo root, `fuzz/`, following the
 cargo-fuzz convention (`cargo fuzz init`). It is:
 
 - **not published** (`publish = false`) and carries no library API —
-  it exists only to host fuzz targets. Code the targets share (the
-  telemetry bootstrap, the miner oracles, the OTLP round-trip check)
-  lives in `fuzz/common/*.rs` and is pulled into each target with a
-  `#[path]` `mod` include, so the package still has no `lib.rs`;
+  it exists only to host fuzz targets;
 - **built with nightly Rust.** libFuzzer requires sanitizer/`-Z`
   support absent from stable. `rust-toolchain.toml` stays `stable`
   (the source of truth for every shipping crate per `CLAUDE.md` §6.1);
@@ -92,58 +89,45 @@ cargo-fuzz convention (`cargo fuzz init`). It is:
 Adding this member is a `CLAUDE.md` §7 new-crate decision; this RFC is
 that decision's record.
 
+> **Amendment (2026-10-11, #951, maintainer-approved): shared harness code.**
+> Code the targets share (the telemetry bootstrap, the miner oracles,
+> the OTLP round-trip check) lives in `fuzz/common/*.rs` and is pulled
+> into each target with a `#[path]` `mod` include. The package still
+> has no `lib.rs`, so the no-library-API rule above holds.
+
 ### 3.2 The targets
 
-Five targets, ranked by risk. Each is a `fuzz_target!` reaching a stable
-entry point with minimal glue; each asserts an invariant of what the
-entry point *accepts*, not only that it does not panic.
+Four targets, ranked by risk. Each is a `fuzz_target!(|data: &[u8]|)`
+reaching a stable entry point with minimal glue.
 
 | Target | Entry point | Crate | Oracle |
 |---|---|---|---|
-| `miner_roundtrip` ⭐ | the input split on `\n`; every line a **string-body** `OtlpLogRecord` into one `MinerCluster` (observable `RecordSink`) for one tenant; the leaf snapshotted via `templates_for` by `(template_id, template_version)` after each `ingest`; then `reconstruct::render` per row | `ourios-miner` | **invariants**: the rendered bytes equal the row's own line whether `render` reports `Reconstruction::Faithful` or `RetainedVerbatim`, a clean row is `Faithful` — §3.3 (RFC0015.1); every row agrees with its template's literals outside the wildcards, versions only widen, one row per ingest — §3.1 (RFC0015.10) |
-| `otlp_json` | `decode_json(&[u8])` | `ourios-ingester` | no panic (RFC0015.2); an accepted request survives the protobuf round trip (RFC0015.9) |
-| `otlp_protobuf` | `decode_protobuf(&[u8])` | `ourios-ingester` | no panic (RFC0015.3); decode → encode is a fixpoint (RFC0015.9) |
-| `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` on the raw input, and `read_frame(write_frame(kind, payload))` with the first byte picking the `FrameKind` — both `pub` only under the `fuzzing` feature (§7) | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB (RFC0015.4); the writer's frame reads back as `(kind, payload)`, fully consumed (RFC0015.9) |
-| `dsl_parse` | `parse_statement(&str)` and `parse_structured_statement(&str)` on the same text | `ourios-querier` | no panic (RFC0015.8); an accepted statement round-trips its canonical form, `parse_statement(serialize_statement(s)) == s` (RFC0002.7) |
+| `miner_roundtrip` ⭐ | `ingest` (with an observable `RecordSink`) → drain the `MinedRecord` → `templates_for` → `reconstruct::render`, on a **string-body** record | `ourios-miner` | **invariant**: the rendered bytes equal the original string body whether `render` reports `Reconstruction::Faithful` (rebuilt) or `Reconstruction::RetainedVerbatim` (retained) — §3.3 |
+| `otlp_json` | `decode_json(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
+| `otlp_protobuf` | `decode_protobuf(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
+| `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` — today `pub(crate)`, exposed to the target via the `fuzzing` feature (§3.2, §7) | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
 
-**`miner_roundtrip` is the centerpiece.** The target feeds the miner a
-*sequence*: the input is split on `\n` (each line capped at 4 KiB, at
-most 64 lines, lossy UTF-8 — nothing is discarded) and every line is
-ingested as an `OtlpLogRecord` whose body is a **`String`** (the Drain
-template path) into one `MinerCluster` for one tenant, so one input
-drives leaf creation, clean reuse, widening and type expansion.
+**`miner_roundtrip` is the centerpiece.** Rather than feed the miner a
+fixed string, the target uses the `arbitrary` crate to build an
+`OtlpLogRecord` whose body is a **`String`** (the Drain template path —
+the fuzz bytes become the log line; attributes are derived alongside).
 `MinerCluster::ingest` returns only a `template_id`, so the harness
 follows the miner's real read-back path (the one
 `crates/ourios-miner/tests/invariants.rs` uses): the cluster is built
 with an observable `RecordSink` (`SharedRecordSink`), `ingest` is called,
-the emitted `MinedRecord` is drained from the sink, and the leaf's
-template tokens are looked up via `MinerCluster::templates_for(tenant)`
-matching the record's `(template_id, template_version)` — right after
-that ingest, because a later widening bumps the leaf past the record's
-version. That is the read path's registry key (RFC 0017 §3.5): a row
-stamped version N renders against the N-version tokens. Once every line
-is in, `reconstruct::render` runs per row with its own version's tokens
-and the target asserts the §3.3 contract: the rendered bytes equal the
-row's own line **in both outcomes** — whether `render` reports
-`Reconstruction::Faithful` (rebuilt from the template) or
-`Reconstruction::RetainedVerbatim` (the original body surfaced verbatim,
-not rebuilt) — and a *clean* row (not lossy, no §6.5 overflow) must be
-`Faithful`, since `render` only retreats to the body on a template-shape
-mismatch, which a stored body would otherwise paper over. §3.3
-guarantees a string line is either reconstructed exactly or has its
-original body retained, so *either* a faithful-rebuild mismatch *or* a
-retention failure is a violation — and makes the target panic, which
-libFuzzer reports as a crash. That turns the fuzzer into a search for
-reconstruction bugs, not just for `unwrap`s.
-
-The same pass asserts §3.1 (`fuzz/common/oracles.rs`, ported from the
-RFC 0024 property suite's `assert_no_silent_merge`): a row attached to a
-template agrees with that template's literal tokens at every
-non-wildcard position (so two rows on one template agree everywhere a
-merge across a semantic boundary would differ), successive versions of
-one template only ever turn a literal into a wildcard — never a literal
-into a different literal, never a wildcard back, never a length change
-— and each string-body ingest emits exactly one row.
+the emitted `MinedRecord` is drained from the sink, the leaf's template
+tokens are looked up via `MinerCluster::templates_for(tenant)` matching
+the record's `(template_id, template_version)`, and `reconstruct::render`
+is called with that record and those tokens. It then asserts the §3.3
+contract: the rendered bytes equal the original string body **in both
+outcomes** — whether `render` reports `Reconstruction::Faithful` (rebuilt
+from the template) or `Reconstruction::RetainedVerbatim` (the original
+body surfaced verbatim, not rebuilt). §3.3 guarantees a string line is
+either reconstructed exactly or has its original body retained, so
+*either* a faithful-rebuild mismatch *or* a retention failure is a
+violation — and makes the target panic, which libFuzzer reports as a
+crash. That turns the fuzzer into a search for reconstruction bugs, not
+just for `unwrap`s.
 
 The target is deliberately scoped to **string** bodies: that is the
 template-mining + line-reconstruction path the §3.3 invariant governs.
@@ -152,24 +136,64 @@ Structured (`kvlist`/array) bodies take the §6.1 canonical-encoding path
 property — a candidate for a separate target (§7), not folded into this
 oracle.
 
-The four parser targets are panic-oracles on untrusted-input
-boundaries — a decoder must reject garbage with a typed error, never
-panic, abort, or exhibit UB — and round-trip oracles on what they
-accept. The OTLP decoders' output is what the WAL stores re-encoded, so
-`encode(decode(encode(request)))` must reproduce `encode(request)`
-byte for byte (bytes, not messages: a `NaN` double is a legal wire
-value unequal to itself). A WAL frame the writer produces must read
-back as exactly `(kind, payload)`, with the reader consuming exactly
-the frame. A DSL statement either parser accepts must re-parse from its
-canonical serialisation to the same IR — the RFC0002.7 contract the
-`dsl/structured.rs` proptest pins over generated trees, here under
-coverage guidance. JSON re-encoding of OTLP is deliberately *not*
-asserted: proto3-JSON is not canonical (`1` vs `"1"` for 64-bit
-integers, enum names vs numbers), so equal JSON is not a contract.
+The three parser targets are panic-oracles on untrusted-input
+boundaries: a decoder must reject garbage with a typed error, never
+panic, abort, or exhibit UB.
 
-`frame::read_frame` and `frame::write_frame` are `pub(crate)` in the
-shipping build; the `fuzzing` cargo feature makes the module `pub`
-(`#[doc(hidden)]`, so rustdoc stays honest) for the target — §7.
+`frame::read_frame` is currently `pub(crate)`. Rather than widen the WAL
+public API, expose it to the fuzz target through a `#[doc(hidden)]`
+shim (or a `fuzzing` cargo feature) — resolved in §7.
+
+> **Amendment (2026-10-11, #951, maintainer-approved): five targets, each an
+> invariant oracle.** The table above lists four targets with mostly
+> panic-only oracles. As amended there are five, and each asserts an
+> invariant of what its entry point *accepts*:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `miner_roundtrip` ⭐ | the input split on `\n` (4 KiB per line, at most 64 lines, lossy UTF-8); every line a **string-body** record into one `MinerCluster` for one tenant, with observable record and audit sinks | §3.3 per row (RFC0015.1 as amended); §3.1 audit per ingest (RFC0015.1 as amended); §3.1 no silent merge (RFC0015.10) |
+> | `otlp_json` | `decode_json(&[u8])` | no panic (RFC0015.2); an accepted request survives the protobuf round trip (RFC0015.9) |
+> | `otlp_protobuf` | `decode_protobuf(&[u8])` | no panic (RFC0015.3); decode → encode is a byte fixpoint (RFC0015.9) |
+> | `wal_frame` | `read_frame` on the raw input, and `read_frame(write_frame(kind, payload))` with the first byte picking the `FrameKind` | typed `FrameError`, never UB (RFC0015.4); the writer's frame reads back as `(kind, payload)`, fully consumed (RFC0015.9) |
+> | `dsl_parse` | `parse_statement` and `parse_structured_statement` on the same text | no panic (RFC0015.8); an accepted statement round-trips its canonical form (RFC0002.7) |
+>
+> **`miner_roundtrip` drives a sequence.** One input now reaches leaf
+> creation, clean reuse, widening and type expansion. Right after each
+> ingest, the leaf the row was stamped with is snapshotted by
+> `(template_id, template_version)`, the read path's registry key (RFC
+> 0017 §3.5). A later widening bumps the leaf past the row's version,
+> and a row stamped N must render against the N-version tokens. Every
+> row is then checked against both halves of §3.3: it renders back to
+> its own line whether `render` reports `Faithful` or
+> `RetainedVerbatim`, and a *clean* row (not lossy, no §6.5 overflow)
+> must be `Faithful`. A diverted row must be lossy-flagged with the
+> line retained verbatim. `render` only retreats to the body on a
+> template-shape mismatch, which a stored body would otherwise paper
+> over.
+>
+> **§3.1 has two checks in this target.** First, after each ingest the
+> tenant's leaves before and after are compared with what the audit
+> sink received. "Every merge emits an audit event with old + new
+> templates" (RFC 0001 H1.3) becomes: a new leaf has exactly one
+> `Created` event, and a version that rose `v → w` has exactly the
+> `Widened` / `TypeExpanded` chain `v → … → w`, its templates matching
+> the tree before and after. Second, ported from the RFC 0024 property
+> suite's `assert_no_silent_merge`: a row agrees with its template's
+> literals at every non-wildcard position, and successive versions of
+> one template only ever turn a literal into a wildcard.
+>
+> **The parser targets assert round trips.** The OTLP decoders' output
+> is what the WAL stores re-encoded, so the re-encoding must be a byte
+> fixpoint. The comparison is on bytes, not messages: a `NaN` double is
+> a legal wire value unequal to itself. JSON re-encoding is not
+> asserted, because proto3-JSON is not canonical (`1` vs `"1"` for
+> 64-bit integers, enum names vs numbers). A DSL statement must
+> re-parse from its canonical serialisation to the same IR, the
+> RFC0002.7 contract the `dsl/structured.rs` proptest pins over
+> generated trees. `frame::write_frame` joins `read_frame` behind the
+> `fuzzing` feature, which makes the module `pub` and
+> `#[doc(hidden)]`. The status stays `accepted`. Scenarios RFC0015.8–.10
+> and the RFC0015.1 amendment are the criteria.
 
 ### 3.3 Seed corpora
 
@@ -179,26 +203,37 @@ The CI job copies the seeds into the working corpus before each run, so
 the committed inputs bootstrap coverage without the evolving corpus
 churning the repo:
 
-- `miner_roundtrip` seeds from a few real-shaped log lines, single-line
-  and multi-line (same shape with differing parameters, so the first
-  mutations already exercise widening and type expansion);
+- `miner_roundtrip` seeds from a few real-shaped log lines;
 - `otlp_json` seeds from a minimal `ExportLogsServiceRequest` (an empty
-  `{"resourceLogs":[]}`) and a one-record request covering every
-  `AnyValue` shape;
-- `otlp_protobuf` seeds from the prost encoding of that one-record
-  request; `wal_frame` from one `write_frame` output per `FrameKind`
-  (`fuzz/README.md` records how both are regenerated);
-- `dsl_parse` seeds from the RFC 0002 cookbook queries, structured-JSON
-  examples, and the regression inputs of fixed crashes (§3.5).
-
-The two text-grammar targets also take a libFuzzer **dictionary**
-(`fuzz/dict/<target>.dict`: the proto3-JSON keys and value shapes of
-`ExportLogsServiceRequest`; the §7 grammar's keywords and operators plus
-the structured surface's tags), passed with `-dict=`, so mutations reach
-the parsers' productions rather than the lexer's error arm.
+  `{"resourceLogs":[]}`);
+- `otlp_protobuf` and `wal_frame` start from libFuzzer's generated
+  inputs in Phase 1; binary seeds (valid protobuf encodings / valid
+  frames) can be added later.
 
 Committed seeds are kept minimal (enough to bootstrap coverage); the
 grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.
+
+> **Amendment (2026-10-11, #951, maintainer-approved): binary seeds and
+> dictionaries.** The binary seeds the list above defers now exist:
+>
+> - `otlp_protobuf`: the prost encoding of a one-record request that
+>   covers every `AnyValue` shape. The same request is also an
+>   `otlp_json` seed.
+> - `wal_frame`: one `write_frame` output per `FrameKind`.
+> - `miner_roundtrip`: multi-line seeds (same shape, differing
+>   parameters) start the fuzzer on widening and type expansion.
+>
+> `fuzz/README.md` records how the binary seeds are regenerated. The
+> two text-grammar targets take a libFuzzer **dictionary**
+> (`fuzz/dict/<target>.dict`):
+>
+> - `otlp_json`: the proto3-JSON keys and value shapes of
+>   `ExportLogsServiceRequest`;
+> - `dsl_parse`: the §7 grammar's keywords and operators, plus the
+>   structured surface's tags.
+>
+> The smoke job passes it with `-dict=`, and ClusterFuzzLite through
+> `dict =` in `<target>.options` (§3.4 as amended).
 
 ### 3.4 CI — phased
 
@@ -277,13 +312,17 @@ PR trigger.
 
 When the fuzzer finds a crash, the workflow per `CLAUDE.md` §6.2 is:
 minimise the reproducer (`cargo fuzz tmin`), commit it as a permanent
-seed under the tracked `fuzz/seeds/<target>/` as
-`regression_<issue>_<n>` (the working `fuzz/corpus/` is gitignored, so
-a reproducer parked there would not persist — §3.3), then fix the bug.
-The seed stays forever, re-checked on every run — a found bug becomes a
-standing specification, never silently dropped. The oracles' panic
-messages name the invariant (`RFC0015.N / CLAUDE.md §3.x`), so a crash
-artefact says which contract broke before anyone opens a debugger.
+seed under the tracked `fuzz/seeds/<target>/` (the working
+`fuzz/corpus/` is gitignored, so a reproducer parked there would not
+persist — §3.3), then fix the bug. The seed stays forever, re-checked
+on every run — a found bug becomes a standing specification, never
+silently dropped.
+
+> **Amendment (2026-10-11, #951, maintainer-approved): naming.** A committed
+> reproducer is named `fuzz/seeds/<target>/regression_<issue>_<n>`.
+> Every oracle's panic message names its invariant
+> (`RFC0015.N / CLAUDE.md §3.x`), so a crash artefact says which
+> contract broke.
 
 ## 4. Alternatives considered
 
@@ -334,9 +373,9 @@ the find.
 >   built from `MinerConfig::default()` with an observable
 >   `RecordSink` attached
 > - **When** the target builds an `OtlpLogRecord` with a
->   **`String`** body from each line of the arbitrary input,
->   ingests it, drains the emitted `MinedRecord` from the sink,
->   looks up the leaf tokens via `templates_for` for the record's
+>   **`String`** body from the arbitrary input, ingests it,
+>   drains the emitted `MinedRecord` from the sink, looks up the
+>   leaf tokens via `templates_for` for the record's
 >   `(template_id, template_version)`, and calls `render`
 > - **Then** the rendered bytes equal the original string body in
 >   **both** outcomes — whether `render` reports
@@ -345,17 +384,34 @@ the find.
 >   verbatim) — since §3.3 guarantees a string line is either
 >   reconstructed exactly or has its original body retained
 > - **And** the `Reconstruction` marker is asserted to be one of
->   those two variants, recording which path produced the bytes;
->   for a clean row (`lossy_flag` unset, no `Overflow` param) it
->   is asserted to be `Faithful`, and for a diverted row
->   (`NO_TEMPLATE`) `lossy_flag` is set and `body` carries the
->   line verbatim
+>   those two variants, recording which path produced the bytes
 > - **And** *any* input whose rendered bytes differ from the
 >   original string body makes the target panic (a libFuzzer
 >   crash) — a faithful-rebuild mismatch **and** a retention
 >   failure are both §3.3 violations
 > - **And** the assertion references the §3.3 invariant id so the
 >   mapping back to `CLAUDE.md` is greppable
+
+> **Amendment (2026-10-11, #951, maintainer-approved): RFC0015.1 as
+> amended.** The **When** applies to *each line* of the input. Every
+> line is ingested into one `MinerCluster` that has an observable audit
+> sink as well as the record sink. Each row's tokens are looked up by
+> its own `(template_id, template_version)` right after its ingest.
+> Added clauses:
+>
+> - **And** a clean row (`lossy_flag` unset, no `Overflow` param)
+>   renders with `Reconstruction::Faithful`;
+> - **And** a diverted row (`NO_TEMPLATE`) has `lossy_flag` set and
+>   `body` equal to the line;
+> - **And** (`CLAUDE.md` §3.1, RFC 0001 H1.3) after each ingest,
+>   every leaf the ingest created has exactly one `Created` audit
+>   event carrying its tokens. Every leaf whose version rose `v → w`
+>   has exactly the `Widened` / `TypeExpanded` chain `v → … → w`, its
+>   old template equal to the leaf before the ingest and its new
+>   template equal to the leaf after. No other leaf has a template
+>   event;
+> - **And** each violation panics with a message citing
+>   `RFC0015.1 / CLAUDE.md §3.1` or `§3.3`.
 
 > **Scenario RFC0015.2 — OTLP/JSON decode never panics**
 > - **Given** the `otlp_json` target
@@ -412,10 +468,15 @@ the find.
 > - **Given** the fuzzer has found and the team has fixed a crash
 > - **When** the fix lands
 > - **Then** the minimised reproducer is committed under
->   `fuzz/seeds/<target>/` as `regression_<issue>_<n>` and is
+>   `fuzz/corpus/<target>/` (or its `regressions/` subdir) and is
 >   re-exercised on every subsequent run
 > - **And** the seed is never removed to make a run pass
 >   (`CLAUDE.md` §6.2)
+
+> **Amendment (2026-10-11, #951, maintainer-approved): RFC0015.6 path.**
+> `fuzz/corpus/` is the gitignored working corpus (§3.3), so the
+> reproducer goes under the tracked `fuzz/seeds/<target>/` as
+> `regression_<issue>_<n>`, as §3.5 already says.
 
 > **Scenario RFC0015.7 — ClusterFuzzLite is detected by Scorecard (Phase 2)**
 > - **Given** the Phase 2 follow-up has landed `.clusterfuzzlite/`
@@ -434,7 +495,8 @@ the find.
 > jobs of `fuzz.yml`". Scorecard's `Fuzzing` check scores 10/10
 > ("project is fuzzed"; Scorecard API, 2026-08-21 run).
 
-> **Scenario RFC0015.8 — DSL parse never panics and round-trips its canonical form**
+> **Scenario RFC0015.8 — DSL parse never panics and round-trips its
+> canonical form** (amendment 2026-10-11, #951)
 > - **Given** the `dsl_parse` target
 > - **When** `parse_statement` and `parse_structured_statement`
 >   are run on arbitrary UTF-8 text
@@ -445,7 +507,8 @@ the find.
 >   is `Ok` and equals `s` (RFC0002.7); a canonical form that fails
 >   to parse or re-parses differently makes the target panic
 
-> **Scenario RFC0015.9 — what a parser accepts survives its round trip**
+> **Scenario RFC0015.9 — what a parser accepts survives its round
+> trip** (amendment 2026-10-11, #951)
 > - **Given** the `otlp_protobuf`, `otlp_json` and `wal_frame`
 >   targets
 > - **When** `decode_protobuf` or `decode_json` returns `Ok(request)`
@@ -460,7 +523,8 @@ the find.
 > - **And** any violation makes the target panic with a message
 >   naming this scenario
 
-> **Scenario RFC0015.10 — the miner sequence target enforces §3.1 no silent merge**
+> **Scenario RFC0015.10 — the miner sequence target enforces §3.1 no
+> silent merge** (amendment 2026-10-11, #951)
 > - **Given** the `miner_roundtrip` target with every line of the
 >   input ingested into one `MinerCluster` for one tenant, and each
 >   row's template snapshotted by `(template_id, template_version)`
@@ -488,27 +552,37 @@ libFuzzer runs rather than fixed-input unit tests.
   tests in `crates/ourios-miner/src/reconstruct.rs`; the fuzz target
   reuses that assertion under coverage guidance. Cross-referenced so the
   two layers stay in sync.
-- **RFC0015.2 / .3 / .4 / .8** — panic-oracle targets. Verified by a
-  bounded fuzz run (no crash) in CI; `cargo fuzz build` proves they
-  compile even on runs where they are not executed.
-- **RFC0015.9 / .10** — round-trip and no-silent-merge oracles inside
-  the same targets. Each was proven to fire before landing by breaking
-  the code under test locally (a mis-encoded frame kind, a dropped
-  literal) and watching the bounded run crash on the first seed; the
-  seeds in §3.3 keep the oracles on the happy path every run.
-- **RFC0015.8** mirrors the `dsl/structured.rs` proptest and the
-  `display.rs` corpus test (`parse(serialize(q)) == q`), so the two
-  layers stay in sync as the grammar grows.
+- **RFC0015.2 / .3 / .4** — panic-oracle targets. Verified by a bounded
+  fuzz run (no crash) in CI; `cargo fuzz build` proves they compile even
+  on runs where they are not executed.
 - **RFC0015.5** — the `fuzz.yml` workflow itself; smoke budgets kept
   small enough to be non-flaky. The real coverage accrues from the
-  Phase 2 continuous runs, not the bounded smoke job (which runs on a
-  schedule and on dispatch, never per PR — §3.4).
+  Phase 2 continuous runs, not the per-PR smoke job.
 - **RFC0015.6** — exercised the first time a crash is found; the
   committed reproducer is a standing corpus entry thereafter.
 
 Each scenario id (`RFC0015.N`) is referenced from the corresponding
 target source or workflow comment so the spec-to-test mapping is
 greppable (`docs/verification.md` §2).
+
+> **Amendment (2026-10-11, #951, maintainer-approved): testing the new
+> oracles.**
+>
+> - **RFC0015.8** extends the panic-oracle bullet above. It mirrors
+>   the `dsl/structured.rs` proptest and the `display.rs` corpus test
+>   (`parse(serialize(q)) == q`), so the two layers stay in sync as the
+>   grammar grows.
+> - **RFC0015.9 / .10 and the RFC0015.1 amendment** run inside the
+>   same bounded runs. Each oracle was shown to fire before landing:
+>   the code under test was broken locally (a render mismatch, a
+>   mislabelled marker, a dropped row, an absorbed literal, a rewritten
+>   literal, a suppressed `Widened` audit event, a mis-encoded frame
+>   kind, a non-round-tripping serialiser), a crafted input crashed
+>   with the expected message, and the break was reverted. The seeds
+>   in §3.3 keep every oracle on its happy path each run.
+> - The RFC0015.5 bullet's "per-PR smoke job" predates §3.4's
+>   schedule-only trigger. The smoke job runs on its schedule and on
+>   dispatch, never per PR.
 
 ## 7. Open questions
 
@@ -519,26 +593,29 @@ confirmed as the RFC advances toward `green`):
 - [x] **Nightly pin** → **pin a dated `nightly-YYYY-MM-DD`** in the fuzz
   job (not a floating `nightly`), for reproducibility; Renovate bumps
   it like the other pinned toolchains.
-- [x] **Smoke-fuzz budget** → **~300 s per target on the daily
-  schedule, ~60 s on a manual dispatch**; the smoke job never runs per
-  PR (see §3.4). Revisit if CI minutes or signal warrant.
+- [x] **Smoke-fuzz budget** → **~60 s per target on PRs, ~300 s on the
+  daily schedule** (see §3.4). Revisit if CI minutes or signal warrant. *(Amended
+  2026-10-11, #951: the smoke job never runs per PR — ~300 s per target
+  on its daily schedule, ~60 s on a manual dispatch, §3.4 as amended.)*
 - [x] **`read_frame` exposure** → a **`fuzzing` cargo feature** on
   `ourios-wal` gating the `pub` export, rather than a `#[doc(hidden)]`
   shim — slightly cleaner and reusable for future non-fuzz tests.
 - [x] **`OtlpLogRecord` construction** → expect a **hand-written
   `Arbitrary` impl** (or a thin newtype) for the string-body path,
   rather than relying on `derive` across the body variants, if a derive
-  proves messy. *Outcome:* neither — the target splits the raw bytes on
-  `\n` and builds each record with `..Default::default()`; `arbitrary`
-  is not a direct dependency of the harness.
+  proves messy. *(Amended 2026-10-11, #951: neither — `miner_roundtrip` splits
+  the raw bytes on `\n` and builds each record with
+  `..Default::default()`; `arbitrary` is no longer a direct dependency
+  of the harness.)*
 
 Still open, deferred to the implementation PRs:
 
-- [x] **A second miner target** driving *sequences* of records, to fuzz
+- [ ] **A second miner target** driving *sequences* of records, to fuzz
   template **merge** behaviour (§3.1), not just single-line round-trip?
-  → Folded into `miner_roundtrip` itself rather than a second binary:
-  the input is a line sequence into one tree, and the §3.1 oracle runs
-  beside the §3.3 one (§3.2, RFC0015.10).
+  Possible Phase 1.5. *(Amended 2026-10-11, #951: resolved inside
+  `miner_roundtrip` rather than as a second binary — the input is a
+  line sequence into one tree, and the §3.1 checks run beside the §3.3
+  one; §3.2 as amended, RFC0015.1 as amended, RFC0015.10.)*
 - [ ] **A structured-body round-trip target** exercising the §6.1
   canonical encoding (`AnyValue ↔ stored bytes` determinism), separate
   from `miner_roundtrip`'s string-body scope? Possible Phase 1.5.

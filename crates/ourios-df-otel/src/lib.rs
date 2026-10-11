@@ -156,10 +156,9 @@ fn node_attributes(aggregated: &MetricsSet) -> Vec<KeyValue> {
 }
 
 #[cfg(test)]
-// Test tracers need no versioned scope; this crate has no ourios-core dependency.
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::physical_plan::metrics::{
         Count, ExecutionPlanMetricsSet, MetricBuilder, PruningMetrics, Time, Timestamp,
     };
@@ -261,6 +260,32 @@ mod tests {
         assert!(get(ATTR_ELAPSED_COMPUTE).is_some());
     }
 
+    type ExpressionWalk = datafusion::error::Result<TreeNodeRecursion>;
+    type ExpressionVisitor<'a> =
+        dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> ExpressionWalk + 'a;
+
+    /// The properties of a single-partition, bounded test leaf with an
+    /// empty schema, shared by the plan doubles below.
+    fn leaf_properties() -> Arc<datafusion::physical_plan::PlanProperties> {
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::physical_expr::EquivalenceProperties;
+        use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+        use datafusion::physical_plan::{Partitioning, PlanProperties};
+
+        Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::new(Schema::empty())),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ))
+    }
+
+    /// A tracer under an explicit scope. This crate does not depend on
+    /// ourios-core, whose versioned `scope` the workspace lint asks for.
+    fn test_tracer(provider: &SdkTracerProvider) -> opentelemetry_sdk::trace::SdkTracer {
+        provider.tracer_with_scope(opentelemetry::InstrumentationScope::builder("test").build())
+    }
+
     /// A minimal `ExecutionPlan` leaf that reports a fixed, hand-built
     /// `MetricsSet` with real Start/EndTimestamp — a stand-in for a real
     /// timed operator, without needing to stand up a live scan.
@@ -271,19 +296,9 @@ mod tests {
 
     impl FakeTimedLeaf {
         fn new() -> Self {
-            use datafusion::arrow::datatypes::Schema;
-            use datafusion::physical_expr::EquivalenceProperties;
-            use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-            use datafusion::physical_plan::{Partitioning, PlanProperties};
-
-            let schema = Arc::new(Schema::empty());
-            let properties = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(schema),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            ));
-            Self { properties }
+            Self {
+                properties: leaf_properties(),
+            }
         }
     }
 
@@ -312,15 +327,8 @@ mod tests {
 
         // DataFusion 55 made this a required method: a leaf carries no
         // physical expressions, so the walk continues untouched.
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(
-                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-            ) -> datafusion::error::Result<
-                datafusion::common::tree_node::TreeNodeRecursion,
-            >,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
-            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        fn apply_expressions(&self, _f: &mut ExpressionVisitor<'_>) -> ExpressionWalk {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
@@ -364,7 +372,7 @@ mod tests {
             .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
             .with_simple_exporter(exporter.clone())
             .build();
-        let tracer = provider.tracer("test");
+        let tracer = test_tracer(&provider);
 
         let leaf: Arc<dyn ExecutionPlan> = Arc::new(FakeTimedLeaf::new());
         assert!(
@@ -415,19 +423,9 @@ mod tests {
 
     impl PanicsIfTouched {
         fn new() -> Self {
-            use datafusion::arrow::datatypes::Schema;
-            use datafusion::physical_expr::EquivalenceProperties;
-            use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-            use datafusion::physical_plan::{Partitioning, PlanProperties};
-
-            let schema = Arc::new(Schema::empty());
-            let properties = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(schema),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            ));
-            Self { properties }
+            Self {
+                properties: leaf_properties(),
+            }
         }
     }
 
@@ -456,15 +454,8 @@ mod tests {
 
         // DataFusion 55 made this a required method: a leaf carries no
         // physical expressions, so the walk continues untouched.
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(
-                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-            ) -> datafusion::error::Result<
-                datafusion::common::tree_node::TreeNodeRecursion,
-            >,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
-            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        fn apply_expressions(&self, _f: &mut ExpressionVisitor<'_>) -> ExpressionWalk {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
@@ -497,7 +488,7 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let tracer = provider.tracer("test");
+        let tracer = test_tracer(&provider);
 
         // An empty `Context` carries no span, so `.span()` resolves to a
         // placeholder whose `SpanContext` is invalid — `is_sampled()` is

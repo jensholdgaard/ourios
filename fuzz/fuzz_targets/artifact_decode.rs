@@ -37,10 +37,10 @@
 //! - **RFC0015.13, decode → encode is a fixpoint.** What decodes re-encodes
 //!   with the writer's own encoder and decodes back equal: the snapshot
 //!   payload, the manifest, the high-water and the template map (the encoded
-//!   bytes are a fixpoint too). A restored snapshot captures back every
-//!   leaf's template, version, key and wildcard route, its structured map
-//!   and its horizon (#892 was a leaf the writer could not place again), and
-//!   capture → restore → capture is a fixpoint.
+//!   bytes are a fixpoint too). A restored snapshot captures back the
+//!   decoded state field for field, leaves, structured map, adopted
+//!   templates and horizon, in the writer's canonical form (#892 was a leaf
+//!   the writer could not place again), and that capture restores to itself.
 //!
 //! Memory: inputs are the fuzzer's (4 KiB by default), and the only expanding
 //! decoder, the template-map zstd frame, stops at its 64 MiB body bound
@@ -53,7 +53,8 @@ use ourios_ingester::template_ids::TemplateIdsError;
 use ourios_ingester::template_ids::fuzzing as high_water;
 use ourios_miner::cluster::{MAX_TEMPLATE_ID, MinerCluster};
 use ourios_miner::snapshot::{
-    self, LegacyMark, RecoveryOutcome, SNAPSHOT_VERSION, SnapshotState, TokenRecord, load_snapshot,
+    self, AdoptedTemplateRecord, LeafRecord, LegacyMark, ParamTypeRecord, ProvenanceRecord,
+    RecoveryOutcome, SNAPSHOT_VERSION, SnapshotState, load_snapshot,
 };
 use ourios_parquet::{Manifest, ManifestError};
 use ourios_querier::{ArtifactRead, QueryError, TemplateMap};
@@ -86,6 +87,21 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
 });
 
 fn miner_snapshot(bytes: &[u8]) {
+    assert_legacy_mark_classified(bytes);
+    let Some(state) = recovered_state(bytes) else {
+        return;
+    };
+    assert_payload_round_trips(&state);
+    let tenant = TenantId::new(TENANT);
+    let Some(miner) = restore_or_assert_isolated(&tenant, &state) else {
+        return;
+    };
+    assert_restore_faithful(&miner, &tenant, &state);
+}
+
+/// RFC0015.11: `legacy_v1_mark` reads as legacy exactly the byte-0 = 1
+/// artefacts.
+fn assert_legacy_mark_classified(bytes: &[u8]) {
     let legacy = snapshot::legacy_v1_mark(bytes);
     assert_eq!(
         matches!(legacy, LegacyMark::NotLegacy),
@@ -93,7 +109,11 @@ fn miner_snapshot(bytes: &[u8]) {
         "RFC0015.11: legacy_v1_mark classified a byte 0 of {:?} as {legacy:?}",
         bytes.first(),
     );
+}
 
+/// RFC0015.11: `recover(Some(_))` restores only what `load_snapshot` reads
+/// under `SNAPSHOT_VERSION`, and discards everything else.
+fn recovered_state(bytes: &[u8]) -> Option<SnapshotState> {
     let state = match snapshot::recover(Some(bytes)) {
         (Some(state), RecoveryOutcome::Restored) => state,
         (None, RecoveryOutcome::UnknownOrCorruptDiscarded) => {
@@ -101,7 +121,7 @@ fn miner_snapshot(bytes: &[u8]) {
                 load_snapshot(bytes).is_err(),
                 "RFC0015.11: recover discarded a snapshot load_snapshot reads"
             );
-            return;
+            return None;
         }
         (state, outcome) => panic!(
             "RFC0015.11: recover(Some(_)) returned {outcome:?} with a state: {}",
@@ -113,51 +133,58 @@ fn miner_snapshot(bytes: &[u8]) {
         Some(&SNAPSHOT_VERSION),
         "RFC0015.11: recover restored a snapshot whose version byte is not {SNAPSHOT_VERSION}",
     );
+    Some(state)
+}
 
-    let encoded = snapshot::snapshot(&state)
+/// RFC0015.13: the decoded payload survives its own encoding.
+fn assert_payload_round_trips(state: &SnapshotState) {
+    let encoded = snapshot::snapshot(state)
         .unwrap_or_else(|e| panic!("RFC0015.13: a decoded snapshot does not re-encode: {e}"));
     match load_snapshot(&encoded) {
         Ok(again) => assert!(
-            again == state,
+            again == *state,
             "RFC0015.13: the snapshot payload did not survive its own encoding"
         ),
         Err(e) => panic!("RFC0015.13: the re-encoded snapshot does not decode: {e}"),
     }
+}
 
-    let tenant = TenantId::new(TENANT);
+/// Restore `state` into a fresh cluster. RFC0015.12: a rejected restore
+/// leaves the cluster exactly as it was, no tenant state and no template id
+/// allocated, and yields `None`.
+fn restore_or_assert_isolated(tenant: &TenantId, state: &SnapshotState) -> Option<MinerCluster> {
     let mut miner = MinerCluster::new(MinerConfig::default());
-    if let Err(e) = miner.restore_tenant(&tenant, &state) {
-        assert!(
-            miner.tenant_ids().is_empty() && miner.template_count(&tenant) == 0,
-            "RFC0015.12: a rejected restore ({e:?}) left state behind for the tenant"
-        );
-        assert_eq!(
-            miner.highest_allocated(),
-            0,
-            "RFC0015.12: a rejected restore ({e:?}) moved the template-id allocator"
-        );
-        return;
-    }
-    let restored = capture(&miner, &tenant);
+    let Err(e) = miner.restore_tenant(tenant, state) else {
+        return Some(miner);
+    };
     assert!(
-        leaf_identities(&restored) == leaf_identities(&state),
-        "RFC0015.13: a restored snapshot does not capture back the leaves it restored \
-         (template, version, key or wildcard route changed)"
+        miner.tenant_ids().is_empty() && miner.template_count(tenant) == 0,
+        "RFC0015.12: a rejected restore ({e:?}) left state behind for the tenant"
     );
-    assert!(
-        structured_keys(&restored) == structured_keys(&state),
-        "RFC0015.13: a restored snapshot does not capture back its structured-template map"
+    assert_eq!(
+        miner.highest_allocated(),
+        0,
+        "RFC0015.12: a rejected restore ({e:?}) moved the template-id allocator"
     );
+    None
+}
+
+/// RFC0015.13: the restored tree captures back the decoded state in its
+/// canonical form, field for field, and that capture restores to itself.
+fn assert_restore_faithful(miner: &MinerCluster, tenant: &TenantId, state: &SnapshotState) {
+    let restored = capture(miner, tenant);
+    let expected = canonical(state);
     assert!(
-        restored.wal_high_water == state.wal_high_water,
-        "RFC0015.13: a restored snapshot does not capture back its folded horizon"
+        restored == expected,
+        "RFC0015.13: a restored snapshot does not capture back what it restored\n\
+         restored: {restored:?}\nexpected: {expected:?}"
     );
     let mut again = MinerCluster::new(MinerConfig::default());
-    if let Err(e) = again.restore_tenant(&tenant, &restored) {
+    if let Err(e) = again.restore_tenant(tenant, &restored) {
         panic!("RFC0015.13: the snapshot of a restored tree does not restore: {e:?}");
     }
     assert!(
-        capture(&again, &tenant) == restored,
+        capture(&again, tenant) == restored,
         "RFC0015.13: restore → snapshot is not a fixpoint (the restored tree differs \
          from the tree it was captured from)"
     );
@@ -171,54 +198,110 @@ fn capture(miner: &MinerCluster, tenant: &TenantId) -> SnapshotState {
     state
 }
 
-/// What restore must reproduce exactly for each leaf: the fields it places
-/// and keys the leaf by. Slot types, provenance and associations are
-/// normalised on restore (an empty provenance reads as `{Mined}`), so they
-/// are held to the capture → restore → capture fixpoint instead.
-type LeafIdentity<'a> = (
-    u64,
-    &'a [TokenRecord],
-    u32,
-    u8,
-    Option<&'a str>,
-    &'a [usize],
-);
-
-/// Sorted by `template_id`, which a restore that succeeded holds unique.
-fn leaf_identities(state: &SnapshotState) -> Vec<LeafIdentity<'_>> {
-    let mut leaves: Vec<_> = state
+/// `state` as a restore must capture it back: every field the payload
+/// carries, in the writer's canonical form. The only rewrites are the ones
+/// the format documents: lists that are sets come back sorted and
+/// deduplicated, an empty provenance is the pre-RFC 0050 default (`{Mined}`
+/// on a leaf, `{UpstreamDerived}` on an owned adoption), an owned adoption
+/// has no tree leaf and so is version 1, and a tree-backed adoption carries
+/// no provenance or associations of its own (its leaf does).
+fn canonical(state: &SnapshotState) -> SnapshotState {
+    let mut leaves: Vec<LeafRecord> = state
         .leaves
         .iter()
-        .map(|leaf| {
-            (
-                leaf.template_id,
-                leaf.template.as_slice(),
-                leaf.template_version,
-                leaf.severity_number,
-                leaf.scope_name.as_deref(),
-                leaf.wildcard_routed.as_slice(),
-            )
+        .map(|leaf| LeafRecord {
+            slot_types: leaf.slot_types.iter().map(|slot| type_set(slot)).collect(),
+            provenance: provenance_set(&leaf.provenance, ProvenanceRecord::Mined),
+            upstream_associations: string_set(&leaf.upstream_associations),
+            ..leaf.clone()
         })
         .collect();
-    leaves.sort_by_key(|leaf| leaf.0);
-    leaves
+    leaves.sort_by_key(|leaf| leaf.template_id);
+
+    let mut structured_templates = state.structured_templates.clone();
+    structured_templates.sort_by_key(|record| record.template_id);
+
+    let mut adopted_templates: Vec<AdoptedTemplateRecord> = state
+        .adopted_templates
+        .iter()
+        .map(|record| {
+            if record.owned {
+                AdoptedTemplateRecord {
+                    template_version: 1,
+                    provenance: provenance_set(
+                        &record.provenance,
+                        ProvenanceRecord::UpstreamDerived,
+                    ),
+                    upstream_associations: string_set(&record.upstream_associations),
+                    ..record.clone()
+                }
+            } else {
+                AdoptedTemplateRecord {
+                    provenance: Vec::new(),
+                    upstream_associations: Vec::new(),
+                    upstream_association_overflow: 0,
+                    ..record.clone()
+                }
+            }
+        })
+        .collect();
+    adopted_templates
+        .sort_by(|a, b| (a.template_id, &a.canonical).cmp(&(b.template_id, &b.canonical)));
+
+    SnapshotState {
+        leaves,
+        structured_templates,
+        wal_high_water: state.wal_high_water.clone(),
+        adopted_templates,
+    }
 }
 
-fn structured_keys(state: &SnapshotState) -> Vec<(u64, u8, Option<&str>, Option<&str>)> {
-    let mut keys: Vec<_> = state
-        .structured_templates
-        .iter()
-        .map(|s| {
-            (
-                s.template_id,
-                s.severity_number,
-                s.scope_name.as_deref(),
-                s.event_name.as_deref(),
-            )
-        })
-        .collect();
-    keys.sort_unstable();
-    keys
+/// A slot's recorded types as a set, in `ParamType` declaration order with
+/// the reader-side `Unknown(n)` ordinals last, which the format promises to
+/// carry verbatim.
+fn type_set(types: &[ParamTypeRecord]) -> Vec<ParamTypeRecord> {
+    let rank = |t: &ParamTypeRecord| match t {
+        ParamTypeRecord::Ip => (0, 0),
+        ParamTypeRecord::Uuid => (1, 0),
+        ParamTypeRecord::Num => (2, 0),
+        ParamTypeRecord::Hex => (3, 0),
+        ParamTypeRecord::Ts => (4, 0),
+        ParamTypeRecord::Path => (5, 0),
+        ParamTypeRecord::Str => (6, 0),
+        ParamTypeRecord::Overflow => (7, 0),
+        ParamTypeRecord::Unknown(n) => (8, *n),
+    };
+    let mut set = types.to_vec();
+    set.sort_by_key(rank);
+    set.dedup();
+    set
+}
+
+/// A provenance list as a set in declaration order; empty reads as
+/// `default`.
+fn provenance_set(
+    provenance: &[ProvenanceRecord],
+    default: ProvenanceRecord,
+) -> Vec<ProvenanceRecord> {
+    let rank = |p: &ProvenanceRecord| match p {
+        ProvenanceRecord::Mined => 0,
+        ProvenanceRecord::UpstreamDerived => 1,
+        ProvenanceRecord::ProducerDeclared => 2,
+    };
+    if provenance.is_empty() {
+        return vec![default];
+    }
+    let mut set = provenance.to_vec();
+    set.sort_by_key(rank);
+    set.dedup();
+    set
+}
+
+fn string_set(strings: &[String]) -> Vec<String> {
+    let mut set = strings.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    set
 }
 
 fn manifest(bytes: &[u8]) {

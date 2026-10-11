@@ -51,6 +51,10 @@ encoders, for tenant `fuzz-tenant`:
   `snapshot_state` with `wal_high_water` set to `folded_horizon`;
   `manifest` is `Manifest::to_json`; `template-ids-high-water` is
   `ourios_ingester::template_ids::fuzzing::encode` (the `fuzzing` feature);
+- `seeds/artifact_decode/miner-snapshot-adopted` is the same capture from a
+  second cluster with `upstream_templates: Adopt`, fed lines carrying a
+  `log.record.template` attribute: one adoption converges on a mined leaf
+  (tree-backed) and one interns its own id (owned);
 - the drained audit events plus one `AliasAsserted` are written by
   `AuditWriter::open_in` to a `Store::in_memory()`;
 - `seeds/artifact_decode/template-map-frame` is `derive_template_map` over

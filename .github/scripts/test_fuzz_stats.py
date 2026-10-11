@@ -147,6 +147,28 @@ class BuildPoints(unittest.TestCase):
         self.assertNotIn("start_time", points["ourios.fuzz.runs"])
 
 
+    def test_attempt_that_failed_before_fuzzing_records_no_measurements(self):
+        log = (
+            "   Compiling ourios-fuzz v0.0.0 (/home/runner/work/ourios/ourios/fuzz)\n"
+            "error[E0425]: cannot find value `frame` in this scope\n"
+            "error: could not compile `ourios-fuzz` (bin \"wal_frame\") due to 1 previous error\n"
+            "Error: failed to build fuzz script: ASAN_OPTIONS=\"detect_odr_violation=0\" cargo build\n"
+        )
+        points = by_name(
+            fuzz_stats.build_points(
+                target="wal_frame",
+                result=fuzz_stats.classify(log, "failure"),
+                parsed=fuzz_stats.parse_log(log),
+                budget=300,
+                start=None,
+                end=None,
+                now=5.0,
+            )
+        )
+        self.assertEqual(sorted(points), ["ourios.fuzz.run.budget", "ourios.fuzz.runs"])
+        self.assertEqual(points["ourios.fuzz.runs"]["attributes"]["ourios.fuzz.result"], "error")
+
+
 class Main(unittest.TestCase):
     def run_main(self, *argv: str) -> dict:
         out = io.StringIO()

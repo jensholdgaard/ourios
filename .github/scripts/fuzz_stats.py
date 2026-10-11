@@ -91,6 +91,8 @@ def build_points(
     end: float | None,
     now: float,
 ) -> list[dict]:
+    """Every attempt counts in `ourios.fuzz.runs`; the measurements come only
+    from a log that reached fuzzing (one with a libFuzzer status line)."""
     attrs = {"ourios.fuzz.target": target, "ourios.fuzz.result": result}
     timing = {"time": end if end is not None else now}
     if start is not None:

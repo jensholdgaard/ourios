@@ -1,0 +1,36 @@
+[1m[92m    Finished[0m `release` profile [optimized + debuginfo] target(s) in 0.18s
+[1m[92m     Running[0m `fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json -artifact_prefix=/home/runner/work/ourios/ourios/fuzz/artifacts/otlp_json/ -max_total_time=300 /home/runner/work/ourios/ourios/fuzz/corpus/otlp_json`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 3386276058
+INFO: Loaded 1 modules   (17538 inline 8-bit counters): 17538 [0x55bda18268a0, 0x55bda182ad22), 
+INFO: Loaded 1 PC tables (17538 PCs): 17538 [0x55bda182ad28,0x55bda186f548), 
+INFO:        1 files found in /home/runner/work/ourios/ourios/fuzz/corpus/otlp_json
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 1 min: 19b max: 19b total: 19b rss: 98Mb
+#2	INITED cov: 90 ft: 91 corp: 1/19b exec/s: 0 rss: 98Mb
+	NEW_FUNC[1/11]: 0x55bda16a0010  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x1c7010) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+	NEW_FUNC[2/11]: 0x55bda16a9d40  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x1d0d40) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+#4	NEW    cov: 146 ft: 155 corp: 2/38b lim: 19 exec/s: 0 rss: 98Mb L: 19/19 MS: 2 ShuffleBytes-ChangeBit-
+	NEW_FUNC[1/4]: 0x55bda16a2040  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x1c9040) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+	NEW_FUNC[2/4]: 0x55bda16a8670  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x1cf670) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+#5	NEW    cov: 175 ft: 199 corp: 3/57b lim: 19 exec/s: 0 rss: 98Mb L: 19/19 MS: 1 CopyPart-
+	NEW_FUNC[1/9]: 0x55bda16a3c70  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x1cac70) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+	NEW_FUNC[2/9]: 0x55bda16aa0c0  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x1d10c0) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+#6	NEW    cov: 269 ft: 322 corp: 4/76b lim: 19 exec/s: 0 rss: 98Mb L: 19/19 MS: 1 ChangeBit-
+	NEW_FUNC[1/8]: 0x55bda170a460  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/otlp_json+0x231460) (BuildId: 558fc3e66819126d56adcc99202f1f6d17c92e15)
+#12132012	REDUCE cov: 3742 ft: 14525 corp: 4205/676Kb lim: 4096 exec/s: 40440 rss: 692Mb L: 823/4038 MS: 3 PersAutoDict-ChangeByte-EraseBytes- DE: "\034\000"-
+#12132039	REDUCE cov: 3742 ft: 14525 corp: 4205/676Kb lim: 4096 exec/s: 40440 rss: 692Mb L: 27/4038 MS: 2 CopyPart-EraseBytes-
+#12132375	REDUCE cov: 3742 ft: 14525 corp: 4205/676Kb lim: 4096 exec/s: 40441 rss: 692Mb L: 43/4038 MS: 1 EraseBytes-
+#12133741	REDUCE cov: 3742 ft: 14525 corp: 4205/676Kb lim: 4096 exec/s: 40445 rss: 692Mb L: 6/4038 MS: 1 EraseBytes-
+#12135052	REDUCE cov: 3742 ft: 14525 corp: 4205/676Kb lim: 4096 exec/s: 40450 rss: 692Mb L: 190/4038 MS: 1 EraseBytes-
+#12135052	DONE   cov: 3742 ft: 14525 corp: 4205/676Kb lim: 4096 exec/s: 40315 rss: 692Mb
+###### Recommended dictionary. ######
+"\013\000" # Uses: 4658
+"\377\377\377\377" # Uses: 4467
+###### End of recommended dictionary. ######
+Done 12135052 runs in 301 second(s)
+stat::number_of_executed_units: 12135052
+stat::average_exec_per_sec:     40316
+stat::new_units_added:          4204
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              692

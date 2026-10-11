@@ -1,0 +1,16 @@
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/miner_roundtrip -artifact_prefix=/home/runner/work/ourios/ourios/fuzz/artifacts/miner_roundtrip/ -max_total_time=300 -print_final_stats=1 /home/runner/work/ourios/ourios/fuzz/corpus/miner_roundtrip`
+INFO: Running with entropic power schedule (0xFF, 100).
+#7	INITED cov: 980 ft: 1210 corp: 6/402b exec/s: 0 rss: 70Mb
+#1048576	pulse  cov: 2210 ft: 6102 corp: 1033/1215Kb lim: 4096 exec/s: 9532 rss: 402Mb
+ALARM: working on the last Unit for 1201 seconds
+       and the timeout value is 1200 (use -timeout=N to change)
+MS: 2 InsertRepeatedBytes-CrossOver-; base unit: 1f4a6c2e8d0b3a5c7e9f1a2b4c6d8e0f1a3b5c7d
+artifact_prefix='/home/runner/work/ourios/ourios/fuzz/artifacts/miner_roundtrip/'; Test unit written to /home/runner/work/ourios/ourios/fuzz/artifacts/miner_roundtrip/timeout-9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b
+==5120== ERROR: libFuzzer: timeout after 1201 seconds
+SUMMARY: libFuzzer: timeout
+stat::number_of_executed_units: 1100001
+stat::average_exec_per_sec:     916
+stat::new_units_added:          1027
+stat::slowest_unit_time_sec:    1201
+stat::peak_rss_mb:              402
+Error: Fuzz target exited with exit status: 70

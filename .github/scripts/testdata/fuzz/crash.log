@@ -1,0 +1,47 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.21s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/wal_frame -artifact_prefix=/home/runner/work/ourios/ourios/fuzz/artifacts/wal_frame/ -max_total_time=300 -print_final_stats=1 /home/runner/work/ourios/ourios/fuzz/corpus/wal_frame`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 1418112233
+INFO: Loaded 1 modules   (9124 inline 8-bit counters): 9124 [0x55d0c1b0a8a0, 0x55d0c1b0cc44),
+INFO: Loaded 1 PC tables (9124 PCs): 9124 [0x55d0c1b0cc48,0x55d0c1b30688),
+INFO:        4 files found in /home/runner/work/ourios/ourios/fuzz/corpus/wal_frame
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 4 min: 12b max: 64b total: 140b rss: 61Mb
+#5	INITED cov: 211 ft: 240 corp: 4/140b exec/s: 0 rss: 61Mb
+#9	NEW    cov: 215 ft: 251 corp: 5/180b lim: 64 exec/s: 0 rss: 61Mb L: 40/64 MS: 4 ChangeBit-CopyPart-ShuffleBytes-InsertByte-
+#262144	pulse  cov: 402 ft: 911 corp: 88/9814b lim: 2050 exec/s: 87381 rss: 143Mb
+#300212	NEW    cov: 404 ft: 915 corp: 89/18Kb lim: 2050 exec/s: 85774 rss: 143Mb L: 1832/2050 MS: 2 InsertRepeatedBytes-CopyPart-
+
+thread '<unnamed>' panicked at fuzz_targets/wal_frame.rs:31:9:
+decoded frame length 1832 exceeds the segment remainder 1024
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+==2741== ERROR: libFuzzer: deadly signal
+    #0 0x55d0c1985a51 in __sanitizer_print_stack_trace /rustc/llvm/src/llvm-project/compiler-rt/lib/asan/asan_stack.cpp:87:3
+    #1 0x55d0c19f0d9a in fuzzer::PrintStackTrace() /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libfuzzer-sys-0.4.10/libfuzzer/FuzzerUtil.cpp:210:38
+    #2 0x55d0c19d6b45 in fuzzer::Fuzzer::CrashCallback() /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libfuzzer-sys-0.4.10/libfuzzer/FuzzerLoop.cpp:231:3
+
+NOTE: libFuzzer has rudimentary signal handlers.
+      Combine libFuzzer with AddressSanitizer or similar for better crash reports.
+SUMMARY: libFuzzer: deadly signal
+MS: 1 ChangeBinInt-; base unit: 5b2c1a4c0c7dbd2a3e8a9b5bd7a5a0f4b1b9d6e2
+artifact_prefix='/home/runner/work/ourios/ourios/fuzz/artifacts/wal_frame/'; Test unit written to /home/runner/work/ourios/ourios/fuzz/artifacts/wal_frame/crash-0b6d4c3a1f2e9d8c7b6a5f4e3d2c1b0a99887766
+Base64: AAAHKAAAAAA=
+stat::number_of_executed_units: 300418
+stat::average_exec_per_sec:     85833
+stat::new_units_added:          85
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              143
+
+────────────────────────────────────────────────────────────────────────────────
+
+Failing input:
+
+	fuzz/artifacts/wal_frame/crash-0b6d4c3a1f2e9d8c7b6a5f4e3d2c1b0a99887766
+
+Reproduce with:
+
+	cargo fuzz run --target=x86_64-unknown-linux-gnu wal_frame fuzz/artifacts/wal_frame/crash-0b6d4c3a1f2e9d8c7b6a5f4e3d2c1b0a99887766
+
+────────────────────────────────────────────────────────────────────────────────
+
+Error: Fuzz target exited with exit status: 77

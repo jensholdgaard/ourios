@@ -94,6 +94,13 @@ jobs:
             exit 1
           fi
           echo "$image is rustc $have, clears the MSRV of $msrv, and both fuzzing paths agree."
+      # The fuzz workflow's telemetry export (#942) only runs on main, so a
+      # parser or payload regression would otherwise surface a day late.
+      - name: Fuzz telemetry scripts pass their tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+          python3 -m unittest discover -s .github/actions/otlp-export -p 'test_*.py'
 
   clippy:
     name: cargo clippy

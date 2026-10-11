@@ -1,0 +1,46 @@
+name: OTLP metrics export
+description: >-
+  Send a JSON file of metric points to an OTLP/HTTP endpoint as OTLP/JSON,
+  tagged with the commit, the workflow run and the runner's spec.
+  Vendor-neutral: the backend is only an endpoint and a bearer token. When
+  either is empty the step prints a notice and succeeds, so a fork or an
+  unconfigured repo is a no-op. Callers should also set
+  `continue-on-error: true`, so a backend outage never fails a job (#942).
+
+inputs:
+  endpoint:
+    description: OTLP/HTTP base URL; `/v1/metrics` is appended. Empty skips the export.
+    required: false
+    default: ""
+  token:
+    description: Bearer token for the Authorization header. Empty skips the export.
+    required: false
+    default: ""
+  metrics-file:
+    description: Path to the metric points JSON (format in otlp_export.py).
+    required: true
+  service-name:
+    description: The `service.name` resource attribute.
+    required: true
+  resource-attributes:
+    description: Extra resource attributes, one key=value per line, applied last.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Export metrics over OTLP
+      shell: bash
+      env:
+        OTLP_EXPORT_ENDPOINT: ${{ inputs.endpoint }}
+        OTLP_EXPORT_TOKEN: ${{ inputs.token }}
+        METRICS_FILE: ${{ inputs.metrics-file }}
+        SERVICE_NAME: ${{ inputs.service-name }}
+        RESOURCE_ATTRIBUTES: ${{ inputs.resource-attributes }}
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/otlp_export.py" \
+          --metrics "${METRICS_FILE}" \
+          --service-name "${SERVICE_NAME}" \
+          --resource-attributes "${RESOURCE_ATTRIBUTES}" \
+          --runner-spec

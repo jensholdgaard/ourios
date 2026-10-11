@@ -39,6 +39,10 @@ jobs:
       fail-fast: false
       matrix:
         target: [miner_roundtrip, otlp_json, otlp_protobuf, wal_frame, dsl_parse]
+    env:
+      # 300 s per target on the daily schedule; 60 s on a manual dispatch.
+      BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
+      FUZZ_LOG: ${{ github.workspace }}/fuzz-run.log
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -54,18 +58,23 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - name: Smoke-fuzz ${{ matrix.target }}
-        env:
-          # 300 s per target on the daily schedule; 60 s on a manual dispatch.
-          BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
+      - name: Build ${{ matrix.target }}
         run: |
           set -euo pipefail
-          target='${{ matrix.target }}'
           # Force the gnu host triple. Left to default, cargo-fuzz picks
           # the musl target on the runner, whose statically-linked libc is
           # incompatible with the ASan sanitizer ("sanitizer is incompatible
           # with statically linked libc").
           host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
+          echo "FUZZ_HOST=${host}" >> "$GITHUB_ENV"
+          # Built in its own step so the run below times fuzzing alone; a
+          # target that stops compiling fails here.
+          cargo "+${NIGHTLY}" fuzz build '${{ matrix.target }}' --target "${host}"
+      - name: Smoke-fuzz ${{ matrix.target }}
+        id: fuzz
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
           mkdir -p "fuzz/corpus/${target}"
           # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
           # Copy the directory contents (`/.`) so an empty/odd glob can't
@@ -74,9 +83,14 @@ jobs:
           if [ -d "fuzz/seeds/${target}" ]; then
             cp -rn "fuzz/seeds/${target}/." "fuzz/corpus/${target}/"
           fi
-          # `fuzz run` also builds, so a target that stops compiling fails
-          # here too.
-          cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- -max_total_time="${BUDGET}"
+          # The log feeds the telemetry export below. `pipefail` keeps a
+          # crash failing this step through the `tee`.
+          echo "FUZZ_RUN_START=$(date +%s.%N)" >> "$GITHUB_ENV"
+          rc=0
+          cargo "+${NIGHTLY}" fuzz run "${target}" --target "${FUZZ_HOST}" -- \
+            -max_total_time="${BUDGET}" -print_final_stats=1 2>&1 | tee "${FUZZ_LOG}" || rc=$?
+          echo "FUZZ_RUN_END=$(date +%s.%N)" >> "$GITHUB_ENV"
+          exit "${rc}"
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -84,3 +98,32 @@ jobs:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore
+      # Trend telemetry for the external OTLP backend (#942): coverage,
+      # corpus, exec/s, memory and the outcome, per target. Only from
+      # trusted runs on main (the schedule, or a dispatch of main), never
+      # from a branch. It never affects the job: both steps continue on
+      # error, and the export is a no-op while the endpoint variable or the
+      # token secret is unset.
+      - name: Summarise the run as metrics
+        id: fuzz-metrics
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          TARGET: ${{ matrix.target }}
+          OUTCOME: ${{ steps.fuzz.outcome }}
+        run: |
+          python3 .github/scripts/fuzz_stats.py --log "${FUZZ_LOG}" --target "${TARGET}" \
+            --step-outcome "${OUTCOME}" --budget "${BUDGET}" \
+            --start "${FUZZ_RUN_START:-}" --end "${FUZZ_RUN_END:-}" \
+            > "${RUNNER_TEMP}/fuzz-metrics.json"
+      - name: Export the metrics over OTLP
+        if: always() && github.ref == 'refs/heads/main' && steps.fuzz-metrics.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/otlp-export
+        with:
+          endpoint: ${{ vars.OTLP_EXPORT_ENDPOINT }}
+          token: ${{ secrets.DASH0_AUTHORIZATION_TOKEN }}
+          metrics-file: ${{ runner.temp }}/fuzz-metrics.json
+          service-name: ourios-fuzz
+          resource-attributes: |
+            cicd.pipeline.task.name=smoke-fuzz ${{ matrix.target }}

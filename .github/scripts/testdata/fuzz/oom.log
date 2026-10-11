@@ -1,0 +1,55 @@
+[1m[92m    Finished[0m `release` profile [optimized + debuginfo] target(s) in 0.29s
+[1m[92m     Running[0m `fuzz/target/x86_64-unknown-linux-gnu/release/dsl_parse -artifact_prefix=/home/runner/work/ourios/ourios/fuzz/artifacts/dsl_parse/ -max_total_time=300 /home/runner/work/ourios/ourios/fuzz/corpus/dsl_parse`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 2290041245
+INFO: Loaded 1 modules   (17860 inline 8-bit counters): 17860 [0x5610053db5e0, 0x5610053dfba4), 
+INFO: Loaded 1 PC tables (17860 PCs): 17860 [0x5610053dfba8,0x5610054257e8), 
+INFO:       19 files found in /home/runner/work/ourios/ourios/fuzz/corpus/dsl_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 19 min: 35b max: 87b total: 1088b rss: 97Mb
+#20	INITED cov: 1198 ft: 1791 corp: 19/1088b exec/s: 0 rss: 97Mb
+	NEW_FUNC[1/1]: 0x5610052d4010  (/home/runner/work/ourios/ourios/fuzz/target/x86_64-unknown-linux-gnu/release/dsl_parse+0x256010) (BuildId: 3e794a04114b7365a52214e5f61e358d3d936a8a)
+#21	NEW    cov: 1208 ft: 1801 corp: 20/1161b lim: 87 exec/s: 0 rss: 97Mb L: 73/87 MS: 1 ChangeByte-
+#3604792	REDUCE cov: 3492 ft: 12396 corp: 2645/304Kb lim: 4096 exec/s: 37162 rss: 878Mb L: 24/4088 MS: 1 EraseBytes-
+#3605129	REDUCE cov: 3492 ft: 12396 corp: 2645/304Kb lim: 4096 exec/s: 37166 rss: 878Mb L: 16/4088 MS: 2 ChangeByte-EraseBytes-
+#3606340	REDUCE cov: 3492 ft: 12398 corp: 2646/304Kb lim: 4096 exec/s: 37178 rss: 878Mb L: 263/4088 MS: 1 InsertByte-
+#3607265	REDUCE cov: 3492 ft: 12398 corp: 2646/304Kb lim: 4096 exec/s: 37188 rss: 878Mb L: 152/4088 MS: 5 ShuffleBytes-EraseBytes-CMP-ShuffleBytes-ChangeByte- DE: "scope"-
+#3607356	REDUCE cov: 3492 ft: 12398 corp: 2646/304Kb lim: 4096 exec/s: 36809 rss: 878Mb L: 227/4088 MS: 1 EraseBytes-
+==3157== ERROR: libFuzzer: out-of-memory (used: 2051Mb; limit: 2048Mb)
+   To change the out-of-memory limit use -rss_limit_mb=<N>
+
+Live Heap Allocations: 27962878 bytes in 19962 chunks; quarantined: 219863755 bytes in 4361490 chunks; 2238850 other chunks; total chunks: 6620302; showing top 95% (at most 8 unique contexts)
+21233984 byte(s) (75%) in 1 allocation(s)
+MS: 2 PersAutoDict-EraseBytes- DE: "value"-; base unit: cdd5e544d92e4edbd55f89d57f13bbe4917948a4
+0x5b,0x5b,0x20,0x20,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0xd,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0x9,0xd,0x9,0x9,0x9,0x9,0x9,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x20,0x20,0x20,0x20,0x30,0x20,0x20,0x20,0x20,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0xff,0x5d,0x7b,0x20,0x20,0x20,0x9,0x9,0x9,0x31,0x31,0x2c,0x9,0x2a,0x0,0x0,0x0,0x0,0x0,0x0,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0x5d,0xff,0x5d,0x7b,0x20,0x20,0x20,0x5b,0x5b,0x5b,0x5a,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x5b,0x72,
+[[  [[[[[[[[[[[\015\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\011\015\011\011\011\011\011[[[[[[[[[[[[[[[[[[[[[[    0    ]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\377]{   \011\011\01111,\011*\000\000\000\000\000\000]]]]]]]]]]\377]{   [[[Z[[[[[[[[[r
+artifact_prefix='/home/runner/work/ourios/ourios/fuzz/artifacts/dsl_parse/'; Test unit written to /home/runner/work/ourios/ourios/fuzz/artifacts/dsl_parse/oom-4750f706de8328362ae2d6347277244514c27113
+Base64: W1sgIFtbW1tbW1tbW1tbDQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkNCQkJCQlbW1tbW1tbW1tbW1tbW1tbW1tbW1tbICAgIDAgICAgXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV3/XXsgICAJCQkxMSwJKgAAAAAAAF1dXV1dXV1dXV3/XXsgICBbW1taW1tbW1tbW1tbcg==
+stat::number_of_executed_units: 3607357
+stat::average_exec_per_sec:     36809
+stat::new_units_added:          2627
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              2051
+SUMMARY: libFuzzer: out-of-memory
+
+────────────────────────────────────────────────────────────────────────────────
+
+Failing input:
+
+	fuzz/artifacts/dsl_parse/oom-4750f706de8328362ae2d6347277244514c27113
+
+Output of `std::fmt::Debug`:
+
+	"[[  [[[[[[[[[[[\r\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\r\t\t\t\t\t[[[[[[[[[[[[[[[[[[[[[[    0    ]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+
+Reproduce with:
+
+	cargo fuzz run --target=x86_64-unknown-linux-gnu dsl_parse fuzz/artifacts/dsl_parse/oom-4750f706de8328362ae2d6347277244514c27113
+
+Minimize test case with:
+
+	cargo fuzz tmin --target=x86_64-unknown-linux-gnu dsl_parse fuzz/artifacts/dsl_parse/oom-4750f706de8328362ae2d6347277244514c27113
+
+────────────────────────────────────────────────────────────────────────────────
+
+Error: Fuzz target exited with exit status: 71

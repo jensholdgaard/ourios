@@ -10,7 +10,6 @@
 
 use arrow_array::{Array, ListArray, UInt64Array};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::statistics::Statistics;
@@ -216,8 +215,7 @@ pub fn decoded_max(
     bytes: bytes::Bytes,
     columns: IdColumns,
 ) -> Result<Option<u64>, AuditReaderError> {
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(AuditReaderError::Parquet)?;
+    let builder = crate::decode::arrow_reader_builder(bytes).map_err(AuditReaderError::Parquet)?;
     let leaves = id_leaves(builder.metadata(), columns);
     if leaves.is_empty() {
         return Ok(None);

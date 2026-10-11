@@ -40,7 +40,7 @@ use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
 use ourios_core::tenant::TenantId;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::errors::ParquetError;
 
 use crate::audit_columns;
@@ -69,7 +69,7 @@ impl AuditReader {
     ///   (filesystem-level errors from [`File::open`]).
     /// - [`AuditReaderError::Parquet`] on Parquet-footer parsing,
     ///   schema-parse, or reader-construction failures (anything
-    ///   surfaced by `ParquetRecordBatchReaderBuilder::try_new`
+    ///   surfaced by opening the Arrow reader builder
     ///   or `build`).
     /// - [`AuditReaderError::MissingRequiredColumn`] if the
     ///   file's schema lacks one of the §3.7 baseline REQUIRED
@@ -117,7 +117,7 @@ impl AuditReader {
         file_path: PathBuf,
     ) -> Result<Self, AuditReaderError> {
         let builder =
-            ParquetRecordBatchReaderBuilder::try_new(reader).map_err(AuditReaderError::Parquet)?;
+            crate::decode::arrow_reader_builder(reader).map_err(AuditReaderError::Parquet)?;
 
         require_baseline_columns(builder.schema(), &crate::audit_schema())?;
 

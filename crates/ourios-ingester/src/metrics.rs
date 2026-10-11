@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{
     Counter, Histogram, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
 };
-use opentelemetry::{KeyValue, global};
 use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
@@ -43,7 +43,7 @@ impl IngestMetrics {
     /// Build the ingest instruments with their registry units.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.ingest");
+        let meter = ourios_core::telemetry::meter("ourios.ingest");
         let records = meter
             .u64_counter(semconv::OURIOS_INGEST_RECORDS)
             .with_unit("{record}")
@@ -241,7 +241,7 @@ impl BarrierMetrics {
     /// time.
     #[must_use]
     pub fn new(epochs: &Arc<BarrierEpochs>) -> Self {
-        let meter = global::meter("ourios.ingest");
+        let meter = ourios_core::telemetry::meter("ourios.ingest");
         let cuts = meter
             .u64_counter(semconv::OURIOS_INGEST_BARRIER_CUTS)
             .with_unit("{cut}")
@@ -360,7 +360,7 @@ impl EncodePoolMetrics {
     /// Build the pool instruments with their registry units.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.ingest");
+        let meter = ourios_core::telemetry::meter("ourios.ingest");
         let queue_depth = meter
             .i64_up_down_counter(semconv::OURIOS_INGEST_ENCODE_QUEUE_DEPTH)
             .with_unit("{batch}")
@@ -405,7 +405,7 @@ impl SinkMetrics {
     /// Build the sink instruments with their registry units.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.sink");
+        let meter = ourios_core::telemetry::meter("ourios.sink");
         let flush_duration = meter
             .f64_histogram(semconv::OURIOS_SINK_FLUSH_DURATION)
             .with_unit("s")
@@ -513,7 +513,7 @@ impl AuditSinkMetrics {
     /// Build the audit-sink instruments with their registry units.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.audit_sink");
+        let meter = ourios_core::telemetry::meter("ourios.audit_sink");
         let flushes = meter
             .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSHES)
             .with_unit("{flush}")

@@ -3,12 +3,10 @@
 //! beneath it and a query waiting on another's acquisition a
 //! `wait template_map` span.
 //!
-//! The fold runs on the blocking pool, and a scoped subscriber does not
-//! reach a span opened there, so this test installs a process-global
-//! subscriber and tracer provider (RFC 0038 §3.7.4 item 3) and lives in its
-//! own integration binary, an RFC0028.2 process-isolation exemption. Its
-//! scenarios run in one `#[test]`, so nothing in the binary races the
-//! globals.
+//! Each test drives its queries under a scoped subscriber over its own
+//! tracer provider, so nothing global is installed. The fold opens its span
+//! on the blocking pool; the acquisition hands the caller's subscriber to
+//! that thread, which is what lets a scoped subscriber see it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,6 +22,7 @@ use ourios_parquet::{PartitionKey, Writer};
 use ourios_querier::Querier;
 use ourios_semconv as semconv;
 use tracing::Instrument as _;
+use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
 
 const TENANT: &str = "acme";
@@ -111,13 +110,29 @@ fn text(span: &SpanData, key: &str) -> Option<String> {
     attribute(span, key).map(|v| v.as_str().into_owned())
 }
 
+/// A scoped tracing pipeline over its own in-memory span exporter. Keep the
+/// provider alive until the spans are read.
+fn traced() -> (InMemorySpanExporter, SdkTracerProvider, tracing::Dispatch) {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test"))),
+    );
+    (exporter, provider, dispatch)
+}
+
 /// A cold acquisition: `load template_map` under the query, its `miss`
 /// outcome recorded, and the fold a `derive template_map` child of it.
-fn cold_acquisition(runtime: &tokio::runtime::Runtime, exporter: &InMemorySpanExporter) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_acquisition_spans_the_load_and_its_derive_under_the_query() {
+    let (exporter, _provider, dispatch) = traced();
     let dir = tempfile::tempdir().expect("tempdir");
     write(dir.path(), &[mined(TS0)]);
     let querier = Arc::new(Querier::new(dir.path()));
-    let query_id = runtime.block_on(query(querier));
+    let query_id = query(querier).with_subscriber(dispatch).await;
     let spans = exporter.get_finished_spans().expect("spans");
 
     let [load] = named(&spans, "load template_map")[..] else {
@@ -154,10 +169,11 @@ fn cold_acquisition(runtime: &tokio::runtime::Runtime, exporter: &InMemorySpanEx
 /// other's acquisition shows a `wait template_map` span under its own
 /// `load template_map`, whose outcome is `joined`.
 #[cfg(feature = "testing")]
-fn shared_acquisition(runtime: &tokio::runtime::Runtime, exporter: &InMemorySpanExporter) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_joining_an_acquisition_spans_its_wait() {
     use std::time::{Duration, Instant};
 
-    exporter.reset();
+    let (exporter, _provider, dispatch) = traced();
     let dir = tempfile::tempdir().expect("tempdir");
     write(dir.path(), &[mined(TS0)]);
     let querier = Arc::new(Querier::new(dir.path()));
@@ -171,14 +187,12 @@ fn shared_acquisition(runtime: &tokio::runtime::Runtime, exporter: &InMemorySpan
             std::thread::sleep(Duration::from_millis(2));
         }
     })));
-    runtime.block_on(async {
-        let tasks: Vec<_> = (0..2)
-            .map(|_| tokio::spawn(query(Arc::clone(&querier))))
-            .collect();
-        for task in tasks {
-            task.await.expect("query task");
-        }
-    });
+    let tasks: Vec<_> = (0..2)
+        .map(|_| tokio::spawn(query(Arc::clone(&querier)).with_subscriber(dispatch.clone())))
+        .collect();
+    for task in tasks {
+        task.await.expect("query task");
+    }
     querier.set_template_map_acquire_gate(None);
 
     let spans = exporter.get_finished_spans().expect("spans");
@@ -193,24 +207,4 @@ fn shared_acquisition(runtime: &tokio::runtime::Runtime, exporter: &InMemorySpan
         text(load, semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME).as_deref(),
         Some("joined")
     );
-}
-
-#[test]
-fn rfc0038_template_map_spans() {
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")))
-        .init();
-    opentelemetry::global::set_tracer_provider(provider);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .build()
-        .expect("runtime");
-
-    cold_acquisition(&runtime, &exporter);
-    #[cfg(feature = "testing")]
-    shared_acquisition(&runtime, &exporter);
 }

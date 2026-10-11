@@ -145,15 +145,21 @@ impl TemplateMapFlights {
         let mut waited = Duration::ZERO;
         loop {
             let span = tracing::Span::current();
+            // The caller's subscriber too, not just its span: the fold opens
+            // its own `derive template_map` span on the blocking thread,
+            // which otherwise resolves only the global default.
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
             let flights = Arc::clone(self);
             let backend = backend
                 .clone()
                 .with_caller(ourios_parquet::Caller::TemplateMap);
             let owned = tenant.clone();
             let step = tokio::task::spawn_blocking(move || {
-                span.in_scope(phase::attached(|| {
-                    flights.step(backend.store_ref(), &owned)
-                }))
+                tracing::dispatcher::with_default(&dispatch, || {
+                    span.in_scope(phase::attached(|| {
+                        flights.step(backend.store_ref(), &owned)
+                    }))
+                })
             })
             .await
             .map_err(|e| QueryError::Storage {

@@ -151,7 +151,7 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 >
 > | Target | Entry point | Oracle |
 > |---|---|---|
-> | `miner_roundtrip` ⭐ | the input split on `\n` (4 KiB per line, at most 64 lines, lossy UTF-8); every line a **string-body** record into one `MinerCluster` for one tenant, with observable record and audit sinks | §3.3 per row (RFC0015.1 as amended); §3.1 audit per ingest (RFC0015.1 as amended); §3.1 no silent merge (RFC0015.10) |
+> | `miner_roundtrip` ⭐ | the input as length-prefixed bodies (little-endian `u16` length, capped at 4 KiB, at most 64 bodies, lossy UTF-8; a body may contain `\n`, which the tokenizer treats as a separator); every body a **string-body** record into one `MinerCluster` for one tenant, with observable record and audit sinks | §3.3 per row (RFC0015.1 as amended); §3.1 audit per ingest (RFC0015.1 as amended); §3.1 no silent merge (RFC0015.10) |
 > | `otlp_json` | `decode_json(&[u8])` | no panic (RFC0015.2); an accepted request survives the protobuf round trip (RFC0015.9) |
 > | `otlp_protobuf` | `decode_protobuf(&[u8])` | no panic (RFC0015.3); decode → encode is a byte fixpoint (RFC0015.9) |
 > | `wal_frame` | `read_frame` on the raw input, and `read_frame(write_frame(kind, payload))` with the first byte picking the `FrameKind` | typed `FrameError`, never UB (RFC0015.4); the writer's frame reads back as `(kind, payload)`, fully consumed (RFC0015.9) |
@@ -393,8 +393,8 @@ the find.
 >   mapping back to `CLAUDE.md` is greppable
 
 > **Amendment (2026-10-11, #951, maintainer-approved): RFC0015.1 as
-> amended.** The **When** applies to *each line* of the input. Every
-> line is ingested into one `MinerCluster` that has an observable audit
+> amended.** The **When** applies to *each* length-prefixed body of
+> the input (a body may contain `\n`). Every body is ingested into one `MinerCluster` that has an observable audit
 > sink as well as the record sink. Each row's tokens are looked up by
 > its own `(template_id, template_version)` right after its ingest.
 > Added clauses:
@@ -608,8 +608,8 @@ confirmed as the RFC advances toward `green`):
 - [x] **`OtlpLogRecord` construction** → expect a **hand-written
   `Arbitrary` impl** (or a thin newtype) for the string-body path,
   rather than relying on `derive` across the body variants, if a derive
-  proves messy. *(Amended 2026-10-11, #951: neither — `miner_roundtrip` splits
-  the raw bytes on `\n` and builds each record with
+  proves messy. *(Amended 2026-10-11, #951: neither — `miner_roundtrip` reads
+  length-prefixed bodies off the raw bytes and builds each record with
   `..Default::default()`; `arbitrary` is no longer a direct dependency
   of the harness.)*
 
@@ -619,7 +619,7 @@ Still open, deferred to the implementation PRs:
   template **merge** behaviour (§3.1), not just single-line round-trip?
   Possible Phase 1.5. *(Amended 2026-10-11, #951: resolved inside
   `miner_roundtrip` rather than as a second binary — the input is a
-  line sequence into one tree, and the §3.1 checks run beside the §3.3
+  sequence of length-prefixed bodies into one tree, and the §3.1 checks run beside the §3.3
   one; §3.2 as amended, RFC0015.1 as amended, RFC0015.10.)*
 - [ ] **A structured-body round-trip target** exercising the §6.1
   canonical encoding (`AnyValue ↔ stored bytes` determinism), separate

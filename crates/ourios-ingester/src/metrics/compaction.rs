@@ -30,6 +30,7 @@ use opentelemetry::metrics::{
     Counter, Histogram, Meter, ObservableCounter, ObservableUpDownCounter,
 };
 use opentelemetry::{KeyValue, global};
+use ourios_core::histogram_buckets;
 use ourios_parquet::MemoryPhase;
 use ourios_semconv as semconv;
 
@@ -141,14 +142,43 @@ impl LiveInstruments {
     }
 }
 
+/// Bucket boundaries (bytes) for `ourios.storage.parquet.file.size`, the
+/// RFC 0009 §3.6 H4 detector: it alerts when more than 5 % of files are
+/// under 128 MiB, and the target band is 256 MiB–2 GiB inclusive, so all
+/// three are edges. Explicit buckets are `(previous, edge]`, so a strict
+/// or inclusive lower threshold sits one byte below its value.
+const FILE_SIZE_BUCKETS: [f64; 12] = [
+    65_536.0,        // 64 KiB
+    262_144.0,       // 256 KiB
+    1_048_576.0,     // 1 MiB
+    4_194_304.0,     // 4 MiB
+    16_777_216.0,    // 16 MiB
+    67_108_864.0,    // 64 MiB
+    134_217_727.0,   // 128 MiB − 1: the H4 alert counts files < 128 MiB
+    268_435_455.0,   // 256 MiB − 1: a 256 MiB file is in the target band
+    536_870_912.0,   // 512 MiB
+    1_073_741_824.0, // 1 GiB
+    2_147_483_648.0, // 2 GiB: the band's inclusive ceiling, already `(1 GiB, 2 GiB]`
+    4_294_967_296.0, // 4 GiB
+];
+
 /// A `u64` counter named `name` in `unit`.
 fn counter(meter: &Meter, name: &'static str, unit: &'static str) -> Counter<u64> {
     meter.u64_counter(name).with_unit(unit).build()
 }
 
-/// A `u64` histogram named `name` in `unit`.
-fn histogram(meter: &Meter, name: &'static str, unit: &'static str) -> Histogram<u64> {
-    meter.u64_histogram(name).with_unit(unit).build()
+/// A `u64` histogram named `name` in `unit`, bucketed at `boundaries`.
+fn histogram(
+    meter: &Meter,
+    name: &'static str,
+    unit: &'static str,
+    boundaries: &[f64],
+) -> Histogram<u64> {
+    meter
+        .u64_histogram(name)
+        .with_unit(unit)
+        .with_boundaries(boundaries.to_vec())
+        .build()
 }
 
 /// `ourios.compaction.backlog`, an **observable** (async) `UpDownCounter`: its
@@ -235,17 +265,29 @@ impl CompactionMetrics {
             duration: meter
                 .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
                 .with_unit("s")
+                .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
                 .build(),
             io: counter(meter, semconv::OURIOS_COMPACTION_IO, "By"),
-            file_size: histogram(meter, semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE, "By"),
+            file_size: histogram(
+                meter,
+                semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+                "By",
+                &FILE_SIZE_BUCKETS,
+            ),
             backlog_state,
             backlog,
             input_files: histogram(
                 meter,
                 semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
                 "{file}",
+                &histogram_buckets::FILE_COUNT,
             ),
-            input_size: histogram(meter, semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE, "By"),
+            input_size: histogram(
+                meter,
+                semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
+                "By",
+                &histogram_buckets::SIZE_BYTES,
+            ),
             gauges,
             live,
         }
@@ -420,6 +462,19 @@ mod tests {
 
     use super::*;
     use crate::compactor::{CompactedFile, TenantSweep};
+
+    // Explicit buckets are `(previous, edge]` and samples are whole bytes.
+    #[test]
+    fn file_size_buckets_put_the_h4_thresholds_on_edges() {
+        const MIB: f64 = 1_048_576.0;
+        let has_edge = |edge: f64| FILE_SIZE_BUCKETS.contains(&edge);
+        // RFC 0009 §3.6: the H4 alert counts files strictly under 128 MiB.
+        assert!(has_edge(128.0 * MIB - 1.0));
+        // RFC 0009 §3.6: a 256 MiB file is inside the 256 MiB–2 GiB band.
+        assert!(has_edge(256.0 * MIB - 1.0));
+        // RFC 0009 §3.6: a 2 GiB file is inside the band, too.
+        assert!(has_edge(2_048.0 * MIB));
+    }
 
     // Collected metric names across the in-memory export.
     fn collected_names(rms: &[ResourceMetrics]) -> Vec<String> {
@@ -643,6 +698,13 @@ mod tests {
         // in one binary would race — one test, one provider.)
         let rms = exporter.get_finished_metrics().expect("metrics exported");
         assert_instruments_exported(&rms);
+        ourios_telemetry::histogram_guard::assert_explicit_buckets(
+            &rms,
+            &[
+                semconv::OURIOS_COMPACTION_DURATION,
+                semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+            ],
+        );
 
         assert_sweeps_classified(&rms);
 

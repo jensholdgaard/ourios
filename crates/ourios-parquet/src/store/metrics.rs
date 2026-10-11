@@ -36,6 +36,7 @@ use object_store::client::{
 };
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 use opentelemetry::{KeyValue, global};
+use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
 use super::StoreError;
@@ -48,26 +49,6 @@ const ERROR_TYPE: &str = "error.type";
 const OTHER: &str = "_OTHER";
 /// `error.type` for a call dropped before it completed.
 const CANCELLED: &str = "cancelled";
-
-/// The bucket boundaries the HTTP semantic conventions advise for
-/// `http.client.request.duration`; the storage durations use them too, so
-/// a logical call and its attempts histogram alike.
-const DURATION_BUCKETS: [f64; 14] = [
-    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
-];
-
-/// Decades up to a million keys: the `#853` whole-prefix listing lands far
-/// above a windowed one.
-const LIST_OBJECT_BUCKETS: [f64; 8] = [
-    0.0,
-    1.0,
-    10.0,
-    100.0,
-    1_000.0,
-    10_000.0,
-    100_000.0,
-    1_000_000.0,
-];
 
 /// Threads the bridge runtime has started, workers and blocking-pool
 /// threads alike. A process-wide count, since the runtime is.
@@ -174,7 +155,7 @@ impl StoreMetrics {
             operation_duration: meter
                 .f64_histogram(semconv::OURIOS_STORAGE_OPERATION_DURATION)
                 .with_unit("s")
-                .with_boundaries(DURATION_BUCKETS.to_vec())
+                .with_boundaries(histogram_buckets::DURATION_S.to_vec())
                 .build(),
             retries: meter
                 .u64_counter(semconv::OURIOS_STORAGE_OPERATION_RETRIES)
@@ -183,7 +164,7 @@ impl StoreMetrics {
             list_objects: meter
                 .u64_histogram(semconv::OURIOS_STORAGE_LIST_OBJECTS)
                 .with_unit("{object}")
-                .with_boundaries(LIST_OBJECT_BUCKETS.to_vec())
+                .with_boundaries(histogram_buckets::COUNT_DECADES.to_vec())
                 .build(),
             bridge_active: meter
                 .i64_up_down_counter(semconv::OURIOS_STORAGE_BRIDGE_CALL_ACTIVE)
@@ -192,13 +173,13 @@ impl StoreMetrics {
             bridge_duration: meter
                 .f64_histogram(semconv::OURIOS_STORAGE_BRIDGE_DURATION)
                 .with_unit("s")
-                .with_boundaries(DURATION_BUCKETS.to_vec())
+                .with_boundaries(histogram_buckets::DURATION_S.to_vec())
                 .build(),
             http_duration: meter
                 .f64_histogram("http.client.request.duration")
                 .with_unit("s")
                 .with_description("Duration of HTTP client requests.")
-                .with_boundaries(DURATION_BUCKETS.to_vec())
+                .with_boundaries(histogram_buckets::DURATION_S.to_vec())
                 .build(),
         }
     }

@@ -80,6 +80,31 @@ const RESOURCE_SERVICE_NAME: &str = "service.name";
 /// state).
 const RESERVOIR_CAP: usize = 1024;
 
+/// Bucket boundaries for `ourios.miner.confidence` (`similarity /
+/// threshold`), exactly as RFC 0001 §6.8 fixes them: straddling the §6.3
+/// decision boundary at 1.0, with `+Inf` implicit.
+const CONFIDENCE_BUCKETS: [f64; 11] = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0];
+
+/// Bucket boundaries (seconds) for `ourios.miner.duration`, one line's
+/// mining time: microseconds normally, milliseconds when a tree search runs
+/// long.
+const LINE_DURATION_BUCKETS_S: [f64; 14] = [
+    0.000_001,
+    0.000_002_5,
+    0.000_005,
+    0.000_01,
+    0.000_025,
+    0.000_05,
+    0.000_1,
+    0.000_25,
+    0.000_5,
+    0.001,
+    0.002_5,
+    0.005,
+    0.01,
+    0.1,
+];
+
 /// Explicit bucket boundaries (bytes) for the `ourios.miner.structured_body.size`
 /// histogram (RFC 0037 §3.2). The SDK's default boundaries top out near 10 000,
 /// which for a byte measure collapses every structured body over ~10 KiB into
@@ -388,10 +413,12 @@ impl MinerMetrics {
         let confidence = meter
             .f64_histogram(semconv::OURIOS_MINER_CONFIDENCE)
             .with_unit("1")
+            .with_boundaries(CONFIDENCE_BUCKETS.to_vec())
             .build();
         let miner_duration = meter
             .f64_histogram(semconv::OURIOS_MINER_DURATION)
             .with_unit("s")
+            .with_boundaries(LINE_DURATION_BUCKETS_S.to_vec())
             .build();
         let structured_body_size = meter
             .u64_histogram(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE)
@@ -627,6 +654,15 @@ mod tests {
         // Computed off-lock from a snapshot, as the gauge callback does.
         assert!((super::quantile_of(r.snapshot(), 0.50).unwrap() - 0.5).abs() < 1e-9);
         assert!((super::quantile_of(r.snapshot(), 0.01).unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    /// RFC 0001 §6.8 fixes the `ourios.miner.confidence` buckets.
+    #[test]
+    fn confidence_buckets_are_the_rfc_0001_6_8_boundaries() {
+        assert_eq!(
+            super::CONFIDENCE_BUCKETS,
+            [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0],
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ use opentelemetry::metrics::{
     Counter, Histogram, ObservableGauge, ObservableUpDownCounter, UpDownCounter,
 };
 use opentelemetry::{KeyValue, global};
+use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
 use crate::cadence::BarrierEpochs;
@@ -54,6 +55,7 @@ impl IngestMetrics {
         let append_duration = meter
             .f64_histogram(semconv::OURIOS_WAL_APPEND_DURATION)
             .with_unit("s")
+            .with_boundaries(histogram_buckets::FAST_DURATION_S.to_vec())
             .build();
         // Seed the attribute-free counters so they are visible before the
         // first batch (collect-on-read); the histogram surfaces on a real
@@ -407,6 +409,7 @@ impl SinkMetrics {
         let flush_duration = meter
             .f64_histogram(semconv::OURIOS_SINK_FLUSH_DURATION)
             .with_unit("s")
+            .with_boundaries(histogram_buckets::DURATION_S.to_vec())
             .build();
         let flush_records = meter
             .u64_counter(semconv::OURIOS_SINK_FLUSH_RECORDS)

@@ -128,8 +128,9 @@ async fn sweep_remaining_counts_down_and_each_partition_records_its_input() {
     assert_eq!(i64_points(&rms, name), vec![(String::new(), 0)]);
     let input = |name, attribute| histogram(&rms, name, attribute).expect(name);
     let files = ourios_semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES;
-    assert_eq!(input(files, None), (4, 8), "two input files per partition");
     let size = ourios_semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE;
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(&rms, &[files, size]);
+    assert_eq!(input(files, None), (4, 8), "two input files per partition");
     let kind = ourios_semconv::OURIOS_COMPACTION_SIZE_KIND;
     let (encoded, decoded) = (
         input(size, Some((kind, "encoded"))),

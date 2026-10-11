@@ -40,8 +40,6 @@ fn invariant_3_1_1_default_threshold_is_0_7() {
 ///       mandatory name is present.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
-    use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
-
     use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -119,6 +117,17 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     // Assert — every mandatory §6.8 metric name is in the stream,
     // now backed by real data points carrying the required attributes.
     let rms = exporter.get_finished_metrics().expect("metrics exported");
+    assert_mandatory_exported(&rms, &MANDATORY);
+}
+
+/// Every `mandatory` name is in the exported stream, and (#949) no miner
+/// histogram falls back to the SDK's millisecond buckets.
+fn assert_mandatory_exported(
+    rms: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    mandatory: &[&str],
+) {
+    use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
+
     let names: Vec<String> = rms
         .iter()
         .flat_map(ResourceMetrics::scope_metrics)
@@ -126,12 +135,20 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
         .map(|m| m.name().to_string())
         .collect();
 
-    for expected in MANDATORY {
+    for expected in mandatory {
         assert!(
             names.iter().any(|n| n == expected),
             "exported stream missing mandatory §6.8 metric `{expected}`, got {names:?}",
         );
     }
+
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(
+        rms,
+        &[
+            ourios_semconv::OURIOS_MINER_CONFIDENCE,
+            ourios_semconv::OURIOS_MINER_DURATION,
+        ],
+    );
 }
 
 /// Scenario §3.2.1 — Default per-parameter byte limit is 256.

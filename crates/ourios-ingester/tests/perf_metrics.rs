@@ -47,6 +47,34 @@ fn u64_sum(rms: &[ResourceMetrics], name: &str, want: Option<&str>) -> u64 {
         .sum()
 }
 
+/// Every ingest and sink instrument is in the exported stream, and (#949)
+/// neither duration falls back to the SDK's millisecond buckets.
+fn assert_instruments_exported(rms: &[ResourceMetrics]) {
+    let collected = names(rms);
+    for expected in [
+        semconv::OURIOS_INGEST_RECORDS,
+        semconv::OURIOS_INGEST_BATCHES,
+        semconv::OURIOS_WAL_APPEND_DURATION,
+        semconv::OURIOS_SINK_FLUSH_DURATION,
+        semconv::OURIOS_SINK_FLUSH_RECORDS,
+        semconv::OURIOS_SINK_FLUSH_ERRORS,
+        semconv::OURIOS_SINK_DERIVE_ERRORS,
+        semconv::OURIOS_SINK_BUFFER_USAGE,
+    ] {
+        assert!(
+            collected.iter().any(|n| n == expected),
+            "exported stream missing {expected}, got {collected:?}",
+        );
+    }
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(
+        rms,
+        &[
+            semconv::OURIOS_WAL_APPEND_DURATION,
+            semconv::OURIOS_SINK_FLUSH_DURATION,
+        ],
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     // Arrange — install an in-memory global provider, then build the
@@ -67,22 +95,7 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
 
     // Assert — every new instrument is in the exported stream.
     let rms = exporter.get_finished_metrics().expect("metrics exported");
-    let collected = names(&rms);
-    for expected in [
-        semconv::OURIOS_INGEST_RECORDS,
-        semconv::OURIOS_INGEST_BATCHES,
-        semconv::OURIOS_WAL_APPEND_DURATION,
-        semconv::OURIOS_SINK_FLUSH_DURATION,
-        semconv::OURIOS_SINK_FLUSH_RECORDS,
-        semconv::OURIOS_SINK_FLUSH_ERRORS,
-        semconv::OURIOS_SINK_DERIVE_ERRORS,
-        semconv::OURIOS_SINK_BUFFER_USAGE,
-    ] {
-        assert!(
-            collected.iter().any(|n| n == expected),
-            "exported stream missing {expected}, got {collected:?}",
-        );
-    }
+    assert_instruments_exported(&rms);
 
     // Throughput counters carry the recorded totals.
     assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_RECORDS, None), 10);

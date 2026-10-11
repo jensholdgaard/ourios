@@ -43,6 +43,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use ourios_core::histogram_buckets;
 use ourios_core::otlp::canonical;
 use ourios_core::tenant::TenantId;
 use ourios_miner::reconstruct::Reconstruction;
@@ -137,24 +138,6 @@ const QUERY_KIND_REJECTED: &str = "rejected";
 /// `ourios.query.row_group.state` attribute values.
 const ROW_GROUP_SCANNED: &str = "scanned";
 const ROW_GROUP_PRUNED: &str = "pruned";
-/// Bucket boundaries for `ourios.query.files`. The SDK defaults are shaped
-/// for milliseconds; a wide window opens thousands of files.
-const QUERY_FILES_BUCKETS: [f64; 11] = [
-    0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1_000.0, 5_000.0,
-];
-/// Bucket boundaries (bytes) for `ourios.query.read.size`. The SDK defaults
-/// top out near 10 kB.
-const QUERY_READ_SIZE_BUCKETS: [f64; 9] = [
-    65_536.0,        // 64 KiB
-    262_144.0,       // 256 KiB
-    1_048_576.0,     // 1 MiB
-    4_194_304.0,     // 4 MiB
-    16_777_216.0,    // 16 MiB
-    67_108_864.0,    // 64 MiB
-    268_435_456.0,   // 256 MiB
-    1_073_741_824.0, // 1 GiB
-    4_294_967_296.0, // 4 GiB
-];
 /// The upstream OpenTelemetry `error.type` attribute key — a failed query is
 /// recorded on the duration metric with this set, not as a bespoke error metric
 /// (the "recording errors on metrics" convention).
@@ -181,6 +164,7 @@ impl QuerierMetrics {
         let duration = meter
             .f64_histogram(semconv::OURIOS_QUERY_DURATION)
             .with_unit("s")
+            .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
             .build();
         let row_groups = meter
             .u64_counter(semconv::OURIOS_QUERY_ROW_GROUPS)
@@ -189,12 +173,12 @@ impl QuerierMetrics {
         let files = meter
             .u64_histogram(semconv::OURIOS_QUERY_FILES)
             .with_unit("{file}")
-            .with_boundaries(QUERY_FILES_BUCKETS.to_vec())
+            .with_boundaries(histogram_buckets::FILE_COUNT.to_vec())
             .build();
         let read_size = meter
             .u64_histogram(semconv::OURIOS_QUERY_READ_SIZE)
             .with_unit("By")
-            .with_boundaries(QUERY_READ_SIZE_BUCKETS.to_vec())
+            .with_boundaries(histogram_buckets::SIZE_BYTES.to_vec())
             .build();
         // Seed each pruning state with a zero so both series are visible before
         // the first query. The `state` attribute is required (there is no

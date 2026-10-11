@@ -63,6 +63,20 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 /// `global::meter("ourios.<subsystem>")`; spans go through this one tracer.
 const TRACER_SCOPE: &str = "ourios";
 
+/// The scope `name`, versioned with this release. The library crates resolve
+/// theirs through `ourios_core::telemetry`, which this crate does not depend
+/// on.
+fn scope(name: &'static str) -> opentelemetry::InstrumentationScope {
+    opentelemetry::InstrumentationScope::builder(name)
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .build()
+}
+
+/// The tracer every Ourios span goes through, under the versioned scope.
+fn ourios_tracer(provider: &SdkTracerProvider) -> opentelemetry_sdk::trace::SdkTracer {
+    provider.tracer_with_scope(scope(TRACER_SCOPE))
+}
+
 /// Bootstrap configuration for the metrics pipeline.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
@@ -555,7 +569,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         // attributes we add deliberately. `thread.{id,name}` are valid semconv
         // (kept by leaving `with_threads` at its default).
         let layer = tracing_opentelemetry::layer()
-            .with_tracer(tracer_provider.tracer(TRACER_SCOPE))
+            .with_tracer(ourios_tracer(&tracer_provider))
             .with_tracked_inactivity(false)
             .with_location(false)
             .with_target(false)
@@ -639,10 +653,10 @@ fn meter_provider(
         .with_reader(reader)
         .with_resource(resource.clone())
         .build();
-    process::register(&provider.meter(process::SCOPE));
+    process::register(&provider.meter_with_scope(scope(process::SCOPE)));
     // The runtime `init` runs on is the binary's main runtime.
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime::register(&provider.meter(runtime::SCOPE), &runtime);
+        runtime::register(&provider.meter_with_scope(scope(runtime::SCOPE)), &runtime);
     }
     Ok(provider)
 }
@@ -875,7 +889,7 @@ mod tests {
             ..TelemetryConfig::new("ourios-test")
         })
         .expect("init over OTLP/HTTP without a runtime");
-        global::meter("ourios.compaction")
+        global::meter_with_scope(scope("ourios.compaction"))
             .u64_counter("ourios.compaction.sweeps")
             .build()
             .add(1, &[]);
@@ -1049,6 +1063,26 @@ mod tests {
                     .is_some_and(|b| format!("{b:?}").contains("compaction sweep finished"))
             }),
             "the tracing event should surface as an OTel log record, got {records:?}",
+        );
+    }
+
+    #[test]
+    fn spans_and_meters_carry_the_release_as_scope_version() {
+        use opentelemetry::trace::Tracer as _;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        ourios_tracer(&provider).in_span("scoped", |_| {});
+        let spans = exporter.get_finished_spans().expect("spans exported");
+        let scope = &spans.first().expect("one span").instrumentation_scope;
+        assert_eq!(scope.name(), TRACER_SCOPE);
+        assert_eq!(scope.version(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            super::scope(process::SCOPE).version(),
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 

@@ -18,8 +18,8 @@
 //! This module is `pub(crate)` by default — `Wal::append` (write
 //! side) and `Wal::replay` (read side) compose against it without
 //! needing the byte layout. The `fuzzing` feature re-exports it as
-//! `pub` so the `fuzz/` `wal_frame` target can drive `read_frame`
-//! directly (RFC 0015); that is not a stable public API.
+//! `pub` so the `fuzz/` `wal_frame` target can drive `read_frame` and
+//! `write_frame` directly (RFC 0015); that is not a stable public API.
 
 use std::io::{Read, Write};
 
@@ -127,11 +127,7 @@ fn checksum_input(kind: u8, payload: &[u8]) -> u32 {
 /// guards against a future caller forgetting; release builds
 /// would write a valid-but-corruption-on-read frame, which
 /// `read_frame` surfaces as `OversizeLen`).
-pub(crate) fn write_frame<W: Write>(
-    w: &mut W,
-    kind: FrameKind,
-    payload: &[u8],
-) -> std::io::Result<()> {
+pub fn write_frame<W: Write>(w: &mut W, kind: FrameKind, payload: &[u8]) -> std::io::Result<()> {
     debug_assert!(
         payload.len() <= MAX_FRAME_BYTES,
         "write_frame called with oversize payload — caller must check first",

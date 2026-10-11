@@ -7,14 +7,16 @@
 name = "ourios-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
+# `prost::Message` for the decode → encode fixpoint oracle on the OTLP
+# targets (`common/otlp.rs`); the same prost the ingester decodes with.
+prost = { version = "0.14", default-features = false, features = ["std"] }
 ourios-config = { path = "../crates/ourios-config" }
 ourios-core = { path = "../crates/ourios-core" }
 ourios-miner = { path = "../crates/ourios-miner" }
@@ -26,7 +28,8 @@ ourios-querier = { path = "../crates/ourios-querier" }
 # path, so the package keeps no library API per RFC 0015 §3.1).
 ourios-telemetry = { path = "../crates/ourios-telemetry", features = ["http-proto"] }
 
-# Drain-template + bit-identical reconstruction round-trip (§3.3 / §3.1).
+# Merge sequence: every line of the input into one tree, then bit-identical
+# reconstruction per row (§3.3) and no silent merge across rows (§3.1).
 [[bin]]
 name = "miner_roundtrip"
 path = "fuzz_targets/miner_roundtrip.rs"
@@ -34,7 +37,8 @@ test = false
 doc = false
 bench = false
 
-# Untrusted-input boundary: OTLP/JSON decode must never panic.
+# Untrusted-input boundary: OTLP/JSON decode must never panic, and what it
+# accepts must survive the protobuf round trip the WAL stores.
 [[bin]]
 name = "otlp_json"
 path = "fuzz_targets/otlp_json.rs"
@@ -42,7 +46,8 @@ test = false
 doc = false
 bench = false
 
-# Untrusted-input boundary: OTLP/protobuf decode must never panic.
+# Untrusted-input boundary: OTLP/protobuf decode must never panic, and
+# decode → encode must be a fixpoint.
 [[bin]]
 name = "otlp_protobuf"
 path = "fuzz_targets/otlp_protobuf.rs"
@@ -50,7 +55,8 @@ test = false
 doc = false
 bench = false
 
-# WAL frame decode: malformed bytes must yield a typed FrameError, never UB.
+# WAL frame decode: malformed bytes must yield a typed FrameError, never UB;
+# a frame the writer produces reads back as (kind, payload).
 [[bin]]
 name = "wal_frame"
 path = "fuzz_targets/wal_frame.rs"
@@ -59,7 +65,8 @@ doc = false
 bench = false
 
 # Untrusted-input boundary: the RFC 0002 DSL parsers (pipe text and the
-# structured-JSON variant) serve /v1/query and MCP; they must never panic.
+# structured-JSON variant) serve /v1/query and MCP; they must never panic,
+# and an accepted query must round-trip its canonical form (RFC0002.7).
 [[bin]]
 name = "dsl_parse"
 path = "fuzz_targets/dsl_parse.rs"

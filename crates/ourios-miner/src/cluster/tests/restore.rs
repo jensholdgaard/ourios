@@ -206,6 +206,55 @@ fn restore_rejects_inconsistent_slot() {
 }
 
 #[test]
+fn restore_rejects_an_unknown_slot_type() {
+    // `SlotTypes` cannot hold an `Unknown` ordinal. Restored, a slot of
+    // only unknowns came back empty, and the next snapshot's restore
+    // rejected that empty set; mixed with known types it was dropped. The
+    // wildcard sits past the walk so no path-tag check rejects it first.
+    let leaf = |slot: Vec<ParamTypeRecord>| LeafRecord {
+        template: vec![
+            TokenRecord::Fixed("a".to_string()),
+            TokenRecord::Fixed("b".to_string()),
+            TokenRecord::Fixed("c".to_string()),
+            TokenRecord::Fixed("d".to_string()),
+            TokenRecord::Wildcard,
+        ],
+        template_id: 1,
+        template_version: 1,
+        severity_number: 0,
+        scope_name: None,
+        slot_types: vec![slot],
+        provenance: vec![],
+        upstream_associations: vec![],
+        upstream_association_overflow: 0,
+        wildcard_routed: vec![],
+    };
+    for slot in [
+        vec![ParamTypeRecord::Unknown(5)],
+        vec![ParamTypeRecord::Num, ParamTypeRecord::Unknown(5)],
+    ] {
+        let state = SnapshotState {
+            leaves: vec![leaf(slot.clone())],
+            structured_templates: vec![],
+            wal_high_water: None,
+            adopted_templates: vec![],
+        };
+        let t = TenantId::new("tenant-x");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let err = cluster
+            .restore_tenant(&t, &state)
+            .expect_err("an Unknown slot type cannot be restored faithfully");
+
+        assert!(
+            matches!(err, RestoreError::Inconsistent { .. }),
+            "{slot:?}: {err:?}"
+        );
+        assert_eq!(cluster.template_count(&t), 0, "{slot:?}: no partial state");
+    }
+}
+
+#[test]
 fn restore_rejects_duplicate_template_id() {
     // Ids are unique cluster-wide; the same id on a leaf and a
     // structured template could not come from a live tree.

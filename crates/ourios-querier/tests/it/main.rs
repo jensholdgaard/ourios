@@ -12,6 +12,7 @@
 mod common;
 
 mod boundary;
+mod corrupt_audit_object;
 mod drift;
 mod execution;
 mod forward_compat;

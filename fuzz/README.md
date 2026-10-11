@@ -17,7 +17,8 @@ cargo install cargo-fuzz --locked
 # seeds, then run one target; the targets with a fuzz/dict/<target>.dict take it.
 target=dsl_parse
 mkdir -p fuzz/corpus/$target && cp -n fuzz/seeds/$target/* fuzz/corpus/$target/
-cargo +nightly-2026-06-01 fuzz run $target -- -max_total_time=60 -dict=fuzz/dict/$target.dict
+dict=; [ -f fuzz/dict/$target.dict ] && dict=-dict=fuzz/dict/$target.dict
+cargo +nightly-2026-06-01 fuzz run $target -- -max_total_time=60 $dict
 ```
 
 `cargo +nightly-2026-06-01 fuzz build` compiles every target (ASan, debug
@@ -51,6 +52,10 @@ encoders, for tenant `fuzz-tenant`:
   `snapshot_state` with `wal_high_water` set to `folded_horizon`;
   `manifest` is `Manifest::to_json`; `template-ids-high-water` is
   `ourios_ingester::template_ids::fuzzing::encode` (the `fuzzing` feature);
+- `seeds/artifact_decode/miner-snapshot-adopted` is the same capture from a
+  second cluster with `upstream_templates: Adopt`, fed lines carrying a
+  `log.record.template` attribute: one adoption converges on a mined leaf
+  (tree-backed) and one interns its own id (owned);
 - the drained audit events plus one `AliasAsserted` are written by
   `AuditWriter::open_in` to a `Store::in_memory()`;
 - `seeds/artifact_decode/template-map-frame` is `derive_template_map` over

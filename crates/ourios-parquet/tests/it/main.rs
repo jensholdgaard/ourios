@@ -11,6 +11,8 @@
 mod audit_round_trip;
 mod audit_row_vs_path_validation;
 mod buffer_and_put;
+mod corrupt_arrow_schema;
+mod decoder_panics;
 mod effective_timestamp;
 mod idle_connection_reaping;
 mod no_body_dict;

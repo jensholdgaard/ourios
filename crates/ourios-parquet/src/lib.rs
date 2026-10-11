@@ -37,6 +37,7 @@ pub mod compaction;
 mod decode;
 pub mod id_max;
 pub mod manifest;
+mod panic_boundary;
 mod parquet_io;
 pub mod partition;
 pub mod promoted;

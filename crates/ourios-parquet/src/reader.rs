@@ -37,12 +37,12 @@ use arrow_array::cast::AsArray;
 // for both readers, generic over the error type.
 #[allow(clippy::wildcard_imports)]
 use crate::decode::*;
+use crate::panic_boundary::{Batches, guard_decode};
 use arrow_array::types::Int32Type;
 use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::errors::ParquetError;
 
 use crate::columns;
@@ -57,7 +57,7 @@ use crate::store::{Store, StoreError};
 /// (the RFC 0036 §3.2 merge holds exactly one batch per sorted
 /// run through this entry point).
 pub struct Reader {
-    inner: ParquetRecordBatchReader,
+    inner: Batches,
     partition: Option<PartitionKey>,
     file_path: PathBuf,
     /// Stream-global index of the next batch's first row, so per-row
@@ -148,13 +148,14 @@ impl Reader {
     /// [`Self::open_partition`] seam, a sentinel on [`Self::open_bytes`]).
     /// Applies the §3.9 baseline-column check; leaves `partition` unset.
     fn from_bytes(bytes: bytes::Bytes, file_path: PathBuf) -> Result<Self, ReaderError> {
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(ReaderError::Parquet)?;
-        require_baseline_columns(builder.schema(), &crate::data_schema())?;
-        let inner = builder.build().map_err(ReaderError::Parquet)?;
+        let inner = guard_decode(&file_path, || {
+            let builder = arrow_reader_builder(bytes).map_err(ReaderError::Parquet)?;
+            require_baseline_columns(builder.schema(), &crate::data_schema())?;
+            builder.build().map_err(ReaderError::Parquet)
+        })?;
 
         Ok(Self {
-            inner,
+            inner: Batches::new(inner),
             partition: None,
             file_path,
             row_offset: 0,
@@ -174,15 +175,16 @@ impl Reader {
             path: path.to_path_buf(),
             source,
         })?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(ReaderError::Parquet)?;
-        require_baseline_columns(builder.schema(), &crate::data_schema())?;
-        let inner = builder
-            .with_batch_size(batch_rows)
-            .build()
-            .map_err(ReaderError::Parquet)?;
+        let inner = guard_decode(path, || {
+            let builder = arrow_reader_builder(file).map_err(ReaderError::Parquet)?;
+            require_baseline_columns(builder.schema(), &crate::data_schema())?;
+            builder
+                .with_batch_size(batch_rows)
+                .build()
+                .map_err(ReaderError::Parquet)
+        })?;
         Ok(Self {
-            inner,
+            inner: Batches::new(inner),
             partition: None,
             file_path: path.to_path_buf(),
             row_offset: 0,
@@ -199,13 +201,10 @@ impl Reader {
     ///
     /// See [`Self::read_all`].
     pub fn next_batch(&mut self) -> Result<Option<Vec<MinedRecord>>, ReaderError> {
-        // `ParquetRecordBatchReader` yields `ArrowError`;
-        // `From<ArrowError> for ParquetError` lets us
-        // route everything through the same variant.
-        let Some(batch) = self.inner.next() else {
+        let Some(batch) = self.inner.next_batch(&self.file_path) else {
             return Ok(None);
         };
-        let batch = batch.map_err(|e| ReaderError::Parquet(e.into()))?;
+        let batch = batch?;
         let records = batch_to_mined_records(&batch, self.row_offset, ShapeValidation::Enforce)?;
         if let Some(p) = &self.partition {
             for (idx_in_batch, r) in records.iter().enumerate() {
@@ -291,6 +290,10 @@ pub enum ReaderError {
     /// can't fit in `i64` — same RFC 0005 §3.2 overflow contract
     /// the writer enforces.
     TimestampOverflow(TimestampOverflowError),
+    /// The `parquet`/`arrow` decoders panicked on the file instead of
+    /// returning an error. Treat as file corruption; `message` is the
+    /// panic's.
+    DecodePanicked { path: PathBuf, message: String },
 }
 
 impl fmt::Display for ReaderError {
@@ -344,6 +347,11 @@ impl fmt::Display for ReaderError {
                 expected.hour,
             ),
             Self::TimestampOverflow(e) => write!(f, "{e}"),
+            Self::DecodePanicked { path, message } => write!(
+                f,
+                "the parquet decoder panicked on {} (a corrupt file): {message}",
+                path.display(),
+            ),
         }
     }
 }
@@ -356,7 +364,8 @@ impl std::error::Error for ReaderError {
             Self::TimestampOverflow(e) => Some(e),
             Self::MissingRequiredColumn { .. }
             | Self::Conversion { .. }
-            | Self::PartitionMismatch { .. } => None,
+            | Self::PartitionMismatch { .. }
+            | Self::DecodePanicked { .. } => None,
             Self::AttributeDecode { source, .. } => Some(source),
         }
     }
@@ -370,6 +379,15 @@ impl crate::decode::DecodeError for ReaderError {
     }
     fn conversion(column: &'static str, detail: String) -> Self {
         Self::Conversion { column, detail }
+    }
+    fn parquet(source: ParquetError) -> Self {
+        Self::Parquet(source)
+    }
+    fn decode_panicked(path: &Path, message: String) -> Self {
+        Self::DecodePanicked {
+            path: path.to_path_buf(),
+            message,
+        }
     }
 }
 

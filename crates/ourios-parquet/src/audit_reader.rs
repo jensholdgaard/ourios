@@ -28,6 +28,7 @@
 // The shared accessor family (epic #745 wave 2).
 #[allow(clippy::wildcard_imports)]
 use crate::decode::*;
+use crate::panic_boundary::{Batches, guard_decode};
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -40,7 +41,6 @@ use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
 use ourios_core::tenant::TenantId;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::errors::ParquetError;
 
 use crate::audit_columns;
@@ -55,7 +55,7 @@ use crate::partition::PartitionKey;
 
 /// Streaming Parquet reader for one audit file.
 pub struct AuditReader {
-    inner: ParquetRecordBatchReader,
+    inner: Batches,
     partition: Option<PartitionKey>,
     file_path: PathBuf,
 }
@@ -69,7 +69,7 @@ impl AuditReader {
     ///   (filesystem-level errors from [`File::open`]).
     /// - [`AuditReaderError::Parquet`] on Parquet-footer parsing,
     ///   schema-parse, or reader-construction failures (anything
-    ///   surfaced by `ParquetRecordBatchReaderBuilder::try_new`
+    ///   surfaced by opening the Arrow reader builder
     ///   or `build`).
     /// - [`AuditReaderError::MissingRequiredColumn`] if the
     ///   file's schema lacks one of the §3.7 baseline REQUIRED
@@ -109,6 +109,17 @@ impl AuditReader {
         Self::from_chunk_reader(bytes, PathBuf::from("<object-store>"))
     }
 
+    /// [`Self::open_bytes`] for the bytes of the store object `key`, which
+    /// diagnostics then name: a corrupt object's error and log say which
+    /// object to look at.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_bytes`].
+    pub fn open_object_bytes(bytes: bytes::Bytes, key: &str) -> Result<Self, AuditReaderError> {
+        Self::from_chunk_reader(bytes, PathBuf::from(key))
+    }
+
     /// Build the reader from any Parquet [`ChunkReader`] (a `File` or in-memory
     /// `Bytes`), enforcing the §3.7 baseline-REQUIRED-column check. Shared by
     /// [`Self::open_file`] and [`Self::open_bytes`].
@@ -116,15 +127,14 @@ impl AuditReader {
         reader: R,
         file_path: PathBuf,
     ) -> Result<Self, AuditReaderError> {
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(reader).map_err(AuditReaderError::Parquet)?;
-
-        require_baseline_columns(builder.schema(), &crate::audit_schema())?;
-
-        let inner = builder.build().map_err(AuditReaderError::Parquet)?;
+        let inner = guard_decode(&file_path, || {
+            let builder = arrow_reader_builder(reader).map_err(AuditReaderError::Parquet)?;
+            require_baseline_columns(builder.schema(), &crate::audit_schema())?;
+            builder.build().map_err(AuditReaderError::Parquet)
+        })?;
 
         Ok(Self {
-            inner,
+            inner: Batches::new(inner),
             partition: None,
             file_path,
         })
@@ -141,9 +151,10 @@ impl AuditReader {
         let mut out = Vec::new();
         let partition = self.partition;
         let file_path = self.file_path;
+        let mut batches = self.inner;
         let mut row_offset: usize = 0;
-        for batch in self.inner {
-            let batch = batch.map_err(|e| AuditReaderError::Parquet(e.into()))?;
+        while let Some(batch) = batches.next_batch(&file_path) {
+            let batch = batch?;
             let events = batch_to_audit_events(&batch, row_offset)?;
             if let Some(p) = &partition {
                 for (idx_in_batch, e) in events.iter().enumerate() {
@@ -190,6 +201,13 @@ pub enum AuditReaderError {
         expected: PartitionKey,
         actual: PartitionKey,
     },
+    /// The `parquet`/`arrow` decoders panicked on the file instead of
+    /// returning an error. Treat as file corruption; `message` is the
+    /// panic's.
+    DecodePanicked {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for AuditReaderError {
@@ -235,6 +253,11 @@ impl fmt::Display for AuditReaderError {
                 expected.month,
                 expected.day,
             ),
+            Self::DecodePanicked { path, message } => write!(
+                f,
+                "the parquet decoder panicked on {} (a corrupt file): {message}",
+                path.display(),
+            ),
         }
     }
 }
@@ -247,7 +270,8 @@ impl std::error::Error for AuditReaderError {
             Self::MissingRequiredColumn { .. }
             | Self::Conversion { .. }
             | Self::TimestampDecode { .. }
-            | Self::PartitionMismatch { .. } => None,
+            | Self::PartitionMismatch { .. }
+            | Self::DecodePanicked { .. } => None,
         }
     }
 }
@@ -260,6 +284,15 @@ impl crate::decode::DecodeError for AuditReaderError {
     }
     fn conversion(column: &'static str, detail: String) -> Self {
         Self::Conversion { column, detail }
+    }
+    fn parquet(source: ParquetError) -> Self {
+        Self::Parquet(source)
+    }
+    fn decode_panicked(path: &Path, message: String) -> Self {
+        Self::DecodePanicked {
+            path: path.to_path_buf(),
+            message,
+        }
     }
 }
 

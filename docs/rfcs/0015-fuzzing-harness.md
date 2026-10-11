@@ -197,8 +197,8 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 
 > **Amendment (2026-10-11, #955, maintainer-approved): a sixth target for
 > the persisted artifacts.** The process reads back from object storage
-> bytes it may not have written, or wrote in an older version; a decoder
-> that panics or half-applies them turns every restart into a crash loop
+> bytes it may not have written, or may have written in an older version;
+> a decoder that panics or half-applies them turns every restart into a crash loop
 > or a silently wrong state (#892: an unreadable self-written snapshot
 > made every restart rebuild from the WAL). One target covers the small
 > JSON artifacts, the first input byte picking the decoder:
@@ -612,10 +612,14 @@ the find.
 > survives its writer** (amendment 2026-10-11, #955)
 > - **When** a snapshot decodes, its payload re-encodes and decodes
 >   equal; when it restores, the captured state (stamped with the
->   folded horizon) has the same leaves — `template_id`, tokens,
->   version, `(severity_number, scope_name)` key and wildcard route —
->   the same structured-template map and the same horizon, and
->   restores again to an equal capture
+>   folded horizon) equals the decoded state in canonical form: every
+>   field of every leaf, structured-template entry and adopted
+>   template, and the horizon, with only the format's documented
+>   rewrites (set-valued lists sorted and deduplicated, an empty
+>   provenance read as its pre-RFC 0050 default, an owned adoption at
+>   version 1, a tree-backed adoption carrying no provenance or
+>   associations of its own); and that capture restores again to an
+>   equal capture
 > - **When** a manifest decodes, `to_json` decodes back equal and is a
 >   byte fixpoint; when the high-water parses, `encode` parses back to
 >   the same id (and so does every id in the domain)
@@ -671,8 +675,9 @@ greppable (`docs/verification.md` §2).
 > **Amendment (2026-10-11, #955, maintainer-approved): testing
 > RFC0015.11–.13.** Each oracle was shown to fire the same way before
 > landing: a restore that moves the id allocator before rejecting, a
-> snapshot writer that drops the wildcard route, a manifest reader that
-> skips `validate`, a high-water encoder off by one, a template-map
+> snapshot writer that drops the wildcard route, a restore that drops
+> the adopted templates, a manifest reader that skips `validate`, a
+> high-water encoder off by one, a template-map
 > writer that drops the alias classes, and `recover` reporting a corrupt
 > snapshot as absent each crashed on a seed or a crafted input with the
 > expected message, and were reverted.

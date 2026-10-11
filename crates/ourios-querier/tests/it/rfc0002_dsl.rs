@@ -835,6 +835,49 @@ async fn rfc0002_6_non_text_operators_rejected() {
     }
 }
 
+/// Scenario RFC0002.8 (malformed regex) — a pattern the regex engine cannot
+/// compile is the query's own `InvalidQuery`, on every column the regex
+/// operators reach (text columns, `matches`, and the promoted attribute arm),
+/// not a storage failure raised while the engine plans the filter.
+#[tokio::test]
+async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all_with_promoted};
+    use ourios_parquet::PromotedAttributes;
+    use ourios_querier::{Querier, QueryError};
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all_with_promoted(
+        bucket.path(),
+        &[simple("a", 1, TS0)],
+        &PromotedAttributes::new([], ["http.route".to_string()]),
+    );
+    let q = Querier::new(bucket.path());
+
+    for text in [
+        "scope =~ \"[b-a]\"",
+        "body !~ \"(\"",
+        "matches(event_name, \"a{2,1}\")",
+        "service =~ \"[b-a]\"",
+        "attr.http.route !~ \"(?P<\"",
+    ] {
+        let query = ourios_querier::dsl::parse(text).expect("parse");
+        let err = q
+            .run_query(
+                &query,
+                &ourios_core::tenant::TenantId::new("a"),
+                NOW,
+                DEFAULT_WINDOW_NS,
+                Some(&no_aliases()),
+            )
+            .await
+            .expect_err(&format!("{text}: a malformed pattern must be rejected"));
+        assert!(
+            matches!(&err, QueryError::InvalidQuery { detail } if detail.contains("regular expression")),
+            "{text}: {err:?}",
+        );
+    }
+}
+
 /// Scenario RFC0002.6 (unsupported stage rejection) — a pipeline stage this
 /// slice does not execute (`count`/aggregation/`sort`/`project`/`render`) is
 /// rejected with a clear error rather than silently dropped.

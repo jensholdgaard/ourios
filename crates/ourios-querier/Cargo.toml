@@ -98,6 +98,11 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 # ourios-bench binds it directly as the A1 reference codec), so this
 # adds no new transitive crate and the version is pinned by `Cargo.lock`.
 zstd = "0.13"
+# RFC0002.8 — the compiler checks a `=~` / `!~` / `matches` pattern with
+# the regex engine DataFusion's `regexp_like` runs, so a malformed one is an
+# `InvalidQuery` rather than a planning failure. Already in the tree via
+# DataFusion; `Cargo.lock` keeps the one copy.
+regex = "1"
 # #924 — the per-session byte-counting `ObjectStore` wrapper
 # (`src/fetch_count.rs`) behind `ourios.query.read.size`. The trait is
 # `async_trait`-based and its listing calls return `BoxStream`s; both

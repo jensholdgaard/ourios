@@ -538,6 +538,11 @@ the find.
 >   token count and changes tokens only from a literal to a
 >   wildcard — never a literal to a different literal, never a
 >   wildcard back to a literal
+> - **And** the same holds for every `Widened` / `TypeExpanded`
+>   audit event of an ingest, including one for an intermediate
+>   version no row was stamped with: a widening changes only its
+>   declared `positions_widened`, each to a wildcard, and a type
+>   expansion changes no token
 > - **And** any violation makes the target panic with a message
 >   citing `CLAUDE.md` §3.1
 

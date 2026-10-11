@@ -543,6 +543,13 @@ the find.
 >   version no row was stamped with: a widening changes only its
 >   declared `positions_widened`, each to a wildcard, and a type
 >   expansion changes no token
+> - **And** the slot types follow the events (RFC 0001 §6.1/§6.4):
+>   replayed from the leaf before the ingest, a widening opens one
+>   slot per declared position, seeded `{Str, type of the line's
+>   token there}`, and a type expansion's `slots_expanded` is
+>   non-empty, names each existing slot at most once, and adds only
+>   types new to it; the replayed slot types equal the leaf's after
+>   the ingest
 > - **And** any violation makes the target panic with a message
 >   citing `CLAUDE.md` §3.1
 

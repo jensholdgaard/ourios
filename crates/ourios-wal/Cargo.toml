@@ -44,9 +44,9 @@ crc32c = "0.6"
 ourios-core = { path = "../ourios-core" }
 
 [features]
-# Exposes the crate-internal `frame` module (`read_frame`, `FrameError`)
-# for the `fuzz/` cargo-fuzz `wal_frame` target (RFC 0015). Off by
-# default; not part of the stable public API.
+# Exposes the crate-internal `frame` module (`read_frame`, `write_frame`,
+# `FrameError`) for the `fuzz/` cargo-fuzz `wal_frame` target (RFC 0015).
+# Off by default; not part of the stable public API.
 fuzzing = []
 
 # RFC 0052 §6's rotation fault-injection seam (`Wal::arm_rotation_faults`).

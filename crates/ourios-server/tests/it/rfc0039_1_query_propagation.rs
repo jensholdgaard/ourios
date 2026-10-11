@@ -55,8 +55,10 @@ async fn query_spans(traceparent: Option<&str>) -> Vec<opentelemetry_sdk::trace:
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
+    );
 
     let mut builder = Request::builder()
         .method("POST")

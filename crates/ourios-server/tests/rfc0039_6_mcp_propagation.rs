@@ -160,7 +160,11 @@ async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
         .with_simple_exporter(exporter.clone())
         .build();
     tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")))
+        .with(
+            tracing_opentelemetry::layer().with_tracer(
+                provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test")),
+            ),
+        )
         .try_init()
         .expect("install global subscriber");
     opentelemetry::global::set_tracer_provider(provider.clone());

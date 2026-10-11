@@ -55,8 +55,10 @@ async fn query_spans_under_parentbased(traceparent: &str) -> Vec<SpanData> {
         .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
+    );
 
     let response = app
         .oneshot(

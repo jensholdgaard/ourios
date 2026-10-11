@@ -419,9 +419,20 @@ uncached query identically.
 > | `A` has no `fold_state` | Full fold | `no_fold_state` |
 > | `F ⊄ L` (a folded file disappeared) | Full fold | `files_removed` |
 > | `incremental_depth` ≥ the depth cap | Full fold (writes depth 0) | `depth_cap` |
-> | Delta `D = L \ F` holds a fold-relevant event with `timestamp ≤ high_water_ns` | Full fold | `out_of_order` |
+> | `high_water_ns` is non-null and delta `D = L \ F` holds a fold-relevant event with `timestamp ≤ high_water_ns` | Full fold | `out_of_order` |
 > | Otherwise | **Incremental fold** of `D` onto `A` | — |
 >
+> - **A `null` high-water admits any delta.** `null` means `F` holds
+>   no fold-relevant event, so no delta event can be ordered before
+>   one, and the timestamp guard passes whatever `D` holds. The
+>   equivalence below still holds: validation pins `registry` and
+>   `alias_map` empty when the high-water is `null`, and every
+>   `binding_conflicts` key must be in `registry`, so that set is
+>   empty too. The seeded fold therefore starts from the empty state,
+>   which is exactly the full fold's state after `F`'s events, and
+>   the fold-relevant events in the total order over `L` are exactly
+>   `D`'s, in `D`'s own order. No key is seeded, so the seed timestamp
+>   is never used.
 > - **"New" is set difference, nothing else.** `D` is the listed
 >   `*.parquet` keys not in `F`, in the lexicographic order the full
 >   fold scans. Audit keys are immutable once visible (uniquely named
@@ -545,12 +556,20 @@ uncached query identically.
 > attributes are added to `ourios.template_map.derive.duration`,
 > `derive.audit.files` and `derive.audit.size`:
 >
-> - `ourios.template_map.derive.mode`: `full` / `incremental`, on
->   every derive sample (a miss, torn or unknown-version derive is
->   always `full`);
+> - `ourios.template_map.derive.mode`: `full` / `incremental`,
+>   **conditionally required**: present once the path is decided. A
+>   miss, torn or unknown-version derive is always `full`. A `stale`
+>   derive carries it once the guard has decided, and a failure after
+>   that point keeps the decided mode. A `stale` derive that fails
+>   before the guard decides (e.g. a delta object fails to read or
+>   decode while its timestamps are being checked) records its
+>   duration sample **without** `mode`, carrying `error.type` as
+>   RFC0033.9 requires. No third value is added for "undecided";
+>   the attribute's absence means exactly that;
 > - `ourios.template_map.derive.fallback.reason`: the guard row that
 >   declined the fast path (`no_fold_state` / `files_removed` /
->   `depth_cap` / `out_of_order`), only on `stale` + `full` samples.
+>   `depth_cap` / `out_of_order`), only on `stale` samples with
+>   `mode = full`.
 >
 > Both names are new. They are maintainer-approved and registered in
 > the shared `ourios-semconv` registry via ourios-semconv#17; the
@@ -841,7 +860,8 @@ incorrectly. A guarded fast path (apply only when the new files'
 minimum timestamp ≥ the folded maximum, recorded in the artifact)
 stays open in §7; the unconditional fallback is the fresh fold.
 *(2026-10-12, #962, maintainer-approved: that guarded fast path is specified
-in the §3.3 amendment. The unguarded append-only fold stays
+in the §3.3 amendment, with a strict `>` guard so that ties fall
+back. The unguarded append-only fold stays
 rejected, for the reason given here.)*
 
 **Guarding on key order, partition or object timestamps instead of
@@ -1082,15 +1102,21 @@ ambiguity cannot recur.
 > **Scenario RFC0033.13 — The path taken is observable**
 > (amendment 2026-10-12, #962, maintainer-approved)
 > - **Given** the RFC0033.9 fixture
-> - **When** acts drive an incremental fold and each of the four
->   fallbacks
-> - **Then** each derive sample carries
+> - **When** acts drive an incremental fold, each of the four
+>   fallbacks, and a stale acquisition whose delta object fails to
+>   read before the guard has decided
+> - **Then** each completed derive sample carries
 >   `ourios.template_map.derive.reason = stale` and
 >   `ourios.template_map.derive.mode` (`incremental` or `full`), and
 >   each fallback sample carries the matching
 >   `ourios.template_map.derive.fallback.reason`
 > - **And** a miss, torn or unknown-version derive carries
 >   `mode = full` and no fallback reason
+> - **And** the stale acquisition that failed before the guard
+>   decided records exactly one `derive.duration` sample with
+>   `derive.reason = stale` and `error.type`, and with neither
+>   `derive.mode` nor `derive.fallback.reason`; it records no
+>   `derive.audit.files` / `derive.audit.size` sample
 > - **And** the incremental sample's `derive.audit.files` /
 >   `derive.audit.size` equal the delta's file count and bytes
 > - **And** an incremental acquisition over an artifact whose
@@ -1185,13 +1211,17 @@ Mapped to `CLAUDE.md` §6.2:
   warm GET further at once-per-miss CPU cost. Measure only if the
   §9.15 numbers stop satisfying — the ratio floor passes without it.
 - [x] **Guarded incremental fold on staleness**: apply new files on
-  top of the cached fold only when their minimum event timestamp ≥
-  the artifact's recorded maximum folded timestamp (else fresh
-  fold). Worth it, or is the fresh fold on miss cheap enough
-  forever? *Answered 2026-10-12 (#962, maintainer-approved): worth it. Every
+  top of the cached fold only when every fold-relevant event in them
+  is strictly later than the artifact's recorded maximum folded
+  timestamp, falling back to a fresh fold otherwise, ties included.
+  Worth it, or is the fresh fold on miss cheap enough forever?
+  *Answered 2026-10-12 (#962, maintainer-approved): worth it. Every
   production derive was stale, at 58–111 s p95. The guard is strict
-  (`>`), over fold-relevant events only. Specified in the §3.3
-  amendment.*
+  (`>`): a new event at exactly the recorded maximum ties an
+  already-folded one, so the acquisition falls back to a full fold.
+  Only fold-relevant events count, and a `null` maximum (nothing
+  fold-relevant folded yet) admits any new file. Specified in the
+  §3.3 amendment.*
 - [ ] **Depth cap value** (2026-10-12 amendment): 256 is a judgment
   call, trading one full fold per 256 stale acquisitions against
   how long a latent defect could persist. Revisit with the

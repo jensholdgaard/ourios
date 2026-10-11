@@ -114,6 +114,15 @@ enum GraphVerb {
     },
 }
 
+/// The telemetry bootstrap the daemon and the operator verbs share: one
+/// `service.name`, and this binary's release as `service.version`.
+fn telemetry_config() -> TelemetryConfig {
+    TelemetryConfig {
+        service_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        ..TelemetryConfig::new("ourios-server")
+    }
+}
+
 /// Run the CLI's operator verb, if one was given: the grammar gate runs
 /// **first** — even `resolve_config` can create the local store root, so
 /// an off-grammar invocation performs no filesystem, telemetry or backend
@@ -137,8 +146,8 @@ async fn run_operator_verb(cli: &Cli) -> Result<bool, String> {
             // flag would duplicate them. The stderr `fmt` mirror is installed
             // either way, so the verb's progress events reach the operator
             // even when nothing is exported.
-            let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))
-                .map_err(|e| e.to_string())?;
+            let telemetry =
+                ourios_telemetry::init(&telemetry_config()).map_err(|e| e.to_string())?;
             // Configuration resolves *inside* the span, so a malformed
             // `storage`/TLS section is a recorded non-zero exit rather than
             // an untraced one (the convention requires an exit code, and
@@ -703,7 +712,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // itself — `OTEL_EXPORTER_OTLP_*` (endpoint/transport), `OTEL_TRACES_SAMPLER`,
     // `OTEL_METRIC_EXPORT_INTERVAL`, and `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none`
     // — so there is no bespoke Ourios telemetry config to map here.
-    let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
+    let telemetry = ourios_telemetry::init(&telemetry_config())?;
 
     let (stopping, mut signalled) = listen_for_shutdown(&config);
 

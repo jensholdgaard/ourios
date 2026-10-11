@@ -94,8 +94,10 @@ fn rfc0038_1_sweep_emits_one_internal_span() {
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
+    );
 
     tracing::subscriber::with_default(subscriber, || {
         run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
@@ -605,7 +607,7 @@ async fn partition_counters_rise_with_each_commit_before_the_sweep_ends() {
         .with_periodic_exporter(exporter.clone())
         .build();
     let metrics = Arc::new(CompactionMetrics::from_meter(
-        &provider.meter("ourios.compaction"),
+        &provider.meter_with_scope(ourios_core::telemetry::scope("ourios.compaction")),
     ));
     let readings = Arc::default();
     let sink = ReadingSink {
@@ -733,7 +735,7 @@ async fn a_sweep_dying_in_post_commit_cleanup_has_recorded_the_partition() {
         .with_periodic_exporter(exporter.clone())
         .build();
     let metrics = Arc::new(CompactionMetrics::from_meter(
-        &provider.meter("ourios.compaction"),
+        &provider.meter_with_scope(ourios_core::telemetry::scope("ourios.compaction")),
     ));
     let audit = ourios_core::audit::SharedAuditSink::new();
 
@@ -882,7 +884,7 @@ async fn a_fatally_failed_sweep_records_its_partial_backlog_and_gc_failures() {
         .with_periodic_exporter(exporter.clone())
         .build();
     let metrics = Arc::new(CompactionMetrics::from_meter(
-        &provider.meter("ourios.compaction"),
+        &provider.meter_with_scope(ourios_core::telemetry::scope("ourios.compaction")),
     ));
 
     // Act

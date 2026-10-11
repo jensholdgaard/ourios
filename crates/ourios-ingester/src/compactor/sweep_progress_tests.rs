@@ -100,7 +100,7 @@ async fn sweep_remaining_counts_down_and_each_partition_records_its_input() {
         .with_periodic_exporter(exporter.clone())
         .build();
     let metrics = Arc::new(CompactionMetrics::from_meter(
-        &provider.meter("ourios.compaction"),
+        &provider.meter_with_scope(ourios_core::telemetry::scope("ourios.compaction")),
     ));
     let readings = Arc::default();
     let sink = RemainingSink {

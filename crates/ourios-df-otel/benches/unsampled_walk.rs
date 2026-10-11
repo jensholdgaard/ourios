@@ -97,6 +97,7 @@ impl ExecutionPlan for PanicsIfTouched {
 
 fn unsampled_walk(c: &mut Criterion) {
     let provider = SdkTracerProvider::builder().build();
+    #[allow(clippy::disallowed_methods)] // a bench tracer; no ourios-core dependency here
     let tracer = provider.tracer("bench");
     let unsampled_cx = Context::new();
     let plan = PanicsIfTouched::new();

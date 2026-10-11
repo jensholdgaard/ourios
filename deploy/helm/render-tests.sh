@@ -178,8 +178,10 @@ check "NOTES budget with only periodSeconds set" "10800s" \
 # the default render regenerates the golden file:
 #   UPDATE_GOLDEN=1 bash deploy/helm/render-tests.sh
 GOLDEN="$(dirname "${BASH_SOURCE[0]}")/testdata/default-render.yaml"
+# Blank lines are dropped: Helm versions disagree on whether a blank line
+# precedes each `---` separator, and they carry no meaning in the manifests.
 default_render() {
-  helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:'
+  helm template t "$CHART" | grep -v -e 'helm.sh/chart:' -e 'app.kubernetes.io/version:' -e '^$'
 }
 if [[ -n "${UPDATE_GOLDEN:-}" ]]; then
   default_render > "$GOLDEN"

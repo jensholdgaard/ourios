@@ -322,9 +322,9 @@ pub(super) fn column_comparison(
     }
     let expr = match op {
         CmpOp::Ord(ord) => ord_expr(col(column), ord, field_literal(field, value)?),
-        CmpOp::Match => regexp_like(col(column), string_literal(field, value)?, None),
+        CmpOp::Match => regexp_like(text_operand(field), string_literal(field, value)?, None),
         CmpOp::NotMatch => not(regexp_like(
-            col(column),
+            text_operand(field),
             string_literal(field, value)?,
             None,
         )),
@@ -758,7 +758,19 @@ pub(super) fn string_call(
     if column_of(field).1 && !has_column(schema, column) {
         return Ok(PredExpr::None);
     }
-    Ok(PredExpr::Filter(build(col(column))))
+    Ok(PredExpr::Filter(build(text_operand(field))))
+}
+
+/// A text field's column as the string functions and regex operators see
+/// it. `body` is stored `Binary` (RFC 0005 §3.2) and the engine's text
+/// functions take no binary operand, so it reads as text; a stored body
+/// that is not UTF-8 reads as NULL and matches nothing.
+pub(super) fn text_operand(field: &Field) -> Expr {
+    let column = col(column_of(field).0);
+    match field {
+        Field::Body => try_cast(column, DataType::Utf8),
+        _ => column,
+    }
 }
 
 pub(super) fn like_call(

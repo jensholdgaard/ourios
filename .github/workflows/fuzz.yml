@@ -42,6 +42,12 @@ jobs:
       fail-fast: false
       matrix:
         target: [miner_roundtrip, otlp_json, otlp_protobuf, wal_frame, dsl_parse]
+    env:
+      # The one gate for every OTEL_* variable of the smoke step: `main` only
+      # (the schedule, or a dispatch of main), with both the endpoint var and
+      # the token secret set. Otherwise none of them reaches the fuzz process,
+      # the credential included.
+      OTLP_EXPORT: ${{ github.ref == 'refs/heads/main' && vars.OTLP_EXPORT_ENDPOINT != '' && secrets.DASH0_AUTHORIZATION_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -63,22 +69,21 @@ jobs:
           BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
           # Fuzz input is an adversarial workload: export the metrics the code
           # under test already records to the external OTLP backend (#942,
-          # `ourios_fuzz::init_telemetry`). Only from `main` (the schedule, or
-          # a dispatch of main), and only when both the endpoint var and the
-          # token secret are set; an empty endpoint leaves the harness exactly
-          # as it is without telemetry. A failed export is dropped and never
-          # fails the job. libFuzzer exits without running destructors, so the
-          # last export interval of each run is lost; the short interval bounds
-          # that. The exporter threads add background coverage to the working
-          # corpus, which this job throws away.
-          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && vars.OTLP_EXPORT_ENDPOINT || '' }}
-          OTEL_EXPORTER_OTLP_HEADERS: ${{ github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && format('Authorization=Bearer {0}', secrets.DASH0_AUTHORIZATION_TOKEN) || '' }}
-          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-          OTEL_METRIC_EXPORT_INTERVAL: "10000"
+          # fuzz/common/telemetry.rs), behind the job's OTLP_EXPORT gate. With
+          # the gate shut every OTEL_* value below is empty, which leaves the
+          # harness exactly as it is without telemetry. A failed export is
+          # dropped and never fails the job. libFuzzer exits without running
+          # destructors, so the last export interval of each run is lost; the
+          # short interval bounds that. The exporter threads add background
+          # coverage to the working corpus, which this job throws away.
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ env.OTLP_EXPORT == 'true' && vars.OTLP_EXPORT_ENDPOINT || '' }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ env.OTLP_EXPORT == 'true' && format('Authorization=Bearer {0}', secrets.DASH0_AUTHORIZATION_TOKEN) || '' }}
+          OTEL_EXPORTER_OTLP_PROTOCOL: ${{ env.OTLP_EXPORT == 'true' && 'http/protobuf' || '' }}
+          OTEL_METRIC_EXPORT_INTERVAL: ${{ env.OTLP_EXPORT == 'true' && '10000' || '' }}
           # Upstream resource attributes only. The cicd.pipeline.run.id on
           # metrics is the opt-in the CI/CD semantic conventions ask for.
           OTEL_RESOURCE_ATTRIBUTES: >-
-            deployment.environment.name=test,cicd.pipeline.name=${{ github.workflow }},cicd.pipeline.task.name=smoke-fuzz/${{ matrix.target }},cicd.pipeline.run.id=${{ github.run_id }},vcs.ref.head.revision=${{ github.sha }}
+            ${{ env.OTLP_EXPORT == 'true' && format('deployment.environment.name=test,cicd.pipeline.name={0},cicd.pipeline.task.name=smoke-fuzz/{1},cicd.pipeline.run.id={2},vcs.ref.head.revision={3}', github.workflow, matrix.target, github.run_id, github.sha) || '' }}
           # Warn and error only on stderr, once a subscriber is installed.
           RUST_LOG: warn
         run: |

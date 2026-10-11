@@ -11,11 +11,14 @@
 use libfuzzer_sys::fuzz_target;
 use ourios_querier::dsl::{parse, parse_structured};
 
+#[path = "../common/telemetry.rs"]
+mod telemetry;
+
 // A typed `&str` target: libFuzzer produces valid UTF-8 directly, so no
 // execution is wasted on byte sequences the real boundary cannot deliver
 // (axum/MCP hand the parsers `String`s, so invalid UTF-8 is rejected
 // upstream of them in production).
-fuzz_target!(init: ourios_fuzz::init_telemetry(), |text: &str| {
+fuzz_target!(init: telemetry::init(), |text: &str| {
     let _ = parse(text);
     let _ = parse_structured(text);
 });

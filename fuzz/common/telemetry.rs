@@ -1,6 +1,7 @@
-//! Shared support for the fuzz targets.
+//! Telemetry for the fuzz targets, shared as a source file (each target pulls
+//! it in with `#[path]`) so the fuzz package keeps no library API (RFC 0015
+//! §3.1).
 //!
-//! [`init_telemetry`] is what every target passes to `fuzz_target!(init: …)`.
 //! Fuzz input is an adversarial workload for the code under test, so the
 //! metrics that code already records through the global `OTel` meter (the
 //! miner's §3.1 instruments, the process metrics) are worth watching while it
@@ -20,15 +21,6 @@ use std::sync::OnceLock;
 
 use ourios_telemetry::{TelemetryConfig, TelemetryGuard};
 
-/// The env var that switches export on; unset or empty leaves the target
-/// exactly as it was, with no provider, no subscriber and no threads.
-const ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
-
-/// The harness exports over OTLP/HTTP only: the gRPC exporter needs a tokio
-/// runtime the targets do not have.
-const PROTOCOL_VAR: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
-const HTTP_PROTOBUF: &str = "http/protobuf";
-
 /// One logical service for every target (each target is told apart by
 /// `cicd.pipeline.task.name`). Distinct from `ourios-server`: the semantic
 /// conventions treat equal `service.name`s as the same service whatever the
@@ -41,62 +33,37 @@ const SERVICE_NAME: &str = "ourios-fuzz";
 /// `OTEL_METRIC_EXPORT_INTERVAL` short where that matters.
 static TELEMETRY: OnceLock<Option<TelemetryGuard>> = OnceLock::new();
 
-/// Install the `OTel` providers once, when `OTEL_EXPORTER_OTLP_ENDPOINT` is
-/// set. Reads only the environment, never fuzz input, and an export failure is
-/// logged by the SDK and dropped, so it cannot change what a target does.
-pub fn init_telemetry() {
+/// Install the `OTel` metrics provider once, when the standard env points
+/// metrics at an OTLP/HTTP endpoint with protobuf payloads
+/// ([`ourios_telemetry::metrics_http_export_configured`], unit-tested there).
+/// Anything else, including no endpoint, leaves the target exactly as it is
+/// without telemetry: no provider, no subscriber, no threads. gRPC is not an
+/// option because its exporter needs a tokio runtime the targets do not have.
+/// Reads only the environment, never fuzz input, and a failed export is
+/// dropped by the SDK, so it cannot change what a target does.
+pub fn init() {
     TELEMETRY.get_or_init(|| {
-        install(
-            std::env::var(ENDPOINT_VAR).ok().as_deref(),
-            std::env::var(PROTOCOL_VAR).ok().as_deref(),
-        )
-    });
-}
-
-fn install(endpoint: Option<&str>, protocol: Option<&str>) -> Option<TelemetryGuard> {
-    if endpoint.is_none_or(|endpoint| endpoint.trim().is_empty()) {
-        return None;
-    }
-    if protocol.map(str::trim) != Some(HTTP_PROTOBUF) {
-        eprintln!("ourios-fuzz: telemetry off, {PROTOCOL_VAR} must be {HTTP_PROTOBUF}");
-        return None;
-    }
-    // `service_version` stays unset: it falls back to the workspace release
-    // (this crate's own version is a placeholder 0.0.0).
-    let config = TelemetryConfig {
-        // One span per iteration would swamp the exporter and the backend.
-        traces_enabled: false,
-        // Nothing on the fuzzed paths logs at warn or error, and the batch
-        // log processor's thread would still wake every second, adding
-        // background coverage (see the module docs).
-        // Warnings stay on stderr through the `fmt` layer.
-        logs_enabled: false,
-        ..TelemetryConfig::new(SERVICE_NAME)
-    };
-    match ourios_telemetry::init(&config) {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            eprintln!("ourios-fuzz: telemetry off, {e}");
-            None
+        if !ourios_telemetry::metrics_http_export_configured() {
+            return None;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_endpoint_installs_nothing() {
-        assert!(install(None, Some(HTTP_PROTOBUF)).is_none());
-        assert!(install(Some(""), Some(HTTP_PROTOBUF)).is_none());
-        assert!(install(Some("  "), Some(HTTP_PROTOBUF)).is_none());
-    }
-
-    #[test]
-    fn grpc_or_unset_protocol_installs_nothing() {
-        let endpoint = Some("http://127.0.0.1:4318");
-        assert!(install(endpoint, None).is_none());
-        assert!(install(endpoint, Some("grpc")).is_none());
-    }
+        // `service_version` stays unset: it falls back to the workspace
+        // release (the fuzz package's own version is a placeholder 0.0.0).
+        let config = TelemetryConfig {
+            // One span per iteration would swamp the exporter and the backend.
+            traces_enabled: false,
+            // Nothing on the fuzzed paths logs at warn or error, and the batch
+            // log processor's thread would still wake every second, adding
+            // background coverage. Warnings stay on stderr through the `fmt`
+            // layer.
+            logs_enabled: false,
+            ..TelemetryConfig::new(SERVICE_NAME)
+        };
+        match ourios_telemetry::init(&config) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!("ourios-fuzz: telemetry off, {e}");
+                None
+            }
+        }
+    });
 }

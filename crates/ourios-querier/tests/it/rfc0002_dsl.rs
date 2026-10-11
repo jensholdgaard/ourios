@@ -855,7 +855,7 @@ async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
 
     for text in [
         "scope =~ \"[b-a]\"",
-        "body !~ \"(\"",
+        "event_name !~ \"(\"",
         "matches(event_name, \"a{2,1}\")",
         "service =~ \"[b-a]\"",
         "attr.http.route !~ \"(?P<\"",

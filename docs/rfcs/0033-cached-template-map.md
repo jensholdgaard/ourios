@@ -288,8 +288,8 @@ behaviour.
 >   ambiguity (abstention and publish IO failure both leaving the
 >   same "no artifact" label) cannot recur.
 
-> **Amendment pointer (2026-10-12, #897, proposed — pending
-> maintainer approval).** The v2 body gains an optional `fold_state`
+> **Amendment pointer (2026-10-12, #962,
+> maintainer-approved).** The v2 body gains an optional `fold_state`
 > object (`high_water_ns`, `binding_conflicts`, `incremental_depth`)
 > that the incremental fold needs. `format_version` stays 2, the key
 > is unchanged, and an artifact without the field is ineligible for
@@ -347,9 +347,8 @@ uncached query identically.
 > as literal absence — the cleanest possible realization of the
 > unknown-version-is-absent rule this table was designed around.
 
-> **Amendment (2026-10-12, #897, proposed — pending maintainer
-> approval): guarded incremental fold on staleness.** Production
-> evidence (node eq-perses, v0.12.2, 24 h): every template-map derive
+> **Amendment (2026-10-12, #962, maintainer-approved): guarded incremental fold on staleness.** Production
+> evidence (the production node, v0.12.2, 24 h): every template-map derive
 > had `ourios.template_map.derive.reason = stale`, derive p95 was
 > 58–111 s, acquire-wait reached 46 s, and one cold derive read
 > ~7,375 audit files (~1 GB) for one tenant. A stale artifact is
@@ -553,8 +552,9 @@ uncached query identically.
 >   declined the fast path (`no_fold_state` / `files_removed` /
 >   `depth_cap` / `out_of_order`), only on `stale` + `full` samples.
 >
-> Both names are **new and need maintainer sign-off** in the shared
-> `ourios-semconv` registry before implementation. The OTel naming
+> Both names are new. They are maintainer-approved and registered in
+> the shared `ourios-semconv` registry via ourios-semconv#17; the
+> registry pin bump lands with the implementation. The OTel naming
 > guidance (`{object}.{property}`, closed enums for short value sets)
 > was checked, and no upstream attribute fits. Duration covers the
 > whole acquisition, including a rejected delta read. The files/size
@@ -687,8 +687,8 @@ converges (the miner's convergence thesis, RFC 0001). The
 ingester-side write-through at mutation time is the recorded
 alternative (§4, §7).
 
-> **Amendment pointer (2026-10-12, #897, proposed — pending
-> maintainer approval).** The cost described in the paragraph above,
+> **Amendment pointer (2026-10-12, #962,
+> maintainer-approved).** The cost described in the paragraph above,
 > one fresh fold per mutation-driven staleness, becomes one fold of
 > the *new* audit files on top of the loaded artifact whenever the
 > §3.3 guard admits it. An incremental fold writes through like a
@@ -787,13 +787,14 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > no wait. The status stays `accepted`. Scenario RFC0033.9 is the
 > criterion.
 
-> **Amendment pointer (2026-10-12, #897, proposed — pending
-> maintainer approval).** The derive instruments gain
+> **Amendment pointer (2026-10-12, #962,
+> maintainer-approved).** The derive instruments gain
 > `ourios.template_map.derive.mode` (`full` / `incremental`) and
 > `ourios.template_map.derive.fallback.reason` (`no_fold_state` /
 > `files_removed` / `depth_cap` / `out_of_order`). The lookup outcome
-> and `derive.reason` are unchanged. Both names are new and need
-> sign-off in the `ourios-semconv` registry. The specification is the
+> and `derive.reason` are unchanged. Both names are new, approved and
+> registered via ourios-semconv#17 (the pin bump comes with the
+> implementation). The specification is the
 > §3.3 amendment of the same date; scenario RFC0033.13 is the
 > criterion.
 
@@ -839,7 +840,7 @@ flush), which an append-only incremental fold would order
 incorrectly. A guarded fast path (apply only when the new files'
 minimum timestamp ≥ the folded maximum, recorded in the artifact)
 stays open in §7; the unconditional fallback is the fresh fold.
-*(2026-10-12, #897, proposed: that guarded fast path is specified
+*(2026-10-12, #962, maintainer-approved: that guarded fast path is specified
 in the §3.3 amendment. The unguarded append-only fold stays
 rejected, for the reason given here.)*
 
@@ -1027,7 +1028,7 @@ ambiguity cannot recur.
 >   and none for an acquirer.
 
 > **Scenario RFC0033.10 — Incremental fold ≡ full fold (property)**
-> (amendment 2026-10-12, #897, proposed)
+> (amendment 2026-10-12, #962, maintainer-approved)
 > - **Given** any generated audit history (the RFC0033.1 generator:
 >   template creations/widenings/type-expansions/adoptions/rejections,
 >   alias assertions/retractions, conflicting re-bindings, non-fold
@@ -1044,7 +1045,7 @@ ambiguity cannot recur.
 > - **And** the query answer through either path is identical.
 
 > **Scenario RFC0033.11 — The guard falls back, never guesses**
-> (amendment 2026-10-12, #897, proposed)
+> (amendment 2026-10-12, #962, maintainer-approved)
 > - **Given** a published artifact with `fold_state`
 > - **When** the next listing adds a delta holding a fold-relevant
 >   event with `timestamp` < `high_water_ns`, or `=` it; or a folded
@@ -1065,7 +1066,7 @@ ambiguity cannot recur.
 >   matches.
 
 > **Scenario RFC0033.12 — Late files and concurrent writers**
-> (amendment 2026-10-12, #897, proposed)
+> (amendment 2026-10-12, #962, maintainer-approved)
 > - **Given** both backends (local root; S3 via the localstack
 >   harness) and an artifact published by an incremental fold
 > - **When** an audit file with a backdated fold-relevant event
@@ -1079,7 +1080,7 @@ ambiguity cannot recur.
 >   correct incremental fold.
 
 > **Scenario RFC0033.13 — The path taken is observable**
-> (amendment 2026-10-12, #897, proposed)
+> (amendment 2026-10-12, #962, maintainer-approved)
 > - **Given** the RFC0033.9 fixture
 > - **When** acts drive an incremental fold and each of the four
 >   fallbacks
@@ -1099,8 +1100,8 @@ ambiguity cannot recur.
 >   (weaver-generated constants).
 
 > **Scenario RFC0033.14 — The stale tax collapses in production**
-> (amendment 2026-10-12, #897, proposed)
-> - **Given** the baseline on Dash0 (node eq-perses, v0.12.2,
+> (amendment 2026-10-12, #962, maintainer-approved)
+> - **Given** the baseline on Dash0 (the production node, v0.12.2,
 >   24 h): every derive `stale`, derive p95 58–111 s, acquire-wait up
 >   to 46 s, ~7,375 audit files per derive, ~10% of queries 5–100 s,
 >   ~187k object-store calls per 6 h for 639 requests
@@ -1156,8 +1157,7 @@ Mapped to `CLAUDE.md` §6.2:
 > addition is run #21's harness printing publish outcomes (§3.2
 > amendment / the Scenario RFC0033.6 run-#20 note's pointer).
 
-> **Amendment (2026-10-12, #897, proposed — pending maintainer
-> approval).**
+> **Amendment (2026-10-12, #962, maintainer-approved).**
 >
 > - **RFC0033.10** — `proptest` extending RFC0033.1's generator with
 >   a split point and chains of 1..k deltas (generated so the guard
@@ -1188,7 +1188,7 @@ Mapped to `CLAUDE.md` §6.2:
   top of the cached fold only when their minimum event timestamp ≥
   the artifact's recorded maximum folded timestamp (else fresh
   fold). Worth it, or is the fresh fold on miss cheap enough
-  forever? *Answered 2026-10-12 (#897, proposed): worth it. Every
+  forever? *Answered 2026-10-12 (#962, maintainer-approved): worth it. Every
   production derive was stale, at 58–111 s p95. The guard is strict
   (`>`), over fold-relevant events only. Specified in the §3.3
   amendment.*

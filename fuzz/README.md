@@ -1,6 +1,6 @@
 # ourios-fuzz
 
-The RFC 0015 cargo-fuzz harness: six libFuzzer targets over the miner, the
+The RFC 0015 cargo-fuzz harness: seven libFuzzer targets over the miner, the
 untrusted-input parsers and the persisted artifacts read back from object
 storage, each asserting an invariant (not just "no panic") — see the target's module docs and `docs/rfcs/0015-fuzzing-harness.md`.
 
@@ -57,7 +57,8 @@ encoders, for tenant `fuzz-tenant`:
   `log.record.template` attribute: one adoption converges on a mined leaf
   (tree-backed) and one interns its own id (owned);
 - the drained audit events plus one `AliasAsserted` are written by
-  `AuditWriter::open_in` to a `Store::in_memory()`;
+  `AuditWriter::open_in` to a `Store::in_memory()`; that Parquet object is
+  `seeds/audit_reader/miner-and-alias-events.parquet`;
 - `seeds/artifact_decode/template-map-frame` is `derive_template_map` over
   that store, `to_artifact_bytes`; `template-map-json` is that frame
   zstd-decoded.
@@ -65,6 +66,17 @@ encoders, for tenant `fuzz-tenant`:
 Each `artifact_decode` seed starts with its selector byte (the target's
 module doc has the table): 0 snapshot, 1 manifest, 2 high-water, 3 frame,
 4 JSON body.
+
+`audit_reader` takes the input as one whole audit-event Parquet object. A
+panic inside the upstream `parquet`/`arrow` decoders is an expected
+`DecodePanicked` (the `ourios-parquet` panic boundary), so the target swaps
+libFuzzer's abort-on-panic hook out for the one decode call; a panic that gets
+past the boundary is re-raised and crashes as usual. Its `regression_decoder_*`
+seeds are minimised upstream-decoder panics that must keep decoding to that
+typed error. parquet 59's footer decoder can be driven into a multi-gigabyte
+allocation (#959, reached after ~145 s), so until the parquet 60 / DataFusion 56
+upgrade (#846) closes #959 the daily smoke run gives `audit_reader` 30 s instead
+of 300 s, and `.clusterfuzzlite/build.sh` does not stage it for ClusterFuzzLite.
 
 `miner_roundtrip` reads its input as length-prefixed record bodies: a
 little-endian `u16` length (capped at 4096), then that many bytes, repeated

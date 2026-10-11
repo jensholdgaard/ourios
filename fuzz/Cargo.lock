@@ -2413,6 +2413,7 @@ dependencies = [
 name = "ourios-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "libfuzzer-sys",
  "ourios-config",
  "ourios-core",
@@ -2422,6 +2423,7 @@ dependencies = [
  "ourios-querier",
  "ourios-telemetry",
  "ourios-wal",
+ "parquet",
  "prost",
  "zstd",
 ]

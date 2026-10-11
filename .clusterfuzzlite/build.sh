@@ -8,6 +8,13 @@ cargo fuzz build -O --debug-assertions
 
 for f in fuzz/fuzz_targets/*.rs; do
   target=$(basename "${f%.*}")
+  # Not staged, so batch, prune and coverage skip it: parquet 59's footer
+  # decoder (read_thrift_vec) reserves an untrusted list count and OOMs
+  # within minutes (#959). The daily smoke run still fuzzes it. Delete this
+  # exclusion when #959 closes (parquet 60 via the DataFusion 56 upgrade, #846).
+  if [ "$target" = audit_reader ]; then
+    continue
+  fi
   # cargo-fuzz writes to fuzz/target/<triple>/release/<target>; locate the
   # binary regardless of which target triple it selected (don't hardcode
   # the triple).

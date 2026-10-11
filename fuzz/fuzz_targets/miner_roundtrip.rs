@@ -18,13 +18,16 @@ use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::reconstruct;
 
+#[path = "../common/telemetry.rs"]
+mod telemetry;
+
 // Realistic log lines are small; cap the candidate body so a pathological
 // multi-MB input can't dominate iteration time / memory during fuzzing.
 // 4 KiB still exercises tokenization, the 256-byte param overflow, and
 // reconstruction comfortably.
 const MAX_LINE_BYTES: usize = 4096;
 
-fuzz_target!(|data: &[u8]| {
+fuzz_target!(init: telemetry::init(), |data: &[u8]| {
     // Use the input as the candidate log line (lossy UTF-8), capped. This
     // never discards an input — unlike `String::arbitrary`, which errors
     // on bytes it can't structure and would throw away coverage. (Future

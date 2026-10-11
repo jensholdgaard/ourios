@@ -339,6 +339,114 @@ fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) 
         && exporter_selected(std::env::var(exporter_var).ok().as_deref())
 }
 
+/// Whether a signal exports over OTLP/HTTP with protobuf payloads: the
+/// signal-specific `OTEL_EXPORTER_OTLP_<SIGNAL>_PROTOCOL` wins over
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, per the exporter spec. Anything else,
+/// including unset, keeps gRPC: the server has always exported over gRPC, and
+/// the spec's `http/protobuf` default would silently retarget existing
+/// deployments.
+#[cfg(feature = "http-proto")]
+fn http_protobuf_selected(signal: &str) -> bool {
+    is_http_protobuf(
+        env_value(&format!("OTEL_EXPORTER_OTLP_{signal}_PROTOCOL")).as_deref(),
+        env_value("OTEL_EXPORTER_OTLP_PROTOCOL").as_deref(),
+    )
+}
+
+/// Whether the standard OTLP env sends metrics to an OTLP/HTTP endpoint with
+/// protobuf payloads: an endpoint is set (`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`,
+/// else `OTEL_EXPORTER_OTLP_ENDPOINT`) and the metrics protocol resolves to
+/// `http/protobuf` with the same precedence [`init`] applies. Empty values
+/// count as unset. A process with no tokio runtime checks this before calling
+/// [`init`], since the gRPC exporter it would otherwise build needs one.
+#[cfg(feature = "http-proto")]
+#[must_use]
+pub fn metrics_http_export_configured() -> bool {
+    http_export_configured(
+        env_value("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").as_deref(),
+        env_value("OTEL_EXPORTER_OTLP_ENDPOINT").as_deref(),
+        env_value("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL").as_deref(),
+        env_value("OTEL_EXPORTER_OTLP_PROTOCOL").as_deref(),
+    )
+}
+
+#[cfg(feature = "http-proto")]
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// The first of a signal-specific and a general OTLP setting that is set and
+/// not blank: an empty signal-specific value must not shadow the general one.
+#[cfg(feature = "http-proto")]
+fn first_set<'a>(signal: Option<&'a str>, general: Option<&'a str>) -> Option<&'a str> {
+    let set = |value: &&str| !value.trim().is_empty();
+    signal.filter(set).or(general.filter(set))
+}
+
+/// The protocol is an Enum in the configuration spec, whose values SHOULD be
+/// read case-insensitively.
+#[cfg(feature = "http-proto")]
+fn is_http_protobuf(signal_protocol: Option<&str>, protocol: Option<&str>) -> bool {
+    first_set(signal_protocol, protocol)
+        .is_some_and(|protocol| protocol.trim().eq_ignore_ascii_case("http/protobuf"))
+}
+
+#[cfg(feature = "http-proto")]
+fn http_export_configured(
+    signal_endpoint: Option<&str>,
+    endpoint: Option<&str>,
+    signal_protocol: Option<&str>,
+    protocol: Option<&str>,
+) -> bool {
+    first_set(signal_endpoint, endpoint).is_some() && is_http_protobuf(signal_protocol, protocol)
+}
+
+/// The OTLP/HTTP client is built with `rustls-no-provider`, so it uses the
+/// process-default crypto provider and panics when there is none. Install ring
+/// unless the process already chose one.
+#[cfg(feature = "http-proto")]
+fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Losing an install race to another thread still leaves a provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+/// Build one signal's OTLP exporter: OTLP/HTTP when the `http-proto` feature is
+/// on and the protocol env selects it, gRPC otherwise. Endpoint and headers
+/// come from the standard `OTEL_EXPORTER_OTLP_*` env unless
+/// [`TelemetryConfig::otlp_endpoint`] overrides the endpoint; over HTTP that
+/// override is a base URL, so the signal path is appended as the env form does.
+macro_rules! otlp_exporter {
+    ($exporter:ident, $config:expr, $signal:literal, $path:literal) => {{
+        let config: &TelemetryConfig = $config;
+        #[cfg(feature = "http-proto")]
+        let http = http_protobuf_selected($signal).then(|| {
+            ensure_crypto_provider();
+            let mut builder = $exporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary);
+            if let Some(endpoint) = &config.otlp_endpoint {
+                builder =
+                    builder.with_endpoint(format!("{}{}", endpoint.trim_end_matches('/'), $path));
+            }
+            builder.build()
+        });
+        #[cfg(not(feature = "http-proto"))]
+        let http: Option<Result<$exporter, opentelemetry_otlp::ExporterBuildError>> = None;
+        match http {
+            Some(built) => built?,
+            None => {
+                let mut builder = $exporter::builder().with_tonic();
+                if let Some(endpoint) = &config.otlp_endpoint {
+                    builder = builder.with_endpoint(endpoint.clone());
+                }
+                builder.build()?
+            }
+        }
+    }};
+}
+
 /// Build the enabled signals' OTLP pipelines — the push `MeterProvider`, the
 /// `LoggerProvider` with its `tracing` bridge, and the tracer — install them
 /// process-globally, and return the [`TelemetryGuard`] that owns them. Each
@@ -354,7 +462,8 @@ fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) 
 /// tests use [`init_in_memory`] or build a provider directly.
 ///
 /// Must run inside a tokio runtime: the gRPC (tonic) OTLP exporters
-/// export on it.
+/// export on it. A signal exporting over OTLP/HTTP (the `http-proto`
+/// feature) does not need one.
 ///
 /// # Errors
 /// Returns [`TelemetryError::Exporter`] if either OTLP exporter cannot
@@ -406,11 +515,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // guard to shut down. `None` when disabled (`OTEL_LOGS_EXPORTER=none`);
     // the stderr `fmt` layer stays, so only the OTel Logs signal is dropped.
     let logger: Option<SdkLoggerProvider> = if logs_enabled {
-        let mut builder = LogExporter::builder().with_tonic();
-        if let Some(endpoint) = &config.otlp_endpoint {
-            builder = builder.with_endpoint(endpoint.clone());
-        }
-        let log_exporter = builder.build()?;
+        let log_exporter = otlp_exporter!(LogExporter, config, "LOGS", "/v1/logs");
         Some(
             SdkLoggerProvider::builder()
                 .with_batch_exporter(log_exporter)
@@ -434,11 +539,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // disciplined span count sits far below the ~1000 traces/sec threshold
     // OTel says to sample at, so the always-on default is the right baseline.
     let (tracer, otel_layer): (Option<SdkTracerProvider>, Option<BoxedLayer>) = if traces_enabled {
-        let mut builder = SpanExporter::builder().with_tonic();
-        if let Some(endpoint) = &config.otlp_endpoint {
-            builder = builder.with_endpoint(endpoint.clone());
-        }
-        let span_exporter = builder.build()?;
+        let span_exporter = otlp_exporter!(SpanExporter, config, "TRACES", "/v1/traces");
         let tracer_provider = SdkTracerProvider::builder()
             .with_batch_exporter(span_exporter)
             .with_resource(resource)
@@ -530,11 +631,8 @@ fn meter_provider(
     config: &TelemetryConfig,
     resource: &Resource,
 ) -> Result<SdkMeterProvider, TelemetryError> {
-    let mut builder = MetricExporter::builder().with_tonic();
-    if let Some(endpoint) = &config.otlp_endpoint {
-        builder = builder.with_endpoint(endpoint.clone());
-    }
-    let reader = PeriodicReader::builder(builder.build()?).build();
+    let exporter = otlp_exporter!(MetricExporter, config, "METRICS", "/v1/metrics");
+    let reader = PeriodicReader::builder(exporter).build();
     let provider = SdkMeterProvider::builder()
         .with_reader(reader)
         .with_resource(resource.clone())
@@ -638,6 +736,148 @@ mod tests {
             !exporter_selected(Some("None")),
             "case-insensitive none → off"
         );
+    }
+
+    /// `http/protobuf` selects OTLP/HTTP; the signal-specific variable wins over
+    /// the general one, and unset or any other value keeps gRPC.
+    #[cfg(feature = "http-proto")]
+    #[test]
+    fn protocol_env_selects_http_protobuf() {
+        assert!(!is_http_protobuf(None, None), "unset keeps gRPC");
+        assert!(is_http_protobuf(None, Some("http/protobuf")));
+        assert!(is_http_protobuf(None, Some(" http/protobuf ")));
+        assert!(!is_http_protobuf(None, Some("grpc")));
+        assert!(
+            !is_http_protobuf(None, Some("http/json")),
+            "JSON is not built"
+        );
+        assert!(is_http_protobuf(Some("http/protobuf"), Some("grpc")));
+        assert!(!is_http_protobuf(Some("grpc"), Some("http/protobuf")));
+        assert!(
+            is_http_protobuf(Some(""), Some("http/protobuf")),
+            "an empty signal-specific protocol counts as unset"
+        );
+        assert!(is_http_protobuf(Some("  "), Some("http/protobuf")));
+        assert!(!is_http_protobuf(Some(""), Some("")));
+        assert!(
+            is_http_protobuf(None, Some("HTTP/PROTOBUF")),
+            "the protocol enum is case-insensitive"
+        );
+        assert!(is_http_protobuf(Some("Http/Protobuf"), Some("grpc")));
+        assert!(!is_http_protobuf(Some("GrPc"), Some("http/protobuf")));
+    }
+
+    /// Metrics export over OTLP/HTTP is configured only with an endpoint (the
+    /// metrics-specific one, else the general one) and a metrics protocol of
+    /// `http/protobuf`; empty values count as unset.
+    #[cfg(feature = "http-proto")]
+    #[test]
+    fn metrics_http_export_needs_an_endpoint_and_http_protobuf() {
+        let http = Some("http/protobuf");
+        let url = Some("https://otlp.example");
+        assert!(
+            !http_export_configured(None, None, None, http),
+            "no endpoint"
+        );
+        assert!(!http_export_configured(Some(""), Some(" "), None, http));
+        assert!(http_export_configured(None, url, None, http));
+        assert!(http_export_configured(url, None, None, http));
+        assert!(http_export_configured(Some(""), url, None, http));
+        assert!(
+            !http_export_configured(None, url, None, None),
+            "gRPC default"
+        );
+        assert!(!http_export_configured(None, url, None, Some("grpc")));
+        assert!(http_export_configured(None, url, http, Some("grpc")));
+        assert!(!http_export_configured(None, url, Some("grpc"), http));
+        assert!(http_export_configured(None, url, Some(""), http));
+    }
+
+    /// The env the re-executed child of
+    /// `http_protobuf_metrics_export_reaches_the_endpoint` reads.
+    #[cfg(feature = "http-proto")]
+    const HTTP_EXPORT_CHILD: &str = "OURIOS_TELEMETRY_HTTP_EXPORT_CHILD";
+
+    /// The OTLP/HTTP path end to end, as the fuzz harnesses use it: `init` with
+    /// only the standard env, in a process with no tokio runtime, exports a
+    /// recorded metric as a protobuf `POST /v1/metrics` carrying the configured
+    /// headers. The child process owns the env, so this test mutates none.
+    #[cfg(feature = "http-proto")]
+    #[test]
+    fn http_protobuf_metrics_export_reaches_the_endpoint() {
+        let sink = otlp_sink::OtlpSink::start();
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::http_export_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(HTTP_EXPORT_CHILD, "1")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", sink.url())
+            .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+            .env(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "Authorization=Bearer test-token",
+            )
+            .env("RUST_LOG", "off")
+            .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+            .env_remove("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
+            .env_remove("OTEL_SDK_DISABLED")
+            .env_remove("OTEL_METRICS_EXPORTER")
+            .output()
+            .expect("re-execute the test binary");
+        let requests = sink.stop();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test failed or did not run:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let metrics = requests
+            .iter()
+            .find(|request| request.head.starts_with("POST /v1/metrics "))
+            .unwrap_or_else(|| panic!("no POST /v1/metrics, got {requests:?}"));
+        let head = metrics.head.to_ascii_lowercase();
+        assert!(
+            head.contains("\r\ncontent-type: application/x-protobuf\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nauthorization: bearer test-token\r\n"),
+            "{head}"
+        );
+        assert!(
+            metrics
+                .body
+                .windows(b"ourios.compaction.sweeps".len())
+                .any(|w| w == b"ourios.compaction.sweeps"),
+            "the recorded instrument should be in the protobuf payload",
+        );
+    }
+
+    #[cfg(feature = "http-proto")]
+    #[test]
+    #[ignore = "re-executed by http_protobuf_metrics_export_reaches_the_endpoint"]
+    fn http_export_child() {
+        if std::env::var_os(HTTP_EXPORT_CHILD).is_none() {
+            return;
+        }
+        assert!(tokio::runtime::Handle::try_current().is_err(), "no runtime");
+        assert!(metrics_http_export_configured());
+        let guard = init(&TelemetryConfig {
+            traces_enabled: false,
+            logs_enabled: false,
+            ..TelemetryConfig::new("ourios-test")
+        })
+        .expect("init over OTLP/HTTP without a runtime");
+        global::meter("ourios.compaction")
+            .u64_counter("ourios.compaction.sweeps")
+            .build()
+            .add(1, &[]);
+        guard.force_flush().expect("the export is acknowledged");
     }
 
     // Build a provider over an in-memory exporter (no global state, no
@@ -855,5 +1095,98 @@ mod tests {
             correlated,
             "a log emitted inside a span should carry a non-zero trace_id/span_id, got {records:?}",
         );
+    }
+
+    /// A minimal OTLP/HTTP endpoint on a `std::net` listener: it answers every
+    /// request `200` and closes the connection, recording what it received.
+    #[cfg(feature = "http-proto")]
+    mod otlp_sink {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread::JoinHandle;
+        use std::time::Duration;
+
+        #[derive(Debug)]
+        pub(super) struct Request {
+            /// Request line and headers, CRLF-separated as received.
+            pub(super) head: String,
+            pub(super) body: Vec<u8>,
+        }
+
+        pub(super) struct OtlpSink {
+            url: String,
+            stop: Arc<AtomicBool>,
+            server: JoinHandle<Vec<Request>>,
+        }
+
+        impl OtlpSink {
+            pub(super) fn start() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+                listener.set_nonblocking(true).expect("non-blocking accept");
+                let url = format!("http://{}", listener.local_addr().expect("local addr"));
+                let stop = Arc::new(AtomicBool::new(false));
+                let server = {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || serve(&listener, &stop))
+                };
+                Self { url, stop, server }
+            }
+
+            pub(super) fn url(&self) -> &str {
+                &self.url
+            }
+
+            pub(super) fn stop(self) -> Vec<Request> {
+                self.stop.store(true, Ordering::Relaxed);
+                self.server.join().expect("sink thread")
+            }
+        }
+
+        fn serve(listener: &TcpListener, stop: &AtomicBool) -> Vec<Request> {
+            let mut requests = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => requests.extend(answer(stream)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            requests
+        }
+
+        fn answer(stream: TcpStream) -> Option<Request> {
+            stream.set_nonblocking(false).ok()?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok()?;
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).ok()? == 0 {
+                    return None;
+                }
+                head.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).ok()?;
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .ok()?;
+            Some(Request { head, body })
+        }
     }
 }

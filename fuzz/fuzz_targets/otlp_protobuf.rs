@@ -7,6 +7,9 @@
 use libfuzzer_sys::fuzz_target;
 use ourios_ingester::receiver::decode_protobuf;
 
-fuzz_target!(|data: &[u8]| {
+#[path = "../common/telemetry.rs"]
+mod telemetry;
+
+fuzz_target!(init: telemetry::init(), |data: &[u8]| {
     let _ = decode_protobuf(data);
 });

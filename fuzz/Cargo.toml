@@ -21,6 +21,10 @@ ourios-miner = { path = "../crates/ourios-miner" }
 ourios-ingester = { path = "../crates/ourios-ingester" }
 ourios-wal = { path = "../crates/ourios-wal", features = ["fuzzing"] }
 ourios-querier = { path = "../crates/ourios-querier" }
+# Installs the OTel metrics provider when the standard OTLP env points at an
+# OTLP/HTTP endpoint (`common/telemetry.rs`, which every target includes by
+# path, so the package keeps no library API per RFC 0015 §3.1).
+ourios-telemetry = { path = "../crates/ourios-telemetry", features = ["http-proto"] }
 
 # Drain-template + bit-identical reconstruction round-trip (§3.3 / §3.1).
 [[bin]]

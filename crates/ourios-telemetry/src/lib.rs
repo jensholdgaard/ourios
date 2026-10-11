@@ -383,9 +383,12 @@ fn first_set<'a>(signal: Option<&'a str>, general: Option<&'a str>) -> Option<&'
     signal.filter(set).or(general.filter(set))
 }
 
+/// The protocol is an Enum in the configuration spec, whose values SHOULD be
+/// read case-insensitively.
 #[cfg(feature = "http-proto")]
 fn is_http_protobuf(signal_protocol: Option<&str>, protocol: Option<&str>) -> bool {
-    first_set(signal_protocol, protocol).is_some_and(|protocol| protocol.trim() == "http/protobuf")
+    first_set(signal_protocol, protocol)
+        .is_some_and(|protocol| protocol.trim().eq_ignore_ascii_case("http/protobuf"))
 }
 
 #[cfg(feature = "http-proto")]
@@ -756,6 +759,12 @@ mod tests {
         );
         assert!(is_http_protobuf(Some("  "), Some("http/protobuf")));
         assert!(!is_http_protobuf(Some(""), Some("")));
+        assert!(
+            is_http_protobuf(None, Some("HTTP/PROTOBUF")),
+            "the protocol enum is case-insensitive"
+        );
+        assert!(is_http_protobuf(Some("Http/Protobuf"), Some("grpc")));
+        assert!(!is_http_protobuf(Some("GrPc"), Some("http/protobuf")));
     }
 
     /// Metrics export over OTLP/HTTP is configured only with an endpoint (the

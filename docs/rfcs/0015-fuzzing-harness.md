@@ -670,6 +670,10 @@ the find.
 > - **And** a panic inside the `parquet`/`arrow` decoders surfaces as
 >   `DecodePanicked`, an accepted outcome, while any panic outside that
 >   boundary (in Ourios's own decode) still crashes the target
+> - **And** the scenario is about panics, not allocation failures: an
+>   abort from parquet 59's footer decoder reserving an untrusted list
+>   count is a known exception no boundary can catch, tracked by #959
+>   until parquet 60 removes it
 > - **And** the decoded events re-encode through
 >   `audit_events_to_batch`, write to Parquet and read back equal
 > - **And** any violation makes the target panic with a message

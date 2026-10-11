@@ -10,20 +10,12 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
-use std::any::Any;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use arrow_array::{Array, BinaryViewArray, RecordBatch, StringViewArray};
-use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
-};
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::reader::ChunkReader;
-
-/// The `error.type` a Parquet decode that panicked is logged under.
-pub const ERROR_TYPE_DECODE_PANICKED: &str = "decode_panicked";
-const ERROR_TYPE: &str = "error.type";
 
 /// A string column in either arrow representation. The parquet reader
 /// yields plain `Utf8`; `DataFusion` (the querier's scan path) yields
@@ -107,84 +99,6 @@ where
         reader,
         ArrowReaderOptions::new().with_skip_arrow_metadata(true),
     )
-}
-
-/// Run one decode of the untrusted Parquet object at `path`, turning a
-/// panic inside the `parquet`/`arrow` decoders into
-/// [`DecodeError::decode_panicked`]. Those crates assert, index and
-/// unwrap on malformed pages and footers instead of returning an error,
-/// and every file read back from the store is untrusted bytes: without
-/// this a single corrupt object would abort the process.
-pub(crate) fn guard_decode<T, E: DecodeError>(
-    path: &Path,
-    decode: impl FnOnce() -> Result<T, E>,
-) -> Result<T, E> {
-    catch_decode_panic(path, decode)
-        .unwrap_or_else(|message| Err(E::decode_panicked(path, message)))
-}
-
-fn catch_decode_panic<T>(path: &Path, decode: impl FnOnce() -> T) -> Result<T, String> {
-    // Unwind-safe in practice: `decode` mutates only decoder state of the
-    // one object being read, and every caller drops that state on the
-    // error path (`Batches` retires its reader), so nothing a panic left
-    // half-updated is observed afterwards.
-    catch_unwind(AssertUnwindSafe(decode)).map_err(|payload| {
-        let message = panic_message(payload.as_ref());
-        tracing::warn!(
-            { { ERROR_TYPE } = ERROR_TYPE_DECODE_PANICKED },
-            "the parquet decoder panicked on {}: {message}; the object is treated as corrupt",
-            path.display(),
-        );
-        message
-    })
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "a panic with a non-string payload".to_owned()
-    }
-}
-
-/// A [`ParquetRecordBatchReader`] whose page decoding runs under
-/// [`guard_decode`]. After a caught panic the reader is dropped and every
-/// later call returns the same error, so a decoder left mid-page is never
-/// read from again.
-pub(crate) struct Batches(BatchesState);
-
-enum BatchesState {
-    Live(ParquetRecordBatchReader),
-    Panicked(String),
-}
-
-impl Batches {
-    pub(crate) fn new(reader: ParquetRecordBatchReader) -> Self {
-        Self(BatchesState::Live(reader))
-    }
-
-    /// The next decoded batch of the object at `path`, or `None` at its
-    /// end.
-    pub(crate) fn next_batch<E: DecodeError>(
-        &mut self,
-        path: &Path,
-    ) -> Option<Result<RecordBatch, E>> {
-        let reader = match &mut self.0 {
-            BatchesState::Live(reader) => reader,
-            BatchesState::Panicked(message) => {
-                return Some(Err(E::decode_panicked(path, message.clone())));
-            }
-        };
-        match catch_decode_panic(path, || reader.next()) {
-            Ok(next) => next.map(|batch| batch.map_err(|e| E::parquet(e.into()))),
-            Err(message) => {
-                self.0 = BatchesState::Panicked(message.clone());
-                Some(Err(E::decode_panicked(path, message)))
-            }
-        }
-    }
 }
 
 /// RFC 0005 §3.9 (the reader contract; §3.8 gives the policy):

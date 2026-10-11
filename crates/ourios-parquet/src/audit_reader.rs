@@ -28,6 +28,7 @@
 // The shared accessor family (epic #745 wave 2).
 #[allow(clippy::wildcard_imports)]
 use crate::decode::*;
+use crate::panic_boundary::{Batches, guard_decode};
 use std::fmt;
 use std::fs::File;
 use std::io;

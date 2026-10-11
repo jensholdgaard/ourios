@@ -3601,7 +3601,6 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
- "tracing",
  "uuid",
 ]
 

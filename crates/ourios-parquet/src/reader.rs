@@ -37,6 +37,7 @@ use arrow_array::cast::AsArray;
 // for both readers, generic over the error type.
 #[allow(clippy::wildcard_imports)]
 use crate::decode::*;
+use crate::panic_boundary::{Batches, guard_decode};
 use arrow_array::types::Int32Type;
 use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::audit::ParamType;

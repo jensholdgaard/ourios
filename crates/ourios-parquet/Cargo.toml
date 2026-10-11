@@ -78,9 +78,6 @@ tempfile = "=3.27.0"
 # split). Names come from the weaver-generated ourios-semconv constants.
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 ourios-semconv = { path = "../ourios-semconv" }
-# The WARN a caught Parquet decoder panic emits (the panic boundary in
-# `decode.rs`); the ingester/querier subscribers forward it via OTLP.
-tracing = { version = "0.1", default-features = false, features = ["std"] }
 # `object_store`'s `HttpService` and `ObjectStore` traits are
 # `#[async_trait]`; the metering wrappers implement them.
 async-trait = "=0.1.89"

@@ -17,7 +17,8 @@ use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaD
 use parquet::file::statistics::Statistics;
 
 use crate::audit_reader::AuditReaderError;
-use crate::decode::{arrow_reader_builder, guard_decode};
+use crate::decode::arrow_reader_builder;
+use crate::panic_boundary::guard_decode;
 use crate::store::{Store, StoreError};
 use crate::{audit_columns, columns};
 

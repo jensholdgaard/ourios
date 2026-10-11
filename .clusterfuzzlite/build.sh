@@ -23,4 +23,9 @@ for f in fuzz/fuzz_targets/*.rs; do
   if [ -d "fuzz/seeds/$target" ] && [ -n "$(ls -A "fuzz/seeds/$target")" ]; then
     zip -j "$OUT/${target}_seed_corpus.zip" "fuzz/seeds/$target"/* >/dev/null
   fi
+  # Stage <target>.options (OSS-Fuzz convention): the libFuzzer engine reads
+  # the `[libfuzzer]` section next to the binary and appends its flags.
+  if [ -f "fuzz/$target.options" ]; then
+    cp "fuzz/$target.options" "$OUT/${target}.options"
+  fi
 done

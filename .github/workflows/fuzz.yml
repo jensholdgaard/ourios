@@ -48,24 +48,25 @@ env:
 
 jobs:
   smoke:
-    name: smoke-fuzz ${{ matrix.target }}
+    name: smoke-fuzz
     if: github.event.schedule == '17 4 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'smoke'))
     runs-on: ubuntu-latest
+    # One sanitizer build (~12 min) plus five 300 s runs; the limit leaves
+    # room for a slow runner, not for a hung target (libFuzzer's own
+    # -max_total_time and -timeout bound those).
+    timeout-minutes: 60
     # A newer push to a branch supersedes its running smoke-fuzz; on `main`
     # every run completes so the daily signal is never dropped.
     concurrency:
       group: fuzz-smoke-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [miner_roundtrip, otlp_json, otlp_protobuf, wal_frame, dsl_parse]
     env:
       # The one gate for every OTEL_* variable of the smoke step: `main` only
       # (the schedule, or a dispatch of main), with both the endpoint var and
       # the token secret set. Otherwise none of them reaches the fuzz process,
       # the credential included.
       OTLP_EXPORT: ${{ github.ref == 'refs/heads/main' && vars.OTLP_EXPORT_ENDPOINT != '' && secrets.DASH0_AUTHORIZATION_TOKEN != '' }}
+      TARGETS: miner_roundtrip otlp_json otlp_protobuf wal_frame dsl_parse
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -81,7 +82,19 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - name: Smoke-fuzz ${{ matrix.target }}
+      - name: Build the fuzz targets
+        run: |
+          set -euo pipefail
+          # Force the gnu host triple. Left to default, cargo-fuzz picks
+          # the musl target on the runner, whose statically-linked libc is
+          # incompatible with the ASan sanitizer ("sanitizer is incompatible
+          # with statically linked libc").
+          host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
+          # Every target in one build: the sanitizer build of the shared
+          # dependency graph (datafusion under ASan) is the expensive part,
+          # and `fuzz run` below reuses it as long as the build options match.
+          cargo "+${NIGHTLY}" fuzz build --target "${host}"
+      - name: Smoke-fuzz every target
         env:
           # 300 s per target on the daily schedule; 60 s on a manual dispatch.
           BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
@@ -100,35 +113,53 @@ jobs:
           OTEL_METRIC_EXPORT_INTERVAL: ${{ env.OTLP_EXPORT == 'true' && '10000' || '' }}
           # Upstream resource attributes only. The cicd.pipeline.run.id on
           # metrics is the opt-in the CI/CD semantic conventions ask for.
-          OTEL_RESOURCE_ATTRIBUTES: >-
-            ${{ env.OTLP_EXPORT == 'true' && format('deployment.environment.name=test,cicd.pipeline.name={0},cicd.pipeline.task.name=smoke-fuzz/{1},cicd.pipeline.run.id={2},vcs.ref.head.revision={3}', github.workflow, matrix.target, github.run_id, github.sha) || '' }}
+          # The per-target `cicd.pipeline.task.name=smoke-fuzz/<target>` is
+          # appended in the loop below, from this base.
+          OTEL_RESOURCE_ATTRIBUTES_BASE: >-
+            ${{ env.OTLP_EXPORT == 'true' && format('deployment.environment.name=test,cicd.pipeline.name={0},cicd.pipeline.run.id={1},vcs.ref.head.revision={2}', github.workflow, github.run_id, github.sha) || '' }}
           # Warn and error only on stderr, once a subscriber is installed.
           RUST_LOG: warn
         run: |
           set -euo pipefail
-          target='${{ matrix.target }}'
-          # Force the gnu host triple. Left to default, cargo-fuzz picks
-          # the musl target on the runner, whose statically-linked libc is
-          # incompatible with the ASan sanitizer ("sanitizer is incompatible
-          # with statically linked libc").
           host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
-          mkdir -p "fuzz/corpus/${target}"
-          # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
-          # Copy the directory contents (`/.`) so an empty/odd glob can't
-          # silently skip seeding; errors surface under `set -e` rather
-          # than being swallowed.
-          if [ -d "fuzz/seeds/${target}" ]; then
-            cp -rn "fuzz/seeds/${target}/." "fuzz/corpus/${target}/"
+          failed=()
+          for target in ${TARGETS}; do
+            echo "::group::${target}"
+            mkdir -p "fuzz/corpus/${target}"
+            # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
+            # Copy the directory contents (`/.`) so an empty/odd glob can't
+            # silently skip seeding; errors surface under `set -e` rather
+            # than being swallowed.
+            if [ -d "fuzz/seeds/${target}" ]; then
+              cp -rn "fuzz/seeds/${target}/." "fuzz/corpus/${target}/"
+            fi
+            # Empty base (gate shut) stays empty, so no OTEL_* value is set.
+            export OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES_BASE:+${OTEL_RESOURCE_ATTRIBUTES_BASE},cicd.pipeline.task.name=smoke-fuzz/${target}}"
+            # Same build options as the build step, so nothing recompiles.
+            # -timeout and -rss_limit_mb turn a hang or a leak-like blowup
+            # into a reported crash instead of a job that runs to the limit.
+            # Every target runs even after a crash, so one does not hide
+            # another; the job fails at the end.
+            if cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- \
+                -max_total_time="${BUDGET}" -timeout=30 -rss_limit_mb=2048 -print_final_stats=1; then
+              echo "${target}: clean"
+            else
+              echo "::error::${target}: cargo fuzz run exited $?"
+              failed+=("${target}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::crashing targets: ${failed[*]}"
+            exit 1
           fi
-          # `fuzz run` also builds, so a target that stops compiling fails
-          # here too.
-          cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- -max_total_time="${BUDGET}"
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}
+          name: fuzz-artifacts
+          # One subdirectory per crashing target.
+          path: fuzz/artifacts/
           if-no-files-found: ignore
 
   # The ClusterFuzzLite corpus lives in GitHub Actions artifacts
@@ -139,6 +170,7 @@ jobs:
     name: cflite batch
     if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'batch'))
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     concurrency:
       group: fuzz-corpus-${{ github.ref }}
       cancel-in-progress: false
@@ -165,6 +197,8 @@ jobs:
     name: cflite coverage
     if: github.event.schedule == '0 3 * * 1' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'coverage'))
     runs-on: ubuntu-latest
+    # A coverage build (~5 min) plus one pass over the corpus; measured ~8 min.
+    timeout-minutes: 30
     concurrency:
       group: fuzz-coverage-${{ github.ref }}
       cancel-in-progress: false

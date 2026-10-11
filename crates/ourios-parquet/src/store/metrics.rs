@@ -20,6 +20,7 @@
 //! `Range`, so they are not mistaken for retries.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -378,7 +379,7 @@ tokio::task_local! {
 struct Attempts {
     metrics: Metrics,
     labels: Labels,
-    seen: Mutex<Vec<(u64, Option<Failure>)>>,
+    seen: Mutex<HashMap<u64, Option<Failure>>>,
 }
 
 impl Attempts {
@@ -386,7 +387,7 @@ impl Attempts {
     /// a retry classified by how that earlier attempt ended.
     fn attempt(&self, identity: u64) {
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((_, earlier)) = seen.iter().find(|(id, _)| *id == identity) else {
+        let Some(earlier) = seen.get(&identity) else {
             return;
         };
         // The earlier attempt got a response under 400, so what failed it is
@@ -400,11 +401,10 @@ impl Attempts {
     }
 
     fn ended(&self, identity: u64, failure: Option<Failure>) {
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        match seen.iter_mut().find(|(id, _)| *id == identity) {
-            Some(entry) => entry.1 = failure,
-            None => seen.push((identity, failure)),
-        }
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(identity, failure);
     }
 }
 
@@ -429,7 +429,7 @@ impl Call {
             Arc::new(Attempts {
                 metrics: metrics.clone(),
                 labels,
-                seen: Mutex::new(Vec::new()),
+                seen: Mutex::new(HashMap::new()),
             })
         });
         Self {
@@ -952,12 +952,34 @@ mod tests {
         );
     }
 
-    /// The bridge runs every call on its runtime's long-lived threads, so
-    /// the count of threads it created stays flat however many calls pass.
-    /// The runtime is process-wide, and other tests in this process may
-    /// grow its blocking pool meanwhile, so the bound is loose.
+    /// The full name of [`bridge_threads_stay_flat_in_a_fresh_process`].
+    const FRESH_PROCESS_TEST: &str =
+        "store::metrics::tests::bridge_threads_stay_flat_in_a_fresh_process";
+
+    /// The bridge runtime and its thread count are process-wide, so other
+    /// tests' local I/O would grow its blocking pool under the count. The
+    /// check runs alone, in a child process of this test binary.
     #[test]
     fn sequential_bridged_calls_do_not_create_threads() {
+        let exe = std::env::current_exe().expect("test binary");
+        let out = std::process::Command::new(exe)
+            .args([FRESH_PROCESS_TEST, "--exact", "--ignored", "--nocapture"])
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The bridge runs every call on its runtime's long-lived threads, so
+    /// the count of threads it created stays flat however many calls pass.
+    #[test]
+    #[ignore = "run alone by sequential_bridged_calls_do_not_create_threads"]
+    fn bridge_threads_stay_flat_in_a_fresh_process() {
         const CALLS: usize = 10_000;
         let harness = Harness::new();
         let store = harness.in_memory(Caller::Other);
@@ -973,6 +995,48 @@ mod tests {
         assert!(
             created <= f64::from(u32::try_from(4 * MAX_BRIDGE_WORKERS).expect("small")),
             "{CALLS} bridged calls created {created} threads"
+        );
+    }
+
+    /// A repeated request is a retry classified by how its latest earlier
+    /// attempt ended; distinct requests (pages, ranges) never are.
+    #[test]
+    fn only_a_repeated_request_counts_as_a_retry() {
+        let harness = Harness::new();
+        let attempts = super::Attempts {
+            metrics: harness.metrics.clone(),
+            labels: super::Labels {
+                op: Operation::List,
+                caller: Caller::Querier,
+            },
+            seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        for page in 0..1_000 {
+            attempts.attempt(page);
+            attempts.ended(page, None);
+        }
+        assert!(
+            harness
+                .points(semconv::OURIOS_STORAGE_OPERATION_RETRIES)
+                .is_empty()
+        );
+        attempts.ended(7, Some(super::Failure::Status(503)));
+        attempts.attempt(7);
+        attempts.ended(7, Some(super::Failure::Transport("timeout")));
+        attempts.attempt(7);
+        let retries: BTreeMap<String, f64> = harness
+            .points(semconv::OURIOS_STORAGE_OPERATION_RETRIES)
+            .into_iter()
+            .map(|p| {
+                (
+                    p.attribute("error.type").expect("error.type").to_owned(),
+                    p.sum,
+                )
+            })
+            .collect();
+        assert_eq!(
+            retries,
+            BTreeMap::from([("503".to_owned(), 1.0), ("timeout".to_owned(), 1.0)])
         );
     }
 

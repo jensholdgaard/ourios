@@ -291,8 +291,10 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 > oracle: an `InvalidQuery` detail echoes the query's own keys and
 > literals, which can contain any token. The first runs found two
 > planner errors that surfaced as `Storage`, each fixed in its own PR:
-> the text functions and regex operators on the `Binary` `body`
-> column (#960), and a malformed regex pattern (#961). The status
+> `starts_with` / `matches` / `=~` / `!~` on the `Binary` `body`
+> column, now rejected at validation because matching only the stored
+> body would silently miss mined lines (RFC 0044 §7, #960, #968), and
+> a malformed regex pattern (#961). The status
 > stays `accepted`; scenario RFC0015.15 is the criterion.
 
 ### 3.3 Seed corpora

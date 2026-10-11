@@ -272,7 +272,7 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > takes precedence over a local pattern (the GenAI `execute_tool` names above
 > are the same kind of case).
 
-> **Amendment 2026-10-12 — two children of `load template_map` (§3.7.2).**
+> **Amendment (2026-10-12, #966, maintainer-approved) — two children of `load template_map` (§3.7.2).**
 > The table gains these rows. Both follow the `{action} {target}` rule.
 >
 > | Operation | Span name | Kind |
@@ -457,7 +457,7 @@ A child `CLIENT` span that failed (a `404` on an absent manifest, say)
 does not make its phase `Error` if the phase handled that outcome as
 normal.
 
-> **Amendment 2026-10-12 — the fold and the wait get their own spans.**
+> **Amendment (2026-10-12, #966, maintainer-approved) — the fold and the wait get their own spans.**
 > A `load template_map` span that covers a 40 s fold, or a query parked
 > behind another query's fold, still does not say which. Two `INTERNAL`
 > children separate them:
@@ -538,7 +538,7 @@ which are at `Development` stability.
   `404` on an absent manifest or a `412` on a lost CAS mark the `CLIENT`
   span `Error`, as the request did fail. The phase above decides whether
   that failed the operation (§3.7.2).
-> **Amendment 2026-10-12 — as implemented.** The spans also carry the
+> **Amendment (2026-10-12, #966, maintainer-approved) — as implemented.** The spans also carry the
 > upstream HTTP client attributes the `http.client.request.duration`
 > metric already records (`http.request.method`, `server.address`,
 > `server.port`) and `http.response.status_code` once a response arrives.
@@ -797,6 +797,20 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > a phase (on the blocking pool included) carries the query's `trace_id`.
 > The test for this arm must satisfy RFC0038.9.
 
+> **Amendment (2026-10-12, #966, maintainer-approved) — RFC0038.1's query
+> arm gains the §3.7.2 children of `load template_map`.** The span set
+> above also contains, under `load template_map`:
+>
+> - **exactly one** `derive template_map` iff the lookup folds (outcome
+>   `miss`, `stale`, `torn` or `unknown_version`), and none on a `hit` or
+>   `joined`;
+> - one `wait template_map` per wait on another query's in-flight
+>   acquisition, so none for the query that acquires.
+>
+> On the S3 backend, the fold's object-store requests' `CLIENT` spans are
+> children of `derive template_map`, not of `load template_map`. "No other
+> span is produced" now applies to this extended set.
+
 > **Scenario RFC0038.2 — the ingest hot path mints no per-record spans.**
 > **Given** traces enabled and an always-on sampler,
 > **When** one `Export` batch of N records is ingested,
@@ -896,6 +910,14 @@ are `drafted`.
 > **And** a `CLIENT` span for a request answered `404` has status `Error`
 > and `error.type = "404"`, while its phase span stays `Unset`.
 
+> **Amendment (2026-10-12, #966, maintainer-approved) — RFC0038.8's
+> parentage.** "Every `CLIENT` span is a child of `resolve files` or
+> `load template_map`" now reads "of `resolve files`, `load template_map`
+> or `derive template_map`". On a cold tenant, the row-returning trace has
+> exactly one `derive template_map` under its `load template_map`. That
+> span carries `ourios.template_map.derive.reason` and lies within its
+> parent's interval.
+
 > **Scenario RFC0038.9 — the span harness sees spans opened off the calling
 > thread.**
 > **Given** the harness used by RFC0038.1's query arm and RFC0038.8,
@@ -937,6 +959,42 @@ are `drafted`.
 > those two names anywhere else, or for any other name, fails the job.
 > `stability: development` shows only as advice, and the §3.6 genai
 > exemption is not widened to cover any of these names.
+
+The following scenarios are added by the 2026-10-12 amendment (#966,
+maintainer-approved).
+
+> **Scenario RFC0038.12 — a query joining another's acquisition shows its
+> wait.**
+> **Given** two concurrent queries for one tenant at the same audit
+> frontier, the first holding the per-tenant acquisition,
+> **When** the second waits on it and is served its result,
+> **Then** the second query's `load template_map` has a `wait template_map`
+> child and `ourios.template_map.lookup.outcome = joined`, and has no
+> `derive template_map` of its own.
+
+> **Scenario RFC0038.13 — a failed acquisition fails its spans.**
+> **Given** a tenant whose audit set holds a file the fold cannot read,
+> **When** a query that acquires the template map runs,
+> **Then** the query fails, and both `derive template_map` and
+> `load template_map` have status `Error` and an `error.type` equal to the
+> failure's class (`storage`), per *Recording errors*.
+
+> **Scenario RFC0038.14 — an abandoned request is not an error.**
+> **Given** a query phase on the S3 backend,
+> **When** the caller drops an object-store request before its response
+> arrives (for example, a client timeout that drops the query),
+> **Then** that request's `CLIENT` span ends `Unset` with no `error.type`,
+> since the HTTP span conventions say an intentional cancellation is not an
+> error. The storage metrics still record the attempt as `cancelled`.
+
+> **Scenario RFC0038.15 — `CLIENT` spans carry the HTTP client
+> attributes.**
+> **Given** a query phase on the S3 backend,
+> **When** a request gets a response,
+> **Then** its `CLIENT` span carries `http.request.method`,
+> `server.address`, `server.port` and `http.response.status_code` (an int)
+> alongside the §3.7.3 AWS attributes. It also carries `aws.request_id`,
+> from the `x-amz-request-id` header, when the response sends one.
 
 ## 6. Testing strategy
 
@@ -993,6 +1051,42 @@ Mapped to `CLAUDE.md` §6.2:
 >   query and per request, never per record (RFC0038.2's invariant). The
 >   `Parquet → query result` benchmark runs on the local backend, where
 >   only two spans are added.
+
+> **Amendment (2026-10-12, #966, maintainer-approved) — testing the
+> template-map children and the `CLIENT` span details (#965).**
+>
+> - **RFC0038.1 (template-map part), RFC0038.12, RFC0038.13** —
+>   `crates/ourios-querier/tests/it/rfc0038_template_map_spans.rs`, in the
+>   crate's consolidated `it` binary (RFC 0028):
+>   - `a_cold_acquisition_spans_the_load_and_its_derive_under_the_query`
+>     checks `derive` under `load` under the query, with outcome and reason
+>     `miss`.
+>   - `a_query_joining_an_acquisition_spans_its_wait` (`testing` feature)
+>     covers RFC0038.12.
+>   - `a_failed_fold_marks_the_derive_and_load_spans_error` covers
+>     RFC0038.13.
+>
+>   These tests use a scoped subscriber over a local tracer provider, not
+>   the RFC0038.9 global harness. That works because the acquisition hands
+>   the caller's `tracing` dispatcher to its blocking-pool thread along with
+>   its span, so a scoped subscriber sees the fold's span. The
+>   cold-acquisition test is the blocking-pool canary for this path.
+> - **RFC0038.8 (`CLIENT` shape), RFC0038.14, RFC0038.15** — unit tests in
+>   `crates/ourios-parquet/src/store/client_span.rs` against a fake S3
+>   endpoint:
+>   - `a_failed_request_in_a_query_phase_is_an_error_client_span`: a 404
+>     gives `Error` and `error.type = "404"`, with the AWS and HTTP
+>     attributes.
+>   - `a_successful_request_leaves_its_client_span_unset`.
+>   - `an_abandoned_request_leaves_its_client_span_unset`: RFC0038.14.
+>   - `a_request_outside_a_query_phase_opens_no_client_span`: RFC0038.10's
+>     local half, at the connector.
+>   - Two table tests: request to operation name, and key extraction.
+> - **Existing exact-count tests.** `rfc0038_1_query_emits_one_server_span`
+>   and `rfc0038_1_mcp_tool_emits_one_internal_span` keep asserting their
+>   exact span counts and are unchanged. Both query an empty tenant, which
+>   returns no rows and so acquires no template map, so neither exercises
+>   the new children.
 
 ## 7. Open questions
 
@@ -1118,7 +1212,9 @@ scope, not ingest) already covers it.
   and the frontmatter stays `accepted` pending the §7 status question.
   Refs #853.
 - **2026-10-12 — the fold and the wait under `load template_map`
-  (`drafted`).** Adds `derive template_map` and `wait template_map` as
+  (#966, maintainer-approved).** Adds `derive template_map` and `wait template_map` as
   `INTERNAL` children of `load template_map` (§3.5, §3.7.2), and records
   how the `CLIENT` spans handle a cancelled request and which HTTP client
-  attributes they carry (§3.7.3). No new attribute names. Matches #965.
+  attributes they carry (§3.7.3). Amends RFC0038.1's query arm and
+  RFC0038.8's parentage, adds RFC0038.12–.15 and maps them to #965's
+  tests (§5, §6). No new attribute names. Matches #965.

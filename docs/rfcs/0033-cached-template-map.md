@@ -270,7 +270,9 @@ behaviour.
 >   in this RFC (§3.3–§3.5, §5, the §3.4 diagram) read as the
 >   versioned key post-amendment; the local tmp is
 >   `template_map.v2.json.zst.tmp` (extension `tmp`, ignored by the
->   walk as before).
+>   walk as before). *(Superseded 2026-10-12, #962: each local
+>   publish uses its own uniquely named temp,
+>   `template_map.v2.json.zst.<UUIDv7>.tmp`; see the §3.3 amendment.)*
 > - **Dependency.** Zero new dependencies: `zstd` 0.13 is already
 >   compiled into every querier build (`parquet` 58's `zstd`
 >   feature via `ourios-parquet`, and `arrow-ipc`), and
@@ -467,8 +469,10 @@ uncached query identically.
 > `high_water_ns = max(high_water_ns, the delta's greatest
 > fold-relevant timestamp)`, the union conflict set, and
 > `incremental_depth + 1`. A delta with no fold-relevant event (only
-> compaction events, say) passes trivially and changes only the
-> frontier.
+> compaction events, say) passes trivially. It leaves the registry,
+> alias map, conflict set and `high_water_ns` unchanged, but it is
+> still an incremental step: `folded_files` grows and
+> `incremental_depth` increments, counting toward the cap.
 >
 > **Equivalence.** The full fold's order is RFC 0005 §3.7.1's
 > `(timestamp, file path, row index)`. When the guard passes, every
@@ -658,7 +662,10 @@ already exists.
 
 > **Amendment (2026-07-13, run #20 / §9.14).** The publish targets
 > the v2 key (`template_map.v2.json.zst`; local tmp
-> `template_map.v2.json.zst.tmp`, same rename; same CAS ladder on
+> `template_map.v2.json.zst.tmp`, same rename — *superseded
+> 2026-10-12, #962: a uniquely named
+> `template_map.v2.json.zst.<UUIDv7>.tmp` per publish, see the §3.3
+> amendment*; same CAS ladder on
 > S3, the expectation being the v2 key's observed ETag or
 > create-if-absent), and on a successful publish best-effort
 > **deletes** the stale v1 `template_map.json` key. The delete is
@@ -1093,7 +1100,8 @@ ambiguity cannot recur.
 
 > **Scenario RFC0033.11 — The guard falls back, never guesses**
 > (amendment 2026-10-12, #962, maintainer-approved)
-> - **Given** a published artifact with `fold_state`
+> - **Given** a published v2 artifact, with `fold_state` except in
+>   the pre-amendment case below
 > - **When** the next listing adds a delta holding a fold-relevant
 >   event with `timestamp` < `high_water_ns`, or `=` it; or a folded
 >   file is missing from the listing; or the artifact's
@@ -1103,8 +1111,10 @@ ambiguity cannot recur.
 >   answer equals the no-cache fold, and the republished artifact
 >   carries `fold_state` with `incremental_depth = 0`
 > - **And** a delta whose only events are not fold-relevant (e.g.
->   compaction events, whatever their timestamps) folds incrementally
->   and changes only `folded_files`
+>   compaction events, whatever their timestamps) folds incrementally:
+>   `folded_files` grows and `incremental_depth` increments by one,
+>   while the registry, alias map, `binding_conflicts` and
+>   `high_water_ns` are unchanged
 > - **And** a `fold_state` failing the §3.3-amendment validation
 >   (unsorted or registry-absent conflict keys, `null` high-water
 >   with a non-empty fold, depth above the cap) classifies **Torn**

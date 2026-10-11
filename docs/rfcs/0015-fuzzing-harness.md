@@ -519,8 +519,9 @@ confirmed as the RFC advances toward `green`):
 - [x] **Nightly pin** → **pin a dated `nightly-YYYY-MM-DD`** in the fuzz
   job (not a floating `nightly`), for reproducibility; Renovate bumps
   it like the other pinned toolchains.
-- [x] **Smoke-fuzz budget** → **~60 s per target on PRs, ~300 s on the
-  daily schedule** (see §3.4). Revisit if CI minutes or signal warrant.
+- [x] **Smoke-fuzz budget** → **~300 s per target on the daily
+  schedule, ~60 s on a manual dispatch**; the smoke job never runs per
+  PR (see §3.4). Revisit if CI minutes or signal warrant.
 - [x] **`read_frame` exposure** → a **`fuzzing` cargo feature** on
   `ourios-wal` gating the `pub` export, rather than a `#[doc(hidden)]`
   shim — slightly cleaner and reusable for future non-fuzz tests.

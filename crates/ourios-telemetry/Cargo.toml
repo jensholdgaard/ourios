@@ -43,6 +43,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 # `process.creation.time` on the resource is ISO 8601; same pin as
 # ourios-df-otel.
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+# The `ourios.runtime.*` metrics read the stable `RuntimeMetrics` of the
+# runtime `init` runs on. Already in the tree via the SDK's `rt-tokio`.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# Generated metric-name constants (the `ourios.runtime.*` names).
+ourios-semconv = { path = "../ourios-semconv" }
 # `testing` only: the weaver live-check sample file and report.
 serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
 

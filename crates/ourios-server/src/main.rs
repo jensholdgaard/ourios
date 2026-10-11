@@ -666,9 +666,9 @@ fn build_compactor(
     // disabled, neither the store clone nor the audit sink is constructed, and
     // the disabled state is logged so it's visible in a multi-pod rollout.
     if config.compaction_enabled {
-        let audit_store = store.clone();
+        let audit_store = store.clone().with_caller(ourios_parquet::Caller::AuditSink);
         let mut compactor = Compactor::new(
-            store,
+            store.with_caller(ourios_parquet::Caller::Compaction),
             CompactionPolicy::default(),
             config.compaction_interval,
         )

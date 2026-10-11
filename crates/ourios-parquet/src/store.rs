@@ -19,68 +19,27 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use std::panic::AssertUnwindSafe;
-
-use futures::{FutureExt, TryStreamExt};
-use object_store::ClientConfigKey;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-use object_store::client::SpawnedReqwestConnector;
+use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
     UpdateVersion,
 };
-use tokio::runtime::Runtime;
 
-/// The process-wide runtime that drives the async `object_store` calls behind
-/// the sync storage API. Built once, lazily, via `get_or_init` so there is no
-/// init-race that could drop a surplus runtime on a caller's thread (an
-/// earlier manual `get`/`set` did, panicking when the loser was inside a tokio
-/// runtime). The runtime lives for the process and is never dropped, so the
-/// "drop a runtime in async context" hazard can't arise.
-///
-/// Its workers are the long-lived threads every bridged future is polled on
-/// (see [`block_on_off_runtime`]), so they are sized to the host but capped at
-/// [`MAX_BRIDGE_WORKERS`]: the work is object-store I/O, and the local backend
-/// moves its file I/O onto tokio's blocking pool anyway. The S3 backend's
-/// HTTP connections also live here, whichever runtime issues the request
-/// (see [`Store::s3`]).
-fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
-    static RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
-    match RT.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .min(MAX_BRIDGE_WORKERS);
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .thread_name("ourios-store-bridge")
-            // `enable_all` so the runtime carries the IO + time drivers the
-            // `AmazonS3` backend's HTTP client (reqwest/hyper) needs; the local
-            // backend ignores them.
-            .enable_all()
-            .build()
-    }) {
-        Ok(rt) => Ok(rt),
-        // Build failure is cached (a permanent resource exhaustion); rebuild a
-        // fresh `io::Error` since it isn't `Clone`.
-        Err(e) => Err(StoreError::Runtime(std::io::Error::new(
-            e.kind(),
-            e.to_string(),
-        ))),
-    }
-}
+mod bridge;
+mod metered;
+mod metrics;
+mod s3;
 
-/// Upper bound on the bridge runtime's worker threads.
-const MAX_BRIDGE_WORKERS: usize = 4;
-
-/// Idle connections the S3 client keeps per host once a burst of concurrent
-/// requests is over; the rest close instead of holding a descriptor each.
-/// When credentials come from the chain, an `AWS_POOL_MAX_IDLE_PER_HOST` in
-/// the environment takes precedence (explicit credentials read no `AWS_*`).
-const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
+#[cfg(test)]
+use bridge::MAX_BRIDGE_WORKERS;
+use bridge::block_on_off_runtime;
+use metered::Backend;
+pub use metrics::Caller;
+use metrics::{Metrics, Operation};
 
 /// Whether `tag` (an `ETag` without its quotes) is safe to send unquoted in
 /// `If-Match`: non-empty ASCII letters, digits and hyphens, the shape of S3
@@ -89,53 +48,6 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 32;
 /// become a wildcard matching any existing object, and a comma a list.
 fn is_plain_opaque_tag(tag: &str) -> bool {
     !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-/// Drive `fut` to completion synchronously — the bridge from the **sync**
-/// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
-/// `object_store` (compaction must reach S3 per RFC0013.3, so a local-only
-/// `std::fs` shortcut won't do).
-///
-/// `fut` is spawned onto the shared [`bridge_runtime`] and the caller blocks
-/// on a plain `std` channel for its result. Nothing here enters or drives a
-/// tokio runtime on the caller's thread, so it is safe from any call site —
-/// a plain thread, a `spawn_blocking` closure, or *inside* a runtime (the
-/// querier resolving manifests on its async task, a `#[tokio::test]`), where
-/// `Handle::block_on` would panic. A current-thread caller blocked here does
-/// not stall `fut`, which runs on the bridge runtime's own workers.
-///
-/// The future is polled on those long-lived workers, never on a thread made
-/// for the call: an earlier design spawned a scoped OS thread per call, and a
-/// query making thousands of store calls churned thousands of threads (and
-/// their allocator arenas, which glibc does not hand back). The cost is that
-/// `fut` must be `'static`; the `*_blocking` methods clone the cheap `Store`
-/// handle and own their keys to satisfy that.
-///
-/// `fut` already yields a [`StoreError`] result, returned directly; the extra
-/// error mode is building the bridge runtime ([`StoreError::Runtime`]). A
-/// panic *inside* `fut` is not swallowed — it is re-raised on the caller's
-/// thread via [`std::panic::resume_unwind`].
-fn block_on_off_runtime<T>(
-    fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
-) -> Result<T, StoreError>
-where
-    T: Send + 'static,
-{
-    let rt = bridge_runtime()?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    // The task, not a `JoinHandle`, carries the outcome back: awaiting a
-    // `JoinHandle` needs an executor, and the caller may be inside a runtime.
-    rt.spawn(async move {
-        // The receiver outlives the send — the caller blocks on it below.
-        let _ = tx.send(AssertUnwindSafe(fut).catch_unwind().await);
-    });
-    match rx.recv() {
-        Ok(Ok(result)) => result,
-        Ok(Err(payload)) => std::panic::resume_unwind(payload),
-        Err(std::sync::mpsc::RecvError) => Err(StoreError::Runtime(std::io::Error::other(
-            "store bridge task dropped before completing",
-        ))),
-    }
 }
 
 /// Object bytes paired with the backend's `ETag` (the compare-and-swap token),
@@ -188,7 +100,16 @@ fn local_sync_targets<'p>(
 /// do **not** assume this type enforces isolation yet.
 #[derive(Clone, Debug)]
 pub struct Store {
+    /// [`Self::backend`] behind the metering wrapper; every call goes
+    /// through this.
     inner: Arc<dyn ObjectStore>,
+    /// The backend itself.
+    backend: Arc<dyn ObjectStore>,
+    /// Whether the backend is reached over HTTP (S3).
+    http: bool,
+    /// The subsystem this handle's calls are attributed to.
+    caller: Caller,
+    metrics: Metrics,
     /// Reserved key prefix (the store root). Always empty at `red`; honoured
     /// once the consumers migrate onto [`Store`] at `green`.
     prefix: ObjectPath,
@@ -206,7 +127,7 @@ pub struct Store {
 /// endpoint, region, and key prefix — plus optional explicit S3 credentials
 /// (RFC 0019 §3.4). When the credential fields are set, [`Store::s3`] applies them
 /// to the builder; when they are unset, credentials fall back to the standard
-/// chain ([`AmazonS3Builder::from_env`] — static `AWS_*` keys, a shared profile,
+/// chain ([`AmazonS3Builder::from_env`](object_store::aws::AmazonS3Builder::from_env) — static `AWS_*` keys, a shared profile,
 /// IRSA, or instance metadata).
 ///
 /// `Default` yields an **empty `bucket`**, which is not valid; [`Store::s3`]
@@ -441,26 +362,30 @@ impl Store {
     /// `object_store` `LocalFileSystem` (e.g. it does not exist).
     pub fn local(root: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let fs = LocalFileSystem::new_with_prefix(root.as_ref()).map_err(StoreError::Backend)?;
-        Ok(Self {
-            inner: Arc::new(fs),
+        Ok(Self::assemble(Backend {
+            store: Arc::new(fs),
+            http: false,
             prefix: ObjectPath::default(),
             // `LocalFileSystem` rejects `PutMode::Update`, so it has no `If-Match`
             // CAS; the compactor commits the manifest with an atomic overwrite here.
             conditional_update: false,
             local_root: Some(root.as_ref().to_path_buf()),
-        })
+            metrics: Metrics::Global,
+        }))
     }
 
     /// An in-process backend with `If-Match` support, for tests and
     /// tools that need the conditional-update path without an S3 endpoint.
     #[must_use]
     pub fn in_memory() -> Self {
-        Self {
-            inner: Arc::new(object_store::memory::InMemory::new()),
+        Self::assemble(Backend {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            http: false,
             prefix: ObjectPath::default(),
             conditional_update: true,
             local_root: None,
-        }
+            metrics: Metrics::Global,
+        })
     }
 
     /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
@@ -470,7 +395,7 @@ impl Store {
     /// `cfg.access_key_id` / `cfg.secret_access_key` (and optionally
     /// `cfg.session_token`) are set they build a **clean** `AmazonS3Builder` (so
     /// no ambient chain credential bleeds in); otherwise credentials fall back to
-    /// the standard chain ([`AmazonS3Builder::from_env`] — static `AWS_*` env,
+    /// the standard chain ([`AmazonS3Builder::from_env`](object_store::aws::AmazonS3Builder::from_env) — static `AWS_*` env,
     /// shared profile, IRSA, or instance metadata). Blank credential values are
     /// trimmed and treated as unset. The static access key and secret are a pair:
     /// setting one without the other, or a session token without that pair, is
@@ -488,113 +413,21 @@ impl Store {
     /// `AmazonS3` backend cannot be built from `cfg`; [`StoreError::Runtime`]
     /// if the bridge runtime its connections run on cannot be built.
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
-        let S3Config {
-            bucket,
-            endpoint,
-            region,
-            prefix,
-            access_key_id,
-            secret_access_key,
-            session_token,
-        } = cfg;
-        // Trim once and use the trimmed value for both the check and the
-        // builder, so a whitespace-padded bucket can't pass validation and then
-        // fail opaquely at request time.
-        let bucket = bucket.trim().to_owned();
-        if bucket.is_empty() {
-            return Err(StoreError::Config(
-                "S3 bucket name must not be empty".to_string(),
-            ));
-        }
-        // Normalize the explicit credential fields: trim and treat an empty or
-        // whitespace-only value as unset, so a blank reads consistently across
-        // every caller of `S3Config` (matching the server's env parsing) and
-        // can't spuriously trip the partial-set check below (RFC 0019 §3.4).
-        let normalize =
-            |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        let access_key_id = normalize(access_key_id);
-        let secret_access_key = normalize(secret_access_key);
-        let session_token = normalize(session_token);
-        // The static access key and its secret are a pair; a session token is
-        // meaningless without them. Reject a partial set rather than silently
-        // falling back to the chain on an operator typo. The message names only
-        // the offending key, never a value (RFC 0019 §3.4).
-        match (&access_key_id, &secret_access_key) {
-            (Some(_), None) => {
-                return Err(StoreError::Config(
-                    "OURIOS_S3_SECRET_ACCESS_KEY must be set (the static access key and secret access key are required together)".to_string(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(StoreError::Config(
-                    "OURIOS_S3_ACCESS_KEY_ID must be set (the static access key and secret access key are required together)".to_string(),
-                ));
-            }
-            (None, None) if session_token.is_some() => {
-                return Err(StoreError::Config(
-                    "OURIOS_S3_SESSION_TOKEN requires the static access key and secret access key (a session token is valid only with the static key pair)".to_string(),
-                ));
-            }
-            _ => {}
-        }
-        // Explicit credentials build from a **clean** builder so no ambient
-        // chain credential (e.g. an `AWS_SESSION_TOKEN` `from_env` would pick up)
-        // bleeds into the explicit static-key pair — the `with_*` setters do not
-        // clear an inherited token. `from_env()` (the standard chain: static
-        // `AWS_*`, shared profile, IRSA, instance metadata) is used only as the
-        // fallback when no explicit pair is given (RFC 0019 §3.4).
-        let mut builder = match (access_key_id, secret_access_key) {
-            (Some(access_key_id), Some(secret_access_key)) => {
-                let mut explicit = AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .with_access_key_id(access_key_id)
-                    .with_secret_access_key(secret_access_key);
-                if let Some(session_token) = session_token {
-                    explicit = explicit.with_token(session_token);
-                }
-                explicit
-            }
-            // The validation above guarantees the remaining case is "no explicit
-            // credentials" (a lone key, lone secret, or lone token is rejected).
-            _ => AmazonS3Builder::from_env().with_bucket_name(bucket),
-        };
-        if let Some(endpoint) = endpoint {
-            // S3-compatible dev endpoints are often plain HTTP; object_store
-            // refuses HTTP unless explicitly allowed.
-            let allow_http = endpoint.starts_with("http://");
-            builder = builder.with_endpoint(endpoint);
-            if allow_http {
-                builder = builder.with_allow_http(true);
-            }
-        }
-        if let Some(region) = region {
-            builder = builder.with_region(region);
-        }
-        let pool_cap = AmazonS3ConfigKey::Client(ClientConfigKey::PoolMaxIdlePerHost);
-        if builder.get_config_value(&pool_cap).is_none() {
-            builder = builder.with_config(pool_cap, MAX_IDLE_CONNECTIONS_PER_HOST.to_string());
-        }
-        // reqwest runs each pooled connection on the runtime that issued the
-        // request, and a connection only notices the store closing it while
-        // that runtime polls it. Callers' runtimes stall (a current-thread
-        // caller between requests, busy `DataFusion` workers), which left
-        // connections in `CLOSE_WAIT` and handed them to later requests
-        // (#791). The bridge runtime is never a caller's, so it always does.
-        let s3 = builder
-            .with_http_connector(SpawnedReqwestConnector::new(
-                bridge_runtime()?.handle().clone(),
-            ))
-            .build()
-            .map_err(StoreError::Backend)?;
-        let prefix = prefix.map_or_else(ObjectPath::default, ObjectPath::from);
-        Ok(Self {
-            inner: Arc::new(s3),
-            prefix,
+        Self::s3_with(cfg, Metrics::Global)
+    }
+
+    fn s3_with(cfg: S3Config, metrics: Metrics) -> Result<Self, StoreError> {
+        let (s3, prefix) = s3::client(cfg, &metrics)?;
+        Ok(Self::assemble(Backend {
+            store: Arc::new(s3),
+            http: true,
+            prefix: prefix.map_or_else(ObjectPath::default, ObjectPath::from),
             // The backend keeps object_store's default `S3ConditionalPut::ETagMatch`,
             // so the `If-Match` CAS the manifest generation-swap needs is available.
             conditional_update: true,
             local_root: None,
-        })
+            metrics,
+        }))
     }
 
     /// Whether this backend supports a conditional update (`If-Match` CAS) — the
@@ -611,7 +444,8 @@ impl Store {
 
     /// The underlying [`ObjectStore`], for handing to `DataFusion`'s table
     /// providers on the read path (RFC 0013 §2.2 — the querier registers the
-    /// same store rather than local file paths).
+    /// same store rather than local file paths). Its calls are recorded in
+    /// the storage metrics under this handle's caller.
     #[must_use]
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
@@ -620,16 +454,18 @@ impl Store {
     /// This store with its backend replaced by `wrap(backend)` — for layering
     /// an instrumenting or fault-injecting [`ObjectStore`] over the real one.
     /// The prefix and the conditional-update capability are kept, so the
-    /// wrapper must forward every call it does not mean to change.
+    /// wrapper must forward every call it does not mean to change. It sits
+    /// under the storage metrics, which see what it returns.
     #[must_use]
     pub fn wrap_backend(
         self,
         wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
     ) -> Self {
         Self {
-            inner: wrap(self.inner),
+            backend: wrap(Arc::clone(&self.backend)),
             ..self
         }
+        .metered()
     }
 
     /// The store's root key prefix.
@@ -663,6 +499,15 @@ impl Store {
                     source: Box::new(source),
                 })
             })
+    }
+
+    /// Run `fut` on the bridge (see [`block_on_off_runtime`]) as an `op` call.
+    fn bridge<T: Send + 'static>(
+        &self,
+        op: Operation,
+        fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        block_on_off_runtime(&self.metrics, op, fut)
     }
 
     /// Resolve a `/`-delimited `key` to an absolute object path under the
@@ -771,7 +616,7 @@ impl Store {
     /// otherwise as [`Self::delete`] (and see the missing-key note above).
     pub fn delete_blocking(&self, key: &str) -> Result<(), StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.delete(&key).await })
+        self.bridge(Operation::Delete, async move { store.delete(&key).await })
     }
 
     /// Blocking [`Self::get`] for the **sync** storage call sites (`Reader`,
@@ -783,7 +628,7 @@ impl Store {
     /// otherwise as [`Self::get`].
     pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.get(&key).await })
+        self.bridge(Operation::Get, async move { store.get(&key).await })
     }
 
     /// Blocking [`Self::get_bytes`]. Safe to call from inside a tokio
@@ -794,7 +639,7 @@ impl Store {
     /// otherwise as [`Self::get_bytes`].
     pub fn get_bytes_blocking(&self, key: &str) -> Result<bytes::Bytes, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.get_bytes(&key).await })
+        self.bridge(Operation::Get, async move { store.get_bytes(&key).await })
     }
 
     /// Blocking [`Self::get_suffix`] for the sync call sites. Safe to call
@@ -805,7 +650,9 @@ impl Store {
     /// otherwise as [`Self::get_suffix`].
     pub fn get_suffix_blocking(&self, key: &str, len: u64) -> Result<Suffix, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.get_suffix(&key, len).await })
+        self.bridge(Operation::GetRange, async move {
+            store.get_suffix(&key, len).await
+        })
     }
 
     /// List every object key under `prefix` (store-relative), recursively, in
@@ -883,7 +730,9 @@ impl Store {
     /// [`StoreError::Backend`] on a listing failure.
     pub fn list_blocking(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list(prefix.as_deref()).await })
+        self.bridge(Operation::List, async move {
+            store.list(prefix.as_deref()).await
+        })
     }
 
     /// Blocking `(key, size)` listing for the **sync** storage call sites — the
@@ -899,7 +748,9 @@ impl Store {
         prefix: Option<&str>,
     ) -> Result<Vec<(String, u64)>, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list_entries(prefix.as_deref()).await })
+        self.bridge(Operation::List, async move {
+            store.list_entries(prefix.as_deref()).await
+        })
     }
 
     /// List the **immediate child common-prefixes** under `prefix` (the
@@ -983,7 +834,9 @@ impl Store {
         prefix: Option<&str>,
     ) -> Result<DelimitedListing, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list_delimited(prefix.as_deref()).await })
+        self.bridge(Operation::ListDelimited, async move {
+            store.list_delimited(prefix.as_deref()).await
+        })
     }
 
     /// Blocking immediate-child common-prefix listing for the **sync** storage
@@ -1000,7 +853,9 @@ impl Store {
         prefix: Option<&str>,
     ) -> Result<Vec<String>, StoreError> {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
-        block_on_off_runtime(async move { store.list_common_prefixes(prefix.as_deref()).await })
+        self.bridge(Operation::ListDelimited, async move {
+            store.list_common_prefixes(prefix.as_deref()).await
+        })
     }
 
     /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
@@ -1012,7 +867,7 @@ impl Store {
     /// otherwise as [`Self::put`].
     pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.put(&key, bytes).await })
+        self.bridge(Operation::Put, async move { store.put(&key, bytes).await })
     }
 
     /// Write `bytes` to `key` only if no object exists there
@@ -1056,7 +911,9 @@ impl Store {
     /// runtime can't be built.
     pub fn put_if_absent_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        block_on_off_runtime(async move { store.put_if_absent(&key, bytes).await })
+        self.bridge(Operation::Put, async move {
+            store.put_if_absent(&key, bytes).await
+        })
     }
 
     /// Read the object at `key` together with its current `ETag` (the
@@ -1133,7 +990,10 @@ impl Store {
         key: &str,
     ) -> Result<Option<EtaggedBytes>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
-        match block_on_off_runtime(async move { store.get_with_etag(&key).await }) {
+        match self.bridge(
+            Operation::Get,
+            async move { store.get_with_etag(&key).await },
+        ) {
             Ok(pair) => Ok(Some(pair)),
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e),
@@ -1152,7 +1012,9 @@ impl Store {
         e_tag: &str,
     ) -> Result<(), StoreError> {
         let (store, key, e_tag) = (self.clone(), key.to_owned(), e_tag.to_owned());
-        block_on_off_runtime(async move { store.put_if_match(&key, bytes, &e_tag).await })
+        self.bridge(Operation::Put, async move {
+            store.put_if_match(&key, bytes, &e_tag).await
+        })
     }
 }
 
@@ -1213,7 +1075,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::ThreadId;
 
-    use super::{MAX_BRIDGE_WORKERS, S3Config, Store, StoreError, block_on_off_runtime};
+    use super::{
+        MAX_BRIDGE_WORKERS, Metrics, Operation, S3Config, Store, StoreError, block_on_off_runtime,
+    };
+
+    fn bridged<T: Send + 'static>(
+        fut: impl Future<Output = Result<T, StoreError>> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        block_on_off_runtime(&Metrics::Global, Operation::Get, fut)
+    }
 
     /// `Store::s3` builds an `AmazonS3` backend from addressing config without
     /// contacting the endpoint (creds/connectivity resolve on first request),
@@ -1707,7 +1577,7 @@ mod tests {
     /// Run one bridged call that records the thread its future is polled on.
     fn bridged_call_records_thread(seen: &Arc<Mutex<HashSet<ThreadId>>>) {
         let seen = Arc::clone(seen);
-        let got = block_on_off_runtime(async move {
+        let got = bridged(async move {
             seen.lock()
                 .expect("thread-id set")
                 .insert(std::thread::current().id());
@@ -1812,7 +1682,7 @@ mod tests {
     fn a_panic_in_the_bridged_future_propagates_to_the_caller() {
         let fail = true;
         let caught = std::panic::catch_unwind(|| {
-            block_on_off_runtime(async move {
+            bridged(async move {
                 assert!(!fail, "bridged future panicked");
                 Ok(())
             })
@@ -1824,9 +1694,6 @@ mod tests {
             .or_else(|| caught.downcast_ref::<&str>().copied())
             .unwrap_or_default();
         assert!(msg.contains("bridged future panicked"), "payload: {msg:?}");
-        assert_eq!(
-            block_on_off_runtime(async { Ok(1_u8) }).expect("after panic"),
-            1
-        );
+        assert_eq!(bridged(async { Ok(1_u8) }).expect("after panic"), 1);
     }
 }

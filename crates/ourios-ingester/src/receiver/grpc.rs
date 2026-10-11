@@ -27,7 +27,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use opentelemetry::context::FutureExt as _;
 
@@ -194,7 +194,7 @@ impl LogsService for LogsReceiver {
         match tokio::spawn(
             async move {
                 pipeline
-                    .ingest_bound(export, tenant, binding.as_deref(), false)
+                    .ingest_reported(export, tenant, binding.as_deref(), false, span_error)
                     .await
             }
             .with_context(parent),
@@ -244,9 +244,32 @@ fn ingest_error_status(error: &ReceiveError) -> Status {
     }
 }
 
+/// The `error.type` the `ingest logs` span fails with for `error`: its gRPC
+/// code, when that code is one the gRPC server convention counts as an error.
+fn span_error(error: &ReceiveError) -> Option<String> {
+    server_error_code(ingest_error_status(error).code()).map(str::to_owned)
+}
+
+/// `code`'s name if it fails a gRPC **server** span. Semconv
+/// (<https://opentelemetry.io/docs/specs/semconv/rpc/grpc/#server>) lists
+/// exactly `UNKNOWN`, `DEADLINE_EXCEEDED`, `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE`
+/// and `DATA_LOSS`; every other code, `PERMISSION_DENIED` and `INVALID_ARGUMENT`
+/// included, leaves the span unset.
+fn server_error_code(code: Code) -> Option<&'static str> {
+    match code {
+        Code::Unknown => Some("UNKNOWN"),
+        Code::DeadlineExceeded => Some("DEADLINE_EXCEEDED"),
+        Code::Unimplemented => Some("UNIMPLEMENTED"),
+        Code::Internal => Some("INTERNAL"),
+        Code::Unavailable => Some("UNAVAILABLE"),
+        Code::DataLoss => Some("DATA_LOSS"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ReceiveError, ingest_error_status};
+    use super::{IngestFailure, ReceiveError, ingest_error_status, server_error_code};
     use ourios_wal::{AppendError, RotationFault, RotationSite, SyncError};
     use tonic::Code;
 
@@ -307,5 +330,113 @@ mod tests {
             source: std::io::Error::other("io"),
         });
         assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
+    }
+
+    /// The `ingest logs` span fails exactly when the gRPC status is one the
+    /// semconv gRPC server convention counts as an error (`UNKNOWN`,
+    /// `DEADLINE_EXCEEDED`, `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE`, `DATA_LOSS`);
+    /// `PERMISSION_DENIED` and `INVALID_ARGUMENT` leave it unset.
+    #[test]
+    fn the_batch_span_fails_exactly_on_a_grpc_server_error_code() {
+        let errors = [
+            ReceiveError::TenantDenied {
+                token_name: "edge".to_string(),
+                tenant: ourios_core::tenant::TenantId::new("intruder"),
+            },
+            ReceiveError::WalAppend(AppendError::TooLarge { len: 2, limit: 1 }),
+            ReceiveError::WalAppend(AppendError::RotationTerminal(fault(3))),
+            ReceiveError::WalSync(SyncError::Io {
+                op: "fdatasync",
+                source: std::io::Error::other("io"),
+            }),
+        ];
+        for e in errors {
+            let server_error = matches!(
+                ingest_error_status(&e).code(),
+                Code::Unknown
+                    | Code::DeadlineExceeded
+                    | Code::Unimplemented
+                    | Code::Internal
+                    | Code::Unavailable
+                    | Code::DataLoss
+            );
+            let span_error = IngestFailure::classify(&e).span_error_type().is_some();
+            assert_eq!(span_error, server_error, "{e}");
+            assert_eq!(super::span_error(&e).is_some(), server_error, "{e}");
+        }
+    }
+
+    /// An `ingest logs`-shaped server span marked from `code` as the gRPC
+    /// arm marks it, exported.
+    fn server_span_for(code: Code) -> opentelemetry_sdk::trace::SpanData {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::prelude::*;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(
+                provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test")),
+            ));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "ingest logs",
+                otel.kind = "server",
+                otel.status_code = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+            );
+            if let Some(error_type) = server_error_code(code) {
+                ourios_core::telemetry::record_span_error(&span, error_type);
+            }
+        });
+        let mut spans = exporter.get_finished_spans().expect("spans");
+        spans.pop().expect("one span")
+    }
+
+    #[test]
+    fn grpc_internal_fails_the_server_span_and_permission_denied_does_not() {
+        let internal = server_span_for(Code::Internal);
+        assert!(
+            matches!(internal.status, opentelemetry::trace::Status::Error { .. }),
+            "{:?}",
+            internal.status
+        );
+        let error_type = internal
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "error.type")
+            .map(|kv| kv.value.as_str().into_owned());
+        assert_eq!(error_type.as_deref(), Some("INTERNAL"));
+
+        let denied = server_span_for(Code::PermissionDenied);
+        assert_eq!(denied.status, opentelemetry::trace::Status::Unset);
+        assert!(
+            denied
+                .attributes
+                .iter()
+                .all(|kv| kv.key.as_str() != "error.type")
+        );
+    }
+
+    #[test]
+    fn only_the_listed_grpc_codes_are_server_errors() {
+        let listed = [
+            Code::Unknown,
+            Code::DeadlineExceeded,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::Unavailable,
+            Code::DataLoss,
+        ];
+        for value in 0..=16 {
+            let code = Code::from_i32(value);
+            assert_eq!(
+                server_error_code(code).is_some(),
+                listed.contains(&code),
+                "{code:?}"
+            );
+        }
     }
 }

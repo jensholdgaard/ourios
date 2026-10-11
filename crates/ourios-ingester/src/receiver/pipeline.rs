@@ -34,7 +34,7 @@ use prost::Message;
 use tracing::Instrument as _;
 
 use crate::metrics::IngestMetrics;
-use crate::receiver::commit::CommitCoordinator;
+use crate::receiver::commit::{CommitCoordinator, CommitOutcome};
 use crate::receiver::tenant::assign;
 use ourios_serving::AuthBinding;
 
@@ -565,6 +565,30 @@ impl IngestPipeline {
     ///   with no partial success (RFC 0026 §3.2).
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
+    pub async fn ingest_bound(
+        &self,
+        request: ExportLogsServiceRequest,
+        tenant: TenantId,
+        binding: Option<&AuthBinding>,
+        lenient_json: bool,
+    ) -> Result<usize, ReceiveError> {
+        self.ingest_reported(request, tenant, binding, lenient_json, |error| {
+            IngestFailure::classify(error)
+                .span_error_type()
+                .map(str::to_owned)
+        })
+        .await
+    }
+
+    /// [`Self::ingest_bound`], with the transport saying how a failure
+    /// marks the `ingest logs` server span: `span_error` returns the
+    /// `error.type` under that transport's convention, or `None` when its
+    /// status is not a server error there (HTTP: only a `5xx`; gRPC: only
+    /// the codes the gRPC server convention lists).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ingest_bound`].
     // RFC 0038: one span per OTLP `Export` batch — the correct coarse
     // granularity (never per record; the miner/encode/sink loops below stay
     // span-free). Opened *inside* this callee, not at the `tokio::spawn` site
@@ -580,20 +604,45 @@ impl IngestPipeline {
             error.type = tracing::field::Empty,
         )
     )]
-    pub async fn ingest_bound(
+    pub(crate) async fn ingest_reported(
         &self,
         request: ExportLogsServiceRequest,
         tenant: TenantId,
         binding: Option<&AuthBinding>,
         lenient_json: bool,
+        span_error: SpanError,
     ) -> Result<usize, ReceiveError> {
         let outcome = self
             .ingest_batch(request, tenant, binding, lenient_json)
             .await;
         if let Err(error) = &outcome
-            && let Some(error_type) = IngestFailure::classify(error).span_error_type()
+            && let Some(error_type) = span_error(error)
         {
-            ourios_core::telemetry::record_span_error(&tracing::Span::current(), error_type);
+            ourios_core::telemetry::record_span_error(&tracing::Span::current(), &error_type);
+        }
+        outcome
+    }
+
+    /// The WAL group-commit as the batch's `commit wal` child span. An
+    /// internal span, so any failed commit marks it `Error`, an oversize
+    /// frame included; the batch span above applies the server-span rule.
+    async fn commit_traced(&self, payload: &[u8]) -> CommitOutcome {
+        let span = tracing::info_span!(
+            "commit wal",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
+        let outcome = self
+            .coordinator
+            .commit(payload)
+            .instrument(span.clone())
+            .await;
+        if let Err(e) = &outcome.result {
+            ourios_core::telemetry::record_span_error(
+                &span,
+                IngestFailure::classify(e).error_type(),
+            );
         }
         outcome
     }
@@ -635,11 +684,7 @@ impl IngestPipeline {
         // I/O-bound, latency-bearing step (a durationful op is a span, not an
         // event). Nests under the batch span; `.instrument` (not an entered
         // guard) carries it across the await cleanly.
-        let outcome = self
-            .coordinator
-            .commit(&payload)
-            .instrument(tracing::info_span!("commit wal", otel.kind = "internal"))
-            .await;
+        let outcome = self.commit_traced(&payload).await;
         // The WAL-before-ack latency: time until the batch is durable
         // (includes the group-commit window + fsync). Recorded below only
         // on a successful, acked commit.
@@ -976,6 +1021,11 @@ pub enum ReceiveError {
     WalSync(ourios_wal::SyncError),
 }
 
+/// How a transport classifies a failed batch for the `ingest logs` server
+/// span: the `error.type` it fails with, or `None` for a status that is not
+/// a server error under that transport's convention.
+pub(crate) type SpanError = fn(&ReceiveError) -> Option<String>;
+
 /// The transport-agnostic classification of a [`ReceiveError`] —
 /// one exhaustive match instead of one per transport (epic #745
 /// wave 2; this replaced twin 4-arm mappers in `http.rs`/`grpc.rs`,
@@ -1038,18 +1088,29 @@ impl IngestFailure {
         }
     }
 
+    /// The low-cardinality `error.type` of the class.
+    #[must_use]
+    pub(super) fn error_type(self) -> &'static str {
+        match self {
+            Self::Denied => "permission_denied",
+            Self::TooLarge => "too_large",
+            Self::Unavailable => "unavailable",
+            Self::ServerTerminal => "server_terminal",
+            Self::Internal => "internal",
+        }
+    }
+
     /// The `error.type` the batch span fails with, or `None` for a
     /// rejection that is the client's fault: an `ingest logs` span is a
     /// server span, which semconv leaves unset on a 4xx / client-error
     /// status (HTTP 403 / 413, gRPC `PERMISSION_DENIED` /
-    /// `INVALID_ARGUMENT`).
+    /// `INVALID_ARGUMENT`). The gRPC server convention counts UNAVAILABLE
+    /// and INTERNAL, the codes the other classes map to, as errors.
     #[must_use]
     pub(super) fn span_error_type(self) -> Option<&'static str> {
         match self {
             Self::Denied | Self::TooLarge => None,
-            Self::Unavailable => Some("unavailable"),
-            Self::ServerTerminal => Some("server_terminal"),
-            Self::Internal => Some("internal"),
+            Self::Unavailable | Self::ServerTerminal | Self::Internal => Some(self.error_type()),
         }
     }
 }

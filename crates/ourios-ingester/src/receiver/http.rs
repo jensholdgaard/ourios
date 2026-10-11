@@ -336,7 +336,11 @@ async fn handle_logs(
     match tokio::spawn(
         async move {
             pipeline
-                .ingest_bound(request, tenant, binding.as_deref(), lenient_json)
+                .ingest_reported(request, tenant, binding.as_deref(), lenient_json, |error| {
+                    ourios_core::telemetry::http_server_error_type(
+                        ingest_error_status(error).as_u16(),
+                    )
+                })
                 .await
         }
         .with_context(parent),

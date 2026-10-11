@@ -352,7 +352,10 @@ fn json_to_value(value: serde_json::Value) -> Result<Value, DslError> {
                 // silently coerce to Float (precision loss; would also diverge
                 // from the string DSL, which errors on out-of-range integers).
                 Err(DslError::new(format!("integer {n} is out of range")))
-            } else if let Some(f) = n.as_f64() {
+            } else if let Some(f) = n.as_f64().filter(|f| f.is_finite()) {
+                // serde_json already refuses an overflowing literal; the filter
+                // keeps that true should `arbitrary_precision` ever be unified
+                // in, since the canonical serialiser cannot write infinity.
                 Ok(Value::Float(f))
             } else {
                 Err(DslError::new(format!("number {n} is out of range")))
@@ -777,6 +780,23 @@ mod tests {
                 let err = parse_structured(&json).unwrap_err();
                 prop_assert!(err.message().contains("exactly one"), "{}", err.message());
             }
+        }
+    }
+
+    #[test]
+    fn rejects_a_json_number_that_overflows_to_infinity() {
+        // Arrange — the structured twin of the string surface's non-finite
+        // float rejection: neither an exponent nor a long decimal may reach
+        // the IR as infinity, which the canonical serialiser cannot print.
+        let huge = format!("{}.0", "9".repeat(400));
+        for number in ["1e400", "-1e400", huge.as_str()] {
+            let json =
+                format!(r#"{{"predicate":{{"field":"confidence","op":"==","value":{number}}}}}"#);
+            // Act / Assert
+            assert!(
+                parse_structured(&json).is_err(),
+                "{number}: a non-finite JSON number must be rejected"
+            );
         }
     }
 

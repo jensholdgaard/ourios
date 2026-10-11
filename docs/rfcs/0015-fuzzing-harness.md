@@ -240,6 +240,39 @@ cargo-fuzz directory), so Phase 2 is what moves that check 0 → positive
 `cflite_batch` after merge — it cannot run on the introducing PR with no
 PR trigger.
 
+> **Amendment (2026-10-11, #950, maintainer-approved): one `Fuzz`
+> workflow, four jobs.** The three workflows above are one
+> `.github/workflows/fuzz.yml` with four jobs, each on its own
+> `schedule` entry (gated by `github.event.schedule`) or on
+> `workflow_dispatch` with a `job` input naming one job (`smoke |
+> batch | coverage | prune`); still no `pull_request` trigger.
+>
+> - `smoke` (daily 04:17) is no longer a matrix: one `cargo fuzz build
+>   --target "$host"` of every target, then a loop over the targets,
+>   each run for its budget (300 s on the schedule, 60 s on dispatch)
+>   with `-timeout=30 -rss_limit_mb=2048`. A crash is recorded and the
+>   loop continues, so a crash in one target does not stop the others;
+>   the job fails at the end and uploads `fuzz/artifacts/`.
+> - `batch` (daily 02:00) is ClusterFuzzLite `mode: batch`, 3000 s
+>   split across the targets, `parallel-fuzzing: true`.
+> - `prune` (daily 01:00, new) is `mode: prune`. The ClusterFuzzLite
+>   GitHub Actions guide requires it of any project that batch-fuzzes
+>   ("If batch fuzzing is running, you must also run corpus pruning").
+>   `batch` and `prune` share a no-cancel concurrency group and never
+>   run in the same workflow run: the corpus artifact is their
+>   handoff, and ClusterFuzzLite cannot hand it over within one run.
+> - `coverage` (Mondays 03:00) is `mode: coverage` and appends
+>   per-target line coverage to the step summary.
+>
+> Every job has a `timeout-minutes` (smoke 60, batch 90, prune 60,
+> coverage 30). The ClusterFuzzLite jobs take the same `timeout` /
+> `rss_limit_mb` from `fuzz/<target>.options`, staged next to each
+> binary by `build.sh`. The corpus persists as the
+> `cifuzz-corpus-<target>` workflow artifacts (90-day expiry, rolled by
+> each run) — not the Actions cache as written above and in §7; a
+> storage repo remains an open maintainer decision. The status stays
+> `accepted`; RFC0015.5 and RFC0015.7 as amended are the criteria.
+
 ### 3.5 Regression discipline
 
 When the fuzzer finds a crash, the workflow per `CLAUDE.md` §6.2 is:
@@ -362,6 +395,19 @@ the find.
 > - **And** the job uses top-level `contents: read` (least
 >   privilege, matching the other workflows)
 
+> **Amendment (2026-10-11, #950): RFC0015.5 as amended.** The
+> scenario reads:
+> - **Given** `.github/workflows/fuzz.yml` on the nightly toolchain
+> - **When** the daily schedule fires or the workflow is dispatched
+>   (there is no `pull_request` trigger — §3.4)
+> - **Then** every target is built once (`cargo fuzz build`) and each
+>   is run for its configured bounded budget with libFuzzer
+>   `-timeout` and `-rss_limit_mb` set
+> - **And** each target's crash fails the job and uploads its
+>   reproducer; a crash in one target does not stop the others
+> - **And** the workflow uses top-level `contents: read` only, and
+>   every job carries a `timeout-minutes`
+
 > **Scenario RFC0015.6 — a found crash becomes a permanent regression seed**
 > - **Given** the fuzzer has found and the team has fixed a crash
 > - **When** the fix lands
@@ -380,6 +426,13 @@ the find.
 > - **Note**: this scenario is **out of scope for this RFC's
 >   `green`** and gates the Phase 2 PR; it is recorded here so the
 >   phasing is explicit.
+
+> **Amendment (2026-10-11, #950): Phase 2 done.** `.clusterfuzzlite/`
+> landed with the `cflite_*` workflows, since folded into `fuzz.yml`
+> as the `batch`, `coverage` and `prune` jobs (§3.4 as amended), so
+> the **Given** reads "`.clusterfuzzlite/` and the ClusterFuzzLite
+> jobs of `fuzz.yml`". Scorecard's `Fuzzing` check scores 10/10
+> ("project is fuzzed"; Scorecard API, 2026-08-21 run).
 
 > **Scenario RFC0015.8 — DSL parse never panics and round-trips its canonical form**
 > - **Given** the `dsl_parse` target
@@ -490,7 +543,11 @@ Still open, deferred to the implementation PRs:
   from `miner_roundtrip`'s string-body scope? Possible Phase 1.5.
 - [x] **Phase 2 corpus-persistence backend** → **GitHub Actions cache**
   (ephemeral, in-repo, no external storage or secrets), chosen over a
-  storage branch/bucket. Implemented in `cflite_batch.yml`.
+  storage branch/bucket. Implemented in `cflite_batch.yml`. *(Amended
+  2026-10-11, #950: with no storage repo ClusterFuzzLite in fact keeps
+  the corpus as `cifuzz-corpus-<target>` workflow artifacts — 90-day
+  expiry, rolled by each run — now the `batch` / `prune` jobs of
+  `fuzz.yml`, §3.4 as amended.)*
 - [ ] **`unsafe` waiver** for `fuzz/`: confirm that having the fuzz
   member opt out of the workspace `unsafe_code = "deny"` lint (the first
   such waiver in the repo) is acceptable, given the `fuzz_target!` macro

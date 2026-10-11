@@ -327,6 +327,7 @@ impl LeafAudit<'_> {
     fn assert_steps(&self, (old_version, old_tokens): Version<'_>) {
         let mut version = old_version;
         let mut template = format_template(old_tokens);
+        let mut typed = old_tokens.to_vec();
         for change in self.changes {
             let step = version_step(change).unwrap_or_else(|| {
                 panic!(
@@ -342,10 +343,19 @@ impl LeafAudit<'_> {
                 self.id,
             );
             self.assert_step_shape(change);
+            self.replay_typed_step(&mut typed, change);
             version = step.1;
             step.3.clone_into(&mut template);
         }
         let (new_version, new_tokens) = self.after;
+        assert!(
+            typed == new_tokens,
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {}: replaying the declared widenings on the \
+             leaf before the ingest gives {typed:?}, but the leaf after it is {new_tokens:?} — a token \
+             changed that no audit event declares",
+            self.index,
+            self.id,
+        );
         let expected = format_template(new_tokens);
         assert!(
             version == new_version && template == expected,
@@ -355,6 +365,63 @@ impl LeafAudit<'_> {
             self.index,
             self.id,
         );
+    }
+
+    /// RFC0015.10 on typed tokens. The events carry templates only as
+    /// canonical strings, where a literal `<*>` token and a wildcard print
+    /// the same, but the chain's ends are typed leaves. So the typed template
+    /// is carried through the chain: from the leaf before the ingest, each
+    /// `Widened` step turns exactly its declared positions (strictly
+    /// increasing, in range, each a literal until then) into wildcards, each
+    /// `TypeExpanded` step changes nothing, and every intermediate must print
+    /// as the event says. [`Self::assert_steps`] then requires the result to
+    /// equal the typed leaf after the ingest, so a position widened without
+    /// being declared, a literal `<*>` included, cannot pass.
+    fn replay_typed_step(&self, typed: &mut [OwnedToken], change: &TemplateChange) {
+        let (positions, new_template): (&[u16], &str) = match change {
+            TemplateChange::Widened {
+                positions_widened,
+                new_template,
+                ..
+            } => (positions_widened, new_template),
+            TemplateChange::TypeExpanded { new_template, .. } => (&[], new_template),
+            _ => return,
+        };
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares positions_widened {positions:?}, \
+             which is not strictly increasing",
+            self.index,
+            self.id,
+        );
+        for &position in positions {
+            self.widen_typed(typed, usize::from(position));
+        }
+        let printed = format_template(typed);
+        assert_eq!(
+            printed, new_template,
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} event {change:?} does not match its declared \
+             positions applied to the typed template",
+            self.index, self.id,
+        );
+    }
+
+    fn widen_typed(&self, typed: &mut [OwnedToken], position: usize) {
+        let token = typed.get_mut(position).unwrap_or_else(|| {
+            panic!(
+                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares widened position {position} \
+                 past its end",
+                self.index, self.id,
+            )
+        });
+        assert!(
+            matches!(token, OwnedToken::Fixed(_)),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares position {position} widened, \
+             but it was already a wildcard",
+            self.index,
+            self.id,
+        );
+        *token = OwnedToken::Wildcard;
     }
 
     /// RFC0015.10 — `CLAUDE.md` §3.1 for every link of the chain, including

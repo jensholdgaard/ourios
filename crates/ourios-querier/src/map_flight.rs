@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use ourios_core::tenant::TenantId;
 use tokio::sync::watch;
@@ -29,6 +30,21 @@ use crate::{Backend, QueryError, StoreRef, audit_scan};
 /// One acquisition's answer: the map plus its template-map acquisition
 /// bytes ([`crate::QueryResult::registry_bytes_read`]).
 pub(crate) type Acquired = Result<(Arc<TemplateMap>, u64), QueryError>;
+
+/// A successful acquisition as one query saw it. A query acquires at most
+/// once (RFC 0033): at compile time when the DSL uses `resolves_to` (the
+/// alias fold), otherwise lazily while rendering rows, so the alias map and
+/// the registry can never come from different frontiers within one query
+/// (§3.1's one-artifact rationale).
+pub(crate) struct MapAcquisition {
+    pub(crate) map: Arc<TemplateMap>,
+    /// The acquisition's bytes ([`crate::QueryResult::registry_bytes_read`]),
+    /// the same for the acquirer and every joiner.
+    pub(crate) bytes: u64,
+    /// The bytes this query fetched itself: `bytes` for the acquirer, `0`
+    /// for a joiner, so a shared fold is counted once across its queries.
+    pub(crate) fetched: u64,
+}
 
 /// The in-flight acquisitions, by tenant. Shared by every clone of a
 /// [`crate::Querier`].
@@ -72,15 +88,36 @@ impl TemplateMapFlights {
     ///
     /// The listing's or the acquisition's [`QueryError`] — a joined
     /// acquisition's error is every joiner's error.
+    #[cfg(test)]
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
     ) -> Acquired {
+        self.acquire_fetched(backend, tenant)
+            .await
+            .map(|acquired| (acquired.map, acquired.bytes))
+    }
+
+    /// [`Self::acquire`], also saying which bytes this query fetched itself:
+    /// the acquisition's bytes for the query that ran it, `0` for a joiner,
+    /// which was handed the result of another query's fetch.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::acquire`].
+    pub(crate) async fn acquire_fetched(
+        self: &Arc<Self>,
+        backend: &Backend,
+        tenant: &TenantId,
+    ) -> Result<MapAcquisition, QueryError> {
+        let mut waited = Duration::ZERO;
         loop {
             let span = tracing::Span::current();
             let flights = Arc::clone(self);
-            let backend = backend.clone();
+            let backend = backend
+                .clone()
+                .with_caller(ourios_parquet::Caller::TemplateMap);
             let owned = tenant.clone();
             let step = tokio::task::spawn_blocking(move || {
                 span.in_scope(|| flights.step(backend.store_ref(), &owned))
@@ -90,11 +127,18 @@ impl TemplateMapFlights {
                 detail: format!("blocking storage task: {e}"),
             })??;
             match step {
-                Step::Done(acquired) => return acquired,
+                Step::Done(acquired) => {
+                    return acquired.map(|(map, bytes)| MapAcquisition {
+                        map,
+                        bytes,
+                        fetched: bytes,
+                    });
+                }
                 Step::Wait {
                     mut done,
                     same_frontier,
                 } => {
+                    let started = Instant::now();
                     // The flight's guard always publishes before dropping its
                     // sender, so a closed channel without a value is
                     // unreachable; it is still an error, never a hang.
@@ -102,16 +146,24 @@ impl TemplateMapFlights {
                         Ok(value) => (*value).clone(),
                         Err(_) => None,
                     };
+                    waited += started.elapsed();
                     if same_frontier {
                         let acquired = outcome.unwrap_or_else(|| Err(abandoned()));
-                        // The acquiring query recorded its own outcome; a
-                        // failed acquisition records nothing for anyone.
+                        // A joiner's wait is recorded whatever the shared
+                        // acquisition returned. The lookup outcome is not:
+                        // the acquiring query recorded its own, and a failed
+                        // acquisition records none for anyone.
+                        template_map::record_acquire_wait(waited);
                         if acquired.is_ok() {
                             template_map::record_joined_lookup();
                             #[cfg(any(test, feature = "testing"))]
                             self.hooks.joined();
                         }
-                        return acquired;
+                        return acquired.map(|(map, bytes)| MapAcquisition {
+                            map,
+                            bytes,
+                            fetched: 0,
+                        });
                     }
                 }
             }

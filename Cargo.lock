@@ -3433,6 +3433,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-http"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+ "reqwest 0.13.5",
+]
+
+[[package]]
 name = "opentelemetry-otlp"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3440,9 +3453,11 @@ checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
  "http",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
+ "reqwest 0.13.5",
  "thiserror",
  "tokio",
  "tonic",
@@ -3485,7 +3500,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-bench"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -3517,11 +3532,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.12.1"
+version = "0.12.2"
 
 [[package]]
 name = "ourios-core"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3545,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -3556,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-ingester"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3602,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3620,18 +3635,22 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow-array",
  "arrow-cast",
  "arrow-schema",
+ "async-trait",
  "bytes",
  "chrono",
  "futures",
  "object_store",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "ourios-config",
  "ourios-core",
  "ourios-miner",
+ "ourios-semconv",
  "ourios-testgen",
  "parquet",
  "proptest",
@@ -3645,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3684,11 +3703,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.12.1"
+version = "0.12.2"
 
 [[package]]
 name = "ourios-server"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow-array",
  "axum",
@@ -3736,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-serving"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3772,14 +3791,17 @@ dependencies = [
 
 [[package]]
 name = "ourios-telemetry"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "chrono",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "ourios-semconv",
+ "reqwest 0.13.5",
  "rustix 1.1.5",
+ "rustls",
  "serde_json",
  "tokio",
  "tracing",
@@ -3789,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-testgen"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "ourios-config",
  "ourios-core",
@@ -3800,7 +3822,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "crc32c",
  "ourios-core",
@@ -4518,6 +4540,7 @@ checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

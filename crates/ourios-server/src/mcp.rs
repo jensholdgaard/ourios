@@ -466,8 +466,7 @@ impl OuriosMcp {
         let elapsed = started.elapsed();
         let result = match result {
             Ok(result) => {
-                self.metrics
-                    .record_ok(crate::querier::QUERY_KIND_LOGS, elapsed, &result.stats);
+                self.metrics.record_logs(elapsed, &result);
                 result
             }
             Err(e) => {
@@ -630,8 +629,7 @@ impl OuriosMcp {
         let elapsed = started.elapsed();
         let result = match result {
             Ok(result) => {
-                self.metrics
-                    .record_ok(crate::querier::QUERY_KIND_DRIFT, elapsed, &result.stats);
+                self.metrics.record_drift(elapsed, &result);
                 result
             }
             Err(e) => {

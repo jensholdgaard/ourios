@@ -52,10 +52,24 @@ pub(crate) enum SchemaMode<'a> {
 /// Remove this override once the upstream fix ships in a release we
 /// depend on; the RFC0044.7/.8 and RFC0007.1 pruning tests are the
 /// gate that will catch it either way.
+///
+/// Each session also carries a [`crate::fetch_count::FetchCounter`]: the local
+/// filesystem it reads through is wrapped to count fetched bytes, as is
+/// the S3 store `object_store_urls` registers on it.
 pub(crate) fn session() -> SessionContext {
-    let mut config = datafusion::prelude::SessionConfig::new();
+    let counter = Arc::new(crate::fetch_count::FetchCounter::default());
+    let mut config = datafusion::prelude::SessionConfig::new().with_extension(Arc::clone(&counter));
     config.options_mut().execution.collect_statistics = false;
-    SessionContext::new_with_config(config)
+    let ctx = SessionContext::new_with_config(config);
+    let local = datafusion::execution::object_store::ObjectStoreUrl::local_filesystem();
+    ctx.register_object_store(
+        local.as_ref(),
+        Arc::new(crate::fetch_count::CountingStore::new(
+            Arc::new(datafusion::object_store::local::LocalFileSystem::new()),
+            counter,
+        )),
+    );
+    ctx
 }
 
 #[cfg(test)]
@@ -134,6 +148,22 @@ pub(crate) async fn execute_plan(
     let stats = scan_stats(plan.as_ref());
     record_operator_spans(plan.as_ref());
     Ok((batches, stats))
+}
+
+/// Count the filtered frame's rows via an aggregate, so the heavy
+/// `attributes` / `params` / `body` columns are never materialised
+/// (projection pushdown). The physical plan is built and executed through
+/// [`execute_plan`] (rather than `df.count()`) so the scan's pruning
+/// metrics can be read off the retained plan.
+pub(crate) async fn count_scan(
+    df: datafusion::dataframe::DataFrame,
+    ctx: &SessionContext,
+) -> Result<(u64, QueryStats), QueryError> {
+    let counted = df
+        .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
+        .map_err(storage_err)?;
+    let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
+    Ok((count_value(&batches)?, stats))
 }
 
 #[cfg(test)]

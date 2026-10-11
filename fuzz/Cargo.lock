@@ -72,9 +72,6 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
 
 [[package]]
 name = "arrayvec"
@@ -1349,17 +1346,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2194,6 +2180,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,6 +2355,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-appender-tracing"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c0080f0dc1d7c786f467cd85a4e395fcab11ee852004f39a29a18ab7c25d837"
+dependencies = [
+ "opentelemetry",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+ "reqwest",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+dependencies = [
+ "http",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tonic-types",
+]
+
+[[package]]
 name = "opentelemetry-proto"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2385,17 +2424,21 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opentelemetry",
+ "percent-encoding",
  "portable-atomic",
+ "rand 0.9.5",
  "thiserror",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
 name = "ourios-config"
-version = "0.12.1"
+version = "0.12.2"
 
 [[package]]
 name = "ourios-core"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "blake3",
  "opentelemetry",
@@ -2408,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "datafusion",
  "opentelemetry",
@@ -2418,19 +2461,20 @@ dependencies = [
 name = "ourios-fuzz"
 version = "0.0.0"
 dependencies = [
- "arbitrary",
  "libfuzzer-sys",
  "ourios-config",
  "ourios-core",
  "ourios-ingester",
  "ourios-miner",
  "ourios-querier",
+ "ourios-telemetry",
  "ourios-wal",
+ "prost",
 ]
 
 [[package]]
 name = "ourios-ingester"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2463,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "opentelemetry",
  "ourios-config",
@@ -2476,15 +2520,18 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "bytes",
  "chrono",
  "futures",
  "object_store",
+ "opentelemetry",
  "ourios-core",
+ "ourios-semconv",
  "parquet",
  "serde",
  "serde_json",
@@ -2495,11 +2542,13 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "datafusion",
+ "futures",
  "opentelemetry",
  "ourios-core",
  "ourios-df-otel",
@@ -2517,11 +2566,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.12.1"
+version = "0.12.2"
 
 [[package]]
 name = "ourios-serving"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "axum",
  "futures-core",
@@ -2543,8 +2592,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-telemetry"
+version = "0.12.2"
+dependencies = [
+ "chrono",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "ourios-semconv",
+ "reqwest",
+ "rustix",
+ "rustls",
+ "tokio",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ourios-wal"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "crc32c",
  "ourios-core",
@@ -2955,6 +3022,7 @@ checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -3017,9 +3085,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
  "bitflags",
  "errno",
@@ -3661,8 +3729,12 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "thread_local",
+ "tracing",
  "tracing-core",
 ]
 

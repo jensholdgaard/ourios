@@ -705,10 +705,12 @@ jobs:
       # had already shed. `--locked` fails only when the manifests have moved
       # past the lock, not merely because newer versions exist, which makes
       # it the PR-time signal to regenerate: `cd fuzz && cargo update`.
-      - name: fuzz lockfile is current and advisory-clean
+      # Licenses are left to the root check: the fuzz graph is the workspace
+      # graph plus libfuzzer-sys and arbitrary, both already in the root graph.
+      - name: fuzz lockfile is current, advisory-clean, and from known sources
         run: |
           cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
-          cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
+          cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories bans sources
       # fuzz/osv-scanner.toml must be a byte-identical copy of the root
       # osv-scanner.toml. OSV-Scanner looks for its config beside each lockfile,
       # and Scorecard reads repository blobs, so a symlink there is only the

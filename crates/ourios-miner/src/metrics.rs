@@ -35,8 +35,10 @@
 //! they read process state through a callback at collection time.
 //! That state — per-`(tenant, service)` line tallies and a bounded
 //! confidence reservoir, plus per-tenant template counts — lives in
-//! [`MinerMetricsState`] behind a `Mutex`, shared with the
-//! callbacks via `Arc`.
+//! [`MinerMetricsState`] behind a `Mutex`. The gauges are registered
+//! once per global provider installation and read every live cluster's state through
+//! a registry of `Weak` references ([`gauges`]), so a dropped cluster
+//! stops reporting and its state is freed.
 //!
 //! # When instruments appear
 //!
@@ -50,14 +52,18 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
 
 use ourios_core::otlp::{KeyValue as OtlpKeyValue, any_value};
 use ourios_core::tenant::TenantId;
 use ourios_semconv as semconv;
+
+mod gauges;
+
+use gauges::{Binding, GaugeRegistry, GlobalProvider};
 
 /// Meter name per RFC 0001 §6.8 (`global::meter("ourios.miner")`).
 const METER_NAME: &str = "ourios.miner";
@@ -73,6 +79,31 @@ const RESOURCE_SERVICE_NAME: &str = "service.name";
 /// (§3.2's cardinality discipline applied to our own telemetry
 /// state).
 const RESERVOIR_CAP: usize = 1024;
+
+/// Bucket boundaries for `ourios.miner.confidence` (`similarity /
+/// threshold`), exactly as RFC 0001 §6.8 fixes them: straddling the §6.3
+/// decision boundary at 1.0, with `+Inf` implicit.
+const CONFIDENCE_BUCKETS: [f64; 11] = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0];
+
+/// Bucket boundaries (seconds) for `ourios.miner.duration`, one line's
+/// mining time: microseconds normally, milliseconds when a tree search runs
+/// long.
+const LINE_DURATION_BUCKETS_S: [f64; 14] = [
+    0.000_001,
+    0.000_002_5,
+    0.000_005,
+    0.000_01,
+    0.000_025,
+    0.000_05,
+    0.000_1,
+    0.000_25,
+    0.000_5,
+    0.001,
+    0.002_5,
+    0.005,
+    0.01,
+    0.1,
+];
 
 /// Explicit bucket boundaries (bytes) for the `ourios.miner.structured_body.size`
 /// histogram (RFC 0037 §3.2). The SDK's default boundaries top out near 10 000,
@@ -118,10 +149,10 @@ pub(crate) fn service_of(resource_attributes: &[OtlpKeyValue]) -> Option<String>
         })
 }
 
-/// Lock the metrics state, recovering the guard if the mutex was poisoned
-/// by an unrelated panic. Telemetry is best-effort: a poisoned lock must
-/// never crash an ingest write or a collection callback.
-fn lock_state(state: &Mutex<MinerMetricsState>) -> std::sync::MutexGuard<'_, MinerMetricsState> {
+/// Lock a metrics mutex, recovering the guard if it was poisoned by an
+/// unrelated panic. Telemetry is best-effort: a poisoned lock must never
+/// crash an ingest write or a collection callback.
+fn lock_recovering<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -319,9 +350,9 @@ fn quantile_of(mut samples: Vec<f64>, q: f64) -> Option<f64> {
 ///
 /// Constructed once per [`crate::cluster::MinerCluster`]. The
 /// synchronous instruments are recorded at the hot-path sites; the
-/// observable gauges are registered with callbacks over the shared
-/// [`MinerMetricsState`] at construction and need no per-call
-/// maintenance beyond updating that state.
+/// observable gauges, registered once per installation (see [`gauges`]),
+/// read this [`MinerMetricsState`] for as long as the `MinerMetrics`
+/// lives and need no per-call maintenance beyond updating it.
 pub(crate) struct MinerMetrics {
     state: Arc<Mutex<MinerMetricsState>>,
     merges_total: Counter<u64>,
@@ -332,24 +363,6 @@ pub(crate) struct MinerMetrics {
     confidence: Histogram<f64>,
     miner_duration: Histogram<f64>,
     structured_body_size: Histogram<u64>,
-    /// The observable gauges are held for the [`MinerMetrics`]'s
-    /// lifetime so their collection callbacks stay registered with
-    /// the meter — dropping a handle deregisters its callback, after
-    /// which the gauge would vanish from the exported stream. The
-    /// values are never read directly; the SDK invokes their
-    /// callbacks on collect.
-    _observable_gauges: ObservableGauges,
-}
-
-/// The five §6.8 observable gauges, retained to keep their callbacks
-/// registered (see [`MinerMetrics`]). `ourios.miner.template.count`
-/// is the only `u64` gauge; the fractions and quantiles are `f64`.
-struct ObservableGauges {
-    _template_count: ObservableGauge<u64>,
-    _body_retention_utilization: ObservableGauge<f64>,
-    _params_overflow_utilization: ObservableGauge<f64>,
-    _confidence_p50: ObservableGauge<f64>,
-    _confidence_p01: ObservableGauge<f64>,
 }
 
 impl MinerMetrics {
@@ -358,8 +371,24 @@ impl MinerMetrics {
     /// registry; each instrument surfaces in the export on its first
     /// real measurement (§3.1.2).
     pub(crate) fn new() -> Self {
-        let meter = global::meter(METER_NAME);
+        Self::for_provider(&global::meter_provider(), &gauges::GLOBAL_BINDINGS)
+    }
+
+    /// Derive the synchronous instruments and the gauge binding from one
+    /// provider snapshot, so a concurrent `set_meter_provider` cannot
+    /// split a cluster's instruments across two providers.
+    fn for_provider(provider: &GlobalProvider, bindings: &Mutex<Vec<Binding>>) -> Self {
+        Self::with_registry(
+            &provider.meter(METER_NAME),
+            &gauges::registry_for(provider, bindings),
+        )
+    }
+
+    /// Build the synchronous instruments on `meter` and enrol a fresh
+    /// state with the gauges reading `registry`.
+    fn with_registry(meter: &Meter, registry: &GaugeRegistry) -> Self {
         let state = Arc::new(Mutex::new(MinerMetricsState::default()));
+        registry.register(&state);
 
         let merges_total = meter
             .u64_counter(semconv::OURIOS_MINER_MERGES)
@@ -384,18 +413,18 @@ impl MinerMetrics {
         let confidence = meter
             .f64_histogram(semconv::OURIOS_MINER_CONFIDENCE)
             .with_unit("1")
+            .with_boundaries(CONFIDENCE_BUCKETS.to_vec())
             .build();
         let miner_duration = meter
             .f64_histogram(semconv::OURIOS_MINER_DURATION)
             .with_unit("s")
+            .with_boundaries(LINE_DURATION_BUCKETS_S.to_vec())
             .build();
         let structured_body_size = meter
             .u64_histogram(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE)
             .with_unit("By")
             .with_boundaries(STRUCTURED_BODY_SIZE_BUCKETS.to_vec())
             .build();
-
-        let observable_gauges = Self::register_observable_gauges(&meter, &state);
 
         Self {
             state,
@@ -407,133 +436,7 @@ impl MinerMetrics {
             confidence,
             miner_duration,
             structured_body_size,
-            _observable_gauges: observable_gauges,
         }
-    }
-
-    /// Register the §6.8 observable gauges
-    /// (`ourios.miner.template.count`, `…confidence.p50`,
-    /// `…confidence.p01`, `…body_retention.utilization`,
-    /// `…params.overflow.utilization`) with callbacks over the shared
-    /// state. A callback emits one data point per `(tenant, service)`
-    /// (or per tenant) present in the state — nothing until real
-    /// traffic populates it.
-    ///
-    /// Returns the gauge handles so the caller can retain them: a
-    /// dropped handle deregisters its callback (see
-    /// [`ObservableGauges`]).
-    fn register_observable_gauges(
-        meter: &Meter,
-        state: &Arc<Mutex<MinerMetricsState>>,
-    ) -> ObservableGauges {
-        let s = Arc::clone(state);
-        let template_count = meter
-            .u64_observable_gauge(semconv::OURIOS_MINER_TEMPLATE_COUNT)
-            .with_unit("{template}")
-            .with_callback(move |obs| {
-                let st = lock_state(&s);
-                for (tenant, count) in &st.template_counts {
-                    obs.observe(
-                        *count,
-                        &[KeyValue::new(
-                            semconv::OURIOS_TENANT,
-                            tenant.as_str().to_owned(),
-                        )],
-                    );
-                }
-            })
-            .build();
-
-        let s = Arc::clone(state);
-        let body_retention_utilization = meter
-            .f64_observable_gauge(semconv::OURIOS_MINER_BODY_RETENTION_UTILIZATION)
-            .with_unit("1")
-            .with_callback(move |obs| {
-                let st = lock_state(&s);
-                for (tenant, lines) in &st.body_lines {
-                    let retained = st.body_retentions.get(tenant).copied().unwrap_or(0);
-                    obs.observe(
-                        ratio(retained, *lines),
-                        &[KeyValue::new(
-                            semconv::OURIOS_TENANT,
-                            tenant.as_str().to_owned(),
-                        )],
-                    );
-                }
-            })
-            .build();
-
-        let s = Arc::clone(state);
-        let params_overflow_utilization = meter
-            .f64_observable_gauge(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION)
-            .with_unit("1")
-            .with_callback(move |obs| {
-                let st = lock_state(&s);
-                for (tenant, tallies) in &st.by_service {
-                    for (service, tally) in tallies.iter() {
-                        obs.observe(
-                            ratio(tally.overflow_lines, tally.lines),
-                            &service_attrs(tenant, service),
-                        );
-                    }
-                }
-            })
-            .build();
-
-        let confidence_p50 =
-            Self::register_quantile_gauge(meter, state, semconv::OURIOS_MINER_CONFIDENCE_P50, 0.50);
-        let confidence_p01 =
-            Self::register_quantile_gauge(meter, state, semconv::OURIOS_MINER_CONFIDENCE_P01, 0.01);
-
-        ObservableGauges {
-            _template_count: template_count,
-            _body_retention_utilization: body_retention_utilization,
-            _params_overflow_utilization: params_overflow_utilization,
-            _confidence_p50: confidence_p50,
-            _confidence_p01: confidence_p01,
-        }
-    }
-
-    /// Register one confidence-quantile observable gauge
-    /// (`ourios.miner.confidence.p50` / `…p01`) over the
-    /// per-`(tenant, service)` reservoir, returning its handle.
-    fn register_quantile_gauge(
-        meter: &Meter,
-        state: &Arc<Mutex<MinerMetricsState>>,
-        name: &'static str,
-        q: f64,
-    ) -> ObservableGauge<f64> {
-        let s = Arc::clone(state);
-        meter
-            .f64_observable_gauge(name)
-            .with_unit("1")
-            .with_callback(move |obs| {
-                // Snapshot the sample windows under the lock (cheap O(n)
-                // copy), then sort + compute the quantiles AFTER releasing
-                // it — collection must never block the ingest hot path on
-                // the O(n log n) sort.
-                let snapshots: Vec<(TenantId, Option<String>, Vec<f64>)> = {
-                    let st = lock_state(&s);
-                    st.by_service
-                        .iter()
-                        .flat_map(|(tenant, tallies)| {
-                            tallies.iter().map(move |(service, tally)| {
-                                (
-                                    tenant.clone(),
-                                    service.map(str::to_owned),
-                                    tally.confidence.snapshot(),
-                                )
-                            })
-                        })
-                        .collect()
-                };
-                for (tenant, service, samples) in snapshots {
-                    if let Some(v) = quantile_of(samples, q) {
-                        obs.observe(v, &service_attrs(&tenant, service.as_deref()));
-                    }
-                }
-            })
-            .build()
     }
 
     /// Bump the per-`(tenant, service)` line denominator (for
@@ -549,7 +452,7 @@ impl MinerMetrics {
     /// observe `numerator > denominator` (utilization > 1) for a line
     /// in flight.
     pub(crate) fn record_line_denominator(&self, tenant: &TenantId, service: Option<&str>) {
-        let mut st = lock_state(&self.state);
+        let mut st = lock_recovering(&self.state);
         bump_tenant(&mut st.body_lines, tenant);
         tally_mut(&mut st.by_service, tenant, service).lines += 1;
     }
@@ -561,7 +464,7 @@ impl MinerMetrics {
     pub(crate) fn record_line(&self, tenant: &TenantId, service: Option<&str>, confidence: f64) {
         self.confidence
             .record(confidence, &service_attrs(tenant, service));
-        let mut st = lock_state(&self.state);
+        let mut st = lock_recovering(&self.state);
         tally_mut(&mut st.by_service, tenant, service)
             .confidence
             .observe(confidence);
@@ -606,7 +509,7 @@ impl MinerMetrics {
         }
         self.params_overflow_total
             .add(count, &service_attrs(tenant, service));
-        let mut st = lock_state(&self.state);
+        let mut st = lock_recovering(&self.state);
         tally_mut(&mut st.by_service, tenant, service).overflow_lines += 1;
     }
 
@@ -672,7 +575,7 @@ impl MinerMetrics {
     /// Record one body-retention event for the
     /// `ourios.miner.body_retention.utilization` numerator (§6.3 retention paths).
     pub(crate) fn record_body_retention(&self, tenant: &TenantId) {
-        let mut st = lock_state(&self.state);
+        let mut st = lock_recovering(&self.state);
         bump_tenant(&mut st.body_retentions, tenant);
     }
 
@@ -700,7 +603,7 @@ impl MinerMetrics {
     /// Mirror a tenant's current template count into the state the
     /// `ourios.miner.template.count` observable gauge reads.
     pub(crate) fn set_template_count(&self, tenant: &TenantId, count: u64) {
-        let mut st = lock_state(&self.state);
+        let mut st = lock_recovering(&self.state);
         set_tenant(&mut st.template_counts, tenant, count);
     }
 }
@@ -751,6 +654,15 @@ mod tests {
         // Computed off-lock from a snapshot, as the gauge callback does.
         assert!((super::quantile_of(r.snapshot(), 0.50).unwrap() - 0.5).abs() < 1e-9);
         assert!((super::quantile_of(r.snapshot(), 0.01).unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    /// RFC 0001 §6.8 fixes the `ourios.miner.confidence` buckets.
+    #[test]
+    fn confidence_buckets_are_the_rfc_0001_6_8_boundaries() {
+        assert_eq!(
+            super::CONFIDENCE_BUCKETS,
+            [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0],
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquet
 use ourios_ingester::recovery::{self, RecoveryReport};
 use ourios_ingester::template_ids::{TemplateIds, TemplateIdsError};
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::{PromotedAttributes, Store};
+use ourios_parquet::{Caller, PromotedAttributes, Store};
 use ourios_serving::AuthResolver;
 use ourios_serving::serve::{
     GRPC_KEEPALIVE_INTERVAL, GRPC_KEEPALIVE_TIMEOUT, PlainListener, TCP_KEEPALIVE, accept_backoff,
@@ -606,13 +606,13 @@ fn build_write_sinks(
     promoted: PromotedAttributes,
 ) -> (SharedParquetSink, SharedParquetAuditSink) {
     let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
-        store.clone(),
+        store.clone().with_caller(Caller::AuditSink),
         AUDIT_SINK_CEILING_EVENTS,
     ));
     let barrier_audit = audit_sink.clone();
     let quarantine_audit = audit_sink.clone();
     let sink = SharedParquetSink::new(
-        ParquetRecordSink::new(store, flush_config())
+        ParquetRecordSink::new(store.with_caller(Caller::Sink), flush_config())
             .with_promoted_attributes(promoted)
             .with_audit_barrier(Box::new(move || barrier_audit.settled()))
             // RFC 0025 §3.3: permanently-rejected records quarantine
@@ -1165,7 +1165,7 @@ pub async fn serve_until(
         .map_err(|e| format!("fsync snapshots root: {e}"))?;
     let wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
-    let ids = TemplateIds::new(config.store.clone())
+    let ids = TemplateIds::new(config.store.clone().with_caller(Caller::TemplateIds))
         .with_bootstrap_allowed(config.template_ids_allow_bootstrap)
         .with_shutdown(stopping);
     let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);

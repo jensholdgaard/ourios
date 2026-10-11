@@ -71,7 +71,7 @@ fn write_file(store: &Store, tenant: &str, template_id: u64, ts_ns: u64) {
 }
 
 /// Two committed files in one sealed partition = a candidate.
-fn write_sealed_candidate(store: &Store, tenant: &str) {
+pub(super) fn write_sealed_candidate(store: &Store, tenant: &str) {
     write_file(store, tenant, 1, TS0);
     write_file(store, tenant, 2, TS0 + 1_000_000);
 }
@@ -160,6 +160,7 @@ fn outcome(files_before: usize, commit_lost: bool) -> CompactionOutcome {
         gc_failures: 0,
         bytes_read: 0,
         bytes_written: 0,
+        decoded_bytes_estimate: 0,
     }
 }
 
@@ -231,6 +232,7 @@ fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
     let mut hooks = SweepHooks {
         observe: None,
         erasure_match: Some(&erase_all),
+        gauges: None,
     };
 
     // Act
@@ -464,7 +466,7 @@ fn run_executes_sweeps_until_cancelled() {
 }
 
 /// A graph-less sweep of `store` under the default policy and promoted set.
-fn target(store: &Store) -> SweepTarget {
+pub(super) fn target(store: &Store) -> SweepTarget {
     SweepTarget::new(
         store.clone(),
         CompactionPolicy::default(),
@@ -474,7 +476,7 @@ fn target(store: &Store) -> SweepTarget {
 
 /// `count` sealed candidates for tenant `a`, one per consecutive hour from
 /// `TS0`'s, two files each.
-fn write_sealed_hours(store: &Store, count: u64) {
+pub(super) fn write_sealed_hours(store: &Store, count: u64) {
     for hour in 0..count {
         write_file(store, "a", 1, TS0 + hour * HOUR);
         write_file(store, "a", 2, TS0 + hour * HOUR + 1_000_000);
@@ -561,7 +563,7 @@ struct ReadingSink {
     readings: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
 }
 
-fn u64_sum(rms: &[ResourceMetrics], name: &str) -> u64 {
+pub(super) fn u64_sum(rms: &[ResourceMetrics], name: &str) -> u64 {
     rms.iter()
         .flat_map(ResourceMetrics::scope_metrics)
         .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)

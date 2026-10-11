@@ -11,6 +11,9 @@
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, BinaryViewArray, RecordBatch, StringViewArray};
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::errors::ParquetError;
+use parquet::file::reader::ChunkReader;
 
 /// A string column in either arrow representation. The parquet reader
 /// yields plain `Utf8`; `DataFusion` (the querier's scan path) yields
@@ -73,6 +76,27 @@ impl<'a> BinCol<'a> {
             Self::View(a) => (!a.is_null(i)).then(|| a.value(i)),
         }
     }
+}
+
+/// The Arrow reader builder every Parquet decode in this crate opens a
+/// file with. It ignores the `ARROW:schema` footer entry and derives the
+/// Arrow schema from the Parquet schema alone: that entry is an IPC
+/// flatbuffer, and `arrow-ipc` panics on a corrupt one (`unimplemented!`
+/// on an unknown type tag) instead of returning an error, and a file read
+/// back from the store is untrusted bytes. What the Parquet schema
+/// itself gets wrong still fails as a typed [`ParquetError`]. The
+/// accessors take either schema's representation (`Utf8` or `Utf8View`,
+/// a nanosecond timestamp in any zone), so the decoded rows are the same.
+pub(crate) fn arrow_reader_builder<R>(
+    reader: R,
+) -> Result<ParquetRecordBatchReaderBuilder<R>, ParquetError>
+where
+    R: ChunkReader + 'static,
+{
+    ParquetRecordBatchReaderBuilder::try_new_with_options(
+        reader,
+        ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+    )
 }
 
 /// RFC 0005 §3.9 (the reader contract; §3.8 gives the policy):

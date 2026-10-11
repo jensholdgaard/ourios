@@ -42,7 +42,7 @@ use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::errors::ParquetError;
 
 use crate::columns;
@@ -148,8 +148,7 @@ impl Reader {
     /// [`Self::open_partition`] seam, a sentinel on [`Self::open_bytes`]).
     /// Applies the §3.9 baseline-column check; leaves `partition` unset.
     fn from_bytes(bytes: bytes::Bytes, file_path: PathBuf) -> Result<Self, ReaderError> {
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(ReaderError::Parquet)?;
+        let builder = crate::decode::arrow_reader_builder(bytes).map_err(ReaderError::Parquet)?;
         require_baseline_columns(builder.schema(), &crate::data_schema())?;
         let inner = builder.build().map_err(ReaderError::Parquet)?;
 
@@ -174,8 +173,7 @@ impl Reader {
             path: path.to_path_buf(),
             source,
         })?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(ReaderError::Parquet)?;
+        let builder = crate::decode::arrow_reader_builder(file).map_err(ReaderError::Parquet)?;
         require_baseline_columns(builder.schema(), &crate::data_schema())?;
         let inner = builder
             .with_batch_size(batch_rows)

@@ -14,13 +14,13 @@
 
 use std::collections::HashMap;
 
-use ourios_core::audit::ParamType;
+use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, TemplateChange};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
 use ourios_miner::reconstruct::{Reconstruction, render};
 use ourios_miner::tokenize::tokenize;
-use ourios_miner::tree::OwnedToken;
+use ourios_miner::tree::{OwnedToken, format_template};
 
 /// `(template_id, template_version) → tokens`, snapshotted from the live
 /// tree right after the ingest that stamped the version (the in-memory
@@ -163,34 +163,184 @@ pub fn assert_no_silent_merge(
 ///
 /// On any violation, with a message naming the invariant.
 pub fn assert_widening_is_monotone(templates: &Templates) {
-    let mut by_id: HashMap<u64, Vec<(u32, &[OwnedToken])>> = HashMap::new();
+    let mut by_id: HashMap<u64, Vec<Version<'_>>> = HashMap::new();
     for (&(id, version), tokens) in templates {
         by_id.entry(id).or_default().push((version, tokens));
     }
     for (id, mut versions) in by_id {
         versions.sort_by_key(|&(version, _)| version);
-        for (&(old_version, older), &(new_version, newer)) in
-            versions.iter().zip(versions.iter().skip(1))
+        for pair in versions.windows(2) {
+            assert_version_step(id, pair[0], pair[1]);
+        }
+    }
+}
+
+/// One version of a template: `(template_version, tokens)`.
+type Version<'a> = (u32, &'a [OwnedToken]);
+
+fn assert_version_step(
+    id: u64,
+    (old_version, older): Version<'_>,
+    (new_version, newer): Version<'_>,
+) {
+    assert_eq!(
+        older.len(),
+        newer.len(),
+        "RFC0015.10 / CLAUDE.md §3.1: template {id} changed length from v{old_version} to v{new_version}",
+    );
+    for (position, (before, after)) in older.iter().zip(newer).enumerate() {
+        match (before, after) {
+            (OwnedToken::Fixed(a), OwnedToken::Fixed(b)) if a != b => panic!(
+                "RFC0015.10 / CLAUDE.md §3.1: template {id} v{old_version}→v{new_version} replaced \
+                 literal {a:?} with {b:?} at token {position} — a merge that rewrites a literal"
+            ),
+            (OwnedToken::Wildcard, OwnedToken::Fixed(b)) => panic!(
+                "RFC0015.10 / CLAUDE.md §3.1: template {id} v{old_version}→v{new_version} narrowed \
+                 the wildcard at token {position} back to literal {b:?}"
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// `template_id → (template_version, tokens)` for every leaf of one tenant.
+pub type Leaves = HashMap<u64, (u32, Vec<OwnedToken>)>;
+
+/// The tenant's leaves as they stand now, for [`assert_changes_audited`].
+pub fn leaves(miner: &MinerCluster, tenant: &TenantId) -> Leaves {
+    miner
+        .templates_for(tenant)
+        .into_iter()
+        .map(|leaf| (leaf.template_id, (leaf.template_version, leaf.template)))
+        .collect()
+}
+
+/// RFC0015.1 — `CLAUDE.md` §3.1 "every merge emits an audit event with old +
+/// new templates" (RFC 0001 H1.3), checked against what one ingest actually
+/// did to the tree. `before` / `after` are the tenant's leaves around the
+/// ingest and `events` everything the audit sink received during it:
+///
+/// - a new leaf has exactly one `Created` event carrying its tokens;
+/// - a leaf whose version rose from `v` to `w` has exactly the chain of
+///   `Widened` / `TypeExpanded` events `v → v+1 → … → w`, each link's
+///   templates continuing the previous one, starting at the tokens before
+///   the ingest and ending at the tokens after it;
+/// - no other leaf has any template event (a degenerate-widening rejection,
+///   which changes nothing, is the exception).
+///
+/// # Panics
+///
+/// On any violation, with a message naming the invariant.
+pub fn assert_changes_audited(
+    index: usize,
+    before: &Leaves,
+    after: &Leaves,
+    events: Vec<AuditEvent>,
+) {
+    let mut by_id: HashMap<u64, Vec<TemplateChange>> = HashMap::new();
+    for event in events {
+        if let AuditPayload::Template {
+            template_id,
+            change,
+            ..
+        } = event.payload
+            && !matches!(change, TemplateChange::RejectedDegenerate { .. })
         {
-            assert_eq!(
-                older.len(),
-                newer.len(),
-                "RFC0015.10 / CLAUDE.md §3.1: template {id} changed length from v{old_version} to v{new_version}",
-            );
-            for (position, (before, after)) in older.iter().zip(newer).enumerate() {
-                match (before, after) {
-                    (OwnedToken::Fixed(a), OwnedToken::Fixed(b)) if a != b => panic!(
-                        "RFC0015.10 / CLAUDE.md §3.1: template {id} v{old_version}→v{new_version} replaced \
-                         literal {a:?} with {b:?} at token {position} — a merge that rewrites a literal"
-                    ),
-                    (OwnedToken::Wildcard, OwnedToken::Fixed(b)) => panic!(
-                        "RFC0015.10 / CLAUDE.md §3.1: template {id} v{old_version}→v{new_version} narrowed \
-                         the wildcard at token {position} back to literal {b:?}"
-                    ),
-                    _ => {}
-                }
+            by_id.entry(template_id).or_default().push(change);
+        }
+    }
+    for (&id, (version, tokens)) in after {
+        let changes = by_id.remove(&id).unwrap_or_default();
+        match before.get(&id) {
+            None => assert_created(index, id, *version, tokens, &changes),
+            Some((old_version, old_tokens)) => {
+                assert_steps(
+                    index,
+                    id,
+                    (*old_version, old_tokens),
+                    (*version, tokens),
+                    &changes,
+                );
             }
         }
+    }
+    let orphans: Vec<u64> = by_id.into_keys().collect();
+    assert!(
+        orphans.is_empty(),
+        "RFC0015.1 / CLAUDE.md §3.1: line {index}: template events for ids {orphans:?}, which have no leaf",
+    );
+}
+
+fn assert_created(
+    index: usize,
+    id: u64,
+    version: u32,
+    tokens: &[OwnedToken],
+    changes: &[TemplateChange],
+) {
+    let expected = format_template(tokens);
+    let audited = matches!(
+        changes,
+        [TemplateChange::Created { new_template }] if *new_template == expected
+    );
+    assert!(
+        version == 1 && audited,
+        "RFC0015.1 / CLAUDE.md §3.1: line {index}: new template {id} (v{version}, {expected:?}) must be \
+         audited by exactly one `Created` event with its tokens; got {changes:?}",
+    );
+}
+
+fn assert_steps(
+    index: usize,
+    id: u64,
+    (old_version, old_tokens): Version<'_>,
+    (new_version, new_tokens): Version<'_>,
+    changes: &[TemplateChange],
+) {
+    let mut version = old_version;
+    let mut template = format_template(old_tokens);
+    for change in changes {
+        let step = version_step(change).unwrap_or_else(|| {
+            panic!(
+                "RFC0015.1 / CLAUDE.md §3.1: line {index}: template {id} already existed but got {change:?}"
+            )
+        });
+        assert!(
+            step.0 == version && step.1 == version + 1 && step.2 == template,
+            "RFC0015.1 / CLAUDE.md §3.1: line {index}: template {id} event {change:?} does not continue \
+             from v{version} {template:?}",
+        );
+        version = step.1;
+        step.3.clone_into(&mut template);
+    }
+    let expected = format_template(new_tokens);
+    assert!(
+        version == new_version && template == expected,
+        "RFC0015.1 / CLAUDE.md §3.1: line {index}: template {id} moved v{old_version}→v{new_version} \
+         ({expected:?}) but its audit events only account for v{old_version}→v{version} ({template:?}) — \
+         a merge without its audit event",
+    );
+}
+
+/// `(old_version, new_version, old_template, new_template)` of a change that
+/// moves an existing template forward one version.
+fn version_step(change: &TemplateChange) -> Option<(u32, u32, &str, &str)> {
+    match change {
+        TemplateChange::Widened {
+            old_version,
+            new_version,
+            old_template,
+            new_template,
+            ..
+        }
+        | TemplateChange::TypeExpanded {
+            old_version,
+            new_version,
+            old_template,
+            new_template,
+            ..
+        } => Some((*old_version, *new_version, old_template, new_template)),
+        _ => None,
     }
 }
 

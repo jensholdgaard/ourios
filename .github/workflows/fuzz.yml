@@ -67,7 +67,7 @@ jobs:
     name: smoke-fuzz
     if: github.event.schedule == '17 4 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'smoke')
     runs-on: ubuntu-latest
-    # One sanitizer build (~12 min) plus five 300 s runs; the limit leaves
+    # One sanitizer build (~12 min) plus six 300 s runs; the limit leaves
     # room for a slow runner, not for a hung target (libFuzzer's own
     # -max_total_time and -timeout bound those).
     timeout-minutes: 60
@@ -82,7 +82,7 @@ jobs:
       # the token secret set. Otherwise none of them reaches the fuzz process,
       # the credential included.
       OTLP_EXPORT: ${{ github.ref == 'refs/heads/main' && vars.OTLP_EXPORT_ENDPOINT != '' && secrets.DASH0_AUTHORIZATION_TOKEN != '' }}
-      TARGETS: miner_roundtrip otlp_json otlp_protobuf wal_frame dsl_parse
+      TARGETS: miner_roundtrip otlp_json otlp_protobuf wal_frame dsl_parse artifact_decode
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -224,7 +224,7 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Split evenly across the five targets (600 s each), on every core
+          # Split evenly across the six targets (500 s each), on every core
           # of the runner (libFuzzer -jobs/-workers).
           fuzz-seconds: 3000
           parallel-fuzzing: true

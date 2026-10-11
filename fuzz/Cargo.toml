@@ -20,9 +20,13 @@ prost = { version = "0.14", default-features = false, features = ["std"] }
 ourios-config = { path = "../crates/ourios-config" }
 ourios-core = { path = "../crates/ourios-core" }
 ourios-miner = { path = "../crates/ourios-miner" }
-ourios-ingester = { path = "../crates/ourios-ingester" }
+ourios-ingester = { path = "../crates/ourios-ingester", features = ["fuzzing"] }
+ourios-parquet = { path = "../crates/ourios-parquet" }
 ourios-wal = { path = "../crates/ourios-wal", features = ["fuzzing"] }
 ourios-querier = { path = "../crates/ourios-querier" }
+# `artifact_decode` compresses its input into a template-map frame, so the
+# fuzzer can mutate the JSON body behind the zstd layer; the querier's zstd.
+zstd = "0.13"
 # Installs the OTel metrics provider when the standard OTLP env points at an
 # OTLP/HTTP endpoint (`common/telemetry.rs`, which every target includes by
 # path, so the package keeps no library API per RFC 0015 §3.1).
@@ -70,6 +74,17 @@ bench = false
 [[bin]]
 name = "dsl_parse"
 path = "fuzz_targets/dsl_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Persisted artifacts read back from object storage (miner snapshot,
+# partition manifest, template-id high-water, template-map frame): corrupt
+# bytes are a typed error or a discard, never a panic or a partial state;
+# what decodes re-encodes to a fixpoint.
+[[bin]]
+name = "artifact_decode"
+path = "fuzz_targets/artifact_decode.rs"
 test = false
 doc = false
 bench = false

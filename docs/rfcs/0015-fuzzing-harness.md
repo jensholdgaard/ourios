@@ -195,6 +195,37 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 > `#[doc(hidden)]`. The status stays `accepted`. Scenarios RFC0015.8–.10
 > and the RFC0015.1 amendment are the criteria.
 
+> **Amendment (2026-10-11, #955, maintainer-approved): a sixth target for
+> the persisted artifacts.** The process reads back from object storage
+> bytes it may not have written, or may have written in an older version;
+> a decoder that panics or half-applies them turns every restart into a crash loop
+> or a silently wrong state (#892: an unreadable self-written snapshot
+> made every restart rebuild from the WAL). One target covers the small
+> JSON artifacts, the first input byte picking the decoder:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `artifact_decode` | `data[0] % 5`: 0 `snapshot::recover` then `MinerCluster::restore_tenant`; 1 `Manifest::from_json`; 2 the RFC 0059 high-water `parse`; 3 `TemplateMap::from_artifact_bytes` on the raw frame; 4 the same on the input zstd-compressed, so mutations reach the JSON body | an allowed outcome, never a panic (RFC0015.11); a rejected snapshot leaves no state (RFC0015.12); decode → encode → decode is a fixpoint, and a restored snapshot captures back what it restored (RFC0015.13) |
+>
+> One binary, not four: each decoder is a few functions of JSON over the
+> same `serde_json`, coverage is still attributed per function, and the
+> ClusterFuzzLite budget (3000 s shared, parallel) splits six ways
+> instead of nine. The template-map frame is the only expanding decoder;
+> its 64 MiB decompression bound classifies a bomb `Torn`, well inside
+> `-rss_limit_mb=2048`. The high-water codec is private to
+> `ourios-ingester`; a `fuzzing` feature exposes it as
+> `template_ids::fuzzing` (`#[doc(hidden)]`), as `ourios-wal` does for
+> its frames, so non-fuzz builds see no API change. The template-map
+> reader is already public. Seeds are one valid artifact per decoder,
+> each produced by its real encoder (`fuzz/README.md` has the recipe),
+> with a dictionary of the artifacts' JSON keys
+> (`fuzz/dict/artifact_decode.dict`).
+>
+> The audit-event Parquet reader (`AuditReader::open_bytes`) is not in
+> this target: a Parquet decode is a far larger and slower coverage space
+> than these, and it gets its own. The status stays `accepted`;
+> scenarios RFC0015.11–.13 are the criteria.
+
 ### 3.3 Seed corpora
 
 Committed seeds live under `fuzz/seeds/<target>/` (a tracked directory,
@@ -553,6 +584,51 @@ the find.
 > - **And** any violation makes the target panic with a message
 >   citing `CLAUDE.md` §3.1
 
+> **Scenario RFC0015.11 — persisted-artifact decoders return an allowed
+> outcome** (amendment 2026-10-11, #955)
+> - **Given** the `artifact_decode` target
+> - **When** a miner snapshot, a partition manifest, a template-id
+>   high-water or a template-map frame (or its JSON body) is decoded
+>   from arbitrary bytes
+> - **Then** no decoder panics, aborts, or triggers a sanitizer error
+> - **And** `recover(Some(_))` is `(Some, Restored)` only for a byte 0
+>   of `SNAPSHOT_VERSION` that `load_snapshot` reads, and otherwise
+>   `(None, UnknownOrCorruptDiscarded)`; `legacy_v1_mark` reads as
+>   legacy exactly the byte-0 = 1 artefacts
+> - **And** `Manifest::from_json` never reports an I/O error and
+>   accepts only manifests `validate` accepts; the high-water parses
+>   to an id within the template-id domain or is `Malformed`
+> - **And** a template-map read is `Valid`, `Torn`, an
+>   `UnknownVersion` other than the reader's own, or the loud
+>   tenant-mismatch error
+
+> **Scenario RFC0015.12 — a rejected snapshot leaves no partial
+> state** (amendment 2026-10-11, #955)
+> - **Given** a snapshot that decodes but `restore_tenant` rejects
+> - **Then** the cluster holds no state for the tenant and its
+>   template-id allocator has not moved
+
+> **Scenario RFC0015.13 — what a persisted-artifact decoder accepts
+> survives its writer** (amendment 2026-10-11, #955)
+> - **When** a snapshot decodes, its payload re-encodes and decodes
+>   equal; when it restores, the captured state (stamped with the
+>   folded horizon) equals the decoded state in canonical form: every
+>   field of every leaf, structured-template entry and adopted
+>   template, and the horizon, with only the format's documented
+>   rewrites (set-valued lists sorted and deduplicated, an empty
+>   provenance read as its pre-RFC 0050 default, an owned adoption at
+>   version 1, a tree-backed adoption carrying no provenance or
+>   associations of its own); and that capture restores again to an
+>   equal capture
+> - **When** a manifest decodes, `to_json` decodes back equal and is a
+>   byte fixpoint; when the high-water parses, `encode` parses back to
+>   the same id (and so does every id in the domain)
+> - **When** a template map reads `Valid`, `to_artifact_bytes` reads
+>   back `Valid` with the same frontier, registry and alias classes,
+>   and re-encodes to the same bytes
+> - **And** any violation makes the target panic with a message
+>   naming the scenario
+
 ## 6. Testing strategy
 
 Per `CLAUDE.md` §6.2, the fuzz targets *are* the tests — coverage-guided
@@ -595,6 +671,16 @@ greppable (`docs/verification.md` §2).
 > - The RFC0015.5 bullet's "per-PR smoke job" predates §3.4's
 >   schedule-only trigger. The smoke job runs on its schedule and on
 >   dispatch, never per PR.
+
+> **Amendment (2026-10-11, #955, maintainer-approved): testing
+> RFC0015.11–.13.** Each oracle was shown to fire the same way before
+> landing: a restore that moves the id allocator before rejecting, a
+> snapshot writer that drops the wildcard route, a restore that drops
+> the adopted templates, a manifest reader that skips `validate`, a
+> high-water encoder off by one, a template-map
+> writer that drops the alias classes, and `recover` reporting a corrupt
+> snapshot as absent each crashed on a seed or a crafted input with the
+> expected message, and were reverted.
 
 ## 7. Open questions
 

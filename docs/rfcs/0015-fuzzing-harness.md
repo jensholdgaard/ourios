@@ -226,6 +226,31 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 > than these, and it gets its own. The status stays `accepted`;
 > scenarios RFC0015.11–.13 are the criteria.
 
+> **Amendment (2026-10-11, #958, maintainer-approved): a seventh target
+> for the audit-event Parquet files.** The template registry, the alias
+> map and the drift query all fold audit events read back from object
+> storage (RFC 0005 §3.7), and the upstream `parquet`/`arrow` decoders
+> assert, index and unwrap on malformed pages and footers. Since #956
+> every Parquet decode in `ourios-parquet` runs behind a panic boundary
+> (`panic_boundary.rs`) that turns such a panic into a typed
+> `DecodePanicked`:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `audit_reader` | the input is the whole object: `AuditReader::open_bytes`, then `read_all` | `Ok` or an `AuditReaderError` other than `Io`/`PartitionMismatch`, a caught decoder panic being the expected `DecodePanicked`; a panic past the boundary crashes; decoded events re-encode through `audit_events_to_batch` and read back equal (RFC0015.14) |
+>
+> libfuzzer-sys installs a panic hook that aborts before any unwinding,
+> so on its own the boundary's `catch_unwind` never runs under the
+> fuzzer. The target swaps that hook for a recording one around the
+> single decode call and restores it straight after; its own
+> `catch_unwind` re-raises, under the restored hook, any panic the
+> boundary let through. Per input and on the fuzzing thread only, so
+> no other panic is ever masked. The seed is the audit object of the
+> `artifact_decode` seed store; no dictionary (a binary format whose
+> column names the seed already carries). The ClusterFuzzLite budget
+> now splits seven ways. The status stays `accepted`; scenario
+> RFC0015.14 is the criterion.
+
 ### 3.3 Seed corpora
 
 Committed seeds live under `fuzz/seeds/<target>/` (a tracked directory,
@@ -629,6 +654,21 @@ the find.
 > - **And** any violation makes the target panic with a message
 >   naming the scenario
 
+> **Scenario RFC0015.14 — an audit-event Parquet file decodes to a
+> typed outcome behind the panic boundary** (amendment 2026-10-11, #958)
+> - **Given** the `audit_reader` target and arbitrary bytes as one
+>   object from the store
+> - **When** `AuditReader::open_bytes` and `read_all` decode them
+> - **Then** the result is `Ok` or an `AuditReaderError`, never `Io` or
+>   `PartitionMismatch` (bytes have no file system and no partition)
+> - **And** a panic inside the `parquet`/`arrow` decoders surfaces as
+>   `DecodePanicked`, an accepted outcome, while any panic outside that
+>   boundary (in Ourios's own decode) still crashes the target
+> - **And** the decoded events re-encode through
+>   `audit_events_to_batch`, write to Parquet and read back equal
+> - **And** any violation makes the target panic with a message
+>   naming the scenario
+
 ## 6. Testing strategy
 
 Per `CLAUDE.md` §6.2, the fuzz targets *are* the tests — coverage-guided
@@ -681,6 +721,23 @@ greppable (`docs/verification.md` §2).
 > writer that drops the alias classes, and `recover` reporting a corrupt
 > snapshot as absent each crashed on a seed or a crafted input with the
 > expected message, and were reverted.
+
+> **Amendment (2026-10-11, #958, maintainer-approved): testing
+> RFC0015.14.** The boundary was shown both ways before landing: the
+> 147 `audit_reader` crash inputs found before #956 (eight upstream
+> panic messages) and the `testdata/corrupt-parquet/` fixtures all run
+> clean, and a panic injected into `AuditReader::read_all` crashed the
+> seed with the scenario's "escaped the decode boundary" message, and
+> was reverted. Four minimised inputs (an out-of-bounds offset, an
+> empty slice, a negative column range, an unset dictionary decoder)
+> stay as `regression_decoder_*` seeds, beside the #954 arrow-schema
+> reproducer; `artifact_decode` gains the #957 unknown-slot-type
+> reproducer. The first 300 s run found one out-of-memory the boundary
+> cannot catch: parquet 59's footer decoder (`read_thrift_vec`)
+> reserves a list's declared length before reading it, so a corrupt
+> footer asks for gigabytes. parquet 60 bounds that count by the
+> remaining input; until the DataFusion upgrade brings it, the daily
+> run can report this allocation as a crash.
 
 ## 7. Open questions
 

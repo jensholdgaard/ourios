@@ -1,33 +1,45 @@
 name: Fuzz
 
-# Bounded smoke-fuzz of the RFC 0015 cargo-fuzz targets. Each target runs
-# for a short budget; a crash fails the job and uploads the reproducer.
-# This is the Phase 1 gate (RFC0015.5) — continuous fuzzing with corpus
-# persistence is Phase 2 (ClusterFuzzLite).
+# Every scheduled fuzzing run of the RFC 0015 cargo-fuzz targets, in one
+# workflow:
 #
-# libFuzzer requires nightly; it is contained to this job via an explicit
-# `+nightly-<date>` invocation, so the stable pin in `rust-toolchain.toml`
-# still governs every shipping crate. Not a required check.
+# - `smoke`: bounded smoke-fuzz on the pinned nightly; a crash fails the
+#   job and uploads the reproducer. The Phase 1 gate (RFC0015.5).
+# - `batch`: ClusterFuzzLite batch fuzzing (Phase 2, RFC0015.7), built from
+#   .clusterfuzzlite/, which grows and persists the corpus between runs.
+# - `coverage`: weekly line coverage of what the accumulated corpus reaches.
+#
+# Each job keys off its own `schedule` entry via its `if:`; a dispatch picks
+# jobs with the `job` input. Not a required check.
+#
+# libFuzzer requires nightly; it is contained to the smoke job via an
+# explicit `+nightly-<date>` invocation, so the stable pin in
+# `rust-toolchain.toml` still governs every shipping crate. ClusterFuzzLite
+# builds on the same nightly inside its container (the Dockerfile's
+# RUSTUP_TOOLCHAIN); ci.yml's `fuzz-toolchain` job keeps the two pins equal.
 
 # Deliberately NOT on `pull_request`: the sanitizer build (datafusion
-# under ASan, minutes per target) is too heavy for per-change CI.
-# Bounded smoke-fuzz runs daily; continuous per-change fuzzing is Phase 2
-# (ClusterFuzzLite, RFC0015.7). Use `workflow_dispatch` for an on-demand
-# run against a branch.
+# under ASan, minutes per target) is too heavy for per-change CI, and
+# ClusterFuzzLite's per-PR mode is out for the same reason (RFC 0015 §3.4).
+# Use `workflow_dispatch` for an on-demand run against a branch.
 #
-# On `main` the run also exports the code under test's own OTel metrics to
-# the external OTLP backend (#942); see the smoke step's env.
+# On `main` the smoke run also exports the code under test's own OTel
+# metrics to the external OTLP backend (#942); see the smoke step's env.
 on:
   schedule:
-    - cron: "17 4 * * *"
+    - cron: "0 2 * * *" # batch: daily
+    - cron: "17 4 * * *" # smoke: daily
+    - cron: "0 3 * * 1" # coverage: weekly, Monday
   workflow_dispatch:
+    inputs:
+      job:
+        description: Which job to run
+        type: choice
+        default: all
+        options: [all, smoke, batch, coverage]
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Pinned for reproducibility; bumped by Renovate like the other
@@ -35,9 +47,15 @@ env:
   NIGHTLY: nightly-2026-06-01
 
 jobs:
-  smoke-fuzz:
+  smoke:
     name: smoke-fuzz ${{ matrix.target }}
+    if: github.event.schedule == '17 4 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'smoke'))
     runs-on: ubuntu-latest
+    # A newer push to a branch supersedes its running smoke-fuzz; on `main`
+    # every run completes so the daily signal is never dropped.
+    concurrency:
+      group: fuzz-smoke-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -112,3 +130,59 @@ jobs:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore
+
+  # The ClusterFuzzLite corpus lives in GitHub Actions artifacts
+  # (`cifuzz-corpus-<target>`, rolled by every run, 90-day expiry) — there is
+  # no storage repo. A run that is cancelled mid-way loses what it fuzzed, so
+  # these jobs never cancel; the shared group serialises the corpus writers.
+  batch:
+    name: cflite batch
+    if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'batch'))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fuzz-corpus-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build fuzzers (address)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      - name: Run fuzzers (address)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: batch
+          sanitizer: address
+
+  coverage:
+    name: cflite coverage
+    if: github.event.schedule == '0 3 * * 1' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'coverage'))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fuzz-coverage-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build fuzzers (coverage)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: coverage
+      - name: Run fuzzers (coverage)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: coverage
+          sanitizer: coverage

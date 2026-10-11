@@ -48,6 +48,11 @@ chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 # Generated metric-name constants (the `ourios.runtime.*` names).
 ourios-semconv = { path = "../ourios-semconv" }
+# `http-proto` only: TLS for the OTLP/HTTP client. The exporter's own
+# `reqwest-rustls` feature would pull in aws-lc-rs; `rustls-no-provider` plus
+# the ring provider (the one the ingester already pins) keeps one crypto stack.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 # `testing` only: the weaver live-check sample file and report.
 serde_json = { version = "1", default-features = false, features = ["std"], optional = true }
 
@@ -58,6 +63,17 @@ serde_json = { version = "1", default-features = false, features = ["std"], opti
 # and `live_check`, which captures named log events and hands them to
 # `weaver registry live-check`.
 testing = ["opentelemetry_sdk/testing", "dep:serde_json"]
+# OTLP/HTTP with protobuf payloads, chosen per signal by the standard
+# `OTEL_EXPORTER_OTLP[_<SIGNAL>]_PROTOCOL=http/protobuf`. Off by default so the
+# server keeps its gRPC-only build; the fuzz harnesses enable it to reach a TLS
+# OTLP/HTTP backend without a tokio runtime (the blocking client runs on its
+# own thread).
+http-proto = [
+    "opentelemetry-otlp/http-proto",
+    "opentelemetry-otlp/reqwest-blocking-client",
+    "dep:reqwest",
+    "dep:rustls",
+]
 
 # `process.cpu.time` converts `/proc/self/stat`'s clock ticks to seconds at
 # the kernel's tick rate, which only the auxiliary vector reports; rustix

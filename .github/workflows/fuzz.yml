@@ -14,6 +14,9 @@ name: Fuzz
 # Bounded smoke-fuzz runs daily; continuous per-change fuzzing is Phase 2
 # (ClusterFuzzLite, RFC0015.7). Use `workflow_dispatch` for an on-demand
 # run against a branch.
+#
+# On `main` the run also exports the code under test's own OTel metrics to
+# the external OTLP backend (#942); see the smoke step's env.
 on:
   schedule:
     - cron: "17 4 * * *"
@@ -58,6 +61,29 @@ jobs:
         env:
           # 300 s per target on the daily schedule; 60 s on a manual dispatch.
           BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
+          # Fuzz input is an adversarial workload: export the metrics the code
+          # under test already records to the external OTLP backend (#942,
+          # `ourios_fuzz::init_telemetry`). Only from `main` (the schedule, or
+          # a dispatch of main), and only when both the endpoint var and the
+          # token secret are set; an empty endpoint leaves the harness exactly
+          # as it is without telemetry. A failed export is dropped and never
+          # fails the job. libFuzzer exits without running destructors, so the
+          # last export interval of each run is lost; the short interval bounds
+          # that. The exporter threads add background coverage to the working
+          # corpus, which this job throws away.
+          # miner_roundtrip stays off until #945: with a real provider, every
+          # per-input MinerCluster stays reachable from its gauge callbacks and
+          # the target runs out of memory within seconds.
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ matrix.target != 'miner_roundtrip' && github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && vars.OTLP_EXPORT_ENDPOINT || '' }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && format('Authorization=Bearer {0}', secrets.DASH0_AUTHORIZATION_TOKEN) || '' }}
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_METRIC_EXPORT_INTERVAL: "10000"
+          # Upstream resource attributes only. The cicd.pipeline.run.id on
+          # metrics is the opt-in the CI/CD semantic conventions ask for.
+          OTEL_RESOURCE_ATTRIBUTES: >-
+            deployment.environment.name=test,cicd.pipeline.name=${{ github.workflow }},cicd.pipeline.task.name=smoke-fuzz/${{ matrix.target }},cicd.pipeline.run.id=${{ github.run_id }},vcs.ref.head.revision=${{ github.sha }}
+          # Warn and error only on stderr, once a subscriber is installed.
+          RUST_LOG: warn
         run: |
           set -euo pipefail
           target='${{ matrix.target }}'

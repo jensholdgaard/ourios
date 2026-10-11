@@ -15,7 +15,7 @@ use ourios_querier::dsl::{parse, parse_structured};
 // execution is wasted on byte sequences the real boundary cannot deliver
 // (axum/MCP hand the parsers `String`s, so invalid UTF-8 is rejected
 // upstream of them in production).
-fuzz_target!(|text: &str| {
+fuzz_target!(init: ourios_fuzz::init_telemetry(), |text: &str| {
     let _ = parse(text);
     let _ = parse_structured(text);
 });

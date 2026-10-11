@@ -339,6 +339,75 @@ fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) 
         && exporter_selected(std::env::var(exporter_var).ok().as_deref())
 }
 
+/// Whether a signal exports over OTLP/HTTP with protobuf payloads: the
+/// signal-specific `OTEL_EXPORTER_OTLP_<SIGNAL>_PROTOCOL` wins over
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, per the exporter spec. Anything else,
+/// including unset, keeps gRPC: the server has always exported over gRPC, and
+/// the spec's `http/protobuf` default would silently retarget existing
+/// deployments.
+#[cfg(feature = "http-proto")]
+fn http_protobuf_selected(signal: &str) -> bool {
+    is_http_protobuf(
+        std::env::var(format!("OTEL_EXPORTER_OTLP_{signal}_PROTOCOL"))
+            .ok()
+            .as_deref(),
+        std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").ok().as_deref(),
+    )
+}
+
+#[cfg(feature = "http-proto")]
+fn is_http_protobuf(signal_protocol: Option<&str>, protocol: Option<&str>) -> bool {
+    signal_protocol
+        .or(protocol)
+        .is_some_and(|protocol| protocol.trim() == "http/protobuf")
+}
+
+/// The OTLP/HTTP client is built with `rustls-no-provider`, so it uses the
+/// process-default crypto provider and panics when there is none. Install ring
+/// unless the process already chose one.
+#[cfg(feature = "http-proto")]
+fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Losing an install race to another thread still leaves a provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+/// Build one signal's OTLP exporter: OTLP/HTTP when the `http-proto` feature is
+/// on and the protocol env selects it, gRPC otherwise. Endpoint and headers
+/// come from the standard `OTEL_EXPORTER_OTLP_*` env unless
+/// [`TelemetryConfig::otlp_endpoint`] overrides the endpoint; over HTTP that
+/// override is a base URL, so the signal path is appended as the env form does.
+macro_rules! otlp_exporter {
+    ($exporter:ident, $config:expr, $signal:literal, $path:literal) => {{
+        let config: &TelemetryConfig = $config;
+        #[cfg(feature = "http-proto")]
+        let http = http_protobuf_selected($signal).then(|| {
+            ensure_crypto_provider();
+            let mut builder = $exporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary);
+            if let Some(endpoint) = &config.otlp_endpoint {
+                builder =
+                    builder.with_endpoint(format!("{}{}", endpoint.trim_end_matches('/'), $path));
+            }
+            builder.build()
+        });
+        #[cfg(not(feature = "http-proto"))]
+        let http: Option<Result<$exporter, opentelemetry_otlp::ExporterBuildError>> = None;
+        match http {
+            Some(built) => built?,
+            None => {
+                let mut builder = $exporter::builder().with_tonic();
+                if let Some(endpoint) = &config.otlp_endpoint {
+                    builder = builder.with_endpoint(endpoint.clone());
+                }
+                builder.build()?
+            }
+        }
+    }};
+}
+
 /// Build the enabled signals' OTLP pipelines — the push `MeterProvider`, the
 /// `LoggerProvider` with its `tracing` bridge, and the tracer — install them
 /// process-globally, and return the [`TelemetryGuard`] that owns them. Each
@@ -354,7 +423,8 @@ fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) 
 /// tests use [`init_in_memory`] or build a provider directly.
 ///
 /// Must run inside a tokio runtime: the gRPC (tonic) OTLP exporters
-/// export on it.
+/// export on it. A signal exporting over OTLP/HTTP (the `http-proto`
+/// feature) does not need one.
 ///
 /// # Errors
 /// Returns [`TelemetryError::Exporter`] if either OTLP exporter cannot
@@ -406,11 +476,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // guard to shut down. `None` when disabled (`OTEL_LOGS_EXPORTER=none`);
     // the stderr `fmt` layer stays, so only the OTel Logs signal is dropped.
     let logger: Option<SdkLoggerProvider> = if logs_enabled {
-        let mut builder = LogExporter::builder().with_tonic();
-        if let Some(endpoint) = &config.otlp_endpoint {
-            builder = builder.with_endpoint(endpoint.clone());
-        }
-        let log_exporter = builder.build()?;
+        let log_exporter = otlp_exporter!(LogExporter, config, "LOGS", "/v1/logs");
         Some(
             SdkLoggerProvider::builder()
                 .with_batch_exporter(log_exporter)
@@ -434,11 +500,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // disciplined span count sits far below the ~1000 traces/sec threshold
     // OTel says to sample at, so the always-on default is the right baseline.
     let (tracer, otel_layer): (Option<SdkTracerProvider>, Option<BoxedLayer>) = if traces_enabled {
-        let mut builder = SpanExporter::builder().with_tonic();
-        if let Some(endpoint) = &config.otlp_endpoint {
-            builder = builder.with_endpoint(endpoint.clone());
-        }
-        let span_exporter = builder.build()?;
+        let span_exporter = otlp_exporter!(SpanExporter, config, "TRACES", "/v1/traces");
         let tracer_provider = SdkTracerProvider::builder()
             .with_batch_exporter(span_exporter)
             .with_resource(resource)
@@ -530,11 +592,8 @@ fn meter_provider(
     config: &TelemetryConfig,
     resource: &Resource,
 ) -> Result<SdkMeterProvider, TelemetryError> {
-    let mut builder = MetricExporter::builder().with_tonic();
-    if let Some(endpoint) = &config.otlp_endpoint {
-        builder = builder.with_endpoint(endpoint.clone());
-    }
-    let reader = PeriodicReader::builder(builder.build()?).build();
+    let exporter = otlp_exporter!(MetricExporter, config, "METRICS", "/v1/metrics");
+    let reader = PeriodicReader::builder(exporter).build();
     let provider = SdkMeterProvider::builder()
         .with_reader(reader)
         .with_resource(resource.clone())
@@ -638,6 +697,23 @@ mod tests {
             !exporter_selected(Some("None")),
             "case-insensitive none → off"
         );
+    }
+
+    /// `http/protobuf` selects OTLP/HTTP; the signal-specific variable wins over
+    /// the general one, and unset or any other value keeps gRPC.
+    #[cfg(feature = "http-proto")]
+    #[test]
+    fn protocol_env_selects_http_protobuf() {
+        assert!(!is_http_protobuf(None, None), "unset keeps gRPC");
+        assert!(is_http_protobuf(None, Some("http/protobuf")));
+        assert!(is_http_protobuf(None, Some(" http/protobuf ")));
+        assert!(!is_http_protobuf(None, Some("grpc")));
+        assert!(
+            !is_http_protobuf(None, Some("http/json")),
+            "JSON is not built"
+        );
+        assert!(is_http_protobuf(Some("http/protobuf"), Some("grpc")));
+        assert!(!is_http_protobuf(Some("grpc"), Some("http/protobuf")));
     }
 
     // Build a provider over an in-memory exporter (no global state, no

@@ -11,7 +11,7 @@ use std::io::Cursor;
 use libfuzzer_sys::fuzz_target;
 use ourios_wal::frame::read_frame;
 
-fuzz_target!(|data: &[u8]| {
+fuzz_target!(init: ourios_fuzz::init_telemetry(), |data: &[u8]| {
     let mut cursor = Cursor::new(data);
     let _ = read_frame(&mut cursor);
 });

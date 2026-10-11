@@ -7,6 +7,6 @@
 use libfuzzer_sys::fuzz_target;
 use ourios_ingester::receiver::decode_json;
 
-fuzz_target!(|data: &[u8]| {
+fuzz_target!(init: ourios_fuzz::init_telemetry(), |data: &[u8]| {
     let _ = decode_json(data);
 });

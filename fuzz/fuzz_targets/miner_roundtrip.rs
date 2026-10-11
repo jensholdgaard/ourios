@@ -24,7 +24,7 @@ use ourios_miner::reconstruct;
 // reconstruction comfortably.
 const MAX_LINE_BYTES: usize = 4096;
 
-fuzz_target!(|data: &[u8]| {
+fuzz_target!(init: ourios_fuzz::init_telemetry(), |data: &[u8]| {
     // Use the input as the candidate log line (lossy UTF-8), capped. This
     // never discards an input — unlike `String::arbitrary`, which errors
     // on bytes it can't structure and would throw away coverage. (Future

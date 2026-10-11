@@ -519,10 +519,37 @@ uncached query identically.
 >   guard. Listing consistency is otherwise unchanged from §3.3. The
 >   incremental and full paths consume the same one listing, so a
 >   missing file affects both identically.
-> - *Concurrent queriers*: as §3.4. The incremental publish is a CAS
->   against the `ETag` of the artifact it extended. A lost race is
->   harmless, because every artifact is a correct fold of its own
->   frontier.
+> - *Concurrent queriers*: as §3.4, per backend.
+>   - **S3:** the incremental publish is a CAS against the `ETag` of
+>     the artifact it extended. A lost race is harmless, because every
+>     artifact is a correct fold of its own frontier.
+>   - **Local:** publication is a rename with no precondition, so the
+>     last writer wins and no `lost_race` occurs. This is safe, and is
+>     required to stay safe, for one reason: every artifact either
+>     writer can install is a correct fold of the listing it was built
+>     from, with a `fold_state` describing exactly that listing. A
+>     rename of an older fold (frontier `F1`) over a newer one (`F2`)
+>     therefore makes the artifact staler, never wrong. The next read
+>     sees `F1 ≠ L` and runs the guard against `F1`'s own
+>     `high_water_ns` and `binding_conflicts`, which are correct for
+>     `F1`. The overwritten artifact's state is not needed, because
+>     the delta from `F1` re-covers it.
+>   - **`incremental_depth` after an overwrite:** the count belongs to
+>     the surviving artifact's own lineage, i.e. the number of
+>     incremental steps since the full fold it descends from. It stays
+>     an exact count and the cap still bounds the surviving lineage.
+>     The overwritten lineage simply ends.
+>   - **The one local requirement:** each publish writes its own
+>     **uniquely named** temp file in the tenant's audit directory
+>     (e.g. `template_map.v2.json.zst.<UUIDv7>.tmp`, extension `tmp`,
+>     ignored by the walk) and renames it into place. Today's fixed
+>     `template_map.v2.json.zst.tmp` lets two concurrent publishers
+>     write into the same temp file. One rename could then install
+>     interleaved bytes. That would almost surely classify Torn and
+>     self-heal, but it is not a correct fold of any listing. A unique
+>     temp name restores the property the argument above relies on:
+>     every renamed file is one writer's complete artifact. A stray
+>     temp left by a crash is harmless, as before.
 > - *Deletion, retention, audit compaction or rewrite*: no code
 >   deletes or rewrites audit files today. Any future one removes a
 >   key from `F`, so the next acquisition is `files_removed`, a full
@@ -1094,10 +1121,19 @@ ambiguity cannot recur.
 >   extend the same stale artifact concurrently
 > - **Then** the backdated file forces a full fold whose answer
 >   includes it in §3.7.1 order
-> - **And** the concurrent incremental publishes resolve by CAS: the
->   loser's query succeeds with the correct answer and its write is
->   discarded (`lost_race`), and the next acquisition is a hit or a
->   correct incremental fold.
+> - **And** on **S3** the concurrent incremental publishes resolve by
+>   CAS: the loser's query succeeds with the correct answer and its
+>   write is discarded (`lost_race`)
+> - **And** on the **local** backend both publishes report
+>   `published`, last writer wins, and each writes and renames its own
+>   uniquely named temp file. The installed artifact decodes `Valid`
+>   and equals exactly one writer's complete artifact (never Torn,
+>   never interleaved). With an older fold renamed over a newer one,
+>   the next acquisition sees the older frontier as stale and still
+>   returns the full-fold answer
+> - **And** on both backends both queries answer correctly, and the
+>   next acquisition is a hit or a guarded fold (incremental or full)
+>   whose answer equals the full fold over its listing.
 
 > **Scenario RFC0033.13 — The path taken is observable**
 > (amendment 2026-10-12, #962, maintainer-approved)

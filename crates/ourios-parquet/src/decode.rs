@@ -10,6 +10,8 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
+use std::path::Path;
+
 use arrow_array::{Array, BinaryViewArray, RecordBatch, StringViewArray};
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::errors::ParquetError;
@@ -131,6 +133,10 @@ pub(crate) trait DecodeError: Sized {
     /// A column present but shape-mismatched (type, null-on-required,
     /// list nesting).
     fn conversion(column: &'static str, detail: String) -> Self;
+    /// The `parquet` crate failed to decode the file.
+    fn parquet(source: ParquetError) -> Self;
+    /// The `parquet`/`arrow` decoders panicked on the object at `path`.
+    fn decode_panicked(path: &Path, message: String) -> Self;
 }
 
 pub(crate) fn required_string<E: DecodeError>(

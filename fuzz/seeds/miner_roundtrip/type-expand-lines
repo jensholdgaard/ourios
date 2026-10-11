@@ -1,0 +1,4 @@
+connection to db-7 failed after 3 retries: timeout
+connection to db-9 failed after 12 retries: timeout
+connection to 10.0.0.9 failed after 5 retries: timeout
+connection to 3f1c2a9e-0b7d-4c6e-9a1f-2d3e4f5a6b7c failed after 1 retries: timeout

@@ -2111,6 +2111,19 @@ SDK and transport crates do not leak into every library:
   `opentelemetry` **API** crate and resolve instruments through
   `global::meter("ourios.<subsystem>")`. No SDK, no OTLP, no
   transport dependency in a library crate.
+
+  > **Amendment (2026-10-12, #963, maintainer-approved) — versioned
+  > instrumentation scopes.** Instrumented crates resolve instruments
+  > through `ourios_core::telemetry::meter("ourios.<subsystem>")` (and
+  > spans through `ourios_core::telemetry::tracer`), a thin wrapper over
+  > the global provider that sets the workspace release as the scope
+  > version, so every series and span carries `otel.scope.version`. A
+  > provider-bound site passes `ourios_core::telemetry::scope(..)` to
+  > `meter_with_scope` / `tracer_with_scope`. The wrapper is API-only:
+  > `ourios-core` depends on the `opentelemetry` API crate and no SDK,
+  > so the split above is preserved. The workspace `clippy.toml`
+  > disallows the unversioned `global::meter` / `global::tracer` and
+  > `MeterProvider::meter` / `TracerProvider::tracer`.
 - A new **`ourios-telemetry`** crate owns the heavy deps — the
   `opentelemetry_sdk` and `opentelemetry-otlp` crates (the upstream
   package names, underscore and hyphen respectively) plus the OTLP

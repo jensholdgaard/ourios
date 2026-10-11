@@ -36,7 +36,7 @@ fn a_decoder_panic_fails_the_scan_with_a_typed_error_and_nothing_is_written() {
             matches!(&err, TemplateIdsError::Scan(e) if e.is_decode_panicked()),
             "{name}: {err}",
         );
-        assert_eq!(err.error_type(), ourios_parquet::ERROR_TYPE_DECODE_PANICKED);
+        assert_eq!(err.error_type(), "scan", "RFC 0059 §3.5: a failed scan");
         assert!(err.to_string().contains(key), "{name}: {err}");
         assert!(
             store

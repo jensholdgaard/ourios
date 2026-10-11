@@ -224,8 +224,9 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Split evenly across the seven targets (~430 s each), on every core
-          # of the runner (libFuzzer -jobs/-workers).
+          # Split evenly across the six staged targets (500 s each), on every core
+          # of the runner (libFuzzer -jobs/-workers). build.sh does not stage
+          # audit_reader until #959 closes.
           fuzz-seconds: 3000
           parallel-fuzzing: true
           mode: batch

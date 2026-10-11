@@ -73,7 +73,10 @@ panic inside the upstream `parquet`/`arrow` decoders is an expected
 libFuzzer's abort-on-panic hook out for the one decode call; a panic that gets
 past the boundary is re-raised and crashes as usual. Its `regression_decoder_*`
 seeds are minimised upstream-decoder panics that must keep decoding to that
-typed error.
+typed error. Only the daily smoke run fuzzes it for now: parquet 59's footer
+decoder can be driven into a multi-gigabyte allocation (#959), so
+`.clusterfuzzlite/build.sh` does not stage it for ClusterFuzzLite until the
+parquet 60 / DataFusion 56 upgrade (#846) closes #959.
 
 `miner_roundtrip` reads its input as length-prefixed record bodies: a
 little-endian `u16` length (capped at 4096), then that many bytes, repeated

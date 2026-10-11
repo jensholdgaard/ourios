@@ -247,9 +247,13 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 > boundary let through. Per input and on the fuzzing thread only, so
 > no other panic is ever masked. The seed is the audit object of the
 > `artifact_decode` seed store; no dictionary (a binary format whose
-> column names the seed already carries). The ClusterFuzzLite budget
-> now splits seven ways. The status stays `accepted`; scenario
-> RFC0015.14 is the criterion.
+> column names the seed already carries). The daily smoke run fuzzes
+> it from the start. ClusterFuzzLite (batch, prune, coverage) does not
+> yet: `.clusterfuzzlite/build.sh` skips staging it while parquet 59's
+> footer decoder can be driven into a multi-gigabyte allocation
+> (#959, §6 below), and that exclusion is deleted when #959 closes
+> with the parquet 60 / DataFusion 56 upgrade (#846). The status stays
+> `accepted`; scenario RFC0015.14 is the criterion.
 
 ### 3.3 Seed corpora
 
@@ -735,9 +739,11 @@ greppable (`docs/verification.md` §2).
 > reproducer. The first 300 s run found one out-of-memory the boundary
 > cannot catch: parquet 59's footer decoder (`read_thrift_vec`)
 > reserves a list's declared length before reading it, so a corrupt
-> footer asks for gigabytes. parquet 60 bounds that count by the
-> remaining input; until the DataFusion upgrade brings it, the daily
-> run can report this allocation as a crash.
+> footer asks for gigabytes (#959). parquet 60 bounds that count by the
+> remaining input. Until the DataFusion 56 upgrade (#846) brings it,
+> the daily smoke run can report this allocation as a crash, and
+> ClusterFuzzLite does not stage the target (§3.2 as amended); the
+> reproducer becomes a regression seed when #959 closes.
 
 ## 7. Open questions
 

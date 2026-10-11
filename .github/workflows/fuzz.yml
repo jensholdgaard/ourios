@@ -1,33 +1,61 @@
 name: Fuzz
 
-# Bounded smoke-fuzz of the RFC 0015 cargo-fuzz targets. Each target runs
-# for a short budget; a crash fails the job and uploads the reproducer.
-# This is the Phase 1 gate (RFC0015.5) — continuous fuzzing with corpus
-# persistence is Phase 2 (ClusterFuzzLite).
+# Every scheduled fuzzing run of the RFC 0015 cargo-fuzz targets, in one
+# workflow:
 #
-# libFuzzer requires nightly; it is contained to this job via an explicit
-# `+nightly-<date>` invocation, so the stable pin in `rust-toolchain.toml`
-# still governs every shipping crate. Not a required check.
+# - `smoke`: bounded smoke-fuzz on the pinned nightly; a crash fails the
+#   job and uploads the reproducer. The Phase 1 gate (RFC0015.5).
+# - `batch`: ClusterFuzzLite batch fuzzing (Phase 2, RFC0015.7), built from
+#   .clusterfuzzlite/, which grows and persists the corpus between runs.
+# - `prune`: ClusterFuzzLite corpus pruning. The ClusterFuzzLite GitHub
+#   Actions guide is explicit: "If batch fuzzing is running, you must also
+#   run corpus pruning", or the corpus only ever grows.
+# - `coverage`: weekly line coverage of what the accumulated corpus reaches.
+#
+# Each job keys off its own `schedule` entry via its `if:`; a dispatch picks
+# jobs with the `job` input. Not a required check.
+#
+# Corpus storage: with no `storage-repo` configured, ClusterFuzzLite keeps
+# the corpus as the `cifuzz-corpus-<target>` workflow artifacts (each run
+# downloads the latest and uploads a new one; artifacts expire after 90
+# days, so a corpus survives only while some run rolls it within that
+# window) and the coverage report as `cifuzz-coverage-latest`.
+# TODO(fuzz-audit): a storage repo would make both durable and browsable;
+# that is a maintainer decision, not made here.
+#
+# libFuzzer requires nightly; it is contained to the smoke job via an
+# explicit `+nightly-<date>` invocation, so the stable pin in
+# `rust-toolchain.toml` still governs every shipping crate. ClusterFuzzLite
+# builds on the same nightly inside its container (the Dockerfile's
+# RUSTUP_TOOLCHAIN); ci.yml's `fuzz-toolchain` job keeps the two pins equal.
 
 # Deliberately NOT on `pull_request`: the sanitizer build (datafusion
-# under ASan, minutes per target) is too heavy for per-change CI.
-# Bounded smoke-fuzz runs daily; continuous per-change fuzzing is Phase 2
-# (ClusterFuzzLite, RFC0015.7). Use `workflow_dispatch` for an on-demand
-# run against a branch.
+# under ASan, minutes per target) is too heavy for per-change CI, and
+# ClusterFuzzLite's per-PR mode is out for the same reason (RFC 0015 §3.4).
+# Use `workflow_dispatch` for an on-demand run against a branch.
 #
-# On `main` the run also exports the code under test's own OTel metrics to
-# the external OTLP backend (#942); see the smoke step's env.
+# On `main` the smoke run also exports the code under test's own OTel
+# metrics to the external OTLP backend (#942); see the smoke step's env.
 on:
   schedule:
-    - cron: "17 4 * * *"
+    # prune runs an hour before batch, in its own run, so batch starts from
+    # a minimised corpus; the shared concurrency group below serialises them
+    # should prune run long.
+    - cron: "0 1 * * *" # prune: daily
+    - cron: "0 2 * * *" # batch: daily
+    - cron: "17 4 * * *" # smoke: daily
+    - cron: "0 3 * * 1" # coverage: weekly, Monday
   workflow_dispatch:
+    inputs:
+      job:
+        description: Which job to run
+        type: choice
+        default: smoke
+        # One job per dispatch, never `all`: see the comment above `batch`.
+        options: [smoke, batch, coverage, prune]
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Pinned for reproducibility; bumped by Renovate like the other
@@ -35,19 +63,26 @@ env:
   NIGHTLY: nightly-2026-06-01
 
 jobs:
-  smoke-fuzz:
-    name: smoke-fuzz ${{ matrix.target }}
+  smoke:
+    name: smoke-fuzz
+    if: github.event.schedule == '17 4 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'smoke')
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [miner_roundtrip, otlp_json, otlp_protobuf, wal_frame, dsl_parse]
+    # One sanitizer build (~12 min) plus five 300 s runs; the limit leaves
+    # room for a slow runner, not for a hung target (libFuzzer's own
+    # -max_total_time and -timeout bound those).
+    timeout-minutes: 60
+    # A newer push to a branch supersedes its running smoke-fuzz; on `main`
+    # every run completes so the daily signal is never dropped.
+    concurrency:
+      group: fuzz-smoke-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     env:
       # The one gate for every OTEL_* variable of the smoke step: `main` only
       # (the schedule, or a dispatch of main), with both the endpoint var and
       # the token secret set. Otherwise none of them reaches the fuzz process,
       # the credential included.
       OTLP_EXPORT: ${{ github.ref == 'refs/heads/main' && vars.OTLP_EXPORT_ENDPOINT != '' && secrets.DASH0_AUTHORIZATION_TOKEN != '' }}
+      TARGETS: miner_roundtrip otlp_json otlp_protobuf wal_frame dsl_parse
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -63,7 +98,19 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - name: Smoke-fuzz ${{ matrix.target }}
+      - name: Build the fuzz targets
+        run: |
+          set -euo pipefail
+          # Force the gnu host triple. Left to default, cargo-fuzz picks
+          # the musl target on the runner, whose statically-linked libc is
+          # incompatible with the ASan sanitizer ("sanitizer is incompatible
+          # with statically linked libc").
+          host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
+          # Every target in one build: the sanitizer build of the shared
+          # dependency graph (datafusion under ASan) is the expensive part,
+          # and `fuzz run` below reuses it as long as the build options match.
+          cargo "+${NIGHTLY}" fuzz build --target "${host}"
+      - name: Smoke-fuzz every target
         env:
           # 300 s per target on the daily schedule; 60 s on a manual dispatch.
           BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
@@ -82,33 +129,194 @@ jobs:
           OTEL_METRIC_EXPORT_INTERVAL: ${{ env.OTLP_EXPORT == 'true' && '10000' || '' }}
           # Upstream resource attributes only. The cicd.pipeline.run.id on
           # metrics is the opt-in the CI/CD semantic conventions ask for.
-          OTEL_RESOURCE_ATTRIBUTES: >-
-            ${{ env.OTLP_EXPORT == 'true' && format('deployment.environment.name=test,cicd.pipeline.name={0},cicd.pipeline.task.name=smoke-fuzz/{1},cicd.pipeline.run.id={2},vcs.ref.head.revision={3}', github.workflow, matrix.target, github.run_id, github.sha) || '' }}
+          # The per-target `cicd.pipeline.task.name=smoke-fuzz/<target>` is
+          # appended in the loop below, from this base.
+          OTEL_RESOURCE_ATTRIBUTES_BASE: >-
+            ${{ env.OTLP_EXPORT == 'true' && format('deployment.environment.name=test,cicd.pipeline.name={0},cicd.pipeline.run.id={1},vcs.ref.head.revision={2}', github.workflow, github.run_id, github.sha) || '' }}
           # Warn and error only on stderr, once a subscriber is installed.
           RUST_LOG: warn
         run: |
           set -euo pipefail
-          target='${{ matrix.target }}'
-          # Force the gnu host triple. Left to default, cargo-fuzz picks
-          # the musl target on the runner, whose statically-linked libc is
-          # incompatible with the ASan sanitizer ("sanitizer is incompatible
-          # with statically linked libc").
           host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
-          mkdir -p "fuzz/corpus/${target}"
-          # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
-          # Copy the directory contents (`/.`) so an empty/odd glob can't
-          # silently skip seeding; errors surface under `set -e` rather
-          # than being swallowed.
-          if [ -d "fuzz/seeds/${target}" ]; then
-            cp -rn "fuzz/seeds/${target}/." "fuzz/corpus/${target}/"
+          failed=()
+          for target in ${TARGETS}; do
+            echo "::group::${target}"
+            mkdir -p "fuzz/corpus/${target}"
+            # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
+            # Copy the directory contents (`/.`) so an empty/odd glob can't
+            # silently skip seeding; errors surface under `set -e` rather
+            # than being swallowed.
+            if [ -d "fuzz/seeds/${target}" ]; then
+              cp -rn "fuzz/seeds/${target}/." "fuzz/corpus/${target}/"
+            fi
+            # Empty base (gate shut) stays empty, so no OTEL_* value is set.
+            export OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES_BASE:+${OTEL_RESOURCE_ATTRIBUTES_BASE},cicd.pipeline.task.name=smoke-fuzz/${target}}"
+            # Same build options as the build step, so nothing recompiles.
+            # -timeout and -rss_limit_mb turn a hang or a leak-like blowup
+            # into a reported crash instead of a job that runs to the limit.
+            # Every target runs even after a crash, so one does not hide
+            # another; the job fails at the end.
+            if cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- \
+                -max_total_time="${BUDGET}" -timeout=30 -rss_limit_mb=2048 -print_final_stats=1; then
+              echo "${target}: clean"
+            else
+              echo "::error::${target}: cargo fuzz run exited $?"
+              failed+=("${target}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::crashing targets: ${failed[*]}"
+            exit 1
           fi
-          # `fuzz run` also builds, so a target that stops compiling fails
-          # here too.
-          cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- -max_total_time="${BUDGET}"
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}
+          name: fuzz-artifacts
+          # One subdirectory per crashing target.
+          path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  # The ClusterFuzzLite corpus lives in GitHub Actions artifacts
+  # (`cifuzz-corpus-<target>`, rolled by every run, 90-day expiry) — there is
+  # no storage repo. A run that is cancelled mid-way loses what it fuzzed, so
+  # these jobs never cancel; the shared group serialises the corpus writers.
+  #
+  # `prune` and `batch` never share a workflow run, which is why the dispatch
+  # input has no `all`. The handoff between them is the corpus artifact, and
+  # within one run it does not work: ClusterFuzzLite finds a corpus by
+  # listing the repository's artifacts through the REST API, and artifact
+  # names are unique per run, so batch could not reliably see prune's upload
+  # and its own upload of the same `cifuzz-corpus-<target>` would be
+  # rejected. Prune at 01:00 and batch at 02:00 are separate runs, which is
+  # the intended handoff.
+  batch:
+    name: cflite batch
+    if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'batch')
+    runs-on: ubuntu-latest
+    # The container build has measured 11–19 min (no cache), plus 50 min of
+    # fuzzing and a couple of minutes of corpus download/upload. A 60 min
+    # limit would cut every run short of its upload.
+    timeout-minutes: 90
+    concurrency:
+      group: fuzz-corpus-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build fuzzers (address)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      - name: Run fuzzers (address)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Split evenly across the five targets (600 s each), on every core
+          # of the runner (libFuzzer -jobs/-workers).
+          fuzz-seconds: 3000
+          parallel-fuzzing: true
+          mode: batch
+          sanitizer: address
+
+  prune:
+    name: cflite prune
+    if: github.event.schedule == '0 1 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'prune')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: fuzz-corpus-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build fuzzers (address)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      # Minimises each `cifuzz-corpus-<target>` and uploads the result in its
+      # place (`fuzz-seconds` is the time limit of the merge, shared across
+      # the targets).
+      - name: Prune the corpus
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: prune
+          sanitizer: address
+
+  coverage:
+    name: cflite coverage
+    if: github.event.schedule == '0 3 * * 1' || (github.event_name == 'workflow_dispatch' && inputs.job == 'coverage')
+    runs-on: ubuntu-latest
+    # A coverage build (~5 min) plus one pass over the corpus; measured ~8 min.
+    timeout-minutes: 30
+    concurrency:
+      group: fuzz-coverage-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build fuzzers (coverage)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: coverage
+      # Uploads the HTML report itself, as the `cifuzz-coverage-latest`
+      # artifact.
+      - name: Run fuzzers (coverage)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: coverage
+          sanitizer: coverage
+      # The run_fuzzers container writes the report under $GITHUB_WORKSPACE
+      # (its `Workspace.coverage_report` is `cifuzz-coverage`), laid out by
+      # the OSS-Fuzz base-runner `coverage` script: `fuzzer_stats/<target>.json`
+      # per target and `report/linux/summary.json` for the merge, each an
+      # `llvm-cov export -summary-only` document. That layout is upstream's,
+      # read at the `v1` images this job floats on, so a change there must
+      # not fail the job: the step prints what it finds instead.
+      - name: Line coverage per target
+        if: steps.run.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          report="${GITHUB_WORKSPACE}/cifuzz-coverage"
+          if [ ! -d "${report}/fuzzer_stats" ]; then
+            echo "::warning::no ${report}/fuzzer_stats; the ClusterFuzzLite report layout has moved. Found:"
+            find "${GITHUB_WORKSPACE}" -maxdepth 3 -path '*cifuzz*' \( -type d -o -name '*.json' \)
+            exit 1
+          fi
+          row() { # <label> <llvm-cov summary json>
+            jq -r --arg t "$1" '.data[0].totals.lines
+              | "| \($t) | \(.covered) | \(.count) | \(.percent * 100 | round / 100) |"' "$2"
+          }
+          {
+            echo "## Fuzz corpus line coverage"
+            echo
+            echo "| target | lines covered | lines total | % |"
+            echo "|---|---:|---:|---:|"
+            for f in "${report}"/fuzzer_stats/*.json; do
+              [ -f "${f}" ] || continue
+              row "$(basename "${f%.json}")" "${f}"
+            done
+            if [ -f "${report}/report/linux/summary.json" ]; then
+              row "**all targets, merged**" "${report}/report/linux/summary.json"
+            fi
+            echo
+            echo "Full HTML report: the \`cifuzz-coverage-latest\` artifact of this run."
+          } | tee -a "${GITHUB_STEP_SUMMARY}"

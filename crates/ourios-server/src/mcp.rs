@@ -420,9 +420,19 @@ impl OuriosMcp {
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
             ourios.query.visibility.branch = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
         )
     )]
     async fn query_logs_traced(
+        &self,
+        args: Parameters<QueryLogsArgs>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tool_outcome(self.query_logs_run(args, ctx).await)
+    }
+
+    async fn query_logs_run(
         &self,
         Parameters(args): Parameters<QueryLogsArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
@@ -512,9 +522,19 @@ impl OuriosMcp {
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
             ourios.query.visibility.branch = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
         )
     )]
     async fn list_templates_traced(
+        &self,
+        args: Parameters<ListTemplatesArgs>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tool_outcome(self.list_templates_run(args, ctx).await)
+    }
+
+    async fn list_templates_run(
         &self,
         Parameters(args): Parameters<ListTemplatesArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
@@ -593,9 +613,19 @@ impl OuriosMcp {
             mcp.method.name = "tools/call",
             mcp.session.id = tracing::field::Empty,
             ourios.query.visibility.branch = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
         )
     )]
     async fn template_drift_traced(
+        &self,
+        args: Parameters<TemplateDriftArgs>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tool_outcome(self.template_drift_run(args, ctx).await)
+    }
+
+    async fn template_drift_run(
         &self,
         Parameters(args): Parameters<TemplateDriftArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
@@ -735,6 +765,16 @@ fn now_unix_nano() -> u64 {
 /// A query-engine failure as a tool error: the engine's `Display` is the
 /// H6-scrubbed surface the JSON API already exposes — no DataFusion/SQL
 /// leaks through either boundary.
+/// Close an `execute_tool` span's outcome: a failed call marks the span
+/// `Error` with the JSON-RPC error code as `error.type` (semconv JSON-RPC:
+/// every error code is an error).
+fn tool_outcome(result: Result<CallToolResult, ErrorData>) -> Result<CallToolResult, ErrorData> {
+    if let Err(e) = &result {
+        ourios_core::telemetry::record_span_error(&tracing::Span::current(), &e.code.0.to_string());
+    }
+    result
+}
+
 fn query_tool_error(e: &ourios_querier::QueryError) -> ErrorData {
     match e {
         // RFC 0047 §3.4: a content column the principal may not read — the
@@ -845,6 +885,8 @@ async fn mcp_server_span(request: Request<Body>, next: Next) -> Response {
         http.request.method = %method,
         http.route = "/mcp",
         http.response.status_code = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
     )
 )]
 async fn mcp_server_span_traced(
@@ -856,11 +898,9 @@ async fn mcp_server_span_traced(
         .extensions_mut()
         .insert(McpTraceContext(tracing::Span::current().context()));
     let response = next.run(request).await;
-    // `i64`, not `u16`: the bridge stringifies `u64`-valued fields, which would
-    // export `String("200")` where the convention wants an integer.
-    tracing::Span::current().record(
-        "http.response.status_code",
-        i64::from(response.status().as_u16()),
+    ourios_core::telemetry::record_http_server_status(
+        &tracing::Span::current(),
+        response.status().as_u16(),
     );
     response
 }

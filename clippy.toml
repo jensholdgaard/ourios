@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "opentelemetry::global::meter", reason = "unversioned scope; use ourios_core::telemetry::meter" },
+    { path = "opentelemetry::global::tracer", reason = "unversioned scope; use ourios_core::telemetry::tracer" },
+]

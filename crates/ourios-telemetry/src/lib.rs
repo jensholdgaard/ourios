@@ -36,6 +36,7 @@
 #[cfg(feature = "testing")]
 pub mod live_check;
 mod process;
+mod runtime;
 
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -391,18 +392,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // the SDK's periodic reader resolves the interval from the standard
     // `OTEL_METRIC_EXPORT_INTERVAL` env var (milliseconds, default 60000 = 60 s).
     let provider: Option<SdkMeterProvider> = if metrics_enabled {
-        let mut builder = MetricExporter::builder().with_tonic();
-        if let Some(endpoint) = &config.otlp_endpoint {
-            builder = builder.with_endpoint(endpoint.clone());
-        }
-        let exporter = builder.build()?;
-        let reader = PeriodicReader::builder(exporter).build();
-        let provider = SdkMeterProvider::builder()
-            .with_reader(reader)
-            .with_resource(resource.clone())
-            .build();
-        process::register(&provider.meter(process::SCOPE));
-        Some(provider)
+        Some(meter_provider(config, &resource)?)
     } else {
         None
     };
@@ -532,6 +522,29 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         logger,
         tracer,
     })
+}
+
+/// The OTLP metrics pipeline, carrying the metrics Ourios observes about
+/// itself rather than records at call sites.
+fn meter_provider(
+    config: &TelemetryConfig,
+    resource: &Resource,
+) -> Result<SdkMeterProvider, TelemetryError> {
+    let mut builder = MetricExporter::builder().with_tonic();
+    if let Some(endpoint) = &config.otlp_endpoint {
+        builder = builder.with_endpoint(endpoint.clone());
+    }
+    let reader = PeriodicReader::builder(builder.build()?).build();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(resource.clone())
+        .build();
+    process::register(&provider.meter(process::SCOPE));
+    // The runtime `init` runs on is the binary's main runtime.
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime::register(&provider.meter(runtime::SCOPE), &runtime);
+    }
+    Ok(provider)
 }
 
 /// Build an in-memory metrics pipeline for tests: a `MeterProvider`

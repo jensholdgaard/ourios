@@ -254,6 +254,14 @@ impl Backend {
             Self::Remote(store) => StoreRef::Remote(store),
         }
     }
+
+    /// This backend, its store calls attributed to `caller`.
+    pub(crate) fn with_caller(self, caller: ourios_parquet::Caller) -> Self {
+        match self {
+            Self::Local(root) => Self::Local(root),
+            Self::Remote(store) => Self::Remote(store.with_caller(caller)),
+        }
+    }
 }
 
 /// The query engine. One per querier process; reads the RFC 0005
@@ -392,7 +400,7 @@ impl Querier {
                 let store = config.open().map_err(|e| QueryError::Storage {
                     detail: format!("open store: {e}"),
                 })?;
-                Backend::Remote(store)
+                Backend::Remote(store.with_caller(ourios_parquet::Caller::Querier))
             }
         };
         Ok(Self {
@@ -1124,6 +1132,29 @@ fn resolve_live_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote querier's store calls count as the querier's, and the
+    /// template-map acquisition re-attributes its own.
+    #[test]
+    fn a_remote_querier_attributes_its_store_calls() {
+        let config = StoreConfig::S3(
+            ourios_parquet::S3Config::new("ourios-test")
+                .with_endpoint("https://s3.example.invalid")
+                .with_region("eu-central-1"),
+        );
+        let querier = Querier::from_store_config(&config).expect("querier");
+        let caller = |backend: &Backend| match backend {
+            Backend::Remote(store) => store.caller(),
+            Backend::Local(root) => panic!("expected a remote backend, got {root:?}"),
+        };
+        assert_eq!(caller(&querier.backend), ourios_parquet::Caller::Querier);
+        let map = querier
+            .backend
+            .clone()
+            .with_caller(ourios_parquet::Caller::TemplateMap);
+        assert_eq!(caller(&map), ourios_parquet::Caller::TemplateMap);
+    }
+
     /// `Querier::new` is infallible and must not panic on a not-yet-created
     /// bucket: it only records the path (no `Store` construction, which would
     /// canonicalize and fail on a missing dir). Querying a non-existent local

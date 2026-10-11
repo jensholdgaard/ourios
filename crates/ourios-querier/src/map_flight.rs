@@ -82,7 +82,9 @@ impl TemplateMapFlights {
         loop {
             let span = tracing::Span::current();
             let flights = Arc::clone(self);
-            let backend = backend.clone();
+            let backend = backend
+                .clone()
+                .with_caller(ourios_parquet::Caller::TemplateMap);
             let owned = tenant.clone();
             let step = tokio::task::spawn_blocking(move || {
                 span.in_scope(|| flights.step(backend.store_ref(), &owned))

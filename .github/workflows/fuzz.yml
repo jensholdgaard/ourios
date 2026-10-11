@@ -156,8 +156,15 @@ jobs:
             # into a reported crash instead of a job that runs to the limit.
             # Every target runs even after a crash, so one does not hide
             # another; the job fails at the end.
+            # The text-grammar targets take a libFuzzer dictionary (RFC 0015
+            # §3.3); ClusterFuzzLite gets the same file via <target>.options.
+            dict=()
+            if [ -f "fuzz/dict/${target}.dict" ]; then
+              dict=("-dict=fuzz/dict/${target}.dict")
+            fi
             if cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- \
-                -max_total_time="${BUDGET}" -timeout=30 -rss_limit_mb=2048 -print_final_stats=1; then
+                -max_total_time="${BUDGET}" -timeout=30 -rss_limit_mb=2048 -print_final_stats=1 \
+                "${dict[@]}"; then
               echo "${target}: clean"
             else
               echo "::error::${target}: cargo fuzz run exited $?"

@@ -72,9 +72,6 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
 
 [[package]]
 name = "arrayvec"
@@ -1327,17 +1324,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2427,7 +2413,6 @@ dependencies = [
 name = "ourios-fuzz"
 version = "0.0.0"
 dependencies = [
- "arbitrary",
  "libfuzzer-sys",
  "ourios-config",
  "ourios-core",
@@ -2436,6 +2421,7 @@ dependencies = [
  "ourios-querier",
  "ourios-telemetry",
  "ourios-wal",
+ "prost",
 ]
 
 [[package]]

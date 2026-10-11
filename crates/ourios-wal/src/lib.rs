@@ -33,11 +33,13 @@ use ourios_core::audit::AuditEvent;
 pub(crate) mod checkpoint;
 mod export;
 // `frame` is crate-internal, but the `fuzzing` feature exposes it so the
-// `fuzz/` cargo-fuzz targets can drive `read_frame` directly (RFC 0015).
-// Not part of the stable public API.
+// `fuzz/` cargo-fuzz targets can drive `read_frame` and `write_frame`
+// directly (RFC 0015). Not part of the stable public API, so it stays out
+// of the rendered docs even when the feature is on.
 #[cfg(not(feature = "fuzzing"))]
 pub(crate) mod frame;
 #[cfg(feature = "fuzzing")]
+#[doc(hidden)]
 pub mod frame;
 pub(crate) mod housekeeping;
 pub(crate) mod ledger;

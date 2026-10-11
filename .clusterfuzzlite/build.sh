@@ -28,4 +28,8 @@ for f in fuzz/fuzz_targets/*.rs; do
   if [ -f "fuzz/$target.options" ]; then
     cp "fuzz/$target.options" "$OUT/${target}.options"
   fi
+  # The `dict =` line in <target>.options names a file next to the binary.
+  if [ -f "fuzz/dict/$target.dict" ]; then
+    cp "fuzz/dict/$target.dict" "$OUT/${target}.dict"
+  fi
 done

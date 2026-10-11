@@ -522,11 +522,15 @@ the old field pinned to audit-stream-only) is recorded in §4.
 >   `ourios.template_map.derive.audit.size` (By), the audit set a
 >   completed fold read, by the same reason.
 >
-> A hit records none of them. A query that joins another query's
-> in-flight acquisition records
+> A hit records none of them. A failure before the disposition is
+> known (the audit listing, or a fetched artifact naming another
+> tenant) runs no fold and records no derive sample. A query that
+> joins another query's in-flight acquisition records
 > `ourios.template_map.acquire.wait.duration` (s, no attributes): the
-> time it waited. The acquirer records no wait. The status stays
-> `accepted`. Scenario RFC0033.9 is the criterion.
+> time it waited, whether the shared acquisition succeeded or failed.
+> Its `joined` lookup outcome stays success-only. The acquirer records
+> no wait. The status stays `accepted`. Scenario RFC0033.9 is the
+> criterion.
 
 ## 4. Alternatives considered
 
@@ -731,16 +735,19 @@ ambiguity cannot recur.
 > 2026-10-11, #924)
 > - **Given** the RFC0033.7 fixture and acts
 > - **When** they drive a miss, a hit, a staleness, a torn artifact,
->   a shared acquisition and a failing fold
+>   an unknown-version artifact, a shared acquisition, a failing fold,
+>   a failing shared acquisition, and an artifact naming another
+>   tenant
 > - **Then** `ourios.template_map.derive.duration` has exactly one
 >   sample per fold, keyed by its `ourios.template_map.derive.reason`,
->   and none for a hit; the failing fold's sample also carries
->   `error.type`
+>   and none for a hit or for the other-tenant artifact; a failing
+>   fold's sample also carries `error.type`
 > - **And** `derive.audit.files` / `derive.audit.size` have one
->   sample per completed fold, the cold miss's equal to the fixture's
->   audit file count and bytes
+>   sample per completed fold, the cold miss's and the unknown
+>   version's equal to their fixture's audit file count and bytes
 > - **And** `ourios.template_map.acquire.wait.duration` has exactly
->   one sample, the joiner's.
+>   one sample per joiner, the failing shared acquisition's included,
+>   and none for an acquirer.
 
 ## 6. Testing strategy
 
@@ -768,10 +775,12 @@ Mapped to `CLAUDE.md` §6.2:
   asserts the event and the lookup anomaly through the in-memory
   log and metric exporters.
 - **RFC0033.9** — `tests/rfc0033_7_observability.rs`: the RFC0033.7
-  acts, asserted through the in-memory metric exporter. The
-  acquire-wait sample needs the shared acquisition, which runs under
-  the `testing` feature (CI runs `--all-features`); without it the
-  test asserts no wait was recorded.
+  acts plus a failing shared acquisition and a final act on its own
+  store (unknown version, then an other-tenant artifact), asserted
+  through the in-memory metric exporter. The acquire-wait samples need
+  the shared acquisitions, which run under the `testing` feature (CI
+  runs `--all-features`); without it the test asserts no wait was
+  recorded.
 
 > **Amendment (2026-07-13).** §6 is structurally unchanged by the
 > compressed encoding: the same tests exercise the v2 artifact

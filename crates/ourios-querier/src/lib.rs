@@ -89,6 +89,7 @@ use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
 mod api;
 mod decode;
 mod exec;
+mod fetch_count;
 mod file_set;
 mod stats;
 #[cfg(test)]
@@ -651,7 +652,7 @@ impl Querier {
         // `resolves_to` alias fold, RFC 0033) — handed to the row-rendering
         // pass so one acquisition serves both folds. `None` ⇒ rendering
         // acquires lazily.
-        mut acquired: Option<AcquiredTemplateMap>,
+        acquired: Option<AcquiredTemplateMap>,
         build_filter: F,
     ) -> Result<QueryResult, QueryError>
     where
@@ -686,21 +687,38 @@ impl Querier {
         // lives on `SchemaMode::Union` (epic #745 wave 2).
         let base =
             register_listing_table(&ctx, "logs", urls, SchemaMode::Union(&self.promoted)).await?;
-        // A provably-empty filter (absent OPTIONAL column) ⇒ no scan.
-        let Some(df) = build_filter(base)? else {
-            return Ok(empty_result(terminal.aggregate()));
+        let mut result = match build_filter(base)? {
+            // A provably-empty filter (absent OPTIONAL column) ⇒ no scan. The
+            // files were still opened: schema inference read every footer.
+            None => empty_result(terminal.aggregate()),
+            Some(df) => {
+                self.run_terminal(&ctx, df, tenant, terminal, acquired)
+                    .await?
+            }
         };
+        result.stats.files_opened = files_opened;
+        result.bytes_fetched = crate::fetch_count::fetched(&ctx);
+        Ok(result)
+    }
 
+    /// Run `terminal` over the filtered frame `df` (see [`Self::execute`],
+    /// which sets the result's `files_opened` and `bytes_fetched`).
+    async fn run_terminal(
+        &self,
+        ctx: &SessionContext,
+        df: datafusion::dataframe::DataFrame,
+        tenant: &TenantId,
+        terminal: Terminal,
+        mut acquired: Option<AcquiredTemplateMap>,
+    ) -> Result<QueryResult, QueryError> {
         // An aggregation query terminates in its own grouped-count scan
         // (RFC 0002 §6.5 amendment): the map is the result, so the
         // count/materialize passes below never run for it.
         let (row_limit, query_options) = match terminal {
             Terminal::Aggregate(agg) => {
-                let mut result = self
+                return self
                     .execute_aggregate(df, &agg, tenant, ctx.task_ctx())
-                    .await?;
-                result.stats.files_opened = files_opened;
-                return Ok(result);
+                    .await;
             }
             Terminal::Rows { limit, options } => (limit, options),
         };
@@ -732,13 +750,13 @@ impl Querier {
                     rows: records.len() as u64,
                     stats: QueryStats {
                         bytes_read: 0,
-                        files_opened,
                         ..collected.scan
                     },
                     records,
                     aggregate: None,
                     materialize_bytes_read: collected.scan.bytes_read,
                     registry_bytes_read: collected.registry_bytes_read,
+                    bytes_fetched: 0,
                 });
             }
             early = Some(collected);
@@ -755,8 +773,7 @@ impl Querier {
             .clone()
             .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
             .map_err(storage_err)?;
-        let (batches, mut stats) = execute_plan(counted, ctx.task_ctx()).await?;
-        stats.files_opened = files_opened;
+        let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
         let rows = count_value(&batches)?;
 
         // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the
@@ -784,6 +801,7 @@ impl Querier {
             aggregate: None,
             materialize_bytes_read: collected.scan.bytes_read,
             registry_bytes_read: collected.registry_bytes_read,
+            bytes_fetched: 0,
         })
     }
 
@@ -833,6 +851,7 @@ impl Querier {
             aggregate: Some(decoded.groups),
             materialize_bytes_read: 0,
             registry_bytes_read: 0,
+            bytes_fetched: 0,
         })
     }
 

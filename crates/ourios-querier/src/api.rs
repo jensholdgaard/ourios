@@ -178,17 +178,21 @@ pub struct QueryResult {
     /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
+    /// Every byte the query's table reads fetched from storage: the footers
+    /// schema inference read, the count scan and the row materialization.
+    /// Unlike `stats.bytes_read` + `materialize_bytes_read` it includes the
+    /// reads made before a plan exists. The template-map acquisition is
+    /// `registry_bytes_read`.
+    pub bytes_fetched: u64,
 }
 
 impl QueryResult {
-    /// The query's total storage IO (RFC 0031 §3.6): the count scan, the
-    /// row materialization and the template-map acquisition.
+    /// Every byte the query fetched from storage: its table reads
+    /// ([`Self::bytes_fetched`], footer reads included) plus the
+    /// template-map acquisition.
     #[must_use]
     pub fn total_bytes_read(&self) -> u64 {
-        self.stats
-            .bytes_read
-            .saturating_add(self.materialize_bytes_read)
-            .saturating_add(self.registry_bytes_read)
+        self.bytes_fetched.saturating_add(self.registry_bytes_read)
     }
 }
 

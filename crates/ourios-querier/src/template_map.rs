@@ -115,7 +115,7 @@ const LOOKUP_OUTCOME_TORN: &str = "torn";
 const LOOKUP_OUTCOME_UNKNOWN_VERSION: &str = "unknown_version";
 /// A query served by another query's in-flight acquisition at the same
 /// frontier (`crate::map_flight`) — semconv v0.3.9.
-pub(crate) const LOOKUP_OUTCOME_JOINED: &str = "joined";
+const LOOKUP_OUTCOME_JOINED: &str = "joined";
 /// `ourios.template_map.lookup.anomaly` value: the fold behind the lookup
 /// found a `(template_id, version)` bound to two different templates.
 const LOOKUP_ANOMALY_BINDING_CONFLICT: &str = "binding_conflict";
@@ -214,10 +214,20 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
 
 impl TemplateMapMetrics {
     fn record_lookup(&self, outcome: CacheOutcome, binding_conflict: bool) {
-        let outcome = KeyValue::new(
-            semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
-            lookup_outcome(outcome),
-        );
+        let value = match outcome {
+            CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
+            CacheOutcome::Miss {
+                reason: MissReason::Absent,
+            } => LOOKUP_OUTCOME_MISS,
+            CacheOutcome::Miss {
+                reason: MissReason::Torn,
+            } => LOOKUP_OUTCOME_TORN,
+            CacheOutcome::Miss {
+                reason: MissReason::UnknownVersion,
+            } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
+            CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
+        };
+        let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
         if binding_conflict {
             self.lookups.add(
                 1,
@@ -302,27 +312,14 @@ fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)]) {
 /// Record a `joined` lookup: this query was served the map another query
 /// acquired at the same frontier. Only for a successful shared acquisition —
 /// the acquirer records its own outcome, and a failure records nothing.
-pub(crate) fn record_joined_lookup(waited: Duration) {
+pub(crate) fn record_joined_lookup() {
     METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED);
-    METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
 }
 
-/// The `ourios.template_map.lookup.outcome` value of a lookup this query
-/// performed itself.
-pub(crate) fn lookup_outcome(outcome: CacheOutcome) -> &'static str {
-    match outcome {
-        CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
-        CacheOutcome::Miss {
-            reason: MissReason::Absent,
-        } => LOOKUP_OUTCOME_MISS,
-        CacheOutcome::Miss {
-            reason: MissReason::Torn,
-        } => LOOKUP_OUTCOME_TORN,
-        CacheOutcome::Miss {
-            reason: MissReason::UnknownVersion,
-        } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
-        CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
-    }
+/// Record how long a query waited on another query's acquisition of the
+/// same frontier, whether that acquisition succeeded or failed.
+pub(crate) fn record_acquire_wait(waited: Duration) {
+    METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
 }
 
 /// The `ourios.template_map.derive.reason` for an outcome that folds;
@@ -554,19 +551,7 @@ pub(crate) fn load_or_derive_resolved(
             }
         }
     };
-    let started = Instant::now();
-    let folded = fold_template_map(resolved, tenant);
-    if let Some(reason) = derive_reason(outcome) {
-        METRICS.record_derive(
-            reason,
-            started.elapsed(),
-            match &folded {
-                Ok((map, bytes, _)) => Ok((map.folded_files().len() as u64, *bytes)),
-                Err(e) => Err(derive_error_type(e)),
-            },
-        );
-    }
-    let (map, fold_bytes, conflicts) = folded?;
+    let (map, fold_bytes, conflicts) = measured_fold(resolved, tenant, outcome)?;
     let acquisition_bytes =
         fold_bytes
             .checked_add(fetched_bytes)
@@ -582,6 +567,30 @@ pub(crate) fn load_or_derive_resolved(
     METRICS.record_lookup(outcome, !conflicts.is_empty());
     map.write_through(backend, expected.as_deref(), fold_bytes);
     Ok((map, acquisition_bytes, outcome))
+}
+
+/// [`fold_template_map`] behind a non-hit lookup, recording what it cost
+/// under the `outcome` that sent the lookup to the fold: the duration
+/// always (with `error.type` when the fold fails), the audit files and
+/// bytes when it completes. A failure before the disposition is known
+/// (the audit listing, or a fetched artifact naming another tenant) runs
+/// no fold and so records no derive sample.
+fn measured_fold(
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+    tenant: &TenantId,
+    outcome: CacheOutcome,
+) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
+    let started = Instant::now();
+    let folded = fold_template_map(resolved, tenant);
+    let Some(reason) = derive_reason(outcome) else {
+        return folded;
+    };
+    let cost = match &folded {
+        Ok((map, bytes, _)) => Ok((map.folded_files().len() as u64, *bytes)),
+        Err(e) => Err(derive_error_type(e)),
+    };
+    METRICS.record_derive(reason, started.elapsed(), cost);
+    folded
 }
 
 /// One GET of `tenant`'s artifact, classified. Infallible by design: a

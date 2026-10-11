@@ -79,6 +79,9 @@ pub struct DriftRow {
 pub struct DriftResult {
     pub rows: Vec<DriftRow>,
     pub stats: QueryStats,
+    /// Every byte the drift query's scans fetched from storage, the
+    /// footers schema inference read included.
+    pub bytes_fetched: u64,
 }
 
 /// Column aliases for the §6.3 projection. Internal to this module — they name
@@ -162,6 +165,7 @@ pub(crate) async fn run_drift(
 
     let (batches, mut stats) = crate::execute_plan(sorted, ctx.task_ctx()).await?;
     stats.files_opened = files.len() as u64;
+    let mut bytes_fetched = crate::fetch_count::fetched(&ctx);
     let mut rows = decode_drift_rows(&batches)?;
 
     // RFC 0050 §3.3 — grow the provenance set to `{mined,
@@ -174,17 +178,23 @@ pub(crate) async fn run_drift(
     // aggregation's.
     if !rows.is_empty() {
         let ids: Vec<u64> = rows.iter().map(|r| r.template_id).collect();
-        let (adopted, adoption_stats) = adopted_template_ids(backend, tenant, &ids).await?;
+        let (adopted, adoption_stats, adoption_fetched) =
+            adopted_template_ids(backend, tenant, &ids).await?;
         stats.row_groups_scanned += adoption_stats.row_groups_scanned;
         stats.row_groups_pruned += adoption_stats.row_groups_pruned;
         stats.bytes_read += adoption_stats.bytes_read;
         stats.files_opened += adoption_stats.files_opened;
+        bytes_fetched += adoption_fetched;
         // Always zero from a plain scan today; folded so the
         // accounting stays complete if it ever isn't.
         stats.rows_excluded += adoption_stats.rows_excluded;
         apply_adoptions(&mut rows, &adopted);
     }
-    Ok(DriftResult { rows, stats })
+    Ok(DriftResult {
+        rows,
+        stats,
+        bytes_fetched,
+    })
 }
 
 /// Union `upstream_derived` into every row whose template the
@@ -228,24 +238,24 @@ async fn audit_dataframe(
 
 /// The subset of `ids` with at least one `template_adopted` audit
 /// event for `tenant`, over the tenant's full audit history — plus
-/// the lookup scan's own IO/pruning stats, which the caller folds
-/// into the drift result so the surface reports the query's full
-/// cost. The scan's operator spans are recorded here for the same
+/// the lookup scan's own IO/pruning stats and fetched bytes, which the
+/// caller folds into the drift result so the surface reports the query's
+/// full cost. The scan's operator spans are recorded here for the same
 /// reason.
 async fn adopted_template_ids(
     backend: StoreRef<'_>,
     tenant: &TenantId,
     ids: &[u64],
-) -> Result<(std::collections::HashSet<u64>, QueryStats), QueryError> {
+) -> Result<(std::collections::HashSet<u64>, QueryStats, u64), QueryError> {
     if ids.is_empty() {
         // Never compile an empty `IN ()` — the caller only asks for
         // non-empty drift results today, but this helper must not
         // rely on `DataFusion`'s empty-list semantics.
-        return Ok((std::collections::HashSet::new(), QueryStats::default()));
+        return Ok((std::collections::HashSet::new(), QueryStats::default(), 0));
     }
     let files = audit_scan::audit_files_blocking(backend, tenant, None).await?;
     if files.is_empty() {
-        return Ok((std::collections::HashSet::new(), QueryStats::default()));
+        return Ok((std::collections::HashSet::new(), QueryStats::default(), 0));
     }
     // Tenant-scoped by `audit_dataframe` (`CLAUDE.md` §3.7).
     let (ctx, base) = audit_dataframe(backend, &files, tenant).await?;
@@ -266,7 +276,7 @@ async fn adopted_template_ids(
     let (batches, mut stats) = crate::execute_plan(grouped, ctx.task_ctx()).await?;
     stats.files_opened = files.len() as u64;
     let out = decode_adopted_ids(&batches)?;
-    Ok((out, stats))
+    Ok((out, stats, crate::fetch_count::fetched(&ctx)))
 }
 
 /// Decode the adoption lookup's grouped `template_id` batches into the

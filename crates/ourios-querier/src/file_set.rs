@@ -408,7 +408,10 @@ pub(super) fn object_store_urls(
     }
     let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(STORE_URL)
         .map_err(storage_err)?;
-    ctx.register_object_store(store_url.as_ref(), store.object_store());
+    ctx.register_object_store(
+        store_url.as_ref(),
+        crate::fetch_count::counted(ctx, store.object_store()),
+    );
     // `Store::object_store()` is the RAW backend (prefix NOT applied), whereas
     // `list_blocking`/`get_blocking` operate in the store-relative key space
     // under `Store::prefix()` (the `OURIOS_S3_PREFIX` root). So the URLs handed

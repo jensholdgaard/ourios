@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ourios_core::tenant::TenantId;
-use ourios_semconv as semconv;
 use tokio::sync::watch;
-use tracing::Instrument as _;
 
 use crate::template_map::{self, TemplateMap};
 use crate::{Backend, QueryError, StoreRef, audit_scan};
@@ -58,11 +56,7 @@ struct Flight {
 }
 
 enum Step {
-    Done {
-        acquired: Acquired,
-        /// The lookup outcome of a successful acquisition.
-        outcome: Option<&'static str>,
-    },
+    Done(Acquired),
     Wait {
         done: watch::Receiver<Option<Acquired>>,
         same_frontier: bool,
@@ -84,38 +78,6 @@ impl TemplateMapFlights {
         backend: &Backend,
         tenant: &TenantId,
     ) -> Acquired {
-        // RFC 0038 §3.7.2: the acquisition phase of the query, on both
-        // backends, joiners included, so the time a query spends on its
-        // template map is never a gap in its trace. Opened here, on the
-        // async side, so it parents to the query span under any subscriber.
-        let span = tracing::info_span!(
-            "load template_map",
-            otel.kind = "internal",
-            ourios.tenant = tenant.as_str(),
-            ourios.template_map.lookup.outcome = tracing::field::Empty,
-            otel.status_code = tracing::field::Empty,
-        );
-        let (acquired, outcome) = self
-            .acquire_traced(backend, tenant)
-            .instrument(span.clone())
-            .await;
-        match (&acquired, outcome) {
-            (Ok(_), Some(outcome)) => {
-                span.record(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, outcome);
-            }
-            (Ok(_), None) => {}
-            (Err(_), _) => {
-                span.record("otel.status_code", "ERROR");
-            }
-        }
-        acquired
-    }
-
-    async fn acquire_traced(
-        self: &Arc<Self>,
-        backend: &Backend,
-        tenant: &TenantId,
-    ) -> (Acquired, Option<&'static str>) {
         let mut waited = Duration::ZERO;
         loop {
             let span = tracing::Span::current();
@@ -128,14 +90,9 @@ impl TemplateMapFlights {
             .await
             .map_err(|e| QueryError::Storage {
                 detail: format!("blocking storage task: {e}"),
-            })
-            .and_then(|step| step);
-            let step = match step {
-                Ok(step) => step,
-                Err(e) => return (Err(e), None),
-            };
+            })??;
             match step {
-                Step::Done { acquired, outcome } => return (acquired, outcome),
+                Step::Done(acquired) => return acquired,
                 Step::Wait {
                     mut done,
                     same_frontier,
@@ -151,15 +108,17 @@ impl TemplateMapFlights {
                     waited += started.elapsed();
                     if same_frontier {
                         let acquired = outcome.unwrap_or_else(|| Err(abandoned()));
-                        // The acquiring query recorded its own outcome; a
-                        // failed acquisition records nothing for anyone.
-                        if acquired.is_err() {
-                            return (acquired, None);
+                        // A joiner's wait is recorded whatever the shared
+                        // acquisition returned. The lookup outcome is not:
+                        // the acquiring query recorded its own, and a failed
+                        // acquisition records none for anyone.
+                        template_map::record_acquire_wait(waited);
+                        if acquired.is_ok() {
+                            template_map::record_joined_lookup();
+                            #[cfg(any(test, feature = "testing"))]
+                            self.hooks.joined();
                         }
-                        template_map::record_joined_lookup(waited);
-                        #[cfg(any(test, feature = "testing"))]
-                        self.hooks.joined();
-                        return (acquired, Some(template_map::LOOKUP_OUTCOME_JOINED));
+                        return acquired;
                     }
                 }
             }
@@ -196,16 +155,10 @@ impl TemplateMapFlights {
         };
         #[cfg(any(test, feature = "testing"))]
         self.hooks.before_acquire();
-        let (acquired, outcome) =
-            match template_map::load_or_derive_resolved(backend, tenant, resolved) {
-                Ok((map, bytes, outcome)) => (
-                    Ok((Arc::new(map), bytes)),
-                    Some(template_map::lookup_outcome(outcome)),
-                ),
-                Err(e) => (Err(e), None),
-            };
+        let acquired = template_map::load_or_derive_resolved(backend, tenant, resolved)
+            .map(|(map, bytes, _)| (Arc::new(map), bytes));
         guard.finish(acquired.clone());
-        Ok(Step::Done { acquired, outcome })
+        Ok(Step::Done(acquired))
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<TenantId, Flight>> {

@@ -241,8 +241,8 @@ impl QuerierMetrics {
     /// Record a successful query: its wall-clock duration (by kind), the
     /// scanned/pruned row-group split (the two states partition the candidates,
     /// so the B1 pruned fraction is derivable in the backend), the files it
-    /// opened, and `bytes_read`, its total storage IO.
-    pub(crate) fn record_ok(
+    /// opened, and `bytes_read`, every byte it fetched from storage.
+    fn record_ok(
         &self,
         kind: &'static str,
         elapsed: Duration,
@@ -261,6 +261,19 @@ impl QuerierMetrics {
             stats.row_groups_pruned,
             &Self::state_attrs(ROW_GROUP_PRUNED),
         );
+    }
+
+    /// Record a successful logs query, its template-map acquisition
+    /// included in the bytes it fetched.
+    pub(crate) fn record_logs(&self, elapsed: Duration, result: &QueryResult) {
+        let bytes = result.total_bytes_read();
+        self.record_ok(QUERY_KIND_LOGS, elapsed, &result.stats, bytes);
+    }
+
+    /// Record a successful drift query.
+    pub(crate) fn record_drift(&self, elapsed: Duration, result: &DriftResult) {
+        let bytes = result.bytes_fetched;
+        self.record_ok(QUERY_KIND_DRIFT, elapsed, &result.stats, bytes);
     }
 
     /// Record a failed query: its duration, tagged with `error.type`.
@@ -616,12 +629,7 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
             let elapsed = started.elapsed();
             match result {
                 Ok(result) => {
-                    state.metrics.record_ok(
-                        QUERY_KIND_DRIFT,
-                        elapsed,
-                        &result.stats,
-                        result.stats.bytes_read,
-                    );
+                    state.metrics.record_drift(elapsed, &result);
                     json_ok(&DriftResponse::from(&result))
                 }
                 Err(e) => {
@@ -1102,12 +1110,7 @@ async fn run_logs_query(
     let elapsed = started.elapsed();
     match result {
         Ok(result) => {
-            state.metrics.record_ok(
-                QUERY_KIND_LOGS,
-                elapsed,
-                &result.stats,
-                result.total_bytes_read(),
-            );
+            state.metrics.record_logs(elapsed, &result);
             json_ok(&LogQueryResponse::from(&result))
         }
         Err(e) => {
@@ -1347,6 +1350,7 @@ mod tests {
                     .insert(Provenance::Mined),
             }],
             stats: QueryStats::default(),
+            bytes_fetched: 0,
         };
         let json = serde_json::to_value(DriftResponse::from(&result)).expect("serialize");
         assert_eq!(

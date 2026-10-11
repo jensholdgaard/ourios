@@ -197,29 +197,34 @@ async fn rfc0016_6_pruning_is_observable() {
         "the pruned-state counter matches the response's row_groups_pruned",
     );
     assert!(scanned_metric >= 1, "at least one row group was scanned");
+    assert_query_reads(&rms, bucket.path(), &json);
+}
 
-    // #924 — what the query read: every live data file of the fixture was
-    // opened (pruned files still have their footer read). The bytes are the
-    // count scan's (the response's `bytes_read`) plus the row
-    // materialization's under the endpoint's default limit; the fixture has
-    // no audit stream, so the template-map acquisition adds nothing. Each
-    // of the two scans reads at most every data file once.
-    let (files, file_bytes) = data_files(bucket.path());
+/// #924 — what the query read. Every live data file of the fixture was
+/// opened (pruned files still have their footer read). The bytes are
+/// schema inference's footer reads, the count scan's (the response's
+/// `bytes_read`) and the row materialization's under the endpoint's default
+/// limit; the fixture has no audit stream, so the template-map acquisition
+/// adds nothing. Each of the three passes reads at most every data file
+/// once.
+fn assert_query_reads(rms: &[ResourceMetrics], bucket: &Path, json: &serde_json::Value) {
+    let (files, file_bytes) = data_files(bucket);
     let count_scan = json["stats"]["bytes_read"]
         .as_u64()
         .expect("bytes_read is a number");
     assert!(count_scan > 0, "the count scan read data");
     assert_eq!(
-        logs_histogram(&rms, semconv::OURIOS_QUERY_FILES),
+        logs_histogram(rms, semconv::OURIOS_QUERY_FILES),
         (1, files),
         "one query.files sample: the fixture's file count",
     );
-    let (samples, read) = logs_histogram(&rms, semconv::OURIOS_QUERY_READ_SIZE);
+    let (samples, read) = logs_histogram(rms, semconv::OURIOS_QUERY_READ_SIZE);
     assert_eq!(samples, 1, "one query.read.size sample");
     assert!(
-        read > count_scan && read <= 2 * file_bytes,
-        "read.size {read} covers the count scan ({count_scan}) and the row \
-         materialization, within two passes over the {file_bytes} fixture bytes",
+        read > count_scan && read <= 3 * file_bytes,
+        "read.size {read} covers the count scan ({count_scan}), the inference \
+         footers and the row materialization, within three passes over the \
+         {file_bytes} fixture bytes",
     );
 }
 

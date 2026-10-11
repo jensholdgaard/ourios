@@ -220,28 +220,19 @@ async fn a_query_joining_an_acquisition_spans_its_wait() {
         text(load, semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME).as_deref(),
         Some("joined")
     );
+    let load_id = load.span_context.span_id();
+    assert!(
+        named(&spans, "derive template_map")
+            .iter()
+            .all(|d| d.parent_span_id != load_id),
+        "the joined query folds nothing of its own"
+    );
 }
 
 /// One committed audit file for the tenant, then overwritten with bytes no
 /// Parquet reader accepts, so the fold over it fails.
 fn unreadable_audit_file(root: &Path) {
-    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink as _, TemplateChange};
-
-    let store = ourios_parquet::Store::local(root).expect("store");
-    let mut sink = ourios_parquet::ParquetAuditSink::new(store);
-    sink.emit(AuditEvent {
-        tenant_id: TenantId::new(TENANT),
-        timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_775_127_480),
-        payload: AuditPayload::Template {
-            template_id: 1,
-            triggering_line_hash: ourios_core::audit::hash_triggering_line(b"line"),
-            triggering_line_sample: None,
-            change: TemplateChange::Created {
-                new_template: "user <*>".to_owned(),
-            },
-        },
-    });
-    assert_eq!(sink.write_failures(), 0, "the fixture event persists");
+    audit_file(root, 1_775_127_480);
     let mut dirs = vec![root.join("audit")];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(dir).expect("read dir") {
@@ -253,6 +244,74 @@ fn unreadable_audit_file(root: &Path) {
             }
         }
     }
+}
+
+/// One committed audit file for the tenant, at `secs` past the epoch.
+fn audit_file(root: &Path, secs: u64) {
+    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink as _, TemplateChange};
+
+    let store = ourios_parquet::Store::local(root).expect("store");
+    let mut sink = ourios_parquet::ParquetAuditSink::new(store);
+    sink.emit(AuditEvent {
+        tenant_id: TenantId::new(TENANT),
+        timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+        payload: AuditPayload::Template {
+            template_id: 1,
+            triggering_line_hash: ourios_core::audit::hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Created {
+                new_template: "user <*>".to_owned(),
+            },
+        },
+    });
+    assert_eq!(sink.write_failures(), 0, "the fixture event persists");
+}
+
+/// One query's `load template_map` outcome and the `derive.reason` of its
+/// fold, if it folded.
+async fn lookup(
+    querier: &Arc<Querier>,
+    exporter: &InMemorySpanExporter,
+    dispatch: &tracing::Dispatch,
+) -> (Option<String>, Option<String>) {
+    exporter.reset();
+    query(Arc::clone(querier))
+        .with_subscriber(dispatch.clone())
+        .await;
+    let spans = exporter.get_finished_spans().expect("spans");
+    let [load] = named(&spans, "load template_map")[..] else {
+        panic!("one load span");
+    };
+    let derive = named(&spans, "derive template_map");
+    assert!(derive.len() <= 1, "at most one fold: {derive:?}");
+    if let Some(derive) = derive.first() {
+        assert_eq!(derive.parent_span_id, load.span_context.span_id());
+    }
+    (
+        text(load, semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME),
+        derive
+            .first()
+            .and_then(|d| text(d, semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON)),
+    )
+}
+
+/// RFC0038.1's derive rule over a tenant's life: a cold lookup folds
+/// (`miss`), the next one hits the published map and opens no fold, and
+/// after a new audit file the stale map is refolded (`stale`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_lookup_that_folds_opens_a_derive_span() {
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), &[mined(TS0)]);
+    audit_file(dir.path(), 1_775_127_480);
+    let querier = Arc::new(Querier::new(dir.path()));
+    let miss = (Some("miss".to_owned()), Some("miss".to_owned()));
+    assert_eq!(lookup(&querier, &exporter, &dispatch).await, miss);
+    let hit = (Some("hit".to_owned()), None);
+    assert_eq!(lookup(&querier, &exporter, &dispatch).await, hit);
+    audit_file(dir.path(), 1_775_131_080);
+    let stale = (Some("stale".to_owned()), Some("stale".to_owned()));
+    assert_eq!(lookup(&querier, &exporter, &dispatch).await, stale);
 }
 
 /// A fold that fails marks both `derive template_map` and `load

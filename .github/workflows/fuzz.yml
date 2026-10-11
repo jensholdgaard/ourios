@@ -71,10 +71,7 @@ jobs:
           # last export interval of each run is lost; the short interval bounds
           # that. The exporter threads add background coverage to the working
           # corpus, which this job throws away.
-          # miner_roundtrip stays off until #945: with a real provider, every
-          # per-input MinerCluster stays reachable from its gauge callbacks and
-          # the target runs out of memory within seconds.
-          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ matrix.target != 'miner_roundtrip' && github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && vars.OTLP_EXPORT_ENDPOINT || '' }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && vars.OTLP_EXPORT_ENDPOINT || '' }}
           OTEL_EXPORTER_OTLP_HEADERS: ${{ github.ref == 'refs/heads/main' && secrets.DASH0_AUTHORIZATION_TOKEN != '' && format('Authorization=Bearer {0}', secrets.DASH0_AUTHORIZATION_TOKEN) || '' }}
           OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
           OTEL_METRIC_EXPORT_INTERVAL: "10000"

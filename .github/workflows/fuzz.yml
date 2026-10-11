@@ -38,8 +38,9 @@ name: Fuzz
 # metrics to the external OTLP backend (#942); see the smoke step's env.
 on:
   schedule:
-    # prune runs before batch so batch starts from a minimised corpus; the
-    # shared concurrency group below serialises them should prune run long.
+    # prune runs an hour before batch, in its own run, so batch starts from
+    # a minimised corpus; the shared concurrency group below serialises them
+    # should prune run long.
     - cron: "0 1 * * *" # prune: daily
     - cron: "0 2 * * *" # batch: daily
     - cron: "17 4 * * *" # smoke: daily
@@ -49,8 +50,9 @@ on:
       job:
         description: Which job to run
         type: choice
-        default: all
-        options: [all, smoke, batch, coverage, prune]
+        default: smoke
+        # One job per dispatch, never `all`: see the comment above `batch`.
+        options: [smoke, batch, coverage, prune]
 
 permissions:
   contents: read
@@ -63,7 +65,7 @@ env:
 jobs:
   smoke:
     name: smoke-fuzz
-    if: github.event.schedule == '17 4 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'smoke'))
+    if: github.event.schedule == '17 4 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'smoke')
     runs-on: ubuntu-latest
     # One sanitizer build (~12 min) plus five 300 s runs; the limit leaves
     # room for a slow runner, not for a hung target (libFuzzer's own
@@ -179,20 +181,19 @@ jobs:
   # The ClusterFuzzLite corpus lives in GitHub Actions artifacts
   # (`cifuzz-corpus-<target>`, rolled by every run, 90-day expiry) — there is
   # no storage repo. A run that is cancelled mid-way loses what it fuzzed, so
-  # these jobs never cancel; the shared group serialises the corpus writers
-  # across runs. Within one run, `batch` runs after `prune` (`needs`) rather
-  # than contending for the group: GitHub keeps at most one pending job per
-  # group and cancels an earlier pending one when another arrives, so a
-  # `job: all` dispatch landing while a scheduled corpus job is running
-  # would otherwise lose one of its two. (`concurrency.queue: max` is the
-  # documented alternative; actionlint 1.7.12 does not know the key yet,
-  # and the ordering is wanted anyway so batch starts from a pruned corpus.)
+  # these jobs never cancel; the shared group serialises the corpus writers.
+  #
+  # `prune` and `batch` never share a workflow run, which is why the dispatch
+  # input has no `all`. The handoff between them is the corpus artifact, and
+  # within one run it does not work: ClusterFuzzLite finds a corpus by
+  # listing the repository's artifacts through the REST API, and artifact
+  # names are unique per run, so batch could not reliably see prune's upload
+  # and its own upload of the same `cifuzz-corpus-<target>` would be
+  # rejected. Prune at 01:00 and batch at 02:00 are separate runs, which is
+  # the intended handoff.
   batch:
     name: cflite batch
-    needs: [prune]
-    # `always()` so a skipped prune (batch's own cron, or `job: batch`) does
-    # not skip batch; a failed or cancelled prune does.
-    if: always() && (github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'batch'))) && (needs.prune.result == 'success' || needs.prune.result == 'skipped')
+    if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'batch')
     runs-on: ubuntu-latest
     # The container build has measured 11–19 min (no cache), plus 50 min of
     # fuzzing and a couple of minutes of corpus download/upload. A 60 min
@@ -225,7 +226,7 @@ jobs:
 
   prune:
     name: cflite prune
-    if: github.event.schedule == '0 1 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'prune'))
+    if: github.event.schedule == '0 1 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'prune')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
@@ -255,7 +256,7 @@ jobs:
 
   coverage:
     name: cflite coverage
-    if: github.event.schedule == '0 3 * * 1' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'coverage'))
+    if: github.event.schedule == '0 3 * * 1' || (github.event_name == 'workflow_dispatch' && inputs.job == 'coverage')
     runs-on: ubuntu-latest
     # A coverage build (~5 min) plus one pass over the corpus; measured ~8 min.
     timeout-minutes: 30

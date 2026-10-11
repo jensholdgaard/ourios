@@ -200,8 +200,8 @@ PR trigger.
 > workflow, four jobs.** The three workflows above are one
 > `.github/workflows/fuzz.yml` with four jobs, each on its own
 > `schedule` entry (gated by `github.event.schedule`) or on
-> `workflow_dispatch` with a `job` input (`all | smoke | batch |
-> coverage | prune`); still no `pull_request` trigger.
+> `workflow_dispatch` with a `job` input naming one job (`smoke |
+> batch | coverage | prune`); still no `pull_request` trigger.
 >
 > - `smoke` (daily 04:17) is no longer a matrix: one `cargo fuzz build
 >   --target "$host"` of every target, then a loop over the targets,
@@ -214,8 +214,9 @@ PR trigger.
 > - `prune` (daily 01:00, new) is `mode: prune`. The ClusterFuzzLite
 >   GitHub Actions guide requires it of any project that batch-fuzzes
 >   ("If batch fuzzing is running, you must also run corpus pruning").
->   `batch` and `prune` share a no-cancel concurrency group, and
->   `batch` `needs` `prune` within a run.
+>   `batch` and `prune` share a no-cancel concurrency group and never
+>   run in the same workflow run: the corpus artifact is their
+>   handoff, and ClusterFuzzLite cannot hand it over within one run.
 > - `coverage` (Mondays 03:00) is `mode: coverage` and appends
 >   per-target line coverage to the step summary.
 >

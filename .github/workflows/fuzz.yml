@@ -179,10 +179,20 @@ jobs:
   # The ClusterFuzzLite corpus lives in GitHub Actions artifacts
   # (`cifuzz-corpus-<target>`, rolled by every run, 90-day expiry) — there is
   # no storage repo. A run that is cancelled mid-way loses what it fuzzed, so
-  # these jobs never cancel; the shared group serialises the corpus writers.
+  # these jobs never cancel; the shared group serialises the corpus writers
+  # across runs. Within one run, `batch` runs after `prune` (`needs`) rather
+  # than contending for the group: GitHub keeps at most one pending job per
+  # group and cancels an earlier pending one when another arrives, so a
+  # `job: all` dispatch landing while a scheduled corpus job is running
+  # would otherwise lose one of its two. (`concurrency.queue: max` is the
+  # documented alternative; actionlint 1.7.12 does not know the key yet,
+  # and the ordering is wanted anyway so batch starts from a pruned corpus.)
   batch:
     name: cflite batch
-    if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'batch'))
+    needs: [prune]
+    # `always()` so a skipped prune (batch's own cron, or `job: batch`) does
+    # not skip batch; a failed or cancelled prune does.
+    if: always() && (github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'batch'))) && (needs.prune.result == 'success' || needs.prune.result == 'skipped')
     runs-on: ubuntu-latest
     # The container build has measured 11–19 min (no cache), plus 50 min of
     # fuzzing and a couple of minutes of corpus download/upload. A 60 min

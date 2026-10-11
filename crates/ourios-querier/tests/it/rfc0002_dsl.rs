@@ -835,45 +835,57 @@ async fn rfc0002_6_non_text_operators_rejected() {
     }
 }
 
-/// Scenario RFC0002.6 (text operators on `body`) — `body` is stored `Binary`
-/// (RFC 0005 §3.2), yet every string function and both regex operators the
-/// grammar admits on it execute as text, rather than failing in the engine's
-/// planner with a storage error. `%` and `_` in a `starts_with` argument are
-/// literal.
-#[tokio::test]
-async fn rfc0002_6_text_operators_on_body_execute() {
-    use crate::common::{TS0, simple, write_all};
-    use ourios_core::record::MinedRecord;
+/// Scenario RFC0002.6 (text matching on `body`) — a prefix or regex match
+/// would read only the physical `body` column, NULL for a faithfully mined
+/// line, and silently miss it. Until RFC 0044 §7's follow-up specifies
+/// matching the logical body, each such operator is rejected before any IO
+/// as the query's own `InvalidQuery`, naming the operator and leaking no
+/// engine detail, even nested under `not` / `or`.
+async fn assert_body_text_match_rejected(text: &str, operator: &str) {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
+    use ourios_querier::QueryError;
 
-    let retained = |ts: u64, body: &str| MinedRecord {
-        body: Some(body.to_string()),
-        lossy_flag: true,
-        ..simple("a", 1, ts)
-    };
     let bucket = tempfile::TempDir::new().expect("temp");
-    write_all(
-        bucket.path(),
-        &[
-            retained(TS0, "GET /cart 200"),
-            retained(TS0 + 1, "POST /cart 500"),
-            retained(TS0 + 2, "GET /health 200"),
-            retained(TS0 + 3, "100% done"),
-            simple("a", 1, TS0 + 4),
-        ],
+    write_all(bucket.path(), &[simple("a", 1, TS0)]);
+    let query = ourios_querier::dsl::parse(text).expect("parse DSL");
+    let err = ourios_querier::Querier::new(bucket.path())
+        .run_query(
+            &query,
+            &ourios_core::tenant::TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&no_aliases()),
+        )
+        .await
+        .expect_err(&format!("{text}: must be rejected"));
+    let QueryError::InvalidQuery { detail } = &err else {
+        panic!("{text}: expected InvalidQuery, got {err:?}");
+    };
+    assert!(
+        detail.contains(&format!("`{operator}` on body")) && detail.contains("RFC 0044 §7"),
+        "{text}: {detail}",
     );
+}
 
-    for (text, expected) in [
-        ("starts_with(body, \"GET /\")", 2),
-        ("starts_with(body, \"100%\")", 1),
-        ("starts_with(body, \"10_\")", 0),
-        ("matches(body, \"^POST\")", 1),
-        ("body =~ \"cart\"", 2),
-        ("body !~ \"cart\"", 2),
-        ("contains(body, \"/cart\")", 2),
-        ("ends_with(body, \" 200\")", 2),
-    ] {
-        assert_eq!(run_dsl(bucket.path(), text).await.rows, expected, "{text}");
-    }
+#[tokio::test]
+async fn rfc0002_6_starts_with_on_body_rejected() {
+    assert_body_text_match_rejected("starts_with(body, \"GET /\")", "starts_with").await;
+}
+
+#[tokio::test]
+async fn rfc0002_6_matches_on_body_rejected() {
+    assert_body_text_match_rejected("severity >= warn and matches(body, \"^POST\")", "matches")
+        .await;
+}
+
+#[tokio::test]
+async fn rfc0002_6_regex_match_on_body_rejected() {
+    assert_body_text_match_rejected("scope == \"x\" or body =~ \"cart\"", "=~").await;
+}
+
+#[tokio::test]
+async fn rfc0002_6_regex_not_match_on_body_rejected() {
+    assert_body_text_match_rejected("not (body !~ \"cart\")", "!~").await;
 }
 
 /// Scenario RFC0002.6 (unsupported stage rejection) — a pipeline stage this

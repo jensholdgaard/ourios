@@ -47,14 +47,22 @@ pub fn record_span_error(span: &tracing::Span, error_type: &str) {
     span.record(ERROR_TYPE, error_type);
 }
 
-/// Record an HTTP **server** span's response status. Only a `5xx` fails the
-/// span, with the status code as `error.type`: semconv leaves a server
-/// span's status unset on a `4xx`, which is the client's error.
+/// The `error.type` an HTTP **server** span fails with for `status`: the
+/// code itself for a `5xx`, `None` otherwise. Semconv leaves a server
+/// span unset on a `4xx`, which is the client's error, and an extension
+/// code outside `500..=599` is not a `5xx`.
+#[must_use]
+pub fn http_server_error_type(status: u16) -> Option<String> {
+    (500..=599).contains(&status).then(|| status.to_string())
+}
+
+/// Record an HTTP **server** span's response status, failing the span on a
+/// `5xx` ([`http_server_error_type`]).
 pub fn record_http_server_status(span: &tracing::Span, status: u16) {
     // `i64`: the bridge stringifies `u64`, where semconv types the code int.
     span.record("http.response.status_code", i64::from(status));
-    if status >= 500 {
-        record_span_error(span, &status.to_string());
+    if let Some(error_type) = http_server_error_type(status) {
+        record_span_error(span, &error_type);
     }
 }
 
@@ -66,5 +74,17 @@ mod tests {
         assert_eq!(scope.name(), "ourios.test");
         assert_eq!(scope.version(), Some(env!("CARGO_PKG_VERSION")));
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
+    }
+
+    #[test]
+    fn only_a_5xx_fails_an_http_server_span() {
+        use super::http_server_error_type as error_type;
+        assert_eq!(error_type(200), None);
+        assert_eq!(error_type(404), None);
+        assert_eq!(error_type(499), None);
+        assert_eq!(error_type(500).as_deref(), Some("500"));
+        assert_eq!(error_type(599).as_deref(), Some("599"));
+        assert_eq!(error_type(600), None, "an extension code is not a 5xx");
+        assert_eq!(error_type(999), None);
     }
 }

@@ -762,9 +762,6 @@ fn now_unix_nano() -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
-/// A query-engine failure as a tool error: the engine's `Display` is the
-/// H6-scrubbed surface the JSON API already exposes — no DataFusion/SQL
-/// leaks through either boundary.
 /// Close an `execute_tool` span's outcome: a failed call marks the span
 /// `Error` with the JSON-RPC error code as `error.type` (semconv JSON-RPC:
 /// every error code is an error).
@@ -775,6 +772,9 @@ fn tool_outcome(result: Result<CallToolResult, ErrorData>) -> Result<CallToolRes
     result
 }
 
+/// A query-engine failure as a tool error: the engine's `Display` is the
+/// H6-scrubbed surface the JSON API already exposes — no DataFusion/SQL
+/// leaks through either boundary.
 fn query_tool_error(e: &ourios_querier::QueryError) -> ErrorData {
     match e {
         // RFC 0047 §3.4: a content column the principal may not read — the

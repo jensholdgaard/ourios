@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.12.3] - 2026-10-11
+
+### Added
+
+- Fuzz the audit reader behind the parquet panic boundary (#958) (5bc2632)
+- Fuzz the persisted artifacts read back from object storage (#955) (b05f4e9)
+- Make the harness oracles test the §3.1/§3.3 invariants and parser round trips (#951) (8b38e14)
+- Export the code under test's own OTel metrics from smoke-fuzz (#946) (5eae153)
+
+### CI
+
+- Consolidate the fuzzing workflows, build once, prune and bound (#950) (8cc0189)
+
+### Fixed
+
+- Turn upstream decoder panics into typed errors (#956) (4562836)
+- Reject a snapshot slot type the restore cannot keep (#957) (ff2a2c7)
+- Ignore the embedded arrow schema so a corrupt one cannot panic (#954) (fc798bd)
+- Give every histogram explicit bucket boundaries (#953) (1f6339d)
+- Reject dsl float literals that overflow to infinity (#952) (f8f65d8)
+- Ignore blank lines when comparing the default render (#948) (1debab4)
+- Register the observable gauges once per provider (#947) (de53f78)
+
 ## [0.12.2] - 2026-10-11
 
 ### Added

@@ -272,6 +272,14 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > takes precedence over a local pattern (the GenAI `execute_tool` names above
 > are the same kind of case).
 
+> **Amendment 2026-10-12 — two children of `load template_map` (§3.7.2).**
+> The table gains these rows. Both follow the `{action} {target}` rule.
+>
+> | Operation | Span name | Kind |
+> |---|---|---|
+> | The RFC 0033 fold behind a non-hit lookup | `derive template_map` | `INTERNAL` (child of `load template_map`) |
+> | Waiting on another query's acquisition of the same frontier | `wait template_map` | `INTERNAL` (child of `load template_map`) |
+
 ### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
 
 The MCP tool spans are Ourios's agent-observability surface: an agent driving
@@ -449,6 +457,26 @@ A child `CLIENT` span that failed (a `404` on an absent manifest, say)
 does not make its phase `Error` if the phase handled that outcome as
 normal.
 
+> **Amendment 2026-10-12 — the fold and the wait get their own spans.**
+> A `load template_map` span that covers a 40 s fold, or a query parked
+> behind another query's fold, still does not say which. Two `INTERNAL`
+> children separate them:
+>
+> | | `derive template_map` | `wait template_map` |
+> |---|---|---|
+> | Parent | `load template_map` | `load template_map` |
+> | Opens / ends | around the fold (`fold_template_map`) behind a `miss`, `stale`, `torn` or `unknown_version` lookup; a `hit` opens none | around one wait on the per-tenant single-flight's result; a query whose frontier differs from the running flight's waits, lists again, and may open a second |
+> | Status | `Error` iff the fold fails, `error.type` = the fold's error class | `Unset`; a failed shared acquisition marks the waiter's `load template_map` instead |
+> | Attributes | `ourios.template_map.derive.reason` (the existing RFC 0033 attribute) | none |
+>
+> `load template_map` also carries `ourios.template_map.lookup.outcome =
+> joined` for a query that was served another query's acquisition, the
+> existing RFC 0033 value. The fold runs inside the query phase, so its
+> object-store requests open their `CLIENT` spans under `derive
+> template_map`. The artifact `GET`, the audit listing and the
+> write-through `PUT` stay under `load template_map`. No new attribute
+> names.
+
 #### 3.7.3 Object-store `CLIENT` spans (S3 backend)
 
 These follow the upstream object-store conventions
@@ -510,6 +538,15 @@ which are at `Development` stability.
   `404` on an absent manifest or a `412` on a lost CAS mark the `CLIENT`
   span `Error`, as the request did fail. The phase above decides whether
   that failed the operation (§3.7.2).
+> **Amendment 2026-10-12 — as implemented.** The spans also carry the
+> upstream HTTP client attributes the `http.client.request.duration`
+> metric already records (`http.request.method`, `server.address`,
+> `server.port`) and `http.response.status_code` once a response arrives.
+> A request its caller abandons before the response (a dropped future)
+> ends `Unset` with no `error.type`, since the HTTP span conventions say an
+> intentional cancellation SHOULD NOT be an error. The storage metrics keep
+> recording it as `cancelled`.
+
 - **S3-compatible, non-AWS endpoints.** Ourios is S3-compatible, not
   AWS-specific (RFC 0019 §9). An S3-compatible endpoint implements the same
   S3 API operations over the same wire protocol, so the spans keep
@@ -1080,3 +1117,8 @@ scope, not ingest) already covers it.
   spans RFC0038.1 then forbade. The seven original criteria stay `green`
   and the frontmatter stays `accepted` pending the §7 status question.
   Refs #853.
+- **2026-10-12 — the fold and the wait under `load template_map`
+  (`drafted`).** Adds `derive template_map` and `wait template_map` as
+  `INTERNAL` children of `load template_map` (§3.5, §3.7.2), and records
+  how the `CLIENT` spans handle a cancelled request and which HTTP client
+  attributes they carry (§3.7.3). No new attribute names. Matches #965.

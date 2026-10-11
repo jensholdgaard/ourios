@@ -369,17 +369,15 @@ mod tests {
     /// An `ingest logs`-shaped server span marked from `code` as the gRPC
     /// arm marks it, exported.
     fn server_span_for(code: Code) -> opentelemetry_sdk::trace::SpanData {
-        use opentelemetry::trace::TracerProvider as _;
         use tracing_subscriber::prelude::*;
 
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(
-                provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test")),
-            ));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)),
+        );
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!(
                 "ingest logs",

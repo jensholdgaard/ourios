@@ -26,7 +26,6 @@ mod ingest_support;
 use axum::body::Body;
 use axum::http::{Request, header};
 use ingest_support::{grpc_request, request, resource_logs, shared_wal_pipeline};
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
@@ -98,11 +97,7 @@ async fn rfc0039_3_extracted_context_survives_the_ingest_spawn() {
         .with_simple_exporter(exporter.clone())
         .build();
     tracing_subscriber::registry()
-        .with(
-            tracing_opentelemetry::layer().with_tracer(
-                provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test")),
-            ),
-        )
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)))
         .try_init()
         .expect("install global subscriber");
     opentelemetry::global::set_tracer_provider(provider.clone());

@@ -15,7 +15,7 @@ use crate::ingest_support::{
     failing_append_pipeline_transient, open_pipeline, oversize_append_pipeline, request,
     resource_logs,
 };
-use opentelemetry::trace::{SpanId, SpanKind, Status, TracerProvider as _};
+use opentelemetry::trace::{SpanId, SpanKind, Status};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
@@ -39,10 +39,8 @@ async fn ingest_and_collect_spans(record_count: usize) -> Vec<SpanData> {
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
 
     let bodies = distinct_bodies(record_count);
     let body_refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
@@ -140,10 +138,8 @@ async fn failed_ingest_spans(pipeline: ourios_ingester::receiver::IngestPipeline
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
     let export = request(vec![resource_logs("checkout", &["a line"])]);
     pipeline
         .ingest_bound(

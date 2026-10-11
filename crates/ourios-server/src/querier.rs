@@ -263,8 +263,9 @@ impl QuerierMetrics {
         );
     }
 
-    /// Record a successful logs query, its template-map acquisition
-    /// included in the bytes it fetched.
+    /// Record a successful logs query. Its bytes include a template-map
+    /// acquisition only when this query ran it, so a fold shared by
+    /// concurrent queries counts once across them.
     pub(crate) fn record_logs(&self, elapsed: Duration, result: &QueryResult) {
         let bytes = result.total_bytes_read();
         self.record_ok(QUERY_KIND_LOGS, elapsed, &result.stats, bytes);

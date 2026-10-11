@@ -311,6 +311,9 @@ struct CollectedRecords {
     /// stats ([`QueryOptions::elide_count_scan`]).
     scan: QueryStats,
     registry_bytes_read: u64,
+    /// Template-map bytes this pass fetched itself acquiring lazily; `0`
+    /// when it reused a compile-time acquisition or joined another query's.
+    map_fetched: u64,
 }
 
 /// How [`Querier::execute`] terminates the filtered scan (RFC 0002 §6.5):
@@ -346,6 +349,19 @@ impl Terminal {
 struct AcquiredTemplateMap {
     map: Arc<TemplateMap>,
     acquisition_bytes: u64,
+    /// The acquisition bytes this query fetched itself: all of them for the
+    /// query that ran the acquisition, `0` for one that joined it.
+    fetched: u64,
+}
+
+impl From<map_flight::MapAcquisition> for AcquiredTemplateMap {
+    fn from(acquired: map_flight::MapAcquisition) -> Self {
+        Self {
+            map: acquired.map,
+            acquisition_bytes: acquired.bytes,
+            fetched: acquired.fetched,
+        }
+    }
 }
 
 impl Querier {
@@ -533,12 +549,11 @@ impl Querier {
         let needs_alias_fold = alias_map.is_none() && plan::uses_resolves_to(&query.predicate);
         let mut acquired: Option<AcquiredTemplateMap> = None;
         if needs_alias_fold || needs_registry {
-            let (template_map, acquisition_bytes) =
-                self.template_maps.acquire(&self.backend, tenant).await?;
-            acquired = Some(AcquiredTemplateMap {
-                map: template_map,
-                acquisition_bytes,
-            });
+            let acquisition = self
+                .template_maps
+                .acquire_fetched(&self.backend, tenant)
+                .await?;
+            acquired = Some(acquisition.into());
         }
         let derived;
         let map = match (alias_map, &acquired) {
@@ -675,7 +690,7 @@ impl Querier {
         let data_prefix = format!("data/tenant_id={enc}");
 
         let ctx = crate::exec::session();
-        let compile_acquisition = acquired.as_ref().map(|a| a.acquisition_bytes);
+        let compile_fetched = acquired.as_ref().map_or(0, |a| a.fetched);
         // Resolve the live file set under the tenant's `data/` prefix,
         // honouring the RFC 0009 §3.4 manifest (glob-fallback when absent),
         // and produce the per-file table URLs (local absolute path, or
@@ -689,7 +704,7 @@ impl Querier {
             .await?;
         if urls.is_empty() {
             let result = empty_result(terminal.aggregate());
-            return Ok(with_fetched(result, &ctx, compile_acquisition));
+            return Ok(with_fetched(result, &ctx, compile_fetched));
         }
         let files_opened = urls.len() as u64;
 
@@ -707,7 +722,7 @@ impl Querier {
             }
         };
         result.stats.files_opened = files_opened;
-        Ok(with_fetched(result, &ctx, compile_acquisition))
+        Ok(with_fetched(result, &ctx, compile_fetched))
     }
 
     /// Run `terminal` over the filtered frame `df` (see [`Self::execute`],
@@ -765,7 +780,7 @@ impl Querier {
                     aggregate: None,
                     materialize_bytes_read: collected.scan.bytes_read,
                     registry_bytes_read: collected.registry_bytes_read,
-                    bytes_fetched: 0,
+                    bytes_fetched: collected.map_fetched,
                 });
             }
             early = Some(collected);
@@ -800,7 +815,7 @@ impl Querier {
             aggregate: None,
             materialize_bytes_read: collected.scan.bytes_read,
             registry_bytes_read: collected.registry_bytes_read,
-            bytes_fetched: 0,
+            bytes_fetched: collected.map_fetched,
         })
     }
 
@@ -952,26 +967,26 @@ impl Querier {
         // (RFC 0031 §3.6 / RFC 0033): reuse the compile-time alias fold's
         // map when the query already acquired one, else resolve through
         // the per-tenant single-flight (`map_flight`).
-        let AcquiredTemplateMap {
-            map,
-            acquisition_bytes,
-        } = if let Some(acquired) = acquired {
-            acquired
+        // A reused compile-time acquisition was already counted by `execute`.
+        let (acquired, map_fetched) = if let Some(acquired) = acquired {
+            (acquired, 0)
         } else {
-            let (map, acquisition_bytes) =
-                self.template_maps.acquire(&self.backend, tenant).await?;
-            AcquiredTemplateMap {
-                map,
-                acquisition_bytes,
-            }
+            let acquired: AcquiredTemplateMap = self
+                .template_maps
+                .acquire_fetched(&self.backend, tenant)
+                .await?
+                .into();
+            let fetched = acquired.fetched;
+            (acquired, fetched)
         };
         Ok(CollectedRecords {
             // The batch constructor memoises per-(id, version) work —
             // one lookup + one formatted string per distinct template,
             // not per row.
-            records: LogRow::from_records(&mined, map.registry()),
+            records: LogRow::from_records(&mined, acquired.map.registry()),
             scan,
-            registry_bytes_read: acquisition_bytes,
+            registry_bytes_read: acquired.acquisition_bytes,
+            map_fetched,
         })
     }
 
@@ -1067,21 +1082,20 @@ impl Querier {
     }
 }
 
-/// `result` with its `bytes_fetched`: what `ctx` fetched, plus the bytes
-/// of a compile-time template-map acquisition (a `resolves_to` query) that
-/// no rendered row reported in `registry_bytes_read`. When rows were
-/// rendered, the renderer reused that same acquisition and reported it
-/// there, so it is not counted twice.
+/// `result` with its full `bytes_fetched`: what `ctx` fetched, plus the
+/// template-map bytes this query fetched itself at compile time
+/// (`compile_fetched`), on top of any it fetched acquiring lazily while
+/// rendering (already in `result.bytes_fetched`). A query acquires at most
+/// once, so at most one of the two is non-zero; a joiner's are both `0`.
 fn with_fetched(
     mut result: QueryResult,
     ctx: &SessionContext,
-    compile_acquisition: Option<u64>,
+    compile_fetched: u64,
 ) -> QueryResult {
-    let unrendered = match (compile_acquisition, result.registry_bytes_read) {
-        (Some(bytes), 0) => bytes,
-        _ => 0,
-    };
-    result.bytes_fetched = crate::fetch_count::fetched(ctx).saturating_add(unrendered);
+    result.bytes_fetched = result
+        .bytes_fetched
+        .saturating_add(crate::fetch_count::fetched(ctx))
+        .saturating_add(compile_fetched);
     result
 }
 

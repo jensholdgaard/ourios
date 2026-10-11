@@ -31,6 +31,17 @@ use crate::{Backend, QueryError, StoreRef, audit_scan};
 /// bytes ([`crate::QueryResult::registry_bytes_read`]).
 pub(crate) type Acquired = Result<(Arc<TemplateMap>, u64), QueryError>;
 
+/// A successful acquisition as one query saw it.
+pub(crate) struct MapAcquisition {
+    pub(crate) map: Arc<TemplateMap>,
+    /// The acquisition's bytes ([`crate::QueryResult::registry_bytes_read`]),
+    /// the same for the acquirer and every joiner.
+    pub(crate) bytes: u64,
+    /// The bytes this query fetched itself: `bytes` for the acquirer, `0`
+    /// for a joiner, so a shared fold is counted once across its queries.
+    pub(crate) fetched: u64,
+}
+
 /// The in-flight acquisitions, by tenant. Shared by every clone of a
 /// [`crate::Querier`].
 #[derive(Default)]
@@ -73,11 +84,29 @@ impl TemplateMapFlights {
     ///
     /// The listing's or the acquisition's [`QueryError`] — a joined
     /// acquisition's error is every joiner's error.
+    #[cfg(test)]
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
     ) -> Acquired {
+        self.acquire_fetched(backend, tenant)
+            .await
+            .map(|acquired| (acquired.map, acquired.bytes))
+    }
+
+    /// [`Self::acquire`], also saying which bytes this query fetched itself:
+    /// the acquisition's bytes for the query that ran it, `0` for a joiner,
+    /// which was handed the result of another query's fetch.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::acquire`].
+    pub(crate) async fn acquire_fetched(
+        self: &Arc<Self>,
+        backend: &Backend,
+        tenant: &TenantId,
+    ) -> Result<MapAcquisition, QueryError> {
         let mut waited = Duration::ZERO;
         loop {
             let span = tracing::Span::current();
@@ -94,7 +123,13 @@ impl TemplateMapFlights {
                 detail: format!("blocking storage task: {e}"),
             })??;
             match step {
-                Step::Done(acquired) => return acquired,
+                Step::Done(acquired) => {
+                    return acquired.map(|(map, bytes)| MapAcquisition {
+                        map,
+                        bytes,
+                        fetched: bytes,
+                    });
+                }
                 Step::Wait {
                     mut done,
                     same_frontier,
@@ -120,7 +155,11 @@ impl TemplateMapFlights {
                             #[cfg(any(test, feature = "testing"))]
                             self.hooks.joined();
                         }
-                        return acquired;
+                        return acquired.map(|(map, bytes)| MapAcquisition {
+                            map,
+                            bytes,
+                            fetched: 0,
+                        });
                     }
                 }
             }

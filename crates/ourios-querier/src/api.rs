@@ -180,24 +180,23 @@ pub struct QueryResult {
     /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
-    /// Every byte the query fetched from storage that
-    /// [`Self::registry_bytes_read`] does not report: the partition
+    /// Every byte this query itself fetched from storage: the partition
     /// manifests file-set resolution read, the footers schema inference
-    /// read, the count scan and the row materialization, plus a
-    /// compile-time template-map acquisition (a `resolves_to` query) whose
-    /// map rendered no row. Unlike `stats.bytes_read` +
-    /// `materialize_bytes_read` it includes the reads made before a plan
-    /// exists.
+    /// read, the count scan, the row materialization, and the template-map
+    /// acquisition when this query ran it (rendered or not). Unlike
+    /// `stats.bytes_read` + `materialize_bytes_read` it includes the reads
+    /// made before a plan exists. Unlike [`Self::registry_bytes_read`] it
+    /// counts a shared acquisition only for the query that ran it, never
+    /// for a query that joined it, so summing it over queries counts each
+    /// fetch once.
     pub bytes_fetched: u64,
 }
 
 impl QueryResult {
-    /// Every byte the query fetched from storage:
-    /// [`Self::bytes_fetched`] plus the template-map acquisition behind the
-    /// rendered rows.
+    /// Every byte this query fetched from storage ([`Self::bytes_fetched`]).
     #[must_use]
     pub fn total_bytes_read(&self) -> u64 {
-        self.bytes_fetched.saturating_add(self.registry_bytes_read)
+        self.bytes_fetched
     }
 }
 

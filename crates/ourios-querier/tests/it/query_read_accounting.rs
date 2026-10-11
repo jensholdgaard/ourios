@@ -254,9 +254,8 @@ async fn an_unrendered_acquisition_is_still_counted() {
 }
 
 /// When the compile-time acquisition's map renders rows, the renderer
-/// reuses it and reports it in `registry_bytes_read`: the table reads in
-/// `bytes_fetched` are exactly those of the same query run without a
-/// compile-time acquisition, so the map is not counted twice.
+/// reuses it: `bytes_fetched` equals the same query's with the map acquired
+/// lazily while rendering, so the map is not counted twice.
 #[tokio::test]
 async fn a_rendered_acquisition_is_counted_once() {
     let (bucket, _) = store_with_audit();
@@ -272,10 +271,87 @@ async fn a_rendered_acquisition_is_counted_once() {
     assert_eq!(compiled.registry_bytes_read, lazy.registry_bytes_read);
     assert_eq!(
         compiled.bytes_fetched, lazy.bytes_fetched,
-        "the acquisition is in registry_bytes_read only",
+        "the reused compile-time acquisition is counted once, as the lazy one is",
+    );
+    assert_eq!(compiled.total_bytes_read(), compiled.bytes_fetched);
+}
+
+/// N concurrent queries on one cold fold: one runs it and the others join.
+/// Every query reports the fold in `registry_bytes_read` (RFC 0033 §3.6),
+/// but only the one that ran it fetched it, so summed over the queries the
+/// fold's bytes are counted once.
+#[cfg(feature = "testing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_fold_is_counted_once_across_its_queries() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const QUERIES: usize = 4;
+    let (bucket, audit_bytes) = store_with_audit();
+    let querier = Arc::new(Querier::new(bucket.path()));
+    let weak = Arc::downgrade(&querier);
+    querier.set_template_map_acquire_gate(Some(Arc::new(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Some(querier) = weak.upgrade()
+            && querier.template_map_waits() < QUERIES - 1
+        {
+            assert!(Instant::now() < deadline, "the other queries never joined");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })));
+
+    let tasks: Vec<_> = (0..QUERIES)
+        .map(|_| {
+            let querier = Arc::clone(&querier);
+            tokio::spawn(async move {
+                let query =
+                    ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse DSL");
+                querier
+                    .run_query(
+                        &query,
+                        &TenantId::new("acme"),
+                        NOW,
+                        DEFAULT_WINDOW_NS,
+                        Some(&no_aliases()),
+                    )
+                    .await
+                    .expect("query")
+            })
+        })
+        .collect();
+    let mut results = Vec::new();
+    for task in tasks {
+        results.push(task.await.expect("query task"));
+    }
+    querier.set_template_map_acquire_gate(None);
+
+    assert_eq!(
+        querier.template_map_waits(),
+        QUERIES - 1,
+        "all but one joined"
+    );
+    for result in &results {
+        assert_eq!(result.rows, 1);
+        assert_eq!(
+            result.registry_bytes_read, audit_bytes,
+            "every query reports the shared fold's bytes",
+        );
+    }
+    let mut fetched: Vec<u64> = results.iter().map(QueryResult::total_bytes_read).collect();
+    fetched.sort_unstable();
+    let table = fetched[0];
+    assert!(
+        fetched[..QUERIES - 1].iter().all(|&f| f == table),
+        "the joiners fetched only their table reads: {fetched:?}",
     );
     assert_eq!(
-        compiled.total_bytes_read(),
-        compiled.bytes_fetched + compiled.registry_bytes_read,
+        fetched[QUERIES - 1],
+        table + audit_bytes,
+        "the acquirer also fetched the fold"
+    );
+    assert_eq!(
+        fetched.iter().sum::<u64>(),
+        table * QUERIES as u64 + audit_bytes,
+        "summed read.size counts the fold once",
     );
 }

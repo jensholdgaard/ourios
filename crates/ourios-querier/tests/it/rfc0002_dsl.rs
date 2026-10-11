@@ -835,12 +835,12 @@ async fn rfc0002_6_non_text_operators_rejected() {
     }
 }
 
-/// Scenario RFC0002.6 (text matching on `body`) — a prefix or regex match
-/// would read only the physical `body` column, NULL for a faithfully mined
-/// line, and silently miss it. Until RFC 0044 §7's follow-up specifies
-/// matching the logical body, each such operator is rejected before any IO
-/// as the query's own `InvalidQuery`, naming the operator and leaking no
-/// engine detail, even nested under `not` / `or`.
+/// Text matching on `body` — a prefix or regex match would read only the
+/// physical `body` column, NULL for a faithfully mined line, and silently
+/// miss it. Until the RFC 0044 §7 follow-up (#968) specifies matching the
+/// logical body and assigns this an acceptance criterion, each such operator
+/// is rejected before any IO as the query's own `InvalidQuery`, naming the
+/// operator and leaking no engine detail, even nested under `not` / `or`.
 async fn assert_body_text_match_rejected(text: &str, operator: &str) {
     use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
     use ourios_querier::QueryError;
@@ -868,23 +868,23 @@ async fn assert_body_text_match_rejected(text: &str, operator: &str) {
 }
 
 #[tokio::test]
-async fn rfc0002_6_starts_with_on_body_rejected() {
+async fn body_text_match_starts_with_rejected() {
     assert_body_text_match_rejected("starts_with(body, \"GET /\")", "starts_with").await;
 }
 
 #[tokio::test]
-async fn rfc0002_6_matches_on_body_rejected() {
+async fn body_text_match_matches_rejected() {
     assert_body_text_match_rejected("severity >= warn and matches(body, \"^POST\")", "matches")
         .await;
 }
 
 #[tokio::test]
-async fn rfc0002_6_regex_match_on_body_rejected() {
+async fn body_text_match_regex_match_rejected() {
     assert_body_text_match_rejected("scope == \"x\" or body =~ \"cart\"", "=~").await;
 }
 
 #[tokio::test]
-async fn rfc0002_6_regex_not_match_on_body_rejected() {
+async fn body_text_match_regex_not_match_rejected() {
     assert_body_text_match_rejected("not (body !~ \"cart\")", "!~").await;
 }
 

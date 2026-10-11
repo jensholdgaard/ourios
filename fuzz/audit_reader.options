@@ -1,0 +1,7 @@
+# libFuzzer flags ClusterFuzzLite applies to this target (staged next to the
+# binary by .clusterfuzzlite/build.sh); the smoke job passes the same two on
+# its command line. A hang or an allocation blowup becomes a reported crash
+# instead of a run that lasts until the job limit.
+[libfuzzer]
+timeout = 30
+rss_limit_mb = 2048

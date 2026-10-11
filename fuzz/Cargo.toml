@@ -24,6 +24,11 @@ ourios-ingester = { path = "../crates/ourios-ingester", features = ["fuzzing"] }
 ourios-parquet = { path = "../crates/ourios-parquet" }
 ourios-wal = { path = "../crates/ourios-wal", features = ["fuzzing"] }
 ourios-querier = { path = "../crates/ourios-querier" }
+# `audit_reader` re-encodes what it read through the writer's own
+# `audit_events_to_batch`; these write that batch to Parquet bytes and hand
+# them back to `AuditReader::open_bytes`. The versions ourios-parquet uses.
+bytes = { version = "1", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow"] }
 # `artifact_decode` compresses its input into a template-map frame, so the
 # fuzzer can mutate the JSON body behind the zstd layer; the querier's zstd.
 zstd = "0.13"
@@ -85,6 +90,16 @@ bench = false
 [[bin]]
 name = "artifact_decode"
 path = "fuzz_targets/artifact_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Audit-event Parquet files read back from object storage: a typed
+# AuditReaderError, never a panic; the events a file decodes to survive the
+# writer's encoding and read back equal.
+[[bin]]
+name = "audit_reader"
+path = "fuzz_targets/audit_reader.rs"
 test = false
 doc = false
 bench = false

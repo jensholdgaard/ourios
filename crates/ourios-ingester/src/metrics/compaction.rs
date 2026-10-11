@@ -142,6 +142,25 @@ impl LiveInstruments {
     }
 }
 
+/// Bucket boundaries (bytes) for `ourios.storage.parquet.file.size`, the
+/// RFC 0009 §3.6 H4 detector: it alerts when more than 5 % of files are
+/// under 128 MiB, and the target band is 256 MiB–2 GiB, so all three are
+/// edges.
+const FILE_SIZE_BUCKETS: [f64; 12] = [
+    65_536.0,        // 64 KiB
+    262_144.0,       // 256 KiB
+    1_048_576.0,     // 1 MiB
+    4_194_304.0,     // 4 MiB
+    16_777_216.0,    // 16 MiB
+    67_108_864.0,    // 64 MiB
+    134_217_728.0,   // 128 MiB, the H4 alert line
+    268_435_456.0,   // 256 MiB, the target band's floor
+    536_870_912.0,   // 512 MiB
+    1_073_741_824.0, // 1 GiB
+    2_147_483_648.0, // 2 GiB, the target band's ceiling
+    4_294_967_296.0, // 4 GiB
+];
+
 /// A `u64` counter named `name` in `unit`.
 fn counter(meter: &Meter, name: &'static str, unit: &'static str) -> Counter<u64> {
     meter.u64_counter(name).with_unit(unit).build()
@@ -252,7 +271,7 @@ impl CompactionMetrics {
                 meter,
                 semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
                 "By",
-                &histogram_buckets::SIZE_BYTES,
+                &FILE_SIZE_BUCKETS,
             ),
             backlog_state,
             backlog,

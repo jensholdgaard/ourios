@@ -3,7 +3,8 @@
 //! RFC 0001 §6.8 ("Export architecture") pins the dependency split:
 //! instrumented library crates depend only on the lightweight
 //! `opentelemetry` **API** and resolve instruments through
-//! `global::meter("ourios.<subsystem>")`; this crate is the single
+//! `ourios_core::telemetry::meter("ourios.<subsystem>")`, which versions
+//! the instrumentation scope with the release; this crate is the single
 //! place the heavy SDK + OTLP exporter + transport live. It builds the
 //! OTLP **push** `MeterProvider` (periodic-reader export), installs it
 //! as the process-global provider, and hands back a [`TelemetryGuard`]
@@ -60,7 +61,8 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 
 /// The instrumentation-scope name for the tracer that opens Ourios's own
 /// spans (RFC 0038). The library crates create instruments through
-/// `global::meter("ourios.<subsystem>")`; spans go through this one tracer.
+/// `ourios_core::telemetry::meter("ourios.<subsystem>")`; spans go through
+/// this one tracer, under the same versioned scope rule.
 const TRACER_SCOPE: &str = "ourios";
 
 /// The scope `name`, versioned with this release. The library crates resolve
@@ -70,6 +72,14 @@ fn scope(name: &'static str) -> opentelemetry::InstrumentationScope {
     opentelemetry::InstrumentationScope::builder(name)
         .with_version(env!("CARGO_PKG_VERSION"))
         .build()
+}
+
+/// A test's tracer over its own `provider`, under a versioned
+/// `ourios-test` scope, for wiring into a `tracing-opentelemetry` layer.
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn test_tracer(provider: &SdkTracerProvider) -> opentelemetry_sdk::trace::SdkTracer {
+    provider.tracer_with_scope(scope("ourios-test"))
 }
 
 /// The tracer every Ourios span goes through, under the versioned scope.
@@ -618,8 +628,8 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .is_ok();
     let (logger, tracer) = if installed {
         // The subscriber — and its traces layer — is live, so register the
-        // tracer provider globally now (any direct `global::tracer(...)` use
-        // resolves against a running pipeline).
+        // tracer provider globally now (any `ourios_core::telemetry::tracer`
+        // use resolves against a running pipeline).
         if let Some(tracer_provider) = &tracer {
             global::set_tracer_provider(tracer_provider.clone());
         }
@@ -664,8 +674,8 @@ fn meter_provider(
 /// Build an in-memory metrics pipeline for tests: a `MeterProvider`
 /// whose periodic reader exports into the returned
 /// [`InMemoryMetricExporter`](opentelemetry_sdk::metrics::InMemoryMetricExporter),
-/// installed as the global provider so `global::meter(...)` resolves
-/// against it. Record through the global meter, call the returned
+/// installed as the global provider so `ourios_core::telemetry::meter(...)`
+/// resolves against it. Record through that meter, call the returned
 /// guard's [`force_flush`](TelemetryGuard::force_flush), then read the
 /// exporter's `get_finished_metrics()` to assert what was produced —
 /// no OTLP endpoint required. Runs inside a tokio runtime (the periodic
@@ -677,8 +687,9 @@ fn meter_provider(
 /// primitive to restore a previously-installed global provider, so the
 /// returned guard's `Drop` shuts the pipeline down but cannot reinstate
 /// an earlier global. For a fully isolated test, skip the global and
-/// build a provider directly, reading through `provider.meter(...)`
-/// (as this crate's own unit test does).
+/// build a provider directly and read through
+/// `provider.meter_with_scope(ourios_core::telemetry::scope(...))`
+/// (this crate's own unit tests use its private, equivalent `scope`).
 ///
 /// Returns the guard plus the exporter to collect from.
 #[cfg(feature = "testing")]

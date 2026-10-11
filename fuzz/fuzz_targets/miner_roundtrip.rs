@@ -102,6 +102,7 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
         let after = oracles::leaves(&miner, &tenant);
         oracles::AuditCtx {
             index,
+            line,
             before: &leaves,
             after: &after,
         }

@@ -14,10 +14,13 @@
 
 use std::collections::HashMap;
 
-use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, TemplateChange};
+use ourios_core::audit::{
+    AuditEvent, AuditPayload, ParamType, SlotExpansion, SlotTypes, TemplateChange,
+};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
+use ourios_miner::mask::mask;
 use ourios_miner::reconstruct::{Reconstruction, render};
 use ourios_miner::tokenize::tokenize;
 use ourios_miner::tree::{OwnedToken, format_template};
@@ -203,23 +206,40 @@ fn assert_version_step(
     }
 }
 
-/// `template_id → (template_version, tokens)` for every leaf of one tenant.
-pub type Leaves = HashMap<u64, (u32, Vec<OwnedToken>)>;
+/// One leaf's typed state: its version, tokens, and the `ParamType`s seen in
+/// each wildcard slot (indexed by wildcard ordinal, RFC 0001 §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafState {
+    pub version: u32,
+    pub tokens: Vec<OwnedToken>,
+    pub slot_types: Vec<SlotTypes>,
+}
+
+/// `template_id → state` for every leaf of one tenant.
+pub type Leaves = HashMap<u64, LeafState>;
 
 /// The tenant's leaves as they stand now, for [`AuditCtx`].
 pub fn leaves(miner: &MinerCluster, tenant: &TenantId) -> Leaves {
     miner
         .templates_for(tenant)
         .into_iter()
-        .map(|leaf| (leaf.template_id, (leaf.template_version, leaf.template)))
+        .map(|leaf| {
+            let state = LeafState {
+                version: leaf.template_version,
+                tokens: leaf.template,
+                slot_types: leaf.slot_types,
+            };
+            (leaf.template_id, state)
+        })
         .collect()
 }
 
-/// What one ingest did to the tenant's tree: its line number, the leaves
-/// before and after it. [`AuditCtx::assert_changes_audited`] checks the audit
-/// events the ingest emitted against it.
+/// What one ingest did to the tenant's tree: its line number and body, the
+/// leaves before and after it. [`AuditCtx::assert_changes_audited`] checks the
+/// audit events the ingest emitted against it.
 pub struct AuditCtx<'a> {
     pub index: usize,
+    pub line: &'a str,
     pub before: &'a Leaves,
     pub after: &'a Leaves,
 }
@@ -246,13 +266,15 @@ impl AuditCtx<'_> {
     /// On any violation, with a message naming the invariant.
     pub fn assert_changes_audited(&self, events: Vec<AuditEvent>) {
         let mut by_id = template_changes_by_id(events);
-        for (&id, (version, tokens)) in self.after {
+        let line_types = line_types(self.line);
+        for (&id, after) in self.after {
             let changes = by_id.remove(&id).unwrap_or_default();
             let leaf = LeafAudit {
                 index: self.index,
                 id,
-                after: (*version, tokens),
+                after,
                 changes: &changes,
+                line_types: &line_types,
             };
             leaf.assert_audited(self.before.get(&id));
         }
@@ -290,25 +312,51 @@ fn template_change(event: AuditEvent) -> Option<(u64, TemplateChange)> {
     }
 }
 
+/// The `ParamType` of each token of `line`, as the miner classifies it for a
+/// widened slot's initial type set (RFC 0001 §6.2 step 5b, mirroring
+/// `param_type_for_line_position`): the mask's type where it masked the
+/// token, `Str` for a literal. Empty when the tokenizer rejects the line,
+/// which can then widen nothing.
+fn line_types(line: &str) -> Vec<ParamType> {
+    let Ok(tokenized) = tokenize(line) else {
+        return Vec::new();
+    };
+    let masked = mask(&tokenized.tokens);
+    (0..tokenized.tokens.len())
+        .map(|position| {
+            masked
+                .wildcard_positions
+                .binary_search(&position)
+                .ok()
+                .and_then(|k| masked.typed_params.get(k))
+                .map_or(ParamType::Str, |param| param.type_tag)
+        })
+        .collect()
+}
+
 /// One leaf after one ingest, with the template events the ingest emitted
-/// for it.
+/// for it and the ingested line's per-token types.
 struct LeafAudit<'a> {
     index: usize,
     id: u64,
-    after: Version<'a>,
+    after: &'a LeafState,
     changes: &'a [TemplateChange],
+    line_types: &'a [ParamType],
 }
 
 impl LeafAudit<'_> {
-    fn assert_audited(&self, before: Option<&(u32, Vec<OwnedToken>)>) {
+    fn assert_audited(&self, before: Option<&LeafState>) {
         match before {
             None => self.assert_created(),
-            Some((version, tokens)) => self.assert_steps((*version, tokens)),
+            Some(before) => self.assert_steps(before),
         }
     }
 
     fn assert_created(&self) {
-        let (version, tokens) = self.after;
+        let LeafState {
+            version, tokens, ..
+        } = self.after;
+        let version = *version;
         let expected = format_template(tokens);
         let audited = matches!(
             self.changes,
@@ -324,10 +372,11 @@ impl LeafAudit<'_> {
         );
     }
 
-    fn assert_steps(&self, (old_version, old_tokens): Version<'_>) {
+    fn assert_steps(&self, before: &LeafState) {
+        let old_version = before.version;
         let mut version = old_version;
-        let mut template = format_template(old_tokens);
-        let mut typed = old_tokens.to_vec();
+        let mut template = format_template(&before.tokens);
+        let mut typed = before.clone();
         for change in self.changes {
             let step = version_step(change).unwrap_or_else(|| {
                 panic!(
@@ -347,14 +396,26 @@ impl LeafAudit<'_> {
             version = step.1;
             step.3.clone_into(&mut template);
         }
-        let (new_version, new_tokens) = self.after;
+        let new_version = self.after.version;
+        let new_tokens = &self.after.tokens;
         assert!(
-            typed == new_tokens,
+            typed.tokens == *new_tokens,
             "RFC0015.10 / CLAUDE.md §3.1: line {}: template {}: replaying the declared widenings on the \
-             leaf before the ingest gives {typed:?}, but the leaf after it is {new_tokens:?} — a token \
+             leaf before the ingest gives {:?}, but the leaf after it is {new_tokens:?} — a token \
              changed that no audit event declares",
             self.index,
             self.id,
+            typed.tokens,
+        );
+        assert!(
+            typed.slot_types == self.after.slot_types,
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {}: replaying the declared widenings and \
+             type expansions gives slot types {:?}, but the leaf after the ingest has {:?} — a slot \
+             type changed that no audit event declares",
+            self.index,
+            self.id,
+            typed.slot_types,
+            self.after.slot_types,
         );
         let expected = format_template(new_tokens);
         assert!(
@@ -377,16 +438,44 @@ impl LeafAudit<'_> {
     /// as the event says. [`Self::assert_steps`] then requires the result to
     /// equal the typed leaf after the ingest, so a position widened without
     /// being declared, a literal `<*>` included, cannot pass.
-    fn replay_typed_step(&self, typed: &mut [OwnedToken], change: &TemplateChange) {
-        let (positions, new_template): (&[u16], &str) = match change {
+    ///
+    /// Slot types are replayed the same way, per RFC 0001 §6.1/§6.4: a
+    /// widening opens one slot per declared position, seeded `{Str, type of
+    /// the line's token there}` and not audited as an expansion; a type
+    /// expansion's `slots_expanded` names existing slots by wildcard ordinal,
+    /// each at most once, with types new to that slot. The replayed sets must
+    /// equal the leaf's after the ingest, so a slot-type change no event
+    /// declares, or a declaration the tree does not show, cannot pass.
+    fn replay_typed_step(&self, typed: &mut LeafState, change: &TemplateChange) {
+        let new_template = match change {
             TemplateChange::Widened {
                 positions_widened,
                 new_template,
                 ..
-            } => (positions_widened, new_template),
-            TemplateChange::TypeExpanded { new_template, .. } => (&[], new_template),
+            } => {
+                self.replay_widening(typed, positions_widened);
+                new_template
+            }
+            TemplateChange::TypeExpanded {
+                slots_expanded,
+                new_template,
+                ..
+            } => {
+                self.replay_type_expansion(typed, slots_expanded);
+                new_template
+            }
             _ => return,
         };
+        let printed = format_template(&typed.tokens);
+        assert_eq!(
+            &printed, new_template,
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} event {change:?} does not match its declared \
+             positions applied to the typed template",
+            self.index, self.id,
+        );
+    }
+
+    fn replay_widening(&self, typed: &mut LeafState, positions: &[u16]) {
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
             "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} declares positions_widened {positions:?}, \
@@ -395,15 +484,89 @@ impl LeafAudit<'_> {
             self.id,
         );
         for &position in positions {
-            self.widen_typed(typed, usize::from(position));
+            self.widen_typed(&mut typed.tokens, usize::from(position));
         }
-        let printed = format_template(typed);
-        assert_eq!(
-            printed, new_template,
-            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} event {change:?} does not match its declared \
-             positions applied to the typed template",
-            self.index, self.id,
+        for &position in positions {
+            self.seed_widened_slot(typed, usize::from(position));
+        }
+    }
+
+    /// The new slot's ordinal is its wildcard count on the post-widening
+    /// template, walked in ascending position order as the miner does.
+    fn seed_widened_slot(&self, typed: &mut LeafState, position: usize) {
+        let ordinal = typed.tokens[..position]
+            .iter()
+            .filter(|token| matches!(token, OwnedToken::Wildcard))
+            .count();
+        let line_type = self.line_types.get(position).copied().unwrap_or_else(|| {
+            panic!(
+                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widened position {position}, which the \
+                 line has no token at",
+                self.index, self.id,
+            )
+        });
+        assert!(
+            ordinal <= typed.slot_types.len(),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} has {} slot types for more wildcards — \
+             slot types out of step with the template",
+            self.index,
+            self.id,
+            typed.slot_types.len(),
         );
+        typed.slot_types.insert(
+            ordinal,
+            SlotTypes::singleton(ParamType::Str).insert(line_type),
+        );
+    }
+
+    fn replay_type_expansion(&self, typed: &mut LeafState, slots: &[SlotExpansion]) {
+        let mut indices: Vec<u16> = slots.iter().map(|slot| slot.slot_index).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        assert!(
+            !slots.is_empty() && indices.len() == slots.len(),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion declares {slots:?}: it must \
+             name at least one slot, each at most once",
+            self.index,
+            self.id,
+        );
+        for slot in slots {
+            self.expand_slot(typed, slot);
+        }
+    }
+
+    fn expand_slot(&self, typed: &mut LeafState, expansion: &SlotExpansion) {
+        let SlotExpansion {
+            slot_index,
+            added_types,
+        } = expansion;
+        let slot = typed
+            .slot_types
+            .get_mut(usize::from(*slot_index))
+            .unwrap_or_else(|| {
+                panic!(
+                    "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion names slot \
+                     {slot_index}, which does not exist",
+                    self.index, self.id,
+                )
+            });
+        assert!(
+            !added_types.is_empty(),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion of slot {slot_index} adds \
+             no type",
+            self.index,
+            self.id,
+        );
+        for &added in added_types {
+            assert!(
+                !slot.contains(added),
+                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion of slot {slot_index} \
+                 adds {added:?}, which the slot already had",
+                self.index,
+                self.id,
+            );
+            *slot = slot.insert(added);
+        }
     }
 
     fn widen_typed(&self, typed: &mut [OwnedToken], position: usize) {

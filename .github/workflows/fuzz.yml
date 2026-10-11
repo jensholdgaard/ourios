@@ -7,10 +7,21 @@ name: Fuzz
 #   job and uploads the reproducer. The Phase 1 gate (RFC0015.5).
 # - `batch`: ClusterFuzzLite batch fuzzing (Phase 2, RFC0015.7), built from
 #   .clusterfuzzlite/, which grows and persists the corpus between runs.
+# - `prune`: ClusterFuzzLite corpus pruning. The ClusterFuzzLite GitHub
+#   Actions guide is explicit: "If batch fuzzing is running, you must also
+#   run corpus pruning", or the corpus only ever grows.
 # - `coverage`: weekly line coverage of what the accumulated corpus reaches.
 #
 # Each job keys off its own `schedule` entry via its `if:`; a dispatch picks
 # jobs with the `job` input. Not a required check.
+#
+# Corpus storage: with no `storage-repo` configured, ClusterFuzzLite keeps
+# the corpus as the `cifuzz-corpus-<target>` workflow artifacts (each run
+# downloads the latest and uploads a new one; artifacts expire after 90
+# days, so a corpus survives only while some run rolls it within that
+# window) and the coverage report as `cifuzz-coverage-latest`.
+# TODO(fuzz-audit): a storage repo would make both durable and browsable;
+# that is a maintainer decision, not made here.
 #
 # libFuzzer requires nightly; it is contained to the smoke job via an
 # explicit `+nightly-<date>` invocation, so the stable pin in
@@ -27,6 +38,9 @@ name: Fuzz
 # metrics to the external OTLP backend (#942); see the smoke step's env.
 on:
   schedule:
+    # prune runs before batch so batch starts from a minimised corpus; the
+    # shared concurrency group below serialises them should prune run long.
+    - cron: "0 1 * * *" # prune: daily
     - cron: "0 2 * * *" # batch: daily
     - cron: "17 4 * * *" # smoke: daily
     - cron: "0 3 * * 1" # coverage: weekly, Monday
@@ -36,7 +50,7 @@ on:
         description: Which job to run
         type: choice
         default: all
-        options: [all, smoke, batch, coverage]
+        options: [all, smoke, batch, coverage, prune]
 
 permissions:
   contents: read
@@ -170,7 +184,10 @@ jobs:
     name: cflite batch
     if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'batch'))
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The container build has measured 11–19 min (no cache), plus 50 min of
+    # fuzzing and a couple of minutes of corpus download/upload. A 60 min
+    # limit would cut every run short of its upload.
+    timeout-minutes: 90
     concurrency:
       group: fuzz-corpus-${{ github.ref }}
       cancel-in-progress: false
@@ -189,8 +206,41 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 600
+          # Split evenly across the five targets (600 s each), on every core
+          # of the runner (libFuzzer -jobs/-workers).
+          fuzz-seconds: 3000
+          parallel-fuzzing: true
           mode: batch
+          sanitizer: address
+
+  prune:
+    name: cflite prune
+    if: github.event.schedule == '0 1 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.job == 'all' || inputs.job == 'prune'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: fuzz-corpus-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build fuzzers (address)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: address
+      # Minimises each `cifuzz-corpus-<target>` and uploads the result in its
+      # place (`fuzz-seconds` is the time limit of the merge, shared across
+      # the targets).
+      - name: Prune the corpus
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: prune
           sanitizer: address
 
   coverage:
@@ -212,6 +262,8 @@ jobs:
         with:
           language: rust
           sanitizer: coverage
+      # Uploads the HTML report itself, as the `cifuzz-coverage-latest`
+      # artifact.
       - name: Run fuzzers (coverage)
         id: run
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
@@ -220,3 +272,40 @@ jobs:
           fuzz-seconds: 600
           mode: coverage
           sanitizer: coverage
+      # The run_fuzzers container writes the report under $GITHUB_WORKSPACE
+      # (its `Workspace.coverage_report` is `cifuzz-coverage`), laid out by
+      # the OSS-Fuzz base-runner `coverage` script: `fuzzer_stats/<target>.json`
+      # per target and `report/linux/summary.json` for the merge, each an
+      # `llvm-cov export -summary-only` document. That layout is upstream's,
+      # read at the `v1` images this job floats on, so a change there must
+      # not fail the job: the step prints what it finds instead.
+      - name: Line coverage per target
+        if: steps.run.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          report="${GITHUB_WORKSPACE}/cifuzz-coverage"
+          if [ ! -d "${report}/fuzzer_stats" ]; then
+            echo "::warning::no ${report}/fuzzer_stats; the ClusterFuzzLite report layout has moved. Found:"
+            find "${GITHUB_WORKSPACE}" -maxdepth 3 -path '*cifuzz*' \( -type d -o -name '*.json' \)
+            exit 1
+          fi
+          row() { # <label> <llvm-cov summary json>
+            jq -r --arg t "$1" '.data[0].totals.lines
+              | "| \($t) | \(.covered) | \(.count) | \(.percent * 100 | round / 100) |"' "$2"
+          }
+          {
+            echo "## Fuzz corpus line coverage"
+            echo
+            echo "| target | lines covered | lines total | % |"
+            echo "|---|---:|---:|---:|"
+            for f in "${report}"/fuzzer_stats/*.json; do
+              [ -f "${f}" ] || continue
+              row "$(basename "${f%.json}")" "${f}"
+            done
+            if [ -f "${report}/report/linux/summary.json" ]; then
+              row "**all targets, merged**" "${report}/report/linux/summary.json"
+            fi
+            echo
+            echo "Full HTML report: the \`cifuzz-coverage-latest\` artifact of this run."
+          } | tee -a "${GITHUB_STEP_SUMMARY}"

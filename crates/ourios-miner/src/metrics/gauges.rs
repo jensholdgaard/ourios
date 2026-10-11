@@ -1,4 +1,5 @@
-//! The five §6.8 observable gauges, registered once per meter provider.
+//! The five §6.8 observable gauges, registered once per global provider
+//! installation.
 //!
 //! The `OTel` SDK never unregisters an observable-instrument callback:
 //! dropping the gauge handle leaves the callback, and everything it
@@ -6,19 +7,26 @@
 //! registered per [`super::MinerMetrics`] would therefore keep every
 //! dropped cluster's state alive and reporting stale values (#945).
 //!
-//! Instead, one set of callbacks is registered per provider. They read
+//! Instead, one set of callbacks is registered per installation. They read
 //! a [`GaugeRegistry`] of `Weak` references to the live clusters'
 //! states and prune the dead ones as they go, so a dropped cluster
 //! stops reporting and frees its state, and a collection costs
 //! O(live clusters).
 //!
-//! Bindings are keyed by provider identity: a cluster joins the
-//! registry of the provider that was global when it was built, and a
-//! provider seen for the first time (say after `global::set_meter_provider`)
-//! gets a fresh registry with the gauges on it. Clusters built earlier
-//! keep reporting where they were registered. That is the same
-//! attribution as a per-cluster registration, at one registration per
-//! provider rather than one per cluster.
+//! Bindings are keyed by the identity of the `Arc` that
+//! `global::set_meter_provider` wraps each installed provider in: a
+//! cluster joins the registry of the installation that was global when
+//! it was built, and an installation seen for the first time gets a
+//! fresh registry with the gauges on it. Clusters built earlier keep
+//! reporting where they were registered. That is the same attribution
+//! as a per-cluster registration, at one registration per installation
+//! rather than one per cluster — in production, one at startup.
+//!
+//! The SDK exposes no stable provider identity, and every
+//! `set_meter_provider` call makes a fresh wrapper. So reinstalling the
+//! *same* `SdkMeterProvider` counts as a new installation and adds one
+//! more set of callbacks to its pipeline. The cost is bounded by the
+//! number of installs, not by the number of clusters.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -77,7 +85,7 @@ impl GaugeRegistry {
     }
 }
 
-/// The registry bound to one provider, plus that provider's gauge
+/// The registry bound to one installation, plus that installation's gauge
 /// handles, retained so the registration outlives this call whatever
 /// the SDK does with a dropped handle.
 pub(super) struct Binding {
@@ -86,12 +94,13 @@ pub(super) struct Binding {
     _gauges: ObservableGauges,
 }
 
-/// One binding per provider the process-global slot has handed out.
+/// One binding per global installation still alive.
 pub(super) static GLOBAL_BINDINGS: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
 
 /// The registry whose gauges report to `provider`, registering them on
-/// it the first time it is seen. Bindings of providers that have since
-/// been dropped are pruned, so the list holds live providers only.
+/// it the first time this `Arc` is seen. Bindings whose `Arc` has since
+/// been dropped (its installation replaced) are pruned, so the list
+/// holds live installations only.
 pub(super) fn registry_for(
     provider: &GlobalProvider,
     bindings: &Mutex<Vec<Binding>>,

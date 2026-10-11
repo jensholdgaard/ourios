@@ -36,7 +36,7 @@
 //! That state — per-`(tenant, service)` line tallies and a bounded
 //! confidence reservoir, plus per-tenant template counts — lives in
 //! [`MinerMetricsState`] behind a `Mutex`. The gauges are registered
-//! once per meter provider and read every live cluster's state through
+//! once per global provider installation and read every live cluster's state through
 //! a registry of `Weak` references ([`gauges`]), so a dropped cluster
 //! stops reporting and its state is freed.
 //!
@@ -325,7 +325,7 @@ fn quantile_of(mut samples: Vec<f64>, q: f64) -> Option<f64> {
 ///
 /// Constructed once per [`crate::cluster::MinerCluster`]. The
 /// synchronous instruments are recorded at the hot-path sites; the
-/// observable gauges, registered once per provider (see [`gauges`]),
+/// observable gauges, registered once per installation (see [`gauges`]),
 /// read this [`MinerMetricsState`] for as long as the `MinerMetrics`
 /// lives and need no per-call maintenance beyond updating it.
 pub(crate) struct MinerMetrics {

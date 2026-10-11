@@ -1,4 +1,4 @@
-//! #945: the gauges are registered once per provider and report only
+//! #945: the gauges are registered once per installation and report only
 //! the clusters still alive. Every test builds its own provider rather
 //! than the process-global one, so they cannot race each other.
 
@@ -225,11 +225,14 @@ fn live_cluster_gauge_values_are_unchanged() {
     );
 }
 
-/// One registration per provider: the same provider reuses its
-/// registry, a newly installed one gets its own, and a cluster keeps
-/// reporting to the provider it was built under.
+/// Bindings are keyed by the provider `Arc`'s identity: the same `Arc`
+/// reuses its registry, a different one gets its own, and a cluster
+/// keeps reporting to the provider it was built under. This drives
+/// `registry_for` directly with long-lived `Arc`s; see
+/// `reinstalling_the_same_provider_registers_once_per_install` for what
+/// `global::set_meter_provider` hands it.
 #[test]
-fn binding_follows_the_provider() {
+fn binding_is_keyed_by_provider_identity() {
     let slot: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
     let (first, first_exporter) = sdk_provider();
     let first_sdk = first.clone();
@@ -263,6 +266,34 @@ fn binding_follows_the_provider() {
         let counts = &points[semconv::OURIOS_MINER_TEMPLATE_COUNT];
         assert_eq!(counts.keys().collect::<Vec<_>>(), [&tenant_key(tenant)]);
     }
+}
+
+/// `global::set_meter_provider` wraps every install in a fresh `Arc`,
+/// even of the same `SdkMeterProvider`. Each install is one binding and
+/// one registration; lookups within an install reuse it. Reinstalling
+/// the same provider therefore registers once more per reinstall —
+/// bounded by installs, never by clusters.
+#[test]
+fn reinstalling_the_same_provider_registers_once_per_install() {
+    let slot: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
+    let (sdk, _exporter) = sdk_provider();
+    let install = || -> Arc<dyn MeterProvider + Send + Sync> { Arc::new(sdk.clone()) };
+
+    let first = install();
+    let a = registry_for(&first, &slot);
+    for _ in 0..100 {
+        assert!(Arc::ptr_eq(&a, &registry_for(&first, &slot)));
+    }
+    drop(first);
+
+    let second = install();
+    let b = registry_for(&second, &slot);
+    assert!(!Arc::ptr_eq(&a, &b), "a reinstall is a new installation");
+    assert_eq!(
+        slot.lock().unwrap().len(),
+        1,
+        "the replaced install is pruned"
+    );
 }
 
 /// A dropped provider's binding is pruned on the next lookup, so the

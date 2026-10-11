@@ -63,7 +63,7 @@ use ourios_semconv as semconv;
 
 mod gauges;
 
-use gauges::GaugeRegistry;
+use gauges::{Binding, GaugeRegistry, GlobalProvider};
 
 /// Meter name per RFC 0001 §6.8 (`global::meter("ourios.miner")`).
 const METER_NAME: &str = "ourios.miner";
@@ -346,7 +346,17 @@ impl MinerMetrics {
     /// registry; each instrument surfaces in the export on its first
     /// real measurement (§3.1.2).
     pub(crate) fn new() -> Self {
-        Self::with_registry(&global::meter(METER_NAME), &gauges::global_registry())
+        Self::for_provider(&global::meter_provider(), &gauges::GLOBAL_BINDINGS)
+    }
+
+    /// Derive the synchronous instruments and the gauge binding from one
+    /// provider snapshot, so a concurrent `set_meter_provider` cannot
+    /// split a cluster's instruments across two providers.
+    fn for_provider(provider: &GlobalProvider, bindings: &Mutex<Vec<Binding>>) -> Self {
+        Self::with_registry(
+            &provider.meter(METER_NAME),
+            &gauges::registry_for(provider, bindings),
+        )
     }
 
     /// Build the synchronous instruments on `meter` and enrol a fresh

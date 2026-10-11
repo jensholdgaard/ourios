@@ -19,7 +19,7 @@ use super::super::{METER_NAME, MinerMetrics, MinerMetricsState};
 use super::{Binding, GaugeRegistry, ObservableGauges, register, registry_for};
 
 /// A local provider with the gauges registered once over a fresh
-/// registry, as `global_registry` does for the global provider.
+/// registry, as `registry_for` does for each provider it first sees.
 struct Harness {
     provider: SdkMeterProvider,
     exporter: InMemoryMetricExporter,
@@ -230,7 +230,7 @@ fn live_cluster_gauge_values_are_unchanged() {
 /// reporting to the provider it was built under.
 #[test]
 fn binding_follows_the_provider() {
-    let slot: Mutex<Option<Binding>> = Mutex::new(None);
+    let slot: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
     let (first, first_exporter) = sdk_provider();
     let first_sdk = first.clone();
     let first: Arc<dyn MeterProvider + Send + Sync> = Arc::new(first);
@@ -248,6 +248,12 @@ fn binding_follows_the_provider() {
     let late = MinerMetrics::with_registry(&second.meter(METER_NAME), &b);
     late.set_template_count(&TenantId::new("late"), 2);
 
+    // A -> B -> A: switching back reuses A's registry instead of
+    // registering a second set of callbacks on A.
+    assert!(Arc::ptr_eq(&a, &registry_for(&first, &slot)));
+    assert!(Arc::ptr_eq(&b, &registry_for(&second, &slot)));
+    assert_eq!(slot.lock().unwrap().len(), 2, "one binding per provider");
+
     for (sdk, exporter, tenant) in [
         (&first_sdk, &first_exporter, "early"),
         (&second_sdk, &second_exporter, "late"),
@@ -256,6 +262,59 @@ fn binding_follows_the_provider() {
         let points = gauge_points(&exporter.get_finished_metrics().unwrap());
         let counts = &points[semconv::OURIOS_MINER_TEMPLATE_COUNT];
         assert_eq!(counts.keys().collect::<Vec<_>>(), [&tenant_key(tenant)]);
+    }
+}
+
+/// A dropped provider's binding is pruned on the next lookup, so the
+/// bindings track the live providers only.
+#[test]
+fn dropped_provider_binding_is_pruned() {
+    let slot: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
+    let (first, _first_exporter) = sdk_provider();
+    let first: Arc<dyn MeterProvider + Send + Sync> = Arc::new(first);
+    let a = Arc::downgrade(&registry_for(&first, &slot));
+    drop(first);
+
+    let (second, _second_exporter) = sdk_provider();
+    let second: Arc<dyn MeterProvider + Send + Sync> = Arc::new(second);
+    registry_for(&second, &slot);
+    assert_eq!(slot.lock().unwrap().len(), 1);
+    assert_eq!(
+        a.strong_count(),
+        0,
+        "the dropped provider's registry is freed"
+    );
+}
+
+/// A cluster's synchronous instruments and gauges come from the same
+/// provider snapshot: both surface on the provider it was built for.
+#[test]
+fn synchronous_instruments_and_gauges_share_one_provider() {
+    let slot: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
+    let (sdk, exporter) = sdk_provider();
+    let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(sdk.clone());
+    let metrics = MinerMetrics::for_provider(&provider, &slot);
+    let tenant = TenantId::new("acme");
+    metrics.record_merge(&tenant, "template_widened");
+    metrics.set_template_count(&tenant, 3);
+
+    sdk.force_flush().unwrap();
+    let names: Vec<String> = exporter
+        .get_finished_metrics()
+        .unwrap()
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(ScopeMetrics::metrics)
+        .map(|m| m.name().to_owned())
+        .collect();
+    for name in [
+        semconv::OURIOS_MINER_MERGES,
+        semconv::OURIOS_MINER_TEMPLATE_COUNT,
+    ] {
+        assert!(
+            names.iter().any(|n| n == name),
+            "{name} missing, got {names:?}"
+        );
     }
 }
 

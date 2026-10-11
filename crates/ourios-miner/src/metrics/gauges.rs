@@ -12,17 +12,18 @@
 //! stops reporting and frees its state, and a collection costs
 //! O(live clusters).
 //!
-//! The binding follows the process-global provider: a cluster built
-//! after `global::set_meter_provider` installs a new provider gets a
-//! fresh registry with gauges on that provider, while clusters built
-//! earlier keep reporting where they were registered. That is the
-//! same attribution as a per-cluster registration, at one registration
-//! per provider rather than one per cluster.
+//! Bindings are keyed by provider identity: a cluster joins the
+//! registry of the provider that was global when it was built, and a
+//! provider seen for the first time (say after `global::set_meter_provider`)
+//! gets a fresh registry with the gauges on it. Clusters built earlier
+//! keep reporting where they were registered. That is the same
+//! attribution as a per-cluster registration, at one registration per
+//! provider rather than one per cluster.
 
 use std::sync::{Arc, Mutex, Weak};
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{AsyncInstrument, Meter, MeterProvider, ObservableGauge};
-use opentelemetry::{KeyValue, global};
 
 use ourios_core::tenant::TenantId;
 use ourios_semconv as semconv;
@@ -33,7 +34,7 @@ use super::{METER_NAME, MinerMetricsState, lock_recovering, quantile_of, ratio, 
 const MIN_PRUNE_AT: usize = 64;
 
 type SharedState = Arc<Mutex<MinerMetricsState>>;
-type GlobalProvider = Arc<dyn MeterProvider + Send + Sync>;
+pub(super) type GlobalProvider = Arc<dyn MeterProvider + Send + Sync>;
 
 /// The live clusters' gauge states for one provider's callbacks.
 #[derive(Default)]
@@ -79,40 +80,41 @@ impl GaugeRegistry {
 /// The registry bound to one provider, plus that provider's gauge
 /// handles, retained so the registration outlives this call whatever
 /// the SDK does with a dropped handle.
-struct Binding {
+pub(super) struct Binding {
     provider: Weak<dyn MeterProvider + Send + Sync>,
     registry: Arc<GaugeRegistry>,
     _gauges: ObservableGauges,
 }
 
-static GLOBAL_BINDING: Mutex<Option<Binding>> = Mutex::new(None);
+/// One binding per provider the process-global slot has handed out.
+pub(super) static GLOBAL_BINDINGS: Mutex<Vec<Binding>> = Mutex::new(Vec::new());
 
-/// The registry whose gauges report to the current global provider,
-/// registering them on that provider the first time it is seen.
-pub(super) fn global_registry() -> Arc<GaugeRegistry> {
-    registry_for(&global::meter_provider(), &GLOBAL_BINDING)
-}
-
-fn registry_for(provider: &GlobalProvider, slot: &Mutex<Option<Binding>>) -> Arc<GaugeRegistry> {
-    let mut binding = lock_recovering(slot);
-    match binding.as_ref() {
-        // The binding's `Weak` keeps the provider allocation alive, so a
-        // replaced provider's address is never reused and the comparison
-        // cannot alias.
-        Some(bound) if Weak::ptr_eq(&bound.provider, &Arc::downgrade(provider)) => {
-            Arc::clone(&bound.registry)
-        }
-        _ => {
-            let registry = Arc::new(GaugeRegistry::default());
-            let gauges = register(&provider.meter(METER_NAME), &registry);
-            *binding = Some(Binding {
-                provider: Arc::downgrade(provider),
-                registry: Arc::clone(&registry),
-                _gauges: gauges,
-            });
-            registry
-        }
+/// The registry whose gauges report to `provider`, registering them on
+/// it the first time it is seen. Bindings of providers that have since
+/// been dropped are pruned, so the list holds live providers only.
+pub(super) fn registry_for(
+    provider: &GlobalProvider,
+    bindings: &Mutex<Vec<Binding>>,
+) -> Arc<GaugeRegistry> {
+    let mut bindings = lock_recovering(bindings);
+    bindings.retain(|bound| bound.provider.strong_count() > 0);
+    let key = Arc::downgrade(provider);
+    // A binding's `Weak` keeps its provider allocation alive, so a live
+    // binding's address is never reused and the comparison cannot alias.
+    if let Some(bound) = bindings
+        .iter()
+        .find(|bound| Weak::ptr_eq(&bound.provider, &key))
+    {
+        return Arc::clone(&bound.registry);
     }
+    let registry = Arc::new(GaugeRegistry::default());
+    let gauges = register(&provider.meter(METER_NAME), &registry);
+    bindings.push(Binding {
+        provider: key,
+        registry: Arc::clone(&registry),
+        _gauges: gauges,
+    });
+    registry
 }
 
 /// The five §6.8 observable gauges. `ourios.miner.template.count` is

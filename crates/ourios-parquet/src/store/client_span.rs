@@ -223,7 +223,7 @@ mod tests {
 
     use super::{QueryPhase, S3Operation, object_key};
     use crate::store::Caller;
-    use crate::store::metrics::tests::{Harness, fake_s3, s3_store};
+    use crate::store::metrics::tests::{Harness, fake_s3, s3_store, serve};
 
     fn request(method: &str, uri: &str, header: Option<&'static str>) -> HttpRequest {
         let mut req = HttpRequest::new(HttpRequestBody::empty());
@@ -322,7 +322,18 @@ mod tests {
     /// Run `work` under a fresh sampled parent span, the phase marker
     /// attached when `in_phase`; the `CLIENT` spans of its trace.
     fn client_spans_of(in_phase: bool, work: impl FnOnce()) -> (TraceId, Vec<SpanData>) {
-        let exporter = exporter();
+        let (trace_id, cx) = parent_context(in_phase);
+        {
+            let _attached = cx.attach();
+            work();
+        }
+        (trace_id, client_spans(trace_id))
+    }
+
+    /// A fresh sampled parent span's context, with the phase marker when
+    /// `in_phase`, and its trace id.
+    fn parent_context(in_phase: bool) -> (TraceId, Context) {
+        exporter();
         let tracer = opentelemetry::global::tracer_provider()
             .tracer_with_scope(ourios_core::telemetry::scope("test"));
         let parent = tracer.start("load template_map");
@@ -333,17 +344,17 @@ mod tests {
         } else {
             cx
         };
-        {
-            let _attached = cx.attach();
-            work();
-        }
-        let spans = exporter
+        (trace_id, cx)
+    }
+
+    /// The exported `CLIENT` spans of `trace_id`.
+    fn client_spans(trace_id: TraceId) -> Vec<SpanData> {
+        exporter()
             .get_finished_spans()
             .expect("spans")
             .into_iter()
             .filter(|s| s.span_context.trace_id() == trace_id && s.span_kind == SpanKind::Client)
-            .collect();
-        (trace_id, spans)
+            .collect()
     }
 
     fn attribute(span: &SpanData, key: &str) -> Option<Value> {
@@ -385,6 +396,11 @@ mod tests {
         assert_eq!(text("aws.request_id").as_deref(), Some("R1"));
         assert_eq!(text("cloud.region").as_deref(), Some("us-east-1"));
         assert_eq!(text("server.address").as_deref(), Some("127.0.0.1"));
+        assert_eq!(text("http.request.method").as_deref(), Some("GET"));
+        assert_eq!(
+            attribute(span, "server.port"),
+            Some(Value::I64(i64::from(port)))
+        );
         assert_eq!(
             attribute(span, "http.response.status_code"),
             Some(Value::I64(404))
@@ -420,5 +436,35 @@ mod tests {
             store.get_blocking("k").expect_err("404");
         });
         assert!(spans.is_empty(), "{spans:?}");
+    }
+
+    /// A request its caller abandons before the response ends its span
+    /// `Unset`, with no `error.type`: semconv does not count an
+    /// intentional cancellation as an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_abandoned_request_leaves_its_client_span_unset() {
+        use object_store::ObjectStoreExt as _;
+        use opentelemetry::context::FutureExt as _;
+
+        let port = serve(1, |_| None);
+        let harness = Harness::new();
+        let store = s3_store(&harness, port, Caller::TemplateMap);
+        let backend = store.object_store();
+        let (trace_id, cx) = parent_context(true);
+        let request = async move { backend.get(&object_store::path::Path::from("k")).await };
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            request.with_context(cx),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the fake never answers");
+
+        let spans = client_spans(trace_id);
+        let [span] = spans.as_slice() else {
+            panic!("one CLIENT span, got {spans:?}");
+        };
+        assert_eq!(span.name.as_ref(), "S3.GetObject");
+        assert_eq!(span.status, Status::Unset);
+        assert_eq!(attribute(span, "error.type"), None);
     }
 }

@@ -1047,7 +1047,7 @@ pub(super) mod tests {
     /// A fake S3 endpoint serving `connections` connections, one request
     /// each, answered by `respond` from the request head. `None` leaves the
     /// request unanswered until the client hangs up. Returns its port.
-    fn serve(
+    pub(in crate::store) fn serve(
         connections: usize,
         mut respond: impl FnMut(&str) -> Option<String> + Send + 'static,
     ) -> u16 {

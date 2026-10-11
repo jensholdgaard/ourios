@@ -82,17 +82,28 @@ fn write(bucket: &Path, records: &[MinedRecord]) {
 /// One body-rendering query under a stand-in `POST /v1/query` span (the real
 /// one is `ourios-server`'s); the stand-in's span id.
 async fn query(querier: Arc<Querier>) -> SpanId {
+    let (id, result) = query_outcome(querier).await;
+    result.expect("query");
+    id
+}
+
+/// [`query`], returning the query's result instead of expecting success.
+async fn query_outcome(
+    querier: Arc<Querier>,
+) -> (
+    SpanId,
+    Result<ourios_querier::QueryResult, ourios_querier::QueryError>,
+) {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
     let span = tracing::info_span!("POST /v1/query");
     let id = span.context().span().span_context().span_id();
     let parsed = ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
-    querier
+    let result = querier
         .run_query(&parsed, &TenantId::new(TENANT), NOW, WINDOW_NS, None)
         .instrument(span)
-        .await
-        .expect("query");
-    id
+        .await;
+    (id, result)
 }
 
 fn named<'s>(spans: &'s [SpanData], name: &str) -> Vec<&'s SpanData> {
@@ -209,4 +220,67 @@ async fn a_query_joining_an_acquisition_spans_its_wait() {
         text(load, semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME).as_deref(),
         Some("joined")
     );
+}
+
+/// One committed audit file for the tenant, then overwritten with bytes no
+/// Parquet reader accepts, so the fold over it fails.
+fn unreadable_audit_file(root: &Path) {
+    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink as _, TemplateChange};
+
+    let store = ourios_parquet::Store::local(root).expect("store");
+    let mut sink = ourios_parquet::ParquetAuditSink::new(store);
+    sink.emit(AuditEvent {
+        tenant_id: TenantId::new(TENANT),
+        timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_775_127_480),
+        payload: AuditPayload::Template {
+            template_id: 1,
+            triggering_line_hash: ourios_core::audit::hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Created {
+                new_template: "user <*>".to_owned(),
+            },
+        },
+    });
+    assert_eq!(sink.write_failures(), 0, "the fixture event persists");
+    let mut dirs = vec![root.join("audit")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                std::fs::write(&path, b"not parquet").expect("corrupt the file");
+            }
+        }
+    }
+}
+
+/// A fold that fails marks both `derive template_map` and `load
+/// template_map` `Error` with the error class, and the query fails with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_fold_marks_the_derive_and_load_spans_error() {
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), &[mined(TS0)]);
+    unreadable_audit_file(dir.path());
+    let querier = Arc::new(Querier::new(dir.path()));
+    let (_, result) = query_outcome(querier).with_subscriber(dispatch).await;
+    assert!(result.is_err(), "an unreadable audit file fails the query");
+
+    let spans = exporter.get_finished_spans().expect("spans");
+    for name in ["derive template_map", "load template_map"] {
+        let [span] = named(&spans, name)[..] else {
+            panic!("one {name} span");
+        };
+        assert!(
+            matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+            "{name}: {:?}",
+            span.status
+        );
+        assert_eq!(
+            text(span, "error.type").as_deref(),
+            Some("storage"),
+            "{name}"
+        );
+    }
 }

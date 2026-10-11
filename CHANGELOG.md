@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.12.2] - 2026-10-11
+
+### Added
+
+- Record template-map derive cost and per-query reads (#935) (ebd2b40)
+- Object-store client, blocking-bridge and async-runtime metrics (#937) (32649a8)
+- Add service.version to the telemetry resource (#941) (0baa83f)
+- Memory, spill, input-shape and in-sweep progress metrics (#936) (56e5c92)
+- Render auth, listener tls, mcp and openfga from chart values (#929) (37a6f3a)
+- Report template-binding conflicts from the template-map fold (#931) (b2c41f5)
+- Emit the upstream otel process metrics (#930) (31f518e)
+
+### Fixed
+
+- Read bootstrap footers concurrently, show progress, stop on SIGTERM (#933) (bace7c3)
+
 ## [0.12.1] - 2026-10-09
 
 ### Documentation

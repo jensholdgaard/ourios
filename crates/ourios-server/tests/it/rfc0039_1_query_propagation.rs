@@ -18,7 +18,6 @@
 use axum::body::Body;
 use axum::http::{Request, header};
 use opentelemetry::propagation::TextMapPropagator as _;
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use tower::ServiceExt as _;
@@ -55,10 +54,8 @@ async fn query_spans(traceparent: Option<&str>) -> Vec<opentelemetry_sdk::trace:
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
 
     let mut builder = Request::builder()
         .method("POST")

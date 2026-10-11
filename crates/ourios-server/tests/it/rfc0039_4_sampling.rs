@@ -18,7 +18,6 @@
 
 use axum::body::Body;
 use axum::http::{Request, header};
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
 use tower::ServiceExt as _;
@@ -55,10 +54,8 @@ async fn query_spans_under_parentbased(traceparent: &str) -> Vec<SpanData> {
         .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
 
     let response = app
         .oneshot(

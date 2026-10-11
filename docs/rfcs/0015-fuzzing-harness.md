@@ -257,6 +257,44 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 > The status stays
 > `accepted`; scenario RFC0015.14 is the criterion.
 
+> **Amendment (2026-10-11, #964, maintainer-approved): `dsl_parse`
+> reaches the plan.** An accepted query used to stop at the parser.
+> The querier then validates it (`plan::validate`), compiles it and
+> lowers it to a `DataFusion` logical plan, and the engine's analyzer
+> and optimizer run over that plan. Every one of those steps sees
+> client text first. A query the DSL accepts but the engine rejects
+> while planning comes back as `Storage` ("failed to read storage"):
+> the engine, not the DSL, has decided what is a valid query (hazard
+> `CLAUDE.md` §4.6). The target now goes on from the parser:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `dsl_parse` | as before, then for an accepted log query the querier's `fuzzing::validate` and `fuzzing::lower`: `plan::compile`, `plan::apply` and the aggregation node over an empty in-memory scan, then the analyzer and optimizer, against the current writer's schema (one promoted key per RFC 0042 class) and a scan with every OPTIONAL column absent (RFC0007.4) | validation accepts or returns `InvalidQuery`; lowering returns exactly validation's rejection and lowers an accepted query to a plan or an `InvalidQuery`; the canonical re-parse validates and lowers to the same verdict and an equal plan (RFC0015.15) |
+>
+> One binary, not two. The plan oracle runs only on the queries a
+> parser accepts, a share of the executions (a 300 s run with ASan
+> still executes about 1 800 inputs a second, peak RSS about
+> 800 MiB). It needs the same seeds and the same
+> dictionary, so a second target would duplicate both and split the
+> ClusterFuzzLite budget eight ways instead of seven. The binary keeps
+> its name, so ClusterFuzzLite's stored corpus carries over. Nothing
+> executes and no store is opened. The alias map and template registry
+> are empty, the clock is fixed, and the session is built once per
+> process. The seam lives behind an `ourios-querier` `fuzzing` feature
+> (`#[doc(hidden)] pub mod fuzzing`, as `ourios-wal` and
+> `ourios-ingester` do). The lowered plan crosses it as an opaque
+> `LoweredPlan` that is only `PartialEq` and `Debug`, so no
+> `DataFusion` type enters the crate's API. The aggregation lowering
+> moved out of `Querier::execute_aggregate` into a function the
+> execution path and the seam share, so the plan fuzzed is the plan
+> run. The token denylist on error text (RFC0007.3) is not part of the
+> oracle: an `InvalidQuery` detail echoes the query's own keys and
+> literals, which can contain any token. The first runs found two
+> planner errors that surfaced as `Storage`, each fixed in its own PR:
+> the text functions and regex operators on the `Binary` `body`
+> column (#960), and a malformed regex pattern (#961). The status
+> stays `accepted`; scenario RFC0015.15 is the criterion.
+
 ### 3.3 Seed corpora
 
 Committed seeds live under `fuzz/seeds/<target>/` (a tracked directory,
@@ -679,6 +717,24 @@ the find.
 > - **And** any violation makes the target panic with a message
 >   naming the scenario
 
+> **Scenario RFC0015.15 — an accepted query validates and lowers to
+> the DSL's own outcome** (amendment 2026-10-11, #964)
+> - **Given** the `dsl_parse` target and a log query either parser
+>   accepts
+> - **When** it is validated and lowered to its optimized logical plan
+>   against the current writer's schema and against a scan with every
+>   OPTIONAL column absent, with nothing executed
+> - **Then** nothing panics, and validation accepts it or rejects it
+>   with `InvalidQuery`
+> - **And** lowering rejects exactly what validation rejects, with the
+>   same error, and lowers what validation accepts to a plan, a
+>   provably empty result, or an `InvalidQuery`, never a `Storage`
+>   error carrying the engine's planning failure (`CLAUDE.md` §4.6)
+> - **And** the canonical re-parse validates to the same verdict and
+>   lowers to an equal plan or the same error
+> - **And** any violation makes the target panic with a message
+>   naming the scenario
+
 ## 6. Testing strategy
 
 Per `CLAUDE.md` §6.2, the fuzz targets *are* the tests — coverage-guided
@@ -751,6 +807,17 @@ greppable (`docs/verification.md` §2).
 > still report it as a crash), and ClusterFuzzLite does not stage the
 > target (§3.2 as amended); the
 > reproducer becomes a regression seed when #959 closes.
+
+> **Amendment (2026-10-11, #964, maintainer-approved): testing
+> RFC0015.15.** Each oracle was shown to fire before landing. A
+> validation that returns `Storage` for an unsupported stage, a panic
+> in the group-term lowering, a compile that lowers what validation
+> rejected, and a default window read off the wall clock instead of
+> the query clock each crashed a seed with the expected message, and
+> were reverted. The `Storage` arm fired on real defects first: the
+> seed `starts_with(body, "GET /")` (#960) and a run that mutated a
+> seed into an invalid regex class (#961). Their minimized inputs
+> become regression seeds once those fixes merge.
 
 ## 7. Open questions
 

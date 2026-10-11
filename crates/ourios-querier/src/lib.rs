@@ -91,6 +91,9 @@ mod decode;
 mod exec;
 mod fetch_count;
 mod file_set;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod stats;
 #[cfg(test)]
 mod test_support;
@@ -195,6 +198,33 @@ fn time_window_filter(
     let eff = || col(columns::EFFECTIVE_TIME_UNIX_NANO);
     let eff_window = eff().gt_eq(lo).and(eff().lt(hi));
     Ok(eff_window.or(eff().is_null().and(ts_window)))
+}
+
+/// Lower a validated aggregation stage over the filtered frame: the grouped
+/// `Aggregate` node `execute_aggregate` runs (`n`, plus `v` for a scalar
+/// stage).
+fn aggregate_frame(
+    df: datafusion::dataframe::DataFrame,
+    agg: &plan::Aggregate,
+    tenant: &TenantId,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
+    // aggregation: the scan is scoped to the tenant's partition prefix,
+    // but an aggregation returns group *values* and has no per-row
+    // check like `collect_records`' — a misplaced row under the prefix
+    // must neither skew the counts nor leak a foreign param value into
+    // a group key.
+    let df = df
+        .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
+        .map_err(storage_err)?;
+    let group_exprs = plan::group_exprs(&agg.by, df.schema())?;
+    // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
+    // the CAST-to-Float64 promoted column) when the stage carries one.
+    let mut aggr_exprs = vec![count(lit(1_i64)).alias(plan::COUNT_COLUMN)];
+    if let Some((func, path)) = &agg.scalar {
+        aggr_exprs.push(plan::scalar_agg_expr(*func, path, df.schema())?.alias(plan::VALUE_COLUMN));
+    }
+    df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)
 }
 
 /// Apply the [`QueryRequest`] predicate set as `DataFusion` filters. Returns
@@ -818,24 +848,7 @@ impl Querier {
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
     ) -> Result<QueryResult, QueryError> {
-        // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
-        // aggregation: the scan is scoped to the tenant's partition prefix,
-        // but an aggregation returns group *values* and has no per-row
-        // check like `collect_records`' — a misplaced row under the prefix
-        // must neither skew the counts nor leak a foreign param value into
-        // a group key.
-        let df = df
-            .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
-            .map_err(storage_err)?;
-        let group_exprs = plan::group_exprs(&agg.by, df.schema())?;
-        // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
-        // the CAST-to-Float64 promoted column) when the stage carries one.
-        let mut aggr_exprs = vec![count(lit(1_i64)).alias(plan::COUNT_COLUMN)];
-        if let Some((func, path)) = &agg.scalar {
-            aggr_exprs
-                .push(plan::scalar_agg_expr(*func, path, df.schema())?.alias(plan::VALUE_COLUMN));
-        }
-        let aggregated = df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)?;
+        let aggregated = aggregate_frame(df, agg, tenant)?;
         let (batches, scan) = execute_plan(aggregated, task_ctx).await?;
         let decoded = decode_aggregate(&batches, agg.by.len(), agg.scalar.is_some())?;
         Ok(QueryResult {

@@ -657,6 +657,26 @@ fn binding_conflict_act(
     );
 }
 
+/// The publish-size histogram recorded each published artifact's byte
+/// size (the number RFC0033.6 gates on): one sample per publish.
+fn assert_artifact_sizes(rms: &[ResourceMetrics], published: [u64; 3]) {
+    let AggregatedMetrics::U64(MetricData::Histogram(hist)) =
+        metric_data(rms, semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
+    else {
+        panic!("artifact.size should be a u64 histogram");
+    };
+    let (count, sum) = hist
+        .data_points()
+        .map(|dp| (dp.count(), dp.sum()))
+        .fold((0, 0), |(c, s), (dc, ds)| (c + dc, s + ds));
+    assert_eq!(count, 3, "one size sample per publish");
+    assert_eq!(
+        sum,
+        published.iter().sum::<u64>(),
+        "each sample is the published artifact's byte size",
+    );
+}
+
 /// Scenario RFC0033.7 — observable outcomes.
 /// Scenario RFC0033.9 — derive cost is observable (`assert_derive_metrics`).
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
@@ -739,23 +759,7 @@ fn rfc0033_7_observable_outcomes() {
     let expected: BTreeMap<String, u64> = [("published".to_string(), 3)].into_iter().collect();
     assert_eq!(publishes, expected, "three write-through publishes");
 
-    // The publish-size histogram recorded each published artifact's
-    // byte size (the number RFC0033.6 gates on).
-    let AggregatedMetrics::U64(MetricData::Histogram(hist)) =
-        metric_data(&rms, semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
-    else {
-        panic!("artifact.size should be a u64 histogram");
-    };
-    let (count, sum) = hist
-        .data_points()
-        .map(|dp| (dp.count(), dp.sum()))
-        .fold((0, 0), |(c, s), (dc, ds)| (c + dc, s + ds));
-    assert_eq!(count, 3, "one size sample per publish");
-    assert_eq!(
-        sum,
-        size_after_miss + size_after_stale + size_after_torn,
-        "each sample is the published artifact's byte size",
-    );
+    assert_artifact_sizes(&rms, [size_after_miss, size_after_stale, size_after_torn]);
     assert_derive_metrics(&rms, cold_audit_set);
     binding_conflict_act(&guard, &exporter, &rms);
     unknown_version_act(&guard, &exporter);

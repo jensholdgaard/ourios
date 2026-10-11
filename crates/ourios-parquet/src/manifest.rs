@@ -134,14 +134,22 @@ impl Manifest {
             .get_blocking_opt(MANIFEST_FILENAME)
             .map_err(store_io)?
         {
-            Some(bytes) => {
-                let manifest: Self =
-                    serde_json::from_slice(&bytes).map_err(ManifestError::Parse)?;
-                manifest.validate()?;
-                Ok(Some(manifest))
-            }
+            Some(bytes) => Self::from_json(&bytes).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Parse and [`validate`](Self::validate) manifest JSON bytes fetched
+    /// by the caller (for a reader that accounts for what it fetched).
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::Parse`] if the bytes aren't manifest JSON, or the
+    /// [`validate`](Self::validate) errors.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let manifest: Self = serde_json::from_slice(bytes).map_err(ManifestError::Parse)?;
+        manifest.validate()?;
+        Ok(manifest)
     }
 
     /// Validate the live set: every entry is a partition-local
@@ -221,12 +229,7 @@ impl Manifest {
         key: &str,
     ) -> Result<Option<(Self, Option<String>)>, ManifestError> {
         match store.get_with_etag_blocking_opt(key).map_err(store_io)? {
-            Some((bytes, e_tag)) => {
-                let manifest: Self =
-                    serde_json::from_slice(&bytes).map_err(ManifestError::Parse)?;
-                manifest.validate()?;
-                Ok(Some((manifest, e_tag)))
-            }
+            Some((bytes, e_tag)) => Ok(Some((Self::from_json(&bytes)?, e_tag))),
             None => Ok(None),
         }
     }

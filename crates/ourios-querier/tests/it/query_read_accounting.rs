@@ -55,6 +55,16 @@ fn parquet_files(root: &std::path::Path) -> (u64, u64, u64) {
 }
 
 async fn run(bucket: &std::path::Path, dsl: &str) -> QueryResult {
+    run_with(bucket, dsl, Some(&no_aliases())).await
+}
+
+/// `dsl` with `aliases` as the caller-held alias projection; `None` makes
+/// a `resolves_to` query acquire the template map at compile time.
+async fn run_with(
+    bucket: &std::path::Path,
+    dsl: &str,
+    aliases: Option<&ourios_core::alias::AliasMap>,
+) -> QueryResult {
     let query = ourios_querier::dsl::parse(dsl).expect("parse DSL");
     Querier::new(bucket)
         .run_query(
@@ -62,7 +72,7 @@ async fn run(bucket: &std::path::Path, dsl: &str) -> QueryResult {
             &TenantId::new("acme"),
             NOW,
             DEFAULT_WINDOW_NS,
-            Some(&no_aliases()),
+            aliases,
         )
         .await
         .expect("query")
@@ -154,5 +164,118 @@ async fn a_drift_query_reports_both_scans_reads() {
          footer bytes",
         result.bytes_fetched,
         result.stats.bytes_read,
+    );
+}
+
+/// Write a manifest naming every committed file into each data partition,
+/// returning the manifests' total bytes.
+fn write_manifests(bucket: &std::path::Path) -> u64 {
+    let mut stack = vec![bucket.join("data")];
+    let mut written = 0;
+    while let Some(dir) = stack.pop() {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("list data dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                let name = path.file_name().expect("file name").to_string_lossy();
+                files.push(name.into_owned());
+            }
+        }
+        if !files.is_empty() {
+            let manifest = ourios_parquet::Manifest {
+                generation: 1,
+                files,
+            };
+            manifest.write_atomic(&dir).expect("write manifest");
+            let path = dir.join(ourios_parquet::MANIFEST_FILENAME);
+            written += std::fs::metadata(path).expect("stat manifest").len();
+        }
+    }
+    written
+}
+
+/// File-set resolution reads each partition's manifest before any table
+/// exists; those bytes are fetched too. The manifests name exactly the
+/// files the glob fallback would, so the scan is unchanged and the
+/// difference is the manifests alone.
+#[tokio::test]
+async fn manifest_reads_are_counted() {
+    let bucket = store();
+    let without = run(bucket.path(), "template_id == 1").await;
+    let manifests = write_manifests(bucket.path());
+    assert!(manifests > 0, "every partition got a manifest");
+
+    let with = run(bucket.path(), "template_id == 1").await;
+
+    assert_eq!(with.rows, without.rows);
+    assert_eq!(with.stats.files_opened, without.stats.files_opened);
+    assert_eq!(
+        with.bytes_fetched,
+        without.bytes_fetched + manifests,
+        "the manifests' bytes are the only difference",
+    );
+}
+
+/// The store plus an audit stream for its templates, so a `resolves_to`
+/// query has a template map to acquire.
+fn store_with_audit() -> (TempDir, u64) {
+    let bucket = store();
+    let events: Vec<_> = (0..FILES)
+        .map(|k| crate::common::widened("acme", 1 + k, 1, TS0 + k))
+        .collect();
+    crate::common::write_audit(bucket.path(), &events);
+    let (_, audit_bytes, _) = parquet_files(&bucket.path().join("audit"));
+    (bucket, audit_bytes)
+}
+
+/// A `resolves_to` query acquires the template map at compile time. When it
+/// renders no row, `registry_bytes_read` stays `0` (it reports the map
+/// behind rendered rows), so the acquisition is in `bytes_fetched` and the
+/// total still includes it.
+#[tokio::test]
+async fn an_unrendered_acquisition_is_still_counted() {
+    let (bucket, audit_bytes) = store_with_audit();
+    // The same query with a caller-held projection acquires nothing.
+    let without = run(bucket.path(), "resolves_to(99) | limit 10").await;
+    assert_eq!(without.bytes_fetched, without.total_bytes_read());
+
+    let result = run_with(bucket.path(), "resolves_to(99) | limit 10", None).await;
+
+    assert_eq!(result.rows, 0);
+    assert_eq!(result.registry_bytes_read, 0, "no row was rendered");
+    assert_eq!(
+        result.bytes_fetched,
+        without.bytes_fetched + audit_bytes,
+        "the cold fold's audit bytes are counted on top of the table reads",
+    );
+    assert_eq!(result.total_bytes_read(), result.bytes_fetched);
+}
+
+/// When the compile-time acquisition's map renders rows, the renderer
+/// reuses it and reports it in `registry_bytes_read`: the table reads in
+/// `bytes_fetched` are exactly those of the same query run without a
+/// compile-time acquisition, so the map is not counted twice.
+#[tokio::test]
+async fn a_rendered_acquisition_is_counted_once() {
+    let (bucket, _) = store_with_audit();
+    // Warm the artifact so both runs below acquire the same way (a hit).
+    run_with(bucket.path(), "resolves_to(1) | limit 10", None).await;
+
+    let compiled = run_with(bucket.path(), "resolves_to(1) | limit 10", None).await;
+    let lazy = run(bucket.path(), "resolves_to(1) | limit 10").await;
+
+    assert_eq!(compiled.rows, 1);
+    assert_eq!(compiled.records.len(), 1);
+    assert!(compiled.registry_bytes_read > 0, "the rendered map's bytes");
+    assert_eq!(compiled.registry_bytes_read, lazy.registry_bytes_read);
+    assert_eq!(
+        compiled.bytes_fetched, lazy.bytes_fetched,
+        "the acquisition is in registry_bytes_read only",
+    );
+    assert_eq!(
+        compiled.total_bytes_read(),
+        compiled.bytes_fetched + compiled.registry_bytes_read,
     );
 }

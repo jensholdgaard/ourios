@@ -7,6 +7,8 @@
 // unchanged.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::fetch_count::FetchCounter;
+use ourios_parquet::ManifestError;
 
 /// Resolve the live data files a query must read under `dir` (a
 /// tenant's partition root), honouring the RFC 0009 §3.4
@@ -30,9 +32,12 @@ use super::*;
 /// denied, transient failure) is propagated as [`QueryError::Storage`]
 /// rather than silently masked as "no data" — a wrong zero-row answer
 /// is worse than a surfaced error.
+///
+/// Every manifest byte read is added to `fetched`.
 pub(super) fn resolve_live_files(
     dir: &std::path::Path,
     window: Option<(u64, u64)>,
+    fetched: &FetchCounter,
 ) -> Result<Vec<PathBuf>, QueryError> {
     let io_err = |op: &str, p: &std::path::Path, e: &std::io::Error| QueryError::Storage {
         detail: format!("{op} {}: {e}", p.display()),
@@ -71,7 +76,7 @@ pub(super) fn resolve_live_files(
         // path it can't prove out of range, so no in-window data is lost.
         let keep = window.is_none_or(|(start, end)| hour_partition_in_window(&d, start, end));
         if keep {
-            match Manifest::read(&d).map_err(|e| QueryError::Storage {
+            match read_local_manifest(&d, fetched).map_err(|e| QueryError::Storage {
                 detail: format!("manifest in {}: {e}", d.display()),
             })? {
                 // Manifest is authoritative: only its named files are live.
@@ -101,6 +106,22 @@ pub(super) fn resolve_live_files(
     Ok(files)
 }
 
+/// `<partition_dir>/manifest.json`, counting the bytes read into `fetched`;
+/// `Ok(None)` when absent (the glob fallback), as [`Manifest::read`].
+fn read_local_manifest(
+    partition_dir: &std::path::Path,
+    fetched: &FetchCounter,
+) -> Result<Option<Manifest>, ManifestError> {
+    match std::fs::read(partition_dir.join(MANIFEST_FILENAME)) {
+        Ok(bytes) => {
+            fetched.add(bytes.len() as u64);
+            Manifest::from_json(&bytes).map(Some)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ManifestError::Io(e)),
+    }
+}
+
 /// The S3 analog of [`resolve_live_files`]: resolve the live data-file **keys**
 /// under the tenant's `prefix` through the [`Store`] seam (RFC 0019 §3.3),
 /// honouring partition-level time pruning + the RFC 0009 §3.4 per-partition
@@ -126,12 +147,13 @@ pub(super) fn resolve_live_keys(
     store: &Store,
     prefix: &str,
     window: Option<(u64, u64)>,
+    fetched: &FetchCounter,
 ) -> Result<Vec<String>, QueryError> {
     let keys = match window {
         Some(window) => window_listing(store, prefix, window)?,
         None => list_recursive(store, prefix)?,
     };
-    live_keys_from_listing(store, &keys, window)
+    live_keys_from_listing(store, &keys, window, fetched)
 }
 
 fn list_recursive(store: &Store, prefix: &str) -> Result<Vec<String>, QueryError> {
@@ -278,15 +300,36 @@ fn child_span(level: HiveLevel, segment: &str) -> Option<(HiveLevel, u64, u64)> 
     Some((next, lo, hi))
 }
 
+/// The manifest at `key` in `store`, counting the bytes read into
+/// `fetched`; `Ok(None)` when absent.
+fn read_store_manifest(
+    store: &Store,
+    key: &str,
+    fetched: &FetchCounter,
+) -> Result<Option<Manifest>, ManifestError> {
+    match store
+        .get_blocking_opt(key)
+        .map_err(|e| ManifestError::Io(std::io::Error::other(e)))?
+    {
+        Some(bytes) => {
+            fetched.add(bytes.len() as u64);
+            Manifest::from_json(&bytes).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
 /// The per-partition half of [`resolve_live_keys`]: group `keys` by partition
 /// directory, drop the partitions an `hour=HH` window prune proves out of
 /// range, and resolve each remaining one through its manifest or the glob
 /// fallback. `keys` must hold every key of each partition it touches — a
-/// partition's manifest counts only when it is in the same listing.
+/// partition's manifest counts only when it is in the same listing. Every
+/// manifest byte read is added to `fetched`.
 fn live_keys_from_listing(
     store: &Store,
     keys: &[String],
     window: Option<(u64, u64)>,
+    fetched: &FetchCounter,
 ) -> Result<Vec<String>, QueryError> {
     // Group keys by partition directory (the key up to its last `/`).
     let mut by_partition: std::collections::BTreeMap<&str, Vec<&str>> =
@@ -315,7 +358,7 @@ fn live_keys_from_listing(
         // glob fallback). `list_blocking` returns store-relative keys, so this
         // compares like-for-like.
         let manifest = if partition_keys.iter().any(|k| *k == manifest_key) {
-            Manifest::read_with_etag(store, &manifest_key).map_err(|e| QueryError::Storage {
+            read_store_manifest(store, &manifest_key, fetched).map_err(|e| QueryError::Storage {
                 detail: format!("manifest {manifest_key}: {e}"),
             })?
         } else {
@@ -324,7 +367,7 @@ fn live_keys_from_listing(
         match manifest {
             // Manifest is authoritative: only its named files are live (joined
             // onto the partition key as `<dir>/<name>`).
-            Some((manifest, _etag)) => {
+            Some(manifest) => {
                 live.extend(
                     manifest
                         .files
@@ -692,7 +735,13 @@ mod tests {
     /// The pre-#853 resolution: list every key under the tenant, then prune.
     fn full_listing_oracle(store: &Store, window: Option<Window>) -> Vec<String> {
         let keys = store.list_blocking(Some(TENANT_PREFIX)).expect("list");
-        live_keys_from_listing(store, &keys, window).expect("resolve")
+        live_keys_from_listing(
+            store,
+            &keys,
+            window,
+            &crate::fetch_count::FetchCounter::default(),
+        )
+        .expect("resolve")
     }
 
     /// #853: a ten-minute window lists only the one hour it can reach, and
@@ -708,7 +757,13 @@ mod tests {
         let in_window_hour = hour_prefix(2026, 4, 2, 10);
 
         // Act
-        let live = resolve_live_keys(&wrapped, TENANT_PREFIX, Some(window)).expect("resolve");
+        let live = resolve_live_keys(
+            &wrapped,
+            TENANT_PREFIX,
+            Some(window),
+            &crate::fetch_count::FetchCounter::default(),
+        )
+        .expect("resolve");
 
         // Assert
         assert_eq!(
@@ -758,7 +813,13 @@ mod tests {
         let window = (ns("2025-01-01T00:00"), ns("2025-03-02T06:00"));
 
         // Act
-        let live = resolve_live_keys(&wrapped, TENANT_PREFIX, Some(window)).expect("resolve");
+        let live = resolve_live_keys(
+            &wrapped,
+            TENANT_PREFIX,
+            Some(window),
+            &crate::fetch_count::FetchCounter::default(),
+        )
+        .expect("resolve");
 
         // Assert
         assert_eq!(live, full_listing_oracle(&plain, Some(window)));
@@ -846,7 +907,13 @@ mod tests {
             ("no window", None, &[]),
         ];
         for (name, window, skipped) in cases {
-            let walked = resolve_live_keys(&store, TENANT_PREFIX, window).expect("resolve");
+            let walked = resolve_live_keys(
+                &store,
+                TENANT_PREFIX,
+                window,
+                &crate::fetch_count::FetchCounter::default(),
+            )
+            .expect("resolve");
             let mut expected = full_listing_oracle(&store, window);
             for key in skipped {
                 assert!(
@@ -882,17 +949,26 @@ mod tests {
             None,
         ];
         for window in windows {
-            let mut local: Vec<String> = resolve_live_files(&tenant_dir, window)
-                .expect("local resolve")
-                .into_iter()
-                .map(|path| {
-                    let relative = path.strip_prefix(tmp.path()).expect("under the root");
-                    relative.to_str().expect("utf-8 key").to_owned()
-                })
-                .collect();
+            let mut local: Vec<String> = resolve_live_files(
+                &tenant_dir,
+                window,
+                &crate::fetch_count::FetchCounter::default(),
+            )
+            .expect("local resolve")
+            .into_iter()
+            .map(|path| {
+                let relative = path.strip_prefix(tmp.path()).expect("under the root");
+                relative.to_str().expect("utf-8 key").to_owned()
+            })
+            .collect();
             local.sort_unstable();
-            let mut remote =
-                resolve_live_keys(&store, TENANT_PREFIX, window).expect("remote resolve");
+            let mut remote = resolve_live_keys(
+                &store,
+                TENANT_PREFIX,
+                window,
+                &crate::fetch_count::FetchCounter::default(),
+            )
+            .expect("remote resolve");
             remote.sort_unstable();
             assert_eq!(local, remote, "window {window:?}");
         }
@@ -913,7 +989,13 @@ mod tests {
             Some((0, u64::MAX)),
             Some((ns("2026-04-02T10:00"), ns("2026-04-02T11:00"))),
         ] {
-            let live = resolve_live_keys(&store, TENANT_PREFIX, window).expect("resolve");
+            let live = resolve_live_keys(
+                &store,
+                TENANT_PREFIX,
+                window,
+                &crate::fetch_count::FetchCounter::default(),
+            )
+            .expect("resolve");
             assert!(live.is_empty(), "window {window:?}: {live:?}");
         }
     }
@@ -934,7 +1016,8 @@ mod tests {
         let ghost = tmp.path().join("data/tenant_id=ghost");
 
         // Act
-        let files = resolve_live_files(&ghost, None).expect("resolve");
+        let files = resolve_live_files(&ghost, None, &crate::fetch_count::FetchCounter::default())
+            .expect("resolve");
 
         // Assert
         assert!(files.is_empty());
@@ -948,7 +1031,8 @@ mod tests {
         std::fs::write(partition.join("x.parquet.tmp"), b"partial").expect("write tmp");
 
         // Act
-        let files = resolve_live_files(&tenant, None).expect("resolve");
+        let files = resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default())
+            .expect("resolve");
 
         // Assert
         assert!(files.is_empty(), "uncommitted .tmp files are not live");
@@ -963,7 +1047,8 @@ mod tests {
         std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
 
         // Act
-        let files = resolve_live_files(&tenant, None).expect("resolve");
+        let files = resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default())
+            .expect("resolve");
 
         // Assert
         assert_eq!(
@@ -991,7 +1076,8 @@ mod tests {
         .expect("write manifest");
 
         // Act
-        let files = resolve_live_files(&tenant, None).expect("resolve");
+        let files = resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default())
+            .expect("resolve");
 
         // Assert
         assert_eq!(files.len(), 1, "only the manifest's file is live");
@@ -1011,7 +1097,8 @@ mod tests {
         .expect("write manifest");
 
         // Act
-        let result = resolve_live_files(&tenant, None);
+        let result =
+            resolve_live_files(&tenant, None, &crate::fetch_count::FetchCounter::default());
 
         // Assert
         assert!(matches!(result, Err(QueryError::Storage { .. })));

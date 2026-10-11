@@ -1,6 +1,6 @@
-//! Per-session storage-read accounting: every byte a query session's table
-//! reads fetch through its object stores, footer reads during schema
-//! inference included.
+//! Per-session storage-read accounting: every byte a query session fetches,
+//! through its object stores (footer reads during schema inference
+//! included) and as the partition manifests file-set resolution reads.
 //!
 //! The scan's own `bytes_scanned` metric (`QueryStats::bytes_read`) only
 //! sees the executed plan. Per-file schema inference in
@@ -10,12 +10,10 @@
 //! sees both.
 
 use std::fmt;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::object_store::path::Path;
 use datafusion::object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -31,7 +29,7 @@ use futures::stream::BoxStream;
 pub(crate) struct FetchCounter(AtomicU64);
 
 impl FetchCounter {
-    fn add(&self, bytes: u64) {
+    pub(crate) fn add(&self, bytes: u64) {
         self.0.fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -108,12 +106,10 @@ impl ObjectStore for CountingStore {
         Ok(result)
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let parts = self.inner.get_ranges(location, ranges).await?;
-        self.counter
-            .add(parts.iter().map(|b| b.len() as u64).sum::<u64>());
-        Ok(parts)
-    }
+    // `get_ranges` keeps the trait default on purpose: it coalesces nearby
+    // ranges and fetches each merged span through `get_opts` above, so the
+    // gap bytes a coalesced fetch transfers are counted too. Delegating to
+    // `inner.get_ranges` would hide them behind the requested parts.
 
     fn delete_stream(
         &self,
@@ -171,11 +167,19 @@ mod tests {
         store.get_opts(&path, suffix).await.expect("get suffix");
         assert_eq!(counter.get(), 8, "a ranged GET counts its range");
 
-        store
+        let parts = store
             .get_ranges(&path, &[0..10, 20..25])
             .await
             .expect("get ranges");
-        assert_eq!(counter.get(), 23);
+        assert_eq!(
+            parts.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
+            vec![10, 5]
+        );
+        assert_eq!(
+            counter.get(),
+            8 + 25,
+            "nearby ranges coalesce into one fetch of 0..25, gap included",
+        );
 
         store
             .get(&path)
@@ -184,6 +188,30 @@ mod tests {
             .bytes()
             .await
             .expect("body");
-        assert_eq!(counter.get(), 123, "a whole GET counts the object");
+        assert_eq!(counter.get(), 133, "a whole GET counts the object");
+    }
+
+    /// Ranges further apart than the coalescing distance are fetched
+    /// separately, so only their own bytes are counted.
+    #[tokio::test]
+    async fn separated_ranges_count_only_their_own_bytes() {
+        const FAR: u64 = 4 * 1024 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("big.parquet");
+        let size = usize::try_from(FAR + 100).expect("fits usize");
+        inner.put(&path, vec![1u8; size].into()).await.expect("put");
+        let counter = Arc::new(FetchCounter::default());
+        let store = CountingStore::new(inner, Arc::clone(&counter));
+
+        let parts = store
+            .get_ranges(&path, &[0..10, FAR..FAR + 5])
+            .await
+            .expect("get ranges");
+
+        assert_eq!(
+            parts.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
+            vec![10, 5]
+        );
+        assert_eq!(counter.get(), 15, "two separate fetches, no gap");
     }
 }

@@ -99,10 +99,11 @@ pub struct QueryOptions {
     /// predicate over the same file set, and a limit that was never reached
     /// cannot stop the scan early, so the counts are the ones the count
     /// scan would have reported), but `stats.bytes_read` is `0` — the count
-    /// scan genuinely read nothing. The three-component sum with
-    /// [`QueryResult::materialize_bytes_read`] /
-    /// [`QueryResult::registry_bytes_read`] therefore remains the honest
-    /// total IO. Callers needing the pinned "a limited query's `stats`
+    /// scan genuinely read nothing. `stats.bytes_read`,
+    /// [`QueryResult::materialize_bytes_read`] and
+    /// [`QueryResult::registry_bytes_read`] stay the scan-specific
+    /// components; the query's total IO, under elision or not, is
+    /// [`QueryResult::total_bytes_read`]. Callers needing the pinned "a limited query's `stats`
     /// equal a count-only query's" shape (RFC 0017 §3.4) keep the default.
     pub elide_count_scan: bool,
     /// RFC 0047 §3.4 layer-2 visibility: `None` = no rewrite (open mode,
@@ -153,8 +154,9 @@ pub struct QueryResult {
     /// the ≤ `limit` returned `records` (RFC 0031 §3.6). `0` for a
     /// count-only query. Additive to `stats.bytes_read`, which keeps its
     /// count/pruning-scan-only meaning (B1/B2 gates and the RFC 0016
-    /// metrics depend on that semantics) — a caller wanting the honest
-    /// total IO for one query sums the three components.
+    /// metrics depend on that semantics). Both are scan-specific
+    /// components; the query's total IO, footer and manifest reads
+    /// included, is [`Self::total_bytes_read`].
     pub materialize_bytes_read: u64,
     /// The executed aggregation's grouped-count map (RFC 0002 §6.5
     /// amendment 2026-07-15) — `Some` iff the query carried a `count [by …]`
@@ -178,18 +180,21 @@ pub struct QueryResult {
     /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
-    /// Every byte the query's table reads fetched from storage: the footers
-    /// schema inference read, the count scan and the row materialization.
-    /// Unlike `stats.bytes_read` + `materialize_bytes_read` it includes the
-    /// reads made before a plan exists. The template-map acquisition is
-    /// `registry_bytes_read`.
+    /// Every byte the query fetched from storage that
+    /// [`Self::registry_bytes_read`] does not report: the partition
+    /// manifests file-set resolution read, the footers schema inference
+    /// read, the count scan and the row materialization, plus a
+    /// compile-time template-map acquisition (a `resolves_to` query) whose
+    /// map rendered no row. Unlike `stats.bytes_read` +
+    /// `materialize_bytes_read` it includes the reads made before a plan
+    /// exists.
     pub bytes_fetched: u64,
 }
 
 impl QueryResult {
-    /// Every byte the query fetched from storage: its table reads
-    /// ([`Self::bytes_fetched`], footer reads included) plus the
-    /// template-map acquisition.
+    /// Every byte the query fetched from storage:
+    /// [`Self::bytes_fetched`] plus the template-map acquisition behind the
+    /// rendered rows.
     #[must_use]
     pub fn total_bytes_read(&self) -> u64 {
         self.bytes_fetched.saturating_add(self.registry_bytes_read)

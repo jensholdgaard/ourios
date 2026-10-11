@@ -667,6 +667,7 @@ impl Querier {
         let data_prefix = format!("data/tenant_id={enc}");
 
         let ctx = crate::exec::session();
+        let compile_acquisition = acquired.as_ref().map(|a| a.acquisition_bytes);
         // Resolve the live file set under the tenant's `data/` prefix,
         // honouring the RFC 0009 §3.4 manifest (glob-fallback when absent),
         // and produce the per-file table URLs (local absolute path, or
@@ -679,7 +680,8 @@ impl Querier {
             .resolve_data_urls(&ctx, &data_prefix, partition_window)
             .await?;
         if urls.is_empty() {
-            return Ok(empty_result(terminal.aggregate()));
+            let result = empty_result(terminal.aggregate());
+            return Ok(with_fetched(result, &ctx, compile_acquisition));
         }
         let files_opened = urls.len() as u64;
 
@@ -697,8 +699,7 @@ impl Querier {
             }
         };
         result.stats.files_opened = files_opened;
-        result.bytes_fetched = crate::fetch_count::fetched(&ctx);
-        Ok(result)
+        Ok(with_fetched(result, &ctx, compile_acquisition))
     }
 
     /// Run `terminal` over the filtered frame `df` (see [`Self::execute`],
@@ -762,19 +763,9 @@ impl Querier {
             early = Some(collected);
         }
 
-        // Count via an aggregate so the heavy `attributes` /
-        // `params` / `body` columns are never materialised
-        // (projection pushdown). We build + execute the physical
-        // plan ourselves (rather than `df.count()`) so we can read
-        // the scan's pruning metrics off the retained plan. Clone
-        // `df` first so the (RFC 0017) row collection below reads the
-        // same filtered frame.
-        let counted = df
-            .clone()
-            .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
-            .map_err(storage_err)?;
-        let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
-        let rows = count_value(&batches)?;
+        // Clone `df` so the (RFC 0017) row collection below reads the same
+        // filtered frame.
+        let (rows, stats) = count_scan(df.clone(), ctx).await?;
 
         // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the
         // matching rows (the same filtered frame, capped at the limit), decode
@@ -1018,11 +1009,13 @@ impl Querier {
         prefix: &str,
         window: Option<(u64, u64)>,
     ) -> Result<Vec<ListingTableUrl>, QueryError> {
+        // The manifest reads count toward the session's fetched bytes.
+        let fetched = fetch_count::counter(ctx).unwrap_or_default();
         let resolved = self
             .spawn_blocking_io({
                 let backend = self.backend.clone();
                 let prefix = prefix.to_owned();
-                move || resolve_live_set(&backend, &prefix, window)
+                move || resolve_live_set(&backend, &prefix, window, &fetched)
             })
             .await?;
         match (resolved, &self.backend) {
@@ -1066,6 +1059,40 @@ impl Querier {
     }
 }
 
+/// `result` with its `bytes_fetched`: what `ctx` fetched, plus the bytes
+/// of a compile-time template-map acquisition (a `resolves_to` query) that
+/// no rendered row reported in `registry_bytes_read`. When rows were
+/// rendered, the renderer reused that same acquisition and reported it
+/// there, so it is not counted twice.
+fn with_fetched(
+    mut result: QueryResult,
+    ctx: &SessionContext,
+    compile_acquisition: Option<u64>,
+) -> QueryResult {
+    let unrendered = match (compile_acquisition, result.registry_bytes_read) {
+        (Some(bytes), 0) => bytes,
+        _ => 0,
+    };
+    result.bytes_fetched = crate::fetch_count::fetched(ctx).saturating_add(unrendered);
+    result
+}
+
+/// Count the filtered frame's rows via an aggregate, so the heavy
+/// `attributes` / `params` / `body` columns are never materialised
+/// (projection pushdown). The physical plan is built and executed here
+/// (rather than `df.count()`) so the scan's pruning metrics can be read
+/// off the retained plan.
+async fn count_scan(
+    df: datafusion::dataframe::DataFrame,
+    ctx: &SessionContext,
+) -> Result<(u64, QueryStats), QueryError> {
+    let counted = df
+        .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
+        .map_err(storage_err)?;
+    let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
+    Ok((count_value(&batches)?, stats))
+}
+
 /// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
 /// the local backend, store keys on S3 (their URLs need the query's
 /// `SessionContext`, which stays on the async side).
@@ -1080,14 +1107,17 @@ fn resolve_live_set(
     backend: &Backend,
     prefix: &str,
     window: Option<(u64, u64)>,
+    fetched: &fetch_count::FetchCounter,
 ) -> Result<LiveSet, QueryError> {
     match backend {
         Backend::Local(root) => {
             let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window)?;
+            let live_files = resolve_live_files(&tenant_dir, window, fetched)?;
             local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
         }
-        Backend::Remote(store) => resolve_live_keys(store, prefix, window).map(LiveSet::Keys),
+        Backend::Remote(store) => {
+            resolve_live_keys(store, prefix, window, fetched).map(LiveSet::Keys)
+        }
     }
 }
 

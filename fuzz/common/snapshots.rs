@@ -1,14 +1,15 @@
 //! Version-keyed template snapshots for the miner oracles, taken from the
-//! live tree right after each ingest; //! shared as a source file (each target pulls it in with `#[path]`, like
-//! `telemetry.rs`) so the fuzz package keeps no library API (RFC 0015 §3.1).
-
-#![deny(unsafe_code)]
-
+//! live tree right after each ingest. Shared as a source file (each target
+//! pulls it in with `#[path]`, like `telemetry.rs`) so the fuzz package keeps
+//! no library API (RFC 0015 §3.1).
+//!
 //! Templates are looked up by `(template_id, template_version)`, the read
 //! path's registry key (RFC 0017 §3.5). A property batch rarely widens a
 //! template, so rendering every row against the leaf's *latest* tokens passes
 //! there; a fuzzer widens within its first few inputs, and a row stamped
 //! version N must render against the N-version tokens.
+
+#![deny(unsafe_code)]
 
 use std::collections::HashMap;
 

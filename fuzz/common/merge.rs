@@ -1,8 +1,9 @@
 //! The per-row §3.1 no-silent-merge oracles for the miner target, ported
 //! from the RFC 0024 property suite's `assert_no_silent_merge`
 //! (`crates/ourios-miner/tests/it/rfc0024_properties.rs`) and keyed by
-//! template version (`snapshots.rs`); //! shared as a source file (each target pulls it in with `#[path]`, like
-//! `telemetry.rs`) so the fuzz package keeps no library API (RFC 0015 §3.1).
+//! template version (`snapshots.rs`). Shared as a source file (each target
+//! pulls it in with `#[path]`, like `telemetry.rs`) so the fuzz package keeps
+//! no library API (RFC 0015 §3.1).
 
 #![deny(unsafe_code)]
 

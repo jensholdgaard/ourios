@@ -1,8 +1,9 @@
 //! The §3.1 audit-chain oracle for the miner target: every template an
 //! ingest created, widened or type-expanded is accounted for by its audit
 //! events, replayed on typed tokens and slot types against the tree before
-//! and after; //! shared as a source file (each target pulls it in with `#[path]`, like
-//! `telemetry.rs`) so the fuzz package keeps no library API (RFC 0015 §3.1).
+//! and after. Shared as a source file (each target pulls it in with
+//! `#[path]`, like `telemetry.rs`) so the fuzz package keeps no library API
+//! (RFC 0015 §3.1).
 
 #![deny(unsafe_code)]
 

@@ -896,8 +896,10 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(
+                provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test")),
+            ));
         let guard = tracing::subscriber::set_default(subscriber);
         let _ = run_graph_verb_traced(verb, Some(config_path.as_path())).await;
         drop(guard);

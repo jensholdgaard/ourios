@@ -34,7 +34,10 @@ impl Harness {
             .with_periodic_exporter(exporter.clone())
             .build();
         let registry = Arc::new(GaugeRegistry::default());
-        let gauges = register(&provider.meter(METER_NAME), &registry);
+        let gauges = register(
+            &provider.meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
+            &registry,
+        );
         Self {
             provider,
             exporter,
@@ -44,7 +47,12 @@ impl Harness {
     }
 
     fn cluster_metrics(&self) -> MinerMetrics {
-        MinerMetrics::with_registry(&self.provider.meter(METER_NAME), &self.registry)
+        MinerMetrics::with_registry(
+            &self
+                .provider
+                .meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
+            &self.registry,
+        )
     }
 
     /// One collection: every gauge point, keyed by metric name and then
@@ -240,7 +248,10 @@ fn binding_is_keyed_by_provider_identity() {
     let a = registry_for(&first, &slot);
     assert!(Arc::ptr_eq(&a, &registry_for(&first, &slot)));
 
-    let early = MinerMetrics::with_registry(&first.meter(METER_NAME), &a);
+    let early = MinerMetrics::with_registry(
+        &first.meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
+        &a,
+    );
     early.set_template_count(&TenantId::new("early"), 1);
 
     let (second, second_exporter) = sdk_provider();
@@ -248,7 +259,10 @@ fn binding_is_keyed_by_provider_identity() {
     let second: Arc<dyn MeterProvider + Send + Sync> = Arc::new(second);
     let b = registry_for(&second, &slot);
     assert!(!Arc::ptr_eq(&a, &b));
-    let late = MinerMetrics::with_registry(&second.meter(METER_NAME), &b);
+    let late = MinerMetrics::with_registry(
+        &second.meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
+        &b,
+    );
     late.set_template_count(&TenantId::new("late"), 2);
 
     // A -> B -> A: switching back reuses A's registry instead of

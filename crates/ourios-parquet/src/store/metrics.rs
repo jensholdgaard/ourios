@@ -664,7 +664,7 @@ mod tests {
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
     use ourios_semconv as semconv;
 
-    use super::{Caller, Metrics, Operation, StoreMetrics};
+    use super::{Caller, Metrics, Operation, SCOPE, StoreMetrics};
     use crate::store::{MAX_BRIDGE_WORKERS, S3Config, Store, StoreError, block_on_off_runtime};
 
     /// Storage instruments of their own, exporting in memory.
@@ -696,7 +696,7 @@ mod tests {
                 .with_periodic_exporter(exporter.clone())
                 .build();
             let metrics = Metrics::Owned(Arc::new(StoreMetrics::from_meter(
-                &provider.meter("ourios.storage"),
+                &provider.meter_with_scope(ourios_core::telemetry::scope(SCOPE)),
             )));
             Self {
                 provider,

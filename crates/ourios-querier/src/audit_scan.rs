@@ -323,7 +323,7 @@ fn read_local(path: &Path) -> Result<(u64, Vec<AuditEvent>), QueryError> {
 /// One fetched audit object's byte count and decoded events.
 fn decode_remote(key: &str, bytes: bytes::Bytes) -> Result<(u64, Vec<AuditEvent>), QueryError> {
     let len = bytes.len() as u64;
-    let events = AuditReader::open_bytes(bytes)
+    let events = AuditReader::open_object_bytes(bytes, key)
         .and_then(AuditReader::read_all)
         .map_err(|e| QueryError::Storage {
             detail: format!("audit file {key}: {e}"),

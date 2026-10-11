@@ -56,6 +56,7 @@ pub use compaction::{
     compact_partition_with_promoted, compact_partition_with_sort_budget, gc_orphans,
     hour_partitions, plan_candidates,
 };
+pub use decode::ERROR_TYPE_DECODE_PANICKED;
 pub use id_max::{FooterMax, IdColumns, IdMaxError, decoded_max, footer_max, object_max_id};
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 pub use partition::{

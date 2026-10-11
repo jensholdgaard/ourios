@@ -112,6 +112,7 @@ impl TemplateIdsError {
             Self::Malformed { .. } => "malformed",
             Self::LaterVersion { .. } => "later_version",
             Self::Contended => "contended",
+            Self::Scan(e) if e.is_decode_panicked() => ourios_parquet::ERROR_TYPE_DECODE_PANICKED,
             Self::Scan(_) => "scan",
             Self::Interrupted { .. } => "interrupted",
             Self::Exhausted(_) => "exhausted",

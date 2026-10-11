@@ -3,8 +3,9 @@
 //! RFC0015.1 / RFC0015.10 — the §3.3 bit-identical-reconstruction and the
 //! §3.1 no-silent-merge oracles over a *sequence* of lines.
 //!
-//! The input is split on `\n`; every line is ingested as a `String`-body
-//! record into one `MinerCluster` for one tenant, so the fuzzer drives the
+//! The input is a sequence of length-prefixed bodies ([`records`]; a body may
+//! contain `\n`); every one is ingested as a `String`-body record into one
+//! `MinerCluster` for one tenant, so the fuzzer drives the
 //! Drain walk through creation, clean reuse, widening and type expansion,
 //! not just one line against an empty tree. Right after each ingest the leaf
 //! the record was stamped with is snapshotted by `(template_id,
@@ -53,15 +54,32 @@ const MAX_LINE_BYTES: usize = 4096;
 // defaults, 20 000 leaves).
 const MAX_LINES: usize = 64;
 
+/// Split the input into record bodies: each is a little-endian `u16` length
+/// (capped at [`MAX_LINE_BYTES`]) followed by that many bytes, at most
+/// [`MAX_LINES`] records. Length-prefixed rather than split on `\n`, so a body
+/// can hold every byte, LF included — the tokenizer treats LF as a separator
+/// whose exact bytes reconstruction must reproduce. A length past the end
+/// takes what is left; a trailing lone byte is ignored. Lossy UTF-8, never
+/// discarding an input: a cut mid-character becomes U+FFFD, which is still a
+/// body the receiver could deliver.
+fn records(mut data: &[u8]) -> Vec<String> {
+    let mut bodies = Vec::new();
+    while bodies.len() < MAX_LINES {
+        let [low, high, rest @ ..] = data else {
+            break;
+        };
+        let len = usize::from(u16::from_le_bytes([*low, *high]))
+            .min(MAX_LINE_BYTES)
+            .min(rest.len());
+        let (body, tail) = rest.split_at(len);
+        bodies.push(String::from_utf8_lossy(body).into_owned());
+        data = tail;
+    }
+    bodies
+}
+
 fuzz_target!(init: telemetry::init(), |data: &[u8]| {
-    // Lossy UTF-8 per line, never discarding an input: a line cut at the cap
-    // becomes U+FFFD at the cut, which is still a line the receiver could
-    // deliver.
-    let lines: Vec<String> = data
-        .split(|&b| b == b'\n')
-        .take(MAX_LINES)
-        .map(|raw| String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE_BYTES)]).into_owned())
-        .collect();
+    let lines = records(data);
 
     let sink = SharedRecordSink::new();
     let audit = SharedAuditSink::new();

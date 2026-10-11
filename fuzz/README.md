@@ -40,6 +40,18 @@ after `decode_json`; `seeds/wal_frame/<kind>.bin` is `ourios_wal::frame::write_f
 (the `fuzzing` feature) of a short payload for each `FrameKind`. Regenerate
 with a throwaway binary against those two functions if either format moves.
 
+`miner_roundtrip` reads its input as length-prefixed record bodies: a
+little-endian `u16` length (capped at 4096), then that many bytes, repeated
+(at most 64 records). Bodies may contain `\n`. To write a seed from a list of
+bodies:
+
+```sh
+python3 -c 'import struct,sys
+bodies=[b"user 42 logged in from 10.0.0.1", b"user 43 logged out\nfrom 10.0.0.2"]
+sys.stdout.buffer.write(b"".join(struct.pack("<H",len(b))+b for b in bodies))' \
+  > fuzz/seeds/miner_roundtrip/<name>
+```
+
 ## Triage a crash
 
 1. Reproduce: `cargo +nightly-2026-06-01 fuzz run <target> fuzz/artifacts/<target>/crash-…`.

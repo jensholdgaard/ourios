@@ -8,6 +8,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use std::cell::Cell;
+
 use ourios_core::otlp::{AnyValue, KeyValue, any_value};
 use ourios_core::record::Param;
 
@@ -19,15 +21,17 @@ pub(super) struct SortPlan<'a> {
     pub(super) promoted: &'a PromotedAttributes,
     pub(super) keys: ClusterKeys,
     pub(super) tuning: SortTuning,
+    pub(super) gauges: Gauges<'a>,
 }
 
-/// What one sort carried: rows written, input bytes read, and rows an
-/// erasure dropped.
+/// What one sort carried: rows written, input bytes read, rows an
+/// erasure dropped, and the [`decoded_footprint`] of the rows sorted.
 #[derive(Debug, Default)]
 pub(super) struct SortTotals {
     pub(super) rows: u64,
     pub(super) bytes_read: u64,
     pub(super) rows_dropped: u64,
+    pub(super) decoded_bytes: u64,
 }
 
 /// Phases 1–2 of the RFC 0036 §3.2 external merge sort: stream
@@ -51,17 +55,43 @@ pub(super) fn sort_inputs_into(
     inputs: &[String],
     hooks: &mut RowHooks<'_>,
 ) -> Result<SortTotals, CompactionError> {
+    set_limits(plan, writer);
     let mut formation = RunFormation::new(plan);
     let mut totals = SortTotals::default();
     for input in inputs {
-        let mut reader = open_input(plan, input, &mut totals)?;
-        while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
-            formation.push(apply_hooks(hooks, batch, &mut totals));
-        }
+        read_input(&mut formation, input, hooks, &mut totals)?;
         formation.end_input()?;
     }
+    totals.decoded_bytes = formation.decoded_total;
     formation.finish(writer)?;
     Ok(totals)
+}
+
+/// Publish the budgets this sort runs under (see [`MemoryPhase`]).
+fn set_limits(plan: SortPlan<'_>, writer: &Writer) {
+    let budget = plan.tuning.in_memory_max_bytes;
+    plan.gauges.set_limit(MemoryPhase::Sort, budget);
+    plan.gauges.set_limit(MemoryPhase::Merge, budget);
+    plan.gauges
+        .set_limit(MemoryPhase::Write, widen(writer.flush_bytes()));
+}
+
+/// Decode `input` batch by batch into `formation`. Its encoded bytes are
+/// charged to the read phase until the reader holding them is dropped.
+fn read_input(
+    formation: &mut RunFormation<'_>,
+    input: &str,
+    hooks: &mut RowHooks<'_>,
+    totals: &mut SortTotals,
+) -> Result<(), CompactionError> {
+    let gauges = formation.plan.gauges;
+    let mut reader = open_input(formation.plan, input, totals)?;
+    while let Some(batch) = reader.next_batch().map_err(CompactionError::Read)? {
+        formation.push(apply_hooks(hooks, batch, totals));
+    }
+    drop(reader);
+    gauges.set(MemoryPhase::Read, 0);
+    Ok(())
 }
 
 /// Fetch one input and open it under the partition, so every row is
@@ -76,7 +106,9 @@ fn open_input(
         .store
         .get_blocking(input)
         .map_err(|e| store_io("get", input, e))?;
-    totals.bytes_read = totals.bytes_read.saturating_add(bytes.len() as u64);
+    let held = bytes.len() as u64;
+    totals.bytes_read = totals.bytes_read.saturating_add(held);
+    plan.gauges.set(MemoryPhase::Read, held);
     Reader::open_partition_bytes(Bytes::from(bytes), plan.partition.clone(), input)
         .map_err(CompactionError::Read)
 }
@@ -125,6 +157,8 @@ struct RunFormation<'a> {
     /// The widest buffered row's [`decoded_footprint`], carried onto the
     /// run the buffer spills as.
     widest_row: u64,
+    /// Every pushed row's [`decoded_footprint`], spilled or not.
+    decoded_total: u64,
     spill: Option<Spill>,
 }
 
@@ -135,6 +169,7 @@ impl<'a> RunFormation<'a> {
             buffer: Vec::new(),
             buffered_bytes: 0,
             widest_row: 0,
+            decoded_total: 0,
             spill: None,
         }
     }
@@ -151,6 +186,8 @@ impl<'a> RunFormation<'a> {
         #[cfg(test)]
         residency::add_bytes(bytes);
         self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.decoded_total = self.decoded_total.saturating_add(bytes);
+        self.plan.gauges.set(MemoryPhase::Sort, self.buffered_bytes);
         self.buffer.extend(batch);
     }
 
@@ -174,7 +211,7 @@ impl<'a> RunFormation<'a> {
             spill.scratch.path(),
             spill.runs.len(),
             &self.buffer,
-            self.plan.promoted,
+            self.plan,
         )?;
         spill.runs.push(Run {
             path,
@@ -188,6 +225,7 @@ impl<'a> RunFormation<'a> {
         self.buffer.clear();
         self.buffered_bytes = 0;
         self.widest_row = 0;
+        self.plan.gauges.set(MemoryPhase::Sort, 0);
         Ok(())
     }
 
@@ -206,7 +244,7 @@ impl<'a> RunFormation<'a> {
             ..
         } = self;
         match spill {
-            None => emit_in_memory(plan.keys, buffer, writer),
+            None => emit_in_memory(plan, buffer, writer),
             Some(spill) => {
                 // `clear()` kept the phase-1 allocation; release it before
                 // the merge so phase 2 holds only (F + 1) × one batch.
@@ -218,20 +256,33 @@ impl<'a> RunFormation<'a> {
 }
 
 fn emit_in_memory(
-    keys: ClusterKeys,
+    plan: SortPlan<'_>,
     mut rows: Vec<MinedRecord>,
     writer: &mut Writer,
 ) -> Result<(), CompactionError> {
-    sort_records(keys, &mut rows);
-    writer
-        .append_records(&rows)
-        .map_err(CompactionError::Write)?;
+    sort_records(plan.keys, &mut rows);
+    write_rows(writer, &rows, plan.gauges)?;
+    plan.gauges.set(MemoryPhase::Sort, 0);
     #[cfg(test)]
     {
         residency::sub(rows.len());
         residency::sub_bytes(rows.iter().map(decoded_footprint).sum());
     }
     Ok(())
+}
+
+/// Append `rows` to the consolidated `writer`, charging its in-progress
+/// row group to the write phase as each sub-batch lands.
+fn write_rows(
+    writer: &mut Writer,
+    rows: &[MinedRecord],
+    gauges: Gauges<'_>,
+) -> Result<(), CompactionError> {
+    writer
+        .append_records_observed(rows, &mut |in_progress| {
+            gauges.set(MemoryPhase::Write, widen(in_progress));
+        })
+        .map_err(CompactionError::Write)
 }
 
 /// Sorted runs on local scratch, in spill order.
@@ -277,18 +328,8 @@ impl Spill {
     }
 
     fn merge_into(self, writer: &mut Writer, plan: SortPlan<'_>) -> Result<(), CompactionError> {
-        let budget = plan.tuning.in_memory_max_bytes;
-        let runs = reduce_runs(
-            self.scratch.path(),
-            self.runs,
-            plan.tuning.fan_in,
-            budget,
-            plan.keys,
-            plan.promoted,
-        )?;
-        merge_runs(&runs, plan.keys, budget, |chunk| {
-            writer.append_records(chunk).map_err(CompactionError::Write)
-        })
+        let runs = reduce_runs(self.scratch.path(), self.runs, plan)?;
+        merge_runs(&runs, plan, |chunk| write_rows(writer, chunk, plan.gauges))
     }
 }
 
@@ -384,10 +425,11 @@ pub(super) fn sort_records(keys: ClusterKeys, records: &mut [MinedRecord]) {
 pub(super) struct RunWriter<'a> {
     inner: ArrowWriter<File>,
     promoted: &'a PromotedAttributes,
+    gauges: Gauges<'a>,
 }
 
 impl<'a> RunWriter<'a> {
-    fn create(path: &Path, promoted: &'a PromotedAttributes) -> Result<Self, CompactionError> {
+    fn create(path: &Path, plan: SortPlan<'a>) -> Result<Self, CompactionError> {
         let file = File::create(path).map_err(|source| CompactionError::Io {
             op: "create run",
             path: path.to_path_buf(),
@@ -399,9 +441,14 @@ impl<'a> RunWriter<'a> {
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
             .build();
-        let inner = ArrowWriter::try_new(file, data_schema_with_promoted(promoted), Some(props))
-            .map_err(parquet_write)?;
-        Ok(Self { inner, promoted })
+        let inner =
+            ArrowWriter::try_new(file, data_schema_with_promoted(plan.promoted), Some(props))
+                .map_err(parquet_write)?;
+        Ok(Self {
+            inner,
+            promoted: plan.promoted,
+            gauges: plan.gauges,
+        })
     }
 
     fn append(&mut self, records: &[MinedRecord]) -> Result<(), CompactionError> {
@@ -421,8 +468,10 @@ impl<'a> RunWriter<'a> {
         Ok(())
     }
 
-    fn finish(self) -> Result<(), CompactionError> {
-        self.inner.close().map_err(parquet_write)?;
+    /// Write the footer, counting the finished run as a spill.
+    fn finish(mut self) -> Result<(), CompactionError> {
+        self.inner.finish().map_err(parquet_write)?;
+        self.gauges.spilled(widen(self.inner.bytes_written()));
         Ok(())
     }
 }
@@ -432,10 +481,10 @@ pub(super) fn spill_run(
     dir: &Path,
     index: usize,
     records: &[MinedRecord],
-    promoted: &PromotedAttributes,
+    plan: SortPlan<'_>,
 ) -> Result<PathBuf, CompactionError> {
     let path = dir.join(format!("run-{index:06}.parquet"));
-    let mut run = RunWriter::create(&path, promoted)?;
+    let mut run = RunWriter::create(&path, plan)?;
     run.append(records)?;
     run.finish()?;
     Ok(path)
@@ -445,16 +494,13 @@ pub(super) fn spill_run(
 /// (RFC 0036 §3.2's cap F): each pass merges consecutive groups of
 /// `fan_in` runs into one intermediate run, preserving run order so
 /// the §3.1 tie-break (input ordinal) survives every level. Each merge
-/// reads its runs within `budget` (see [`merge_runs`]).
+/// reads its runs within the budget (see [`merge_runs`]).
 pub(super) fn reduce_runs(
     scratch: &Path,
     mut runs: Vec<Run>,
-    fan_in: usize,
-    budget: u64,
-    keys: ClusterKeys,
-    promoted: &PromotedAttributes,
+    plan: SortPlan<'_>,
 ) -> Result<Vec<Run>, CompactionError> {
-    let fan_in = fan_in.max(2);
+    let fan_in = plan.tuning.fan_in.max(2);
     let mut next_index = runs.len();
     while runs.len() > fan_in {
         let mut merged = Vec::with_capacity(runs.len().div_ceil(fan_in));
@@ -468,8 +514,8 @@ pub(super) fn reduce_runs(
             }
             let path = scratch.join(format!("run-{next_index:06}.parquet"));
             next_index += 1;
-            let mut out = RunWriter::create(&path, promoted)?;
-            merge_runs(group, keys, budget, |chunk| out.append(chunk))?;
+            let mut out = RunWriter::create(&path, plan)?;
+            merge_runs(group, plan, |chunk| out.append(chunk))?;
             out.finish()?;
             let widest_row = group.iter().map(|run| run.widest_row).max().unwrap_or(0);
             merged.push(Run { path, widest_row });
@@ -499,17 +545,18 @@ pub(super) fn reduce_runs(
 /// accrued.
 pub(super) fn merge_runs<F>(
     runs: &[Run],
-    keys: ClusterKeys,
-    budget: u64,
+    plan: SortPlan<'_>,
     mut emit: F,
 ) -> Result<(), CompactionError>
 where
     F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
 {
+    let (keys, budget) = (plan.keys, plan.tuning.in_memory_max_bytes);
+    let charge = MergeCharge::new(plan.gauges, runs);
     let mut cursors = Vec::with_capacity(runs.len());
     for run in runs {
         let batch_rows = cursor_batch_rows(budget, runs.len(), run.widest_row);
-        cursors.push(RunCursor::open(&run.path, batch_rows)?);
+        cursors.push(RunCursor::open(run, batch_rows, &charge)?);
     }
     let mut heap = BinaryHeap::with_capacity(cursors.len());
     for (run, cursor) in cursors.iter_mut().enumerate() {
@@ -526,24 +573,33 @@ where
             residency::add_bytes(decoded_footprint(&entry.record));
         }
         out.push(entry.record);
+        charge.fill(out.len());
         if out.len() == SUB_BATCH_ROWS {
-            emit_chunk(&mut out, &mut emit)?;
+            emit_chunk(&mut out, &mut emit, &charge)?;
         }
         if let Some(record) = cursors[run].next_record()? {
             heap.push(Reverse(MergeEntry::new(keys, run, record)));
         }
     }
     if !out.is_empty() {
-        emit_chunk(&mut out, &mut emit)?;
+        emit_chunk(&mut out, &mut emit, &charge)?;
     }
     Ok(())
 }
 
-fn emit_chunk<F>(out: &mut Vec<MinedRecord>, emit: &mut F) -> Result<(), CompactionError>
+fn emit_chunk<F>(
+    out: &mut Vec<MinedRecord>,
+    emit: &mut F,
+    charge: &MergeCharge<'_>,
+) -> Result<(), CompactionError>
 where
     F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
 {
+    charge.fill(out.len());
+    charge.publish();
     emit(out)?;
+    charge.fill(0);
+    charge.publish();
     #[cfg(test)]
     {
         residency::sub(out.len());
@@ -610,11 +666,57 @@ impl PartialEq for MergeEntry {
 
 impl Eq for MergeEntry {}
 
+/// The merge's charge against its budget, published as the merge phase's
+/// usage: each open cursor's batch at its run's widest row — the width
+/// [`cursor_batch_rows`] sizes the batch by — plus the output chunk at the
+/// widest row of any run. The chunk's fill is noted per row in a plain
+/// cell and published with every cursor batch load and chunk emit, so
+/// the gauge follows the chunk as it fills without a per-row atomic.
+pub(super) struct MergeCharge<'a> {
+    gauges: Gauges<'a>,
+    widest_row: u64,
+    cursors: Cell<u64>,
+    chunk_rows: Cell<usize>,
+}
+
+impl<'a> MergeCharge<'a> {
+    fn new(gauges: Gauges<'a>, runs: &[Run]) -> Self {
+        Self {
+            gauges,
+            widest_row: runs.iter().map(|run| run.widest_row).max().unwrap_or(0),
+            cursors: Cell::new(0),
+            chunk_rows: Cell::new(0),
+        }
+    }
+
+    /// A cursor's batch went from `old` to `new` charged bytes.
+    fn swap(&self, old: u64, new: u64) {
+        let cursors = self.cursors.get().saturating_sub(old).saturating_add(new);
+        self.cursors.set(cursors);
+        self.publish();
+    }
+
+    /// The output chunk now holds `rows` rows; seen at the next publish.
+    fn fill(&self, rows: usize) {
+        self.chunk_rows.set(rows);
+    }
+
+    fn publish(&self) {
+        let chunk = widen(self.chunk_rows.get()).saturating_mul(self.widest_row);
+        self.gauges
+            .set(MemoryPhase::Merge, self.cursors.get().saturating_add(chunk));
+    }
+}
+
 /// A sorted run streamed batch-by-batch off scratch — the phase-2
 /// merge holds exactly one decoded batch per open run.
-pub(super) struct RunCursor {
+pub(super) struct RunCursor<'c> {
     reader: Reader,
     batch: std::vec::IntoIter<MinedRecord>,
+    widest_row: u64,
+    /// This cursor's batch in [`MergeCharge`] bytes.
+    charged: u64,
+    charge: &'c MergeCharge<'c>,
     /// Rows in the batch this cursor currently holds decoded, for the
     /// RFC0036.3 residency gauge: the merge keeps ≤ one batch resident
     /// per open run, and the merge charges its output chunk on top, so
@@ -630,11 +732,19 @@ pub(super) struct RunCursor {
     batch_bytes: u64,
 }
 
-impl RunCursor {
-    fn open(path: &Path, batch_rows: usize) -> Result<Self, CompactionError> {
+impl<'c> RunCursor<'c> {
+    fn open(
+        run: &Run,
+        batch_rows: usize,
+        charge: &'c MergeCharge<'c>,
+    ) -> Result<Self, CompactionError> {
         Ok(Self {
-            reader: Reader::open_streaming_file(path, batch_rows).map_err(CompactionError::Read)?,
+            reader: Reader::open_streaming_file(&run.path, batch_rows)
+                .map_err(CompactionError::Read)?,
             batch: Vec::new().into_iter(),
+            widest_row: run.widest_row,
+            charged: 0,
+            charge,
             #[cfg(test)]
             batch_len: 0,
             #[cfg(test)]
@@ -657,6 +767,7 @@ impl RunCursor {
                     self.batch_bytes = batch.iter().map(decoded_footprint).sum();
                     residency::add_bytes(self.batch_bytes);
                 }
+                self.recharge(widen(batch.len()).saturating_mul(self.widest_row));
                 self.batch = batch.into_iter();
             } else {
                 #[cfg(test)]
@@ -666,9 +777,15 @@ impl RunCursor {
                     residency::sub_bytes(self.batch_bytes);
                     self.batch_bytes = 0;
                 }
+                self.recharge(0);
                 return Ok(None);
             }
         }
+    }
+
+    fn recharge(&mut self, charged: u64) {
+        self.charge.swap(self.charged, charged);
+        self.charged = charged;
     }
 }
 

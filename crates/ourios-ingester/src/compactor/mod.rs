@@ -13,13 +13,14 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionOutcome, CompactionPolicy, PartitionKey,
+    Committed, CompactionError, CompactionOutcome, CompactionPolicy, CompactionStats, PartitionKey,
     PromotedAttributes, RowFilter, RowHooks, RowObserver, Store, compact_partition_hooked,
     gc_orphans, hour_partitions, percent_decode_tenant, percent_encode_tenant, plan_candidates,
 };
@@ -145,6 +146,8 @@ mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
 mod graph_tests;
 #[cfg(test)]
+mod sweep_progress_tests;
+#[cfg(test)]
 mod tests;
 
 // Scope glue: siblings and the test module reach each other's items
@@ -230,6 +233,112 @@ pub struct SweepHooks<'a> {
     pub observe: Option<&'a mut SweepObserver<'a>>,
     /// `(row, conversation_id)` → whether the row belongs to the conversation.
     pub erasure_match: Option<&'a ErasureMatch<'a>>,
+    /// Kept current while the sweep runs, for the metrics to read.
+    pub gauges: Option<&'a SweepGauges>,
+}
+
+/// Live measurements of a running sweep (#925), written by the sweep and
+/// read by the metric callbacks at collect time.
+#[derive(Debug, Default)]
+pub struct SweepGauges {
+    /// Consolidation candidates the running sweep has not yet processed;
+    /// zero between sweeps. It never rises during a sweep: candidates that
+    /// became eligible after the sweep counted them still compact but are
+    /// not counted, so it can reach zero slightly before the sweep ends
+    /// ([`Countdown`]).
+    remaining: AtomicU64,
+    /// Every rewrite's memory, budgets and spills.
+    compaction: CompactionStats,
+}
+
+impl SweepGauges {
+    /// Candidates the running sweep has not yet processed.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.remaining.load(Ordering::Relaxed)
+    }
+
+    /// The rewrites' memory, budget and spill measurements.
+    #[must_use]
+    pub fn compaction(&self) -> &CompactionStats {
+        &self.compaction
+    }
+}
+
+/// Counts a sweep's consolidation candidates down as they are processed,
+/// and back to zero when dropped, however the pass ends.
+///
+/// The total comes from a counting pass that keeps one number per tenant,
+/// never the candidates themselves: each tenant's candidate list is held
+/// only while that tenant compacts. The count only ever falls during a
+/// sweep: a tenant planned with fewer candidates than counted gives up the
+/// difference, but one planned with more is not raised. Candidates that
+/// became eligible after the counting pass are still compacted in this
+/// sweep, uncounted, so the count can reach zero slightly before the sweep
+/// ends; the next sweep's count includes whatever they left behind.
+struct Countdown<'a> {
+    remaining: Option<&'a AtomicU64>,
+    counted: std::vec::IntoIter<usize>,
+}
+
+impl<'a> Countdown<'a> {
+    /// Without `gauges` nothing is counted, so a sweep nobody measures
+    /// lists each tenant once, as before.
+    fn start(gauges: Option<&'a SweepGauges>, count: impl FnOnce() -> Vec<usize>) -> Self {
+        let remaining = gauges.map(|gauges| &gauges.remaining);
+        let counted = if remaining.is_some() {
+            count()
+        } else {
+            Vec::new()
+        };
+        if let Some(remaining) = remaining {
+            remaining.store(to_u64(counted.iter().sum()), Ordering::Relaxed);
+        }
+        Self {
+            remaining,
+            counted: counted.into_iter(),
+        }
+    }
+
+    /// The next tenant planned `planned` candidates: drop the ones it was
+    /// counted with but no longer has.
+    fn begin_tenant(&mut self, planned: usize) {
+        let counted = self.counted.next().unwrap_or(0);
+        let vanished = to_u64(counted.saturating_sub(planned));
+        self.store(|left| left.saturating_sub(vanished));
+    }
+
+    fn tick(&self) {
+        self.store(|left| left.saturating_sub(1));
+    }
+
+    fn store(&self, update: impl FnOnce(u64) -> u64) {
+        if let Some(remaining) = self.remaining {
+            // The sweep is the only writer.
+            remaining.store(update(remaining.load(Ordering::Relaxed)), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Countdown<'_> {
+    fn drop(&mut self) {
+        self.store(|_| 0);
+    }
+}
+
+/// How many candidates each of `tenants` has, keeping only the counts; a
+/// tenant whose planning fails counts none (its error is recorded when it
+/// is planned again to compact).
+fn count_candidates(
+    store: &Store,
+    tenants: &[String],
+    sealed_at: u64,
+    policy: &CompactionPolicy,
+) -> Vec<usize> {
+    tenants
+        .iter()
+        .map(|tenant| plan_candidates(store, tenant, sealed_at, policy).map_or(0, |c| c.len()))
+        .collect()
 }
 
 /// A [`SweepHooks::observe`] callback.
@@ -315,8 +424,10 @@ pub struct PartitionCommitted<'a> {
     pub files: u64,
     /// Rows rewritten.
     pub rows: u64,
-    /// Input bytes read.
+    /// Input bytes read: the inputs' stored (encoded) size.
     pub bytes_read: u64,
+    /// The inputs' decoded size as the RFC 0036 §3.2 budget estimates it.
+    pub decoded_bytes_estimate: u64,
     /// Size of the consolidated output file.
     pub bytes_written: u64,
     /// The partition's [`AuditPayload::Compaction`] event.
@@ -366,10 +477,9 @@ pub fn run_sweep_committing(
         promoted,
         report: SweepReport::default(),
         on_commit,
+        stats: hooks.gauges.map(SweepGauges::compaction),
     };
-    for tenant in &tenants {
-        sweep.tenant(tenant, policy, hooks.observe.as_deref_mut());
-    }
+    sweep.consolidate_all(&tenants, policy, hooks);
     match erase_pending(&mut sweep, hooks.erasure_match) {
         Ok(()) => Ok(sweep.report),
         Err(error) => Err(FailedSweep {
@@ -387,6 +497,7 @@ struct Sweep<'s, 'c> {
     promoted: &'s PromotedAttributes,
     report: SweepReport,
     on_commit: &'s mut CommitObserver<'c>,
+    stats: Option<&'s CompactionStats>,
 }
 
 /// One partition of one tenant.
@@ -397,16 +508,37 @@ struct Target<'p> {
 }
 
 impl Sweep<'_, '_> {
-    /// Plan and consolidate `tenant`'s sealed candidates. A planning
-    /// failure is recorded and the tenant skipped.
+    /// The consolidation pass over every tenant, one tenant planned at a
+    /// time, counting its candidates down ([`Countdown`]).
+    fn consolidate_all(
+        &mut self,
+        tenants: &[String],
+        policy: &CompactionPolicy,
+        hooks: &mut SweepHooks<'_>,
+    ) {
+        let sealed_at = self.clock.sealed_at;
+        let mut countdown = Countdown::start(hooks.gauges, || {
+            count_candidates(self.store, tenants, sealed_at, policy)
+        });
+        for tenant in tenants {
+            let observe = hooks.observe.as_deref_mut();
+            self.tenant(tenant, policy, observe, &mut countdown);
+        }
+    }
+
+    /// Plan and consolidate `tenant`'s sealed candidates, counting each
+    /// down. A planning failure is recorded and the tenant skipped.
     fn tenant(
         &mut self,
         tenant: &str,
         policy: &CompactionPolicy,
         mut observe: Option<&mut SweepObserver<'_>>,
+        countdown: &mut Countdown<'_>,
     ) {
         self.report.tenants_scanned += 1;
-        let candidates = match plan_candidates(self.store, tenant, self.clock.sealed_at, policy) {
+        let planned = plan_candidates(self.store, tenant, self.clock.sealed_at, policy);
+        countdown.begin_tenant(planned.as_ref().map_or(0, Vec::len));
+        let candidates = match planned {
             Ok(candidates) => candidates,
             Err(e) => {
                 self.report
@@ -421,6 +553,7 @@ impl Sweep<'_, '_> {
             if self.consolidate(target, observe.as_deref_mut()) {
                 compacted_here += 1;
             }
+            countdown.tick();
         }
         self.report.per_tenant.push(TenantSweep {
             tenant: tenant.to_string(),
@@ -476,6 +609,7 @@ impl Sweep<'_, '_> {
             promoted,
             report,
             on_commit,
+            stats,
         } = self;
         let mut record = |outcome: &CompactionOutcome| {
             if let Some(committed) = &outcome.committed {
@@ -493,6 +627,7 @@ impl Sweep<'_, '_> {
             observe: observe.map(|observe| observe as &mut dyn FnMut(&[MinedRecord])),
             drop: drop.map(|drop| drop as &dyn Fn(&MinedRecord) -> bool),
             on_commit: Some(&mut record),
+            stats: *stats,
         };
         compact_candidate(store, target.partition, promoted, &mut hooks)
     }
@@ -646,6 +781,7 @@ fn record_commit(
         files,
         rows: outcome.rows,
         bytes_read: outcome.bytes_read,
+        decoded_bytes_estimate: outcome.decoded_bytes_estimate,
         bytes_written: outcome.bytes_written,
         event: &event,
     });

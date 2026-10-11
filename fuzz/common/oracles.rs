@@ -206,7 +206,7 @@ fn assert_version_step(
 /// `template_id → (template_version, tokens)` for every leaf of one tenant.
 pub type Leaves = HashMap<u64, (u32, Vec<OwnedToken>)>;
 
-/// The tenant's leaves as they stand now, for [`assert_changes_audited`].
+/// The tenant's leaves as they stand now, for [`AuditCtx`].
 pub fn leaves(miner: &MinerCluster, tenant: &TenantId) -> Leaves {
     miner
         .templates_for(tenant)
@@ -215,111 +215,209 @@ pub fn leaves(miner: &MinerCluster, tenant: &TenantId) -> Leaves {
         .collect()
 }
 
-/// RFC0015.1 — `CLAUDE.md` §3.1 "every merge emits an audit event with old +
-/// new templates" (RFC 0001 H1.3), checked against what one ingest actually
-/// did to the tree. `before` / `after` are the tenant's leaves around the
-/// ingest and `events` everything the audit sink received during it:
-///
-/// - a new leaf has exactly one `Created` event carrying its tokens;
-/// - a leaf whose version rose from `v` to `w` has exactly the chain of
-///   `Widened` / `TypeExpanded` events `v → v+1 → … → w`, each link's
-///   templates continuing the previous one, starting at the tokens before
-///   the ingest and ending at the tokens after it;
-/// - no other leaf has any template event (a degenerate-widening rejection,
-///   which changes nothing, is the exception).
-///
-/// # Panics
-///
-/// On any violation, with a message naming the invariant.
-pub fn assert_changes_audited(
-    index: usize,
-    before: &Leaves,
-    after: &Leaves,
-    events: Vec<AuditEvent>,
-) {
+/// What one ingest did to the tenant's tree: its line number, the leaves
+/// before and after it. [`AuditCtx::assert_changes_audited`] checks the audit
+/// events the ingest emitted against it.
+pub struct AuditCtx<'a> {
+    pub index: usize,
+    pub before: &'a Leaves,
+    pub after: &'a Leaves,
+}
+
+impl AuditCtx<'_> {
+    /// RFC0015.1 — `CLAUDE.md` §3.1 "every merge emits an audit event with
+    /// old + new templates" (RFC 0001 H1.3), checked against what one ingest
+    /// actually did to the tree, given everything the audit sink received
+    /// during it:
+    ///
+    /// - a new leaf has exactly one `Created` event carrying its tokens;
+    /// - a leaf whose version rose from `v` to `w` has exactly the chain of
+    ///   `Widened` / `TypeExpanded` events `v → v+1 → … → w`, each link's
+    ///   templates continuing the previous one, starting at the tokens before
+    ///   the ingest and ending at the tokens after it;
+    /// - every link of that chain is a legal step on its own (RFC0015.10,
+    ///   [`LeafAudit::assert_step_shape`]), so an intermediate version that
+    ///   no row was stamped with is checked too;
+    /// - no other leaf has any template event (a degenerate-widening
+    ///   rejection, which changes nothing, is the exception).
+    ///
+    /// # Panics
+    ///
+    /// On any violation, with a message naming the invariant.
+    pub fn assert_changes_audited(&self, events: Vec<AuditEvent>) {
+        let mut by_id = template_changes_by_id(events);
+        for (&id, (version, tokens)) in self.after {
+            let changes = by_id.remove(&id).unwrap_or_default();
+            let leaf = LeafAudit {
+                index: self.index,
+                id,
+                after: (*version, tokens),
+                changes: &changes,
+            };
+            leaf.assert_audited(self.before.get(&id));
+        }
+        let orphans: Vec<u64> = by_id.into_keys().collect();
+        assert!(
+            orphans.is_empty(),
+            "RFC0015.1 / CLAUDE.md §3.1: line {}: template events for ids {orphans:?}, which have no leaf",
+            self.index,
+        );
+    }
+}
+
+/// The template events of one ingest, per template id, in emission order.
+/// Degenerate-widening rejections change no template and are dropped.
+fn template_changes_by_id(events: Vec<AuditEvent>) -> HashMap<u64, Vec<TemplateChange>> {
     let mut by_id: HashMap<u64, Vec<TemplateChange>> = HashMap::new();
-    for event in events {
-        if let AuditPayload::Template {
+    for (id, change) in events.into_iter().filter_map(template_change) {
+        by_id.entry(id).or_default().push(change);
+    }
+    by_id
+}
+
+fn template_change(event: AuditEvent) -> Option<(u64, TemplateChange)> {
+    match event.payload {
+        AuditPayload::Template {
+            change: TemplateChange::RejectedDegenerate { .. },
+            ..
+        } => None,
+        AuditPayload::Template {
             template_id,
             change,
             ..
-        } = event.payload
-            && !matches!(change, TemplateChange::RejectedDegenerate { .. })
-        {
-            by_id.entry(template_id).or_default().push(change);
-        }
+        } => Some((template_id, change)),
+        _ => None,
     }
-    for (&id, (version, tokens)) in after {
-        let changes = by_id.remove(&id).unwrap_or_default();
-        match before.get(&id) {
-            None => assert_created(index, id, *version, tokens, &changes),
-            Some((old_version, old_tokens)) => {
-                assert_steps(
-                    index,
-                    id,
-                    (*old_version, old_tokens),
-                    (*version, tokens),
-                    &changes,
-                );
-            }
-        }
-    }
-    let orphans: Vec<u64> = by_id.into_keys().collect();
-    assert!(
-        orphans.is_empty(),
-        "RFC0015.1 / CLAUDE.md §3.1: line {index}: template events for ids {orphans:?}, which have no leaf",
-    );
 }
 
-fn assert_created(
+/// One leaf after one ingest, with the template events the ingest emitted
+/// for it.
+struct LeafAudit<'a> {
     index: usize,
     id: u64,
-    version: u32,
-    tokens: &[OwnedToken],
-    changes: &[TemplateChange],
-) {
-    let expected = format_template(tokens);
-    let audited = matches!(
-        changes,
-        [TemplateChange::Created { new_template }] if *new_template == expected
-    );
-    assert!(
-        version == 1 && audited,
-        "RFC0015.1 / CLAUDE.md §3.1: line {index}: new template {id} (v{version}, {expected:?}) must be \
-         audited by exactly one `Created` event with its tokens; got {changes:?}",
-    );
+    after: Version<'a>,
+    changes: &'a [TemplateChange],
 }
 
-fn assert_steps(
-    index: usize,
-    id: u64,
-    (old_version, old_tokens): Version<'_>,
-    (new_version, new_tokens): Version<'_>,
-    changes: &[TemplateChange],
-) {
-    let mut version = old_version;
-    let mut template = format_template(old_tokens);
-    for change in changes {
-        let step = version_step(change).unwrap_or_else(|| {
-            panic!(
-                "RFC0015.1 / CLAUDE.md §3.1: line {index}: template {id} already existed but got {change:?}"
-            )
-        });
-        assert!(
-            step.0 == version && step.1 == version + 1 && step.2 == template,
-            "RFC0015.1 / CLAUDE.md §3.1: line {index}: template {id} event {change:?} does not continue \
-             from v{version} {template:?}",
+impl LeafAudit<'_> {
+    fn assert_audited(&self, before: Option<&(u32, Vec<OwnedToken>)>) {
+        match before {
+            None => self.assert_created(),
+            Some((version, tokens)) => self.assert_steps((*version, tokens)),
+        }
+    }
+
+    fn assert_created(&self) {
+        let (version, tokens) = self.after;
+        let expected = format_template(tokens);
+        let audited = matches!(
+            self.changes,
+            [TemplateChange::Created { new_template }] if *new_template == expected
         );
-        version = step.1;
-        step.3.clone_into(&mut template);
+        assert!(
+            version == 1 && audited,
+            "RFC0015.1 / CLAUDE.md §3.1: line {}: new template {} (v{version}, {expected:?}) must be \
+             audited by exactly one `Created` event with its tokens; got {:?}",
+            self.index,
+            self.id,
+            self.changes,
+        );
     }
-    let expected = format_template(new_tokens);
-    assert!(
-        version == new_version && template == expected,
-        "RFC0015.1 / CLAUDE.md §3.1: line {index}: template {id} moved v{old_version}→v{new_version} \
-         ({expected:?}) but its audit events only account for v{old_version}→v{version} ({template:?}) — \
-         a merge without its audit event",
-    );
+
+    fn assert_steps(&self, (old_version, old_tokens): Version<'_>) {
+        let mut version = old_version;
+        let mut template = format_template(old_tokens);
+        for change in self.changes {
+            let step = version_step(change).unwrap_or_else(|| {
+                panic!(
+                    "RFC0015.1 / CLAUDE.md §3.1: line {}: template {} already existed but got {change:?}",
+                    self.index, self.id,
+                )
+            });
+            assert!(
+                step.0 == version && step.1 == version + 1 && step.2 == template,
+                "RFC0015.1 / CLAUDE.md §3.1: line {}: template {} event {change:?} does not continue \
+                 from v{version} {template:?}",
+                self.index,
+                self.id,
+            );
+            self.assert_step_shape(change);
+            version = step.1;
+            step.3.clone_into(&mut template);
+        }
+        let (new_version, new_tokens) = self.after;
+        let expected = format_template(new_tokens);
+        assert!(
+            version == new_version && template == expected,
+            "RFC0015.1 / CLAUDE.md §3.1: line {}: template {} moved v{old_version}→v{new_version} \
+             ({expected:?}) but its audit events only account for v{old_version}→v{version} \
+             ({template:?}) — a merge without its audit event",
+            self.index,
+            self.id,
+        );
+    }
+
+    /// RFC0015.10 — `CLAUDE.md` §3.1 for every link of the chain, including
+    /// versions no emitted row was stamped with: a widening turns exactly its
+    /// declared positions into wildcards and changes nothing else; a type
+    /// expansion changes no token at all.
+    fn assert_step_shape(&self, change: &TemplateChange) {
+        match change {
+            TemplateChange::Widened {
+                old_template,
+                new_template,
+                positions_widened,
+                ..
+            } => self.assert_widened_shape(old_template, new_template, positions_widened),
+            TemplateChange::TypeExpanded {
+                old_template,
+                new_template,
+                ..
+            } => assert_eq!(
+                old_template, new_template,
+                "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} type expansion changed its tokens",
+                self.index, self.id,
+            ),
+            _ => {}
+        }
+    }
+
+    /// Compared on the canonical strings token by token, not on
+    /// `parse_template`: a literal `<*>` token is legal input and would parse
+    /// as a wildcard.
+    fn assert_widened_shape(&self, old: &str, new: &str, positions: &[u16]) {
+        let old_tokens: Vec<&str> = old.split(' ').collect();
+        let new_tokens: Vec<&str> = new.split(' ').collect();
+        assert_eq!(
+            old_tokens.len(),
+            new_tokens.len(),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widening {old:?} → {new:?} changed length",
+            self.index,
+            self.id,
+        );
+        let declared: Vec<usize> = positions.iter().map(|&p| usize::from(p)).collect();
+        assert!(
+            !declared.is_empty() && declared.iter().all(|&p| new_tokens.get(p) == Some(&"<*>")),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widening {old:?} → {new:?} declares \
+             positions {positions:?} that are not all wildcards afterwards",
+            self.index,
+            self.id,
+        );
+        let changed: Vec<usize> = old_tokens
+            .iter()
+            .zip(&new_tokens)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(position, _)| position)
+            .collect();
+        assert!(
+            changed.iter().all(|p| declared.contains(p)),
+            "RFC0015.10 / CLAUDE.md §3.1: line {}: template {} widening {old:?} → {new:?} changed \
+             positions {changed:?}, outside its declared {positions:?} — a merge that rewrites a literal",
+            self.index,
+            self.id,
+        );
+    }
 }
 
 /// `(old_version, new_version, old_template, new_template)` of a change that

@@ -82,7 +82,12 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
 
         // (e) — every template the ingest created or moved forward is audited.
         let after = oracles::leaves(&miner, &tenant);
-        oracles::assert_changes_audited(index, &leaves, &after, audit.drain());
+        oracles::AuditCtx {
+            index,
+            before: &leaves,
+            after: &after,
+        }
+        .assert_changes_audited(audit.drain());
         leaves = after;
 
         // (c) — one string-body ingest, one emitted row.

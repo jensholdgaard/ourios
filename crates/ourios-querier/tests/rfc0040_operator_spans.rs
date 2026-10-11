@@ -3,7 +3,7 @@
 //! sites) whose spans nest under the current tracing span.
 //!
 //! `record_operator_spans` resolves its tracer via the process-global
-//! `opentelemetry::global::tracer` (matching real `ourios_telemetry::init`
+//! provider (`ourios_core::telemetry::tracer`, matching real `ourios_telemetry::init`
 //! wiring), so this test installs a process-global `TracerProvider` — the
 //! `rfc0016_6_query_metrics` / `rfc0033_7_observability.rs` precedent,
 //! applied to traces — and lives in its own integration binary (its own
@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
@@ -130,10 +129,8 @@ async fn run_traced_query(
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test"))),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
 
     opentelemetry::global::set_tracer_provider(provider.clone());
 

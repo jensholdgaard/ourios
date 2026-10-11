@@ -108,6 +108,7 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
         let after = audit::leaves(&miner, &tenant);
         audit::AuditCtx {
             index,
+            tenant: &tenant,
             line,
             before: &leaves,
             after: &after,

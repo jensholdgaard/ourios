@@ -51,6 +51,7 @@ pub fn leaves(miner: &MinerCluster, tenant: &TenantId) -> Leaves {
 /// audit events the ingest emitted against it.
 pub struct AuditCtx<'a> {
     pub index: usize,
+    pub tenant: &'a TenantId,
     pub line: &'a str,
     pub before: &'a Leaves,
     pub after: &'a Leaves,
@@ -77,6 +78,7 @@ impl AuditCtx<'_> {
     ///
     /// On any violation, with a message naming the invariant.
     pub fn assert_changes_audited(&self, events: Vec<AuditEvent>) {
+        self.assert_events_name_tenant(&events);
         let mut by_id = template_changes_by_id(events);
         let line_types = line_types(self.line);
         for (&id, after) in self.after {
@@ -96,6 +98,23 @@ impl AuditCtx<'_> {
             "RFC0015.1 / CLAUDE.md §3.1: line {}: template events for ids {orphans:?}, which have no leaf",
             self.index,
         );
+    }
+
+    /// RFC0015.1 — `CLAUDE.md` §3.1 / §3.7: an audit event names the tenant
+    /// whose ingest caused it (RFC 0001 H1.3). Checked on every drained event,
+    /// before any grouping drops the field.
+    fn assert_events_name_tenant(&self, events: &[AuditEvent]) {
+        for event in events {
+            assert!(
+                event.tenant_id == *self.tenant,
+                "RFC0015.1 / CLAUDE.md §3.1/§3.7: line {}: audit event {:?} names tenant {:?}, but the \
+                 ingest that emitted it was tenant {:?}",
+                self.index,
+                event.payload,
+                event.tenant_id,
+                self.tenant,
+            );
+        }
     }
 }
 

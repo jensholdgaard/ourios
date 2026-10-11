@@ -49,6 +49,7 @@ mod drift;
 pub mod dsl;
 mod log_row;
 mod map_flight;
+mod phase;
 mod plan;
 mod schema_adapt;
 mod template_map;

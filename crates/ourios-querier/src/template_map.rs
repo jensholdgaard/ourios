@@ -233,6 +233,7 @@ impl TemplateMapMetrics {
             } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
             CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
         };
+        record_outcome_on_span(value);
         let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
         if binding_conflict {
             self.lookups.add(
@@ -251,6 +252,7 @@ impl TemplateMapMetrics {
     }
 
     fn record_lookup_value(&self, value: &'static str) {
+        record_outcome_on_span(value);
         self.lookups.add(
             1,
             &[KeyValue::new(
@@ -292,6 +294,12 @@ impl TemplateMapMetrics {
             )],
         );
     }
+}
+
+/// The lookup outcome on the `load template_map` span the lookup runs under
+/// (RFC 0038 §3.7.2); a no-op under any other span, which has no such field.
+fn record_outcome_on_span(value: &'static str) {
+    tracing::Span::current().record(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
 }
 
 /// Name every binding conflict a fold found, once per acquisition. The
@@ -346,9 +354,9 @@ fn derive_reason(outcome: CacheOutcome) -> Option<&'static str> {
     }
 }
 
-/// The `error.type` a failed derive carries: the classes the query
-/// surface reports for the same [`QueryError`].
-fn derive_error_type(error: &QueryError) -> &'static str {
+/// The `error.type` a failed derive or acquisition carries: the classes the
+/// query surface reports for the same [`QueryError`].
+pub(crate) fn error_type(error: &QueryError) -> &'static str {
     match error {
         QueryError::Storage { .. } => "storage",
         QueryError::TenantRequired => "tenant_required",
@@ -586,16 +594,38 @@ fn measured_fold(
     tenant: &TenantId,
     outcome: CacheOutcome,
 ) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
-    let started = Instant::now();
-    let folded = fold_template_map(resolved, tenant);
     let Some(reason) = derive_reason(outcome) else {
-        return folded;
+        return fold_template_map(resolved, tenant);
     };
+    let started = Instant::now();
+    let folded = traced_fold(resolved, tenant, reason);
     let cost = match &folded {
         Ok((map, bytes, _)) => Ok((map.folded_files().len() as u64, *bytes)),
-        Err(e) => Err(derive_error_type(e)),
+        Err(e) => Err(error_type(e)),
     };
     METRICS.record_derive(reason, started.elapsed(), cost);
+    folded
+}
+
+/// [`fold_template_map`] as its own `derive template_map` span, so a
+/// trace shows the fold apart from the artifact fetch and the write-through,
+/// with the object-store requests it makes beneath it.
+fn traced_fold(
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+    tenant: &TenantId,
+    reason: &'static str,
+) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
+    let span = tracing::info_span!(
+        "derive template_map",
+        otel.kind = "internal",
+        ourios.template_map.derive.reason = reason,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    let folded = span.in_scope(crate::phase::nested(|| fold_template_map(resolved, tenant)));
+    if let Err(e) = &folded {
+        ourios_core::telemetry::record_span_error(&span, error_type(e));
+    }
     folded
 }
 

@@ -907,7 +907,7 @@ mod tests {
             .with_periodic_exporter(exporter.clone())
             .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
-        let meter = provider.meter("ourios.compaction");
+        let meter = provider.meter_with_scope(scope("ourios.compaction"));
         let counter = meter.u64_counter("ourios.compaction.sweeps").build();
         let guard = TelemetryGuard {
             provider: Some(provider),
@@ -1109,7 +1109,7 @@ mod tests {
             .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
         let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer(TRACER_SCOPE)))
+            .with(tracing_opentelemetry::layer().with_tracer(ourios_tracer(&tracer_provider)))
             .with(OpenTelemetryTracingBridge::new(&logger));
 
         // Act — emit a log *inside* an entered span.

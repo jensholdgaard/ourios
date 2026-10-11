@@ -156,6 +156,8 @@ fn node_attributes(aggregated: &MetricsSet) -> Vec<KeyValue> {
 }
 
 #[cfg(test)]
+// Test tracers need no versioned scope; this crate has no ourios-core dependency.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use datafusion::physical_plan::metrics::{

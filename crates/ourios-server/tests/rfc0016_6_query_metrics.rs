@@ -163,16 +163,7 @@ async fn rfc0016_6_pruning_is_observable() {
     // Assert — the OTel query metrics are emitted.
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
-    let names = metric_names(&rms);
-    for expected in [
-        semconv::OURIOS_QUERY_DURATION,
-        semconv::OURIOS_QUERY_ROW_GROUPS,
-    ] {
-        assert!(
-            names.iter().any(|n| n == expected),
-            "exported stream missing {expected}, got {names:?}",
-        );
-    }
+    assert_query_instruments_exported(&rms);
 
     // The duration histogram recorded exactly the one query.
     let AggregatedMetrics::F64(MetricData::Histogram(hist)) =
@@ -198,10 +189,24 @@ async fn rfc0016_6_pruning_is_observable() {
     );
     assert!(scanned_metric >= 1, "at least one row group was scanned");
     assert_query_reads(&rms, bucket.path(), &json);
-    // #949 — no histogram the query path exported uses the SDK's
-    // millisecond buckets.
+}
+
+/// The query duration and row-group instruments are in the exported stream,
+/// and (#949) no histogram the query path exported uses the SDK's
+/// millisecond buckets.
+fn assert_query_instruments_exported(rms: &[ResourceMetrics]) {
+    let names = metric_names(rms);
+    for expected in [
+        semconv::OURIOS_QUERY_DURATION,
+        semconv::OURIOS_QUERY_ROW_GROUPS,
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "exported stream missing {expected}, got {names:?}",
+        );
+    }
     ourios_telemetry::histogram_guard::assert_explicit_buckets(
-        &rms,
+        rms,
         &[
             semconv::OURIOS_QUERY_DURATION,
             semconv::OURIOS_QUERY_FILES,

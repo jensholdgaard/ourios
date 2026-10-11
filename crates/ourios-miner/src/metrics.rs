@@ -80,11 +80,15 @@ const RESOURCE_SERVICE_NAME: &str = "service.name";
 /// state).
 const RESERVOIR_CAP: usize = 1024;
 
-/// Bucket boundaries for `ourios.miner.confidence`, a 0–1 score: dense
-/// around the default 0.4 floor and 0.7 threshold (RFC 0001 §6.3), the
-/// edges between the confidence zones.
-const CONFIDENCE_BUCKETS: [f64; 15] = [
-    0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 0.95, 1.0,
+/// Bucket boundaries for `ourios.miner.confidence`, which is
+/// `similarity / threshold` (RFC 0001 §6.3), not raw similarity: 0 for a
+/// parse failure, `[floor / threshold, 1)` for a lossy-zone mint, and the
+/// 1.0 sentinel for every clean attach, so it never exceeds 1. The edges
+/// assume the default floor 0.4 and threshold 0.7: 0.57 sits just below
+/// the lossy zone's lower edge (0.4 / 0.7 ≈ 0.571) and 0.99 just below the
+/// clean sentinel; the 0.05 grid between keeps other configs readable.
+const CONFIDENCE_BUCKETS: [f64; 18] = [
+    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.57, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99, 1.0,
 ];
 
 /// Bucket boundaries (seconds) for `ourios.miner.duration`, one line's
@@ -656,6 +660,29 @@ mod tests {
         // Computed off-lock from a snapshot, as the gauge callback does.
         assert!((super::quantile_of(r.snapshot(), 0.50).unwrap() - 0.5).abs() < 1e-9);
         assert!((super::quantile_of(r.snapshot(), 0.01).unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    /// The confidence buckets' zone edges follow the default config: an
+    /// edge just below `floor / threshold` and one just below the clean
+    /// sentinel, and none above 1 (no exported confidence exceeds it).
+    #[test]
+    fn confidence_buckets_track_the_default_zone_edges() {
+        let config = ourios_config::MinerConfig::default();
+        let lossy_floor = f64::from(config.similarity_floor / config.similarity_threshold);
+        let edge_just_below = |at: f64| {
+            super::CONFIDENCE_BUCKETS
+                .iter()
+                .any(|&b| b < at && at - b < 0.015)
+        };
+        assert!(
+            edge_just_below(lossy_floor),
+            "retuned defaults: no bucket edge just below floor / threshold = {lossy_floor}",
+        );
+        assert!(
+            edge_just_below(1.0),
+            "no edge just below the clean sentinel"
+        );
+        assert_eq!(super::CONFIDENCE_BUCKETS.last(), Some(&1.0));
     }
 
     #[test]

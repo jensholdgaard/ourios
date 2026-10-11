@@ -1304,6 +1304,11 @@ fn parse_number(lexeme: &str, neg: bool) -> Result<Value, DslError> {
         let v = lexeme
             .parse::<f64>()
             .map_err(|_| DslError::new(format!("malformed number {lexeme:?}")))?;
+        // A digits-only lexeme too long for f64 parses as infinity, which the
+        // canonical serialiser cannot write back (RFC0002.7).
+        if !v.is_finite() {
+            return Err(DslError::new(format!("number {lexeme:?} is out of range")));
+        }
         Ok(Value::Float(if neg { -v } else { v }))
     } else {
         let v = lexeme
@@ -1349,6 +1354,38 @@ fn describe(tok: Option<&Tok>) -> String {
 mod tests {
     use super::*;
     use crate::dsl::ir::{Field, GroupTerm, Predicate, Stage, Value};
+
+    #[test]
+    fn rejects_a_float_literal_that_overflows_to_infinity() {
+        // Arrange — 400 nines parse as f64 infinity, which the serialiser
+        // would print as `inf.0`: a query that could never round-trip.
+        let huge = format!("{}.0", "9".repeat(400));
+        for query in [
+            format!("confidence == {huge}"),
+            format!("confidence == -{huge}"),
+            format!("attr.x < {huge}"),
+        ] {
+            // Act
+            let err = parse(&query).expect_err("a non-finite float literal must be rejected");
+            // Assert
+            assert!(
+                err.message().contains("out of range"),
+                "{query}: unexpected error {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_largest_finite_float_literal_still_parses_and_round_trips() {
+        // Arrange — f64::MAX printed fixed-point, the boundary just below the
+        // rejection above.
+        let query = format!("confidence == {:.1}", f64::MAX);
+        // Act
+        let parsed = parse(&query).expect("f64::MAX is finite");
+        let reparsed = parse(&crate::dsl::serialize(&parsed)).expect("canonical form parses");
+        // Assert
+        assert_eq!(parsed, reparsed);
+    }
 
     #[test]
     fn parses_match_all_and_match_none() {

@@ -458,4 +458,29 @@ mod tests {
             assert_eq!(parse(&s).unwrap(), q, "round-trip failed for {s:?}");
         }
     }
+
+    proptest::proptest! {
+        /// Every finite float literal round-trips (RFC0002.7); the parser
+        /// rejects the non-finite ones, which have no canonical form.
+        #[test]
+        fn every_finite_float_round_trips(
+            f in proptest::num::f64::POSITIVE
+                | proptest::num::f64::NEGATIVE
+                | proptest::num::f64::NORMAL
+                | proptest::num::f64::SUBNORMAL
+                | proptest::num::f64::ZERO,
+        ) {
+            use crate::dsl::ir::{CmpOp, Field, OrdOp, Predicate, Query, Value};
+            let q = Query {
+                predicate: Predicate::Comparison {
+                    field: Field::Confidence,
+                    op: CmpOp::Ord(OrdOp::Eq),
+                    value: Value::Float(f),
+                },
+                stages: Vec::new(),
+            };
+            let s = serialize(&q);
+            proptest::prop_assert_eq!(parse(&s).unwrap(), q, "round-trip failed for {}", s);
+        }
+    }
 }

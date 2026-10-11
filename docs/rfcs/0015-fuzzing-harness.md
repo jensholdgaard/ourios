@@ -197,8 +197,8 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 
 > **Amendment (2026-10-11, #955, maintainer-approved): a sixth target for
 > the persisted artifacts.** The process reads back from object storage
-> bytes it may not have written, or wrote in an older version; a decoder
-> that panics or half-applies them turns every restart into a crash loop
+> bytes it may not have written, or may have written in an older version;
+> a decoder that panics or half-applies them turns every restart into a crash loop
 > or a silently wrong state (#892: an unreadable self-written snapshot
 > made every restart rebuild from the WAL). One target covers the small
 > JSON artifacts, the first input byte picking the decoder:

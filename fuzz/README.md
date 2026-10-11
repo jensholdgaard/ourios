@@ -17,7 +17,8 @@ cargo install cargo-fuzz --locked
 # seeds, then run one target; the targets with a fuzz/dict/<target>.dict take it.
 target=dsl_parse
 mkdir -p fuzz/corpus/$target && cp -n fuzz/seeds/$target/* fuzz/corpus/$target/
-cargo +nightly-2026-06-01 fuzz run $target -- -max_total_time=60 -dict=fuzz/dict/$target.dict
+dict=; [ -f fuzz/dict/$target.dict ] && dict=-dict=fuzz/dict/$target.dict
+cargo +nightly-2026-06-01 fuzz run $target -- -max_total_time=60 $dict
 ```
 
 `cargo +nightly-2026-06-01 fuzz build` compiles every target (ASan, debug

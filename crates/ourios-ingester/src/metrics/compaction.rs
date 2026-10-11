@@ -30,6 +30,7 @@ use opentelemetry::metrics::{
     Counter, Histogram, Meter, ObservableCounter, ObservableUpDownCounter,
 };
 use opentelemetry::{KeyValue, global};
+use ourios_core::histogram_buckets;
 use ourios_parquet::MemoryPhase;
 use ourios_semconv as semconv;
 
@@ -146,9 +147,18 @@ fn counter(meter: &Meter, name: &'static str, unit: &'static str) -> Counter<u64
     meter.u64_counter(name).with_unit(unit).build()
 }
 
-/// A `u64` histogram named `name` in `unit`.
-fn histogram(meter: &Meter, name: &'static str, unit: &'static str) -> Histogram<u64> {
-    meter.u64_histogram(name).with_unit(unit).build()
+/// A `u64` histogram named `name` in `unit`, bucketed at `boundaries`.
+fn histogram(
+    meter: &Meter,
+    name: &'static str,
+    unit: &'static str,
+    boundaries: &[f64],
+) -> Histogram<u64> {
+    meter
+        .u64_histogram(name)
+        .with_unit(unit)
+        .with_boundaries(boundaries.to_vec())
+        .build()
 }
 
 /// `ourios.compaction.backlog`, an **observable** (async) `UpDownCounter`: its
@@ -235,17 +245,29 @@ impl CompactionMetrics {
             duration: meter
                 .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
                 .with_unit("s")
+                .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
                 .build(),
             io: counter(meter, semconv::OURIOS_COMPACTION_IO, "By"),
-            file_size: histogram(meter, semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE, "By"),
+            file_size: histogram(
+                meter,
+                semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+                "By",
+                &histogram_buckets::SIZE_BYTES,
+            ),
             backlog_state,
             backlog,
             input_files: histogram(
                 meter,
                 semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
                 "{file}",
+                &histogram_buckets::FILE_COUNT,
             ),
-            input_size: histogram(meter, semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE, "By"),
+            input_size: histogram(
+                meter,
+                semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
+                "By",
+                &histogram_buckets::SIZE_BYTES,
+            ),
             gauges,
             live,
         }
@@ -643,6 +665,13 @@ mod tests {
         // in one binary would race — one test, one provider.)
         let rms = exporter.get_finished_metrics().expect("metrics exported");
         assert_instruments_exported(&rms);
+        ourios_telemetry::histogram_guard::assert_explicit_buckets(
+            &rms,
+            &[
+                semconv::OURIOS_COMPACTION_DURATION,
+                semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+            ],
+        );
 
         assert_sweeps_classified(&rms);
 

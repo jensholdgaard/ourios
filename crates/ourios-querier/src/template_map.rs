@@ -39,6 +39,7 @@ use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::AuditPayload;
+use ourios_core::histogram_buckets;
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{format_template, parse_template};
 use ourios_parquet::percent_encode_tenant;
@@ -139,9 +140,13 @@ const DURATION_BUCKETS_S: [f64; 12] = [
     0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
 ];
 
-/// Bucket boundaries (bytes) for the derive's audit size. The SDK defaults
-/// top out near 10 kB; audit sets reach hundreds of MiB.
-const AUDIT_SIZE_BUCKETS: [f64; 9] = [
+/// Bucket boundaries (bytes) for the published artifact: powers of four
+/// from 1 KiB, since a small tenant's map is a few KiB and a large one's
+/// hundreds of MiB.
+const ARTIFACT_SIZE_BUCKETS: [f64; 11] = [
+    1_024.0,         // 1 KiB
+    4_096.0,         // 4 KiB
+    16_384.0,        // 16 KiB
     65_536.0,        // 64 KiB
     262_144.0,       // 256 KiB
     1_048_576.0,     // 1 MiB
@@ -150,7 +155,6 @@ const AUDIT_SIZE_BUCKETS: [f64; 9] = [
     67_108_864.0,    // 64 MiB
     268_435_456.0,   // 256 MiB
     1_073_741_824.0, // 1 GiB
-    4_294_967_296.0, // 4 GiB
 ];
 
 /// The RFC 0033 §3.7 instruments: lookups by outcome, publishes by
@@ -189,6 +193,7 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
         artifact_size: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
             .with_unit("By")
+            .with_boundaries(ARTIFACT_SIZE_BUCKETS.to_vec())
             .build(),
         derive_duration: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
@@ -198,11 +203,12 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
         derive_audit_files: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES)
             .with_unit("{file}")
+            .with_boundaries(histogram_buckets::COUNT_DECADES.to_vec())
             .build(),
         derive_audit_size: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE)
             .with_unit("By")
-            .with_boundaries(AUDIT_SIZE_BUCKETS.to_vec())
+            .with_boundaries(histogram_buckets::SIZE_BYTES.to_vec())
             .build(),
         acquire_wait: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION)

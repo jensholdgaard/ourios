@@ -132,6 +132,15 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
             "exported stream missing mandatory §6.8 metric `{expected}`, got {names:?}",
         );
     }
+
+    // #949 — no miner histogram falls back to the SDK's millisecond buckets.
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(
+        &rms,
+        &[
+            ourios_semconv::OURIOS_MINER_CONFIDENCE,
+            ourios_semconv::OURIOS_MINER_DURATION,
+        ],
+    );
 }
 
 /// Scenario §3.2.1 — Default per-parameter byte limit is 256.

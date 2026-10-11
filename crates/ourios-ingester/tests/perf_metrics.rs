@@ -84,6 +84,15 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
         );
     }
 
+    // #949 — neither duration falls back to the SDK's millisecond buckets.
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(
+        &rms,
+        &[
+            semconv::OURIOS_WAL_APPEND_DURATION,
+            semconv::OURIOS_SINK_FLUSH_DURATION,
+        ],
+    );
+
     // Throughput counters carry the recorded totals.
     assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_RECORDS, None), 10);
     assert_eq!(u64_sum(&rms, semconv::OURIOS_INGEST_BATCHES, None), 1);

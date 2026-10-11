@@ -34,6 +34,8 @@
 #![deny(unsafe_code)]
 
 #[cfg(feature = "testing")]
+pub mod histogram_guard;
+#[cfg(feature = "testing")]
 pub mod live_check;
 mod process;
 mod runtime;

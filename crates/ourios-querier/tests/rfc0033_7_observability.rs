@@ -761,6 +761,16 @@ fn rfc0033_7_observable_outcomes() {
 
     assert_artifact_sizes(&rms, [size_after_miss, size_after_stale, size_after_torn]);
     assert_derive_metrics(&rms, cold_audit_set);
+    // #949 — no template-map histogram uses the SDK's millisecond buckets.
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(
+        &rms,
+        &[
+            semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE,
+            semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION,
+            semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
+            semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
+        ],
+    );
     binding_conflict_act(&guard, &exporter, &rms);
     unknown_version_act(&guard, &exporter);
 }

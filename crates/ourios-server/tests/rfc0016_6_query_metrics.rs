@@ -198,6 +198,16 @@ async fn rfc0016_6_pruning_is_observable() {
     );
     assert!(scanned_metric >= 1, "at least one row group was scanned");
     assert_query_reads(&rms, bucket.path(), &json);
+    // #949 — no histogram the query path exported uses the SDK's
+    // millisecond buckets.
+    ourios_telemetry::histogram_guard::assert_explicit_buckets(
+        &rms,
+        &[
+            semconv::OURIOS_QUERY_DURATION,
+            semconv::OURIOS_QUERY_FILES,
+            semconv::OURIOS_QUERY_READ_SIZE,
+        ],
+    );
 }
 
 /// #924 — what the query read. Every live data file of the fixture was

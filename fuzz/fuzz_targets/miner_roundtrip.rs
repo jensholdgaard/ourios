@@ -37,8 +37,14 @@ use ourios_core::record::SharedRecordSink;
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
 
-#[path = "../common/oracles.rs"]
-mod oracles;
+#[path = "../common/audit.rs"]
+mod audit;
+#[path = "../common/merge.rs"]
+mod merge;
+#[path = "../common/reconstruction.rs"]
+mod reconstruction;
+#[path = "../common/snapshots.rs"]
+mod snapshots;
 #[path = "../common/telemetry.rs"]
 mod telemetry;
 
@@ -87,9 +93,9 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
         .with_record_sink(Box::new(sink.clone()));
     let tenant = TenantId::new("fuzz");
 
-    let mut templates = oracles::Templates::new();
+    let mut templates = snapshots::Templates::new();
     let mut records = Vec::with_capacity(lines.len());
-    let mut leaves = oracles::Leaves::new();
+    let mut leaves = audit::Leaves::new();
     for (index, line) in lines.iter().enumerate() {
         let record = OtlpLogRecord {
             tenant_id: tenant.clone(),
@@ -99,8 +105,8 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
         miner.ingest(&record);
 
         // (e) — every template the ingest created or moved forward is audited.
-        let after = oracles::leaves(&miner, &tenant);
-        oracles::AuditCtx {
+        let after = audit::leaves(&miner, &tenant);
+        audit::AuditCtx {
             index,
             line,
             before: &leaves,
@@ -115,16 +121,16 @@ fuzz_target!(init: telemetry::init(), |data: &[u8]| {
             panic!("RFC0015.10: line {index}: one string-body ingest must emit exactly one record");
         };
         if mined.template_id != NO_TEMPLATE {
-            oracles::snapshot_leaf(&miner, &tenant, &mined, &mut templates);
+            snapshots::snapshot_leaf(&miner, &tenant, &mined, &mut templates);
         }
         records.push(mined);
     }
 
     for (index, (line, record)) in lines.iter().zip(&records).enumerate() {
         if record.template_id != NO_TEMPLATE {
-            oracles::assert_no_silent_merge(index, line, record, &templates);
+            merge::assert_no_silent_merge(index, line, record, &templates);
         }
-        oracles::assert_reconstructs(index, line, record, &templates);
+        reconstruction::assert_reconstructs(index, line, record, &templates);
     }
-    oracles::assert_widening_is_monotone(&templates);
+    merge::assert_widening_is_monotone(&templates);
 });

@@ -311,6 +311,29 @@ fn parse(bytes: &[u8]) -> Result<u64, TemplateIdsError> {
     }
 }
 
+/// The high-water codec, exposed by the `fuzzing` feature so the `fuzz/`
+/// cargo-fuzz `artifact_decode` target can drive it on raw bytes (RFC 0015).
+/// Not part of the stable public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// [`super::read`]'s decode of the object's bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`super::TemplateIdsError::Malformed`] for anything but a version-1
+    /// high-water.
+    pub fn parse(bytes: &[u8]) -> Result<u64, super::TemplateIdsError> {
+        super::parse(bytes)
+    }
+
+    /// The bytes every write of the high-water puts.
+    #[must_use]
+    pub fn encode(reserved_through: u64) -> Vec<u8> {
+        super::encode(reserved_through)
+    }
+}
+
 fn refuse_later_version(store: &Store) -> Result<(), TemplateIdsError> {
     let keys = store
         .list_blocking(Some(HIGH_WATER_PREFIX))

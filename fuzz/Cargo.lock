@@ -2418,10 +2418,12 @@ dependencies = [
  "ourios-core",
  "ourios-ingester",
  "ourios-miner",
+ "ourios-parquet",
  "ourios-querier",
  "ourios-telemetry",
  "ourios-wal",
  "prost",
+ "zstd",
 ]
 
 [[package]]

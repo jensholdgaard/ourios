@@ -162,6 +162,10 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 oidc = ["ourios-serving/oidc"]
 # RFC 0047: the OpenFGA resolver binding tenants behind the same seam.
 openfga = ["ourios-serving/openfga"]
+# Exposes the RFC 0059 high-water codec (`template_ids::fuzzing`) for the
+# `fuzz/` cargo-fuzz `artifact_decode` target (RFC 0015). Off by default;
+# not part of the stable public API.
+fuzzing = []
 
 [dev-dependencies]
 # RFC 0052 §6's rotation fault-injection seam, for the RFC0052.15 arms

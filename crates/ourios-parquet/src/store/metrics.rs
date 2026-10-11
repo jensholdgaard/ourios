@@ -34,8 +34,8 @@ use object_store::ClientOptions;
 use object_store::client::{
     HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
 };
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
-use opentelemetry::{KeyValue, global};
 use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
@@ -259,7 +259,7 @@ pub(crate) enum Metrics {
 impl Metrics {
     pub(crate) fn get(&self) -> &StoreMetrics {
         static GLOBAL: LazyLock<StoreMetrics> =
-            LazyLock::new(|| StoreMetrics::from_meter(&global::meter(SCOPE)));
+            LazyLock::new(|| StoreMetrics::from_meter(&ourios_core::telemetry::meter(SCOPE)));
         match self {
             Self::Global => &GLOBAL,
             Self::Owned(metrics) => metrics,

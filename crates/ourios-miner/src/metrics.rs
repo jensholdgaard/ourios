@@ -379,7 +379,7 @@ impl MinerMetrics {
     /// split a cluster's instruments across two providers.
     fn for_provider(provider: &GlobalProvider, bindings: &Mutex<Vec<Binding>>) -> Self {
         Self::with_registry(
-            &provider.meter(METER_NAME),
+            &provider.meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
             &gauges::registry_for(provider, bindings),
         )
     }

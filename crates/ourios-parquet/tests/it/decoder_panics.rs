@@ -46,32 +46,46 @@ fn fixture(name: &str) -> bytes::Bytes {
     bytes::Bytes::from(std::fs::read(&path).expect("read the fixture"))
 }
 
-#[test]
-fn audit_reader_turns_decoder_panics_into_typed_errors() {
-    for name in AUDIT_FIXTURES {
-        // Act
-        let read =
-            AuditReader::open_object_bytes(fixture(name), name).and_then(AuditReader::read_all);
+#[derive(Debug, Clone, Copy)]
+enum Via {
+    AuditReader,
+    DataReader,
+}
 
-        // Assert
-        assert!(
-            matches!(&read, Err(AuditReaderError::DecodePanicked { path, .. }) if path == Path::new(name)),
-            "{name}: {read:?}",
-        );
+/// Read the fixture `name` to the end through `via`, opened under its own
+/// name as the object key: the object a `DecodePanicked` error names, or
+/// the outcome otherwise.
+fn decode_via(via: Via, name: &str) -> Result<PathBuf, String> {
+    let bytes = fixture(name);
+    match via {
+        Via::AuditReader => {
+            match AuditReader::open_object_bytes(bytes, name).and_then(AuditReader::read_all) {
+                Err(AuditReaderError::DecodePanicked { path, .. }) => Ok(path),
+                other => Err(format!("{other:?}")),
+            }
+        }
+        Via::DataReader => {
+            let partition = PartitionKey::derive(&record(0)).expect("derive partition");
+            match Reader::open_partition_bytes(bytes, partition, name).and_then(Reader::read_all) {
+                Err(ReaderError::DecodePanicked { path, .. }) => Ok(path),
+                other => Err(format!("{other:?}")),
+            }
+        }
     }
 }
 
 #[test]
-fn data_reader_turns_decoder_panics_into_typed_errors() {
-    for name in DATA_FIXTURES {
+fn both_readers_turn_decoder_panics_into_typed_errors_naming_the_object() {
+    let cases = AUDIT_FIXTURES
+        .map(|name| (Via::AuditReader, name))
+        .into_iter()
+        .chain(DATA_FIXTURES.map(|name| (Via::DataReader, name)));
+    for (via, name) in cases {
         // Act
-        let read = Reader::open_bytes(fixture(name)).and_then(Reader::read_all);
+        let named = decode_via(via, name);
 
         // Assert
-        assert!(
-            matches!(read, Err(ReaderError::DecodePanicked { .. })),
-            "{name}: {read:?}",
-        );
+        assert_eq!(named, Ok(PathBuf::from(name)), "{via:?}");
     }
 }
 

@@ -144,8 +144,9 @@ impl LiveInstruments {
 
 /// Bucket boundaries (bytes) for `ourios.storage.parquet.file.size`, the
 /// RFC 0009 §3.6 H4 detector: it alerts when more than 5 % of files are
-/// under 128 MiB, and the target band is 256 MiB–2 GiB, so all three are
-/// edges.
+/// under 128 MiB, and the target band is 256 MiB–2 GiB inclusive, so all
+/// three are edges. Explicit buckets are `(previous, edge]`, so a strict
+/// or inclusive lower threshold sits one byte below its value.
 const FILE_SIZE_BUCKETS: [f64; 12] = [
     65_536.0,        // 64 KiB
     262_144.0,       // 256 KiB
@@ -153,11 +154,11 @@ const FILE_SIZE_BUCKETS: [f64; 12] = [
     4_194_304.0,     // 4 MiB
     16_777_216.0,    // 16 MiB
     67_108_864.0,    // 64 MiB
-    134_217_728.0,   // 128 MiB, the H4 alert line
-    268_435_456.0,   // 256 MiB, the target band's floor
+    134_217_727.0,   // 128 MiB − 1: the H4 alert counts files < 128 MiB
+    268_435_455.0,   // 256 MiB − 1: a 256 MiB file is in the target band
     536_870_912.0,   // 512 MiB
     1_073_741_824.0, // 1 GiB
-    2_147_483_648.0, // 2 GiB, the target band's ceiling
+    2_147_483_648.0, // 2 GiB: the band's inclusive ceiling, already `(1 GiB, 2 GiB]`
     4_294_967_296.0, // 4 GiB
 ];
 
@@ -461,6 +462,19 @@ mod tests {
 
     use super::*;
     use crate::compactor::{CompactedFile, TenantSweep};
+
+    // Explicit buckets are `(previous, edge]` and samples are whole bytes.
+    #[test]
+    fn file_size_buckets_put_the_h4_thresholds_on_edges() {
+        const MIB: f64 = 1_048_576.0;
+        let has_edge = |edge: f64| FILE_SIZE_BUCKETS.contains(&edge);
+        // RFC 0009 §3.6: the H4 alert counts files strictly under 128 MiB.
+        assert!(has_edge(128.0 * MIB - 1.0));
+        // RFC 0009 §3.6: a 256 MiB file is inside the 256 MiB–2 GiB band.
+        assert!(has_edge(256.0 * MIB - 1.0));
+        // RFC 0009 §3.6: a 2 GiB file is inside the band, too.
+        assert!(has_edge(2_048.0 * MIB));
+    }
 
     // Collected metric names across the in-memory export.
     fn collected_names(rms: &[ResourceMetrics]) -> Vec<String> {

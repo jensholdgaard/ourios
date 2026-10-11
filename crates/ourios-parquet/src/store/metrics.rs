@@ -40,6 +40,7 @@ use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
 use super::StoreError;
+use super::client_span::{ClientSpan, S3Target};
 
 /// The instrumentation scope the storage metrics are recorded under.
 const SCOPE: &str = "ourios.storage";
@@ -334,14 +335,14 @@ impl Labels {
 
 /// How one HTTP attempt failed: its `error.type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Failure {
+pub(super) enum Failure {
     Status(u16),
     Transport(&'static str),
     Cancelled,
 }
 
 impl Failure {
-    fn error_type(self) -> Cow<'static, str> {
+    pub(super) fn error_type(self) -> Cow<'static, str> {
         match self {
             Self::Status(code) => Cow::Owned(code.to_string()),
             Self::Transport(kind) => Cow::Borrowed(kind),
@@ -512,11 +513,13 @@ impl<T> Stream for Observed<T> {
     }
 }
 
-/// The S3 client's connector, timing every HTTP attempt.
+/// The S3 client's connector, timing every HTTP attempt and, inside a query
+/// phase, tracing it as a `CLIENT` span.
 #[derive(Debug)]
 pub(super) struct MeteredConnector<C> {
     pub(super) inner: C,
     pub(super) metrics: Metrics,
+    pub(super) target: S3Target,
 }
 
 impl<C: HttpConnector> HttpConnector for MeteredConnector<C> {
@@ -524,6 +527,7 @@ impl<C: HttpConnector> HttpConnector for MeteredConnector<C> {
         Ok(HttpClient::new(MeteredHttp {
             inner: self.inner.connect(options)?,
             metrics: self.metrics.clone(),
+            target: self.target.clone(),
         }))
     }
 }
@@ -532,6 +536,7 @@ impl<C: HttpConnector> HttpConnector for MeteredConnector<C> {
 struct MeteredHttp {
     inner: HttpClient,
     metrics: Metrics,
+    target: S3Target,
 }
 
 #[async_trait]
@@ -542,16 +547,22 @@ impl HttpService for MeteredHttp {
             attempts.attempt(identity);
             (attempts, identity)
         });
+        let attributes = request_attributes(&req);
+        let span = ClientSpan::start(&req, &self.target, &attributes);
         let mut attempt = Attempt {
             metrics: self.metrics.clone(),
-            attributes: request_attributes(&req),
+            attributes,
             started: Instant::now(),
             scope,
+            span,
             done: false,
         };
         let response = self.inner.execute(req).await;
         match &response {
             Ok(response) => {
+                if let Some(span) = &mut attempt.span {
+                    span.response(response);
+                }
                 let status = response.status().as_u16();
                 attempt.finish(
                     Some(status),
@@ -572,6 +583,7 @@ struct Attempt {
     started: Instant,
     /// The logical operation it belongs to, and its request identity.
     scope: Option<(Arc<Attempts>, u64)>,
+    span: Option<ClientSpan>,
     done: bool,
 }
 
@@ -594,6 +606,9 @@ impl Attempt {
         self.metrics.get().http_duration.record(took, &attributes);
         if let Some((attempts, identity)) = &self.scope {
             attempts.ended(*identity, failure);
+        }
+        if let Some(span) = self.span.take() {
+            span.end(failure);
         }
     }
 }
@@ -651,7 +666,7 @@ fn request_attributes(req: &HttpRequest) -> Vec<KeyValue> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::Arc;
@@ -668,7 +683,7 @@ mod tests {
     use crate::store::{MAX_BRIDGE_WORKERS, S3Config, Store, StoreError, block_on_off_runtime};
 
     /// Storage instruments of their own, exporting in memory.
-    struct Harness {
+    pub(in crate::store) struct Harness {
         provider: SdkMeterProvider,
         exporter: InMemoryMetricExporter,
         metrics: Metrics,
@@ -690,7 +705,7 @@ mod tests {
     }
 
     impl Harness {
-        fn new() -> Self {
+        pub(in crate::store) fn new() -> Self {
             let exporter = InMemoryMetricExporter::default();
             let provider = SdkMeterProvider::builder()
                 .with_periodic_exporter(exporter.clone())
@@ -1023,7 +1038,7 @@ mod tests {
 
     /// A fake S3 endpoint answering each request on its own connection with
     /// the next of `responses`. Returns its port.
-    fn fake_s3(responses: Vec<&'static str>) -> u16 {
+    pub(in crate::store) fn fake_s3(responses: Vec<&'static str>) -> u16 {
         let count = responses.len();
         let mut responses = responses.into_iter();
         serve(count, move |_| responses.next().map(str::to_owned))
@@ -1071,7 +1086,7 @@ mod tests {
         conn.write_all(response.as_bytes()).expect("write");
     }
 
-    fn s3_store(harness: &Harness, port: u16, caller: Caller) -> Store {
+    pub(in crate::store) fn s3_store(harness: &Harness, port: u16, caller: Caller) -> Store {
         let cfg = S3Config::new("bucket")
             .with_endpoint(format!("http://127.0.0.1:{port}"))
             .with_region("us-east-1")

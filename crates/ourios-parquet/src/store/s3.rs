@@ -5,6 +5,7 @@ use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::client::SpawnedReqwestConnector;
 
 use super::bridge::bridge_runtime;
+use super::client_span::S3Target;
 use super::metrics::{MeteredConnector, Metrics};
 use super::{S3Config, StoreError};
 
@@ -35,6 +36,10 @@ pub(super) fn client(
         secret_access_key,
         session_token,
     } = cfg;
+    let target = S3Target {
+        bucket: bucket.trim().to_owned(),
+        region: region.clone(),
+    };
     let builder = authenticated(
         &bucket,
         Credentials {
@@ -53,6 +58,7 @@ pub(super) fn client(
         .with_http_connector(MeteredConnector {
             inner: SpawnedReqwestConnector::new(bridge_runtime()?.handle().clone()),
             metrics: metrics.clone(),
+            target,
         })
         .build()
         .map_err(StoreError::Backend)?;

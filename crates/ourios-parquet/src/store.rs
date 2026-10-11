@@ -30,6 +30,7 @@ use object_store::{
 };
 
 mod bridge;
+mod client_span;
 mod metered;
 mod metrics;
 mod s3;
@@ -37,6 +38,7 @@ mod s3;
 #[cfg(test)]
 use bridge::MAX_BRIDGE_WORKERS;
 use bridge::block_on_off_runtime;
+pub use client_span::QueryPhase;
 use metered::Backend;
 pub use metrics::Caller;
 use metrics::{Metrics, Operation};

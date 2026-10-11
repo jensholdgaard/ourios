@@ -150,6 +150,22 @@ pub(crate) async fn execute_plan(
     Ok((batches, stats))
 }
 
+/// Count the filtered frame's rows via an aggregate, so the heavy
+/// `attributes` / `params` / `body` columns are never materialised
+/// (projection pushdown). The physical plan is built and executed through
+/// [`execute_plan`] (rather than `df.count()`) so the scan's pruning
+/// metrics can be read off the retained plan.
+pub(crate) async fn count_scan(
+    df: datafusion::dataframe::DataFrame,
+    ctx: &SessionContext,
+) -> Result<(u64, QueryStats), QueryError> {
+    let counted = df
+        .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
+        .map_err(storage_err)?;
+    let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
+    Ok((count_value(&batches)?, stats))
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(clippy::wildcard_imports)]

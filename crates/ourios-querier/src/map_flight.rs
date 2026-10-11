@@ -31,7 +31,11 @@ use crate::{Backend, QueryError, StoreRef, audit_scan};
 /// bytes ([`crate::QueryResult::registry_bytes_read`]).
 pub(crate) type Acquired = Result<(Arc<TemplateMap>, u64), QueryError>;
 
-/// A successful acquisition as one query saw it.
+/// A successful acquisition as one query saw it. A query acquires at most
+/// once (RFC 0033): at compile time when the DSL uses `resolves_to` (the
+/// alias fold), otherwise lazily while rendering rows, so the alias map and
+/// the registry can never come from different frontiers within one query
+/// (§3.1's one-artifact rationale).
 pub(crate) struct MapAcquisition {
     pub(crate) map: Arc<TemplateMap>,
     /// The acquisition's bytes ([`crate::QueryResult::registry_bytes_read`]),

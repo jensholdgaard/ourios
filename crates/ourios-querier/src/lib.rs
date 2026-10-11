@@ -339,31 +339,6 @@ impl Terminal {
     }
 }
 
-/// One per-query template-map acquisition (RFC 0033): the artifact-or-fold
-/// [`TemplateMap`] plus the bytes fetched acquiring it
-/// ([`QueryResult::registry_bytes_read`]). Acquired at most once per query
-/// — at compile time when the DSL uses `resolves_to` (the alias fold),
-/// otherwise lazily by [`Querier::collect_records`] when there are rows to
-/// render — so the alias map and the registry can never come from
-/// different frontiers within one query (§3.1's one-artifact rationale).
-struct AcquiredTemplateMap {
-    map: Arc<TemplateMap>,
-    acquisition_bytes: u64,
-    /// The acquisition bytes this query fetched itself: all of them for the
-    /// query that ran the acquisition, `0` for one that joined it.
-    fetched: u64,
-}
-
-impl From<map_flight::MapAcquisition> for AcquiredTemplateMap {
-    fn from(acquired: map_flight::MapAcquisition) -> Self {
-        Self {
-            map: acquired.map,
-            acquisition_bytes: acquired.bytes,
-            fetched: acquired.fetched,
-        }
-    }
-}
-
 impl Querier {
     /// Create a querier reading the RFC 0005 store under the **local**
     /// `bucket_root` (the same root the `ourios-parquet` writer writes
@@ -547,13 +522,13 @@ impl Querier {
         // runtime worker, mirroring `run_drift`.
         let needs_registry = plan::uses_body_equality(&query.predicate);
         let needs_alias_fold = alias_map.is_none() && plan::uses_resolves_to(&query.predicate);
-        let mut acquired: Option<AcquiredTemplateMap> = None;
+        let mut acquired: Option<map_flight::MapAcquisition> = None;
         if needs_alias_fold || needs_registry {
             let acquisition = self
                 .template_maps
                 .acquire_fetched(&self.backend, tenant)
                 .await?;
-            acquired = Some(acquisition.into());
+            acquired = Some(acquisition);
         }
         let derived;
         let map = match (alias_map, &acquired) {
@@ -675,7 +650,7 @@ impl Querier {
         // `resolves_to` alias fold, RFC 0033) — handed to the row-rendering
         // pass so one acquisition serves both folds. `None` ⇒ rendering
         // acquires lazily.
-        acquired: Option<AcquiredTemplateMap>,
+        acquired: Option<map_flight::MapAcquisition>,
         build_filter: F,
     ) -> Result<QueryResult, QueryError>
     where
@@ -704,7 +679,11 @@ impl Querier {
             .await?;
         if urls.is_empty() {
             let result = empty_result(terminal.aggregate());
-            return Ok(with_fetched(result, &ctx, compile_fetched));
+            return Ok(crate::fetch_count::with_fetched(
+                result,
+                &ctx,
+                compile_fetched,
+            ));
         }
         let files_opened = urls.len() as u64;
 
@@ -722,7 +701,11 @@ impl Querier {
             }
         };
         result.stats.files_opened = files_opened;
-        Ok(with_fetched(result, &ctx, compile_fetched))
+        Ok(crate::fetch_count::with_fetched(
+            result,
+            &ctx,
+            compile_fetched,
+        ))
     }
 
     /// Run `terminal` over the filtered frame `df` (see [`Self::execute`],
@@ -733,7 +716,7 @@ impl Querier {
         df: datafusion::dataframe::DataFrame,
         tenant: &TenantId,
         terminal: Terminal,
-        mut acquired: Option<AcquiredTemplateMap>,
+        mut acquired: Option<map_flight::MapAcquisition>,
     ) -> Result<QueryResult, QueryError> {
         // An aggregation query terminates in its own grouped-count scan
         // (RFC 0002 §6.5 amendment): the map is the result, so the
@@ -884,7 +867,7 @@ impl Querier {
         limit: usize,
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
-        acquired: Option<AcquiredTemplateMap>,
+        acquired: Option<map_flight::MapAcquisition>,
     ) -> Result<CollectedRecords, QueryError> {
         // Filter pushdown ("late materialization", off by default in
         // DataFusion 54): the scan evaluates the predicate during Parquet
@@ -971,11 +954,10 @@ impl Querier {
         let (acquired, map_fetched) = if let Some(acquired) = acquired {
             (acquired, 0)
         } else {
-            let acquired: AcquiredTemplateMap = self
+            let acquired = self
                 .template_maps
                 .acquire_fetched(&self.backend, tenant)
-                .await?
-                .into();
+                .await?;
             let fetched = acquired.fetched;
             (acquired, fetched)
         };
@@ -985,7 +967,7 @@ impl Querier {
             // not per row.
             records: LogRow::from_records(&mined, acquired.map.registry()),
             scan,
-            registry_bytes_read: acquired.acquisition_bytes,
+            registry_bytes_read: acquired.bytes,
             map_fetched,
         })
     }
@@ -1079,67 +1061,6 @@ impl Querier {
             .hooks
             .waits
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// `result` with its full `bytes_fetched`: what `ctx` fetched, plus the
-/// template-map bytes this query fetched itself at compile time
-/// (`compile_fetched`), on top of any it fetched acquiring lazily while
-/// rendering (already in `result.bytes_fetched`). A query acquires at most
-/// once, so at most one of the two is non-zero; a joiner's are both `0`.
-fn with_fetched(
-    mut result: QueryResult,
-    ctx: &SessionContext,
-    compile_fetched: u64,
-) -> QueryResult {
-    result.bytes_fetched = result
-        .bytes_fetched
-        .saturating_add(crate::fetch_count::fetched(ctx))
-        .saturating_add(compile_fetched);
-    result
-}
-
-/// Count the filtered frame's rows via an aggregate, so the heavy
-/// `attributes` / `params` / `body` columns are never materialised
-/// (projection pushdown). The physical plan is built and executed here
-/// (rather than `df.count()`) so the scan's pruning metrics can be read
-/// off the retained plan.
-async fn count_scan(
-    df: datafusion::dataframe::DataFrame,
-    ctx: &SessionContext,
-) -> Result<(u64, QueryStats), QueryError> {
-    let counted = df
-        .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
-        .map_err(storage_err)?;
-    let (batches, stats) = execute_plan(counted, ctx.task_ctx()).await?;
-    Ok((count_value(&batches)?, stats))
-}
-
-/// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
-/// the local backend, store keys on S3 (their URLs need the query's
-/// `SessionContext`, which stays on the async side).
-enum LiveSet {
-    Urls(Vec<ListingTableUrl>),
-    Keys(Vec<String>),
-}
-
-/// Resolve the tenant's live data files for [`Querier::resolve_data_urls`] —
-/// blocking IO, run on the blocking pool.
-fn resolve_live_set(
-    backend: &Backend,
-    prefix: &str,
-    window: Option<(u64, u64)>,
-    fetched: &fetch_count::FetchCounter,
-) -> Result<LiveSet, QueryError> {
-    match backend {
-        Backend::Local(root) => {
-            let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window, fetched)?;
-            local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
-        }
-        Backend::Remote(store) => {
-            resolve_live_keys(store, prefix, window, fetched).map(LiveSet::Keys)
-        }
     }
 }
 

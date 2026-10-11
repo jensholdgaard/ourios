@@ -283,24 +283,41 @@ async fn a_rendered_acquisition_is_counted_once() {
 #[cfg(feature = "testing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shared_fold_is_counted_once_across_its_queries() {
+    const QUERIES: usize = 4;
+    let (bucket, audit_bytes) = store_with_audit();
+
+    let results = run_sharing_one_acquisition(bucket.path(), QUERIES).await;
+
+    for result in &results {
+        assert_eq!(result.rows, 1);
+        assert_eq!(
+            result.registry_bytes_read, audit_bytes,
+            "every query reports the shared fold's bytes",
+        );
+    }
+    assert_fold_counted_once(&results, audit_bytes);
+}
+
+/// Run `count` concurrent body-rendering queries on one querier, holding
+/// the first acquisition until all the others have joined it.
+#[cfg(feature = "testing")]
+async fn run_sharing_one_acquisition(bucket: &std::path::Path, count: usize) -> Vec<QueryResult> {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    const QUERIES: usize = 4;
-    let (bucket, audit_bytes) = store_with_audit();
-    let querier = Arc::new(Querier::new(bucket.path()));
+    let querier = Arc::new(Querier::new(bucket));
     let weak = Arc::downgrade(&querier);
     querier.set_template_map_acquire_gate(Some(Arc::new(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         while let Some(querier) = weak.upgrade()
-            && querier.template_map_waits() < QUERIES - 1
+            && querier.template_map_waits() < count - 1
         {
             assert!(Instant::now() < deadline, "the other queries never joined");
             std::thread::sleep(Duration::from_millis(2));
         }
     })));
 
-    let tasks: Vec<_> = (0..QUERIES)
+    let tasks: Vec<_> = (0..count)
         .map(|_| {
             let querier = Arc::clone(&querier);
             tokio::spawn(async move {
@@ -324,34 +341,34 @@ async fn a_shared_fold_is_counted_once_across_its_queries() {
         results.push(task.await.expect("query task"));
     }
     querier.set_template_map_acquire_gate(None);
-
     assert_eq!(
         querier.template_map_waits(),
-        QUERIES - 1,
+        count - 1,
         "all but one joined"
     );
-    for result in &results {
-        assert_eq!(result.rows, 1);
-        assert_eq!(
-            result.registry_bytes_read, audit_bytes,
-            "every query reports the shared fold's bytes",
-        );
-    }
+    results
+}
+
+/// The joiners' totals are their table reads alone, the acquirer's adds the
+/// fold, and the sum over all the queries counts the fold once.
+#[cfg(feature = "testing")]
+fn assert_fold_counted_once(results: &[QueryResult], fold_bytes: u64) {
+    let queries = results.len();
     let mut fetched: Vec<u64> = results.iter().map(QueryResult::total_bytes_read).collect();
     fetched.sort_unstable();
     let table = fetched[0];
     assert!(
-        fetched[..QUERIES - 1].iter().all(|&f| f == table),
+        fetched[..queries - 1].iter().all(|&f| f == table),
         "the joiners fetched only their table reads: {fetched:?}",
     );
     assert_eq!(
-        fetched[QUERIES - 1],
-        table + audit_bytes,
+        fetched[queries - 1],
+        table + fold_bytes,
         "the acquirer also fetched the fold"
     );
     assert_eq!(
         fetched.iter().sum::<u64>(),
-        table * QUERIES as u64 + audit_bytes,
+        table * queries as u64 + fold_bytes,
         "summed read.size counts the fold once",
     );
 }

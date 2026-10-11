@@ -99,10 +99,10 @@ pub struct QueryOptions {
     /// predicate over the same file set, and a limit that was never reached
     /// cannot stop the scan early, so the counts are the ones the count
     /// scan would have reported), but `stats.bytes_read` is `0` — the count
-    /// scan genuinely read nothing. `stats.bytes_read`,
-    /// [`QueryResult::materialize_bytes_read`] and
-    /// [`QueryResult::registry_bytes_read`] stay the scan-specific
-    /// components; the query's total IO, under elision or not, is
+    /// scan genuinely read nothing. `stats.bytes_read` and
+    /// [`QueryResult::materialize_bytes_read`] stay the scan-specific
+    /// components (and [`QueryResult::registry_bytes_read`] the RFC 0033
+    /// diagnostic); the query's total IO, under elision or not, is
     /// [`QueryResult::total_bytes_read`]. Callers needing the pinned "a limited query's `stats`
     /// equal a count-only query's" shape (RFC 0017 §3.4) keep the default.
     pub elide_count_scan: bool,
@@ -177,8 +177,14 @@ pub struct QueryResult {
     /// `resolves_to` queries, the alias map. `0` when no rows were
     /// rendered. A query that waited on another query's in-flight
     /// acquisition of the same frontier reports that acquisition's bytes —
-    /// the artifact's size on a hit, the fold's on a miss. Same additive contract as `materialize_bytes_read`
-    /// (RFC 0031 §3.6).
+    /// the artifact's size on a hit, the fold's on a miss.
+    ///
+    /// This is RFC 0033 diagnostic accounting of what the map behind the
+    /// rows cost, reported to every query that rendered with it, joiners
+    /// included. It is therefore **not** a component of
+    /// [`Self::total_bytes_read`]: summed over concurrent queries it would
+    /// count one shared fold once per joiner. The bytes this query fetched
+    /// itself for the map are in [`Self::bytes_fetched`].
     pub registry_bytes_read: u64,
     /// Every byte this query itself fetched from storage: the partition
     /// manifests file-set resolution read, the footers schema inference

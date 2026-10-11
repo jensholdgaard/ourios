@@ -122,6 +122,34 @@ fn read_local_manifest(
     }
 }
 
+/// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
+/// the local backend, store keys on S3 (their URLs need the query's
+/// `SessionContext`, which stays on the async side).
+pub(super) enum LiveSet {
+    Urls(Vec<ListingTableUrl>),
+    Keys(Vec<String>),
+}
+
+/// Resolve the tenant's live data files for [`Querier::resolve_data_urls`] —
+/// blocking IO, run on the blocking pool.
+pub(super) fn resolve_live_set(
+    backend: &Backend,
+    prefix: &str,
+    window: Option<(u64, u64)>,
+    fetched: &FetchCounter,
+) -> Result<LiveSet, QueryError> {
+    match backend {
+        Backend::Local(root) => {
+            let tenant_dir = root.join(prefix);
+            let live_files = resolve_live_files(&tenant_dir, window, fetched)?;
+            local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
+        }
+        Backend::Remote(store) => {
+            resolve_live_keys(store, prefix, window, fetched).map(LiveSet::Keys)
+        }
+    }
+}
+
 /// The S3 analog of [`resolve_live_files`]: resolve the live data-file **keys**
 /// under the tenant's `prefix` through the [`Store`] seam (RFC 0019 §3.3),
 /// honouring partition-level time pruning + the RFC 0009 §3.4 per-partition

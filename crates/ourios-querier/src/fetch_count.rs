@@ -49,6 +49,23 @@ pub(crate) fn fetched(ctx: &SessionContext) -> u64 {
     counter(ctx).map_or(0, |c| c.get())
 }
 
+/// `result` with its full `bytes_fetched`: what `ctx` fetched, plus the
+/// template-map bytes the query fetched itself at compile time
+/// (`compile_fetched`), on top of any it fetched acquiring lazily while
+/// rendering (already in `result.bytes_fetched`). A query acquires at most
+/// once, so at most one of the two is non-zero; a joiner's are both `0`.
+pub(crate) fn with_fetched(
+    mut result: crate::QueryResult,
+    ctx: &SessionContext,
+    compile_fetched: u64,
+) -> crate::QueryResult {
+    result.bytes_fetched = result
+        .bytes_fetched
+        .saturating_add(fetched(ctx))
+        .saturating_add(compile_fetched);
+    result
+}
+
 /// `inner`, counting into `ctx`'s counter when it has one.
 pub(crate) fn counted(ctx: &SessionContext, inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
     match counter(ctx) {

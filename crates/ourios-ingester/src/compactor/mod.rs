@@ -146,6 +146,8 @@ mod graph_phase;
 #[cfg(all(test, feature = "openfga"))]
 mod graph_tests;
 #[cfg(test)]
+mod sweep_progress_tests;
+#[cfg(test)]
 mod tests;
 
 // Scope glue: siblings and the test module reach each other's items
@@ -240,7 +242,10 @@ pub struct SweepHooks<'a> {
 #[derive(Debug, Default)]
 pub struct SweepGauges {
     /// Consolidation candidates the running sweep has not yet processed;
-    /// zero between sweeps.
+    /// zero between sweeps. It never rises during a sweep: candidates that
+    /// became eligible after the sweep counted them still compact but are
+    /// not counted, so it can reach zero slightly before the sweep ends
+    /// ([`Countdown`]).
     remaining: AtomicU64,
     /// Every rewrite's memory, budgets and spills.
     compaction: CompactionStats,
@@ -265,8 +270,12 @@ impl SweepGauges {
 ///
 /// The total comes from a counting pass that keeps one number per tenant,
 /// never the candidates themselves: each tenant's candidate list is held
-/// only while that tenant compacts. When a tenant is planned for real, the
-/// difference from its counted candidates is folded in.
+/// only while that tenant compacts. The count only ever falls during a
+/// sweep: a tenant planned with fewer candidates than counted gives up the
+/// difference, but one planned with more is not raised. Candidates that
+/// became eligible after the counting pass are still compacted in this
+/// sweep, uncounted, so the count can reach zero slightly before the sweep
+/// ends; the next sweep's count includes whatever they left behind.
 struct Countdown<'a> {
     remaining: Option<&'a AtomicU64>,
     counted: std::vec::IntoIter<usize>,
@@ -291,13 +300,12 @@ impl<'a> Countdown<'a> {
         }
     }
 
-    /// The next tenant planned `planned` candidates.
+    /// The next tenant planned `planned` candidates: drop the ones it was
+    /// counted with but no longer has.
     fn begin_tenant(&mut self, planned: usize) {
         let counted = self.counted.next().unwrap_or(0);
-        self.store(|left| {
-            left.saturating_sub(to_u64(counted))
-                .saturating_add(to_u64(planned))
-        });
+        let vanished = to_u64(counted.saturating_sub(planned));
+        self.store(|left| left.saturating_sub(vanished));
     }
 
     fn tick(&self) {

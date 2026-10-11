@@ -549,13 +549,10 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn record_sweep_exports_the_compaction_metric_set() {
-        // Arrange — an in-memory provider, then the instruments (built
-        // after, so they resolve against it).
-        let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
-        let metrics = CompactionMetrics::new();
-        let report = SweepReport {
+    // A two-tenant sweep: acme lags, beta clears its backlog, and a ghost
+    // tenant's 0-byte output stands in for a failed `stat`.
+    fn sample_report() -> SweepReport {
+        SweepReport {
             erasures_deferred: Vec::new(),
             erasures: Vec::new(),
             graph_tuples_emitted: 0,
@@ -604,18 +601,12 @@ mod tests {
                     partitions_compacted: 2,
                 },
             ],
-        };
+        }
+    }
 
-        // Act
-        metrics.record_sweep(&Ok(report), Duration::from_millis(50));
-        guard.force_flush().expect("force_flush succeeds");
-
-        // Assert — every recorded instrument is in the exported stream.
-        // (All assertions share this test's single in-memory provider:
-        // `init_in_memory` installs the *global* meter, so two such tests
-        // in one binary would race — one test, one provider.)
-        let rms = exporter.get_finished_metrics().expect("metrics exported");
-        let names = collected_names(&rms);
+    // Every compaction instrument the sweep recorded is in the export.
+    fn assert_instruments_exported(rms: &[ResourceMetrics]) {
+        let names = collected_names(rms);
         for expected in [
             semconv::OURIOS_COMPACTION_SWEEPS,
             semconv::OURIOS_COMPACTION_PARTITIONS,
@@ -632,6 +623,26 @@ mod tests {
                 "exported stream missing {expected}, got {names:?}",
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn record_sweep_exports_the_compaction_metric_set() {
+        // Arrange — an in-memory provider, then the instruments (built
+        // after, so they resolve against it).
+        let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+        let metrics = CompactionMetrics::new();
+        let report = sample_report();
+
+        // Act
+        metrics.record_sweep(&Ok(report), Duration::from_millis(50));
+        guard.force_flush().expect("force_flush succeeds");
+
+        // Assert — every recorded instrument is in the exported stream.
+        // (All assertions share this test's single in-memory provider:
+        // `init_in_memory` installs the *global* meter, so two such tests
+        // in one binary would race — one test, one provider.)
+        let rms = exporter.get_finished_metrics().expect("metrics exported");
+        assert_instruments_exported(&rms);
 
         assert_sweeps_classified(&rms);
 

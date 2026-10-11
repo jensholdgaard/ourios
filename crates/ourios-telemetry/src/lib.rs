@@ -37,6 +37,7 @@
 pub mod live_check;
 mod process;
 
+use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
@@ -46,6 +47,9 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::resource::{
+    EnvResourceDetector, SdkProvidedResourceDetector, TelemetryResourceDetector,
+};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -64,6 +68,12 @@ pub struct TelemetryConfig {
     /// attribute (RFC 0001 §6.8 — set once on the provider, never a
     /// per-data-point attribute).
     pub service_name: String,
+    /// The release this process runs, the `service.version` **resource**
+    /// attribute. The binary sets its own `CARGO_PKG_VERSION`, which names the
+    /// artefact actually deployed; `None` falls back to this crate's version,
+    /// the same workspace release. An operator-set `service.version` in
+    /// `OTEL_RESOURCE_ATTRIBUTES` overrides either.
+    pub service_version: Option<String>,
     /// OTLP collector endpoint. `None` uses the exporter's default
     /// (`http://localhost:4317` for gRPC), so the `OTEL_EXPORTER_*`
     /// environment overrides still apply. The periodic-reader export
@@ -103,11 +113,21 @@ impl TelemetryConfig {
     pub fn new(service_name: impl Into<String>) -> Self {
         Self {
             service_name: service_name.into(),
+            service_version: None,
             otlp_endpoint: None,
             traces_enabled: true,
             metrics_enabled: true,
             logs_enabled: true,
         }
+    }
+
+    fn resource(&self) -> Resource {
+        resource(
+            &self.service_name,
+            self.service_version
+                .as_deref()
+                .unwrap_or(DEFAULT_SERVICE_VERSION),
+        )
     }
 }
 
@@ -224,10 +244,24 @@ impl Drop for TelemetryGuard {
     }
 }
 
+/// The `service.version` used when [`TelemetryConfig::service_version`] is unset.
+const DEFAULT_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The resource every signal shares: the service, and the `process` entity
 /// that the process metrics describe.
-fn resource(service_name: &str) -> Resource {
-    Resource::builder()
+///
+/// Precedence, later wins: `service.version` (a default), then the SDK's
+/// detectors (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `telemetry.sdk.*`),
+/// then `service.name` and the `process` identity. So an operator can relabel
+/// the version but not the service name or the process identity.
+fn resource(service_name: &str, service_version: &str) -> Resource {
+    Resource::builder_empty()
+        .with_attribute(KeyValue::new("service.version", service_version.to_owned()))
+        .with_detectors(&[
+            Box::new(SdkProvidedResourceDetector),
+            Box::new(TelemetryResourceDetector),
+            Box::new(EnvResourceDetector::new()),
+        ])
         .with_service_name(service_name.to_owned())
         .with_attributes(process::identity())
         .build()
@@ -325,7 +359,7 @@ fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) 
 /// Returns [`TelemetryError::Exporter`] if either OTLP exporter cannot
 /// be constructed.
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
-    let resource = resource(&config.service_name);
+    let resource = config.resource();
 
     // RFC 0039 §3.1: the W3C trace-context propagator, installed
     // unconditionally. It is stateless and cheap, and extraction is inert when
@@ -530,7 +564,7 @@ pub fn init_in_memory(
     let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
     let provider = SdkMeterProvider::builder()
         .with_periodic_exporter(exporter.clone())
-        .with_resource(resource(service_name))
+        .with_resource(resource(service_name, DEFAULT_SERVICE_VERSION))
         .build();
     global::set_meter_provider(provider.clone());
     (
@@ -558,6 +592,7 @@ mod tests {
     async fn init_with_signals_disabled_installs_no_pipelines() {
         let guard = init(&TelemetryConfig {
             service_name: "ourios-test-disabled".into(),
+            service_version: None,
             otlp_endpoint: None,
             traces_enabled: false,
             metrics_enabled: false,
@@ -601,7 +636,7 @@ mod tests {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
             .with_periodic_exporter(exporter.clone())
-            .with_resource(resource("ourios-test"))
+            .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
         let meter = provider.meter("ourios.compaction");
         let counter = meter.u64_counter("ourios.compaction.sweeps").build();
@@ -648,6 +683,81 @@ mod tests {
                     .timestamp_millis(),
             "the process was created in the past, got {created}",
         );
+
+        // The release rides on the resource too, so telemetry compares by version.
+        assert_eq!(
+            resource.get(&"service.version".into()),
+            Some(opentelemetry::Value::from(env!("CARGO_PKG_VERSION"))),
+        );
+    }
+
+    /// The configured `service_version` names the release; unset, it falls
+    /// back to this crate's (workspace) version.
+    #[test]
+    fn config_service_version_defaults_to_the_crate_version() {
+        let version = |config: &TelemetryConfig| config.resource().get(&"service.version".into());
+        assert_eq!(
+            version(&TelemetryConfig::new("ourios-test")),
+            Some(opentelemetry::Value::from(env!("CARGO_PKG_VERSION"))),
+        );
+        let pinned = TelemetryConfig {
+            service_version: Some("1.2.3".into()),
+            ..TelemetryConfig::new("ourios-test")
+        };
+        assert_eq!(version(&pinned), Some(opentelemetry::Value::from("1.2.3")));
+    }
+
+    /// The env var the re-executed child of
+    /// `otel_resource_attributes_service_version_wins` reads, so the child runs
+    /// with the process environment set before start rather than mutating the
+    /// shared environment of this test binary.
+    const RESOURCE_ATTRIBUTES_CHILD: &str = "OURIOS_TELEMETRY_RESOURCE_ATTRIBUTES_CHILD";
+
+    /// An operator's `OTEL_RESOURCE_ATTRIBUTES=service.version=…` wins over the
+    /// configured version, while `service.name` stays the configured one. Runs
+    /// the assertion in a re-executed copy of this test binary, since the env
+    /// detector reads process-global state.
+    #[test]
+    fn otel_resource_attributes_service_version_wins() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::resource_attributes_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(RESOURCE_ATTRIBUTES_CHILD, "1")
+            .env(
+                "OTEL_RESOURCE_ATTRIBUTES",
+                "service.version=9.9.9-operator,service.name=operator-name",
+            )
+            .env_remove("OTEL_SERVICE_NAME")
+            .output()
+            .expect("re-execute the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test failed or did not run:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore = "re-executed by otel_resource_attributes_service_version_wins"]
+    fn resource_attributes_child() {
+        if std::env::var_os(RESOURCE_ATTRIBUTES_CHILD).is_none() {
+            return;
+        }
+        let resource = resource("ourios-test", "0.0.0-configured");
+        assert_eq!(
+            resource.get(&"service.version".into()),
+            Some(opentelemetry::Value::from("9.9.9-operator")),
+        );
+        assert_eq!(
+            resource.get(&"service.name".into()),
+            Some(opentelemetry::Value::from("ourios-test")),
+        );
     }
 
     // The dogfooding pipe end-to-end at the unit level: a `tracing`
@@ -664,7 +774,7 @@ mod tests {
         let exporter = InMemoryLogExporter::default();
         let logger = SdkLoggerProvider::builder()
             .with_simple_exporter(exporter.clone())
-            .with_resource(resource("ourios-test"))
+            .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
         let subscriber =
             tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&logger));
@@ -702,12 +812,12 @@ mod tests {
         let span_exporter = InMemorySpanExporter::default();
         let tracer_provider = SdkTracerProvider::builder()
             .with_simple_exporter(span_exporter)
-            .with_resource(resource("ourios-test"))
+            .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
         let log_exporter = InMemoryLogExporter::default();
         let logger = SdkLoggerProvider::builder()
             .with_simple_exporter(log_exporter.clone())
-            .with_resource(resource("ourios-test"))
+            .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer(TRACER_SCOPE)))

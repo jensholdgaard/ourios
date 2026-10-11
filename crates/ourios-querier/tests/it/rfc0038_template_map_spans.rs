@@ -117,10 +117,12 @@ fn traced() -> (InMemorySpanExporter, SdkTracerProvider, tracing::Dispatch) {
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let dispatch = tracing::Dispatch::new(
-        tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test"))),
-    );
+    let dispatch =
+        tracing::Dispatch::new(tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(
+                provider.tracer_with_scope(ourios_core::telemetry::scope("ourios-test")),
+            ),
+        ));
     (exporter, provider, dispatch)
 }
 

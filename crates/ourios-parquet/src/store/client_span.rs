@@ -323,7 +323,8 @@ mod tests {
     /// attached when `in_phase`; the `CLIENT` spans of its trace.
     fn client_spans_of(in_phase: bool, work: impl FnOnce()) -> (TraceId, Vec<SpanData>) {
         let exporter = exporter();
-        let tracer = opentelemetry::global::tracer_provider().tracer("test");
+        let tracer = opentelemetry::global::tracer_provider()
+            .tracer_with_scope(ourios_core::telemetry::scope("test"));
         let parent = tracer.start("load template_map");
         let trace_id = parent.span_context().trace_id();
         let cx = Context::current_with_span(parent);

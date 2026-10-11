@@ -996,20 +996,34 @@ mod tests {
         std::thread::spawn(move || {
             for _ in 0..connections {
                 let (mut conn, _) = listener.accept().expect("accept");
-                let mut request = Vec::new();
-                let mut buf = [0_u8; 1024];
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = conn.read(&mut buf).expect("read");
-                    assert!(n > 0, "request ended early");
-                    request.extend_from_slice(&buf[..n]);
-                }
-                match respond(&String::from_utf8_lossy(&request)) {
-                    Some(response) => conn.write_all(response.as_bytes()).expect("write"),
-                    None => while conn.read(&mut buf).is_ok_and(|n| n > 0) {},
-                }
+                let request = read_head(&mut conn);
+                answer(&mut conn, respond(&request));
             }
         });
         port
+    }
+
+    /// Read a request up to the end of its head.
+    fn read_head(conn: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = conn.read(&mut buf).expect("read");
+            assert!(n > 0, "request ended early");
+            request.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    /// Send `response`, or with none, hold the connection until the client
+    /// hangs up.
+    fn answer(conn: &mut std::net::TcpStream, response: Option<String>) {
+        let Some(response) = response else {
+            let mut buf = [0_u8; 1024];
+            while conn.read(&mut buf).is_ok_and(|n| n > 0) {}
+            return;
+        };
+        conn.write_all(response.as_bytes()).expect("write");
     }
 
     fn s3_store(harness: &Harness, port: u16, caller: Caller) -> Store {

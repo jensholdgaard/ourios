@@ -1060,7 +1060,7 @@ impl TemplateMap {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
             return;
         };
-        if bytes.len() as u64 >= acquisition_bytes {
+        if abstains(bytes.len() as u64, acquisition_bytes) {
             return;
         }
         // Best-effort by contract: Published and LostRace are both fine,
@@ -1137,6 +1137,13 @@ impl TemplateMap {
             }
         }
     }
+}
+
+/// The §3.5 abstention: publishing pays only when the compressed artifact
+/// costs less to GET than `acquisition_bytes`, what the next acquisition
+/// pays at the same listing without it.
+fn abstains(artifact_bytes: u64, acquisition_bytes: u64) -> bool {
+    artifact_bytes >= acquisition_bytes
 }
 
 /// Validate the canonical form [`TemplateMap::to_json`] writes; any
@@ -1355,6 +1362,19 @@ mod tests {
         );
         assert_eq!(restored.folded_files(), map.folded_files());
         assert_eq!(restored.tenant(), &tenant());
+    }
+
+    /// RFC0033.11 abstention boundary: an artifact between the folded
+    /// audit bytes and the full acquisition bytes (the stale artifact's GET
+    /// or the incremental base included) publishes; one at or above them
+    /// abstains.
+    #[test]
+    fn abstention_compares_against_acquisition_bytes() {
+        let (artifact, folded, fetched_artifact) = (1_000, 900, 300);
+        assert!(!abstains(artifact, folded + fetched_artifact));
+        assert!(abstains(artifact, folded));
+        assert!(abstains(artifact, artifact));
+        assert!(!abstains(artifact, artifact + 1));
     }
 
     #[test]

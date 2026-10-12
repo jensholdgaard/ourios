@@ -397,13 +397,13 @@ const ENGINE_LEAK_TOKENS: &[&str] = &[
     "binary(",
 ];
 
-/// Assert the operator-facing `message` names no engine/SQL construct.
-fn assert_leaks_no_engine_token(context: &str, message: &str) {
-    let message = message.to_ascii_lowercase();
+/// Assert the error's operator-facing message names no engine/SQL construct.
+fn assert_leaks_no_engine_token(err: &ourios_querier::QueryError) {
+    let message = err.to_string().to_ascii_lowercase();
     for token in ENGINE_LEAK_TOKENS {
         assert!(
             !message.contains(token),
-            "{context}: leaked engine token {token:?}: {message:?}",
+            "leaked engine token {token:?}: {message:?} ({err:?})",
         );
     }
 }
@@ -446,7 +446,7 @@ async fn rfc0002_3_no_datafusion_leakage() {
     assert!(matches!(err, QueryError::InvalidQuery { .. }));
     let msg = err.to_string().to_ascii_lowercase();
     assert!(!msg.trim().is_empty(), "compile error must be non-empty");
-    assert_leaks_no_engine_token("compile-path error", &msg);
+    assert_leaks_no_engine_token(&err);
 }
 
 /// Scenario RFC0002.4 — A query without an explicit range gets the tenant default window.
@@ -836,7 +836,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
             msg.contains(fragment),
             "{text:?} should name {fragment:?}: {msg:?}"
         );
-        assert_leaks_no_engine_token(text, &msg);
+        assert_leaks_no_engine_token(&err);
     }
 }
 
@@ -846,10 +846,41 @@ async fn rfc0002_6_non_text_operators_rejected() {
 /// logical body and assigns this an acceptance criterion, each such operator
 /// is rejected before any IO as the query's own `InvalidQuery`, naming the
 /// operator and leaking no engine detail, even nested under `not` / `or`.
-async fn assert_body_text_match_rejected(text: &str, operator: &str) {
+#[derive(Clone, Copy)]
+enum BodyTextOp {
+    StartsWith,
+    Matches,
+    RegexMatch,
+    RegexNotMatch,
+}
+
+impl BodyTextOp {
+    /// A query using the operator on `body`, nested a different way each.
+    fn query(self) -> &'static str {
+        match self {
+            Self::StartsWith => "starts_with(body, \"GET /\")",
+            Self::Matches => "severity >= warn and matches(body, \"^POST\")",
+            Self::RegexMatch => "scope == \"x\" or body =~ \"cart\"",
+            Self::RegexNotMatch => "not (body !~ \"cart\")",
+        }
+    }
+
+    /// The operator's DSL spelling, which the rejection names.
+    fn spelling(self) -> &'static str {
+        match self {
+            Self::StartsWith => "starts_with",
+            Self::Matches => "matches",
+            Self::RegexMatch => "=~",
+            Self::RegexNotMatch => "!~",
+        }
+    }
+}
+
+async fn assert_body_text_match_rejected(op: BodyTextOp) {
     use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
     use ourios_querier::QueryError;
 
+    let text = op.query();
     let bucket = tempfile::TempDir::new().expect("temp");
     write_all(bucket.path(), &[simple("a", 1, TS0)]);
     let query = ourios_querier::dsl::parse(text).expect("parse DSL");
@@ -867,31 +898,30 @@ async fn assert_body_text_match_rejected(text: &str, operator: &str) {
         panic!("{text}: expected InvalidQuery, got {err:?}");
     };
     assert!(
-        detail.contains(&format!("`{operator}` on body")) && detail.contains("RFC 0044 §7"),
+        detail.contains(&format!("`{}` on body", op.spelling())) && detail.contains("RFC 0044 §7"),
         "{text}: {detail}",
     );
-    assert_leaks_no_engine_token(text, &err.to_string());
+    assert_leaks_no_engine_token(&err);
 }
 
 #[tokio::test]
 async fn body_text_match_starts_with_rejected() {
-    assert_body_text_match_rejected("starts_with(body, \"GET /\")", "starts_with").await;
+    assert_body_text_match_rejected(BodyTextOp::StartsWith).await;
 }
 
 #[tokio::test]
 async fn body_text_match_matches_rejected() {
-    assert_body_text_match_rejected("severity >= warn and matches(body, \"^POST\")", "matches")
-        .await;
+    assert_body_text_match_rejected(BodyTextOp::Matches).await;
 }
 
 #[tokio::test]
 async fn body_text_match_regex_match_rejected() {
-    assert_body_text_match_rejected("scope == \"x\" or body =~ \"cart\"", "=~").await;
+    assert_body_text_match_rejected(BodyTextOp::RegexMatch).await;
 }
 
 #[tokio::test]
 async fn body_text_match_regex_not_match_rejected() {
-    assert_body_text_match_rejected("not (body !~ \"cart\")", "!~").await;
+    assert_body_text_match_rejected(BodyTextOp::RegexNotMatch).await;
 }
 
 /// Scenario RFC0002.6 (unsupported stage rejection) — a pipeline stage this

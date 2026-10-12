@@ -382,6 +382,32 @@ fn rfc0002_2_string_and_structured_surfaces_agree() {
     );
 }
 
+/// Engine/SQL tokens that must never surface in an operator-facing query
+/// error (hazard `CLAUDE.md` §4.6), matched case-insensitively.
+const ENGINE_LEAK_TOKENS: &[&str] = &[
+    "datafusion",
+    "arrow",
+    "sql",
+    "logicalplan",
+    "logical plan",
+    "recordbatch",
+    "select",
+    "schema",
+    "fixedsizebinary",
+    "binary(",
+];
+
+/// Assert the operator-facing `message` names no engine/SQL construct.
+fn assert_leaks_no_engine_token(context: &str, message: &str) {
+    let message = message.to_ascii_lowercase();
+    for token in ENGINE_LEAK_TOKENS {
+        assert!(
+            !message.contains(token),
+            "{context}: leaked engine token {token:?}: {message:?}",
+        );
+    }
+}
+
 /// Scenario RFC0002.3 — No `DataFusion`/arrow/SQL leakage.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 ///
@@ -395,18 +421,6 @@ async fn rfc0002_3_no_datafusion_leakage() {
     use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
-
-    // Engine/SQL tokens that must never surface in a compile-path error.
-    const LEAK_TOKENS: &[&str] = &[
-        "datafusion",
-        "arrow",
-        "sql",
-        "logicalplan",
-        "logical plan",
-        "recordbatch",
-        "select",
-        "schema",
-    ];
 
     // Arrange — a real store, and a query whose compilation fails
     // (ordering operator on a JSON-encoded attribute is out of scope).
@@ -432,12 +446,7 @@ async fn rfc0002_3_no_datafusion_leakage() {
     assert!(matches!(err, QueryError::InvalidQuery { .. }));
     let msg = err.to_string().to_ascii_lowercase();
     assert!(!msg.trim().is_empty(), "compile error must be non-empty");
-    for token in LEAK_TOKENS {
-        assert!(
-            !msg.contains(token),
-            "compile-path error leaked engine token {token:?}: {msg:?}",
-        );
-    }
+    assert_leaks_no_engine_token("compile-path error", &msg);
 }
 
 /// Scenario RFC0002.4 — A query without an explicit range gets the tenant default window.
@@ -791,8 +800,6 @@ async fn rfc0002_6_non_text_operators_rejected() {
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
-    const LEAK_TOKENS: &[&str] = &["datafusion", "arrow", "sql", "fixedsizebinary", "binary("];
-
     let bucket = tempfile::TempDir::new().expect("temp");
     write_all(bucket.path(), &[simple("a", 1, TS0)]);
     let q = Querier::new(bucket.path());
@@ -829,9 +836,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
             msg.contains(fragment),
             "{text:?} should name {fragment:?}: {msg:?}"
         );
-        for token in LEAK_TOKENS {
-            assert!(!msg.contains(token), "{text:?} leaked {token:?}: {msg:?}");
-        }
+        assert_leaks_no_engine_token(text, &msg);
     }
 }
 
@@ -865,6 +870,7 @@ async fn assert_body_text_match_rejected(text: &str, operator: &str) {
         detail.contains(&format!("`{operator}` on body")) && detail.contains("RFC 0044 §7"),
         "{text}: {detail}",
     );
+    assert_leaks_no_engine_token(text, &err.to_string());
 }
 
 #[tokio::test]

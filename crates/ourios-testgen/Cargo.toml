@@ -16,7 +16,7 @@ ourios-core = { path = "../ourios-core" }
 # `OtlpLogRecord` (RFC 0024 §3.2). A *regular* dependency here is the
 # point of the crate: consumers take `ourios-testgen` as a
 # dev-dependency, so no production crate's graph grows `proptest`.
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 # Calibration-manifest (de)serialization (RFC 0024 §3.1) — the
 # workspace-default serialization stack (same pins as ourios-core).
 serde = { version = "1", default-features = false, features = ["std", "derive"] }

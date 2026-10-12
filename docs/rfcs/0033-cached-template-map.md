@@ -1241,7 +1241,19 @@ ambiguity cannot recur.
 >   fold is served and nothing is published
 > - **And** an artifact carrying `fold_state` read by the
 >   pre-amendment v2 reader is a `Valid` hit when its frontier
->   matches.
+>   matches
+> - **And** the abstention uses acquisition bytes, pinned at the
+>   boundary. For an **incremental** derive whose compressed result
+>   is larger than the delta's bytes but smaller than base plus delta,
+>   the write-through publishes; the delta-only rule would have
+>   abstained. A result of at least base plus delta abstains. For a
+>   **stale full-fold fallback** whose compressed result is at least
+>   the folded audit bytes but smaller than the artifact GET plus the
+>   audit objects fetched (any rejected delta read included), it
+>   publishes; the pre-amendment folded-bytes rule would have
+>   abstained. A result of at least that total abstains. Each case
+>   asserts the publish outcome (`published`, or no outcome on
+>   abstention) and the answer equals the full fold.
 
 > **Scenario RFC0033.12 — Late files and concurrent writers**
 > (amendment 2026-10-12, #962, maintainer-approved)
@@ -1292,6 +1304,13 @@ ambiguity cannot recur.
 >   `derive.audit.files` / `derive.audit.size` sample
 > - **And** the incremental sample's `derive.audit.files` /
 >   `derive.audit.size` equal the delta's file count and bytes
+> - **And** the `out_of_order` fallback's `derive.audit.files` /
+>   `derive.audit.size` equal the audit objects actually fetched,
+>   including the rejected delta read. That is the delta plus the full
+>   set's remaining objects when the delta bytes are reused, or the
+>   delta plus the whole full set when they are re-fetched. The test
+>   asserts against a fetch-counting store, so it holds whichever the
+>   implementation does
 > - **And** an incremental acquisition over an artifact whose
 >   `binding_conflicts` is non-empty reports every persisted and new
 >   conflict exactly as RFC0033.8 does for a full fold

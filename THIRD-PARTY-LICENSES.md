@@ -19,10 +19,10 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 340 |
-| `MIT` | 69 |
+| `Apache-2.0` | 346 |
+| `MIT` | 67 |
 | `Unicode-3.0` | 19 |
-| `BSD-3-Clause` | 9 |
+| `BSD-3-Clause` | 10 |
 | `ISC` | 4 |
 | `Zlib` | 3 |
 | `CC0-1.0` | 1 |
@@ -482,6 +482,8 @@ Used by:
 - `arrow-select` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `arrow-string` 59.2.0 — <https://github.com/apache/arrow-rs>
 - `arrow` 59.2.0 — <https://github.com/apache/arrow-rs>
+- `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
+- `multiversion_no_op` 1.0.0 — <https://github.com/hsivonen/multiversion_no_op>
 - `parquet` 59.3.0 — <https://github.com/apache/arrow-rs>
 - `utf8_iter` 1.0.4 — <https://github.com/hsivonen/utf8_iter>
 - `zeroize` 1.9.0 — <https://github.com/RustCrypto/utils>
@@ -2495,6 +2497,7 @@ Used by:
 
 Used by:
 
+- `annotate-snippets` 0.12.16 — <https://github.com/rust-lang/annotate-snippets-rs>
 - `anstream` 1.0.0 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle-parse` 1.0.0 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle-query` 1.1.5 — <https://github.com/rust-cli/anstyle.git>
@@ -4913,6 +4916,7 @@ Used by:
 - `curve25519-dalek-derive` 0.1.1 — <https://github.com/dalek-cryptography/curve25519-dalek>
 - `displaydoc` 0.2.6 — <https://github.com/yaahc/displaydoc>
 - `either` 1.16.0 — <https://github.com/rayon-rs/either>
+- `encoding_rs_io` 0.1.8 — <https://github.com/BurntSushi/encoding_rs_io>
 - `equivalent` 1.0.2 — <https://github.com/indexmap-rs/equivalent>
 - `errno` 0.3.14 — <https://github.com/lambda-fairy/rust-errno>
 - `fastrand` 2.4.1 — <https://github.com/smol-rs/fastrand>
@@ -4933,7 +4937,6 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
-- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
@@ -6980,6 +6983,7 @@ Used by:
 - `allocator-api2` 0.2.21 — <https://github.com/zakarumych/allocator-api2>
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
+- `arraydeque` 0.5.1 — <https://github.com/andylokandy/arraydeque>
 - `async-trait` 0.1.92 — <https://github.com/dtolnay/async-trait>
 - `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
@@ -6988,6 +6992,7 @@ Used by:
 - `dyn-clone` 1.0.20 — <https://github.com/dtolnay/dyn-clone>
 - `fiat-crypto` 0.2.9 — <https://github.com/mit-plv/fiat-crypto>
 - `flatbuffers` 25.12.19 — <https://github.com/google/flatbuffers>
+- `granit-parser` 1.3.0 — <https://github.com/bourumir-wyngs/granit-parser>
 - `half` 2.7.1 — <https://github.com/VoidStarKat/half-rs>
 - `ident_case` 1.0.1 — <https://github.com/TedDriggs/ident_case>
 - `itoa` 1.0.18 — <https://github.com/dtolnay/itoa>
@@ -7020,6 +7025,7 @@ Used by:
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>
 - `semver` 1.0.28 — <https://github.com/dtolnay/semver>
 - `seq-macro` 0.3.6 — <https://github.com/dtolnay/seq-macro>
+- `serde-saphyr` 1.3.0 — <https://github.com/bourumir-wyngs/serde-saphyr>
 - `serde` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_core` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_derive` 1.0.229 — <https://github.com/serde-rs/serde>
@@ -7894,6 +7900,47 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 </details>
 
+### BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`)
+
+Used by:
+
+- `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+</details>
+
 ### Creative Commons Zero v1.0 Universal (`CC0-1.0`)
 
 Used by:
@@ -8219,43 +8266,6 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
-
-```
-
-</details>
-
-### MIT License (`MIT`)
-
-Used by:
-
-- `serde_yaml_ng` 0.10.0 — <https://github.com/acatton/serde-yaml-ng>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-                                  MIT License
-
-Copyright 2024 Antoine Catton
-Copyright 2016-2024 David Tolnay
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the “Software”), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 ```
 
@@ -9464,7 +9474,6 @@ SOFTWARE.
 
 Used by:
 
-- `unsafe-libyaml` 0.2.11 — <https://github.com/dtolnay/unsafe-libyaml>
 - `zmij` 1.0.23 — <https://github.com/dtolnay/zmij>
 
 <details>

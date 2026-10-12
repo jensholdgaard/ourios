@@ -729,7 +729,7 @@ impl Querier {
             // field as a string, and §3.7.2 wants a count.
             .inspect(|urls| {
                 phase.record(
-                    "ourios.file_set.live_files",
+                    ourios_semconv::OURIOS_FILE_SET_LIVE_FILES,
                     i64::try_from(urls.len()).unwrap_or(i64::MAX),
                 );
             })

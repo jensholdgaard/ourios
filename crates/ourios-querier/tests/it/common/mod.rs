@@ -369,3 +369,18 @@ pub async fn localstack_s3(
     .expect("build s3 store");
     (container, store)
 }
+
+/// Install a process-wide default subscriber once. Without one, a callsite
+/// first reached by a test running with no subscriber can cache a `never`
+/// interest while another test's scoped subscriber is being registered,
+/// and that scoped subscriber then misses the span. A default subscriber
+/// that is interested in everything keeps every callsite enabled, so each
+/// test's scoped subscriber decides what it records.
+pub fn global_subscriber() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // Another test binary component may already have set one; either
+        // way a default now exists.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}

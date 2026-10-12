@@ -337,6 +337,18 @@ pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
 /// `ourios.compaction.size.kind` attribute key.
 pub const OURIOS_COMPACTION_SIZE_KIND: &str = "ourios.compaction.size.kind";
 
+/// `ourios.file_set.list_request_count` attribute key.
+pub const OURIOS_FILE_SET_LIST_REQUEST_COUNT: &str = "ourios.file_set.list_request_count";
+
+/// `ourios.file_set.listed_objects` attribute key.
+pub const OURIOS_FILE_SET_LISTED_OBJECTS: &str = "ourios.file_set.listed_objects";
+
+/// `ourios.file_set.live_files` attribute key.
+pub const OURIOS_FILE_SET_LIVE_FILES: &str = "ourios.file_set.live_files";
+
+/// `ourios.file_set.manifest_read_count` attribute key.
+pub const OURIOS_FILE_SET_MANIFEST_READ_COUNT: &str = "ourios.file_set.manifest_read_count";
+
 /// `ourios.graph.tuple.operation` attribute key.
 pub const OURIOS_GRAPH_TUPLE_OPERATION: &str = "ourios.graph.tuple.operation";
 

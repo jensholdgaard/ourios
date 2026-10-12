@@ -21,11 +21,11 @@ use tracing_subscriber::prelude::*;
 use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
 
 const TENANT: &str = "acme";
-const LIVE_FILES: &str = "ourios.file_set.live_files";
 
 /// A scoped tracing pipeline over its own in-memory span exporter. Keep the
 /// provider alive until the spans are read.
 fn traced() -> (InMemorySpanExporter, SdkTracerProvider, tracing::Dispatch) {
+    crate::common::global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -100,7 +100,10 @@ async fn resolution_spans_the_file_set_under_the_query() {
         text(resolve, semconv::OURIOS_TENANT).as_deref(),
         Some(TENANT)
     );
-    assert_eq!(attribute(resolve, LIVE_FILES), Some(Value::I64(1)));
+    assert_eq!(
+        attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
+        Some(Value::I64(1))
+    );
 }
 
 /// A tenant with nothing live still gets the span — the listing ran — with
@@ -117,7 +120,10 @@ async fn an_empty_file_set_still_spans_the_resolution() {
         panic!("one resolve span over an empty tenant");
     };
     assert_eq!(resolve.parent_span_id, query_id);
-    assert_eq!(attribute(resolve, LIVE_FILES), Some(Value::I64(0)));
+    assert_eq!(
+        attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
+        Some(Value::I64(0))
+    );
 }
 
 /// Plant a manifest that does not parse in every partition holding data
@@ -159,23 +165,29 @@ async fn a_failed_resolution_marks_the_phase_as_an_error() {
         "the fixture wrote a partition"
     );
     let querier = Querier::new(dir.path());
-    let parsed = ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
-    let result = querier
-        .run_query(
-            &parsed,
-            &TenantId::new(TENANT),
-            NOW,
-            DEFAULT_WINDOW_NS,
-            None,
-        )
-        .instrument(tracing::info_span!("POST /v1/query"))
-        .with_subscriber(dispatch)
-        .await;
+    let result = async {
+        let parsed = ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
+        querier
+            .run_query(
+                &parsed,
+                &TenantId::new(TENANT),
+                NOW,
+                DEFAULT_WINDOW_NS,
+                None,
+            )
+            .instrument(tracing::info_span!("POST /v1/query"))
+            .await
+    }
+    .with_subscriber(dispatch)
+    .await;
     assert!(result.is_err(), "a corrupt manifest fails the query");
     let spans = exporter.get_finished_spans().expect("spans");
 
     let [resolve] = named(&spans, "resolve files")[..] else {
-        panic!("one resolve span for the failed resolution");
+        panic!(
+            "one resolve span for the failed resolution: {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     };
     assert!(
         matches!(resolve.status, opentelemetry::trace::Status::Error { .. }),
@@ -183,5 +195,8 @@ async fn a_failed_resolution_marks_the_phase_as_an_error() {
         resolve.status
     );
     assert_eq!(text(resolve, "error.type").as_deref(), Some("storage"));
-    assert_eq!(attribute(resolve, LIVE_FILES), None);
+    assert_eq!(
+        attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
+        None
+    );
 }

@@ -6,9 +6,9 @@
 //! `template_type_expanded` events (RFC 0001 §6.4, RFC 0017 §3.1) off the
 //! RFC 0005 §3.7 audit Parquet stream. The RFC 0033 cached template map
 //! (`template_map.v2.json.zst`, discharging the RFC 0005 §3.7.1 deferral)
-//! accelerates this derivation at the query call sites; this fold remains
-//! the source-of-truth derivation and the fallback for every non-hit
-//! disposition.
+//! accelerates this derivation at the query call sites, extending a stale
+//! artifact incrementally when its guard admits it; this fold remains the
+//! source-of-truth derivation and the full-fold fallback.
 //!
 //! This mirrors [`crate::alias_store::derive_alias_map`] exactly — the same
 //! shared [`crate::audit_scan`] walk and the same total, deterministic fold

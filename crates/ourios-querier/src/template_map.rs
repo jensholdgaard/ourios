@@ -18,9 +18,10 @@
 //! [`TemplateMap::publish`] commits the artifact atomically (tmp+rename
 //! locally, conditional put on the store — §3.4, the RFC 0009 manifest
 //! precedent). [`load_or_derive`] is the cached read path the query
-//! layer consumes: one listing, the §3.3 frontier check, fallback to
-//! the fresh fold on every non-hit disposition, and the §3.5
-//! best-effort write-through.
+//! layer consumes: one listing, the §3.3 frontier check, the guarded
+//! incremental extension of a stale artifact (falling back to a full
+//! fold when the guard declines it), a full fold on every other non-hit
+//! disposition, and the §3.5 best-effort write-through.
 //!
 //! JSON follows the `manifest.json` precedent
 //! (`ourios_parquet::Manifest`, RFC 0009 §3.4): small, human-
@@ -519,15 +520,19 @@ pub enum CacheOutcome {
         reason: MissReason,
     },
     /// A valid artifact at a different frontier — never served (§3.3:
-    /// re-derive, never serve stale): fresh fold over the live listing,
-    /// write-through republish at the new frontier.
+    /// re-derive, never serve stale): extended by only the newly listed
+    /// audit files when the incremental guard admits it, else a full fold
+    /// over the live listing; either way a write-through republish at the
+    /// new frontier.
     StaleRefreshed,
 }
 
 /// The cached read path (RFC 0033 §3.3/§3.5): resolve `tenant`'s
 /// [`TemplateMap`] through the published artifact when it is exactly
-/// fresh, and by the fresh fold — today's behaviour, then a best-effort
-/// write-through publish — on **every** other disposition.
+/// fresh; a stale artifact by the guarded incremental extension (§3.3
+/// amendment 2026-10-12), falling back to a full fold when the guard
+/// declines it; and by a full fold on every other disposition — each
+/// non-hit followed by a best-effort write-through publish.
 ///
 /// IO per outcome (the freshness LIST is never byte-counted, matching
 /// both backends' existing accounting):
@@ -540,11 +545,14 @@ pub enum CacheOutcome {
 ///   best-effort publish. Acquisition bytes = the fold's audit bytes,
 ///   plus the failed GET's bytes if it returned any (torn / unknown
 ///   version).
-/// - [`CacheOutcome::StaleRefreshed`] — as a miss, with the stale
-///   artifact's GET bytes counted (they were fetched and discarded).
+/// - [`CacheOutcome::StaleRefreshed`] — one LIST + the artifact GET,
+///   then either the incremental fold, which reads only the delta files
+///   (acquisition bytes = the artifact GET + the delta's bytes), or the
+///   full-fold fallback (acquisition bytes = the artifact GET + the full
+///   fold's audit bytes + any rejected delta read).
 ///
 /// The listing is taken **once**, before the artifact GET is compared,
-/// and the fallback fold consumes that same listing (§3.3's
+/// and the incremental or full fold consumes that same listing (§3.3's
 /// LIST-before-GET-is-compared rule), so a file appearing mid-query
 /// affects a cached and an uncached query identically.
 ///

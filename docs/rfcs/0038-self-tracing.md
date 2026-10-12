@@ -815,11 +815,18 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > arm gains the §3.7.2 children of `load template_map`.** The span set
 > above also contains, under `load template_map`:
 >
-> - **exactly one** `derive template_map` iff the lookup folds (outcome
->   `miss`, `stale`, `torn` or `unknown_version`), and none on a `hit` or
->   `joined`;
-> - one `wait template_map` per wait on another query's in-flight
->   acquisition, so none for the query that acquires.
+> - one `wait template_map` per iteration of the single-flight loop that
+>   finds another query's acquisition in flight. A query that finds none
+>   opens no wait span. A query whose listed frontier equals the running
+>   flight's waits once and is served its result. A query whose frontier
+>   differs waits, lists again and repeats, so it may wait more than once
+>   and then acquire itself;
+> - **at most one** `derive template_map`, and exactly one iff the query
+>   itself acquires and its lookup folds (outcome `miss`, `stale`, `torn` or
+>   `unknown_version`). None on a `hit`, and none for a query served
+>   another's acquisition (`joined`). A query that waited behind a
+>   different frontier and then acquired can carry both wait spans and its
+>   one derive.
 >
 > On the S3 backend, the fold's object-store requests' `CLIENT` spans are
 > children of `derive template_map`, not of `load template_map`. "No other
@@ -1098,6 +1105,12 @@ Mapped to `CLAUDE.md` §6.2:
 >   - `a_query_joining_an_acquisition_spans_its_wait` (`testing` feature)
 >     covers RFC0038.12, including that the joining query has no
 >     `derive template_map` of its own.
+>   - `a_query_behind_another_frontier_waits_then_folds_itself` (`testing`
+>     feature) covers the differing-frontier path. An audit file lands
+>     after the first query lists. The second query waits once, then
+>     acquires and refolds the stale map, so its `load template_map` carries
+>     one `wait template_map` and one `derive template_map` (outcome
+>     `stale`). The first query has neither a wait nor the second's fold.
 >   - `a_failed_fold_marks_the_derive_and_load_spans_error` covers
 >     RFC0038.13.
 >

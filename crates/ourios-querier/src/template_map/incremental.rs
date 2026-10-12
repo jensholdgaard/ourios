@@ -14,7 +14,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use ourios_core::tenant::TenantId;
 
 use super::{
-    DerivePath, Derived, FallbackReason, FoldBase, FoldPass, TemplateMap, add_bytes, full_fold,
+    DeriveError, DerivePath, Derived, FallbackReason, FoldBase, FoldPass, TemplateMap, add_bytes,
+    full_fold,
 };
 use crate::fold_state::{FoldState, INCREMENTAL_DEPTH_CAP, is_fold_relevant, nanos};
 use crate::template_registry::{RegistryFold, TemplateRegistry};
@@ -27,7 +28,7 @@ pub(super) fn derive_stale(
     base: TemplateMap,
     resolved: ResolvedAuditSet<'_>,
     tenant: &TenantId,
-) -> Result<Derived, QueryError> {
+) -> Result<Derived, DeriveError> {
     let TemplateMap {
         folded_files,
         registry,
@@ -107,12 +108,16 @@ fn delta_over(folded: &[String], live: &[String]) -> Option<Vec<String>> {
 /// Fold the delta onto the base, checking every fold-relevant delta event
 /// against the base's high-water as it streams through the same validated
 /// scan a full fold uses.
+///
+/// A delta file that fails after an earlier one was rejected fails the
+/// derive as an `out_of_order` fallback without running it: the full fold
+/// would read that same object, and no fold retries a failed read.
 fn fold_delta(
     base: Base,
     delta_set: ResolvedAuditSet<'_>,
     live: Vec<String>,
     tenant: &TenantId,
-) -> Result<DeltaFold, QueryError> {
+) -> Result<DeltaFold, DeriveError> {
     let high_water = base.state.high_water_ns();
     let held_at = UNIX_EPOCH + Duration::from_nanos(high_water.unwrap_or(0));
     let mut pass = FoldPass {
@@ -127,7 +132,16 @@ fn fold_delta(
         if !rejected {
             pass.visit(event);
         }
-    })?;
+    });
+    let scan = match scan {
+        Ok(scan) => scan,
+        Err(e) if rejected => {
+            return Err(DeriveError::on(DerivePath::Fallback(
+                FallbackReason::OutOfOrder,
+            ))(e));
+        }
+        Err(e) => return Err(DeriveError::undecided(e)),
+    };
     let fetched = Fetched {
         files: scan.frontier.len() as u64,
         bytes: scan.bytes_read,
@@ -151,17 +165,24 @@ fn fold_delta(
 }
 
 /// A full fold over `resolved` after the guard declined, its cost
-/// including whatever the rejected delta read `already` fetched.
+/// including whatever the rejected delta read `already` fetched. Any
+/// failure here comes after the path was decided.
 fn fallback(
     resolved: ResolvedAuditSet<'_>,
     tenant: &TenantId,
     reason: FallbackReason,
     already: Fetched,
-) -> Result<Derived, QueryError> {
-    let mut derived = full_fold(resolved, tenant, DerivePath::Fallback(reason))?;
-    derived.fetched_files = add_bytes(derived.fetched_files, already.files)?;
-    derived.fetched_bytes = add_bytes(derived.fetched_bytes, already.bytes)?;
-    Ok(derived)
+) -> Result<Derived, DeriveError> {
+    let path = DerivePath::Fallback(reason);
+    let decided = DeriveError::on(path);
+    let counted = |mut derived: Derived| -> Result<Derived, QueryError> {
+        derived.fetched_files = add_bytes(derived.fetched_files, already.files)?;
+        derived.fetched_bytes = add_bytes(derived.fetched_bytes, already.bytes)?;
+        Ok(derived)
+    };
+    full_fold(resolved, tenant, path)
+        .and_then(counted)
+        .map_err(decided)
 }
 
 #[cfg(test)]

@@ -130,6 +130,16 @@ const DERIVE_REASON_MISS: &str = "miss";
 const DERIVE_REASON_STALE: &str = "stale";
 const DERIVE_REASON_TORN: &str = "torn";
 const DERIVE_REASON_UNKNOWN_VERSION: &str = "unknown_version";
+/// `ourios.template_map.derive.mode` values (RFC 0033 §3.3 amendment
+/// 2026-10-12): how the derive produced its map.
+const DERIVE_MODE_FULL: &str = "full";
+const DERIVE_MODE_INCREMENTAL: &str = "incremental";
+/// `ourios.template_map.derive.fallback.reason` values: the guard row that
+/// declined a stale artifact's incremental path.
+const FALLBACK_NO_FOLD_STATE: &str = "no_fold_state";
+const FALLBACK_FILES_REMOVED: &str = "files_removed";
+const FALLBACK_DEPTH_CAP: &str = "depth_cap";
+const FALLBACK_OUT_OF_ORDER: &str = "out_of_order";
 /// The upstream `error.type` attribute key a failed derive carries.
 const ERROR_TYPE: &str = "error.type";
 /// `ourios.template_map.publish.outcome` attribute values (RFC 0033 §3.7).
@@ -255,25 +265,24 @@ impl TemplateMapMetrics {
     }
 
     /// One fold's cost: its duration always (with `error.type` when it
-    /// failed), and the audit files and bytes it read when it completed.
+    /// failed), and the audit files and bytes it fetched when it completed.
+    /// Every sample carries `attrs` ([`derive_attributes`]).
     fn record_derive(
         &self,
-        reason: &'static str,
+        mut attrs: Vec<KeyValue>,
         elapsed: Duration,
         folded: Result<(u64, u64), &'static str>,
     ) {
-        let reason = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON, reason);
         match folded {
             Ok((files, bytes)) => {
-                let attrs = [reason];
                 self.derive_duration.record(elapsed.as_secs_f64(), &attrs);
                 self.derive_audit_files.record(files, &attrs);
                 self.derive_audit_size.record(bytes, &attrs);
             }
-            Err(error_type) => self.derive_duration.record(
-                elapsed.as_secs_f64(),
-                &[reason, KeyValue::new(ERROR_TYPE, error_type)],
-            ),
+            Err(error_type) => {
+                attrs.push(KeyValue::new(ERROR_TYPE, error_type));
+                self.derive_duration.record(elapsed.as_secs_f64(), &attrs);
+            }
         }
     }
 
@@ -343,6 +352,43 @@ pub(crate) fn record_joined_lookup() {
 /// same frontier, whether that acquisition succeeded or failed.
 pub(crate) fn record_acquire_wait(waited: Duration) {
     METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
+}
+
+/// A derive sample's attributes: its `reason`, plus the mode and
+/// fallback reason of `path` once the path was decided.
+fn derive_attributes(reason: &'static str, path: Option<DerivePath>) -> Vec<KeyValue> {
+    let mut attrs = vec![KeyValue::new(
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON,
+        reason,
+    )];
+    attrs.extend(path.map_or_else(Vec::new, path_attributes));
+    attrs
+}
+
+/// The `derive.mode` and, for a declined stale artifact,
+/// `derive.fallback.reason` attributes of a decided `path`.
+fn path_attributes(path: DerivePath) -> Vec<KeyValue> {
+    let mode = |value| KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_DERIVE_MODE, value);
+    match path {
+        DerivePath::Full => vec![mode(DERIVE_MODE_FULL)],
+        DerivePath::Incremental => vec![mode(DERIVE_MODE_INCREMENTAL)],
+        DerivePath::Fallback(reason) => vec![
+            mode(DERIVE_MODE_FULL),
+            KeyValue::new(
+                semconv::OURIOS_TEMPLATE_MAP_DERIVE_FALLBACK_REASON,
+                fallback_reason(reason),
+            ),
+        ],
+    }
+}
+
+fn fallback_reason(reason: FallbackReason) -> &'static str {
+    match reason {
+        FallbackReason::NoFoldState => FALLBACK_NO_FOLD_STATE,
+        FallbackReason::FilesRemoved => FALLBACK_FILES_REMOVED,
+        FallbackReason::DepthCap => FALLBACK_DEPTH_CAP,
+        FallbackReason::OutOfOrder => FALLBACK_OUT_OF_ORDER,
+    }
 }
 
 /// The `ourios.template_map.derive.reason` for an outcome that folds;
@@ -621,6 +667,28 @@ enum FallbackReason {
     OutOfOrder,
 }
 
+/// A failed derive, with the path it had decided on when it failed: `None`
+/// when a stale derive failed before its guard decided (a delta object
+/// that could not be read while its timestamps were checked).
+struct DeriveError {
+    error: QueryError,
+    path: Option<DerivePath>,
+}
+
+impl DeriveError {
+    /// Tag errors raised after `path` was decided.
+    fn on(path: DerivePath) -> impl FnOnce(QueryError) -> Self {
+        move |error| Self {
+            error,
+            path: Some(path),
+        }
+    }
+
+    fn undecided(error: QueryError) -> Self {
+        Self { error, path: None }
+    }
+}
+
 /// The derive behind a non-hit lookup — the guarded incremental fold of a
 /// `stale` artifact, else a full fold — recording what it cost under the
 /// `outcome` that sent the lookup to the fold: the duration always (with
@@ -635,19 +703,16 @@ fn measured_fold(
     stale: Option<TemplateMap>,
 ) -> Result<Derived, QueryError> {
     let Some(reason) = derive_reason(outcome) else {
-        return derive(resolved, tenant, stale);
+        return derive(resolved, tenant, stale).map_err(|e| e.error);
     };
     let started = Instant::now();
     let derived = traced_derive(resolved, tenant, reason, stale);
-    let cost = match &derived {
-        Ok(d) => Ok((d.fetched_files, d.fetched_bytes)),
-        Err(e) => Err(error_type(e)),
+    let (path, cost) = match &derived {
+        Ok(d) => (Some(d.path), Ok((d.fetched_files, d.fetched_bytes))),
+        Err(e) => (e.path, Err(error_type(&e.error))),
     };
-    METRICS.record_derive(reason, started.elapsed(), cost);
-    if let Ok(d) = &derived {
-        tracing::debug!(path = ?d.path, files = d.fetched_files, "template map derived");
-    }
-    derived
+    METRICS.record_derive(derive_attributes(reason, path), started.elapsed(), cost);
+    derived.map_err(|e| e.error)
 }
 
 /// [`derive`] as its own `derive template_map` span, so a trace shows the
@@ -658,7 +723,7 @@ fn traced_derive(
     tenant: &TenantId,
     reason: &'static str,
     stale: Option<TemplateMap>,
-) -> Result<Derived, QueryError> {
+) -> Result<Derived, DeriveError> {
     let span = tracing::info_span!(
         "derive template_map",
         otel.kind = "internal",
@@ -668,7 +733,7 @@ fn traced_derive(
     );
     let derived = crate::phase::nested_in(&span, || derive(resolved, tenant, stale));
     if let Err(e) = &derived {
-        ourios_core::telemetry::record_span_error(&span, error_type(e));
+        ourios_core::telemetry::record_span_error(&span, error_type(&e.error));
     }
     derived
 }
@@ -678,10 +743,12 @@ fn derive(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
     stale: Option<TemplateMap>,
-) -> Result<Derived, QueryError> {
+) -> Result<Derived, DeriveError> {
     match stale {
         Some(base) => incremental::derive_stale(base, resolved, tenant),
-        None => full_fold(resolved, tenant, DerivePath::Full),
+        None => {
+            full_fold(resolved, tenant, DerivePath::Full).map_err(DeriveError::on(DerivePath::Full))
+        }
     }
 }
 

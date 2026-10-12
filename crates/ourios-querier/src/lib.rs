@@ -89,6 +89,7 @@ use ourios_parquet::columns;
 use ourios_parquet::hour_partition_in_window;
 use ourios_parquet::percent_encode_tenant;
 use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
+use tracing::Instrument as _;
 
 mod api;
 mod decode;
@@ -708,9 +709,26 @@ impl Querier {
         // case and a partition holding only `*.parquet.tmp` (a poisoned /
         // crashed writer) — where building a table over zero files would
         // otherwise error and wrongly fail the query.
+        //
+        // RFC 0038 §3.7.1: one `resolve files` phase per compiled query, open
+        // from before the first listing to the finished URLs — on both
+        // backends, and when nothing is live, since that work ran either way.
+        let phase = tracing::info_span!(
+            "resolve files",
+            otel.kind = "internal",
+            ourios.tenant = tenant.as_str(),
+            ourios.file_set.live_files = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
         let urls = self
-            .resolve_data_urls(&ctx, &data_prefix, partition_window)
-            .await?;
+            .resolve_data_urls(&ctx, &data_prefix, partition_window, &phase)
+            .instrument(phase.clone())
+            .await
+            .inspect(|urls| phase.record("ourios.file_set.live_files", urls.len() as u64))
+            .inspect_err(|e| {
+                ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));
+            })?;
         if urls.is_empty() {
             let result = empty_result(terminal.aggregate());
             return Ok(crate::fetch_count::with_fetched(
@@ -1012,6 +1030,30 @@ impl Querier {
             })?
     }
 
+    /// [`Self::spawn_blocking_io`] for work that is a query phase: `phase` is
+    /// re-entered on the blocking thread *and* attached as the `OTel` context,
+    /// so the object-store requests the closure makes open `CLIENT` spans
+    /// beneath it (RFC 0038 §3.7.3–§3.7.4). Takes the phase span itself —
+    /// `Span::current()` would hand the marker to whatever is current, and an
+    /// ancestor receiving it parents those `CLIENT` spans with no phase span
+    /// between (`crate::phase`).
+    async fn spawn_blocking_phase<T, F>(
+        &self,
+        phase: &tracing::Span,
+        work: F,
+    ) -> Result<T, QueryError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, QueryError> + Send + 'static,
+    {
+        let phase = phase.clone();
+        tokio::task::spawn_blocking(move || crate::phase::in_phase(&phase, work))
+            .await
+            .map_err(|e| QueryError::Storage {
+                detail: format!("blocking storage task: {e}"),
+            })?
+    }
+
     /// Resolve the live data files under the tenant's `data/` prefix and turn
     /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
     /// with the listing and manifest reads on the blocking pool:
@@ -1030,11 +1072,12 @@ impl Querier {
         ctx: &SessionContext,
         prefix: &str,
         window: Option<(u64, u64)>,
+        phase: &tracing::Span,
     ) -> Result<Vec<ListingTableUrl>, QueryError> {
         // The manifest reads count toward the session's fetched bytes.
         let fetched = fetch_count::counter(ctx).unwrap_or_default();
         let resolved = self
-            .spawn_blocking_io({
+            .spawn_blocking_phase(phase, {
                 let backend = self.backend.clone();
                 let prefix = prefix.to_owned();
                 move || resolve_live_set(&backend, &prefix, window, &fetched)

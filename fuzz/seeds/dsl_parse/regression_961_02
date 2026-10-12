@@ -1,0 +1,1 @@
+attr.duration > 1.5 and attr.user.id =~ "^u-[tice !-dae-dae0-9]g+$" | avg(attr.duration) by service, bucket(1h)

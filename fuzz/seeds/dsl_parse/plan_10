@@ -1,0 +1,1 @@
+attr.http.response.status_code != 200 and attr.region == "eu-west-1" and severity < 9 | count

@@ -109,3 +109,96 @@ fn rfc0020_6_secret_hygiene_across_the_file_path() {
         "shows presence only: {rendered}"
     );
 }
+
+/// Every configuration file the repository ships or documents parses under the
+/// RFC 0020 schema: the dogfood config, the config files the Helm chart's golden
+/// render mounts, and each fenced `yaml` block in `docs/guides/` whose first
+/// top-level key is an Ourios section (Collector snippets are skipped). A parser
+/// swap or a schema change that breaks a real config fails here, not at startup.
+#[test]
+fn every_example_config_in_the_repo_parses() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use ourios_server::config::file::parse;
+
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        kind: Option<String>,
+        data: Option<BTreeMap<String, String>>,
+    }
+
+    const SECTIONS: [&str; 6] = [
+        "storage",
+        "receiver",
+        "querier",
+        "compaction",
+        "auth",
+        "miner",
+    ];
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+    let mut configs: Vec<(String, String)> = vec![(
+        "dogfood-config.yaml".to_owned(),
+        read("dogfood-config.yaml"),
+    )];
+
+    let render = read("deploy/helm/testdata/default-render.yaml");
+    let manifests: Vec<Manifest> =
+        serde_saphyr::from_multiple(&render).expect("golden Helm render is valid YAML");
+    for manifest in manifests {
+        if manifest.kind.as_deref() != Some("ConfigMap") {
+            continue;
+        }
+        for (name, text) in manifest.data.into_iter().flatten() {
+            configs.push((format!("default-render.yaml ConfigMap {name}"), text));
+        }
+    }
+
+    let mut guides: Vec<_> = std::fs::read_dir(root.join("docs/guides"))
+        .expect("docs/guides")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    guides.sort();
+    for guide in guides {
+        let text = std::fs::read_to_string(&guide).expect("read guide");
+        let mut block: Option<String> = None;
+        for line in text.lines() {
+            match (&mut block, line.trim_end()) {
+                (None, "```yaml") => block = Some(String::new()),
+                (Some(_), "```") => {
+                    let yaml = block.take().unwrap_or_default();
+                    let first_key = yaml
+                        .lines()
+                        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                        .and_then(|l| l.split_once(':'))
+                        .map(|(key, _)| key.to_owned());
+                    if first_key.is_some_and(|key| SECTIONS.contains(&key.as_str())) {
+                        configs.push((guide.display().to_string(), yaml));
+                    }
+                }
+                (Some(buf), _) => {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+                (None, _) => {}
+            }
+        }
+    }
+
+    assert!(
+        configs.len() >= 6,
+        "expected the dogfood config, three Helm role configs and the guide examples; \
+         found {}",
+        configs.len()
+    );
+    for (origin, yaml) in &configs {
+        if let Err(e) = parse(yaml, &|_| None) {
+            panic!("{origin} does not parse: {e}");
+        }
+    }
+}

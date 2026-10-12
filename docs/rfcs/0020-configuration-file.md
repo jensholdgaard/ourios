@@ -143,8 +143,10 @@ Rules (each is an acceptance scenario in §5):
    scalar, after its value is substituted — never on a pre-parse text pass.
 
    > **Amendment (2026-10-12, #978, maintainer-approved) — verbatim
-   > scalars.** A scalar reaches its `ServerConfig` field as the text
-   > written (after substitution), not as a YAML-typed value. Numeric and
+   > scalars.** This supersedes the YAML re-interpretation above: a scalar
+   > reaches its `ServerConfig` field as the text written (after
+   > substitution), not as a YAML-typed value, and the double-quoted /
+   > bare distinction affects only rule 3's null case. Numeric and
    > boolean fields parse that text with their own validation, so
    > `default_window_secs: ${env:W}` with `W=3600` still yields `3600` and
    > a bare `true` still yields `true`. What changes is the spelling YAML
@@ -156,7 +158,11 @@ Rules (each is an acceptance scenario in §5):
    > mappings, are still type-resolved; quote such a key to keep its
    > spelling. This follows the OpenTelemetry Collector, which passes the
    > verbatim string to string fields (confmap v0.106,
-   > open-telemetry/opentelemetry-collector#10605).
+   > open-telemetry/opentelemetry-collector#10605). Covered by the
+   > `bare_scalars_reach_string_fields_verbatim`, `bare_null_is_still_absent`
+   > and `verbatim_bare_booleans_and_integers_still_resolve` tests in
+   > `crates/ourios-server/src/config/file.rs`.
+
 8. A `${…}` reference that does not conform to `REF` (e.g. `${1BAD}`,
    `${A$B}`), **encountered in a scalar value during substitution**, is a
    **whole-file parse error** — no partial

@@ -160,8 +160,8 @@ Rules (each is an acceptance scenario in §5):
    > spelling. This follows the OpenTelemetry Collector, which passes the
    > verbatim string to string fields (confmap v0.106,
    > open-telemetry/opentelemetry-collector#10605). Covered by
-   > `bare_scalars_reach_string_fields_verbatim`, `bare_null_is_still_absent`
-   > and `promoted_bare_entries_keep_the_scalar_model` in
+   > `bare_scalars_reach_string_fields_verbatim` and
+   > `bare_null_is_still_absent` in
    > `crates/ourios-server/src/config/file.rs`, and by
    > `verbatim_bare_booleans_and_integers_still_resolve` in
    > `crates/ourios-server/src/config/resolve.rs`.

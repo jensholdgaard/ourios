@@ -1292,86 +1292,9 @@ fn abstains(artifact_bytes: u64, acquisition_bytes: u64) -> bool {
 /// keys, so a hostile artifact cannot name paths outside the tenant's
 /// audit subtree (`CLAUDE.md` §3.7).
 fn validate(raw: &TemplateMapJson) -> Result<(), String> {
-    // Canonical-form check on every template string: the artifact is
-    // untrusted input. parse_template/format_template round-trip alone
-    // is NOT sufficient — empty segments (leading/trailing/doubled
-    // spaces) parse to Fixed("") and round-trip unchanged — so enforce
-    // what mine-time tokenization actually guarantees: a non-empty
-    // string splits into non-empty, whitespace-free tokens.
-    for entry in &raw.registry {
-        let canonical = entry.template.is_empty()
-            || entry
-                .template
-                .split(' ')
-                .all(|tok| !tok.is_empty() && !tok.chars().any(char::is_whitespace));
-        if !canonical {
-            return Err(format!(
-                "registry template for id {} v{} is not in canonical format_template form",
-                entry.template_id, entry.version,
-            ));
-        }
-    }
-    for name in &raw.folded_files {
-        if !is_tenant_relative_parquet(name) {
-            return Err(format!(
-                "folded_files entry is not a tenant-relative *.parquet key: {name:?}"
-            ));
-        }
-    }
-    for pair in raw.folded_files.windows(2) {
-        if pair[0] >= pair[1] {
-            return Err(format!(
-                "folded_files is not strictly sorted: {:?} >= {:?}",
-                pair[0], pair[1],
-            ));
-        }
-    }
-    for pair in raw.registry.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        if (a.template_id, a.version) >= (b.template_id, b.version) {
-            return Err(format!(
-                "registry is not strictly sorted by (template_id, version) at \
-                 ({}, {}) / ({}, {})",
-                a.template_id, a.version, b.template_id, b.version,
-            ));
-        }
-    }
-    let mut seen_members = std::collections::HashSet::new();
-    for class in &raw.alias_map {
-        if class.members.len() < 2 {
-            return Err(format!(
-                "alias class of {} member(s) is not an alias set",
-                class.members.len()
-            ));
-        }
-        for pair in class.members.windows(2) {
-            if pair[0] >= pair[1] {
-                return Err(format!(
-                    "alias class members are not strictly sorted: {} >= {}",
-                    pair[0], pair[1],
-                ));
-            }
-        }
-        if class.members.first() != Some(&class.representative) {
-            return Err(format!(
-                "alias class representative {} is not min(members)",
-                class.representative
-            ));
-        }
-        for member in &class.members {
-            if !seen_members.insert(*member) {
-                return Err(format!("alias classes overlap on template_id {member}"));
-            }
-        }
-    }
-    for pair in raw.alias_map.windows(2) {
-        if pair[0].representative >= pair[1].representative {
-            return Err(format!(
-                "alias classes are not sorted by representative: {} >= {}",
-                pair[0].representative, pair[1].representative,
-            ));
-        }
-    }
+    validate_registry(&raw.registry)?;
+    validate_frontier(&raw.folded_files)?;
+    validate_alias_map(&raw.alias_map)?;
     match &raw.fold_state {
         Some(fold_state) => fold_state.validate(
             |template_id, version| {
@@ -1383,6 +1306,103 @@ fn validate(raw: &TemplateMapJson) -> Result<(), String> {
         ),
         None => Ok(()),
     }
+}
+
+/// Every registry template in canonical form, the entries strictly sorted
+/// by `(template_id, version)`.
+fn validate_registry(registry: &[RegistryEntry]) -> Result<(), String> {
+    if let Some(entry) = registry
+        .iter()
+        .find(|e| !is_canonical_template(&e.template))
+    {
+        return Err(format!(
+            "registry template for id {} v{} is not in canonical format_template form",
+            entry.template_id, entry.version,
+        ));
+    }
+    match registry.windows(2).find(|pair| {
+        (pair[0].template_id, pair[0].version) >= (pair[1].template_id, pair[1].version)
+    }) {
+        Some(pair) => Err(format!(
+            "registry is not strictly sorted by (template_id, version) at \
+             ({}, {}) / ({}, {})",
+            pair[0].template_id, pair[0].version, pair[1].template_id, pair[1].version,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Canonical-form check on a template string: the artifact is untrusted
+/// input. A `parse_template`/`format_template` round-trip alone is NOT
+/// sufficient — empty segments (leading/trailing/doubled spaces) parse to
+/// Fixed("") and round-trip unchanged — so enforce what mine-time
+/// tokenization actually guarantees: a non-empty string splits into
+/// non-empty, whitespace-free tokens.
+fn is_canonical_template(template: &str) -> bool {
+    template.is_empty()
+        || template
+            .split(' ')
+            .all(|tok| !tok.is_empty() && !tok.chars().any(char::is_whitespace))
+}
+
+/// Every frontier entry a tenant-relative `*.parquet` key, strictly sorted.
+fn validate_frontier(folded_files: &[String]) -> Result<(), String> {
+    if let Some(name) = folded_files.iter().find(|n| !is_tenant_relative_parquet(n)) {
+        return Err(format!(
+            "folded_files entry is not a tenant-relative *.parquet key: {name:?}"
+        ));
+    }
+    match folded_files.windows(2).find(|pair| pair[0] >= pair[1]) {
+        Some(pair) => Err(format!(
+            "folded_files is not strictly sorted: {:?} >= {:?}",
+            pair[0], pair[1],
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Every alias class well-formed, no member in two classes, the classes
+/// sorted by representative.
+fn validate_alias_map(alias_map: &[AliasClass]) -> Result<(), String> {
+    let mut seen_members = std::collections::HashSet::new();
+    for class in alias_map {
+        validate_alias_class(class)?;
+        if let Some(member) = class.members.iter().find(|m| !seen_members.insert(**m)) {
+            return Err(format!("alias classes overlap on template_id {member}"));
+        }
+    }
+    match alias_map
+        .windows(2)
+        .find(|pair| pair[0].representative >= pair[1].representative)
+    {
+        Some(pair) => Err(format!(
+            "alias classes are not sorted by representative: {} >= {}",
+            pair[0].representative, pair[1].representative,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// At least two members, strictly sorted, the representative their min.
+fn validate_alias_class(class: &AliasClass) -> Result<(), String> {
+    if class.members.len() < 2 {
+        return Err(format!(
+            "alias class of {} member(s) is not an alias set",
+            class.members.len()
+        ));
+    }
+    if let Some(&[a, b]) = class.members.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(format!(
+            "alias class members are not strictly sorted: {a} >= {b}"
+        ));
+    }
+    if class.members.first() != Some(&class.representative) {
+        return Err(format!(
+            "alias class representative {} is not min(members)",
+            class.representative
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `name` is a tenant-root-relative `*.parquet` key: one or

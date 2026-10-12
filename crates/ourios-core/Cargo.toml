@@ -76,8 +76,8 @@ serde = { version = "1", default-features = false }
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # Property test for the canonical encoding's exact finite-f64
 # round-trip (#130).
-proptest = "=1.11.0"
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }
+proptest = "=1.12.0"
+tokio = { version = "=1.53.2", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }
 # The RFC 0047 client tests' fake OpenFGA streams NDJSON from a channel
 # (`ReceiverStream` + `futures_core::Stream` for axum's `Body::from_stream`);
 # both already in the tree via tonic/hyper.

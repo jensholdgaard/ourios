@@ -342,31 +342,31 @@ async fn a_failed_fold_marks_the_derive_and_load_spans_error() {
             "{name}"
         );
     }
+    let [load] = named(&spans, "load template_map")[..] else {
+        panic!("one load span");
+    };
+    assert_eq!(
+        text(load, semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME).as_deref(),
+        Some("miss"),
+        "the failed lookup still says why it folded"
+    );
 }
 
-/// Two concurrent queries at different frontiers: an audit file lands
-/// after the first query listed. The second query waits on the first's
-/// acquisition (`wait template_map`), then lists again and acquires itself,
-/// refolding the now-stale map (`derive template_map`, reason `stale`)
-/// under the same `load template_map`. The first query neither waits nor
-/// sees the second's fold.
+/// Gate the first acquisition: once it has listed, land a new audit file
+/// under `root`, then hold it until another query waits on it. The flag
+/// says the frontier has moved.
 #[cfg(feature = "testing")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_query_behind_another_frontier_waits_then_folds_itself() {
+fn gate_moving_the_frontier(
+    querier: &Arc<Querier>,
+    root: std::path::PathBuf,
+) -> Arc<std::sync::atomic::AtomicBool> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    let (exporter, _provider, dispatch) = traced();
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(dir.path(), &[mined(TS0)]);
-    audit_file(dir.path(), 1_775_127_480);
-    let root = dir.path().to_path_buf();
-    let querier = Arc::new(Querier::new(dir.path()));
-    let weak = Arc::downgrade(&querier);
+    let weak = Arc::downgrade(querier);
     let moved = Arc::new(AtomicBool::new(false));
-    let frontier_moved = Arc::clone(&moved);
+    let flag = Arc::clone(&moved);
     querier.set_template_map_acquire_gate(Some(Arc::new(move || {
-        // The first acquirer has listed; move the frontier past it.
         if !moved.swap(true, Ordering::SeqCst) {
             audit_file(&root, 1_775_131_080);
         }
@@ -378,6 +378,27 @@ async fn a_query_behind_another_frontier_waits_then_folds_itself() {
             std::thread::sleep(Duration::from_millis(2));
         }
     })));
+    flag
+}
+
+/// Two concurrent queries at different frontiers: an audit file lands
+/// after the first query listed. The second query waits on the first's
+/// acquisition (`wait template_map`), then lists again and acquires itself,
+/// refolding the now-stale map (`derive template_map`, reason `stale`)
+/// under the same `load template_map`. The first query neither waits nor
+/// sees the second's fold.
+#[cfg(feature = "testing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_behind_another_frontier_waits_then_folds_itself() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), &[mined(TS0)]);
+    audit_file(dir.path(), 1_775_127_480);
+    let querier = Arc::new(Querier::new(dir.path()));
+    let frontier_moved = gate_moving_the_frontier(&querier, dir.path().to_path_buf());
     // The second query starts only once the first holds the acquisition and
     // the frontier has moved, so it lists the newer frontier.
     let first = tokio::spawn(query(Arc::clone(&querier)).with_subscriber(dispatch.clone()));

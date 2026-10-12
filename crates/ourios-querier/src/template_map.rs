@@ -220,19 +220,7 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
 
 impl TemplateMapMetrics {
     fn record_lookup(&self, outcome: CacheOutcome, binding_conflict: bool) {
-        let value = match outcome {
-            CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
-            CacheOutcome::Miss {
-                reason: MissReason::Absent,
-            } => LOOKUP_OUTCOME_MISS,
-            CacheOutcome::Miss {
-                reason: MissReason::Torn,
-            } => LOOKUP_OUTCOME_TORN,
-            CacheOutcome::Miss {
-                reason: MissReason::UnknownVersion,
-            } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
-            CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
-        };
+        let value = lookup_outcome(outcome);
         record_outcome_on_span(value);
         let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
         if binding_conflict {
@@ -293,6 +281,23 @@ impl TemplateMapMetrics {
                 outcome,
             )],
         );
+    }
+}
+
+/// The `ourios.template_map.lookup.outcome` value of `outcome`.
+fn lookup_outcome(outcome: CacheOutcome) -> &'static str {
+    match outcome {
+        CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
+        CacheOutcome::Miss {
+            reason: MissReason::Absent,
+        } => LOOKUP_OUTCOME_MISS,
+        CacheOutcome::Miss {
+            reason: MissReason::Torn,
+        } => LOOKUP_OUTCOME_TORN,
+        CacheOutcome::Miss {
+            reason: MissReason::UnknownVersion,
+        } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
+        CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
     }
 }
 
@@ -565,6 +570,9 @@ pub(crate) fn load_or_derive_resolved(
             }
         }
     };
+    // On the span before the fold, so a failed fold's span still says why
+    // it folded; the metric keeps counting only lookups that answered.
+    record_outcome_on_span(lookup_outcome(outcome));
     let (map, fold_bytes, conflicts) = measured_fold(resolved, tenant, outcome)?;
     let acquisition_bytes =
         fold_bytes

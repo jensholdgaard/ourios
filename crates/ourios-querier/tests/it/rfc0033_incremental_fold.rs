@@ -1,7 +1,7 @@
 //! RFC 0033 §3.3 amendment (2026-10-12) — the guarded incremental fold:
 //! Scenario RFC0033.10 (incremental ≡ full fold, property), RFC0033.11
-//! (the guard falls back, never guesses) and the local-backend arm of
-//! RFC0033.12 (late files and concurrent writers).
+//! (the guard falls back, never guesses) and RFC0033.12 (late files and
+//! concurrent writers) on the local backend and a conditional-put store.
 //!
 //! Every assertion compares against `derive_template_map`, the full fold
 //! over the same listing, which is the source of truth the incremental
@@ -9,13 +9,17 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, at, simple, write_all, write_audit};
+use crate::common::{
+    DEFAULT_WINDOW_NS, NOW, TS0, at, localstack_s3, simple, write_all, write_audit,
+};
 use ourios_core::alias::ActorId;
+use ourios_core::audit::AuditSink;
 use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange, hash_triggering_line};
 use ourios_core::tenant::TenantId;
+use ourios_parquet::{AuditWriter, ParquetAuditSink, Store, derive_audit_partition};
 use ourios_querier::{
-    ArtifactRead, CacheOutcome, INCREMENTAL_DEPTH_CAP, Querier, QueryError, StoreRef,
-    TEMPLATE_MAP_FILENAME, TemplateMap, derive_template_map, load_or_derive,
+    ArtifactRead, CacheOutcome, INCREMENTAL_DEPTH_CAP, PublishOutcome, Querier, QueryError,
+    StoreRef, TEMPLATE_MAP_FILENAME, TemplateMap, derive_template_map, load_or_derive,
 };
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -390,7 +394,14 @@ fn rfc0033_11_each_guard_row_falls_back_to_a_full_fold() {
         assert_eq!(acquired.registry(), full.registry(), "{label}");
         assert_eq!(acquired.folded_files(), full.folded_files(), "{label}");
         assert_eq!(depth(&acquired), 0, "{label}: a full fold writes depth 0");
-        assert_eq!(depth(&stored(bucket.path())), 0, "{label}: republished");
+        let republished = stored(bucket.path());
+        assert_eq!(depth(&republished), 0, "{label}: republished");
+        assert_eq!(
+            republished.folded_files(),
+            full.folded_files(),
+            "{label}: the stored artifact is the new full fold, not the base",
+        );
+        assert_eq!(republished.registry(), full.registry(), "{label}");
     }
 }
 
@@ -612,4 +623,328 @@ fn rfc0033_12_backdated_late_file_forces_a_full_fold() {
         Some(vec![(1, 1)]),
         "the late binding conflicts with the earlier one",
     );
+}
+
+/// One audit file holding every event in `events` (the production sink
+/// writes a file per event).
+fn write_audit_file(bucket: &Path, events: &[AuditEvent]) {
+    let store = Store::local(bucket).expect("store");
+    let partition = derive_audit_partition(&events[0]).expect("partition");
+    let mut writer = AuditWriter::open_in(&store, partition).expect("open audit writer");
+    writer.append_events(events).expect("append");
+    writer.close().expect("close");
+}
+
+fn xorshift(x: &mut u64) -> u64 {
+    *x ^= *x << 13;
+    *x ^= *x >> 7;
+    *x ^= *x << 17;
+    *x
+}
+
+/// `n` creations from `first`, each binding a pseudo-random 64-char
+/// template of control characters. JSON escapes each as `\u00XX`, so the
+/// compressed artifact outgrows the Parquet column carrying the same text,
+/// which is what lets a result reach the acquisition bytes it is weighed
+/// against.
+fn bulky(first: u64, n: u64, ts_ns: u64) -> Vec<AuditEvent> {
+    let mut x = 0x9E37_79B9_7F4A_7C15 ^ first;
+    (first..first + n)
+        .map(|id| {
+            let text: String = (0..64)
+                .map(|_| char::from(1 + u8::try_from(xorshift(&mut x) % 8).expect("< 8")))
+                .collect();
+            event(ts_ns, created(id, &text))
+        })
+        .collect()
+}
+
+fn audit_bytes(bucket: &Path, keys: &[String]) -> u64 {
+    let root = bucket.join("audit").join(format!("tenant_id={TENANT}"));
+    keys.iter()
+        .map(|k| {
+            std::fs::metadata(root.join(k))
+                .expect("stat audit file")
+                .len()
+        })
+        .sum()
+}
+
+fn artifact_len(bucket: &Path) -> u64 {
+    std::fs::metadata(artifact_path(bucket))
+        .expect("stat artifact")
+        .len()
+}
+
+/// One acquisition through the write-through, with what it cost and
+/// whether it replaced the stored artifact.
+struct Measured {
+    map: TemplateMap,
+    acquisition_bytes: u64,
+    result_bytes: u64,
+    published: bool,
+}
+
+fn acquire_measured(bucket: &Path) -> Measured {
+    let before = std::fs::read(artifact_path(bucket)).expect("read");
+    let (map, acquisition_bytes, outcome) =
+        load_or_derive(StoreRef::Local(bucket), &tenant()).expect("acquire");
+    assert_eq!(outcome, CacheOutcome::StaleRefreshed);
+    let result = map.to_artifact_bytes().expect("serialize");
+    let after = std::fs::read(artifact_path(bucket)).expect("read");
+    let published = after == result;
+    assert!(
+        published || after == before,
+        "the write-through publishes the result or leaves the artifact in place",
+    );
+    Measured {
+        map,
+        acquisition_bytes,
+        result_bytes: result.len() as u64,
+        published,
+    }
+}
+
+/// The listed keys `after` adds to `before`.
+fn added(before: &[String], after: &[String]) -> Vec<String> {
+    after
+        .iter()
+        .filter(|k| !before.contains(k))
+        .cloned()
+        .collect()
+}
+
+/// RFC0033.11 size boundary, incremental: the write-through weighs the
+/// compressed result against the artifact GET plus the delta's bytes. A
+/// result above the delta but below base plus delta publishes, where the
+/// delta-only rule would have abstained; one at or above base plus delta
+/// abstains.
+#[test]
+fn rfc0033_11_incremental_abstention_weighs_base_plus_delta() {
+    let bucket = TempDir::new().expect("temp dir");
+    write_audit_file(bucket.path(), &bulky(1, 1000, TS0 + 10));
+    let base = publish_full_fold(bucket.path());
+    let base_len = artifact_len(bucket.path());
+    write_audit(bucket.path(), &[event(TS0 + 20, created(5000, "job <*>"))]);
+
+    let m = acquire_measured(bucket.path());
+
+    let delta = audit_bytes(
+        bucket.path(),
+        &added(base.folded_files(), m.map.folded_files()),
+    );
+    assert_eq!(depth(&m.map), 1);
+    assert_eq!(
+        m.acquisition_bytes,
+        base_len + delta,
+        "artifact GET + delta"
+    );
+    assert!(
+        delta <= m.result_bytes && m.result_bytes < base_len + delta,
+        "the publish window: delta={delta} result={} base={base_len}",
+        m.result_bytes,
+    );
+    assert!(m.published);
+    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+
+    let bucket = TempDir::new().expect("temp dir");
+    write_audit(bucket.path(), &[event(TS0 + 10, created(1, "user <*>"))]);
+    let base = publish_full_fold(bucket.path());
+    let base_len = artifact_len(bucket.path());
+    write_audit_file(bucket.path(), &bulky(2, 3000, TS0 + 20));
+
+    let m = acquire_measured(bucket.path());
+
+    let delta = audit_bytes(
+        bucket.path(),
+        &added(base.folded_files(), m.map.folded_files()),
+    );
+    assert_eq!(depth(&m.map), 1);
+    assert_eq!(
+        m.acquisition_bytes,
+        base_len + delta,
+        "artifact GET + delta"
+    );
+    assert!(
+        m.result_bytes >= base_len + delta,
+        "the abstain side: delta={delta} result={} base={base_len}",
+        m.result_bytes,
+    );
+    assert!(!m.published);
+    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+}
+
+/// RFC0033.11 size boundary, out-of-order fallback: the write-through
+/// weighs the full fold's result against the artifact GET plus every audit
+/// object fetched, the rejected delta read included. A result at or above
+/// the folded audit bytes but below that total publishes, where the
+/// folded-bytes rule would have abstained; one at or above it abstains.
+#[test]
+fn rfc0033_11_fallback_abstention_weighs_every_fetched_byte() {
+    let bucket = TempDir::new().expect("temp dir");
+    write_audit_file(bucket.path(), &bulky(1, 3000, TS0 + 10));
+    let base = publish_full_fold(bucket.path());
+    let base_len = artifact_len(bucket.path());
+    write_audit(bucket.path(), &[event(TS0 + 5, created(9000, "late <*>"))]);
+
+    let m = acquire_measured(bucket.path());
+
+    let delta = audit_bytes(
+        bucket.path(),
+        &added(base.folded_files(), m.map.folded_files()),
+    );
+    let folded = audit_bytes(bucket.path(), m.map.folded_files());
+    assert_eq!(depth(&m.map), 0, "the guard fell back");
+    assert_eq!(
+        m.acquisition_bytes,
+        base_len + delta + folded,
+        "artifact GET + rejected delta read + full fold",
+    );
+    assert!(
+        folded <= m.result_bytes && m.result_bytes < m.acquisition_bytes,
+        "the publish window: folded={folded} result={} acquisition={}",
+        m.result_bytes,
+        m.acquisition_bytes,
+    );
+    assert!(m.published);
+    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+
+    // An emptied registry keeps the stored artifact Valid at the same
+    // frontier and high-water while its GET stays small, so the bulky
+    // audit set it names outweighs the whole acquisition.
+    let bucket = TempDir::new().expect("temp dir");
+    write_audit_file(bucket.path(), &bulky(1, 3000, TS0 + 10));
+    let base = publish_full_fold(bucket.path());
+    rewrite_artifact(bucket.path(), |body| {
+        body["registry"] = serde_json::json!([]);
+    });
+    let base_len = artifact_len(bucket.path());
+    write_audit(bucket.path(), &[event(TS0 + 5, created(9000, "late <*>"))]);
+
+    let m = acquire_measured(bucket.path());
+
+    let delta = audit_bytes(
+        bucket.path(),
+        &added(base.folded_files(), m.map.folded_files()),
+    );
+    let folded = audit_bytes(bucket.path(), m.map.folded_files());
+    assert_eq!(depth(&m.map), 0, "the guard fell back");
+    assert_eq!(m.acquisition_bytes, base_len + delta + folded);
+    assert!(
+        m.result_bytes >= m.acquisition_bytes,
+        "the abstain side: result={} acquisition={}",
+        m.result_bytes,
+        m.acquisition_bytes,
+    );
+    assert!(!m.published);
+    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+}
+
+/// Persist `events` to `store`'s audit stream, one file per event.
+fn write_audit_to(store: &Store, events: &[AuditEvent]) {
+    let mut sink = ParquetAuditSink::new(store.clone());
+    for e in events {
+        sink.emit(e.clone());
+    }
+    assert_eq!(
+        sink.write_failures(),
+        0,
+        "audit fixture events must persist"
+    );
+}
+
+/// The RFC0033.12 arm on a conditional-put store: an incremental result
+/// publishes at the observed `ETag`; a second querier that extended the
+/// same stale artifact loses the CAS (`lost_race`) with its answer still
+/// the full fold's; two queriers racing for real both answer correctly
+/// and leave a Valid artifact; and a backdated late file forces a full
+/// fold that includes it.
+fn incremental_publish_resolves_by_cas(store: &Store) {
+    let remote = StoreRef::Remote(store);
+    let key = format!("audit/tenant_id={TENANT}/{TEMPLATE_MAP_FILENAME}");
+    let held = || {
+        let (bytes, e_tag) = store
+            .get_with_etag_blocking_opt(&key)
+            .expect("get")
+            .expect("artifact present");
+        match TemplateMap::from_artifact_bytes(&bytes, &tenant()).expect("read") {
+            ArtifactRead::Valid(map) => (map, e_tag.expect("the store exposes an ETag")),
+            other => panic!("the stored artifact must be Valid, got {other:?}"),
+        }
+    };
+    let full = || derive_template_map(remote, &tenant()).expect("full fold").0;
+    let acquire = || load_or_derive(remote, &tenant()).expect("acquire");
+
+    write_audit_to(
+        store,
+        &[
+            event(TS0, created(1, "user <*>")),
+            event(TS0 + 10, created(2, "job <*>")),
+        ],
+    );
+    assert_eq!(
+        full().publish(remote, None).expect("publish the base"),
+        PublishOutcome::Published,
+    );
+
+    write_audit_to(store, &[event(TS0 + 20, created(3, "a"))]);
+    let (_, stale_tag) = held();
+    let (extended, _, outcome) = acquire();
+    assert_eq!(outcome, CacheOutcome::StaleRefreshed);
+    assert_eq!(depth(&extended), 1);
+    assert_equivalent(&extended, &full()).expect("equals the full fold");
+    let (stored, _) = held();
+    assert_eq!(stored.folded_files(), extended.folded_files(), "published");
+    assert_eq!(depth(&stored), 1);
+    assert_eq!(
+        extended
+            .publish(remote, Some(&stale_tag))
+            .expect("a lost race is Ok"),
+        PublishOutcome::LostRace,
+        "the second extension of the same stale artifact loses the CAS",
+    );
+    assert_eq!(held().0.folded_files(), extended.folded_files());
+
+    write_audit_to(store, &[event(TS0 + 30, created(4, "b"))]);
+    let racers: Vec<TemplateMap> = std::thread::scope(|s| {
+        let racers = [s.spawn(acquire), s.spawn(acquire)];
+        racers
+            .map(|r| r.join().expect("querier thread").0)
+            .into_iter()
+            .collect()
+    });
+    let at_race = full();
+    for racer in &racers {
+        assert_equivalent(racer, &at_race).expect("each racer answers the full fold");
+    }
+    assert_eq!(held().0.folded_files(), at_race.folded_files());
+
+    write_audit_to(store, &[event(TS0 + 5, created(1, "user <*> late"))]);
+    let (late, _, _) = acquire();
+    assert_eq!(depth(&late), 0, "the backdated file forces a full fold");
+    assert_equivalent(&late, &full()).expect("equals the full fold");
+    assert_eq!(
+        late.fold_state().map(|s| s.binding_conflicts().to_vec()),
+        Some(vec![(1, 1)]),
+    );
+    let (stored, _) = held();
+    assert_eq!(stored.folded_files(), late.folded_files());
+    assert_eq!(depth(&stored), 0);
+}
+
+/// RFC0033.12 on the in-memory store, which honours conditional puts.
+#[test]
+fn rfc0033_12_incremental_publish_resolves_by_cas_in_memory() {
+    incremental_publish_resolves_by_cas(&Store::in_memory());
+}
+
+/// RFC0033.12 on a real S3 backend (`LocalStack`). Run by the
+/// `s3-integration` CI job by exact name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0033.12 S3 arm; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn rfc0033_12_incremental_publish_resolves_by_cas_on_s3() {
+    let (_container, s3) = localstack_s3("ourios-it-incremental").await;
+    tokio::task::spawn_blocking(move || incremental_publish_resolves_by_cas(&s3))
+        .await
+        .expect("the S3 arm");
 }

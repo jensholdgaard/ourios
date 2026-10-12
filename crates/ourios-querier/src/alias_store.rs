@@ -18,8 +18,9 @@
 //! eventual-consistency stance, with the staleness window being
 //! audit-flush visibility. The RFC 0033 cached template map
 //! accelerates this derivation at the query call sites (an
-//! exactly-fresh artifact skips the scan); this fold remains the
-//! semantics owner and the fallback for every non-hit disposition.
+//! exactly-fresh artifact skips the scan, a stale one is extended by the
+//! newly listed files when the incremental guard admits it); this fold
+//! remains the semantics owner and the full-fold fallback.
 
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::{AuditEvent, AuditPayload};

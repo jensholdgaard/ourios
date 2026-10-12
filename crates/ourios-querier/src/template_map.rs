@@ -265,20 +265,13 @@ impl TemplateMapMetrics {
 
     /// One fold's cost: its duration always (with `error.type` when it
     /// failed), and the audit files and bytes it fetched when it completed.
-    /// Every sample carries the `reason`, plus the mode and fallback
-    /// reason of `path` once the path was decided.
+    /// Every sample carries `attrs` ([`derive_attributes`]).
     fn record_derive(
         &self,
-        reason: &'static str,
-        path: Option<DerivePath>,
+        mut attrs: Vec<KeyValue>,
         elapsed: Duration,
         folded: Result<(u64, u64), &'static str>,
     ) {
-        let mut attrs = vec![KeyValue::new(
-            semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON,
-            reason,
-        )];
-        attrs.extend(path.map_or_else(Vec::new, path_attributes));
         match folded {
             Ok((files, bytes)) => {
                 self.derive_duration.record(elapsed.as_secs_f64(), &attrs);
@@ -358,6 +351,17 @@ pub(crate) fn record_joined_lookup() {
 /// same frontier, whether that acquisition succeeded or failed.
 pub(crate) fn record_acquire_wait(waited: Duration) {
     METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
+}
+
+/// A derive sample's attributes: its `reason`, plus the mode and
+/// fallback reason of `path` once the path was decided.
+fn derive_attributes(reason: &'static str, path: Option<DerivePath>) -> Vec<KeyValue> {
+    let mut attrs = vec![KeyValue::new(
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON,
+        reason,
+    )];
+    attrs.extend(path.map_or_else(Vec::new, path_attributes));
+    attrs
 }
 
 /// The `derive.mode` and, for a declined stale artifact,
@@ -699,7 +703,7 @@ fn measured_fold(
         Ok(d) => (Some(d.path), Ok((d.fetched_files, d.fetched_bytes))),
         Err(e) => (e.path, Err(error_type(&e.error))),
     };
-    METRICS.record_derive(reason, path, started.elapsed(), cost);
+    METRICS.record_derive(derive_attributes(reason, path), started.elapsed(), cost);
     derived.map_err(|e| e.error)
 }
 

@@ -123,6 +123,15 @@ fn read_local_manifest(
     }
 }
 
+/// What one file-set resolution covers: the tenant, its `data/` prefix and
+/// the partition window that prunes it.
+#[derive(Clone, Copy)]
+pub(super) struct DataScope<'a> {
+    pub(super) tenant: &'a TenantId,
+    pub(super) prefix: &'a str,
+    pub(super) window: Option<(u64, u64)>,
+}
+
 /// Resolve the live data files under the tenant's `data/` prefix and turn
 /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
 /// with the listing and manifest reads on the blocking pool:
@@ -143,19 +152,17 @@ fn read_local_manifest(
 pub(super) async fn resolve_data_urls(
     backend: &Backend,
     ctx: &SessionContext,
-    tenant: &TenantId,
-    prefix: &str,
-    window: Option<(u64, u64)>,
+    scope: DataScope<'_>,
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
     let span = tracing::info_span!(
         "resolve files",
         otel.kind = "internal",
-        ourios.tenant = tenant.as_str(),
+        ourios.tenant = scope.tenant.as_str(),
         ourios.file_set.live_files = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
     );
-    resolve_in_phase(backend, ctx, prefix, window, &span)
+    resolve_in_phase(backend, ctx, scope, &span)
         .instrument(span.clone())
         .await
         // `i64`, not `usize`/`u64`: tracing-opentelemetry renders a `u64`
@@ -174,15 +181,15 @@ pub(super) async fn resolve_data_urls(
 async fn resolve_in_phase(
     backend: &Backend,
     ctx: &SessionContext,
-    prefix: &str,
-    window: Option<(u64, u64)>,
+    scope: DataScope<'_>,
     span: &tracing::Span,
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
     // The manifest reads count toward the session's fetched bytes.
     let fetched = fetch_count::counter(ctx).unwrap_or_default();
     let resolved = crate::phase::spawn_blocking(span, {
         let backend = backend.clone();
-        let prefix = prefix.to_owned();
+        let prefix = scope.prefix.to_owned();
+        let window = scope.window;
         move || resolve_live_set(&backend, &prefix, window, &fetched)
     })
     .await?;

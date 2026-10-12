@@ -708,14 +708,12 @@ impl Querier {
         // case and a partition holding only `*.parquet.tmp` (a poisoned /
         // crashed writer) — where building a table over zero files would
         // otherwise error and wrongly fail the query.
-        let urls = file_set::resolve_data_urls(
-            &self.backend,
-            &ctx,
+        let scope = file_set::DataScope {
             tenant,
-            &data_prefix,
-            partition_window,
-        )
-        .await?;
+            prefix: &data_prefix,
+            window: partition_window,
+        };
+        let urls = file_set::resolve_data_urls(&self.backend, &ctx, scope).await?;
         if urls.is_empty() {
             let result = empty_result(terminal.aggregate());
             return Ok(crate::fetch_count::with_fetched(

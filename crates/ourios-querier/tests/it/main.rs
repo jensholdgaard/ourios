@@ -12,6 +12,7 @@
 mod common;
 
 mod boundary;
+mod corrupt_audit_object;
 mod drift;
 mod execution;
 mod forward_compat;
@@ -33,7 +34,10 @@ mod rfc0024_properties;
 mod rfc0025_rendering;
 mod rfc0031_single_pass;
 mod rfc0033_cached_template_map;
+mod rfc0033_fold_state;
+mod rfc0033_incremental_fold;
 mod rfc0036_window_materialization;
+mod rfc0038_template_map_spans;
 mod rfc0042_mixed_schema;
 mod rfc0044_body_equality;
 mod rfc0047_visibility;

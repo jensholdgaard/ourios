@@ -1,0 +1,1 @@
+flags != 0 and observed_ts >= 2026-10-10T12:00:00.5+02:00 and span_id == "00f067aa0ba902b7" and confidence < 0.7 | min(resource.deployment.environment) by template_id

@@ -126,6 +126,15 @@ associated `Span` type and is not object-safe as a bare trait object. Callers pa
 the global tracer (`opentelemetry::global::tracer("ourios-df-otel")`, a
 `BoxedTracer`) or any concrete tracer.
 
+> **Amendment (2026-10-12, #963, maintainer-approved) — the versioned
+> scope.** The querier resolves this tracer as
+> `ourios_core::telemetry::tracer("ourios-df-otel")`, the same global
+> provider but under an instrumentation scope versioned with the release
+> (RFC 0001 §6.8's 2026-10-12 amendment). The workspace `clippy.toml`
+> disallows the unversioned `opentelemetry::global::tracer`. The operator
+> spans, their names and their attributes are unchanged; only
+> `otel.scope.version` is now set.
+
 The `where T::Span: Send + Sync + 'static` bound is load-bearing, not decoration:
 threading a child span as the parent `Context` for recursion goes through
 `Context::with_span`, which requires it. Every real tracer (`BoxedTracer`, the SDK

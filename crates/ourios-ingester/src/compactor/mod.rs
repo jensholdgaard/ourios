@@ -72,6 +72,20 @@ impl std::error::Error for IngestError {
     }
 }
 
+impl IngestError {
+    /// The low-cardinality `error.type` a failed sweep carries.
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Compaction(CompactionError::Read(_)) => "read",
+            Self::Compaction(CompactionError::Write(_)) => "write",
+            Self::Compaction(CompactionError::Manifest(_)) => "manifest",
+            Self::Compaction(CompactionError::Io { .. }) | Self::Io { .. } => "io",
+            Self::Compaction(_) => "_OTHER",
+        }
+    }
+}
+
 impl From<CompactionError> for IngestError {
     fn from(e: CompactionError) -> Self {
         Self::Compaction(e)
@@ -457,9 +471,32 @@ pub type CommitObserver<'a> = dyn FnMut(&PartitionCommitted<'_>) + 'a;
 #[tracing::instrument(
     skip_all,
     name = "sweep partitions",
-    fields(otel.kind = "internal")
+    fields(
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    )
 )]
 pub fn run_sweep_committing(
+    store: &Store,
+    clock: SweepClock,
+    policy: &CompactionPolicy,
+    promoted: &PromotedAttributes,
+    hooks: &mut SweepHooks<'_>,
+    on_commit: &mut CommitObserver<'_>,
+) -> Result<SweepReport, FailedSweep> {
+    let outcome = sweep_committing(store, clock, policy, promoted, hooks, on_commit);
+    if let Err(failed) = &outcome {
+        ourios_core::telemetry::record_span_error(
+            &tracing::Span::current(),
+            failed.error.error_type(),
+        );
+    }
+    outcome
+}
+
+/// [`run_sweep_committing`]'s work, inside its span.
+fn sweep_committing(
     store: &Store,
     clock: SweepClock,
     policy: &CompactionPolicy,

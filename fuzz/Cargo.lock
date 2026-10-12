@@ -219,7 +219,7 @@ dependencies = [
  "arrow-select",
  "flatbuffers",
  "lz4_flex",
- "zstd 0.14.0",
+ "zstd 0.14.2",
 ]
 
 [[package]]
@@ -318,13 +318,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -350,9 +350,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.18.1"
+version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -360,9 +360,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.45.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
 dependencies = [
  "cc",
  "cmake",
@@ -2434,11 +2434,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.12.2"
+version = "0.13.0"
 
 [[package]]
 name = "ourios-core"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "opentelemetry",
@@ -2447,11 +2447,12 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "tracing",
 ]
 
 [[package]]
 name = "ourios-df-otel"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "datafusion",
  "opentelemetry",
@@ -2461,20 +2462,24 @@ dependencies = [
 name = "ourios-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "libfuzzer-sys",
  "ourios-config",
  "ourios-core",
  "ourios-ingester",
  "ourios-miner",
+ "ourios-parquet",
  "ourios-querier",
  "ourios-telemetry",
  "ourios-wal",
+ "parquet",
  "prost",
+ "zstd 0.13.3",
 ]
 
 [[package]]
 name = "ourios-ingester"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2507,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "opentelemetry",
  "ourios-config",
@@ -2520,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2533,6 +2538,7 @@ dependencies = [
  "ourios-core",
  "ourios-semconv",
  "parquet",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",
@@ -2542,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2556,21 +2562,23 @@ dependencies = [
  "ourios-parquet",
  "ourios-semconv",
  "percent-encoding",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
+ "uuid",
  "zstd 0.13.3",
 ]
 
 [[package]]
 name = "ourios-semconv"
-version = "0.12.2"
+version = "0.13.0"
 
 [[package]]
 name = "ourios-serving"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "axum",
  "futures-core",
@@ -2593,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-telemetry"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -2611,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "crc32c",
  "ourios-core",
@@ -2673,7 +2681,7 @@ dependencies = [
  "snap",
  "tokio",
  "twox-hash",
- "zstd 0.14.0",
+ "zstd 0.14.2",
 ]
 
 [[package]]
@@ -4246,11 +4254,11 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.14.0"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+checksum = "057cfd910cfac363a0ada849592624b4c9ff2e10bef504c3433810d78ed96f93"
 dependencies = [
- "zstd-safe 8.0.0",
+ "zstd-safe 8.1.0",
 ]
 
 [[package]]
@@ -4264,18 +4272,18 @@ dependencies = [
 
 [[package]]
 name = "zstd-safe"
-version = "8.0.0"
+version = "8.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
+checksum = "bdd44c6a7284e91f3717755b24315a302edd9153a01f753c3cba3d765e8eafac"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.1+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
 dependencies = [
  "cc",
  "pkg-config",

@@ -8,4 +8,5 @@ pub mod confidence;
 pub mod histogram_buckets;
 pub mod otlp;
 pub mod record;
+pub mod telemetry;
 pub mod tenant;

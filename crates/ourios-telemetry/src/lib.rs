@@ -3,7 +3,8 @@
 //! RFC 0001 §6.8 ("Export architecture") pins the dependency split:
 //! instrumented library crates depend only on the lightweight
 //! `opentelemetry` **API** and resolve instruments through
-//! `global::meter("ourios.<subsystem>")`; this crate is the single
+//! `ourios_core::telemetry::meter("ourios.<subsystem>")`, which versions
+//! the instrumentation scope with the release; this crate is the single
 //! place the heavy SDK + OTLP exporter + transport live. It builds the
 //! OTLP **push** `MeterProvider` (periodic-reader export), installs it
 //! as the process-global provider, and hands back a [`TelemetryGuard`]
@@ -60,8 +61,31 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 
 /// The instrumentation-scope name for the tracer that opens Ourios's own
 /// spans (RFC 0038). The library crates create instruments through
-/// `global::meter("ourios.<subsystem>")`; spans go through this one tracer.
+/// `ourios_core::telemetry::meter("ourios.<subsystem>")`; spans go through
+/// this one tracer, under the same versioned scope rule.
 const TRACER_SCOPE: &str = "ourios";
+
+/// The scope `name`, versioned with this release. The library crates resolve
+/// theirs through `ourios_core::telemetry`, which this crate does not depend
+/// on.
+fn scope(name: &'static str) -> opentelemetry::InstrumentationScope {
+    opentelemetry::InstrumentationScope::builder(name)
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .build()
+}
+
+/// A test's tracer over its own `provider`, under a versioned
+/// `ourios-test` scope, for wiring into a `tracing-opentelemetry` layer.
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn test_tracer(provider: &SdkTracerProvider) -> opentelemetry_sdk::trace::SdkTracer {
+    provider.tracer_with_scope(scope("ourios-test"))
+}
+
+/// The tracer every Ourios span goes through, under the versioned scope.
+fn ourios_tracer(provider: &SdkTracerProvider) -> opentelemetry_sdk::trace::SdkTracer {
+    provider.tracer_with_scope(scope(TRACER_SCOPE))
+}
 
 /// Bootstrap configuration for the metrics pipeline.
 #[derive(Debug, Clone)]
@@ -555,7 +579,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         // attributes we add deliberately. `thread.{id,name}` are valid semconv
         // (kept by leaving `with_threads` at its default).
         let layer = tracing_opentelemetry::layer()
-            .with_tracer(tracer_provider.tracer(TRACER_SCOPE))
+            .with_tracer(ourios_tracer(&tracer_provider))
             .with_tracked_inactivity(false)
             .with_location(false)
             .with_target(false)
@@ -604,8 +628,8 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .is_ok();
     let (logger, tracer) = if installed {
         // The subscriber — and its traces layer — is live, so register the
-        // tracer provider globally now (any direct `global::tracer(...)` use
-        // resolves against a running pipeline).
+        // tracer provider globally now (any `ourios_core::telemetry::tracer`
+        // use resolves against a running pipeline).
         if let Some(tracer_provider) = &tracer {
             global::set_tracer_provider(tracer_provider.clone());
         }
@@ -639,10 +663,10 @@ fn meter_provider(
         .with_reader(reader)
         .with_resource(resource.clone())
         .build();
-    process::register(&provider.meter(process::SCOPE));
+    process::register(&provider.meter_with_scope(scope(process::SCOPE)));
     // The runtime `init` runs on is the binary's main runtime.
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime::register(&provider.meter(runtime::SCOPE), &runtime);
+        runtime::register(&provider.meter_with_scope(scope(runtime::SCOPE)), &runtime);
     }
     Ok(provider)
 }
@@ -650,8 +674,8 @@ fn meter_provider(
 /// Build an in-memory metrics pipeline for tests: a `MeterProvider`
 /// whose periodic reader exports into the returned
 /// [`InMemoryMetricExporter`](opentelemetry_sdk::metrics::InMemoryMetricExporter),
-/// installed as the global provider so `global::meter(...)` resolves
-/// against it. Record through the global meter, call the returned
+/// installed as the global provider so `ourios_core::telemetry::meter(...)`
+/// resolves against it. Record through that meter, call the returned
 /// guard's [`force_flush`](TelemetryGuard::force_flush), then read the
 /// exporter's `get_finished_metrics()` to assert what was produced —
 /// no OTLP endpoint required. Runs inside a tokio runtime (the periodic
@@ -663,8 +687,9 @@ fn meter_provider(
 /// primitive to restore a previously-installed global provider, so the
 /// returned guard's `Drop` shuts the pipeline down but cannot reinstate
 /// an earlier global. For a fully isolated test, skip the global and
-/// build a provider directly, reading through `provider.meter(...)`
-/// (as this crate's own unit test does).
+/// build a provider directly and read through
+/// `provider.meter_with_scope(ourios_core::telemetry::scope(...))`
+/// (this crate's own unit tests use its private, equivalent `scope`).
 ///
 /// Returns the guard plus the exporter to collect from.
 #[cfg(feature = "testing")]
@@ -875,7 +900,7 @@ mod tests {
             ..TelemetryConfig::new("ourios-test")
         })
         .expect("init over OTLP/HTTP without a runtime");
-        global::meter("ourios.compaction")
+        global::meter_with_scope(scope("ourios.compaction"))
             .u64_counter("ourios.compaction.sweeps")
             .build()
             .add(1, &[]);
@@ -893,7 +918,7 @@ mod tests {
             .with_periodic_exporter(exporter.clone())
             .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
-        let meter = provider.meter("ourios.compaction");
+        let meter = provider.meter_with_scope(scope("ourios.compaction"));
         let counter = meter.u64_counter("ourios.compaction.sweeps").build();
         let guard = TelemetryGuard {
             provider: Some(provider),
@@ -1052,6 +1077,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spans_and_meters_carry_the_release_as_scope_version() {
+        use opentelemetry::trace::Tracer as _;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        ourios_tracer(&provider).in_span("scoped", |_| {});
+        let spans = exporter.get_finished_spans().expect("spans exported");
+        let scope = &spans.first().expect("one span").instrumentation_scope;
+        assert_eq!(scope.name(), TRACER_SCOPE);
+        assert_eq!(scope.version(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            super::scope(process::SCOPE).version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     // Scenario RFC0038.1 (unit slice): with the traces layer and the appender
     // bridge on the same subscriber, a `tracing::info!` emitted *inside* a
     // `tracing` span carries that span's (non-zero) `trace_id`/`span_id` on the
@@ -1075,7 +1120,7 @@ mod tests {
             .with_resource(resource("ourios-test", DEFAULT_SERVICE_VERSION))
             .build();
         let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer(TRACER_SCOPE)))
+            .with(tracing_opentelemetry::layer().with_tracer(ourios_tracer(&tracer_provider)))
             .with(OpenTelemetryTracingBridge::new(&logger));
 
         // Act — emit a log *inside* an entered span.

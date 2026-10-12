@@ -401,6 +401,13 @@ pub const OURIOS_TEMPLATE_ID: &str = "ourios.template.id";
 /// `ourios.template.version` attribute key.
 pub const OURIOS_TEMPLATE_VERSION: &str = "ourios.template.version";
 
+/// `ourios.template_map.derive.fallback.reason` attribute key.
+pub const OURIOS_TEMPLATE_MAP_DERIVE_FALLBACK_REASON: &str =
+    "ourios.template_map.derive.fallback.reason";
+
+/// `ourios.template_map.derive.mode` attribute key.
+pub const OURIOS_TEMPLATE_MAP_DERIVE_MODE: &str = "ourios.template_map.derive.mode";
+
 /// `ourios.template_map.derive.reason` attribute key.
 pub const OURIOS_TEMPLATE_MAP_DERIVE_REASON: &str = "ourios.template_map.derive.reason";
 

@@ -79,7 +79,7 @@ futures-core = { version = "0.3", default-features = false }
 # bootstrap scan there. A [[bin]] fixture cannot use dev-dependencies; both
 # are already in the tree via ourios-parquet.
 object_store = { version = "=0.14.2", default-features = false }
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 # `.next()` on the incoming stream inside the gRPC TLS adapter.
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 # Structured per-connection handshake-failure logs on the TLS listeners.
@@ -162,6 +162,10 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 oidc = ["ourios-serving/oidc"]
 # RFC 0047: the OpenFGA resolver binding tenants behind the same seam.
 openfga = ["ourios-serving/openfga"]
+# Exposes the RFC 0059 high-water codec (`template_ids::fuzzing`) for the
+# `fuzz/` cargo-fuzz `artifact_decode` target (RFC 0015). Off by default;
+# not part of the stable public API.
+fuzzing = []
 
 [dev-dependencies]
 # RFC 0052 §6's rotation fault-injection seam, for the RFC0052.15 arms
@@ -195,7 +199,7 @@ parquet = { version = "=60.0.0", default-features = false, features = ["arrow"] 
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # Proptest strategy over the OTLP proto value space for the
 # wire-decode equivalence scenarios (RFC0003.5/.6 per §8).
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 # `proptest_cases` (the PROPTEST_CASES override convention) for the
 # RFC0035.1 interleaving property.
 ourios-testgen = { path = "../ourios-testgen" }
@@ -218,7 +222,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # The metrics test collects via the in-memory reader's periodic-export
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
+tokio = { version = "=1.53.2", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 # RFC 0052 §3.1's publisher legs hold a PUT at the object-store seam
 # (`Store::wrap_backend`) — the one place the publisher's write waits with
 # no sink lock held. Both are already in the tree via ourios-parquet, as

@@ -109,3 +109,114 @@ fn rfc0020_6_secret_hygiene_across_the_file_path() {
         "shows presence only: {rendered}"
     );
 }
+
+const OURIOS_SECTIONS: [&str; 6] = [
+    "storage",
+    "receiver",
+    "querier",
+    "compaction",
+    "auth",
+    "miner",
+];
+
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn read_repo_file(rel: &str) -> String {
+    std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+/// The config files the Helm chart's golden render mounts, one per `ConfigMap` key.
+fn helm_render_configs() -> Vec<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        kind: Option<String>,
+        data: Option<std::collections::BTreeMap<String, String>>,
+    }
+
+    let render = read_repo_file("deploy/helm/testdata/default-render.yaml");
+    let manifests: Vec<Manifest> =
+        serde_saphyr::from_multiple(&render).expect("golden Helm render is valid YAML");
+    manifests
+        .into_iter()
+        .filter(|manifest| manifest.kind.as_deref() == Some("ConfigMap"))
+        .flat_map(|manifest| manifest.data.into_iter().flatten())
+        .map(|(name, text)| (format!("default-render.yaml ConfigMap {name}"), text))
+        .collect()
+}
+
+/// The fenced `yaml` blocks of a markdown text, in order.
+fn yaml_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut block: Option<String> = None;
+    for line in text.lines() {
+        match (&mut block, line.trim_end()) {
+            (None, "```yaml") => block = Some(String::new()),
+            (Some(_), "```") => blocks.extend(block.take()),
+            (Some(buf), _) => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            (None, _) => {}
+        }
+    }
+    blocks
+}
+
+fn starts_with_ourios_section(yaml: &str) -> bool {
+    yaml.lines()
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .and_then(|l| l.split_once(':'))
+        .is_some_and(|(key, _)| OURIOS_SECTIONS.contains(&key))
+}
+
+/// Each `docs/guides/` yaml block whose first top-level key is an Ourios section.
+fn guide_configs() -> Vec<(String, String)> {
+    let mut guides: Vec<_> = std::fs::read_dir(repo_root().join("docs/guides"))
+        .expect("docs/guides")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    guides.sort();
+    guides
+        .iter()
+        .flat_map(|guide| {
+            let text = std::fs::read_to_string(guide).expect("read guide");
+            yaml_blocks(&text)
+                .into_iter()
+                .filter(|yaml| starts_with_ourios_section(yaml))
+                .map(|yaml| (guide.display().to_string(), yaml))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Every configuration file the repository ships or documents parses under the
+/// RFC 0020 schema: the dogfood config, the config files the Helm chart's golden
+/// render mounts, and each fenced `yaml` block in `docs/guides/` whose first
+/// top-level key is an Ourios section (Collector snippets are skipped). A parser
+/// swap or a schema change that breaks a real config fails here, not at startup.
+#[test]
+fn every_example_config_in_the_repo_parses() {
+    use ourios_server::config::file::parse;
+
+    let mut configs = vec![(
+        "dogfood-config.yaml".to_owned(),
+        read_repo_file("dogfood-config.yaml"),
+    )];
+    configs.extend(helm_render_configs());
+    configs.extend(guide_configs());
+
+    assert!(
+        configs.len() >= 6,
+        "expected the dogfood config, three Helm role configs and the guide examples; \
+         found {}",
+        configs.len()
+    );
+    for (origin, yaml) in &configs {
+        if let Err(e) = parse(yaml, &|_| None) {
+            panic!("{origin} does not parse: {e}");
+        }
+    }
+}

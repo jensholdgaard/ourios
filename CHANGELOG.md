@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.13.0] - 2026-10-12
+
+### Added
+
+- Report derive mode and fallback reason (#976) (75bd27d)
+- Fold only new audit files when a stale artifact's guard passes (#975) (01fdfe9)
+- Persist template-map fold state and publish through unique temps (#974) (eb0b2ed)
+- Span the template-map acquisition and add query-phase s3 client spans (#965) (3a8334c)
+- Version every meter and tracer scope and set span error status (#963) (9169e20)
+- Lower accepted dsl queries to their plan in dsl_parse (#964) (c7611d4)
+
+### Chore
+
+- Update cargo (minor/patch) (#972) (68ae75a)
+- Update rust:1.99.0-bookworm docker digest to 114c7a4 (#971) (9ca3e4f)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 3428d0a (#969) (ee561fd)
+- Update github-actions (#970) (b8e5c3b)
+
+### Documentation
+
+- Rfc 0020 amendment for verbatim config scalars (#980) (d8c6a1a)
+- Rfc 0033 amendment for a guarded incremental template-map fold (#962) (89bf4fa)
+- Add the derive and wait template-map spans to rfc 0038 (#966) (9f3987c)
+
+### Fixed
+
+- Parse the yaml config with a maintained pure-rust parser (#978) (8758721)
+- Reject a malformed regex pattern as an invalid query (#961) (7fc73ce)
+- Reject text operators on body as invalid until logical-body matching is specified (#960) (bbe90cb)
+
+### Tests
+
+- Spawn the parked task before the runtime metrics register (#982) (c86538c)
+
+## [0.12.3] - 2026-10-11
+
+### Added
+
+- Fuzz the audit reader behind the parquet panic boundary (#958) (5bc2632)
+- Fuzz the persisted artifacts read back from object storage (#955) (b05f4e9)
+- Make the harness oracles test the §3.1/§3.3 invariants and parser round trips (#951) (8b38e14)
+- Export the code under test's own OTel metrics from smoke-fuzz (#946) (5eae153)
+
+### CI
+
+- Consolidate the fuzzing workflows, build once, prune and bound (#950) (8cc0189)
+
+### Fixed
+
+- Turn upstream decoder panics into typed errors (#956) (4562836)
+- Reject a snapshot slot type the restore cannot keep (#957) (ff2a2c7)
+- Ignore the embedded arrow schema so a corrupt one cannot panic (#954) (fc798bd)
+- Give every histogram explicit bucket boundaries (#953) (1f6339d)
+- Reject dsl float literals that overflow to infinity (#952) (f8f65d8)
+- Ignore blank lines when comparing the default render (#948) (1debab4)
+- Register the observable gauges once per provider (#947) (de53f78)
+
 ## [0.12.2] - 2026-10-11
 
 ### Added

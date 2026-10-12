@@ -23,7 +23,7 @@ ourios-semconv = { path = "../ourios-semconv" }
 sha2 = { version = "0.11", default-features = false }
 # The OTel metrics **API** only (RFC 0001 §6.8 "Export architecture":
 # library crates depend on the lightweight API and resolve instruments
-# through `global::meter`; the heavy SDK + OTLP exporter live in
+# through `ourios_core::telemetry`'s versioned scopes; the heavy SDK + OTLP exporter live in
 # `ourios-telemetry`). Drives the §6.8 miner instrument set in
 # `crate::metrics`.
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
@@ -43,12 +43,12 @@ ourios-testgen = { path = "../ourios-testgen" }
 # H2.2 telemetry tests — same pattern as the alias + compaction
 # metrics tests.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.2", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 # Property test for the canonical template encode/decode invariant
 # (`tree::format_template` ↔ `tree::parse_template`), per CLAUDE.md §6.2
 # ("reconstruction is always a property test").
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 
 [lints]
 workspace = true

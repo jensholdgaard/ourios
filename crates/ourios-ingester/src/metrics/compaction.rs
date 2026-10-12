@@ -26,10 +26,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{
     Counter, Histogram, Meter, ObservableCounter, ObservableUpDownCounter,
 };
-use opentelemetry::{KeyValue, global};
 use ourios_core::histogram_buckets;
 use ourios_parquet::MemoryPhase;
 use ourios_semconv as semconv;
@@ -235,7 +235,7 @@ impl CompactionMetrics {
     /// surface on the first sweep with a real `result`.
     #[must_use]
     pub fn new() -> Self {
-        Self::from_meter(&global::meter("ourios.compaction"))
+        Self::from_meter(&ourios_core::telemetry::meter("ourios.compaction"))
     }
 
     /// [`Self::new`] on `meter` rather than the global one.

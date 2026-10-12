@@ -47,8 +47,11 @@ mod audit_scan;
 mod body_match;
 mod drift;
 pub mod dsl;
+mod fold_state;
+mod local_publish;
 mod log_row;
 mod map_flight;
+mod phase;
 mod plan;
 mod schema_adapt;
 mod template_map;
@@ -58,6 +61,7 @@ pub mod visibility;
 pub use alias_store::derive_alias_map;
 pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
+pub use fold_state::{FoldState, INCREMENTAL_DEPTH_CAP};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_map::{
     ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME, TemplateMap,
@@ -91,6 +95,9 @@ mod decode;
 mod exec;
 mod fetch_count;
 mod file_set;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod stats;
 #[cfg(test)]
 mod test_support;
@@ -195,6 +202,33 @@ fn time_window_filter(
     let eff = || col(columns::EFFECTIVE_TIME_UNIX_NANO);
     let eff_window = eff().gt_eq(lo).and(eff().lt(hi));
     Ok(eff_window.or(eff().is_null().and(ts_window)))
+}
+
+/// Lower a validated aggregation stage over the filtered frame: the grouped
+/// `Aggregate` node `execute_aggregate` runs (`n`, plus `v` for a scalar
+/// stage).
+fn aggregate_frame(
+    df: datafusion::dataframe::DataFrame,
+    agg: &plan::Aggregate,
+    tenant: &TenantId,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
+    // aggregation: the scan is scoped to the tenant's partition prefix,
+    // but an aggregation returns group *values* and has no per-row
+    // check like `collect_records`' — a misplaced row under the prefix
+    // must neither skew the counts nor leak a foreign param value into
+    // a group key.
+    let df = df
+        .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
+        .map_err(storage_err)?;
+    let group_exprs = plan::group_exprs(&agg.by, df.schema())?;
+    // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
+    // the CAST-to-Float64 promoted column) when the stage carries one.
+    let mut aggr_exprs = vec![count(lit(1_i64)).alias(plan::COUNT_COLUMN)];
+    if let Some((func, path)) = &agg.scalar {
+        aggr_exprs.push(plan::scalar_agg_expr(*func, path, df.schema())?.alias(plan::VALUE_COLUMN));
+    }
+    df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)
 }
 
 /// Apply the [`QueryRequest`] predicate set as `DataFusion` filters. Returns
@@ -499,19 +533,19 @@ impl Querier {
         alias_map: Option<&ourios_core::alias::AliasMap>,
         options: QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        // Error precedence: stage-support and window/limit validation
-        // runs before the alias-map derivation below, so those query
-        // errors surface without paying the audit-tree IO (or its
-        // Storage errors). Predicate compilation needs the map, so its
-        // errors necessarily come after. `compile` re-runs the same
-        // pure validation internally — one source of truth, negligible
-        // cost.
-        plan::validate(query, now_unix_nano, default_window_nanos)?;
-        // RFC 0047 §3.4: a metadata-only reader's query must not touch a
-        // content column — rejected before any IO, naming the column.
+        // Error precedence: authorization first, so a metadata-only
+        // reader's query on a content column is `Forbidden` (RFC0047.8,
+        // RFC 0047 §3.4) whatever else is wrong with it. Then stage-support
+        // and window/limit validation, before the alias-map derivation
+        // below, so those query errors surface without paying the
+        // audit-tree IO (or its Storage errors). Predicate compilation
+        // needs the map, so its errors necessarily come after. `compile`
+        // re-runs the same pure validation internally — one source of
+        // truth, negligible cost.
         if let Some(visibility) = &options.visibility {
             visibility.validate(query)?;
         }
+        plan::validate(query, now_unix_nano, default_window_nanos)?;
         // A `body ==`/`!=` needs the RFC 0017 registry for the RFC 0044
         // template arm; the `resolves_to` alias fold needs the alias map.
         // Both ride the one RFC 0033 cached-map acquisition (artifact hit or
@@ -818,24 +852,7 @@ impl Querier {
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
     ) -> Result<QueryResult, QueryError> {
-        // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
-        // aggregation: the scan is scoped to the tenant's partition prefix,
-        // but an aggregation returns group *values* and has no per-row
-        // check like `collect_records`' — a misplaced row under the prefix
-        // must neither skew the counts nor leak a foreign param value into
-        // a group key.
-        let df = df
-            .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
-            .map_err(storage_err)?;
-        let group_exprs = plan::group_exprs(&agg.by, df.schema())?;
-        // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
-        // the CAST-to-Float64 promoted column) when the stage carries one.
-        let mut aggr_exprs = vec![count(lit(1_i64)).alias(plan::COUNT_COLUMN)];
-        if let Some((func, path)) = &agg.scalar {
-            aggr_exprs
-                .push(plan::scalar_agg_expr(*func, path, df.schema())?.alias(plan::VALUE_COLUMN));
-        }
-        let aggregated = df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)?;
+        let aggregated = aggregate_frame(df, agg, tenant)?;
         let (batches, scan) = execute_plan(aggregated, task_ctx).await?;
         let decoded = decode_aggregate(&batches, agg.by.len(), agg.scalar.is_some())?;
         Ok(QueryResult {

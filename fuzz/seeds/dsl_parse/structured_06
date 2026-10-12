@@ -1,0 +1,1 @@
+{"predicate":{"or":[{"field":{"attr":"duration"},"op":">","value":2.5},{"call":"contains","args":["body","timeout"]}]},"stages":[{"sum":{"attr":"duration"},"by":["service",{"bucket":"1m"}]}]}

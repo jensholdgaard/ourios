@@ -225,6 +225,10 @@ async fn masked_visibility_nulls_content_and_forbids_reading_it() {
     for dsl in [
         "attr.gen_ai.input.messages == \"x\"",
         "contains(body, \"secret\")",
+        "starts_with(body, \"secret\")",
+        "matches(body, \"secret\")",
+        "body =~ \"secret\"",
+        "body !~ \"secret\"",
         "true | count by attr.gen_ai.input.messages",
     ] {
         match run(bucket.path(), dsl, masked.clone()).await {

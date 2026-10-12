@@ -382,6 +382,32 @@ fn rfc0002_2_string_and_structured_surfaces_agree() {
     );
 }
 
+/// Engine/SQL tokens that must never surface in an operator-facing query
+/// error (hazard `CLAUDE.md` §4.6), matched case-insensitively.
+const ENGINE_LEAK_TOKENS: &[&str] = &[
+    "datafusion",
+    "arrow",
+    "sql",
+    "logicalplan",
+    "logical plan",
+    "recordbatch",
+    "select",
+    "schema",
+    "fixedsizebinary",
+    "binary(",
+];
+
+/// Assert the error's operator-facing message names no engine/SQL construct.
+fn assert_leaks_no_engine_token(err: &ourios_querier::QueryError) {
+    let message = err.to_string().to_ascii_lowercase();
+    for token in ENGINE_LEAK_TOKENS {
+        assert!(
+            !message.contains(token),
+            "leaked engine token {token:?}: {message:?} ({err:?})",
+        );
+    }
+}
+
 /// Scenario RFC0002.3 — No `DataFusion`/arrow/SQL leakage.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 ///
@@ -395,18 +421,6 @@ async fn rfc0002_3_no_datafusion_leakage() {
     use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
-
-    // Engine/SQL tokens that must never surface in a compile-path error.
-    const LEAK_TOKENS: &[&str] = &[
-        "datafusion",
-        "arrow",
-        "sql",
-        "logicalplan",
-        "logical plan",
-        "recordbatch",
-        "select",
-        "schema",
-    ];
 
     // Arrange — a real store, and a query whose compilation fails
     // (ordering operator on a JSON-encoded attribute is out of scope).
@@ -432,12 +446,7 @@ async fn rfc0002_3_no_datafusion_leakage() {
     assert!(matches!(err, QueryError::InvalidQuery { .. }));
     let msg = err.to_string().to_ascii_lowercase();
     assert!(!msg.trim().is_empty(), "compile error must be non-empty");
-    for token in LEAK_TOKENS {
-        assert!(
-            !msg.contains(token),
-            "compile-path error leaked engine token {token:?}: {msg:?}",
-        );
-    }
+    assert_leaks_no_engine_token(&err);
 }
 
 /// Scenario RFC0002.4 — A query without an explicit range gets the tenant default window.
@@ -791,8 +800,6 @@ async fn rfc0002_6_non_text_operators_rejected() {
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
-    const LEAK_TOKENS: &[&str] = &["datafusion", "arrow", "sql", "fixedsizebinary", "binary("];
-
     let bucket = tempfile::TempDir::new().expect("temp");
     write_all(bucket.path(), &[simple("a", 1, TS0)]);
     let q = Querier::new(bucket.path());
@@ -829,10 +836,153 @@ async fn rfc0002_6_non_text_operators_rejected() {
             msg.contains(fragment),
             "{text:?} should name {fragment:?}: {msg:?}"
         );
-        for token in LEAK_TOKENS {
-            assert!(!msg.contains(token), "{text:?} leaked {token:?}: {msg:?}");
+        assert_leaks_no_engine_token(&err);
+    }
+}
+
+/// Text matching on `body` — a prefix or regex match would read only the
+/// physical `body` column, NULL for a faithfully mined line, and silently
+/// miss it. Until the RFC 0044 §7 follow-up (#968) specifies matching the
+/// logical body and assigns this an acceptance criterion, each such operator
+/// is rejected before any IO as the query's own `InvalidQuery`, naming the
+/// operator and leaking no engine detail, even nested under `not` / `or`.
+#[derive(Clone, Copy)]
+enum BodyTextOp {
+    StartsWith,
+    Matches,
+    RegexMatch,
+    RegexNotMatch,
+}
+
+impl BodyTextOp {
+    /// A query using the operator on `body`, nested a different way each.
+    fn query(self) -> &'static str {
+        match self {
+            Self::StartsWith => "starts_with(body, \"GET /\")",
+            Self::Matches => "severity >= warn and matches(body, \"^POST\")",
+            Self::RegexMatch => "scope == \"x\" or body =~ \"cart\"",
+            Self::RegexNotMatch => "not (body !~ \"cart\")",
         }
     }
+
+    /// The operator's DSL spelling, which the rejection names.
+    fn spelling(self) -> &'static str {
+        match self {
+            Self::StartsWith => "starts_with",
+            Self::Matches => "matches",
+            Self::RegexMatch => "=~",
+            Self::RegexNotMatch => "!~",
+        }
+    }
+}
+
+async fn assert_body_text_match_rejected(op: BodyTextOp) {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
+    use ourios_querier::QueryError;
+
+    let text = op.query();
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(bucket.path(), &[simple("a", 1, TS0)]);
+    let query = ourios_querier::dsl::parse(text).expect("parse DSL");
+    let err = ourios_querier::Querier::new(bucket.path())
+        .run_query(
+            &query,
+            &ourios_core::tenant::TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&no_aliases()),
+        )
+        .await
+        .expect_err(&format!("{text}: must be rejected"));
+    let QueryError::InvalidQuery { detail } = &err else {
+        panic!("{text}: expected InvalidQuery, got {err:?}");
+    };
+    assert!(
+        detail.contains(&format!("`{}` on body", op.spelling())) && detail.contains("RFC 0044 §7"),
+        "{text}: {detail}",
+    );
+    assert_leaks_no_engine_token(&err);
+}
+
+#[tokio::test]
+async fn body_text_match_starts_with_rejected() {
+    assert_body_text_match_rejected(BodyTextOp::StartsWith).await;
+}
+
+#[tokio::test]
+async fn body_text_match_matches_rejected() {
+    assert_body_text_match_rejected(BodyTextOp::Matches).await;
+}
+
+#[tokio::test]
+async fn body_text_match_regex_match_rejected() {
+    assert_body_text_match_rejected(BodyTextOp::RegexMatch).await;
+}
+
+#[tokio::test]
+async fn body_text_match_regex_not_match_rejected() {
+    assert_body_text_match_rejected(BodyTextOp::RegexNotMatch).await;
+}
+
+/// Scenario RFC0002.8 (malformed regex) — a pattern the regex engine cannot
+/// compile is the query's own `InvalidQuery`, on every site the regex
+/// operators reach (text columns, `matches`, and the promoted attribute arm),
+/// whatever `q`'s store holds: never a storage failure raised while the
+/// engine plans the filter, nor an empty result from a short-circuit.
+pub(crate) async fn assert_malformed_regexes_rejected(q: &ourios_querier::Querier) {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, no_aliases};
+    use ourios_querier::QueryError;
+
+    for text in [
+        "scope =~ \"[b-a]\"",
+        "event_name !~ \"(\"",
+        "matches(event_name, \"a{2,1}\")",
+        "service =~ \"[b-a]\"",
+        "attr.http.route !~ \"(?P<\"",
+        // Nested, so only a recursive walk reaches the pattern.
+        "not (scope =~ \"[b-a]\")",
+        "severity >= warn and event_name =~ \"(\"",
+        "template_id == 1 or matches(scope, \"a{2,1}\")",
+    ] {
+        let query = ourios_querier::dsl::parse(text).expect("parse");
+        let err = q
+            .run_query(
+                &query,
+                &ourios_core::tenant::TenantId::new("a"),
+                NOW,
+                DEFAULT_WINDOW_NS,
+                Some(&no_aliases()),
+            )
+            .await
+            .expect_err(&format!("{text}: a malformed pattern must be rejected"));
+        assert!(
+            matches!(&err, QueryError::InvalidQuery { detail } if detail.contains("regular expression")),
+            "{text}: {err:?}",
+        );
+        assert_leaks_no_engine_token(&err);
+    }
+}
+
+#[tokio::test]
+async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
+    use crate::common::{TS0, simple, write_all_with_promoted};
+    use ourios_parquet::PromotedAttributes;
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all_with_promoted(
+        bucket.path(),
+        &[simple("a", 1, TS0)],
+        &PromotedAttributes::new([], ["http.route".to_string()]),
+    );
+    assert_malformed_regexes_rejected(&ourios_querier::Querier::new(bucket.path())).await;
+}
+
+/// RFC0002.8 over a tenant with no data: the scan short-circuits to an empty
+/// result before planning, and the malformed pattern is still rejected.
+#[tokio::test]
+async fn rfc0002_8_malformed_regex_is_rejected_on_an_empty_store() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    assert_malformed_regexes_rejected(&ourios_querier::Querier::new(bucket.path())).await;
 }
 
 /// Scenario RFC0002.6 (unsupported stage rejection) — a pipeline stage this
@@ -1297,14 +1447,14 @@ fn assert_round_trips_through_yaml(beta: &str, expected: &ourios_querier::dsl::Q
         "canonical serialisation must be single-line: {beta:?}",
     );
 
-    // serde_yaml_ng emits a correctly-quoted scalar for any string, so building
+    // serde-saphyr emits a correctly-quoted scalar for any string, so building
     // the document via the serializer is itself part of the round-trip.
     let mut doc = std::collections::BTreeMap::new();
     doc.insert("query".to_string(), beta.to_string());
-    let yaml = serde_yaml_ng::to_string(&doc).expect("embed query as a YAML scalar");
+    let yaml = serde_saphyr::to_string(&doc).expect("embed query as a YAML scalar");
 
     let recovered: std::collections::BTreeMap<String, String> =
-        serde_yaml_ng::from_str(&yaml).expect("YAML round-trips");
+        serde_saphyr::from_str(&yaml).expect("YAML round-trips");
     let extracted = recovered.get("query").expect("query scalar survives");
 
     let reparsed = ourios_querier::dsl::parse(extracted)
@@ -1330,10 +1480,10 @@ fn yaml_round_trip_property() {
 
             let mut doc = std::collections::BTreeMap::new();
             doc.insert("query".to_string(), beta.clone());
-            let yaml = serde_yaml_ng::to_string(&doc)
+            let yaml = serde_saphyr::to_string(&doc)
                 .map_err(|e| TestCaseError::fail(format!("YAML embed failed: {e}")))?;
             let recovered: std::collections::BTreeMap<String, String> =
-                serde_yaml_ng::from_str(&yaml)
+                serde_saphyr::from_str(&yaml)
                     .map_err(|e| TestCaseError::fail(format!("YAML parse failed: {e}")))?;
             let extracted = recovered
                 .get("query")

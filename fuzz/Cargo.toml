@@ -20,9 +20,19 @@ prost = { version = "0.14", default-features = false, features = ["std"] }
 ourios-config = { path = "../crates/ourios-config" }
 ourios-core = { path = "../crates/ourios-core" }
 ourios-miner = { path = "../crates/ourios-miner" }
-ourios-ingester = { path = "../crates/ourios-ingester" }
+ourios-ingester = { path = "../crates/ourios-ingester", features = ["fuzzing"] }
+ourios-parquet = { path = "../crates/ourios-parquet" }
 ourios-wal = { path = "../crates/ourios-wal", features = ["fuzzing"] }
-ourios-querier = { path = "../crates/ourios-querier" }
+# `fuzzing` exposes the DSL → plan seam `dsl_parse` lowers through.
+ourios-querier = { path = "../crates/ourios-querier", features = ["fuzzing"] }
+# `audit_reader` re-encodes what it read through the writer's own
+# `audit_events_to_batch`; these write that batch to Parquet bytes and hand
+# them back to `AuditReader::open_bytes`. The versions ourios-parquet uses.
+bytes = { version = "1", default-features = false }
+parquet = { version = "60", default-features = false, features = ["arrow"] }
+# `artifact_decode` compresses its input into a template-map frame, so the
+# fuzzer can mutate the JSON body behind the zstd layer; the querier's zstd.
+zstd = "0.13"
 # Installs the OTel metrics provider when the standard OTLP env points at an
 # OTLP/HTTP endpoint (`common/telemetry.rs`, which every target includes by
 # path, so the package keeps no library API per RFC 0015 §3.1).
@@ -66,10 +76,34 @@ bench = false
 
 # Untrusted-input boundary: the RFC 0002 DSL parsers (pipe text and the
 # structured-JSON variant) serve /v1/query and MCP; they must never panic,
-# and an accepted query must round-trip its canonical form (RFC0002.7).
+# and an accepted query must round-trip its canonical form (RFC0002.7). An
+# accepted log query is then validated and lowered to its DataFusion plan
+# (the querier's `fuzzing` feature): a rejection is the DSL's own error,
+# never the engine's, and the plan is a function of the query (RFC0015.15).
 [[bin]]
 name = "dsl_parse"
 path = "fuzz_targets/dsl_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Persisted artifacts read back from object storage (miner snapshot,
+# partition manifest, template-id high-water, template-map frame): corrupt
+# bytes are a typed error or a discard, never a panic or a partial state;
+# what decodes re-encodes to a fixpoint.
+[[bin]]
+name = "artifact_decode"
+path = "fuzz_targets/artifact_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Audit-event Parquet files read back from object storage: a typed
+# AuditReaderError, never a panic; the events a file decodes to survive the
+# writer's encoding and read back equal.
+[[bin]]
+name = "audit_reader"
+path = "fuzz_targets/audit_reader.rs"
 test = false
 doc = false
 bench = false

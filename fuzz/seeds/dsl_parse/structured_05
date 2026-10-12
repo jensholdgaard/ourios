@@ -1,0 +1,1 @@
+{"predicate":{"field":"template_id","op":"==","value":42},"stages":[{"range":{"from":"-3h","to":"now"}},{"count":{"by":[{"param":0},{"bucket":"5m"}]}}]}

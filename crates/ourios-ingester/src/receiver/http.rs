@@ -336,7 +336,7 @@ async fn handle_logs(
     match tokio::spawn(
         async move {
             pipeline
-                .ingest_bound(request, tenant, binding.as_deref(), lenient_json)
+                .ingest_reported(request, tenant, binding.as_deref(), lenient_json, as_5xx)
                 .await
         }
         .with_context(parent),
@@ -382,6 +382,12 @@ fn ingest_error_status(error: &ReceiveError) -> StatusCode {
         }
         IngestFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// The `error.type` the `ingest logs` span fails with for `error`: its HTTP
+/// status code, when that is a `5xx`.
+fn as_5xx(error: &ReceiveError) -> Option<String> {
+    ourios_core::telemetry::http_server_error_type(ingest_error_status(error).as_u16())
 }
 
 /// The ingest-failure response: the mapped status and a `Status` body

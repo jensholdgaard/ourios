@@ -98,11 +98,20 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 # ourios-bench binds it directly as the A1 reference codec), so this
 # adds no new transitive crate and the version is pinned by `Cargo.lock`.
 zstd = "0.13"
+# RFC 0033 §3.3 amendment (2026-10-12) — each local artifact publish writes
+# its own `<artifact>.<UUIDv7>.tmp`. Already in the tree via ourios-parquet,
+# ourios-wal and ourios-ingester with the same features.
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+# RFC0002.8 — the compiler checks a `=~` / `!~` / `matches` pattern with
+# the regex engine DataFusion's `regexp_like` runs, so a malformed one is an
+# `InvalidQuery` rather than a planning failure. Already in the tree via
+# DataFusion; `Cargo.lock` keeps the one copy.
+regex = "1"
 # #924 — the per-session byte-counting `ObjectStore` wrapper
 # (`src/fetch_count.rs`) behind `ourios.query.read.size`. The trait is
 # `async_trait`-based and its listing calls return `BoxStream`s; both
 # crates are already in the tree via DataFusion / object_store.
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
 
 [features]
@@ -111,6 +120,10 @@ futures = { version = "=0.3.34", default-features = false, features = ["std"] }
 # acquisition and a count of queries waiting on one. Disabled by default;
 # test-only hooks, which CI's `--all-features` runs turn on.
 testing = []
+# Exposes the DSL → plan seam (`fuzzing::lower`) for the `fuzz/` cargo-fuzz
+# `dsl_parse` target (RFC 0015, RFC0015.15). Off by default; not part of the
+# stable public API.
+fuzzing = []
 
 [dev-dependencies]
 # #853 — the request-counting `ObjectStore` wrapper (`src/test_support.rs`)
@@ -130,7 +143,7 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
 # RFC0002.7 — the parse/serialise round-trip is a property test over
 # generated well-formed queries.
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 # RFC 0024 §5 P4 (`tests/rfc0024_properties.rs`): generated OTLP
 # batches + generated predicates come from the dev-only generator
 # crate; the real miner (already a regular dep) shapes the rows.
@@ -140,7 +153,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 # tempfile gives each test a scratch bucket. `rt-multi-thread` for the
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
 # `time` for the delayed-GET store wrapper (`test_support::SlowStore`).
-tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile = "=3.27.0"
 # #895 (`tests/rfc0033_bounded_fold.rs`) — testing-mode heap profiler as the
 # global allocator, so the cold template-map derivation's peak heap is
@@ -164,12 +177,12 @@ arrow-array = { version = "=60.0.0", default-features = false }
 arrow-schema = { version = "=60.0.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
-serde_yaml_ng = { version = "=0.10.0", default-features = false }
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize", "serialize"] }
 # RFC0002.11 — validates the structured surface against its published JSON
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.56.0", default-features = false }
+jsonschema = { version = "=0.58.6", default-features = false }
 
 [lints]
 workspace = true

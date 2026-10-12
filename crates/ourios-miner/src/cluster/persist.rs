@@ -624,6 +624,24 @@ pub(super) fn restore_slot_types(
     }
     let mut slot_types = Vec::with_capacity(record.slot_types.len());
     for (slot, recorded) in record.slot_types.iter().enumerate() {
+        // `SlotTypes` has no bit for a reader-side `Unknown` ordinal, so
+        // restoring one would silently drop it, and a slot of only
+        // unknowns would come back empty: the next snapshot would carry
+        // that empty set and the restore after it reject it. The miner
+        // never mints `Unknown`, so the snapshot is not from a tree this
+        // build can rebuild.
+        if let Some(unknown) = recorded
+            .iter()
+            .find(|t| matches!(t, crate::snapshot::ParamTypeRecord::Unknown(_)))
+        {
+            return Err(RestoreError::Inconsistent {
+                detail: format!(
+                    "template_id {} slot {slot}: recorded type {unknown:?} is not one this \
+                     build tracks",
+                    record.template_id,
+                ),
+            });
+        }
         let mut types = recorded.iter().copied().map(ParamType::from);
         let Some(first) = types.next() else {
             return Err(RestoreError::Inconsistent {

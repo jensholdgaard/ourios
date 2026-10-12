@@ -195,6 +195,108 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 > `#[doc(hidden)]`. The status stays `accepted`. Scenarios RFC0015.8–.10
 > and the RFC0015.1 amendment are the criteria.
 
+> **Amendment (2026-10-11, #955, maintainer-approved): a sixth target for
+> the persisted artifacts.** The process reads back from object storage
+> bytes it may not have written, or may have written in an older version;
+> a decoder that panics or half-applies them turns every restart into a crash loop
+> or a silently wrong state (#892: an unreadable self-written snapshot
+> made every restart rebuild from the WAL). One target covers the small
+> JSON artifacts, the first input byte picking the decoder:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `artifact_decode` | `data[0] % 5`: 0 `snapshot::recover` then `MinerCluster::restore_tenant`; 1 `Manifest::from_json`; 2 the RFC 0059 high-water `parse`; 3 `TemplateMap::from_artifact_bytes` on the raw frame; 4 the same on the input zstd-compressed, so mutations reach the JSON body | an allowed outcome, never a panic (RFC0015.11); a rejected snapshot leaves no state (RFC0015.12); decode → encode → decode is a fixpoint, and a restored snapshot captures back what it restored (RFC0015.13) |
+>
+> One binary, not four: each decoder is a few functions of JSON over the
+> same `serde_json`, coverage is still attributed per function, and the
+> ClusterFuzzLite budget (3000 s shared, parallel) splits six ways
+> instead of nine. The template-map frame is the only expanding decoder;
+> its 64 MiB decompression bound classifies a bomb `Torn`, well inside
+> `-rss_limit_mb=2048`. The high-water codec is private to
+> `ourios-ingester`; a `fuzzing` feature exposes it as
+> `template_ids::fuzzing` (`#[doc(hidden)]`), as `ourios-wal` does for
+> its frames, so non-fuzz builds see no API change. The template-map
+> reader is already public. Seeds are one valid artifact per decoder,
+> each produced by its real encoder (`fuzz/README.md` has the recipe),
+> with a dictionary of the artifacts' JSON keys
+> (`fuzz/dict/artifact_decode.dict`).
+>
+> The audit-event Parquet reader (`AuditReader::open_bytes`) is not in
+> this target: a Parquet decode is a far larger and slower coverage space
+> than these, and it gets its own. The status stays `accepted`;
+> scenarios RFC0015.11–.13 are the criteria.
+
+> **Amendment (2026-10-11, #958, maintainer-approved): a seventh target
+> for the audit-event Parquet files.** The template registry, the alias
+> map and the drift query all fold audit events read back from object
+> storage (RFC 0005 §3.7), and the upstream `parquet`/`arrow` decoders
+> assert, index and unwrap on malformed pages and footers. Since #956
+> every Parquet decode in `ourios-parquet` runs behind a panic boundary
+> (`panic_boundary.rs`) that turns such a panic into a typed
+> `DecodePanicked`:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `audit_reader` | the input is the whole object: `AuditReader::open_bytes`, then `read_all` | `Ok` or an `AuditReaderError` other than `Io`/`PartitionMismatch`, a caught decoder panic being the expected `DecodePanicked`; a panic past the boundary crashes; decoded events re-encode through `audit_events_to_batch` and read back equal (RFC0015.14) |
+>
+> libfuzzer-sys installs a panic hook that aborts before any unwinding,
+> so on its own the boundary's `catch_unwind` never runs under the
+> fuzzer. The target swaps that hook for a recording one around the
+> single decode call and restores it straight after; its own
+> `catch_unwind` re-raises, under the restored hook, any panic the
+> boundary let through. Per input and on the fuzzing thread only, so
+> no other panic is ever masked. The seed is the audit object of the
+> `artifact_decode` seed store; no dictionary (a binary format whose
+> column names the seed already carries). While parquet 59's footer
+> decoder can be driven into a multi-gigabyte allocation (#959, §6
+> below), which the first run reached after ~145 s, the daily smoke run
+> gives the target 30 s instead of 300 s and ClusterFuzzLite (batch,
+> prune, coverage) does not run it: `.clusterfuzzlite/build.sh` skips
+> staging it. Both the smoke override and the exclusion are deleted
+> when #959 closes with the parquet 60 / DataFusion 56 upgrade (#846).
+> The status stays
+> `accepted`; scenario RFC0015.14 is the criterion.
+
+> **Amendment (2026-10-11, #964, maintainer-approved): `dsl_parse`
+> reaches the plan.** An accepted query used to stop at the parser.
+> The querier then validates it (`plan::validate`), compiles it and
+> lowers it to a `DataFusion` logical plan, and the engine's analyzer
+> and optimizer run over that plan. Every one of those steps sees
+> client text first. A query the DSL accepts but the engine rejects
+> while planning comes back as `Storage` ("failed to read storage"):
+> the engine, not the DSL, has decided what is a valid query (hazard
+> `CLAUDE.md` §4.6). The target now goes on from the parser:
+>
+> | Target | Entry point | Oracle |
+> |---|---|---|
+> | `dsl_parse` | as before, then for an accepted log query the querier's `fuzzing::validate` and `fuzzing::lower`: `plan::compile`, `plan::apply` and the aggregation node over an empty in-memory scan, then the analyzer and optimizer, against the current writer's schema (one promoted key per RFC 0042 class) and a scan with every OPTIONAL column absent (RFC0007.4) | validation accepts or returns `InvalidQuery`; lowering returns exactly validation's rejection and lowers an accepted query to a plan or an `InvalidQuery`; the canonical re-parse validates and lowers to the same verdict and an equal plan (RFC0015.15) |
+>
+> One binary, not two. The plan oracle runs only on the queries a
+> parser accepts, a share of the executions (a 300 s run with ASan
+> still executes about 1 800 inputs a second, peak RSS about
+> 800 MiB). It needs the same seeds and the same
+> dictionary, so a second target would duplicate both and split the
+> ClusterFuzzLite budget eight ways instead of seven. The binary keeps
+> its name, so ClusterFuzzLite's stored corpus carries over. Nothing
+> executes and no store is opened. The alias map and template registry
+> are empty, the clock is fixed, and the session is built once per
+> process. The seam lives behind an `ourios-querier` `fuzzing` feature
+> (`#[doc(hidden)] pub mod fuzzing`, as `ourios-wal` and
+> `ourios-ingester` do). The lowered plan crosses it as an opaque
+> `LoweredPlan` that is only `PartialEq` and `Debug`, so no
+> `DataFusion` type enters the crate's API. The aggregation lowering
+> moved out of `Querier::execute_aggregate` into a function the
+> execution path and the seam share, so the plan fuzzed is the plan
+> run. The token denylist on error text (RFC0007.3) is not part of the
+> oracle: an `InvalidQuery` detail echoes the query's own keys and
+> literals, which can contain any token. The first runs found two
+> planner errors that surfaced as `Storage`, each fixed in its own PR:
+> `starts_with` / `matches` / `=~` / `!~` on the `Binary` `body`
+> column, now rejected at validation because matching only the stored
+> body would silently miss mined lines (RFC 0044 §7, #960, #968), and
+> a malformed regex pattern (#961). The status
+> stays `accepted`; scenario RFC0015.15 is the criterion.
+
 ### 3.3 Seed corpora
 
 Committed seeds live under `fuzz/seeds/<target>/` (a tracked directory,
@@ -553,6 +655,88 @@ the find.
 > - **And** any violation makes the target panic with a message
 >   citing `CLAUDE.md` §3.1
 
+> **Scenario RFC0015.11 — persisted-artifact decoders return an allowed
+> outcome** (amendment 2026-10-11, #955)
+> - **Given** the `artifact_decode` target
+> - **When** a miner snapshot, a partition manifest, a template-id
+>   high-water or a template-map frame (or its JSON body) is decoded
+>   from arbitrary bytes
+> - **Then** no decoder panics, aborts, or triggers a sanitizer error
+> - **And** `recover(Some(_))` is `(Some, Restored)` only for a byte 0
+>   of `SNAPSHOT_VERSION` that `load_snapshot` reads, and otherwise
+>   `(None, UnknownOrCorruptDiscarded)`; `legacy_v1_mark` reads as
+>   legacy exactly the byte-0 = 1 artefacts
+> - **And** `Manifest::from_json` never reports an I/O error and
+>   accepts only manifests `validate` accepts; the high-water parses
+>   to an id within the template-id domain or is `Malformed`
+> - **And** a template-map read is `Valid`, `Torn`, an
+>   `UnknownVersion` other than the reader's own, or the loud
+>   tenant-mismatch error
+
+> **Scenario RFC0015.12 — a rejected snapshot leaves no partial
+> state** (amendment 2026-10-11, #955)
+> - **Given** a snapshot that decodes but `restore_tenant` rejects
+> - **Then** the cluster holds no state for the tenant and its
+>   template-id allocator has not moved
+
+> **Scenario RFC0015.13 — what a persisted-artifact decoder accepts
+> survives its writer** (amendment 2026-10-11, #955)
+> - **When** a snapshot decodes, its payload re-encodes and decodes
+>   equal; when it restores, the captured state (stamped with the
+>   folded horizon) equals the decoded state in canonical form: every
+>   field of every leaf, structured-template entry and adopted
+>   template, and the horizon, with only the format's documented
+>   rewrites (set-valued lists sorted and deduplicated, an empty
+>   provenance read as its pre-RFC 0050 default, an owned adoption at
+>   version 1, a tree-backed adoption carrying no provenance or
+>   associations of its own); and that capture restores again to an
+>   equal capture
+> - **When** a manifest decodes, `to_json` decodes back equal and is a
+>   byte fixpoint; when the high-water parses, `encode` parses back to
+>   the same id (and so does every id in the domain)
+> - **When** a template map reads `Valid`, `to_artifact_bytes` reads
+>   back `Valid` with the same frontier, registry and alias classes,
+>   and re-encodes to the same bytes
+> - **And** any violation makes the target panic with a message
+>   naming the scenario
+
+> **Scenario RFC0015.14 — an audit-event Parquet file decodes to a
+> typed outcome behind the panic boundary** (amendment 2026-10-11, #958)
+> - **Given** the `audit_reader` target and arbitrary bytes as one
+>   object from the store
+> - **When** `AuditReader::open_bytes` and `read_all` decode them
+> - **Then** the result is `Ok` or an `AuditReaderError`, never `Io` or
+>   `PartitionMismatch` (bytes have no file system and no partition)
+> - **And** a panic inside the `parquet`/`arrow` decoders surfaces as
+>   `DecodePanicked`, an accepted outcome, while any panic outside that
+>   boundary (in Ourios's own decode) still crashes the target
+> - **And** the scenario is about panics, not allocation failures: an
+>   abort from parquet 59's footer decoder reserving an untrusted list
+>   count is a known exception no boundary can catch, tracked by #959
+>   until parquet 60 removes it
+> - **And** the decoded events re-encode through
+>   `audit_events_to_batch`, write to Parquet and read back equal
+> - **And** any violation makes the target panic with a message
+>   naming the scenario
+
+> **Scenario RFC0015.15 — an accepted query validates and lowers to
+> the DSL's own outcome** (amendment 2026-10-11, #964)
+> - **Given** the `dsl_parse` target and a log query either parser
+>   accepts
+> - **When** it is validated and lowered to its optimized logical plan
+>   against the current writer's schema and against a scan with every
+>   OPTIONAL column absent, with nothing executed
+> - **Then** nothing panics, and validation accepts it or rejects it
+>   with `InvalidQuery`
+> - **And** lowering rejects exactly what validation rejects, with the
+>   same error, and lowers what validation accepts to a plan, a
+>   provably empty result, or an `InvalidQuery`, never a `Storage`
+>   error carrying the engine's planning failure (`CLAUDE.md` §4.6)
+> - **And** the canonical re-parse validates to the same verdict and
+>   lowers to an equal plan or the same error
+> - **And** any violation makes the target panic with a message
+>   naming the scenario
+
 ## 6. Testing strategy
 
 Per `CLAUDE.md` §6.2, the fuzz targets *are* the tests — coverage-guided
@@ -595,6 +779,47 @@ greppable (`docs/verification.md` §2).
 > - The RFC0015.5 bullet's "per-PR smoke job" predates §3.4's
 >   schedule-only trigger. The smoke job runs on its schedule and on
 >   dispatch, never per PR.
+
+> **Amendment (2026-10-11, #955, maintainer-approved): testing
+> RFC0015.11–.13.** Each oracle was shown to fire the same way before
+> landing: a restore that moves the id allocator before rejecting, a
+> snapshot writer that drops the wildcard route, a restore that drops
+> the adopted templates, a manifest reader that skips `validate`, a
+> high-water encoder off by one, a template-map
+> writer that drops the alias classes, and `recover` reporting a corrupt
+> snapshot as absent each crashed on a seed or a crafted input with the
+> expected message, and were reverted.
+
+> **Amendment (2026-10-11, #958, maintainer-approved): testing
+> RFC0015.14.** The boundary was shown both ways before landing: the
+> 147 `audit_reader` crash inputs found before #956 (eight upstream
+> panic messages) and the `testdata/corrupt-parquet/` fixtures all run
+> clean, and a panic injected into `AuditReader::read_all` crashed the
+> seed with the scenario's "escaped the decode boundary" message, and
+> was reverted. Four minimised inputs (an out-of-bounds offset, an
+> empty slice, a negative column range, an unset dictionary decoder)
+> stay as `regression_decoder_*` seeds, beside the #954 arrow-schema
+> reproducer; `artifact_decode` gains the #957 unknown-slot-type
+> reproducer. The first 300 s run found one out-of-memory the boundary
+> cannot catch: parquet 59's footer decoder (`read_thrift_vec`)
+> reserves a list's declared length before reading it, so a corrupt
+> footer asks for gigabytes (#959). parquet 60 bounds that count by the
+> remaining input. Until the DataFusion 56 upgrade (#846) brings it,
+> the smoke run's 30 s budget for the target rarely reaches it (it can
+> still report it as a crash), and ClusterFuzzLite does not stage the
+> target (§3.2 as amended); the
+> reproducer becomes a regression seed when #959 closes.
+
+> **Amendment (2026-10-11, #964, maintainer-approved): testing
+> RFC0015.15.** Each oracle was shown to fire before landing. A
+> validation that returns `Storage` for an unsupported stage, a panic
+> in the group-term lowering, a compile that lowers what validation
+> rejected, and a default window read off the wall clock instead of
+> the query clock each crashed a seed with the expected message, and
+> were reverted. The `Storage` arm fired on real defects first: the
+> seed `starts_with(body, "GET /")` (#960) and a run that mutated a
+> seed into an invalid regex class (#961). Their minimized inputs are
+> the `regression_960_*` and `regression_961_*` seeds.
 
 ## 7. Open questions
 

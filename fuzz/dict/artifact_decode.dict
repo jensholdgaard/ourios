@@ -1,0 +1,82 @@
+# libFuzzer dictionary for the artifact_decode target: the JSON keys and
+# value shapes of the persisted artifacts it decodes (miner snapshot,
+# partition manifest, template-id high-water, template-map body), so
+# mutations reach past the JSON syntax error into the deserialisers and
+# validators. Format: one quoted token per line
+# (https://llvm.org/docs/LibFuzzer.html#dictionaries). Pass with -dict=.
+
+# selectors (byte 0) and the snapshot version bytes (byte 1 under selector 0)
+"\x00\x03"
+"\x00\x01"
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+
+# miner snapshot (RFC 0001 §6.9)
+"leaves"
+"template"
+"template_id"
+"template_version"
+"severity_number"
+"scope_name"
+"slot_types"
+"provenance"
+"upstream_associations"
+"upstream_association_overflow"
+"wildcard_routed"
+"structured_templates"
+"event_name"
+"wal_high_water"
+"segment"
+"byte"
+"adopted_templates"
+"canonical"
+"owned"
+"Fixed"
+"Wildcard"
+"Ip"
+"Uuid"
+"Num"
+"Hex"
+"Ts"
+"Path"
+"Str"
+"Overflow"
+"Unknown"
+"Mined"
+"UpstreamDerived"
+"ProducerDeclared"
+
+# partition manifest (RFC 0009 §3.4)
+"generation"
+"files"
+".parquet"
+
+# template-id high-water (RFC 0059 §3.1)
+"reserved_through"
+"9223372036854775807"
+"9223372036854775808"
+
+# template map (RFC 0033 §3.2)
+"format_version"
+"tenant_id"
+"fuzz-tenant"
+"folded_files"
+"registry"
+"version"
+"alias_map"
+"representative"
+"members"
+"year=2026/month=10/day=11/"
+"<*>"
+
+# JSON shapes
+"null"
+"true"
+"false"
+"[]"
+"{}"
+"-1"
+"1e400"
+"\"\""

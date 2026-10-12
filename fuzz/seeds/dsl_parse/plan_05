@@ -1,0 +1,1 @@
+body == "user 42 logged in from 10.0.0.1" or resolves_to(7) | limit 100

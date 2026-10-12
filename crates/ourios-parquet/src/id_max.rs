@@ -8,20 +8,26 @@
 //! makes the whole file come down, and then only its id columns decode.
 //! No row is ever materialised.
 
+use std::path::Path;
+
 use arrow_array::{Array, ListArray, UInt64Array};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::statistics::Statistics;
 
 use crate::audit_reader::AuditReaderError;
+use crate::decode::arrow_reader_builder;
+use crate::panic_boundary::guard_decode;
 use crate::store::{Store, StoreError};
 use crate::{audit_columns, columns};
 
 /// How much of a file's tail the first read fetches: enough for the
 /// footer of every file the writers produce.
 pub const FOOTER_PREFETCH_BYTES: u64 = 64 * 1024;
+
+/// What diagnostics name a file by when only its bytes are known.
+const UNNAMED: &str = "<object-store>";
 
 /// Which id-carrying columns a file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +93,14 @@ impl IdMaxError {
     pub fn is_permission_denied(&self) -> bool {
         matches!(self, Self::Store { source, .. } if source.is_permission_denied())
     }
+
+    /// True if the file was rejected because the `parquet`/`arrow` decoders
+    /// panicked on it.
+    #[must_use]
+    pub fn is_decode_panicked(&self) -> bool {
+        matches!(self, Self::Decode { source, .. }
+            if matches!(**source, AuditReaderError::DecodePanicked { .. }))
+    }
 }
 
 impl std::error::Error for IdMaxError {
@@ -117,15 +131,17 @@ pub fn object_max_id(
         key: key.to_owned(),
         source: Box::new(source),
     };
+    let path = Path::new(key);
     let mut want = FOOTER_PREFETCH_BYTES;
     loop {
         let tail = store.get_suffix_blocking(key, want).map_err(store_err)?;
-        match footer_max(&tail.bytes, tail.object_size, columns).map_err(decode_err)? {
+        match footer_max_of(path, &tail.bytes, tail.object_size, columns).map_err(decode_err)? {
             FooterMax::Known(max) => return Ok(max),
             FooterMax::NeedsTail(needed) if needed > want => want = needed,
             FooterMax::NeedsTail(_) | FooterMax::NeedsDecode => {
                 let bytes = store.get_blocking(key).map_err(store_err)?;
-                return decoded_max(bytes::Bytes::from(bytes), columns).map_err(decode_err);
+                return decoded_max_of(path, bytes::Bytes::from(bytes), columns)
+                    .map_err(decode_err);
             }
         }
     }
@@ -136,22 +152,34 @@ pub fn object_max_id(
 ///
 /// # Errors
 ///
-/// [`AuditReaderError::Parquet`] when the footer does not parse.
+/// [`AuditReaderError::Parquet`] when the footer does not parse;
+/// [`AuditReaderError::DecodePanicked`] when the decoder panics on it.
 pub fn footer_max(
     tail: &bytes::Bytes,
     object_size: u64,
     columns: IdColumns,
 ) -> Result<FooterMax, AuditReaderError> {
-    let mut reader = ParquetMetaDataReader::new();
-    match reader.try_parse_sized(tail, object_size) {
-        Ok(()) => {}
-        Err(ParquetError::NeedMoreData(needed)) => {
-            return Ok(FooterMax::NeedsTail(needed as u64));
+    footer_max_of(Path::new(UNNAMED), tail, object_size, columns)
+}
+
+fn footer_max_of(
+    path: &Path,
+    tail: &bytes::Bytes,
+    object_size: u64,
+    columns: IdColumns,
+) -> Result<FooterMax, AuditReaderError> {
+    guard_decode(path, || {
+        let mut reader = ParquetMetaDataReader::new();
+        match reader.try_parse_sized(tail, object_size) {
+            Ok(()) => {}
+            Err(ParquetError::NeedMoreData(needed)) => {
+                return Ok(FooterMax::NeedsTail(needed as u64));
+            }
+            Err(e) => return Err(AuditReaderError::Parquet(e)),
         }
-        Err(e) => return Err(AuditReaderError::Parquet(e)),
-    }
-    let metadata = reader.finish().map_err(AuditReaderError::Parquet)?;
-    Ok(metadata_max(&metadata, columns))
+        let metadata = reader.finish().map_err(AuditReaderError::Parquet)?;
+        Ok(metadata_max(&metadata, columns))
+    })
 }
 
 fn metadata_max(metadata: &ParquetMetaData, columns: IdColumns) -> FooterMax {
@@ -211,30 +239,42 @@ fn chunk_max(chunk: &ColumnChunkMetaData) -> ChunkMax {
 ///
 /// [`AuditReaderError::Parquet`] when the file does not parse;
 /// [`AuditReaderError::Conversion`] when an id column is neither `UInt64`
-/// nor a list of `UInt64`.
+/// nor a list of `UInt64`; [`AuditReaderError::DecodePanicked`] when the
+/// decoder panics on it.
 pub fn decoded_max(
     bytes: bytes::Bytes,
     columns: IdColumns,
 ) -> Result<Option<u64>, AuditReaderError> {
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(AuditReaderError::Parquet)?;
-    let leaves = id_leaves(builder.metadata(), columns);
-    if leaves.is_empty() {
-        return Ok(None);
-    }
-    let schema = builder.metadata().file_metadata().schema_descr_ptr();
-    let reader = builder
-        .with_projection(ProjectionMask::leaves(&schema, leaves))
-        .build()
-        .map_err(AuditReaderError::Parquet)?;
-    let mut highest = None;
-    for batch in reader {
-        let batch = batch.map_err(|e| AuditReaderError::Parquet(e.into()))?;
-        for column in batch.columns() {
-            highest = highest.max(column_max(column.as_ref())?);
+    decoded_max_of(Path::new(UNNAMED), bytes, columns)
+}
+
+fn decoded_max_of(
+    path: &Path,
+    bytes: bytes::Bytes,
+    columns: IdColumns,
+) -> Result<Option<u64>, AuditReaderError> {
+    // The reader lives and dies inside the guard, so a panic mid-page
+    // leaves nothing behind to read from.
+    guard_decode(path, || {
+        let builder = arrow_reader_builder(bytes).map_err(AuditReaderError::Parquet)?;
+        let leaves = id_leaves(builder.metadata(), columns);
+        if leaves.is_empty() {
+            return Ok(None);
         }
-    }
-    Ok(highest)
+        let schema = builder.metadata().file_metadata().schema_descr_ptr();
+        let reader = builder
+            .with_projection(ProjectionMask::leaves(&schema, leaves))
+            .build()
+            .map_err(AuditReaderError::Parquet)?;
+        let mut highest = None;
+        for batch in reader {
+            let batch = batch.map_err(|e| AuditReaderError::Parquet(e.into()))?;
+            for column in batch.columns() {
+                highest = highest.max(column_max(column.as_ref())?);
+            }
+        }
+        Ok(highest)
+    })
 }
 
 fn column_max(column: &dyn Array) -> Result<Option<u64>, AuditReaderError> {

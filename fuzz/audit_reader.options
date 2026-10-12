@@ -1,0 +1,9 @@
+# libFuzzer flags ClusterFuzzLite applies to this target, once
+# .clusterfuzzlite/build.sh stages it next to the binary. Until #959 closes,
+# build.sh skips audit_reader, so this file is reserved for that staging; the
+# smoke job already passes the same two on its command line. A hang or an
+# allocation blowup becomes a reported crash instead of a run that lasts
+# until the job limit.
+[libfuzzer]
+timeout = 30
+rss_limit_mb = 2048

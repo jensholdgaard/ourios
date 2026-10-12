@@ -1,7 +1,8 @@
 //! RFC 0001 §6.8 telemetry instruments for the template miner.
 //!
-//! Instruments are resolved through the process-global meter
-//! (`global::meter("ourios.miner")`) per the §6.8 *Export
+//! Instruments are resolved through the process-global meter provider
+//! under the versioned `ourios.miner` scope
+//! (`ourios_core::telemetry::scope`) per the §6.8 *Export
 //! architecture* API/SDK split: this library depends only on the
 //! lightweight `opentelemetry` API crate; the SDK + OTLP exporter
 //! live in `ourios-telemetry`. With no provider installed the
@@ -65,7 +66,8 @@ mod gauges;
 
 use gauges::{Binding, GaugeRegistry, GlobalProvider};
 
-/// Meter name per RFC 0001 §6.8 (`global::meter("ourios.miner")`).
+/// Meter name per RFC 0001 §6.8, resolved under a versioned scope
+/// (`ourios_core::telemetry::scope(METER_NAME)`).
 const METER_NAME: &str = "ourios.miner";
 
 /// Resource-attribute key the source service is read from. The
@@ -379,7 +381,7 @@ impl MinerMetrics {
     /// split a cluster's instruments across two providers.
     fn for_provider(provider: &GlobalProvider, bindings: &Mutex<Vec<Binding>>) -> Self {
         Self::with_registry(
-            &provider.meter(METER_NAME),
+            &provider.meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
             &gauges::registry_for(provider, bindings),
         )
     }

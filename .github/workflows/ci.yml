@@ -145,7 +145,7 @@ jobs:
       # (12x the warm suite wall time locally — epic #382). Doctests are not
       # in nextest's model, so `cargo test --doc` keeps them covered — the
       # pair preserves the exact suite inventory (RFC0028.5).
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
@@ -208,11 +208,13 @@ jobs:
           rfc0013_object_store::parquet_audit_sink_persists_to_s3
       # RFC 0033 §3.4 S3 publish arm: the template-map artifact's
       # conditional-put ladder (create / lost create / If-Match swap /
-      # lost swap) against the same LocalStack.
+      # lost swap), and the RFC0033.12 incremental publish under CAS,
+      # against the same LocalStack.
       - run: >
           cargo test -p ourios-querier --test it --
           --ignored --exact
           rfc0033_cached_template_map::template_map_publish_cas_on_s3
+          rfc0033_incremental_fold::rfc0033_12_incremental_publish_resolves_by_cas_on_s3
       # RFC 0019 server-level §5 scenarios (.2/.3/.4/.5): spawn the
       # `ourios-server` binary configured for the S3 backend against the same
       # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored
@@ -318,7 +320,7 @@ jobs:
       # mdbook-mermaid: RFC diagrams are Mermaid (docs/rfcs/README.md).
       # The preprocessor is declared in book.toml, so the binary must be
       # on PATH or `mdbook build` fails with "preprocessor not found".
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: mdbook@0.5.2,mdbook-mermaid@0.17.0
       - run: mdbook build
@@ -669,7 +671,7 @@ jobs:
           cargo test -p ourios-serving --test listener_events
       - name: Upload live-check report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: live-check-report
           path: ${{ runner.temp }}/live-check/report/
@@ -691,7 +693,7 @@ jobs:
       # schema, advisory handling) can't change under us when a new release
       # lands; bump deliberately (Renovate/manual) alongside any deny.toml
       # changes the new version needs.
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
@@ -832,7 +834,7 @@ jobs:
           rustup toolchain install
           rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-llvm-cov
       # Collect once (runs the test suite under instrumentation), then
@@ -841,7 +843,7 @@ jobs:
       - run: cargo llvm-cov report --summary-only
       - run: cargo llvm-cov report --lcov --output-path lcov.info
       - run: cargo llvm-cov report --html --output-dir coverage-html
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage
           path: |

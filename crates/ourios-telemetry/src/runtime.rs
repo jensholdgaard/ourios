@@ -81,11 +81,12 @@ mod tests {
             .with_interval(Duration::from_millis(50))
             .build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        // Spawned before registering so no export can observe zero alive tasks.
+        let parked = tokio::spawn(std::future::pending::<()>());
         super::register(
-            &provider.meter(super::SCOPE),
+            &provider.meter_with_scope(crate::scope(super::SCOPE)),
             &tokio::runtime::Handle::current(),
         );
-        let parked = tokio::spawn(std::future::pending::<()>());
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let collected = loop {

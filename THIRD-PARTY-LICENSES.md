@@ -19,10 +19,10 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 351 |
-| `MIT` | 75 |
+| `Apache-2.0` | 359 |
+| `MIT` | 73 |
 | `Unicode-3.0` | 19 |
-| `BSD-3-Clause` | 12 |
+| `BSD-3-Clause` | 13 |
 | `ISC` | 6 |
 | `Zlib` | 3 |
 | `CDLA-Permissive-2.0` | 2 |
@@ -483,6 +483,8 @@ Used by:
 - `arrow-select` 60.0.0 — <https://github.com/apache/arrow-rs>
 - `arrow-string` 60.0.0 — <https://github.com/apache/arrow-rs>
 - `arrow` 60.0.0 — <https://github.com/apache/arrow-rs>
+- `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
+- `multiversion_no_op` 1.0.0 — <https://github.com/hsivonen/multiversion_no_op>
 - `parquet` 60.0.0 — <https://github.com/apache/arrow-rs>
 - `utf8_iter` 1.0.4 — <https://github.com/hsivonen/utf8_iter>
 - `zeroize` 1.9.0 — <https://github.com/RustCrypto/utils>
@@ -2498,6 +2500,7 @@ Used by:
 
 Used by:
 
+- `annotate-snippets` 0.12.16 — <https://github.com/rust-lang/annotate-snippets-rs>
 - `anstream` 1.0.0 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle-parse` 1.0.0 — <https://github.com/rust-cli/anstyle.git>
 - `anstyle-query` 1.1.5 — <https://github.com/rust-cli/anstyle.git>
@@ -3601,7 +3604,7 @@ limitations under the License.
 
 Used by:
 
-- `tokio-rustls` 0.26.5 — <https://github.com/rustls/tokio-rustls>
+- `tokio-rustls` 0.26.6 — <https://github.com/rustls/tokio-rustls>
 
 <details>
 <summary>Full license text</summary>
@@ -4684,6 +4687,7 @@ limitations under the License.
 
 Used by:
 
+- `core_detect` 1.0.0 — <https://github.com/thomcc/core_detect>
 - `rsa` 0.9.10 — <https://github.com/RustCrypto/RSA>
 
 <details>
@@ -4918,6 +4922,7 @@ Used by:
 - `curve25519-dalek-derive` 0.1.1 — <https://github.com/dalek-cryptography/curve25519-dalek>
 - `displaydoc` 0.2.6 — <https://github.com/yaahc/displaydoc>
 - `either` 1.16.0 — <https://github.com/rayon-rs/either>
+- `encoding_rs_io` 0.1.8 — <https://github.com/BurntSushi/encoding_rs_io>
 - `equivalent` 1.0.2 — <https://github.com/indexmap-rs/equivalent>
 - `errno` 0.3.14 — <https://github.com/lambda-fairy/rust-errno>
 - `fastrand` 2.4.1 — <https://github.com/smol-rs/fastrand>
@@ -4938,7 +4943,7 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
-- `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
+- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
 - `js-sys` 0.3.103 — <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys>
@@ -4961,13 +4966,13 @@ Used by:
 - `percent-encoding` 2.3.2 — <https://github.com/servo/rust-url/>
 - `petgraph` 0.8.3 — <https://github.com/petgraph/petgraph>
 - `pkg-config` 0.3.33 — <https://github.com/rust-lang/pkg-config-rs>
-- `proptest` 1.11.0 — <https://github.com/proptest-rs/proptest>
+- `proptest` 1.12.0 — <https://github.com/proptest-rs/proptest>
 - `prost-derive` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `prost-types` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `prost` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `regex-automata` 0.4.18 — <https://github.com/rust-lang/regex>
 - `regex-syntax` 0.8.11 — <https://github.com/rust-lang/regex>
-- `regex` 1.12.4 — <https://github.com/rust-lang/regex>
+- `regex` 1.13.1 — <https://github.com/rust-lang/regex>
 - `ring` 0.17.14 — <https://github.com/briansmith/ring>
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
 - `rustix` 1.1.5 — <https://github.com/bytecodealliance/rustix>
@@ -4980,14 +4985,14 @@ Used by:
 - `signal-hook-registry` 1.4.8 — <https://github.com/vorner/signal-hook>
 - `simd_cesu8` 1.2.0 — <https://github.com/seancroach/simd_cesu8>
 - `smallvec` 1.15.2 — <https://github.com/servo/rust-smallvec>
-- `socket2` 0.6.4 — <https://github.com/rust-lang/socket2>
+- `socket2` 0.6.5 — <https://github.com/rust-lang/socket2>
 - `stable_deref_trait` 1.2.1 — <https://github.com/storyyeller/stable_deref_trait>
 - `tempfile` 3.27.0 — <https://github.com/Stebalien/tempfile>
 - `thread_local` 1.1.9 — <https://github.com/Amanieu/thread_local-rs>
 - `unicode-segmentation` 1.13.3 — <https://github.com/unicode-rs/unicode-segmentation>
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `url` 2.5.8 — <https://github.com/servo/rust-url>
-- `uuid` 1.26.1 — <https://github.com/uuid-rs/uuid>
+- `uuid` 1.28.0 — <https://github.com/uuid-rs/uuid>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>
 - `wait-timeout` 0.2.1 — <https://github.com/alexcrichton/wait-timeout>
 - `wasi` 0.11.1+wasi-snapshot-preview1 — <https://github.com/bytecodealliance/wasi>
@@ -5431,8 +5436,8 @@ limitations under the License.
 
 Used by:
 
-- `bit-set` 0.8.0 — <https://github.com/contain-rs/bit-set>
-- `bit-vec` 0.8.0 — <https://github.com/contain-rs/bit-vec>
+- `bit-set` 0.11.1 — <https://github.com/contain-rs/bit-vec>
+- `bit-vec` 0.10.1 — <https://github.com/contain-rs/bit-vec>
 - `lexical-core` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
 - `lexical-parse-float` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
 - `lexical-parse-integer` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
@@ -6968,25 +6973,26 @@ limitations under the License.
 
 Used by:
 
-- `ourios-bench` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-config` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-core` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-df-otel` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-ingester` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-miner` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-parquet` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-querier` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-semconv` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-server` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-serving` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-telemetry` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-testgen` 0.12.2 — <https://github.com/jensholdgaard/ourios>
-- `ourios-wal` 0.12.2 — <https://github.com/jensholdgaard/ourios>
+- `ourios-bench` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-config` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-core` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-df-otel` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-ingester` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-miner` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-parquet` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-querier` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-semconv` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-server` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-serving` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-telemetry` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-testgen` 0.13.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-wal` 0.13.0 — <https://github.com/jensholdgaard/ourios>
 - `allocator-api2` 0.2.21 — <https://github.com/zakarumych/allocator-api2>
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
-- `async-trait` 0.1.89 — <https://github.com/dtolnay/async-trait>
-- `aws-lc-sys` 0.45.0 — <https://github.com/aws/aws-lc-rs>
+- `arraydeque` 0.5.1 — <https://github.com/andylokandy/arraydeque>
+- `async-trait` 0.1.92 — <https://github.com/dtolnay/async-trait>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 - `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
 - `constant_time_eq` 0.4.2 — <https://github.com/cesarb/constant_time_eq>
@@ -6995,13 +7001,14 @@ Used by:
 - `dyn-clone` 1.0.20 — <https://github.com/dtolnay/dyn-clone>
 - `fiat-crypto` 0.2.9 — <https://github.com/mit-plv/fiat-crypto>
 - `flatbuffers` 25.12.19 — <https://github.com/google/flatbuffers>
+- `granit-parser` 1.3.0 — <https://github.com/bourumir-wyngs/granit-parser>
 - `half` 2.7.1 — <https://github.com/VoidStarKat/half-rs>
 - `ident_case` 1.0.1 — <https://github.com/TedDriggs/ident_case>
 - `itoa` 1.0.18 — <https://github.com/dtolnay/itoa>
 - `jni-macros` 0.22.4 — <https://github.com/jni-rs/jni-rs>
 - `jni-sys-macros` 0.4.1 — <https://github.com/jni-rs/jni-sys>
 - `jni` 0.22.4 — <https://github.com/jni-rs/jni-rs>
-- `libc` 0.2.186 — <https://github.com/rust-lang/libc>
+- `libc` 0.2.190 — <https://github.com/rust-lang/libc>
 - `miniz_oxide` 0.9.1 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
 - `num-conv` 0.2.2 — <https://github.com/jhpratt/num-conv>
 - `opentelemetry-appender-tracing` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-appender-tracing>
@@ -7021,7 +7028,7 @@ Used by:
 - `rand` 0.8.8 — <https://github.com/rust-random/rand>
 - `rand` 0.9.4 — <https://github.com/rust-random/rand>
 - `rand_chacha` 0.9.0 — <https://github.com/rust-random/rand>
-- `rand_xorshift` 0.4.0 — <https://github.com/rust-random/rngs>
+- `rand_xorshift` 0.5.0 — <https://github.com/rust-random/rngs>
 - `ref-cast-impl` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `rmcp-macros` 2.2.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
@@ -7031,11 +7038,12 @@ Used by:
 - `ryu` 1.0.23 — <https://github.com/dtolnay/ryu>
 - `semver` 1.0.28 — <https://github.com/dtolnay/semver>
 - `seq-macro` 0.3.6 — <https://github.com/dtolnay/seq-macro>
+- `serde-saphyr` 1.3.0 — <https://github.com/bourumir-wyngs/serde-saphyr>
 - `serde` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_core` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_derive` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_derive_internals` 0.30.0 — <https://github.com/serde-rs/serde>
-- `serde_json` 1.0.151 — <https://github.com/serde-rs/json>
+- `serde_json` 1.0.154 — <https://github.com/serde-rs/json>
 - `serde_urlencoded` 0.7.1 — <https://github.com/nox/serde_urlencoded>
 - `shlex` 2.0.1 — <https://github.com/comex/rust-shlex>
 - `simdutf8` 0.1.5 — <https://github.com/rusticstuff/simdutf8>
@@ -7682,9 +7690,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- `zstd-safe` 8.0.0 — <https://github.com/gyscos/zstd-rs>
-- `zstd-sys` 2.1.0+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
-- `zstd` 0.14.0 — <https://github.com/gyscos/zstd-rs>
+- `zstd-safe` 8.1.0 — <https://github.com/gyscos/zstd-rs>
+- `zstd-sys` 2.1.1+zstd.1.5.7 — <https://github.com/gyscos/zstd-rs>
+- `zstd` 0.14.2 — <https://github.com/gyscos/zstd-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -7843,7 +7851,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Used by:
 
 - `alloc-stdlib` 0.3.0 — <https://github.com/dropbox/rust-alloc-no-stdlib>
-- `aws-lc-sys` 0.45.0 — <https://github.com/aws/aws-lc-rs>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 - `curve25519-dalek` 4.1.3 — <https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek>
 
 <details>
@@ -7902,6 +7910,47 @@ LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
 DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+</details>
+
+### BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`)
+
+Used by:
+
+- `encoding_rs` 0.8.42 — <https://github.com/hsivonen/encoding_rs>
+
+<details>
+<summary>Full license text</summary>
+
+```text
+Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
@@ -8243,8 +8292,8 @@ third-party/chromium/LICENSE.
 
 Used by:
 
-- `aws-lc-rs` 1.18.1 — <https://github.com/aws/aws-lc-rs>
-- `aws-lc-sys` 0.45.0 — <https://github.com/aws/aws-lc-rs>
+- `aws-lc-rs` 1.18.2 — <https://github.com/aws/aws-lc-rs>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 
 <details>
 <summary>Full license text</summary>
@@ -8258,43 +8307,6 @@ Copyright (c) 1995-2003 by Internet Software Consortium
 Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
 
 THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL ISC BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
-```
-
-</details>
-
-### MIT License (`MIT`)
-
-Used by:
-
-- `serde_yaml_ng` 0.10.0 — <https://github.com/acatton/serde-yaml-ng>
-
-<details>
-<summary>Full license text</summary>
-
-```text
-                                  MIT License
-
-Copyright 2024 Antoine Catton
-Copyright 2016-2024 David Tolnay
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the “Software”), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 ```
 
@@ -8372,7 +8384,7 @@ THE SOFTWARE.
 
 Used by:
 
-- `hyper` 1.10.1 — <https://github.com/hyperium/hyper>
+- `hyper` 1.12.0 — <https://github.com/hyperium/hyper>
 
 <details>
 <summary>Full license text</summary>
@@ -8545,7 +8557,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `want` 0.3.1 — <https://github.com/seanmonstar/want>
+- `want` 0.3.2 — <https://github.com/seanmonstar/want>
 
 <details>
 <summary>Full license text</summary>
@@ -8970,7 +8982,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `hyper-util` 0.1.20 — <https://github.com/hyperium/hyper-util>
+- `hyper-util` 0.1.21 — <https://github.com/hyperium/hyper-util>
 
 <details>
 <summary>Full license text</summary>
@@ -9491,7 +9503,7 @@ Used by:
 
 - `tokio-stream` 0.1.19 — <https://github.com/tokio-rs/tokio>
 - `tokio-util` 0.7.18 — <https://github.com/tokio-rs/tokio>
-- `tokio` 1.53.1 — <https://github.com/tokio-rs/tokio>
+- `tokio` 1.53.2 — <https://github.com/tokio-rs/tokio>
 
 <details>
 <summary>Full license text</summary>
@@ -9563,7 +9575,6 @@ SOFTWARE.
 
 Used by:
 
-- `unsafe-libyaml` 0.2.11 — <https://github.com/dtolnay/unsafe-libyaml>
 - `zmij` 1.0.23 — <https://github.com/dtolnay/zmij>
 
 <details>
@@ -9897,7 +9908,7 @@ SOFTWARE.
 
 Used by:
 
-- `aws-lc-sys` 0.45.0 — <https://github.com/aws/aws-lc-rs>
+- `aws-lc-sys` 0.46.0 — <https://github.com/aws/aws-lc-rs>
 
 <details>
 <summary>Full license text</summary>

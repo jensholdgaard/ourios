@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # The OTel metrics API. Library crates depend only on this (via
-# `global::meter`); this crate is the one place the heavy SDK +
+# `ourios_core::telemetry::meter`); this crate is the one place the heavy SDK +
 # exporter live (RFC 0001 §6.8 "Export architecture").
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 # The SDK: MeterProvider + periodic reader (metrics), LoggerProvider +
@@ -84,7 +84,7 @@ rustix = { version = "=1.1.5", default-features = false, features = ["param", "s
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "logs", "trace", "testing"] }
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.2", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 # Emit `tracing` events + spans in the bridge / correlation tests.
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 

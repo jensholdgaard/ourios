@@ -327,7 +327,7 @@ mod tests {
             let provider = SdkMeterProvider::builder()
                 .with_periodic_exporter(exporter.clone())
                 .build();
-            super::register(&provider.meter(super::SCOPE));
+            super::register(&provider.meter_with_scope(crate::scope(super::SCOPE)));
             Self { provider, exporter }
         }
 

@@ -200,3 +200,30 @@ async fn a_failed_resolution_marks_the_phase_as_an_error() {
         None
     );
 }
+
+/// The phase closes at the finished URLs (RFC 0038 §3.7.1), not when the
+/// query ends: it has ended before the render pass opens `load template_map`
+/// after the scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolution_phase_ends_before_the_render_pass() {
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_all(dir.path(), &[simple(TENANT, 1, TS0)]);
+    let querier = Arc::new(Querier::new(dir.path()));
+    query(querier).with_subscriber(dispatch).await;
+    let spans = exporter.get_finished_spans().expect("spans");
+
+    let [resolve] = named(&spans, "resolve files")[..] else {
+        panic!("one resolve span");
+    };
+    let [load] = named(&spans, "load template_map")[..] else {
+        panic!(
+            "one render-time map load: {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    };
+    assert!(
+        resolve.end_time <= load.start_time,
+        "resolve files must end before the render pass loads the map",
+    );
+}

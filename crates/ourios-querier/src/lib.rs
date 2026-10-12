@@ -89,7 +89,6 @@ use ourios_parquet::columns;
 use ourios_parquet::hour_partition_in_window;
 use ourios_parquet::percent_encode_tenant;
 use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
-use tracing::Instrument as _;
 
 mod api;
 mod decode;
@@ -709,33 +708,14 @@ impl Querier {
         // case and a partition holding only `*.parquet.tmp` (a poisoned /
         // crashed writer) — where building a table over zero files would
         // otherwise error and wrongly fail the query.
-        //
-        // RFC 0038 §3.7.1: one `resolve files` phase per compiled query, open
-        // from before the first listing to the finished URLs — on both
-        // backends, and when nothing is live, since that work ran either way.
-        let phase = tracing::info_span!(
-            "resolve files",
-            otel.kind = "internal",
-            ourios.tenant = tenant.as_str(),
-            ourios.file_set.live_files = tracing::field::Empty,
-            otel.status_code = tracing::field::Empty,
-            error.type = tracing::field::Empty,
-        );
-        let urls = self
-            .resolve_data_urls(&ctx, &data_prefix, partition_window, &phase)
-            .instrument(phase.clone())
-            .await
-            // `i64`, not `usize`/`u64`: tracing-opentelemetry renders a `u64`
-            // field as a string, and §3.7.2 wants a count.
-            .inspect(|urls| {
-                phase.record(
-                    ourios_semconv::OURIOS_FILE_SET_LIVE_FILES,
-                    i64::try_from(urls.len()).unwrap_or(i64::MAX),
-                );
-            })
-            .inspect_err(|e| {
-                ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));
-            })?;
+        let urls = file_set::resolve_data_urls(
+            &self.backend,
+            &ctx,
+            tenant,
+            &data_prefix,
+            partition_window,
+        )
+        .await?;
         if urls.is_empty() {
             let result = empty_result(terminal.aggregate());
             return Ok(crate::fetch_count::with_fetched(
@@ -1035,45 +1015,6 @@ impl Querier {
             .map_err(|e| QueryError::Storage {
                 detail: format!("blocking storage task: {e}"),
             })?
-    }
-
-    /// Resolve the live data files under the tenant's `data/` prefix and turn
-    /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
-    /// with the listing and manifest reads on the blocking pool:
-    ///
-    /// - **Local backend** ([`Backend::Local`]): walk `std::fs` under
-    ///   `<root>/<prefix>` honouring the RFC 0009 §3.4 manifest, then address
-    ///   each file by its absolute local path — byte-for-byte the pre-RFC-0019
-    ///   read path, with the canonical-path tenant-isolation backstop intact.
-    /// - **S3 backend** ([`Backend::Remote`]): list the window's keys under
-    ///   `prefix` through the [`Store`] (segment-wise prefix-scoped, the
-    ///   RFC0019.5 tenant guarantee), resolve the per-partition manifest through
-    ///   the [`Store`], register the store on `ctx`, and address each key by the
-    ///   `ourios://store/<key>` object-store URL.
-    async fn resolve_data_urls(
-        &self,
-        ctx: &SessionContext,
-        prefix: &str,
-        window: Option<(u64, u64)>,
-        phase: &tracing::Span,
-    ) -> Result<Vec<ListingTableUrl>, QueryError> {
-        // The manifest reads count toward the session's fetched bytes.
-        let fetched = fetch_count::counter(ctx).unwrap_or_default();
-        let resolved = phase::spawn_blocking(phase, {
-            let backend = self.backend.clone();
-            let prefix = prefix.to_owned();
-            move || resolve_live_set(&backend, &prefix, window, &fetched)
-        })
-        .await?;
-        match (resolved, &self.backend) {
-            (LiveSet::Urls(urls), _) => Ok(urls),
-            (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),
-            // Keys come only from the remote branch of `resolve_live_set`,
-            // which read this same backend; surfaced rather than unwrapped.
-            (LiveSet::Keys(_), Backend::Local(_)) => Err(QueryError::Storage {
-                detail: "internal: S3 data keys reached with a local backend".to_string(),
-            }),
-        }
     }
 }
 

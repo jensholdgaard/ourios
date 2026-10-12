@@ -2663,6 +2663,13 @@ resolves bidirectionally between RFC and tests.
   `ourios.miner.confidence` histogram quantiles.
   *Covers:* §3.1.2, RFC0001.8.
 
+  > **Amendment (2026-10-12, #963, maintainer-approved).** The meter is
+  > resolved through `ourios_core::telemetry::meter("ourios.miner")`
+  > (or `meter_with_scope` with `ourios_core::telemetry::scope(..)` for a
+  > provider-bound reader), not `global::meter`, which `clippy.toml` now
+  > disallows. The test also asserts the collected scope carries
+  > `otel.scope.version` equal to the crate version.
+
 - **Data-model contract tests**: small unit tests against the
   `template_id` query semantics that RFC 0002's DSL compiles to.
   These cover the cross-version vs. cross-alias distinction at the

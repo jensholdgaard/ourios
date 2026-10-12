@@ -10,7 +10,7 @@
 //! **Order: validate the schema, then substitute.** Deserialisation runs on the
 //! *raw* (pre-substitution) YAML text, so a shape or unknown-key error references
 //! the file's own text — a bare `${env:SECRET}` written where a section is
-//! expected is reported as `invalid type: string "${env:SECRET}", …`, naming the
+//! expected is reported as `` … (found `${env:SECRET}`) `` ([`SchemaError`]), naming the
 //! reference, never a resolved secret (RFC 0020 §3.5 / RFC 0019 §3.4). `serde`
 //! never sees a substituted value. Substitution then rewrites the typed scalar
 //! leaves in place — the parsed *values* only, so mapping keys (which became
@@ -20,7 +20,7 @@
 //! resolved value without re-scanning it.
 //!
 //! **Type after substitution** (rule 7) is resolved at the typed boundary rather
-//! than by re-tagging a node tree. `serde_yaml_ng`'s `Value` does not preserve a
+//! than by re-tagging a node tree. A generic YAML value tree does not preserve a
 //! scalar's quoting style, so a literal "re-interpret the substituted scalar by
 //! YAML's type rules" pass cannot tell a quoted string from a bare one and would
 //! wrongly coerce `"01"` to an integer. Instead every leaf is captured as its
@@ -71,7 +71,7 @@ pub enum FileConfigError {
     Substitution(MalformedReference),
     /// A YAML syntax error, an unknown key (`deny_unknown_fields`), or a value
     /// whose shape does not match the schema.
-    Schema(serde_yaml_ng::Error),
+    Schema(SchemaError),
     /// A `storage.s3.*` credential holds an inline literal instead of an
     /// `${env:…}` reference (RFC 0020 §3.5). Names the offending key only, never
     /// the value.
@@ -124,6 +124,62 @@ impl std::error::Error for FileConfigError {
                 None
             }
         }
+    }
+}
+
+/// A YAML syntax or schema error, naming the source token it points at.
+///
+/// The parser reports *where* a value failed (`expected mapping start at line
+/// 1, column 10`) but not *what* was there, so the offending token — sliced
+/// from the raw, pre-substitution text by the error's span — is appended:
+/// `storage: ${env:SECRET}` reports `` (found `${env:SECRET}`) ``, naming the
+/// reference, never a resolved value (RFC 0020 §3.5). Only that one token is
+/// echoed, never the surrounding lines. A position that does not map to a
+/// single-line scalar token (a structure start, a block scalar, an empty span)
+/// falls back to the parser's message alone.
+#[derive(Debug)]
+pub struct SchemaError {
+    error: Box<serde_saphyr::Error>,
+    found: Option<String>,
+}
+
+impl SchemaError {
+    fn new(error: serde_saphyr::Error, yaml: &str) -> Self {
+        let message = error.to_string();
+        let found = error
+            .location()
+            .and_then(|location| {
+                let span = location.span();
+                let start = usize::try_from(span.byte_offset()?).ok()?;
+                let len = usize::try_from(span.byte_len()?).ok()?;
+                yaml.get(start..start.checked_add(len)?)
+            })
+            .filter(|token| {
+                !token.is_empty()
+                    && !token.contains('\n')
+                    && !token.starts_with(['[', '{'])
+                    && !message.contains(token)
+            })
+            .map(str::to_owned);
+        Self {
+            error: Box::new(error),
+            found,
+        }
+    }
+}
+
+impl fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.found {
+            Some(token) => write!(f, "{} (found `{token}`)", self.error),
+            None => self.error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -260,10 +316,11 @@ impl<'de> Deserialize<'de> for PromotedEntry {
                 f.write_str("an attribute key, or a `{ key, type }` mapping (RFC 0042 §3.2)")
             }
 
-            // The bare spelling takes the full scalar treatment (RFC
-            // 0020 §3.3 rule 7, as `Scalar` renders): a bare boolean
-            // or numeric key is captured as its string form, exactly
-            // as the pre-RFC-0042 `scalar_vec` model did.
+            // The bare spelling is captured as its string form (RFC
+            // 0020 §3.3 rule 7). Telling it apart from the mapping
+            // spelling needs `deserialize_any`, so a bare boolean or
+            // numeric key arrives type-inferred and is re-rendered —
+            // unlike `Scalar`, which reads its text verbatim.
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PromotedEntry, E> {
                 Ok(PromotedEntry {
                     key: v.to_owned(),
@@ -672,16 +729,31 @@ pub fn parse(
     yaml: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<FileConfig, FileConfigError> {
-    // Deserialise straight from the text (not via an intermediate
-    // `serde_yaml_ng::Value`) so a schema error keeps its source location.
-    // Validation runs on the
-    // raw (pre-substitution) text, so any shape / unknown-key error names the
+    // Deserialise straight from the text (not via an intermediate value tree)
+    // so a schema error keeps its source location. Validation runs on the raw
+    // (pre-substitution) text, so any shape / unknown-key error names the
     // file's own text, never a resolved secret (RFC 0020 §3.5). `Option` lets an
     // empty / null document resolve to an all-default config (`None`) rather than
     // fail the `null`-into-struct type check.
-    let mut config: FileConfig = serde_yaml_ng::from_str::<Option<FileConfig>>(yaml)
-        .map_err(FileConfigError::Schema)?
-        .unwrap_or_default();
+    //
+    // `<<` is an ordinary — hence unknown — key, not a merge: the schema is
+    // strict and has never accepted merge keys. No source snippet is rendered:
+    // it would echo neighbouring raw lines, which may hold an inline credential
+    // literal the §3.5 check has not rejected yet ([`SchemaError`] names only
+    // the offending token). The two scalar options matter only where a value is
+    // type-inferred — a bare `promoted_attributes` entry, which may also be a
+    // mapping — so a bare `yes` stays `yes` and `.inf` stays text rather than
+    // failing the parse; every other leaf is read verbatim (see [`Scalar`]).
+    let options = serde_saphyr::options! {
+        merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+        with_snippet: false,
+        strict_booleans: true,
+        reject_non_finite_typeless_float: false,
+    };
+    let mut config: FileConfig =
+        serde_saphyr::from_str_with_options::<Option<FileConfig>>(yaml, options)
+            .map_err(|error| FileConfigError::Schema(SchemaError::new(error, yaml)))?
+            .unwrap_or_default();
     // Enforce §3.5 on the *raw* credential values — after substitution a
     // reference is indistinguishable from a literal.
     check_credentials_are_references(&config.storage.s3)?;
@@ -922,11 +994,11 @@ impl CompactionSection {
 
 /// Deserialise an optional YAML scalar into its string form.
 ///
-/// A scalar of any type (string, boolean, number) is rendered as text so a bare
-/// `interval_secs: 300` and a substituted `${env:I}` both reach the `build_*`
-/// validators as `"300"` (the type-after-substitution model, RFC 0020 §3.3
-/// rule 7 — see the module docs). A mapping or sequence where a scalar is
-/// expected is a schema error.
+/// A scalar of any type (string, boolean, number) is captured as its verbatim
+/// text so a bare `interval_secs: 300` and a substituted `${env:I}` both reach
+/// the `build_*` validators as `"300"` (the type-after-substitution model, RFC
+/// 0020 §3.3 rule 7 — see the module docs). A mapping or sequence where a
+/// scalar is expected is a schema error.
 fn scalar_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -983,25 +1055,13 @@ impl<'de> Deserialize<'de> for Scalar {
             fn visit_string<E>(self, v: String) -> Result<Scalar, E> {
                 Ok(Scalar(v))
             }
-
-            fn visit_bool<E>(self, v: bool) -> Result<Scalar, E> {
-                Ok(Scalar(v.to_string()))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> Result<Scalar, E> {
-                Ok(Scalar(v.to_string()))
-            }
-
-            fn visit_u64<E>(self, v: u64) -> Result<Scalar, E> {
-                Ok(Scalar(v.to_string()))
-            }
-
-            fn visit_f64<E>(self, v: f64) -> Result<Scalar, E> {
-                Ok(Scalar(v.to_string()))
-            }
         }
 
-        deserializer.deserialize_any(ScalarVisitor)
+        // `deserialize_str`, not `deserialize_any`: a plain scalar reaches the
+        // schema as its verbatim source text (`0700` stays `0700`, `1_000`
+        // stays `1_000`) instead of being re-rendered from an inferred number
+        // or boolean — the OTel Collector's confmap rule for string fields.
+        deserializer.deserialize_str(ScalarVisitor)
     }
 }
 
@@ -1894,6 +1954,72 @@ auth:
             resolved, refs_in_yaml,
             "every YAML reference must surface as a resolved leaf \
              (a mismatch means a field in this YAML never reached the tree)",
+        );
+    }
+
+    /// A string field receives the verbatim text of a bare scalar — the `OTel`
+    /// Collector's confmap rule (`0123` to a string field stays `0123`) — not a
+    /// re-rendering of an inferred number or boolean. A quoted scalar is its
+    /// unquoted content, as before.
+    #[test]
+    fn bare_scalars_reach_string_fields_verbatim() {
+        for raw in [
+            "007",
+            "0700",
+            "01",
+            "-01",
+            "1_000",
+            "tRUE",
+            "FaLsE",
+            ".inf",
+            "123456789012345678901234567890",
+            "0x1F",
+            "1e3",
+            "true",
+            "3600",
+        ] {
+            let cfg = parse(&format!("storage:\n  s3:\n    prefix: {raw}\n"), &|_| None)
+                .unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(cfg.storage.s3.prefix.as_deref(), Some(raw), "bare {raw}");
+        }
+        let cfg = parse("storage:\n  s3:\n    prefix: '007'\n", &|_| None).expect("valid");
+        assert_eq!(cfg.storage.s3.prefix.as_deref(), Some("007"));
+    }
+
+    /// A YAML null is still an absent value, not the string `~` / `null`.
+    #[test]
+    fn bare_null_is_still_absent() {
+        for raw in ["~", "null", ""] {
+            let cfg = parse(&format!("storage:\n  s3:\n    prefix: {raw}\n"), &|_| None)
+                .unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            assert_eq!(cfg.storage.s3.prefix, None, "{raw:?}");
+        }
+    }
+
+    /// A schema error names the offending token from the raw text and echoes
+    /// nothing else — not the neighbouring lines, which may hold an inline
+    /// credential literal the §3.5 check has not rejected yet.
+    #[test]
+    fn schema_error_names_only_the_offending_token() {
+        let yaml = "storage:\n  s3:\n    secret_access_key: AKIANEIGHBOUR\n    bucket:\n      nested: x\nreceiver: 0700\n";
+        let err = parse(yaml, &|_| None).expect_err("shape mismatch");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("AKIANEIGHBOUR"),
+            "no neighbouring lines: {msg}"
+        );
+
+        let err = parse("receiver: 0700\n", &|_| None).expect_err("scalar for a section");
+        assert!(
+            err.to_string().ends_with("(found `0700`)"),
+            "names the token: {err}"
+        );
+
+        let err = parse("receiver: [a, b]\n", &|_| None).expect_err("sequence for a section");
+        assert!(
+            !err.to_string().contains("found"),
+            "a structure start is not a scalar token: {err}"
         );
     }
 }

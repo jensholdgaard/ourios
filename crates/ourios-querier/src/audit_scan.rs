@@ -143,6 +143,9 @@ pub(crate) enum ResolvedAuditSet<'a> {
         /// Absolute, canonical local file paths (lexicographically sorted,
         /// unique — [`local_audit_files`]'s output).
         paths: Vec<PathBuf>,
+        /// Each path's tenant-root-relative key, index-aligned with
+        /// `paths` (scan order, not frontier order).
+        keys: Vec<String>,
         frontier: Vec<String>,
     },
     Remote {
@@ -169,15 +172,20 @@ pub(crate) fn resolve_audit_set<'a>(
             // recomputed only when there are files, so an absent tree stays
             // a valid empty scan — relativizes the frontier the same way
             // the S3 branch's keys already are.
-            let mut frontier = Vec::with_capacity(paths.len());
+            let mut keys = Vec::with_capacity(paths.len());
             if !paths.is_empty() {
                 let tenant_root = canonical_tenant_root(root, tenant)?;
                 for path in &paths {
-                    frontier.push(tenant_relative(path, &tenant_root)?);
+                    keys.push(tenant_relative(path, &tenant_root)?);
                 }
             }
+            let mut frontier = keys.clone();
             frontier.sort_unstable();
-            Ok(ResolvedAuditSet::Local { paths, frontier })
+            Ok(ResolvedAuditSet::Local {
+                paths,
+                keys,
+                frontier,
+            })
         }
         StoreRef::Remote(store) => {
             let enc = percent_encode_tenant(tenant.as_str());
@@ -201,13 +209,53 @@ pub(crate) fn resolve_audit_set<'a>(
     }
 }
 
-impl ResolvedAuditSet<'_> {
+impl<'a> ResolvedAuditSet<'a> {
     /// The frontier: the resolved audit `*.parquet` set as tenant-root-
     /// relative keys, sorted lexicographically — the right-hand side of the
     /// RFC 0033 §3.3 set-equality freshness check.
     pub(crate) fn frontier(&self) -> &[String] {
         match self {
             Self::Local { frontier, .. } | Self::Remote { frontier, .. } => frontier,
+        }
+    }
+
+    /// The members of this set whose frontier key is in `keep` (sorted),
+    /// in this set's scan order — the delta an RFC 0033 incremental fold
+    /// reads through the same validated scan as a full fold.
+    pub(crate) fn restricted_to(&self, tenant: &TenantId, keep: &[String]) -> ResolvedAuditSet<'a> {
+        let kept = |key: &str| keep.binary_search_by(|k| k.as_str().cmp(key)).is_ok();
+        let mut frontier: Vec<String> = keep.to_vec();
+        frontier.retain(|key| self.frontier().binary_search(key).is_ok());
+        match self {
+            Self::Local { paths, keys, .. } => {
+                let (paths, keys) = paths
+                    .iter()
+                    .zip(keys)
+                    .filter(|(_, key)| kept(key))
+                    .map(|(path, key)| (path.clone(), key.clone()))
+                    .unzip();
+                Self::Local {
+                    paths,
+                    keys,
+                    frontier,
+                }
+            }
+            Self::Remote { store, objects, .. } => {
+                let prefix = format!(
+                    "audit/tenant_id={}/",
+                    percent_encode_tenant(tenant.as_str())
+                );
+                let objects: Vec<(String, u64)> = objects
+                    .iter()
+                    .filter(|(key, _)| kept(key.strip_prefix(&prefix).unwrap_or(key)))
+                    .cloned()
+                    .collect();
+                Self::Remote {
+                    store,
+                    objects: objects.into(),
+                    frontier,
+                }
+            }
         }
     }
 
@@ -252,7 +300,9 @@ impl ResolvedAuditSet<'_> {
     ) -> Result<ScanSummary, QueryError> {
         let mut bytes_read: u64 = 0;
         let frontier = match self {
-            Self::Local { paths, frontier } => {
+            Self::Local {
+                paths, frontier, ..
+            } => {
                 for path in &paths {
                     let (len, events) = read_local(path)?;
                     bytes_read = add_measured(bytes_read, len)?;

@@ -463,9 +463,18 @@ uncached query identically.
 > **The incremental fold.** The registry fold is seeded with `A`'s
 > registry, every held key at timestamp `high_water_ns`; the alias
 > projection with `A`'s classes; the conflict set with
-> `binding_conflicts`. `D`'s events are pushed through the same
-> `RegistryFold` / `AliasFold` code in scan order, with the same
-> row-level tenant backstop. The result carries `folded_files = L`,
+> `binding_conflicts`. `D`'s events are read in scan order, with the
+> same row-level tenant backstop, and each fold then orders them by
+> the full key `(timestamp, file path, row index)` the way it already
+> does for a full fold. `RegistryFold` does this while streaming: it
+> replaces on `>=` timestamp in scan order. `AliasFold` buffers the
+> alias events and stably sorts them by timestamp before applying
+> them. The incremental path differs only in what the projection
+> starts from: `A`'s classes instead of the empty map. The guard
+> orders `F` before `D`, and it is these folds that order events
+> *within* `D`. Applying delta alias events in raw scan order would
+> be wrong: interleaved timestamps across delta files would reorder
+> union and retraction. The result carries `folded_files = L`,
 > `high_water_ns = max(high_water_ns, the delta's greatest
 > fold-relevant timestamp)`, the union conflict set, and
 > `incremental_depth + 1`. A delta with no fold-relevant event (only
@@ -491,8 +500,9 @@ uncached query identically.
 >   total-order last.
 > - **Alias map.** `AliasMap::apply` is a state machine whose whole
 >   state is the class set. `A`'s classes are the state after `F`'s
->   events (RFC0033.1), and the alias fold applies `D`'s events in
->   total order after them.
+>   events (RFC0033.1). The alias fold's stable timestamp sort over
+>   `D`'s scan-ordered events produces exactly `D`'s restriction of
+>   the total order, and applies it after them.
 > - **Binding conflicts.** A key is in conflict iff its bindings span
 >   at least two distinct token sequences, regardless of order. If
 >   `F` already held two, the key is in `binding_conflicts`. If `F`
@@ -688,13 +698,27 @@ sequenceDiagram
     Q->>FS: GET template_map.v2.json.zst
     alt hit — folded_files == S
         Q->>Q: deserialize registry + alias map (no audit GETs)
-    else miss / stale / torn / unknown version
+    else stale, fold_state present, folded_files ⊆ S, depth below cap (2026-10-12 amendment)
+        Q->>FS: GET only the delta files D = S minus folded_files
+        alt every fold-relevant event in D later than high_water_ns
+            Q->>Q: fold D onto the artifact's registry + alias map (§3.7.1 order within D)
+        else guard rejects (out_of_order)
+            Q->>FS: GET every audit file in S (delta bytes may be reused)
+            Q->>Q: full fold registry + alias map (§3.7.1 order)
+        end
+        Q-->>FS: publish template_map.v2.json.zst @ frontier S (unique tmp+rename / CAS, best-effort)
+    else miss / torn / unknown version / other stale fallbacks
         Q->>FS: GET every audit file in S (today's fold)
         Q->>Q: fold registry + alias map (§3.7.1 order)
-        Q-->>FS: publish template_map.v2.json.zst @ frontier S (tmp+rename / CAS, best-effort)
+        Q-->>FS: publish template_map.v2.json.zst @ frontier S (unique tmp+rename / CAS, best-effort)
     end
-    Q->>Q: answer the query (identical either way)
+    Q->>Q: answer the query (identical on every path)
 ```
+
+*Diagram updated 2026-10-12 (#962) for the §3.3 incremental-fold
+amendment. "Other stale fallbacks" are `no_fold_state`,
+`files_removed` and `depth_cap`. Abstention (§3.5) can skip any
+publish arrow.*
 
 ### 3.5 Who writes it — querier write-through
 
@@ -1088,14 +1112,21 @@ ambiguity cannot recur.
 >   alias assertions/retractions, conflicting re-bindings, non-fold
 >   events at arbitrary timestamps), split into a folded prefix file
 >   set and one or more delta file sets whose fold-relevant events are
->   each strictly later than every earlier set's
+>   each strictly later than every earlier set's. Timestamps may
+>   interleave arbitrarily across the files of one delta, including
+>   alias assertions and retractions.
 > - **When** the prefix is full-folded and published, and each delta
->   is then acquired through the incremental path in turn
+>   is then acquired through the incremental path in turn. Each base
+>   is published with the direct `TemplateMap::publish`, which has no
+>   size abstention, so a chain never depends on the write-through's
+>   publish decision.
 > - **Then** after every step the registry, alias map, binding
 >   conflicts, `folded_files` and `high_water_ns` equal those of a
 >   full fold over the same listing
-> - **And** the published artifact's decompressed JSON equals the full
->   fold's byte for byte, except `incremental_depth`
+> - **And** the acquired map's canonical decompressed JSON
+>   (`to_artifact_bytes`) equals the full fold's byte for byte, except
+>   `incremental_depth`, whether or not the write-through then
+>   publishes or abstains
 > - **And** the query answer through either path is identical.
 
 > **Scenario RFC0033.11 — The guard falls back, never guesses**
@@ -1108,8 +1139,11 @@ ambiguity cannot recur.
 >   `incremental_depth` is at the cap; or the artifact has no
 >   `fold_state` (a pre-amendment v2 artifact)
 > - **Then** the acquisition is a full fold over the listing, its
->   answer equals the no-cache fold, and the republished artifact
->   carries `fold_state` with `incremental_depth = 0`
+>   answer equals the no-cache fold, and, when the write-through
+>   passes the size abstention, the republished artifact carries
+>   `fold_state` with `incremental_depth = 0`. When it abstains, no
+>   publish outcome is recorded, the prior artifact stays in place,
+>   and the answer is still the full fold's.
 > - **And** a delta whose only events are not fold-relevant (e.g.
 >   compaction events, whatever their timestamps) folds incrementally:
 >   `folded_files` grows and `incremental_depth` increments by one,

@@ -110,41 +110,42 @@ impl TemplateMapFlights {
     /// # Errors
     ///
     /// As [`Self::acquire`].
-    #[tracing::instrument(
-        skip_all,
-        name = "load template_map",
-        fields(
-            otel.kind = "internal",
-            ourios.tenant = tenant.as_str(),
-            ourios.template_map.lookup.outcome = tracing::field::Empty,
-            otel.status_code = tracing::field::Empty,
-            error.type = tracing::field::Empty,
-        )
-    )]
     pub(crate) async fn acquire_fetched(
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
     ) -> Result<MapAcquisition, QueryError> {
-        let acquired = self.acquire_shared(backend, tenant).await;
+        let phase = tracing::info_span!(
+            "load template_map",
+            otel.kind = "internal",
+            ourios.tenant = tenant.as_str(),
+            ourios.template_map.lookup.outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
+        let acquired = self
+            .acquire_shared(backend, tenant, &phase)
+            .instrument(phase.clone())
+            .await;
         if let Err(e) = &acquired {
-            ourios_core::telemetry::record_span_error(
-                &tracing::Span::current(),
-                template_map::error_type(e),
-            );
+            ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));
         }
         acquired
     }
 
-    /// [`Self::acquire_fetched`]'s single-flight loop, inside its span.
+    /// [`Self::acquire_fetched`]'s single-flight loop, inside `phase`.
     async fn acquire_shared(
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
+        phase: &tracing::Span,
     ) -> Result<MapAcquisition, QueryError> {
         let mut waited = Duration::ZERO;
         loop {
-            let span = tracing::Span::current();
+            // The phase span itself, never `Span::current()`: when the
+            // subscriber filters the phase out, the current span is the
+            // query, which must not become the phase (`crate::phase`).
+            let span = phase.clone();
             // The caller's subscriber too, not just its span: the fold opens
             // its own `derive template_map` span on the blocking thread,
             // which otherwise resolves only the global default.
@@ -156,9 +157,7 @@ impl TemplateMapFlights {
             let owned = tenant.clone();
             let step = tokio::task::spawn_blocking(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    span.in_scope(phase::attached(|| {
-                        flights.step(backend.store_ref(), &owned)
-                    }))
+                    phase::in_phase(&span, || flights.step(backend.store_ref(), &owned))
                 })
             })
             .await

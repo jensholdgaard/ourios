@@ -630,7 +630,7 @@ fn traced_fold(
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
     );
-    let folded = span.in_scope(crate::phase::nested(|| fold_template_map(resolved, tenant)));
+    let folded = crate::phase::nested_in(&span, || fold_template_map(resolved, tenant));
     if let Err(e) = &folded {
         ourios_core::telemetry::record_span_error(&span, error_type(e));
     }

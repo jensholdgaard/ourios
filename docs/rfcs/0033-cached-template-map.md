@@ -562,8 +562,28 @@ uncached query identically.
 >     interleaved bytes. That would almost surely classify Torn and
 >     self-heal, but it is not a correct fold of any listing. A unique
 >     temp name restores the property the argument above relies on:
->     every renamed file is one writer's complete artifact. A stray
->     temp left by a crash is harmless, as before.
+>     every renamed file is one writer's complete artifact.
+>   - **Reclaiming leaked temps:** unique names mean a temp leaked by
+>     a crash is no longer overwritten by the next publish, so leaks
+>     must be swept explicitly.
+>     - **What is swept.** Each local publish, before writing its own
+>       temp, removes the tenant-directory siblings named
+>       `template_map.v2.json.zst.*.tmp`, plus the legacy fixed
+>       `template_map.v2.json.zst.tmp`, whose modification time is
+>       more than **1 hour** old. A failed removal is ignored, as are
+>       a missing file and a racing remover.
+>     - **Why 1 hour.** A publish writes at most the 64 MiB
+>       decode-bound artifact to local disk, which takes seconds. An
+>       hour is two to three orders of magnitude above any plausible
+>       publish, so a live publisher's temp never matches. It is
+>       still short enough that leaks stay bounded by the crashes in
+>       one hour.
+>     - **Safety does not rest on the number.** If a stalled
+>       publisher's temp were removed anyway, its `rename` fails, the
+>       publish records `error`, and the query answers from the fold
+>       it holds (§3.5). Nothing wrong is installed.
+>     - **The sweep is local-only.** S3 publishes are single
+>       conditional PUTs and leave no temp object.
 > - *Deletion, retention, audit compaction or rewrite*: no code
 >   deletes or rewrites audit files today. Any future one removes a
 >   key from `F`, so the next acquisition is `files_removed`, a full
@@ -577,9 +597,37 @@ uncached query identically.
 > persisted artifact is otherwise only rebuilt from the source of
 > truth when something else forces a full fold, and on a busy tenant
 > that may be never. The cap is a code constant, 256, not
-> configuration: it costs one full fold per 256 stale acquisitions.
-> A wall-clock refresh was rejected because it adds a clock to a
-> rule that is otherwise a pure function of the store.
+> configuration: it costs at most one full fold per 256 *published*
+> incremental steps. A wall-clock refresh was rejected because it
+> adds a clock to a rule that is otherwise a pure function of the
+> store.
+>
+> **The guarantee is per served map, so no publish is needed to keep
+> it.**
+>
+> - **The invariant:** every map the querier serves or publishes is at
+>   most 256 incremental steps from a full fold. The guard extends only
+>   a base whose `incremental_depth` is below the cap, and the result's
+>   depth is the base's plus one, so the result is within the cap
+>   whether or not it is published.
+> - **Without a publish:** an incremental result that is not published
+>   persists nothing. That covers size abstention, the hard ceiling,
+>   an IO error and an S3 lost race. The next acquisition extends the
+>   same stored base again, and its result is again one step from a
+>   base within the cap.
+> - **Why a defect cannot compound:** a defect in that step affects
+>   only the answer it is in. It cannot be persisted, so it never
+>   becomes the base of a further step. The cap exists to bound
+>   exactly that compounding.
+> - **Why no extra state:** a skipped publish therefore needs no
+>   separate counter and no forced full fold.
+> - **Abstention on the incremental path is transient.** Each
+>   unpublished acquisition re-reads a delta that only grows, while
+>   the artifact grows by about one frontier entry per audit file plus
+>   the delta's new templates. "Base plus delta bytes" therefore
+>   overtakes the new artifact's size and the next write-through
+>   publishes. The delta's reads, meanwhile, stay bounded by the full
+>   fold they replace.
 >
 > **Write-through and abstention** (§3.5 pointer amendment). An
 > incremental fold publishes like a full one. Abstention keeps its
@@ -1144,6 +1192,14 @@ ambiguity cannot recur.
 >   `fold_state` with `incremental_depth = 0`. When it abstains, no
 >   publish outcome is recorded, the prior artifact stays in place,
 >   and the answer is still the full fold's.
+> - **And** an incremental result that is not published (forced
+>   abstention or a failing publish), extended from a base at
+>   `incremental_depth = 255`, leaves the stored artifact unchanged.
+>   Repeated acquisitions each fold incrementally from that same base,
+>   each acquired map's canonical bytes carry `incremental_depth = 256`
+>   (never more), and each answer equals the full fold. Once a result
+>   at depth 256 is published, the next stale acquisition is a
+>   `depth_cap` full fold.
 > - **And** a delta whose only events are not fold-relevant (e.g.
 >   compaction events, whatever their timestamps) folds incrementally:
 >   `folded_files` grows and `incremental_depth` increments by one,
@@ -1175,6 +1231,12 @@ ambiguity cannot recur.
 >   never interleaved). With an older fold renamed over a newer one,
 >   the next acquisition sees the older frontier as stale and still
 >   returns the full-fold answer
+> - **And** on the **local** backend a publish removes sibling
+>   `template_map.v2.json.zst.*.tmp` files, and the legacy fixed
+>   `.tmp`, that are more than 1 hour old, and leaves younger ones in
+>   place. A temp removed or missing under a publisher makes that
+>   publish record `error` without failing its query. A failed
+>   removal fails nothing
 > - **And** on both backends both queries answer correctly, and the
 >   next acquisition is a hit or a guarded fold (incremental or full)
 >   whose answer equals the full fold over its listing.

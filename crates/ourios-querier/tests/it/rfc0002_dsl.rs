@@ -964,6 +964,7 @@ async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
             matches!(&err, QueryError::InvalidQuery { detail } if detail.contains("regular expression")),
             "{text}: {err:?}",
         );
+        assert_leaks_no_engine_token(&err);
     }
 }
 

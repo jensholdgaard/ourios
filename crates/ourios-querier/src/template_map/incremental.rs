@@ -13,7 +13,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use ourios_core::tenant::TenantId;
 
-use super::{DerivePath, Derived, FallbackReason, FoldPass, TemplateMap, add_bytes, full_fold};
+use super::{
+    DeriveError, DerivePath, Derived, FallbackReason, FoldPass, TemplateMap, add_bytes, full_fold,
+};
 use crate::fold_state::{FoldState, INCREMENTAL_DEPTH_CAP, is_fold_relevant, nanos};
 use crate::template_registry::{RegistryFold, TemplateRegistry};
 use crate::{QueryError, audit_scan::ResolvedAuditSet};
@@ -25,7 +27,7 @@ pub(super) fn derive_stale(
     base: TemplateMap,
     resolved: ResolvedAuditSet<'_>,
     tenant: &TenantId,
-) -> Result<Derived, QueryError> {
+) -> Result<Derived, DeriveError> {
     let TemplateMap {
         folded_files,
         registry,
@@ -53,7 +55,9 @@ pub(super) fn derive_stale(
         aliases,
         state,
     };
-    match fold_delta(base, delta_set, resolved.frontier().to_vec(), tenant)? {
+    match fold_delta(base, delta_set, resolved.frontier().to_vec(), tenant)
+        .map_err(DeriveError::undecided)?
+    {
         DeltaFold::Folded(derived) => Ok(*derived),
         DeltaFold::Rejected(fetched) => {
             fallback(resolved, tenant, FallbackReason::OutOfOrder, fetched)
@@ -145,17 +149,24 @@ fn fold_delta(
 }
 
 /// A full fold over `resolved` after the guard declined, its cost
-/// including whatever the rejected delta read `already` fetched.
+/// including whatever the rejected delta read `already` fetched. Any
+/// failure here comes after the path was decided.
 fn fallback(
     resolved: ResolvedAuditSet<'_>,
     tenant: &TenantId,
     reason: FallbackReason,
     already: Fetched,
-) -> Result<Derived, QueryError> {
-    let mut derived = full_fold(resolved, tenant, DerivePath::Fallback(reason))?;
-    derived.fetched_files = add_bytes(derived.fetched_files, already.files)?;
-    derived.fetched_bytes = add_bytes(derived.fetched_bytes, already.bytes)?;
-    Ok(derived)
+) -> Result<Derived, DeriveError> {
+    let path = DerivePath::Fallback(reason);
+    let decided = DeriveError::on(path);
+    let counted = |mut derived: Derived| -> Result<Derived, QueryError> {
+        derived.fetched_files = add_bytes(derived.fetched_files, already.files)?;
+        derived.fetched_bytes = add_bytes(derived.fetched_bytes, already.bytes)?;
+        Ok(derived)
+    };
+    full_fold(resolved, tenant, path)
+        .and_then(counted)
+        .map_err(decided)
 }
 
 #[cfg(test)]

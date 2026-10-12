@@ -379,6 +379,32 @@ fn reason(r: &str) -> String {
     format!("{}={r}", semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON)
 }
 
+/// The `ourios.template_map.derive.mode` attribute as a key entry.
+fn mode(m: &str) -> String {
+    format!("{}={m}", semconv::OURIOS_TEMPLATE_MAP_DERIVE_MODE)
+}
+
+/// The `ourios.template_map.derive.fallback.reason` attribute as a key
+/// entry.
+fn fallback(r: &str) -> String {
+    format!(
+        "{}={r}",
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_FALLBACK_REASON
+    )
+}
+
+/// A [`histogram_points`] key: `entries` sorted.
+fn key(entries: &[String]) -> Vec<String> {
+    let mut key = entries.to_vec();
+    key.sort();
+    key
+}
+
+/// The derive key of a completed full fold for `derive_reason`.
+fn full(derive_reason: &str) -> Vec<String> {
+    key(&[mode("full"), reason(derive_reason)])
+}
+
 /// A histogram's sample count per attribute set.
 fn sample_counts(rms: &[ResourceMetrics], metric: &str) -> BTreeMap<Vec<String>, u64> {
     histogram_points(rms, metric)
@@ -401,13 +427,19 @@ const FAILED_STALE_FOLDS: u64 = 2;
 /// duration with `error.type` and no audit files or size. The hits (act
 /// 2, and act 4b's acquirer) never derive. The `unknown_version` reason
 /// is [`unknown_version_act`]'s.
+///
+/// Scenario RFC0033.13: act 3's `stale` derive extends the artifact
+/// (`mode = incremental`); the miss and torn derives are `full`. Act 5's
+/// stale derive fails reading its delta before the guard decides, so its
+/// sample carries `error.type` and no `mode`.
 fn assert_derive_metrics(rms: &[ResourceMetrics], cold_audit_set: (u64, u64)) {
+    let incremental = key(&[mode("incremental"), reason("stale")]);
     let expected: BTreeMap<Vec<String>, u64> = [
-        (vec![reason("miss")], 1),
-        (vec![reason("stale")], 1),
-        (vec![reason("torn")], 1),
+        (full("miss"), 1),
+        (incremental.clone(), 1),
+        (full("torn"), 1),
         (
-            vec!["error.type=storage".to_string(), reason("stale")],
+            key(&["error.type=storage".to_string(), reason("stale")]),
             FAILED_STALE_FOLDS,
         ),
     ]
@@ -418,13 +450,10 @@ fn assert_derive_metrics(rms: &[ResourceMetrics], cold_audit_set: (u64, u64)) {
         expected,
         "one duration sample per fold and none for a hit; a failed fold carries error.type",
     );
-    let completed: BTreeMap<Vec<String>, u64> = [
-        (vec![reason("miss")], 1),
-        (vec![reason("stale")], 1),
-        (vec![reason("torn")], 1),
-    ]
-    .into_iter()
-    .collect();
+    let completed: BTreeMap<Vec<String>, u64> =
+        [(full("miss"), 1), (incremental, 1), (full("torn"), 1)]
+            .into_iter()
+            .collect();
     for metric in [
         semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
         semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
@@ -435,16 +464,16 @@ fn assert_derive_metrics(rms: &[ResourceMetrics], cold_audit_set: (u64, u64)) {
             "{metric}: one sample per completed fold"
         );
     }
-    assert_audit_read(rms, "miss", cold_audit_set);
+    assert_audit_read(rms, &full("miss"), cold_audit_set);
     assert_acquire_waits(rms);
 }
 
-/// The `reason` derive's single files and size samples equal `audit_set`,
+/// The derive `key`'s single files and size samples equal `audit_set`,
 /// the fixture's audit file count and bytes.
-fn assert_audit_read(rms: &[ResourceMetrics], derive_reason: &str, audit_set: (u64, u64)) {
+fn assert_audit_read(rms: &[ResourceMetrics], key: &[String], audit_set: (u64, u64)) {
     let (files, bytes) = audit_set;
     assert!(files > 0 && bytes > 0, "the fixture has an audit set");
-    let key = vec![reason(derive_reason)];
+    let key = key.to_vec();
     #[allow(clippy::cast_precision_loss)] // fixture-sized values
     let expected = [(1, files as f64), (1, bytes as f64)];
     let observed = [
@@ -453,7 +482,7 @@ fn assert_audit_read(rms: &[ResourceMetrics], derive_reason: &str, audit_set: (u
     ];
     assert_eq!(
         observed, expected,
-        "the {derive_reason} derive read exactly the fixture's audit files and bytes",
+        "the {key:?} derive read exactly the fixture's audit files and bytes",
     );
 }
 
@@ -524,11 +553,11 @@ fn unknown_version_act(
     let rms = std::slice::from_ref(rms.last().expect("a collection"));
     assert_eq!(
         sample_counts(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
-            .get(&vec![reason("unknown_version")]),
+            .get(&full("unknown_version")),
         Some(&1),
         "one duration sample for the unknown-version fold",
     );
-    assert_audit_read(rms, "unknown_version", audit_set(&audit_dir));
+    assert_audit_read(rms, &full("unknown_version"), audit_set(&audit_dir));
     let folds = |rms: &[ResourceMetrics]| -> u64 {
         sample_counts(rms, semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
             .values()
@@ -773,4 +802,139 @@ fn rfc0033_7_observable_outcomes() {
     );
     binding_conflict_act(&guard, &exporter, &rms);
     unknown_version_act(&guard, &exporter);
+    derive_mode_act(&guard, &exporter);
+}
+
+/// The derive histograms' `(count, sum)` per attribute set, from the
+/// latest cumulative collection.
+fn derive_points(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) -> [BTreeMap<Vec<String>, (u64, f64)>; 3] {
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let rms = std::slice::from_ref(rms.last().expect("a collection"));
+    [
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
+    ]
+    .map(|metric| histogram_points(rms, metric))
+}
+
+/// What `after` added over `before`, per attribute set: `(count, sum)`.
+fn added(
+    before: &BTreeMap<Vec<String>, (u64, f64)>,
+    after: &BTreeMap<Vec<String>, (u64, f64)>,
+) -> BTreeMap<Vec<String>, (u64, f64)> {
+    after
+        .iter()
+        .filter_map(|(key, &(count, sum))| {
+            let (c0, s0) = before.get(key).copied().unwrap_or((0, 0.0));
+            (count > c0).then(|| (key.clone(), (count - c0, sum - s0)))
+        })
+        .collect()
+}
+
+/// Run one body query after `setup`, which writes the audit file(s) the
+/// next acquisition sees; return the parquet files and bytes `setup`
+/// added.
+fn step(bucket: &Path, audit_dir: &Path, setup: impl FnOnce()) -> (u64, u64) {
+    let (files0, bytes0) = audit_set(audit_dir);
+    setup();
+    let (files1, bytes1) = audit_set(audit_dir);
+    assert_eq!(body_query(bucket).rows, 1);
+    (files1.saturating_sub(files0), bytes1.saturating_sub(bytes0))
+}
+
+/// Scenario RFC0033.13 — the path taken is observable, on a store of its
+/// own. An incremental fold and each of the four fallbacks record
+/// `derive.reason = stale` with their `derive.mode`, the fallbacks also
+/// their `derive.fallback.reason`; the incremental sample's files and
+/// size are the delta's, the `out_of_order` sample's the rejected delta
+/// read plus the full fold.
+#[allow(clippy::cast_precision_loss)] // fixture-sized values
+fn derive_mode_act(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
+    let bucket = tempfile::tempdir().expect("temp dir");
+    let path = bucket.path();
+    write_audit(path, &[widened(1, 1, TS0)]);
+    write_records(path, &[mined(1, TS0 + 2)]);
+    let audit_dir = path.join("audit").join(format!("tenant_id={TENANT}"));
+    let artifact = audit_dir.join(TEMPLATE_MAP_FILENAME);
+    assert_eq!(body_query(path).rows, 1, "the miss publishes");
+    let before = derive_points(guard, exporter);
+
+    let delta = step(path, &audit_dir, || {
+        write_audit(path, &[widened(1, 2, TS0 + 10)]);
+    });
+    let rejected = step(path, &audit_dir, || {
+        write_audit(path, &[widened(1, 3, TS0 + 5)]);
+    });
+    let full_after_rejection = audit_set(&audit_dir);
+    step(path, &audit_dir, || {
+        rewrite_artifact(&artifact, |json| {
+            json["fold_state"]["incremental_depth"] = 256.into();
+        });
+        write_audit(path, &[widened(1, 4, TS0 + 20)]);
+    });
+    step(path, &audit_dir, || {
+        rewrite_artifact(&artifact, |json| {
+            json.as_object_mut().expect("object").remove("fold_state");
+        });
+        write_audit(path, &[widened(1, 5, TS0 + 30)]);
+    });
+    let newest = walk_files(&audit_dir);
+    let delta2 = step(path, &audit_dir, || {
+        write_audit(path, &[widened(1, 6, TS0 + 40)]);
+    });
+    step(path, &audit_dir, || {
+        let added = walk_files(&audit_dir)
+            .into_iter()
+            .find(|p| !newest.contains(p))
+            .expect("the last audit file");
+        std::fs::remove_file(added).expect("remove a folded file");
+    });
+
+    let after = derive_points(guard, exporter);
+    let incremental = key(&[mode("incremental"), reason("stale")]);
+    let declined = |r: &str| key(&[fallback(r), mode("full"), reason("stale")]);
+    let durations: BTreeMap<Vec<String>, u64> = added(&before[0], &after[0])
+        .into_iter()
+        .map(|(k, (count, _))| (k, count))
+        .collect();
+    let expected: BTreeMap<Vec<String>, u64> = [
+        (incremental.clone(), 2),
+        (declined("out_of_order"), 1),
+        (declined("depth_cap"), 1),
+        (declined("no_fold_state"), 1),
+        (declined("files_removed"), 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        durations, expected,
+        "one sample per derive, keyed by its path"
+    );
+
+    let files = added(&before[1], &after[1]);
+    let size = added(&before[2], &after[2]);
+    let (full_files, full_bytes) = full_after_rejection;
+    assert_eq!(
+        files[&declined("out_of_order")],
+        (1, (rejected.0 + full_files) as f64),
+        "the rejected delta read counts beside the full fold",
+    );
+    assert_eq!(
+        size[&declined("out_of_order")],
+        (1, (rejected.1 + full_bytes) as f64),
+    );
+    assert_eq!(
+        files[&incremental],
+        (2, (delta.0 + delta2.0) as f64),
+        "each incremental derive reads only its delta's files",
+    );
+    assert_eq!(size[&incremental], (2, (delta.1 + delta2.1) as f64));
 }

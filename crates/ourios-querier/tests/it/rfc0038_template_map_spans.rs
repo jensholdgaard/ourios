@@ -343,3 +343,88 @@ async fn a_failed_fold_marks_the_derive_and_load_spans_error() {
         );
     }
 }
+
+/// Two concurrent queries at different frontiers: an audit file lands
+/// after the first query listed. The second query waits on the first's
+/// acquisition (`wait template_map`), then lists again and acquires itself,
+/// refolding the now-stale map (`derive template_map`, reason `stale`)
+/// under the same `load template_map`. The first query neither waits nor
+/// sees the second's fold.
+#[cfg(feature = "testing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_behind_another_frontier_waits_then_folds_itself() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), &[mined(TS0)]);
+    audit_file(dir.path(), 1_775_127_480);
+    let root = dir.path().to_path_buf();
+    let querier = Arc::new(Querier::new(dir.path()));
+    let weak = Arc::downgrade(&querier);
+    let moved = Arc::new(AtomicBool::new(false));
+    let frontier_moved = Arc::clone(&moved);
+    querier.set_template_map_acquire_gate(Some(Arc::new(move || {
+        // The first acquirer has listed; move the frontier past it.
+        if !moved.swap(true, Ordering::SeqCst) {
+            audit_file(&root, 1_775_131_080);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Some(querier) = weak.upgrade()
+            && querier.template_map_waits() < 1
+        {
+            assert!(Instant::now() < deadline, "the second query never waited");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })));
+    // The second query starts only once the first holds the acquisition and
+    // the frontier has moved, so it lists the newer frontier.
+    let first = tokio::spawn(query(Arc::clone(&querier)).with_subscriber(dispatch.clone()));
+    while !frontier_moved.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let second = tokio::spawn(query(Arc::clone(&querier)).with_subscriber(dispatch.clone()));
+    for task in [first, second] {
+        task.await.expect("query task");
+    }
+    querier.set_template_map_acquire_gate(None);
+
+    let spans = exporter.get_finished_spans().expect("spans");
+    let children = |load: &SpanData, name: &str| {
+        let id = load.span_context.span_id();
+        named(&spans, name)
+            .into_iter()
+            .filter(|s| s.parent_span_id == id)
+            .count()
+    };
+    let loads = named(&spans, "load template_map");
+    let [waiter] = loads
+        .iter()
+        .copied()
+        .filter(|l| children(l, "wait template_map") > 0)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("exactly one query waited: {loads:?}");
+    };
+    assert_eq!(
+        children(waiter, "wait template_map"),
+        1,
+        "one wait per loop"
+    );
+    assert_eq!(
+        children(waiter, "derive template_map"),
+        1,
+        "then its own fold"
+    );
+    assert_eq!(
+        text(waiter, semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME).as_deref(),
+        Some("stale")
+    );
+    let first = loads
+        .iter()
+        .find(|l| l.span_context.span_id() != waiter.span_context.span_id())
+        .expect("the first query's load");
+    assert_eq!(children(first, "wait template_map"), 0);
+    assert_eq!(children(first, "derive template_map"), 1);
+}

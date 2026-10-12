@@ -260,7 +260,11 @@ behaviour.
 >   **compressed** artifact byte size is smaller than the audit
 >   bytes just folded: the comparison is between the bytes a warm
 >   GET would pay and the bytes the fold just paid — the v1 rule
->   applied to the bytes actually shipped.
+>   applied to the bytes actually shipped. *(Refined 2026-10-12,
+>   #962: the comparison is against the acquisition's total bytes,
+>   meaning the artifact GET plus every audit object fetched. That
+>   equals the folded audit bytes on a miss. See the §3.3
+>   amendment.)*
 > - **Telemetry (§3.7).** The artifact-size histogram records the
 >   **compressed** (published-object) bytes — the GET cost, which
 >   is what the instrument always measured (it records the
@@ -632,11 +636,23 @@ uncached query identically.
 > **Write-through and abstention** (§3.5 pointer amendment). An
 > incremental fold publishes like a full one. Abstention keeps its
 > principle: publish iff the compressed artifact costs less than what
-> the next acquisition would pay without this publish. After a full
-> fold that is the folded audit bytes, as before. After an
-> incremental fold it is the base artifact's bytes plus the delta's.
+> the next acquisition would pay without this publish. The listing is
+> unchanged in that case, so that cost is this acquisition's own
+> **acquisition bytes**: the fetched artifact's bytes (zero on an
+> absent artifact) plus every audit object fetched. One definition
+> covers every path:
+>
+> - a miss: the folded audit bytes, exactly the pre-amendment rule;
+> - a full fold behind a stale, torn or unknown-version artifact: the
+>   artifact GET, plus any rejected delta read, plus the full fold;
+> - an incremental fold: the base artifact plus the delta.
+>
+> The pre-amendment rule compared only against the folded audit
+> bytes. That under-counts whenever an artifact was fetched, and
+> could abstain where publishing is cheaper. This amendment replaces
+> it with the acquisition-bytes comparison.
 > `QueryResult::registry_bytes_read` stays "template-map acquisition
-> bytes": the artifact GET plus every audit object fetched.
+> bytes", and the abstention compares against exactly that figure.
 >
 > **Telemetry** (§3.7 pointer amendment). The lookup outcome stays
 > `stale` and `ourios.template_map.derive.reason` stays `stale`.
@@ -748,7 +764,7 @@ sequenceDiagram
         Q->>Q: deserialize registry + alias map (no audit GETs)
     else stale, fold_state present, folded_files ⊆ S, depth below cap (2026-10-12 amendment)
         Q->>FS: GET only the delta files D = S minus folded_files
-        alt every fold-relevant event in D later than high_water_ns
+        alt high_water_ns null, or every fold-relevant event in D later than it
             Q->>Q: fold D onto the artifact's registry + alias map (§3.7.1 order within D)
         else guard rejects (out_of_order)
             Q->>FS: GET every audit file in S (delta bytes may be reused)
@@ -817,9 +833,11 @@ alternative (§4, §7).
 > one fresh fold per mutation-driven staleness, becomes one fold of
 > the *new* audit files on top of the loaded artifact whenever the
 > §3.3 guard admits it. An incremental fold writes through like a
-> full one. Its abstention comparison is against the base artifact
-> plus delta bytes, i.e. what the next acquisition would pay without
-> the publish. See the §3.3 amendment of the same date.
+> full one. Every write-through's abstention now compares against
+> that acquisition's own acquisition bytes (artifact GET plus every
+> audit object fetched), i.e. what the next acquisition would pay
+> without the publish. For an incremental fold that is the base
+> artifact plus the delta. See the §3.3 amendment of the same date.
 
 ### 3.6 Back-compat — additive and advisory (`CLAUDE.md` §3.5)
 
@@ -1171,10 +1189,10 @@ ambiguity cannot recur.
 > - **Then** after every step the registry, alias map, binding
 >   conflicts, `folded_files` and `high_water_ns` equal those of a
 >   full fold over the same listing
-> - **And** the acquired map's canonical decompressed JSON
->   (`to_artifact_bytes`) equals the full fold's byte for byte, except
->   `incremental_depth`, whether or not the write-through then
->   publishes or abstains
+> - **And** decoding the acquired map's `to_artifact_bytes` (the
+>   zstd frame) and normalizing `incremental_depth` on both sides
+>   gives JSON bodies equal byte for byte to the full fold's, whether
+>   or not the write-through then publishes or abstains
 > - **And** the query answer through either path is identical.
 
 > **Scenario RFC0033.11 — The guard falls back, never guesses**

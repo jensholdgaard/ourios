@@ -18,9 +18,10 @@
 //! [`TemplateMap::publish`] commits the artifact atomically (tmp+rename
 //! locally, conditional put on the store — §3.4, the RFC 0009 manifest
 //! precedent). [`load_or_derive`] is the cached read path the query
-//! layer consumes: one listing, the §3.3 frontier check, fallback to
-//! the fresh fold on every non-hit disposition, and the §3.5
-//! best-effort write-through.
+//! layer consumes: one listing, the §3.3 frontier check, the guarded
+//! incremental extension of a stale artifact (falling back to a full
+//! fold when the guard declines it), a full fold on every other non-hit
+//! disposition, and the §3.5 best-effort write-through.
 //!
 //! JSON follows the `manifest.json` precedent
 //! (`ourios_parquet::Manifest`, RFC 0009 §3.4): small, human-
@@ -38,7 +39,7 @@ use std::time::{Duration, Instant};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram};
 use ourios_core::alias::AliasMap;
-use ourios_core::audit::AuditPayload;
+use ourios_core::audit::{AuditEvent, AuditPayload};
 use ourios_core::histogram_buckets;
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{format_template, parse_template};
@@ -50,6 +51,8 @@ use crate::alias_store::AliasFold;
 use crate::fold_state::{FoldState, FoldStateJson, HighWater};
 use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
 use crate::{QueryError, StoreRef, audit_scan, local_publish};
+
+mod incremental;
 
 /// Canonical artifact key at the root of a tenant's audit subtree
 /// (`audit/tenant_id=<enc>/template_map.v2.json.zst`, RFC 0033 §3.2
@@ -471,15 +474,19 @@ pub enum CacheOutcome {
         reason: MissReason,
     },
     /// A valid artifact at a different frontier — never served (§3.3:
-    /// re-derive, never serve stale): fresh fold over the live listing,
-    /// write-through republish at the new frontier.
+    /// re-derive, never serve stale): extended by only the newly listed
+    /// audit files when the incremental guard admits it, else a full fold
+    /// over the live listing; either way a write-through republish at the
+    /// new frontier.
     StaleRefreshed,
 }
 
 /// The cached read path (RFC 0033 §3.3/§3.5): resolve `tenant`'s
 /// [`TemplateMap`] through the published artifact when it is exactly
-/// fresh, and by the fresh fold — today's behaviour, then a best-effort
-/// write-through publish — on **every** other disposition.
+/// fresh; a stale artifact by the guarded incremental extension (§3.3
+/// amendment 2026-10-12), falling back to a full fold when the guard
+/// declines it; and by a full fold on every other disposition — each
+/// non-hit followed by a best-effort write-through publish.
 ///
 /// IO per outcome (the freshness LIST is never byte-counted, matching
 /// both backends' existing accounting):
@@ -492,11 +499,14 @@ pub enum CacheOutcome {
 ///   best-effort publish. Acquisition bytes = the fold's audit bytes,
 ///   plus the failed GET's bytes if it returned any (torn / unknown
 ///   version).
-/// - [`CacheOutcome::StaleRefreshed`] — as a miss, with the stale
-///   artifact's GET bytes counted (they were fetched and discarded).
+/// - [`CacheOutcome::StaleRefreshed`] — one LIST + the artifact GET,
+///   then either the incremental fold, which reads only the delta files
+///   (acquisition bytes = the artifact GET + the delta's bytes), or the
+///   full-fold fallback (acquisition bytes = the artifact GET + the full
+///   fold's audit bytes + any rejected delta read).
 ///
 /// The listing is taken **once**, before the artifact GET is compared,
-/// and the fallback fold consumes that same listing (§3.3's
+/// and the incremental or full fold consumes that same listing (§3.3's
 /// LIST-before-GET-is-compared rule), so a file appearing mid-query
 /// affects a cached and an uncached query identically.
 ///
@@ -535,21 +545,9 @@ pub(crate) fn load_or_derive_resolved(
     tenant: &TenantId,
     resolved: audit_scan::ResolvedAuditSet<'_>,
 ) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
-    let (fetched_bytes, expected, outcome) = match fetch_artifact(backend, tenant) {
-        FetchedArtifact::Absent => (
-            0,
-            None,
-            CacheOutcome::Miss {
-                reason: MissReason::Absent,
-            },
-        ),
-        FetchedArtifact::Unreadable => (
-            0,
-            None,
-            CacheOutcome::Miss {
-                reason: MissReason::Torn,
-            },
-        ),
+    let (fetched_bytes, expected, outcome, stale) = match fetch_artifact(backend, tenant) {
+        FetchedArtifact::Absent => (0, None, miss(MissReason::Absent), None),
+        FetchedArtifact::Unreadable => (0, None, miss(MissReason::Torn), None),
         FetchedArtifact::Present { bytes, e_tag } => {
             let len = bytes.len() as u64;
             match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
@@ -557,77 +555,110 @@ pub(crate) fn load_or_derive_resolved(
                     METRICS.record_lookup(CacheOutcome::Hit, false);
                     return Ok((map, len, CacheOutcome::Hit));
                 }
-                ArtifactRead::Valid(_) => (len, e_tag, CacheOutcome::StaleRefreshed),
-                ArtifactRead::Torn { .. } => (
-                    len,
-                    e_tag,
-                    CacheOutcome::Miss {
-                        reason: MissReason::Torn,
-                    },
-                ),
-                ArtifactRead::UnknownVersion { .. } => (
-                    len,
-                    e_tag,
-                    CacheOutcome::Miss {
-                        reason: MissReason::UnknownVersion,
-                    },
-                ),
+                ArtifactRead::Valid(map) => (len, e_tag, CacheOutcome::StaleRefreshed, Some(map)),
+                ArtifactRead::Torn { .. } => (len, e_tag, miss(MissReason::Torn), None),
+                ArtifactRead::UnknownVersion { .. } => {
+                    (len, e_tag, miss(MissReason::UnknownVersion), None)
+                }
             }
         }
     };
     // On the span before the fold, so a failed fold's span still says why
     // it folded; the metric keeps counting only lookups that answered.
     record_outcome_on_span(lookup_outcome(outcome));
-    let (map, fold_bytes, conflicts) = measured_fold(resolved, tenant, outcome)?;
-    let acquisition_bytes =
-        fold_bytes
-            .checked_add(fetched_bytes)
-            .ok_or_else(|| QueryError::Storage {
-                detail: format!(
-                    "template-map acquisition bytes overflow u64 (fold={fold_bytes}, \
-                     artifact={fetched_bytes})"
-                ),
-            })?;
+    let derived = measured_fold(resolved, tenant, outcome, stale)?;
+    let acquisition_bytes = add_bytes(derived.fetched_bytes, fetched_bytes)?;
     // Recorded only after every fallible step — a counted outcome is
     // always one that answered, mirroring the hit arm's record-at-return.
-    announce_binding_conflicts(tenant, &conflicts);
-    METRICS.record_lookup(outcome, !conflicts.is_empty());
-    map.write_through(backend, expected.as_deref(), acquisition_bytes);
-    Ok((map, acquisition_bytes, outcome))
+    announce_binding_conflicts(tenant, &derived.conflicts);
+    METRICS.record_lookup(outcome, !derived.conflicts.is_empty());
+    derived
+        .map
+        .write_through(backend, expected.as_deref(), acquisition_bytes);
+    Ok((derived.map, acquisition_bytes, outcome))
 }
 
-/// [`fold_template_map`] behind a non-hit lookup, recording what it cost
-/// under the `outcome` that sent the lookup to the fold: the duration
-/// always (with `error.type` when the fold fails), the audit files and
-/// bytes when it completes. A failure before the disposition is known
-/// (the audit listing, or a fetched artifact naming another tenant) runs
-/// no fold and so records no derive sample.
+fn miss(reason: MissReason) -> CacheOutcome {
+    CacheOutcome::Miss { reason }
+}
+
+/// Sum two measured byte counts, failing loudly on overflow — a wrapped
+/// total would silently corrupt the RFC 0031 §3.6 figure.
+fn add_bytes(a: u64, b: u64) -> Result<u64, QueryError> {
+    a.checked_add(b).ok_or_else(|| QueryError::Storage {
+        detail: format!("template-map acquisition bytes overflow u64 ({a} + {b})"),
+    })
+}
+
+/// What one derive produced and what it cost: the map, the audit objects
+/// and bytes actually fetched (a rejected delta read included), the
+/// binding conflicts to report, and the path that produced the map.
+struct Derived {
+    map: TemplateMap,
+    fetched_files: u64,
+    fetched_bytes: u64,
+    conflicts: BindingConflicts,
+    path: DerivePath,
+}
+
+/// How a derive produced its map (RFC 0033 §3.3 amendment 2026-10-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivePath {
+    /// A full fold with no stale artifact to extend.
+    Full,
+    /// The stale artifact extended by the new audit files.
+    Incremental,
+    /// A full fold because the guard declined the stale artifact.
+    Fallback(FallbackReason),
+}
+
+/// The guard row that declined a stale artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackReason {
+    NoFoldState,
+    FilesRemoved,
+    DepthCap,
+    OutOfOrder,
+}
+
+/// The derive behind a non-hit lookup — the guarded incremental fold of a
+/// `stale` artifact, else a full fold — recording what it cost under the
+/// `outcome` that sent the lookup to the fold: the duration always (with
+/// `error.type` when the derive fails), the audit files and bytes fetched
+/// when it completes. A failure before the disposition is known (the audit
+/// listing, or a fetched artifact naming another tenant) runs no derive and
+/// so records no derive sample.
 fn measured_fold(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
     outcome: CacheOutcome,
-) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
+    stale: Option<TemplateMap>,
+) -> Result<Derived, QueryError> {
     let Some(reason) = derive_reason(outcome) else {
-        return fold_template_map(resolved, tenant);
+        return derive(resolved, tenant, stale);
     };
     let started = Instant::now();
-    let folded = traced_fold(resolved, tenant, reason);
-    let cost = match &folded {
-        Ok((map, bytes, _)) => Ok((map.folded_files().len() as u64, *bytes)),
+    let derived = traced_derive(resolved, tenant, reason, stale);
+    let cost = match &derived {
+        Ok(d) => Ok((d.fetched_files, d.fetched_bytes)),
         Err(e) => Err(error_type(e)),
     };
     METRICS.record_derive(reason, started.elapsed(), cost);
-    folded
+    if let Ok(d) = &derived {
+        tracing::debug!(path = ?d.path, files = d.fetched_files, "template map derived");
+    }
+    derived
 }
 
-/// [`fold_template_map`] as its own `derive template_map` span, so a
-/// trace shows the fold apart from the artifact fetch and the write-through,
-/// with the object-store requests it makes beneath it.
-fn traced_fold(
+/// [`derive`] as its own `derive template_map` span, so a trace shows the
+/// fold apart from the artifact fetch and the write-through, with the
+/// object-store requests it makes beneath it.
+fn traced_derive(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
     reason: &'static str,
-) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
+    stale: Option<TemplateMap>,
+) -> Result<Derived, QueryError> {
     let span = tracing::info_span!(
         "derive template_map",
         otel.kind = "internal",
@@ -635,11 +666,39 @@ fn traced_fold(
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
     );
-    let folded = crate::phase::nested_in(&span, || fold_template_map(resolved, tenant));
-    if let Err(e) = &folded {
+    let derived = crate::phase::nested_in(&span, || derive(resolved, tenant, stale));
+    if let Err(e) = &derived {
         ourios_core::telemetry::record_span_error(&span, error_type(e));
     }
-    folded
+    derived
+}
+
+/// Extend a stale artifact when its guard admits it, else fold in full.
+fn derive(
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+    tenant: &TenantId,
+    stale: Option<TemplateMap>,
+) -> Result<Derived, QueryError> {
+    match stale {
+        Some(base) => incremental::derive_stale(base, resolved, tenant),
+        None => full_fold(resolved, tenant, DerivePath::Full),
+    }
+}
+
+/// A full fold over `resolved`, labelled with the `path` that chose it.
+fn full_fold(
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+    tenant: &TenantId,
+    path: DerivePath,
+) -> Result<Derived, QueryError> {
+    let (map, fetched_bytes, conflicts) = fold_template_map(resolved, tenant)?;
+    Ok(Derived {
+        fetched_files: map.folded_files().len() as u64,
+        map,
+        fetched_bytes,
+        conflicts,
+        path,
+    })
 }
 
 /// One GET of `tenant`'s artifact, classified. Infallible by design: a
@@ -727,28 +786,70 @@ fn fold_template_map(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
 ) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
-    let mut registry = RegistryFold::default();
-    let mut aliases = AliasFold::default();
-    let mut high_water = HighWater::default();
-    let scan = resolved.for_each_event(tenant, |event| {
-        high_water.observe(&event);
+    let mut pass = FoldPass::default();
+    let scan = resolved.for_each_event(tenant, |event| pass.visit(event))?;
+    let (map, conflicts) = pass.finish(tenant, scan.frontier, FoldBase::empty());
+    Ok((map, scan.bytes_read, conflicts))
+}
+
+/// One streaming pass feeding both folds and the high-water mark — the
+/// same code for a full fold and for the delta of an incremental one.
+#[derive(Default)]
+struct FoldPass {
+    registry: RegistryFold,
+    aliases: AliasFold,
+    high_water: HighWater,
+}
+
+impl FoldPass {
+    fn visit(&mut self, event: AuditEvent) {
+        self.high_water.observe(&event);
         match &event.payload {
-            AuditPayload::Template { .. } => registry.push(event),
-            _ => aliases.push(event),
+            AuditPayload::Template { .. } => self.registry.push(event),
+            _ => self.aliases.push(event),
         }
-    })?;
-    let (registry, conflicts) = registry.finish_checked();
-    Ok((
-        TemplateMap {
+    }
+
+    /// The map at `folded_files`: the alias events applied onto the
+    /// base's classes, the high-water the max of this pass's and the
+    /// base's (`None` orders below every `Some`), recorded at the base's
+    /// depth.
+    fn finish(
+        self,
+        tenant: &TenantId,
+        folded_files: Vec<String>,
+        base: FoldBase,
+    ) -> (TemplateMap, BindingConflicts) {
+        let (registry, conflicts) = self.registry.finish_checked();
+        let high_water = self.high_water.get().max(base.high_water);
+        let map = TemplateMap {
             tenant: tenant.clone(),
-            folded_files: scan.frontier,
+            folded_files,
             registry,
-            aliases: aliases.finish(),
-            fold_state: Some(FoldState::new(high_water.get(), conflicts.clone(), 0)),
-        },
-        scan.bytes_read,
-        conflicts,
-    ))
+            aliases: self.aliases.finish_onto(base.aliases),
+            fold_state: Some(FoldState::new(high_water, conflicts.clone(), base.depth)),
+        };
+        (map, conflicts)
+    }
+}
+
+/// What a [`FoldPass`] finishes on top of: nothing for a full fold, the
+/// stale artifact's classes and high-water (one step deeper) for an
+/// incremental one.
+struct FoldBase {
+    aliases: AliasMap,
+    high_water: Option<u64>,
+    depth: u32,
+}
+
+impl FoldBase {
+    fn empty() -> Self {
+        Self {
+            aliases: AliasMap::new(),
+            high_water: None,
+            depth: 0,
+        }
+    }
 }
 
 /// The artifact's JSON body — the decompressed content of the zstd

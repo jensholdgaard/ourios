@@ -311,3 +311,61 @@ pub fn write_audit(bucket: &Path, events: &[AuditEvent]) {
         "audit fixture events must all persist",
     );
 }
+
+/// Start `LocalStack` (S3 only), create `bucket` with the image's own
+/// `awslocal`, and point `Store::s3` at it through the endpoint override:
+/// the RFC 0013 harness pattern. Credentials come from the CI job's
+/// `AWS_*` env (`LocalStack` accepts any). The container stops when the
+/// returned handle drops.
+pub async fn localstack_s3(
+    bucket: &str,
+) -> (
+    testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::localstack::LocalStack,
+    >,
+    ourios_parquet::Store,
+) {
+    use testcontainers_modules::localstack::LocalStack;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::core::ExecCommand;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    let container = LocalStack::default()
+        .with_env_var("SERVICES", "s3")
+        .start()
+        .await
+        .expect("start localstack");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(4566)
+        .await
+        .expect("container port");
+    let mut mb = container
+        .exec(ExecCommand::new([
+            "awslocal".to_string(),
+            "s3".to_string(),
+            "mb".to_string(),
+            format!("s3://{bucket}"),
+        ]))
+        .await
+        .expect("exec awslocal s3 mb");
+    // Drain both streams before reading the exit code — testcontainers
+    // reports `exit_code()` as `None` until the output is consumed.
+    let stdout =
+        String::from_utf8_lossy(&mb.stdout_to_vec().await.expect("mb stdout")).into_owned();
+    let stderr =
+        String::from_utf8_lossy(&mb.stderr_to_vec().await.expect("mb stderr")).into_owned();
+    let code = mb.exit_code().await.expect("mb exit code");
+    assert_eq!(
+        code,
+        Some(0),
+        "awslocal s3 mb failed (code {code:?}): stdout={stdout:?} stderr={stderr:?}",
+    );
+    let store = ourios_parquet::Store::s3(
+        ourios_parquet::S3Config::new(bucket)
+            .with_endpoint(format!("http://{host}:{port}"))
+            .with_region("us-east-1"),
+    )
+    .expect("build s3 store");
+    (container, store)
+}

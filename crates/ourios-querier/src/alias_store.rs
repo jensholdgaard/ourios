@@ -18,8 +18,9 @@
 //! eventual-consistency stance, with the staleness window being
 //! audit-flush visibility. The RFC 0033 cached template map
 //! accelerates this derivation at the query call sites (an
-//! exactly-fresh artifact skips the scan); this fold remains the
-//! semantics owner and the fallback for every non-hit disposition.
+//! exactly-fresh artifact skips the scan, a stale one is extended by the
+//! newly listed files when the incremental guard admits it); this fold
+//! remains the semantics owner and the full-fold fallback.
 
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::{AuditEvent, AuditPayload};
@@ -75,8 +76,18 @@ impl AliasFold {
 
     /// The stable sort by event time completes the total order:
     /// same-timestamp events keep their (file path, row index) order.
-    pub(crate) fn finish(mut self) -> AliasMap {
+    pub(crate) fn finish(self) -> AliasMap {
+        self.finish_onto(AliasMap::new())
+    }
+
+    /// [`Self::finish`] applied on top of an already-folded `base` (RFC
+    /// 0033 §3.3 amendment, the incremental path): the same stable sort,
+    /// then each event applied to the base's classes in that order.
+    pub(crate) fn finish_onto(mut self, mut base: AliasMap) -> AliasMap {
         self.events.sort_by_key(|e| e.timestamp);
-        AliasMap::from_events(&self.events)
+        for event in &self.events {
+            base.apply(event);
+        }
+        base
     }
 }

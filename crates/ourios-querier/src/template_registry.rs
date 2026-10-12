@@ -6,9 +6,9 @@
 //! `template_type_expanded` events (RFC 0001 §6.4, RFC 0017 §3.1) off the
 //! RFC 0005 §3.7 audit Parquet stream. The RFC 0033 cached template map
 //! (`template_map.v2.json.zst`, discharging the RFC 0005 §3.7.1 deferral)
-//! accelerates this derivation at the query call sites; this fold remains
-//! the source-of-truth derivation and the fallback for every non-hit
-//! disposition.
+//! accelerates this derivation at the query call sites, extending a stale
+//! artifact incrementally when its guard admits it; this fold remains the
+//! source-of-truth derivation and the full-fold fallback.
 //!
 //! This mirrors [`crate::alias_store::derive_alias_map`] exactly — the same
 //! shared [`crate::audit_scan`] walk and the same total, deterministic fold
@@ -20,7 +20,7 @@
 
 use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
 use ourios_core::tenant::TenantId;
-use ourios_miner::tree::{OwnedToken, parse_template};
+use ourios_miner::tree::{OwnedToken, format_template, parse_template};
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
@@ -130,6 +130,25 @@ pub(crate) struct RegistryFold {
 pub(crate) type BindingConflicts = Vec<(u64, u32)>;
 
 impl RegistryFold {
+    /// A fold resuming from an already-folded `registry` (RFC 0033 §3.3
+    /// amendment, the incremental path): every held key at timestamp
+    /// `held_at`, the persisted `conflicts` carried forward. Events pushed
+    /// afterwards must be strictly later than `held_at` for the result to
+    /// equal the full fold, which the caller's guard establishes.
+    pub(crate) fn seeded(
+        registry: &TemplateRegistry,
+        held_at: SystemTime,
+        conflicts: &[(u64, u32)],
+    ) -> Self {
+        Self {
+            latest: registry
+                .iter()
+                .map(|(&key, tokens)| (key, (held_at, format_template(tokens))))
+                .collect(),
+            conflicts: conflicts.iter().copied().collect(),
+        }
+    }
+
     pub(crate) fn push(&mut self, event: AuditEvent) {
         let AuditPayload::Template {
             template_id,

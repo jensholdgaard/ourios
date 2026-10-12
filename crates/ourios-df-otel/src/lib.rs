@@ -280,10 +280,14 @@ mod tests {
         ))
     }
 
-    /// A tracer under an explicit scope. This crate does not depend on
+    /// A tracer under an explicit, versioned scope. This crate does not depend on
     /// ourios-core, whose versioned `scope` the workspace lint asks for.
     fn test_tracer(provider: &SdkTracerProvider) -> opentelemetry_sdk::trace::SdkTracer {
-        provider.tracer_with_scope(opentelemetry::InstrumentationScope::builder("test").build())
+        provider.tracer_with_scope(
+            opentelemetry::InstrumentationScope::builder("test")
+                .with_version(env!("CARGO_PKG_VERSION"))
+                .build(),
+        )
     }
 
     /// A minimal `ExecutionPlan` leaf that reports a fixed, hand-built

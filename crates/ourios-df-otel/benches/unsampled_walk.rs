@@ -97,8 +97,11 @@ impl ExecutionPlan for PanicsIfTouched {
 
 fn unsampled_walk(c: &mut Criterion) {
     let provider = SdkTracerProvider::builder().build();
-    let tracer =
-        provider.tracer_with_scope(opentelemetry::InstrumentationScope::builder("bench").build());
+    let tracer = provider.tracer_with_scope(
+        opentelemetry::InstrumentationScope::builder("bench")
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .build(),
+    );
     let unsampled_cx = Context::new();
     let plan = PanicsIfTouched::new();
 

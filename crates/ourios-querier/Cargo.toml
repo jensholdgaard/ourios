@@ -98,6 +98,10 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 # ourios-bench binds it directly as the A1 reference codec), so this
 # adds no new transitive crate and the version is pinned by `Cargo.lock`.
 zstd = "0.13"
+# RFC 0033 §3.3 amendment (2026-10-12) — each local artifact publish writes
+# its own `<artifact>.<UUIDv7>.tmp`. Already in the tree via ourios-parquet,
+# ourios-wal and ourios-ingester with the same features.
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 # RFC0002.8 — the compiler checks a `=~` / `!~` / `matches` pattern with
 # the regex engine DataFusion's `regexp_like` runs, so a malformed one is an
 # `InvalidQuery` rather than a planning failure. Already in the tree via

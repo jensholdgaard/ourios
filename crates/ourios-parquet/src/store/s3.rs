@@ -5,7 +5,9 @@ use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::client::SpawnedReqwestConnector;
 
 use super::bridge::bridge_runtime;
-use super::metrics::{MeteredConnector, Metrics};
+use super::client_span::{S3Target, Tracing};
+use super::metrics::Metrics;
+use super::transport::MeteredConnector;
 use super::{S3Config, StoreError};
 
 /// Idle connections the S3 client keeps per host once a burst of concurrent
@@ -25,6 +27,7 @@ struct Credentials {
 pub(super) fn client(
     cfg: S3Config,
     metrics: &Metrics,
+    tracing: Tracing,
 ) -> Result<(AmazonS3, Option<String>), StoreError> {
     let S3Config {
         bucket,
@@ -43,20 +46,69 @@ pub(super) fn client(
             session_token,
         },
     )?;
+    let builder = addressed(builder, endpoint, region);
+    let target = target_of(&builder, tracing);
     // reqwest runs each pooled connection on the runtime that issued the
     // request, and a connection only notices the store closing it while
     // that runtime polls it. Callers' runtimes stall (a current-thread
     // caller between requests, busy `DataFusion` workers), which left
     // connections in `CLOSE_WAIT` and handed them to later requests
     // (#791). The bridge runtime is never a caller's, so it always does.
-    let s3 = addressed(builder, endpoint, region)
+    let s3 = builder
         .with_http_connector(MeteredConnector {
             inner: SpawnedReqwestConnector::new(bridge_runtime()?.handle().clone()),
             metrics: metrics.clone(),
+            target,
         })
         .build()
         .map_err(StoreError::Backend)?;
     Ok((s3, prefix))
+}
+
+/// What the client's CLIENT spans need to know about where it sends
+/// requests, read from the builder's effective configuration. That
+/// includes values `from_env` inherited (`AWS_ENDPOINT`,
+/// `AWS_ENDPOINT_URL_S3`, `AWS_REGION`), with the S3-specific endpoint
+/// taking precedence over the generic one, as the client itself does.
+fn target_of(builder: &AmazonS3Builder, tracing: Tracing) -> S3Target {
+    let get = |key: AmazonS3ConfigKey| builder.get_config_value(&key);
+    let endpoint = get(AmazonS3ConfigKey::S3Endpoint).or_else(|| get(AmazonS3ConfigKey::Endpoint));
+    S3Target {
+        bucket: get(AmazonS3ConfigKey::Bucket).unwrap_or_default(),
+        region: get(AmazonS3ConfigKey::Region),
+        endpoint_host: endpoint.as_deref().map(endpoint_host),
+        path_prefix: endpoint.as_deref().map(endpoint_path).unwrap_or_default(),
+        virtual_hosted: get(AmazonS3ConfigKey::VirtualHostedStyleRequest)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true")),
+        tracing,
+    }
+}
+
+/// An endpoint override's authority and path: what follows the scheme,
+/// split at the first `/`.
+fn endpoint_parts(endpoint: &str) -> (&str, &str) {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    after_scheme
+        .find('/')
+        .map_or((after_scheme, ""), |slash| after_scheme.split_at(slash))
+}
+
+/// The host of an endpoint override, as a request URI reports it: no port,
+/// an IPv6 literal kept in brackets.
+fn endpoint_host(endpoint: &str) -> String {
+    let (authority, _) = endpoint_parts(endpoint);
+    match authority.strip_prefix('[') {
+        Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
+        None => authority.split(':').next().unwrap_or_default().to_owned(),
+    }
+}
+
+/// The path an endpoint override sits below (`/prefix`), without a trailing
+/// slash; empty for one at the host root.
+fn endpoint_path(endpoint: &str) -> String {
+    endpoint_parts(endpoint).1.trim_end_matches('/').to_owned()
 }
 
 /// A builder for `bucket` carrying the credentials, explicit or from the
@@ -150,4 +202,54 @@ fn addressed(
         builder = builder.with_config(pool_cap, MAX_IDLE_CONNECTIONS_PER_HOST.to_string());
     }
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+
+    use super::{Tracing, endpoint_host, endpoint_path, target_of};
+
+    /// The span target follows the builder's effective configuration: the
+    /// S3-specific endpoint wins over the generic one, whichever was set
+    /// first, and the region comes along.
+    #[test]
+    fn the_span_target_follows_the_effective_endpoint_and_region() {
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("b")
+            .with_config(AmazonS3ConfigKey::S3Endpoint, "http://s3.local:9000/p")
+            .with_endpoint("http://generic.local")
+            .with_region("eu-north-1");
+        let target = target_of(&builder, Tracing::Global);
+        assert_eq!(target.bucket, "b");
+        assert_eq!(target.endpoint_host.as_deref(), Some("s3.local"));
+        assert_eq!(target.path_prefix, "/p");
+        assert_eq!(target.region.as_deref(), Some("eu-north-1"));
+
+        let generic = AmazonS3Builder::new()
+            .with_bucket_name("b")
+            .with_endpoint("http://generic.local");
+        let target = target_of(&generic, Tracing::Global);
+        assert_eq!(target.endpoint_host.as_deref(), Some("generic.local"));
+        assert_eq!(target.region, None);
+        assert!(!target.virtual_hosted);
+
+        let virtual_hosted = generic.with_virtual_hosted_style_request(true);
+        assert!(target_of(&virtual_hosted, Tracing::Global).virtual_hosted);
+    }
+
+    #[test]
+    fn the_endpoint_path_is_what_sits_below_the_host() {
+        assert_eq!(endpoint_path("http://h:9000"), "");
+        assert_eq!(endpoint_path("http://h:9000/"), "");
+        assert_eq!(endpoint_path("https://h/s3/"), "/s3");
+        assert_eq!(endpoint_path("https://h/a/b"), "/a/b");
+    }
+
+    #[test]
+    fn the_endpoint_host_drops_the_port_and_keeps_ipv6_brackets() {
+        assert_eq!(endpoint_host("http://127.0.0.1:9000/s3"), "127.0.0.1");
+        assert_eq!(endpoint_host("https://minio.example"), "minio.example");
+        assert_eq!(endpoint_host("http://[::1]:9000"), "[::1]");
+    }
 }

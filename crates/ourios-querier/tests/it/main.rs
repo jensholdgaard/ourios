@@ -35,6 +35,7 @@ mod rfc0025_rendering;
 mod rfc0031_single_pass;
 mod rfc0033_cached_template_map;
 mod rfc0036_window_materialization;
+mod rfc0038_template_map_spans;
 mod rfc0042_mixed_schema;
 mod rfc0044_body_equality;
 mod rfc0047_visibility;

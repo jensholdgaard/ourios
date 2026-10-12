@@ -3596,6 +3596,7 @@ dependencies = [
  "ourios-semconv",
  "ourios-testgen",
  "parquet",
+ "percent-encoding",
  "proptest",
  "serde",
  "serde_json",

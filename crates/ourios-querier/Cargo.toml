@@ -107,7 +107,7 @@ regex = "1"
 # (`src/fetch_count.rs`) behind `ourios.query.read.size`. The trait is
 # `async_trait`-based and its listing calls return `BoxStream`s; both
 # crates are already in the tree via DataFusion / object_store.
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
 
 [features]
@@ -139,7 +139,7 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
 # RFC0002.7 — the parse/serialise round-trip is a property test over
 # generated well-formed queries.
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 # RFC 0024 §5 P4 (`tests/rfc0024_properties.rs`): generated OTLP
 # batches + generated predicates come from the dev-only generator
 # crate; the real miner (already a regular dep) shapes the rows.
@@ -149,7 +149,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 # tempfile gives each test a scratch bucket. `rt-multi-thread` for the
 # `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
 # `time` for the delayed-GET store wrapper (`test_support::SlowStore`).
-tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile = "=3.27.0"
 # #895 (`tests/rfc0033_bounded_fold.rs`) — testing-mode heap profiler as the
 # global allocator, so the cold template-map derivation's peak heap is
@@ -178,7 +178,7 @@ serde_yaml_ng = { version = "=0.10.0", default-features = false }
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.56.0", default-features = false }
+jsonschema = { version = "=0.58.6", default-features = false }
 
 [lints]
 workspace = true

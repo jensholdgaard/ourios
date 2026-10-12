@@ -3632,6 +3632,7 @@ dependencies = [
  "parquet",
  "percent-encoding",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml_ng",

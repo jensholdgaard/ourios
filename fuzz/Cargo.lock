@@ -2513,6 +2513,7 @@ dependencies = [
  "ourios-parquet",
  "ourios-semconv",
  "percent-encoding",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

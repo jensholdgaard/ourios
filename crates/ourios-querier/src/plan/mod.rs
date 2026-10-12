@@ -158,6 +158,42 @@ pub(crate) fn validate(
     now_unix_nano: u64,
     default_window_nanos: u64,
 ) -> Result<Validated, QueryError> {
+    let aggregate = validate_stages(query)?;
+    reject_body_text_match(&query.predicate)?;
+    check_regex_patterns(&query.predicate)?;
+    let window = resolve_window(&query.stages, now_unix_nano, default_window_nanos)?;
+    let limit = query.stages.iter().rev().find_map(|s| match s {
+        Stage::Limit(n) => Some(*n),
+        _ => None,
+    });
+    let limit = match limit {
+        Some(n) => Some(usize::try_from(n).map_err(|_| QueryError::InvalidQuery {
+            detail: format!("limit {n} is too large"),
+        })?),
+        None => None,
+    };
+    // `Terminal::Aggregate` executes its own grouped-count scan and never
+    // consults `plan.limit` (the aggregation *is* the result — group-limiting
+    // semantics are not implemented), so a `count [by …] | limit n` pipeline
+    // would silently drop the `limit` instead of applying it. Reject the
+    // combination rather than execute the wrong query.
+    if limit.is_some() && aggregate.is_some() {
+        return Err(QueryError::InvalidQuery {
+            detail: "a query with a `count` stage does not support `limit`; \
+                     group-limiting semantics are not implemented yet"
+                .to_string(),
+        });
+    }
+    Ok(Validated {
+        window,
+        limit,
+        aggregate,
+    })
+}
+
+/// Stage support: which stages this slice executes, and the one aggregation
+/// stage, if any, with its group terms checked.
+fn validate_stages(query: &Query) -> Result<Option<Aggregate>, QueryError> {
     // This slice executes `range` (time window), `limit`, `count [by …]`
     // (RFC 0002 amendment 2026-07-15), and the `sum`/`min`/`max`/`avg` scalar
     // aggregates (RFC0002.17, 2026-07-23). The remaining sort / projection /
@@ -202,35 +238,7 @@ pub(crate) fn validate(
             });
         }
     }
-    reject_body_text_match(&query.predicate)?;
-    let window = resolve_window(&query.stages, now_unix_nano, default_window_nanos)?;
-    let limit = query.stages.iter().rev().find_map(|s| match s {
-        Stage::Limit(n) => Some(*n),
-        _ => None,
-    });
-    let limit = match limit {
-        Some(n) => Some(usize::try_from(n).map_err(|_| QueryError::InvalidQuery {
-            detail: format!("limit {n} is too large"),
-        })?),
-        None => None,
-    };
-    // `Terminal::Aggregate` executes its own grouped-count scan and never
-    // consults `plan.limit` (the aggregation *is* the result — group-limiting
-    // semantics are not implemented), so a `count [by …] | limit n` pipeline
-    // would silently drop the `limit` instead of applying it. Reject the
-    // combination rather than execute the wrong query.
-    if limit.is_some() && aggregate.is_some() {
-        return Err(QueryError::InvalidQuery {
-            detail: "a query with a `count` stage does not support `limit`; \
-                     group-limiting semantics are not implemented yet"
-                .to_string(),
-        });
-    }
-    Ok(Validated {
-        window,
-        limit,
-        aggregate,
-    })
+    Ok(aggregate)
 }
 
 /// Validate a `by`-list against the §6.3 amendment rules: `param(n)` only
@@ -303,6 +311,33 @@ fn reject_body_text_match(predicate: &Predicate) -> Result<(), QueryError> {
             ),
         }),
         None => Ok(()),
+    }
+}
+
+/// Every regex pattern (`=~`, `!~`, `matches`, on any field) must compile with
+/// the regex engine `regexp_like` runs (RFC0002.8). Checked on the AST, so a
+/// malformed one is an `InvalidQuery` whatever the scan holds: before any IO,
+/// an empty store's short-circuit, or an absent column's match-nothing.
+fn check_regex_patterns(p: &Predicate) -> Result<(), QueryError> {
+    match p {
+        Predicate::Comparison {
+            op: CmpOp::Match | CmpOp::NotMatch,
+            value: Value::Str(pattern),
+            ..
+        }
+        | Predicate::Call(Call::Matches { arg: pattern, .. }) => regex::Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|e| QueryError::InvalidQuery {
+                detail: format!("invalid regular expression: {e}"),
+            }),
+        Predicate::Not(inner) => check_regex_patterns(inner),
+        Predicate::And(terms) | Predicate::Or(terms) => {
+            terms.iter().try_for_each(check_regex_patterns)
+        }
+        Predicate::Bool(_)
+        | Predicate::Comparison { .. }
+        | Predicate::Severity { .. }
+        | Predicate::Call(_) => Ok(()),
     }
 }
 

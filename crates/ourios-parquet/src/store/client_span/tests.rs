@@ -82,13 +82,14 @@ fn target(path_prefix: &str) -> S3Target {
     S3Target {
         bucket: "bucket".to_owned(),
         region: None,
+        endpoint_host: Some("h".to_owned()),
         path_prefix: path_prefix.to_owned(),
         tracing: Tracing::Global,
     }
 }
 
 fn key(uri: &str, path_prefix: &str) -> Option<String> {
-    object_key(&request("GET", uri, None), &target(path_prefix)).map(str::to_owned)
+    object_key(&request("GET", uri, None), &target(path_prefix))
 }
 
 #[test]
@@ -104,6 +105,39 @@ fn the_key_is_read_path_style_or_virtual_hosted_and_only_for_the_bucket() {
     );
     assert_eq!(key("http://h/bucket2/k", ""), None);
     assert_eq!(key("http://169.254.169.254/latest/api/token", ""), None);
+}
+
+/// Only the configured S3 host addresses the bucket: with a bucket named
+/// like the instance-metadata path, a metadata request is still not an S3
+/// request.
+#[test]
+fn a_request_to_another_host_is_not_an_s3_request() {
+    let latest = S3Target {
+        bucket: "latest".to_owned(),
+        ..target("")
+    };
+    let request = request("GET", "http://169.254.169.254/latest/api/token", None);
+    assert_eq!(object_key(&request, &latest), None);
+}
+
+/// A virtual-hosted request keeps its whole path as the key, even when the
+/// key's first segment is the bucket's name.
+#[test]
+fn a_virtual_hosted_key_may_start_with_the_bucket_name() {
+    assert_eq!(
+        key("http://bucket.h/bucket/foo", ""),
+        Some("bucket/foo".into())
+    );
+}
+
+/// The key is recorded as stored, not as escaped on the wire: a literal
+/// `%2F` in a tenant component travels as `%252F`.
+#[test]
+fn the_key_is_percent_decoded_once() {
+    assert_eq!(
+        key("http://h/bucket/data/tenant_id=a%252Fb/x.parquet", ""),
+        Some("data/tenant_id=a%2Fb/x.parquet".into())
+    );
 }
 
 /// An endpoint configured below a path prefixes every path-style request
@@ -185,7 +219,9 @@ fn a_failed_request_in_a_query_phase_is_an_error_client_span() {
     let traced = Traced::new();
     let port = fake_s3(vec![NOT_FOUND]);
     let store = traced.store(port);
-    under(traced.phase(), || {
+    let phase = traced.phase();
+    let parent = phase.span().span_context().span_id();
+    under(phase, || {
         let err = store.get_blocking("data/a.parquet").expect_err("404");
         assert!(err.is_not_found(), "{err:?}");
     });
@@ -195,6 +231,7 @@ fn a_failed_request_in_a_query_phase_is_an_error_client_span() {
         panic!("one CLIENT span, got {spans:?}");
     };
     assert_eq!(span.name.as_ref(), "S3.GetObject");
+    assert_eq!(span.parent_span_id, parent, "parented to the phase span");
     assert!(
         matches!(span.status, Status::Error { .. }),
         "{:?}",

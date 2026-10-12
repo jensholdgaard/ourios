@@ -41,7 +41,8 @@ pub(super) fn client(
     let target = S3Target {
         bucket: bucket.trim().to_owned(),
         region: region.clone(),
-        path_prefix: endpoint_path(endpoint.as_deref()),
+        endpoint_host: endpoint.as_deref().map(endpoint_host),
+        path_prefix: endpoint.as_deref().map(endpoint_path).unwrap_or_default(),
         tracing,
     };
     let builder = authenticated(
@@ -69,20 +70,31 @@ pub(super) fn client(
     Ok((s3, prefix))
 }
 
-/// The path an endpoint override sits below (`/prefix`), without a trailing
-/// slash; empty for no endpoint or one at the host root.
-fn endpoint_path(endpoint: Option<&str>) -> String {
-    let Some(endpoint) = endpoint else {
-        return String::new();
-    };
+/// An endpoint override's authority and path: what follows the scheme,
+/// split at the first `/`.
+fn endpoint_parts(endpoint: &str) -> (&str, &str) {
     let after_scheme = endpoint
         .split_once("://")
         .map_or(endpoint, |(_, rest)| rest);
     after_scheme
         .find('/')
-        .map_or("", |slash| &after_scheme[slash..])
-        .trim_end_matches('/')
-        .to_owned()
+        .map_or((after_scheme, ""), |slash| after_scheme.split_at(slash))
+}
+
+/// The host of an endpoint override, as a request URI reports it: no port,
+/// an IPv6 literal kept in brackets.
+fn endpoint_host(endpoint: &str) -> String {
+    let (authority, _) = endpoint_parts(endpoint);
+    match authority.strip_prefix('[') {
+        Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
+        None => authority.split(':').next().unwrap_or_default().to_owned(),
+    }
+}
+
+/// The path an endpoint override sits below (`/prefix`), without a trailing
+/// slash; empty for one at the host root.
+fn endpoint_path(endpoint: &str) -> String {
+    endpoint_parts(endpoint).1.trim_end_matches('/').to_owned()
 }
 
 /// A builder for `bucket` carrying the credentials, explicit or from the
@@ -180,14 +192,20 @@ fn addressed(
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_path;
+    use super::{endpoint_host, endpoint_path};
 
     #[test]
     fn the_endpoint_path_is_what_sits_below_the_host() {
-        assert_eq!(endpoint_path(None), "");
-        assert_eq!(endpoint_path(Some("http://h:9000")), "");
-        assert_eq!(endpoint_path(Some("http://h:9000/")), "");
-        assert_eq!(endpoint_path(Some("https://h/s3/")), "/s3");
-        assert_eq!(endpoint_path(Some("https://h/a/b")), "/a/b");
+        assert_eq!(endpoint_path("http://h:9000"), "");
+        assert_eq!(endpoint_path("http://h:9000/"), "");
+        assert_eq!(endpoint_path("https://h/s3/"), "/s3");
+        assert_eq!(endpoint_path("https://h/a/b"), "/a/b");
+    }
+
+    #[test]
+    fn the_endpoint_host_drops_the_port_and_keeps_ipv6_brackets() {
+        assert_eq!(endpoint_host("http://127.0.0.1:9000/s3"), "127.0.0.1");
+        assert_eq!(endpoint_host("https://minio.example"), "minio.example");
+        assert_eq!(endpoint_host("http://[::1]:9000"), "[::1]");
     }
 }

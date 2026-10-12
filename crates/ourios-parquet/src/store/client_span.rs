@@ -63,6 +63,10 @@ impl Tracing {
 pub(super) struct S3Target {
     pub(super) bucket: String,
     pub(super) region: Option<String>,
+    /// The configured endpoint's host, `None` for the AWS default, where
+    /// the S3 hosts are under `amazonaws.com`. A request to any other host
+    /// (instance metadata, a credential endpoint) is not an S3 request.
+    pub(super) endpoint_host: Option<String>,
     /// The configured endpoint's path (`/prefix`), empty for none: an
     /// endpoint override may sit below a path, and path-style requests then
     /// start with it.
@@ -142,7 +146,7 @@ fn in_traced_phase(cx: &Context) -> bool {
 /// AWS SDK / S3 ones.
 fn attributes(
     operation: S3Operation,
-    key: &str,
+    key: String,
     target: &S3Target,
     request_attributes: &[KeyValue],
 ) -> Vec<KeyValue> {
@@ -155,7 +159,7 @@ fn attributes(
         attributes.push(KeyValue::new("rpc.method", method));
     }
     if operation.on_object() && !key.is_empty() {
-        attributes.push(KeyValue::new("aws.s3.key", key.to_owned()));
+        attributes.push(KeyValue::new("aws.s3.key", key));
     }
     if let Some(region) = &target.region {
         attributes.push(KeyValue::new("cloud.region", region.clone()));
@@ -163,21 +167,37 @@ fn attributes(
     attributes
 }
 
-/// The object key `req` addresses in the target's bucket, path-style
-/// (`[/prefix]/bucket/key`) or virtual-hosted (`bucket.host[/prefix]/key`);
-/// empty for a bucket-level request, `None` for a request to anything but
-/// the bucket.
-fn object_key<'r>(req: &'r HttpRequest, target: &S3Target) -> Option<&'r str> {
+/// The object key `req` addresses in the target's bucket, decoded from
+/// the request path: virtual-hosted (`bucket.host[/prefix]/key`) or
+/// path-style (`host[/prefix]/bucket/key`). Empty for a bucket-level
+/// request, `None` for a request to anything but the bucket on the
+/// configured S3 host.
+fn object_key(req: &HttpRequest, target: &S3Target) -> Option<String> {
+    let host = req.uri().host()?;
     let path = below_prefix(req.uri().path(), &target.path_prefix)?;
     let bucket = target.bucket.as_str();
-    let virtual_hosted = req
-        .uri()
-        .host()
-        .and_then(|host| host.strip_prefix(bucket))
-        .is_some_and(|rest| rest.starts_with('.'));
-    let path_style = below_prefix(path, &format!("/{bucket}"))
-        .map(|rest| rest.strip_prefix('/').unwrap_or(rest));
-    path_style.or_else(|| virtual_hosted.then(|| path.trim_start_matches('/')))
+    let encoded = match host.strip_prefix(bucket).and_then(|h| h.strip_prefix('.')) {
+        Some(base) if is_s3_host(base, target) => path.trim_start_matches('/'),
+        _ if is_s3_host(host, target) => {
+            let rest = below_prefix(path, &format!("/{bucket}"))?;
+            rest.strip_prefix('/').unwrap_or(rest)
+        }
+        _ => return None,
+    };
+    Some(
+        percent_encoding::percent_decode_str(encoded)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
+}
+
+/// Whether `host` is the configured S3 endpoint, or an AWS S3 host when no
+/// endpoint is configured.
+fn is_s3_host(host: &str, target: &S3Target) -> bool {
+    match &target.endpoint_host {
+        Some(endpoint) => host == endpoint,
+        None => host.ends_with(".amazonaws.com"),
+    }
 }
 
 /// `path` with `prefix` removed, where `prefix` ends at a path-segment

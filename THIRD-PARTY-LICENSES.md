@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 338 |
+| `Apache-2.0` | 340 |
 | `MIT` | 69 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 9 |
@@ -921,36 +921,36 @@ Used by:
 
 Used by:
 
-- `datafusion-catalog-listing` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-catalog` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-common-runtime` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-common` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-arrow` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-csv` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-json` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource-parquet` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-datasource` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-doc` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-execution` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr-common` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-expr` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate-common` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-aggregate` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-nested` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-table` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window-common` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions-window` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-functions` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-macros` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-optimizer` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-adapter` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr-common` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-expr` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-optimizer` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-physical-plan` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-pruning` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion-session` 55.1.0 — <https://github.com/apache/datafusion>
-- `datafusion` 55.1.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog-listing` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-catalog` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-common-runtime` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-common` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-arrow` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-csv` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-json` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource-parquet` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-datasource` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-doc` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-execution` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr-common` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-expr` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate-common` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-aggregate` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-nested` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-table` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window-common` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions-window` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-functions` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-macros` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-optimizer` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-adapter` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr-common` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-expr` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-optimizer` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-physical-plan` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-pruning` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion-session` 55.2.0 — <https://github.com/apache/datafusion>
+- `datafusion` 55.2.0 — <https://github.com/apache/datafusion>
 
 <details>
 <summary>Full license text</summary>
@@ -3596,7 +3596,7 @@ limitations under the License.
 
 Used by:
 
-- `tokio-rustls` 0.26.5 — <https://github.com/rustls/tokio-rustls>
+- `tokio-rustls` 0.26.6 — <https://github.com/rustls/tokio-rustls>
 
 <details>
 <summary>Full license text</summary>
@@ -4679,6 +4679,7 @@ limitations under the License.
 
 Used by:
 
+- `core_detect` 1.0.0 — <https://github.com/thomcc/core_detect>
 - `rsa` 0.9.10 — <https://github.com/RustCrypto/RSA>
 
 <details>
@@ -4932,6 +4933,7 @@ Used by:
 - `idna` 1.1.0 — <https://github.com/servo/rust-url/>
 - `idna_adapter` 1.2.2 — <https://github.com/hsivonen/idna_adapter>
 - `indexmap` 2.14.0 — <https://github.com/indexmap-rs/indexmap>
+- `itertools` 0.13.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.14.0 — <https://github.com/rust-itertools/itertools>
 - `itertools` 0.15.0 — <https://github.com/rust-itertools/itertools>
 - `jobserver` 0.1.34 — <https://github.com/rust-lang/jobserver-rs>
@@ -4955,13 +4957,13 @@ Used by:
 - `percent-encoding` 2.3.2 — <https://github.com/servo/rust-url/>
 - `petgraph` 0.8.3 — <https://github.com/petgraph/petgraph>
 - `pkg-config` 0.3.33 — <https://github.com/rust-lang/pkg-config-rs>
-- `proptest` 1.11.0 — <https://github.com/proptest-rs/proptest>
+- `proptest` 1.12.0 — <https://github.com/proptest-rs/proptest>
 - `prost-derive` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `prost-types` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `prost` 0.14.4 — <https://github.com/tokio-rs/prost>
 - `regex-automata` 0.4.18 — <https://github.com/rust-lang/regex>
 - `regex-syntax` 0.8.11 — <https://github.com/rust-lang/regex>
-- `regex` 1.12.4 — <https://github.com/rust-lang/regex>
+- `regex` 1.13.1 — <https://github.com/rust-lang/regex>
 - `ring` 0.17.14 — <https://github.com/briansmith/ring>
 - `rustc_version` 0.4.1 — <https://github.com/djc/rustc-version-rs>
 - `rustix` 1.1.5 — <https://github.com/bytecodealliance/rustix>
@@ -4973,14 +4975,14 @@ Used by:
 - `security-framework` 3.7.0 — <https://github.com/kornelski/rust-security-framework>
 - `signal-hook-registry` 1.4.8 — <https://github.com/vorner/signal-hook>
 - `smallvec` 1.15.2 — <https://github.com/servo/rust-smallvec>
-- `socket2` 0.6.4 — <https://github.com/rust-lang/socket2>
+- `socket2` 0.6.5 — <https://github.com/rust-lang/socket2>
 - `stable_deref_trait` 1.2.1 — <https://github.com/storyyeller/stable_deref_trait>
 - `tempfile` 3.27.0 — <https://github.com/Stebalien/tempfile>
 - `thread_local` 1.1.9 — <https://github.com/Amanieu/thread_local-rs>
 - `unicode-segmentation` 1.13.3 — <https://github.com/unicode-rs/unicode-segmentation>
 - `unicode-width` 0.2.2 — <https://github.com/unicode-rs/unicode-width>
 - `url` 2.5.8 — <https://github.com/servo/rust-url>
-- `uuid` 1.26.1 — <https://github.com/uuid-rs/uuid>
+- `uuid` 1.28.0 — <https://github.com/uuid-rs/uuid>
 - `version_check` 0.9.5 — <https://github.com/SergioBenitez/version_check>
 - `wait-timeout` 0.2.1 — <https://github.com/alexcrichton/wait-timeout>
 - `wasi` 0.11.1+wasi-snapshot-preview1 — <https://github.com/bytecodealliance/wasi>
@@ -5424,8 +5426,8 @@ limitations under the License.
 
 Used by:
 
-- `bit-set` 0.8.0 — <https://github.com/contain-rs/bit-set>
-- `bit-vec` 0.8.0 — <https://github.com/contain-rs/bit-vec>
+- `bit-set` 0.11.1 — <https://github.com/contain-rs/bit-vec>
+- `bit-vec` 0.10.1 — <https://github.com/contain-rs/bit-vec>
 - `lexical-core` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
 - `lexical-parse-float` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
 - `lexical-parse-integer` 1.0.6 — <https://github.com/Alexhuszagh/rust-lexical>
@@ -6978,7 +6980,7 @@ Used by:
 - `allocator-api2` 0.2.21 — <https://github.com/zakarumych/allocator-api2>
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>
-- `async-trait` 0.1.89 — <https://github.com/dtolnay/async-trait>
+- `async-trait` 0.1.92 — <https://github.com/dtolnay/async-trait>
 - `blake3` 1.8.7 — <https://github.com/BLAKE3-team/BLAKE3>
 - `const-hex` 1.19.1 — <https://github.com/danipopes/const-hex>
 - `constant_time_eq` 0.4.2 — <https://github.com/cesarb/constant_time_eq>
@@ -6989,7 +6991,7 @@ Used by:
 - `half` 2.7.1 — <https://github.com/VoidStarKat/half-rs>
 - `ident_case` 1.0.1 — <https://github.com/TedDriggs/ident_case>
 - `itoa` 1.0.18 — <https://github.com/dtolnay/itoa>
-- `libc` 0.2.186 — <https://github.com/rust-lang/libc>
+- `libc` 0.2.190 — <https://github.com/rust-lang/libc>
 - `miniz_oxide` 0.9.1 — <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
 - `num-conv` 0.2.2 — <https://github.com/jhpratt/num-conv>
 - `opentelemetry-appender-tracing` 0.32.0 — <https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-appender-tracing>
@@ -7009,7 +7011,7 @@ Used by:
 - `rand` 0.8.8 — <https://github.com/rust-random/rand>
 - `rand` 0.9.4 — <https://github.com/rust-random/rand>
 - `rand_chacha` 0.9.0 — <https://github.com/rust-random/rand>
-- `rand_xorshift` 0.4.0 — <https://github.com/rust-random/rngs>
+- `rand_xorshift` 0.5.0 — <https://github.com/rust-random/rngs>
 - `ref-cast-impl` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `ref-cast` 1.0.25 — <https://github.com/dtolnay/ref-cast>
 - `rmcp-macros` 2.2.0 — <https://github.com/modelcontextprotocol/rust-sdk/>
@@ -7022,7 +7024,7 @@ Used by:
 - `serde_core` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_derive` 1.0.229 — <https://github.com/serde-rs/serde>
 - `serde_derive_internals` 0.30.0 — <https://github.com/serde-rs/serde>
-- `serde_json` 1.0.151 — <https://github.com/serde-rs/json>
+- `serde_json` 1.0.154 — <https://github.com/serde-rs/json>
 - `serde_urlencoded` 0.7.1 — <https://github.com/nox/serde_urlencoded>
 - `shlex` 2.0.1 — <https://github.com/comex/rust-shlex>
 - `simdutf8` 0.1.5 — <https://github.com/rusticstuff/simdutf8>
@@ -8331,7 +8333,7 @@ THE SOFTWARE.
 
 Used by:
 
-- `hyper` 1.10.1 — <https://github.com/hyperium/hyper>
+- `hyper` 1.12.0 — <https://github.com/hyperium/hyper>
 
 <details>
 <summary>Full license text</summary>
@@ -8504,7 +8506,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `want` 0.3.1 — <https://github.com/seanmonstar/want>
+- `want` 0.3.2 — <https://github.com/seanmonstar/want>
 
 <details>
 <summary>Full license text</summary>
@@ -8929,7 +8931,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `hyper-util` 0.1.20 — <https://github.com/hyperium/hyper-util>
+- `hyper-util` 0.1.21 — <https://github.com/hyperium/hyper-util>
 
 <details>
 <summary>Full license text</summary>
@@ -9390,7 +9392,7 @@ Used by:
 
 - `tokio-stream` 0.1.19 — <https://github.com/tokio-rs/tokio>
 - `tokio-util` 0.7.18 — <https://github.com/tokio-rs/tokio>
-- `tokio` 1.53.1 — <https://github.com/tokio-rs/tokio>
+- `tokio` 1.53.2 — <https://github.com/tokio-rs/tokio>
 
 <details>
 <summary>Full license text</summary>

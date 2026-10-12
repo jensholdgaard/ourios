@@ -633,6 +633,20 @@ low-cardinality.
    canary proving that the harness sees a span opened inside
    `spawn_blocking`.
 
+> **Amendment (2026-10-12, #966, maintainer-approved) — a scoped harness
+> for the template-map spans.** Item 3 still binds the server-level
+> RFC0038.1 query-arm and RFC0038.8 tests. The template-map acquisition is
+> an exception: it hands the caller's `tracing` dispatcher to its
+> blocking-pool thread along with its span, so its spans can be asserted
+> under a scoped subscriber. In production the caller's dispatcher is the
+> global default, so the forwarding changes nothing there. Under a scoped
+> subscriber it is what makes the fold's span visible, so a regression at
+> this boundary removes `derive template_map` or its parent, which the
+> tests assert. These tests live in the crate's consolidated `it` binary
+> (RFC 0028) and install nothing process-global. The store-bridge boundary
+> is covered separately, at the connector, with a tracer of the test's own
+> (§6).
+
 #### 3.7.5 Names and the registry
 
 Upstream attributes are used where they exist: `rpc.system`,
@@ -930,6 +944,19 @@ are `drafted`.
 > **And** the harness lives in its own test binary so the global install
 > does not reach other tests (the `rfc0038_1_mcp_span.rs` pattern).
 
+> **Amendment (2026-10-12, #966, maintainer-approved) — RFC0038.9's
+> scope.** RFC0038.9 governs the harness of the server-level tests
+> (RFC0038.1's query arm, RFC0038.8). The template-map span tests satisfy
+> its intent another way, per the §3.7.4 item 3 amendment:
+>
+> - **Blocking pool:** `a_cold_acquisition_spans_the_load_and_its_derive_under_the_query`
+>   asserts a span opened inside `spawn_blocking` (`derive template_map`)
+>   is exported with its parent. It runs under a scoped subscriber, which
+>   the acquisition's dispatcher forwarding reaches.
+> - **Store bridge:** the `ourios-parquet` client-span tests drive real
+>   requests through `block_on_off_runtime` under an attached phase
+>   context, and assert the parented `CLIENT` span.
+
 > **Scenario RFC0038.10 — `CLIENT` spans appear only under a query phase,
 > and never as roots.**
 > **Given** traces enabled and an S3-backed server,
@@ -1061,27 +1088,39 @@ Mapped to `CLAUDE.md` §6.2:
 >   - `a_cold_acquisition_spans_the_load_and_its_derive_under_the_query`
 >     checks `derive` under `load` under the query, with outcome and reason
 >     `miss`.
+>   - `only_a_lookup_that_folds_opens_a_derive_span` walks one tenant
+>     through `miss` (one fold), `hit` (no fold) and, after a new audit
+>     file, `stale` (one fold with reason `stale`).
+>   - `torn` and `unknown_version` take the same fold path as these two
+>     outcomes; only the reason value differs. Those values are pinned
+>     per outcome by the RFC0033.7 `derive.reason` metric test
+>     (`tests/rfc0033_7_observability.rs`).
 >   - `a_query_joining_an_acquisition_spans_its_wait` (`testing` feature)
->     covers RFC0038.12.
+>     covers RFC0038.12, including that the joining query has no
+>     `derive template_map` of its own.
 >   - `a_failed_fold_marks_the_derive_and_load_spans_error` covers
 >     RFC0038.13.
 >
->   These tests use a scoped subscriber over a local tracer provider, not
->   the RFC0038.9 global harness. That works because the acquisition hands
->   the caller's `tracing` dispatcher to its blocking-pool thread along with
->   its span, so a scoped subscriber sees the fold's span. The
->   cold-acquisition test is the blocking-pool canary for this path.
-> - **RFC0038.8 (`CLIENT` shape), RFC0038.14, RFC0038.15** — unit tests in
->   `crates/ourios-parquet/src/store/client_span.rs` against a fake S3
->   endpoint:
+>   These tests use a scoped subscriber over a local tracer provider, as
+>   the §3.7.4 item 3 and RFC0038.9 amendments allow.
+> - **RFC0038.8 (`CLIENT` shape), RFC0038.10 (connector half),
+>   RFC0038.14, RFC0038.15** — unit tests in
+>   `crates/ourios-parquet/src/store/client_span/tests.rs` against a fake
+>   S3 endpoint. Each test uses a tracer of its own, so nothing global is
+>   installed:
 >   - `a_failed_request_in_a_query_phase_is_an_error_client_span`: a 404
 >     gives `Error` and `error.type = "404"`, with the AWS and HTTP
 >     attributes.
 >   - `a_successful_request_leaves_its_client_span_unset`.
->   - `an_abandoned_request_leaves_its_client_span_unset`: RFC0038.14.
->   - `a_request_outside_a_query_phase_opens_no_client_span`: RFC0038.10's
->     local half, at the connector.
->   - Two table tests: request to operation name, and key extraction.
+>   - `an_abandoned_request_leaves_its_client_span_unset`: RFC0038.14's
+>     span clause. Its metric clause (the attempt still recorded as
+>     `cancelled`) is the existing
+>     `store::metrics::tests::an_abandoned_s3_request_records_a_cancelled_attempt`.
+>   - `no_client_span_outside_a_traced_query_phase`: no span without the
+>     phase marker, under a sampled-out parent, or under an invalid parent
+>     that carries the sampled flag, which would otherwise be a root.
+>   - Table tests: request to operation name, and key extraction, the
+>     latter including an endpoint configured below a path prefix.
 > - **Existing exact-count tests.** `rfc0038_1_query_emits_one_server_span`
 >   and `rfc0038_1_mcp_tool_emits_one_internal_span` keep asserting their
 >   exact span counts and are unchanged. Both query an empty tenant, which

@@ -47,6 +47,7 @@ mod audit_scan;
 mod body_match;
 mod drift;
 pub mod dsl;
+mod fold_state;
 mod local_publish;
 mod log_row;
 mod map_flight;
@@ -60,6 +61,7 @@ pub mod visibility;
 pub use alias_store::derive_alias_map;
 pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
+pub use fold_state::{FoldState, INCREMENTAL_DEPTH_CAP};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_map::{
     ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME, TemplateMap,

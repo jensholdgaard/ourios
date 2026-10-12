@@ -47,6 +47,7 @@ use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasFold;
+use crate::fold_state::{FoldState, FoldStateJson, HighWater};
 use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
 use crate::{QueryError, StoreRef, audit_scan, local_publish};
 
@@ -387,6 +388,9 @@ pub struct TemplateMap {
     folded_files: Vec<String>,
     registry: TemplateRegistry,
     aliases: AliasMap,
+    /// `None` only for an artifact a pre-amendment writer published; every
+    /// fold this binary runs records one.
+    fold_state: Option<FoldState>,
 }
 
 /// Outcome of reading `template_map.v2.json.zst` bytes — the RFC 0033
@@ -501,8 +505,9 @@ pub enum CacheOutcome {
 /// with the CAS expectation observed by this read (the artifact's `ETag`,
 /// or create-if-absent). A publish failure or lost race is never a query
 /// failure; it abstains entirely when the **compressed** artifact would
-/// not be smaller than the audit bytes just folded (§3.2 amendment —
-/// nothing to win, and the no-artifact path is today's behaviour).
+/// not be smaller than this acquisition's bytes (the artifact GET plus
+/// every audit object fetched, §3.3 amendment 2026-10-12 — nothing to
+/// win, and the no-artifact path is today's behaviour).
 ///
 /// # Errors
 ///
@@ -587,7 +592,7 @@ pub(crate) fn load_or_derive_resolved(
     // always one that answered, mirroring the hit arm's record-at-return.
     announce_binding_conflicts(tenant, &conflicts);
     METRICS.record_lookup(outcome, !conflicts.is_empty());
-    map.write_through(backend, expected.as_deref(), fold_bytes);
+    map.write_through(backend, expected.as_deref(), acquisition_bytes);
     Ok((map, acquisition_bytes, outcome))
 }
 
@@ -724,9 +729,13 @@ fn fold_template_map(
 ) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
     let mut registry = RegistryFold::default();
     let mut aliases = AliasFold::default();
-    let scan = resolved.for_each_event(tenant, |event| match &event.payload {
-        AuditPayload::Template { .. } => registry.push(event),
-        _ => aliases.push(event),
+    let mut high_water = HighWater::default();
+    let scan = resolved.for_each_event(tenant, |event| {
+        high_water.observe(&event);
+        match &event.payload {
+            AuditPayload::Template { .. } => registry.push(event),
+            _ => aliases.push(event),
+        }
     })?;
     let (registry, conflicts) = registry.finish_checked();
     Ok((
@@ -735,6 +744,7 @@ fn fold_template_map(
             folded_files: scan.frontier,
             registry,
             aliases: aliases.finish(),
+            fold_state: Some(FoldState::new(high_water.get(), conflicts.clone(), 0)),
         },
         scan.bytes_read,
         conflicts,
@@ -754,6 +764,11 @@ struct TemplateMapJson {
     folded_files: Vec<String>,
     registry: Vec<RegistryEntry>,
     alias_map: Vec<AliasClass>,
+    /// Absent in an artifact a pre-amendment writer published; that
+    /// writer's reader ignores it, since this struct denies no unknown
+    /// fields (RFC 0033 §3.3 amendment 2026-10-12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fold_state: Option<FoldStateJson>,
 }
 
 /// One `(template_id, version)` registry key with its template in the
@@ -808,6 +823,13 @@ impl TemplateMap {
     #[must_use]
     pub fn alias_map(&self) -> &AliasMap {
         &self.aliases
+    }
+
+    /// The fold state the incremental path extends; `None` for an
+    /// artifact a pre-amendment writer published.
+    #[must_use]
+    pub fn fold_state(&self) -> Option<&FoldState> {
+        self.fold_state.as_ref()
     }
 
     /// The published-object bytes: the canonical JSON body
@@ -885,6 +907,7 @@ impl TemplateMap {
             folded_files: self.folded_files.clone(),
             registry,
             alias_map,
+            fold_state: self.fold_state.as_ref().map(FoldState::to_json),
         })
         .map_err(|e| QueryError::Storage {
             detail: format!("template_map serialization: {e}"),
@@ -959,6 +982,7 @@ impl TemplateMap {
             folded_files: raw.folded_files,
             registry,
             aliases,
+            fold_state: raw.fold_state.map(FoldState::from_json),
         }))
     }
 
@@ -1021,25 +1045,22 @@ impl TemplateMap {
     /// telemetry-only outcomes (the §3.7 publish-outcome counter, via
     /// [`publish_bytes`](Self::publish_bytes)) — and **abstains** when
     /// the **compressed** artifact would not be smaller than
-    /// `folded_audit_bytes`, the audit bytes the fold just read (§3.2
-    /// amendment: the comparison is between the bytes a warm GET would
-    /// pay and the bytes the fold just paid; on a tiny or empty tenant
-    /// even the compressed envelope can exceed the stream it caches,
-    /// and the no-artifact path is exactly today's behaviour). An
-    /// abstention records no publish outcome — §3.7 pins the values to
+    /// `acquisition_bytes`: the artifact bytes this acquisition fetched
+    /// (zero when absent) plus every audit object it fetched — what the
+    /// next acquisition pays at the same listing if this publish is
+    /// skipped (§3.3 amendment 2026-10-12; on a miss it is the folded
+    /// audit bytes, the pre-amendment rule). On a tiny or empty tenant
+    /// even the compressed envelope can exceed what it caches, and the
+    /// no-artifact path is exactly today's behaviour. An abstention
+    /// records no publish outcome — §3.7 pins the values to
     /// `published` / `lost_race` / `error`, and a publish that never
     /// starts is none of them.
-    fn write_through(
-        &self,
-        backend: StoreRef<'_>,
-        expected: Option<&str>,
-        folded_audit_bytes: u64,
-    ) {
+    fn write_through(&self, backend: StoreRef<'_>, expected: Option<&str>, acquisition_bytes: u64) {
         let Ok(bytes) = self.to_artifact_bytes() else {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
             return;
         };
-        if bytes.len() as u64 >= folded_audit_bytes {
+        if bytes.len() as u64 >= acquisition_bytes {
             return;
         }
         // Best-effort by contract: Published and LostRace are both fine,
@@ -1205,7 +1226,17 @@ fn validate(raw: &TemplateMapJson) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    match &raw.fold_state {
+        Some(fold_state) => fold_state.validate(
+            |template_id, version| {
+                raw.registry
+                    .binary_search_by_key(&(template_id, version), |e| (e.template_id, e.version))
+                    .is_ok()
+            },
+            raw.registry.is_empty() && raw.alias_map.is_empty(),
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Whether `name` is a tenant-root-relative `*.parquet` key: one or
@@ -1287,6 +1318,7 @@ mod tests {
             ],
             registry,
             aliases,
+            fold_state: None,
         }
     }
 
@@ -1323,6 +1355,56 @@ mod tests {
         );
         assert_eq!(restored.folded_files(), map.folded_files());
         assert_eq!(restored.tenant(), &tenant());
+    }
+
+    #[test]
+    fn fold_state_round_trips_through_artifact_bytes() {
+        let mut map = sample();
+        map.fold_state = Some(FoldState::new(Some(u64::MAX - 1), vec![(7, 2)], 3));
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(
+            &map.to_artifact_bytes().expect("serialize"),
+            &tenant(),
+        ));
+        assert_eq!(restored.fold_state(), map.fold_state());
+    }
+
+    /// An artifact a pre-amendment writer published has no `fold_state`:
+    /// it reads Valid, ineligible for the incremental path.
+    #[test]
+    fn artifact_without_fold_state_reads_valid() {
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(
+            &sample().to_artifact_bytes().expect("serialize"),
+            &tenant(),
+        ));
+        assert!(restored.fold_state().is_none());
+    }
+
+    #[test]
+    fn invalid_fold_state_is_torn() {
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&sample().to_json().expect("serialize")).expect("json");
+        for (label, fold_state) in [
+            (
+                "conflict key outside the registry",
+                serde_json::json!({ "high_water_ns": 5, "binding_conflicts": [{ "template_id": 99, "version": 1 }], "incremental_depth": 0 }),
+            ),
+            (
+                "null high-water over a non-empty fold",
+                serde_json::json!({ "high_water_ns": null, "binding_conflicts": [], "incremental_depth": 0 }),
+            ),
+            (
+                "depth above the cap",
+                serde_json::json!({ "high_water_ns": 5, "binding_conflicts": [], "incremental_depth": crate::fold_state::INCREMENTAL_DEPTH_CAP + 1 }),
+            ),
+        ] {
+            body["fold_state"] = fold_state;
+            let bytes = compress(&serde_json::to_vec(&body).expect("encode"));
+            let read = TemplateMap::from_artifact_bytes(&bytes, &tenant()).expect("read");
+            assert!(
+                matches!(read, ArtifactRead::Torn { .. }),
+                "{label}: got {read:?}"
+            );
+        }
     }
 
     #[test]

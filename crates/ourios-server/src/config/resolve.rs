@@ -1057,6 +1057,37 @@ querier:
         );
     }
 
+    /// Leaves are captured verbatim (the Collector's string-field rule), so a
+    /// bare boolean or integer reaches the shared validators as its own text
+    /// and still resolves to the typed value — the verbatim capture changes
+    /// spelling, never meaning, for the values the binary parses.
+    #[test]
+    fn verbatim_bare_booleans_and_integers_still_resolve() {
+        let config = server_config(
+            "\
+storage:
+  local:
+    bucket_root: /store
+querier:
+  enabled: true
+  default_window_secs: 3600
+compaction:
+  enabled: false
+",
+        )
+        .expect("valid");
+        assert_eq!(
+            config.querier.expect("enabled: true").default_window_nanos,
+            3600 * NANOS_PER_SEC,
+        );
+
+        let err = server_config(
+            "storage:\n  local:\n    bucket_root: /store\nquerier:\n  enabled: true\n  default_window_secs: 1_000\n",
+        )
+        .expect_err("`1_000` is text the validator rejects, not a silently accepted 1000");
+        assert!(err.contains("1_000"), "names the verbatim value: {err}");
+    }
+
     /// RFC 0059 §3.5 — the bootstrap authorisation is off unless the
     /// file says so, and it rides `${env:…}` like any other value.
     #[test]

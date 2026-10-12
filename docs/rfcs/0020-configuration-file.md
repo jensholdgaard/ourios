@@ -159,10 +159,12 @@ Rules (each is an acceptance scenario in §5):
    > mappings, are still type-resolved; quote such a key to keep its
    > spelling. This follows the OpenTelemetry Collector, which passes the
    > verbatim string to string fields (confmap v0.106,
-   > open-telemetry/opentelemetry-collector#10605). Covered by the
+   > open-telemetry/opentelemetry-collector#10605). Covered by
    > `bare_scalars_reach_string_fields_verbatim`, `bare_null_is_still_absent`
-   > and `verbatim_bare_booleans_and_integers_still_resolve` tests in
-   > `crates/ourios-server/src/config/file.rs`.
+   > and `promoted_bare_entries_keep_the_scalar_model` in
+   > `crates/ourios-server/src/config/file.rs`, and by
+   > `verbatim_bare_booleans_and_integers_still_resolve` in
+   > `crates/ourios-server/src/config/resolve.rs`.
 
 8. A `${…}` reference that does not conform to `REF` (e.g. `${1BAD}`,
    `${A$B}`), **encountered in a scalar value during substitution**, is a

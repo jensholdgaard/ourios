@@ -16,12 +16,14 @@
 //! reproduce (the proptest in `dsl/structured.rs` pins the same contract
 //! over generated trees).
 //!
-//! An accepted log query then goes where `run_query` takes it before any
-//! IO (the querier's `fuzzing` feature): `plan::validate`, then the
-//! compile, the filter and aggregation lowering and `DataFusion`'s
+//! An accepted log query then goes through `run_query`'s planning steps
+//! without its IO (the querier's `fuzzing` feature): `plan::validate`, then
+//! the compile, the filter and aggregation lowering and `DataFusion`'s
 //! analyzer and optimizer over an empty in-memory scan, against the
 //! current writer's schema (one promoted key per RFC 0042 class) and a
-//! scan with every OPTIONAL column absent (RFC0007.4). Nothing executes.
+//! scan with every OPTIONAL column absent (RFC0007.4). Nothing executes,
+//! and the alias map and template registry `run_query` would fetch for
+//! `resolves_to` / `body ==` are empty.
 //! RFC0015.15 asserts:
 //!
 //! - validation accepts or rejects with `InvalidQuery`, the DSL's own

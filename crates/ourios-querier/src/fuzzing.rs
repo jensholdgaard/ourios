@@ -2,13 +2,16 @@
 //! (RFC 0015, RFC0015.15). Behind the `fuzzing` feature; not part of the
 //! stable public API.
 //!
-//! [`lower`] runs what [`Querier::run_query`](crate::Querier::run_query)
-//! does before its first IO: `plan::compile`, `plan::apply` and, for an
-//! aggregation stage, the grouped `Aggregate` node, over an empty in-memory
-//! table with a scan's schema, then `DataFusion`'s analyzer and optimizer.
-//! Nothing is executed. The alias map and template registry are empty (the
-//! store-derived inputs a real query would fold first), and the clock is
-//! fixed so the window resolves the same way on every call.
+//! [`lower`] runs the planning steps of
+//! [`Querier::run_query`](crate::Querier::run_query) without its IO:
+//! `plan::compile`, `plan::apply` and, for an aggregation stage, the grouped
+//! `Aggregate` node, over an empty in-memory table with a scan's schema, then
+//! `DataFusion`'s analyzer and optimizer. Nothing is executed. `run_query`
+//! fetches the tenant's template map before compiling a query that uses
+//! `body ==` or `resolves_to`; here the alias map and template registry it
+//! would supply are empty, so `resolves_to(n)` lowers to `{n}` alone and a
+//! `body ==` literal to its physical arm with no template candidates. The
+//! clock is fixed so the window resolves the same way on every call.
 
 use std::sync::{Arc, LazyLock};
 

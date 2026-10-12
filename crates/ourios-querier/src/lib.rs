@@ -1037,30 +1037,6 @@ impl Querier {
             })?
     }
 
-    /// [`Self::spawn_blocking_io`] for work that is a query phase: `phase` is
-    /// re-entered on the blocking thread *and* attached as the `OTel` context,
-    /// so the object-store requests the closure makes open `CLIENT` spans
-    /// beneath it (RFC 0038 §3.7.3–§3.7.4). Takes the phase span itself —
-    /// `Span::current()` would hand the marker to whatever is current, and an
-    /// ancestor receiving it parents those `CLIENT` spans with no phase span
-    /// between (`crate::phase`).
-    async fn spawn_blocking_phase<T, F>(
-        &self,
-        phase: &tracing::Span,
-        work: F,
-    ) -> Result<T, QueryError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> Result<T, QueryError> + Send + 'static,
-    {
-        let phase = phase.clone();
-        tokio::task::spawn_blocking(move || crate::phase::in_phase(&phase, work))
-            .await
-            .map_err(|e| QueryError::Storage {
-                detail: format!("blocking storage task: {e}"),
-            })?
-    }
-
     /// Resolve the live data files under the tenant's `data/` prefix and turn
     /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
     /// with the listing and manifest reads on the blocking pool:
@@ -1083,13 +1059,12 @@ impl Querier {
     ) -> Result<Vec<ListingTableUrl>, QueryError> {
         // The manifest reads count toward the session's fetched bytes.
         let fetched = fetch_count::counter(ctx).unwrap_or_default();
-        let resolved = self
-            .spawn_blocking_phase(phase, {
-                let backend = self.backend.clone();
-                let prefix = prefix.to_owned();
-                move || resolve_live_set(&backend, &prefix, window, &fetched)
-            })
-            .await?;
+        let resolved = phase::spawn_blocking(phase, {
+            let backend = self.backend.clone();
+            let prefix = prefix.to_owned();
+            move || resolve_live_set(&backend, &prefix, window, &fetched)
+        })
+        .await?;
         match (resolved, &self.backend) {
             (LiveSet::Urls(urls), _) => Ok(urls),
             (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),

@@ -119,3 +119,69 @@ async fn an_empty_file_set_still_spans_the_resolution() {
     assert_eq!(resolve.parent_span_id, query_id);
     assert_eq!(attribute(resolve, LIVE_FILES), Some(Value::I64(0)));
 }
+
+/// Plant a manifest that does not parse in every partition holding data
+/// under `root`, so file-set resolution fails on its first manifest read.
+fn corrupt_manifests(root: &std::path::Path) -> usize {
+    let mut corrupted = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut holds_data = false;
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                holds_data |= path.extension().is_some_and(|e| e == "parquet");
+            }
+        }
+        if holds_data {
+            std::fs::write(
+                dir.join(ourios_parquet::MANIFEST_FILENAME),
+                b"not a manifest",
+            )
+            .expect("corrupt manifest");
+            corrupted += 1;
+        }
+    }
+    corrupted
+}
+
+/// A resolution that fails sets the phase's status to `Error` with
+/// `error.type` and records no live-file count (RFC 0038 §3.7.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_resolution_marks_the_phase_as_an_error() {
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_all(dir.path(), &[simple(TENANT, 1, TS0)]);
+    assert!(
+        corrupt_manifests(dir.path()) > 0,
+        "the fixture wrote a partition"
+    );
+    let querier = Querier::new(dir.path());
+    let parsed = ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
+    let result = querier
+        .run_query(
+            &parsed,
+            &TenantId::new(TENANT),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            None,
+        )
+        .instrument(tracing::info_span!("POST /v1/query"))
+        .with_subscriber(dispatch)
+        .await;
+    assert!(result.is_err(), "a corrupt manifest fails the query");
+    let spans = exporter.get_finished_spans().expect("spans");
+
+    let [resolve] = named(&spans, "resolve files")[..] else {
+        panic!("one resolve span for the failed resolution");
+    };
+    assert!(
+        matches!(resolve.status, opentelemetry::trace::Status::Error { .. }),
+        "{:?}",
+        resolve.status
+    );
+    assert_eq!(text(resolve, "error.type").as_deref(), Some("storage"));
+    assert_eq!(attribute(resolve, LIVE_FILES), None);
+}

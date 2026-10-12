@@ -725,8 +725,13 @@ impl Querier {
             .resolve_data_urls(&ctx, &data_prefix, partition_window, &phase)
             .instrument(phase.clone())
             .await
+            // `i64`, not `usize`/`u64`: tracing-opentelemetry renders a `u64`
+            // field as a string, and §3.7.2 wants a count.
             .inspect(|urls| {
-                phase.record("ourios.file_set.live_files", urls.len() as u64);
+                phase.record(
+                    "ourios.file_set.live_files",
+                    i64::try_from(urls.len()).unwrap_or(i64::MAX),
+                );
             })
             .inspect_err(|e| {
                 ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));

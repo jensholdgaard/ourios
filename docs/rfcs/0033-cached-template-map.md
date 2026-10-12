@@ -625,13 +625,17 @@ uncached query identically.
 >   exactly that compounding.
 > - **Why no extra state:** a skipped publish therefore needs no
 >   separate counter and no forced full fold.
-> - **Abstention on the incremental path is transient.** Each
->   unpublished acquisition re-reads a delta that only grows, while
->   the artifact grows by about one frontier entry per audit file plus
->   the delta's new templates. "Base plus delta bytes" therefore
->   overtakes the new artifact's size and the next write-through
->   publishes. The delta's reads, meanwhile, stay bounded by the full
->   fold they replace.
+> - **What an abstaining incremental path costs.** No eventual
+>   publication is promised. On a stable listing every acquisition
+>   re-derives the same delta from the same base. Compressed JSON is
+>   not guaranteed to drop below base plus delta, so the
+>   write-through may abstain every time. The bound is per
+>   acquisition instead: at most the base artifact plus the delta's
+>   bytes. The gate abstains only when the result would cost at
+>   least that much to GET, so re-reading is the cheaper option by
+>   the gate's own definition. Correctness is unaffected,
+>   since every answer is one guarded step from a stored base within
+>   the cap. No forced-publication rule is added.
 >
 > **Write-through and abstention** (§3.5 pointer amendment). An
 > incremental fold publishes like a full one. Abstention keeps its

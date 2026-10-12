@@ -725,7 +725,9 @@ impl Querier {
             .resolve_data_urls(&ctx, &data_prefix, partition_window, &phase)
             .instrument(phase.clone())
             .await
-            .inspect(|urls| phase.record("ourios.file_set.live_files", urls.len() as u64))
+            .inspect(|urls| {
+                phase.record("ourios.file_set.live_files", urls.len() as u64);
+            })
             .inspect_err(|e| {
                 ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));
             })?;

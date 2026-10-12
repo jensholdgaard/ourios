@@ -2520,6 +2520,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-opentelemetry",
+ "uuid",
  "zstd",
 ]
 

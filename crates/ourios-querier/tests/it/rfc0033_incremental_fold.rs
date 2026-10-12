@@ -268,12 +268,24 @@ fn resolves_rows(bucket: &Path, probe: u64, aliases: Option<&TemplateMap>) -> u6
 }
 
 fn assert_equivalent(acquired: &TemplateMap, full: &TemplateMap) -> Result<(), TestCaseError> {
+    assert_same_folds(acquired, full)?;
+    assert_same_fold_state(acquired, full)
+}
+
+/// The registry, alias map and frontier are the full fold's.
+fn assert_same_folds(acquired: &TemplateMap, full: &TemplateMap) -> Result<(), TestCaseError> {
     prop_assert_eq!(acquired.registry(), full.registry());
     prop_assert_eq!(
         acquired.alias_map().classes(&tenant()),
         full.alias_map().classes(&tenant())
     );
     prop_assert_eq!(acquired.folded_files(), full.folded_files());
+    Ok(())
+}
+
+/// The high-water, binding conflicts and canonical body (depth aside) are
+/// the full fold's.
+fn assert_same_fold_state(acquired: &TemplateMap, full: &TemplateMap) -> Result<(), TestCaseError> {
     let (a, f) = (
         acquired.fold_state().expect("fold state"),
         full.fold_state().expect("fold state"),
@@ -282,6 +294,23 @@ fn assert_equivalent(acquired: &TemplateMap, full: &TemplateMap) -> Result<(), T
     prop_assert_eq!(a.binding_conflicts(), f.binding_conflicts());
     prop_assert_eq!(normalized(acquired), normalized(full));
     Ok(())
+}
+
+/// `acquired` holds the full fold's registry and frontier at
+/// `expected_depth`.
+fn assert_folds_to(acquired: &TemplateMap, full: &TemplateMap, expected_depth: u32, label: &str) {
+    assert_eq!(acquired.registry(), full.registry(), "{label}: registry");
+    assert_eq!(
+        acquired.folded_files(),
+        full.folded_files(),
+        "{label}: frontier"
+    );
+    assert_eq!(depth(acquired), expected_depth, "{label}: depth");
+}
+
+/// The stored local artifact is `expected` at `expected_depth`.
+fn assert_stored(bucket: &Path, expected: &TemplateMap, expected_depth: u32, label: &str) {
+    assert_folds_to(&stored(bucket), expected, expected_depth, label);
 }
 
 proptest! {
@@ -391,17 +420,13 @@ fn rfc0033_11_each_guard_row_falls_back_to_a_full_fold() {
         let (acquired, outcome) = acquire(bucket.path());
         assert_eq!(outcome, CacheOutcome::StaleRefreshed, "{label}");
         let full = full_fold(bucket.path());
-        assert_eq!(acquired.registry(), full.registry(), "{label}");
-        assert_eq!(acquired.folded_files(), full.folded_files(), "{label}");
-        assert_eq!(depth(&acquired), 0, "{label}: a full fold writes depth 0");
-        let republished = stored(bucket.path());
-        assert_eq!(depth(&republished), 0, "{label}: republished");
-        assert_eq!(
-            republished.folded_files(),
-            full.folded_files(),
-            "{label}: the stored artifact is the new full fold, not the base",
+        assert_folds_to(&acquired, &full, 0, label);
+        assert_stored(
+            bucket.path(),
+            &full,
+            0,
+            &format!("{label}: the stored artifact is the new full fold, not the base"),
         );
-        assert_eq!(republished.registry(), full.registry(), "{label}");
     }
 }
 
@@ -417,6 +442,16 @@ fn rfc0033_11_irrelevant_delta_folds_incrementally() {
     let (acquired, _) = acquire(bucket.path());
 
     assert_eq!(depth(&acquired), 1);
+    assert_only_frontier_grew(&acquired, &before);
+    assert_eq!(
+        acquired.folded_files(),
+        full_fold(bucket.path()).folded_files()
+    );
+}
+
+/// `acquired` keeps `before`'s registry and high-water and folds exactly
+/// one more file.
+fn assert_only_frontier_grew(acquired: &TemplateMap, before: &TemplateMap) {
     assert_eq!(acquired.registry(), before.registry());
     assert_eq!(
         acquired
@@ -429,10 +464,6 @@ fn rfc0033_11_irrelevant_delta_folds_incrementally() {
     assert_eq!(
         acquired.folded_files().len(),
         before.folded_files().len() + 1
-    );
-    assert_eq!(
-        acquired.folded_files(),
-        full_fold(bucket.path()).folded_files()
     );
 }
 
@@ -478,8 +509,12 @@ fn rfc0033_11_unpublished_results_never_exceed_the_cap() {
     set_mode(0o555);
     for _ in 0..2 {
         let (acquired, _) = acquire(bucket.path());
-        assert_eq!(depth(&acquired), INCREMENTAL_DEPTH_CAP);
-        assert_eq!(acquired.registry(), full_fold(bucket.path()).registry());
+        assert_folds_to(
+            &acquired,
+            &full_fold(bucket.path()),
+            INCREMENTAL_DEPTH_CAP,
+            "unpublished",
+        );
     }
     let after = std::fs::read(artifact_path(bucket.path())).expect("read");
     set_mode(0o755);
@@ -489,8 +524,12 @@ fn rfc0033_11_unpublished_results_never_exceed_the_cap() {
     );
 
     let (published, _) = acquire(bucket.path());
-    assert_eq!(depth(&published), INCREMENTAL_DEPTH_CAP);
-    assert_eq!(depth(&stored(bucket.path())), INCREMENTAL_DEPTH_CAP);
+    assert_stored(
+        bucket.path(),
+        &published,
+        INCREMENTAL_DEPTH_CAP,
+        "the depth-256 result is published",
+    );
     write_audit(bucket.path(), &[event(TS0 + 30, created(4, "b"))]);
     let (capped, _) = acquire(bucket.path());
     assert_eq!(depth(&capped), 0, "the cap forces a full fold");
@@ -590,11 +629,11 @@ fn rfc0033_12_older_fold_over_newer_is_only_staler() {
     let (acquired, outcome) = acquire(bucket.path());
 
     assert_eq!(outcome, CacheOutcome::StaleRefreshed);
-    assert_eq!(depth(&acquired), depth(&older) + 1);
-    assert_eq!(acquired.registry(), full_fold(bucket.path()).registry());
-    assert_eq!(
-        acquired.folded_files(),
-        full_fold(bucket.path()).folded_files()
+    assert_folds_to(
+        &acquired,
+        &full_fold(bucket.path()),
+        depth(&older) + 1,
+        "extended from the older fold",
     );
 }
 
@@ -606,6 +645,12 @@ fn rfc0033_12_backdated_late_file_forces_a_full_fold() {
     write_audit(bucket.path(), &[event(TS0 + 20, created(3, "a"))]);
     let (incremental, _) = acquire(bucket.path());
     assert_eq!(depth(&incremental), 1);
+    assert_stored(
+        bucket.path(),
+        &incremental,
+        1,
+        "the late file lands on a published incremental base",
+    );
 
     write_audit(
         bucket.path(),
@@ -613,9 +658,7 @@ fn rfc0033_12_backdated_late_file_forces_a_full_fold() {
     );
     let (acquired, _) = acquire(bucket.path());
 
-    assert_eq!(depth(&acquired), 0);
-    let full = full_fold(bucket.path());
-    assert_eq!(acquired.registry(), full.registry());
+    assert_folds_to(&acquired, &full_fold(bucket.path()), 0, "late file");
     assert_eq!(
         acquired
             .fold_state()
@@ -705,6 +748,24 @@ fn acquire_measured(bucket: &Path) -> Measured {
     }
 }
 
+/// What an acquisition is expected to have cost and done.
+struct Expected {
+    depth: u32,
+    acquisition_bytes: u64,
+    published: bool,
+}
+
+/// `m` matches `expected` and its map equals the full fold over `bucket`.
+fn assert_measured(m: &Measured, bucket: &Path, expected: &Expected, label: &str) {
+    assert_eq!(depth(&m.map), expected.depth, "{label}: depth");
+    assert_eq!(
+        m.acquisition_bytes, expected.acquisition_bytes,
+        "{label}: acquisition bytes"
+    );
+    assert_eq!(m.published, expected.published, "{label}: published");
+    assert_equivalent(&m.map, &full_fold(bucket)).expect("equals the full fold");
+}
+
 /// The listed keys `after` adds to `before`.
 fn added(before: &[String], after: &[String]) -> Vec<String> {
     after
@@ -733,19 +794,17 @@ fn rfc0033_11_incremental_abstention_weighs_base_plus_delta() {
         bucket.path(),
         &added(base.folded_files(), m.map.folded_files()),
     );
-    assert_eq!(depth(&m.map), 1);
-    assert_eq!(
-        m.acquisition_bytes,
-        base_len + delta,
-        "artifact GET + delta"
-    );
     assert!(
         delta <= m.result_bytes && m.result_bytes < base_len + delta,
         "the publish window: delta={delta} result={} base={base_len}",
         m.result_bytes,
     );
-    assert!(m.published);
-    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+    let expected = Expected {
+        depth: 1,
+        acquisition_bytes: base_len + delta,
+        published: true,
+    };
+    assert_measured(&m, bucket.path(), &expected, "artifact GET + delta");
 
     let bucket = TempDir::new().expect("temp dir");
     write_audit(bucket.path(), &[event(TS0 + 10, created(1, "user <*>"))]);
@@ -759,19 +818,17 @@ fn rfc0033_11_incremental_abstention_weighs_base_plus_delta() {
         bucket.path(),
         &added(base.folded_files(), m.map.folded_files()),
     );
-    assert_eq!(depth(&m.map), 1);
-    assert_eq!(
-        m.acquisition_bytes,
-        base_len + delta,
-        "artifact GET + delta"
-    );
     assert!(
         m.result_bytes >= base_len + delta,
         "the abstain side: delta={delta} result={} base={base_len}",
         m.result_bytes,
     );
-    assert!(!m.published);
-    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+    let expected = Expected {
+        depth: 1,
+        acquisition_bytes: base_len + delta,
+        published: false,
+    };
+    assert_measured(&m, bucket.path(), &expected, "artifact GET + delta");
 }
 
 /// RFC0033.11 size boundary, out-of-order fallback: the write-through
@@ -794,20 +851,19 @@ fn rfc0033_11_fallback_abstention_weighs_every_fetched_byte() {
         &added(base.folded_files(), m.map.folded_files()),
     );
     let folded = audit_bytes(bucket.path(), m.map.folded_files());
-    assert_eq!(depth(&m.map), 0, "the guard fell back");
-    assert_eq!(
-        m.acquisition_bytes,
-        base_len + delta + folded,
-        "artifact GET + rejected delta read + full fold",
-    );
     assert!(
         folded <= m.result_bytes && m.result_bytes < m.acquisition_bytes,
         "the publish window: folded={folded} result={} acquisition={}",
         m.result_bytes,
         m.acquisition_bytes,
     );
-    assert!(m.published);
-    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+    let expected = Expected {
+        depth: 0,
+        acquisition_bytes: base_len + delta + folded,
+        published: true,
+    };
+    let label = "the guard fell back: artifact GET + rejected delta read + full fold";
+    assert_measured(&m, bucket.path(), &expected, label);
 
     // An emptied registry keeps the stored artifact Valid at the same
     // frontier and high-water while its GET stays small, so the bulky
@@ -828,16 +884,19 @@ fn rfc0033_11_fallback_abstention_weighs_every_fetched_byte() {
         &added(base.folded_files(), m.map.folded_files()),
     );
     let folded = audit_bytes(bucket.path(), m.map.folded_files());
-    assert_eq!(depth(&m.map), 0, "the guard fell back");
-    assert_eq!(m.acquisition_bytes, base_len + delta + folded);
     assert!(
         m.result_bytes >= m.acquisition_bytes,
         "the abstain side: result={} acquisition={}",
         m.result_bytes,
         m.acquisition_bytes,
     );
-    assert!(!m.published);
-    assert_equivalent(&m.map, &full_fold(bucket.path())).expect("equals the full fold");
+    let expected = Expected {
+        depth: 0,
+        acquisition_bytes: base_len + delta + folded,
+        published: false,
+    };
+    let label = "the guard fell back: artifact GET + rejected delta read + full fold";
+    assert_measured(&m, bucket.path(), &expected, label);
 }
 
 /// Persist `events` to `store`'s audit stream, one file per event.
@@ -853,28 +912,39 @@ fn write_audit_to(store: &Store, events: &[AuditEvent]) {
     );
 }
 
-/// The RFC0033.12 arm on a conditional-put store: an incremental result
-/// publishes at the observed `ETag`; a second querier that extended the
-/// same stale artifact loses the CAS (`lost_race`) with its answer still
-/// the full fold's; two queriers racing for real both answer correctly
-/// and leave a Valid artifact; and a backdated late file forces a full
-/// fold that includes it.
-fn incremental_publish_resolves_by_cas(store: &Store) {
-    let remote = StoreRef::Remote(store);
+/// The Valid artifact `store` holds for the tenant, and its `ETag`.
+fn held(store: &Store) -> (TemplateMap, String) {
     let key = format!("audit/tenant_id={TENANT}/{TEMPLATE_MAP_FILENAME}");
-    let held = || {
-        let (bytes, e_tag) = store
-            .get_with_etag_blocking_opt(&key)
-            .expect("get")
-            .expect("artifact present");
-        match TemplateMap::from_artifact_bytes(&bytes, &tenant()).expect("read") {
-            ArtifactRead::Valid(map) => (map, e_tag.expect("the store exposes an ETag")),
-            other => panic!("the stored artifact must be Valid, got {other:?}"),
-        }
-    };
-    let full = || derive_template_map(remote, &tenant()).expect("full fold").0;
-    let acquire = || load_or_derive(remote, &tenant()).expect("acquire");
+    let (bytes, e_tag) = store
+        .get_with_etag_blocking_opt(&key)
+        .expect("get")
+        .expect("artifact present");
+    match TemplateMap::from_artifact_bytes(&bytes, &tenant()).expect("read") {
+        ArtifactRead::Valid(map) => (map, e_tag.expect("the store exposes an ETag")),
+        other => panic!("the stored artifact must be Valid, got {other:?}"),
+    }
+}
 
+/// `store` holds `expected`'s frontier at `expected_depth`.
+fn assert_held(store: &Store, expected: &TemplateMap, expected_depth: u32, label: &str) {
+    let (map, _) = held(store);
+    assert_eq!(
+        map.folded_files(),
+        expected.folded_files(),
+        "{label}: frontier"
+    );
+    assert_eq!(depth(&map), expected_depth, "{label}: depth");
+}
+
+/// `acquired` is at `expected_depth` and equals the full fold `full`.
+fn assert_acquired(acquired: &TemplateMap, full: &TemplateMap, expected_depth: u32, label: &str) {
+    assert_eq!(depth(acquired), expected_depth, "{label}: depth");
+    assert_equivalent(acquired, full).expect("equals the full fold");
+}
+
+/// Write two creations to `store` and publish their full fold directly.
+fn publish_remote_base(store: &Store) {
+    let remote = StoreRef::Remote(store);
     write_audit_to(
         store,
         &[
@@ -882,20 +952,31 @@ fn incremental_publish_resolves_by_cas(store: &Store) {
             event(TS0 + 10, created(2, "job <*>")),
         ],
     );
+    let (base, _) = derive_template_map(remote, &tenant()).expect("full fold");
     assert_eq!(
-        full().publish(remote, None).expect("publish the base"),
+        base.publish(remote, None).expect("publish the base"),
         PublishOutcome::Published,
     );
+}
+
+/// The RFC0033.12 arm on a conditional-put store: an incremental result
+/// publishes at the observed `ETag`; a second querier that extended the
+/// same stale artifact loses the CAS (`lost_race`) with its answer still
+/// the full fold's; two queriers racing for real both answer correctly
+/// and leave a Valid incremental artifact; and a backdated late file on
+/// that published incremental base forces a full fold that includes it.
+fn incremental_publish_resolves_by_cas(store: &Store) {
+    let remote = StoreRef::Remote(store);
+    let full = || derive_template_map(remote, &tenant()).expect("full fold").0;
+    let acquire = || load_or_derive(remote, &tenant()).expect("acquire");
+    publish_remote_base(store);
 
     write_audit_to(store, &[event(TS0 + 20, created(3, "a"))]);
-    let (_, stale_tag) = held();
+    let (_, stale_tag) = held(store);
     let (extended, _, outcome) = acquire();
     assert_eq!(outcome, CacheOutcome::StaleRefreshed);
-    assert_eq!(depth(&extended), 1);
-    assert_equivalent(&extended, &full()).expect("equals the full fold");
-    let (stored, _) = held();
-    assert_eq!(stored.folded_files(), extended.folded_files(), "published");
-    assert_eq!(depth(&stored), 1);
+    assert_acquired(&extended, &full(), 1, "extended");
+    assert_held(store, &extended, 1, "the extension is published");
     assert_eq!(
         extended
             .publish(remote, Some(&stale_tag))
@@ -903,7 +984,7 @@ fn incremental_publish_resolves_by_cas(store: &Store) {
         PublishOutcome::LostRace,
         "the second extension of the same stale artifact loses the CAS",
     );
-    assert_eq!(held().0.folded_files(), extended.folded_files());
+    assert_held(store, &extended, 1, "the loser's write is discarded");
 
     write_audit_to(store, &[event(TS0 + 30, created(4, "b"))]);
     let racers: Vec<TemplateMap> = std::thread::scope(|s| {
@@ -917,19 +998,21 @@ fn incremental_publish_resolves_by_cas(store: &Store) {
     for racer in &racers {
         assert_equivalent(racer, &at_race).expect("each racer answers the full fold");
     }
-    assert_eq!(held().0.folded_files(), at_race.folded_files());
+    assert_held(
+        store,
+        &at_race,
+        2,
+        "the late file lands on a published incremental base",
+    );
 
     write_audit_to(store, &[event(TS0 + 5, created(1, "user <*> late"))]);
     let (late, _, _) = acquire();
-    assert_eq!(depth(&late), 0, "the backdated file forces a full fold");
-    assert_equivalent(&late, &full()).expect("equals the full fold");
+    assert_acquired(&late, &full(), 0, "the backdated file forces a full fold");
     assert_eq!(
         late.fold_state().map(|s| s.binding_conflicts().to_vec()),
         Some(vec![(1, 1)]),
     );
-    let (stored, _) = held();
-    assert_eq!(stored.folded_files(), late.folded_files());
-    assert_eq!(depth(&stored), 0);
+    assert_held(store, &late, 0, "the full fold is republished");
 }
 
 /// RFC0033.12 on the in-memory store, which honours conditional puts.

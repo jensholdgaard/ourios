@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasFold;
 use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
-use crate::{QueryError, StoreRef, audit_scan};
+use crate::{QueryError, StoreRef, audit_scan, local_publish};
 
 /// Canonical artifact key at the root of a tenant's audit subtree
 /// (`audit/tenant_id=<enc>/template_map.v2.json.zst`, RFC 0033 §3.2
@@ -967,11 +967,13 @@ impl TemplateMap {
     /// amendment) following the RFC 0009 §3.4 manifest precedent,
     /// adapted to a derived, discardable object:
     ///
-    /// - [`StoreRef::Local`]: write `template_map.v2.json.zst.tmp` in
-    ///   the tenant's audit dir and `rename` it into place — the rename
-    ///   is the only visibility point, so a reader observes the prior
-    ///   artifact (or its absence) or the new one, never a partial
-    ///   write; a crash leaves a stray `.tmp` no reader opens. Like
+    /// - [`StoreRef::Local`]: write a uniquely named
+    ///   `template_map.v2.json.zst.<UUIDv7>.tmp` in the tenant's audit
+    ///   dir and `rename` it into place (`crate::local_publish`) — the
+    ///   rename is the only visibility point, so a reader observes the
+    ///   prior artifact (or its absence) or one writer's complete new
+    ///   one, never a partial or interleaved write; a crash leaves a
+    ///   stray `.tmp` no reader opens, swept by a later publish. Like
     ///   `Manifest::write_atomic` this is atomic but not crash-durable
     ///   (no fsync): losing the artifact in a crash costs one
     ///   re-derivation. `expected` cannot be enforced on the filesystem
@@ -1080,17 +1082,8 @@ impl TemplateMap {
         let enc = percent_encode_tenant(self.tenant.as_str());
         match backend {
             StoreRef::Local(root) => {
-                let io_err = |op: &str, p: &Path, e: &std::io::Error| QueryError::Storage {
-                    detail: format!("{op} {}: {e}", p.display()),
-                };
                 let dir = root.join("audit").join(format!("tenant_id={enc}"));
-                std::fs::create_dir_all(&dir).map_err(|e| io_err("create_dir_all", &dir, &e))?;
-                let tmp = dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp"));
-                std::fs::write(&tmp, &bytes).map_err(|e| io_err("write", &tmp, &e))?;
-                let target = dir.join(TEMPLATE_MAP_FILENAME);
-                std::fs::rename(&tmp, &target).map_err(|e| QueryError::Storage {
-                    detail: format!("rename {} -> {}: {e}", tmp.display(), target.display()),
-                })?;
+                local_publish::publish_local(&dir, TEMPLATE_MAP_FILENAME, &bytes)?;
                 // §3.4 amendment: best-effort unconditional delete of the
                 // stale v1 key — failure is harmless (both keys may
                 // coexist; the next publish retries implicitly).

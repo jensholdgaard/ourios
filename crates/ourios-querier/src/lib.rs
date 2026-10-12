@@ -47,6 +47,7 @@ mod audit_scan;
 mod body_match;
 mod drift;
 pub mod dsl;
+mod local_publish;
 mod log_row;
 mod map_flight;
 mod phase;

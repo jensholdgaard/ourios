@@ -24,7 +24,8 @@
 use std::path::Path;
 
 use crate::common::{
-    DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, at, simple, widened, write_all, write_audit,
+    DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, at, localstack_s3, simple, widened, write_all,
+    write_audit,
 };
 use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange, hash_triggering_line};
@@ -536,11 +537,6 @@ fn rfc0033_3_crash_tear_safety() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "RFC0033.3 S3 arm; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
 async fn template_map_publish_cas_on_s3() {
-    use testcontainers_modules::localstack::LocalStack;
-    use testcontainers_modules::testcontainers::ImageExt;
-    use testcontainers_modules::testcontainers::core::ExecCommand;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-
     // Two correct folds at different frontiers, derived from a local
     // audit fixture (the publish target is the store under test, not
     // the fold source).
@@ -553,47 +549,7 @@ async fn template_map_publish_cas_on_s3() {
     let (map_b, _) =
         derive_template_map(StoreRef::Local(bucket.path()), &tenant).expect("derive b");
 
-    // The RFC 0013 localstack harness pattern: start LocalStack, create
-    // the bucket with the image's own `awslocal`, point `Store::s3` at
-    // it via the endpoint override (credentials from the CI job's
-    // `AWS_*` env — LocalStack accepts any).
-    let container = LocalStack::default()
-        .with_env_var("SERVICES", "s3")
-        .start()
-        .await
-        .expect("start localstack");
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(4566)
-        .await
-        .expect("container port");
-    let mut mb = container
-        .exec(ExecCommand::new([
-            "awslocal".to_string(),
-            "s3".to_string(),
-            "mb".to_string(),
-            "s3://ourios-it-templatemap".to_string(),
-        ]))
-        .await
-        .expect("exec awslocal s3 mb");
-    // Drain both streams before reading the exit code — testcontainers
-    // reports `exit_code()` as `None` until the output is consumed.
-    let stdout =
-        String::from_utf8_lossy(&mb.stdout_to_vec().await.expect("mb stdout")).into_owned();
-    let stderr =
-        String::from_utf8_lossy(&mb.stderr_to_vec().await.expect("mb stderr")).into_owned();
-    let code = mb.exit_code().await.expect("mb exit code");
-    assert_eq!(
-        code,
-        Some(0),
-        "awslocal s3 mb failed (code {code:?}): stdout={stdout:?} stderr={stderr:?}",
-    );
-    let s3 = Store::s3(
-        ourios_parquet::S3Config::new("ourios-it-templatemap")
-            .with_endpoint(format!("http://{host}:{port}"))
-            .with_region("us-east-1"),
-    )
-    .expect("build s3 store");
+    let (_container, s3) = localstack_s3("ourios-it-templatemap").await;
     let remote = StoreRef::Remote(&s3);
     let key = format!("audit/tenant_id={TENANT}/{TEMPLATE_MAP_FILENAME}");
 

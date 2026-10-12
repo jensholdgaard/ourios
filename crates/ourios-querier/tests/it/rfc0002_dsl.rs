@@ -939,6 +939,10 @@ pub(crate) async fn assert_malformed_regexes_rejected(q: &ourios_querier::Querie
         "matches(event_name, \"a{2,1}\")",
         "service =~ \"[b-a]\"",
         "attr.http.route !~ \"(?P<\"",
+        // Nested, so only a recursive walk reaches the pattern.
+        "not (scope =~ \"[b-a]\")",
+        "severity >= warn and event_name =~ \"(\"",
+        "template_id == 1 or matches(scope, \"a{2,1}\")",
     ] {
         let query = ourios_querier::dsl::parse(text).expect("parse");
         let err = q

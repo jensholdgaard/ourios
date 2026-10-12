@@ -122,36 +122,24 @@ fn future_schema_batch(record: &MinedRecord) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("future batch")
 }
 
-/// A batch built from the current schema with one OPTIONAL column
-/// (`severity_text`) dropped — what an older writer produced before
-/// that column existed.
-fn old_schema_batch(record: &MinedRecord) -> RecordBatch {
+/// A batch built from the current schema with the `dropped` columns left
+/// out — what an older writer produced before those columns existed.
+fn batch_without(record: &MinedRecord, dropped: &[&str]) -> RecordBatch {
     let base = mined_records_to_batch(std::slice::from_ref(record)).expect("base batch");
     let keep: Vec<usize> = base
         .schema()
         .fields()
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.name() != columns::SEVERITY_TEXT)
+        .filter(|(_, f)| !dropped.contains(&f.name().as_str()))
         .map(|(i, _)| i)
         .collect();
     base.project(&keep).expect("old batch")
 }
 
-/// A batch built from the current schema without the OPTIONAL text columns
-/// the regex operators reach (`scope_name`, `event_name`) and without any
-/// promoted column — what an older writer produced.
-fn text_columns_absent_batch(record: &MinedRecord) -> RecordBatch {
-    let base = mined_records_to_batch(std::slice::from_ref(record)).expect("base batch");
-    let keep: Vec<usize> = base
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| f.name() != columns::SCOPE_NAME && f.name() != columns::EVENT_NAME)
-        .map(|(i, _)| i)
-        .collect();
-    base.project(&keep).expect("old batch")
+/// A batch whose one OPTIONAL column `severity_text` is absent.
+fn old_schema_batch(record: &MinedRecord) -> RecordBatch {
+    batch_without(record, &[columns::SEVERITY_TEXT])
 }
 
 /// RFC0002.8 over files that lack the column a regex targets: the absent
@@ -161,7 +149,10 @@ fn text_columns_absent_batch(record: &MinedRecord) -> RecordBatch {
 async fn rfc0002_8_malformed_regex_is_rejected_over_absent_columns() {
     let bucket = tempfile::TempDir::new().expect("temp");
     let old = rec(1, TS0);
-    write_raw_at(bucket.path(), &old, &text_columns_absent_batch(&old));
+    // The OPTIONAL text columns the regex operators reach, and (as the
+    // base schema carries none) every promoted column, are absent.
+    let batch = batch_without(&old, &[columns::SCOPE_NAME, columns::EVENT_NAME]);
+    write_raw_at(bucket.path(), &old, &batch);
     crate::rfc0002_dsl::assert_malformed_regexes_rejected(&Querier::new(bucket.path())).await;
 }
 

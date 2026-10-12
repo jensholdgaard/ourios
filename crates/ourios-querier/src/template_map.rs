@@ -47,8 +47,9 @@ use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
 use crate::alias_store::AliasFold;
+use crate::fold_state::{FoldState, FoldStateJson, HighWater};
 use crate::template_registry::{BindingConflicts, RegistryFold, TemplateRegistry};
-use crate::{QueryError, StoreRef, audit_scan};
+use crate::{QueryError, StoreRef, audit_scan, local_publish};
 
 /// Canonical artifact key at the root of a tenant's audit subtree
 /// (`audit/tenant_id=<enc>/template_map.v2.json.zst`, RFC 0033 §3.2
@@ -387,6 +388,9 @@ pub struct TemplateMap {
     folded_files: Vec<String>,
     registry: TemplateRegistry,
     aliases: AliasMap,
+    /// `None` only for an artifact a pre-amendment writer published; every
+    /// fold this binary runs records one.
+    fold_state: Option<FoldState>,
 }
 
 /// Outcome of reading `template_map.v2.json.zst` bytes — the RFC 0033
@@ -501,8 +505,9 @@ pub enum CacheOutcome {
 /// with the CAS expectation observed by this read (the artifact's `ETag`,
 /// or create-if-absent). A publish failure or lost race is never a query
 /// failure; it abstains entirely when the **compressed** artifact would
-/// not be smaller than the audit bytes just folded (§3.2 amendment —
-/// nothing to win, and the no-artifact path is today's behaviour).
+/// not be smaller than this acquisition's bytes (the artifact GET plus
+/// every audit object fetched, §3.3 amendment 2026-10-12 — nothing to
+/// win, and the no-artifact path is today's behaviour).
 ///
 /// # Errors
 ///
@@ -587,7 +592,7 @@ pub(crate) fn load_or_derive_resolved(
     // always one that answered, mirroring the hit arm's record-at-return.
     announce_binding_conflicts(tenant, &conflicts);
     METRICS.record_lookup(outcome, !conflicts.is_empty());
-    map.write_through(backend, expected.as_deref(), fold_bytes);
+    map.write_through(backend, expected.as_deref(), acquisition_bytes);
     Ok((map, acquisition_bytes, outcome))
 }
 
@@ -724,9 +729,13 @@ fn fold_template_map(
 ) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
     let mut registry = RegistryFold::default();
     let mut aliases = AliasFold::default();
-    let scan = resolved.for_each_event(tenant, |event| match &event.payload {
-        AuditPayload::Template { .. } => registry.push(event),
-        _ => aliases.push(event),
+    let mut high_water = HighWater::default();
+    let scan = resolved.for_each_event(tenant, |event| {
+        high_water.observe(&event);
+        match &event.payload {
+            AuditPayload::Template { .. } => registry.push(event),
+            _ => aliases.push(event),
+        }
     })?;
     let (registry, conflicts) = registry.finish_checked();
     Ok((
@@ -735,6 +744,7 @@ fn fold_template_map(
             folded_files: scan.frontier,
             registry,
             aliases: aliases.finish(),
+            fold_state: Some(FoldState::new(high_water.get(), conflicts.clone(), 0)),
         },
         scan.bytes_read,
         conflicts,
@@ -754,6 +764,11 @@ struct TemplateMapJson {
     folded_files: Vec<String>,
     registry: Vec<RegistryEntry>,
     alias_map: Vec<AliasClass>,
+    /// Absent in an artifact a pre-amendment writer published; that
+    /// writer's reader ignores it, since this struct denies no unknown
+    /// fields (RFC 0033 §3.3 amendment 2026-10-12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fold_state: Option<FoldStateJson>,
 }
 
 /// One `(template_id, version)` registry key with its template in the
@@ -808,6 +823,13 @@ impl TemplateMap {
     #[must_use]
     pub fn alias_map(&self) -> &AliasMap {
         &self.aliases
+    }
+
+    /// The fold state the incremental path extends; `None` for an
+    /// artifact a pre-amendment writer published.
+    #[must_use]
+    pub fn fold_state(&self) -> Option<&FoldState> {
+        self.fold_state.as_ref()
     }
 
     /// The published-object bytes: the canonical JSON body
@@ -885,6 +907,7 @@ impl TemplateMap {
             folded_files: self.folded_files.clone(),
             registry,
             alias_map,
+            fold_state: self.fold_state.as_ref().map(FoldState::to_json),
         })
         .map_err(|e| QueryError::Storage {
             detail: format!("template_map serialization: {e}"),
@@ -959,6 +982,7 @@ impl TemplateMap {
             folded_files: raw.folded_files,
             registry,
             aliases,
+            fold_state: raw.fold_state.map(FoldState::from_json),
         }))
     }
 
@@ -967,11 +991,13 @@ impl TemplateMap {
     /// amendment) following the RFC 0009 §3.4 manifest precedent,
     /// adapted to a derived, discardable object:
     ///
-    /// - [`StoreRef::Local`]: write `template_map.v2.json.zst.tmp` in
-    ///   the tenant's audit dir and `rename` it into place — the rename
-    ///   is the only visibility point, so a reader observes the prior
-    ///   artifact (or its absence) or the new one, never a partial
-    ///   write; a crash leaves a stray `.tmp` no reader opens. Like
+    /// - [`StoreRef::Local`]: write a uniquely named
+    ///   `template_map.v2.json.zst.<UUIDv7>.tmp` in the tenant's audit
+    ///   dir and `rename` it into place (`crate::local_publish`) — the
+    ///   rename is the only visibility point, so a reader observes the
+    ///   prior artifact (or its absence) or one writer's complete new
+    ///   one, never a partial or interleaved write; a crash leaves a
+    ///   stray `.tmp` no reader opens, swept by a later publish. Like
     ///   `Manifest::write_atomic` this is atomic but not crash-durable
     ///   (no fsync): losing the artifact in a crash costs one
     ///   re-derivation. `expected` cannot be enforced on the filesystem
@@ -1019,25 +1045,22 @@ impl TemplateMap {
     /// telemetry-only outcomes (the §3.7 publish-outcome counter, via
     /// [`publish_bytes`](Self::publish_bytes)) — and **abstains** when
     /// the **compressed** artifact would not be smaller than
-    /// `folded_audit_bytes`, the audit bytes the fold just read (§3.2
-    /// amendment: the comparison is between the bytes a warm GET would
-    /// pay and the bytes the fold just paid; on a tiny or empty tenant
-    /// even the compressed envelope can exceed the stream it caches,
-    /// and the no-artifact path is exactly today's behaviour). An
-    /// abstention records no publish outcome — §3.7 pins the values to
+    /// `acquisition_bytes`: the artifact bytes this acquisition fetched
+    /// (zero when absent) plus every audit object it fetched — what the
+    /// next acquisition pays at the same listing if this publish is
+    /// skipped (§3.3 amendment 2026-10-12; on a miss it is the folded
+    /// audit bytes, the pre-amendment rule). On a tiny or empty tenant
+    /// even the compressed envelope can exceed what it caches, and the
+    /// no-artifact path is exactly today's behaviour. An abstention
+    /// records no publish outcome — §3.7 pins the values to
     /// `published` / `lost_race` / `error`, and a publish that never
     /// starts is none of them.
-    fn write_through(
-        &self,
-        backend: StoreRef<'_>,
-        expected: Option<&str>,
-        folded_audit_bytes: u64,
-    ) {
+    fn write_through(&self, backend: StoreRef<'_>, expected: Option<&str>, acquisition_bytes: u64) {
         let Ok(bytes) = self.to_artifact_bytes() else {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
             return;
         };
-        if bytes.len() as u64 >= folded_audit_bytes {
+        if abstains(bytes.len() as u64, acquisition_bytes) {
             return;
         }
         // Best-effort by contract: Published and LostRace are both fine,
@@ -1080,17 +1103,8 @@ impl TemplateMap {
         let enc = percent_encode_tenant(self.tenant.as_str());
         match backend {
             StoreRef::Local(root) => {
-                let io_err = |op: &str, p: &Path, e: &std::io::Error| QueryError::Storage {
-                    detail: format!("{op} {}: {e}", p.display()),
-                };
                 let dir = root.join("audit").join(format!("tenant_id={enc}"));
-                std::fs::create_dir_all(&dir).map_err(|e| io_err("create_dir_all", &dir, &e))?;
-                let tmp = dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp"));
-                std::fs::write(&tmp, &bytes).map_err(|e| io_err("write", &tmp, &e))?;
-                let target = dir.join(TEMPLATE_MAP_FILENAME);
-                std::fs::rename(&tmp, &target).map_err(|e| QueryError::Storage {
-                    detail: format!("rename {} -> {}: {e}", tmp.display(), target.display()),
-                })?;
+                local_publish::publish_local(&dir, TEMPLATE_MAP_FILENAME, &bytes)?;
                 // §3.4 amendment: best-effort unconditional delete of the
                 // stale v1 key — failure is harmless (both keys may
                 // coexist; the next publish retries implicitly).
@@ -1125,6 +1139,13 @@ impl TemplateMap {
     }
 }
 
+/// The §3.5 abstention: publishing pays only when the compressed artifact
+/// costs less to GET than `acquisition_bytes`, what the next acquisition
+/// pays at the same listing without it.
+fn abstains(artifact_bytes: u64, acquisition_bytes: u64) -> bool {
+    artifact_bytes >= acquisition_bytes
+}
+
 /// Validate the canonical form [`TemplateMap::to_json`] writes; any
 /// violation is a torn artifact (treated as absent, self-healed by the
 /// next write-through). The frontier check mirrors the `Manifest`
@@ -1132,85 +1153,115 @@ impl TemplateMap {
 /// keys, so a hostile artifact cannot name paths outside the tenant's
 /// audit subtree (`CLAUDE.md` §3.7).
 fn validate(raw: &TemplateMapJson) -> Result<(), String> {
-    // Canonical-form check on every template string: the artifact is
-    // untrusted input. parse_template/format_template round-trip alone
-    // is NOT sufficient — empty segments (leading/trailing/doubled
-    // spaces) parse to Fixed("") and round-trip unchanged — so enforce
-    // what mine-time tokenization actually guarantees: a non-empty
-    // string splits into non-empty, whitespace-free tokens.
-    for entry in &raw.registry {
-        let canonical = entry.template.is_empty()
-            || entry
-                .template
-                .split(' ')
-                .all(|tok| !tok.is_empty() && !tok.chars().any(char::is_whitespace));
-        if !canonical {
-            return Err(format!(
-                "registry template for id {} v{} is not in canonical format_template form",
-                entry.template_id, entry.version,
-            ));
-        }
+    validate_registry(&raw.registry)?;
+    validate_frontier(&raw.folded_files)?;
+    validate_alias_map(&raw.alias_map)?;
+    match &raw.fold_state {
+        Some(fold_state) => fold_state.validate(
+            |template_id, version| {
+                raw.registry
+                    .binary_search_by_key(&(template_id, version), |e| (e.template_id, e.version))
+                    .is_ok()
+            },
+            raw.registry.is_empty() && raw.alias_map.is_empty(),
+        ),
+        None => Ok(()),
     }
-    for name in &raw.folded_files {
-        if !is_tenant_relative_parquet(name) {
-            return Err(format!(
-                "folded_files entry is not a tenant-relative *.parquet key: {name:?}"
-            ));
-        }
+}
+
+/// Every registry template in canonical form, the entries strictly sorted
+/// by `(template_id, version)`.
+fn validate_registry(registry: &[RegistryEntry]) -> Result<(), String> {
+    if let Some(entry) = registry
+        .iter()
+        .find(|e| !is_canonical_template(&e.template))
+    {
+        return Err(format!(
+            "registry template for id {} v{} is not in canonical format_template form",
+            entry.template_id, entry.version,
+        ));
     }
-    for pair in raw.folded_files.windows(2) {
-        if pair[0] >= pair[1] {
-            return Err(format!(
-                "folded_files is not strictly sorted: {:?} >= {:?}",
-                pair[0], pair[1],
-            ));
-        }
+    match registry.windows(2).find(|pair| {
+        (pair[0].template_id, pair[0].version) >= (pair[1].template_id, pair[1].version)
+    }) {
+        Some(pair) => Err(format!(
+            "registry is not strictly sorted by (template_id, version) at \
+             ({}, {}) / ({}, {})",
+            pair[0].template_id, pair[0].version, pair[1].template_id, pair[1].version,
+        )),
+        None => Ok(()),
     }
-    for pair in raw.registry.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        if (a.template_id, a.version) >= (b.template_id, b.version) {
-            return Err(format!(
-                "registry is not strictly sorted by (template_id, version) at \
-                 ({}, {}) / ({}, {})",
-                a.template_id, a.version, b.template_id, b.version,
-            ));
-        }
+}
+
+/// Canonical-form check on a template string: the artifact is untrusted
+/// input. A `parse_template`/`format_template` round-trip alone is NOT
+/// sufficient — empty segments (leading/trailing/doubled spaces) parse to
+/// Fixed("") and round-trip unchanged — so enforce what mine-time
+/// tokenization actually guarantees: a non-empty string splits into
+/// non-empty, whitespace-free tokens.
+fn is_canonical_template(template: &str) -> bool {
+    template.is_empty()
+        || template
+            .split(' ')
+            .all(|tok| !tok.is_empty() && !tok.chars().any(char::is_whitespace))
+}
+
+/// Every frontier entry a tenant-relative `*.parquet` key, strictly sorted.
+fn validate_frontier(folded_files: &[String]) -> Result<(), String> {
+    if let Some(name) = folded_files.iter().find(|n| !is_tenant_relative_parquet(n)) {
+        return Err(format!(
+            "folded_files entry is not a tenant-relative *.parquet key: {name:?}"
+        ));
     }
+    match folded_files.windows(2).find(|pair| pair[0] >= pair[1]) {
+        Some(pair) => Err(format!(
+            "folded_files is not strictly sorted: {:?} >= {:?}",
+            pair[0], pair[1],
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Every alias class well-formed, no member in two classes, the classes
+/// sorted by representative.
+fn validate_alias_map(alias_map: &[AliasClass]) -> Result<(), String> {
     let mut seen_members = std::collections::HashSet::new();
-    for class in &raw.alias_map {
-        if class.members.len() < 2 {
-            return Err(format!(
-                "alias class of {} member(s) is not an alias set",
-                class.members.len()
-            ));
-        }
-        for pair in class.members.windows(2) {
-            if pair[0] >= pair[1] {
-                return Err(format!(
-                    "alias class members are not strictly sorted: {} >= {}",
-                    pair[0], pair[1],
-                ));
-            }
-        }
-        if class.members.first() != Some(&class.representative) {
-            return Err(format!(
-                "alias class representative {} is not min(members)",
-                class.representative
-            ));
-        }
-        for member in &class.members {
-            if !seen_members.insert(*member) {
-                return Err(format!("alias classes overlap on template_id {member}"));
-            }
+    for class in alias_map {
+        validate_alias_class(class)?;
+        if let Some(member) = class.members.iter().find(|m| !seen_members.insert(**m)) {
+            return Err(format!("alias classes overlap on template_id {member}"));
         }
     }
-    for pair in raw.alias_map.windows(2) {
-        if pair[0].representative >= pair[1].representative {
-            return Err(format!(
-                "alias classes are not sorted by representative: {} >= {}",
-                pair[0].representative, pair[1].representative,
-            ));
-        }
+    match alias_map
+        .windows(2)
+        .find(|pair| pair[0].representative >= pair[1].representative)
+    {
+        Some(pair) => Err(format!(
+            "alias classes are not sorted by representative: {} >= {}",
+            pair[0].representative, pair[1].representative,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// At least two members, strictly sorted, the representative their min.
+fn validate_alias_class(class: &AliasClass) -> Result<(), String> {
+    if class.members.len() < 2 {
+        return Err(format!(
+            "alias class of {} member(s) is not an alias set",
+            class.members.len()
+        ));
+    }
+    if let Some(&[a, b]) = class.members.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(format!(
+            "alias class members are not strictly sorted: {a} >= {b}"
+        ));
+    }
+    if class.members.first() != Some(&class.representative) {
+        return Err(format!(
+            "alias class representative {} is not min(members)",
+            class.representative
+        ));
     }
     Ok(())
 }
@@ -1294,6 +1345,7 @@ mod tests {
             ],
             registry,
             aliases,
+            fold_state: None,
         }
     }
 
@@ -1330,6 +1382,69 @@ mod tests {
         );
         assert_eq!(restored.folded_files(), map.folded_files());
         assert_eq!(restored.tenant(), &tenant());
+    }
+
+    /// RFC0033.11 abstention boundary: an artifact between the folded
+    /// audit bytes and the full acquisition bytes (the stale artifact's GET
+    /// or the incremental base included) publishes; one at or above them
+    /// abstains.
+    #[test]
+    fn abstention_compares_against_acquisition_bytes() {
+        let (artifact, folded, fetched_artifact) = (1_000, 900, 300);
+        assert!(!abstains(artifact, folded + fetched_artifact));
+        assert!(abstains(artifact, folded));
+        assert!(abstains(artifact, artifact));
+        assert!(!abstains(artifact, artifact + 1));
+    }
+
+    #[test]
+    fn fold_state_round_trips_through_artifact_bytes() {
+        let mut map = sample();
+        map.fold_state = Some(FoldState::new(Some(u64::MAX - 1), vec![(7, 2)], 3));
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(
+            &map.to_artifact_bytes().expect("serialize"),
+            &tenant(),
+        ));
+        assert_eq!(restored.fold_state(), map.fold_state());
+    }
+
+    /// An artifact a pre-amendment writer published has no `fold_state`:
+    /// it reads Valid, ineligible for the incremental path.
+    #[test]
+    fn artifact_without_fold_state_reads_valid() {
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(
+            &sample().to_artifact_bytes().expect("serialize"),
+            &tenant(),
+        ));
+        assert!(restored.fold_state().is_none());
+    }
+
+    #[test]
+    fn invalid_fold_state_is_torn() {
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&sample().to_json().expect("serialize")).expect("json");
+        for (label, fold_state) in [
+            (
+                "conflict key outside the registry",
+                serde_json::json!({ "high_water_ns": 5, "binding_conflicts": [{ "template_id": 99, "version": 1 }], "incremental_depth": 0 }),
+            ),
+            (
+                "null high-water over a non-empty fold",
+                serde_json::json!({ "high_water_ns": null, "binding_conflicts": [], "incremental_depth": 0 }),
+            ),
+            (
+                "depth above the cap",
+                serde_json::json!({ "high_water_ns": 5, "binding_conflicts": [], "incremental_depth": crate::fold_state::INCREMENTAL_DEPTH_CAP + 1 }),
+            ),
+        ] {
+            body["fold_state"] = fold_state;
+            let bytes = compress(&serde_json::to_vec(&body).expect("encode"));
+            let read = TemplateMap::from_artifact_bytes(&bytes, &tenant()).expect("read");
+            assert!(
+                matches!(read, ArtifactRead::Torn { .. }),
+                "{label}: got {read:?}"
+            );
+        }
     }
 
     #[test]

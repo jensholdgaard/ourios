@@ -143,10 +143,11 @@ Rules (each is an acceptance scenario in §5):
    scalar, after its value is substituted — never on a pre-parse text pass.
 
    > **Amendment (2026-10-12, #978, maintainer-approved) — verbatim
-   > scalars.** This supersedes the YAML re-interpretation above: a scalar
-   > reaches its `ServerConfig` field as the text written (after
-   > substitution), not as a YAML-typed value, and the double-quoted /
-   > bare distinction affects only rule 3's null case. Numeric and
+   > scalars.** This supersedes the YAML type inference above: a scalar
+   > reaches its `ServerConfig` field as its string content after
+   > substitution, never as a YAML-typed value. A plain scalar's content is
+   > its spelling; a quoted scalar's content is what remains after YAML's
+   > quoting and escape processing. Numeric and
    > boolean fields parse that text with their own validation, so
    > `default_window_secs: ${env:W}` with `W=3600` still yields `3600` and
    > a bare `true` still yields `true`. What changes is the spelling YAML

@@ -113,6 +113,23 @@ fn substitute_segment(
     }
 }
 
+/// The `${[env:]NAME}` form of `token` when it is exactly one conforming
+/// reference, with any `:-default` dropped (a default may be a literal
+/// secret); `None` for anything else.
+pub(super) fn whole_reference(token: &str) -> Option<String> {
+    let body = token.strip_prefix("${")?.strip_suffix('}')?;
+    if body.contains(['$', '}']) {
+        return None;
+    }
+    let reference = match parse_body(body)? {
+        (_, Some(_)) => body
+            .split_once(":-")
+            .map_or(body, |(reference, _)| reference),
+        (_, None) => body,
+    };
+    Some(format!("${{{reference}}}"))
+}
+
 /// Resolve a reference body (the text between `${` and `}`). `None` ⇒ malformed.
 fn resolve_reference(body: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let (name, default) = parse_body(body)?;

@@ -133,10 +133,10 @@ impl std::error::Error for FileConfigError {
 /// 1, column 10`) but not *what* was there, so the offending token — sliced
 /// from the raw, pre-substitution text by the error's span — is appended:
 /// `storage: ${env:SECRET}` reports `` (found `${env:SECRET}`) ``, naming the
-/// reference, never a resolved value (RFC 0020 §3.5). Only that one token is
-/// echoed, never the surrounding lines. A position that does not map to a
-/// single-line scalar token (a structure start, a block scalar, an empty span)
-/// falls back to the parser's message alone.
+/// reference, never a resolved value (RFC 0020 §3.5). The token is echoed only
+/// when it is exactly one environment reference, minus any `:-default`; any
+/// other token (a literal that may be an inline secret, a structure start, an
+/// empty span) falls back to the parser's message alone.
 #[derive(Debug)]
 pub struct SchemaError {
     error: Box<serde_saphyr::Error>,
@@ -154,13 +154,8 @@ impl SchemaError {
                 let len = usize::try_from(span.byte_len()?).ok()?;
                 yaml.get(start..start.checked_add(len)?)
             })
-            .filter(|token| {
-                !token.is_empty()
-                    && !token.contains('\n')
-                    && !token.starts_with(['[', '{'])
-                    && !message.contains(token)
-            })
-            .map(str::to_owned);
+            .filter(|token| !message.contains(token))
+            .and_then(env_subst::whole_reference);
         Self {
             error: Box::new(error),
             found,
@@ -2012,14 +2007,46 @@ auth:
 
         let err = parse("receiver: 0700\n", &|_| None).expect_err("scalar for a section");
         assert!(
-            err.to_string().ends_with("(found `0700`)"),
-            "names the token: {err}"
+            !err.to_string().contains("found"),
+            "a literal is not echoed: {err}"
+        );
+
+        let err = parse("receiver: ${env:RECEIVER}\n", &|_| None).expect_err("reference");
+        assert!(
+            err.to_string().ends_with("(found `${env:RECEIVER}`)"),
+            "names the reference: {err}"
         );
 
         let err = parse("receiver: [a, b]\n", &|_| None).expect_err("sequence for a section");
         assert!(
             !err.to_string().contains("found"),
             "a structure start is not a scalar token: {err}"
+        );
+    }
+
+    /// A literal where a section is expected may itself be an inline secret, so
+    /// it is never echoed; only a whole environment reference is (RFC 0020 §3.5).
+    #[test]
+    fn schema_error_never_echoes_a_literal_or_a_default() {
+        let err = parse("storage: AKIAIOSFODNN7EXAMPLE\n", &|_| None).expect_err("scalar");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"), "{rendered}");
+        }
+
+        let err = parse("storage: ${env:SECRET}\n", &|_| None).expect_err("reference");
+        assert!(
+            err.to_string().ends_with("(found `${env:SECRET}`)"),
+            "names the reference: {err}"
+        );
+
+        let err = parse("storage: ${env:X:-secretdefault}\n", &|_| None).expect_err("default");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains("secretdefault"), "{rendered}");
+        }
+        assert!(
+            err.to_string().ends_with("(found `${env:X}`)"),
+            "names the reference without its default: {err}"
         );
     }
 }

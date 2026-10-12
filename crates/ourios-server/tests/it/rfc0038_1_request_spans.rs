@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, header};
 use opentelemetry::Value;
 use opentelemetry::trace::SpanKind;
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tower::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
@@ -90,20 +90,8 @@ async fn rfc0038_1_query_emits_the_server_span_and_its_resolve_phase() {
     let mut names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, ["POST /v1/query", "resolve files"]);
-    let [server] = spans
-        .iter()
-        .filter(|s| s.name.as_ref() == "POST /v1/query")
-        .collect::<Vec<_>>()[..]
-    else {
-        unreachable!("the multiset holds one query span");
-    };
-    let [resolve] = spans
-        .iter()
-        .filter(|s| s.name.as_ref() == "resolve files")
-        .collect::<Vec<_>>()[..]
-    else {
-        unreachable!("the multiset holds one resolve span");
-    };
+    let server = one_named(&spans, "POST /v1/query");
+    let resolve = one_named(&spans, "resolve files");
     assert_eq!(
         server.span_kind,
         SpanKind::Server,
@@ -130,9 +118,24 @@ async fn rfc0038_1_query_emits_the_server_span_and_its_resolve_phase() {
         "an empty tenant resolves zero live files; attrs = {:?}",
         resolve.attributes,
     );
+    assert_query_server_attributes(server);
+}
 
-    // §3.5 — the query span carries the standard HTTP server attributes plus
-    // the tenant it scoped to (a successful query against tenant `acme`).
+/// The one exported span named `name`.
+fn one_named<'s>(spans: &'s [SpanData], name: &str) -> &'s SpanData {
+    let [span] = spans
+        .iter()
+        .filter(|s| s.name.as_ref() == name)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("exactly one {name:?} span");
+    };
+    span
+}
+
+/// §3.5 — the query span carries the standard HTTP server attributes plus
+/// the tenant it scoped to (a successful query against tenant `acme`).
+fn assert_query_server_attributes(server: &SpanData) {
     let attr = |key: &str| {
         server
             .attributes

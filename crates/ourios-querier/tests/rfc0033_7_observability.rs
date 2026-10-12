@@ -29,7 +29,7 @@
 //! `rfc0033_bounded_fold.rs`, installs a global allocator).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use opentelemetry_sdk::metrics::data::{
@@ -803,6 +803,7 @@ fn rfc0033_7_observable_outcomes() {
     binding_conflict_act(&guard, &exporter, &rms);
     unknown_version_act(&guard, &exporter);
     derive_mode_act(&guard, &exporter);
+    failure_after_decision_act(&guard, &exporter);
 }
 
 /// The derive histograms' `(count, sum)` per attribute set, from the
@@ -941,6 +942,14 @@ fn derive_mode_act(
 
     let files = added(&before[1], &after[1]);
     let size = added(&before[2], &after[2]);
+    let counts = |points: &BTreeMap<Vec<String>, (u64, f64)>| -> BTreeMap<Vec<String>, u64> {
+        points
+            .iter()
+            .map(|(k, &(count, _))| (k.clone(), count))
+            .collect()
+    };
+    assert_eq!(counts(&files), expected, "one files sample per derive");
+    assert_eq!(counts(&size), expected, "one size sample per derive");
     let (rejected, full) = (driven.rejected, driven.full_after_rejection);
     assert_eq!(
         (
@@ -962,4 +971,83 @@ fn derive_mode_act(
         ),
         "each incremental derive reads only its delta",
     );
+}
+
+/// A store whose miss has published an artifact folded from one audit
+/// file at `TS0`; its tenant audit directory.
+fn published_store(path: &Path) -> std::path::PathBuf {
+    write_audit(path, &[widened(1, 1, TS0)]);
+    write_records(path, &[mined(1, TS0 + 2)]);
+    assert_eq!(body_query(path).rows, 1, "the miss publishes");
+    path.join("audit").join(format!("tenant_id={TENANT}"))
+}
+
+/// Write `event` as one audit file and rename it to `name` in its
+/// partition directory, so the test fixes the delta's read order.
+fn write_audit_named(path: &Path, audit_dir: &Path, event: AuditEvent, name: &str) -> PathBuf {
+    let before = walk_files(audit_dir);
+    write_audit(path, &[event]);
+    let written = walk_files(audit_dir)
+        .into_iter()
+        .find(|p| !before.contains(p))
+        .expect("a new audit file");
+    let named = written.with_file_name(name);
+    std::fs::rename(&written, &named).expect("rename audit file");
+    named
+}
+
+fn tear(file: &Path) {
+    let bytes = std::fs::read(file).expect("read audit file");
+    std::fs::write(file, &bytes[..bytes.len() / 2]).expect("tear audit file");
+}
+
+/// Scenario RFC0033.13 — a stale derive that fails after the guard chose
+/// its path keeps that path. A `depth_cap` fallback whose full fold hits a
+/// torn file, and a delta whose first file holds an out-of-order event and
+/// whose second is torn, each record one duration sample with
+/// `mode = full`, the fallback reason and `error.type`, and no files or
+/// size sample.
+fn failure_after_decision_act(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
+    type Setup = fn(&Path, &Path);
+    let cases: [(&str, Setup); 2] = [
+        ("depth_cap", |path, audit_dir| {
+            rewrite_artifact(&audit_dir.join(TEMPLATE_MAP_FILENAME), |json| {
+                json["fold_state"]["incremental_depth"] = 256.into();
+            });
+            let file = write_audit_named(path, audit_dir, widened(1, 2, TS0 + 10), "1.parquet");
+            tear(&file);
+        }),
+        ("out_of_order", |path, audit_dir| {
+            write_audit_named(path, audit_dir, widened(1, 2, TS0), "0.parquet");
+            let file = write_audit_named(path, audit_dir, widened(1, 3, TS0 + 10), "1.parquet");
+            tear(&file);
+        }),
+    ];
+    for (fallback_reason, setup) in cases {
+        let bucket = tempfile::tempdir().expect("temp dir");
+        let audit_dir = published_store(bucket.path());
+        setup(bucket.path(), &audit_dir);
+        let before = derive_points(guard, exporter);
+        try_body_query(bucket.path()).expect_err("the fallback's read fails the query");
+        let after = derive_points(guard, exporter);
+
+        let failed = key(&[
+            "error.type=storage".to_string(),
+            fallback(fallback_reason),
+            mode("full"),
+            reason("stale"),
+        ]);
+        let durations: Vec<(Vec<String>, u64)> = added(&before[0], &after[0])
+            .into_iter()
+            .map(|(k, (count, _))| (k, count))
+            .collect();
+        assert_eq!(durations, vec![(failed, 1)], "{fallback_reason}");
+        assert!(
+            added(&before[1], &after[1]).is_empty() && added(&before[2], &after[2]).is_empty(),
+            "{fallback_reason}: a failed derive records no files or size",
+        );
+    }
 }

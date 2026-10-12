@@ -56,9 +56,7 @@ pub(super) fn derive_stale(
         aliases,
         state,
     };
-    match fold_delta(base, delta_set, resolved.frontier().to_vec(), tenant)
-        .map_err(DeriveError::undecided)?
-    {
+    match fold_delta(base, delta_set, resolved.frontier().to_vec(), tenant)? {
         DeltaFold::Folded(derived) => Ok(*derived),
         DeltaFold::Rejected(fetched) => {
             fallback(resolved, tenant, FallbackReason::OutOfOrder, fetched)
@@ -110,12 +108,16 @@ fn delta_over(folded: &[String], live: &[String]) -> Option<Vec<String>> {
 /// Fold the delta onto the base, checking every fold-relevant delta event
 /// against the base's high-water as it streams through the same validated
 /// scan a full fold uses.
+///
+/// A delta file that fails after an earlier one was rejected fails the
+/// derive as an `out_of_order` fallback without running it: the full fold
+/// would read that same object, and no fold retries a failed read.
 fn fold_delta(
     base: Base,
     delta_set: ResolvedAuditSet<'_>,
     live: Vec<String>,
     tenant: &TenantId,
-) -> Result<DeltaFold, QueryError> {
+) -> Result<DeltaFold, DeriveError> {
     let high_water = base.state.high_water_ns();
     let held_at = UNIX_EPOCH + Duration::from_nanos(high_water.unwrap_or(0));
     let mut pass = FoldPass {
@@ -130,7 +132,16 @@ fn fold_delta(
         if !rejected {
             pass.visit(event);
         }
-    })?;
+    });
+    let scan = match scan {
+        Ok(scan) => scan,
+        Err(e) if rejected => {
+            return Err(DeriveError::on(DerivePath::Fallback(
+                FallbackReason::OutOfOrder,
+            ))(e));
+        }
+        Err(e) => return Err(DeriveError::undecided(e)),
+    };
     let fetched = Fetched {
         files: scan.frontier.len() as u64,
         bytes: scan.bytes_read,

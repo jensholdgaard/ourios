@@ -141,6 +141,22 @@ Rules (each is an acceptance scenario in §5):
    `W=3600` yields the integer `3600`; a double-quoted scalar is forced to
    a string. Type interpretation therefore happens on the already-parsed
    scalar, after its value is substituted — never on a pre-parse text pass.
+
+   > **Amendment (2026-10-12, #978, maintainer-approved) — verbatim
+   > scalars.** A scalar reaches its `ServerConfig` field as the text
+   > written (after substitution), not as a YAML-typed value. Numeric and
+   > boolean fields parse that text with their own validation, so
+   > `default_window_secs: ${env:W}` with `W=3600` still yields `3600` and
+   > a bare `true` still yields `true`. What changes is the spelling YAML
+   > typing used to rewrite: a string field keeps `007`, `0700`, `1e3` or
+   > `tRUE` as written, and an integer field rejects `1_000` instead of
+   > reading it as `1000`. An unquoted empty or `~` scalar is still null
+   > (rule 3). One exception: the bare-key entries of
+   > `promoted_attributes`, which share a list with `{ key, type }`
+   > mappings, are still type-resolved; quote such a key to keep its
+   > spelling. This follows the OpenTelemetry Collector, which passes the
+   > verbatim string to string fields (confmap v0.106,
+   > open-telemetry/opentelemetry-collector#10605).
 8. A `${…}` reference that does not conform to `REF` (e.g. `${1BAD}`,
    `${A$B}`), **encountered in a scalar value during substitution**, is a
    **whole-file parse error** — no partial

@@ -847,6 +847,57 @@ fn step(bucket: &Path, audit_dir: &Path, setup: impl FnOnce()) -> (u64, u64) {
     (files1.saturating_sub(files0), bytes1.saturating_sub(bytes0))
 }
 
+/// What [`drive_derive_paths`] read: each incremental delta's files and
+/// bytes, the rejected delta's, and the full audit set the `out_of_order`
+/// fallback then folded.
+struct DrivenPaths {
+    deltas: [(u64, u64); 2],
+    rejected: (u64, u64),
+    full_after_rejection: (u64, u64),
+}
+
+/// Drive, on `path`'s published artifact, an incremental derive, the four
+/// fallbacks (`out_of_order`, `depth_cap`, `no_fold_state`,
+/// `files_removed`) and a second incremental derive.
+fn drive_derive_paths(path: &Path, audit_dir: &Path) -> DrivenPaths {
+    let artifact = audit_dir.join(TEMPLATE_MAP_FILENAME);
+    let first = step(path, audit_dir, || {
+        write_audit(path, &[widened(1, 2, TS0 + 10)]);
+    });
+    let rejected = step(path, audit_dir, || {
+        write_audit(path, &[widened(1, 3, TS0 + 5)]);
+    });
+    let full_after_rejection = audit_set(audit_dir);
+    step(path, audit_dir, || {
+        rewrite_artifact(&artifact, |json| {
+            json["fold_state"]["incremental_depth"] = 256.into();
+        });
+        write_audit(path, &[widened(1, 4, TS0 + 20)]);
+    });
+    step(path, audit_dir, || {
+        rewrite_artifact(&artifact, |json| {
+            json.as_object_mut().expect("object").remove("fold_state");
+        });
+        write_audit(path, &[widened(1, 5, TS0 + 30)]);
+    });
+    let newest = walk_files(audit_dir);
+    let second = step(path, audit_dir, || {
+        write_audit(path, &[widened(1, 6, TS0 + 40)]);
+    });
+    step(path, audit_dir, || {
+        let added = walk_files(audit_dir)
+            .into_iter()
+            .find(|p| !newest.contains(p))
+            .expect("the last audit file");
+        std::fs::remove_file(added).expect("remove a folded file");
+    });
+    DrivenPaths {
+        deltas: [first, second],
+        rejected,
+        full_after_rejection,
+    }
+}
+
 /// Scenario RFC0033.13 — the path taken is observable, on a store of its
 /// own. An incremental fold and each of the four fallbacks record
 /// `derive.reason = stale` with their `derive.mode`, the fallbacks also
@@ -863,42 +914,11 @@ fn derive_mode_act(
     write_audit(path, &[widened(1, 1, TS0)]);
     write_records(path, &[mined(1, TS0 + 2)]);
     let audit_dir = path.join("audit").join(format!("tenant_id={TENANT}"));
-    let artifact = audit_dir.join(TEMPLATE_MAP_FILENAME);
     assert_eq!(body_query(path).rows, 1, "the miss publishes");
     let before = derive_points(guard, exporter);
-
-    let delta = step(path, &audit_dir, || {
-        write_audit(path, &[widened(1, 2, TS0 + 10)]);
-    });
-    let rejected = step(path, &audit_dir, || {
-        write_audit(path, &[widened(1, 3, TS0 + 5)]);
-    });
-    let full_after_rejection = audit_set(&audit_dir);
-    step(path, &audit_dir, || {
-        rewrite_artifact(&artifact, |json| {
-            json["fold_state"]["incremental_depth"] = 256.into();
-        });
-        write_audit(path, &[widened(1, 4, TS0 + 20)]);
-    });
-    step(path, &audit_dir, || {
-        rewrite_artifact(&artifact, |json| {
-            json.as_object_mut().expect("object").remove("fold_state");
-        });
-        write_audit(path, &[widened(1, 5, TS0 + 30)]);
-    });
-    let newest = walk_files(&audit_dir);
-    let delta2 = step(path, &audit_dir, || {
-        write_audit(path, &[widened(1, 6, TS0 + 40)]);
-    });
-    step(path, &audit_dir, || {
-        let added = walk_files(&audit_dir)
-            .into_iter()
-            .find(|p| !newest.contains(p))
-            .expect("the last audit file");
-        std::fs::remove_file(added).expect("remove a folded file");
-    });
-
+    let driven = drive_derive_paths(path, &audit_dir);
     let after = derive_points(guard, exporter);
+
     let incremental = key(&[mode("incremental"), reason("stale")]);
     let declined = |r: &str| key(&[fallback(r), mode("full"), reason("stale")]);
     let durations: BTreeMap<Vec<String>, u64> = added(&before[0], &after[0])
@@ -921,20 +941,25 @@ fn derive_mode_act(
 
     let files = added(&before[1], &after[1]);
     let size = added(&before[2], &after[2]);
-    let (full_files, full_bytes) = full_after_rejection;
+    let (rejected, full) = (driven.rejected, driven.full_after_rejection);
     assert_eq!(
-        files[&declined("out_of_order")],
-        (1, (rejected.0 + full_files) as f64),
+        (
+            files[&declined("out_of_order")],
+            size[&declined("out_of_order")]
+        ),
+        (
+            (1, (rejected.0 + full.0) as f64),
+            (1, (rejected.1 + full.1) as f64)
+        ),
         "the rejected delta read counts beside the full fold",
     );
+    let [first, second] = driven.deltas;
     assert_eq!(
-        size[&declined("out_of_order")],
-        (1, (rejected.1 + full_bytes) as f64),
+        (files[&incremental], size[&incremental]),
+        (
+            (2, (first.0 + second.0) as f64),
+            (2, (first.1 + second.1) as f64)
+        ),
+        "each incremental derive reads only its delta",
     );
-    assert_eq!(
-        files[&incremental],
-        (2, (delta.0 + delta2.0) as f64),
-        "each incremental derive reads only its delta's files",
-    );
-    assert_eq!(size[&incremental], (2, (delta.1 + delta2.1) as f64));
 }

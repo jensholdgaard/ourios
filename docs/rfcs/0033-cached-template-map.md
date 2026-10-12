@@ -586,6 +586,11 @@ uncached query identically.
 >       publisher's temp were removed anyway, its `rename` fails, the
 >       publish records `error`, and the query answers from the fold
 >       it holds (§3.5). Nothing wrong is installed.
+>     - **A failed publish cleans up after itself.** Once its temp
+>       exists, a publisher that fails at any later step (write,
+>       rename, or any error before the rename) removes its own temp,
+>       best-effort. The age sweep is only for leftovers of a crash,
+>       where no cleanup could run.
 >     - **The sweep is local-only.** S3 publishes are single
 >       conditional PUTs and leave no temp object.
 > - *Deletion, retention, audit compaction or rewrite*: no code
@@ -684,8 +689,12 @@ uncached query identically.
 > the shared `ourios-semconv` registry via ourios-semconv#17; the
 > registry pin bump lands with the implementation. The OTel naming
 > guidance (`{object}.{property}`, closed enums for short value sets)
-> was checked, and no upstream attribute fits. Duration covers the
-> whole acquisition, including a rejected delta read. The files/size
+> was checked, and no upstream attribute fits. RFC0033.9's duration
+> boundary is unchanged: one sample per fold, and none for a failure
+> before the disposition is known (the listing, or an artifact naming
+> another tenant). The guard and the delta read run after the stale
+> disposition is known, so they fall inside that boundary. A rejected
+> delta read is part of the same fold's duration. The files/size
 > samples count the objects actually fetched. An incremental
 > acquisition reports conflicts like any fold-backed one (RFC0033.8),
 > i.e. the whole union set, as the full fold would.
@@ -1034,6 +1043,13 @@ sits inside the RFC 0031 headline metric fails the condition.
 >   subsequent unchanged-store query is a cache hit
 > - **And** the same holds when files *disappear* from the live set
 >   (frontier is set equality, not subset).
+> - *Amendment (2026-10-12, #962, maintainer-approved):* the
+>   republish and the next-query hit are required only after a
+>   successful publish (`published`). Publication is best-effort
+>   (§3.5), so an abstention, an `error` or an S3 `lost_race` leaves
+>   the prior artifact, or a concurrent winner's, in place. The
+>   answer still equals the no-cache fold over the live set for every
+>   publish outcome.
 
 > **Scenario RFC0033.3 — Crash/tear safety around the publish**
 > - **Given** a publish interrupted mid-write (simulated: a stray
@@ -1279,7 +1295,9 @@ ambiguity cannot recur.
 >   `.tmp`, that are more than 1 hour old, and leaves younger ones in
 >   place. A temp removed or missing under a publisher makes that
 >   publish record `error` without failing its query. A failed
->   removal fails nothing
+>   removal fails nothing. A publish that fails after creating its
+>   temp (e.g. an injected rename failure) leaves no temp of its own
+>   behind
 > - **And** on both backends both queries answer correctly, and the
 >   next acquisition is a hit or a guarded fold (incremental or full)
 >   whose answer equals the full fold over its listing.

@@ -26,8 +26,8 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use futures_core::Stream;
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
-use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
@@ -162,7 +162,7 @@ pub fn reloading_acceptor(
             settings: settings.clone(),
             alpn: alpn.iter().map(|p| p.to_vec()).collect(),
             current: Arc::downgrade(&current),
-            failures: global::meter("ourios.receiver")
+            failures: ourios_core::telemetry::meter("ourios.receiver")
                 .u64_counter(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES)
                 .build(),
             listener,
@@ -328,7 +328,7 @@ struct HandshakeFailures {
 
 impl HandshakeFailures {
     fn new(listener: &'static str) -> Self {
-        let counter = global::meter("ourios.receiver")
+        let counter = ourios_core::telemetry::meter("ourios.receiver")
             .u64_counter(semconv::OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES)
             .build();
         Self { counter, listener }

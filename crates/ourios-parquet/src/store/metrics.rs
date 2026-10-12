@@ -21,21 +21,16 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use futures::stream::{BoxStream, Stream, StreamExt};
-use object_store::ClientOptions;
-use object_store::client::{
-    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
-};
+use object_store::client::{HttpError, HttpErrorKind};
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
-use opentelemetry::{KeyValue, global};
 use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
@@ -44,9 +39,9 @@ use super::StoreError;
 /// The instrumentation scope the storage metrics are recorded under.
 const SCOPE: &str = "ourios.storage";
 
-const ERROR_TYPE: &str = "error.type";
+pub(super) const ERROR_TYPE: &str = "error.type";
 /// The `error.type` fallback when no more specific class is known.
-const OTHER: &str = "_OTHER";
+pub(super) const OTHER: &str = "_OTHER";
 /// `error.type` for a call dropped before it completed.
 const CANCELLED: &str = "cancelled";
 
@@ -196,6 +191,11 @@ impl StoreMetrics {
         }
     }
 
+    /// One HTTP attempt's duration, under its client attributes.
+    pub(super) fn record_http(&self, took: Duration, attributes: &[KeyValue]) {
+        self.http_duration.record(took.as_secs_f64(), attributes);
+    }
+
     fn record_listing(&self, caller: Caller, objects: u64) {
         self.list_objects.record(
             objects,
@@ -259,7 +259,7 @@ pub(crate) enum Metrics {
 impl Metrics {
     pub(crate) fn get(&self) -> &StoreMetrics {
         static GLOBAL: LazyLock<StoreMetrics> =
-            LazyLock::new(|| StoreMetrics::from_meter(&global::meter(SCOPE)));
+            LazyLock::new(|| StoreMetrics::from_meter(&ourios_core::telemetry::meter(SCOPE)));
         match self {
             Self::Global => &GLOBAL,
             Self::Owned(metrics) => metrics,
@@ -305,7 +305,7 @@ fn transport_kind(e: &(dyn std::error::Error + 'static)) -> Option<HttpErrorKind
     None
 }
 
-fn http_error_kind(kind: HttpErrorKind) -> &'static str {
+pub(super) fn http_error_kind(kind: HttpErrorKind) -> &'static str {
     match kind {
         HttpErrorKind::Connect => "connect",
         HttpErrorKind::Request => "request",
@@ -334,14 +334,14 @@ impl Labels {
 
 /// How one HTTP attempt failed: its `error.type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Failure {
+pub(super) enum Failure {
     Status(u16),
     Transport(&'static str),
     Cancelled,
 }
 
 impl Failure {
-    fn error_type(self) -> Cow<'static, str> {
+    pub(super) fn error_type(self) -> Cow<'static, str> {
         match self {
             Self::Status(code) => Cow::Owned(code.to_string()),
             Self::Transport(kind) => Cow::Borrowed(kind),
@@ -355,9 +355,14 @@ tokio::task_local! {
     static OPERATION: Arc<Attempts>;
 }
 
+/// The logical operation the HTTP attempt being polled belongs to, if any.
+pub(super) fn current_attempts() -> Option<Arc<Attempts>> {
+    OPERATION.try_with(Arc::clone).ok()
+}
+
 /// The HTTP attempts one logical operation made, by request identity, with
 /// how the latest attempt of each ended (`None`: it got a response under 400).
-struct Attempts {
+pub(super) struct Attempts {
     metrics: Metrics,
     labels: Labels,
     seen: Mutex<HashMap<u64, Option<Failure>>>,
@@ -366,7 +371,7 @@ struct Attempts {
 impl Attempts {
     /// Note an attempt at `identity`; when it repeats an earlier one, count
     /// a retry classified by how that earlier attempt ended.
-    fn attempt(&self, identity: u64) {
+    pub(super) fn attempt(&self, identity: u64) {
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(earlier) = seen.get(&identity) else {
             return;
@@ -381,7 +386,7 @@ impl Attempts {
             .add(1, &[operation, caller, KeyValue::new(ERROR_TYPE, class)]);
     }
 
-    fn ended(&self, identity: u64, failure: Option<Failure>) {
+    pub(super) fn ended(&self, identity: u64, failure: Option<Failure>) {
         self.seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -512,148 +517,9 @@ impl<T> Stream for Observed<T> {
     }
 }
 
-/// The S3 client's connector, timing every HTTP attempt.
-#[derive(Debug)]
-pub(super) struct MeteredConnector<C> {
-    pub(super) inner: C,
-    pub(super) metrics: Metrics,
-}
-
-impl<C: HttpConnector> HttpConnector for MeteredConnector<C> {
-    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        Ok(HttpClient::new(MeteredHttp {
-            inner: self.inner.connect(options)?,
-            metrics: self.metrics.clone(),
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct MeteredHttp {
-    inner: HttpClient,
-    metrics: Metrics,
-}
-
-#[async_trait]
-impl HttpService for MeteredHttp {
-    async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
-        let scope = OPERATION.try_with(Arc::clone).ok().map(|attempts| {
-            let identity = request_identity(&req);
-            attempts.attempt(identity);
-            (attempts, identity)
-        });
-        let mut attempt = Attempt {
-            metrics: self.metrics.clone(),
-            attributes: request_attributes(&req),
-            started: Instant::now(),
-            scope,
-            done: false,
-        };
-        let response = self.inner.execute(req).await;
-        match &response {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                attempt.finish(
-                    Some(status),
-                    (status >= 400).then_some(Failure::Status(status)),
-                );
-            }
-            Err(e) => attempt.finish(None, Some(Failure::Transport(http_error_kind(e.kind())))),
-        }
-        response
-    }
-}
-
-/// One HTTP attempt, recorded when it ends. Dropped before a response, as
-/// when its caller gives up on the request, it records as cancelled.
-struct Attempt {
-    metrics: Metrics,
-    attributes: Vec<KeyValue>,
-    started: Instant,
-    /// The logical operation it belongs to, and its request identity.
-    scope: Option<(Arc<Attempts>, u64)>,
-    done: bool,
-}
-
-impl Attempt {
-    fn finish(&mut self, status: Option<u16>, failure: Option<Failure>) {
-        if std::mem::replace(&mut self.done, true) {
-            return;
-        }
-        let took = self.started.elapsed().as_secs_f64();
-        let mut attributes = std::mem::take(&mut self.attributes);
-        if let Some(status) = status {
-            attributes.push(KeyValue::new(
-                "http.response.status_code",
-                i64::from(status),
-            ));
-        }
-        if let Some(failure) = failure {
-            attributes.push(KeyValue::new(ERROR_TYPE, failure.error_type()));
-        }
-        self.metrics.get().http_duration.record(took, &attributes);
-        if let Some((attempts, identity)) = &self.scope {
-            attempts.ended(*identity, failure);
-        }
-    }
-}
-
-impl Drop for Attempt {
-    fn drop(&mut self) {
-        self.finish(None, Some(Failure::Cancelled));
-    }
-}
-
-/// What makes two requests the same request: method, URI and `Range`, so
-/// the parallel ranged GETs of one `get_ranges` stay distinct. Other headers
-/// are left out, since a retry re-signs. A body retry resumes with a
-/// narrower `Range`, so it is not counted.
-fn request_identity(req: &HttpRequest) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    req.method().hash(&mut hasher);
-    req.uri().hash(&mut hasher);
-    req.headers()
-        .get("range")
-        .map(object_store::HeaderValue::as_bytes)
-        .hash(&mut hasher);
-    hasher.finish()
-}
-
-/// The HTTP client attributes known before the response.
-fn request_attributes(req: &HttpRequest) -> Vec<KeyValue> {
-    // Spelled out because `as_str` borrows the request and the attribute
-    // needs a `'static` value.
-    let method = match req.method().as_str() {
-        "GET" => "GET",
-        "HEAD" => "HEAD",
-        "PUT" => "PUT",
-        "POST" => "POST",
-        "DELETE" => "DELETE",
-        "PATCH" => "PATCH",
-        "OPTIONS" => "OPTIONS",
-        _ => OTHER,
-    };
-    let uri = req.uri();
-    let mut attributes = Vec::with_capacity(5);
-    attributes.push(KeyValue::new("http.request.method", method));
-    if let Some(host) = uri.host() {
-        attributes.push(KeyValue::new("server.address", host.to_owned()));
-    }
-    let port = uri.port_u16().or(match uri.scheme_str() {
-        Some("https") => Some(443),
-        Some("http") => Some(80),
-        _ => None,
-    });
-    if let Some(port) = port {
-        attributes.push(KeyValue::new("server.port", i64::from(port)));
-    }
-    attributes
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -664,8 +530,10 @@ mod tests {
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
     use ourios_semconv as semconv;
 
-    use super::{Caller, Metrics, Operation, StoreMetrics};
-    use crate::store::{MAX_BRIDGE_WORKERS, S3Config, Store, StoreError, block_on_off_runtime};
+    use super::{Caller, Metrics, Operation, SCOPE, StoreMetrics};
+    use crate::store::client_span::Tracing;
+    use crate::store::test_support::{fake_s3, s3_config, serve};
+    use crate::store::{MAX_BRIDGE_WORKERS, Store, StoreError, block_on_off_runtime};
 
     /// Storage instruments of their own, exporting in memory.
     struct Harness {
@@ -696,7 +564,7 @@ mod tests {
                 .with_periodic_exporter(exporter.clone())
                 .build();
             let metrics = Metrics::Owned(Arc::new(StoreMetrics::from_meter(
-                &provider.meter("ourios.storage"),
+                &provider.meter_with_scope(ourios_core::telemetry::scope(SCOPE)),
             )));
             Self {
                 provider,
@@ -1021,63 +889,8 @@ mod tests {
         );
     }
 
-    /// A fake S3 endpoint answering each request on its own connection with
-    /// the next of `responses`. Returns its port.
-    fn fake_s3(responses: Vec<&'static str>) -> u16 {
-        let count = responses.len();
-        let mut responses = responses.into_iter();
-        serve(count, move |_| responses.next().map(str::to_owned))
-    }
-
-    /// A fake S3 endpoint serving `connections` connections, one request
-    /// each, answered by `respond` from the request head. `None` leaves the
-    /// request unanswered until the client hangs up. Returns its port.
-    fn serve(
-        connections: usize,
-        mut respond: impl FnMut(&str) -> Option<String> + Send + 'static,
-    ) -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
-            for _ in 0..connections {
-                let (mut conn, _) = listener.accept().expect("accept");
-                let request = read_head(&mut conn);
-                answer(&mut conn, respond(&request));
-            }
-        });
-        port
-    }
-
-    /// Read a request up to the end of its head.
-    fn read_head(conn: &mut std::net::TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buf = [0_u8; 1024];
-        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = conn.read(&mut buf).expect("read");
-            assert!(n > 0, "request ended early");
-            request.extend_from_slice(&buf[..n]);
-        }
-        String::from_utf8_lossy(&request).into_owned()
-    }
-
-    /// Send `response`, or with none, hold the connection until the client
-    /// hangs up.
-    fn answer(conn: &mut std::net::TcpStream, response: Option<String>) {
-        let Some(response) = response else {
-            let mut buf = [0_u8; 1024];
-            while conn.read(&mut buf).is_ok_and(|n| n > 0) {}
-            return;
-        };
-        conn.write_all(response.as_bytes()).expect("write");
-    }
-
     fn s3_store(harness: &Harness, port: u16, caller: Caller) -> Store {
-        let cfg = S3Config::new("bucket")
-            .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_region("us-east-1")
-            .with_access_key_id("key")
-            .with_secret_access_key("secret");
-        Store::s3_with(cfg, harness.metrics.clone())
+        Store::s3_with(s3_config(port), harness.metrics.clone(), Tracing::Global)
             .expect("s3")
             .with_caller(caller)
     }

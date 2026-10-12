@@ -1,0 +1,6 @@
+disallowed-methods = [
+    { path = "opentelemetry::global::meter", reason = "unversioned scope; use ourios_core::telemetry::meter" },
+    { path = "opentelemetry::global::tracer", reason = "unversioned scope; use ourios_core::telemetry::tracer" },
+    { path = "opentelemetry::metrics::MeterProvider::meter", reason = "unversioned scope; use meter_with_scope(ourios_core::telemetry::scope(..))" },
+    { path = "opentelemetry::trace::TracerProvider::tracer", reason = "unversioned scope; use tracer_with_scope(ourios_core::telemetry::scope(..))" },
+]

@@ -20,7 +20,7 @@
 use axum::body::Body;
 use axum::http::{Request, header};
 use opentelemetry::Value;
-use opentelemetry::trace::{SpanKind, TracerProvider as _};
+use opentelemetry::trace::SpanKind;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use tower::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
@@ -44,7 +44,7 @@ fn scoped_tracer() -> (
         .with_simple_exporter(exporter.clone())
         .build();
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
     (exporter, provider, subscriber)
 }
 
@@ -121,5 +121,78 @@ async fn rfc0038_1_query_emits_one_server_span() {
         matches!(attr("http.response.status_code"), Some(Value::I64(200))),
         "http.response.status_code = 200, got {:?}",
         attr("http.response.status_code"),
+    );
+}
+
+/// Drive one `POST /v1/query` against `bucket` and return its status and the
+/// exported query span.
+async fn query_span(
+    bucket: &std::path::Path,
+    tenant: Option<&str>,
+) -> (u16, opentelemetry_sdk::trace::SpanData) {
+    let app = ourios_server::querier::router(bucket.to_path_buf(), WINDOW_NANOS);
+    let (exporter, provider, subscriber) = scoped_tracer();
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1/query")
+        .header(header::CONTENT_TYPE, "text/plain");
+    if let Some(tenant) = tenant {
+        request = request.header("X-Ourios-Tenant", tenant);
+    }
+    let request = request
+        .body(Body::from("template_id == 1"))
+        .expect("build request");
+    let response = app
+        .oneshot(request)
+        .with_subscriber(subscriber)
+        .await
+        .expect("oneshot");
+    provider.force_flush().expect("spans flush");
+    let span = exporter
+        .get_finished_spans()
+        .expect("spans exported")
+        .into_iter()
+        .find(|span| span.name.as_ref() == "POST /v1/query")
+        .expect("the query span");
+    (response.status().as_u16(), span)
+}
+
+fn error_type(span: &opentelemetry_sdk::trace::SpanData) -> Option<Value> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "error.type")
+        .map(|kv| kv.value.clone())
+}
+
+// Semconv HTTP server spans: a 4xx is the client's error, so the span's
+// status stays unset and it carries no `error.type`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_4xx_query_leaves_the_server_span_unset() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let (status, span) = query_span(bucket.path(), None).await;
+    assert_eq!(status, 400, "a query without a tenant is a 400");
+    assert_eq!(span.status, opentelemetry::trace::Status::Unset);
+    assert_eq!(error_type(&span), None);
+}
+
+// A query the server fails (a store root that is not a directory, so the
+// listing errors) answers 500, and the server span is `Error` with the
+// status code as `error.type`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_5xx_query_marks_the_server_span_error() {
+    let dir = tempfile::tempdir().expect("temp");
+    let bucket = dir.path().join("not-a-directory");
+    std::fs::write(&bucket, b"").expect("write the file");
+    let (status, span) = query_span(&bucket, Some("acme")).await;
+    assert_eq!(status, 500, "a failed store listing is a 500");
+    assert!(
+        matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+        "status = {:?}",
+        span.status,
+    );
+    assert!(
+        matches!(error_type(&span), Some(Value::String(s)) if s.as_str() == "500"),
+        "error.type = {:?}",
+        error_type(&span),
     );
 }

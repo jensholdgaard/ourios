@@ -24,7 +24,7 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
-use opentelemetry::trace::{SpanKind, TracerProvider as _};
+use opentelemetry::trace::SpanKind;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tower::ServiceExt as _;
@@ -160,7 +160,7 @@ async fn rfc0039_6_mcp_tool_call_joins_the_caller_trace() {
         .with_simple_exporter(exporter.clone())
         .build();
     tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")))
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)))
         .try_init()
         .expect("install global subscriber");
     opentelemetry::global::set_tracer_provider(provider.clone());

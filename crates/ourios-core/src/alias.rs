@@ -39,8 +39,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
-use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
 use crate::audit::{AuditEvent, AuditPayload, AuditSink};
@@ -209,7 +209,7 @@ impl AliasMap {
     /// attribute-less series.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.miner");
+        let meter = crate::telemetry::meter("ourios.miner");
         let assertions_total = meter
             .u64_counter(semconv::OURIOS_MINER_ALIAS_ASSERTIONS)
             .with_unit("{assertion}")

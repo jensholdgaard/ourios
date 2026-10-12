@@ -82,7 +82,7 @@ mod tests {
             .build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
         super::register(
-            &provider.meter(super::SCOPE),
+            &provider.meter_with_scope(crate::scope(super::SCOPE)),
             &tokio::runtime::Handle::current(),
         );
         let parked = tokio::spawn(std::future::pending::<()>());

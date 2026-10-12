@@ -11,8 +11,11 @@
 //! tracer provider, so this stays inside the consolidated harness (see
 //! `tests/README.md` on the global-installer exclusions).
 
-use crate::ingest_support::{open_pipeline, request, resource_logs};
-use opentelemetry::trace::{SpanId, SpanKind, TracerProvider as _};
+use crate::ingest_support::{
+    failing_append_pipeline_transient, open_pipeline, oversize_append_pipeline, request,
+    resource_logs,
+};
+use opentelemetry::trace::{SpanId, SpanKind, Status};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
@@ -37,7 +40,7 @@ async fn ingest_and_collect_spans(record_count: usize) -> Vec<SpanData> {
         .with_simple_exporter(exporter.clone())
         .build();
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
 
     let bodies = distinct_bodies(record_count);
     let body_refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
@@ -126,4 +129,70 @@ async fn rfc0038_2_span_count_is_constant_in_record_count() {
         "ingest-logs + commit-wal only, got {:?}",
         many.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
+}
+
+/// Drive one batch through `pipeline`, whose WAL append fails, and return
+/// the finished spans.
+async fn failed_ingest_spans(pipeline: ourios_ingester::receiver::IngestPipeline) -> Vec<SpanData> {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)));
+    let export = request(vec![resource_logs("checkout", &["a line"])]);
+    pipeline
+        .ingest_bound(
+            export,
+            ourios_core::tenant::TenantId::new("checkout"),
+            None,
+            false,
+        )
+        .with_subscriber(subscriber)
+        .await
+        .expect_err("the append fails");
+    provider.force_flush().expect("spans flush");
+    exporter.get_finished_spans().expect("spans exported")
+}
+
+fn error_type(span: &SpanData) -> Option<String> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "error.type")
+        .map(|kv| kv.value.as_str().into_owned())
+}
+
+/// A WAL that cannot take the batch fails the `commit wal` span itself, and
+/// the server span above it, since the server is at fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_failed_wal_commit_marks_the_commit_span_and_the_batch_span() {
+    let spans = failed_ingest_spans(failing_append_pipeline_transient()).await;
+    for name in ["commit wal", "ingest logs"] {
+        let [span] = spans_named(&spans, name)[..] else {
+            panic!("one {name} span, got {spans:?}");
+        };
+        assert!(
+            matches!(span.status, Status::Error { .. }),
+            "{name}: {:?}",
+            span.status
+        );
+        assert_eq!(error_type(span).as_deref(), Some("unavailable"), "{name}");
+    }
+}
+
+/// An oversize batch fails its commit, but it is the client's fault, so the
+/// server span stays unset (HTTP 413 / gRPC `INVALID_ARGUMENT`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn an_oversize_batch_fails_the_commit_span_but_not_the_batch_span() {
+    let spans = failed_ingest_spans(oversize_append_pipeline()).await;
+    let [commit] = spans_named(&spans, "commit wal")[..] else {
+        panic!("one commit span, got {spans:?}");
+    };
+    assert!(matches!(commit.status, Status::Error { .. }));
+    assert_eq!(error_type(commit).as_deref(), Some("too_large"));
+    let [batch] = spans_named(&spans, "ingest logs")[..] else {
+        panic!("one batch span");
+    };
+    assert_eq!(batch.status, Status::Unset);
+    assert_eq!(error_type(batch), None);
 }

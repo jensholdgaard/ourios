@@ -17,7 +17,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use opentelemetry::KeyValue;
-use opentelemetry::global;
 use opentelemetry::metrics::Counter;
 use ourios_core::auth::openfga::{
     MCP_TOOL_NAMES, OpenFgaConfig, PrincipalKind, TenantObjects, is_object_id,
@@ -138,7 +137,7 @@ impl GraphEmitter {
                 "identities.agent_columns",
                 config.visibility().agent_columns(),
             )?,
-            tuples: global::meter("ourios.graph")
+            tuples: ourios_core::telemetry::meter("ourios.graph")
                 .u64_counter(semconv::OURIOS_GRAPH_TUPLES)
                 .with_unit("{tuple}")
                 .build(),

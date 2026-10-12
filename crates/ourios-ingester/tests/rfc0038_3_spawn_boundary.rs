@@ -23,7 +23,6 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use ingest_support::{grpc_request, request, resource_logs, shared_wal_pipeline};
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use ourios_ingester::Compactor;
@@ -46,7 +45,7 @@ async fn rfc0038_3_span_context_survives_spawn_boundaries() {
         .with_simple_exporter(exporter.clone())
         .build();
     tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")))
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)))
         .try_init()
         .expect("install global subscriber");
     opentelemetry::global::set_tracer_provider(provider.clone());

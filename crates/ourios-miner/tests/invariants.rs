@@ -142,6 +142,17 @@ fn assert_mandatory_exported(
         );
     }
 
+    let miner_scope = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .find(|s| s.scope().name() == "ourios.miner")
+        .expect("an ourios.miner scope is exported");
+    assert_eq!(
+        miner_scope.scope().version(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "the ourios.miner scope must carry the crate version",
+    );
+
     ourios_telemetry::histogram_guard::assert_explicit_buckets(
         rms,
         &[

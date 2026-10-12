@@ -30,9 +30,9 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use opentelemetry::KeyValue;
 use opentelemetry::context::FutureExt as _;
 use opentelemetry::metrics::{Counter, Histogram};
-use opentelemetry::{KeyValue, global};
 use ourios_serving::auth::{AuthBinding, AuthError, AuthResolver};
 use ourios_serving::extract_context;
 use ourios_serving::serve::{PlainListener, serve_http};
@@ -160,7 +160,7 @@ pub(crate) struct QuerierMetrics {
 
 impl QuerierMetrics {
     fn new() -> Self {
-        let meter = global::meter("ourios.query");
+        let meter = ourios_core::telemetry::meter("ourios.query");
         let duration = meter
             .f64_histogram(semconv::OURIOS_QUERY_DURATION)
             .with_unit("s")
@@ -507,18 +507,18 @@ async fn handle_query(
         ourios.tenant = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         ourios.query.visibility.branch = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
     )
 )]
 async fn handle_query_traced(state: QuerierState, headers: HeaderMap, body: Bytes) -> Response {
     // Record the outgoing status across every early-return path at the one
     // exit; the RFC 0016 flow lives in the inner fn, which runs inside this
-    // span so its `ourios.tenant` record lands on it. Record as `i64`:
-    // `tracing-opentelemetry` stringifies `u64` (OTel has no unsigned type),
-    // but semconv types `http.response.status_code` as an int.
+    // span so its `ourios.tenant` record lands on it.
     let response = handle_query_inner(state, headers, body).await;
-    tracing::Span::current().record(
-        "http.response.status_code",
-        i64::from(response.status().as_u16()),
+    ourios_core::telemetry::record_http_server_status(
+        &tracing::Span::current(),
+        response.status().as_u16(),
     );
     response
 }

@@ -88,7 +88,7 @@ mod tests {
         let provider = SdkMeterProvider::builder()
             .with_periodic_exporter(exporter.clone())
             .build();
-        let meter = provider.meter("guard-test");
+        let meter = provider.meter_with_scope(crate::scope("guard-test"));
         let builder = meter.f64_histogram("test.duration").with_unit("s");
         let histogram = if declare {
             builder.with_boundaries(vec![0.1, 1.0]).build()

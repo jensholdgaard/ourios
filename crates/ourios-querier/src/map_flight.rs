@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 
 use ourios_core::tenant::TenantId;
 use tokio::sync::watch;
+use tracing::Instrument as _;
 
 use crate::template_map::{self, TemplateMap};
-use crate::{Backend, QueryError, StoreRef, audit_scan};
+use crate::{Backend, QueryError, StoreRef, audit_scan, phase};
 
 /// One acquisition's answer: the map plus its template-map acquisition
 /// bytes ([`crate::QueryResult::registry_bytes_read`]).
@@ -103,6 +104,9 @@ impl TemplateMapFlights {
     /// the acquisition's bytes for the query that ran it, `0` for a joiner,
     /// which was handed the result of another query's fetch.
     ///
+    /// RFC 0038 §3.7.2: the acquisition is the query's `load template_map`
+    /// span, a query phase whose object-store requests open `CLIENT` spans.
+    ///
     /// # Errors
     ///
     /// As [`Self::acquire`].
@@ -111,16 +115,50 @@ impl TemplateMapFlights {
         backend: &Backend,
         tenant: &TenantId,
     ) -> Result<MapAcquisition, QueryError> {
+        let phase = tracing::info_span!(
+            "load template_map",
+            otel.kind = "internal",
+            ourios.tenant = tenant.as_str(),
+            ourios.template_map.lookup.outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
+        let acquired = self
+            .acquire_shared(backend, tenant, &phase)
+            .instrument(phase.clone())
+            .await;
+        if let Err(e) = &acquired {
+            ourios_core::telemetry::record_span_error(&phase, template_map::error_type(e));
+        }
+        acquired
+    }
+
+    /// [`Self::acquire_fetched`]'s single-flight loop, inside `phase`.
+    async fn acquire_shared(
+        self: &Arc<Self>,
+        backend: &Backend,
+        tenant: &TenantId,
+        phase: &tracing::Span,
+    ) -> Result<MapAcquisition, QueryError> {
         let mut waited = Duration::ZERO;
         loop {
-            let span = tracing::Span::current();
+            // The phase span itself, never `Span::current()`: when the
+            // subscriber filters the phase out, the current span is the
+            // query, which must not become the phase (`crate::phase`).
+            let span = phase.clone();
+            // The caller's subscriber too, not just its span: the fold opens
+            // its own `derive template_map` span on the blocking thread,
+            // which otherwise resolves only the global default.
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
             let flights = Arc::clone(self);
             let backend = backend
                 .clone()
                 .with_caller(ourios_parquet::Caller::TemplateMap);
             let owned = tenant.clone();
             let step = tokio::task::spawn_blocking(move || {
-                span.in_scope(|| flights.step(backend.store_ref(), &owned))
+                tracing::dispatcher::with_default(&dispatch, || {
+                    phase::in_phase(&span, || flights.step(backend.store_ref(), &owned))
+                })
             })
             .await
             .map_err(|e| QueryError::Storage {
@@ -142,10 +180,17 @@ impl TemplateMapFlights {
                     // The flight's guard always publishes before dropping its
                     // sender, so a closed channel without a value is
                     // unreachable; it is still an error, never a hang.
-                    let outcome = match done.wait_for(Option::is_some).await {
-                        Ok(value) => (*value).clone(),
-                        Err(_) => None,
-                    };
+                    let outcome = async {
+                        match done.wait_for(Option::is_some).await {
+                            Ok(value) => (*value).clone(),
+                            Err(_) => None,
+                        }
+                    }
+                    .instrument(tracing::info_span!(
+                        "wait template_map",
+                        otel.kind = "internal"
+                    ))
+                    .await;
                     waited += started.elapsed();
                     if same_frontier {
                         let acquired = outcome.unwrap_or_else(|| Err(abandoned()));

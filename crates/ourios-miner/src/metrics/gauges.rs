@@ -117,7 +117,10 @@ pub(super) fn registry_for(
         return Arc::clone(&bound.registry);
     }
     let registry = Arc::new(GaugeRegistry::default());
-    let gauges = register(&provider.meter(METER_NAME), &registry);
+    let gauges = register(
+        &provider.meter_with_scope(ourios_core::telemetry::scope(METER_NAME)),
+        &registry,
+    );
     bindings.push(Binding {
         provider: key,
         registry: Arc::clone(&registry),

@@ -32,7 +32,7 @@ pub(super) fn record_operator_spans(plan: &dyn ExecutionPlan) {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
     let cx = tracing::Span::current().context();
-    let tracer = opentelemetry::global::tracer("ourios-df-otel");
+    let tracer = ourios_core::telemetry::tracer("ourios-df-otel");
     ourios_df_otel::record_plan_spans(plan, &cx, &tracer);
 }
 

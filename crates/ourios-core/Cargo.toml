@@ -37,13 +37,17 @@ subtle = { version = "2.6", default-features = false }
 # f64 (#130) — RFC 0001 §6.1's `stored_bytes ↔ AnyValue` faithfulness
 # guarantee requires the correctly-rounded parser.
 serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
-# The OTel metrics **API** only (RFC 0001 §6.8 "Export architecture":
+# The OTel metrics and trace **API** only (RFC 0001 §6.8 "Export architecture":
 # library crates depend on the lightweight API and resolve instruments
-# through `global::meter`; the heavy SDK + OTLP exporter live in
+# through `telemetry::meter`; the heavy SDK + OTLP exporter live in
 # `ourios-telemetry`). Drives the alias map's
 # `ourios.miner.alias.assertions` / `ourios.miner.alias.retractions`
-# counters (§6.8 telemetry table).
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# counters (§6.8 telemetry table), and `telemetry`'s versioned meter and
+# tracer scopes for every crate.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+# `telemetry`'s span-status helpers record onto `tracing` spans, which the
+# `tracing-opentelemetry` layer in ourios-telemetry exports.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Generated dotted-`ourios.*` semconv name constants for the alias
 # counters' metric names + `ourios.tenant` attribute key (§6.8).
 # Zero-dep leaf crate.

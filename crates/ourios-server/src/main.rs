@@ -877,7 +877,6 @@ mod tests {
         PathBuf,
         tempfile::TempDir,
     ) {
-        use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
         use tracing_subscriber::prelude::*;
 
@@ -896,8 +895,9 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)),
+        );
         let guard = tracing::subscriber::set_default(subscriber);
         let _ = run_graph_verb_traced(verb, Some(config_path.as_path())).await;
         drop(guard);

@@ -5,6 +5,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 
 use futures::FutureExt;
+use opentelemetry::context::FutureExt as _;
 use tokio::runtime::Runtime;
 
 use super::StoreError;
@@ -110,12 +111,18 @@ where
         Err(e) => return Ok(Err(e)),
     };
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // The caller's OTel context rides along, so a request `fut` makes inside a
+    // query phase opens its CLIENT span under that phase (RFC 0038 §3.7.4).
+    let cx = opentelemetry::Context::current();
     // The task, not a `JoinHandle`, carries the outcome back: awaiting a
     // `JoinHandle` needs an executor, and the caller may be inside a runtime.
-    rt.spawn(async move {
-        // The receiver outlives the send — the caller blocks on it below.
-        let _ = tx.send(AssertUnwindSafe(fut).catch_unwind().await);
-    });
+    rt.spawn(
+        async move {
+            // The receiver outlives the send — the caller blocks on it below.
+            let _ = tx.send(AssertUnwindSafe(fut).catch_unwind().await);
+        }
+        .with_context(cx),
+    );
     rx.recv().unwrap_or_else(|std::sync::mpsc::RecvError| {
         Ok(Err(StoreError::Runtime(std::io::Error::other(
             "store bridge task dropped before completing",

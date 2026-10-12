@@ -316,14 +316,20 @@ pub(super) fn column_comparison(
             ),
         });
     }
+    // The literal is checked before the absent-column guard, so whether a
+    // query is valid never depends on which files its window scans.
+    let rhs = match op {
+        CmpOp::Ord(_) => field_literal(field, value)?,
+        CmpOp::Match | CmpOp::NotMatch => regex_literal(field, value)?,
+    };
     // Absent OPTIONAL column ⇒ all-NULL ⇒ the leaf matches nothing.
     if optional && !has_column(schema, column) {
         return Ok(PredExpr::None);
     }
     let expr = match op {
-        CmpOp::Ord(ord) => ord_expr(col(column), ord, field_literal(field, value)?),
-        CmpOp::Match => regexp_like(col(column), regex_literal(field, value)?, None),
-        CmpOp::NotMatch => not(regexp_like(col(column), regex_literal(field, value)?, None)),
+        CmpOp::Ord(ord) => ord_expr(col(column), ord, rhs),
+        CmpOp::Match => regexp_like(col(column), rhs, None),
+        CmpOp::NotMatch => not(regexp_like(col(column), rhs, None)),
     };
     Ok(PredExpr::Filter(expr))
 }

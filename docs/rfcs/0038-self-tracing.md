@@ -355,6 +355,10 @@ flowchart TD
     RG["S3.GetObject × m<br/>CLIENT (manifests)"]
     TL["S3.ListObjectsV2 × k<br/>CLIENT (audit prefix)"]
     TG["S3.GetObject<br/>CLIENT (artifact)"]
+    W["wait template_map × w<br/>INTERNAL<br/>(behind an in-flight acquisition)"]
+    D["derive template_map<br/>INTERNAL<br/>(at most one: a folding lookup)"]
+    DG["S3.GetObject × f<br/>CLIENT (audit files)"]
+    TP["S3.PutObject<br/>CLIENT (write-through)"]
     Q --> T1
     Q --> R
     Q --> O1
@@ -366,7 +370,26 @@ flowchart TD
     T1 -.-> TG
     T2 --> TL
     T2 --> TG
+    T1 -.-> W
+    T1 -.-> D
+    T1 -.-> TP
+    T2 --> W
+    T2 --> D
+    T2 --> TP
+    D --> DG
 ```
+
+> **Amendment (2026-10-12, #966, maintainer-approved).** The tree above
+> includes the §3.7.2 children of `load template_map`:
+>
+> - `wait template_map`: one per single-flight loop iteration that finds
+>   another query's acquisition in flight.
+> - `derive template_map`: at most one, for a `miss`, `stale`, `torn` or
+>   `unknown_version` lookup the query itself acquires. The fold's
+>   audit-file reads are its `CLIENT` children.
+>
+> The audit listing, the artifact `GET` and the write-through `PUT` stay
+> directly under `load template_map`.
 
 A query run through MCP never passes through the HTTP handler. Its root is
 the `execute_tool query_logs` span (§3.5), which is itself the child of
@@ -1039,6 +1062,18 @@ maintainer-approved).
 > alongside the §3.7.3 AWS attributes. It also carries `aws.request_id`,
 > from the `x-amz-request-id` header, when the response sends one.
 
+> **Scenario RFC0038.16 — a failed shared acquisition fails the waiter's
+> load, not its wait.**
+> **Given** two concurrent queries for one tenant at the same audit
+> frontier, the first holding the per-tenant acquisition, and an audit set
+> holding a file the fold cannot read,
+> **When** the second waits on the first's acquisition and the acquisition
+> fails,
+> **Then** both queries fail. The second query's `wait template_map` stays
+> `Unset`, since the wait itself completed. Its `load template_map` is
+> `Error`, with an `error.type` equal to the shared failure's class
+> (`storage`).
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -1120,6 +1155,8 @@ Mapped to `CLAUDE.md` §6.2:
 >     acquires and refolds the stale map, so its `load template_map` carries
 >     one `wait template_map` and one `derive template_map` (outcome
 >     `stale`). The first query has neither a wait nor the second's fold.
+>   - `a_failed_shared_acquisition_fails_the_waiters_load_not_its_wait`
+>     (`testing` feature) covers RFC0038.16.
 >   - `a_failed_fold_marks_the_derive_and_load_spans_error` covers
 >     RFC0038.13.
 >
@@ -1277,5 +1314,5 @@ scope, not ingest) already covers it.
   `INTERNAL` children of `load template_map` (§3.5, §3.7.2), and records
   how the `CLIENT` spans handle a cancelled request and which HTTP client
   attributes they carry (§3.7.3). Amends RFC0038.1's query arm and
-  RFC0038.8's parentage, adds RFC0038.12–.15 and maps them to #965's
+  RFC0038.8's parentage, adds RFC0038.12–.16 and maps them to #965's
   tests (§5, §6). No new attribute names. Matches #965.

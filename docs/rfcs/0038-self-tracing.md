@@ -264,7 +264,7 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > |---|---|---|
 > | File-set resolution (listing + manifest reads) | `resolve files` | `INTERNAL` (child of `POST /v1/query`) |
 > | Template-map acquisition (RFC 0033) | `load template_map` | `INTERNAL` (child of `POST /v1/query`) |
-> | One object-store HTTP request (S3 backend) | `S3.{Operation}`, e.g. `S3.ListObjectsV2`, `S3.GetObject` | `CLIENT` (child of one of the two above) |
+> | One object-store HTTP request (S3 backend) | `S3.{Operation}`, e.g. `S3.ListObjectsV2`, `S3.GetObject` | `CLIENT` (child of one of the two above, or of `derive template_map` for the fold's reads, per the 2026-10-12 amendment below) |
 >
 > The first two follow this section's `{action} {target}` rule. The
 > `CLIENT` names follow the upstream `Service.Operation` rule for AWS-API
@@ -419,8 +419,10 @@ Children of the query's root span, in the order they start:
 - **The RFC 0040 operator spans** are unchanged: one tree per executed
   physical plan.
 - On the **S3 backend**, `resolve files` and `load template_map` each
-  parent one `CLIENT` span per HTTP request the phase makes (§3.7.3). On
-  the local backend they parent none.
+  parent one `CLIENT` span per HTTP request the phase makes (§3.7.3). The
+  fold's audit-file reads are the exception: their `CLIENT` spans are
+  children of `derive template_map` (2026-10-12 amendment). On the local
+  backend they parent none.
 
 Both `INTERNAL` spans are emitted on **both backends**. On the local
 backend, resolution is a `std::fs` walk and not a network call, but the tree

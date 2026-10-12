@@ -78,6 +78,8 @@ fn target_of(builder: &AmazonS3Builder, tracing: Tracing) -> S3Target {
         region: get(AmazonS3ConfigKey::Region),
         endpoint_host: endpoint.as_deref().map(endpoint_host),
         path_prefix: endpoint.as_deref().map(endpoint_path).unwrap_or_default(),
+        virtual_hosted: get(AmazonS3ConfigKey::VirtualHostedStyleRequest)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true")),
         tracing,
     }
 }
@@ -230,6 +232,10 @@ mod tests {
         let target = target_of(&generic, Tracing::Global);
         assert_eq!(target.endpoint_host.as_deref(), Some("generic.local"));
         assert_eq!(target.region, None);
+        assert!(!target.virtual_hosted);
+
+        let virtual_hosted = generic.with_virtual_hosted_style_request(true);
+        assert!(target_of(&virtual_hosted, Tracing::Global).virtual_hosted);
     }
 
     #[test]

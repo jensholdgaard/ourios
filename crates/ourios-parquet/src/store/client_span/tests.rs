@@ -84,6 +84,7 @@ fn target(path_prefix: &str) -> S3Target {
         region: None,
         endpoint_host: Some("h".to_owned()),
         path_prefix: path_prefix.to_owned(),
+        virtual_hosted: false,
         tracing: Tracing::Global,
     }
 }
@@ -118,6 +119,42 @@ fn a_request_to_another_host_is_not_an_s3_request() {
     };
     let request = request("GET", "http://169.254.169.254/latest/api/token", None);
     assert_eq!(object_key(&request, &latest), None);
+}
+
+/// With virtual-hosted style on a custom endpoint, the client addresses
+/// the endpoint verbatim (bucket already in its host), and the whole path
+/// is the key.
+#[test]
+fn a_custom_virtual_hosted_endpoint_keys_by_the_whole_path() {
+    let virtual_hosted = S3Target {
+        endpoint_host: Some("bucket.h".to_owned()),
+        virtual_hosted: true,
+        ..target("")
+    };
+    let request = request("GET", "http://bucket.h/data/a.parquet", None);
+    assert_eq!(
+        object_key(&request, &virtual_hosted).as_deref(),
+        Some("data/a.parquet")
+    );
+}
+
+/// With no endpoint configured, both AWS partitions' S3 hosts address the
+/// bucket, in both addressing styles.
+#[test]
+fn the_aws_global_and_china_partitions_are_s3_hosts() {
+    let aws = S3Target {
+        endpoint_host: None,
+        ..target("")
+    };
+    for uri in [
+        "https://s3.us-east-1.amazonaws.com/bucket/k",
+        "https://bucket.s3.us-east-1.amazonaws.com/k",
+        "https://s3.cn-north-1.amazonaws.com.cn/bucket/k",
+        "https://bucket.s3.cn-north-1.amazonaws.com.cn/k",
+    ] {
+        let request = request("GET", uri, None);
+        assert_eq!(object_key(&request, &aws).as_deref(), Some("k"), "{uri}");
+    }
 }
 
 /// A virtual-hosted request keeps its whole path as the key, even when the

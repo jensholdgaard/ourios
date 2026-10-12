@@ -71,6 +71,10 @@ pub(super) struct S3Target {
     /// endpoint override may sit below a path, and path-style requests then
     /// start with it.
     pub(super) path_prefix: String,
+    /// Virtual-hosted-style requests (`aws_virtual_hosted_style_request`):
+    /// the client addresses the configured endpoint verbatim, the bucket
+    /// already in its host, and the whole path is the key.
+    pub(super) virtual_hosted: bool,
     pub(super) tracing: Tracing,
 }
 
@@ -177,6 +181,7 @@ fn object_key(req: &HttpRequest, target: &S3Target) -> Option<String> {
     let path = below_prefix(req.uri().path(), &target.path_prefix)?;
     let bucket = target.bucket.as_str();
     let encoded = match host.strip_prefix(bucket).and_then(|h| h.strip_prefix('.')) {
+        _ if target.virtual_hosted && is_s3_host(host, target) => path.trim_start_matches('/'),
         Some(base) if is_s3_host(base, target) => path.trim_start_matches('/'),
         _ if is_s3_host(host, target) => {
             let rest = below_prefix(path, &format!("/{bucket}"))?;
@@ -191,12 +196,12 @@ fn object_key(req: &HttpRequest, target: &S3Target) -> Option<String> {
     )
 }
 
-/// Whether `host` is the configured S3 endpoint, or an AWS S3 host when no
-/// endpoint is configured.
+/// Whether `host` is the configured S3 endpoint, or an AWS S3 host (the
+/// global or the China partition) when no endpoint is configured.
 fn is_s3_host(host: &str, target: &S3Target) -> bool {
     match &target.endpoint_host {
         Some(endpoint) => host == endpoint,
-        None => host.ends_with(".amazonaws.com"),
+        None => host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn"),
     }
 }
 

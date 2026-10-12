@@ -13,7 +13,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use ourios_core::tenant::TenantId;
 
-use super::{DerivePath, Derived, FallbackReason, FoldPass, TemplateMap, add_bytes, full_fold};
+use super::{
+    DerivePath, Derived, FallbackReason, FoldBase, FoldPass, TemplateMap, add_bytes, full_fold,
+};
 use crate::fold_state::{FoldState, INCREMENTAL_DEPTH_CAP, is_fold_relevant, nanos};
 use crate::template_registry::{RegistryFold, TemplateRegistry};
 use crate::{QueryError, audit_scan::ResolvedAuditSet};
@@ -133,8 +135,12 @@ fn fold_delta(
     if rejected {
         return Ok(DeltaFold::Rejected(fetched));
     }
-    let depth = base.state.incremental_depth() + 1;
-    let (map, conflicts) = pass.finish(tenant, live, base.aliases, high_water, depth);
+    let resumed = FoldBase {
+        aliases: base.aliases,
+        high_water,
+        depth: base.state.incremental_depth() + 1,
+    };
+    let (map, conflicts) = pass.finish(tenant, live, resumed);
     Ok(DeltaFold::Folded(Box::new(Derived {
         map,
         fetched_files: fetched.files,

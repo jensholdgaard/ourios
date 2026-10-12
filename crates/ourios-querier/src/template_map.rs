@@ -780,7 +780,7 @@ fn fold_template_map(
 ) -> Result<(TemplateMap, u64, BindingConflicts), QueryError> {
     let mut pass = FoldPass::default();
     let scan = resolved.for_each_event(tenant, |event| pass.visit(event))?;
-    let (map, conflicts) = pass.finish(tenant, scan.frontier, AliasMap::new(), None, 0);
+    let (map, conflicts) = pass.finish(tenant, scan.frontier, FoldBase::empty());
     Ok((map, scan.bytes_read, conflicts))
 }
 
@@ -802,28 +802,45 @@ impl FoldPass {
         }
     }
 
-    /// The map at `folded_files`: the alias events applied onto
-    /// `base_aliases`, the high-water the max of this pass's and
-    /// `base_high_water` (`None` orders below every `Some`), recorded at
-    /// `depth`.
+    /// The map at `folded_files`: the alias events applied onto the
+    /// base's classes, the high-water the max of this pass's and the
+    /// base's (`None` orders below every `Some`), recorded at the base's
+    /// depth.
     fn finish(
         self,
         tenant: &TenantId,
         folded_files: Vec<String>,
-        base_aliases: AliasMap,
-        base_high_water: Option<u64>,
-        depth: u32,
+        base: FoldBase,
     ) -> (TemplateMap, BindingConflicts) {
         let (registry, conflicts) = self.registry.finish_checked();
-        let high_water = self.high_water.get().max(base_high_water);
+        let high_water = self.high_water.get().max(base.high_water);
         let map = TemplateMap {
             tenant: tenant.clone(),
             folded_files,
             registry,
-            aliases: self.aliases.finish_onto(base_aliases),
-            fold_state: Some(FoldState::new(high_water, conflicts.clone(), depth)),
+            aliases: self.aliases.finish_onto(base.aliases),
+            fold_state: Some(FoldState::new(high_water, conflicts.clone(), base.depth)),
         };
         (map, conflicts)
+    }
+}
+
+/// What a [`FoldPass`] finishes on top of: nothing for a full fold, the
+/// stale artifact's classes and high-water (one step deeper) for an
+/// incremental one.
+struct FoldBase {
+    aliases: AliasMap,
+    high_water: Option<u64>,
+    depth: u32,
+}
+
+impl FoldBase {
+    fn empty() -> Self {
+        Self {
+            aliases: AliasMap::new(),
+            high_water: None,
+            depth: 0,
+        }
     }
 }
 

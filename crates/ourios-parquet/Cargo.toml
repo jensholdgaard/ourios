@@ -83,6 +83,9 @@ ourios-semconv = { path = "../ourios-semconv" }
 # `object_store`'s `HttpService` and `ObjectStore` traits are
 # `#[async_trait]`; the metering wrappers implement them.
 async-trait = "=0.1.89"
+# The S3 CLIENT span's `aws.s3.key` is the stored key, decoded once from the
+# request path object_store percent-encodes. Already in the tree via url.
+percent-encoding = "2.3"
 
 [dev-dependencies]
 # In-memory metric and span export for the store, bridge and CLIENT-span tests.

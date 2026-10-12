@@ -2490,6 +2490,7 @@ dependencies = [
  "ourios-core",
  "ourios-semconv",
  "parquet",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",

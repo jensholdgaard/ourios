@@ -1187,11 +1187,14 @@ ambiguity cannot recur.
 >   `incremental_depth` is at the cap; or the artifact has no
 >   `fold_state` (a pre-amendment v2 artifact)
 > - **Then** the acquisition is a full fold over the listing, its
->   answer equals the no-cache fold, and, when the write-through
->   passes the size abstention, the republished artifact carries
->   `fold_state` with `incremental_depth = 0`. When it abstains, no
->   publish outcome is recorded, the prior artifact stays in place,
->   and the answer is still the full fold's.
+>   answer equals the no-cache fold whatever the publish outcome.
+>   When the write-through passes the size abstention **and the
+>   publish succeeds** (`published`), the stored artifact carries
+>   `fold_state` with `incremental_depth = 0`. If the write-through
+>   abstains (no publish outcome recorded), or the publish records
+>   `error` or an S3 `lost_race` (best-effort, §3.5), the prior
+>   artifact, or a concurrent winner's, stays in place, and the
+>   answer is still the full fold's.
 > - **And** an incremental result that is not published (forced
 >   abstention or a failing publish), extended from a base at
 >   `incremental_depth = 255`, leaves the stored artifact unchanged.
@@ -1208,6 +1211,12 @@ ambiguity cannot recur.
 > - **And** a `fold_state` failing the §3.3-amendment validation
 >   (unsorted or registry-absent conflict keys, `null` high-water
 >   with a non-empty fold, depth above the cap) classifies **Torn**
+> - **And** on both backends a delta file holding a row for another
+>   tenant fails the acquisition exactly as the full scan does: the
+>   same loud `QueryError::Storage` from the shared validated visit
+>   (`visit_validated` in `audit_scan.rs`). The incremental path reads
+>   the delta through that same visit, never a separate reader. No
+>   fold is served and nothing is published
 > - **And** an artifact carrying `fold_state` read by the
 >   pre-amendment v2 reader is a `Valid` hit when its frontier
 >   matches.

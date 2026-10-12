@@ -499,19 +499,19 @@ impl Querier {
         alias_map: Option<&ourios_core::alias::AliasMap>,
         options: QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        // Error precedence: stage-support and window/limit validation
-        // runs before the alias-map derivation below, so those query
-        // errors surface without paying the audit-tree IO (or its
-        // Storage errors). Predicate compilation needs the map, so its
-        // errors necessarily come after. `compile` re-runs the same
-        // pure validation internally — one source of truth, negligible
-        // cost.
-        plan::validate(query, now_unix_nano, default_window_nanos)?;
-        // RFC 0047 §3.4: a metadata-only reader's query must not touch a
-        // content column — rejected before any IO, naming the column.
+        // Error precedence: authorization first, so a metadata-only
+        // reader's query on a content column is `Forbidden` (RFC0047.8,
+        // RFC 0047 §3.4) whatever else is wrong with it. Then stage-support
+        // and window/limit validation, before the alias-map derivation
+        // below, so those query errors surface without paying the
+        // audit-tree IO (or its Storage errors). Predicate compilation
+        // needs the map, so its errors necessarily come after. `compile`
+        // re-runs the same pure validation internally — one source of
+        // truth, negligible cost.
         if let Some(visibility) = &options.visibility {
             visibility.validate(query)?;
         }
+        plan::validate(query, now_unix_nano, default_window_nanos)?;
         // A `body ==`/`!=` needs the RFC 0017 registry for the RFC 0044
         // template arm; the `resolves_to` alias fold needs the alias map.
         // Both ride the one RFC 0033 cached-map acquisition (artifact hit or

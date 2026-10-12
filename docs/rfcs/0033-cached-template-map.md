@@ -260,7 +260,11 @@ behaviour.
 >   **compressed** artifact byte size is smaller than the audit
 >   bytes just folded: the comparison is between the bytes a warm
 >   GET would pay and the bytes the fold just paid — the v1 rule
->   applied to the bytes actually shipped.
+>   applied to the bytes actually shipped. *(Refined 2026-10-12,
+>   #962: the comparison is against the acquisition's total bytes,
+>   meaning the artifact GET plus every audit object fetched. That
+>   equals the folded audit bytes on a miss. See the §3.3
+>   amendment.)*
 > - **Telemetry (§3.7).** The artifact-size histogram records the
 >   **compressed** (published-object) bytes — the GET cost, which
 >   is what the instrument always measured (it records the
@@ -270,7 +274,9 @@ behaviour.
 >   in this RFC (§3.3–§3.5, §5, the §3.4 diagram) read as the
 >   versioned key post-amendment; the local tmp is
 >   `template_map.v2.json.zst.tmp` (extension `tmp`, ignored by the
->   walk as before).
+>   walk as before). *(Superseded 2026-10-12, #962: each local
+>   publish uses its own uniquely named temp,
+>   `template_map.v2.json.zst.<UUIDv7>.tmp`; see the §3.3 amendment.)*
 > - **Dependency.** Zero new dependencies: `zstd` 0.13 is already
 >   compiled into every querier build (`parquet` 58's `zstd`
 >   feature via `ourios-parquet`, and `arrow-ipc`), and
@@ -287,6 +293,14 @@ behaviour.
 >   folded audit bytes), `lost_race`, or `error` — so run #20's
 >   ambiguity (abstention and publish IO failure both leaving the
 >   same "no artifact" label) cannot recur.
+
+> **Amendment pointer (2026-10-12, #962,
+> maintainer-approved).** The v2 body gains an optional `fold_state`
+> object (`high_water_ns`, `binding_conflicts`, `incremental_depth`)
+> that the incremental fold needs. `format_version` stays 2, the key
+> is unchanged, and an artifact without the field is ineligible for
+> the incremental path. The specification is the §3.3 amendment of
+> the same date.
 
 ### 3.3 Freshness — the frontier check
 
@@ -339,6 +353,375 @@ uncached query identically.
 > as literal absence — the cleanest possible realization of the
 > unknown-version-is-absent rule this table was designed around.
 
+> **Amendment (2026-10-12, #962, maintainer-approved): guarded incremental fold on staleness.** Production
+> evidence (the production node, v0.12.2, 24 h): every template-map derive
+> had `ourios.template_map.derive.reason = stale`, derive p95 was
+> 58–111 s, acquire-wait reached 46 s, and one cold derive read
+> ~7,375 audit files (~1 GB) for one tenant. A stale artifact is
+> almost always "the same history plus a few appended files", yet row
+> 4 of the table above re-reads the whole history. This amendment
+> adds a guarded fast path to that row and closes the §7 open
+> question. Every other row, the LIST-before-GET rule and
+> "re-derive, never serve stale" are unchanged: the incremental path
+> produces the map a full fold over the same listing would, or it is
+> not taken.
+>
+> **The artifact carries its fold state** (§3.2 pointer amendment).
+> An optional `fold_state` object joins the v2 body:
+>
+> ```json
+> "fold_state": {
+>   "high_water_ns": 1760227200123456789,
+>   "binding_conflicts": [ { "template_id": 7, "version": 2 } ],
+>   "incremental_depth": 3
+> }
+> ```
+>
+> - A **fold-relevant event** is one either fold consumes: a template
+>   event that binds a `(template_id, version)` key (`created`,
+>   `widened`, `type_expanded`, `adopted`; a degenerate-widening
+>   rejection binds none) or an `alias_asserted` / `alias_retracted`
+>   event. Compaction, quarantine, ingest-denied, erasure and unknown
+>   events change neither fold, so they never constrain the guard.
+> - `high_water_ns` — the greatest RFC 0005 §3.7 `timestamp`
+>   (`TIMESTAMP(NANOS, UTC)`, as integer nanoseconds since the epoch)
+>   of any fold-relevant event in `folded_files`; `null` when there is
+>   none. It is a JSON integer, read and written as `u64`, never
+>   through a float.
+> - `binding_conflicts` — the RFC0033.8 conflict set of the fold
+>   (every key seen bound to two semantically different templates),
+>   sorted ascending by `(template_id, version)`. The registry keeps
+>   only each key's winner, so without this field an incremental fold
+>   cannot know a key was already in conflict (see *Equivalence*).
+> - `incremental_depth` — the number of incremental folds since the
+>   last full fold; a full fold writes `0`.
+>
+> Validation, in addition to §3.2's (a failure classifies **Torn**):
+> `binding_conflicts` strictly sorted and each key present in
+> `registry`; `high_water_ns = null` only when `registry` and
+> `alias_map` are both empty; `incremental_depth` ≤ the depth cap.
+>
+> **Evolution: an optional field, not a version bump.**
+> `format_version` stays 2 and the key stays
+> `template_map.v2.json.zst`. The field is additive: the pre-amendment
+> reader's serde struct does not deny unknown fields, so an old
+> binary serves a `fold_state` artifact on a hit exactly as before,
+> and on a stale lookup it full-folds and republishes without the
+> field. A new binary treats an artifact without `fold_state` as
+> ineligible for the incremental path (full fold, then republish with
+> the field). A mixed fleet therefore stays correct; it only loses
+> the fast path until the old binaries retire. A bump (v3 at a new
+> key) was rejected: it buys nothing for correctness (the absent
+> field already means "full fold"), and the §3.2 amendment reserves
+> new keys for encoding changes. The persisted-layout-break license
+> pre-production is not needed here. No reader ever needs a dual read.
+>
+> **The guard.** Given the one listing (live frontier `L`) and a
+> `Valid` artifact `A` whose `folded_files` `F` ≠ `L`, the querier
+> takes the first matching row:
+>
+> | Condition | Disposition | `derive.fallback.reason` |
+> |---|---|---|
+> | `A` has no `fold_state` | Full fold | `no_fold_state` |
+> | `F ⊄ L` (a folded file disappeared) | Full fold | `files_removed` |
+> | `incremental_depth` ≥ the depth cap | Full fold (writes depth 0) | `depth_cap` |
+> | `high_water_ns` is non-null and delta `D = L \ F` holds a fold-relevant event with `timestamp ≤ high_water_ns` | Full fold | `out_of_order` |
+> | Otherwise | **Incremental fold** of `D` onto `A` | — |
+>
+> - **A `null` high-water admits any delta.** `null` means `F` holds
+>   no fold-relevant event, so no delta event can be ordered before
+>   one, and the timestamp guard passes whatever `D` holds. The
+>   equivalence below still holds: validation pins `registry` and
+>   `alias_map` empty when the high-water is `null`, and every
+>   `binding_conflicts` key must be in `registry`, so that set is
+>   empty too. The seeded fold therefore starts from the empty state,
+>   which is exactly the full fold's state after `F`'s events, and
+>   the fold-relevant events in the total order over `L` are exactly
+>   `D`'s, in `D`'s own order. No key is seeded, so the seed timestamp
+>   is never used.
+> - **"New" is set difference, nothing else.** `D` is the listed
+>   `*.parquet` keys not in `F`, in the lexicographic order the full
+>   fold scans. Audit keys are immutable once visible (uniquely named
+>   `<UUIDv7>.parquet`; a single PUT on S3, tmp+rename locally; §3.2),
+>   so a key in both `F` and `L` names the same bytes.
+> - **What is deliberately not trusted.** The guard reads the
+>   fold-order key itself, the event `timestamp`, from the delta's
+>   rows. It never infers order from anything else. The UUIDv7 in the
+>   key is the writer's clock at file open, which skews between
+>   ingester, compactor and querier processes. The `day=` partition
+>   is derived from the event timestamp, so a backdated event lands
+>   in an old day directory. LIST order is lexicographic, not
+>   temporal. An object's `LastModified` is store PUT time and has no
+>   local-backend equivalent. A rule built on any of these would
+>   admit a delta that a full fold orders differently.
+> - **The guard is strict (`>`, not `≥`).** A delta event at exactly
+>   `high_water_ns` would tie an already-folded event, and the full
+>   fold breaks that tie by file path, which an append cannot see.
+>   Ties fall back.
+> - **Reading the delta is the guard's price.** The delta must be
+>   fetched to learn its minimum timestamp. On a rejection the full
+>   fold runs over `L`; an implementation may reuse the delta bytes
+>   it already holds, and the telemetry counts the objects actually
+>   fetched.
+>
+> **The incremental fold.** The registry fold is seeded with `A`'s
+> registry, every held key at timestamp `high_water_ns`; the alias
+> projection with `A`'s classes; the conflict set with
+> `binding_conflicts`. `D`'s events are read in scan order, with the
+> same row-level tenant backstop, and each fold then orders them by
+> the full key `(timestamp, file path, row index)` the way it already
+> does for a full fold. `RegistryFold` does this while streaming: it
+> replaces on `>=` timestamp in scan order. `AliasFold` buffers the
+> alias events and stably sorts them by timestamp before applying
+> them. The incremental path differs only in what the projection
+> starts from: `A`'s classes instead of the empty map. The guard
+> orders `F` before `D`, and it is these folds that order events
+> *within* `D`. Applying delta alias events in raw scan order would
+> be wrong: interleaved timestamps across delta files would reorder
+> union and retraction. The result carries `folded_files = L`,
+> `high_water_ns = max(high_water_ns, the delta's greatest
+> fold-relevant timestamp)`, the union conflict set, and
+> `incremental_depth + 1`. A delta with no fold-relevant event (only
+> compaction events, say) passes trivially. It leaves the registry,
+> alias map, conflict set and `high_water_ns` unchanged, but it is
+> still an incremental step: `folded_files` grows and
+> `incremental_depth` increments, counting toward the cap.
+>
+> **Equivalence.** The full fold's order is RFC 0005 §3.7.1's
+> `(timestamp, file path, row index)`. When the guard passes, every
+> fold-relevant delta event is strictly later than every
+> fold-relevant event in `F`, so in that order all of `F`'s relevant
+> events precede all of `D`'s. Non-relevant events change neither
+> fold, so they may sit anywhere. Within `D`, scan order is the
+> restriction of the full scan order. Therefore:
+>
+> - **Registry.** A key's full-fold winner is its last binding in the
+>   total order: `D`'s last binding of the key if `D` binds it,
+>   otherwise `F`'s winner, which is what `A` holds (RFC0033.1). The
+>   seeded fold computes exactly that: every delta binding has a
+>   timestamp greater than the seed's, so it replaces the seed, and
+>   among delta events the existing `>=`-in-scan-order rule picks the
+>   total-order last.
+> - **Alias map.** `AliasMap::apply` is a state machine whose whole
+>   state is the class set. `A`'s classes are the state after `F`'s
+>   events (RFC0033.1). The alias fold's stable timestamp sort over
+>   `D`'s scan-ordered events produces exactly `D`'s restriction of
+>   the total order, and applies it after them.
+> - **Binding conflicts.** A key is in conflict iff its bindings span
+>   at least two distinct token sequences, regardless of order. If
+>   `F` already held two, the key is in `binding_conflicts`. If `F`
+>   held one (so `A`'s winner has it), a distinct delta binding
+>   differs from the held text or from an earlier delta binding, and
+>   the fold's existing check flags it. Without the persisted set the
+>   first case is lost, which is why the field exists.
+> - **Frontier and high-water** are the union and the max by
+>   construction.
+>
+> Each incremental step is thus a full fold over its listing, and by
+> induction so is any chain of steps. RFC0033.10 property-tests both.
+>
+> **Late, out-of-order and concurrent writers.** Every case reduces
+> to the guard:
+>
+> - *An ingester flushes a buffered or retried batch late*, or *a
+>   second ingester or the compactor writes concurrently*: the new
+>   file is in `D`. If its fold-relevant events are later than the
+>   high-water it folds incrementally; if not, `out_of_order`.
+> - *Clock skew between writers*: a writer whose clock runs ahead
+>   raises `high_water_ns`, and an honest writer's next relevant
+>   events then fail the guard until real time passes the skewed
+>   mark. Correct, but it degrades to full folds, and the
+>   `out_of_order` fallback rate is the signal.
+> - *A file was invisible to the listing that built `A`* and appears
+>   later with backdated events: it is in the next `D` and fails the
+>   guard. Listing consistency is otherwise unchanged from §3.3. The
+>   incremental and full paths consume the same one listing, so a
+>   missing file affects both identically.
+> - *Concurrent queriers*: as §3.4, per backend.
+>   - **S3:** the incremental publish is a CAS against the `ETag` of
+>     the artifact it extended. A lost race is harmless, because every
+>     artifact is a correct fold of its own frontier.
+>   - **Local:** publication is a rename with no precondition, so the
+>     last writer wins and no `lost_race` occurs. This is safe, and is
+>     required to stay safe, for one reason: every artifact either
+>     writer can install is a correct fold of the listing it was built
+>     from, with a `fold_state` describing exactly that listing. A
+>     rename of an older fold (frontier `F1`) over a newer one (`F2`)
+>     therefore makes the artifact staler, never wrong. The next read
+>     sees `F1 ≠ L` and runs the guard against `F1`'s own
+>     `high_water_ns` and `binding_conflicts`, which are correct for
+>     `F1`. The overwritten artifact's state is not needed, because
+>     the delta from `F1` re-covers it.
+>   - **`incremental_depth` after an overwrite:** the count belongs to
+>     the surviving artifact's own lineage, i.e. the number of
+>     incremental steps since the full fold it descends from. It stays
+>     an exact count and the cap still bounds the surviving lineage.
+>     The overwritten lineage simply ends.
+>   - **The one local requirement:** each publish writes its own
+>     **uniquely named** temp file in the tenant's audit directory
+>     (e.g. `template_map.v2.json.zst.<UUIDv7>.tmp`, extension `tmp`,
+>     ignored by the walk) and renames it into place. Today's fixed
+>     `template_map.v2.json.zst.tmp` lets two concurrent publishers
+>     write into the same temp file. One rename could then install
+>     interleaved bytes. That would almost surely classify Torn and
+>     self-heal, but it is not a correct fold of any listing. A unique
+>     temp name restores the property the argument above relies on:
+>     every renamed file is one writer's complete artifact.
+>   - **Reclaiming leaked temps:** unique names mean a temp leaked by
+>     a crash is no longer overwritten by the next publish, so leaks
+>     must be swept explicitly.
+>     - **What is swept.** Each local publish, before writing its own
+>       temp, removes the tenant-directory siblings named
+>       `template_map.v2.json.zst.*.tmp`, plus the legacy fixed
+>       `template_map.v2.json.zst.tmp`, whose modification time is
+>       more than **1 hour** old. A failed removal is ignored, as are
+>       a missing file and a racing remover.
+>     - **Why 1 hour.** A publish writes at most the 64 MiB
+>       decode-bound artifact to local disk, which takes seconds. An
+>       hour is two to three orders of magnitude above any plausible
+>       publish, so a live publisher's temp never matches. It is
+>       still short enough that leaks stay bounded by the crashes in
+>       one hour.
+>     - **Safety does not rest on the number.** If a stalled
+>       publisher's temp were removed anyway, its `rename` fails, the
+>       publish records `error`, and the query answers from the fold
+>       it holds (§3.5). Nothing wrong is installed.
+>     - **A failed publish cleans up after itself.** Once its temp
+>       exists, a publisher that fails at any later step (write,
+>       rename, or any error before the rename) removes its own temp,
+>       best-effort. The age sweep is only for leftovers of a crash,
+>       where no cleanup could run.
+>     - **The sweep is local-only.** S3 publishes are single
+>       conditional PUTs and leave no temp object.
+> - *Deletion, retention, audit compaction or rewrite*: no code
+>   deletes or rewrites audit files today. Any future one removes a
+>   key from `F`, so the next acquisition is `files_removed`, a full
+>   fold. A rewrite under the *same* key would break §3.2's
+>   immutability premise for the plain hit path too. It is
+>   out of contract for both.
+>
+> **Bound: a depth cap, no timer.** The equivalence holds for chains
+> of any length, so the cap is not needed for correctness. It bounds
+> the blast radius of an undetected implementation defect. A
+> persisted artifact is otherwise only rebuilt from the source of
+> truth when something else forces a full fold, and on a busy tenant
+> that may be never. The cap is a code constant, 256, not
+> configuration: it costs at most one full fold per 256 *published*
+> incremental steps. A wall-clock refresh was rejected because it
+> adds a clock to a rule that is otherwise a pure function of the
+> store.
+>
+> **The guarantee is per served map, so no publish is needed to keep
+> it.**
+>
+> - **The invariant:** every map the querier serves or publishes is at
+>   most 256 incremental steps from a full fold. The guard extends only
+>   a base whose `incremental_depth` is below the cap, and the result's
+>   depth is the base's plus one, so the result is within the cap
+>   whether or not it is published.
+> - **Without a publish:** an incremental result that is not published
+>   persists nothing. That covers size abstention, the hard ceiling,
+>   an IO error and an S3 lost race. The next acquisition extends the
+>   same stored base again, and its result is again one step from a
+>   base within the cap.
+> - **Why a defect cannot compound:** a defect in that step affects
+>   only the answer it is in. It cannot be persisted, so it never
+>   becomes the base of a further step. The cap exists to bound
+>   exactly that compounding.
+> - **Why no extra state:** a skipped publish therefore needs no
+>   separate counter and no forced full fold.
+> - **What an abstaining incremental path costs.** No eventual
+>   publication is promised. On a stable listing every acquisition
+>   re-derives the same delta from the same base. Compressed JSON is
+>   not guaranteed to drop below base plus delta, so the
+>   write-through may abstain every time. The bound is per
+>   acquisition instead: at most the base artifact plus the delta's
+>   bytes. The gate abstains only when the result would cost at
+>   least that much to GET, so re-reading is the cheaper option by
+>   the gate's own definition. Correctness is unaffected,
+>   since every answer is one guarded step from a stored base within
+>   the cap. No forced-publication rule is added.
+>
+> **Write-through and abstention** (§3.5 pointer amendment). An
+> incremental fold publishes like a full one. Abstention keeps its
+> principle: publish iff the compressed artifact costs less than what
+> the next acquisition would pay without this publish. The listing is
+> unchanged in that case, so that cost is this acquisition's own
+> **acquisition bytes**: the fetched artifact's bytes (zero on an
+> absent artifact) plus every audit object fetched. One definition
+> covers every path:
+>
+> - a miss: the folded audit bytes, exactly the pre-amendment rule;
+> - a full fold behind a stale, torn or unknown-version artifact: the
+>   artifact GET, plus any rejected delta read, plus the full fold;
+> - an incremental fold: the base artifact plus the delta.
+>
+> The pre-amendment rule compared only against the folded audit
+> bytes. That under-counts whenever an artifact was fetched, and
+> could abstain where publishing is cheaper. This amendment replaces
+> it with the acquisition-bytes comparison.
+> `QueryResult::registry_bytes_read` stays "template-map acquisition
+> bytes", and the abstention compares against exactly that figure.
+>
+> **Telemetry** (§3.7 pointer amendment). The lookup outcome stays
+> `stale` and `ourios.template_map.derive.reason` stays `stale`.
+> RFC0033.9 pins that the reason is known *before* the fold, and the
+> path is only known after the guard has read the delta. Two
+> attributes are added to `ourios.template_map.derive.duration`,
+> `derive.audit.files` and `derive.audit.size`:
+>
+> - `ourios.template_map.derive.mode`: `full` / `incremental`,
+>   **conditionally required**: present once the path is decided. A
+>   miss, torn or unknown-version derive is always `full`. A `stale`
+>   derive carries it once the guard has decided, and a failure after
+>   that point keeps the decided mode. A `stale` derive that fails
+>   before the guard decides (e.g. a delta object fails to read or
+>   decode while its timestamps are being checked) records its
+>   duration sample **without** `mode`, carrying `error.type` as
+>   RFC0033.9 requires. No third value is added for "undecided";
+>   the attribute's absence means exactly that;
+> - `ourios.template_map.derive.fallback.reason`: the guard row that
+>   declined the fast path (`no_fold_state` / `files_removed` /
+>   `depth_cap` / `out_of_order`), only on `stale` samples with
+>   `mode = full`.
+>
+> Both names are new. They are maintainer-approved and registered in
+> the shared `ourios-semconv` registry via ourios-semconv#17; the
+> registry pin bump lands with the implementation. The OTel naming
+> guidance (`{object}.{property}`, closed enums for short value sets)
+> was checked, and no upstream attribute fits. RFC0033.9's duration
+> boundary is unchanged: one sample per fold, and none for a failure
+> before the disposition is known (the listing, or an artifact naming
+> another tenant). The guard and the delta read run after the stale
+> disposition is known, so they fall inside that boundary. A rejected
+> delta read is part of the same fold's duration. The files/size
+> samples count the objects actually fetched. An incremental
+> acquisition reports conflicts like any fold-backed one (RFC0033.8),
+> i.e. the whole union set, as the full fold would.
+>
+> **What this does not change.** The freshness LIST still walks the
+> whole audit prefix (~7,375 keys, about 8 LIST pages per
+> acquisition on the node above). Bounding it is #853 option (a), a
+> separate amendment. Whether a **hit** re-reports `binding_conflicts`
+> stays #928. This amendment persists the set, which #928's option 1
+> needs anyway, but leaves the hit-path report cadence to that issue.
+>
+> **Expected effect** (measured on Dash0, scenario RFC0033.14). A
+> stale acquisition's audit IO goes from O(tenant history) to O(files
+> since the last publish), plus one artifact GET. Against the
+> baseline above:
+>
+> - stale derive p95 drops from 58–111 s to seconds;
+> - acquire-wait tracks it;
+> - audit GETs per stale derive drop from ~7,375 to the delta count;
+> - the 5–100 s tail (~10% of queries) shrinks to the residual
+>   full-fold fallbacks.
+>
+> The ~187k object-store calls per 6 h should fall by roughly the
+> audit GETs that full re-folds paid. LIST pages remain until #853.
+> The status stays `accepted`. Scenarios RFC0033.10–RFC0033.14 are
+> the criteria.
+
 ### 3.4 Atomic publish — the RFC 0009 §3.4 precedent
 
 The artifact is published the way the compaction manifest is
@@ -366,7 +749,10 @@ already exists.
 
 > **Amendment (2026-07-13, run #20 / §9.14).** The publish targets
 > the v2 key (`template_map.v2.json.zst`; local tmp
-> `template_map.v2.json.zst.tmp`, same rename; same CAS ladder on
+> `template_map.v2.json.zst.tmp`, same rename — *superseded
+> 2026-10-12, #962: a uniquely named
+> `template_map.v2.json.zst.<UUIDv7>.tmp` per publish, see the §3.3
+> amendment*; same CAS ladder on
 > S3, the expectation being the v2 key's observed ETag or
 > create-if-absent), and on a successful publish best-effort
 > **deletes** the stale v1 `template_map.json` key. The delete is
@@ -389,13 +775,27 @@ sequenceDiagram
     Q->>FS: GET template_map.v2.json.zst
     alt hit — folded_files == S
         Q->>Q: deserialize registry + alias map (no audit GETs)
-    else miss / stale / torn / unknown version
+    else stale, fold_state present, folded_files ⊆ S, depth below cap (2026-10-12 amendment)
+        Q->>FS: GET only the delta files D = S minus folded_files
+        alt high_water_ns null, or every fold-relevant event in D later than it
+            Q->>Q: fold D onto the artifact's registry + alias map (§3.7.1 order within D)
+        else guard rejects (out_of_order)
+            Q->>FS: GET every audit file in S (delta bytes may be reused)
+            Q->>Q: full fold registry + alias map (§3.7.1 order)
+        end
+        Q-->>FS: publish template_map.v2.json.zst @ frontier S (unique tmp+rename / CAS, best-effort)
+    else miss / torn / unknown version / other stale fallbacks
         Q->>FS: GET every audit file in S (today's fold)
         Q->>Q: fold registry + alias map (§3.7.1 order)
-        Q-->>FS: publish template_map.v2.json.zst @ frontier S (tmp+rename / CAS, best-effort)
+        Q-->>FS: publish template_map.v2.json.zst @ frontier S (unique tmp+rename / CAS, best-effort)
     end
-    Q->>Q: answer the query (identical either way)
+    Q->>Q: answer the query (identical on every path)
 ```
+
+*Diagram updated 2026-10-12 (#962) for the §3.3 incremental-fold
+amendment. "Other stale fallbacks" are `no_fold_state`,
+`files_removed` and `depth_cap`. Abstention (§3.5) can skip any
+publish arrow.*
 
 ### 3.5 Who writes it — querier write-through
 
@@ -440,6 +840,17 @@ publish — and template mutation decays as a tenant's template set
 converges (the miner's convergence thesis, RFC 0001). The
 ingester-side write-through at mutation time is the recorded
 alternative (§4, §7).
+
+> **Amendment pointer (2026-10-12, #962,
+> maintainer-approved).** The cost described in the paragraph above,
+> one fresh fold per mutation-driven staleness, becomes one fold of
+> the *new* audit files on top of the loaded artifact whenever the
+> §3.3 guard admits it. An incremental fold writes through like a
+> full one. Every write-through's abstention now compares against
+> that acquisition's own acquisition bytes (artifact GET plus every
+> audit object fetched), i.e. what the next acquisition would pay
+> without the publish. For an incremental fold that is the base
+> artifact plus the delta. See the §3.3 amendment of the same date.
 
 ### 3.6 Back-compat — additive and advisory (`CLAUDE.md` §3.5)
 
@@ -532,6 +943,17 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > no wait. The status stays `accepted`. Scenario RFC0033.9 is the
 > criterion.
 
+> **Amendment pointer (2026-10-12, #962,
+> maintainer-approved).** The derive instruments gain
+> `ourios.template_map.derive.mode` (`full` / `incremental`) and
+> `ourios.template_map.derive.fallback.reason` (`no_fold_state` /
+> `files_removed` / `depth_cap` / `out_of_order`). The lookup outcome
+> and `derive.reason` are unchanged. Both names are new, approved and
+> registered via ourios-semconv#17 (the pin bump comes with the
+> implementation). The specification is the
+> §3.3 amendment of the same date; scenario RFC0033.13 is the
+> criterion.
+
 ## 4. Alternatives considered
 
 **Two artifacts (registry and alias map separately).** Independent
@@ -574,6 +996,19 @@ flush), which an append-only incremental fold would order
 incorrectly. A guarded fast path (apply only when the new files'
 minimum timestamp ≥ the folded maximum, recorded in the artifact)
 stays open in §7; the unconditional fallback is the fresh fold.
+*(2026-10-12, #962, maintainer-approved: that guarded fast path is specified
+in the §3.3 amendment, with a strict `>` guard so that ties fall
+back. The unguarded append-only fold stays
+rejected, for the reason given here.)*
+
+**Guarding on key order, partition or object timestamps instead of
+event timestamps** (2026-10-12, #897). Skipping the delta read by
+trusting the UUIDv7 in the key, the `day=` directory, or
+`LastModified` would save GETs on a rejection. Rejected: none of
+them is the fold's ordering key. Writer clocks skew, backdated events
+land in old day directories, and a store's PUT time says nothing
+about event time. A guard on any of them could admit a delta the
+full fold orders differently.
 
 **Do nothing (keep the v1 fold).** The RFC 0005 §3.7.1 deferral was
 explicitly conditioned on measurement; run #8 produced the number
@@ -608,6 +1043,13 @@ sits inside the RFC 0031 headline metric fails the condition.
 >   subsequent unchanged-store query is a cache hit
 > - **And** the same holds when files *disappear* from the live set
 >   (frontier is set equality, not subset).
+> - *Amendment (2026-10-12, #962, maintainer-approved):* the
+>   republish and the next-query hit are required only after a
+>   successful publish (`published`). Publication is best-effort
+>   (§3.5), so an abstention, an `error` or an S3 `lost_race` leaves
+>   the prior artifact, or a concurrent winner's, in place. The
+>   answer still equals the no-cache fold over the live set for every
+>   publish outcome.
 
 > **Scenario RFC0033.3 — Crash/tear safety around the publish**
 > - **Given** a publish interrupted mid-write (simulated: a stray
@@ -749,6 +1191,166 @@ ambiguity cannot recur.
 >   one sample per joiner, the failing shared acquisition's included,
 >   and none for an acquirer.
 
+> **Scenario RFC0033.10 — Incremental fold ≡ full fold (property)**
+> (amendment 2026-10-12, #962, maintainer-approved)
+> - **Given** any generated audit history (the RFC0033.1 generator:
+>   template creations/widenings/type-expansions/adoptions/rejections,
+>   alias assertions/retractions, conflicting re-bindings, non-fold
+>   events at arbitrary timestamps), split into a folded prefix file
+>   set and one or more delta file sets whose fold-relevant events are
+>   each strictly later than every earlier set's. Timestamps may
+>   interleave arbitrarily across the files of one delta, including
+>   alias assertions and retractions.
+> - **When** the prefix is full-folded and published, and each delta
+>   is then acquired through the incremental path in turn. Each base
+>   is published with the direct `TemplateMap::publish`, which has no
+>   size abstention, so a chain never depends on the write-through's
+>   publish decision.
+> - **Then** after every step the registry, alias map, binding
+>   conflicts, `folded_files` and `high_water_ns` equal those of a
+>   full fold over the same listing
+> - **And** decoding the acquired map's `to_artifact_bytes` (the
+>   zstd frame) and normalizing `incremental_depth` on both sides
+>   gives JSON bodies equal byte for byte to the full fold's, whether
+>   or not the write-through then publishes or abstains
+> - **And** the query answer through either path is identical.
+
+> **Scenario RFC0033.11 — The guard falls back, never guesses**
+> (amendment 2026-10-12, #962, maintainer-approved)
+> - **Given** a published v2 artifact, with `fold_state` except in
+>   the pre-amendment case below
+> - **When** the next listing adds a delta holding a fold-relevant
+>   event with `timestamp` < `high_water_ns`, or `=` it; or a folded
+>   file is missing from the listing; or the artifact's
+>   `incremental_depth` is at the cap; or the artifact has no
+>   `fold_state` (a pre-amendment v2 artifact)
+> - **Then** the acquisition is a full fold over the listing, its
+>   answer equals the no-cache fold whatever the publish outcome.
+>   When the write-through passes the size abstention **and the
+>   publish succeeds** (`published`), the stored artifact carries
+>   `fold_state` with `incremental_depth = 0`. If the write-through
+>   abstains (no publish outcome recorded), or the publish records
+>   `error` or an S3 `lost_race` (best-effort, §3.5), the prior
+>   artifact, or a concurrent winner's, stays in place, and the
+>   answer is still the full fold's.
+> - **And** an incremental result that is not published (forced
+>   abstention or a failing publish), extended from a base at
+>   `incremental_depth = 255`, leaves the stored artifact unchanged.
+>   Repeated acquisitions each fold incrementally from that same base,
+>   each acquired map's canonical bytes carry `incremental_depth = 256`
+>   (never more), and each answer equals the full fold. Once a result
+>   at depth 256 is published, the next stale acquisition is a
+>   `depth_cap` full fold.
+> - **And** a delta whose only events are not fold-relevant (e.g.
+>   compaction events, whatever their timestamps) folds incrementally:
+>   `folded_files` grows and `incremental_depth` increments by one,
+>   while the registry, alias map, `binding_conflicts` and
+>   `high_water_ns` are unchanged
+> - **And** a `fold_state` failing the §3.3-amendment validation
+>   (unsorted or registry-absent conflict keys, `null` high-water
+>   with a non-empty fold, depth above the cap) classifies **Torn**
+> - **And** on both backends a delta file holding a row for another
+>   tenant fails the acquisition exactly as the full scan does: the
+>   same loud `QueryError::Storage` from the shared validated visit
+>   (`visit_validated` in `audit_scan.rs`). The incremental path reads
+>   the delta through that same visit, never a separate reader. No
+>   fold is served and nothing is published
+> - **And** an artifact carrying `fold_state` read by the
+>   pre-amendment v2 reader is a `Valid` hit when its frontier
+>   matches
+> - **And** the abstention uses acquisition bytes, pinned at the
+>   boundary. For an **incremental** derive whose compressed result
+>   is larger than the delta's bytes but smaller than base plus delta,
+>   the write-through publishes; the delta-only rule would have
+>   abstained. A result of at least base plus delta abstains. For a
+>   **stale full-fold fallback** whose compressed result is at least
+>   the folded audit bytes but smaller than the artifact GET plus the
+>   audit objects fetched (any rejected delta read included), it
+>   publishes; the pre-amendment folded-bytes rule would have
+>   abstained. A result of at least that total abstains. Each case
+>   asserts the publish outcome (`published`, or no outcome on
+>   abstention) and the answer equals the full fold.
+
+> **Scenario RFC0033.12 — Late files and concurrent writers**
+> (amendment 2026-10-12, #962, maintainer-approved)
+> - **Given** both backends (local root; S3 via the localstack
+>   harness) and an artifact published by an incremental fold
+> - **When** an audit file with a backdated fold-relevant event
+>   becomes visible after that publish, and separately two queriers
+>   extend the same stale artifact concurrently
+> - **Then** the backdated file forces a full fold whose answer
+>   includes it in §3.7.1 order
+> - **And** on **S3** the concurrent incremental publishes resolve by
+>   CAS: the loser's query succeeds with the correct answer and its
+>   write is discarded (`lost_race`)
+> - **And** on the **local** backend both publishes report
+>   `published`, last writer wins, and each writes and renames its own
+>   uniquely named temp file. The installed artifact decodes `Valid`
+>   and equals exactly one writer's complete artifact (never Torn,
+>   never interleaved). With an older fold renamed over a newer one,
+>   the next acquisition sees the older frontier as stale and still
+>   returns the full-fold answer
+> - **And** on the **local** backend a publish removes sibling
+>   `template_map.v2.json.zst.*.tmp` files, and the legacy fixed
+>   `.tmp`, that are more than 1 hour old, and leaves younger ones in
+>   place. A temp removed or missing under a publisher makes that
+>   publish record `error` without failing its query. A failed
+>   removal fails nothing. A publish that fails after creating its
+>   temp (e.g. an injected rename failure) leaves no temp of its own
+>   behind
+> - **And** on both backends both queries answer correctly, and the
+>   next acquisition is a hit or a guarded fold (incremental or full)
+>   whose answer equals the full fold over its listing.
+
+> **Scenario RFC0033.13 — The path taken is observable**
+> (amendment 2026-10-12, #962, maintainer-approved)
+> - **Given** the RFC0033.9 fixture
+> - **When** acts drive an incremental fold, each of the four
+>   fallbacks, and a stale acquisition whose delta object fails to
+>   read before the guard has decided
+> - **Then** each completed derive sample carries
+>   `ourios.template_map.derive.reason = stale` and
+>   `ourios.template_map.derive.mode` (`incremental` or `full`), and
+>   each fallback sample carries the matching
+>   `ourios.template_map.derive.fallback.reason`
+> - **And** a miss, torn or unknown-version derive carries
+>   `mode = full` and no fallback reason
+> - **And** the stale acquisition that failed before the guard
+>   decided records exactly one `derive.duration` sample with
+>   `derive.reason = stale` and `error.type`, and with neither
+>   `derive.mode` nor `derive.fallback.reason`; it records no
+>   `derive.audit.files` / `derive.audit.size` sample
+> - **And** the incremental sample's `derive.audit.files` /
+>   `derive.audit.size` equal the delta's file count and bytes
+> - **And** the `out_of_order` fallback's `derive.audit.files` /
+>   `derive.audit.size` equal the audit objects actually fetched,
+>   including the rejected delta read. That is the delta plus the full
+>   set's remaining objects when the delta bytes are reused, or the
+>   delta plus the whole full set when they are re-fetched. The test
+>   asserts against a fetch-counting store, so it holds whichever the
+>   implementation does
+> - **And** an incremental acquisition over an artifact whose
+>   `binding_conflicts` is non-empty reports every persisted and new
+>   conflict exactly as RFC0033.8 does for a full fold
+> - **And** the attribute names exist in the semconv registry
+>   (weaver-generated constants).
+
+> **Scenario RFC0033.14 — The stale tax collapses in production**
+> (amendment 2026-10-12, #962, maintainer-approved)
+> - **Given** the baseline on Dash0 (the production node, v0.12.2,
+>   24 h): every derive `stale`, derive p95 58–111 s, acquire-wait up
+>   to 46 s, ~7,375 audit files per derive, ~10% of queries 5–100 s,
+>   ~187k object-store calls per 6 h for 639 requests
+> - **When** a release with the incremental fold has run 24 h on the
+>   same node
+> - **Then** at least 90% of `stale` derives are `mode = incremental`
+> - **And** the `stale` derive-duration p95 is at most 1/10 of the
+>   baseline's lower bound (≤ 5.8 s)
+> - **And** the median `derive.audit.files` of `incremental` derives
+>   is at most 1% of the full fold's
+> - **And** the before/after numbers, including the fallback-reason
+>   mix and object-store calls per request, are recorded on #897.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -791,17 +1393,54 @@ Mapped to `CLAUDE.md` §6.2:
 > addition is run #21's harness printing publish outcomes (§3.2
 > amendment / the Scenario RFC0033.6 run-#20 note's pointer).
 
+> **Amendment (2026-10-12, #962, maintainer-approved).**
+>
+> - **RFC0033.10** — `proptest` extending RFC0033.1's generator with
+>   a split point and chains of 1..k deltas (generated so the guard
+>   admits them), round-tripped through real audit Parquet files on
+>   the local backend. Equivalence is asserted on every fold output
+>   and on the canonical JSON minus `incremental_depth`. A companion
+>   property generates *unconstrained* splits and asserts that the
+>   acquisition result always equals the full fold, whichever path
+>   the guard picks.
+> - **RFC0033.11, RFC0033.12** — integration tests in
+>   `crates/ourios-querier/tests/` on both backends. The validation
+>   cases are unit tests beside `validate` in `template_map.rs`. The
+>   pre-amendment-reader case deserializes a `fold_state` body
+>   through a copy of the pre-amendment struct.
+> - **RFC0033.13** — new acts in `tests/rfc0033_7_observability.rs`,
+>   asserted through the in-memory metric and log exporters, plus the
+>   semconv no-diff CI gate.
+> - **RFC0033.14** — a production measurement, not a CI test: Dash0
+>   queries on the node that produced the baseline, recorded on #897.
+
 ## 7. Open questions
 
 - [ ] **zstd level beyond the default** (2026-07-14 amendment): run
   #21's 187,904 B artifact used level 3; a higher level shrinks the
   warm GET further at once-per-miss CPU cost. Measure only if the
   §9.15 numbers stop satisfying — the ratio floor passes without it.
-- [ ] **Guarded incremental fold on staleness**: apply new files on
-  top of the cached fold only when their minimum event timestamp ≥
-  the artifact's recorded maximum folded timestamp (else fresh
-  fold). Worth it, or is the fresh fold on miss cheap enough
-  forever?
+- [x] **Guarded incremental fold on staleness**: apply new files on
+  top of the cached fold only when every fold-relevant event in them
+  is strictly later than the artifact's recorded maximum folded
+  timestamp, falling back to a fresh fold otherwise, ties included.
+  Worth it, or is the fresh fold on miss cheap enough forever?
+  *Answered 2026-10-12 (#962, maintainer-approved): worth it. Every
+  production derive was stale, at 58–111 s p95. The guard is strict
+  (`>`): a new event at exactly the recorded maximum ties an
+  already-folded one, so the acquisition falls back to a full fold.
+  Only fold-relevant events count, and a `null` maximum (nothing
+  fold-relevant folded yet) admits any new file. Specified in the
+  §3.3 amendment.*
+- [ ] **Depth cap value** (2026-10-12 amendment): 256 is a judgment
+  call, trading one full fold per 256 stale acquisitions against
+  how long a latent defect could persist. Revisit with the
+  RFC0033.14 fallback mix.
+- [ ] **Skew-driven fallback** (2026-10-12 amendment): a writer whose
+  clock runs ahead pins `high_water_ns` and makes honest writers'
+  deltas fall back as `out_of_order`. If RFC0033.14 shows that
+  dominating, the remedy belongs to writer clock discipline, not to
+  a looser guard.
 - [ ] **Ingester write-through at template-mutation time** (the §4
   alternative): adopt if §3.7 miss-rate telemetry shows
   mutation-driven staleness dominating on live tenants? Requires an

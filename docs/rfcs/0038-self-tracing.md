@@ -277,8 +277,8 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 >
 > | Operation | Span name | Kind |
 > |---|---|---|
-> | The RFC 0033 fold behind a non-hit lookup | `derive template_map` | `INTERNAL` (child of `load template_map`) |
-> | Waiting on another query's acquisition of the same frontier | `wait template_map` | `INTERNAL` (child of `load template_map`) |
+> | The RFC 0033 fold behind a `miss`, `stale`, `torn` or `unknown_version` lookup (not `hit`, not `joined`) | `derive template_map` | `INTERNAL` (child of `load template_map`) |
+> | Waiting on another query's in-flight acquisition, of the same frontier or another; one per single-flight loop iteration that finds one | `wait template_map` | `INTERNAL` (child of `load template_map`) |
 
 ### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
 
@@ -658,6 +658,14 @@ reusing it would collide with that meaning (the RFC 0040 §3.3 argument).
 Two existing Ourios attributes are reused: `ourios.tenant` and
 `ourios.template_map.lookup.outcome`.
 
+> **Amendment (2026-10-12, #966, maintainer-approved) — the full emitted
+> set.** The `CLIENT` spans also carry `http.request.method` and
+> `http.response.status_code` (§3.7.3, "as implemented"), alongside
+> `server.address` and `server.port` above. Both are upstream names, so no
+> registry change. The `derive template_map` span reuses the existing
+> `ourios.template_map.derive.reason` attribute. RFC0038.11's
+> no-violation list covers `http.*` as well.
+
 **New names, added to the ourios-semconv registry** (a registry change in
 that repo, a `semconv/REGISTRY_REF` bump here, and regenerated
 `ourios-semconv` constants; no name written inline in code):
@@ -987,7 +995,8 @@ are `drafted`.
 > deterministic, unlike the best-effort MCP handshake,
 > **And** the report has no violation for any `ourios.file_set.*` name or
 > for the upstream `rpc.*` / `aws.*` / `cloud.region` / `server.*` /
-> `error.type` attributes, apart from the §3.7.5 exemption: the deprecated
+> `http.*` / `error.type` attributes (`http.*` added by the 2026-10-12
+> amendment), apart from the §3.7.5 exemption: the deprecated
 > `rpc.system` and `rpc.service` on `S3.*` `CLIENT` spans, which the pinned
 > `span.aws.client` definition requires. A deprecated-name finding for
 > those two names anywhere else, or for any other name, fails the job.

@@ -184,22 +184,11 @@ async fn a_cold_acquisition_spans_the_load_and_its_derive_under_the_query() {
 #[cfg(feature = "testing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_query_joining_an_acquisition_spans_its_wait() {
-    use std::time::{Duration, Instant};
-
     let (exporter, _provider, dispatch) = traced();
     let dir = tempfile::tempdir().expect("tempdir");
     write(dir.path(), &[mined(TS0)]);
     let querier = Arc::new(Querier::new(dir.path()));
-    let weak = Arc::downgrade(&querier);
-    querier.set_template_map_acquire_gate(Some(Arc::new(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while let Some(querier) = weak.upgrade()
-            && querier.template_map_waits() < 1
-        {
-            assert!(Instant::now() < deadline, "the second query never waited");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    })));
+    gate_until_one_waits(&querier);
     let tasks: Vec<_> = (0..2)
         .map(|_| tokio::spawn(query(Arc::clone(&querier)).with_subscriber(dispatch.clone())))
         .collect();
@@ -350,6 +339,67 @@ async fn a_failed_fold_marks_the_derive_and_load_spans_error() {
         Some("miss"),
         "the failed lookup still says why it folded"
     );
+}
+
+/// Hold each acquisition until another query waits on it, so two
+/// concurrent queries at one frontier share it.
+#[cfg(feature = "testing")]
+fn gate_until_one_waits(querier: &Arc<Querier>) {
+    use std::time::{Duration, Instant};
+
+    let weak = Arc::downgrade(querier);
+    querier.set_template_map_acquire_gate(Some(Arc::new(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Some(querier) = weak.upgrade()
+            && querier.template_map_waits() < 1
+        {
+            assert!(Instant::now() < deadline, "the second query never waited");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })));
+}
+
+/// A shared acquisition at one frontier that fails: the waiter's
+/// `wait template_map` stays `Unset` (the wait itself did not fail), and its
+/// `load template_map` is `Error` with the shared failure's class.
+#[cfg(feature = "testing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_shared_acquisition_fails_the_waiters_load_not_its_wait() {
+    let (exporter, _provider, dispatch) = traced();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), &[mined(TS0)]);
+    unreadable_audit_file(dir.path());
+    let querier = Arc::new(Querier::new(dir.path()));
+    gate_until_one_waits(&querier);
+    let tasks: Vec<_> = (0..2)
+        .map(|_| {
+            tokio::spawn(query_outcome(Arc::clone(&querier)).with_subscriber(dispatch.clone()))
+        })
+        .collect();
+    for task in tasks {
+        let (_, result) = task.await.expect("query task");
+        assert!(
+            result.is_err(),
+            "a failed shared acquisition fails both queries"
+        );
+    }
+    querier.set_template_map_acquire_gate(None);
+
+    let spans = exporter.get_finished_spans().expect("spans");
+    let [wait] = named(&spans, "wait template_map")[..] else {
+        panic!("one wait span");
+    };
+    assert_eq!(wait.status, opentelemetry::trace::Status::Unset);
+    let load = named(&spans, "load template_map")
+        .into_iter()
+        .find(|s| s.span_context.span_id() == wait.parent_span_id)
+        .expect("the waiter's load span");
+    assert!(
+        matches!(load.status, opentelemetry::trace::Status::Error { .. }),
+        "{:?}",
+        load.status
+    );
+    assert_eq!(text(load, "error.type").as_deref(), Some("storage"));
 }
 
 /// Gate the first acquisition: once it has listed, land a new audit file

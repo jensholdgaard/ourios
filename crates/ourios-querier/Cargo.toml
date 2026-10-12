@@ -116,6 +116,10 @@ futures = { version = "=0.3.34", default-features = false, features = ["std"] }
 # acquisition and a count of queries waiting on one. Disabled by default;
 # test-only hooks, which CI's `--all-features` runs turn on.
 testing = []
+# Exposes the DSL → plan seam (`fuzzing::lower`) for the `fuzz/` cargo-fuzz
+# `dsl_parse` target (RFC 0015, RFC0015.15). Off by default; not part of the
+# stable public API.
+fuzzing = []
 
 [dev-dependencies]
 # #853 — the request-counting `ObjectStore` wrapper (`src/test_support.rs`)

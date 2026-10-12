@@ -1,0 +1,1 @@
+severity >= error and resource.deployment.environment == "prod" | range(-1h, now) | count by service, bucket(5m)

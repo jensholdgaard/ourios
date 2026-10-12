@@ -128,3 +128,14 @@
 "\"drift\":"
 "\"attr\":"
 "\"resource\":"
+
+# the promoted keys the planning oracle's scan schema declares (RFC0015.15),
+# one per RFC 0042 class, so ordering, regex and grouping on attributes lower
+"deployment.environment"
+"user.id"
+"http.response.status_code"
+"duration"
+"attr.user.id"
+"attr.duration"
+"attr.http.response.status_code"
+"resource.deployment.environment"

@@ -1,0 +1,1 @@
+not (scope == "checkout" or event_name != "db.query") and starts_with(scope, "lib.") and ends_with(body, " 200") and trace_id != "4bf92f3577b34da6a3ce929d0e0e4736" | range(2026-10-10T00:00:00Z, 2026-10-11T00:00:00Z)

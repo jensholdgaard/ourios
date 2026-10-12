@@ -1,0 +1,1 @@
+ends_with(attr["user.id"], "-admin") or matches(resource["deployment.environment"], "stag.*") or contains(attr.region, "eu") | range(-2w, -1d) | limit 5

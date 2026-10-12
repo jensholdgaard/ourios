@@ -1,0 +1,1 @@
+template_id == 7 and template_id == 7 | max(attr.http.response.status_code) by param(2), bucket(30s)

@@ -41,6 +41,15 @@ after `decode_json`; `seeds/wal_frame/<kind>.bin` is `ourios_wal::frame::write_f
 (the `fuzzing` feature) of a short payload for each `FrameKind`. Regenerate
 with a throwaway binary against those two functions if either format moves.
 
+The `dsl_parse` seeds are query text, one query per file: the RFC 0002
+cookbook (`docs/guides/query-cookbook.md`), structured-JSON requests, and
+`plan_*` queries the planner accepts, so the RFC0015.15 lowering oracle runs
+from the first execution. Those use the promoted keys the target's scan
+schema declares (`resource.deployment.environment`, `attr.user.id`,
+`attr.http.response.status_code`, `attr.duration`, besides `service`): on
+any other attribute key only `==` / `!=` lower, and ordering, regex and
+grouping are rejected.
+
 The persisted-artifact seeds come from one throwaway binary over the real
 encoders, for tenant `fuzz-tenant`:
 

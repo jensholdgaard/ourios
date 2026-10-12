@@ -818,8 +818,8 @@ greppable (`docs/verification.md` §2).
 > the query clock each crashed a seed with the expected message, and
 > were reverted. The `Storage` arm fired on real defects first: the
 > seed `starts_with(body, "GET /")` (#960) and a run that mutated a
-> seed into an invalid regex class (#961). Their minimized inputs
-> become regression seeds once those fixes merge.
+> seed into an invalid regex class (#961). #960's inputs are the
+> `regression_960_*` seeds; #961's join them once that fix merges.
 
 ## 7. Open questions
 

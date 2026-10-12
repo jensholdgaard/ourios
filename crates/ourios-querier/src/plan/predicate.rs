@@ -316,20 +316,18 @@ pub(super) fn column_comparison(
             ),
         });
     }
-    // The literal is checked before the absent-column guard, so whether a
-    // query is valid never depends on which files its window scans.
-    let rhs = match op {
-        CmpOp::Ord(_) => field_literal(field, value)?,
-        CmpOp::Match | CmpOp::NotMatch => regex_literal(field, value)?,
-    };
     // Absent OPTIONAL column ⇒ all-NULL ⇒ the leaf matches nothing.
     if optional && !has_column(schema, column) {
         return Ok(PredExpr::None);
     }
     let expr = match op {
-        CmpOp::Ord(ord) => ord_expr(col(column), ord, rhs),
-        CmpOp::Match => regexp_like(col(column), rhs, None),
-        CmpOp::NotMatch => not(regexp_like(col(column), rhs, None)),
+        CmpOp::Ord(ord) => ord_expr(col(column), ord, field_literal(field, value)?),
+        CmpOp::Match => regexp_like(col(column), string_literal(field, value)?, None),
+        CmpOp::NotMatch => not(regexp_like(
+            col(column),
+            string_literal(field, value)?,
+            None,
+        )),
     };
     Ok(PredExpr::Filter(expr))
 }
@@ -391,23 +389,6 @@ pub(super) fn string_literal(field: &Field, value: &Value) -> Result<Expr, Query
             detail: format!("{} expects a string literal", field_name(field)),
         }),
     }
-}
-
-/// A regex operand: a string literal the regex engine compiles. Checked
-/// here so a malformed pattern is the query's error (RFC0002.8), not one the
-/// engine raises while planning the filter.
-pub(super) fn regex_literal(field: &Field, value: &Value) -> Result<Expr, QueryError> {
-    match value {
-        Value::Str(pattern) => regex_pattern(pattern),
-        _ => string_literal(field, value),
-    }
-}
-
-pub(super) fn regex_pattern(pattern: &str) -> Result<Expr, QueryError> {
-    regex::Regex::new(pattern).map_err(|e| QueryError::InvalidQuery {
-        detail: format!("invalid regular expression: {e}"),
-    })?;
-    Ok(lit(pattern.to_string()))
 }
 
 /// Hex-decode a `trace_id` (16 bytes) / `span_id` (8 bytes) literal,
@@ -556,8 +537,8 @@ pub(super) fn attr_match(
             };
             let expr = match op {
                 CmpOp::Ord(ord) => ord_expr(p, ord, lit(v.clone())),
-                CmpOp::Match => regexp_like(p, regex_pattern(v)?, None),
-                CmpOp::NotMatch => not(regexp_like(p, regex_pattern(v)?, None)),
+                CmpOp::Match => regexp_like(p, lit(v.clone()), None),
+                CmpOp::NotMatch => not(regexp_like(p, lit(v.clone()), None)),
             };
             return Ok(PredExpr::Filter(expr));
         }
@@ -731,10 +712,9 @@ pub(super) fn compile_call(
     alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
 ) -> Result<PredExpr, QueryError> {
     match call {
-        Call::Matches { field, arg } => {
-            let pattern = regex_pattern(arg)?;
-            string_call(field, schema, |lhs| regexp_like(lhs, pattern, None))
-        }
+        Call::Matches { field, arg } => string_call(field, schema, |lhs| {
+            regexp_like(lhs, lit(arg.clone()), None)
+        }),
         Call::Contains { field, arg } => {
             like_call(field, schema, &format!("%{}%", like_escape(arg)))
         }

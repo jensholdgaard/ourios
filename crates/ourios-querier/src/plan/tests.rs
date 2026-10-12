@@ -78,34 +78,6 @@ fn lowering_needs_only_a_schema() {
     assert!(matches!(lowered, PredExpr::None));
 }
 
-/// RFC0002.8: a malformed regex is the query's `InvalidQuery` even over an
-/// OPTIONAL column the scan lacks (older files without `scope`), not the
-/// match-nothing shortcut, so validity does not depend on the files scanned.
-#[test]
-fn malformed_regex_is_rejected_over_an_absent_column() {
-    use datafusion::arrow::datatypes::{Field as ArrowField, Schema};
-
-    let without_scope = DFSchema::try_from(Schema::new(vec![ArrowField::new(
-        columns::TEMPLATE_ID,
-        DataType::UInt64,
-        true,
-    )]))
-    .expect("schema");
-    for op in [CmpOp::Match, CmpOp::NotMatch] {
-        let leaf = Predicate::Comparison {
-            field: Field::Scope,
-            op,
-            value: Value::Str("[b-a]".to_string()),
-        };
-        let lowered = compile_predicate(&leaf, &without_scope, &BTreeMap::new(), &BTreeMap::new());
-        assert!(
-            matches!(&lowered, Err(QueryError::InvalidQuery { detail }) if detail.contains("regular expression")),
-            "{op:?}: {:?}",
-            lowered.map(|_| ()),
-        );
-    }
-}
-
 /// RFC0002.21 lowering: a floor admits unspecified, a ceiling excludes it,
 /// and an explicit `0` threshold does neither. Asserted on the lowered
 /// predicate rather than end-to-end, so a regression is caught at the

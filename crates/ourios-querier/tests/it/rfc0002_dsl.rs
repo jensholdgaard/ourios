@@ -925,22 +925,13 @@ async fn body_text_match_regex_not_match_rejected() {
 }
 
 /// Scenario RFC0002.8 (malformed regex) — a pattern the regex engine cannot
-/// compile is the query's own `InvalidQuery`, on every column the regex
+/// compile is the query's own `InvalidQuery`, on every site the regex
 /// operators reach (text columns, `matches`, and the promoted attribute arm),
-/// not a storage failure raised while the engine plans the filter.
-#[tokio::test]
-async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
-    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all_with_promoted};
-    use ourios_parquet::PromotedAttributes;
-    use ourios_querier::{Querier, QueryError};
-
-    let bucket = tempfile::TempDir::new().expect("temp");
-    write_all_with_promoted(
-        bucket.path(),
-        &[simple("a", 1, TS0)],
-        &PromotedAttributes::new([], ["http.route".to_string()]),
-    );
-    let q = Querier::new(bucket.path());
+/// whatever `q`'s store holds: never a storage failure raised while the
+/// engine plans the filter, nor an empty result from a short-circuit.
+pub(crate) async fn assert_malformed_regexes_rejected(q: &ourios_querier::Querier) {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, no_aliases};
+    use ourios_querier::QueryError;
 
     for text in [
         "scope =~ \"[b-a]\"",
@@ -966,6 +957,28 @@ async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
         );
         assert_leaks_no_engine_token(&err);
     }
+}
+
+#[tokio::test]
+async fn rfc0002_8_malformed_regex_is_an_invalid_query() {
+    use crate::common::{TS0, simple, write_all_with_promoted};
+    use ourios_parquet::PromotedAttributes;
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all_with_promoted(
+        bucket.path(),
+        &[simple("a", 1, TS0)],
+        &PromotedAttributes::new([], ["http.route".to_string()]),
+    );
+    assert_malformed_regexes_rejected(&ourios_querier::Querier::new(bucket.path())).await;
+}
+
+/// RFC0002.8 over a tenant with no data: the scan short-circuits to an empty
+/// result before planning, and the malformed pattern is still rejected.
+#[tokio::test]
+async fn rfc0002_8_malformed_regex_is_rejected_on_an_empty_store() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    assert_malformed_regexes_rejected(&ourios_querier::Querier::new(bucket.path())).await;
 }
 
 /// Scenario RFC0002.6 (unsupported stage rejection) — a pipeline stage this

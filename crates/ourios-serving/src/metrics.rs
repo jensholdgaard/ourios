@@ -4,8 +4,8 @@
 //! rejections re-import the class constants from here so the two
 //! instruments can never drift apart on the value space.
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
-use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
 /// The `error.type` value for every [`AuthError::Unauthenticated`]
@@ -41,7 +41,7 @@ impl AuthMetrics {
     /// Build the instrument with its registry unit.
     #[must_use]
     pub fn new() -> Self {
-        let meter = global::meter("ourios.auth");
+        let meter = ourios_core::telemetry::meter("ourios.auth");
         Self {
             resolutions: meter
                 .u64_counter(semconv::OURIOS_AUTH_RESOLUTIONS)

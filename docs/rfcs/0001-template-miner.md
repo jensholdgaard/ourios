@@ -2111,6 +2111,19 @@ SDK and transport crates do not leak into every library:
   `opentelemetry` **API** crate and resolve instruments through
   `global::meter("ourios.<subsystem>")`. No SDK, no OTLP, no
   transport dependency in a library crate.
+
+  > **Amendment (2026-10-12, #963, maintainer-approved) — versioned
+  > instrumentation scopes.** Instrumented crates resolve instruments
+  > through `ourios_core::telemetry::meter("ourios.<subsystem>")` (and
+  > spans through `ourios_core::telemetry::tracer`), a thin wrapper over
+  > the global provider that sets the workspace release as the scope
+  > version, so every series and span carries `otel.scope.version`. A
+  > provider-bound site passes `ourios_core::telemetry::scope(..)` to
+  > `meter_with_scope` / `tracer_with_scope`. The wrapper is API-only:
+  > `ourios-core` depends on the `opentelemetry` API crate and no SDK,
+  > so the split above is preserved. The workspace `clippy.toml`
+  > disallows the unversioned `global::meter` / `global::tracer` and
+  > `MeterProvider::meter` / `TracerProvider::tracer`.
 - A new **`ourios-telemetry`** crate owns the heavy deps — the
   `opentelemetry_sdk` and `opentelemetry-otlp` crates (the upstream
   package names, underscore and hyphen respectively) plus the OTLP
@@ -2649,6 +2662,13 @@ resolves bidirectionally between RFC and tests.
   `ourios.miner.confidence.p01` gauges track the same-attributed
   `ourios.miner.confidence` histogram quantiles.
   *Covers:* §3.1.2, RFC0001.8.
+
+  > **Amendment (2026-10-12, #963, maintainer-approved).** The meter is
+  > resolved through `ourios_core::telemetry::meter("ourios.miner")`
+  > (or `meter_with_scope` with `ourios_core::telemetry::scope(..)` for a
+  > provider-bound reader), not `global::meter`, which `clippy.toml` now
+  > disallows. The test also asserts the collected scope carries
+  > `otel.scope.version` equal to the crate version.
 
 - **Data-model contract tests**: small unit tests against the
   `template_id` query semantics that RFC 0002's DSL compiles to.

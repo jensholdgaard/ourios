@@ -35,8 +35,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram};
-use opentelemetry::{KeyValue, global};
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::AuditPayload;
 use ourios_core::histogram_buckets;
@@ -180,7 +180,7 @@ struct TemplateMapMetrics {
 /// `CompactionMetrics` stance): each series surfaces on its first real
 /// measurement.
 static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
-    let meter = global::meter("ourios.template_map");
+    let meter = ourios_core::telemetry::meter("ourios.template_map");
     TemplateMapMetrics {
         lookups: meter
             .u64_counter(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS)

@@ -34,8 +34,8 @@ use object_store::ClientOptions;
 use object_store::client::{
     HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
 };
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
-use opentelemetry::{KeyValue, global};
 use ourios_core::histogram_buckets;
 use ourios_semconv as semconv;
 
@@ -259,7 +259,7 @@ pub(crate) enum Metrics {
 impl Metrics {
     pub(crate) fn get(&self) -> &StoreMetrics {
         static GLOBAL: LazyLock<StoreMetrics> =
-            LazyLock::new(|| StoreMetrics::from_meter(&global::meter(SCOPE)));
+            LazyLock::new(|| StoreMetrics::from_meter(&ourios_core::telemetry::meter(SCOPE)));
         match self {
             Self::Global => &GLOBAL,
             Self::Owned(metrics) => metrics,
@@ -664,7 +664,7 @@ mod tests {
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
     use ourios_semconv as semconv;
 
-    use super::{Caller, Metrics, Operation, StoreMetrics};
+    use super::{Caller, Metrics, Operation, SCOPE, StoreMetrics};
     use crate::store::{MAX_BRIDGE_WORKERS, S3Config, Store, StoreError, block_on_off_runtime};
 
     /// Storage instruments of their own, exporting in memory.
@@ -696,7 +696,7 @@ mod tests {
                 .with_periodic_exporter(exporter.clone())
                 .build();
             let metrics = Metrics::Owned(Arc::new(StoreMetrics::from_meter(
-                &provider.meter("ourios.storage"),
+                &provider.meter_with_scope(ourios_core::telemetry::scope(SCOPE)),
             )));
             Self {
                 provider,

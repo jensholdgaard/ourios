@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::SystemTime;
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Meter, ObservableGauge, ObservableUpDownCounter};
-use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 use ourios_wal::{
     HousekeepingProgress, ReclaimState, RetainFloor, RotationFault, RotationSite, RotationState,
@@ -284,7 +284,7 @@ const BACKLOG: [(&str, BacklogRead); 2] = [
 
 impl Instruments {
     fn register(observed: &Shared, rotation: &Arc<RotationCell>) -> Self {
-        let meter = global::meter("ourios.wal");
+        let meter = ourios_core::telemetry::meter("ourios.wal");
         let mut updown: Vec<_> = STATE_SUMS
             .into_iter()
             .map(|(name, unit, read)| {

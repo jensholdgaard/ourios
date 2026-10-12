@@ -11,8 +11,8 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
-use opentelemetry::trace::{SpanKind, TracerProvider as _};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use opentelemetry::trace::{SpanKind, Status};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tower::ServiceExt as _;
 use tracing_subscriber::prelude::*;
 
@@ -53,56 +53,64 @@ async fn mcp_post(
     (status, session_id)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rfc0038_1_mcp_tool_emits_one_internal_span() {
-    // Process-global tracer over an in-memory exporter — reaches rmcp's spawned
-    // dispatch task. Keep `provider` alive until after the flush.
+/// Install the process-global subscriber and tracer provider over an
+/// in-memory exporter; they reach rmcp's spawned dispatch task. Keep the
+/// provider alive until after the flush.
+fn install_global_tracer() -> (InMemorySpanExporter, SdkTracerProvider) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")))
+        .with(tracing_opentelemetry::layer().with_tracer(ourios_telemetry::test_tracer(&provider)))
         .try_init()
         .expect("install global subscriber");
     opentelemetry::global::set_tracer_provider(provider.clone());
+    (exporter, provider)
+}
 
-    let bucket = tempfile::tempdir().expect("temp");
-    let router = ourios_server::querier::router_with_mcp(
-        bucket.path().to_path_buf(),
-        3_600_000_000_000,
-        ourios_serving::AuthResolver::static_only(None),
-        true,
-    );
-
-    // Handshake, then one tools/call. `list_templates` is the leanest tool —
-    // an empty registry still opens the `execute_tool list_templates` span.
+/// The MCP handshake; the session id.
+async fn handshake(router: &Router) -> String {
     let init = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                    "clientInfo": {"name": "rfc0038-test", "version": "0"}}
     });
-    let (status, session) = mcp_post(&router, None, init).await;
+    let (status, session) = mcp_post(router, None, init).await;
     assert_eq!(status, StatusCode::OK, "initialize");
     let session = session.expect("session id issued");
-
     let (status, _) = mcp_post(
-        &router,
+        router,
         Some(&session),
         serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     )
     .await;
     assert!(status.is_success(), "initialized notification");
+    session
+}
 
+/// One `list_templates` tools/call for `tenant`. `list_templates` is the
+/// leanest tool: an empty registry still opens its `execute_tool` span.
+async fn list_templates(router: &Router, session: &str, id: u64, tenant: &str) {
     let call = serde_json::json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": "list_templates", "arguments": {"tenant": "acme"}}
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": "list_templates", "arguments": {"tenant": tenant}}
     });
-    let (status, _) = mcp_post(&router, Some(&session), call).await;
+    let (status, _) = mcp_post(router, Some(session), call).await;
     assert_eq!(status, StatusCode::OK, "tools/call");
+}
 
-    provider.force_flush().expect("spans flush");
-    let spans = exporter.get_finished_spans().expect("spans exported");
+fn attribute(span: &SpanData, key: &str) -> Option<String> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.as_str().into_owned())
+}
+
+/// The one successful call's span: INTERNAL, with the canonical GenAI/MCP
+/// semconv attributes (RFC0038.7, the agent-observability payload) and
+/// status left unset.
+fn assert_successful_tool_span(spans: &[SpanData], session: &str) {
     let mcp: Vec<_> = spans
         .iter()
         .filter(|s| s.name.as_ref() == "execute_tool list_templates")
@@ -113,41 +121,70 @@ async fn rfc0038_1_mcp_tool_emits_one_internal_span() {
         "one `execute_tool list_templates` span survived rmcp's spawn, got {:?}",
         spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
+    let span = mcp[0];
     assert_eq!(
-        mcp[0].span_kind,
+        span.span_kind,
         SpanKind::Internal,
         "`execute_tool list_templates` is an INTERNAL span",
     );
-
-    // RFC0038.7 — the span carries the canonical GenAI/MCP semconv attributes
-    // (the agent-observability payload): the tool-execution operation, the
-    // tool name, the MCP method, and the caller's session id.
-    let attr = |key: &str| -> Option<String> {
-        mcp[0]
-            .attributes
-            .iter()
-            .find(|kv| kv.key.as_str() == key)
-            .map(|kv| kv.value.as_str().into_owned())
-    };
     assert_eq!(
-        attr("gen_ai.operation.name").as_deref(),
+        attribute(span, "gen_ai.operation.name").as_deref(),
         Some("execute_tool"),
         "gen_ai.operation.name = execute_tool; attrs = {:?}",
-        mcp[0].attributes,
+        span.attributes,
     );
     assert_eq!(
-        attr("gen_ai.tool.name").as_deref(),
+        attribute(span, "gen_ai.tool.name").as_deref(),
         Some("list_templates"),
         "gen_ai.tool.name names the invoked tool",
     );
     assert_eq!(
-        attr("mcp.method.name").as_deref(),
+        attribute(span, "mcp.method.name").as_deref(),
         Some("tools/call"),
         "mcp.method.name = tools/call",
     );
     assert_eq!(
-        attr("mcp.session.id").as_deref(),
-        Some(session.as_str()),
+        attribute(span, "mcp.session.id").as_deref(),
+        Some(session),
         "mcp.session.id carries the caller's session, correlating its tool calls",
     );
+    assert_eq!(
+        span.status,
+        Status::Unset,
+        "a successful call is not an error"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0038_1_mcp_tool_emits_one_internal_span() {
+    let (exporter, provider) = install_global_tracer();
+    let bucket = tempfile::tempdir().expect("temp");
+    let router = ourios_server::querier::router_with_mcp(
+        bucket.path().to_path_buf(),
+        3_600_000_000_000,
+        ourios_serving::AuthResolver::static_only(None),
+        true,
+    );
+    let session = handshake(&router).await;
+
+    list_templates(&router, &session, 2, "acme").await;
+    provider.force_flush().expect("spans flush");
+    assert_successful_tool_span(&exporter.get_finished_spans().expect("spans"), &session);
+
+    // A call the tool rejects (an off-grammar tenant is JSON-RPC
+    // `invalid_params`, -32602) fails its span, with the code as `error.type`.
+    exporter.reset();
+    list_templates(&router, &session, 3, "").await;
+    provider.force_flush().expect("spans flush");
+    let spans = exporter.get_finished_spans().expect("spans");
+    let failed = spans
+        .iter()
+        .find(|s| s.name.as_ref() == "execute_tool list_templates")
+        .expect("the failed call's span");
+    assert!(
+        matches!(failed.status, Status::Error { .. }),
+        "{:?}",
+        failed.status
+    );
+    assert_eq!(attribute(failed, "error.type").as_deref(), Some("-32602"));
 }

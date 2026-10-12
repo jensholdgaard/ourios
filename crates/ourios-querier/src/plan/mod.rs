@@ -202,6 +202,7 @@ pub(crate) fn validate(
             });
         }
     }
+    reject_body_text_match(&query.predicate)?;
     let window = resolve_window(&query.stages, now_unix_nano, default_window_nanos)?;
     let limit = query.stages.iter().rev().find_map(|s| match s {
         Stage::Limit(n) => Some(*n),
@@ -287,6 +288,51 @@ fn validate_group_terms(by: &[GroupTerm], predicate: &Predicate) -> Result<(), Q
         }
     }
     Ok(())
+}
+
+/// Prefix and regex matches on `body` would read only the physical `body`
+/// column, which is NULL for a faithfully mined line, so they are rejected
+/// until RFC 0044 §7's follow-up specifies matching the logical body.
+fn reject_body_text_match(predicate: &Predicate) -> Result<(), QueryError> {
+    match body_text_match(predicate) {
+        Some(operator) => Err(QueryError::InvalidQuery {
+            detail: format!(
+                "`{operator}` on body is not supported yet: a mined log line is stored as \
+                 its template and parameters, not as body text, so matching the stored \
+                 text alone would silently miss most lines (RFC 0044 §7)"
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The first prefix or regex match on `body` in the predicate, by its DSL
+/// spelling.
+fn body_text_match(p: &Predicate) -> Option<&'static str> {
+    match p {
+        Predicate::Comparison {
+            field: Field::Body,
+            op: CmpOp::Match,
+            ..
+        } => Some("=~"),
+        Predicate::Comparison {
+            field: Field::Body,
+            op: CmpOp::NotMatch,
+            ..
+        } => Some("!~"),
+        Predicate::Call(Call::Matches {
+            field: Field::Body, ..
+        }) => Some("matches"),
+        Predicate::Call(Call::StartsWith {
+            field: Field::Body, ..
+        }) => Some("starts_with"),
+        Predicate::Not(inner) => body_text_match(inner),
+        Predicate::And(terms) | Predicate::Or(terms) => terms.iter().find_map(body_text_match),
+        Predicate::Bool(_)
+        | Predicate::Comparison { .. }
+        | Predicate::Severity { .. }
+        | Predicate::Call(_) => None,
+    }
 }
 
 /// The §6.3 amendment pinning rule, decidable on the associative-normalised

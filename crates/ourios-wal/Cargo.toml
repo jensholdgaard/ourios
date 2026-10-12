@@ -82,7 +82,7 @@ ourios-wal = { path = ".", features = ["fault-injection", "legacy-housekeeping"]
 tempfile = "=3.27.0"
 # Property test for the RFC0008.9 `wal_unflushed_bytes` bound
 # under a randomised frame-arrival pattern.
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 
 [lints]
 workspace = true

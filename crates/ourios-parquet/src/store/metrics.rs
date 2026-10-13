@@ -141,7 +141,8 @@ impl StoreMetrics {
     pub(crate) fn from_meter(meter: &Meter) -> Self {
         meter
             .u64_observable_counter(semconv::OURIOS_STORAGE_BRIDGE_THREAD_CREATED)
-            .with_unit("{thread}")
+            .with_description(semconv::OURIOS_STORAGE_BRIDGE_THREAD_CREATED_DESCRIPTION)
+            .with_unit(semconv::OURIOS_STORAGE_BRIDGE_THREAD_CREATED_UNIT)
             .with_callback(|observer| {
                 observer.observe(BRIDGE_THREADS_CREATED.load(Ordering::Relaxed), &[]);
             })
@@ -149,25 +150,30 @@ impl StoreMetrics {
         Self {
             operation_duration: meter
                 .f64_histogram(semconv::OURIOS_STORAGE_OPERATION_DURATION)
-                .with_unit("s")
+                .with_description(semconv::OURIOS_STORAGE_OPERATION_DURATION_DESCRIPTION)
+                .with_unit(semconv::OURIOS_STORAGE_OPERATION_DURATION_UNIT)
                 .with_boundaries(histogram_buckets::DURATION_S.to_vec())
                 .build(),
             retries: meter
                 .u64_counter(semconv::OURIOS_STORAGE_OPERATION_RETRIES)
-                .with_unit("{retry}")
+                .with_description(semconv::OURIOS_STORAGE_OPERATION_RETRIES_DESCRIPTION)
+                .with_unit(semconv::OURIOS_STORAGE_OPERATION_RETRIES_UNIT)
                 .build(),
             list_objects: meter
                 .u64_histogram(semconv::OURIOS_STORAGE_LIST_OBJECTS)
-                .with_unit("{object}")
+                .with_description(semconv::OURIOS_STORAGE_LIST_OBJECTS_DESCRIPTION)
+                .with_unit(semconv::OURIOS_STORAGE_LIST_OBJECTS_UNIT)
                 .with_boundaries(histogram_buckets::COUNT_DECADES.to_vec())
                 .build(),
             bridge_active: meter
                 .i64_up_down_counter(semconv::OURIOS_STORAGE_BRIDGE_CALL_ACTIVE)
-                .with_unit("{call}")
+                .with_description(semconv::OURIOS_STORAGE_BRIDGE_CALL_ACTIVE_DESCRIPTION)
+                .with_unit(semconv::OURIOS_STORAGE_BRIDGE_CALL_ACTIVE_UNIT)
                 .build(),
             bridge_duration: meter
                 .f64_histogram(semconv::OURIOS_STORAGE_BRIDGE_DURATION)
-                .with_unit("s")
+                .with_description(semconv::OURIOS_STORAGE_BRIDGE_DURATION_DESCRIPTION)
+                .with_unit(semconv::OURIOS_STORAGE_BRIDGE_DURATION_UNIT)
                 .with_boundaries(histogram_buckets::DURATION_S.to_vec())
                 .build(),
             http_duration: meter

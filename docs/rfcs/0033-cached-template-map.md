@@ -1221,7 +1221,11 @@ ambiguity cannot recur.
 >   key (the conflicting acquisition's artifact was published), but
 >   its lookup still carries the anomaly
 > - **And** a further audit file that binds a second key to two
->   templates is announced once, as one event naming only that key.
+>   templates is announced once, as one event naming only that key
+> - **And** when an audit file the published artifact had folded is
+>   removed, the `files_removed` full-fold fallback announces no event
+>   for keys in that artifact's `binding_conflicts`, and its lookup
+>   still carries the anomaly.
 
 > **Scenario RFC0033.9 — Derive cost is observable** (amendment
 > 2026-10-11, #924)

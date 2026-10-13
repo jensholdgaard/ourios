@@ -836,6 +836,37 @@ fn assert_artifact_sizes(rms: &[ResourceMetrics], published: [u64; 3]) {
     );
 }
 
+/// RFC0033.7's counted outcomes: one lookup per answered outcome, each
+/// `query`-triggered, and one publish per write-through that published.
+fn assert_lookups_and_publishes(rms: &[ResourceMetrics]) {
+    let lookups = outcome_counts(
+        rms,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
+        &[QUERY_TRIGGER],
+    );
+    let expected: BTreeMap<String, u64> = EXPECTED_LOOKUPS
+        .iter()
+        .map(|(outcome, n)| ((*outcome).to_string(), *n))
+        .collect();
+    assert_eq!(
+        lookups, expected,
+        "one lookup per answered outcome, no extras — act 5's failed fold \
+         counted nothing"
+    );
+
+    // The three publishing lookups (miss, stale, torn) each published;
+    // no lost race or error occurred, so no other series exists.
+    let publishes = outcome_counts(
+        rms,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME,
+        &[],
+    );
+    let expected: BTreeMap<String, u64> = [("published".to_string(), 3)].into_iter().collect();
+    assert_eq!(publishes, expected, "three write-through publishes");
+}
+
 /// Scenario RFC0033.7 — observable outcomes.
 /// Scenario RFC0033.9 — derive cost is observable (`assert_derive_metrics`).
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
@@ -893,33 +924,7 @@ fn rfc0033_7_observable_outcomes() {
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
 
-    let lookups = outcome_counts(
-        &rms,
-        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
-        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
-        &[QUERY_TRIGGER],
-    );
-    let expected: BTreeMap<String, u64> = EXPECTED_LOOKUPS
-        .iter()
-        .map(|(outcome, n)| ((*outcome).to_string(), *n))
-        .collect();
-    assert_eq!(
-        lookups, expected,
-        "one lookup per answered outcome, no extras — act 5's failed fold \
-         counted nothing"
-    );
-
-    // The three publishing lookups (miss, stale, torn) each published;
-    // no lost race or error occurred, so no other series exists.
-    let publishes = outcome_counts(
-        &rms,
-        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES,
-        semconv::OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME,
-        &[],
-    );
-    let expected: BTreeMap<String, u64> = [("published".to_string(), 3)].into_iter().collect();
-    assert_eq!(publishes, expected, "three write-through publishes");
-
+    assert_lookups_and_publishes(&rms);
     assert_artifact_sizes(&rms, [size_after_miss, size_after_stale, size_after_torn]);
     assert_derive_metrics(&rms, cold_audit_set);
     // #949 — no template-map histogram uses the SDK's millisecond buckets.

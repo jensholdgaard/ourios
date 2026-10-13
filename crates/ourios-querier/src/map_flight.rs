@@ -99,6 +99,14 @@ enum Step {
     },
 }
 
+/// Who acquires: the tenant whose map is wanted, and what initiated the
+/// acquisition (RFC 0060 §3.5).
+#[derive(Clone)]
+struct Acquirer {
+    tenant: TenantId,
+    trigger: AcquireTrigger,
+}
+
 impl TemplateMapFlights {
     /// Acquire `tenant`'s [`TemplateMap`] at its current audit frontier,
     /// joining an in-flight acquisition of the same frontier if there is
@@ -147,7 +155,14 @@ impl TemplateMapFlights {
             error.type = tracing::field::Empty,
         );
         let acquired = self
-            .acquire_shared(backend, tenant, trigger, &phase)
+            .acquire_shared(
+                backend,
+                Acquirer {
+                    tenant: tenant.clone(),
+                    trigger,
+                },
+                &phase,
+            )
             .instrument(phase.clone())
             .await;
         if let Err(e) = &acquired {
@@ -160,8 +175,7 @@ impl TemplateMapFlights {
     async fn acquire_shared(
         self: &Arc<Self>,
         backend: &Backend,
-        tenant: &TenantId,
-        trigger: AcquireTrigger,
+        request: Acquirer,
         phase: &tracing::Span,
     ) -> Result<MapAcquisition, QueryError> {
         let mut waited = Duration::ZERO;
@@ -178,10 +192,12 @@ impl TemplateMapFlights {
             let backend = backend
                 .clone()
                 .with_caller(ourios_parquet::Caller::TemplateMap);
-            let owned = tenant.clone();
+            let Acquirer { tenant, trigger } = request.clone();
             let step = tokio::task::spawn_blocking(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    phase::in_phase(&span, || flights.step(backend.store_ref(), &owned, trigger))
+                    phase::in_phase(&span, || {
+                        flights.step(backend.store_ref(), &tenant, trigger)
+                    })
                 })
             })
             .await

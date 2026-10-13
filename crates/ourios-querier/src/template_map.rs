@@ -322,7 +322,9 @@ fn record_outcome_on_span(value: &'static str) {
 
 /// Name each binding conflict a fold found that `known` (the conflict set
 /// of the artifact this acquisition replaces, ascending) lacks, so a key
-/// is announced once rather than on every derive (RFC0033.8). The event
+/// is announced once per artifact that records it, not on every derive:
+/// until a write-through lands, the next acquisition announces it again
+/// (RFC0033.8). The event
 /// carries the key, never the template texts — they can hold user data.
 /// Rendering for the key stays last-wins; the event is the signal that
 /// rows carrying it may render against the wrong template.

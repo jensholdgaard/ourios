@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.13.1] - 2026-10-13
+
+### Added
+
+- Run the template-map refresh task in the served role (rfc 0060 stage 2) (#1000) (29c0c4d)
+- Background template-map refresh task (rfc 0060 stage 1) (#997) (cc197c1)
+- Span file-set resolution as a query phase (#985) (bbeb537)
+
+### Chore
+
+- Pin ourios-semconv v0.3.17 for the template-map refresh names (#996) (d9d2449)
+
+### Documentation
+
+- Rfc 0060 background template-map refresh (specified) (#994) (1e7cde1)
+- Rfc 0033 amendment to announce a binding conflict once (#992) (0475a08)
+
+### Fixed
+
+- Log the withheld detail of a query 5xx as an exception event (#995) (a042b2c)
+- Announce a template binding conflict once, not every derive (#993) (ef7ab83)
+- Lead put_if_match with the etag spelling that last won (#991) (17cd1a4)
+
+### Tests
+
+- Red, the §5 stubs land, status specified→red (#999) (3b3b55f)
+- Land the audit file before the frontier-moved flag (#998) (96c6093)
+
 ## [0.13.0] - 2026-10-12
 
 ### Added

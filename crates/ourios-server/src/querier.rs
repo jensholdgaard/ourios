@@ -177,21 +177,25 @@ impl QuerierMetrics {
         let meter = ourios_core::telemetry::meter("ourios.query");
         let duration = meter
             .f64_histogram(semconv::OURIOS_QUERY_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_QUERY_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_DURATION_UNIT)
             .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
             .build();
         let row_groups = meter
             .u64_counter(semconv::OURIOS_QUERY_ROW_GROUPS)
-            .with_unit("{row_group}")
+            .with_description(semconv::OURIOS_QUERY_ROW_GROUPS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_ROW_GROUPS_UNIT)
             .build();
         let files = meter
             .u64_histogram(semconv::OURIOS_QUERY_FILES)
-            .with_unit("{file}")
+            .with_description(semconv::OURIOS_QUERY_FILES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_FILES_UNIT)
             .with_boundaries(histogram_buckets::FILE_COUNT.to_vec())
             .build();
         let read_size = meter
             .u64_histogram(semconv::OURIOS_QUERY_READ_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_QUERY_READ_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_READ_SIZE_UNIT)
             .with_boundaries(histogram_buckets::SIZE_BYTES.to_vec())
             .build();
         // Seed each pruning state with a zero so both series are visible before
@@ -202,7 +206,8 @@ impl QuerierMetrics {
         row_groups.add(0, &Self::state_attrs(ROW_GROUP_PRUNED));
         let visibility = meter
             .u64_counter(semconv::OURIOS_QUERY_VISIBILITY)
-            .with_unit("{query}")
+            .with_description(semconv::OURIOS_QUERY_VISIBILITY_DESCRIPTION)
+            .with_unit(semconv::OURIOS_QUERY_VISIBILITY_UNIT)
             .build();
         for branch in [
             crate::visibility::BRANCH_TENANT_WIDE,

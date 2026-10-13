@@ -867,6 +867,41 @@ fn assert_lookups_and_publishes(rms: &[ResourceMetrics]) {
     assert_eq!(publishes, expected, "three write-through publishes");
 }
 
+/// The template-map instruments the acts drive, each exported with the
+/// registry's description and unit.
+const REGISTERED: &[ourios_telemetry::metadata_guard::Registered] = &[
+    (
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE,
+        semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_UNIT,
+    ),
+    (
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_DESCRIPTION,
+        semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_UNIT,
+    ),
+];
+
 /// Scenario RFC0033.7 — observable outcomes.
 /// Scenario RFC0033.9 — derive cost is observable (`assert_derive_metrics`).
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
@@ -937,6 +972,7 @@ fn rfc0033_7_observable_outcomes() {
             semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE,
         ],
     );
+    ourios_telemetry::metadata_guard::assert_registry_metadata(&rms, REGISTERED);
     binding_conflict_act(&guard, &exporter, &rms);
     unknown_version_act(&guard, &exporter);
     derive_mode_act(&guard, &exporter);

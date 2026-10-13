@@ -191,9 +191,35 @@ async fn rfc0016_6_pruning_is_observable() {
     assert_query_reads(&rms, bucket.path(), &json);
 }
 
+/// The query instruments, each exported with the registry description and
+/// unit.
+const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 4] = [
+    (
+        semconv::OURIOS_QUERY_DURATION,
+        semconv::OURIOS_QUERY_DURATION_DESCRIPTION,
+        semconv::OURIOS_QUERY_DURATION_UNIT,
+    ),
+    (
+        semconv::OURIOS_QUERY_ROW_GROUPS,
+        semconv::OURIOS_QUERY_ROW_GROUPS_DESCRIPTION,
+        semconv::OURIOS_QUERY_ROW_GROUPS_UNIT,
+    ),
+    (
+        semconv::OURIOS_QUERY_FILES,
+        semconv::OURIOS_QUERY_FILES_DESCRIPTION,
+        semconv::OURIOS_QUERY_FILES_UNIT,
+    ),
+    (
+        semconv::OURIOS_QUERY_READ_SIZE,
+        semconv::OURIOS_QUERY_READ_SIZE_DESCRIPTION,
+        semconv::OURIOS_QUERY_READ_SIZE_UNIT,
+    ),
+];
+
 /// The query duration and row-group instruments are in the exported stream,
-/// and (#949) no histogram the query path exported uses the SDK's
-/// millisecond buckets.
+/// (#949) no histogram the query path exported uses the SDK's millisecond
+/// buckets, and every exported `ourios.*` metric carries its registry
+/// description and unit.
 fn assert_query_instruments_exported(rms: &[ResourceMetrics]) {
     let names = metric_names(rms);
     for expected in [
@@ -213,6 +239,7 @@ fn assert_query_instruments_exported(rms: &[ResourceMetrics]) {
             semconv::OURIOS_QUERY_READ_SIZE,
         ],
     );
+    ourios_telemetry::metadata_guard::assert_registry_metadata(rms, &REGISTERED);
 }
 
 /// #924 — what the query read. Every live data file of the fixture was

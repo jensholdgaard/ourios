@@ -613,18 +613,13 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
             let result = state.querier.run_drift(&query, &tenant, now).await;
             let elapsed = started.elapsed();
             match result {
-                Ok(result) => match serde_json::to_vec(&DriftResponse::from(&result)) {
-                    Ok(body) => {
-                        state.metrics.record_drift(elapsed, &result);
-                        json_ok(body)
-                    }
-                    Err(e) => {
-                        state
-                            .metrics
-                            .record_err(QUERY_KIND_DRIFT, elapsed, ENCODE_ERROR_TYPE);
-                        encode_failure(&e)
-                    }
-                },
+                Ok(result) => served(
+                    &state,
+                    QUERY_KIND_DRIFT,
+                    elapsed,
+                    &DriftResponse::from(&result),
+                    || state.metrics.record_drift(elapsed, &result),
+                ),
                 Err(e) => {
                     state
                         .metrics
@@ -1043,6 +1038,27 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Encode a query's `response` and record the query: `record_served` only
+/// once the body encodes, otherwise a failure of `kind` and the logged `500`.
+fn served<T: Serialize>(
+    state: &QuerierState,
+    kind: &'static str,
+    elapsed: Duration,
+    response: &T,
+    record_served: impl FnOnce(),
+) -> Response {
+    match serde_json::to_vec(response) {
+        Ok(body) => {
+            record_served();
+            json_ok(body)
+        }
+        Err(e) => {
+            state.metrics.record_err(kind, elapsed, ENCODE_ERROR_TYPE);
+            encode_failure(&e)
+        }
+    }
+}
+
 /// `200` with an encoded JSON body.
 fn json_ok(body: Vec<u8>) -> Response {
     (
@@ -1114,18 +1130,13 @@ async fn run_logs_query(
         .await;
     let elapsed = started.elapsed();
     match result {
-        Ok(result) => match serde_json::to_vec(&LogQueryResponse::from(&result)) {
-            Ok(body) => {
-                state.metrics.record_logs(elapsed, &result);
-                json_ok(body)
-            }
-            Err(e) => {
-                state
-                    .metrics
-                    .record_err(QUERY_KIND_LOGS, elapsed, ENCODE_ERROR_TYPE);
-                encode_failure(&e)
-            }
-        },
+        Ok(result) => served(
+            state,
+            QUERY_KIND_LOGS,
+            elapsed,
+            &LogQueryResponse::from(&result),
+            || state.metrics.record_logs(elapsed, &result),
+        ),
         Err(e) => {
             state
                 .metrics

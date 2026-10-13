@@ -699,24 +699,15 @@ fn announced_once_act(
     capture: &live_check::EventCapture,
     bucket: &Path,
 ) {
-    let conflict_events = || -> Vec<_> {
-        capture
-            .events()
-            .into_iter()
-            .filter(|e| e.name == BINDING_CONFLICTED.name)
-            .collect()
-    };
+    let conflict_events = || conflict_events(capture);
     capture.reset();
 
-    let parquet_files = || -> std::collections::BTreeSet<PathBuf> {
-        walk_files(&bucket.join("audit"))
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
-            .collect()
-    };
-    let before_fresh = parquet_files();
+    let before_fresh = audit_parquet_files(bucket);
     write_audit(bucket, &[created(5, "fresh <*>", TS0 + 5)]);
-    let fresh: Vec<_> = parquet_files().difference(&before_fresh).cloned().collect();
+    let fresh: Vec<_> = audit_parquet_files(bucket)
+        .difference(&before_fresh)
+        .cloned()
+        .collect();
     assert_eq!(body_query(bucket).rows, 1);
     let events = conflict_events();
     assert!(
@@ -756,6 +747,32 @@ fn announced_once_act(
         "a files_removed full fold re-announces no known key: {events:#?}"
     );
 
+    assert_refresh_anomalies(guard, exporter);
+}
+
+/// The binding-conflict events captured since the last reset.
+fn conflict_events(capture: &live_check::EventCapture) -> Vec<live_check::Event> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|e| e.name == BINDING_CONFLICTED.name)
+        .collect()
+}
+
+/// The audit Parquet objects under `bucket`.
+fn audit_parquet_files(bucket: &Path) -> std::collections::BTreeSet<PathBuf> {
+    walk_files(&bucket.join("audit"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect()
+}
+
+/// `announced_once_act`'s lookups: the conflicting miss and its three
+/// stale refreshes each carry the anomaly.
+fn assert_refresh_anomalies(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
     let rms = std::slice::from_ref(rms.last().expect("a collection"));

@@ -937,10 +937,12 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > 2026-10-12), so a querier restart doesn't re-announce it either.
 >
 > - **"Once" is per published artifact, not durable suppression.** The
->   known set is what the store holds. When the write-through doesn't
->   land, the next acquisition replaces the same artifact and announces
->   the same new keys again. That covers a size abstention, an IO error
->   and a lost race. No separate suppression state is kept: the
+>   known set is whatever artifact the store holds when the next
+>   acquisition reads it. After a size abstention or an IO error, that
+>   is the same artifact, so the same new keys are announced again.
+>   After a lost race it is the concurrent winner's artifact, so only
+>   keys absent from the winner's set are announced again. No separate
+>   suppression state is kept: the
 >   repetition lasts only while publication does not land, is at
 >   most one event per new key per acquisition, and is never worse
 >   than the behaviour before this amendment.

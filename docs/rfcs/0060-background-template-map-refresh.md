@@ -11,12 +11,13 @@ superseded-by: —
 
 # RFC 0060 — Background template-map refresh
 
-> **Status: `red`.** Every CI-testable §5 scenario has an `#[ignore]`d
-> `todo!` stub naming the slice that discharges it: RFC0060.1–.4, .7,
-> .8, .10 and .11 in `ourios-querier` (`tests/it/rfc0060_refresh.rs`),
-> and .5–.6 in `ourios-server`
-> (`tests/it/rfc0060_refresh_config.rs`). RFC0060.9 is a Dash0 measurement
-> after release, not a CI test (§6).
+> **Status: `red`.** RFC0060.1–.7, .10 and .11 pass: in `ourios-querier`
+> (`tests/it/rfc0060_refresh.rs`, `tests/rfc0060_refresh_observability.rs`)
+> and `ourios-server` (`tests/it/rfc0060_refresh_config.rs`). RFC0060.8's
+> span shape is asserted with .1; its weaver live-check of
+> `acquire.trigger` is still an `#[ignore]`d `todo!` stub, the one open
+> criterion before `green`. RFC0060.9 is a Dash0 measurement after
+> release, not a CI test (§6).
 > Specified 2026-10-13 (#990, maintainer-approved: the
 > RFC 0033 §4 reversal, the two telemetry names and the §7 decisions
 > as recorded below; checked against the OpenTelemetry docs). This RFC adds a querier

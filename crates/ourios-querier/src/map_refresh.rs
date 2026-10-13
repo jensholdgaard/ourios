@@ -40,6 +40,8 @@ pub struct TemplateMapRefresher {
     backoff: HashMap<TenantId, Backoff>,
     #[cfg(feature = "testing")]
     log: Arc<testing::PassLog>,
+    #[cfg(feature = "testing")]
+    before_list: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// One tenant's back-off: `k` consecutive acquisitions that persisted
@@ -87,6 +89,8 @@ impl TemplateMapRefresher {
             backoff: HashMap::new(),
             #[cfg(feature = "testing")]
             log: Arc::default(),
+            #[cfg(feature = "testing")]
+            before_list: None,
         }
     }
 
@@ -148,9 +152,14 @@ impl TemplateMapRefresher {
         span: &tracing::Span,
         mut shutdown: Pin<&mut S>,
     ) -> PassEnd {
-        let tenants = match self.list_tenants(span).await {
-            Ok(tenants) => tenants,
-            Err(e) => return PassEnd::ListingFailed(template_map::error_type(&e)),
+        // Shutdown races the listing as it races an acquisition: a slow
+        // LIST is abandoned to the blocking pool, never awaited.
+        let tenants = match select(shutdown.as_mut(), pin!(self.list_tenants(span))).await {
+            Either::Left(_) => return PassEnd::ShutDown,
+            Either::Right((Ok(tenants), _)) => tenants,
+            Either::Right((Err(e), _)) => {
+                return PassEnd::ListingFailed(template_map::error_type(&e));
+            }
         };
         let listed: HashSet<&TenantId> = tenants.iter().collect();
         self.backoff.retain(|tenant, _| listed.contains(tenant));
@@ -180,7 +189,16 @@ impl TemplateMapRefresher {
             .backend
             .clone()
             .with_caller(ourios_parquet::Caller::TemplateMap);
-        phase::spawn_blocking(span, move || audit_tenants(backend.store_ref())).await
+        #[cfg(feature = "testing")]
+        let gate = self.before_list.clone();
+        phase::spawn_blocking(span, move || {
+            #[cfg(feature = "testing")]
+            if let Some(gate) = gate {
+                gate();
+            }
+            audit_tenants(backend.store_ref())
+        })
+        .await
     }
 
     /// Record what `tenant`'s acquisition left in the store: a current
@@ -295,6 +313,15 @@ pub mod testing {
         pub async fn run_pass(&mut self) {
             self.pass(std::pin::pin!(std::future::pending::<()>()))
                 .await;
+        }
+
+        /// Run `gate` on the blocking thread before every tenant listing, so a
+        /// test can hold a pass inside its LIST.
+        #[doc(hidden)]
+        #[must_use]
+        pub fn with_listing_gate(mut self, gate: Arc<dyn Fn() + Send + Sync>) -> Self {
+            self.before_list = Some(gate);
+            self
         }
 
         /// This refresher's pass log, shared with it.

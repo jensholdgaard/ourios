@@ -421,6 +421,42 @@ async fn rfc0060_7_shutdown_leaves_a_blocked_flight_to_finish() {
     eventually("the abandoned flight publishes", || artifact.exists()).await;
 }
 
+/// Scenario RFC0060.7 — shutdown during a slow tenant listing: the task
+/// exits without waiting for the LIST, which finishes on the blocking pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0060_7_shutdown_does_not_wait_for_a_slow_listing() {
+    let dir = store(&["acme"]);
+    let querier = Querier::new(dir.path());
+    let released = Arc::new(AtomicBool::new(false));
+    let listing = Arc::new(AtomicBool::new(false));
+    let gate = {
+        let (released, listing) = (Arc::clone(&released), Arc::clone(&listing));
+        Arc::new(move || {
+            listing.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !released.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "never released");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let (stop, signal) = shutdown();
+    let run = tokio::spawn(
+        querier
+            .template_map_refresher()
+            .with_listing_gate(gate)
+            .run(Duration::from_secs(3_600), signal),
+    );
+    eventually("the pass is listing", || listing.load(Ordering::SeqCst)).await;
+    stop.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the task exits while its listing is held")
+        .expect("task");
+    assert!(acquired(&querier).is_empty(), "no tenant was acquired");
+    released.store(true, Ordering::SeqCst);
+}
+
 /// Scenario RFC0060.10 — a tenant that persists nothing is backed off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0060_10_a_tenant_that_persists_nothing_is_backed_off() {

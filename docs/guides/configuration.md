@@ -68,6 +68,10 @@ querier:
     key_file: /etc/ourios/tls/tls.key
   mcp:
     enabled: false
+  template_map:
+    refresh:                          # RFC 0060: warm template maps off the query path
+      enabled: true
+      interval: 5m                    # idle time between passes; ms/s/m/h, at least 10s
 
 auth:
   # See the Authentication guide. Omit the whole section for open

@@ -20,9 +20,7 @@ use tokio::time::timeout;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0030_3_querier_and_mcp_over_tls() {
     use ourios_core::auth::{TokenSpec, build_token_store};
-    use ourios_parquet::StoreConfig;
-    use ourios_server::querier::{QuerierConfig, serve};
-    use ourios_serving::AuthResolver;
+    use ourios_server::querier::serve;
     use ourios_serving::tls::TlsSettings;
 
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -55,17 +53,9 @@ async fn rfc0030_3_querier_and_mcp_over_tls() {
     .expect("valid")
     .expect("enabled");
 
-    let handle = serve(QuerierConfig {
-        http_addr: "127.0.0.1:0".parse().expect("addr"),
-        http_tls: Some(http_tls),
-        store: StoreConfig::Local(store_root),
-        mcp_enabled: true,
-        auth: AuthResolver::static_only(Some(std::sync::Arc::new(tokens))),
-        default_window_nanos: 3600 * 1_000_000_000,
-        promoted: ourios_parquet::PromotedAttributes::default(),
-    })
-    .await
-    .expect("querier serves");
+    let handle = serve(tls_querier(http_tls, store_root, tokens))
+        .await
+        .expect("querier serves");
     let port = handle.http_addr.port();
 
     let client = reqwest::Client::builder()
@@ -118,6 +108,25 @@ async fn rfc0030_3_querier_and_mcp_over_tls() {
     assert!(plaintext.is_err(), "plaintext to the TLS querier must fail");
 
     handle.shutdown().await.ok();
+}
+
+/// RFC0030.3's querier: TLS on the HTTP listener, MCP on, the static
+/// `tokens`, and no background template-map refresh.
+fn tls_querier(
+    http_tls: ourios_serving::tls::TlsSettings,
+    store_root: std::path::PathBuf,
+    tokens: ourios_core::auth::TokenStore,
+) -> ourios_server::querier::QuerierConfig {
+    ourios_server::querier::QuerierConfig {
+        http_addr: "127.0.0.1:0".parse().expect("addr"),
+        http_tls: Some(http_tls),
+        store: ourios_parquet::StoreConfig::Local(store_root),
+        mcp_enabled: true,
+        auth: ourios_serving::AuthResolver::static_only(Some(std::sync::Arc::new(tokens))),
+        default_window_nanos: 3600 * 1_000_000_000,
+        promoted: ourios_parquet::PromotedAttributes::default(),
+        template_map_refresh: None,
+    }
 }
 
 /// Spawn the server with the given config file, collect stderr until

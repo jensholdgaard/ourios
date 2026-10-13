@@ -102,6 +102,9 @@ pub struct QuerierConfig {
     /// server-supplied default window the DSL compiler expects (RFC 0002 §4 P5;
     /// RFC 0016 §7).
     pub default_window_nanos: u64,
+    /// The idle time between background template-map refresh passes
+    /// (RFC 0060); `None` runs no refresh task.
+    pub template_map_refresh: Option<Duration>,
 }
 
 /// A running querier role: the resolved bound address plus the handle to shut
@@ -110,21 +113,32 @@ pub struct QuerierHandle {
     pub http_addr: SocketAddr,
     shutdown: watch::Sender<()>,
     http: JoinHandle<()>,
+    refresh: Option<JoinHandle<()>>,
 }
 
 impl QuerierHandle {
-    /// Signal the listener to stop and await its graceful drain. A send error
-    /// just means the listener already stopped.
+    /// Signal the listener and the refresh task to stop and await both. A
+    /// send error just means they already stopped. The refresh task exits
+    /// at once: it abandons an acquisition in flight rather than waiting
+    /// for it (RFC 0060 §3.1).
     ///
     /// # Errors
     ///
-    /// The listener task's join error, as a `String` (no engine type
-    /// crosses the boundary).
+    /// A task's join error, as a `String` (no engine type crosses the
+    /// boundary).
     pub async fn shutdown(self) -> Result<(), String> {
         let _ = self.shutdown.send(());
-        self.http
+        let http = self
+            .http
             .await
-            .map_err(|e| format!("HTTP listener task: {e}"))
+            .map_err(|e| format!("HTTP listener task: {e}"));
+        let refresh = match self.refresh {
+            Some(task) => task
+                .await
+                .map_err(|e| format!("template-map refresh task: {e}")),
+            None => Ok(()),
+        };
+        http.and(refresh)
     }
 }
 
@@ -438,6 +452,14 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         None => None,
     };
 
+    let (shutdown, mut shutdown_rx) = watch::channel(());
+    let refresh = config.template_map_refresh.map(|interval| {
+        let refresher = querier.template_map_refresher();
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(refresher.run(interval, async move {
+            let _ = shutdown_rx.changed().await;
+        }))
+    });
     let app = router_from_querier(
         querier,
         config.default_window_nanos,
@@ -445,7 +467,6 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         config.mcp_enabled,
         &config.promoted,
     );
-    let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {
         let shutdown = async move {
             let _ = shutdown_rx.changed().await;
@@ -474,6 +495,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         http_addr,
         shutdown,
         http,
+        refresh,
     })
 }
 

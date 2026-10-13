@@ -13,8 +13,8 @@ superseded-by: —
 
 > **Status: `red`.** Every CI-testable §5 scenario has an `#[ignore]`d
 > `todo!` stub naming the slice that discharges it: RFC0060.1–.4, .7,
-> .10 and .11 in `ourios-querier` (`tests/it/rfc0060_refresh.rs`; .8's
-> span shape is asserted with .1), and .5–.6 in `ourios-server`
+> .8, .10 and .11 in `ourios-querier` (`tests/it/rfc0060_refresh.rs`),
+> and .5–.6 in `ourios-server`
 > (`tests/it/rfc0060_refresh_config.rs`). RFC0060.9 is a Dash0 measurement
 > after release, not a CI test (§6).
 > Specified 2026-10-13 (#990, maintainer-approved: the

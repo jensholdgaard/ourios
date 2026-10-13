@@ -1201,12 +1201,33 @@ fn query_error_response(error: &ourios_querier::QueryError) -> Response {
         // `Storage` and any future `#[non_exhaustive]` variant → a scrubbed
         // 500. `QueryError::Display` is the H6-safe surface (it withholds the
         // engine detail), so this never leaks DataFusion/SQL text.
-        _ => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            &error.to_string(),
-        ),
+        _ => {
+            log_server_exception(error);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &error.to_string(),
+            )
+        }
     }
+}
+
+/// Semconv `http.server.request.exception`: one `ERROR` log per `5xx`, in
+/// the request span, carrying the detail the scrubbed response withholds.
+/// Without it a failed query leaves nothing to debug but `error.type`.
+fn log_server_exception(error: &ourios_querier::QueryError) {
+    let message = match error {
+        ourios_querier::QueryError::Storage { detail } => detail.clone(),
+        other => other.to_string(),
+    };
+    tracing::error!(
+        name: "http.server.request.exception",
+        {
+            { "exception.type" } = query_error_type(error),
+            { "exception.message" } = message.as_str(),
+        },
+        "query failed",
+    );
 }
 
 /// The `{"query": "<dsl text>"}` JSON wrapper (RFC 0016 §3.3). `deny_unknown_fields`
@@ -1228,8 +1249,96 @@ mod tests {
 
     use super::{
         DEFAULT_LIMIT, LogRowDto, MAX_LIMIT, Stage, Statement, TenantHeaderError, apply_limit,
-        parse_body, tenant_from_headers,
+        parse_body, query_error_response, tenant_from_headers,
     };
+
+    /// An event's name, level and fields.
+    type Seen = (String, tracing::Level, Vec<(String, String)>);
+
+    /// The events a scope saw.
+    #[derive(Clone, Default)]
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<Seen>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(Vec<(String, String)>);
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push((field.name().to_owned(), value.to_owned()));
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push((field.name().to_owned(), format!("{value:?}")));
+                }
+            }
+            let mut fields = Fields(Vec::new());
+            event.record(&mut fields);
+            let meta = event.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((meta.name().to_owned(), *meta.level(), fields.0));
+        }
+    }
+
+    fn events_of(f: impl FnOnce()) -> Vec<Seen> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let events = Events::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(events.clone()), f);
+        events.0.lock().unwrap().clone()
+    }
+
+    /// A `500` logs one `http.server.request.exception` at `ERROR` with the
+    /// storage detail the response body withholds.
+    #[test]
+    fn a_storage_500_logs_the_withheld_detail() {
+        let error = ourios_querier::QueryError::Storage {
+            detail: "list data prefix data/tenant_id=acme/: timed out".to_owned(),
+        };
+        let events = events_of(|| {
+            let response = query_error_response(&error);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        });
+        let [(name, level, fields)] = &events[..] else {
+            panic!("one event: {events:?}");
+        };
+        assert_eq!(name, "http.server.request.exception");
+        assert_eq!(*level, tracing::Level::ERROR);
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(field("exception.type"), Some("storage"));
+        assert_eq!(
+            field("exception.message"),
+            Some("list data prefix data/tenant_id=acme/: timed out"),
+        );
+    }
+
+    /// A `4xx` is the client's error: no exception log.
+    #[test]
+    fn a_4xx_logs_no_exception() {
+        let error = ourios_querier::QueryError::InvalidQuery {
+            detail: "unexpected token".to_owned(),
+        };
+        let events = events_of(|| {
+            let response = query_error_response(&error);
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        });
+        assert!(events.is_empty(), "{events:?}");
+    }
 
     fn headers(content_type: Option<&str>, tenant: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();

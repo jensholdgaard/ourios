@@ -921,6 +921,32 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > conflict; persisting conflicts in the artifact is #928. The status
 > stays `accepted`. Scenario RFC0033.8 is the criterion.
 
+> **Amendment (2026-10-13, #987, maintainer-approved): announce a
+> conflict once.** With incremental folds, derives are frequent, and
+> each one re-announced the whole union conflict set. On the node that
+> was about 630 identical WARNs per derive for `nocturnal`, and about
+> 2,385 per fold of `eq-perses`. The event now names only the keys
+> that are **new** to this acquisition: keys in the derived conflict
+> set that are absent from the `binding_conflicts` of the artifact
+> this acquisition replaces. That set persists (§3.3 amendment
+> 2026-10-12), so a querier restart doesn't re-announce it either.
+>
+> - **No known set.** An acquisition with no stale artifact, a torn or
+>   unknown-version artifact, or one without `fold_state` announces
+>   its whole conflict set, as before. This includes the one-time
+>   `no_fold_state` bootstrap.
+> - **The anomaly is unchanged.** `ourios.template_map.lookup.anomaly
+>   = binding_conflict` still marks every fold-backed acquisition
+>   whose conflict set is non-empty, so the lookups counter still
+>   shows a tenant living with conflicts. The persisted set still
+>   names every key.
+>
+> A full-fold fallback from a stale artifact that has `fold_state`
+> (`files_removed`, `depth_cap`, `out_of_order`) subtracts that
+> artifact's set like an incremental fold. The served map is
+> unchanged, and a hit still announces nothing. The status stays
+> `accepted`. Scenario RFC0033.8 gains the criterion below.
+
 > **Amendment (2026-10-11, #924, maintainer-approved): what an
 > acquisition costs.** The lookup counter says a derive happened, not
 > what it cost. Each fold behind a non-hit lookup also records:
@@ -1172,6 +1198,13 @@ ambiguity cannot recur.
 > - **And** the served map is unchanged (last-wins)
 > - **And** an identical re-emit, a widening (same id, new version)
 >   and an adoption onto an existing leaf report no conflict.
+>
+> *Amendment (2026-10-13, #987):*
+> - **And** when a later audit file makes the artifact stale, the
+>   refreshing acquisition announces no event for the already-known
+>   key, but its lookup still carries the anomaly
+> - **And** a further audit file that binds a second key to two
+>   templates is announced once, as one event naming only that key.
 
 > **Scenario RFC0033.9 — Derive cost is observable** (amendment
 > 2026-10-11, #924)

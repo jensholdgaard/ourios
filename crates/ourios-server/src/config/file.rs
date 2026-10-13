@@ -1921,6 +1921,10 @@ querier:
   default_window_secs: ${env:L36}
   mcp:
     enabled: ${env:L37}
+  template_map:
+    refresh:
+      enabled: ${env:L70}
+      interval: ${env:L71}
 compaction:
   enabled: ${env:L38}
   interval_secs: ${env:L39}

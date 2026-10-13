@@ -122,8 +122,15 @@ async fn served(root: &Path, template_map_refresh: Option<Duration>) -> QuerierH
 /// The enabled run is the control: the same store and the same wait are
 /// enough for the start pass to publish, so the disabled run's missing
 /// artifact means no acquisition ran.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Single-threaded so the thread-local subscriber below sees the spans the
+// served role's spawned tasks open.
+#[tokio::test(flavor = "current_thread")]
 async fn rfc0060_5_disabled_means_todays_behaviour() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let spans = SpanNames::default();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
     let enabled = store();
     let started = Instant::now();
     let handle = served(enabled.path(), Some(Duration::from_secs(10))).await;
@@ -136,6 +143,10 @@ async fn rfc0060_5_disabled_means_todays_behaviour() {
     }
     let published_after = started.elapsed();
     handle.shutdown().await.expect("enabled shutdown");
+    assert!(
+        spans.take().iter().any(|name| name == PASS_SPAN),
+        "the enabled run opened its pass span"
+    );
 
     let disabled = store();
     let handle = served(disabled.path(), None).await;
@@ -145,6 +156,38 @@ async fn rfc0060_5_disabled_means_todays_behaviour() {
         "with refresh disabled nothing acquires the map before a query"
     );
     handle.shutdown().await.expect("disabled shutdown");
+    // The `refresh.duration` sample is recorded only where this span is
+    // opened, at the end of a pass, so no span means no sample.
+    assert!(
+        !spans.take().iter().any(|name| name == PASS_SPAN),
+        "with refresh disabled no pass span is opened"
+    );
+}
+
+const PASS_SPAN: &str = "refresh template_map";
+
+/// The names of the spans opened under this subscriber, drained by `take`.
+#[derive(Clone, Default)]
+struct SpanNames(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl SpanNames {
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().expect("span names"))
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanNames {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.0
+            .lock()
+            .expect("span names")
+            .push(attrs.metadata().name().to_owned());
+    }
 }
 
 fn resolve(refresh: &str) -> Result<Option<Duration>, String> {

@@ -1281,12 +1281,13 @@ fn log_server_exception(error: &ourios_querier::QueryError) {
 /// `exception.type` is the Rust error type, per semconv; `error.type` is
 /// the class the query metrics record, so the log joins them.
 fn log_exception(exception_type: &str, error_type: &str, message: &str) {
+    use ourios_core::telemetry;
     tracing::error!(
-        name: "http.server.request.exception",
+        name: telemetry::EVENT_HTTP_SERVER_REQUEST_EXCEPTION,
         {
-            { "exception.type" } = exception_type,
-            { ourios_core::telemetry::ERROR_TYPE } = error_type,
-            { "exception.message" } = message,
+            { telemetry::EXCEPTION_TYPE } = exception_type,
+            { telemetry::ERROR_TYPE } = error_type,
+            { telemetry::EXCEPTION_MESSAGE } = message,
         },
         "query failed",
     );

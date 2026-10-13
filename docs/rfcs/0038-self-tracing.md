@@ -22,6 +22,14 @@ superseded-by: —
 > new scenarios are `drafted` until review confirms they are testable, then
 > move through `specified`, `red` and `green` on their own. Refs #853.
 
+> **Status update (2026-10-13, #985, maintainer-approved) — RFC0038.1's
+> query arm is `red`.** The `resolve files` span is implemented with
+> `ourios.tenant` and `ourios.file_set.live_files`, and
+> `rfc0038_1_query_emits_the_server_span_and_its_resolve_phase` replaces the
+> superseded one-span test, as §6 directs. The arm stays `red` until the
+> other three `ourios.file_set.*` counts and the S3 variant land (#986).
+> RFC0038.8–.11 stay `drafted`.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip. Where a thesis-gate applies it
 > stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is

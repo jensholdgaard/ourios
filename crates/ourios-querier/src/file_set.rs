@@ -9,6 +9,7 @@
 use super::*;
 use crate::fetch_count::FetchCounter;
 use ourios_parquet::ManifestError;
+use tracing::Instrument as _;
 
 /// Resolve the live data files a query must read under `dir` (a
 /// tenant's partition root), honouring the RFC 0009 §3.4
@@ -122,7 +123,88 @@ fn read_local_manifest(
     }
 }
 
-/// The blocking half of [`Querier::resolve_data_urls`]: finished table URLs on
+/// What one file-set resolution covers: the tenant, its `data/` prefix and
+/// the partition window that prunes it.
+#[derive(Clone, Copy)]
+pub(super) struct DataScope<'a> {
+    pub(super) tenant: &'a TenantId,
+    pub(super) prefix: &'a str,
+    pub(super) window: Option<(u64, u64)>,
+}
+
+/// Resolve the live data files under the tenant's `data/` prefix and turn
+/// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
+/// with the listing and manifest reads on the blocking pool:
+///
+/// - **Local backend** ([`Backend::Local`]): walk `std::fs` under
+///   `<root>/<prefix>` honouring the RFC 0009 §3.4 manifest, then address
+///   each file by its absolute local path — byte-for-byte the pre-RFC-0019
+///   read path, with the canonical-path tenant-isolation backstop intact.
+/// - **S3 backend** ([`Backend::Remote`]): list the window's keys under
+///   `prefix` through the [`Store`] (segment-wise prefix-scoped, the
+///   RFC0019.5 tenant guarantee), resolve the per-partition manifest through
+///   the [`Store`], register the store on `ctx`, and address each key by the
+///   `ourios://store/<key>` object-store URL.
+///
+/// The whole resolution is the RFC 0038 §3.7.1 `resolve files` phase, open
+/// from before the first listing to the finished URLs — on both backends,
+/// and when nothing is live, since that work ran either way.
+pub(super) async fn resolve_data_urls(
+    backend: &Backend,
+    ctx: &SessionContext,
+    scope: DataScope<'_>,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    let span = tracing::info_span!(
+        "resolve files",
+        otel.kind = "internal",
+        ourios.tenant = scope.tenant.as_str(),
+        ourios.file_set.live_files = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    resolve_in_phase(backend, ctx, scope, &span)
+        .instrument(span.clone())
+        .await
+        // `i64`, not `usize`/`u64`: tracing-opentelemetry renders a `u64`
+        // field as a string, and §3.7.2 wants a count.
+        .inspect(|urls| {
+            span.record(
+                ourios_semconv::OURIOS_FILE_SET_LIVE_FILES,
+                i64::try_from(urls.len()).unwrap_or(i64::MAX),
+            );
+        })
+        .inspect_err(|e| {
+            ourios_core::telemetry::record_span_error(&span, crate::template_map::error_type(e));
+        })
+}
+
+async fn resolve_in_phase(
+    backend: &Backend,
+    ctx: &SessionContext,
+    scope: DataScope<'_>,
+    span: &tracing::Span,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    // The manifest reads count toward the session's fetched bytes.
+    let fetched = fetch_count::counter(ctx).unwrap_or_default();
+    let resolved = crate::phase::spawn_blocking(span, {
+        let backend = backend.clone();
+        let prefix = scope.prefix.to_owned();
+        let window = scope.window;
+        move || resolve_live_set(&backend, &prefix, window, &fetched)
+    })
+    .await?;
+    match (resolved, backend) {
+        (LiveSet::Urls(urls), _) => Ok(urls),
+        (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),
+        // Keys come only from the remote branch of `resolve_live_set`,
+        // which read this same backend; surfaced rather than unwrapped.
+        (LiveSet::Keys(_), Backend::Local(_)) => Err(QueryError::Storage {
+            detail: "internal: S3 data keys reached with a local backend".to_string(),
+        }),
+    }
+}
+
+/// The blocking half of [`resolve_data_urls`]: finished table URLs on
 /// the local backend, store keys on S3 (their URLs need the query's
 /// `SessionContext`, which stays on the async side).
 pub(super) enum LiveSet {
@@ -130,7 +212,7 @@ pub(super) enum LiveSet {
     Keys(Vec<String>),
 }
 
-/// Resolve the tenant's live data files for [`Querier::resolve_data_urls`] —
+/// Resolve the tenant's live data files for [`resolve_data_urls`] —
 /// blocking IO, run on the blocking pool.
 pub(super) fn resolve_live_set(
     backend: &Backend,

@@ -1,5 +1,6 @@
 //! RFC0038.1 — the served query request-scope span is emitted, one per
-//! operation, with the §3.5 kind contract.
+//! operation, with the §3.5 kind contract, and (§3.7 amendment) parents the
+//! query's phase spans.
 //!
 //! Slice 2 covered the ingest arm (`crates/ourios-ingester/tests/it/`); this
 //! file covers the served query (`POST /v1/query`, SERVER), driving the real
@@ -21,7 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, header};
 use opentelemetry::Value;
 use opentelemetry::trace::SpanKind;
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tower::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
@@ -48,8 +49,13 @@ fn scoped_tracer() -> (
     (exporter, provider, subscriber)
 }
 
+/// The query arm as amended by RFC 0038 §3.7: a compiled query over a tenant
+/// with nothing live produces the `POST /v1/query` server span as the root,
+/// exactly one `resolve files` child (still emitted when no file is live),
+/// no `load template_map` (this query needs no map) and no operator spans
+/// (no scan runs). No other span is produced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn rfc0038_1_query_emits_one_server_span() {
+async fn rfc0038_1_query_emits_the_server_span_and_its_resolve_phase() {
     let bucket = tempfile::tempdir().expect("temp");
     let app = ourios_server::querier::router(bucket.path().to_path_buf(), WINDOW_NANOS);
     let (exporter, provider, subscriber) = scoped_tracer();
@@ -78,27 +84,60 @@ async fn rfc0038_1_query_emits_one_server_span() {
 
     provider.force_flush().expect("spans flush");
     let spans = exporter.get_finished_spans().expect("spans exported");
-    // Exactly one span, and it is the query server span — asserting the total
-    // count catches accidental extra instrumentation (the "one span per
-    // operation" contract). The query path emits no other span: the miner /
-    // DataFusion inner work stays span-free (RFC0038.2).
+    // The exact span multiset: asserting the total catches accidental extra
+    // instrumentation. The miner / DataFusion inner work stays span-free
+    // (RFC0038.2), and with nothing live no operator span opens.
+    let mut names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["POST /v1/query", "resolve files"]);
+    let server = one_named(&spans, "POST /v1/query");
+    let resolve = one_named(&spans, "resolve files");
     assert_eq!(
-        spans.len(),
-        1,
-        "exactly one span total, got {:?}",
-        spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-    );
-    assert_eq!(spans[0].name.as_ref(), "POST /v1/query");
-    assert_eq!(
-        spans[0].span_kind,
+        server.span_kind,
         SpanKind::Server,
-        "POST /v1/query is a SERVER span",
+        "POST /v1/query is a SERVER span"
     );
+    assert_eq!(
+        resolve.span_kind,
+        SpanKind::Internal,
+        "resolve files is INTERNAL"
+    );
+    assert_eq!(
+        resolve.parent_span_id,
+        server.span_context.span_id(),
+        "the phase is a child of the query span",
+    );
+    assert_eq!(
+        resolve.span_context.trace_id(),
+        server.span_context.trace_id()
+    );
+    assert!(
+        resolve.attributes.iter().any(|kv| kv.key.as_str()
+            == ourios_semconv::OURIOS_FILE_SET_LIVE_FILES
+            && kv.value == Value::I64(0)),
+        "an empty tenant resolves zero live files; attrs = {:?}",
+        resolve.attributes,
+    );
+    assert_query_server_attributes(server);
+}
 
-    // §3.5 — the query span carries the standard HTTP server attributes plus
-    // the tenant it scoped to (a successful query against tenant `acme`).
+/// The one exported span named `name`.
+fn one_named<'s>(spans: &'s [SpanData], name: &str) -> &'s SpanData {
+    let [span] = spans
+        .iter()
+        .filter(|s| s.name.as_ref() == name)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("exactly one {name:?} span");
+    };
+    span
+}
+
+/// §3.5 — the query span carries the standard HTTP server attributes plus
+/// the tenant it scoped to (a successful query against tenant `acme`).
+fn assert_query_server_attributes(server: &SpanData) {
     let attr = |key: &str| {
-        spans[0]
+        server
             .attributes
             .iter()
             .find(|kv| kv.key.as_str() == key)
@@ -107,7 +146,7 @@ async fn rfc0038_1_query_emits_one_server_span() {
     assert!(
         matches!(attr("http.request.method"), Some(Value::String(s)) if s.as_str() == "POST"),
         "http.request.method = POST; attrs = {:?}",
-        spans[0].attributes,
+        server.attributes,
     );
     assert!(
         matches!(attr("http.route"), Some(Value::String(s)) if s.as_str() == "/v1/query"),

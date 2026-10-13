@@ -124,6 +124,7 @@ fn text(span: &SpanData, key: &str) -> Option<String> {
 /// A scoped tracing pipeline over its own in-memory span exporter. Keep the
 /// provider alive until the spans are read.
 fn traced() -> (InMemorySpanExporter, SdkTracerProvider, tracing::Dispatch) {
+    crate::common::global_subscriber();
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())

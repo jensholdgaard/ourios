@@ -37,6 +37,7 @@ mod rfc0033_cached_template_map;
 mod rfc0033_fold_state;
 mod rfc0033_incremental_fold;
 mod rfc0036_window_materialization;
+mod rfc0038_file_set_span;
 mod rfc0038_template_map_spans;
 mod rfc0042_mixed_schema;
 mod rfc0044_body_equality;

@@ -708,9 +708,12 @@ impl Querier {
         // case and a partition holding only `*.parquet.tmp` (a poisoned /
         // crashed writer) — where building a table over zero files would
         // otherwise error and wrongly fail the query.
-        let urls = self
-            .resolve_data_urls(&ctx, &data_prefix, partition_window)
-            .await?;
+        let scope = file_set::DataScope {
+            tenant,
+            prefix: &data_prefix,
+            window: partition_window,
+        };
+        let urls = file_set::resolve_data_urls(&self.backend, &ctx, scope).await?;
         if urls.is_empty() {
             let result = empty_result(terminal.aggregate());
             return Ok(crate::fetch_count::with_fetched(
@@ -1010,45 +1013,6 @@ impl Querier {
             .map_err(|e| QueryError::Storage {
                 detail: format!("blocking storage task: {e}"),
             })?
-    }
-
-    /// Resolve the live data files under the tenant's `data/` prefix and turn
-    /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3),
-    /// with the listing and manifest reads on the blocking pool:
-    ///
-    /// - **Local backend** ([`Backend::Local`]): walk `std::fs` under
-    ///   `<root>/<prefix>` honouring the RFC 0009 §3.4 manifest, then address
-    ///   each file by its absolute local path — byte-for-byte the pre-RFC-0019
-    ///   read path, with the canonical-path tenant-isolation backstop intact.
-    /// - **S3 backend** ([`Backend::Remote`]): list the window's keys under
-    ///   `prefix` through the [`Store`] (segment-wise prefix-scoped, the
-    ///   RFC0019.5 tenant guarantee), resolve the per-partition manifest through
-    ///   the [`Store`], register the store on `ctx`, and address each key by the
-    ///   `ourios://store/<key>` object-store URL.
-    async fn resolve_data_urls(
-        &self,
-        ctx: &SessionContext,
-        prefix: &str,
-        window: Option<(u64, u64)>,
-    ) -> Result<Vec<ListingTableUrl>, QueryError> {
-        // The manifest reads count toward the session's fetched bytes.
-        let fetched = fetch_count::counter(ctx).unwrap_or_default();
-        let resolved = self
-            .spawn_blocking_io({
-                let backend = self.backend.clone();
-                let prefix = prefix.to_owned();
-                move || resolve_live_set(&backend, &prefix, window, &fetched)
-            })
-            .await?;
-        match (resolved, &self.backend) {
-            (LiveSet::Urls(urls), _) => Ok(urls),
-            (LiveSet::Keys(keys), Backend::Remote(store)) => object_store_urls(ctx, store, &keys),
-            // Keys come only from the remote branch of `resolve_live_set`,
-            // which read this same backend; surfaced rather than unwrapped.
-            (LiveSet::Keys(_), Backend::Local(_)) => Err(QueryError::Storage {
-                detail: "internal: S3 data keys reached with a local backend".to_string(),
-            }),
-        }
     }
 }
 

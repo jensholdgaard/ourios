@@ -16,6 +16,8 @@ use ourios_parquet::QueryPhase;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
+use crate::QueryError;
+
 /// `work`, run inside `span` as a query phase.
 pub(crate) fn in_phase<T>(span: &Span, work: impl FnOnce() -> T) -> T {
     // Attached after entering: entering activates the span's own context,
@@ -24,6 +26,23 @@ pub(crate) fn in_phase<T>(span: &Span, work: impl FnOnce() -> T) -> T {
         let _phase = (!span.is_disabled()).then(|| span.context().with_value(QueryPhase).attach());
         work()
     })
+}
+
+/// `work` on the blocking pool as the query phase `span` ([`in_phase`]), so
+/// the store requests it makes open `CLIENT` spans beneath the phase
+/// (RFC 0038 §3.7.3). The span is taken explicitly: `Span::current()` could
+/// be an ancestor, which would parent those spans with no phase between.
+pub(crate) async fn spawn_blocking<T, F>(span: &Span, work: F) -> Result<T, QueryError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, QueryError> + Send + 'static,
+{
+    let span = span.clone();
+    tokio::task::spawn_blocking(move || in_phase(&span, work))
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("blocking storage task: {e}"),
+        })?
 }
 
 /// `work`, run inside `span`, and still a query phase when the work around

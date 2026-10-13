@@ -20,6 +20,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
@@ -127,6 +128,10 @@ pub struct Store {
     /// The directory a local backend writes under, for
     /// [`Self::sync_local_blocking`]; `None` on every other backend.
     local_root: Option<std::path::PathBuf>,
+    /// Whether the last [`Self::put_if_match`] that needed its fallback won
+    /// with the unquoted `ETag`, so later swaps lead with that spelling.
+    /// Shared by every handle on the backend.
+    if_match_unquoted: Arc<AtomicBool>,
 }
 
 /// Addressing for the S3 / S3-compatible backend (RFC0013.7) — bucket,
@@ -945,13 +950,15 @@ impl Store {
     /// supports conditional update — S3-compatible stores do;
     /// `LocalFileSystem` does not.
     ///
-    /// A `412` against a quoted `ETag` is retried once with the quotes
-    /// stripped: some S3-compatible stores (Ceph RGW-based ones) return the
+    /// A `412` against a quoted `ETag` is retried once in the other
+    /// spelling: some S3-compatible stores (Ceph RGW-based ones) return the
     /// quoted form from `GET` but honour `If-Match` only unquoted, so every
-    /// swap would otherwise lose. The retry cannot weaken the swap — it
-    /// still succeeds only if the object is unchanged — because it is sent
-    /// only for a plain opaque tag (letters, digits and hyphens), whose
-    /// unquoted spelling cannot become a wildcard or a list.
+    /// swap would otherwise lose. The spelling that won a retry leads the
+    /// next swap, so such a store costs one request per swap, not a `412`
+    /// and a second `PUT`. The retry cannot weaken the swap — it still
+    /// succeeds only if the object is unchanged — because it is sent only
+    /// for a plain opaque tag (letters, digits and hyphens), whose unquoted
+    /// spelling cannot become a wildcard or a list.
     ///
     /// # Errors
     /// [`StoreError::Backend`] whose [`StoreError::is_precondition`] is true if
@@ -976,10 +983,19 @@ impl Store {
             .strip_prefix('"')
             .and_then(|rest| rest.strip_suffix('"'))
             .filter(|tag| is_plain_opaque_tag(tag));
-        match (put(e_tag).await, unquoted) {
+        let lead_unquoted = self.if_match_unquoted.load(Ordering::Relaxed);
+        let (first, fallback) = match unquoted {
+            Some(unquoted) if lead_unquoted => (unquoted, Some(e_tag)),
+            Some(unquoted) => (e_tag, Some(unquoted)),
+            None => (e_tag, None),
+        };
+        match (put(first).await, fallback) {
             (Ok(_), _) => Ok(()),
-            (Err(object_store::Error::Precondition { .. }), Some(unquoted)) => {
-                put(unquoted).await.map(|_| ()).map_err(StoreError::Backend)
+            (Err(object_store::Error::Precondition { .. }), Some(fallback)) => {
+                put(fallback).await.map_err(StoreError::Backend)?;
+                self.if_match_unquoted
+                    .store(!lead_unquoted, Ordering::Relaxed);
+                Ok(())
             }
             (Err(e), _) => Err(StoreError::Backend(e)),
         }

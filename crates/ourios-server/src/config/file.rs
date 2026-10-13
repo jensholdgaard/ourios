@@ -998,8 +998,17 @@ impl QuerierSection {
         self.http_tls.substitute(lookup)?;
         substitute(&mut self.default_window_secs, lookup)?;
         substitute(&mut self.mcp.enabled, lookup)?;
-        substitute(&mut self.template_map.refresh.enabled, lookup)?;
-        substitute(&mut self.template_map.refresh.interval, lookup)
+        self.template_map.refresh.substitute(lookup)
+    }
+}
+
+impl RefreshSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.enabled, lookup)?;
+        substitute(&mut self.interval, lookup)
     }
 }
 

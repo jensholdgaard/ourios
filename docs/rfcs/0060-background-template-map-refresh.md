@@ -56,9 +56,12 @@ Full folds still happen, and each lands on whichever query asks first:
 
 - **Bootstrap.** The first acquisition after an artifact-format change
   (`no_fold_state`, `unknown_version`) or after a torn artifact.
-- **Depth cap.** Every `INCREMENTAL_DEPTH_CAP` (256) incremental folds.
-  That is about every ten days per tenant at the node's current rate,
-  and sooner on a busier tenant.
+- **Depth cap.** Every `INCREMENTAL_DEPTH_CAP` (256) *published*
+  incremental steps (RFC 0033 §3.3). An abstained, failed or lost
+  publish leaves the stored depth unchanged. If every one of the 24
+  incremental derives a day observed above published, that is one cap
+  fold per tenant per ten to eleven days. That is an upper bound on the
+  frequency: each unpublished step makes the interval longer.
 - **Fallbacks.** `files_removed` (audit objects removed, e.g. by
   retention) and `out_of_order`.
 
@@ -138,11 +141,23 @@ ask. §7 lists pre-emptive full folds as an open question.
 - **Failure.** A failed acquisition is recorded (§3.5), and the pass
   moves on to the next tenant. A failed tenant listing ends the pass;
   the next pass retries. Neither failure stops the task or the process.
-- **Cost on an idle tenant.** A tenant with nothing new costs one audit
-  `LIST` plus one artifact `GET` per pass (a hit). With the default
-  interval that is negligible beside the ingest path's own requests. It
-  is still paid per tenant, hence §7's question about large tenant
-  counts.
+- **Cost on an idle tenant.** A tenant with a current artifact costs
+  one audit `LIST` plus one artifact `GET` per pass (a hit). With the
+  default interval that is negligible beside the ingest path's own
+  requests. It is still paid per tenant, hence §7's question about
+  large tenant counts.
+- **Back-off when nothing persists.** An acquisition that ends without
+  a publish and without a hit persists nothing. That covers a
+  write-through abstention (RFC 0033 §3.2 size gate or ceiling, which
+  may recur indefinitely), a failed publish, and a failed acquisition.
+  Re-running it each pass would repeat the fold and its `GET`s every
+  `interval` for no later query's benefit. So after `k` consecutive
+  such acquisitions, the task skips that tenant for the next
+  `min(2^k − 1, 11)` passes, which is at most an hour at the default
+  interval. A hit, a publish of its own, or a lost CAS race (someone
+  else published) resets `k` to 0. The counter lives in process
+  memory and resets on restart. A query is never skipped: it acquires
+  exactly as it does without the task.
 
 ### 3.4 Configuration
 
@@ -154,9 +169,13 @@ These keys sit under `querier.template_map.refresh.*` (RFC 0020;
 | `enabled`  | bool     | `true`  | spawn the task                               |
 | `interval` | duration | `5m`    | idle time between passes; must be ≥ `10s`    |
 
-`enabled: false` restores today's behaviour exactly. An `interval`
-below the floor is a startup configuration error naming the key, not a
-silent clamp, as RFC 0020 validates every other resolved value.
+`enabled: false` restores today's behaviour exactly. As with
+`compaction.enabled` / `interval`, `interval` is parsed and validated
+only when the task is enabled, so an unused bad value never blocks
+startup. When enabled, an `interval` that is not a duration, or is
+below the floor, is a startup configuration error naming the key. It
+is not silently clamped, as RFC 0020 validates every other resolved
+value.
 
 ### 3.5 Observability (CLAUDE.md §6.3)
 
@@ -194,10 +213,9 @@ MCP, and the start pass is not a timer. With two values it at most
 doubles the existing series.
 
 `ourios.template_map.acquire.trigger` and
-`ourios.template_map.refresh.duration` are new names. They are
-registered in ourios-semconv under the purpose-check and
-maintainer-approval rule before implementation, after an OTel
-naming-guidance check.
+`ourios.template_map.refresh.duration` are new names, registered in
+ourios-semconv `v0.3.17` under the purpose-check and
+maintainer-approval rule, after an OTel naming-guidance check.
 
 ### 3.6 Multi-tenancy and replicas (CLAUDE.md §3.7)
 
@@ -285,9 +303,12 @@ path, and a second publisher contends for the CAS.
 >   refresh sample is emitted.
 
 > **Scenario RFC0060.6 — Configuration is validated**
-> - **Given** `interval: 1s`, or a non-duration value
+> - **Given** refresh enabled with `interval: 1s`, or a non-duration
+>   value
 > - **When** the configuration is resolved
-> - **Then** startup fails with an error naming the key.
+> - **Then** startup fails with an error naming the key
+> - **And** with `enabled: false` the same values resolve without
+>   error.
 
 > **Scenario RFC0060.7 — Shutdown is prompt**
 > - **Given** a pass between tenants, or waiting on its interval
@@ -296,25 +317,44 @@ path, and a second publisher contends for the CAS.
 
 > **Scenario RFC0060.8 — Telemetry is registry-conformant**
 > - **Given** RFC0060.1's run
-> - **When** its spans and metrics are checked with weaver live-check
-> - **Then** `refresh template_map`, `acquire.trigger` and
->   `refresh.duration` conform to the ourios-semconv registry.
+> - **When** its spans and metrics are exported
+> - **Then** the pass is one root `INTERNAL` span named
+>   `refresh template_map`, with each tenant's `load template_map`
+>   span beneath it, asserted through the in-memory span exporter
+>   (span names are not registry entries)
+> - **And** `acquire.trigger` and `refresh.duration` pass weaver
+>   live-check against the ourios-semconv registry.
 
 > **Scenario RFC0060.9 — Query-paid full folds drop** (Dash0, after
 > deploy)
-> - **Given** the node on the release that ships this RFC, over 7 days
-> - **Then** `derive.duration{mode=full, acquire.trigger=query}` counts
->   only folds whose query arrived during the background pass's own
->   fold, and is below the previous release's full-fold count.
+> - **Given** the node on the release that ships this RFC, and the
+>   previous release, each over a 7-day window
+> - **When** full folds are counted, normalised per tenant-day
+> - **Then** `derive.duration{mode=full, acquire.trigger=query}` on
+>   the new release is below the previous release's `mode=full` count.
+>   A query that joins a background fold records no derive of its own,
+>   so the remaining `query` full folds are those where a query became
+>   the acquirer before the pass reached its tenant.
+
+> **Scenario RFC0060.10 — A tenant that persists nothing is backed off**
+> - **Given** a tenant whose write-through abstains on every acquisition
+> - **When** consecutive passes run
+> - **Then** the task acquires it on passes 1, 3 and 7 (skipping 1,
+>   then 3), and on no more than one pass in 12 thereafter
+> - **And** a query for that tenant still acquires on every request
+> - **And** after a hit or a publish the tenant is acquired on the next
+>   pass again.
 
 ## 6. Testing strategy
 
-- RFC0060.1–.4 and .7 are integration tests in `ourios-querier` over a
+- RFC0060.1–.4, .7 and .10 are integration tests in `ourios-querier` over a
   local store, using the `map_flight` hooks (`before_acquire` gating,
   acquisition and join counters) through the `testing` feature.
 - RFC0060.5–.6 are `ourios-server` config tests (RFC 0020 style) plus
   one served-role test.
-- RFC0060.8 uses the weaver live-check harness (`live_check`).
+- RFC0060.8 asserts span names and nesting through the in-memory span
+  exporter, and the registry names through the weaver live-check
+  harness (`live_check`).
 - RFC0060.9 is a Dash0 before/after measurement recorded on the release
   (the RFC0033.14 precedent), not a CI test.
 
@@ -328,8 +368,10 @@ Decided for this RFC (maintainer, 2026-10-13); each is revisited only on
 the Dash0 evidence named:
 
 - [x] **Pre-emptive full fold near `INCREMENTAL_DEPTH_CAP`: deferred.**
-      At about one cap fold per tenant per ten days, a 5-minute pass
-      almost always reaches it first. Reopen, as an RFC 0033 derive-policy
+      Cap folds come at most once per 256 published incremental steps
+      per tenant (about ten days at the observed rate if every step
+      published, rarer otherwise), so a 5-minute pass almost always
+      reaches them first. Reopen, as an RFC 0033 derive-policy
       amendment, if `derive.duration{mode=full, acquire.trigger=query}`
       stays above zero after RFC0060.9.
 - [x] **Large tenant counts: not in v1.** Every tenant is visited each

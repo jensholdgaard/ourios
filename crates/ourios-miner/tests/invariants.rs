@@ -120,8 +120,34 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     assert_mandatory_exported(&rms, &MANDATORY);
 }
 
-/// Every `mandatory` name is in the exported stream, and (#949) no miner
-/// histogram falls back to the SDK's millisecond buckets.
+/// Miner instruments exported with the registry description and unit: the
+/// confidence quantiles share one registration helper.
+const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 4] = [
+    (
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P50,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P50_DESCRIPTION,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P50_UNIT,
+    ),
+    (
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P01,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P01_DESCRIPTION,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P01_UNIT,
+    ),
+    (
+        ourios_semconv::OURIOS_MINER_TEMPLATE_COUNT,
+        ourios_semconv::OURIOS_MINER_TEMPLATE_COUNT_DESCRIPTION,
+        ourios_semconv::OURIOS_MINER_TEMPLATE_COUNT_UNIT,
+    ),
+    (
+        ourios_semconv::OURIOS_MINER_CONFIDENCE,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_DESCRIPTION,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_UNIT,
+    ),
+];
+
+/// Every `mandatory` name is in the exported stream, (#949) no miner
+/// histogram falls back to the SDK's millisecond buckets, and every
+/// `ourios.*` metric carries its registry description and unit.
 fn assert_mandatory_exported(
     rms: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
     mandatory: &[&str],
@@ -160,6 +186,7 @@ fn assert_mandatory_exported(
             ourios_semconv::OURIOS_MINER_DURATION,
         ],
     );
+    ourios_telemetry::metadata_guard::assert_registry_metadata(rms, &REGISTERED);
 }
 
 /// Scenario §3.2.1 — Default per-parameter byte limit is 256.

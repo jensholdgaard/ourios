@@ -149,7 +149,8 @@ pub(super) fn register(meter: &Meter, registry: &Arc<GaugeRegistry>) -> Observab
     let reg = Arc::clone(registry);
     let template_count = meter
         .u64_observable_gauge(semconv::OURIOS_MINER_TEMPLATE_COUNT)
-        .with_unit("{template}")
+        .with_description(semconv::OURIOS_MINER_TEMPLATE_COUNT_DESCRIPTION)
+        .with_unit(semconv::OURIOS_MINER_TEMPLATE_COUNT_UNIT)
         .with_callback(move |obs| {
             for state in reg.live() {
                 observe_template_counts(&lock_recovering(&state), obs);
@@ -160,7 +161,8 @@ pub(super) fn register(meter: &Meter, registry: &Arc<GaugeRegistry>) -> Observab
     let reg = Arc::clone(registry);
     let body_retention_utilization = meter
         .f64_observable_gauge(semconv::OURIOS_MINER_BODY_RETENTION_UTILIZATION)
-        .with_unit("1")
+        .with_description(semconv::OURIOS_MINER_BODY_RETENTION_UTILIZATION_DESCRIPTION)
+        .with_unit(semconv::OURIOS_MINER_BODY_RETENTION_UTILIZATION_UNIT)
         .with_callback(move |obs| {
             for state in reg.live() {
                 observe_body_retention(&lock_recovering(&state), obs);
@@ -171,7 +173,8 @@ pub(super) fn register(meter: &Meter, registry: &Arc<GaugeRegistry>) -> Observab
     let reg = Arc::clone(registry);
     let params_overflow_utilization = meter
         .f64_observable_gauge(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION)
-        .with_unit("1")
+        .with_description(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION_DESCRIPTION)
+        .with_unit(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION_UNIT)
         .with_callback(move |obs| {
             for state in reg.live() {
                 observe_params_overflow(&lock_recovering(&state), obs);
@@ -186,13 +189,21 @@ pub(super) fn register(meter: &Meter, registry: &Arc<GaugeRegistry>) -> Observab
         _confidence_p50: register_quantile(
             meter,
             registry,
-            semconv::OURIOS_MINER_CONFIDENCE_P50,
+            (
+                semconv::OURIOS_MINER_CONFIDENCE_P50,
+                semconv::OURIOS_MINER_CONFIDENCE_P50_DESCRIPTION,
+                semconv::OURIOS_MINER_CONFIDENCE_P50_UNIT,
+            ),
             0.50,
         ),
         _confidence_p01: register_quantile(
             meter,
             registry,
-            semconv::OURIOS_MINER_CONFIDENCE_P01,
+            (
+                semconv::OURIOS_MINER_CONFIDENCE_P01,
+                semconv::OURIOS_MINER_CONFIDENCE_P01_DESCRIPTION,
+                semconv::OURIOS_MINER_CONFIDENCE_P01_UNIT,
+            ),
             0.01,
         ),
     }
@@ -250,13 +261,14 @@ fn confidence_windows(state: &MinerMetricsState, out: &mut Vec<ConfidenceWindow>
 fn register_quantile(
     meter: &Meter,
     registry: &Arc<GaugeRegistry>,
-    name: &'static str,
+    (name, description, unit): (&'static str, &'static str, &'static str),
     q: f64,
 ) -> ObservableGauge<f64> {
     let reg = Arc::clone(registry);
     meter
         .f64_observable_gauge(name)
-        .with_unit("1")
+        .with_description(description)
+        .with_unit(unit)
         .with_callback(move |obs| {
             // Snapshot each window under its state's lock (a cheap O(n)
             // copy), then sort + compute the quantiles AFTER releasing

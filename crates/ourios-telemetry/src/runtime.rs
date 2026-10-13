@@ -19,24 +19,28 @@ pub(crate) fn register(meter: &Meter, runtime: &Handle) {
     let observed = [
         (
             semconv::OURIOS_RUNTIME_WORKER_COUNT,
-            "{worker}",
+            semconv::OURIOS_RUNTIME_WORKER_COUNT_DESCRIPTION,
+            semconv::OURIOS_RUNTIME_WORKER_COUNT_UNIT,
             tokio::runtime::RuntimeMetrics::num_workers as fn(&_) -> usize,
         ),
         (
             semconv::OURIOS_RUNTIME_TASK_COUNT,
-            "{task}",
+            semconv::OURIOS_RUNTIME_TASK_COUNT_DESCRIPTION,
+            semconv::OURIOS_RUNTIME_TASK_COUNT_UNIT,
             tokio::runtime::RuntimeMetrics::num_alive_tasks,
         ),
         (
             semconv::OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE,
-            "{task}",
+            semconv::OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE_DESCRIPTION,
+            semconv::OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE_UNIT,
             tokio::runtime::RuntimeMetrics::global_queue_depth,
         ),
     ];
-    for (name, unit, read) in observed {
+    for (name, description, unit, read) in observed {
         let metrics = runtime.metrics();
         meter
             .i64_observable_up_down_counter(name)
+            .with_description(description)
             .with_unit(unit)
             .with_callback(move |observer| {
                 observer.observe(i64::try_from(read(&metrics)).unwrap_or(i64::MAX), &[]);

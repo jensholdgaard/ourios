@@ -35,6 +35,66 @@ const INSTRUMENTS: [&str; 19] = [
     semconv::OURIOS_INGEST_BARRIER_FAILED_EPOCH,
 ];
 
+/// The registry description and unit the WAL instruments carry: every
+/// name `reclaim_telemetry` registers from a table, plus a barrier counter.
+const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 11] = [
+    (
+        semconv::OURIOS_WAL_SIZE,
+        semconv::OURIOS_WAL_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_SIZE_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_UNFLUSHED_SIZE,
+        semconv::OURIOS_WAL_UNFLUSHED_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_UNFLUSHED_SIZE_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_SEGMENT_COUNT,
+        semconv::OURIOS_WAL_SEGMENT_COUNT_DESCRIPTION,
+        semconv::OURIOS_WAL_SEGMENT_COUNT_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_UNRECLAIMED_SIZE,
+        semconv::OURIOS_WAL_UNRECLAIMED_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_UNRECLAIMED_SIZE_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT_DESCRIPTION,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE_DESCRIPTION,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT_DESCRIPTION,
+        semconv::OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING,
+        semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING_DESCRIPTION,
+        semconv::OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING,
+        semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_DESCRIPTION,
+        semconv::OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_UNIT,
+    ),
+    (
+        semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES,
+        semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES_DESCRIPTION,
+        semconv::OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES_UNIT,
+    ),
+    (
+        semconv::OURIOS_INGEST_BARRIER_CUTS,
+        semconv::OURIOS_INGEST_BARRIER_CUTS_DESCRIPTION,
+        semconv::OURIOS_INGEST_BARRIER_CUTS_UNIT,
+    ),
+];
+
 /// The barrier counters carry their outcomes, and successes carry no
 /// error.type. Counters are cumulative for the process, so one cut is
 /// read as the difference between the collections either side of it.
@@ -169,6 +229,8 @@ async fn rfc0052_7_every_wal_instrument_is_exported_under_its_registry_name() {
             "{name} is missing from the exported stream"
         );
     }
+
+    ourios_telemetry::metadata_guard::assert_registry_metadata(&rms, &REGISTERED);
 
     assert_state_metrics(&rms);
 

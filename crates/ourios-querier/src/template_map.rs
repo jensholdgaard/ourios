@@ -202,40 +202,48 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
     TemplateMapMetrics {
         lookups: meter
             .u64_counter(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS)
-            .with_unit("{lookup}")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS_UNIT)
             .build(),
         publishes: meter
             .u64_counter(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES)
-            .with_unit("{publish}")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES_UNIT)
             .build(),
         artifact_size: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_UNIT)
             .with_boundaries(ARTIFACT_SIZE_BUCKETS.to_vec())
             .build(),
         derive_duration: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_DERIVE_DURATION_UNIT)
             .with_boundaries(DURATION_BUCKETS_S.to_vec())
             .build(),
         derive_audit_files: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES)
-            .with_unit("{file}")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_UNIT)
             .with_boundaries(histogram_buckets::COUNT_DECADES.to_vec())
             .build(),
         derive_audit_size: meter
             .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_UNIT)
             .with_boundaries(histogram_buckets::SIZE_BYTES.to_vec())
             .build(),
         acquire_wait: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION_UNIT)
             .with_boundaries(DURATION_BUCKETS_S.to_vec())
             .build(),
         refresh_duration: meter
             .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION_UNIT)
             .with_boundaries(DURATION_BUCKETS_S.to_vec())
             .build(),
     }

@@ -94,19 +94,22 @@ impl LiveInstruments {
         let read = Arc::clone(gauges);
         let spill_runs = meter
             .u64_observable_counter(semconv::OURIOS_COMPACTION_SPILL_RUNS)
-            .with_unit("{run}")
+            .with_description(semconv::OURIOS_COMPACTION_SPILL_RUNS_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_SPILL_RUNS_UNIT)
             .with_callback(move |observer| observer.observe(read.compaction().spill_runs(), &[]))
             .build();
         let read = Arc::clone(gauges);
         let spill_size = meter
             .u64_observable_counter(semconv::OURIOS_COMPACTION_SPILL_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_COMPACTION_SPILL_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_SPILL_SIZE_UNIT)
             .with_callback(move |observer| observer.observe(read.compaction().spill_bytes(), &[]))
             .build();
         let read = Arc::clone(gauges);
         let memory_usage = meter
             .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_MEMORY_USAGE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_COMPACTION_MEMORY_USAGE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_MEMORY_USAGE_UNIT)
             .with_callback(move |observer| {
                 for phase in MemoryPhase::ALL {
                     let usage = read.compaction().usage(phase);
@@ -117,7 +120,8 @@ impl LiveInstruments {
         let read = Arc::clone(gauges);
         let memory_limit = meter
             .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_MEMORY_LIMIT)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_COMPACTION_MEMORY_LIMIT_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_MEMORY_LIMIT_UNIT)
             .with_callback(move |observer| {
                 for phase in MemoryPhase::ALL {
                     if let Some(limit) = read.compaction().limit(phase) {
@@ -129,7 +133,8 @@ impl LiveInstruments {
         let read = Arc::clone(gauges);
         let sweep_remaining = meter
             .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_SWEEP_REMAINING)
-            .with_unit("{partition}")
+            .with_description(semconv::OURIOS_COMPACTION_SWEEP_REMAINING_DESCRIPTION)
+            .with_unit(semconv::OURIOS_COMPACTION_SWEEP_REMAINING_UNIT)
             .with_callback(move |observer| observer.observe(saturating_i64(read.remaining()), &[]))
             .build();
         Self {
@@ -162,20 +167,73 @@ const FILE_SIZE_BUCKETS: [f64; 12] = [
     4_294_967_296.0, // 4 GiB
 ];
 
-/// A `u64` counter named `name` in `unit`.
-fn counter(meter: &Meter, name: &'static str, unit: &'static str) -> Counter<u64> {
-    meter.u64_counter(name).with_unit(unit).build()
+/// A registry metric's `(name, description, unit)` constants.
+type MetricDef = (&'static str, &'static str, &'static str);
+
+const COMPACTION_PARTITIONS: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITIONS,
+    semconv::OURIOS_COMPACTION_PARTITIONS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITIONS_UNIT,
+);
+const COMPACTION_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_FILES,
+    semconv::OURIOS_COMPACTION_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_FILES_UNIT,
+);
+const COMPACTION_ROWS: MetricDef = (
+    semconv::OURIOS_COMPACTION_ROWS,
+    semconv::OURIOS_COMPACTION_ROWS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ROWS_UNIT,
+);
+const COMPACTION_ORPHAN_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES,
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES_UNIT,
+);
+const COMPACTION_SWEEPS: MetricDef = (
+    semconv::OURIOS_COMPACTION_SWEEPS,
+    semconv::OURIOS_COMPACTION_SWEEPS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_SWEEPS_UNIT,
+);
+const COMPACTION_IO: MetricDef = (
+    semconv::OURIOS_COMPACTION_IO,
+    semconv::OURIOS_COMPACTION_IO_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_IO_UNIT,
+);
+const STORAGE_PARQUET_FILE_SIZE: MetricDef = (
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_DESCRIPTION,
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_UNIT,
+);
+const COMPACTION_PARTITION_INPUT_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_UNIT,
+);
+const COMPACTION_PARTITION_INPUT_SIZE: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_UNIT,
+);
+
+/// A `u64` counter for `def`.
+fn counter(meter: &Meter, (name, description, unit): MetricDef) -> Counter<u64> {
+    meter
+        .u64_counter(name)
+        .with_description(description)
+        .with_unit(unit)
+        .build()
 }
 
-/// A `u64` histogram named `name` in `unit`, bucketed at `boundaries`.
+/// A `u64` histogram for `def`, bucketed at `boundaries`.
 fn histogram(
     meter: &Meter,
-    name: &'static str,
-    unit: &'static str,
+    (name, description, unit): MetricDef,
     boundaries: &[f64],
 ) -> Histogram<u64> {
     meter
         .u64_histogram(name)
+        .with_description(description)
         .with_unit(unit)
         .with_boundaries(boundaries.to_vec())
         .build()
@@ -192,7 +250,8 @@ fn backlog(meter: &Meter) -> (BacklogState, ObservableUpDownCounter<i64>) {
     let callback_state = Arc::clone(&backlog_state);
     let backlog = meter
         .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_BACKLOG)
-        .with_unit("{partition}")
+        .with_description(semconv::OURIOS_COMPACTION_BACKLOG_DESCRIPTION)
+        .with_unit(semconv::OURIOS_COMPACTION_BACKLOG_UNIT)
         .with_callback(move |observer| {
             // Recover a poisoned lock rather than panic — a metrics
             // collection callback must never bring the process down.
@@ -240,10 +299,10 @@ impl CompactionMetrics {
 
     /// [`Self::new`] on `meter` rather than the global one.
     pub(crate) fn from_meter(meter: &Meter) -> Self {
-        let partitions = counter(meter, semconv::OURIOS_COMPACTION_PARTITIONS, "{partition}");
-        let files = counter(meter, semconv::OURIOS_COMPACTION_FILES, "{file}");
-        let rows = counter(meter, semconv::OURIOS_COMPACTION_ROWS, "{row}");
-        let orphan_files = counter(meter, semconv::OURIOS_COMPACTION_ORPHAN_FILES, "{file}");
+        let partitions = counter(meter, COMPACTION_PARTITIONS);
+        let files = counter(meter, COMPACTION_FILES);
+        let rows = counter(meter, COMPACTION_ROWS);
+        let orphan_files = counter(meter, COMPACTION_ORPHAN_FILES);
         // Only the attribute-free counters; `sweeps` and `io` carry
         // required attributes (`result` / `io.direction`) and `duration`
         // / `file_size` are histograms, so none are zero-seeded here —
@@ -257,35 +316,29 @@ impl CompactionMetrics {
         let live = LiveInstruments::register(meter, &gauges);
 
         Self {
-            sweeps: counter(meter, semconv::OURIOS_COMPACTION_SWEEPS, "{sweep}"),
+            sweeps: counter(meter, COMPACTION_SWEEPS),
             partitions,
             files,
             rows,
             orphan_files,
             duration: meter
                 .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
-                .with_unit("s")
+                .with_description(semconv::OURIOS_COMPACTION_DURATION_DESCRIPTION)
+                .with_unit(semconv::OURIOS_COMPACTION_DURATION_UNIT)
                 .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
                 .build(),
-            io: counter(meter, semconv::OURIOS_COMPACTION_IO, "By"),
-            file_size: histogram(
-                meter,
-                semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
-                "By",
-                &FILE_SIZE_BUCKETS,
-            ),
+            io: counter(meter, COMPACTION_IO),
+            file_size: histogram(meter, STORAGE_PARQUET_FILE_SIZE, &FILE_SIZE_BUCKETS),
             backlog_state,
             backlog,
             input_files: histogram(
                 meter,
-                semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
-                "{file}",
+                COMPACTION_PARTITION_INPUT_FILES,
                 &histogram_buckets::FILE_COUNT,
             ),
             input_size: histogram(
                 meter,
-                semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
-                "By",
+                COMPACTION_PARTITION_INPUT_SIZE,
                 &histogram_buckets::SIZE_BYTES,
             ),
             gauges,
@@ -680,6 +733,15 @@ mod tests {
         }
     }
 
+    /// Compaction instruments exported with the registry description and
+    /// unit, through both the `counter` and `histogram` helpers.
+    const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 4] = [
+        COMPACTION_PARTITIONS,
+        COMPACTION_SWEEPS,
+        COMPACTION_IO,
+        STORAGE_PARQUET_FILE_SIZE,
+    ];
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn record_sweep_exports_the_compaction_metric_set() {
         // Arrange — an in-memory provider, then the instruments (built
@@ -705,6 +767,7 @@ mod tests {
                 semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
             ],
         );
+        ourios_telemetry::metadata_guard::assert_registry_metadata(&rms, &REGISTERED);
 
         assert_sweeps_classified(&rms);
 

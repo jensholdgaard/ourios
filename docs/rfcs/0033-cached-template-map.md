@@ -697,7 +697,10 @@ uncached query identically.
 > delta read is part of the same fold's duration. The files/size
 > samples count the objects actually fetched. An incremental
 > acquisition reports conflicts like any fold-backed one (RFC0033.8),
-> i.e. the whole union set, as the full fold would.
+> i.e. the whole union set, as the full fold would. *(2026-10-13, #987:
+> "reports" here means its conflict set and lookup anomaly; the
+> event announces only the keys the replaced artifact lacks, per the
+> §3.7 amendment of that date.)*
 >
 > **What this does not change.** The freshness LIST still walks the
 > whole audit prefix (~7,375 keys, about 8 LIST pages per
@@ -905,7 +908,8 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > holds against each incoming binding. A semantically different
 > template (different parsed tokens) is a binding conflict, i.e. a
 > template-id collision (CLAUDE.md §3.1). Each fold-backed acquisition
-> reports every conflicting key once:
+> reports every conflicting key once *(event cadence narrowed by the
+> amendment of 2026-10-13, #987, below)*:
 >
 > - the `ourios.template_map.binding.conflicted` log event (WARN),
 >   carrying `ourios.tenant`, `ourios.template.id` and
@@ -920,6 +924,44 @@ the old field pinned to audit-stream-only) is recorded in §4.
 > exactly. A cache hit runs no fold, so it doesn't re-report a
 > conflict; persisting conflicts in the artifact is #928. The status
 > stays `accepted`. Scenario RFC0033.8 is the criterion.
+
+> **Amendment (2026-10-13, #987, maintainer-approved): announce a
+> conflict once per artifact that records it.** With incremental
+> folds, derives are frequent, and
+> each one re-announced the whole union conflict set. On the node that
+> was about 630 identical WARNs per derive for `nocturnal`, and about
+> 2,385 per fold of `eq-perses`. The event now names only the keys
+> that are **new** to this acquisition: keys in the derived conflict
+> set that are absent from the `binding_conflicts` of the artifact
+> this acquisition replaces. That set persists (§3.3 amendment
+> 2026-10-12), so a querier restart doesn't re-announce it either.
+>
+> - **"Once" is per published artifact, not durable suppression.** The
+>   known set is whatever artifact the store holds when the next
+>   acquisition reads it. After a size abstention or an IO error, that
+>   is the same artifact, so the same new keys are announced again.
+>   After a lost race it is the concurrent winner's artifact, so only
+>   keys absent from the winner's set are announced again. No separate
+>   suppression state is kept: the
+>   repetition lasts only while publication does not land, is at
+>   most one event per new key per acquisition, and is never worse
+>   than the behaviour before this amendment.
+>
+> - **No known set.** An acquisition with no stale artifact, a torn or
+>   unknown-version artifact, or one without `fold_state` announces
+>   its whole conflict set, as before. This includes the one-time
+>   `no_fold_state` bootstrap.
+> - **The anomaly is unchanged.** `ourios.template_map.lookup.anomaly
+>   = binding_conflict` still marks every fold-backed acquisition
+>   whose conflict set is non-empty, so the lookups counter still
+>   shows a tenant living with conflicts. The persisted set still
+>   names every key.
+>
+> A full-fold fallback from a stale artifact that has `fold_state`
+> (`files_removed`, `depth_cap`, `out_of_order`) subtracts that
+> artifact's set like an incremental fold. The served map is
+> unchanged, and a hit still announces nothing. The status stays
+> `accepted`. Scenario RFC0033.8 gains the criterion below.
 
 > **Amendment (2026-10-11, #924, maintainer-approved): what an
 > acquisition costs.** The lookup counter says a derive happened, not
@@ -1172,6 +1214,18 @@ ambiguity cannot recur.
 > - **And** the served map is unchanged (last-wins)
 > - **And** an identical re-emit, a widening (same id, new version)
 >   and an adoption onto an existing leaf report no conflict.
+>
+> *Amendment (2026-10-13, #987):*
+> - **And** when a later audit file makes the artifact stale, the
+>   refreshing acquisition announces no event for the already-known
+>   key (the conflicting acquisition's artifact was published), but
+>   its lookup still carries the anomaly
+> - **And** a further audit file that binds a second key to two
+>   templates is announced once, as one event naming only that key
+> - **And** when an audit file the published artifact had folded is
+>   removed, the `files_removed` full-fold fallback announces no event
+>   for keys in that artifact's `binding_conflicts`, and its lookup
+>   still carries the anomaly.
 
 > **Scenario RFC0033.9 — Derive cost is observable** (amendment
 > 2026-10-11, #924)
@@ -1331,7 +1385,9 @@ ambiguity cannot recur.
 >   implementation does
 > - **And** an incremental acquisition over an artifact whose
 >   `binding_conflicts` is non-empty reports every persisted and new
->   conflict exactly as RFC0033.8 does for a full fold
+>   conflict exactly as RFC0033.8 does for a full fold *(2026-10-13,
+>   #987: in its conflict set and lookup anomaly; the event names only
+>   the new ones)*
 > - **And** the attribute names exist in the semconv registry
 >   (weaver-generated constants).
 
@@ -1375,7 +1431,9 @@ Mapped to `CLAUDE.md` §6.2:
   and a property test that the conflicts are exactly the
   multiply-bound keys. Act 6 of `tests/rfc0033_7_observability.rs`
   asserts the event and the lookup anomaly through the in-memory
-  log and metric exporters.
+  log and metric exporters; its `announced_once_act` (2026-10-13,
+  #987) covers a stale refresh that announces nothing for a known key
+  and a new key announced alone.
 - **RFC0033.9** — `tests/rfc0033_7_observability.rs`: the RFC0033.7
   acts plus a failing shared acquisition and a final act on its own
   store (unknown version, then an other-tenant artifact), asserted

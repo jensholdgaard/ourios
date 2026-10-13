@@ -320,12 +320,19 @@ fn record_outcome_on_span(value: &'static str) {
     tracing::Span::current().record(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
 }
 
-/// Name every binding conflict a fold found, once per acquisition. The
-/// event carries the key, never the template texts — they can hold user
-/// data. Rendering for the key stays last-wins; the event is the signal
-/// that rows carrying it may render against the wrong template.
-fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)]) {
-    for &(template_id, version) in conflicts {
+/// Name each binding conflict a fold found that `known` (the conflict set
+/// of the artifact this acquisition replaces, ascending) lacks, so a key
+/// is announced once per artifact that records it, not on every derive:
+/// until a write-through lands, the next acquisition announces it again
+/// (RFC0033.8). The event
+/// carries the key, never the template texts — they can hold user data.
+/// Rendering for the key stays last-wins; the event is the signal that
+/// rows carrying it may render against the wrong template.
+fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)], known: &[(u64, u32)]) {
+    let new = conflicts
+        .iter()
+        .filter(|key| known.binary_search(key).is_err());
+    for &(template_id, version) in new {
         tracing::warn!(
             name: semconv::EVENT_OURIOS_TEMPLATE_MAP_BINDING_CONFLICTED,
             {
@@ -609,6 +616,11 @@ pub(crate) fn load_or_derive_resolved(
             }
         }
     };
+    let known = stale
+        .as_ref()
+        .and_then(TemplateMap::fold_state)
+        .map(|state| state.binding_conflicts().to_vec())
+        .unwrap_or_default();
     // On the span before the fold, so a failed fold's span still says why
     // it folded; the metric keeps counting only lookups that answered.
     record_outcome_on_span(lookup_outcome(outcome));
@@ -616,7 +628,7 @@ pub(crate) fn load_or_derive_resolved(
     let acquisition_bytes = add_bytes(derived.fetched_bytes, fetched_bytes)?;
     // Recorded only after every fallible step — a counted outcome is
     // always one that answered, mirroring the hit arm's record-at-return.
-    announce_binding_conflicts(tenant, &derived.conflicts);
+    announce_binding_conflicts(tenant, &derived.conflicts, &known);
     METRICS.record_lookup(outcome, !derived.conflicts.is_empty());
     derived
         .map

@@ -684,6 +684,109 @@ fn binding_conflict_act(
         expected,
         "the folding miss carries the anomaly; the hit after it does not",
     );
+
+    announced_once_act(guard, exporter, capture, bucket.path());
+}
+
+/// Scenario RFC0033.8, amendment 2026-10-13 (#987): a refresh of the
+/// artifact the conflicting miss published re-announces nothing for the
+/// known key, though its lookup still carries the anomaly; a second key
+/// coming into conflict is announced once, alone; and a `files_removed`
+/// full-fold fallback re-announces neither known key.
+fn announced_once_act(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+    capture: &live_check::EventCapture,
+    bucket: &Path,
+) {
+    let conflict_events = || conflict_events(capture);
+    capture.reset();
+
+    let before_fresh = audit_parquet_files(bucket);
+    write_audit(bucket, &[created(5, "fresh <*>", TS0 + 5)]);
+    let fresh: Vec<_> = audit_parquet_files(bucket)
+        .difference(&before_fresh)
+        .cloned()
+        .collect();
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    assert!(
+        events.is_empty(),
+        "a refresh re-announces no known key: {events:#?}"
+    );
+
+    write_audit(
+        bucket,
+        &[
+            created(3, "left <*>", TS0 + 6),
+            created(3, "right <*>", TS0 + 7),
+        ],
+    );
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    let [event] = events.as_slice() else {
+        panic!("only the new key is announced: {events:#?}");
+    };
+    assert_eq!(
+        event
+            .attributes
+            .get(semconv::OURIOS_TEMPLATE_ID)
+            .map(String::as_str),
+        Some("3")
+    );
+
+    capture.reset();
+    assert!(!fresh.is_empty(), "the fresh audit file was written");
+    for file in &fresh {
+        std::fs::remove_file(file).expect("remove a folded audit file");
+    }
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    assert!(
+        events.is_empty(),
+        "a files_removed full fold re-announces no known key: {events:#?}"
+    );
+
+    assert_refresh_anomalies(guard, exporter);
+}
+
+/// The binding-conflict events captured since the last reset.
+fn conflict_events(capture: &live_check::EventCapture) -> Vec<live_check::Event> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|e| e.name == BINDING_CONFLICTED.name)
+        .collect()
+}
+
+/// The audit Parquet objects under `bucket`.
+fn audit_parquet_files(bucket: &Path) -> std::collections::BTreeSet<PathBuf> {
+    walk_files(&bucket.join("audit"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect()
+}
+
+/// `announced_once_act`'s lookups: the conflicting miss and its three
+/// stale refreshes each carry the anomaly.
+fn assert_refresh_anomalies(
+    guard: &ourios_telemetry::TelemetryGuard,
+    exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) {
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let rms = std::slice::from_ref(rms.last().expect("a collection"));
+    let expected: BTreeMap<(String, String), u64> = [
+        (("miss".to_string(), "binding_conflict".to_string()), 1),
+        (("stale".to_string(), "binding_conflict".to_string()), 3),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        anomaly_counts(rms),
+        expected,
+        "every refresh of a conflicted map still carries the anomaly",
+    );
 }
 
 /// The publish-size histogram recorded each published artifact's byte

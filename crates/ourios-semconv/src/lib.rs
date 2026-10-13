@@ -25,288 +25,874 @@
 /// resolved provenance (uniform across the registry).
 pub const SCHEMA_URL: &str = "https://ourios.dev/schemas/ourios-0.1.0.yaml";
 
-// Metric names (RFC 0009 §3.6).
+// Metric names, descriptions and units (RFC 0009 §3.6). The registry is the
+// single source for all three: pass the `_DESCRIPTION` and `_UNIT` constants
+// to `with_description` and `with_unit` at the instrument call site so the
+// registry `brief` and `unit` reach the wire instead of being restated there.
 
 /// `ourios.audit_sink.buffer.usage` (updowncounter, unit `{event}`).
 pub const OURIOS_AUDIT_SINK_BUFFER_USAGE: &str = "ourios.audit_sink.buffer.usage";
 
+/// `ourios.audit_sink.buffer.usage` description (the registry `brief`).
+pub const OURIOS_AUDIT_SINK_BUFFER_USAGE_DESCRIPTION: &str = "Audit events currently buffered in memory awaiting flush, against the ceiling that triggers an eager flush.";
+
+/// `ourios.audit_sink.buffer.usage` unit (UCUM).
+pub const OURIOS_AUDIT_SINK_BUFFER_USAGE_UNIT: &str = "{event}";
+
 /// `ourios.audit_sink.derive.errors` (counter, unit `{error}`).
 pub const OURIOS_AUDIT_SINK_DERIVE_ERRORS: &str = "ourios.audit_sink.derive.errors";
+
+/// `ourios.audit_sink.derive.errors` description (the registry `brief`).
+pub const OURIOS_AUDIT_SINK_DERIVE_ERRORS_DESCRIPTION: &str = "Audit events dropped because their partition key could not be derived (a pre-epoch / overflowing timestamp).";
+
+/// `ourios.audit_sink.derive.errors` unit (UCUM).
+pub const OURIOS_AUDIT_SINK_DERIVE_ERRORS_UNIT: &str = "{error}";
 
 /// `ourios.audit_sink.flush.errors` (counter, unit `{error}`).
 pub const OURIOS_AUDIT_SINK_FLUSH_ERRORS: &str = "ourios.audit_sink.flush.errors";
 
+/// `ourios.audit_sink.flush.errors` description (the registry `brief`).
+pub const OURIOS_AUDIT_SINK_FLUSH_ERRORS_DESCRIPTION: &str = "Failed audit partition flushes, split by disposition: transient (store unreachable → retained + retried) vs permanent (bad content/encode → dropped so it cannot wedge the partition).";
+
+/// `ourios.audit_sink.flush.errors` unit (UCUM).
+pub const OURIOS_AUDIT_SINK_FLUSH_ERRORS_UNIT: &str = "{error}";
+
 /// `ourios.audit_sink.flush.events` (counter, unit `{event}`).
 pub const OURIOS_AUDIT_SINK_FLUSH_EVENTS: &str = "ourios.audit_sink.flush.events";
+
+/// `ourios.audit_sink.flush.events` description (the registry `brief`).
+pub const OURIOS_AUDIT_SINK_FLUSH_EVENTS_DESCRIPTION: &str =
+    "Audit events written out across sink flushes.";
+
+/// `ourios.audit_sink.flush.events` unit (UCUM).
+pub const OURIOS_AUDIT_SINK_FLUSH_EVENTS_UNIT: &str = "{event}";
 
 /// `ourios.audit_sink.flushes` (counter, unit `{flush}`).
 pub const OURIOS_AUDIT_SINK_FLUSHES: &str = "ourios.audit_sink.flushes";
 
+/// `ourios.audit_sink.flushes` description (the registry `brief`).
+pub const OURIOS_AUDIT_SINK_FLUSHES_DESCRIPTION: &str =
+    "Audit partition flushes (one published Parquet file each).";
+
+/// `ourios.audit_sink.flushes` unit (UCUM).
+pub const OURIOS_AUDIT_SINK_FLUSHES_UNIT: &str = "{flush}";
+
 /// `ourios.auth.resolutions` (counter, unit `{resolution}`).
 pub const OURIOS_AUTH_RESOLUTIONS: &str = "ourios.auth.resolutions";
+
+/// `ourios.auth.resolutions` description (the registry `brief`).
+pub const OURIOS_AUTH_RESOLUTIONS_DESCRIPTION: &str = "Credential resolution attempts by the auth resolver (RFC 0026 static tokens, RFC 0029 OIDC, RFC 0047 OpenFGA): one per request that presents itself to a non-open deployment, whether or not it resolves. A successful binding carries no `error.type`; a failed one carries `unauthenticated` (missing/malformed/unknown/unbound credential) or `upstream_unavailable` (the OpenFGA resolver could not answer and the request failed closed).";
+
+/// `ourios.auth.resolutions` unit (UCUM).
+pub const OURIOS_AUTH_RESOLUTIONS_UNIT: &str = "{resolution}";
 
 /// `ourios.compaction.backlog` (updowncounter, unit `{partition}`).
 pub const OURIOS_COMPACTION_BACKLOG: &str = "ourios.compaction.backlog";
 
+/// `ourios.compaction.backlog` description (the registry `brief`).
+pub const OURIOS_COMPACTION_BACKLOG_DESCRIPTION: &str = "Sealed partitions awaiting compaction.";
+
+/// `ourios.compaction.backlog` unit (UCUM).
+pub const OURIOS_COMPACTION_BACKLOG_UNIT: &str = "{partition}";
+
 /// `ourios.compaction.duration` (histogram, unit `s`).
 pub const OURIOS_COMPACTION_DURATION: &str = "ourios.compaction.duration";
+
+/// `ourios.compaction.duration` description (the registry `brief`).
+pub const OURIOS_COMPACTION_DURATION_DESCRIPTION: &str =
+    "Wall-clock duration of a compaction sweep.";
+
+/// `ourios.compaction.duration` unit (UCUM).
+pub const OURIOS_COMPACTION_DURATION_UNIT: &str = "s";
 
 /// `ourios.compaction.files` (counter, unit `{file}`).
 pub const OURIOS_COMPACTION_FILES: &str = "ourios.compaction.files";
 
+/// `ourios.compaction.files` description (the registry `brief`).
+pub const OURIOS_COMPACTION_FILES_DESCRIPTION: &str =
+    "Number of input files merged away by compaction.";
+
+/// `ourios.compaction.files` unit (UCUM).
+pub const OURIOS_COMPACTION_FILES_UNIT: &str = "{file}";
+
 /// `ourios.compaction.io` (counter, unit `By`).
 pub const OURIOS_COMPACTION_IO: &str = "ourios.compaction.io";
+
+/// `ourios.compaction.io` description (the registry `brief`).
+pub const OURIOS_COMPACTION_IO_DESCRIPTION: &str =
+    "Bytes read from inputs and written to the consolidated file.";
+
+/// `ourios.compaction.io` unit (UCUM).
+pub const OURIOS_COMPACTION_IO_UNIT: &str = "By";
 
 /// `ourios.compaction.memory.limit` (updowncounter, unit `By`).
 pub const OURIOS_COMPACTION_MEMORY_LIMIT: &str = "ourios.compaction.memory.limit";
 
+/// `ourios.compaction.memory.limit` description (the registry `brief`).
+pub const OURIOS_COMPACTION_MEMORY_LIMIT_DESCRIPTION: &str = "Compaction's configured memory budget, by phase (#925), so usage/limit can be graphed and alerted on.";
+
+/// `ourios.compaction.memory.limit` unit (UCUM).
+pub const OURIOS_COMPACTION_MEMORY_LIMIT_UNIT: &str = "By";
+
 /// `ourios.compaction.memory.usage` (updowncounter, unit `By`).
 pub const OURIOS_COMPACTION_MEMORY_USAGE: &str = "ourios.compaction.memory.usage";
+
+/// `ourios.compaction.memory.usage` description (the registry `brief`).
+pub const OURIOS_COMPACTION_MEMORY_USAGE_DESCRIPTION: &str =
+    "Bytes compaction currently tracks against its memory budget, by phase (#925).";
+
+/// `ourios.compaction.memory.usage` unit (UCUM).
+pub const OURIOS_COMPACTION_MEMORY_USAGE_UNIT: &str = "By";
 
 /// `ourios.compaction.orphan.files` (counter, unit `{file}`).
 pub const OURIOS_COMPACTION_ORPHAN_FILES: &str = "ourios.compaction.orphan.files";
 
+/// `ourios.compaction.orphan.files` description (the registry `brief`).
+pub const OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION: &str =
+    "Superseded input files that could not be removed after commit.";
+
+/// `ourios.compaction.orphan.files` unit (UCUM).
+pub const OURIOS_COMPACTION_ORPHAN_FILES_UNIT: &str = "{file}";
+
 /// `ourios.compaction.partition.input.files` (histogram, unit `{file}`).
 pub const OURIOS_COMPACTION_PARTITION_INPUT_FILES: &str = "ourios.compaction.partition.input.files";
+
+/// `ourios.compaction.partition.input.files` description (the registry `brief`).
+pub const OURIOS_COMPACTION_PARTITION_INPUT_FILES_DESCRIPTION: &str =
+    "Input files of one compacted partition (#925); the small-file shape.";
+
+/// `ourios.compaction.partition.input.files` unit (UCUM).
+pub const OURIOS_COMPACTION_PARTITION_INPUT_FILES_UNIT: &str = "{file}";
 
 /// `ourios.compaction.partition.input.size` (histogram, unit `By`).
 pub const OURIOS_COMPACTION_PARTITION_INPUT_SIZE: &str = "ourios.compaction.partition.input.size";
 
+/// `ourios.compaction.partition.input.size` description (the registry `brief`).
+pub const OURIOS_COMPACTION_PARTITION_INPUT_SIZE_DESCRIPTION: &str =
+    "Input size of one compacted partition (#925).";
+
+/// `ourios.compaction.partition.input.size` unit (UCUM).
+pub const OURIOS_COMPACTION_PARTITION_INPUT_SIZE_UNIT: &str = "By";
+
 /// `ourios.compaction.partitions` (counter, unit `{partition}`).
 pub const OURIOS_COMPACTION_PARTITIONS: &str = "ourios.compaction.partitions";
+
+/// `ourios.compaction.partitions` description (the registry `brief`).
+pub const OURIOS_COMPACTION_PARTITIONS_DESCRIPTION: &str = "Number of partitions consolidated.";
+
+/// `ourios.compaction.partitions` unit (UCUM).
+pub const OURIOS_COMPACTION_PARTITIONS_UNIT: &str = "{partition}";
 
 /// `ourios.compaction.rows` (counter, unit `{row}`).
 pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 
+/// `ourios.compaction.rows` description (the registry `brief`).
+pub const OURIOS_COMPACTION_ROWS_DESCRIPTION: &str =
+    "Number of rows rewritten during consolidation.";
+
+/// `ourios.compaction.rows` unit (UCUM).
+pub const OURIOS_COMPACTION_ROWS_UNIT: &str = "{row}";
+
 /// `ourios.compaction.spill.runs` (counter, unit `{run}`).
 pub const OURIOS_COMPACTION_SPILL_RUNS: &str = "ourios.compaction.spill.runs";
+
+/// `ourios.compaction.spill.runs` description (the registry `brief`).
+pub const OURIOS_COMPACTION_SPILL_RUNS_DESCRIPTION: &str =
+    "Sorted runs compaction spilled to local disk (#925); how often the memory budget is hit.";
+
+/// `ourios.compaction.spill.runs` unit (UCUM).
+pub const OURIOS_COMPACTION_SPILL_RUNS_UNIT: &str = "{run}";
 
 /// `ourios.compaction.spill.size` (counter, unit `By`).
 pub const OURIOS_COMPACTION_SPILL_SIZE: &str = "ourios.compaction.spill.size";
 
+/// `ourios.compaction.spill.size` description (the registry `brief`).
+pub const OURIOS_COMPACTION_SPILL_SIZE_DESCRIPTION: &str =
+    "Bytes compaction spilled to local disk (#925).";
+
+/// `ourios.compaction.spill.size` unit (UCUM).
+pub const OURIOS_COMPACTION_SPILL_SIZE_UNIT: &str = "By";
+
 /// `ourios.compaction.sweep.remaining` (updowncounter, unit `{partition}`).
 pub const OURIOS_COMPACTION_SWEEP_REMAINING: &str = "ourios.compaction.sweep.remaining";
+
+/// `ourios.compaction.sweep.remaining` description (the registry `brief`).
+pub const OURIOS_COMPACTION_SWEEP_REMAINING_DESCRIPTION: &str = "Candidate partitions not yet processed in the running compaction sweep (#925); zero between sweeps.";
+
+/// `ourios.compaction.sweep.remaining` unit (UCUM).
+pub const OURIOS_COMPACTION_SWEEP_REMAINING_UNIT: &str = "{partition}";
 
 /// `ourios.compaction.sweeps` (counter, unit `{sweep}`).
 pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 
+/// `ourios.compaction.sweeps` description (the registry `brief`).
+pub const OURIOS_COMPACTION_SWEEPS_DESCRIPTION: &str =
+    "Number of compaction sweeps executed, by outcome.";
+
+/// `ourios.compaction.sweeps` unit (UCUM).
+pub const OURIOS_COMPACTION_SWEEPS_UNIT: &str = "{sweep}";
+
 /// `ourios.graph.tuples` (counter, unit `{tuple}`).
 pub const OURIOS_GRAPH_TUPLES: &str = "ourios.graph.tuples";
+
+/// `ourios.graph.tuples` description (the registry `brief`).
+pub const OURIOS_GRAPH_TUPLES_DESCRIPTION: &str = "Relationship tuples the RFC 0047 §3.3 emitter wrote to (or, for an erasure, deleted from) the authorization graph, by operation. A failed batch carries `error.type` (`upstream_unavailable`) with the batch's tuple count.";
+
+/// `ourios.graph.tuples` unit (UCUM).
+pub const OURIOS_GRAPH_TUPLES_UNIT: &str = "{tuple}";
 
 /// `ourios.ingest.barrier.captures` (counter, unit `{capture}`).
 pub const OURIOS_INGEST_BARRIER_CAPTURES: &str = "ourios.ingest.barrier.captures";
 
+/// `ourios.ingest.barrier.captures` description (the registry `brief`).
+pub const OURIOS_INGEST_BARRIER_CAPTURES_DESCRIPTION: &str = "Barrier captures, by what each did to the pending slot (RFC 0052 §3.1). `parked` is the RFC0052.14 ceiling leg.";
+
+/// `ourios.ingest.barrier.captures` unit (UCUM).
+pub const OURIOS_INGEST_BARRIER_CAPTURES_UNIT: &str = "{capture}";
+
 /// `ourios.ingest.barrier.checkpoint.writes` (counter, unit `{write}`).
 pub const OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES: &str = "ourios.ingest.barrier.checkpoint.writes";
+
+/// `ourios.ingest.barrier.checkpoint.writes` description (the registry `brief`).
+pub const OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES_DESCRIPTION: &str = "WAL checkpoint writes the barrier attempted when stamping a cut's mark (RFC 0052 §6.7). A failed write carries `error.type`; which mark is in force afterwards depends on the step that failed, and a later cut retries the stamp.";
+
+/// `ourios.ingest.barrier.checkpoint.writes` unit (UCUM).
+pub const OURIOS_INGEST_BARRIER_CHECKPOINT_WRITES_UNIT: &str = "{write}";
 
 /// `ourios.ingest.barrier.cuts` (counter, unit `{cut}`).
 pub const OURIOS_INGEST_BARRIER_CUTS: &str = "ourios.ingest.barrier.cuts";
 
+/// `ourios.ingest.barrier.cuts` description (the registry `brief`).
+pub const OURIOS_INGEST_BARRIER_CUTS_DESCRIPTION: &str =
+    "Barrier cuts run, by what each decided (RFC 0052 §3.1).";
+
+/// `ourios.ingest.barrier.cuts` unit (UCUM).
+pub const OURIOS_INGEST_BARRIER_CUTS_UNIT: &str = "{cut}";
+
 /// `ourios.ingest.barrier.epoch` (gauge, unit `{epoch}`).
 pub const OURIOS_INGEST_BARRIER_EPOCH: &str = "ourios.ingest.barrier.epoch";
+
+/// `ourios.ingest.barrier.epoch` description (the registry `brief`).
+pub const OURIOS_INGEST_BARRIER_EPOCH_DESCRIPTION: &str =
+    "The current barrier epoch (RFC 0052 §3.1).";
+
+/// `ourios.ingest.barrier.epoch` unit (UCUM).
+pub const OURIOS_INGEST_BARRIER_EPOCH_UNIT: &str = "{epoch}";
 
 /// `ourios.ingest.barrier.failed_epoch` (gauge, unit `{epoch}`).
 pub const OURIOS_INGEST_BARRIER_FAILED_EPOCH: &str = "ourios.ingest.barrier.failed_epoch";
 
+/// `ourios.ingest.barrier.failed_epoch` description (the registry `brief`).
+pub const OURIOS_INGEST_BARRIER_FAILED_EPOCH_DESCRIPTION: &str = "The epoch the `cadence_failed` latch holds — every cut at or above it is refused (RFC 0052 §3.1/§3.5). Not reported while the latch is clear.";
+
+/// `ourios.ingest.barrier.failed_epoch` unit (UCUM).
+pub const OURIOS_INGEST_BARRIER_FAILED_EPOCH_UNIT: &str = "{epoch}";
+
 /// `ourios.ingest.barrier.snapshot.writes` (counter, unit `{write}`).
 pub const OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES: &str = "ourios.ingest.barrier.snapshot.writes";
+
+/// `ourios.ingest.barrier.snapshot.writes` description (the registry `brief`).
+pub const OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES_DESCRIPTION: &str = "Per-tenant miner-snapshot writes the barrier attempted while installing a cut (RFC 0052 §3.1). A failed write carries `error.type`; the cut then retains rather than stamps.";
+
+/// `ourios.ingest.barrier.snapshot.writes` unit (UCUM).
+pub const OURIOS_INGEST_BARRIER_SNAPSHOT_WRITES_UNIT: &str = "{write}";
 
 /// `ourios.ingest.batches` (counter, unit `{batch}`).
 pub const OURIOS_INGEST_BATCHES: &str = "ourios.ingest.batches";
 
+/// `ourios.ingest.batches` description (the registry `brief`).
+pub const OURIOS_INGEST_BATCHES_DESCRIPTION: &str = "OTLP batches accepted by the ingest pipeline.";
+
+/// `ourios.ingest.batches` unit (UCUM).
+pub const OURIOS_INGEST_BATCHES_UNIT: &str = "{batch}";
+
 /// `ourios.ingest.encode.queue_depth` (updowncounter, unit `{batch}`).
 pub const OURIOS_INGEST_ENCODE_QUEUE_DEPTH: &str = "ourios.ingest.encode.queue_depth";
+
+/// `ourios.ingest.encode.queue_depth` description (the registry `brief`).
+pub const OURIOS_INGEST_ENCODE_QUEUE_DEPTH_DESCRIPTION: &str = "Encode batches submitted to the concurrent encode pool and not yet emitted to the record sink (RFC 0035 §3.1). The pool's queue is bounded, so a persistently high depth means encode-bound backpressure is reaching the ingest gate.";
+
+/// `ourios.ingest.encode.queue_depth` unit (UCUM).
+pub const OURIOS_INGEST_ENCODE_QUEUE_DEPTH_UNIT: &str = "{batch}";
 
 /// `ourios.ingest.records` (counter, unit `{record}`).
 pub const OURIOS_INGEST_RECORDS: &str = "ourios.ingest.records";
 
+/// `ourios.ingest.records` description (the registry `brief`).
+pub const OURIOS_INGEST_RECORDS_DESCRIPTION: &str =
+    "Log records accepted by the ingest pipeline (post-WAL-durable).";
+
+/// `ourios.ingest.records` unit (UCUM).
+pub const OURIOS_INGEST_RECORDS_UNIT: &str = "{record}";
+
 /// `ourios.miner.alias.assertions` (counter, unit `{assertion}`).
 pub const OURIOS_MINER_ALIAS_ASSERTIONS: &str = "ourios.miner.alias.assertions";
+
+/// `ourios.miner.alias.assertions` description (the registry `brief`).
+pub const OURIOS_MINER_ALIAS_ASSERTIONS_DESCRIPTION: &str =
+    "Operator-driven template-alias assertions recorded.";
+
+/// `ourios.miner.alias.assertions` unit (UCUM).
+pub const OURIOS_MINER_ALIAS_ASSERTIONS_UNIT: &str = "{assertion}";
 
 /// `ourios.miner.alias.retractions` (counter, unit `{retraction}`).
 pub const OURIOS_MINER_ALIAS_RETRACTIONS: &str = "ourios.miner.alias.retractions";
 
+/// `ourios.miner.alias.retractions` description (the registry `brief`).
+pub const OURIOS_MINER_ALIAS_RETRACTIONS_DESCRIPTION: &str =
+    "Operator-driven template-alias retractions recorded.";
+
+/// `ourios.miner.alias.retractions` unit (UCUM).
+pub const OURIOS_MINER_ALIAS_RETRACTIONS_UNIT: &str = "{retraction}";
+
 /// `ourios.miner.body_retention.utilization` (gauge, unit `1`).
 pub const OURIOS_MINER_BODY_RETENTION_UTILIZATION: &str = "ourios.miner.body_retention.utilization";
+
+/// `ourios.miner.body_retention.utilization` description (the registry `brief`).
+pub const OURIOS_MINER_BODY_RETENTION_UTILIZATION_DESCRIPTION: &str = "Fraction of lines whose original body was retained on a §6.3 confidence-zone path (lossy zone or parse failure).";
+
+/// `ourios.miner.body_retention.utilization` unit (UCUM).
+pub const OURIOS_MINER_BODY_RETENTION_UTILIZATION_UNIT: &str = "1";
 
 /// `ourios.miner.confidence` (histogram, unit `1`).
 pub const OURIOS_MINER_CONFIDENCE: &str = "ourios.miner.confidence";
 
+/// `ourios.miner.confidence` description (the registry `brief`).
+pub const OURIOS_MINER_CONFIDENCE_DESCRIPTION: &str = "Per-line parse-confidence distribution.";
+
+/// `ourios.miner.confidence` unit (UCUM).
+pub const OURIOS_MINER_CONFIDENCE_UNIT: &str = "1";
+
 /// `ourios.miner.confidence.p01` (gauge, unit `1`).
 pub const OURIOS_MINER_CONFIDENCE_P01: &str = "ourios.miner.confidence.p01";
+
+/// `ourios.miner.confidence.p01` description (the registry `brief`).
+pub const OURIOS_MINER_CONFIDENCE_P01_DESCRIPTION: &str = "1st-percentile parse confidence, an in-process named view of the `ourios.miner.confidence` histogram (RFC 0001 §6.8, RFC0001.8).";
+
+/// `ourios.miner.confidence.p01` unit (UCUM).
+pub const OURIOS_MINER_CONFIDENCE_P01_UNIT: &str = "1";
 
 /// `ourios.miner.confidence.p50` (gauge, unit `1`).
 pub const OURIOS_MINER_CONFIDENCE_P50: &str = "ourios.miner.confidence.p50";
 
+/// `ourios.miner.confidence.p50` description (the registry `brief`).
+pub const OURIOS_MINER_CONFIDENCE_P50_DESCRIPTION: &str = "Median parse confidence, an in-process named view of the `ourios.miner.confidence` histogram (RFC 0001 §6.8, RFC0001.8).";
+
+/// `ourios.miner.confidence.p50` unit (UCUM).
+pub const OURIOS_MINER_CONFIDENCE_P50_UNIT: &str = "1";
+
 /// `ourios.miner.duration` (histogram, unit `s`).
 pub const OURIOS_MINER_DURATION: &str = "ourios.miner.duration";
+
+/// `ourios.miner.duration` description (the registry `brief`).
+pub const OURIOS_MINER_DURATION_DESCRIPTION: &str =
+    "Per-line miner processing duration (hot-path budget D1).";
+
+/// `ourios.miner.duration` unit (UCUM).
+pub const OURIOS_MINER_DURATION_UNIT: &str = "s";
 
 /// `ourios.miner.merges` (counter, unit `{merge}`).
 pub const OURIOS_MINER_MERGES: &str = "ourios.miner.merges";
 
+/// `ourios.miner.merges` description (the registry `brief`).
+pub const OURIOS_MINER_MERGES_DESCRIPTION: &str =
+    "Template change events (wildcard widening, slot type-expansion).";
+
+/// `ourios.miner.merges` unit (UCUM).
+pub const OURIOS_MINER_MERGES_UNIT: &str = "{merge}";
+
 /// `ourios.miner.params.overflow` (counter, unit `{overflow}`).
 pub const OURIOS_MINER_PARAMS_OVERFLOW: &str = "ourios.miner.params.overflow";
+
+/// `ourios.miner.params.overflow` description (the registry `brief`).
+pub const OURIOS_MINER_PARAMS_OVERFLOW_DESCRIPTION: &str =
+    "Per-parameter byte-limit overflow events (§3.2).";
+
+/// `ourios.miner.params.overflow` unit (UCUM).
+pub const OURIOS_MINER_PARAMS_OVERFLOW_UNIT: &str = "{overflow}";
 
 /// `ourios.miner.params.overflow.utilization` (gauge, unit `1`).
 pub const OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION: &str =
     "ourios.miner.params.overflow.utilization";
 
+/// `ourios.miner.params.overflow.utilization` description (the registry `brief`).
+pub const OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION_DESCRIPTION: &str = "Fraction of lines with at least one overflowing parameter (§3.2 / H2 per-service overflow alert).";
+
+/// `ourios.miner.params.overflow.utilization` unit (UCUM).
+pub const OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION_UNIT: &str = "1";
+
 /// `ourios.miner.parse_failures` (counter, unit `{failure}`).
 pub const OURIOS_MINER_PARSE_FAILURES: &str = "ourios.miner.parse_failures";
+
+/// `ourios.miner.parse_failures` description (the registry `brief`).
+pub const OURIOS_MINER_PARSE_FAILURES_DESCRIPTION: &str =
+    "Lines that failed to parse and fell back to body retention.";
+
+/// `ourios.miner.parse_failures` unit (UCUM).
+pub const OURIOS_MINER_PARSE_FAILURES_UNIT: &str = "{failure}";
 
 /// `ourios.miner.structured_body.size` (histogram, unit `By`).
 pub const OURIOS_MINER_STRUCTURED_BODY_SIZE: &str = "ourios.miner.structured_body.size";
 
+/// `ourios.miner.structured_body.size` description (the registry `brief`).
+pub const OURIOS_MINER_STRUCTURED_BODY_SIZE_DESCRIPTION: &str = "Canonical-JSON byte length of each structured (non-string) log body (RFC 0037 §3.2). Structured bodies are retained whole and never capped; this histogram is the hazard-#2 guard — an operator watches its per-service distribution to spot services emitting oversized payloads, the fix belonging at the emitter rather than a store-side truncation.";
+
+/// `ourios.miner.structured_body.size` unit (UCUM).
+pub const OURIOS_MINER_STRUCTURED_BODY_SIZE_UNIT: &str = "By";
+
 /// `ourios.miner.template.count` (gauge, unit `{template}`).
 pub const OURIOS_MINER_TEMPLATE_COUNT: &str = "ourios.miner.template.count";
 
+/// `ourios.miner.template.count` description (the registry `brief`).
+pub const OURIOS_MINER_TEMPLATE_COUNT_DESCRIPTION: &str = "Number of templates a tenant currently has (Drain-tree leaves plus structured-body templates).";
+
+/// `ourios.miner.template.count` unit (UCUM).
+pub const OURIOS_MINER_TEMPLATE_COUNT_UNIT: &str = "{template}";
+
 /// `ourios.miner.template.version_changes` (counter, unit `{change}`).
 pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES: &str = "ourios.miner.template.version_changes";
+
+/// `ourios.miner.template.version_changes` description (the registry `brief`).
+pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES_DESCRIPTION: &str =
+    "Template-version increments (schema evolution, §3.5 / H5).";
+
+/// `ourios.miner.template.version_changes` unit (UCUM).
+pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES_UNIT: &str = "{change}";
 
 /// `ourios.miner.upstream_template.processed` (counter, unit `{log_record}`).
 pub const OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED: &str =
     "ourios.miner.upstream_template.processed";
 
+/// `ourios.miner.upstream_template.processed` description (the registry `brief`).
+pub const OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED_DESCRIPTION: &str = "Records whose `log.record.template` attribute was considered under RFC 0050 `observe` or `adopt` mode, whether the handling succeeded or failed — the OTel processor `.processed` shape (one counter for successes and failures). A successful handling (string associated under `observe`, template adopted under `adopt`) carries no `error.type`; a rejected one carries the cause: `byte_limit` (the value exceeded `upstream_template_byte_limit` and was not parsed), `grammar` (outside the RFC 0050 §3.1 v1 grammar), `alignment` (the template could not be aligned byte-for-byte against the body), or `template_ceiling` (adoption would exceed the RFC 0023 `max_templates` budget). Every rejection falls back to mining the record; this counter is how a misbehaving upstream producer is visible. One deliberate exclusion: under `observe`, a validated string on a record that itself fails to parse (`NO_TEMPLATE`) is not counted — there is no mined entry to associate it with, and the record's failure is already visible on `ourios.miner.parse_failures`.";
+
+/// `ourios.miner.upstream_template.processed` unit (UCUM).
+pub const OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED_UNIT: &str = "{log_record}";
+
 /// `ourios.query.duration` (histogram, unit `s`).
 pub const OURIOS_QUERY_DURATION: &str = "ourios.query.duration";
+
+/// `ourios.query.duration` description (the registry `brief`).
+pub const OURIOS_QUERY_DURATION_DESCRIPTION: &str = "Duration of a query served by the querier endpoint, by kind (RFC 0016). Follows the OTel `{operation}.duration` convention; a failed query carries the `error.type` attribute.";
+
+/// `ourios.query.duration` unit (UCUM).
+pub const OURIOS_QUERY_DURATION_UNIT: &str = "s";
 
 /// `ourios.query.files` (histogram, unit `{file}`).
 pub const OURIOS_QUERY_FILES: &str = "ourios.query.files";
 
+/// `ourios.query.files` description (the registry `brief`).
+pub const OURIOS_QUERY_FILES_DESCRIPTION: &str = "Parquet files a query opened (#924).";
+
+/// `ourios.query.files` unit (UCUM).
+pub const OURIOS_QUERY_FILES_UNIT: &str = "{file}";
+
 /// `ourios.query.read.size` (histogram, unit `By`).
 pub const OURIOS_QUERY_READ_SIZE: &str = "ourios.query.read.size";
+
+/// `ourios.query.read.size` description (the registry `brief`).
+pub const OURIOS_QUERY_READ_SIZE_DESCRIPTION: &str = "Bytes a query fetched from storage (#924).";
+
+/// `ourios.query.read.size` unit (UCUM).
+pub const OURIOS_QUERY_READ_SIZE_UNIT: &str = "By";
 
 /// `ourios.query.row_groups` (counter, unit `{row_group}`).
 pub const OURIOS_QUERY_ROW_GROUPS: &str = "ourios.query.row_groups";
 
+/// `ourios.query.row_groups` description (the registry `brief`).
+pub const OURIOS_QUERY_ROW_GROUPS_DESCRIPTION: &str = "Candidate row groups a query scanned vs. pruned (pillar #1's footer-skip; the B1 win). The two states partition the candidates, so the pruned fraction is derived as `pruned / (scanned + pruned)`.";
+
+/// `ourios.query.row_groups` unit (UCUM).
+pub const OURIOS_QUERY_ROW_GROUPS_UNIT: &str = "{row_group}";
+
 /// `ourios.query.visibility` (counter, unit `{query}`).
 pub const OURIOS_QUERY_VISIBILITY: &str = "ourios.query.visibility";
+
+/// `ourios.query.visibility` description (the registry `brief`).
+pub const OURIOS_QUERY_VISIBILITY_DESCRIPTION: &str = "Queries answered under RFC 0047 §3.4 layer-2 visibility, by the two-step branch taken. `scoped` counts every streamed conversation enumeration issued; a tenant-wide or metadata reader never enumerates (RFC0047.4 / RFC0047.8).";
+
+/// `ourios.query.visibility` unit (UCUM).
+pub const OURIOS_QUERY_VISIBILITY_UNIT: &str = "{query}";
 
 /// `ourios.receiver.tenant.divergences` (counter, unit `{divergence}`).
 pub const OURIOS_RECEIVER_TENANT_DIVERGENCES: &str = "ourios.receiver.tenant.divergences";
 
+/// `ourios.receiver.tenant.divergences` description (the registry `brief`).
+pub const OURIOS_RECEIVER_TENANT_DIVERGENCES_DESCRIPTION: &str = "ResourceLogs groups whose watched resource attribute differed from the value first observed for their tenant (RFC 0045 §3.4) — the signal that one tenant spans what are probably several producers (two clusters merged under a single-key rule). Observation only; ingest is never rejected. The tenant id rides the accompanying warning event, not this counter.";
+
+/// `ourios.receiver.tenant.divergences` unit (UCUM).
+pub const OURIOS_RECEIVER_TENANT_DIVERGENCES_UNIT: &str = "{divergence}";
+
 /// `ourios.receiver.tls.handshake_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES: &str = "ourios.receiver.tls.handshake_failures";
+
+/// `ourios.receiver.tls.handshake_failures` description (the registry `brief`).
+pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES_DESCRIPTION: &str = "TLS connections that failed before reaching the request handler (RFC 0030 §3.2), split by listener and cause. A dropped handshake never reaches the auth layer or the WAL; the counter is the only signal it happened.";
+
+/// `ourios.receiver.tls.handshake_failures` unit (UCUM).
+pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES_UNIT: &str = "{failure}";
 
 /// `ourios.receiver.tls.reload_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_RELOAD_FAILURES: &str = "ourios.receiver.tls.reload_failures";
 
+/// `ourios.receiver.tls.reload_failures` description (the registry `brief`).
+pub const OURIOS_RECEIVER_TLS_RELOAD_FAILURES_DESCRIPTION: &str = "TLS certificate reloads that were skipped (RFC0030.6), by cause. The listener keeps serving the last good certificate; this counter (and the accompanying log) is the signal that a rotation did not take effect.";
+
+/// `ourios.receiver.tls.reload_failures` unit (UCUM).
+pub const OURIOS_RECEIVER_TLS_RELOAD_FAILURES_UNIT: &str = "{failure}";
+
 /// `ourios.runtime.global_queue.size` (updowncounter, unit `{task}`).
 pub const OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE: &str = "ourios.runtime.global_queue.size";
+
+/// `ourios.runtime.global_queue.size` description (the registry `brief`).
+pub const OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE_DESCRIPTION: &str = "Tasks waiting in the async runtime's global injection queue (#926); a growing value is a starved runtime.";
+
+/// `ourios.runtime.global_queue.size` unit (UCUM).
+pub const OURIOS_RUNTIME_GLOBAL_QUEUE_SIZE_UNIT: &str = "{task}";
 
 /// `ourios.runtime.task.count` (updowncounter, unit `{task}`).
 pub const OURIOS_RUNTIME_TASK_COUNT: &str = "ourios.runtime.task.count";
 
+/// `ourios.runtime.task.count` description (the registry `brief`).
+pub const OURIOS_RUNTIME_TASK_COUNT_DESCRIPTION: &str =
+    "Tasks currently alive on the Ourios async runtime (#926).";
+
+/// `ourios.runtime.task.count` unit (UCUM).
+pub const OURIOS_RUNTIME_TASK_COUNT_UNIT: &str = "{task}";
+
 /// `ourios.runtime.worker.count` (updowncounter, unit `{worker}`).
 pub const OURIOS_RUNTIME_WORKER_COUNT: &str = "ourios.runtime.worker.count";
+
+/// `ourios.runtime.worker.count` description (the registry `brief`).
+pub const OURIOS_RUNTIME_WORKER_COUNT_DESCRIPTION: &str =
+    "Worker threads of the Ourios async runtime (#926).";
+
+/// `ourios.runtime.worker.count` unit (UCUM).
+pub const OURIOS_RUNTIME_WORKER_COUNT_UNIT: &str = "{worker}";
 
 /// `ourios.sink.buffer.usage` (updowncounter, unit `By`).
 pub const OURIOS_SINK_BUFFER_USAGE: &str = "ourios.sink.buffer.usage";
 
+/// `ourios.sink.buffer.usage` description (the registry `brief`).
+pub const OURIOS_SINK_BUFFER_USAGE_DESCRIPTION: &str = "Estimated bytes currently buffered across all partitions, against the hard ceiling (RFC0014.4).";
+
+/// `ourios.sink.buffer.usage` unit (UCUM).
+pub const OURIOS_SINK_BUFFER_USAGE_UNIT: &str = "By";
+
 /// `ourios.sink.derive.errors` (counter, unit `{error}`).
 pub const OURIOS_SINK_DERIVE_ERRORS: &str = "ourios.sink.derive.errors";
+
+/// `ourios.sink.derive.errors` description (the registry `brief`).
+pub const OURIOS_SINK_DERIVE_ERRORS_DESCRIPTION: &str = "Records dropped from the sink because a partition key could not be derived (the WAL still holds them).";
+
+/// `ourios.sink.derive.errors` unit (UCUM).
+pub const OURIOS_SINK_DERIVE_ERRORS_UNIT: &str = "{error}";
 
 /// `ourios.sink.flush.duration` (histogram, unit `s`).
 pub const OURIOS_SINK_FLUSH_DURATION: &str = "ourios.sink.flush.duration";
 
+/// `ourios.sink.flush.duration` description (the registry `brief`).
+pub const OURIOS_SINK_FLUSH_DURATION_DESCRIPTION: &str =
+    "Wall-clock time to encode + write one partition's Parquet object.";
+
+/// `ourios.sink.flush.duration` unit (UCUM).
+pub const OURIOS_SINK_FLUSH_DURATION_UNIT: &str = "s";
+
 /// `ourios.sink.flush.errors` (counter, unit `{error}`).
 pub const OURIOS_SINK_FLUSH_ERRORS: &str = "ourios.sink.flush.errors";
+
+/// `ourios.sink.flush.errors` description (the registry `brief`).
+pub const OURIOS_SINK_FLUSH_ERRORS_DESCRIPTION: &str = "Failed partition flushes (encode or store error). The buffer is retained and retried — the WAL is the durability of record.";
+
+/// `ourios.sink.flush.errors` unit (UCUM).
+pub const OURIOS_SINK_FLUSH_ERRORS_UNIT: &str = "{error}";
 
 /// `ourios.sink.flush.records` (counter, unit `{record}`).
 pub const OURIOS_SINK_FLUSH_RECORDS: &str = "ourios.sink.flush.records";
 
+/// `ourios.sink.flush.records` description (the registry `brief`).
+pub const OURIOS_SINK_FLUSH_RECORDS_DESCRIPTION: &str = "Records written out across sink flushes.";
+
+/// `ourios.sink.flush.records` unit (UCUM).
+pub const OURIOS_SINK_FLUSH_RECORDS_UNIT: &str = "{record}";
+
 /// `ourios.storage.bridge.call.active` (updowncounter, unit `{call}`).
 pub const OURIOS_STORAGE_BRIDGE_CALL_ACTIVE: &str = "ourios.storage.bridge.call.active";
+
+/// `ourios.storage.bridge.call.active` description (the registry `brief`).
+pub const OURIOS_STORAGE_BRIDGE_CALL_ACTIVE_DESCRIPTION: &str =
+    "Object-store calls currently bridged off the async runtime (#926).";
+
+/// `ourios.storage.bridge.call.active` unit (UCUM).
+pub const OURIOS_STORAGE_BRIDGE_CALL_ACTIVE_UNIT: &str = "{call}";
 
 /// `ourios.storage.bridge.duration` (histogram, unit `s`).
 pub const OURIOS_STORAGE_BRIDGE_DURATION: &str = "ourios.storage.bridge.duration";
 
+/// `ourios.storage.bridge.duration` description (the registry `brief`).
+pub const OURIOS_STORAGE_BRIDGE_DURATION_DESCRIPTION: &str =
+    "Duration of one bridged object-store call (#926).";
+
+/// `ourios.storage.bridge.duration` unit (UCUM).
+pub const OURIOS_STORAGE_BRIDGE_DURATION_UNIT: &str = "s";
+
 /// `ourios.storage.bridge.thread.created` (counter, unit `{thread}`).
 pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED: &str = "ourios.storage.bridge.thread.created";
+
+/// `ourios.storage.bridge.thread.created` description (the registry `brief`).
+pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED_DESCRIPTION: &str = "OS threads the blocking bridge created (#926). Flat when the bridge reuses threads; a rising rate is the #853 thread-explosion signature.";
+
+/// `ourios.storage.bridge.thread.created` unit (UCUM).
+pub const OURIOS_STORAGE_BRIDGE_THREAD_CREATED_UNIT: &str = "{thread}";
 
 /// `ourios.storage.list.objects` (histogram, unit `{object}`).
 pub const OURIOS_STORAGE_LIST_OBJECTS: &str = "ourios.storage.list.objects";
 
+/// `ourios.storage.list.objects` description (the registry `brief`).
+pub const OURIOS_STORAGE_LIST_OBJECTS_DESCRIPTION: &str = "Objects returned by one logical LIST (#923); a large value is the per-query whole-prefix listing of #853.";
+
+/// `ourios.storage.list.objects` unit (UCUM).
+pub const OURIOS_STORAGE_LIST_OBJECTS_UNIT: &str = "{object}";
+
 /// `ourios.storage.operation.duration` (histogram, unit `s`).
 pub const OURIOS_STORAGE_OPERATION_DURATION: &str = "ourios.storage.operation.duration";
+
+/// `ourios.storage.operation.duration` description (the registry `brief`).
+pub const OURIOS_STORAGE_OPERATION_DURATION_DESCRIPTION: &str =
+    "Duration of one logical object-store operation, including every retry (#923).";
+
+/// `ourios.storage.operation.duration` unit (UCUM).
+pub const OURIOS_STORAGE_OPERATION_DURATION_UNIT: &str = "s";
 
 /// `ourios.storage.operation.retries` (counter, unit `{retry}`).
 pub const OURIOS_STORAGE_OPERATION_RETRIES: &str = "ourios.storage.operation.retries";
 
+/// `ourios.storage.operation.retries` description (the registry `brief`).
+pub const OURIOS_STORAGE_OPERATION_RETRIES_DESCRIPTION: &str = "Retries the object-store client made inside logical operations (#923). A rising rate separates slow-because-retrying from slow-because-large.";
+
+/// `ourios.storage.operation.retries` unit (UCUM).
+pub const OURIOS_STORAGE_OPERATION_RETRIES_UNIT: &str = "{retry}";
+
 /// `ourios.storage.parquet.file.size` (histogram, unit `By`).
 pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.size";
+
+/// `ourios.storage.parquet.file.size` description (the registry `brief`).
+pub const OURIOS_STORAGE_PARQUET_FILE_SIZE_DESCRIPTION: &str =
+    "Sizes of published Parquet data files (hazard H4 detector).";
+
+/// `ourios.storage.parquet.file.size` unit (UCUM).
+pub const OURIOS_STORAGE_PARQUET_FILE_SIZE_UNIT: &str = "By";
 
 /// `ourios.template_map.acquire.wait.duration` (histogram, unit `s`).
 pub const OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION: &str =
     "ourios.template_map.acquire.wait.duration";
 
+/// `ourios.template_map.acquire.wait.duration` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION_DESCRIPTION: &str = "Time a lookup waited on an acquisition another query or the background refresh initiated (#924, RFC 0060); recorded only for joiners (lookup outcome `joined`).";
+
+/// `ourios.template_map.acquire.wait.duration` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_ACQUIRE_WAIT_DURATION_UNIT: &str = "s";
+
 /// `ourios.template_map.artifact.size` (histogram, unit `By`).
 pub const OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE: &str = "ourios.template_map.artifact.size";
+
+/// `ourios.template_map.artifact.size` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_DESCRIPTION: &str = "Byte size of the template-map artifact at publish — the RFC 0033 §3.2 size-bound expectation, and the number the RFC0033.6 cache-warm acquisition gate reads.";
+
+/// `ourios.template_map.artifact.size` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE_UNIT: &str = "By";
 
 /// `ourios.template_map.derive.audit.files` (histogram, unit `{file}`).
 pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES: &str = "ourios.template_map.derive.audit.files";
 
+/// `ourios.template_map.derive.audit.files` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_DESCRIPTION: &str =
+    "Audit files one template-map derive read (#924); tracks audit-history growth (#897).";
+
+/// `ourios.template_map.derive.audit.files` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_FILES_UNIT: &str = "{file}";
+
 /// `ourios.template_map.derive.audit.size` (histogram, unit `By`).
 pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE: &str = "ourios.template_map.derive.audit.size";
+
+/// `ourios.template_map.derive.audit.size` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_DESCRIPTION: &str =
+    "Audit bytes one template-map derive read (#924).";
+
+/// `ourios.template_map.derive.audit.size` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_AUDIT_SIZE_UNIT: &str = "By";
 
 /// `ourios.template_map.derive.duration` (histogram, unit `s`).
 pub const OURIOS_TEMPLATE_MAP_DERIVE_DURATION: &str = "ourios.template_map.derive.duration";
 
+/// `ourios.template_map.derive.duration` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_DURATION_DESCRIPTION: &str =
+    "Duration of one template-map derive: a fold over the tenant's audit history (#924).";
+
+/// `ourios.template_map.derive.duration` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_DERIVE_DURATION_UNIT: &str = "s";
+
 /// `ourios.template_map.lookups` (counter, unit `{lookup}`).
 pub const OURIOS_TEMPLATE_MAP_LOOKUPS: &str = "ourios.template_map.lookups";
+
+/// `ourios.template_map.lookups` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_LOOKUPS_DESCRIPTION: &str = "Cached template-map lookups by the querier (RFC 0033 §3.3), by outcome, whether a query or the background refresh (RFC 0060) initiated them. Every outcome yields a correct map — the attribute distinguishes what IO paid for it (one attribute on one counter, the error.type convention, not per-outcome counters).";
+
+/// `ourios.template_map.lookups` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_LOOKUPS_UNIT: &str = "{lookup}";
 
 /// `ourios.template_map.publishes` (counter, unit `{publish}`).
 pub const OURIOS_TEMPLATE_MAP_PUBLISHES: &str = "ourios.template_map.publishes";
 
+/// `ourios.template_map.publishes` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_PUBLISHES_DESCRIPTION: &str = "Template-map artifact publishes (RFC 0033 §3.4/§3.5), by outcome. The write-through is best-effort by contract — a lost race or a publish error never fails the query, so this counter is the only place they surface.";
+
+/// `ourios.template_map.publishes` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_PUBLISHES_UNIT: &str = "{publish}";
+
 /// `ourios.template_map.refresh.duration` (histogram, unit `s`).
 pub const OURIOS_TEMPLATE_MAP_REFRESH_DURATION: &str = "ourios.template_map.refresh.duration";
 
+/// `ourios.template_map.refresh.duration` description (the registry `brief`).
+pub const OURIOS_TEMPLATE_MAP_REFRESH_DURATION_DESCRIPTION: &str =
+    "Duration of one background template-map refresh pass over every tenant (RFC 0060).";
+
+/// `ourios.template_map.refresh.duration` unit (UCUM).
+pub const OURIOS_TEMPLATE_MAP_REFRESH_DURATION_UNIT: &str = "s";
+
 /// `ourios.wal.append.duration` (histogram, unit `s`).
 pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
+
+/// `ourios.wal.append.duration` description (the registry `brief`).
+pub const OURIOS_WAL_APPEND_DURATION_DESCRIPTION: &str = "Wall-clock time to append a batch to the WAL and make it durable (append + fsync) — the WAL-before-ack latency (`CLAUDE.md` §3.4).";
+
+/// `ourios.wal.append.duration` unit (UCUM).
+pub const OURIOS_WAL_APPEND_DURATION_UNIT: &str = "s";
 
 /// `ourios.wal.housekeeping.horizon.remaining` (gauge, unit `{segment}`).
 pub const OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING: &str =
     "ourios.wal.housekeeping.horizon.remaining";
 
+/// `ourios.wal.housekeeping.horizon.remaining` description (the registry `brief`).
+pub const OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING_DESCRIPTION: &str = "Segments a received snapshot horizon has not yet been applied to, summed over tenants, as of the last housekeeping pass (`horizon_remaining`, RFC 0052 §3.5/§3.7).";
+
+/// `ourios.wal.housekeeping.horizon.remaining` unit (UCUM).
+pub const OURIOS_WAL_HOUSEKEEPING_HORIZON_REMAINING_UNIT: &str = "{segment}";
+
 /// `ourios.wal.housekeeping.unlink.remaining` (gauge, unit `{segment}`).
 pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING: &str =
     "ourios.wal.housekeeping.unlink.remaining";
+
+/// `ourios.wal.housekeeping.unlink.remaining` description (the registry `brief`).
+pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_DESCRIPTION: &str = "Reclaimable segments not yet unlinked, plus entries reclaiming or uncertain, as of the last housekeeping pass (`unlink_remaining`, RFC 0052 §3.5/§3.7).";
+
+/// `ourios.wal.housekeeping.unlink.remaining` unit (UCUM).
+pub const OURIOS_WAL_HOUSEKEEPING_UNLINK_REMAINING_UNIT: &str = "{segment}";
 
 /// `ourios.wal.retain_floor.lag.segment.count` (updowncounter, unit `{segment}`).
 pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT: &str =
     "ourios.wal.retain_floor.lag.segment.count";
 
+/// `ourios.wal.retain_floor.lag.segment.count` description (the registry `brief`).
+pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT_DESCRIPTION: &str = "Segments at least one tenant still holds back, less the current append segment (`lag_segments`, RFC 0052 §3.5).";
+
+/// `ourios.wal.retain_floor.lag.segment.count` unit (UCUM).
+pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SEGMENT_COUNT_UNIT: &str = "{segment}";
+
 /// `ourios.wal.retain_floor.lag.size` (updowncounter, unit `By`).
 pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE: &str = "ourios.wal.retain_floor.lag.size";
+
+/// `ourios.wal.retain_floor.lag.size` description (the registry `brief`).
+pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE_DESCRIPTION: &str = "Frame bytes in the segments at least one tenant still holds back, less the current append segment (`lag_bytes`, RFC 0052 §3.5).";
+
+/// `ourios.wal.retain_floor.lag.size` unit (UCUM).
+pub const OURIOS_WAL_RETAIN_FLOOR_LAG_SIZE_UNIT: &str = "By";
 
 /// `ourios.wal.retain_floor.pinned_tenant.count` (updowncounter, unit `{tenant}`).
 pub const OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT: &str =
     "ourios.wal.retain_floor.pinned_tenant.count";
 
+/// `ourios.wal.retain_floor.pinned_tenant.count` description (the registry `brief`).
+pub const OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT_DESCRIPTION: &str = "Tenants pinning the retain floor at their oldest surviving frame because they have no valid snapshot; 0 unless the floor is `pinned`. What tells a lagging tenant from an unexplained stall (RFC0052.13).";
+
+/// `ourios.wal.retain_floor.pinned_tenant.count` unit (UCUM).
+pub const OURIOS_WAL_RETAIN_FLOOR_PINNED_TENANT_COUNT_UNIT: &str = "{tenant}";
+
 /// `ourios.wal.retain_floor.status` (updowncounter, unit `1`).
 pub const OURIOS_WAL_RETAIN_FLOOR_STATUS: &str = "ourios.wal.retain_floor.status";
+
+/// `ourios.wal.retain_floor.status` description (the registry `brief`).
+pub const OURIOS_WAL_RETAIN_FLOOR_STATUS_DESCRIPTION: &str =
+    "The kind of the WAL's current retain floor (RFC 0052 §3.2).";
+
+/// `ourios.wal.retain_floor.status` unit (UCUM).
+pub const OURIOS_WAL_RETAIN_FLOOR_STATUS_UNIT: &str = "1";
 
 /// `ourios.wal.rotation.consecutive_failures` (gauge, unit `{failure}`).
 pub const OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES: &str =
     "ourios.wal.rotation.consecutive_failures";
 
+/// `ourios.wal.rotation.consecutive_failures` description (the registry `brief`).
+pub const OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES_DESCRIPTION: &str = "Consecutive failed rotation attempts counted against the `rotation_retry_attempts` budget; 0 when healthy (RFC 0052 §3.3).";
+
+/// `ourios.wal.rotation.consecutive_failures` unit (UCUM).
+pub const OURIOS_WAL_ROTATION_CONSECUTIVE_FAILURES_UNIT: &str = "{failure}";
+
 /// `ourios.wal.rotation.status` (updowncounter, unit `1`).
 pub const OURIOS_WAL_ROTATION_STATUS: &str = "ourios.wal.rotation.status";
+
+/// `ourios.wal.rotation.status` description (the registry `brief`).
+pub const OURIOS_WAL_ROTATION_STATUS_DESCRIPTION: &str =
+    "The WAL's rotation-failure state (RFC 0052 §3.3).";
+
+/// `ourios.wal.rotation.status` unit (UCUM).
+pub const OURIOS_WAL_ROTATION_STATUS_UNIT: &str = "1";
 
 /// `ourios.wal.segment.count` (updowncounter, unit `{segment}`).
 pub const OURIOS_WAL_SEGMENT_COUNT: &str = "ourios.wal.segment.count";
 
+/// `ourios.wal.segment.count` description (the registry `brief`).
+pub const OURIOS_WAL_SEGMENT_COUNT_DESCRIPTION: &str =
+    "WAL segment files present, the open segment included.";
+
+/// `ourios.wal.segment.count` unit (UCUM).
+pub const OURIOS_WAL_SEGMENT_COUNT_UNIT: &str = "{segment}";
+
 /// `ourios.wal.size` (updowncounter, unit `By`).
 pub const OURIOS_WAL_SIZE: &str = "ourios.wal.size";
+
+/// `ourios.wal.size` description (the registry `brief`).
+pub const OURIOS_WAL_SIZE_DESCRIPTION: &str = "On-disk bytes of every regular file directly in the WAL root, including the segments, the checkpoint sidecar, the reclamation records and any stale partial rotation file.";
+
+/// `ourios.wal.size` unit (UCUM).
+pub const OURIOS_WAL_SIZE_UNIT: &str = "By";
 
 /// `ourios.wal.unflushed.size` (updowncounter, unit `By`).
 pub const OURIOS_WAL_UNFLUSHED_SIZE: &str = "ourios.wal.unflushed.size";
 
+/// `ourios.wal.unflushed.size` description (the registry `brief`).
+pub const OURIOS_WAL_UNFLUSHED_SIZE_DESCRIPTION: &str = "Bytes appended to the WAL and not yet made durable by an fsync — the figure the batched-fsync decision reads.";
+
+/// `ourios.wal.unflushed.size` unit (UCUM).
+pub const OURIOS_WAL_UNFLUSHED_SIZE_UNIT: &str = "By";
+
 /// `ourios.wal.unreclaimed.age` (gauge, unit `s`).
 pub const OURIOS_WAL_UNRECLAIMED_AGE: &str = "ourios.wal.unreclaimed.age";
 
+/// `ourios.wal.unreclaimed.age` description (the registry `brief`).
+pub const OURIOS_WAL_UNRECLAIMED_AGE_DESCRIPTION: &str = "Age of the oldest unreclaimed WAL frame — the figure to alert on when reclamation stalls (RFC 0052 §3.5).";
+
+/// `ourios.wal.unreclaimed.age` unit (UCUM).
+pub const OURIOS_WAL_UNRECLAIMED_AGE_UNIT: &str = "s";
+
 /// `ourios.wal.unreclaimed.size` (updowncounter, unit `By`).
 pub const OURIOS_WAL_UNRECLAIMED_SIZE: &str = "ourios.wal.unreclaimed.size";
+
+/// `ourios.wal.unreclaimed.size` description (the registry `brief`).
+pub const OURIOS_WAL_UNRECLAIMED_SIZE_DESCRIPTION: &str = "Frame bytes the WAL still holds — everything not yet reclaimed, including the post-checkpoint tail, the open segment and anything the retain floor keeps (RFC 0052 §3.5).";
+
+/// `ourios.wal.unreclaimed.size` unit (UCUM).
+pub const OURIOS_WAL_UNRECLAIMED_SIZE_UNIT: &str = "By";
 
 // Attribute keys.
 

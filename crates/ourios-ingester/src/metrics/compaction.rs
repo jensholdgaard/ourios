@@ -170,6 +170,52 @@ const FILE_SIZE_BUCKETS: [f64; 12] = [
 /// A registry metric's `(name, description, unit)` constants.
 type MetricDef = (&'static str, &'static str, &'static str);
 
+const COMPACTION_PARTITIONS: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITIONS,
+    semconv::OURIOS_COMPACTION_PARTITIONS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITIONS_UNIT,
+);
+const COMPACTION_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_FILES,
+    semconv::OURIOS_COMPACTION_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_FILES_UNIT,
+);
+const COMPACTION_ROWS: MetricDef = (
+    semconv::OURIOS_COMPACTION_ROWS,
+    semconv::OURIOS_COMPACTION_ROWS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ROWS_UNIT,
+);
+const COMPACTION_ORPHAN_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES,
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_ORPHAN_FILES_UNIT,
+);
+const COMPACTION_SWEEPS: MetricDef = (
+    semconv::OURIOS_COMPACTION_SWEEPS,
+    semconv::OURIOS_COMPACTION_SWEEPS_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_SWEEPS_UNIT,
+);
+const COMPACTION_IO: MetricDef = (
+    semconv::OURIOS_COMPACTION_IO,
+    semconv::OURIOS_COMPACTION_IO_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_IO_UNIT,
+);
+const STORAGE_PARQUET_FILE_SIZE: MetricDef = (
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_DESCRIPTION,
+    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_UNIT,
+);
+const COMPACTION_PARTITION_INPUT_FILES: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_UNIT,
+);
+const COMPACTION_PARTITION_INPUT_SIZE: MetricDef = (
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_DESCRIPTION,
+    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_UNIT,
+);
+
 /// A `u64` counter for `def`.
 fn counter(meter: &Meter, (name, description, unit): MetricDef) -> Counter<u64> {
     meter
@@ -253,38 +299,10 @@ impl CompactionMetrics {
 
     /// [`Self::new`] on `meter` rather than the global one.
     pub(crate) fn from_meter(meter: &Meter) -> Self {
-        let partitions = counter(
-            meter,
-            (
-                semconv::OURIOS_COMPACTION_PARTITIONS,
-                semconv::OURIOS_COMPACTION_PARTITIONS_DESCRIPTION,
-                semconv::OURIOS_COMPACTION_PARTITIONS_UNIT,
-            ),
-        );
-        let files = counter(
-            meter,
-            (
-                semconv::OURIOS_COMPACTION_FILES,
-                semconv::OURIOS_COMPACTION_FILES_DESCRIPTION,
-                semconv::OURIOS_COMPACTION_FILES_UNIT,
-            ),
-        );
-        let rows = counter(
-            meter,
-            (
-                semconv::OURIOS_COMPACTION_ROWS,
-                semconv::OURIOS_COMPACTION_ROWS_DESCRIPTION,
-                semconv::OURIOS_COMPACTION_ROWS_UNIT,
-            ),
-        );
-        let orphan_files = counter(
-            meter,
-            (
-                semconv::OURIOS_COMPACTION_ORPHAN_FILES,
-                semconv::OURIOS_COMPACTION_ORPHAN_FILES_DESCRIPTION,
-                semconv::OURIOS_COMPACTION_ORPHAN_FILES_UNIT,
-            ),
-        );
+        let partitions = counter(meter, COMPACTION_PARTITIONS);
+        let files = counter(meter, COMPACTION_FILES);
+        let rows = counter(meter, COMPACTION_ROWS);
+        let orphan_files = counter(meter, COMPACTION_ORPHAN_FILES);
         // Only the attribute-free counters; `sweeps` and `io` carry
         // required attributes (`result` / `io.direction`) and `duration`
         // / `file_size` are histograms, so none are zero-seeded here —
@@ -298,14 +316,7 @@ impl CompactionMetrics {
         let live = LiveInstruments::register(meter, &gauges);
 
         Self {
-            sweeps: counter(
-                meter,
-                (
-                    semconv::OURIOS_COMPACTION_SWEEPS,
-                    semconv::OURIOS_COMPACTION_SWEEPS_DESCRIPTION,
-                    semconv::OURIOS_COMPACTION_SWEEPS_UNIT,
-                ),
-            ),
+            sweeps: counter(meter, COMPACTION_SWEEPS),
             partitions,
             files,
             rows,
@@ -316,41 +327,18 @@ impl CompactionMetrics {
                 .with_unit(semconv::OURIOS_COMPACTION_DURATION_UNIT)
                 .with_boundaries(histogram_buckets::LONG_DURATION_S.to_vec())
                 .build(),
-            io: counter(
-                meter,
-                (
-                    semconv::OURIOS_COMPACTION_IO,
-                    semconv::OURIOS_COMPACTION_IO_DESCRIPTION,
-                    semconv::OURIOS_COMPACTION_IO_UNIT,
-                ),
-            ),
-            file_size: histogram(
-                meter,
-                (
-                    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
-                    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_DESCRIPTION,
-                    semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_UNIT,
-                ),
-                &FILE_SIZE_BUCKETS,
-            ),
+            io: counter(meter, COMPACTION_IO),
+            file_size: histogram(meter, STORAGE_PARQUET_FILE_SIZE, &FILE_SIZE_BUCKETS),
             backlog_state,
             backlog,
             input_files: histogram(
                 meter,
-                (
-                    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES,
-                    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_DESCRIPTION,
-                    semconv::OURIOS_COMPACTION_PARTITION_INPUT_FILES_UNIT,
-                ),
+                COMPACTION_PARTITION_INPUT_FILES,
                 &histogram_buckets::FILE_COUNT,
             ),
             input_size: histogram(
                 meter,
-                (
-                    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE,
-                    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_DESCRIPTION,
-                    semconv::OURIOS_COMPACTION_PARTITION_INPUT_SIZE_UNIT,
-                ),
+                COMPACTION_PARTITION_INPUT_SIZE,
                 &histogram_buckets::SIZE_BYTES,
             ),
             gauges,
@@ -748,26 +736,10 @@ mod tests {
     /// Compaction instruments exported with the registry description and
     /// unit, through both the `counter` and `histogram` helpers.
     const REGISTERED: [ourios_telemetry::metadata_guard::Registered; 4] = [
-        (
-            semconv::OURIOS_COMPACTION_PARTITIONS,
-            semconv::OURIOS_COMPACTION_PARTITIONS_DESCRIPTION,
-            semconv::OURIOS_COMPACTION_PARTITIONS_UNIT,
-        ),
-        (
-            semconv::OURIOS_COMPACTION_SWEEPS,
-            semconv::OURIOS_COMPACTION_SWEEPS_DESCRIPTION,
-            semconv::OURIOS_COMPACTION_SWEEPS_UNIT,
-        ),
-        (
-            semconv::OURIOS_COMPACTION_IO,
-            semconv::OURIOS_COMPACTION_IO_DESCRIPTION,
-            semconv::OURIOS_COMPACTION_IO_UNIT,
-        ),
-        (
-            semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
-            semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_DESCRIPTION,
-            semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE_UNIT,
-        ),
+        COMPACTION_PARTITIONS,
+        COMPACTION_SWEEPS,
+        COMPACTION_IO,
+        STORAGE_PARQUET_FILE_SIZE,
     ];
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -38,6 +38,8 @@
 pub mod histogram_guard;
 #[cfg(feature = "testing")]
 pub mod live_check;
+#[cfg(feature = "testing")]
+pub mod metadata_guard;
 mod process;
 mod runtime;
 

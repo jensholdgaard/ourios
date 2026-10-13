@@ -1866,12 +1866,8 @@ auth:
         }
     }
 
-    // The length is the maximal YAML document itself — one line per
-    // config leaf is the census.
-    #[allow(clippy::too_many_lines)]
-    #[test]
-    fn every_scalar_leaf_resolves_env_references() {
-        let yaml = r"
+    /// The maximal YAML document: one line per config leaf is the census.
+    const MAXIMAL_YAML: &str = r"
 storage:
   backend: ${env:L01}
   s3:
@@ -1971,6 +1967,10 @@ auth:
       max_objects: ${env:L68}
       list_timeout_ms: ${env:L69}
 ";
+
+    #[test]
+    fn every_scalar_leaf_resolves_env_references() {
+        let yaml = MAXIMAL_YAML;
         let refs_in_yaml = yaml.matches("${env:").count();
         let config = parse(yaml, &|name| Some(format!("resolved+{name}")))
             .expect("the maximal config parses");

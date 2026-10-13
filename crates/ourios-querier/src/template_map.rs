@@ -146,6 +146,9 @@ const ERROR_TYPE: &str = "error.type";
 const PUBLISH_OUTCOME_PUBLISHED: &str = "published";
 const PUBLISH_OUTCOME_LOST_RACE: &str = "lost_race";
 const PUBLISH_OUTCOME_ERROR: &str = "error";
+/// `ourios.template_map.acquire.trigger` values (RFC 0060 §3.5).
+const ACQUIRE_TRIGGER_QUERY: &str = "query";
+const ACQUIRE_TRIGGER_REFRESH: &str = "refresh";
 
 /// Bucket boundaries (seconds) for the derive and acquire-wait durations.
 /// The SDK defaults are millisecond-shaped; a cold derive over a large
@@ -183,6 +186,7 @@ struct TemplateMapMetrics {
     derive_audit_files: Histogram<u64>,
     derive_audit_size: Histogram<u64>,
     acquire_wait: Histogram<f64>,
+    refresh_duration: Histogram<f64>,
 }
 
 /// Resolved once, on the first lookup or publish, through the
@@ -229,39 +233,36 @@ static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
             .with_unit("s")
             .with_boundaries(DURATION_BUCKETS_S.to_vec())
             .build(),
+        refresh_duration: meter
+            .f64_histogram(semconv::OURIOS_TEMPLATE_MAP_REFRESH_DURATION)
+            .with_unit("s")
+            .with_boundaries(DURATION_BUCKETS_S.to_vec())
+            .build(),
     }
 });
 
 impl TemplateMapMetrics {
-    fn record_lookup(&self, outcome: CacheOutcome, binding_conflict: bool) {
+    fn record_lookup(
+        &self,
+        outcome: CacheOutcome,
+        binding_conflict: bool,
+        trigger: AcquireTrigger,
+    ) {
         let value = lookup_outcome(outcome);
         record_outcome_on_span(value);
-        let outcome = KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, value);
+        let mut attrs = lookup_attributes(value, trigger);
         if binding_conflict {
-            self.lookups.add(
-                1,
-                &[
-                    outcome,
-                    KeyValue::new(
-                        semconv::OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY,
-                        LOOKUP_ANOMALY_BINDING_CONFLICT,
-                    ),
-                ],
-            );
-        } else {
-            self.lookups.add(1, &[outcome]);
+            attrs.push(KeyValue::new(
+                semconv::OURIOS_TEMPLATE_MAP_LOOKUP_ANOMALY,
+                LOOKUP_ANOMALY_BINDING_CONFLICT,
+            ));
         }
+        self.lookups.add(1, &attrs);
     }
 
-    fn record_lookup_value(&self, value: &'static str) {
+    fn record_lookup_value(&self, value: &'static str, trigger: AcquireTrigger) {
         record_outcome_on_span(value);
-        self.lookups.add(
-            1,
-            &[KeyValue::new(
-                semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
-                value,
-            )],
-        );
+        self.lookups.add(1, &lookup_attributes(value, trigger));
     }
 
     /// One fold's cost: its duration always (with `error.type` when it
@@ -295,6 +296,14 @@ impl TemplateMapMetrics {
             )],
         );
     }
+}
+
+/// A lookup sample's outcome and the trigger of the acquisition behind it.
+fn lookup_attributes(outcome: &'static str, trigger: AcquireTrigger) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME, outcome),
+        trigger.attribute(),
+    ]
 }
 
 /// The `ourios.template_map.lookup.outcome` value of `outcome`.
@@ -348,11 +357,24 @@ fn announce_binding_conflicts(tenant: &TenantId, conflicts: &[(u64, u32)], known
     }
 }
 
-/// Record a `joined` lookup: this query was served the map another query
-/// acquired at the same frontier. Only for a successful shared acquisition —
-/// the acquirer records its own outcome, and a failure records nothing.
-pub(crate) fn record_joined_lookup() {
-    METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED);
+/// Record a `joined` lookup: this query was served the map another
+/// acquisition, started by `trigger`, took at the same frontier. Only for a
+/// successful shared acquisition — the acquirer records its own outcome, and
+/// a failure records nothing.
+pub(crate) fn record_joined_lookup(trigger: AcquireTrigger) {
+    METRICS.record_lookup_value(LOOKUP_OUTCOME_JOINED, trigger);
+}
+
+/// Record one background refresh pass (RFC 0060 §3.5): its duration, with
+/// `error.type` when the pass ended early.
+pub(crate) fn record_refresh_pass(elapsed: Duration, error_type: Option<&'static str>) {
+    let attrs: Vec<KeyValue> = error_type
+        .map(|e| KeyValue::new(ERROR_TYPE, e))
+        .into_iter()
+        .collect();
+    METRICS
+        .refresh_duration
+        .record(elapsed.as_secs_f64(), &attrs);
 }
 
 /// Record how long a query waited on another query's acquisition of the
@@ -361,13 +383,17 @@ pub(crate) fn record_acquire_wait(waited: Duration) {
     METRICS.acquire_wait.record(waited.as_secs_f64(), &[]);
 }
 
-/// A derive sample's attributes: its `reason`, plus the mode and
-/// fallback reason of `path` once the path was decided.
-fn derive_attributes(reason: &'static str, path: Option<DerivePath>) -> Vec<KeyValue> {
-    let mut attrs = vec![KeyValue::new(
-        semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON,
-        reason,
-    )];
+/// A derive sample's attributes: its `reason` and `trigger`, plus the mode
+/// and fallback reason of `path` once the path was decided.
+fn derive_attributes(
+    reason: &'static str,
+    trigger: AcquireTrigger,
+    path: Option<DerivePath>,
+) -> Vec<KeyValue> {
+    let mut attrs = vec![
+        KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON, reason),
+        trigger.attribute(),
+    ];
     attrs.extend(path.map_or_else(Vec::new, path_attributes));
     attrs
 }
@@ -425,6 +451,43 @@ pub(crate) fn error_type(error: &QueryError) -> &'static str {
         QueryError::InvalidQuery { .. } => "invalid_query",
         QueryError::Forbidden { .. } => "permission_denied",
     }
+}
+
+/// Who started an acquisition (`ourios.template_map.acquire.trigger`,
+/// RFC 0060 §3.5). A query that joins an acquisition records the trigger of
+/// the one that started it, not its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireTrigger {
+    Query,
+    Refresh,
+}
+
+impl AcquireTrigger {
+    fn attribute(self) -> KeyValue {
+        let value = match self {
+            Self::Query => ACQUIRE_TRIGGER_QUERY,
+            Self::Refresh => ACQUIRE_TRIGGER_REFRESH,
+        };
+        KeyValue::new(semconv::OURIOS_TEMPLATE_MAP_ACQUIRE_TRIGGER, value)
+    }
+}
+
+/// What an acquisition left in the store for the next one at its frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Persisted {
+    /// A current artifact: a hit, this acquisition's publish, or a
+    /// concurrent writer's (a lost race).
+    Current,
+    /// Nothing: the write-through abstained or failed.
+    Nothing,
+}
+
+/// One acquisition's answer (`load_or_derive_resolved`).
+pub(crate) struct Loaded {
+    pub(crate) map: TemplateMap,
+    pub(crate) bytes: u64,
+    pub(crate) outcome: CacheOutcome,
+    pub(crate) persisted: Persisted,
 }
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):
@@ -585,19 +648,23 @@ pub fn load_or_derive(
         backend,
         tenant,
         audit_scan::resolve_audit_set(backend, tenant)?,
+        AcquireTrigger::Query,
     )
+    .map(|loaded| (loaded.map, loaded.bytes, loaded.outcome))
 }
 
 /// [`load_or_derive`] against a listing the caller already took — the
 /// querier's per-tenant single-flight (`map_flight`) lists once, keys the
 /// flight by that listing's frontier, and acquires against the same
 /// listing, so the §3.3 one-listing rule holds. No map is retained once
-/// the acquisition completes.
+/// the acquisition completes. Its lookup and derive samples carry
+/// `trigger`; the answer also says what the acquisition left in the store.
 pub(crate) fn load_or_derive_resolved(
     backend: StoreRef<'_>,
     tenant: &TenantId,
     resolved: audit_scan::ResolvedAuditSet<'_>,
-) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
+    trigger: AcquireTrigger,
+) -> Result<Loaded, QueryError> {
     let (fetched_bytes, expected, outcome, stale) = match fetch_artifact(backend, tenant) {
         FetchedArtifact::Absent => (0, None, miss(MissReason::Absent), None),
         FetchedArtifact::Unreadable => (0, None, miss(MissReason::Torn), None),
@@ -605,8 +672,13 @@ pub(crate) fn load_or_derive_resolved(
             let len = bytes.len() as u64;
             match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
-                    METRICS.record_lookup(CacheOutcome::Hit, false);
-                    return Ok((map, len, CacheOutcome::Hit));
+                    METRICS.record_lookup(CacheOutcome::Hit, false, trigger);
+                    return Ok(Loaded {
+                        map,
+                        bytes: len,
+                        outcome: CacheOutcome::Hit,
+                        persisted: Persisted::Current,
+                    });
                 }
                 ArtifactRead::Valid(map) => (len, e_tag, CacheOutcome::StaleRefreshed, Some(map)),
                 ArtifactRead::Torn { .. } => (len, e_tag, miss(MissReason::Torn), None),
@@ -624,16 +696,29 @@ pub(crate) fn load_or_derive_resolved(
     // On the span before the fold, so a failed fold's span still says why
     // it folded; the metric keeps counting only lookups that answered.
     record_outcome_on_span(lookup_outcome(outcome));
-    let derived = measured_fold(resolved, tenant, outcome, stale)?;
+    let derived = measured_fold(resolved, tenant, stale, FoldCause { outcome, trigger })?;
     let acquisition_bytes = add_bytes(derived.fetched_bytes, fetched_bytes)?;
     // Recorded only after every fallible step — a counted outcome is
     // always one that answered, mirroring the hit arm's record-at-return.
     announce_binding_conflicts(tenant, &derived.conflicts, &known);
-    METRICS.record_lookup(outcome, !derived.conflicts.is_empty());
-    derived
+    METRICS.record_lookup(outcome, !derived.conflicts.is_empty(), trigger);
+    let persisted = derived
         .map
         .write_through(backend, expected.as_deref(), acquisition_bytes);
-    Ok((derived.map, acquisition_bytes, outcome))
+    Ok(Loaded {
+        map: derived.map,
+        bytes: acquisition_bytes,
+        outcome,
+        persisted,
+    })
+}
+
+/// The lookup outcome that sent an acquisition to the fold, and who started
+/// the acquisition: what its derive sample is keyed by.
+#[derive(Clone, Copy)]
+struct FoldCause {
+    outcome: CacheOutcome,
+    trigger: AcquireTrigger,
 }
 
 fn miss(reason: MissReason) -> CacheOutcome {
@@ -711,10 +796,10 @@ impl DeriveError {
 fn measured_fold(
     resolved: audit_scan::ResolvedAuditSet<'_>,
     tenant: &TenantId,
-    outcome: CacheOutcome,
     stale: Option<TemplateMap>,
+    cause: FoldCause,
 ) -> Result<Derived, QueryError> {
-    let Some(reason) = derive_reason(outcome) else {
+    let Some(reason) = derive_reason(cause.outcome) else {
         return derive(resolved, tenant, stale).map_err(|e| e.error);
     };
     let started = Instant::now();
@@ -723,7 +808,11 @@ fn measured_fold(
         Ok(d) => (Some(d.path), Ok((d.fetched_files, d.fetched_bytes))),
         Err(e) => (e.path, Err(error_type(&e.error))),
     };
-    METRICS.record_derive(derive_attributes(reason, path), started.elapsed(), cost);
+    METRICS.record_derive(
+        derive_attributes(reason, cause.trigger, path),
+        started.elapsed(),
+        cost,
+    );
     derived.map_err(|e| e.error)
 }
 
@@ -1235,18 +1324,26 @@ impl TemplateMap {
     /// records no publish outcome — §3.7 pins the values to
     /// `published` / `lost_race` / `error`, and a publish that never
     /// starts is none of them.
-    fn write_through(&self, backend: StoreRef<'_>, expected: Option<&str>, acquisition_bytes: u64) {
+    fn write_through(
+        &self,
+        backend: StoreRef<'_>,
+        expected: Option<&str>,
+        acquisition_bytes: u64,
+    ) -> Persisted {
         let Ok(bytes) = self.to_artifact_bytes() else {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
-            return;
+            return Persisted::Nothing;
         };
         if abstains(bytes.len() as u64, acquisition_bytes) {
-            return;
+            return Persisted::Nothing;
         }
-        // Best-effort by contract: Published and LostRace are both fine,
-        // and an error must not fail the query answered from the fold in
-        // hand (publish_bytes already recorded it).
-        let _ = self.publish_bytes(backend, expected, bytes);
+        // Best-effort by contract: Published and LostRace both leave a
+        // current artifact, and an error must not fail the query answered
+        // from the fold in hand (publish_bytes already recorded it).
+        match self.publish_bytes(backend, expected, bytes) {
+            Ok(PublishOutcome::Published | PublishOutcome::LostRace) => Persisted::Current,
+            Err(_) => Persisted::Nothing,
+        }
     }
 
     /// Commit `bytes` per the §3.4 backend ladder, recording the §3.7

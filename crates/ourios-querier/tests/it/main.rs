@@ -4,10 +4,11 @@
 //! stack, and the link count — not compilation — dominated `cargo test`
 //! wall time (RFC 0028 §1 / epic #382). Files here moved verbatim from
 //! `tests/*.rs`; test names gain only this harness's module-path prefix
-//! (RFC0028.1). One binary is exempt under the RFC0028.2 rule
-//! (process isolation): `tests/rfc0033_7_observability.rs` installs a
-//! process-global in-memory `MeterProvider` (the RFC 0016 metrics-test
-//! shape).
+//! (RFC0028.1). Three binaries are exempt under the RFC0028.2 rule
+//! (process isolation): `tests/rfc0033_7_observability.rs` and
+//! `tests/rfc0060_refresh_observability.rs` each install a process-global
+//! in-memory `MeterProvider` (the RFC 0016 metrics-test shape), and
+//! `tests/rfc0033_bounded_fold.rs` installs a global allocator.
 
 mod common;
 
@@ -43,4 +44,5 @@ mod rfc0042_mixed_schema;
 mod rfc0044_body_equality;
 mod rfc0047_visibility;
 mod rfc0050_read_path;
+#[cfg(feature = "testing")]
 mod rfc0060_refresh;

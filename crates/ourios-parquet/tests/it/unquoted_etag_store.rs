@@ -546,3 +546,42 @@ fn put_if_match_never_retries_a_tag_that_would_change_meaning_unquoted() {
 
     assert_eq!(kept, [b"v1".to_vec(), b"v1".to_vec()]);
 }
+
+/// Swap `key` to `bytes` against its current `ETag`, as the store returns it.
+fn swap(store: &Store, key: &str, bytes: &[u8]) {
+    let (_, etag) = store
+        .get_with_etag_blocking_opt(key)
+        .expect("get")
+        .expect("present");
+    store
+        .put_if_match_blocking(key, bytes.to_vec(), &etag.expect("etag"))
+        .expect("CAS against the current ETag wins");
+}
+
+/// Once a swap has won, the next one — from any handle on the backend —
+/// leads with the spelling that won and sends one `PUT`, not a `412` and a
+/// retry; and a stale `ETag` still loses afterwards.
+#[test]
+fn put_if_match_leads_with_the_spelling_that_last_won() {
+    for mode in [IfMatch::Unquoted, IfMatch::Quoted, IfMatch::Either] {
+        let (store, state) = fake_store(mode);
+        store
+            .put_blocking("data/manifest.json", b"v1".to_vec())
+            .expect("put");
+        swap(&store, "data/manifest.json", b"v2");
+        state.if_match_puts.store(0, Ordering::SeqCst);
+
+        swap(&store.clone(), "data/manifest.json", b"v3");
+
+        assert_eq!(state.if_match_puts.load(Ordering::SeqCst), 1);
+        let stale_tag = stale_etag(&store, "data/manifest.json");
+        let err = store
+            .put_if_match_blocking("data/manifest.json", b"lost".to_vec(), &stale_tag)
+            .expect_err("a stale ETag must lose");
+        assert!(err.is_precondition(), "{err}");
+        assert_eq!(
+            store.get_blocking("data/manifest.json").expect("get"),
+            b"v2".to_vec()
+        );
+    }
+}

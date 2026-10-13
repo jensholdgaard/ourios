@@ -691,7 +691,8 @@ fn binding_conflict_act(
 /// Scenario RFC0033.8, amendment 2026-10-13 (#987): a refresh of the
 /// artifact the conflicting miss published re-announces nothing for the
 /// known key, though its lookup still carries the anomaly; a second key
-/// coming into conflict is announced once, alone.
+/// coming into conflict is announced once, alone; and a `files_removed`
+/// full-fold fallback re-announces neither known key.
 fn announced_once_act(
     guard: &ourios_telemetry::TelemetryGuard,
     exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
@@ -707,7 +708,15 @@ fn announced_once_act(
     };
     capture.reset();
 
+    let parquet_files = || -> std::collections::BTreeSet<PathBuf> {
+        walk_files(&bucket.join("audit"))
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect()
+    };
+    let before_fresh = parquet_files();
     write_audit(bucket, &[created(5, "fresh <*>", TS0 + 5)]);
+    let fresh: Vec<_> = parquet_files().difference(&before_fresh).cloned().collect();
     assert_eq!(body_query(bucket).rows, 1);
     let events = conflict_events();
     assert!(
@@ -735,12 +744,24 @@ fn announced_once_act(
         Some("3")
     );
 
+    capture.reset();
+    assert!(!fresh.is_empty(), "the fresh audit file was written");
+    for file in &fresh {
+        std::fs::remove_file(file).expect("remove a folded audit file");
+    }
+    assert_eq!(body_query(bucket).rows, 1);
+    let events = conflict_events();
+    assert!(
+        events.is_empty(),
+        "a files_removed full fold re-announces no known key: {events:#?}"
+    );
+
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
     let rms = std::slice::from_ref(rms.last().expect("a collection"));
     let expected: BTreeMap<(String, String), u64> = [
         (("miss".to_string(), "binding_conflict".to_string()), 1),
-        (("stale".to_string(), "binding_conflict".to_string()), 2),
+        (("stale".to_string(), "binding_conflict".to_string()), 3),
     ]
     .into_iter()
     .collect();

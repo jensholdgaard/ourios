@@ -610,23 +610,34 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
             if let Some(rejection) = crate::visibility::require_tenant_wide(visibility.as_ref()) {
                 return reject_visibility(&state, gate_started, &rejection);
             }
-            let result = state.querier.run_drift(&query, &tenant, now).await;
-            let elapsed = started.elapsed();
-            match result {
-                Ok(result) => served(
-                    &state,
-                    QUERY_KIND_DRIFT,
-                    elapsed,
-                    &DriftResponse::from(&result),
-                    || state.metrics.record_drift(elapsed, &result),
-                ),
-                Err(e) => {
-                    state
-                        .metrics
-                        .record_err(QUERY_KIND_DRIFT, elapsed, query_error_type(&e));
-                    query_error_response(&e)
-                }
-            }
+            run_drift_query(&state, &query, &tenant, now, started).await
+        }
+    }
+}
+
+/// The drift arm of the query endpoint: run, record, encode.
+async fn run_drift_query(
+    state: &QuerierState,
+    query: &ourios_querier::dsl::DriftQuery,
+    tenant: &TenantId,
+    now: u64,
+    started: Instant,
+) -> Response {
+    let result = state.querier.run_drift(query, tenant, now).await;
+    let elapsed = started.elapsed();
+    match result {
+        Ok(result) => served(
+            state,
+            QUERY_KIND_DRIFT,
+            elapsed,
+            &DriftResponse::from(&result),
+            || state.metrics.record_drift(elapsed, &result),
+        ),
+        Err(e) => {
+            state
+                .metrics
+                .record_err(QUERY_KIND_DRIFT, elapsed, query_error_type(&e));
+            query_error_response(&e)
         }
     }
 }

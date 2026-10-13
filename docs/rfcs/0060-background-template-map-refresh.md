@@ -157,7 +157,10 @@ ask. §7 lists pre-emptive full folds as an open question.
   time: at the default interval that is 11 × `interval` plus the
   skipped passes' own run time. A hit, a publish of its own, or a lost CAS race (someone
   else published) resets `k` to 0. The counter lives in process
-  memory and resets on restart. A query is never skipped: it acquires
+  memory and resets on restart. A successful tenant listing drops the
+  counters of tenants it no longer names, so the state follows the
+  current tenants, not their history; a failed listing keeps them,
+  since it names no current set. A query is never skipped: it acquires
   exactly as it does without the task.
 
 ### 3.4 Configuration
@@ -267,7 +270,9 @@ path, and a second publisher contends for the CAS.
 ## 5. Acceptance criteria
 
 > **Scenario RFC0060.1 — A start pass absorbs the bootstrap**
-> - **Given** a store whose tenant has an artifact without `fold_state`
+> - **Given** a store whose tenant has an artifact without `fold_state`,
+>   and a folded map the write-through publishes (not abstained, no
+>   IO error)
 > - **When** the querier starts with refresh enabled, and a query
 >   arrives after the first pass has finished
 > - **Then** the full fold ran with `acquire.trigger = refresh`
@@ -278,7 +283,10 @@ path, and a second publisher contends for the CAS.
 > - **Given** the task holding a tenant's flight on a gated fold
 > - **When** a query for that tenant at the same frontier arrives
 > - **Then** exactly one fold runs, and the query records `joined` and
->   receives the task's map.
+>   receives the task's map
+> - **And** the query's `joined` lookup carries
+>   `acquire.trigger = refresh`: the attribute names who initiated the
+>   shared acquisition, not who recorded the sample.
 
 > **Scenario RFC0060.3 — One background acquisition at a time**
 > - **Given** three tenants, each with a gated fold
@@ -314,7 +322,11 @@ path, and a second publisher contends for the CAS.
 > **Scenario RFC0060.7 — Shutdown is prompt**
 > - **Given** a pass between tenants, or waiting on its interval
 > - **When** the querier shuts down
-> - **Then** the task exits without starting another acquisition.
+> - **Then** the task exits without starting another acquisition
+> - **And given** a pass whose acquisition is on the blocking pool,
+>   gated, **when** the querier shuts down, **then** the task exits
+>   without waiting for the gate, and once the gate is released the
+>   flight still completes and publishes (it is not cancelled).
 
 > **Scenario RFC0060.8 — Telemetry is registry-conformant**
 > - **Given** RFC0060.1's run
@@ -344,11 +356,22 @@ path, and a second publisher contends for the CAS.
 >   then 3), and on no more than one pass in 12 thereafter
 > - **And** a query for that tenant still acquires on every request
 > - **And** after a hit or a publish the tenant is acquired on the next
->   pass again.
+>   pass again
+> - **And** once a successful listing no longer names the tenant, its
+>   counter is dropped; a failed listing drops nothing.
+
+> **Scenario RFC0060.11 — Passes are spaced from their end, never overlap**
+> - **Given** paused time, `interval: 5m`, and a pass whose fold is
+>   gated for longer than `interval`
+> - **When** the gate is released
+> - **Then** no second pass starts while the first is running, and the
+>   next pass starts `interval` after the first pass finished, with no
+>   catch-up pass in between.
 
 ## 6. Testing strategy
 
-- RFC0060.1–.4, .7 and .10 are integration tests in `ourios-querier` over a
+- RFC0060.1–.4, .7, .10 and .11 are integration tests (RFC0060.11
+  under tokio paused time) in `ourios-querier` over a
   local store, using the `map_flight` hooks (`before_acquire` gating,
   acquisition and join counters) through the `testing` feature.
 - RFC0060.5–.6 are `ourios-server` config tests (RFC 0020 style) plus

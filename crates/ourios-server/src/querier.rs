@@ -613,10 +613,18 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
             let result = state.querier.run_drift(&query, &tenant, now).await;
             let elapsed = started.elapsed();
             match result {
-                Ok(result) => {
-                    state.metrics.record_drift(elapsed, &result);
-                    json_ok(&DriftResponse::from(&result))
-                }
+                Ok(result) => match serde_json::to_vec(&DriftResponse::from(&result)) {
+                    Ok(body) => {
+                        state.metrics.record_drift(elapsed, &result);
+                        json_ok(body)
+                    }
+                    Err(e) => {
+                        state
+                            .metrics
+                            .record_err(QUERY_KIND_DRIFT, elapsed, ENCODE_ERROR_TYPE);
+                        encode_failure(&e)
+                    }
+                },
                 Err(e) => {
                     state
                         .metrics
@@ -1035,30 +1043,35 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// `200` with a JSON body. A serialisation failure (should not happen for these
-/// owned DTOs) degrades to a `500` rather than a `200` with an empty body.
-fn json_ok<T: Serialize>(value: &T) -> Response {
-    match serde_json::to_vec(value) {
-        Ok(body) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response(),
-        Err(e) => {
-            log_exception(
-                std::any::type_name::<serde_json::Error>(),
-                "_OTHER",
-                &e.to_string(),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "failed to encode the query result",
-            )
-        }
-    }
+/// `200` with an encoded JSON body.
+fn json_ok(body: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
+
+/// A result that failed to encode (should not happen for these owned DTOs):
+/// a logged `500` rather than a `200` with an empty body. The caller records
+/// the query as failed, not as served.
+fn encode_failure(error: &serde_json::Error) -> Response {
+    log_exception(
+        std::any::type_name::<serde_json::Error>(),
+        ENCODE_ERROR_TYPE,
+        &error.to_string(),
+    );
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to encode the query result",
+    )
+}
+
+/// OpenTelemetry's fallback `error.type`: an encoding failure has no class
+/// of its own among the query errors.
+const ENCODE_ERROR_TYPE: &str = "_OTHER";
 
 /// A `status` JSON error body `{ "error": { "kind", "message" } }` (RFC 0016
 /// §3.5). `message` is Ourios-owned text — never engine internals.
@@ -1101,10 +1114,18 @@ async fn run_logs_query(
         .await;
     let elapsed = started.elapsed();
     match result {
-        Ok(result) => {
-            state.metrics.record_logs(elapsed, &result);
-            json_ok(&LogQueryResponse::from(&result))
-        }
+        Ok(result) => match serde_json::to_vec(&LogQueryResponse::from(&result)) {
+            Ok(body) => {
+                state.metrics.record_logs(elapsed, &result);
+                json_ok(body)
+            }
+            Err(e) => {
+                state
+                    .metrics
+                    .record_err(QUERY_KIND_LOGS, elapsed, ENCODE_ERROR_TYPE);
+                encode_failure(&e)
+            }
+        },
         Err(e) => {
             state
                 .metrics
@@ -1360,7 +1381,8 @@ mod tests {
             }
         }
         let events = events_of(|| {
-            let response = super::json_ok(&Unencodable);
+            let error = serde_json::to_vec(&Unencodable).expect_err("unencodable");
+            let response = super::encode_failure(&error);
             assert_eq!(
                 response.status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR

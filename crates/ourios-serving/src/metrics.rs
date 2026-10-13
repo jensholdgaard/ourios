@@ -45,7 +45,8 @@ impl AuthMetrics {
         Self {
             resolutions: meter
                 .u64_counter(semconv::OURIOS_AUTH_RESOLUTIONS)
-                .with_unit("{resolution}")
+                .with_description(semconv::OURIOS_AUTH_RESOLUTIONS_DESCRIPTION)
+                .with_unit(semconv::OURIOS_AUTH_RESOLUTIONS_UNIT)
                 .build(),
         }
     }

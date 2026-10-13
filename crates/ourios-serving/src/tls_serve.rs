@@ -164,6 +164,8 @@ pub fn reloading_acceptor(
             current: Arc::downgrade(&current),
             failures: ourios_core::telemetry::meter("ourios.receiver")
                 .u64_counter(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES)
+                .with_description(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES_DESCRIPTION)
+                .with_unit(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES_UNIT)
                 .build(),
             listener,
         };
@@ -330,6 +332,8 @@ impl HandshakeFailures {
     fn new(listener: &'static str) -> Self {
         let counter = ourios_core::telemetry::meter("ourios.receiver")
             .u64_counter(semconv::OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES)
+            .with_description(semconv::OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES_UNIT)
             .build();
         Self { counter, listener }
     }

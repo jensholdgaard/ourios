@@ -1045,11 +1045,18 @@ fn json_ok<T: Serialize>(value: &T) -> Response {
             body,
         )
             .into_response(),
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "failed to encode the query result",
-        ),
+        Err(e) => {
+            log_exception(
+                std::any::type_name::<serde_json::Error>(),
+                "_OTHER",
+                &e.to_string(),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "failed to encode the query result",
+            )
+        }
     }
 }
 
@@ -1212,19 +1219,31 @@ fn query_error_response(error: &ourios_querier::QueryError) -> Response {
     }
 }
 
-/// Semconv `http.server.request.exception`: one `ERROR` log per `5xx`, in
-/// the request span, carrying the detail the scrubbed response withholds.
-/// Without it a failed query leaves nothing to debug but `error.type`.
+/// Semconv `http.server.request.exception`: one `ERROR` log per `5xx` the
+/// server itself caused, in the request span, carrying the detail the
+/// scrubbed response withholds. Without it a failed query leaves nothing to
+/// debug but `error.type`.
 fn log_server_exception(error: &ourios_querier::QueryError) {
     let message = match error {
         ourios_querier::QueryError::Storage { detail } => detail.clone(),
         other => other.to_string(),
     };
+    log_exception(
+        std::any::type_name::<ourios_querier::QueryError>(),
+        query_error_type(error),
+        &message,
+    );
+}
+
+/// `exception.type` is the Rust error type, per semconv; `error.type` is
+/// the class the query metrics record, so the log joins them.
+fn log_exception(exception_type: &str, error_type: &str, message: &str) {
     tracing::error!(
         name: "http.server.request.exception",
         {
-            { "exception.type" } = query_error_type(error),
-            { "exception.message" } = message.as_str(),
+            { "exception.type" } = exception_type,
+            { ourios_core::telemetry::ERROR_TYPE } = error_type,
+            { "exception.message" } = message,
         },
         "query failed",
     );
@@ -1320,11 +1339,49 @@ mod tests {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.as_str())
         };
-        assert_eq!(field("exception.type"), Some("storage"));
+        assert_eq!(
+            field("exception.type"),
+            Some(std::any::type_name::<ourios_querier::QueryError>()),
+        );
+        assert_eq!(field("error.type"), Some("storage"));
         assert_eq!(
             field("exception.message"),
             Some("list data prefix data/tenant_id=acme/: timed out"),
         );
+    }
+
+    /// A result that fails to encode is a server `500`: logged the same way.
+    #[test]
+    fn an_encoding_500_logs_the_serializer_error() {
+        struct Unencodable;
+        impl serde::Serialize for Unencodable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("not encodable"))
+            }
+        }
+        let events = events_of(|| {
+            let response = super::json_ok(&Unencodable);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        });
+        let [(name, level, fields)] = &events[..] else {
+            panic!("one event: {events:?}");
+        };
+        assert_eq!(name, "http.server.request.exception");
+        assert_eq!(*level, tracing::Level::ERROR);
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            field("exception.type"),
+            Some(std::any::type_name::<serde_json::Error>()),
+        );
+        assert_eq!(field("exception.message"), Some("not encodable"));
     }
 
     /// A `4xx` is the client's error: no exception log.

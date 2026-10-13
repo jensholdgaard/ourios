@@ -1,7 +1,7 @@
 ---
 rfc: 0060
 title: Background template-map refresh
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-13
@@ -11,7 +11,9 @@ superseded-by: —
 
 # RFC 0060 — Background template-map refresh
 
-> **Status: `drafted` (2026-10-13, #990).** This RFC adds a querier
+> **Status: `specified` (2026-10-13, #990, maintainer-approved: the
+> RFC 0033 §4 reversal, the two telemetry names and the §7 decisions
+> as recorded below; checked against the OpenTelemetry docs).** This RFC adds a querier
 > background task on top of RFC 0033's acquisition path. It changes no
 > artifact format, fold rule or publish rule of RFC 0033 (`accepted`), so
 > it is a new RFC rather than an amendment. It **revisits** an
@@ -158,20 +160,38 @@ silent clamp, as RFC 0020 validates every other resolved value.
 
 ### 3.5 Observability (CLAUDE.md §6.3)
 
-- **Span.** Each background acquisition is a root `INTERNAL` span,
-  `refresh template_map`, carrying `ourios.tenant`. The acquisition's
-  `load template_map` phase, and the CLIENT spans beneath it, nest
-  under it as they nest under `POST /v1/query` today (RFC 0038
-  §3.7.2). Under the default `parentbased_always_on` sampler these
-  roots are always sampled.
+- **Span.** Each pass is one root `INTERNAL` span, `refresh
+  template_map`. It has no remote parent or child, so `INTERNAL` is the
+  kind, and the name follows OTel's `{action} {target}` pattern beside
+  `load template_map`. Each tenant's acquisition is the existing
+  `load template_map` phase span, carrying `ourios.tenant`, with its
+  CLIENT spans beneath it, nested under the pass as it nests under
+  `POST /v1/query` today (RFC 0038 §3.7.2). Under the default
+  `parentbased_always_on` sampler these roots are always sampled.
+- **Errors** (OTel *Recording errors*). A tenant's failed acquisition
+  sets error status and `error.type` on that tenant's
+  `load template_map` span. The pass handled it and continued, so the
+  pass span and the pass sample carry no error for it. Only a pass
+  that ends early (a failed tenant listing) sets `error.type`, on both
+  the pass span and its `refresh.duration` sample, with the same value.
+  So the span and its duration metric describe the same operation, as
+  OTel recommends.
 - **Metrics.** The RFC 0033 lookup and derive instruments gain one
   attribute, `ourios.template_map.acquire.trigger` = `query` |
   `refresh`. This splits the existing series so a dashboard can tell a
   fold a user paid for from one the task paid for. The criterion of
   this RFC is that `query`-triggered full folds approach zero.
 - **Pass.** One histogram, `ourios.template_map.refresh.duration` (s),
-  per completed pass, with `error.type` on a pass that ended early.
-  Tenant counts are not attributes (cardinality).
+  one sample per pass, named per OTel's `{operation}.duration` rule.
+  Tenants and tenant counts are not attributes: OTel's cardinality
+  guidance keeps ID-like values off metrics, and they are on the spans.
+
+`ourios.template_map.acquire.trigger` follows the precedent of the
+upstream `faas.trigger` ("type of the trigger which caused this
+invocation"). Its own values (`query`, `refresh`) are more precise here
+than `faas.trigger`'s `http` / `timer`: a query can arrive over HTTP or
+MCP, and the start pass is not a timer. With two values it at most
+doubles the existing series.
 
 `ourios.template_map.acquire.trigger` and
 `ourios.template_map.refresh.duration` are new names. They are
@@ -250,8 +270,13 @@ path, and a second publisher contends for the CAS.
 > **Scenario RFC0060.4 — Failure is contained**
 > - **Given** two tenants, the first with an unreadable audit object
 > - **When** a pass runs
-> - **Then** the first tenant's span carries `error.type`, the second
->   tenant is still acquired, and the task runs its next pass.
+> - **Then** the first tenant's `load template_map` span carries error
+>   status and `error.type`
+> - **And** the second tenant is still acquired, under the same pass span
+> - **And** the pass span and its `refresh.duration` sample carry no
+>   `error.type`, and the task runs its next pass
+> - **And** a pass whose tenant listing fails ends early with the same
+>   `error.type` on its span and its sample.
 
 > **Scenario RFC0060.5 — Disabled means today's behaviour**
 > - **Given** `querier.template_map.refresh.enabled: false`
@@ -299,15 +324,23 @@ already cover what it calls.
 
 ## 7. Open questions
 
-- [ ] Pre-emptive full fold when a tenant nears `INCREMENTAL_DEPTH_CAP`,
-      so a cap fold never reaches a query (needs an RFC 0033 derive-policy
-      amendment).
-- [ ] Large tenant counts: should a pass skip tenants with no queries
-      since the last pass, or rotate through a bounded slice per pass?
-- [ ] Replicas: elect one refresher (e.g. a lease object with CAS) or
-      accept duplicated folds?
-- [ ] Default `interval`: `5m` is a guess; revisit with Dash0 data on
-      publish and fold rates.
+Decided for this RFC (maintainer, 2026-10-13); each is revisited only on
+the Dash0 evidence named:
+
+- [x] **Pre-emptive full fold near `INCREMENTAL_DEPTH_CAP`: deferred.**
+      At about one cap fold per tenant per ten days, a 5-minute pass
+      almost always reaches it first. Reopen, as an RFC 0033 derive-policy
+      amendment, if `derive.duration{mode=full, acquire.trigger=query}`
+      stays above zero after RFC0060.9.
+- [x] **Large tenant counts: not in v1.** Every tenant is visited each
+      pass. The preferred later shape is to refresh only tenants queried
+      within a window. Reopen when `refresh.duration` approaches
+      `interval`.
+- [x] **Replicas: accept duplicated folds.** CAS publish keeps them
+      correct (§3.6). A CAS lease object for a single refresher is the
+      later shape, when replicas are deployed.
+- [x] **Default `interval`: `5m`.** Revisit with publish and fold rates
+      after release.
 
 ## 8. References
 

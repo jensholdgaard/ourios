@@ -153,8 +153,9 @@ ask. §7 lists pre-emptive full folds as an open question.
   Re-running it each pass would repeat the fold and its `GET`s every
   `interval` for no later query's benefit. So after `k` consecutive
   such acquisitions, the task skips that tenant for the next
-  `min(2^k − 1, 11)` passes, which is at most an hour at the default
-  interval. A hit, a publish of its own, or a lost CAS race (someone
+  `min(2^k − 1, 11)` passes. The cap counts passes, not wall-clock
+  time: at the default interval that is 11 × `interval` plus the
+  skipped passes' own run time. A hit, a publish of its own, or a lost CAS race (someone
   else published) resets `k` to 0. The counter lives in process
   memory and resets on restart. A query is never skipped: it acquires
   exactly as it does without the task.

@@ -1,7 +1,7 @@
 ---
 rfc: 0060
 title: Background template-map refresh
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-10-13
@@ -11,9 +11,15 @@ superseded-by: —
 
 # RFC 0060 — Background template-map refresh
 
-> **Status: `specified` (2026-10-13, #990, maintainer-approved: the
+> **Status: `red`.** Every CI-testable §5 scenario has an `#[ignore]`d
+> `todo!` stub naming the slice that discharges it: RFC0060.1–.4, .7,
+> .8, .10 and .11 in `ourios-querier` (`tests/it/rfc0060_refresh.rs`),
+> and .5–.6 in `ourios-server`
+> (`tests/it/rfc0060_refresh_config.rs`). RFC0060.9 is a Dash0 measurement
+> after release, not a CI test (§6).
+> Specified 2026-10-13 (#990, maintainer-approved: the
 > RFC 0033 §4 reversal, the two telemetry names and the §7 decisions
-> as recorded below; checked against the OpenTelemetry docs).** This RFC adds a querier
+> as recorded below; checked against the OpenTelemetry docs). This RFC adds a querier
 > background task on top of RFC 0033's acquisition path. It changes no
 > artifact format, fold rule or publish rule of RFC 0033 (`accepted`), so
 > it is a new RFC rather than an amendment. It **revisits** an

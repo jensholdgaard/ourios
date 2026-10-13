@@ -38,6 +38,16 @@ pub fn tracer(name: &'static str) -> BoxedTracer {
 /// The upstream `error.type` attribute key.
 pub const ERROR_TYPE: &str = "error.type";
 
+/// The upstream `http.server.request.exception` log event name (semconv
+/// v1.42.0, the ourios-semconv registry's dependency).
+pub const EVENT_HTTP_SERVER_REQUEST_EXCEPTION: &str = "http.server.request.exception";
+
+/// The upstream `exception.type` attribute key.
+pub const EXCEPTION_TYPE: &str = "exception.type";
+
+/// The upstream `exception.message` attribute key.
+pub const EXCEPTION_MESSAGE: &str = "exception.message";
+
 /// Mark `span` failed: status `Error` and `error.type = error_type`, per
 /// semconv *Recording errors*. The span must declare `otel.status_code`
 /// and `error.type` as `tracing::field::Empty`; `tracing` drops a record of

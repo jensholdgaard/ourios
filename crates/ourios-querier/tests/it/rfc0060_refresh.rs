@@ -533,3 +533,15 @@ async fn rfc0060_11_passes_are_spaced_from_their_end() {
     stop.notify_one();
     run.await.expect("task");
 }
+
+/// Scenario RFC0060.8 — Telemetry is registry-conformant.
+/// See `docs/rfcs/0060-background-template-map-refresh.md` §5.
+#[test]
+#[ignore = "RFC0060.8 stub — span shape in stage 1 (with RFC0060.1), weaver live-check of the metrics in stage 2 (the served role)"]
+fn rfc0060_8_telemetry_is_registry_conformant() {
+    todo!(
+        "RFC0060.8 — the pass is one root INTERNAL `refresh template_map` span over \
+         each tenant's `load template_map`, and `acquire.trigger` and \
+         `refresh.duration` pass weaver live-check against ourios-semconv"
+    );
+}

@@ -418,8 +418,11 @@ fn gate_moving_the_frontier(
     let moved = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&moved);
     querier.set_template_map_acquire_gate(Some(Arc::new(move || {
-        if !moved.swap(true, Ordering::SeqCst) {
+        // The file lands before the flag: the second query starts on the
+        // flag, and must list the moved frontier, not join this one.
+        if !moved.load(Ordering::SeqCst) {
             audit_file(&root, 1_775_131_080);
+            moved.store(true, Ordering::SeqCst);
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         while let Some(querier) = weak.upgrade()

@@ -564,6 +564,7 @@ async fn start_querier(
         // The same effective set the write paths apply — the MCP
         // query-schema resource publishes it (RFC 0032 §3.1).
         promoted: config.promoted.clone(),
+        template_map_refresh: params.template_map_refresh,
     })
     .await?;
     println!("querier HTTP listening on {}", handle.http_addr);

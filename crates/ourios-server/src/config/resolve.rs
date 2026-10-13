@@ -30,6 +30,11 @@ pub const DEFAULT_QUERIER_HTTP_ADDR: &str = "0.0.0.0:4319";
 pub const DEFAULT_QUERIER_WINDOW_SECS: u64 = 3600;
 /// Nanoseconds per second — the unit the DSL compiler's window is in.
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;
+/// Default idle time between background template-map refresh passes
+/// (RFC 0060 §3.4).
+pub const DEFAULT_TEMPLATE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+/// The shortest refresh interval accepted (RFC 0060 §3.4).
+pub const MIN_TEMPLATE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Resolved server configuration. `PartialEq` only — the receiver
 /// params carry the miner's `f32` thresholds.
@@ -74,6 +79,10 @@ pub struct QuerierParams {
     /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled` /
     /// `OURIOS_QUERIER_MCP_ENABLED`; default off).
     pub mcp_enabled: bool,
+    /// The idle time between background template-map refresh passes
+    /// (`querier.template_map.refresh.*`, RFC 0060 §3.4); `None` when the
+    /// task is disabled.
+    pub template_map_refresh: Option<Duration>,
 }
 
 /// Resolved OTLP-receiver-role configuration (RFC 0003 §6.2).
@@ -188,6 +197,12 @@ pub struct QuerierInputs<'a> {
     pub mcp_enabled: Option<&'a str>,
     /// `querier.http_tls` (config-file only, RFC 0030 §3.1).
     pub http_tls: Option<&'a TlsSection>,
+    /// `querier.template_map.refresh.enabled` (config-file only; default
+    /// on, RFC 0060 §3.4).
+    pub refresh_enabled: Option<&'a str>,
+    /// `querier.template_map.refresh.interval` (config-file only; default
+    /// [`DEFAULT_TEMPLATE_MAP_REFRESH_INTERVAL`]).
+    pub refresh_interval: Option<&'a str>,
 }
 
 /// Raw inputs for [`build_miner_config`] (RFC 0050 §3.2; config-file
@@ -279,7 +294,7 @@ pub fn config_from_env() -> Result<ServerConfig, String> {
         http_addr: querier_http_addr.as_deref(),
         default_window_secs: window_secs.as_deref(),
         mcp_enabled: mcp_enabled.as_deref(),
-        http_tls: None,
+        ..QuerierInputs::default()
     })?;
     let compaction_enabled = std::env::var("OURIOS_COMPACTION_ENABLED").ok();
     let interval_raw = std::env::var("OURIOS_COMPACTION_INTERVAL_SECS").ok();
@@ -367,6 +382,8 @@ pub fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String
         default_window_secs: file.querier.default_window_secs.as_deref(),
         mcp_enabled: file.querier.mcp.enabled.as_deref(),
         http_tls: Some(&file.querier.http_tls),
+        refresh_enabled: file.querier.template_map.refresh.enabled.as_deref(),
+        refresh_interval: file.querier.template_map.refresh.interval.as_deref(),
     })?;
     let promoted = build_promoted_attributes(
         &file.storage.promoted_attributes.resource,
@@ -482,8 +499,10 @@ pub fn with_s3_credentials(
 /// # Errors
 ///
 /// Only when enabled (a disabled role validates nothing): a malformed
-/// address, a zero / non-numeric / nanosecond-overflowing window, or an
-/// invalid `http_tls` block.
+/// address, a zero / non-numeric / nanosecond-overflowing window, an
+/// invalid `http_tls` block, or, with the refresh task enabled, a refresh
+/// interval that is not a duration or is below
+/// [`MIN_TEMPLATE_MAP_REFRESH_INTERVAL`].
 pub fn build_querier_config(inputs: QuerierInputs<'_>) -> Result<Option<QuerierParams>, String> {
     if !matches!(inputs.enabled, Some("1" | "true" | "yes")) {
         return Ok(None);
@@ -512,12 +531,68 @@ pub fn build_querier_config(inputs: QuerierInputs<'_>) -> Result<Option<QuerierP
         Some(section) => tls_settings("querier.http_tls", section)?,
         None => None,
     };
+    let template_map_refresh =
+        build_template_map_refresh(inputs.refresh_enabled, inputs.refresh_interval)?;
     Ok(Some(QuerierParams {
         http_addr,
         http_tls,
         default_window_nanos,
         mcp_enabled,
+        template_map_refresh,
     }))
+}
+
+/// Resolve `querier.template_map.refresh.*` (RFC 0060 §3.4): `None` when
+/// disabled, else the interval. Default on, like compaction, and the
+/// interval is validated only when the task is enabled, so an unused bad
+/// value never blocks startup.
+///
+/// # Errors
+///
+/// With the task enabled, an interval that is not a duration or is below
+/// [`MIN_TEMPLATE_MAP_REFRESH_INTERVAL`]. It is never clamped.
+pub fn build_template_map_refresh(
+    enabled: Option<&str>,
+    interval: Option<&str>,
+) -> Result<Option<Duration>, String> {
+    const KEY: &str = "querier.template_map.refresh.interval";
+    if matches!(enabled.map(str::trim), Some("0" | "false" | "no" | "off")) {
+        return Ok(None);
+    }
+    let interval = match interval {
+        None => DEFAULT_TEMPLATE_MAP_REFRESH_INTERVAL,
+        Some(raw) => parse_duration(raw).ok_or_else(|| {
+            format!("{KEY} must be a duration such as 30s, 5m or 1h, got {raw:?}")
+        })?,
+    };
+    if interval < MIN_TEMPLATE_MAP_REFRESH_INTERVAL {
+        return Err(format!(
+            "{KEY} must be at least {}s, got {interval:?}",
+            MIN_TEMPLATE_MAP_REFRESH_INTERVAL.as_secs()
+        ));
+    }
+    Ok(Some(interval))
+}
+
+/// Parse `<integer><unit>`, the unit one of `ms`, `s`, `m` or `h`. Strict:
+/// no sign, fraction, whitespace inside, or compound form, and `None` on
+/// overflow.
+#[must_use]
+pub fn parse_duration(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let split = raw.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = raw.split_at(split);
+    if digits.is_empty() {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    match unit {
+        "ms" => Some(Duration::from_millis(n)),
+        "s" => Some(Duration::from_secs(n)),
+        "m" => n.checked_mul(60).map(Duration::from_secs),
+        "h" => n.checked_mul(3600).map(Duration::from_secs),
+        _ => None,
+    }
 }
 
 /// Pure receiver-config assembly + validation (env reads live in
@@ -1022,7 +1097,7 @@ compaction:
             http_addr: None,
             default_window_secs: None,
             mcp_enabled: None,
-            http_tls: None,
+            ..QuerierInputs::default()
         })
         .expect("querier");
 
@@ -1439,7 +1514,7 @@ auth:
                 http_addr: None,
                 default_window_secs: None,
                 mcp_enabled: off,
-                http_tls: None,
+                ..QuerierInputs::default()
             })
             .expect("valid")
             .expect("enabled");
@@ -1451,7 +1526,7 @@ auth:
                 http_addr: None,
                 default_window_secs: None,
                 mcp_enabled: Some(on),
-                http_tls: None,
+                ..QuerierInputs::default()
             })
             .expect("valid")
             .expect("enabled");
@@ -2136,7 +2211,7 @@ auth:
                     http_addr: None,
                     default_window_secs: None,
                     mcp_enabled: None,
-                    http_tls: None
+                    ..QuerierInputs::default()
                 })
                 .expect("ok"),
                 None,
@@ -2153,7 +2228,7 @@ auth:
             http_addr: None,
             default_window_secs: None,
             mcp_enabled: None,
-            http_tls: None,
+            ..QuerierInputs::default()
         })
         .expect("ok")
         .expect("enabled");
@@ -2174,7 +2249,7 @@ auth:
             http_addr: Some("127.0.0.1:9"),
             default_window_secs: Some("120"),
             mcp_enabled: None,
-            http_tls: None,
+            ..QuerierInputs::default()
         })
         .expect("ok")
         .expect("enabled");
@@ -2194,7 +2269,7 @@ auth:
                 http_addr: None,
                 default_window_secs: Some("0"),
                 mcp_enabled: None,
-                http_tls: None
+                ..QuerierInputs::default()
             })
             .is_err(),
             "a zero default window is rejected",
@@ -2205,11 +2280,50 @@ auth:
                 http_addr: None,
                 default_window_secs: Some("soon"),
                 mcp_enabled: None,
-                http_tls: None
+                ..QuerierInputs::default()
             })
             .is_err(),
             "a non-numeric default window is rejected",
         );
+    }
+
+    #[test]
+    fn parse_duration_takes_one_integer_and_one_unit() {
+        assert_eq!(parse_duration("250ms"), Some(Duration::from_millis(250)));
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration(" 5m "), Some(Duration::from_secs(300)));
+        assert_eq!(parse_duration("2h"), Some(Duration::from_secs(7200)));
+        for bad in [
+            "", "m", "5", "5 m", "+5m", "-5m", "1.5m", "5d", "1h30m", "5M",
+        ] {
+            assert_eq!(parse_duration(bad), None, "{bad:?} is not a duration");
+        }
+        assert_eq!(parse_duration(&format!("{}h", u64::MAX)), None, "overflow");
+    }
+
+    #[test]
+    fn template_map_refresh_defaults_on_and_validates_only_when_enabled() {
+        assert_eq!(
+            build_template_map_refresh(None, None),
+            Ok(Some(DEFAULT_TEMPLATE_MAP_REFRESH_INTERVAL))
+        );
+        assert_eq!(
+            build_template_map_refresh(Some("true"), Some("10s")),
+            Ok(Some(MIN_TEMPLATE_MAP_REFRESH_INTERVAL))
+        );
+        for bad in ["9s", "soon"] {
+            let err = build_template_map_refresh(None, Some(bad)).expect_err(bad);
+            assert!(
+                err.contains("querier.template_map.refresh.interval"),
+                "{err}"
+            );
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert_eq!(
+                build_template_map_refresh(Some(off), Some("soon")),
+                Ok(None)
+            );
+        }
     }
 
     #[test]
@@ -2221,7 +2335,7 @@ auth:
                 http_addr: Some("not-an-addr"),
                 default_window_secs: None,
                 mcp_enabled: None,
-                http_tls: None
+                ..QuerierInputs::default()
             })
             .is_err(),
             "a malformed bind address is rejected",

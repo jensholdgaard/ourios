@@ -51,6 +51,7 @@ mod fold_state;
 mod local_publish;
 mod log_row;
 mod map_flight;
+mod map_refresh;
 mod phase;
 mod plan;
 mod schema_adapt;
@@ -63,6 +64,10 @@ pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use fold_state::{FoldState, INCREMENTAL_DEPTH_CAP};
 pub use log_row::{LogBody, LogRow, render_log_body};
+pub use map_refresh::TemplateMapRefresher;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub use map_refresh::testing::PassLog;
 pub use template_map::{
     ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME, TemplateMap,
     derive_template_map, load_or_derive,
@@ -435,6 +440,14 @@ impl Querier {
         })
     }
 
+    /// The background template-map refresh task over this querier's store
+    /// (RFC 0060), sharing its per-tenant single-flight: a query for a
+    /// tenant the task is folding joins that fold.
+    #[must_use]
+    pub fn template_map_refresher(&self) -> TemplateMapRefresher {
+        TemplateMapRefresher::new(Arc::clone(&self.template_maps), self.backend.clone())
+    }
+
     /// Execute `request` against the RFC 0005 store with predicate
     /// pushdown and return the matching row count + pruning stats,
     /// without exposing `DataFusion` (§4.6).
@@ -560,7 +573,7 @@ impl Querier {
         if needs_alias_fold || needs_registry {
             let acquisition = self
                 .template_maps
-                .acquire_fetched(&self.backend, tenant)
+                .acquire_fetched(&self.backend, tenant, template_map::AcquireTrigger::Query)
                 .await?;
             acquired = Some(acquisition);
         }
@@ -976,7 +989,7 @@ impl Querier {
         } else {
             let acquired = self
                 .template_maps
-                .acquire_fetched(&self.backend, tenant)
+                .acquire_fetched(&self.backend, tenant, template_map::AcquireTrigger::Query)
                 .await?;
             let fetched = acquired.fetched;
             (acquired, fetched)
@@ -1042,6 +1055,31 @@ impl Querier {
             .hooks
             .waits
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many queries have so far joined another acquisition.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn template_map_joins(&self) -> usize {
+        self.template_maps
+            .hooks
+            .joins
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Every acquisition started so far, in order: its tenant, and how many
+    /// acquisitions (itself included) were in flight as it started.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn template_map_acquisitions(&self) -> Vec<(String, usize)> {
+        self.template_maps
+            .hooks
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(tenant, in_flight)| (tenant.as_str().to_owned(), *in_flight))
+            .collect()
     }
 }
 

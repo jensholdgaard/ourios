@@ -25,12 +25,17 @@ use ourios_core::tenant::TenantId;
 use tokio::sync::watch;
 use tracing::Instrument as _;
 
-use crate::template_map::{self, TemplateMap};
+use crate::template_map::{self, AcquireTrigger, Persisted, TemplateMap};
 use crate::{Backend, QueryError, StoreRef, audit_scan, phase};
 
 /// One acquisition's answer: the map plus its template-map acquisition
 /// bytes ([`crate::QueryResult::registry_bytes_read`]).
+#[cfg(test)]
 pub(crate) type Acquired = Result<(Arc<TemplateMap>, u64), QueryError>;
+
+/// One acquisition's answer as its flight publishes it: the map, its
+/// acquisition bytes, and what it left in the store.
+type Shared = Result<(Arc<TemplateMap>, u64, Persisted), QueryError>;
 
 /// A successful acquisition as one query saw it. A query acquires at most
 /// once (RFC 0033): at compile time when the DSL uses `resolves_to` (the
@@ -45,6 +50,19 @@ pub(crate) struct MapAcquisition {
     /// The bytes this query fetched itself: `bytes` for the acquirer, `0`
     /// for a joiner, so a shared fold is counted once across its queries.
     pub(crate) fetched: u64,
+    /// What the acquisition left in the store, the same for every joiner.
+    pub(crate) persisted: Persisted,
+}
+
+impl MapAcquisition {
+    fn new((map, bytes, persisted): (Arc<TemplateMap>, u64, Persisted), fetched: u64) -> Self {
+        Self {
+            map,
+            bytes,
+            fetched,
+            persisted,
+        }
+    }
 }
 
 /// The in-flight acquisitions, by tenant. Shared by every clone of a
@@ -64,18 +82,20 @@ impl fmt::Debug for TemplateMapFlights {
     }
 }
 
-/// An acquisition in progress: the frontier it was listed at and where its
-/// result will be published.
+/// An acquisition in progress: the frontier it was listed at, who started
+/// it, and where its result will be published.
 struct Flight {
     frontier: Vec<String>,
-    done: watch::Receiver<Option<Acquired>>,
+    trigger: AcquireTrigger,
+    done: watch::Receiver<Option<Shared>>,
 }
 
 enum Step {
-    Done(Acquired),
+    Done(Shared),
     Wait {
-        done: watch::Receiver<Option<Acquired>>,
+        done: watch::Receiver<Option<Shared>>,
         same_frontier: bool,
+        trigger: AcquireTrigger,
     },
 }
 
@@ -95,7 +115,7 @@ impl TemplateMapFlights {
         backend: &Backend,
         tenant: &TenantId,
     ) -> Acquired {
-        self.acquire_fetched(backend, tenant)
+        self.acquire_fetched(backend, tenant, AcquireTrigger::Query)
             .await
             .map(|acquired| (acquired.map, acquired.bytes))
     }
@@ -106,6 +126,8 @@ impl TemplateMapFlights {
     ///
     /// RFC 0038 §3.7.2: the acquisition is the query's `load template_map`
     /// span, a query phase whose object-store requests open `CLIENT` spans.
+    /// `trigger` says who asks (RFC 0060 §3.5); an acquisition it starts
+    /// records it, and one it joins records the starter's.
     ///
     /// # Errors
     ///
@@ -114,6 +136,7 @@ impl TemplateMapFlights {
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
+        trigger: AcquireTrigger,
     ) -> Result<MapAcquisition, QueryError> {
         let phase = tracing::info_span!(
             "load template_map",
@@ -124,7 +147,7 @@ impl TemplateMapFlights {
             error.type = tracing::field::Empty,
         );
         let acquired = self
-            .acquire_shared(backend, tenant, &phase)
+            .acquire_shared(backend, tenant, trigger, &phase)
             .instrument(phase.clone())
             .await;
         if let Err(e) = &acquired {
@@ -138,6 +161,7 @@ impl TemplateMapFlights {
         self: &Arc<Self>,
         backend: &Backend,
         tenant: &TenantId,
+        trigger: AcquireTrigger,
         phase: &tracing::Span,
     ) -> Result<MapAcquisition, QueryError> {
         let mut waited = Duration::ZERO;
@@ -157,7 +181,7 @@ impl TemplateMapFlights {
             let owned = tenant.clone();
             let step = tokio::task::spawn_blocking(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    phase::in_phase(&span, || flights.step(backend.store_ref(), &owned))
+                    phase::in_phase(&span, || flights.step(backend.store_ref(), &owned, trigger))
                 })
             })
             .await
@@ -166,15 +190,15 @@ impl TemplateMapFlights {
             })??;
             match step {
                 Step::Done(acquired) => {
-                    return acquired.map(|(map, bytes)| MapAcquisition {
-                        map,
-                        bytes,
-                        fetched: bytes,
+                    return acquired.map(|shared| {
+                        let bytes = shared.1;
+                        MapAcquisition::new(shared, bytes)
                     });
                 }
                 Step::Wait {
                     mut done,
                     same_frontier,
+                    trigger,
                 } => {
                     let started = Instant::now();
                     // The flight's guard always publishes before dropping its
@@ -200,15 +224,11 @@ impl TemplateMapFlights {
                         // acquisition records none for anyone.
                         template_map::record_acquire_wait(waited);
                         if acquired.is_ok() {
-                            template_map::record_joined_lookup();
+                            template_map::record_joined_lookup(trigger);
                             #[cfg(any(test, feature = "testing"))]
                             self.hooks.joined();
                         }
-                        return acquired.map(|(map, bytes)| MapAcquisition {
-                            map,
-                            bytes,
-                            fetched: 0,
-                        });
+                        return acquired.map(|shared| MapAcquisition::new(shared, 0));
                     }
                 }
             }
@@ -217,7 +237,12 @@ impl TemplateMapFlights {
 
     /// One blocking pass: LIST, then join the running flight or become the
     /// flight and acquire against this listing.
-    fn step(&self, backend: StoreRef<'_>, tenant: &TenantId) -> Result<Step, QueryError> {
+    fn step(
+        &self,
+        backend: StoreRef<'_>,
+        tenant: &TenantId,
+        trigger: AcquireTrigger,
+    ) -> Result<Step, QueryError> {
         let resolved = audit_scan::resolve_audit_set(backend, tenant)?;
         let guard = {
             let mut flights = self.lock();
@@ -227,6 +252,7 @@ impl TemplateMapFlights {
                 return Ok(Step::Wait {
                     done: flight.done.clone(),
                     same_frontier: flight.frontier == resolved.frontier(),
+                    trigger: flight.trigger,
                 });
             }
             let (tx, done) = watch::channel(None);
@@ -234,6 +260,7 @@ impl TemplateMapFlights {
                 tenant.clone(),
                 Flight {
                     frontier: resolved.frontier().to_vec(),
+                    trigger,
                     done,
                 },
             );
@@ -244,9 +271,12 @@ impl TemplateMapFlights {
             }
         };
         #[cfg(any(test, feature = "testing"))]
-        self.hooks.before_acquire();
-        let acquired = template_map::load_or_derive_resolved(backend, tenant, resolved)
-            .map(|(map, bytes, _)| (Arc::new(map), bytes));
+        {
+            let in_flight = self.lock().len();
+            self.hooks.before_acquire(tenant, in_flight);
+        }
+        let acquired = template_map::load_or_derive_resolved(backend, tenant, resolved, trigger)
+            .map(|loaded| (Arc::new(loaded.map), loaded.bytes, loaded.persisted));
         guard.finish(acquired.clone());
         Ok(Step::Done(acquired))
     }
@@ -268,15 +298,15 @@ fn abandoned() -> QueryError {
 struct FlightGuard<'a> {
     flights: &'a TemplateMapFlights,
     tenant: &'a TenantId,
-    tx: Option<watch::Sender<Option<Acquired>>>,
+    tx: Option<watch::Sender<Option<Shared>>>,
 }
 
 impl FlightGuard<'_> {
-    fn finish(mut self, acquired: Acquired) {
+    fn finish(mut self, acquired: Shared) {
         self.complete(acquired);
     }
 
-    fn complete(&mut self, acquired: Acquired) {
+    fn complete(&mut self, acquired: Shared) {
         let Some(tx) = self.tx.take() else {
             return;
         };
@@ -292,19 +322,23 @@ impl Drop for FlightGuard<'_> {
 }
 
 /// Test seams (unit tests, and integration tests through the `testing`
-/// feature): acquisitions started, acquisitions that waited on a flight,
-/// `joined` lookups recorded, and a gate the acquiring thread runs just
-/// before it acquires.
+/// feature): acquisitions started, the tenants they were for and how many
+/// flights were in flight as each started, acquisitions that waited on a
+/// flight, `joined` lookups recorded, and a gate the acquiring thread runs
+/// just before it acquires.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
+
+    use ourios_core::tenant::TenantId;
 
     pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
 
     #[derive(Default)]
     pub(crate) struct Hooks {
         pub(crate) acquisitions: AtomicUsize,
+        pub(crate) started: Mutex<Vec<(TenantId, usize)>>,
         pub(crate) waits: AtomicUsize,
         pub(crate) joins: AtomicUsize,
         pub(crate) before_acquire: Mutex<Option<Hook>>,
@@ -319,7 +353,11 @@ pub(crate) mod hooks {
             self.joins.fetch_add(1, Ordering::SeqCst);
         }
 
-        pub(crate) fn before_acquire(&self) {
+        pub(crate) fn before_acquire(&self, tenant: &TenantId, in_flight: usize) {
+            self.started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((tenant.clone(), in_flight));
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
             let hook = self
                 .before_acquire

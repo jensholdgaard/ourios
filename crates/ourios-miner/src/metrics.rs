@@ -394,37 +394,45 @@ impl MinerMetrics {
 
         let merges_total = meter
             .u64_counter(semconv::OURIOS_MINER_MERGES)
-            .with_unit("{merge}")
+            .with_description(semconv::OURIOS_MINER_MERGES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_MERGES_UNIT)
             .build();
         let parse_failures_total = meter
             .u64_counter(semconv::OURIOS_MINER_PARSE_FAILURES)
-            .with_unit("{failure}")
+            .with_description(semconv::OURIOS_MINER_PARSE_FAILURES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_PARSE_FAILURES_UNIT)
             .build();
         let upstream_template_processed = meter
             .u64_counter(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED)
-            .with_unit("{log_record}")
+            .with_description(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_UPSTREAM_TEMPLATE_PROCESSED_UNIT)
             .build();
         let params_overflow_total = meter
             .u64_counter(semconv::OURIOS_MINER_PARAMS_OVERFLOW)
-            .with_unit("{overflow}")
+            .with_description(semconv::OURIOS_MINER_PARAMS_OVERFLOW_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UNIT)
             .build();
         let template_version_changes_total = meter
             .u64_counter(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES)
-            .with_unit("{change}")
+            .with_description(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES_UNIT)
             .build();
         let confidence = meter
             .f64_histogram(semconv::OURIOS_MINER_CONFIDENCE)
-            .with_unit("1")
+            .with_description(semconv::OURIOS_MINER_CONFIDENCE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_CONFIDENCE_UNIT)
             .with_boundaries(CONFIDENCE_BUCKETS.to_vec())
             .build();
         let miner_duration = meter
             .f64_histogram(semconv::OURIOS_MINER_DURATION)
-            .with_unit("s")
+            .with_description(semconv::OURIOS_MINER_DURATION_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_DURATION_UNIT)
             .with_boundaries(LINE_DURATION_BUCKETS_S.to_vec())
             .build();
         let structured_body_size = meter
             .u64_histogram(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE)
-            .with_unit("By")
+            .with_description(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE_DESCRIPTION)
+            .with_unit(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE_UNIT)
             .with_boundaries(STRUCTURED_BODY_SIZE_BUCKETS.to_vec())
             .build();
 

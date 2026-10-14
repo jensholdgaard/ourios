@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.13.2] - 2026-10-14
+
+### Added
+
+- Registry description and unit at every ourios.* instrument (#1003) (ce2e366)
+
+### Chore
+
+- Pin ourios-semconv v0.3.18 for metric description and unit constants (#1002) (f25c365)
+
+### Fixed
+
+- Bump rustls to 0.23.46 for RUSTSEC-2026-0346/0347/0348 (#1010) (86904d6)
+
+### Performance
+
+- Read partition manifests concurrently in resolve files (#1011) (fdcad8c)
+- Read the union schema's footers concurrently (#1009) (a38ce58)
+
 ## [0.13.1] - 2026-10-13
 
 ### Added

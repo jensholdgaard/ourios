@@ -7,6 +7,9 @@
 // unchanged.
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use std::collections::HashMap;
+
+use crate::audit_fetch::{FetchPool, fetch_in_order};
 use crate::fetch_count::FetchCounter;
 use ourios_parquet::ManifestError;
 use tracing::Instrument as _;
@@ -266,9 +269,10 @@ pub(super) fn resolve_live_keys(
     live_keys_from_listing(store, &keys, window, fetched)
 }
 
-fn list_recursive(store: &Store, prefix: &str) -> Result<Vec<String>, QueryError> {
+/// Every `(key, size)` under `prefix`, recursively.
+fn list_recursive(store: &Store, prefix: &str) -> Result<Vec<(String, u64)>, QueryError> {
     store
-        .list_blocking(Some(prefix))
+        .list_with_sizes_blocking(Some(prefix))
         .map_err(|e| QueryError::Storage {
             detail: format!("list data prefix {prefix}: {e}"),
         })
@@ -285,8 +289,8 @@ enum HiveLevel {
     Hour,
 }
 
-/// Every key under the tenant `prefix` that the window `[start, end)` can
-/// reach, sorted: a walk down the Hive time levels with one delimited listing
+/// Every `(key, size)` under the tenant `prefix` that the window
+/// `[start, end)` can reach, sorted by key: a walk down the Hive time levels with one delimited listing
 /// per visited level. At each level a child whose segment parses to a UTC span
 /// is dropped when the span misses the window, listed recursively in one call
 /// when the window covers it whole (and at the `hour=` leaves), and descended
@@ -302,7 +306,7 @@ fn window_listing(
     store: &Store,
     prefix: &str,
     (start, end): (u64, u64),
-) -> Result<Vec<String>, QueryError> {
+) -> Result<Vec<(String, u64)>, QueryError> {
     let mut keys = Vec::new();
     let mut pending = vec![(prefix.to_owned(), HiveLevel::Year)];
     while let Some((dir, level)) = pending.pop() {
@@ -410,22 +414,46 @@ fn child_span(level: HiveLevel, segment: &str) -> Option<(HiveLevel, u64, u64)> 
     Some((next, lo, hi))
 }
 
-/// The manifest at `key` in `store`, counting the bytes read into
-/// `fetched`; `Ok(None)` when absent.
-fn read_store_manifest(
+/// Read the listed partition `manifests` (`(key, size)`, in listing
+/// order) through the process-wide [`FetchPool`], so a query spanning many
+/// partitions keeps several GETs in flight instead of paying one round trip
+/// per partition. Returns each manifest under its partition directory;
+/// every manifest byte read is added to `fetched`.
+///
+/// A listed manifest that cannot be read is an error, not "no manifest": the
+/// glob fallback would bring back the inputs the manifest retired, counting
+/// compacted rows twice.
+fn read_store_manifests(
     store: &Store,
-    key: &str,
+    manifests: Vec<(String, u64)>,
     fetched: &FetchCounter,
-) -> Result<Option<Manifest>, ManifestError> {
-    match store
-        .get_blocking_opt(key)
-        .map_err(|e| ManifestError::Io(std::io::Error::other(e)))?
-    {
-        Some(bytes) => {
+) -> Result<HashMap<String, Manifest>, QueryError> {
+    let objects: Arc<[(String, u64)]> = manifests.into();
+    let mut read = HashMap::with_capacity(objects.len());
+    let store = store.clone();
+    fetch_in_order(
+        FetchPool::shared(),
+        Arc::clone(&objects),
+        Arc::new(move |key: &str| {
+            store
+                .get_bytes_blocking(key)
+                .map_err(|e| manifest_error(key, &ManifestError::Io(std::io::Error::other(e))))
+        }),
+        |index, bytes| {
+            let key = &objects[index].0;
             fetched.add(bytes.len() as u64);
-            Manifest::from_json(&bytes).map(Some)
-        }
-        None => Ok(None),
+            let manifest = Manifest::from_json(&bytes).map_err(|e| manifest_error(key, &e))?;
+            let (dir, _) = key.rsplit_once('/').unwrap_or(("", key));
+            read.insert(dir.to_owned(), manifest);
+            Ok(())
+        },
+    )?;
+    Ok(read)
+}
+
+fn manifest_error(key: &str, e: &ManifestError) -> QueryError {
+    QueryError::Storage {
+        detail: format!("manifest {key}: {e}"),
     }
 }
 
@@ -437,44 +465,45 @@ fn read_store_manifest(
 /// manifest byte read is added to `fetched`.
 fn live_keys_from_listing(
     store: &Store,
-    keys: &[String],
+    keys: &[(String, u64)],
     window: Option<(u64, u64)>,
     fetched: &FetchCounter,
 ) -> Result<Vec<String>, QueryError> {
     // Group keys by partition directory (the key up to its last `/`).
-    let mut by_partition: std::collections::BTreeMap<&str, Vec<&str>> =
+    let mut by_partition: std::collections::BTreeMap<&str, Vec<(&str, u64)>> =
         std::collections::BTreeMap::new();
-    for key in keys {
+    for (key, size) in keys {
         let (dir, _) = key.rsplit_once('/').unwrap_or(("", key.as_str()));
-        by_partition.entry(dir).or_default().push(key);
+        by_partition.entry(dir).or_default().push((key, *size));
     }
+    // Partition-level time pruning (RFC 0007), conservative — never prunes a
+    // partition it can't prove out of range. `hour_partition_in_window`
+    // parses the trailing Hive segments off a path, so build one from the
+    // partition-dir key.
+    if let Some((start, end)) = window {
+        by_partition.retain(|dir, _| hour_partition_in_window(&PathBuf::from(dir), start, end));
+    }
+
+    // Only read a manifest whose key is actually in the listing: the
+    // partition is already enumerated, so a GET for an absent manifest is a
+    // wasted (404) request per un-compacted partition on S3. Absent ⇒ no
+    // manifest ⇒ all committed files live. Listings return store-relative
+    // keys, so this compares like-for-like.
+    let listed_manifests = by_partition
+        .iter()
+        .filter_map(|(dir, partition_keys)| {
+            let manifest_key = format!("{dir}/{MANIFEST_FILENAME}");
+            partition_keys
+                .iter()
+                .find(|(key, _)| *key == manifest_key)
+                .map(|(key, size)| ((*key).to_owned(), *size))
+        })
+        .collect();
+    let mut manifests = read_store_manifests(store, listed_manifests, fetched)?;
 
     let mut live = Vec::new();
     for (dir, partition_keys) in by_partition {
-        // Partition-level time pruning (RFC 0007), conservative — never prunes a
-        // partition it can't prove out of range. `hour_partition_in_window`
-        // parses the trailing Hive segments off a path, so build one from the
-        // partition-dir key.
-        if let Some((start, end)) = window
-            && !hour_partition_in_window(&PathBuf::from(dir), start, end)
-        {
-            continue;
-        }
-        let manifest_key = format!("{dir}/{MANIFEST_FILENAME}");
-        // Only read the manifest when its key is actually in the listing: the
-        // partition is already enumerated, so a `read_with_etag` for an absent
-        // manifest is a wasted (404) GET per un-compacted partition on S3.
-        // Absent ⇒ no manifest ⇒ all committed files live (same as today's
-        // glob fallback). `list_blocking` returns store-relative keys, so this
-        // compares like-for-like.
-        let manifest = if partition_keys.iter().any(|k| *k == manifest_key) {
-            read_store_manifest(store, &manifest_key, fetched).map_err(|e| QueryError::Storage {
-                detail: format!("manifest {manifest_key}: {e}"),
-            })?
-        } else {
-            None
-        };
-        match manifest {
+        match manifests.remove(dir) {
             // Manifest is authoritative: only its named files are live (joined
             // onto the partition key as `<dir>/<name>`).
             Some(manifest) => {
@@ -489,8 +518,8 @@ fn live_keys_from_listing(
             None => live.extend(
                 partition_keys
                     .into_iter()
-                    .filter(|k| k.ends_with(".parquet"))
-                    .map(ToOwned::to_owned),
+                    .filter(|(key, _)| key.ends_with(".parquet"))
+                    .map(|(key, _)| key.to_owned()),
             ),
         }
     }
@@ -844,7 +873,9 @@ mod tests {
 
     /// The pre-#853 resolution: list every key under the tenant, then prune.
     fn full_listing_oracle(store: &Store, window: Option<Window>) -> Vec<String> {
-        let keys = store.list_blocking(Some(TENANT_PREFIX)).expect("list");
+        let keys = store
+            .list_with_sizes_blocking(Some(TENANT_PREFIX))
+            .expect("list");
         live_keys_from_listing(
             store,
             &keys,
@@ -1192,6 +1223,99 @@ mod tests {
         // Assert
         assert_eq!(files.len(), 1, "only the manifest's file is live");
         assert!(files[0].ends_with("a.parquet"));
+    }
+
+    /// A store of `partitions` hour partitions on 2026-04-02, each with a
+    /// manifest naming `a.parquet` plus a retired `b.parquet` it excludes,
+    /// seen through a [`SlowStore`] whose GETs answer later partitions first.
+    fn manifested_partitions(
+        root: &std::path::Path,
+        partitions: u32,
+        fail: Option<String>,
+    ) -> (Store, crate::test_support::SlowStore) {
+        fn later_answers_first(key: &str) -> std::time::Duration {
+            let hour = key
+                .split("hour=")
+                .nth(1)
+                .and_then(|rest| rest.get(..2))
+                .and_then(|hh| hh.parse::<u64>().ok())
+                .unwrap_or(0);
+            std::time::Duration::from_millis(24_u64.saturating_sub(hour) * 3)
+        }
+        let plain = Store::local(root).expect("local store");
+        for hour in 0..partitions {
+            let dir = hour_prefix(2026, 4, 2, hour);
+            put(&plain, &format!("{dir}/a.parquet"));
+            put(&plain, &format!("{dir}/b.parquet"));
+            put_manifest(&plain, &dir, &["a.parquet"]);
+        }
+        let mut slow = None;
+        let wrapped = plain.wrap_backend(|inner| {
+            let delayed = crate::test_support::SlowStore::new(inner, later_answers_first, fail);
+            slow = Some(delayed.clone());
+            Arc::new(delayed)
+        });
+        (wrapped, slow.expect("wrap_backend calls the wrapper"))
+    }
+
+    /// The partition manifests are read with several GETs in flight, yet
+    /// the live set is exactly the manifests' files in partition order,
+    /// with every manifest byte counted.
+    #[test]
+    fn manifests_are_read_concurrently_in_partition_order() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("temp");
+        let (store, slow) = manifested_partitions(tmp.path(), 12, None);
+        let fetched = crate::fetch_count::FetchCounter::default();
+
+        // Act
+        let live = resolve_live_keys(&store, TENANT_PREFIX, None, &fetched).expect("resolve");
+
+        // Assert
+        let expected: Vec<_> = (0..12)
+            .map(|hour| format!("{}/a.parquet", hour_prefix(2026, 4, 2, hour)))
+            .collect();
+        assert_eq!(
+            live, expected,
+            "only the manifests' files, in partition order"
+        );
+        assert!(
+            slow.max_in_flight() > 1,
+            "manifest GETs overlap, got {} in flight at most",
+            slow.max_in_flight(),
+        );
+        assert!(fetched.get() > 0, "manifest bytes are counted");
+    }
+
+    /// A listed manifest that cannot be read fails the resolution, naming
+    /// the manifest, rather than falling back to the partition's glob and
+    /// reviving the files it retired.
+    #[test]
+    fn an_unreadable_listed_manifest_is_a_storage_error() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("temp");
+        let broken = format!(
+            "{}/{}",
+            hour_prefix(2026, 4, 2, 5),
+            ourios_parquet::MANIFEST_FILENAME
+        );
+        let (store, _) = manifested_partitions(tmp.path(), 8, Some(broken.clone()));
+
+        // Act
+        let result = resolve_live_keys(
+            &store,
+            TENANT_PREFIX,
+            None,
+            &crate::fetch_count::FetchCounter::default(),
+        );
+
+        // Assert
+        match result {
+            Err(QueryError::Storage { detail }) => {
+                assert!(detail.contains(&broken), "names the manifest: {detail}");
+            }
+            other => panic!("expected a storage error, got {other:?}"),
+        }
     }
 
     #[test]

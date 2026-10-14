@@ -67,8 +67,9 @@ pub type EtaggedBytes = (Vec<u8>, Option<String>);
 /// and unique.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DelimitedListing {
-    /// Objects directly under the listed prefix (not in a child "directory").
-    pub objects: Vec<String>,
+    /// Objects directly under the listed prefix (not in a child "directory"),
+    /// as `(key, size)` pairs.
+    pub objects: Vec<(String, u64)>,
     /// The immediate child common-prefixes ("directories"), without a
     /// trailing `/`.
     pub common_prefixes: Vec<String>,
@@ -811,15 +812,15 @@ impl Store {
                     .join("/"),
             )
         };
-        let mut objects: Vec<String> = result
+        let mut objects: Vec<(String, u64)> = result
             .objects
             .iter()
-            .filter_map(|m| relative(&m.location))
+            .filter_map(|m| Some((relative(&m.location)?, m.size)))
             .collect();
         let mut common_prefixes: Vec<String> =
             result.common_prefixes.iter().filter_map(relative).collect();
         objects.sort();
-        objects.dedup();
+        objects.dedup_by(|a, b| a.0 == b.0);
         common_prefixes.sort();
         common_prefixes.dedup();
         Ok(DelimitedListing {
@@ -1437,7 +1438,7 @@ mod tests {
         assert_eq!(
             level,
             super::DelimitedListing {
-                objects: vec!["data/tenant_id=a/stray.parquet".to_string()],
+                objects: vec![("data/tenant_id=a/stray.parquet".to_string(), 1)],
                 common_prefixes: vec![
                     "data/tenant_id=a/year=2025".to_string(),
                     "data/tenant_id=a/year=2026".to_string(),

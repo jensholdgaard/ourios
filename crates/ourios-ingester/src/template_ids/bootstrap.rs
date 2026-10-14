@@ -367,7 +367,11 @@ fn walk(
                     source: Box::new(source),
                 }))
             })?;
-        for key in listing.objects.iter().filter(|k| k.ends_with(".parquet")) {
+        for (key, _) in listing
+            .objects
+            .iter()
+            .filter(|(k, _)| k.ends_with(".parquet"))
+        {
             if !visit(key) {
                 return Ok(false);
             }

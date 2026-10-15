@@ -1,8 +1,9 @@
 //! #925 sweep-progress and partition-input metrics: `sweep.remaining`
-//! counting down through a sweep, the per-tenant counting pass behind it,
-//! and each compacted partition's input shape.
+//! counting down through a sweep, the one planning pass behind it, and each
+//! compacted partition's input shape.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
@@ -10,8 +11,10 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use ourios_core::audit::{AuditEvent, AuditSink};
 use ourios_parquet::CompactionPolicy;
 
-use super::tests::{store_at, target, u64_sum, write_sealed_candidate, write_sealed_hours};
-use super::{Countdown, SweepGauges, count_candidates, now_unix_nanos, sweep_recorded};
+use super::tests::{
+    HOUR, TS0, store_at, target, u64_sum, write_file, write_sealed_candidate, write_sealed_hours,
+};
+use super::{Countdown, SweepGauges, now_unix_nanos, plan_tenants, sweep_recorded};
 use crate::metrics::CompactionMetrics;
 
 /// Reads `sweep.remaining` through a fresh collection at every event the
@@ -159,81 +162,170 @@ async fn sweep_remaining_counts_down_and_each_partition_records_its_input() {
     );
 }
 
-/// #925 — the counting pass keeps one number per tenant, never the
-/// candidates: tenant `a` has three sealed candidates, `b` one, and a
-/// tenant with no data none.
+/// #1019 — the sweep plans each tenant once: tenant `a` has three sealed
+/// candidates, `b` one, and a tenant with no data none.
 #[test]
-fn the_counting_pass_keeps_only_per_tenant_counts() {
+fn the_planning_pass_plans_each_tenant_once() {
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     write_sealed_hours(&store, 3);
     write_sealed_candidate(&store, "b");
     let tenants = ["a", "b", "none"].map(str::to_string);
 
-    let counts: Vec<usize> = count_candidates(
+    let plans = plan_tenants(
         &store,
         &tenants,
         now_unix_nanos(),
         &CompactionPolicy::default(),
     );
 
-    assert_eq!(counts, vec![3, 1, 0]);
+    let counts: Vec<(&str, usize)> = plans
+        .iter()
+        .map(|(tenant, planned)| (*tenant, planned.as_ref().expect("planned").len()))
+        .collect();
+    assert_eq!(counts, vec![("a", 3), ("b", 1), ("none", 0)]);
 }
 
-/// Drive a countdown over `counted` per-tenant counts: each tenant is
-/// planned with its `planned` candidates and ticks once per candidate.
-/// Returns `remaining` at the start, after every step, and once dropped.
-fn countdown_readings(counted: Vec<usize>, planned: &[usize]) -> Vec<u64> {
+/// The countdown starts at the planned total, ticks down per candidate,
+/// never below zero, and is zero once dropped.
+#[test]
+fn the_countdown_ticks_from_the_plan_to_zero() {
     let gauges = SweepGauges::default();
     let mut readings = Vec::new();
     {
-        let mut countdown = Countdown::start(Some(&gauges), || counted);
+        let countdown = Countdown::start(Some(&gauges), 2);
         readings.push(gauges.remaining());
-        for &candidates in planned {
-            countdown.begin_tenant(candidates);
+        for _ in 0..3 {
+            countdown.tick();
             readings.push(gauges.remaining());
-            for _ in 0..candidates {
-                countdown.tick();
-                readings.push(gauges.remaining());
-            }
         }
     }
     readings.push(gauges.remaining());
-    readings
+
+    assert_eq!(readings, vec![2, 1, 0, 0, 0]);
 }
 
-/// The countdown starts at the counted total, gives up candidates a
-/// tenant no longer has when it is planned, ticks down per candidate, and
-/// is zero once dropped.
-#[test]
-fn the_countdown_drops_candidates_a_replanned_tenant_no_longer_has() {
-    let readings = countdown_readings(vec![2, 3], &[2, 1]);
-
-    assert_eq!(readings, vec![5, 5, 4, 3, 1, 0, 0]);
+/// Counts the store's reads and listings, passing every call through.
+#[derive(Debug)]
+struct CountingStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    reads: Arc<AtomicUsize>,
+    lists: Arc<AtomicUsize>,
 }
 
-/// A tenant planned with more candidates than counted never raises the
-/// count: the uncounted ones still compact, and the count floors at zero.
-#[test]
-fn the_countdown_never_rises_when_a_tenant_finds_more_than_counted() {
-    let readings = countdown_readings(vec![1, 1], &[3, 1]);
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// `(reads, listings)` one sweep makes over three settled hour partitions
+/// (one file each, so nothing to compact), measured or not.
+async fn settled_sweep_requests(measured: bool) -> (usize, usize) {
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    for hour in 0..3 {
+        write_file(&store, "a", 1, TS0 + hour * HOUR);
+    }
+    let (reads, lists) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let store = store.wrap_backend(|inner| {
+        Arc::new(CountingStore {
+            inner,
+            reads: Arc::clone(&reads),
+            lists: Arc::clone(&lists),
+        })
+    });
+    let metrics = measured.then(|| {
+        let provider = SdkMeterProvider::builder().build();
+        Arc::new(CompactionMetrics::from_meter(&provider.meter_with_scope(
+            ourios_core::telemetry::scope("ourios.compaction"),
+        )))
+    });
+    let sink = Box::new(ourios_core::audit::NoOpAuditSink);
+
+    let (result, _, _) = sweep_recorded(target(&store), sink, metrics).await;
+
+    assert_eq!(result.expect("sweep").partitions_compacted, 0);
+    (reads.load(Ordering::Relaxed), lists.load(Ordering::Relaxed))
+}
+
+/// #1019 — measuring `sweep.remaining` costs no extra requests: a measured
+/// sweep reads and lists exactly what an unmeasured one does, because both
+/// plan each tenant once. Before, the measured sweep planned every tenant a
+/// second time just to count, doubling the dominant cost of a sweep with
+/// nothing to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_measured_sweep_plans_each_partition_once() {
+    let unmeasured = settled_sweep_requests(false).await;
+    let measured = settled_sweep_requests(true).await;
 
     assert!(
-        readings.windows(2).all(|pair| pair[1] <= pair[0]),
-        "{readings:?}"
+        unmeasured.0 > 0,
+        "planning reads the manifests: {unmeasured:?}"
     );
-    assert_eq!(readings, vec![2, 2, 1, 0, 0, 0, 0, 0]);
-}
-
-/// Without gauges the counting pass never runs.
-#[test]
-fn an_unmeasured_sweep_skips_the_counting_pass() {
-    let mut counted = false;
-
-    let _countdown = Countdown::start(None, || {
-        counted = true;
-        Vec::new()
-    });
-
-    assert!(!counted);
+    assert_eq!(measured, unmeasured);
 }

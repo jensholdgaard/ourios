@@ -62,8 +62,9 @@ impl AuditSink for RemainingSink {
     }
 }
 
-/// `(count, sum)` of the u64 histogram `name`'s datapoint whose attributes
-/// include `attribute`, if any.
+/// `(count, sum)` over the u64 histogram `name`'s datapoints whose
+/// attributes include `attribute`, summed across the tenants they are split
+/// by (#1016), if any.
 fn histogram(
     rms: &[ResourceMetrics],
     name: &str,
@@ -76,13 +77,14 @@ fn histogram(
         .find_map(|m| match m.data() {
             AggregatedMetrics::U64(MetricData::Histogram(hist)) => hist
                 .data_points()
-                .find(|dp| {
+                .filter(|dp| {
                     attribute.is_none_or(|(key, value)| {
                         dp.attributes()
                             .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
                     })
                 })
-                .map(|dp| (dp.count(), dp.sum())),
+                .map(|dp| (dp.count(), dp.sum()))
+                .reduce(|(c, s), (dc, ds)| (c + dc, s + ds)),
             other => panic!("{name} is not a u64 histogram: {other:?}"),
         })
 }

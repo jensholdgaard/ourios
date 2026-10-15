@@ -288,6 +288,13 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > | The RFC 0033 fold behind a `miss`, `stale`, `torn` or `unknown_version` lookup (not `hit`, not `joined`) | `derive template_map` | `INTERNAL` (child of `load template_map`) |
 > | Waiting on another query's in-flight acquisition, of the same frontier or another; one per single-flight loop iteration that finds one | `wait template_map` | `INTERNAL` (child of `load template_map`) |
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — the schema inference gets a span (§3.7.2).**
+> The table gains this row. It follows the `{action} {target}` rule.
+>
+> | Operation | Span name | Kind |
+> |---|---|---|
+> | Union-schema inference over the resolved files' footers | `infer schema` | `INTERNAL` (child of `POST /v1/query`) |
+
 ### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
 
 The MCP tool spans are Ourios's agent-observability surface: an agent driving
@@ -398,6 +405,51 @@ flowchart TD
 >
 > The audit listing, the artifact `GET` and the write-through `PUT` stay
 > directly under `load template_map`.
+
+> **Amendment (2026-10-15, #1014, maintainer-approved) — `infer schema`.** The tree gains a
+> third phase under the query's root, between `resolve files` and the
+> first RFC 0040 operator tree:
+
+```mermaid
+flowchart TD
+    Q["POST /v1/query<br/>SERVER (root)"]
+    R["resolve files<br/>INTERNAL"]
+    I["infer schema<br/>INTERNAL<br/>(at most one: when a live file exists)"]
+    O["RFC 0040 operator trees"]
+    IH["S3.HeadObject × n<br/>CLIENT"]
+    IG["S3.GetObject × m<br/>CLIENT (footers)"]
+    Q --> R
+    Q --> I
+    Q --> O
+    I --> IH
+    I --> IG
+```
+
+> Before the scan can be planned, the querier builds one table schema from
+> every resolved file's footer (`SchemaMode::Union`: RFC 0005 §3.9's union, which
+> RFC 0022's predicate compilation relies on). DataFusion does that per file with a `HEAD` and a
+> footer read, `meta_fetch_concurrency` files at a time. The phase was
+> missing from the list above. It is neither in-process work nor an
+> operator span's I/O, so the "what does not get a span" reasoning never
+> covered it, and the closing claim of this section did not hold for it.
+> On v0.13.2 it was about 3 s of a 16.2 s `nocturnal` query with no span
+> over it at all (trace `36049ab82fd1dc1212e6e3f6cd08c34e`, 2026-10-15),
+> where an inference regression and a slow scan look the same.
+>
+> `infer schema` appears **at most once** per query: exactly once when
+> `resolve files` found at least one live file, and none when it found
+> none (that query runs no scan, as above). It is opened by the caller,
+> which knows the tenant. The listing-table helper stays tenant-free by
+> design. A query whose filter turns out provably empty after inference
+> still has the span, because the footers were read.
+>
+> Where the text below says "both `INTERNAL` spans", it now means all
+> three phase spans. `infer schema` is emitted on both backends, for the
+> same reason: on the local backend its reads are `std::fs` and open no
+> `CLIENT` span. The closing paragraph's pre-scan gap is now attributed
+> to `resolve files` and `infer schema` together. The §3.7.2 heading
+> "The two `INTERNAL` spans" keeps naming the two in its table.
+> `infer schema` has its own table there.
 
 A query run through MCP never passes through the HTTP handler. Its root is
 the `execute_tool query_logs` span (§3.5), which is itself the child of
@@ -510,6 +562,23 @@ normal.
 > write-through `PUT` stay under `load template_map`. No new attribute
 > names.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — `infer schema`.**
+>
+> | | `infer schema` |
+> |---|---|
+> | Kind | `INTERNAL` |
+> | Parent | the query's root, as for `resolve files` |
+> | Opens / ends | around registering the scan's listing table: from before the first footer read, through the merge, to the registered table (the build after the merge is in-process) |
+> | Status | `Error` iff the inference or the merge fails (the query then fails with it), `error.type` = the error's class as on `resolve files`; `Unset` otherwise |
+> | Required attributes | `ourios.tenant` |
+>
+> It carries no count. The number of files it reads is the sibling `resolve
+> files` span's `ourios.file_set.live_files`, since it reads each of those
+> files once. On the S3 backend, its `CLIENT` children show how many
+> requests it made. A second attribute with the same value would add a
+> name and say nothing new. It installs the query-phase marker (§3.7.3),
+> so its object-store requests open `CLIENT` spans beneath it.
+
 #### 3.7.3 Object-store `CLIENT` spans (S3 backend)
 
 These follow the upstream object-store conventions
@@ -611,6 +680,16 @@ OTel `Context` they attach. With no marker there is no span. So:
 - DataFusion's scan reads carry no marker and no parent, so they emit
   none (§3.7.1).
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — a third phase installs the marker.**
+> `infer schema` installs it too. The inference runs on the calling task
+> rather than the blocking pool, so the marked `Context` is attached to
+> the inference future itself, not entered in a closure. Its `HEAD` and
+> footer reads are DataFusion requests, like the scan's, and they are
+> scoped by the same rule: under a phase span they get `CLIENT` spans,
+> and the scan's reads, under no phase, still get none. Their number is
+> bounded by the query's live files, as `resolve files`' manifest reads
+> are bounded by its partitions.
+
 Extending `CLIENT` spans to the sweep is left open (§7): a sweep over a
 large backlog can make thousands of requests, and that trade-off deserves
 its own look.
@@ -698,6 +777,12 @@ Two existing Ourios attributes are reused: `ourios.tenant` and
 > registry change. The `derive template_map` span reuses the existing
 > `ourios.template_map.derive.reason` attribute. RFC0038.11's
 > no-violation list covers `http.*` as well.
+
+> **Amendment (2026-10-15, #1014, maintainer-approved) — no new names.** `infer schema` is a
+> span name, fixed in §3.5 like the others. It carries only `ourios.tenant`
+> and, on failure, `error.type`. Its `CLIENT` children use the §3.7.3
+> upstream set (`S3.HeadObject` is already a §3.7.3 name). No registry
+> change and no `REGISTRY_REF` bump.
 
 **New names, added to the ourios-semconv registry** (a registry change in
 that repo, a `semconv/REGISTRY_REF` bump here, and regenerated
@@ -873,6 +958,13 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > children of `derive template_map`, not of `load template_map`. "No other
 > span is produced" now applies to this extended set.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — RFC0038.1's query arm gains `infer
+> schema`.** The span set above also contains, under the query's root,
+> **at most one** `infer schema`: exactly one iff `resolve files` found at
+> least one live file. On the S3 backend, its `CLIENT` children are its
+> `HEAD` and footer reads. "No other span is produced" now applies to this
+> extended set.
+
 > **Scenario RFC0038.2 — the ingest hot path mints no per-record spans.**
 > **Given** traces enabled and an always-on sampler,
 > **When** one `Export` batch of N records is ingested,
@@ -979,6 +1071,18 @@ are `drafted`.
 > exactly one `derive template_map` under its `load template_map`. That
 > span carries `ourios.template_map.derive.reason` and lies within its
 > parent's interval.
+
+> **Amendment (2026-10-15, #1014, maintainer-approved) — RFC0038.8 and `infer schema`.** The
+> zero-row and row-returning traces each have exactly one `infer schema`
+> child of the root, carrying `ourios.tenant`. The no-file trace has none.
+> `infer schema` starts after `resolve files` ends and ends before the
+> first RFC 0040 operator span starts, which replaces "`resolve files`
+> ends before the first RFC 0040 operator span starts". "Every `CLIENT`
+> span is a child of …" gains `infer schema`. The `CLIENT` spans under it
+> are `S3.HeadObject` and `S3.GetObject` only, with `aws.s3.key` equal to
+> one of the resolved files' keys. Their number is not fixed, since
+> DataFusion decides how it reads a footer. "No `CLIENT` span exists for
+> the scan's own reads" stands.
 
 > **Scenario RFC0038.9 — the span harness sees spans opened off the calling
 > thread.**
@@ -1196,6 +1300,38 @@ Mapped to `CLAUDE.md` §6.2:
 >   returns no rows and so acquires no template map, so neither exercises
 >   the new children.
 
+> **Amendment (2026-10-15, #1014, maintainer-approved) — testing `infer schema`.**
+>
+> - **RFC0038.1 (query arm), local backend** — in
+>   `crates/ourios-querier/tests/it/rfc0038_file_set_span.rs`, next to the
+>   `resolve files` tests and under the same scoped harness:
+>   - a query over live files has exactly one `infer schema` under the
+>     query's span, carrying `ourios.tenant`, starting after `resolve
+>     files` ends and ending before the render pass's `load template_map`
+>     starts. The operator spans go to the global tracer provider, which
+>     this scoped harness does not install, so the ordering against them
+>     is RFC0038.8's to assert;
+>   - `an_empty_file_set_still_spans_the_resolution` also asserts that no
+>     `infer schema` span exists. That adds an assertion and weakens
+>     nothing;
+>   - a data file whose footer does not parse fails the query and marks
+>     `infer schema` `Error` with `error.type`, while `resolve files`
+>     stays `Unset`.
+> - **The marker on a future** — a unit test in
+>   `crates/ourios-querier/src/phase.rs`, beside
+>   `only_an_enabled_phase_span_attaches_the_marker`. It asserts that a
+>   future run as a phase sees the marker and the phase span's context
+>   while it is polled, and that a disabled phase span attaches no
+>   marker.
+> - **RFC0038.8, S3 backend** — the `CLIENT` parentage under `infer
+>   schema` joins the RFC0038.8 localstack test, which is still to be
+>   written (#986). Until then the local tests and the phase unit test
+>   above cover the span, and the `ourios-parquet` client-span tests
+>   cover the connector's behaviour under a marked context.
+> - The existing exact-count tests (`rfc0038_1_query_emits_one_server_span`,
+>   `rfc0038_1_mcp_tool_emits_one_internal_span`) are unchanged. An empty
+>   tenant has no live file, so it opens no `infer schema`.
+
 ## 7. Open questions
 
 - [ ] Should the per-Export-batch span live on `ingest_bound` (single choke
@@ -1326,3 +1462,9 @@ scope, not ingest) already covers it.
   attributes they carry (§3.7.3). Amends RFC0038.1's query arm and
   RFC0038.8's parentage, adds RFC0038.12–.16 and maps them to #965's
   tests (§5, §6). No new attribute names. Matches #965.
+- **2026-10-15 — `infer schema` (#1014, maintainer-approved).** Adds `infer schema` as an
+  `INTERNAL` child of the query's root around the union-schema footer
+  inference, which no span covered, and lets it install the query-phase
+  marker so its `HEAD` and footer reads get `CLIENT` spans (§3.5,
+  §3.7.1–§3.7.3, §3.7.5). Amends RFC0038.1's query arm and RFC0038.8, and
+  maps the tests (§5, §6). No new attribute names.

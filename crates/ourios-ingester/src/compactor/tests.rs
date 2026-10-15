@@ -62,7 +62,7 @@ pub(super) fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
 }
 
 /// Write one committed file for `tenant` at `ts_ns` through the store seam.
-fn write_file(store: &Store, tenant: &str, template_id: u64, ts_ns: u64) {
+pub(super) fn write_file(store: &Store, tenant: &str, template_id: u64, ts_ns: u64) {
     let record = rec(tenant, template_id, ts_ns);
     let mut w = Writer::open_in(store, PartitionKey::derive(&record).expect("derive"))
         .expect("open writer");

@@ -256,10 +256,8 @@ pub struct SweepHooks<'a> {
 #[derive(Debug, Default)]
 pub struct SweepGauges {
     /// Consolidation candidates the running sweep has not yet processed;
-    /// zero between sweeps. It never rises during a sweep: candidates that
-    /// became eligible after the sweep counted them still compact but are
-    /// not counted, so it can reach zero slightly before the sweep ends
-    /// ([`Countdown`]).
+    /// zero between sweeps. Set from the sweep's one planning pass, so it
+    /// never rises during a sweep ([`Countdown`]).
     remaining: AtomicU64,
     /// Every rewrite's memory, budgets and spills.
     compaction: CompactionStats,
@@ -281,45 +279,17 @@ impl SweepGauges {
 
 /// Counts a sweep's consolidation candidates down as they are processed,
 /// and back to zero when dropped, however the pass ends.
-///
-/// The total comes from a counting pass that keeps one number per tenant,
-/// never the candidates themselves: each tenant's candidate list is held
-/// only while that tenant compacts. The count only ever falls during a
-/// sweep: a tenant planned with fewer candidates than counted gives up the
-/// difference, but one planned with more is not raised. Candidates that
-/// became eligible after the counting pass are still compacted in this
-/// sweep, uncounted, so the count can reach zero slightly before the sweep
-/// ends; the next sweep's count includes whatever they left behind.
 struct Countdown<'a> {
     remaining: Option<&'a AtomicU64>,
-    counted: std::vec::IntoIter<usize>,
 }
 
 impl<'a> Countdown<'a> {
-    /// Without `gauges` nothing is counted, so a sweep nobody measures
-    /// lists each tenant once, as before.
-    fn start(gauges: Option<&'a SweepGauges>, count: impl FnOnce() -> Vec<usize>) -> Self {
+    fn start(gauges: Option<&'a SweepGauges>, planned: usize) -> Self {
         let remaining = gauges.map(|gauges| &gauges.remaining);
-        let counted = if remaining.is_some() {
-            count()
-        } else {
-            Vec::new()
-        };
         if let Some(remaining) = remaining {
-            remaining.store(to_u64(counted.iter().sum()), Ordering::Relaxed);
+            remaining.store(to_u64(planned), Ordering::Relaxed);
         }
-        Self {
-            remaining,
-            counted: counted.into_iter(),
-        }
-    }
-
-    /// The next tenant planned `planned` candidates: drop the ones it was
-    /// counted with but no longer has.
-    fn begin_tenant(&mut self, planned: usize) {
-        let counted = self.counted.next().unwrap_or(0);
-        let vanished = to_u64(counted.saturating_sub(planned));
-        self.store(|left| left.saturating_sub(vanished));
+        Self { remaining }
     }
 
     fn tick(&self) {
@@ -340,18 +310,27 @@ impl Drop for Countdown<'_> {
     }
 }
 
-/// How many candidates each of `tenants` has, keeping only the counts; a
-/// tenant whose planning fails counts none (its error is recorded when it
-/// is planned again to compact).
-fn count_candidates(
+/// One tenant's sealed consolidation candidates, or why planning them
+/// failed.
+type TenantPlan<'t> = (&'t str, Result<Vec<PartitionKey>, CompactionError>);
+
+/// Plan every tenant once, up front. Planning reads every hour partition's
+/// manifest, so it is the sweep's dominant request cost on a store with a
+/// long history; the plans both set the countdown and drive the
+/// consolidation. A partition that becomes a candidate during the sweep (a
+/// late write into a sealed hour) is planned by the next one.
+fn plan_tenants<'t>(
     store: &Store,
-    tenants: &[String],
+    tenants: &'t [String],
     sealed_at: u64,
     policy: &CompactionPolicy,
-) -> Vec<usize> {
+) -> Vec<TenantPlan<'t>> {
     tenants
         .iter()
-        .map(|tenant| plan_candidates(store, tenant, sealed_at, policy).map_or(0, |c| c.len()))
+        .map(|tenant| {
+            let planned = plan_candidates(store, tenant, sealed_at, policy);
+            (tenant.as_str(), planned)
+        })
         .collect()
 }
 
@@ -545,36 +524,36 @@ struct Target<'p> {
 }
 
 impl Sweep<'_, '_> {
-    /// The consolidation pass over every tenant, one tenant planned at a
-    /// time, counting its candidates down ([`Countdown`]).
+    /// The consolidation pass over every tenant, planned once
+    /// ([`plan_tenants`]), counting the candidates down ([`Countdown`]).
     fn consolidate_all(
         &mut self,
         tenants: &[String],
         policy: &CompactionPolicy,
         hooks: &mut SweepHooks<'_>,
     ) {
-        let sealed_at = self.clock.sealed_at;
-        let mut countdown = Countdown::start(hooks.gauges, || {
-            count_candidates(self.store, tenants, sealed_at, policy)
-        });
-        for tenant in tenants {
+        let plans = plan_tenants(self.store, tenants, self.clock.sealed_at, policy);
+        let planned = plans
+            .iter()
+            .map(|(_, planned)| planned.as_ref().map_or(0, Vec::len))
+            .sum();
+        let countdown = Countdown::start(hooks.gauges, planned);
+        for (tenant, planned) in plans {
             let observe = hooks.observe.as_deref_mut();
-            self.tenant(tenant, policy, observe, &mut countdown);
+            self.tenant(tenant, planned, observe, &countdown);
         }
     }
 
-    /// Plan and consolidate `tenant`'s sealed candidates, counting each
-    /// down. A planning failure is recorded and the tenant skipped.
+    /// Consolidate `tenant`'s planned candidates, counting each down. A
+    /// planning failure is recorded and the tenant skipped.
     fn tenant(
         &mut self,
         tenant: &str,
-        policy: &CompactionPolicy,
+        planned: Result<Vec<PartitionKey>, CompactionError>,
         mut observe: Option<&mut SweepObserver<'_>>,
-        countdown: &mut Countdown<'_>,
+        countdown: &Countdown<'_>,
     ) {
         self.report.tenants_scanned += 1;
-        let planned = plan_candidates(self.store, tenant, self.clock.sealed_at, policy);
-        countdown.begin_tenant(planned.as_ref().map_or(0, Vec::len));
         let candidates = match planned {
             Ok(candidates) => candidates,
             Err(e) => {

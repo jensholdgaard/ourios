@@ -124,47 +124,94 @@ async fn an_empty_file_set_still_spans_the_resolution() {
         attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
         Some(Value::I64(0))
     );
+    assert!(
+        named(&spans, "infer schema").is_empty(),
+        "no live file, so no footer to infer from"
+    );
 }
 
-/// Plant a manifest that does not parse in every partition holding data
-/// under `root`, so file-set resolution fails on its first manifest read.
-fn corrupt_manifests(root: &std::path::Path) -> usize {
-    let mut corrupted = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut holds_data = false;
-        for entry in std::fs::read_dir(&dir).expect("read dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                holds_data |= path.extension().is_some_and(|e| e == "parquet");
-            }
-        }
-        if holds_data {
-            std::fs::write(
-                dir.join(ourios_parquet::MANIFEST_FILENAME),
-                b"not a manifest",
-            )
-            .expect("corrupt manifest");
-            corrupted += 1;
-        }
-    }
-    corrupted
-}
-
-/// A resolution that fails sets the phase's status to `Error` with
-/// `error.type` and records no live-file count (RFC 0038 §3.7.2).
+/// The footer reads between resolution and the scan are one `infer schema`
+/// span under the query, with the tenant, after `resolve files` ends and
+/// before the scan (RFC 0038 §3.7.1, 2026-10-15 amendment).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_resolution_marks_the_phase_as_an_error() {
+async fn schema_inference_spans_the_gap_between_resolution_and_the_scan() {
     let (exporter, _provider, dispatch) = traced();
     let dir = tempfile::tempdir().expect("tempdir");
     write_all(dir.path(), &[simple(TENANT, 1, TS0)]);
+    let querier = Arc::new(Querier::new(dir.path()));
+    let query_id = query(querier).with_subscriber(dispatch).await;
+    let spans = exporter.get_finished_spans().expect("spans");
+
+    let [resolve] = named(&spans, "resolve files")[..] else {
+        panic!("one resolve span");
+    };
+    let [infer] = named(&spans, "infer schema")[..] else {
+        panic!(
+            "one infer span: {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    };
+    assert_eq!(infer.span_kind, SpanKind::Internal);
+    assert_eq!(infer.parent_span_id, query_id, "a sibling of resolve files");
+    assert_eq!(text(infer, semconv::OURIOS_TENANT).as_deref(), Some(TENANT));
+    assert!(matches!(infer.status, opentelemetry::trace::Status::Unset));
+    assert!(resolve.end_time <= infer.start_time);
+    // The operator spans go to the global tracer, which this scoped harness
+    // does not install; the render pass's map load comes after the scan.
+    let [load] = named(&spans, "load template_map")[..] else {
+        panic!("one render-time map load");
+    };
+    assert!(infer.end_time <= load.start_time);
+}
+
+/// A data file whose footer does not parse fails the inference: its span
+/// is `Error` with `error.type`, and the resolution, which read only
+/// manifests, stays `Unset`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_inference_marks_its_phase_as_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_all(dir.path(), &[simple(TENANT, 1, TS0)]);
     assert!(
-        corrupt_manifests(dir.path()) > 0,
-        "the fixture wrote a partition"
+        corrupt_data_files(dir.path()) > 0,
+        "the fixture wrote a data file"
     );
-    let querier = Querier::new(dir.path());
+    let spans = failed_query_spans(dir.path(), "a corrupt footer").await;
+
+    let [resolve] = named(&spans, "resolve files")[..] else {
+        panic!("one resolve span");
+    };
+    assert!(matches!(
+        resolve.status,
+        opentelemetry::trace::Status::Unset
+    ));
+    let [infer] = named(&spans, "infer schema")[..] else {
+        panic!(
+            "one infer span for the failed inference: {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    };
+    assert!(
+        matches!(infer.status, opentelemetry::trace::Status::Error { .. }),
+        "{:?}",
+        infer.status
+    );
+    assert_eq!(text(infer, "error.type").as_deref(), Some("storage"));
+}
+
+/// Overwrite every data file under `root` with bytes that are not Parquet,
+/// leaving the manifests that list them intact.
+fn corrupt_data_files(root: &std::path::Path) -> usize {
+    let files = parquet_files(root);
+    for file in &files {
+        std::fs::write(file, b"not parquet").expect("corrupt data file");
+    }
+    files.len()
+}
+
+/// The spans of one query over `root` that `fault` makes fail.
+async fn failed_query_spans(root: &std::path::Path, fault: &str) -> Vec<SpanData> {
+    let (exporter, _provider, dispatch) = traced();
+    let querier = Querier::new(root);
     let result = async {
         let parsed = ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
         querier
@@ -180,8 +227,55 @@ async fn a_failed_resolution_marks_the_phase_as_an_error() {
     }
     .with_subscriber(dispatch)
     .await;
-    assert!(result.is_err(), "a corrupt manifest fails the query");
-    let spans = exporter.get_finished_spans().expect("spans");
+    assert!(result.is_err(), "{fault} fails the query");
+    exporter.get_finished_spans().expect("spans")
+}
+
+/// Every `.parquet` file under `root`.
+fn parquet_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Plant a manifest that does not parse in every partition holding data
+/// under `root`, so file-set resolution fails on its first manifest read.
+fn corrupt_manifests(root: &std::path::Path) -> usize {
+    let partitions: std::collections::BTreeSet<_> = parquet_files(root)
+        .iter()
+        .filter_map(|file| file.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    for dir in &partitions {
+        std::fs::write(
+            dir.join(ourios_parquet::MANIFEST_FILENAME),
+            b"not a manifest",
+        )
+        .expect("corrupt manifest");
+    }
+    partitions.len()
+}
+
+/// A resolution that fails sets the phase's status to `Error` with
+/// `error.type` and records no live-file count (RFC 0038 §3.7.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_resolution_marks_the_phase_as_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_all(dir.path(), &[simple(TENANT, 1, TS0)]);
+    assert!(
+        corrupt_manifests(dir.path()) > 0,
+        "the fixture wrote a partition"
+    );
+    let spans = failed_query_spans(dir.path(), "a corrupt manifest").await;
 
     let [resolve] = named(&spans, "resolve files")[..] else {
         panic!(

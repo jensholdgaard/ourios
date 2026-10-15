@@ -739,8 +739,7 @@ impl Querier {
 
         // Union schema + promoted no-coercion adapter — the rationale
         // lives on `SchemaMode::Union` (epic #745 wave 2).
-        let base =
-            register_listing_table(&ctx, "logs", urls, SchemaMode::Union(&self.promoted)).await?;
+        let base = register_logs_table(&ctx, urls, &self.promoted, tenant).await?;
         let mut result = match build_filter(base)? {
             // A provably-empty filter (absent OPTIONAL column) ⇒ no scan. The
             // files were still opened: schema inference read every footer.

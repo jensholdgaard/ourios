@@ -1299,7 +1299,10 @@ Mapped to `CLAUDE.md` §6.2:
 >   `resolve files` tests and under the same scoped harness:
 >   - a query over live files has exactly one `infer schema` under the
 >     query's span, carrying `ourios.tenant`, starting after `resolve
->     files` ends and ending before the first operator span starts;
+>     files` ends and ending before the render pass's `load template_map`
+>     starts. The operator spans go to the global tracer provider, which
+>     this scoped harness does not install, so the ordering against them
+>     is RFC0038.8's to assert;
 >   - `an_empty_file_set_still_spans_the_resolution` also asserts that no
 >     `infer schema` span exists. That adds an assertion and weakens
 >     nothing;

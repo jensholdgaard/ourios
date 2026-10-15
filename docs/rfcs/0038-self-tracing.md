@@ -442,6 +442,14 @@ flowchart TD
 > which knows the tenant. The listing-table helper stays tenant-free by
 > design. A query whose filter turns out provably empty after inference
 > still has the span, because the footers were read.
+>
+> Where the text below says "both `INTERNAL` spans", it now means all
+> three phase spans. `infer schema` is emitted on both backends, for the
+> same reason: on the local backend its reads are `std::fs` and open no
+> `CLIENT` span. The closing paragraph's pre-scan gap is now attributed
+> to `resolve files` and `infer schema` together. The §3.7.2 heading
+> "The two `INTERNAL` spans" keeps naming the two in its table.
+> `infer schema` has its own table there.
 
 A query run through MCP never passes through the HTTP handler. Its root is
 the `execute_tool query_logs` span (§3.5), which is itself the child of

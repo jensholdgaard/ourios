@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::Request;
 use axum::serve::Listener;
 use futures_core::Stream;
@@ -73,10 +74,13 @@ const LISTENER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// `listener` is a [`PlainListener`] or a
 /// [`TlsListener`](crate::tls_serve::TlsListener); both set
-/// [`TCP_KEEPALIVE`] on the sockets they accept.
+/// [`TCP_KEEPALIVE`] on the sockets they accept. Every request carries
+/// the peer address the listener accepted it from as an
+/// `axum::extract::ConnectInfo<L::Addr>` extension.
 pub async fn serve_http<L>(listener: L, router: Router, shutdown: impl Future<Output = ()>)
 where
     L: NamedListener,
+    L::Addr: Clone + Sync,
 {
     serve_with(listener, router, shutdown, HEADER_READ_TIMEOUT).await;
 }
@@ -95,6 +99,7 @@ async fn serve_with<L>(
     header_read: Duration,
 ) where
     L: NamedListener,
+    L::Addr: Clone + Sync,
 {
     let name = listener.name();
     let mut builder = http1::Builder::new();
@@ -106,12 +111,12 @@ async fn serve_with<L>(
     let (open_tx, open_rx) = watch::channel(());
     let mut shutdown = pin!(shutdown);
     loop {
-        let (io, _) = tokio::select! {
+        let (io, peer) = tokio::select! {
             accepted = listener.accept() => accepted,
             () = &mut shutdown => break,
         };
         tokio::spawn(serve_connection(
-            io,
+            Accepted { io, peer },
             router.clone(),
             builder.clone(),
             stop_rx.clone(),
@@ -125,8 +130,14 @@ async fn serve_with<L>(
     open_tx.closed().await;
 }
 
-async fn serve_connection<I>(
+/// An accepted connection and the address of the peer at its far end.
+struct Accepted<I, A> {
     io: I,
+    peer: A,
+}
+
+async fn serve_connection<I, A>(
+    accepted: Accepted<I, A>,
     router: Router,
     builder: http1::Builder,
     mut stop: watch::Receiver<bool>,
@@ -134,9 +145,16 @@ async fn serve_connection<I>(
     listener: &'static str,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: Clone + Send + Sync + 'static,
 {
-    let service =
-        service_fn(move |request: Request<Incoming>| router.clone().call(request.map(Body::new)));
+    let Accepted { io, peer } = accepted;
+    // Each request carries its connection's peer as `ConnectInfo`, as
+    // `axum::serve` does via `into_make_service_with_connect_info`.
+    let service = service_fn(move |request: Request<Incoming>| {
+        let mut request = request.map(Body::new);
+        request.extensions_mut().insert(ConnectInfo(peer.clone()));
+        router.clone().call(request)
+    });
     let mut conn = pin!(
         builder
             .serve_connection(TokioIo::new(io), service)
@@ -325,6 +343,7 @@ mod tests {
 
     use axum::Router;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use axum::routing::get;
     use axum::serve::Listener as _;
@@ -354,13 +373,19 @@ mod tests {
     const PARTIAL_HEAD: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n";
 
     fn app() -> Router {
-        Router::new().route("/", get(|| async { "ok" })).route(
-            "/slow",
-            get(|| async {
-                tokio::time::sleep(SLOW_HANDLER).await;
-                "slow"
-            }),
-        )
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(SLOW_HANDLER).await;
+                    "slow"
+                }),
+            )
+            .route(
+                "/peer",
+                get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+            )
     }
 
     async fn bind() -> (TcpListener, SocketAddr) {
@@ -378,6 +403,18 @@ mod tests {
             SHORT,
         ));
         addr
+    }
+
+    async fn serve_tls() -> (SocketAddr, TlsConnector) {
+        let (listener, addr) = bind().await;
+        let (acceptor, connector) = tls_pair();
+        tokio::spawn(serve_with(
+            TlsListener::new(listener, acceptor, LISTENER_HTTP),
+            app(),
+            std::future::pending(),
+            SHORT,
+        ));
+        (addr, connector)
     }
 
     /// A fixed acceptor for a cert minted now, and a connector trusting it.
@@ -468,18 +505,32 @@ mod tests {
 
     #[tokio::test]
     async fn tls_slowloris_is_dropped_after_the_header_read_timeout() {
-        let (listener, addr) = bind().await;
-        let (acceptor, connector) = tls_pair();
-        tokio::spawn(serve_with(
-            TlsListener::new(listener, acceptor, LISTENER_HTTP),
-            app(),
-            std::future::pending(),
-            SHORT,
-        ));
+        let (addr, connector) = serve_tls().await;
         let mut stream = tls_connect(addr, &connector).await;
         stream.write_all(PARTIAL_HEAD).await.expect("write");
         stream.flush().await.expect("flush");
         assert!(time_to_close(&mut stream).await >= SHORT / 2);
+    }
+
+    /// Each request carries the peer it was accepted from, plaintext and
+    /// TLS alike.
+    #[tokio::test]
+    async fn requests_carry_their_connections_peer() {
+        let mut plain = TcpStream::connect(serve_plain().await)
+            .await
+            .expect("connect");
+        let peer = plain.local_addr().expect("client addr").to_string();
+        get_ok(&mut plain, "/peer", &peer).await;
+
+        let (addr, connector) = serve_tls().await;
+        let mut tls = tls_connect(addr, &connector).await;
+        let peer = tls
+            .get_ref()
+            .0
+            .local_addr()
+            .expect("client addr")
+            .to_string();
+        get_ok(&mut tls, "/peer", &peer).await;
     }
 
     /// hyper's header-read clock also runs while a keep-alive connection

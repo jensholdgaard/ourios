@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.13.3] - 2026-10-15
+
+### Added
+
+- Record ourios.tenant on the ingest logs and derive template_map spans (#1015) (70150a9)
+
+### CI
+
+- Collect coverage through nextest, as the test job runs (#1012) (cfcb58e)
+
+### Fixed
+
+- Record the query endpoint's 400s on query.duration with error.type (#1013) (bbd3d0f)
+
 ## [0.13.2] - 2026-10-14
 
 ### Added

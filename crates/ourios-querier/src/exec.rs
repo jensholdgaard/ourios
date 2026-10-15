@@ -148,6 +148,38 @@ pub(crate) async fn register_listing_table(
     ctx.table(name).await.map_err(storage_err)
 }
 
+/// The data path's [`register_listing_table`] (union schema), as the
+/// RFC 0038 §3.7.2 `infer schema` phase: every resolved file's `HEAD` and
+/// footer read happen here, before the scan, and would otherwise sit under
+/// the query's root with no span.
+pub(crate) async fn register_logs_table(
+    ctx: &SessionContext,
+    urls: Vec<ListingTableUrl>,
+    promoted: &PromotedAttributes,
+    tenant: &TenantId,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    let span = tracing::info_span!(
+        "infer schema",
+        otel.kind = "internal",
+        ourios.tenant = tenant.as_str(),
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    );
+    // Boxed: the phase wrappers inline the whole inference into every
+    // query future that awaits it.
+    let registered = Box::pin(register_listing_table(
+        ctx,
+        "logs",
+        urls,
+        SchemaMode::Union(promoted),
+    ));
+    crate::phase::in_phase_async(&span, registered)
+        .await
+        .inspect_err(|e| {
+            ourios_core::telemetry::record_span_error(&span, crate::template_map::error_type(e));
+        })
+}
+
 /// The one execution path: physical-plan the frame, collect it, and
 /// account for it — [`scan_stats`] plus the RFC 0040 operator spans,
 /// which every call site MUST record (this helper replaced five

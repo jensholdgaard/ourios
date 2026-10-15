@@ -566,29 +566,9 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
     // (RFC 0016 §3.3): a missing/empty header is a `400` that never scans data.
     let tenant = match tenant_from_headers(&headers) {
         Ok(tenant) => tenant,
-        Err(TenantHeaderError::Missing) => {
-            return reject_bad_request(
-                &state,
-                gate_started,
-                "missing_tenant",
-                "the X-Ourios-Tenant header is required and must be non-empty",
-            );
-        }
-        Err(TenantHeaderError::NotText) => {
-            return reject_bad_request(
-                &state,
-                gate_started,
-                "invalid_tenant",
-                "the X-Ourios-Tenant value must be visible ASCII text (RFC 0048 §3.1)",
-            );
-        }
-        Err(TenantHeaderError::Invalid(e)) => {
-            return reject_bad_request(
-                &state,
-                gate_started,
-                "invalid_tenant",
-                &format!("the X-Ourios-Tenant value is invalid: {e} (RFC 0048 §3.1)"),
-            );
+        Err(e) => {
+            let (kind, message) = e.rejection();
+            return reject_bad_request(&state, gate_started, kind, &message);
         }
     };
     tracing::Span::current().record("ourios.tenant", tenant.as_str());
@@ -714,6 +694,26 @@ enum TenantHeaderError {
     Missing,
     NotText,
     Invalid(ourios_core::tenant::TenantIdError),
+}
+
+impl TenantHeaderError {
+    /// The `400`'s error kind and message.
+    fn rejection(&self) -> (&'static str, String) {
+        match self {
+            Self::Missing => (
+                "missing_tenant",
+                "the X-Ourios-Tenant header is required and must be non-empty".to_owned(),
+            ),
+            Self::NotText => (
+                "invalid_tenant",
+                "the X-Ourios-Tenant value must be visible ASCII text (RFC 0048 §3.1)".to_owned(),
+            ),
+            Self::Invalid(e) => (
+                "invalid_tenant",
+                format!("the X-Ourios-Tenant value is invalid: {e} (RFC 0048 §3.1)"),
+            ),
+        }
+    }
 }
 
 /// Parse the body into a [`Statement`] by `Content-Type` (RFC 0016 §3.3):

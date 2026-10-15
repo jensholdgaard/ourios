@@ -318,7 +318,9 @@ type TenantPlan<'t> = (&'t str, Result<Vec<PartitionKey>, CompactionError>);
 /// manifest, so it is the sweep's dominant request cost on a store with a
 /// long history; the plans both set the countdown and drive the
 /// consolidation. A partition that becomes a candidate during the sweep (a
-/// late write into a sealed hour) is planned by the next one.
+/// late write into a sealed hour) is planned by the next one. The plans
+/// hold one key, the tenant plus four integers, per *candidate*: they grow
+/// with the compaction backlog, not with the retained history.
 fn plan_tenants<'t>(
     store: &Store,
     tenants: &'t [String],

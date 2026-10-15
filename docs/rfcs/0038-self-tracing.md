@@ -288,7 +288,7 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > | The RFC 0033 fold behind a `miss`, `stale`, `torn` or `unknown_version` lookup (not `hit`, not `joined`) | `derive template_map` | `INTERNAL` (child of `load template_map`) |
 > | Waiting on another query's in-flight acquisition, of the same frontier or another; one per single-flight loop iteration that finds one | `wait template_map` | `INTERNAL` (child of `load template_map`) |
 
-> **Amendment (2026-10-15, #1014) — the schema inference gets a span (§3.7.2).**
+> **Amendment (2026-10-15, #1014, maintainer-approved) — the schema inference gets a span (§3.7.2).**
 > The table gains this row. It follows the `{action} {target}` rule.
 >
 > | Operation | Span name | Kind |
@@ -406,7 +406,7 @@ flowchart TD
 > The audit listing, the artifact `GET` and the write-through `PUT` stay
 > directly under `load template_map`.
 
-> **Amendment (2026-10-15, #1014) — `infer schema`.** The tree gains a
+> **Amendment (2026-10-15, #1014, maintainer-approved) — `infer schema`.** The tree gains a
 > third phase under the query's root, between `resolve files` and the
 > first RFC 0040 operator tree:
 
@@ -562,7 +562,7 @@ normal.
 > write-through `PUT` stay under `load template_map`. No new attribute
 > names.
 
-> **Amendment (2026-10-15, #1014) — `infer schema`.**
+> **Amendment (2026-10-15, #1014, maintainer-approved) — `infer schema`.**
 >
 > | | `infer schema` |
 > |---|---|
@@ -680,7 +680,7 @@ OTel `Context` they attach. With no marker there is no span. So:
 - DataFusion's scan reads carry no marker and no parent, so they emit
   none (§3.7.1).
 
-> **Amendment (2026-10-15, #1014) — a third phase installs the marker.**
+> **Amendment (2026-10-15, #1014, maintainer-approved) — a third phase installs the marker.**
 > `infer schema` installs it too. The inference runs on the calling task
 > rather than the blocking pool, so the marked `Context` is attached to
 > the inference future itself, not entered in a closure. Its `HEAD` and
@@ -778,7 +778,7 @@ Two existing Ourios attributes are reused: `ourios.tenant` and
 > `ourios.template_map.derive.reason` attribute. RFC0038.11's
 > no-violation list covers `http.*` as well.
 
-> **Amendment (2026-10-15, #1014) — no new names.** `infer schema` is a
+> **Amendment (2026-10-15, #1014, maintainer-approved) — no new names.** `infer schema` is a
 > span name, fixed in §3.5 like the others. It carries only `ourios.tenant`
 > and, on failure, `error.type`. Its `CLIENT` children use the §3.7.3
 > upstream set (`S3.HeadObject` is already a §3.7.3 name). No registry
@@ -958,7 +958,7 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > children of `derive template_map`, not of `load template_map`. "No other
 > span is produced" now applies to this extended set.
 
-> **Amendment (2026-10-15, #1014) — RFC0038.1's query arm gains `infer
+> **Amendment (2026-10-15, #1014, maintainer-approved) — RFC0038.1's query arm gains `infer
 > schema`.** The span set above also contains, under the query's root,
 > **at most one** `infer schema`: exactly one iff `resolve files` found at
 > least one live file. On the S3 backend, its `CLIENT` children are its
@@ -1072,7 +1072,7 @@ are `drafted`.
 > span carries `ourios.template_map.derive.reason` and lies within its
 > parent's interval.
 
-> **Amendment (2026-10-15, #1014) — RFC0038.8 and `infer schema`.** The
+> **Amendment (2026-10-15, #1014, maintainer-approved) — RFC0038.8 and `infer schema`.** The
 > zero-row and row-returning traces each have exactly one `infer schema`
 > child of the root, carrying `ourios.tenant`. The no-file trace has none.
 > `infer schema` starts after `resolve files` ends and ends before the
@@ -1300,7 +1300,7 @@ Mapped to `CLAUDE.md` §6.2:
 >   returns no rows and so acquires no template map, so neither exercises
 >   the new children.
 
-> **Amendment (2026-10-15, #1014) — testing `infer schema`.**
+> **Amendment (2026-10-15, #1014, maintainer-approved) — testing `infer schema`.**
 >
 > - **RFC0038.1 (query arm), local backend** — in
 >   `crates/ourios-querier/tests/it/rfc0038_file_set_span.rs`, next to the
@@ -1462,7 +1462,7 @@ scope, not ingest) already covers it.
   attributes they carry (§3.7.3). Amends RFC0038.1's query arm and
   RFC0038.8's parentage, adds RFC0038.12–.16 and maps them to #965's
   tests (§5, §6). No new attribute names. Matches #965.
-- **2026-10-15 — `infer schema` (#1014).** Adds `infer schema` as an
+- **2026-10-15 — `infer schema` (#1014, maintainer-approved).** Adds `infer schema` as an
   `INTERNAL` child of the query's root around the union-schema footer
   inference, which no span covered, and lets it install the query-phase
   marker so its `HEAD` and footer reads get `CLIENT` spans (§3.5,

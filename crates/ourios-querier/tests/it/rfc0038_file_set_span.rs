@@ -111,20 +111,16 @@ async fn resolution_spans_the_file_set_under_the_query() {
             spans.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     };
-    assert_eq!(resolve.span_kind, SpanKind::Internal);
     assert_eq!(
-        resolve.parent_span_id, query_id,
-        "the phase nests under the query"
+        (
+            resolve.span_kind.clone(),
+            resolve.parent_span_id,
+            text(resolve, semconv::OURIOS_TENANT).as_deref(),
+        ),
+        (SpanKind::Internal, query_id, Some(TENANT)),
+        "an INTERNAL phase under the query, with the tenant"
     );
-    assert_eq!(
-        text(resolve, semconv::OURIOS_TENANT).as_deref(),
-        Some(TENANT)
-    );
-    assert_eq!(
-        attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
-        Some(Value::I64(1))
-    );
-    // The window cuts `year=2026`, `month=04` and `day=02` takes it whole:
+    // `counts` ends with the live-file count. The window cuts `year=2026`, `month=04` and `day=02` takes it whole:
     // the tenant directory and those four are read, and only the one data
     // file is an object. No manifest.
     assert_eq!(counts(resolve), expected([5, 1, 0, 1]));
@@ -145,13 +141,9 @@ async fn an_empty_file_set_still_spans_the_resolution() {
     };
     assert_eq!(resolve.parent_span_id, query_id);
     assert_eq!(
-        attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
-        Some(Value::I64(0))
-    );
-    assert_eq!(
         counts(resolve),
         expected([1, 0, 0, 0]),
-        "one read of the absent tenant directory"
+        "one read of the absent tenant directory; zero live files"
     );
     assert!(
         named(&spans, "infer schema").is_empty(),
@@ -318,16 +310,13 @@ async fn a_failed_resolution_marks_the_phase_as_an_error() {
         resolve.status
     );
     assert_eq!(text(resolve, "error.type").as_deref(), Some("storage"));
-    assert_eq!(
-        attribute(resolve, semconv::OURIOS_FILE_SET_LIVE_FILES),
-        None
-    );
     // The work done up to the failure is still counted (§3.7.2): the five
     // directory reads down to `hour=10`, its data file and manifest, and the
-    // one manifest read that failed.
+    // one manifest read that failed. No live-file count.
+    let [list_requests, listed, manifests, _] = expected([5, 2, 1, 0]);
     assert_eq!(
-        counts(resolve)[..3],
-        expected([5, 2, 1, 0])[..3],
+        counts(resolve),
+        [list_requests, listed, manifests, None],
         "the counts are set on the error path"
     );
 }
@@ -387,18 +376,15 @@ async fn s3_resolution_requests_nest_under_the_phase() {
             .count()
     };
     let [list_requests, _, manifest_reads, _] = narrow_counts();
-    assert_eq!(
+    let spans_of = |name| {
         Some(Value::I64(
-            i64::try_from(under_resolve("S3.ListObjectsV2")).expect("count")
-        )),
-        list_requests,
-        "one ListObjectsV2 per listing call (each under one page)"
-    );
+            i64::try_from(under_resolve(name)).expect("count"),
+        ))
+    };
     assert_eq!(
-        Some(Value::I64(
-            i64::try_from(under_resolve("S3.GetObject")).expect("count")
-        )),
-        manifest_reads,
+        (spans_of("S3.ListObjectsV2"), spans_of("S3.GetObject")),
+        (list_requests, manifest_reads),
+        "one ListObjectsV2 per listing call (each under one page), one GetObject per manifest read"
     );
 }
 

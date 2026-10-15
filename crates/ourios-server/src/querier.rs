@@ -146,8 +146,9 @@ impl QuerierHandle {
 pub(crate) const QUERY_KIND_LOGS: &str = "logs";
 pub(crate) const QUERY_KIND_DRIFT: &str = "drift";
 /// The `ourios.query.kind` value for a request rejected before kind
-/// dispatch (RFC 0026 §3.4) — authn/authz answer before the body parse,
-/// so neither `logs` nor `drift` applies.
+/// dispatch (RFC 0026 §3.4) — authn/authz, the tenant header and the body
+/// parse all answer before the statement is known, so neither `logs` nor
+/// `drift` applies.
 const QUERY_KIND_REJECTED: &str = "rejected";
 /// `ourios.query.row_group.state` attribute values.
 const ROW_GROUP_SCANNED: &str = "scanned";
@@ -566,22 +567,25 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
     let tenant = match tenant_from_headers(&headers) {
         Ok(tenant) => tenant,
         Err(TenantHeaderError::Missing) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
+            return reject_bad_request(
+                &state,
+                gate_started,
                 "missing_tenant",
                 "the X-Ourios-Tenant header is required and must be non-empty",
             );
         }
         Err(TenantHeaderError::NotText) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
+            return reject_bad_request(
+                &state,
+                gate_started,
                 "invalid_tenant",
                 "the X-Ourios-Tenant value must be visible ASCII text (RFC 0048 §3.1)",
             );
         }
         Err(TenantHeaderError::Invalid(e)) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
+            return reject_bad_request(
+                &state,
+                gate_started,
                 "invalid_tenant",
                 &format!("the X-Ourios-Tenant value is invalid: {e} (RFC 0048 §3.1)"),
             );
@@ -609,7 +613,9 @@ async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes
 
     let statement = match parse_body(&headers, &body) {
         Ok(statement) => statement,
-        Err(message) => return error_response(StatusCode::BAD_REQUEST, "invalid_query", &message),
+        Err(message) => {
+            return reject_bad_request(&state, gate_started, "invalid_query", &message);
+        }
     };
 
     // RFC 0047 §3.4: the two-step decides which rows this principal may see
@@ -1185,6 +1191,21 @@ async fn run_logs_query(
 }
 
 /// An RFC 0047 §3.4 refusal, recorded like every pre-dispatch rejection.
+/// A `400` before kind dispatch, recorded on `ourios.query.duration` (kind
+/// `rejected`) with the response's error kind as `error.type`. The server
+/// span stays unset: semconv leaves a server span's `4xx` to the client.
+fn reject_bad_request(
+    state: &QuerierState,
+    gate_started: Instant,
+    kind: &'static str,
+    message: &str,
+) -> Response {
+    state
+        .metrics
+        .record_err(QUERY_KIND_REJECTED, gate_started.elapsed(), kind);
+    error_response(StatusCode::BAD_REQUEST, kind, message)
+}
+
 fn reject_visibility(
     state: &QuerierState,
     gate_started: Instant,

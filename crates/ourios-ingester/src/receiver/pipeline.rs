@@ -600,6 +600,7 @@ impl IngestPipeline {
         name = "ingest logs",
         fields(
             otel.kind = "server",
+            ourios.tenant = tenant.as_str(),
             otel.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
         )

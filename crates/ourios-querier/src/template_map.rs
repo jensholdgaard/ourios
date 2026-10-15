@@ -836,6 +836,7 @@ fn traced_derive(
     let span = tracing::info_span!(
         "derive template_map",
         otel.kind = "internal",
+        ourios.tenant = tenant.as_str(),
         ourios.template_map.derive.reason = reason,
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,

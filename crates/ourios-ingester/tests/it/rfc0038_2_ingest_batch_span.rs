@@ -109,6 +109,22 @@ async fn rfc0038_2_ingest_batch_emits_one_span_with_a_wal_commit_child() {
     );
 }
 
+/// The batch span names the tenant it ingested for, so ingest is
+/// attributable per tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn the_ingest_span_carries_the_batch_tenant() {
+    let spans = ingest_and_collect_spans(1).await;
+    let [batch] = spans_named(&spans, "ingest logs")[..] else {
+        panic!("one ingest-logs span, got {spans:?}");
+    };
+    let tenant = batch
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == ourios_semconv::OURIOS_TENANT)
+        .map(|kv| kv.value.as_str().into_owned());
+    assert_eq!(tenant.as_deref(), Some("checkout"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn rfc0038_2_span_count_is_constant_in_record_count() {
     let one = ingest_and_collect_spans(1).await;

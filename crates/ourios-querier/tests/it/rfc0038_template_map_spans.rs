@@ -176,6 +176,10 @@ async fn a_cold_acquisition_spans_the_load_and_its_derive_under_the_query() {
         text(derive, semconv::OURIOS_TEMPLATE_MAP_DERIVE_REASON).as_deref(),
         Some("miss")
     );
+    assert_eq!(
+        text(derive, semconv::OURIOS_TENANT).as_deref(),
+        Some(TENANT)
+    );
     assert!(derive.start_time >= load.start_time && derive.end_time <= load.end_time);
 }
 

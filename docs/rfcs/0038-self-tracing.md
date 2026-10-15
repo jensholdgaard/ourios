@@ -560,7 +560,7 @@ normal.
 > |---|---|
 > | Kind | `INTERNAL` |
 > | Parent | the query's root, as for `resolve files` |
-> | Opens / ends | around the union-schema inference: from before the first footer read to the merged schema, before the listing table is built |
+> | Opens / ends | around registering the scan's listing table: from before the first footer read, through the merge, to the registered table (the build after the merge is in-process) |
 > | Status | `Error` iff the inference or the merge fails (the query then fails with it), `error.type` = the error's class as on `resolve files`; `Unset` otherwise |
 > | Required attributes | `ourios.tenant` |
 >

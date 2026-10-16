@@ -67,7 +67,8 @@ pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
 pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
 pub use store::{
-    Caller, DelimitedListing, QueryPhase, S3Config, Store, StoreConfig, StoreError, Suffix,
+    Caller, DelimitedListing, ListedObject, QueryPhase, S3Config, Store, StoreConfig, StoreError,
+    Suffix,
 };
 pub use writer::{
     COMPACTED_RG_BYTES_ENV, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, MIN_COMPACTED_RG_BYTES,

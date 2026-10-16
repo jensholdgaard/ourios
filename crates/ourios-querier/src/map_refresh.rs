@@ -20,8 +20,8 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::percent_decode_tenant;
 use tracing::Instrument as _;
 
-use crate::map_flight::{MapAcquisition, TemplateMapFlights};
-use crate::template_map::{self, AcquireTrigger, Persisted};
+use crate::map_flight::{Refreshed, TemplateMapFlights, Verified};
+use crate::template_map::{self, Persisted};
 use crate::{Backend, QueryError, StoreRef, phase};
 
 /// The most consecutive passes a tenant that persists nothing is skipped
@@ -38,6 +38,9 @@ pub struct TemplateMapRefresher {
     /// Tenants whose recent acquisitions persisted nothing. In memory only:
     /// a restart forgets it.
     backoff: HashMap<TenantId, Backoff>,
+    /// Each tenant's last verified hit (RFC 0060 §3.7). In memory only, like
+    /// `backoff`.
+    verified: HashMap<TenantId, Arc<Verified>>,
     #[cfg(feature = "testing")]
     log: Arc<testing::PassLog>,
     #[cfg(feature = "testing")]
@@ -87,6 +90,7 @@ impl TemplateMapRefresher {
             flights,
             backend,
             backoff: HashMap::new(),
+            verified: HashMap::new(),
             #[cfg(feature = "testing")]
             log: Arc::default(),
             #[cfg(feature = "testing")]
@@ -163,6 +167,7 @@ impl TemplateMapRefresher {
         };
         let listed: HashSet<&TenantId> = tenants.iter().collect();
         self.backoff.retain(|tenant, _| listed.contains(tenant));
+        self.verified.retain(|tenant, _| listed.contains(tenant));
         for tenant in &tenants {
             if shutdown.as_mut().now_or_never().is_some() {
                 return PassEnd::ShutDown;
@@ -170,14 +175,13 @@ impl TemplateMapRefresher {
             if self.backoff.get_mut(tenant).is_some_and(Backoff::skips) {
                 continue;
             }
-            let acquire =
-                self.flights
-                    .acquire_fetched(&self.backend, tenant, AcquireTrigger::Refresh);
-            let acquired = match select(shutdown.as_mut(), pin!(acquire)).await {
+            let known = self.verified.get(tenant).cloned();
+            let refresh = self.flights.refresh(&self.backend, tenant, known);
+            let refreshed = match select(shutdown.as_mut(), pin!(refresh)).await {
                 Either::Left(_) => return PassEnd::ShutDown,
-                Either::Right((acquired, _)) => acquired,
+                Either::Right((refreshed, _)) => refreshed,
             };
-            self.settle(tenant, &acquired);
+            self.settle(tenant, refreshed);
         }
         PassEnd::Finished
     }
@@ -203,20 +207,42 @@ impl TemplateMapRefresher {
 
     /// Record what `tenant`'s acquisition left in the store: a current
     /// artifact clears its back-off; nothing (abstained, failed publish,
-    /// failed acquisition) extends it.
-    fn settle(&mut self, tenant: &TenantId, acquired: &Result<MapAcquisition, QueryError>) {
-        match acquired {
-            Ok(MapAcquisition {
-                persisted: Persisted::Current,
-                ..
-            }) => {
+    /// failed acquisition) extends it. Only a verified hit is remembered
+    /// (RFC 0060 §3.7); an unchanged listing keeps what was.
+    fn settle(&mut self, tenant: &TenantId, refreshed: Result<Refreshed, QueryError>) {
+        match refreshed {
+            Ok(Refreshed::Unchanged) => {
                 self.backoff.remove(tenant);
             }
-            Ok(_) | Err(_) => self
-                .backoff
-                .entry(tenant.clone())
-                .or_default()
-                .persisted_nothing(),
+            Ok(Refreshed::Acquired {
+                persisted: Persisted::Current,
+                verified,
+            }) => {
+                self.backoff.remove(tenant);
+                self.remember(tenant, verified);
+            }
+            Ok(Refreshed::Acquired {
+                persisted: Persisted::Nothing,
+                ..
+            })
+            | Err(_) => {
+                self.verified.remove(tenant);
+                self.backoff
+                    .entry(tenant.clone())
+                    .or_default()
+                    .persisted_nothing();
+            }
+        }
+    }
+
+    fn remember(&mut self, tenant: &TenantId, verified: Option<Verified>) {
+        match verified {
+            Some(verified) => {
+                self.verified.insert(tenant.clone(), Arc::new(verified));
+            }
+            None => {
+                self.verified.remove(tenant);
+            }
         }
     }
 }
@@ -329,6 +355,20 @@ pub mod testing {
         #[must_use]
         pub fn pass_log(&self) -> Arc<PassLog> {
             Arc::clone(&self.log)
+        }
+
+        /// The tenants it holds a verified listing for (RFC 0060 §3.7),
+        /// sorted.
+        #[doc(hidden)]
+        #[must_use]
+        pub fn verified(&self) -> Vec<String> {
+            let mut tenants: Vec<String> = self
+                .verified
+                .keys()
+                .map(|tenant| tenant.as_str().to_owned())
+                .collect();
+            tenants.sort();
+            tenants
         }
 
         /// The tenants it holds a back-off for, sorted.

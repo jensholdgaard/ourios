@@ -854,7 +854,15 @@ async fn rfc0060_16_a_deletion_after_the_listing_is_repaired_one_pass_late() {
         "paying the fold itself"
     );
 
-    std::fs::remove_file(&artifact).expect("undo the query's publish");
+    assert!(artifact.exists(), "the query's write-through republished");
+    assert_ne!(
+        pass_outcome(&mut refresher).await.as_deref(),
+        Some("miss"),
+        "the next pass takes the republished artifact as it finds it"
+    );
+
+    // The branch where the artifact stays absent until the next pass.
+    std::fs::remove_file(&artifact).expect("remove the artifact");
     assert_eq!(
         pass_outcome(&mut refresher).await.as_deref(),
         Some("miss"),

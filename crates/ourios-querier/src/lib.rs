@@ -363,12 +363,23 @@ struct CollectedRecords {
 /// over a file set that keeps changing is returned (RFC0009.18).
 const SCAN_ATTEMPTS: u32 = 3;
 
-/// One scan of a resolved file set by [`Querier::execute`].
+/// One resolve-and-scan attempt of [`Querier::execute`].
 struct ScanAttempt<'a, F> {
-    tenant: &'a TenantId,
+    scope: file_set::DataScope<'a>,
     terminal: Terminal,
+    /// The query's one compile-time template-map acquisition, handed to
+    /// every attempt so filter and rendering use the same map (RFC 0033).
     acquired: Option<map_flight::MapAcquisition>,
     build_filter: &'a F,
+    /// The last attempt returns its error rather than retrying.
+    last: bool,
+}
+
+/// How one [`ScanAttempt`] ended.
+enum Attempt {
+    Done(Result<QueryResult, QueryError>),
+    /// The resolution went stale under a concurrent commit: try again.
+    Stale,
 }
 
 /// How [`Querier::execute`] terminates the filtered scan (RFC 0002 §6.5):
@@ -738,42 +749,70 @@ impl Querier {
         // changed is a stale resolution, not a loss. Resolve and scan again,
         // a bounded number of times (RFC 0009 §3.4, RFC0009.18). A result
         // is only ever returned whole, so no rows have been sent on a retry.
+        // The compile-time acquisition's bytes are counted once, here.
         let mut fetched = acquired.as_ref().map_or(0, |a| a.fetched);
-        let mut acquired = acquired;
         let mut attempt = 1;
         loop {
             let ctx = crate::exec::session();
-            let urls = file_set::resolve_data_urls(&self.backend, &ctx, scope).await?;
             let scan = ScanAttempt {
-                tenant,
+                scope,
                 terminal: terminal.clone(),
-                acquired: acquired.take(),
+                acquired: acquired.clone(),
                 build_filter: &build_filter,
+                last: attempt == SCAN_ATTEMPTS,
             };
-            match self.scan_resolved(&ctx, urls.clone(), scan).await {
-                Err(QueryError::Storage { .. })
-                    if attempt < SCAN_ATTEMPTS && self.file_set_moved(scope, &urls).await? =>
-                {
-                    fetched += crate::fetch_count::fetched(&ctx);
-                    attempt += 1;
-                }
-                outcome => {
+            match self.attempt_scan(&ctx, scan).await {
+                Attempt::Done(outcome) => {
                     return outcome
                         .map(|result| crate::fetch_count::with_fetched(result, &ctx, fetched));
+                }
+                Attempt::Stale => {
+                    fetched += crate::fetch_count::fetched(&ctx);
+                    attempt += 1;
                 }
             }
         }
     }
 
+    /// Resolve and scan once. A storage error from the scan is a stale
+    /// resolution, worth another attempt, when the file set has moved since
+    /// it was resolved; an error that persists is returned by the last
+    /// attempt. (A file that vanishes during the local resolution itself is
+    /// re-listed inside it, see `file_set::resolve_local_urls`.)
+    async fn attempt_scan<F>(&self, ctx: &SessionContext, scan: ScanAttempt<'_, F>) -> Attempt
+    where
+        F: Fn(
+            datafusion::dataframe::DataFrame,
+        ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError>,
+    {
+        let (scope, last) = (scan.scope, scan.last);
+        let urls = match file_set::resolve_data_urls(&self.backend, ctx, scope).await {
+            Ok(urls) => urls,
+            Err(e) => return Attempt::Done(Err(e)),
+        };
+        match self.scan_resolved(ctx, urls.clone(), scan).await {
+            Err(e @ QueryError::Storage { .. }) if !last => {
+                match self.file_set_moved(ctx, scope, &urls).await {
+                    Ok(true) => Attempt::Stale,
+                    Ok(false) => Attempt::Done(Err(e)),
+                    Err(recheck) => Attempt::Done(Err(recheck)),
+                }
+            }
+            outcome => Attempt::Done(outcome),
+        }
+    }
+
     /// Whether `scope` now resolves to a different file set than `used`: a
-    /// commit has replaced files since `used` was resolved.
+    /// commit has replaced files since `used` was resolved. The recheck runs
+    /// on the failed attempt's session, so the manifest bytes it reads count
+    /// toward the query's `bytes_fetched`.
     async fn file_set_moved(
         &self,
+        ctx: &SessionContext,
         scope: file_set::DataScope<'_>,
         used: &[ListingTableUrl],
     ) -> Result<bool, QueryError> {
-        let ctx = crate::exec::session();
-        let now = file_set::recheck_data_urls(&self.backend, &ctx, scope).await?;
+        let now = file_set::recheck_data_urls(&self.backend, ctx, scope).await?;
         Ok(now != used)
     }
 
@@ -794,11 +833,13 @@ impl Querier {
         ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError>,
     {
         let ScanAttempt {
-            tenant,
+            scope,
             terminal,
             acquired,
             build_filter,
+            ..
         } = scan;
+        let tenant = scope.tenant;
         if urls.is_empty() {
             return Ok(empty_result(terminal.aggregate()));
         }

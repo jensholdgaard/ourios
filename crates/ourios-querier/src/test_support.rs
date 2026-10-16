@@ -326,3 +326,36 @@ impl ObjectStore for HookStore {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// One-shot hooks run by the local resolver right after it has listed a
+/// tenant under a registered root, before it canonicalizes the files it
+/// found: the window a commit can delete them in.
+type LocalListingHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+
+static LOCAL_LISTING_HOOKS: Mutex<Vec<LocalListingHook>> = Mutex::new(Vec::new());
+
+/// Run `hook` once, the next time the local resolver lists a tenant under
+/// `root`.
+pub(crate) fn on_local_listing(root: std::path::PathBuf, hook: Box<dyn FnOnce() + Send>) {
+    LOCAL_LISTING_HOOKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((root, hook));
+}
+
+/// Called by the local resolver: run and drop the first hook registered for
+/// a root `tenant_dir` lies under.
+pub(crate) fn after_local_listing(tenant_dir: &std::path::Path) {
+    let hook = {
+        let mut hooks = LOCAL_LISTING_HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        hooks
+            .iter()
+            .position(|(root, _)| tenant_dir.starts_with(root))
+            .map(|index| hooks.remove(index).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}

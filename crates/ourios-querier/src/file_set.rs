@@ -330,14 +330,47 @@ pub(super) fn resolve_live_set(
 ) -> Result<LiveSet, QueryError> {
     match backend {
         Backend::Local(root) => {
-            let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window, tally)?;
-            local_file_urls(&tenant_dir, &live_files).map(LiveSet::Urls)
+            resolve_local_urls(&root.join(prefix), window, tally).map(LiveSet::Urls)
         }
         Backend::Remote(store) => {
             resolve_live_keys(store, prefix, window, tally).map(LiveSet::Keys)
         }
     }
+}
+
+/// Resolutions the local backend makes before a file that keeps vanishing
+/// between its listing and its canonicalization fails the query.
+const LOCAL_RESOLVE_ATTEMPTS: u32 = 3;
+
+/// [`resolve_live_files`] then [`canonical_file_urls`] for `tenant_dir`. A file
+/// that vanished between the two was deleted by a commit that already holds
+/// its rows (RFC 0009 §3.4, RFC0009.18), so the listing is stale: list again,
+/// a bounded number of times. Each attempt runs the whole resolution, the
+/// canonical-path tenant check included.
+fn resolve_local_urls(
+    tenant_dir: &std::path::Path,
+    window: Option<(u64, u64)>,
+    tally: &mut Tally<'_>,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    let mut attempt = 1;
+    loop {
+        let live_files = resolve_live_files(tenant_dir, window, tally)?;
+        #[cfg(test)]
+        crate::test_support::after_local_listing(tenant_dir);
+        match canonical_file_urls(tenant_dir, &live_files) {
+            Ok(urls) => return Ok(urls),
+            Err(Canonical::Vanished(_)) if attempt < LOCAL_RESOLVE_ATTEMPTS => attempt += 1,
+            Err(Canonical::Vanished(e) | Canonical::Failed(e)) => return Err(e),
+        }
+    }
+}
+
+/// Why [`canonical_file_urls`] failed.
+enum Canonical {
+    /// A listed file no longer exists.
+    Vanished(QueryError),
+    /// Anything else, a tenant-root escape included.
+    Failed(QueryError),
 }
 
 /// The S3 analog of [`resolve_live_files`]: resolve the live data-file **keys**
@@ -684,33 +717,46 @@ fn live_in_partition<T: AsRef<std::path::Path>>(
 /// characters are handled without a hand-built `file://…` string.
 /// `year/month/day/hour` stay path-only (not file columns) and the query
 /// filters only data columns, so no table partition columns are declared.
-pub(super) fn local_file_urls(
+///
+/// A listed file that has since vanished is told apart from every other
+/// failure ([`Canonical::Vanished`]), so the caller can list again.
+fn canonical_file_urls(
     tenant_dir: &std::path::Path,
     live_files: &[PathBuf],
-) -> Result<Vec<ListingTableUrl>, QueryError> {
+) -> Result<Vec<ListingTableUrl>, Canonical> {
     if live_files.is_empty() {
         return Ok(Vec::new());
     }
-    let tenant_root = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
-        detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+    let tenant_root = tenant_dir.canonicalize().map_err(|e| {
+        Canonical::Failed(QueryError::Storage {
+            detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+        })
     })?;
     let mut seen = std::collections::HashSet::new();
     let mut urls = Vec::with_capacity(live_files.len());
     for file in live_files {
-        let abs = file.canonicalize().map_err(|e| QueryError::Storage {
-            detail: format!("canonicalize {}: {e}", file.display()),
+        let abs = file.canonicalize().map_err(|e| {
+            let error = QueryError::Storage {
+                detail: format!("canonicalize {}: {e}", file.display()),
+            };
+            match e.kind() {
+                std::io::ErrorKind::NotFound => Canonical::Vanished(error),
+                _ => Canonical::Failed(error),
+            }
         })?;
         if !abs.starts_with(&tenant_root) {
-            return Err(QueryError::Storage {
+            return Err(Canonical::Failed(QueryError::Storage {
                 detail: format!(
                     "resolved file {} escapes tenant partition root {}",
                     abs.display(),
                     tenant_root.display(),
                 ),
-            });
+            }));
         }
         if seen.insert(abs.clone()) {
-            urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
+            let url = ListingTableUrl::parse(abs.display().to_string())
+                .map_err(|e| Canonical::Failed(storage_err(e)))?;
+            urls.push(url);
         }
     }
     Ok(urls)

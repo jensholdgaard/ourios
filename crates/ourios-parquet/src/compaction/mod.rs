@@ -39,7 +39,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::data_schema_with_promoted;
 use crate::manifest::{
-    MANIFEST_FILENAME, Manifest, ManifestError, Published, compacted_generation,
+    LiveSet, MANIFEST_FILENAME, Manifest, ManifestError, Published, compacted_generation,
 };
 use crate::partition::{PartitionKey, percent_encode_tenant};
 use crate::promoted::{PromotedAttributes, SERVICE_NAME_KEY, project_string_value};
@@ -472,22 +472,17 @@ fn compact_sorted_hooked(
     // is independent of the store's listing order (RFC0036.4).
     inputs.sort();
 
-    // Make the reader manifest-authoritative *before* the consolidated file
-    // appears. With no prior manifest, a concurrent glob reader would otherwise
-    // see the inputs *and* the new file in the window before the commit (a
-    // double count). Bootstrapping a manifest naming the current inputs is the
-    // same set the glob already returns, so it changes nothing visible
-    // (RFC0009.3 — no torn read), and from then on the new file stays invisible
-    // until the commit names it. The bootstrap is a create-if-absent
-    // conditional PUT (supported on both backends); a lost race means another
-    // compactor owns this partition, so back off as a no-op rather than fight it.
+    // Claim the partition before writing anything. The bootstrap consumes
+    // nothing and names no compacted file, so it changes nothing visible: the
+    // live set is still every flush file (RFC0009.3 — no torn read), and the
+    // output stays invisible until the commit names it, as any unnamed
+    // compacted file does. The bootstrap is a create-if-absent conditional
+    // PUT (supported on both backends); a lost race means another compactor
+    // owns this partition, so back off as a no-op rather than fight it.
     let (base_generation, commit_etag) = if let Some(manifest) = &existing {
         (manifest.generation, etag)
     } else {
-        let bootstrap = Manifest {
-            generation: 1,
-            files: basenames(&inputs),
-        };
+        let bootstrap = Manifest::new(1, Vec::new(), Vec::new());
         match bootstrap
             .publish_cas(store, &key, None)
             .map_err(CompactionError::Manifest)?
@@ -496,8 +491,12 @@ fn compact_sorted_hooked(
             Published::Lost => return Ok(no_op_outcome(inputs.len())),
         }
         // Re-read to learn the bootstrap generation's ETag for the CAS commit
-        // (the S3 path; the local overwrite commit ignores it).
-        (1, read_manifest_etag(store, &key)?)
+        // (the S3 path; the local overwrite commit ignores it). A peer that
+        // committed in between owns the partition now: back off.
+        match bootstrap_etag(store, &key, &bootstrap)? {
+            Claim::Held { etag } => (1, etag),
+            Claim::Overtaken => return Ok(no_op_outcome(inputs.len())),
+        }
     };
 
     // RFC 0036 §3.3 adaptive row-group threshold: estimate the output size
@@ -539,15 +538,13 @@ fn compact_sorted_hooked(
     let bytes_written = written.bytes_written;
     let consolidated = basename(&written.key).to_owned();
 
-    // Commit: swap the manifest to name only the consolidated file. The input
-    // names (the merged-away set) for the §3.6 audit event are already sorted
-    // (the §3.1 tie-break order), so the event is deterministic regardless of
-    // listing order.
+    // Commit: name only the consolidated file and consume the flush inputs. A
+    // flush file that landed after the inputs were listed is not consumed and
+    // stays live (RFC0009.15). The input names (the merged-away set) for the
+    // §3.6 audit event are already sorted (the §3.1 tie-break order), so the
+    // event is deterministic regardless of listing order.
     let input_files = basenames(&inputs);
-    let commit = Manifest {
-        generation,
-        files: vec![consolidated.clone()],
-    };
+    let commit = next_manifest(existing.as_ref(), generation, &consolidated, &input_files);
     match commit_manifest(store, &key, &commit, commit_etag.as_deref())? {
         Published::Won => {}
         // Lost the CAS race (S3 only — the local overwrite always wins): the
@@ -564,6 +561,25 @@ fn compact_sorted_hooked(
     };
     let outcome = committed_outcome(&inputs, &totals, committed, bytes_written);
     Ok(announce_and_clean_up(store, &inputs, hooks, outcome))
+}
+
+/// The manifest a won commit at `generation` publishes: `output` is the only
+/// live compacted file, and the flush files among `inputs` join the ones
+/// `existing` already consumed (RFC 0009 §3.4 late-write note).
+fn next_manifest(
+    existing: Option<&Manifest>,
+    generation: u64,
+    output: &str,
+    inputs: &[String],
+) -> Manifest {
+    let mut consumed = existing.map(|m| m.consumed.clone()).unwrap_or_default();
+    consumed.extend(
+        inputs
+            .iter()
+            .filter(|name| compacted_generation(name).is_none())
+            .cloned(),
+    );
+    Manifest::new(generation, vec![output.to_owned()], consumed)
 }
 
 /// Sort `inputs` into `writer` and close it, leaving no phase's memory

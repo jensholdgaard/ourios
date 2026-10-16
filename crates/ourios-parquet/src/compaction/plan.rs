@@ -131,30 +131,30 @@ impl<'s> Lister<'s> {
             if !is_sealed(&partition, now_unix_nanos, policy) {
                 continue;
             }
-            let live = self.live_names(&partition, &listed)?;
-            if is_candidate(&listed, live.as_ref(), policy) {
+            let manifest = self.listed_manifest(&partition, &listed)?;
+            let live = LiveSet::new(manifest.as_ref());
+            if is_candidate(&listed, &live, policy) {
                 plan.candidates.push(partition);
-            } else if has_orphan(&listed, live.as_ref()) {
+            } else if has_orphan(&listed, &live) {
                 plan.reclaimable.push(partition);
             }
         }
         Ok(plan)
     }
 
-    /// The names the partition's manifest makes live, read only when two or
-    /// more files are listed beside a manifest: fewer can't be two live
-    /// files, and one listed file can't be a dead one beside a live one.
-    fn live_names(
+    /// The partition's manifest, read only when two or more committed files
+    /// are listed beside one: fewer can't be two live files, nor a dead file
+    /// beside a live one.
+    fn listed_manifest(
         &mut self,
         partition: &PartitionKey,
         listed: &ListedPartition,
-    ) -> Result<Option<HashSet<String>>, CompactionError> {
-        if listed.files.len() < 2 || !listed.has_manifest {
+    ) -> Result<Option<Manifest>, CompactionError> {
+        if !listed.reads_manifest() {
             return Ok(None);
         }
         self.counts.manifest_reads += 1;
-        let manifest = read_manifest(self.store, partition)?;
-        Ok(manifest.map(|m| m.files.into_iter().collect()))
+        read_manifest(self.store, partition)
     }
 
     /// Group one recursive listing of the tenant's data prefix by hour
@@ -278,29 +278,36 @@ struct ListedPartition {
     has_tmp: bool,
 }
 
+impl ListedPartition {
+    /// Whether planning reads the manifest: two or more committed files
+    /// listed beside one.
+    fn reads_manifest(&self) -> bool {
+        self.has_manifest && self.files.len() >= 2
+    }
+}
+
 /// Whether a partition is worth compacting per `policy` (see
-/// [`meets_policy`]). The live set is the listed files, restricted to the
-/// manifest's names (`live`) when it was read.
-fn is_candidate(
-    listed: &ListedPartition,
-    live: Option<&HashSet<String>>,
-    policy: &CompactionPolicy,
-) -> bool {
+/// [`meets_policy`]): its listed files that are live under the RFC 0009
+/// §3.4 rule ([`LiveSet`]).
+fn is_candidate(listed: &ListedPartition, live: &LiveSet<'_>, policy: &CompactionPolicy) -> bool {
     let sizes: Vec<u64> = listed
         .files
         .iter()
-        .filter(|(name, _)| live.is_none_or(|l| l.contains(name)))
+        .filter(|(name, _)| live.is_live(name))
         .map(|(_, size)| *size)
         .collect();
     meets_policy(&sizes, policy)
 }
 
-/// Whether the listing shows an object the orphan GC may reclaim: an
-/// interrupted publish, or a committed file the read manifest does not name.
-/// [`gc_orphans`] decides each object; this only picks the partitions worth
-/// its listing and manifest read.
-fn has_orphan(listed: &ListedPartition, live: Option<&HashSet<String>>) -> bool {
-    listed.has_tmp || live.is_some_and(|l| listed.files.iter().any(|(name, _)| !l.contains(name)))
+/// Whether the listing shows an object [`gc_orphans`] would delete, by its
+/// own rule ([`LiveSet::is_orphan`]): an interrupted publish, or a listed
+/// file that is an orphan under the manifest planning read (or under no
+/// manifest, when none is listed). A manifest left unread (one committed
+/// file beside it) can't make a lone file an orphan, so only a
+/// `*.parquet.tmp` counts there.
+fn has_orphan(listed: &ListedPartition, live: &LiveSet<'_>) -> bool {
+    let names_known = !listed.has_manifest || listed.reads_manifest();
+    listed.has_tmp || (names_known && listed.files.iter().any(|(name, _)| live.is_orphan(name)))
 }
 
 /// The RFC 0009 §3.3 candidate test over a partition's live file sizes: at
@@ -385,14 +392,17 @@ pub(super) fn parse_partition_segment(segment: &str, prefix: &str, width: usize)
     (digits == format!("{value:0width$}")).then_some(value)
 }
 
-/// The partition's live data-file *keys*: the manifest's named files joined to
-/// the partition prefix when a manifest is present (authoritative), else every
-/// committed `*.parquet` object under the prefix (`*.parquet.tmp` and
-/// `manifest.json` are excluded by suffix). Mirrors the querier's resolution.
 /// Visit every live row of `partition`, batch by batch, without rewriting
-/// anything — the read half of the compaction path (manifest-listed files
-/// when a manifest exists, committed Parquet objects otherwise), for the
-/// RFC 0048 §3.4 backfill.
+/// anything — the read half of the compaction path under the RFC 0009 §3.4
+/// live-set rule, for the RFC 0048 §3.4 backfill.
+///
+/// The partition is listed **before** its manifest is read, as the querier
+/// resolves (RFC 0009 §3.4, reader order). A commit that lands between the two
+/// reads is then seen through its manifest: the flush files it consumed are
+/// excluded and the compacted file it names is read by name. The reverse order
+/// would pair an older manifest with a listing taken after the commit deleted
+/// its inputs, and silently visit fewer rows. A commit that deletes a listed
+/// file after both reads makes its `get` fail loudly.
 ///
 /// # Errors
 ///
@@ -402,8 +412,9 @@ pub fn visit_partition_rows(
     partition: &PartitionKey,
     mut visit: impl FnMut(&[MinedRecord]),
 ) -> Result<(), CompactionError> {
+    let listed = list_partition(store, partition)?;
     let manifest = read_manifest(store, partition)?;
-    for key in live_file_keys(store, partition, manifest.as_ref())? {
+    for key in live_keys_of(partition, manifest.as_ref(), listed) {
         let bytes = store
             .get_blocking(&key)
             .map_err(|e| store_io("get", &key, e))?;

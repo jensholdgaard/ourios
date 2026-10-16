@@ -564,23 +564,16 @@ fn write_records(store: &Store, records: &[MinedRecord]) -> String {
     w.close().expect("close").key
 }
 
-/// Lay down what a compactor killed before its commit leaves: a manifest
-/// at generation 1 naming the two inputs, and their consolidated rows
-/// under an unnamed output for generation 2. Returns that output's key.
+/// Lay down what a compactor killed before its commit leaves: the two
+/// inputs, its bootstrap manifest at generation 1 (which consumes nothing,
+/// so the inputs stay live), and their consolidated rows under an unnamed
+/// output for generation 2. Returns that output's key.
 pub(super) fn crash_before_commit(store: &Store, records: &[MinedRecord; 2]) -> String {
-    let inputs = [
-        write_records(store, &records[..1]),
-        write_records(store, &records[1..]),
-    ];
+    write_records(store, &records[..1]);
+    write_records(store, &records[1..]);
     let staged = write_records(store, records);
     let (prefix, _) = staged.rsplit_once('/').expect("partition prefix");
-    let manifest = ourios_parquet::Manifest {
-        generation: 1,
-        files: inputs
-            .iter()
-            .map(|k| k.rsplit_once('/').expect("name").1.to_owned())
-            .collect(),
-    };
+    let manifest = ourios_parquet::Manifest::new(1, Vec::new(), Vec::new());
     store
         .put_blocking(
             &format!("{prefix}/{}", ourios_parquet::MANIFEST_FILENAME),

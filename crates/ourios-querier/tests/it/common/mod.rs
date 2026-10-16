@@ -402,3 +402,17 @@ pub fn global_subscriber() {
         let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
     });
 }
+
+/// Install `provider` as the process-global tracer provider, which the
+/// store's `CLIENT` spans go to, for as long as the returned guard lives.
+/// Every test in this binary that reads spans through the global provider
+/// holds it for its whole tracing lifetime, so two of them never swap the
+/// provider under each other when they share a process (`cargo test`).
+pub async fn global_tracer_provider(
+    provider: &opentelemetry_sdk::trace::SdkTracerProvider,
+) -> tokio::sync::MutexGuard<'static, ()> {
+    static GLOBAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let guard = GLOBAL.lock().await;
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    guard
+}

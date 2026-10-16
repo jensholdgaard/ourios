@@ -62,6 +62,16 @@ fn is_plain_opaque_tag(tag: &str) -> bool {
 /// backend doesn't expose one.
 pub type EtaggedBytes = (Vec<u8>, Option<String>);
 
+/// One object of a recursive listing, as returned by
+/// [`Store::list_objects_blocking`]: its store-relative key, its size, and
+/// the `ETag` the backend listed for it (`None` when it lists none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: u64,
+    pub e_tag: Option<String>,
+}
+
 /// One `/`-delimited level of a listing, as returned by
 /// [`Store::list_delimited_blocking`]: store-relative keys, each list sorted
 /// and unique.
@@ -695,6 +705,16 @@ impl Store {
     /// per-object `head`. Same tenant-isolation gating and key normalisation as
     /// [`Self::list`].
     async fn list_entries(&self, prefix: Option<&str>) -> Result<Vec<(String, u64)>, StoreError> {
+        Ok(self
+            .list_objects(prefix)
+            .await?
+            .into_iter()
+            .map(|object| (object.key, object.size))
+            .collect())
+    }
+
+    /// [`Self::list_entries`] with each object's listed `ETag`.
+    async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<ListedObject>, StoreError> {
         let scoped = match prefix {
             Some(p) => self.resolve(p)?,
             None => self.prefix.clone(),
@@ -706,7 +726,7 @@ impl Store {
             .await
             .map_err(StoreError::Backend)?;
         let root = &self.prefix;
-        let mut entries: Vec<(String, u64)> = metas
+        let mut entries: Vec<ListedObject> = metas
             .into_iter()
             .filter_map(|m| {
                 // The backend's `list` does **string**-prefix matching, so S3
@@ -726,10 +746,14 @@ impl Store {
                     .map(|p| p.as_ref().to_owned())
                     .collect::<Vec<_>>()
                     .join("/");
-                Some((key, m.size))
+                Some(ListedObject {
+                    key,
+                    size: m.size,
+                    e_tag: m.e_tag,
+                })
             })
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(entries)
     }
 
@@ -762,6 +786,24 @@ impl Store {
         let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
         self.bridge(Operation::List, async move {
             store.list_entries(prefix.as_deref()).await
+        })
+    }
+
+    /// Blocking [`ListedObject`] listing for the **sync** storage call sites:
+    /// [`Self::list_with_sizes_blocking`] plus each object's listed `ETag`, so
+    /// a caller can tell an object unchanged without reading it. Same order +
+    /// isolation contract as [`Self::list_blocking`].
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// [`StoreError::Backend`] on a listing failure.
+    pub fn list_objects_blocking(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ListedObject>, StoreError> {
+        let (store, prefix) = (self.clone(), prefix.map(str::to_owned));
+        self.bridge(Operation::List, async move {
+            store.list_objects(prefix.as_deref()).await
         })
     }
 

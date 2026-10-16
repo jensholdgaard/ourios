@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use ourios_core::audit::AuditEvent;
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{AuditReader, Store, percent_encode_tenant};
+use ourios_parquet::{AuditReader, ListedObject, Store, percent_encode_tenant};
 
 use crate::audit_fetch::{FetchPool, fetch_in_order};
 use crate::{Backend, QueryError};
@@ -187,26 +187,128 @@ pub(crate) fn resolve_audit_set<'a>(
                 frontier,
             })
         }
+        StoreRef::Remote(store) => Ok(remote_resolved(
+            store,
+            tenant,
+            remote_audit_objects(store, tenant, None)?,
+        )),
+    }
+}
+
+/// The remote [`ResolvedAuditSet`] of a tenant's listed audit `objects`.
+fn remote_resolved<'a>(
+    store: &'a Store,
+    tenant: &TenantId,
+    objects: Vec<(String, u64)>,
+) -> ResolvedAuditSet<'a> {
+    let enc = percent_encode_tenant(tenant.as_str());
+    let prefix = format!("audit/tenant_id={enc}/");
+    // The listing is prefix-scoped, so the strip always applies; keeping the
+    // full key on a (can't-happen) miss stays consistent for set-equality as
+    // long as both sides use this same rule.
+    let mut frontier: Vec<String> = objects
+        .iter()
+        .map(|(key, _)| key.strip_prefix(&prefix).unwrap_or(key).to_owned())
+        .collect();
+    frontier.sort_unstable();
+    ResolvedAuditSet::Remote {
+        store,
+        objects: objects.into(),
+        frontier,
+    }
+}
+
+/// One tenant listing: its [`ResolvedAuditSet`], and the tag of the object
+/// named `artifact` directly under the tenant's audit root as that same
+/// listing saw it (RFC 0060 §3.7).
+pub(crate) struct AuditListing<'a> {
+    pub(crate) set: ResolvedAuditSet<'a>,
+    /// `None` when the object is absent, or listed without a tag.
+    pub(crate) artifact: Option<ObjectTag>,
+}
+
+/// [`resolve_audit_set`], also tagging the `artifact` object beside the audit
+/// files. On S3 the tag comes from the same listing request, so it costs
+/// nothing; locally it is one `stat`.
+pub(crate) fn list_audit_stream<'a>(
+    backend: StoreRef<'a>,
+    tenant: &TenantId,
+    artifact: &str,
+) -> Result<AuditListing<'a>, QueryError> {
+    let enc = percent_encode_tenant(tenant.as_str());
+    match backend {
+        StoreRef::Local(root) => {
+            let path = root
+                .join("audit")
+                .join(format!("tenant_id={enc}"))
+                .join(artifact);
+            let artifact = std::fs::metadata(path)
+                .ok()
+                .and_then(|meta| ObjectTag::from_metadata(&meta));
+            Ok(AuditListing {
+                set: resolve_audit_set(backend, tenant)?,
+                artifact,
+            })
+        }
         StoreRef::Remote(store) => {
-            let enc = percent_encode_tenant(tenant.as_str());
-            let prefix = format!("audit/tenant_id={enc}/");
-            let objects = remote_audit_objects(store, tenant, None)?;
-            // The listing is prefix-scoped, so the strip always applies;
-            // keeping the full key on a (can't-happen) miss stays
-            // consistent for set-equality as long as both sides use this
-            // same rule.
-            let mut frontier: Vec<String> = objects
+            let listed = remote_listing(store, tenant)?;
+            let key = format!("audit/tenant_id={enc}/{artifact}");
+            let artifact = listed
                 .iter()
-                .map(|(key, _)| key.strip_prefix(&prefix).unwrap_or(key).to_owned())
-                .collect();
-            frontier.sort_unstable();
-            Ok(ResolvedAuditSet::Remote {
-                store,
-                objects: objects.into(),
-                frontier,
+                .find(|object| object.key == key)
+                .and_then(|object| object.e_tag.as_deref())
+                .map(ObjectTag::from_e_tag);
+            Ok(AuditListing {
+                set: remote_resolved(store, tenant, audit_objects(listed, None)),
+                artifact,
             })
         }
     }
+}
+
+/// What identifies one version of an object without reading it (RFC 0060
+/// §3.7): the S3 `ETag`, or a local file's size, modification time and inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectTag(String);
+
+impl ObjectTag {
+    /// An `ETag` without one pair of surrounding quotes: some S3-compatible
+    /// stores quote it in one response and not in another. A weak `W/` tag
+    /// keeps its prefix, so it never equals a strong one.
+    pub(crate) fn from_e_tag(e_tag: &str) -> Self {
+        let bare = e_tag
+            .strip_prefix('"')
+            .and_then(|tag| tag.strip_suffix('"'))
+            .unwrap_or(e_tag);
+        Self(bare.to_owned())
+    }
+
+    /// A local file's tag; `None` when the platform reports no modification
+    /// time. A publish installs a new file by `rename`, so its inode changes
+    /// even when its size and modification time do not.
+    pub(crate) fn from_metadata(meta: &std::fs::Metadata) -> Option<Self> {
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(Self(format!(
+            "{:x}-{modified:x}-{:x}",
+            meta.len(),
+            inode(meta)
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn inode(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(meta)
+}
+
+#[cfg(not(unix))]
+fn inode(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 impl<'a> ResolvedAuditSet<'a> {
@@ -585,16 +687,26 @@ fn remote_audit_objects(
     tenant: &TenantId,
     window: Option<(u64, u64)>,
 ) -> Result<Vec<(String, u64)>, QueryError> {
+    Ok(audit_objects(remote_listing(store, tenant)?, window))
+}
+
+/// Every object under `audit/tenant_id=<enc>`, audit or not, with its listed
+/// `ETag`: one listing.
+fn remote_listing(store: &Store, tenant: &TenantId) -> Result<Vec<ListedObject>, QueryError> {
     let enc = percent_encode_tenant(tenant.as_str());
     let prefix = format!("audit/tenant_id={enc}");
-    let entries =
-        store
-            .list_with_sizes_blocking(Some(&prefix))
-            .map_err(|e| QueryError::Storage {
-                detail: format!("list audit prefix {prefix}: {e}"),
-            })?;
-    let files = entries
+    store
+        .list_objects_blocking(Some(&prefix))
+        .map_err(|e| QueryError::Storage {
+            detail: format!("list audit prefix {prefix}: {e}"),
+        })
+}
+
+/// The live audit `*.parquet` objects of a listing, as `(key, size)`.
+fn audit_objects(listed: Vec<ListedObject>, window: Option<(u64, u64)>) -> Vec<(String, u64)> {
+    listed
         .into_iter()
+        .map(|object| (object.key, object.size))
         // `*.parquet.tmp` does not end in `.parquet`, so an uncommitted /
         // crashed writer's temp object contributes nothing.
         .filter(|(key, _)| key.ends_with(".parquet"))
@@ -604,8 +716,7 @@ fn remote_audit_objects(
         // conservative — a key whose segments don't parse is never
         // pruned — so an unrecognised layout never drops in-window data.
         .filter(|(key, _)| window.is_none_or(|(start, end)| day_key_in_window(key, start, end)))
-        .collect();
-    Ok(files)
+        .collect()
 }
 
 /// One day in nanoseconds — the span a `…/day=DD/` audit partition covers.
@@ -700,6 +811,34 @@ pub(crate) async fn audit_files_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 0060 §3.7: a quoted and an unquoted spelling of one `ETag` are one
+    /// tag; a weak tag is never a strong one; different tags differ.
+    #[test]
+    fn e_tags_compare_without_their_quotes() {
+        let tag = ObjectTag::from_e_tag;
+        assert_eq!(tag("\"abc\""), tag("abc"));
+        assert_ne!(tag("W/\"abc\""), tag("\"abc\""));
+        assert_ne!(tag("\"abc\""), tag("\"abd\""));
+        assert_eq!(tag("\""), ObjectTag("\"".to_owned()));
+    }
+
+    /// RFC 0060 §3.7: replacing a local file by `rename` changes its tag even
+    /// with the same bytes.
+    #[test]
+    fn a_renamed_in_copy_has_another_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("artifact");
+        std::fs::write(&path, b"same bytes").expect("write");
+        let tag = || ObjectTag::from_metadata(&std::fs::metadata(&path).expect("stat"));
+        let first = tag();
+        assert!(first.is_some());
+        assert_eq!(tag(), first, "an unchanged file keeps its tag");
+        let copy = dir.path().join("copy");
+        std::fs::copy(&path, &copy).expect("copy");
+        std::fs::rename(&copy, &path).expect("rename");
+        assert_ne!(tag(), first);
+    }
 
     /// `day=02` on 2026-04 covers [00:00, next-00:00) UTC.
     const DAY_START: u64 = 1_775_088_000_000_000_000; // 2026-04-02T00:00:00Z

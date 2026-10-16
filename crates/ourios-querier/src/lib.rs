@@ -56,6 +56,8 @@ mod phase;
 mod plan;
 mod schema_adapt;
 mod template_map;
+#[cfg(feature = "testing")]
+mod template_map_hooks;
 mod template_registry;
 pub mod visibility;
 
@@ -1025,60 +1027,6 @@ impl Querier {
             .map_err(|e| QueryError::Storage {
                 detail: format!("blocking storage task: {e}"),
             })?
-    }
-}
-
-/// Test seams over the per-tenant template-map single-flight, for
-/// integration tests that must steer it deterministically (RFC0033.7's
-/// `joined` outcome). Not part of the query surface.
-#[cfg(feature = "testing")]
-impl Querier {
-    /// Run `gate` on the acquiring thread just before each template-map
-    /// acquisition this querier starts; `None` removes it.
-    #[doc(hidden)]
-    pub fn set_template_map_acquire_gate(&self, gate: Option<Arc<dyn Fn() + Send + Sync>>) {
-        *self
-            .template_maps
-            .hooks
-            .before_acquire
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
-    }
-
-    /// How many queries have so far found an acquisition in flight and
-    /// waited on it.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn template_map_waits(&self) -> usize {
-        self.template_maps
-            .hooks
-            .waits
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// How many queries have so far joined another acquisition.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn template_map_joins(&self) -> usize {
-        self.template_maps
-            .hooks
-            .joins
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Every acquisition started so far, in order: its tenant, and how many
-    /// acquisitions (itself included) were in flight as it started.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn template_map_acquisitions(&self) -> Vec<(String, usize)> {
-        self.template_maps
-            .hooks
-            .started
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|(tenant, in_flight)| (tenant.as_str().to_owned(), *in_flight))
-            .collect()
     }
 }
 

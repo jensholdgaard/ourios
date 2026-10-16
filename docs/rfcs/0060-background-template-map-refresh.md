@@ -28,6 +28,23 @@ superseded-by: —
 > evidence (§2.1). If this RFC is accepted, RFC 0033 §4 gets a dated
 > pointer here.
 
+> **Amendment (2026-10-16, #1008, maintainer-approved) — a pass skips the
+> artifact read its listing proves unnecessary.**
+> Adds §3.7: a pass remembers, per tenant, the frontier and artifact
+> `ETag` of its last verified hit. When its next listing shows the same
+> frontier and the same `ETag`, it stops there instead of reading the
+> artifact again. The skipped read could only have been a hit, so the
+> freshness argument of §2.1 holds for every change that completed before
+> the listing. A change that lands between the listing and the skipped
+> read is repaired one pass late (§3.7). Queries are untouched. It
+> does not shrink the per-tenant listing itself, which is most of a
+> pass's requests on a tenant with a long audit history. §7 records the
+> maintainer's decisions on that and on telemetry. In-place notes
+> in §3.3, §3.5 and §6, and an amended RFC0060.10 (a hit or publish no
+> longer forces an acquisition on the next pass, only a listing). New
+> scenarios RFC0060.12–.16 (`drafted`); §9 records the history. The
+> frontmatter status and RFC0060.1–.9 and .11 are unchanged.
+
 ## 1. Summary
 
 The querier refreshes each tenant's template map in the background:
@@ -153,6 +170,16 @@ ask. §7 lists pre-emptive full folds as an open question.
   default interval that is negligible beside the ingest path's own
   requests. It is still paid per tenant, hence §7's question about
   large tenant counts.
+
+  > *Amendment (2026-10-16, #1008, maintainer-approved).* Measured on the
+  > production node (one pass, 2026-10-16, five idle tenants): one
+  > delimited `LIST` of `audit/`, then per tenant one `LIST` **per
+  > 1,000 audit objects** (8 and 6 pages for the two oldest tenants, 1
+  > for the rest) and one artifact `GET`. That is 23 requests a pass,
+  > about 6,600 a day at the default interval, and the `LIST` pages grow
+  > with each tenant's audit history. §3.7 removes the artifact `GET`
+  > from a pass whose listing proves the tenant unchanged (5 of the 23).
+  > The `LIST` pages stay; see §7.
 - **Back-off when nothing persists.** An acquisition that ends without
   a publish and without a hit persists nothing. That covers a
   write-through abstention (RFC 0033 §3.2 size gate or ceiling, which
@@ -228,6 +255,15 @@ doubles the existing series.
 ourios-semconv `v0.3.17` under the purpose-check and
 maintainer-approval rule, after an OTel naming-guidance check.
 
+> *Amendment (2026-10-16, #1008, maintainer-approved).* A tenant that §3.7 skips
+> still gets its `load template_map` span, with the listing's `CLIENT`
+> spans beneath it and no `S3.GetObject`. It carries no
+> `ourios.template_map.lookup.outcome` and records no `lookups` sample:
+> no artifact was looked up. The effect is measured by the existing
+> `ourios.storage.operation.duration{ourios.storage.caller=template_map,
+> ourios.storage.operation=get}` count and the `S3.GetObject` spans. No
+> new name; §7 asks whether a registered `unchanged` outcome is wanted.
+
 ### 3.6 Multi-tenancy and replicas (CLAUDE.md §3.7)
 
 Each acquisition is per tenant, as today. Several querier replicas each
@@ -247,6 +283,93 @@ sequenceDiagram
     F-->>T: map, published
     T->>T: next tenant
 ```
+
+### 3.7 Skipping a read the listing proves unnecessary (amendment 2026-10-16, #1008, maintainer-approved)
+
+Every acquisition starts with one recursive listing of the tenant's
+audit prefix (RFC 0033 §3.3). The artifact lives under that prefix, so
+the listing already returns it, with its `ETag`, next to the audit
+objects. Today the listing keeps only the `*.parquet` keys. A pass now
+also keeps the artifact's listed `ETag`, and uses it like this.
+
+**What a pass remembers.** Per tenant, at most one *verified listing*: a
+frontier `F` and an artifact tag `T`. It is recorded only when the
+pass's own acquisition was a **hit** (RFC 0033 §3.3: the artifact
+decoded `Valid` with `folded_files == F`, the listed frontier), **and**
+the artifact `GET` returned the same tag the listing showed. Nothing
+else records one: a publish (the new object's tag is not known
+without a read), a lost CAS race, an abstention, a failure, or a
+joined flight. Any of those, or an error, drops the tenant's verified
+listing.
+
+**What a pass skips.** Before the acquisition it would start, a pass
+compares its listing against the tenant's verified listing. If the
+listed frontier equals `F` and the listed artifact tag equals `T`, the
+pass stops: no artifact `GET`, no flight, no derive, no publish. Any
+difference (a new audit object, a removed one, a replaced, removed or
+unlisted artifact) runs the acquisition exactly as §3.1 describes,
+against the same listing.
+
+**Why the skip changes nothing a query sees.** The skipped acquisition
+would have read the artifact the listing shows. That object has tag
+`T`, and an object store's `ETag` names one object content, the
+identity RFC 0033 §3.4's CAS publish already relies on. So the read
+would have returned the bytes the verified hit read, which decode to a
+`Valid` map at `F`, which is the listed frontier: a hit. A hit derives
+nothing and publishes nothing. So the store after a skip is exactly the
+store after the acquisition it replaces, and §2.1's argument holds
+unchanged: the task still never serves anything, and every query still
+lists and reads for itself. S3's listings are strongly consistent, so
+the listing reflects every write and delete that completed before it,
+by any process: another querier replica, an ingester elsewhere, or a
+bucket lifecycle rule. That is why the proof needs no in-process
+signal and holds in multi-process deployments.
+
+**The one interleaving it does not cover.** The proof is about the
+store as the listing saw it. The artifact `GET` is not pinned to the
+listed version: it reads whatever is at the key when it runs. If
+another process replaces or deletes the artifact after the listing and
+before that `GET`, the acquisition the skip replaces would have read the
+new state. On a deletion it would have folded and published. The skip
+does neither. So "exactly the store after the acquisition it replaces"
+holds for every change that completed before the listing, and not for
+one that lands between the listing and the would-be `GET`. That change
+is in the next pass's listing (a different tag, or no artifact) and is
+repaired there. The repair is late by at most one pass, `interval` plus
+the pass's run time. This RFC accepts that delay. Query correctness
+does not depend on it: a query in that window lists and reads for
+itself, and pays the fold that the old pass might have paid. The same
+window already exists without §3.7 for a change that lands just after a
+pass's `GET`. §3.7 moves the window's start from the `GET` to the
+listing, a few milliseconds earlier. RFC0060.16 states the behaviour.
+
+**Tags.** On the S3 backend the tag is the object's `ETag`, compared
+after stripping one pair of surrounding double quotes, since some
+S3-compatible stores spell it quoted in one response and unquoted in
+the other. A weak (`W/`) tag never equals a strong one. A store that
+lists no `ETag` never skips. On the local backend the tag is the
+file's size, modification time (nanoseconds) and, on Unix, inode. The
+listing takes it with a `stat`. The read takes it from the open file
+handle it reads through, so it names the bytes read. A local publish
+installs a fresh temp file by `rename` (RFC 0033 §3.4), which changes
+the inode.
+
+**Bounds.** One verified listing per tenant, the size of one frontier.
+That is the same size as the listing a pass already holds for that
+tenant. It lives in process memory and resets on restart, so a new
+binary (and a new artifact format) always reads. A successful tenant
+listing drops the verified listings of tenants it no longer names, as
+§3.3 does for the back-off counters. Queries never consult it: a query
+needs the map itself, and `map_flight` keeps no map once a flight ends.
+
+**What it saves, and what it does not.** On the production node
+(2026-10-16) the skip removes the artifact `GET` from about 1,150 of
+the 1,255 daily refresh acquisitions (the hits), together with their
+bytes. One tenant listing is still paid per tenant per pass, at one
+`LIST` request per 1,000 audit objects. On a long-lived tenant those
+pages are most of the cost (§3.3 note). Cutting them needs a signal
+weaker than a listing, or a smaller listing. §7 lists the options; each
+needs a maintainer decision.
 
 ## 4. Alternatives considered
 
@@ -366,6 +489,13 @@ path, and a second publisher contends for the CAS.
 >   pass again
 > - **And** once a successful listing no longer names the tenant, its
 >   counter is dropped; a failed listing drops nothing.
+>
+> *Amendment (2026-10-16, #1008, maintainer-approved).* The second **And** becomes:
+> after a hit or a publish, back-off no longer skips the tenant. The next
+> pass lists it, and acquires it unless §3.7's skip applies; RFC0060.12
+> says when it does. After a publish the skip never applies on the next
+> pass, since a publish leaves no verified listing (RFC0060.14), so the
+> existing test's "a hit, on the next pass" after a publish still holds.
 
 > **Scenario RFC0060.11 — Passes are spaced from their end, never overlap**
 > - **Given** paused time, `interval: 5m`, and a pass whose fold is
@@ -374,6 +504,75 @@ path, and a second publisher contends for the CAS.
 > - **Then** no second pass starts while the first is running, and the
 >   next pass starts `interval` after the first pass finished, with no
 >   catch-up pass in between.
+
+The scenarios below are added by the 2026-10-16 amendment (§3.7, #1008)
+and are `drafted`.
+
+> **Scenario RFC0060.12 — An unchanged listing skips the artifact read**
+> - **Given** a tenant whose last pass acquired a hit, with the
+>   artifact read's tag equal to the listed one
+> - **When** the next pass lists the same frontier and the same artifact
+>   tag
+> - **Then** that pass reads no artifact and starts no flight, and
+>   records no `lookups` or `derive.duration` sample for the tenant
+> - **And** a query for the tenant afterwards still lists and reads the
+>   artifact, and records a `hit` with `acquire.trigger = query`.
+
+> **Scenario RFC0060.13 — Any change in the listing reads again**
+> - **Given** a tenant with a verified listing
+> - **When** before the next pass (a) a new audit object appears, (b) an
+>   audit object is removed, (c) another writer replaces the artifact
+>   with a valid one at the same frontier whose tag differs from the
+>   verified one, or (d) the artifact is removed
+> - **Then** that pass runs the acquisition: (a) and (b) are `stale`
+>   lookups and fold, (c) is a `hit` that records a new verified
+>   listing, and (d) is a `miss` that folds in full and publishes
+> - **And** in every case the store afterwards equals what the
+>   acquisition would leave without §3.7
+> - **And** a replacement with the same bytes that keeps the same
+>   `ETag` (a single-part S3 `PUT` of identical content) is not a
+>   change: the pass skips it, correctly, since a read would return the
+>   same bytes.
+
+> **Scenario RFC0060.14 — Only a verified hit is remembered**
+> - **Given** a tenant whose pass acquisition publishes (a stale or
+>   missing artifact), abstains, fails, or reads an artifact whose tag
+>   differs from the listed one
+> - **When** the next pass that §3.3's back-off does not skip for that
+>   tenant lists the same frontier (the very next pass after a publish
+>   or a mismatched read; a later one after an abstention or failure)
+> - **Then** it reads the artifact (no skip), and only after that read
+>   is a hit with matching tags does a later pass skip
+> - **And** the back-off is unchanged by §3.7: an abstention or failure
+>   still skips the passes §3.3 says, and drops the verified listing
+> - **And** once a successful tenant listing no longer names a tenant,
+>   its verified listing is dropped; a failed listing drops nothing.
+
+> **Scenario RFC0060.15 — The skip on S3, and its spans**
+> - **Given** the S3 backend and a tenant with a verified listing
+> - **When** a pass skips it
+> - **Then** its `load template_map` span has its `S3.ListObjectsV2`
+>   children and no `S3.GetObject` child, and carries no
+>   `ourios.template_map.lookup.outcome`
+> - **And** after another writer `PUT`s an artifact with different
+>   bytes (so a different `ETag`), the next pass has an `S3.GetObject`
+>   child again.
+
+> **Scenario RFC0060.16 — A deletion after the listing is repaired one
+> pass late**
+> - **Given** a tenant with a verified listing
+> - **When** another process deletes the artifact after a pass's tenant
+>   listing and before the pass decides
+> - **Then** that pass skips: it reads nothing and publishes nothing
+> - **And** a query between the two passes answers correctly. Its
+>   lookup is a `miss`, it pays the fold itself, and its usual
+>   write-through (RFC 0033 §3.5) may republish the artifact
+> - **And** if the artifact is still absent at the next pass's listing,
+>   that pass acquires a `miss`, folds and publishes
+> - **And** if a query republished it instead, the next pass reads the
+>   artifact the listing shows. Should that artifact restore the
+>   verified frontier and tag, the pass may skip under §3.7; a hit is not
+>   required.
 
 ## 6. Testing strategy
 
@@ -392,6 +591,19 @@ path, and a second publisher contends for the CAS.
 No `proptest` or corpus test applies: the task adds scheduling, not
 fold semantics, and the fold's own property tests (RFC0033.10–.13)
 already cover what it calls.
+
+> *Amendment (2026-10-16, #1008, maintainer-approved).* Test map for §3.7:
+>
+> | Scenario | Test | Where |
+> |:--|:--|:--|
+> | RFC0060.12 | `rfc0060_12_an_unchanged_listing_skips_the_artifact_read` | `ourios-querier` `tests/it/rfc0060_refresh.rs`, local backend, acquisition counter + lookup metrics |
+> | RFC0060.13 | `rfc0060_13_any_change_in_the_listing_reads_again` | same file; (a)–(d) as four cases over one store |
+> | RFC0060.14 | `rfc0060_14_only_a_verified_hit_is_remembered` | same file, plus unit tests of the tag comparison in `map_refresh` / `audit_scan` |
+> | RFC0060.15 | `rfc0060_15_the_skip_on_s3_reads_no_artifact` | same file, `#[ignore]`d, run by the `s3-integration` CI job (LocalStack) |
+> | RFC0060.16 | `rfc0060_16_a_deletion_after_the_listing_is_repaired_one_pass_late` | same file; a test hook deletes the artifact right after the tenant listing |
+>
+> The local backend's tag is exercised by .12–.14; the S3 `ETag` path,
+> including the listing that carries it, by .15.
 
 ## 7. Open questions
 
@@ -415,6 +627,53 @@ the Dash0 evidence named:
 - [x] **Default `interval`: `5m`.** Revisit with publish and fold rates
       after release.
 
+Decided for the 2026-10-16 amendment (#1008, maintainer, 2026-10-16):
+
+- [x] **The listing pages (most of a pass's cost): compact the audit
+      stream, in a follow-up RFC.** Option 1 below, not part of this
+      amendment. Options 2–5 are not taken. §3.7 is the only skip a
+      listing can prove. The options considered for fewer `LIST` pages:
+      1. **Shrink the listing: compact the audit stream** (chosen).
+         Pages grow with audit objects, and the stream writes many small
+         objects (one per audit flush and one per compaction event,
+         RFC 0005 §3.7). Merging a tenant's closed audit days into a few
+         objects shrinks every
+         listing, the refresher's and every query's, and the full folds
+         too. It changes no freshness rule. It is an RFC 0005 §3.7 and
+         RFC 0033 change (merged objects change the frontier, so it
+         must not cost a full fold each time), and so a separate RFC.
+      2. **Probe recent days, list in full every `k` passes.** A pass
+         lists only the current and previous UTC day of each tenant, and
+         lists in full every `k`-th pass or when the probe shows a
+         change. Most passes cost one page per tenant. But it misses a
+         backdated audit object (a WAL replay) or a removed one (a
+         lifecycle rule) for up to `k × interval`. In that window a
+         query pays the `out_of_order` or `files_removed` full fold that
+         the refresher exists to absorb. That weakens §2.1's guarantee
+         to "within `k × interval`" for those two causes.
+      3. **Back off unchanged tenants.** Lengthen a tenant's interval
+         while its listing stays unchanged, as §3.3 does for tenants
+         that persist nothing. This weakens freshness the same way as 2,
+         for every cause. It also saves little where it matters: the
+         tenants with many pages are the active ones, which move every
+         few passes.
+      4. **A per-tenant change marker.** Every audit writer rewrites a
+         small marker object after each audit write, and a pass `HEAD`s
+         it instead of listing. This is a new object in the store layout
+         (CLAUDE.md §3.5), adds a `PUT` to each audit write, and cannot
+         see removals by a lifecycle rule or writes by older binaries, so
+         it still needs a periodic full listing. Same weakening as 2.
+      5. **An in-process signal from the local ingester** (combined
+         role). It sees only this process's writes: not another
+         ingester, a lifecycle rule, or a separate-process deployment.
+         Not a proof, so it is rejected as the basis of a skip.
+- [x] **An `unchanged` lookup outcome: not now.** §3.5's note records a skip
+      only through the storage counters and the span shape. Registering
+      `unchanged` as a value of `ourios.template_map.lookup.outcome`
+      would let a dashboard count skips directly. That is a new registry
+      value under the purpose-check rule. Recommended: not now; the
+      `GetObject` count is the quantity #1008 is about.
+
 ## 8. References
 
 - RFC 0033 (cached template map): §3.3 freshness and the incremental
@@ -425,3 +684,23 @@ the Dash0 evidence named:
 - #853 (cold map / RSS), #897 (incremental fold), #934 (resumable
   bootstrap), #990 (this RFC's issue).
 - CLAUDE.md §3.3, §3.7, §6.3.
+
+## 9. Amendment history
+
+- **2026-10-16 — a pass skips the artifact read its listing proves
+  unnecessary (#1008, maintainer-approved 2026-10-16).** Adds
+  §3.7: a per-tenant verified listing (frontier and artifact tag),
+  recorded only on a hit whose read tag equals the listed one; a pass
+  whose listing matches it reads nothing. In-place notes in §3.3 (the
+  measured per-pass request count), §3.5 (no new name; the skip's span
+  shape) and §6 (test map). Amends RFC0060.10: after a hit or a
+  publish the next pass lists the tenant and acquires it unless §3.7's
+  skip applies. States the one interleaving §3.7 does not cover, a
+  change between the listing and the skipped read, and accepts its
+  one-pass repair delay. New scenarios RFC0060.12–.16. Two §7
+  decisions: the listing pages are cut by compacting the audit stream
+  (a follow-up RFC), and there is no `unchanged` lookup outcome for now.
+  RFC0060.1–.9, .11 and the frontmatter status are unchanged.
+  Review (Copilot, #1028): the race qualification and RFC0060.16, the
+  RFC0060.10 amendment, a different tag in RFC0060.13 (c), and the
+  back-off-eligible pass in RFC0060.14.

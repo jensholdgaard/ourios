@@ -328,11 +328,14 @@ impl TemplateMapFlights {
                 } => {
                     let outcome = Self::wait(done, &mut waited).await;
                     if same_frontier {
-                        return self.join(outcome, waited, trigger).map(|acquisition| {
-                            Settled::Acquired {
-                                acquisition,
-                                verified: None,
-                            }
+                        let joined = Self::join(outcome, waited, trigger);
+                        #[cfg(any(test, feature = "testing"))]
+                        if joined.is_ok() {
+                            self.hooks.joined();
+                        }
+                        return joined.map(|acquisition| Settled::Acquired {
+                            acquisition,
+                            verified: None,
                         });
                     }
                 }
@@ -397,7 +400,6 @@ impl TemplateMapFlights {
 
     /// A joiner's answer: the shared acquisition's, with none of its bytes.
     fn join(
-        &self,
         outcome: Option<Shared>,
         waited: Duration,
         trigger: AcquireTrigger,
@@ -409,8 +411,6 @@ impl TemplateMapFlights {
         template_map::record_acquire_wait(waited);
         if acquired.is_ok() {
             template_map::record_joined_lookup(trigger);
-            #[cfg(any(test, feature = "testing"))]
-            self.hooks.joined();
         }
         acquired.map(|shared| MapAcquisition::new(shared, 0))
     }

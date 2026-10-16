@@ -582,47 +582,47 @@ fn rfc0060_8_telemetry_is_registry_conformant() {
     );
 }
 
-/// One traced pass: the `load template_map` span of `tenant` it exported
+/// The tenant the RFC 0060 §3.7 scenarios refresh.
+const TENANT: &str = "acme";
+
+/// One traced pass: the `load template_map` span of [`TENANT`] it exported
 /// (if any), and whether it folded.
 async fn traced_pass(
     refresher: &mut ourios_querier::TemplateMapRefresher,
-    tenant: &str,
 ) -> (Option<SpanData>, bool) {
     let (exporter, _provider, dispatch) = traced();
     refresher.run_pass().with_subscriber(dispatch).await;
     let spans = exporter.get_finished_spans().expect("spans");
     let load = named(&spans, "load template_map")
         .into_iter()
-        .find(|s| text(s, semconv::OURIOS_TENANT).as_deref() == Some(tenant))
+        .find(|s| text(s, semconv::OURIOS_TENANT).as_deref() == Some(TENANT))
         .cloned();
     (load, !named(&spans, "derive template_map").is_empty())
 }
 
-/// The lookup outcome a traced pass recorded for `tenant`, `None` for a skip.
-async fn pass_outcome(
-    refresher: &mut ourios_querier::TemplateMapRefresher,
-    tenant: &str,
-) -> Option<String> {
-    let (load, _) = traced_pass(refresher, tenant).await;
+/// The lookup outcome a traced pass recorded for [`TENANT`], `None` for a
+/// skip.
+async fn pass_outcome(refresher: &mut ourios_querier::TemplateMapRefresher) -> Option<String> {
+    let (load, _) = traced_pass(refresher).await;
     text(
         &load.expect("every listed tenant has a load span"),
         semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
     )
 }
 
-/// Install a copy of `tenant`'s artifact by rename, as another writer's
+/// Install a copy of [`TENANT`]'s artifact by rename, as another writer's
 /// publish at the same frontier would.
-fn republish_artifact(root: &Path, tenant: &str) {
-    let path = tenant_dir(root, tenant).join(TEMPLATE_MAP_FILENAME);
+fn republish_artifact(root: &Path) {
+    let path = tenant_dir(root, TENANT).join(TEMPLATE_MAP_FILENAME);
     let copy = path.with_extension("other-writer.tmp");
     std::fs::copy(&path, &copy).expect("copy artifact");
     std::fs::rename(&copy, &path).expect("install the copy");
 }
 
-/// The audit Parquet files of `tenant`, sorted.
-fn audit_files(root: &Path, tenant: &str) -> Vec<PathBuf> {
+/// The audit Parquet files of [`TENANT`], sorted.
+fn audit_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let mut dirs = vec![tenant_dir(root, tenant)];
+    let mut dirs = vec![tenant_dir(root, TENANT)];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(dir).expect("read dir") {
             let path = entry.expect("entry").path();
@@ -637,44 +637,38 @@ fn audit_files(root: &Path, tenant: &str) -> Vec<PathBuf> {
     files
 }
 
-/// A refresher over `tenant` that has just verified a hit: the first pass
+/// A refresher over [`TENANT`] that has just verified a hit: the first pass
 /// publishes, the second hits and records the verified listing.
-async fn verified(querier: &Querier, tenant: &str) -> ourios_querier::TemplateMapRefresher {
+async fn verified(querier: &Querier) -> ourios_querier::TemplateMapRefresher {
     let mut refresher = querier.template_map_refresher();
     refresher.run_pass().await;
     assert!(
         refresher.verified().is_empty(),
         "a publish verifies nothing"
     );
-    assert_eq!(
-        pass_outcome(&mut refresher, tenant).await.as_deref(),
-        Some("hit")
-    );
-    assert_eq!(refresher.verified(), vec![tenant]);
+    assert_eq!(pass_outcome(&mut refresher).await.as_deref(), Some("hit"));
+    assert_eq!(refresher.verified(), vec![TENANT]);
     refresher
 }
 
 /// Back to a skipping state after a change: a verifying hit if the change
 /// left none, then a skip.
-async fn reverify(refresher: &mut ourios_querier::TemplateMapRefresher, tenant: &str) {
+async fn reverify(refresher: &mut ourios_querier::TemplateMapRefresher) {
     if refresher.verified().is_empty() {
-        assert_eq!(
-            pass_outcome(refresher, tenant).await.as_deref(),
-            Some("hit")
-        );
+        assert_eq!(pass_outcome(refresher).await.as_deref(), Some("hit"));
     }
-    assert_eq!(pass_outcome(refresher, tenant).await, None, "skips again");
+    assert_eq!(pass_outcome(refresher).await, None, "skips again");
 }
 
 /// Scenario RFC0060.12 — an unchanged listing skips the artifact read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0060_12_an_unchanged_listing_skips_the_artifact_read() {
-    let dir = store(&["acme"]);
+    let dir = store(&[TENANT]);
     let querier = Querier::new(dir.path());
-    let mut refresher = verified(&querier, "acme").await;
+    let mut refresher = verified(&querier).await;
 
     let before = acquired(&querier).len();
-    let (load, folded) = traced_pass(&mut refresher, "acme").await;
+    let (load, folded) = traced_pass(&mut refresher).await;
     let load = load.expect("the skipped tenant still has its load span");
     assert_eq!(acquired(&querier).len(), before, "no flight, no read");
     assert_eq!(
@@ -683,10 +677,10 @@ async fn rfc0060_12_an_unchanged_listing_skips_the_artifact_read() {
         "no lookup was made"
     );
     assert!(!folded, "nothing folded");
-    assert_eq!(refresher.verified(), vec!["acme"], "the skip keeps it");
+    assert_eq!(refresher.verified(), vec![TENANT], "the skip keeps it");
 
     let (exporter, _provider, dispatch) = traced();
-    query(&querier, "acme")
+    query(&querier, TENANT)
         .with_subscriber(dispatch)
         .await
         .expect("query");
@@ -698,7 +692,7 @@ async fn rfc0060_12_an_unchanged_listing_skips_the_artifact_read() {
     let spans = exporter.get_finished_spans().expect("spans");
     assert_eq!(
         text(
-            load_of(&spans, "acme"),
+            load_of(&spans, TENANT),
             semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME
         )
         .as_deref(),
@@ -711,22 +705,22 @@ async fn rfc0060_12_an_unchanged_listing_skips_the_artifact_read() {
 /// same frontier, (d) a removed artifact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0060_13_any_change_in_the_listing_reads_again() {
-    let dir = store(&["acme"]);
-    write_audit(dir.path(), &[adopted("acme", 2, TS0 + HOUR_NS)]);
+    let dir = store(&[TENANT]);
+    write_audit(dir.path(), &[adopted(TENANT, 2, TS0 + HOUR_NS)]);
     let querier = Querier::new(dir.path());
-    let mut refresher = verified(&querier, "acme").await;
-    let artifact = tenant_dir(dir.path(), "acme").join(TEMPLATE_MAP_FILENAME);
+    let mut refresher = verified(&querier).await;
+    let artifact = tenant_dir(dir.path(), TENANT).join(TEMPLATE_MAP_FILENAME);
 
-    let before = audit_files(dir.path(), "acme");
-    write_audit(dir.path(), &[adopted("acme", 3, TS0 + 2 * HOUR_NS)]);
+    let before = audit_files(dir.path());
+    write_audit(dir.path(), &[adopted(TENANT, 3, TS0 + 2 * HOUR_NS)]);
     assert_eq!(
-        pass_outcome(&mut refresher, "acme").await.as_deref(),
+        pass_outcome(&mut refresher).await.as_deref(),
         Some("stale"),
         "(a) a new audit object"
     );
-    reverify(&mut refresher, "acme").await;
+    reverify(&mut refresher).await;
 
-    let added: Vec<PathBuf> = audit_files(dir.path(), "acme")
+    let added: Vec<PathBuf> = audit_files(dir.path())
         .into_iter()
         .filter(|file| !before.contains(file))
         .collect();
@@ -735,35 +729,35 @@ async fn rfc0060_13_any_change_in_the_listing_reads_again() {
     };
     std::fs::remove_file(added).expect("remove it");
     assert_eq!(
-        pass_outcome(&mut refresher, "acme").await.as_deref(),
+        pass_outcome(&mut refresher).await.as_deref(),
         Some("stale"),
         "(b) a removed audit object"
     );
-    reverify(&mut refresher, "acme").await;
+    reverify(&mut refresher).await;
 
-    republish_artifact(dir.path(), "acme");
+    republish_artifact(dir.path());
     assert_eq!(
-        pass_outcome(&mut refresher, "acme").await.as_deref(),
+        pass_outcome(&mut refresher).await.as_deref(),
         Some("hit"),
         "(c) another writer's artifact"
     );
     assert_eq!(
         refresher.verified(),
-        vec!["acme"],
+        vec![TENANT],
         "a hit verifies it again"
     );
-    reverify(&mut refresher, "acme").await;
+    reverify(&mut refresher).await;
 
     std::fs::remove_file(&artifact).expect("remove the artifact");
     assert_eq!(
-        pass_outcome(&mut refresher, "acme").await.as_deref(),
+        pass_outcome(&mut refresher).await.as_deref(),
         Some("miss"),
         "(d) a removed artifact"
     );
     assert!(artifact.exists(), "the miss publishes");
-    reverify(&mut refresher, "acme").await;
+    reverify(&mut refresher).await;
 
-    let rows = query(&querier, "acme").await.expect("query").rows;
+    let rows = query(&querier, TENANT).await.expect("query").rows;
     assert_eq!(rows, 1, "queries answer as without the skip");
 }
 
@@ -772,34 +766,28 @@ async fn rfc0060_13_any_change_in_the_listing_reads_again() {
 async fn rfc0060_14_only_a_verified_hit_is_remembered() {
     // A read whose tag differs from the listed one: another writer installs
     // an artifact between this pass's listing and its read.
-    let dir = store(&["acme"]);
+    let dir = store(&[TENANT]);
     let querier = Querier::new(dir.path());
     let mut refresher = querier.template_map_refresher();
     refresher.run_pass().await;
     let root = dir.path().to_path_buf();
     querier.set_template_map_acquire_gate(Some(Arc::new(move || {
-        republish_artifact(&root, "acme");
+        republish_artifact(&root);
     })));
-    assert_eq!(
-        pass_outcome(&mut refresher, "acme").await.as_deref(),
-        Some("hit")
-    );
+    assert_eq!(pass_outcome(&mut refresher).await.as_deref(), Some("hit"));
     assert!(
         refresher.verified().is_empty(),
         "a read of another artifact than the listed one verifies nothing"
     );
     querier.set_template_map_acquire_gate(None);
-    assert_eq!(
-        pass_outcome(&mut refresher, "acme").await.as_deref(),
-        Some("hit")
-    );
-    assert_eq!(refresher.verified(), vec!["acme"]);
+    assert_eq!(pass_outcome(&mut refresher).await.as_deref(), Some("hit"));
+    assert_eq!(refresher.verified(), vec![TENANT]);
 
-    write_audit(dir.path(), &[adopted("acme", 2, TS0 + HOUR_NS)]);
-    corrupt_audit(dir.path(), "acme");
+    write_audit(dir.path(), &[adopted(TENANT, 2, TS0 + HOUR_NS)]);
+    corrupt_audit(dir.path(), TENANT);
     refresher.run_pass().await;
     assert!(refresher.verified().is_empty(), "a failure drops it");
-    assert_eq!(refresher.backed_off(), vec!["acme"]);
+    assert_eq!(refresher.backed_off(), vec![TENANT]);
 
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(tenant_dir(dir.path(), "idle")).expect("tenant dir");
@@ -811,18 +799,18 @@ async fn rfc0060_14_only_a_verified_hit_is_remembered() {
         "an abstention verifies nothing"
     );
 
-    let dir = store(&["acme"]);
+    let dir = store(&[TENANT]);
     let querier = Querier::new(dir.path());
-    let mut refresher = verified(&querier, "acme").await;
+    let mut refresher = verified(&querier).await;
     break_listing(dir.path());
     refresher.run_pass().await;
     assert_eq!(
         refresher.verified(),
-        vec!["acme"],
+        vec![TENANT],
         "a failed listing drops nothing"
     );
     restore_listing(dir.path());
-    std::fs::remove_dir_all(tenant_dir(dir.path(), "acme")).expect("drop the tenant");
+    std::fs::remove_dir_all(tenant_dir(dir.path(), TENANT)).expect("drop the tenant");
     refresher.run_pass().await;
     assert!(
         refresher.verified().is_empty(),
@@ -858,7 +846,7 @@ async fn rfc0060_15_the_skip_on_s3_reads_no_artifact() {
     let spans = pass().await;
     assert_eq!(
         text(
-            load_of(&spans, "acme"),
+            load_of(&spans, TENANT),
             semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME
         )
         .as_deref(),
@@ -867,7 +855,7 @@ async fn rfc0060_15_the_skip_on_s3_reads_no_artifact() {
     assert_eq!(client_spans(&spans, "S3.GetObject"), 1);
 
     let spans = pass().await;
-    let load = load_of(&spans, "acme");
+    let load = load_of(&spans, TENANT);
     assert_eq!(
         client_spans(&spans, "S3.GetObject"),
         0,
@@ -905,18 +893,18 @@ fn seed_s3(store: &ourios_parquet::Store) {
     use ourios_core::audit::AuditSink as _;
 
     let mut sink = ourios_parquet::ParquetAuditSink::new(store.clone());
-    sink.emit(adopted("acme", 1, TS0));
+    sink.emit(adopted(TENANT, 1, TS0));
     assert_eq!(sink.write_failures(), 0);
     crate::common::write_all_in(
         store,
-        &[simple("acme", 1, TS0)],
+        &[simple(TENANT, 1, TS0)],
         &ourios_parquet::PromotedAttributes::default(),
     );
 }
 
 /// The `CLIENT` spans named `name` under the `load template_map` of `acme`.
 fn client_spans(spans: &[SpanData], name: &str) -> usize {
-    let load = id(load_of(spans, "acme"));
+    let load = id(load_of(spans, TENANT));
     spans
         .iter()
         .filter(|s| {

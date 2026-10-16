@@ -8,28 +8,51 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// The manifest a commit replaces.
+#[derive(Clone, Copy)]
+pub(super) enum Base<'e> {
+    /// None yet: the commit creates the first one.
+    Absent,
+    /// The manifest read before the rewrite, with its `ETag` (`None` if the
+    /// backend exposes none).
+    Current(Option<&'e str>),
+}
+
 /// Commit `manifest` to `key` in `store` with the backend-appropriate atomic
 /// swap (CLAUDE.md §3.5 / RFC0009.3 — no torn read either way):
 ///
+/// - **First commit (any backend):** a create-if-absent conditional PUT
+///   ([`Manifest::publish_cas`] with no `ETag`); a peer that created the
+///   manifest first makes it [`Published::Lost`] (RFC 0009 §3.4).
 /// - **CAS-capable backend (S3, RFC0019.4):** an `If-Match` conditional PUT
-///   ([`Manifest::publish_cas`]) against `expected`; a lost race returns
-///   [`Published::Lost`].
-/// - **Local backend (RFC0019.7 — byte-for-byte unchanged):** `LocalFileSystem`
-///   rejects `PutMode::Update`, so commit with an atomic overwrite (it stages to
+///   against the base's `ETag`; a lost race returns [`Published::Lost`].
+/// - **Local backend (RFC0019.7):** `LocalFileSystem` rejects
+///   `PutMode::Update`, so a later commit is an atomic overwrite (it stages to
 ///   a temp object and renames it into place — the same swap
-///   [`Manifest::write_atomic`] performed pre-RFC-0019). Last-writer-wins; there
-///   is no S3-style CAS race to lose on a single local host, so it always wins.
+///   [`Manifest::write_atomic`] performed pre-RFC-0019). Last-writer-wins; one
+///   compactor per local store (RFC0009.24), so it always wins.
 pub(super) fn commit_manifest(
     store: &Store,
     key: &str,
     manifest: &Manifest,
-    expected: Option<&str>,
+    base: Base<'_>,
 ) -> Result<Published, CompactionError> {
-    if store.supports_conditional_update() {
-        return manifest
-            .publish_cas(store, key, expected)
-            .map_err(CompactionError::Manifest);
-    }
+    let expected = match base {
+        Base::Absent => None,
+        Base::Current(etag) if store.supports_conditional_update() => etag,
+        Base::Current(_) => return overwrite_manifest(store, key, manifest),
+    };
+    manifest
+        .publish_cas(store, key, expected)
+        .map_err(CompactionError::Manifest)
+}
+
+/// The local backend's last-writer-wins commit over an existing manifest.
+fn overwrite_manifest(
+    store: &Store,
+    key: &str,
+    manifest: &Manifest,
+) -> Result<Published, CompactionError> {
     manifest.validate().map_err(CompactionError::Manifest)?;
     let bytes = manifest
         .to_json()

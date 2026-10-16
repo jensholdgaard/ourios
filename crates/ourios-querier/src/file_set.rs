@@ -566,6 +566,10 @@ fn read_store_manifests(
             Ok(())
         },
     );
+    // On a failure the pool lets GETs its workers already claimed run to
+    // completion, detached from this resolution, so a claimed GET can still
+    // be issued after this read. The error-path count is the GETs issued up
+    // to the failure, not those detached workers' late ones.
     tally.counts.manifest_reads += gets.load(Ordering::Relaxed);
     result.map(|()| read)
 }

@@ -1523,7 +1523,8 @@ The following scenario is added by the 2026-10-16 orphan-GC amendment
 > **When** a compaction sweep runs,
 > **Then** `sweep partitions` has exactly one `reclaim orphans` child, of
 > kind `INTERNAL`, that starts after `plan partitions` ends and after the
-> sweep's last committed partition, and lies within its parent's interval,
+> sweep's last consolidation commit (an RFC 0047 erasure rewrite, which
+> runs after it, is not one), and lies within its parent's interval,
 > **And** its `ourios.compaction.orphan.reclaimed_count` is 2, its
 > `ourios.compaction.orphan.failed_count` is 0, and its status is `Unset`,
 > **And** on a store with no orphan (a candidate without one, or an empty
@@ -1764,7 +1765,7 @@ Mapped to `CLAUDE.md` §6.2:
 > - **RFC0038.18** — in the same file, under the same scoped harness:
 >   - `the_reclaim_phase_counts_the_orphans_it_deleted`: two orphans, the
 >     two counts, `Unset`, the interval after `plan partitions` and after
->     the last commit callback;
+>     the last consolidation commit callback (the fixture has no erasure);
 >   - `an_idle_reclaim_phase_still_spans_with_zero_counts`: no orphan
 >     anywhere, as a candidate without one and as an empty store;
 >   - `rfc0009_26_a_later_sweep_reclaims_what_an_interrupted_one_left`

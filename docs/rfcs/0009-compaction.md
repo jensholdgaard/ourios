@@ -54,7 +54,7 @@ superseded-by: —
 > approved the amendment with decisions D1–D4 (§7). Its scenarios move
 > through `red` and `green` with their tests. Refs #1026.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — orphan GC is
+> **Amendment (2026-10-16, #1039, maintainer-approved) — orphan GC is
 > observable.** The sweep's orphan GC (`gc_orphans`, RFC0009.4) emits no
 > telemetry today: what it removed is summed into the sweep report and
 > never exported, and a delete it could not make is dropped.
@@ -757,7 +757,7 @@ The H4 "file-count grows sub-linearly with bytes" signal is a derived
 alert over `ourios.storage.parquet.file.size` (count) and ingested
 bytes, not a base metric.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — the orphan GC
+> **Amendment (2026-10-16, #1039, maintainer-approved) — the orphan GC
 > pass gets a counter.** The table gains this row:
 >
 > | Metric | Instrument | Unit | Attributes | Source |
@@ -1177,7 +1177,7 @@ bytes, not a base metric.
     the new one, and two compactor pods never share the data volume.
 
 The following scenario is added by the 2026-10-16 orphan-GC amendment
-(§3.6, #ORPHANPR, maintainer-approved).
+(§3.6, #1039, maintainer-approved).
 
 - **RFC0009.25 — the orphan GC pass is counted per tenant
   `[CLAUDE.md §6.3]`**
@@ -1306,7 +1306,7 @@ Mapped to `CLAUDE.md` §6.2:
 > the amendment does not approve it. The implementation PR changes this
 > test only after the maintainer has approved this wording.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — test map for
+> **Amendment (2026-10-16, #1039, maintainer-approved) — test map for
 > RFC0009.25.** In `ourios-ingester`, beside the existing compaction metric
 > tests, over an in-memory metric reader.
 >
@@ -1557,7 +1557,7 @@ change (§6 late-write test map).
   decisions D1–D4 in §7. The
   `rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable` test-contract
   change (§6) awaits separate approval. Refs #1026.
-- **2026-10-16 — orphan GC is observable (#ORPHANPR, maintainer-approved).**
+- **2026-10-16 — orphan GC is observable (#1039, maintainer-approved).**
   Adds `ourios.compaction.orphan.reclaimed`, a per-tenant counter of the
   files the orphan GC deleted or failed to delete (`error.type` on a
   failure), and moves the GC of every candidate into one pass after the

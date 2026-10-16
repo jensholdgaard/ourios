@@ -56,7 +56,7 @@ superseded-by: —
 > expected counts and the §6 test map are corrected in place to match. The
 > span, its attributes and its names are unchanged.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — the sweep's
+> **Amendment (2026-10-16, #1039, maintainer-approved) — the sweep's
 > orphan-reclaim phase gets a span.** RFC 0009's orphan-GC amendment moves
 > the GC of every candidate into one pass after the consolidation pass.
 > That pass gets one `INTERNAL` child of `sweep partitions`,
@@ -190,7 +190,7 @@ measure" — minimal new code.
 > partition gets no span of its own, and neither does consolidating a
 > partition.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — and a second
+> **Amendment (2026-10-16, #1039, maintainer-approved) — and a second
 > phase child (§3.9).** The sweep row now reads: one `INTERNAL`
 > `sweep partitions` span, plus two `INTERNAL` children, `plan partitions`
 > and then `reclaim orphans`, each a single aggregate span over all
@@ -351,7 +351,7 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > |---|---|---|
 > | Planning every tenant's consolidation candidates, once per sweep | `plan partitions` | `INTERNAL` (child of `sweep partitions`) |
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — the sweep's
+> **Amendment (2026-10-16, #1039, maintainer-approved) — the sweep's
 > orphan-reclaim phase (§3.9).** The table gains this row. It follows the
 > `{action} {target}` rule.
 >
@@ -1041,14 +1041,14 @@ existing `ourios.compaction.*` metrics. The time under
 tenant listing before it, and the consolidation and RFC 0047 erasure
 passes after it.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved).** The orphan
+> **Amendment (2026-10-16, #1039, maintainer-approved).** The orphan
 > GC that ran inside the consolidation loop now runs as its own pass after
 > it, under `reclaim orphans` (§3.9). The consolidation pass itself still
 > gets no span.
 
 ### 3.9 The sweep's orphan-reclaim phase (Amendment 2026-10-16)
 
-> This section is new in the 2026-10-16 orphan-GC amendment (#ORPHANPR,
+> This section is new in the 2026-10-16 orphan-GC amendment (#1039,
 > maintainer-approved). It amends §3.1 and §3.5 as the in-place notes
 > there say, and RFC0038.1's sweep arm as the note in §5 says.
 
@@ -1248,7 +1248,7 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > RFC0038.10's "the sweep produces exactly the spans RFC0038.1 fixes"
 > follows this arm.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — RFC0038.1's
+> **Amendment (2026-10-16, #1039, maintainer-approved) — RFC0038.1's
 > sweep arm, again (§3.9).** "Exactly one `INTERNAL` `plan partitions`
 > child" now reads: **exactly two** `INTERNAL` children when the tenant
 > enumeration succeeds, `plan partitions` and `reclaim orphans`, the
@@ -1511,7 +1511,7 @@ maintainer-approved).
 > counts.
 
 The following scenario is added by the 2026-10-16 orphan-GC amendment
-(§3.9, #ORPHANPR, maintainer-approved).
+(§3.9, #1039, maintainer-approved).
 
 > **Scenario RFC0038.18 — the sweep's orphan-reclaim phase is a span that
 > counts what it deleted.**
@@ -1739,7 +1739,7 @@ Mapped to `CLAUDE.md` §6.2:
 > counts its failing manifest read, because that partition lists two
 > files and a manifest.
 
-> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — testing
+> **Amendment (2026-10-16, #1039, maintainer-approved) — testing
 > `reclaim orphans` (§3.9).**
 >
 > - **RFC0038.1 (sweep arm)** — `crates/ourios-ingester/src/compactor/tests.rs`.
@@ -1960,7 +1960,7 @@ scope, not ingest) already covers it.
   the §6 test map's counts and the §7 partition-count question. The span,
   its attributes and the approved reuse of the `ourios.file_set.*` names
   are unchanged.
-- **2026-10-16 — the sweep's orphan-reclaim phase (#ORPHANPR,
+- **2026-10-16 — the sweep's orphan-reclaim phase (#1039,
   maintainer-approved).** Adds §3.9: `reclaim orphans` as the second
   `INTERNAL` child of `sweep partitions`, around the orphan GC pass that
   RFC 0009's orphan-GC amendment moves after consolidation. It carries

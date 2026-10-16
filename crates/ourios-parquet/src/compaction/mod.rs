@@ -74,7 +74,9 @@ pub use commit::{OrphanGc, gc_orphans};
 use keys::*;
 #[allow(unused_imports, clippy::wildcard_imports)]
 use plan::*;
-pub use plan::{hour_partitions, plan_candidates, visit_partition_rows};
+pub use plan::{
+    PlanCounts, hour_partitions, plan_candidates, plan_candidates_counted, visit_partition_rows,
+};
 #[allow(unused_imports, clippy::wildcard_imports)]
 use sort::*;
 pub use stats::{CompactionStats, MemoryPhase};

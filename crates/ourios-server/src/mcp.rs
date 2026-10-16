@@ -30,7 +30,7 @@ use ourios_querier::Querier;
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
 use ourios_serving::openfga::{OpenFgaResolver, TupleKey};
-use ourios_serving::{AuthBinding, AuthError, AuthResolver, extract_context};
+use ourios_serving::{AuthBinding, AuthError, AuthResolver, HttpClient, extract_context};
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -865,7 +865,8 @@ fn mcp_parent_context(
 async fn mcp_server_span(request: Request<Body>, next: Next) -> Response {
     let parent = extract_context(request.headers());
     let method = request.method().clone();
-    mcp_server_span_traced(method, request, next)
+    let client = HttpClient::new(request.headers(), request.extensions());
+    mcp_server_span_traced(method, &client, request, next)
         .with_context(parent)
         .await
 }
@@ -884,6 +885,11 @@ async fn mcp_server_span(request: Request<Body>, next: Next) -> Response {
         otel.kind = "server",
         http.request.method = %method,
         http.route = "/mcp",
+        client.address = client.address().map(tracing::field::display),
+        client.port = client.port(),
+        network.peer.address = client.address().map(tracing::field::display),
+        network.peer.port = client.port(),
+        user_agent.original = client.user_agent(),
         http.response.status_code = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
@@ -891,6 +897,7 @@ async fn mcp_server_span(request: Request<Body>, next: Next) -> Response {
 )]
 async fn mcp_server_span_traced(
     method: axum::http::Method,
+    client: &HttpClient,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {

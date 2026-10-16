@@ -287,9 +287,6 @@ fn get(state: &State, key: &str, stream: &TcpStream) {
 }
 
 fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
-    let State {
-        objects, next_etag, ..
-    } = state;
     let Some(req) = read_request(stream) else {
         return;
     };
@@ -300,49 +297,74 @@ fn handle(mode: IfMatch, state: &State, stream: &TcpStream) {
         .trim_start_matches('/')
         .to_string();
     match req.method.as_str() {
-        "GET" if key.is_empty() => {
-            let xml = list(objects, &req);
-            state.run_interleave(After::Read);
-            respond(stream, "200 OK", &[], xml.as_bytes());
-        }
+        "GET" if key.is_empty() => list_objects(state, &req, stream),
         "GET" | "HEAD" => get(state, &key, stream),
-        "PUT" => {
-            if req.header("if-match").is_some() {
-                state.if_match_puts.fetch_add(1, Ordering::SeqCst);
-            }
-            let mut held = objects.lock().unwrap_or_else(PoisonError::into_inner);
-            let current = held.get(&key).map(|(_, etag)| etag);
-            if precondition_holds(mode, &req, current) {
-                let mut n = next_etag.lock().unwrap_or_else(PoisonError::into_inner);
-                *n += 1;
-                let etag = format!("e{n}");
-                let created_manifest =
-                    req.header("if-none-match") == Some("*") && key.ends_with("manifest.json");
-                held.insert(key, (req.body, etag.clone()));
-                drop((held, n));
-                if created_manifest {
-                    state.run_interleave(After::ManifestCreate);
-                }
-                respond(stream, "200 OK", &[("ETag", format!("\"{etag}\""))], b"");
-            } else {
-                respond(
-                    stream,
-                    "412 Precondition Failed",
-                    &[],
-                    b"<Error><Code>PreconditionFailed</Code></Error>",
-                );
-            }
-        }
-        "DELETE" => {
-            objects
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&key);
-            respond(stream, "204 No Content", &[], b"");
-        }
-        "POST" if req.query("delete").is_some() => bulk_delete(objects, &req, stream),
+        "PUT" => put(mode, state, req, key, stream),
+        "DELETE" => delete(state, &key, stream),
+        "POST" if req.query("delete").is_some() => bulk_delete(&state.objects, &req, stream),
         _ => respond(stream, "405 Method Not Allowed", &[], b""),
     }
+}
+
+/// `ListObjectsV2`, answered from the state before any interleaved change.
+fn list_objects(state: &State, req: &Request, stream: &TcpStream) {
+    let xml = list(&state.objects, req);
+    state.run_interleave(After::Read);
+    respond(stream, "200 OK", &[], xml.as_bytes());
+}
+
+/// `PUT`, plain or conditional as `mode` compares tags.
+fn put(mode: IfMatch, state: &State, req: Request, key: String, stream: &TcpStream) {
+    if req.header("if-match").is_some() {
+        state.if_match_puts.fetch_add(1, Ordering::SeqCst);
+    }
+    let created_manifest =
+        req.header("if-none-match") == Some("*") && key.ends_with("manifest.json");
+    let Some(etag) = store_if_precondition_holds(mode, state, req, key) else {
+        respond(
+            stream,
+            "412 Precondition Failed",
+            &[],
+            b"<Error><Code>PreconditionFailed</Code></Error>",
+        );
+        return;
+    };
+    if created_manifest {
+        state.run_interleave(After::ManifestCreate);
+    }
+    respond(stream, "200 OK", &[("ETag", format!("\"{etag}\""))], b"");
+}
+
+/// Store `req`'s body at `key` under a fresh `ETag` when its conditional
+/// headers hold; that `ETag`, or `None` for a failed precondition.
+fn store_if_precondition_holds(
+    mode: IfMatch,
+    state: &State,
+    req: Request,
+    key: String,
+) -> Option<String> {
+    let mut objects = state.objects.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = objects.get(&key).map(|(_, etag)| etag);
+    if !precondition_holds(mode, &req, current) {
+        return None;
+    }
+    let mut n = state
+        .next_etag
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    *n += 1;
+    let etag = format!("e{n}");
+    objects.insert(key, (req.body, etag.clone()));
+    Some(etag)
+}
+
+fn delete(state: &State, key: &str, stream: &TcpStream) {
+    state
+        .objects
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(key);
+    respond(stream, "204 No Content", &[], b"");
 }
 
 /// `DeleteObjects` (`POST ?delete`), which `object_store` uses for every

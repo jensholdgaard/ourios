@@ -54,6 +54,22 @@ superseded-by: —
 > approved the amendment with decisions D1–D4 (§7). Its scenarios move
 > through `red` and `green` with their tests. Refs #1026.
 
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — orphan GC is
+> observable.** The sweep's orphan GC (`gc_orphans`, RFC0009.4) emits no
+> telemetry today: what it removed is summed into the sweep report and
+> never exported, and a delete it could not make is dropped.
+> `ourios.compaction.orphan.files` does not cover it, since that counter
+> counts the superseded inputs the committing rewrite could not delete.
+> This amendment adds one counter, `ourios.compaction.orphan.reclaimed`,
+> per tenant, with `error.type` on a file whose delete failed (§3.6), and
+> runs the GC of every candidate as one pass after the consolidation pass,
+> so the pass can carry one RFC 0038 phase span (`reclaim orphans`, RFC
+> 0038 §3.9). The GC rule, RFC0009.17 and the files GC may delete are
+> unchanged. Adds the in-place note in §3.6, scenario RFC0009.25 (§5), its
+> test map (§6) and the history (§9). The new names go to the ourios-semconv
+> registry. `ourios.compaction.orphan.files` keeps its meaning and its
+> attributes.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip; thesis-gates passed at `validated`.
 >
@@ -741,6 +757,43 @@ The H4 "file-count grows sub-linearly with bytes" signal is a derived
 alert over `ourios.storage.parquet.file.size` (count) and ingested
 bytes, not a base metric.
 
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — the orphan GC
+> pass gets a counter.** The table gains this row:
+>
+> | Metric | Instrument | Unit | Attributes | Source |
+> |---|---|---|---|---|
+> | `ourios.compaction.orphan.reclaimed` | Counter | `{file}` | `ourios.tenant` (required); `error.type` (iff the delete failed) | orphan files the GC pass deleted, or tried to (RFC0009.4) |
+>
+> **What it counts.** Each orphan file `gc_orphans` tries to delete, once,
+> under the tenant whose partition holds it. A delete that succeeds adds
+> one with no `error.type`. A delete that fails adds one with
+> `error.type = io`, and the file is left for a later pass, which counts it
+> again when it tries again. A file already gone when the delete runs is
+> not counted. A partition whose GC scan fails (an unreadable manifest, a
+> failed listing) deletes nothing and adds nothing here; the scan failure
+> is a sweep error and marks the phase span (RFC 0038 §3.9). This follows
+> OpenTelemetry's guidance to report successes and failures on one metric
+> and tell them apart by `error.type`
+> ([recording errors](https://opentelemetry.io/docs/specs/semconv/general/recording-errors/#recording-errors-on-metrics)).
+> The failed fraction is
+> `reclaimed{error.type="io"} / reclaimed`.
+>
+> **What stays.** `ourios.compaction.orphan.files` keeps its meaning (the
+> superseded inputs the committing rewrite could not delete,
+> `gc_failures`) and stays without attributes. The two are distinct
+> events: an input left by a rewrite becomes an orphan, and a later GC
+> pass reclaims it, so one file can appear on both counters.
+>
+> **When the GC runs.** The sweep reclaims orphans in one pass over every
+> planned candidate of every tenant, after the consolidation pass and
+> before the RFC 0047 erasure pass. Each partition's GC still runs after
+> its own rewrite, which is what RFC0009.17 needs: an output a crashed
+> compaction wrote for the generation this sweep commits is dead only once
+> that commit is in. A partition whose rewrite failed is still GC'd, as
+> before. Moving the GC out of the per-partition loop changes when, not
+> what, it deletes: no file becomes deletable earlier. Erasure rewrites
+> still run no GC.
+
 > **Validation gate.** This set is the OpenTelemetry semantic-
 > conventions **registry** at `semconv/registry/`, validated by
 > `weaver registry check` in CI (the `semconv` job, a required check)
@@ -1123,6 +1176,24 @@ bytes, not a base metric.
     { type: Recreate }`, so an upgrade stops the old pod before it starts
     the new one, and two compactor pods never share the data volume.
 
+The following scenario is added by the 2026-10-16 orphan-GC amendment
+(§3.6, #ORPHANPR, maintainer-approved).
+
+- **RFC0009.25 — the orphan GC pass is counted per tenant
+  `[CLAUDE.md §6.3]`**
+  - **Given** two tenants' sealed candidates, one holding two orphan files
+    a crashed compaction left, the other none
+  - **When** a sweep runs
+  - **Then** `ourios.compaction.orphan.reclaimed` gains 2 under the first
+    tenant with no `error.type`, and no point under the second, and
+    `ourios.compaction.orphan.files` is unchanged.
+  - **And** when the orphan's delete fails, the counter gains 1 under the
+    tenant with `error.type = io`, the file is still listed, and the next
+    sweep that deletes it adds 1 with no `error.type`.
+  - **And** every partition's GC runs after the sweep's last
+    consolidation commit, and RFC0009.17's sweep test still reclaims the
+    crashed output once.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -1234,6 +1305,16 @@ Mapped to `CLAUDE.md` §6.2:
 > removed. Under `CLAUDE.md` §6.2 this is a contract change: approving
 > the amendment does not approve it. The implementation PR changes this
 > test only after the maintainer has approved this wording.
+
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — test map for
+> RFC0009.25.** In `ourios-ingester`, beside the existing compaction metric
+> tests, over an in-memory metric reader.
+>
+> | Scenario | Test | Kind |
+> |---|---|---|
+> | RFC0009.25 | `rfc0009_25_reclaimed_orphans_are_counted_per_tenant`: two tenants, one with two orphans; the counter's points per tenant, and `orphan.files` unchanged | integration |
+> | RFC0009.25 | `rfc0009_25_a_failed_orphan_delete_carries_error_type`: an orphan in a partition directory made read-only; `error.type = io`, the file still listed; after the directory is restored, the next sweep counts it without `error.type` | integration |
+> | RFC0009.25 | `rfc0009_17_sweeps_reclaim_an_output_a_crashed_compaction_left` (existing, unchanged): the crashed output is reclaimed once under the moved pass | integration |
 
 ## 7. Open questions
 
@@ -1476,3 +1557,11 @@ change (§6 late-write test map).
   decisions D1–D4 in §7. The
   `rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable` test-contract
   change (§6) awaits separate approval. Refs #1026.
+- **2026-10-16 — orphan GC is observable (#ORPHANPR, maintainer-approved).**
+  Adds `ourios.compaction.orphan.reclaimed`, a per-tenant counter of the
+  files the orphan GC deleted or failed to delete (`error.type` on a
+  failure), and moves the GC of every candidate into one pass after the
+  consolidation pass so it can carry RFC 0038's `reclaim orphans` phase
+  span. The GC rule and RFC0009.17 are unchanged, and
+  `ourios.compaction.orphan.files` keeps its meaning. §3.6 note,
+  RFC0009.25, test map. The new names go to the ourios-semconv registry.

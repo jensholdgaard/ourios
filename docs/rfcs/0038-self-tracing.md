@@ -56,6 +56,16 @@ superseded-by: —
 > expected counts and the §6 test map are corrected in place to match. The
 > span, its attributes and its names are unchanged.
 
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — the sweep's
+> orphan-reclaim phase gets a span.** RFC 0009's orphan-GC amendment moves
+> the GC of every candidate into one pass after the consolidation pass.
+> That pass gets one `INTERNAL` child of `sweep partitions`,
+> `reclaim orphans`, carrying the files it deleted and the deletes that
+> failed, and marked `Error` when any partition's GC failed (§3.9). Amends
+> RFC0038.1's sweep arm (exactly two children) and adds RFC0038.18 (§5).
+> Two new attribute names go to the ourios-semconv registry. GC of one
+> partition still gets no span.
+
 > **Status: `accepted` (2026-08-25, maintainer sign-off).** Terminal —
 > the completed-backlog batch flip. Where a thesis-gate applies it
 > stands passing in `docs/benchmarks.md` §7; elsewhere `validated` is
@@ -179,6 +189,12 @@ measure" — minimal new code.
 > span over the planning of all tenants. Planning one tenant or one
 > partition gets no span of its own, and neither does consolidating a
 > partition.
+
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — and a second
+> phase child (§3.9).** The sweep row now reads: one `INTERNAL`
+> `sweep partitions` span, plus two `INTERNAL` children, `plan partitions`
+> and then `reclaim orphans`, each a single aggregate span over all
+> tenants. Reclaiming one partition's orphans gets no span of its own.
 
 ### 3.2 The tracer, in the bootstrap
 
@@ -334,6 +350,14 @@ are **attributes**, never part of the span name, keeping names low-cardinality.
 > | Operation | Span name | Kind |
 > |---|---|---|
 > | Planning every tenant's consolidation candidates, once per sweep | `plan partitions` | `INTERNAL` (child of `sweep partitions`) |
+
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — the sweep's
+> orphan-reclaim phase (§3.9).** The table gains this row. It follows the
+> `{action} {target}` rule.
+>
+> | Operation | Span name | Kind |
+> |---|---|---|
+> | Reclaiming orphan files from every planned candidate, once per sweep after consolidation | `reclaim orphans` | `INTERNAL` (child of `sweep partitions`) |
 
 ### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
 
@@ -1017,6 +1041,68 @@ existing `ourios.compaction.*` metrics. The time under
 tenant listing before it, and the consolidation and RFC 0047 erasure
 passes after it.
 
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved).** The orphan
+> GC that ran inside the consolidation loop now runs as its own pass after
+> it, under `reclaim orphans` (§3.9). The consolidation pass itself still
+> gets no span.
+
+### 3.9 The sweep's orphan-reclaim phase (Amendment 2026-10-16)
+
+> This section is new in the 2026-10-16 orphan-GC amendment (#ORPHANPR,
+> maintainer-approved). It amends §3.1 and §3.5 as the in-place notes
+> there say, and RFC0038.1's sweep arm as the note in §5 says.
+
+**Why.** The sweep's orphan GC (`gc_orphans`, RFC 0009 RFC0009.4)
+deletes files from object storage, and nothing in a trace showed it:
+not its duration, not what it deleted, not a delete that failed. It ran
+inside the per-partition consolidation loop, which §3.1 keeps span-free,
+so it could not get a span there. RFC 0009's orphan-GC amendment moves it
+into one pass after the consolidation pass. That pass has duration and,
+on the S3 backend, makes one listing, one manifest read and one `DELETE`
+per orphan for each candidate, which is the §3.7 rule for a phase span.
+
+**The span.**
+
+| | `reclaim orphans` |
+|---|---|
+| Kind | `INTERNAL` |
+| Parent | `sweep partitions` |
+| Opens / ends | around the GC of every planned candidate of every tenant whose planning succeeded: after the consolidation pass's last rewrite, before the RFC 0047 erasure pass. It starts after `plan partitions` ends. |
+| Cardinality | **exactly one** per sweep whose tenant enumeration succeeds, also when there is no candidate (the counts are then zero); **none** when the enumeration fails, since the sweep then ends before planning |
+| Status | `Error` iff the GC of at least one partition failed, either its scan (an unreadable manifest or a failed listing) or the delete of at least one orphan. `error.type` is the first such failure's class, in pass order: a scan failure takes the class `sweep partitions` already uses (`read`, `write`, `manifest`, `io`, `_OTHER`), and a failed delete is `io`. `Unset` otherwise. The sweep goes on either way, so `sweep partitions` stays `Unset` (its existing rule). |
+| Required attributes | `ourios.compaction.orphan.reclaimed_count`, `ourios.compaction.orphan.failed_count`, summed over every partition GC'd |
+
+It carries no `ourios.tenant`: it covers every tenant. The per-tenant
+split is `ourios.compaction.orphan.reclaimed` (RFC 0009 §3.6).
+
+**The counts.** Set when the phase ends, including when some partition's
+GC failed (the counts up to and after it, since the pass goes on).
+
+- `reclaimed_count` counts the orphan files whose delete succeeded. A file
+  already gone when its delete runs is not counted.
+- `failed_count` counts the orphan files whose delete failed. A partition
+  whose scan failed deletes nothing and adds to neither count; it shows as
+  the span's `Error`.
+
+The two counts equal the sweep's points on
+`ourios.compaction.orphan.reclaimed` without and with `error.type`,
+summed over tenants.
+
+**The names.** Two new attributes, `ourios.compaction.orphan.reclaimed_count`
+and `ourios.compaction.orphan.failed_count` (int), in the
+`ourios.compaction.orphan` namespace beside the two orphan counters. The
+`_count` suffix follows the registry's existing span counts
+(`ourios.file_set.list_request_count`) and keeps the attribute names
+distinct from the metric name `ourios.compaction.orphan.reclaimed`.
+Neither existing registered name fits: the `ourios.file_set.*` counts
+describe a resolution's listings and reads, not deletions.
+
+**What does not get a span.** Reclaiming one partition, and deleting one
+file, are per-item loops, which §3.1 keeps span-free. The pass's listings
+and manifest reads are not counted on the span; the
+`ourios.storage.operation.*` metrics already count them under the
+`compaction` caller.
+
 ## 4. Alternatives considered
 
 **Correlation-only (a tracer that generates ids but exports no spans).** The
@@ -1161,6 +1247,13 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > query, MCP and ingest arms and the log-correlation clause are unchanged.
 > RFC0038.10's "the sweep produces exactly the spans RFC0038.1 fixes"
 > follows this arm.
+
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — RFC0038.1's
+> sweep arm, again (§3.9).** "Exactly one `INTERNAL` `plan partitions`
+> child" now reads: **exactly two** `INTERNAL` children when the tenant
+> enumeration succeeds, `plan partitions` and `reclaim orphans`, the
+> second starting after the first ends, and **none** when it fails. No
+> other span is produced. The other arms are unchanged.
 
 > **Scenario RFC0038.2 — the ingest hot path mints no per-record spans.**
 > **Given** traces enabled and an always-on sampler,
@@ -1417,6 +1510,27 @@ maintainer-approved).
 > failure clause is unchanged: the failing tenant's one listing still
 > counts.
 
+The following scenario is added by the 2026-10-16 orphan-GC amendment
+(§3.9, #ORPHANPR, maintainer-approved).
+
+> **Scenario RFC0038.18 — the sweep's orphan-reclaim phase is a span that
+> counts what it deleted.**
+> **Given** traces enabled with an always-on sampler, and a store with a
+> sealed candidate partition holding two orphan files a crashed
+> compaction left,
+> **When** a compaction sweep runs,
+> **Then** `sweep partitions` has exactly one `reclaim orphans` child, of
+> kind `INTERNAL`, that starts after `plan partitions` ends and after the
+> sweep's last committed partition, and lies within its parent's interval,
+> **And** its `ourios.compaction.orphan.reclaimed_count` is 2, its
+> `ourios.compaction.orphan.failed_count` is 0, and its status is `Unset`,
+> **And** on a store with no orphan (or no candidate), the span is still
+> there with both counts 0,
+> **And** when an orphan's delete fails (its partition directory is
+> read-only), `reclaim orphans` has status `Error` with
+> `error.type = io` and `failed_count` 1, and `sweep partitions` stays
+> `Unset`.
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -1625,6 +1739,36 @@ Mapped to `CLAUDE.md` §6.2:
 > counts its failing manifest read, because that partition lists two
 > files and a manifest.
 
+> **Amendment (2026-10-16, #ORPHANPR, maintainer-approved) — testing
+> `reclaim orphans` (§3.9).**
+>
+> - **RFC0038.1 (sweep arm)** — `crates/ourios-ingester/src/compactor/tests.rs`.
+>   `rfc0038_1_sweep_emits_its_span_and_one_plan_phase` asserts exactly two
+>   spans. Changing that to three is the contract change this amendment
+>   approves (maintainer, 2026-10-16) (`CLAUDE.md` §6.2). The test becomes
+>   `rfc0038_1_sweep_emits_its_span_and_two_phases` in the change that adds
+>   the span. It keeps every other assertion (the sweep's name, kind and
+>   root parentage; `plan partitions`' name, kind, parentage and trace) and
+>   adds the same for `reclaim orphans`, plus that it starts after
+>   `plan partitions` ends.
+> - **RFC0038.1 (sweep arm, failed enumeration)** —
+>   `a_failed_sweep_marks_its_span_error` is unchanged: exactly one span.
+> - **RFC0038.3** — `rfc0038_3_span_context_survives_spawn_boundaries`
+>   gains an assertion that the one `reclaim orphans` span is the sweep
+>   span's child across `spawn_blocking`.
+> - **RFC0038.17** — unchanged. Its tests find `plan partitions` by name.
+> - **RFC0038.18** — in the same file, under the same scoped harness:
+>   - `the_reclaim_phase_counts_the_orphans_it_deleted`: two orphans, the
+>     two counts, `Unset`, the interval after `plan partitions` and after
+>     the last commit callback;
+>   - `an_idle_reclaim_phase_still_spans_with_zero_counts`: a candidate with
+>     no orphan, and an empty store;
+>   - `a_failed_orphan_delete_marks_the_reclaim_phase_error`: a read-only
+>     partition directory holding an orphan; `Error`, `error.type = io`,
+>     `failed_count` 1, and `sweep partitions` `Unset`.
+> - No `criterion` guard: one span per sweep, and the counts are integer
+>   increments beside store calls.
+
 ## 7. Open questions
 
 - [ ] Should the per-Export-batch span live on `ingest_bound` (single choke
@@ -1816,3 +1960,13 @@ scope, not ingest) already covers it.
   the §6 test map's counts and the §7 partition-count question. The span,
   its attributes and the approved reuse of the `ourios.file_set.*` names
   are unchanged.
+- **2026-10-16 — the sweep's orphan-reclaim phase (#ORPHANPR,
+  maintainer-approved).** Adds §3.9: `reclaim orphans` as the second
+  `INTERNAL` child of `sweep partitions`, around the orphan GC pass that
+  RFC 0009's orphan-GC amendment moves after consolidation. It carries
+  `ourios.compaction.orphan.reclaimed_count` and
+  `ourios.compaction.orphan.failed_count` (new registry names) and is
+  `Error` with `error.type` when a partition's GC failed. In-place notes in
+  §3.1, §3.5, §3.8, §5 (RFC0038.1's sweep arm: exactly two children) and
+  §6, which names the two-span test that becomes a three-span test. New
+  scenario RFC0038.18.

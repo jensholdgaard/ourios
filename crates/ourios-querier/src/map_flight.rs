@@ -327,17 +327,16 @@ impl TemplateMapFlights {
                     trigger,
                 } => {
                     let outcome = Self::wait(done, &mut waited).await;
-                    if same_frontier {
-                        let joined = Self::join(outcome, waited, trigger);
-                        #[cfg(any(test, feature = "testing"))]
-                        if joined.is_ok() {
-                            self.hooks.joined();
-                        }
-                        return joined.map(|acquisition| Settled::Acquired {
-                            acquisition,
-                            verified: None,
-                        });
+                    if !same_frontier {
+                        continue;
                     }
+                    let joined = Self::join(outcome, waited, trigger);
+                    #[cfg(any(test, feature = "testing"))]
+                    self.hooks.joined(&joined);
+                    return joined.map(|acquisition| Settled::Acquired {
+                        acquisition,
+                        verified: None,
+                    });
                 }
             }
         }
@@ -425,6 +424,8 @@ impl TemplateMapFlights {
     ) -> Result<Step<P::Unchanged>, QueryError> {
         let tenant = &request.tenant;
         let listing = audit_scan::list_audit_stream(backend, tenant, TEMPLATE_MAP_FILENAME)?;
+        #[cfg(any(test, feature = "testing"))]
+        self.hooks.after_listing();
         if let Some(unchanged) = request.prior.unchanged(&listing) {
             return Ok(Step::Unchanged(unchanged));
         }
@@ -538,6 +539,7 @@ pub(crate) mod hooks {
         pub(crate) waits: AtomicUsize,
         pub(crate) joins: AtomicUsize,
         pub(crate) before_acquire: Mutex<Option<Hook>>,
+        pub(crate) after_listing: Mutex<Option<Hook>>,
     }
 
     impl Hooks {
@@ -545,8 +547,22 @@ pub(crate) mod hooks {
             self.waits.fetch_add(1, Ordering::SeqCst);
         }
 
-        pub(crate) fn joined(&self) {
-            self.joins.fetch_add(1, Ordering::SeqCst);
+        /// Count a join that answered; a failed shared acquisition is none.
+        pub(crate) fn joined<T, E>(&self, joined: &Result<T, E>) {
+            if joined.is_ok() {
+                self.joins.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        pub(crate) fn after_listing(&self) {
+            let hook = self
+                .after_listing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
 
         pub(crate) fn before_acquire(&self, tenant: &TenantId, in_flight: usize) {

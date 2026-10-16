@@ -1045,6 +1045,19 @@ impl Querier {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
     }
 
+    /// Run `gate` on the acquiring thread right after each tenant listing a
+    /// template-map acquisition takes, before anything is decided from it;
+    /// `None` removes it.
+    #[doc(hidden)]
+    pub fn set_template_map_listing_gate(&self, gate: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .template_maps
+            .hooks
+            .after_listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
+
     /// How many queries have so far found an acquisition in flight and
     /// waited on it.
     #[doc(hidden)]

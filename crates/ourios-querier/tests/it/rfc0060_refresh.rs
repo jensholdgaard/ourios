@@ -818,6 +818,51 @@ async fn rfc0060_14_only_a_verified_hit_is_remembered() {
     );
 }
 
+/// Scenario RFC0060.16 — a deletion after the listing is repaired one pass
+/// late: the pass that listed the artifact skips, a query in between pays
+/// its own fold, and the next pass sees the deletion and publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0060_16_a_deletion_after_the_listing_is_repaired_one_pass_late() {
+    let dir = store(&[TENANT]);
+    let querier = Querier::new(dir.path());
+    let mut refresher = verified(&querier).await;
+    let artifact = tenant_dir(dir.path(), TENANT).join(TEMPLATE_MAP_FILENAME);
+
+    let deleted = artifact.clone();
+    querier.set_template_map_listing_gate(Some(Arc::new(move || {
+        let _ = std::fs::remove_file(&deleted);
+    })));
+    assert_eq!(pass_outcome(&mut refresher).await, None, "this pass skips");
+    querier.set_template_map_listing_gate(None);
+    assert!(!artifact.exists(), "and repairs nothing");
+
+    let (exporter, _provider, dispatch) = traced();
+    let rows = query(&querier, TENANT)
+        .with_subscriber(dispatch)
+        .await
+        .expect("query")
+        .rows;
+    assert_eq!(rows, 1, "a query in between answers correctly");
+    let spans = exporter.get_finished_spans().expect("spans");
+    assert_eq!(
+        text(
+            load_of(&spans, TENANT),
+            semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME
+        )
+        .as_deref(),
+        Some("miss"),
+        "paying the fold itself"
+    );
+
+    std::fs::remove_file(&artifact).expect("undo the query's publish");
+    assert_eq!(
+        pass_outcome(&mut refresher).await.as_deref(),
+        Some("miss"),
+        "the next pass sees the deletion"
+    );
+    assert!(artifact.exists(), "and publishes");
+}
+
 /// Scenario RFC0060.15 — the skip on S3: no `GetObject` under a skipped
 /// tenant's `load template_map`, and one again after another writer's
 /// `PUT`. Run by the `s3-integration` CI job by exact name.
@@ -826,7 +871,7 @@ async fn rfc0060_14_only_a_verified_hit_is_remembered() {
 async fn rfc0060_15_the_skip_on_s3_reads_no_artifact() {
     let (exporter, provider, dispatch) = traced();
     // The store's `CLIENT` spans go to the global tracer provider.
-    opentelemetry::global::set_tracer_provider(provider.clone());
+    let _global = crate::common::global_tracer_provider(&provider).await;
     let (_container, config) = crate::common::localstack_s3_config("ourios-it-refresh-skip").await;
     let store = ourios_parquet::Store::s3(config.clone()).expect("s3 store");
     let seed = store.clone();

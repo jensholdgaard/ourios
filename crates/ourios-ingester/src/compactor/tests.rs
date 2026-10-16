@@ -206,15 +206,15 @@ fn the_plan_phase_counts_its_listings_and_manifest_reads() {
         )
     });
 
-    // Assert — per tenant four roll-ups (year, month, day, hour); `a`'s
-    // sealed partition adds one manifest read and one listing of its two
-    // files; `b`'s open partition adds nothing.
+    // Assert — one recursive listing per tenant, returning `a`'s two files
+    // and `b`'s one; `a`'s partition lists no manifest, so none is read
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
     assert_eq!(result.expect("sweep").partitions_compacted, 1);
     let sweep = only_span(&spans, "sweep partitions");
     let plan = only_span(&spans, "plan partitions");
     assert_eq!(
         (plan_counts(plan), &plan.status),
-        (counts(9, 2, 1), &Status::Unset)
+        (counts(2, 3, 0), &Status::Unset)
     );
     assert!(sweep.start_time <= plan.start_time && plan.end_time <= sweep.end_time);
     let first_commit = first_commit.expect("a partition committed");
@@ -242,8 +242,8 @@ fn a_failed_tenant_plan_marks_the_plan_phase_error() {
     let (result, spans) = traced(|| run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()));
     drop(unlistable);
 
-    // Assert — `a`'s five listings, two objects and one manifest read,
-    // plus `b`'s one failed roll-up.
+    // Assert — `a`'s one listing of its two objects, no manifest read
+    // (none is listed), plus `b`'s one failed listing.
     let report = result.expect("a failed tenant does not fail the sweep");
     assert_eq!(report.partitions_compacted, 1, "{report:?}");
     let plan = only_span(&spans, "plan partitions");
@@ -258,7 +258,7 @@ fn a_failed_tenant_plan_marks_the_plan_phase_error() {
             plan_counts(plan),
             &only_span(&spans, "sweep partitions").status,
         ),
-        (Some("io".into()), counts(6, 2, 1), &Status::Unset),
+        (Some("io".into()), counts(2, 2, 0), &Status::Unset),
     );
 }
 
@@ -471,6 +471,69 @@ fn erasure_keeps_the_rows_phase_when_its_manifest_swap_lost() {
     assert_eq!(pending, vec![ErasurePhase::Rows]);
 }
 
+/// RFC0009.12 — an erasure still rewrites a settled partition: one live
+/// file at or above the small-file size, which candidate planning skips
+/// without reading it. Erasure walks every hour partition itself.
+#[test]
+fn rfc0009_12_erasure_rewrites_a_settled_partition_the_planner_skips() {
+    // Arrange — one file holding a row to erase (template 1) and one to keep.
+    let bucket = tempfile::tempdir().expect("temp");
+    let store = store_at(bucket.path());
+    let records = [rec("a", 1, TS0), rec("a", 2, TS0 + 1_000_000)];
+    let partition = PartitionKey::derive(&records[0]).expect("derive");
+    let mut w = Writer::open_in(&store, partition.clone()).expect("open writer");
+    w.append_records(&records).expect("append");
+    w.close().expect("close");
+    let policy = CompactionPolicy {
+        small_file_bytes: 1,
+        ..CompactionPolicy::default()
+    };
+    assert!(
+        plan_candidates(&store, "a", NOW_SEALED, &policy)
+            .expect("plan")
+            .is_empty(),
+        "the partition is settled: the planner skips it",
+    );
+    request_erasure(&store, "a", "c-1").expect("request");
+    let erase_template_1 = |record: &MinedRecord, _: &str| record.template_id == 1;
+    let mut hooks = SweepHooks {
+        observe: None,
+        erasure_match: Some(&erase_template_1),
+        gauges: None,
+    };
+
+    // Act
+    let report = run_sweep_hooked(
+        &store,
+        NOW_SEALED,
+        &policy,
+        &PromotedAttributes::default(),
+        &mut hooks,
+    )
+    .expect("sweep");
+
+    // Assert
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let candidates: Vec<_> = report
+        .per_tenant
+        .iter()
+        .map(|t| t.candidates_found)
+        .collect();
+    assert_eq!(candidates, vec![0], "no consolidation candidate");
+    let outcomes: Vec<_> = report
+        .erasures
+        .iter()
+        .map(|o| (o.partitions_rewritten, o.rows_dropped))
+        .collect();
+    assert_eq!(outcomes, vec![(1, 1)], "{report:?}");
+    let mut kept = Vec::new();
+    ourios_parquet::compaction::visit_partition_rows(&store, &partition, |batch| {
+        kept.extend(batch.iter().map(|r| r.template_id));
+    })
+    .expect("read");
+    assert_eq!(kept, vec![2], "the erased row is gone, the other kept");
+}
+
 #[test]
 fn sweep_compacts_a_sealed_candidate() {
     // Arrange
@@ -592,11 +655,13 @@ fn sweep_scans_every_tenant() {
 #[test]
 fn sweep_isolates_a_failing_tenant() {
     // Arrange — tenant "a" is a healthy sealed candidate; tenant
-    // "b" has a malformed manifest.json, so planning it errors.
+    // "b" has a malformed manifest.json, so planning it errors. b holds two
+    // files: planning reads a manifest only where two or more are listed
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
     let bucket = tempfile::tempdir().expect("temp");
     let store = store_at(bucket.path());
     write_sealed_candidate(&store, "a");
-    write_file(&store, "b", 1, TS0);
+    write_sealed_candidate(&store, "b");
     // Corrupt b's manifest on the local store (its partition dir exists
     // after the write above); planning b then fails to parse it.
     let b_dir = PartitionKey::derive(&rec("b", 1, TS0))

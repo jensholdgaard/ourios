@@ -326,8 +326,12 @@ async fn a_measured_sweep_plans_each_partition_once() {
     let measured = settled_sweep_requests(true).await;
 
     assert!(
-        unmeasured.0 > 0,
-        "planning reads the manifests: {unmeasured:?}"
+        unmeasured.1 > 0,
+        "planning lists the tenant: {unmeasured:?}"
+    );
+    assert_eq!(
+        unmeasured.0, 0,
+        "a settled partition costs no read (RFC0009.8): {unmeasured:?}"
     );
     assert_eq!(measured, unmeasured);
 }

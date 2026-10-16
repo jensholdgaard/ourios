@@ -9,6 +9,7 @@ use ourios_core::tenant::TenantId;
 use super::*;
 
 mod bounded_sort;
+mod plan_cost;
 
 /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
 /// every record shares one partition.
@@ -1167,16 +1168,16 @@ fn planning_counts_its_listings_and_manifest_reads() {
     let (selected, counts) =
         plan_candidates_counted(&store, "a", NOW_SEALED, &CompactionPolicy::default());
 
-    // Assert — four roll-ups (year, month, day, hour) plus one listing of
-    // the sealed partition, which returned its two objects; one manifest
-    // read, for the sealed partition only.
+    // Assert — one recursive listing of the tenant, returning all three
+    // objects (the open hour's too); no manifest is listed, so none is read
+    // (RFC 0009 §3.3, 2026-10-16 amendment).
     assert_eq!(selected.expect("plan"), vec![partition()]);
     assert_eq!(
         counts,
         PlanCounts {
-            list_requests: 5,
-            listed_objects: 2,
-            manifest_reads: 1,
+            list_requests: 1,
+            listed_objects: 3,
+            manifest_reads: 0,
         }
     );
 }
@@ -1193,14 +1194,14 @@ fn planning_keeps_its_counts_on_the_error_path() {
     let (selected, counts) =
         plan_candidates_counted(&store, "a", NOW_SEALED, &CompactionPolicy::default());
 
-    // Assert — the failed manifest read counts; the partition listing that
-    // would have followed it never ran.
+    // Assert — the tenant listing ran first and returned the partition's
+    // three objects; the failed manifest read after it still counts.
     assert!(selected.is_err(), "an unparseable manifest fails planning");
     assert_eq!(
         counts,
         PlanCounts {
-            list_requests: 4,
-            listed_objects: 0,
+            list_requests: 1,
+            listed_objects: 3,
             manifest_reads: 1,
         }
     );
